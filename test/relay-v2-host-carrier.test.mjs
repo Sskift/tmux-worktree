@@ -47,6 +47,16 @@ class FakeTransport {
     return delivery.deliveryToken;
   }
 
+  rejectNext(expectedByteLength) {
+    const delivery = this.pendingDeliveries.shift();
+    assert.ok(delivery, "no pending fake delivery");
+    if (expectedByteLength !== undefined) {
+      assert.equal(delivery.byteLength, expectedByteLength);
+    }
+    this.bufferedBytes -= delivery.byteLength;
+    return delivery.deliveryToken;
+  }
+
   close(code, reason) {
     this.closes.push({ code, reason });
     this.onClose?.(code);
@@ -126,7 +136,7 @@ function createHarness(options = {}) {
     publicPayloadDecoder: options.publicPayloadDecoder,
     clock: options.clock ?? (() => 1_783_700_100_000),
     schedule: options.schedule,
-    idFactory: () => `host-hello-${nextId++}`,
+    idFactory: options.idFactory ?? (() => `host-hello-${nextId++}`),
     queueLimits: options.queueLimits,
     routeSink: {
       onRouteBound(binding) {
@@ -244,6 +254,15 @@ function publicV2Frame(requestId = "hosts-request") {
     type: "hosts.snapshot.get",
     requestId,
     payload: {},
+  });
+}
+
+function outboundReceipt(outcomes, onSettle) {
+  return Object.freeze({
+    settle(delivered) {
+      outcomes.push(delivered);
+      onSettle?.(delivered);
+    },
   });
 }
 
@@ -771,6 +790,309 @@ test("late callbacks from a replaced connector generation cannot affect the winn
   )));
   assert.equal(h.received.length, 1);
   assert.equal(h.received[0].binding, secondBinding);
+});
+
+test("outbound receipt ownership follows admission, exact delivery, and cleanup accounting", async (t) => {
+  function openRoute() {
+    const h = createHarness();
+    const active = connect(h);
+    const connectorId = register(active.connection, active.hello);
+    active.connection.receive(wire(routeOpen(connectorId)));
+    const binding = h.bound.at(-1);
+    acknowledgeAll(active.connection, active.transport);
+    return { h, active, connectorId, binding };
+  }
+
+  await t.test("immediate rejection and synchronous clear before admission never callback", () => {
+    const immediate = openRoute();
+    const immediateOutcomes = [];
+    assert.equal(immediate.h.actor.sendPublic(
+      { ...immediate.binding, routeFence: "foreign-fence" },
+      publicV2Frame("receipt-immediate-reject"),
+      outboundReceipt(immediateOutcomes),
+    ), false);
+    assert.deepEqual(immediateOutcomes, []);
+    assert.equal(immediate.active.transport.pendingDeliveries.length, 0);
+
+    const reentrant = openRoute();
+    const reentrantOutcomes = [];
+    reentrant.active.transport.onTrySend = (_deliveryToken, bytes) => {
+      const frame = codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
+      if (frame.type === "route.data") reentrant.active.connection.closed(1006);
+    };
+    assert.equal(reentrant.h.actor.sendPublic(
+      reentrant.binding,
+      publicV2Frame("receipt-sync-clear"),
+      outboundReceipt(reentrantOutcomes),
+    ), false);
+    assert.deepEqual(reentrantOutcomes, []);
+    assert.equal(reentrant.h.actor.status().phase, "offline");
+  });
+
+  await t.test("temporary refusal stays pending and exact ACK settles true once", () => {
+    const context = openRoute();
+    const outcomes = [];
+    context.active.transport.accepting = false;
+    assert.equal(context.h.actor.sendPublic(
+      context.binding,
+      publicV2Frame("receipt-temporary-refusal"),
+      outboundReceipt(outcomes),
+    ), true);
+    assert.deepEqual(outcomes, []);
+    context.active.transport.accepting = true;
+    context.active.connection.writable();
+    assert.deepEqual(outcomes, []);
+    const token = context.active.transport.confirmNext();
+    context.active.connection.acknowledge(token);
+    assert.deepEqual(outcomes, [true]);
+  });
+
+  await t.test("transport throw after queued refusal settles the shifted route exactly once", () => {
+    const context = openRoute();
+    const outcomes = [];
+    context.active.transport.accepting = false;
+    assert.equal(context.h.actor.sendPublic(
+      context.binding,
+      publicV2Frame("receipt-shifted-route-throw"),
+      outboundReceipt(outcomes),
+    ), true);
+    assert.deepEqual(outcomes, []);
+
+    context.active.transport.accepting = true;
+    context.active.transport.acceptFrame = (bytes) => {
+      const frame = codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
+      if (frame.type === "route.data") throw new Error("injected transport failure");
+      return true;
+    };
+    context.active.connection.writable();
+
+    assert.deepEqual(outcomes, [false]);
+    assert.equal(context.h.actor.status().phase, "offline");
+    assert.deepEqual(context.active.transport.pendingDeliveries, []);
+    assert.deepEqual(context.active.transport.closes, [{
+      code: 1013,
+      reason: "carrier_transport_failure",
+    }]);
+    context.active.connection.writable();
+    assert.deepEqual(outcomes, [false]);
+  });
+
+  await t.test("route cleanup rejects queued data but leaves transport-owned data pending", () => {
+    const queued = openRoute();
+    const queuedOutcomes = [];
+    queued.active.transport.accepting = false;
+    assert.equal(queued.h.actor.sendPublic(
+      queued.binding,
+      publicV2Frame("receipt-queued-unbind"),
+      outboundReceipt(queuedOutcomes),
+    ), true);
+    queued.active.connection.receive(wire({
+      carrierVersion: 1,
+      type: "route.unbind",
+      connectorId: queued.connectorId,
+      routeId: queued.binding.routeId,
+      routeFence: queued.binding.routeFence,
+      payload: { reason: "client_closed", lastClientToHostSeq: "0" },
+    }));
+    assert.deepEqual(queuedOutcomes, [false]);
+
+    const inFlight = openRoute();
+    const inFlightOutcomes = [];
+    assert.equal(inFlight.h.actor.sendPublic(
+      inFlight.binding,
+      publicV2Frame("receipt-inflight-unbind"),
+      outboundReceipt(inFlightOutcomes),
+    ), true);
+    inFlight.active.connection.receive(wire({
+      carrierVersion: 1,
+      type: "route.unbind",
+      connectorId: inFlight.connectorId,
+      routeId: inFlight.binding.routeId,
+      routeFence: inFlight.binding.routeFence,
+      payload: { reason: "client_closed", lastClientToHostSeq: "0" },
+    }));
+    assert.deepEqual(inFlightOutcomes, []);
+    inFlight.active.connection.acknowledge(inFlight.active.transport.confirmNext());
+    assert.deepEqual(inFlightOutcomes, [true]);
+  });
+
+  await t.test("definitive transport rejection settles false after route close", () => {
+    const context = openRoute();
+    const outcomes = [];
+    assert.equal(context.h.actor.sendPublic(
+      context.binding,
+      publicV2Frame("receipt-definitive-reject"),
+      outboundReceipt(outcomes),
+    ), true);
+    assert.equal(context.h.actor.closeRoute(context.binding, {
+      closeCode: 1013,
+      reason: "slow_consumer",
+      errorCode: "SLOW_CONSUMER",
+      retryable: true,
+    }), true);
+    assert.deepEqual(outcomes, []);
+    context.active.connection.rejectUnaccepted(context.active.transport.rejectNext());
+    assert.deepEqual(outcomes, [false]);
+  });
+
+  await t.test("connector terminal cleanup is one-shot and isolates callback reentry", () => {
+    for (const mode of ["closed", "superseded", "dispose"]) {
+      const context = openRoute();
+      const outcomes = [];
+      assert.equal(context.h.actor.sendPublic(
+        context.binding,
+        publicV2Frame(`receipt-cleanup-first-${mode}`),
+        outboundReceipt(outcomes, () => {
+          context.active.connection.closed(1006);
+          throw new Error("receipt observer failure");
+        }),
+      ), true);
+      assert.equal(context.h.actor.sendPublic(
+        context.binding,
+        publicV2Frame(`receipt-cleanup-second-${mode}`),
+        outboundReceipt(outcomes),
+      ), true);
+
+      if (mode === "closed") context.active.connection.closed(1006);
+      if (mode === "dispose") context.h.actor.dispose();
+      if (mode === "superseded") {
+        context.active.connection.receive(wire({
+          carrierVersion: 1,
+          type: "host.superseded",
+          connectorId: context.connectorId,
+          payload: {
+            hostId: "mac-admin",
+            losingConnectorId: context.connectorId,
+            winningConnectorId: "receipt-winning-connector",
+            losingHostInstanceId: "host-process-uuid",
+            winningHostInstanceId: "receipt-winning-process",
+            reason: "new_authenticated_connector",
+          },
+        }));
+      }
+      assert.deepEqual(outcomes, [false, false], mode);
+      const lateToken = context.active.transport.confirmNext();
+      context.active.connection.acknowledge(lateToken);
+      assert.deepEqual(outcomes, [false, false], `${mode} late ACK`);
+      if (mode === "dispose") {
+        assert.throws(
+          () => context.h.actor.connect(new FakeTransport(), "credential-1"),
+          /disposed and cannot reconnect/,
+        );
+      }
+    }
+  });
+
+  await t.test("receipt callbacks cannot recursively advance another delivery", () => {
+    for (const operation of ["acknowledge", "rejectUnaccepted"]) {
+      const context = openRoute();
+      const firstOutcomes = [];
+      const secondOutcomes = [];
+      assert.equal(context.h.actor.sendPublic(
+        context.binding,
+        publicV2Frame(`receipt-reentrant-first-${operation}`),
+        outboundReceipt(firstOutcomes, () => {
+          const token = operation === "acknowledge"
+            ? context.active.transport.confirmNext()
+            : context.active.transport.rejectNext();
+          context.active.connection[operation](token);
+        }),
+      ), true);
+      assert.equal(context.h.actor.sendPublic(
+        context.binding,
+        publicV2Frame(`receipt-reentrant-second-${operation}`),
+        outboundReceipt(secondOutcomes),
+      ), true);
+
+      context.active.connection.acknowledge(context.active.transport.confirmNext());
+      assert.deepEqual(firstOutcomes, [true], operation);
+      assert.deepEqual(secondOutcomes, [false], operation);
+      assert.deepEqual(context.active.transport.closes, [{
+        code: 4400,
+        reason: operation === "acknowledge"
+          ? "reentrant_transport_ack"
+          : "reentrant_transport_reject",
+      }]);
+    }
+  });
+
+  await t.test("replacement settles only the old cells and old ACK cannot reach the winner", () => {
+    const h = createHarness();
+    const first = connect(h);
+    const firstConnectorId = register(first.connection, first.hello, {
+      connectorId: "receipt-old-connector",
+    });
+    first.connection.receive(wire(routeOpen(firstConnectorId, {
+      routeId: "receipt-old-route",
+      routeFence: "receipt-old-fence",
+    })));
+    const oldBinding = h.bound.at(-1);
+    acknowledgeAll(first.connection, first.transport);
+    const oldOutcomes = [];
+    assert.equal(h.actor.sendPublic(
+      oldBinding,
+      publicV2Frame("receipt-old-data"),
+      outboundReceipt(oldOutcomes),
+    ), true);
+
+    const replacement = connect(h, new FakeTransport());
+    const replacementConnectorId = register(replacement.connection, replacement.hello, {
+      connectorId: "receipt-new-connector",
+    });
+    replacement.connection.receive(wire(routeOpen(replacementConnectorId, {
+      routeId: "receipt-new-route",
+      routeFence: "receipt-new-fence",
+    })));
+    const newBinding = h.bound.at(-1);
+    acknowledgeAll(replacement.connection, replacement.transport);
+    assert.deepEqual(oldOutcomes, [false]);
+
+    const newOutcomes = [];
+    assert.equal(h.actor.sendPublic(
+      newBinding,
+      publicV2Frame("receipt-new-data"),
+      outboundReceipt(newOutcomes),
+    ), true);
+    first.connection.acknowledge(first.transport.confirmNext());
+    assert.deepEqual(oldOutcomes, [false]);
+    assert.deepEqual(newOutcomes, []);
+    replacement.connection.acknowledge(replacement.transport.confirmNext());
+    assert.deepEqual(newOutcomes, [true]);
+  });
+});
+
+test("connect cannot publish a connector after synchronous adapter disposal", async (t) => {
+  await t.test("credential read", () => {
+    const h = createHarness();
+    const read = h.credentials.read.bind(h.credentials);
+    h.credentials.read = (reference) => {
+      const credential = read(reference);
+      h.actor.dispose();
+      return credential;
+    };
+    const transport = new FakeTransport();
+    assert.throws(
+      () => h.actor.connect(transport, "credential-1"),
+      /disposed and cannot reconnect/,
+    );
+    assert.deepEqual(transport.sent, []);
+  });
+
+  await t.test("connector id creation", () => {
+    let h;
+    h = createHarness({
+      idFactory() {
+        h.actor.dispose();
+        return "disposed-host-hello";
+      },
+    });
+    const transport = new FakeTransport();
+    assert.throws(
+      () => h.actor.connect(transport, "credential-1"),
+      /disposed and cannot reconnect/,
+    );
+    assert.deepEqual(transport.sent, []);
+  });
 });
 
 test("connector replacement and broker supersede are atomic and never report a false offline winner", () => {

@@ -48,6 +48,42 @@ export interface RelayV2HostCarrierTransport {
   close(code: number, reason: string): void;
 }
 
+export interface RelayV2HostCarrierOutboundReceipt {
+  settle(delivered: boolean): void;
+}
+
+export type RelayV2HostCarrierRouteClose =
+  | Readonly<{
+      closeCode: 1013;
+      reason: "slow_consumer";
+      errorCode: "SLOW_CONSUMER";
+      retryable: true;
+    }>
+  | Readonly<{
+      closeCode: 4400;
+      reason: "protocol_error";
+      errorCode: "INTERNAL";
+      retryable: false;
+    }>
+  | Readonly<{
+      closeCode: 4406;
+      reason: "protocol_error";
+      errorCode: "CAPABILITY_UNAVAILABLE";
+      retryable: false;
+    }>
+  | Readonly<{
+      closeCode: 1011;
+      reason: "host_shutdown";
+      errorCode: "INTERNAL";
+      retryable: false;
+    }>
+  | Readonly<{
+      closeCode: 4409;
+      reason: "host_shutdown";
+      errorCode: "HOST_SUPERSEDED";
+      retryable: false;
+    }>;
+
 export interface RelayV2HostCredentialRecord {
   reference: string;
   version: string;
@@ -152,11 +188,15 @@ export type RelayV2HostCarrierStructuredErrorCode =
   | "HOST_DIALECT_UNAVAILABLE"
   | "CAPABILITY_UNAVAILABLE"
   | "SLOW_CONSUMER"
+  | "HOST_SUPERSEDED"
   | "INTERNAL";
 
 export interface RelayV2HostRouteBindingRejection {
   readonly accepted: false;
-  readonly code: Exclude<RelayV2HostCarrierStructuredErrorCode, "SLOW_CONSUMER">;
+  readonly code: Exclude<
+    RelayV2HostCarrierStructuredErrorCode,
+    "SLOW_CONSUMER" | "HOST_SUPERSEDED"
+  >;
   readonly message: string;
   readonly retryable: boolean;
 }
@@ -263,6 +303,19 @@ interface PendingReauthentication extends RelayV2HostCredentialAckFence {
   queueKey: string;
 }
 
+interface OutboundReceiptCallback {
+  receiver: RelayV2HostCarrierOutboundReceipt;
+  settle: RelayV2HostCarrierOutboundReceipt["settle"];
+}
+
+interface OutboundReceiptCell {
+  admissionKnown: boolean;
+  owned: boolean;
+  pendingOutcome: boolean | null;
+  done: boolean;
+  callback: OutboundReceiptCallback | null;
+}
+
 interface OutboundItem {
   bytes: Uint8Array;
   deliveryToken: string;
@@ -274,6 +327,7 @@ interface OutboundItem {
   /** Durable reauthentication is retried only by an explicit caller attempt. */
   dropOnTransportRefusal?: boolean;
   transportRefused?: boolean;
+  receipt?: OutboundReceiptCell;
 }
 
 interface RouteState {
@@ -540,6 +594,86 @@ function structuredError(
   };
 }
 
+const ROUTE_CLOSE_SLOW_CONSUMER: RelayV2HostCarrierRouteClose = Object.freeze({
+  closeCode: 1013,
+  reason: "slow_consumer",
+  errorCode: "SLOW_CONSUMER",
+  retryable: true,
+});
+
+const ROUTE_CLOSE_PROTOCOL_ERROR: RelayV2HostCarrierRouteClose = Object.freeze({
+  closeCode: 4400,
+  reason: "protocol_error",
+  errorCode: "INTERNAL",
+  retryable: false,
+});
+
+const ROUTE_CLOSE_HOST_SHUTDOWN: RelayV2HostCarrierRouteClose = Object.freeze({
+  closeCode: 1011,
+  reason: "host_shutdown",
+  errorCode: "INTERNAL",
+  retryable: false,
+});
+
+function captureOutboundReceipt(
+  receipt: RelayV2HostCarrierOutboundReceipt,
+): OutboundReceiptCallback {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    throw new Error("Relay v2 host carrier outbound receipt is invalid");
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(receipt, "settle");
+  } catch {
+    throw new Error("Relay v2 host carrier outbound receipt is invalid");
+  }
+  if (!descriptor || !Object.hasOwn(descriptor, "value")
+    || typeof descriptor.value !== "function") {
+    throw new Error("Relay v2 host carrier outbound receipt is invalid");
+  }
+  return Object.freeze({
+    receiver: receipt,
+    settle: descriptor.value as RelayV2HostCarrierOutboundReceipt["settle"],
+  });
+}
+
+function exactRouteClose(value: unknown): RelayV2HostCarrierRouteClose | null {
+  const values = captureExactOwnDataValues(
+    value,
+    ["closeCode", "reason", "errorCode", "retryable"],
+  );
+  if (!values) return null;
+  const tuple = values as readonly [unknown, unknown, unknown, unknown];
+  if ((tuple[0] === 1013 && tuple[1] === "slow_consumer"
+      && tuple[2] === "SLOW_CONSUMER" && tuple[3] === true)
+    || (tuple[0] === 4400 && tuple[1] === "protocol_error"
+      && tuple[2] === "INTERNAL" && tuple[3] === false)
+    || (tuple[0] === 4406 && tuple[1] === "protocol_error"
+      && tuple[2] === "CAPABILITY_UNAVAILABLE" && tuple[3] === false)
+    || (tuple[0] === 1011 && tuple[1] === "host_shutdown"
+      && tuple[2] === "INTERNAL" && tuple[3] === false)
+    || (tuple[0] === 4409 && tuple[1] === "host_shutdown"
+      && tuple[2] === "HOST_SUPERSEDED" && tuple[3] === false)) {
+    return Object.freeze({
+      closeCode: tuple[0],
+      reason: tuple[1],
+      errorCode: tuple[2],
+      retryable: tuple[3],
+    }) as RelayV2HostCarrierRouteClose;
+  }
+  return null;
+}
+
+function legacyRouteClose(
+  reason: "slow_consumer" | "protocol_error" | "host_shutdown",
+): RelayV2HostCarrierRouteClose {
+  switch (reason) {
+    case "slow_consumer": return ROUTE_CLOSE_SLOW_CONSUMER;
+    case "protocol_error": return ROUTE_CLOSE_PROTOCOL_ERROR;
+    case "host_shutdown": return ROUTE_CLOSE_HOST_SHUTDOWN;
+  }
+}
+
 export class RelayV2HostCarrierActor {
   private readonly clock: () => number;
   private readonly schedule: (delayMs: number, callback: () => void) => () => void;
@@ -561,6 +695,12 @@ export class RelayV2HostCarrierActor {
    */
   private reauthenticationPreparation: ReauthenticationPreparationLease | null = null;
   private permanentlySuperseded = false;
+  private disposed = false;
+  private dispatchingReceipts = false;
+  private readonly receiptDispatchQueue: Array<Readonly<{
+    callback: OutboundReceiptCallback;
+    outcome: boolean;
+  }>> = [];
   private latestStatus: RelayV2HostCarrierStatus | null = null;
 
   constructor(private readonly options: RelayV2HostCarrierOptions) {
@@ -606,25 +746,107 @@ export class RelayV2HostCarrierActor {
     return this.latestStatus ? { ...this.latestStatus } : null;
   }
 
+  private newReceiptCell(
+    receipt: RelayV2HostCarrierOutboundReceipt | undefined,
+  ): OutboundReceiptCell | undefined {
+    if (receipt === undefined) return undefined;
+    return {
+      admissionKnown: false,
+      owned: false,
+      pendingOutcome: null,
+      done: false,
+      callback: captureOutboundReceipt(receipt),
+    };
+  }
+
+  private finishReceiptAdmission(cell: OutboundReceiptCell | undefined, accepted: boolean): void {
+    if (!cell || cell.admissionKnown) return;
+    cell.admissionKnown = true;
+    if (!accepted) {
+      cell.done = true;
+      cell.owned = false;
+      cell.pendingOutcome = null;
+      cell.callback = null;
+      return;
+    }
+    cell.owned = true;
+    const pending = cell.pendingOutcome;
+    cell.pendingOutcome = null;
+    if (pending !== null) this.recordReceiptOutcome(cell, pending);
+  }
+
+  private recordReceiptOutcome(cell: OutboundReceiptCell | undefined, outcome: boolean): void {
+    if (!cell || cell.done) return;
+    if (!cell.admissionKnown) {
+      // A synchronous flush/cleanup may finish before sendPublic knows whether
+      // ownership was transferred. The first terminal outcome is authoritative.
+      if (cell.pendingOutcome === null) cell.pendingOutcome = outcome;
+      return;
+    }
+    if (!cell.owned) return;
+    cell.done = true;
+    cell.pendingOutcome = null;
+    const callback = cell.callback;
+    cell.callback = null;
+    if (!callback) return;
+    this.receiptDispatchQueue.push(Object.freeze({ callback, outcome }));
+    if (this.dispatchingReceipts) return;
+    this.dispatchingReceipts = true;
+    try {
+      while (this.receiptDispatchQueue.length > 0) {
+        const dispatch = this.receiptDispatchQueue.shift()!;
+        try {
+          Reflect.apply(
+            dispatch.callback.settle,
+            dispatch.callback.receiver,
+            [dispatch.outcome],
+          );
+        } catch {
+          // Receipt observation cannot regain queue ownership or corrupt the
+          // accounting already committed before this dispatch.
+        }
+      }
+    } finally {
+      this.dispatchingReceipts = false;
+    }
+  }
+
+  private settleDetached(items: readonly OutboundItem[], outcome: boolean): void {
+    for (const item of items) this.recordReceiptOutcome(item.receipt, outcome);
+  }
+
   connect(
     transport: RelayV2HostCarrierTransport,
     credentialReference: string,
   ): RelayV2HostCarrierConnection {
+    if (this.disposed) {
+      throw new Error("Relay v2 host carrier was disposed and cannot reconnect");
+    }
     if (this.permanentlySuperseded) {
       throw new Error("Relay v2 host carrier was superseded and cannot reconnect");
     }
     const credential = this.options.credentialReferences.read(credentialReference);
     validateCredentialRecord(credentialReference, credential);
-
+    const credentialMetadata = copyCredentialMetadata(credential);
+    const helloRequestId = this.idFactory();
+    // Credential/id adapters are synchronous but may reenter arbitrary actor
+    // lifecycle. Never publish a connector after such reentry disposed or
+    // permanently superseded this actor.
+    if (this.disposed) {
+      throw new Error("Relay v2 host carrier was disposed and cannot reconnect");
+    }
+    if (this.permanentlySuperseded) {
+      throw new Error("Relay v2 host carrier was superseded and cannot reconnect");
+    }
     const previous = this.current;
     const connector: ConnectorState = {
       generation: ++this.generation,
       transport,
-      helloRequestId: this.idFactory(),
+      helloRequestId,
       helloSent: false,
       phase: "hello",
       connectorId: null,
-      credential: copyCredentialMetadata(credential),
+      credential: credentialMetadata,
       pendingReauthentication: null,
       routes: new Map(),
       seenRouteIds: new Set(),
@@ -653,9 +875,8 @@ export class RelayV2HostCarrierActor {
         connectorId: null,
       });
       if (previous) {
-        this.retireConnectorRoutes(previous, "connector_replaced");
-        this.clearQueues(previous);
         previous.phase = "closed";
+        this.cleanupConnector(previous, "connector_replaced");
         previous.transport.close(1000, "connector_replaced");
       }
 
@@ -706,8 +927,7 @@ export class RelayV2HostCarrierActor {
     const wasCurrent = this.current === connector;
     if (wasCurrent) this.current = null;
     connector.phase = "closed";
-    this.retireConnectorRoutes(connector, "carrier_closed");
-    this.clearQueues(connector);
+    this.cleanupConnector(connector, "carrier_closed");
     if (wasCurrent) {
       this.publishStatus({
         phase: "offline",
@@ -719,6 +939,7 @@ export class RelayV2HostCarrierActor {
   }
 
   requestReauthentication(requestId: string, credentialReference: string): boolean {
+    if (this.disposed) return false;
     const activePreparation = this.reauthenticationPreparation;
     if (activePreparation) {
       activePreparation.invalidated = true;
@@ -805,24 +1026,38 @@ export class RelayV2HostCarrierActor {
       && connector.phase === "registered";
   }
 
-  sendPublic(binding: RelayV2HostRouteBinding, payload: Uint8Array): boolean {
+  sendPublic(
+    binding: RelayV2HostRouteBinding,
+    payload: Uint8Array,
+    receipt?: RelayV2HostCarrierOutboundReceipt,
+  ): boolean {
+    let receiptCell: OutboundReceiptCell | undefined;
+    try {
+      receiptCell = this.newReceiptCell(receipt);
+    } catch {
+      return false;
+    }
     const connector = this.current;
     const route = connector ? this.currentRoute(connector, binding) : undefined;
     if (!connector || connector.phase !== "registered" || !route || route.phase !== "open") {
+      this.finishReceiptAdmission(receiptCell, false);
       return false;
     }
     if (payload.byteLength > route.binding.maxFrameBytes) {
-      this.failRoute(connector, route, "protocol_error", "INTERNAL");
+      this.failRoute(connector, route, ROUTE_CLOSE_PROTOCOL_ERROR);
+      this.finishReceiptAdmission(receiptCell, false);
       return false;
     }
     try {
       this.validatePublicPayload(route, payload);
     } catch {
-      this.failRoute(connector, route, "protocol_error", "INTERNAL");
+      this.failRoute(connector, route, ROUTE_CLOSE_PROTOCOL_ERROR);
+      this.finishReceiptAdmission(receiptCell, false);
       return false;
     }
     if (route.hostToClientAllocatedSeq >= MAX_COUNTER) {
-      this.failRoute(connector, route, "protocol_error", "INTERNAL");
+      this.failRoute(connector, route, ROUTE_CLOSE_PROTOCOL_ERROR);
+      this.finishReceiptAdmission(receiptCell, false);
       return false;
     }
 
@@ -841,25 +1076,31 @@ export class RelayV2HostCarrierActor {
         data: Buffer.from(payload).toString("base64"),
       },
     };
-    if (!this.enqueueData(connector, route, next, frame, payload.byteLength)) {
-      return false;
-    }
-    return true;
+    const accepted = this.enqueueData(
+      connector,
+      route,
+      next,
+      frame,
+      payload.byteLength,
+      receiptCell,
+    );
+    this.finishReceiptAdmission(receiptCell, accepted);
+    return accepted;
   }
 
   closeRoute(
     binding: RelayV2HostRouteBinding,
-    reason: "slow_consumer" | "protocol_error" | "host_shutdown" = "host_shutdown",
+    input: RelayV2HostCarrierRouteClose
+      | "slow_consumer"
+      | "protocol_error"
+      | "host_shutdown" = "host_shutdown",
   ): boolean {
     const connector = this.current;
     const route = connector ? this.currentRoute(connector, binding) : undefined;
     if (!connector || !route || route.phase === "closing") return false;
-    this.failRoute(
-      connector,
-      route,
-      reason,
-      reason === "slow_consumer" ? "SLOW_CONSUMER" : "INTERNAL",
-    );
+    const close = typeof input === "string" ? legacyRouteClose(input) : exactRouteClose(input);
+    if (!close) return false;
+    this.failRoute(connector, route, close);
     return true;
   }
 
@@ -1011,8 +1252,7 @@ export class RelayV2HostCarrierActor {
     this.permanentlySuperseded = true;
     this.current = null;
     connector.phase = "closed";
-    this.retireConnectorRoutes(connector, "host_superseded");
-    this.clearQueues(connector);
+    this.cleanupConnector(connector, "host_superseded");
     this.publishStatus({
       phase: "superseded",
       generation: connector.generation,
@@ -1250,16 +1490,8 @@ export class RelayV2HostCarrierActor {
     }
     route.phase = "closing";
     connector.routes.delete(route.binding.routeId);
-    this.removeDataForRoute(connector, route);
+    const detached = this.detachQueuedDataForRoute(connector, route);
     this.removeControlItems(connector, (item) => item.route === route);
-    if (route.outstandingCarrierBytes > 0) {
-      // The route owner is gone, so its route-level pressure timer can no
-      // longer provide liveness for transport-owned writes. Keep a carrier
-      // fence until those writes are ACKed; a lost transport ACK then closes
-      // the carrier instead of leaving unaccounted bytes alive forever.
-      connector.orphanedInFlightSinceMs ??= safeNow(this.clock);
-      this.refreshPressureTimer(connector);
-    }
     const reason = stringField(payload, "reason") as RelayV2HostRouteUnbindReason;
     try {
       this.options.routeSink.onRouteUnbound(route.binding, reason);
@@ -1267,6 +1499,7 @@ export class RelayV2HostCarrierActor {
       // The transport binding is already removed. A presentation/domain sink
       // callback cannot resurrect it or prevent the carrier ACK.
     }
+    this.settleDetached(detached, false);
     this.enqueueControl(connector, {
       carrierVersion: 1,
       type: "route.unbound",
@@ -1279,14 +1512,20 @@ export class RelayV2HostCarrierActor {
         lastHostToClientSeq: route.hostToClientEmittedSeq.toString(10),
       },
     });
+    if (route.outstandingCarrierBytes > 0) {
+      // The route owner is gone, so its route-level pressure timer can no
+      // longer provide liveness for transport-owned writes. Keep a carrier
+      // fence until those writes are ACKed; a lost transport ACK then closes
+      // the carrier instead of leaving unaccounted bytes alive forever.
+      connector.orphanedInFlightSinceMs ??= safeNow(this.clock);
+    }
     if (this.connectorCanFlush(connector)) this.refreshPressureTimer(connector);
   }
 
   private failRoute(
     connector: ConnectorState,
     route: RouteState,
-    reason: "slow_consumer" | "protocol_error" | "host_shutdown",
-    code: "SLOW_CONSUMER" | "INTERNAL",
+    close: RelayV2HostCarrierRouteClose,
   ): void {
     if (route.phase === "closing") return;
     const ownsCarrierPressure = connector.carrierPressureSinceMs !== null
@@ -1296,15 +1535,20 @@ export class RelayV2HostCarrierActor {
     if (ownsCarrierPressure) {
       connector.carrierPressureSinceMs = null;
     }
-    this.removeDataForRoute(connector, route);
+    const detached = this.detachQueuedDataForRoute(connector, route);
     try {
-      this.options.routeSink.onRouteClosing?.(route.binding, code);
+      this.options.routeSink.onRouteClosing?.(route.binding, close.errorCode);
     } catch {
       // Route fencing and the close control remain authoritative.
     }
-    const message = code === "SLOW_CONSUMER"
+    this.settleDetached(detached, false);
+    const message = close.errorCode === "SLOW_CONSUMER"
       ? "Route cannot drain"
-      : "Route carrier state is no longer safe";
+      : close.errorCode === "CAPABILITY_UNAVAILABLE"
+        ? "Route capability is unavailable"
+        : close.errorCode === "HOST_SUPERSEDED"
+          ? "Host process was superseded"
+          : "Route carrier state is no longer safe";
     this.enqueueControl(connector, {
       carrierVersion: 1,
       type: "route.close",
@@ -1312,9 +1556,9 @@ export class RelayV2HostCarrierActor {
       routeId: route.binding.routeId,
       routeFence: route.binding.routeFence,
       payload: {
-        closeCode: code === "SLOW_CONSUMER" ? 1013 : 4400,
-        reason,
-        error: structuredError(code, message, code === "SLOW_CONSUMER"),
+        closeCode: close.closeCode,
+        reason: close.reason,
+        error: structuredError(close.errorCode, message, close.retryable),
       },
     }, { route });
     if (this.connectorCanFlush(connector)) this.refreshPressureTimer(connector);
@@ -1388,6 +1632,7 @@ export class RelayV2HostCarrierActor {
     routeSequence: bigint,
     frame: RelayV2JsonObject,
     payloadBytes: number,
+    receipt: OutboundReceiptCell | undefined,
   ): boolean {
     let bytes: Uint8Array;
     try {
@@ -1413,6 +1658,7 @@ export class RelayV2HostCarrierActor {
       route,
       routeSequence,
       payloadBytes,
+      receipt,
     } satisfies OutboundItem;
     if (route.outboundQueue.length === 0) connector.dataRoutes.push(route);
     route.outboundQueue.push(item);
@@ -1694,7 +1940,7 @@ export class RelayV2HostCarrierActor {
         route.pressureSinceMs = null;
       } else if (now - route.pressureSinceMs >= 5_000 && route.phase === "open") {
         route.pressureSinceMs = null;
-        this.failRoute(connector, route, "slow_consumer", "SLOW_CONSUMER");
+        this.failRoute(connector, route, ROUTE_CLOSE_SLOW_CONSUMER);
       }
     }
     if (!this.connectorCanFlush(connector)) return;
@@ -1714,7 +1960,7 @@ export class RelayV2HostCarrierActor {
       const pressureRoute = this.carrierPressureOwner(connector);
       connector.carrierPressureSinceMs = null;
       if (pressureRoute && pressureRoute.phase === "open") {
-        this.failRoute(connector, pressureRoute, "slow_consumer", "SLOW_CONSUMER");
+        this.failRoute(connector, pressureRoute, ROUTE_CLOSE_SLOW_CONSUMER);
       } else {
         this.failConnector(connector, 1013, "carrier_pressure_timeout");
       }
@@ -1725,7 +1971,7 @@ export class RelayV2HostCarrierActor {
   private acknowledge(generation: number, deliveryToken: string): void {
     const connector = this.current;
     if (!connector || connector.generation !== generation) return;
-    if (connector.flushing) {
+    if (connector.flushing || this.dispatchingReceipts) {
       this.failConnector(connector, 4400, "reentrant_transport_ack");
       return;
     }
@@ -1755,6 +2001,7 @@ export class RelayV2HostCarrierActor {
       item.route.outstandingPayloadBytes -= item.payloadBytes;
       item.route.outstandingCarrierBytes -= item.bytes.byteLength;
     }
+    this.recordReceiptOutcome(item.receipt, true);
     // Pressure is evaluated against post-ACK accounting. Evaluating before
     // the decrement can expire a five-second fence even when this exact ACK
     // crosses low water and should recover the route/carrier.
@@ -1767,7 +2014,7 @@ export class RelayV2HostCarrierActor {
   private rejectUnaccepted(generation: number, deliveryToken: string): void {
     const connector = this.current;
     if (!connector || connector.generation !== generation) return;
-    if (connector.flushing) {
+    if (connector.flushing || this.dispatchingReceipts) {
       this.failConnector(connector, 4400, "reentrant_transport_reject");
       return;
     }
@@ -1786,6 +2033,8 @@ export class RelayV2HostCarrierActor {
     item.route.outstandingPayloadBytes -= item.payloadBytes;
     item.route.outstandingCarrierBytes -= item.bytes.byteLength;
     item.route.hostToClientEmittedSeq -= 1n;
+    item.route.hostToClientAllocatedSeq = item.route.hostToClientEmittedSeq;
+    this.recordReceiptOutcome(item.receipt, false);
     // Do not flush synchronously. The pump must deliver the route close/unbind
     // control before this route is allowed to produce again.
     this.evaluatePressure(connector);
@@ -1806,8 +2055,7 @@ export class RelayV2HostCarrierActor {
       this.permanentlySuperseded = true;
       this.current = null;
       connector.phase = "closed";
-      this.retireConnectorRoutes(connector, "host_superseded");
-      this.clearQueues(connector);
+      this.cleanupConnector(connector, "host_superseded");
       this.publishStatus({
         phase: "superseded",
         generation,
@@ -1818,8 +2066,7 @@ export class RelayV2HostCarrierActor {
     }
     this.current = null;
     connector.phase = "closed";
-    this.retireConnectorRoutes(connector, "carrier_closed");
-    this.clearQueues(connector);
+    this.cleanupConnector(connector, "carrier_closed");
     this.publishStatus({
       phase: "offline",
       generation,
@@ -1832,8 +2079,7 @@ export class RelayV2HostCarrierActor {
     if (this.current !== connector || connector.phase === "closed") return;
     this.current = null;
     connector.phase = "closed";
-    this.retireConnectorRoutes(connector, "carrier_closed");
-    this.clearQueues(connector);
+    this.cleanupConnector(connector, "carrier_closed");
     this.publishStatus({
       phase: "offline",
       generation: connector.generation,
@@ -1843,22 +2089,47 @@ export class RelayV2HostCarrierActor {
     connector.transport.close(code, reason);
   }
 
-  private retireConnectorRoutes(
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    const connector = this.current;
+    this.current = null;
+    if (!connector || connector.phase === "closed") return;
+    connector.phase = "closed";
+    this.cleanupConnector(connector, "carrier_closed");
+    this.publishStatus({
+      phase: "offline",
+      generation: connector.generation,
+      connectorId: connector.connectorId,
+      closeCode: 1000,
+    });
+    try { connector.transport.close(1000, "host_shutdown"); } catch {}
+  }
+
+  private cleanupConnector(
     connector: ConnectorState,
     reason: RelayV2HostLocalUnbindReason,
   ): void {
-    for (const route of connector.routes.values()) {
+    const routes = [...connector.routes.values()];
+    for (const route of routes) route.phase = "closing";
+    connector.routes.clear();
+    const detached = this.detachConnectorQueues(connector, routes);
+    for (const route of routes) {
       try {
         this.options.routeSink.onRouteUnbound(route.binding, reason);
       } catch {
         // Connector retirement is not reversible by a sink callback.
       }
     }
-    connector.routes.clear();
+    this.settleDetached(detached, false);
   }
 
-  private removeDataForRoute(connector: ConnectorState, route: RouteState): void {
-    for (const item of route.outboundQueue) {
+  private detachQueuedDataForRoute(
+    connector: ConnectorState,
+    route: RouteState,
+  ): OutboundItem[] {
+    const detached = route.outboundQueue;
+    for (const item of detached) {
       connector.dataCarrierBytes -= item.bytes.byteLength;
       connector.dataQueuedFrames -= 1;
       route.queuedFrames -= 1;
@@ -1867,7 +2138,9 @@ export class RelayV2HostCarrierActor {
       route.outstandingCarrierBytes -= item.bytes.byteLength;
     }
     route.outboundQueue = [];
+    route.hostToClientAllocatedSeq = route.hostToClientEmittedSeq;
     connector.dataRoutes = connector.dataRoutes.filter((candidate) => candidate !== route);
+    return detached;
   }
 
   private removeControlItems(
@@ -1882,7 +2155,10 @@ export class RelayV2HostCarrierActor {
     connector.controlQueue = retained;
   }
 
-  private clearQueues(connector: ConnectorState): void {
+  private detachConnectorQueues(
+    connector: ConnectorState,
+    routesSnapshot: readonly RouteState[],
+  ): OutboundItem[] {
     try {
       connector.pressureTimer?.cancel();
     } catch {
@@ -1890,6 +2166,26 @@ export class RelayV2HostCarrierActor {
       // cancellation receipt is faulty.
     }
     connector.pressureTimer = null;
+    const detached = [...connector.controlQueue];
+    const sequenceOwners = new Set<RouteState>();
+    for (const route of new Set([...routesSnapshot, ...connector.dataRoutes])) {
+      sequenceOwners.add(route);
+      detached.push(...this.detachQueuedDataForRoute(connector, route));
+    }
+    for (const item of connector.inFlight) {
+      connector.socketUnconfirmedBytes -= item.bytes.byteLength;
+      if (item.route && item.payloadBytes !== undefined) {
+        sequenceOwners.add(item.route);
+        item.route.outstandingFrames -= 1;
+        item.route.outstandingPayloadBytes -= item.payloadBytes;
+        item.route.outstandingCarrierBytes -= item.bytes.byteLength;
+        item.route.hostToClientEmittedSeq -= 1n;
+      }
+      detached.push(item);
+    }
+    for (const route of sequenceOwners) {
+      route.hostToClientAllocatedSeq = route.hostToClientEmittedSeq;
+    }
     connector.controlQueue = [];
     connector.controlBytes = 0;
     connector.dataRoutes = [];
@@ -1900,6 +2196,7 @@ export class RelayV2HostCarrierActor {
     connector.carrierPressureSinceMs = null;
     connector.orphanedInFlightSinceMs = null;
     connector.pendingReauthentication = null;
+    return detached;
   }
 
   private publishStatus(status: RelayV2HostCarrierStatus): void {

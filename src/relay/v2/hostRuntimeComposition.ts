@@ -1,6 +1,12 @@
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import { RelayV2HostCarrierActor } from "./hostCarrier.js";
 import type {
+  RelayV2HostCarrierConnection,
+  RelayV2HostCarrierOptions,
+  RelayV2HostCarrierRouteClose,
   RelayV2HostCarrierRouteSink,
+  RelayV2HostCarrierStatus,
+  RelayV2HostCarrierTransport,
   RelayV2HostLocalUnbindReason,
   RelayV2HostRouteBinding,
   RelayV2HostRouteBindingRejection,
@@ -20,6 +26,7 @@ import {
 import type {
   RelayV2HostReadinessSnapshot,
   RelayV2HostRuntimeActualAuthorityInput,
+  RelayV2HostRuntimeClose,
   RelayV2HostRuntimeOptions,
   RelayV2HostRuntimeOutboundPort,
   RelayV2HostRuntimeWelcomeSerializer,
@@ -91,6 +98,50 @@ export interface RelayV2HostRuntimeComposition {
   dispose(): void;
 }
 
+export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
+  RelayV2HostCarrierOptions,
+  | "hostId"
+  | "hostEpoch"
+  | "hostInstanceId"
+  | "routeSink"
+  | "advertisedCapabilities"
+  | "clientDialects"
+  | "dialectAdapters"
+> & Readonly<{
+  hostId?: never;
+  hostEpoch?: never;
+  hostInstanceId?: never;
+  routeSink?: never;
+  advertisedCapabilities?: never;
+  clientDialects?: never;
+  dialectAdapters?: never;
+}>;
+
+export interface RelayV2HostCarrierRuntimeCompositionOptions {
+  runtime: Omit<RelayV2HostRuntimeCompositionOptions, "outbound">;
+  carrier: RelayV2HostCarrierRuntimeCompositionCarrierOptions;
+}
+
+export interface RelayV2HostCarrierRuntimeFacade {
+  status(): RelayV2HostCarrierStatus | null;
+  connect(
+    transport: RelayV2HostCarrierTransport,
+    credentialReference: string,
+  ): RelayV2HostCarrierConnection;
+  requestReauthentication(requestId: string, credentialReference: string): boolean;
+}
+
+export interface RelayV2HostCarrierRuntimeComposition {
+  readonly carrier: RelayV2HostCarrierRuntimeFacade;
+  readonly readiness: RelayV2HostRuntimeCompositionReadinessLifecycle;
+  sendTerminalFrame(
+    route: RelayV2TerminalRuntimeBinding,
+    frame: RelayV2JsonObject,
+    responseLineage?: RelayV2TerminalOpenResponseLineage,
+  ): Promise<void>;
+  dispose(): void;
+}
+
 function guardedSource<Source extends NonH2ReadinessSource>(
   sink: RelayV2HostCapabilityReadinessSourceSink<Source>,
   disposed: () => boolean,
@@ -138,6 +189,126 @@ function captureRuntimeAuthorities(
     nextDedupeWindowBounds,
     nextDedupeWindowBoundsReceiver: value,
   });
+}
+
+function routeBindingKey(binding: Pick<
+  RelayV2HostRouteBinding,
+  "connectorGeneration" | "connectorId" | "routeId" | "routeFence"
+>): string {
+  return JSON.stringify([
+    binding.connectorGeneration,
+    binding.connectorId,
+    binding.routeId,
+    binding.routeFence,
+  ]);
+}
+
+function hasExactKeys(value: object, expected: readonly string[]): boolean {
+  try {
+    const keys = Object.keys(value);
+    return keys.length === expected.length && keys.every((key) => expected.includes(key));
+  } catch {
+    return false;
+  }
+}
+
+function sameAuthContext(
+  left: RelayV2HostRouteBinding["authContext"],
+  right: RelayV2HostRouteBinding["authContext"],
+): boolean {
+  if (left.scheme !== right.scheme || left.role !== right.role || left.hostId !== right.hostId) {
+    return false;
+  }
+  if (left.scheme === "twcap2" && right.scheme === "twcap2") {
+    return hasExactKeys(left, [
+      "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
+      "jti", "kid", "expiresAtMs",
+    ])
+      && hasExactKeys(right, [
+        "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
+        "jti", "kid", "expiresAtMs",
+      ])
+      && left.principalId === right.principalId
+      && left.grantId === right.grantId
+      && left.clientInstanceId === right.clientInstanceId
+      && left.jti === right.jti
+      && left.kid === right.kid
+      && left.expiresAtMs === right.expiresAtMs;
+  }
+  if (left.scheme === "legacy_shared_secret" && right.scheme === "legacy_shared_secret") {
+    return hasExactKeys(left, [
+      "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
+    ])
+      && hasExactKeys(right, [
+        "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
+      ])
+      && left.principalId === right.principalId
+      && left.grantId === right.grantId
+      && left.clientInstanceId === right.clientInstanceId;
+  }
+  return false;
+}
+
+function sameRouteBinding(
+  left: RelayV2HostRouteBinding,
+  right: RelayV2HostRouteBinding,
+): boolean {
+  return left.connectorGeneration === right.connectorGeneration
+    && left.connectorId === right.connectorId
+    && left.routeId === right.routeId
+    && left.routeFence === right.routeFence
+    && left.connectionId === right.connectionId
+    && left.clientDialect === right.clientDialect
+    && left.maxFrameBytes === right.maxFrameBytes
+    && sameAuthContext(left.authContext, right.authContext);
+}
+
+function carrierCloseForRuntime(close: RelayV2HostRuntimeClose): RelayV2HostCarrierRouteClose {
+  switch (close.reason) {
+    case "slow_consumer":
+      if (close.code !== 1013) throw new Error("invalid Relay v2 slow-consumer close code");
+      return Object.freeze({
+        closeCode: close.code,
+        reason: "slow_consumer",
+        errorCode: "SLOW_CONSUMER",
+        retryable: true,
+      });
+    case "protocol_error":
+    case "event_cursor_ahead":
+      if (close.code !== 4400) throw new Error("invalid Relay v2 protocol close code");
+      return Object.freeze({
+        closeCode: close.code,
+        reason: "protocol_error",
+        errorCode: "INTERNAL",
+        retryable: false,
+      });
+    case "route_unavailable":
+    case "capability_withdrawn":
+      if (close.code !== 4406) throw new Error("invalid Relay v2 capability close code");
+      return Object.freeze({
+        closeCode: close.code,
+        reason: "protocol_error",
+        errorCode: "CAPABILITY_UNAVAILABLE",
+        retryable: false,
+      });
+    case "authority_failure":
+    case "host_shutdown":
+      if (close.code !== 1011) throw new Error("invalid Relay v2 host-shutdown close code");
+      return Object.freeze({
+        closeCode: close.code,
+        reason: "host_shutdown",
+        errorCode: "INTERNAL",
+        retryable: false,
+      });
+    case "host_superseded":
+      if (close.code !== 4409) throw new Error("invalid Relay v2 superseded close code");
+      return Object.freeze({
+        closeCode: close.code,
+        reason: "host_shutdown",
+        errorCode: "HOST_SUPERSEDED",
+        retryable: false,
+      });
+  }
 }
 
 /**
@@ -248,6 +419,158 @@ export function createRelayV2HostRuntimeComposition(
         if (source !== "h2") sink.close();
       }
       runtime.dispose();
+    },
+  });
+}
+
+/**
+ * Default-off carrier/runtime composition. The public carrier is a frozen
+ * transport lifecycle facade; route binding and outbound ownership remain
+ * private so callers cannot bypass exact provenance or receipt accounting.
+ */
+export function createRelayV2HostCarrierRuntimeComposition(
+  options: RelayV2HostCarrierRuntimeCompositionOptions,
+): RelayV2HostCarrierRuntimeComposition {
+  const runtimeOptions = options.runtime;
+  const hostId = runtimeOptions.hostId;
+  const hostEpoch = runtimeOptions.hostEpoch;
+  const hostInstanceId = runtimeOptions.hostInstanceId;
+  const authorities = runtimeOptions.authorities;
+  const welcome = runtimeOptions.welcome;
+  const testLimits = runtimeOptions.testLimits;
+  const bindings = new Map<string, RelayV2HostRouteBinding>();
+  let acceptingBindings = true;
+  let bridgeActive = true;
+  let lifecycleDisposed = false;
+  let actor: RelayV2HostCarrierActor | null = null;
+
+  const resolveCarrierBinding = (
+    binding: RelayV2HostRouteBinding,
+  ): RelayV2HostRouteBinding | null => {
+    const original = bindings.get(routeBindingKey(binding));
+    return original && sameRouteBinding(original, binding) ? original : null;
+  };
+
+  const outbound: RelayV2HostRuntimeOutboundPort = Object.freeze({
+    trySend(binding, payload, receipt): boolean {
+      if (!bridgeActive || !actor) return false;
+      const original = resolveCarrierBinding(binding);
+      return original ? actor.sendPublic(original, payload, receipt) : false;
+    },
+    close(binding, close): void {
+      if (!bridgeActive || !actor) return;
+      const original = resolveCarrierBinding(binding);
+      if (!original) return;
+      actor.closeRoute(original, carrierCloseForRuntime(close));
+    },
+  });
+
+  const runtime = createRelayV2HostRuntimeComposition({
+    hostId,
+    hostEpoch,
+    hostInstanceId,
+    authorities,
+    welcome,
+    outbound,
+    testLimits,
+  });
+
+  const routeSink: RelayV2HostCarrierRouteSink = Object.freeze({
+    onRouteBound(binding): void | RelayV2HostRouteBindingRejection {
+      if (!acceptingBindings || !bridgeActive) {
+        return Object.freeze({
+          accepted: false,
+          code: "CAPABILITY_UNAVAILABLE",
+          message: "Relay v2 host carrier/runtime composition is closing",
+          retryable: false,
+        });
+      }
+      const key = routeBindingKey(binding);
+      if (bindings.has(key)) {
+        return Object.freeze({
+          accepted: false,
+          code: "BUSY",
+          message: "Relay v2 host route binding is already composed",
+          retryable: true,
+        });
+      }
+      bindings.set(key, binding);
+      try {
+        const rejection = runtime.routeSink.onRouteBound(binding);
+        if (rejection !== undefined) bindings.delete(key);
+        return rejection;
+      } catch (error) {
+        bindings.delete(key);
+        throw error;
+      }
+    },
+    onClientFrame(binding, payload): void {
+      if (resolveCarrierBinding(binding) !== binding) return;
+      runtime.routeSink.onClientFrame(binding, payload);
+    },
+    onRouteClosing(binding, code): void {
+      if (resolveCarrierBinding(binding) !== binding) return;
+      runtime.routeSink.onRouteClosing(binding, code);
+    },
+    onRouteUnbound(binding, reason): void {
+      const key = routeBindingKey(binding);
+      if (resolveCarrierBinding(binding) !== binding) return;
+      bindings.delete(key);
+      runtime.routeSink.onRouteUnbound(binding, reason);
+    },
+  });
+
+  try {
+    actor = new RelayV2HostCarrierActor({
+      ...options.carrier,
+      hostId,
+      hostEpoch,
+      hostInstanceId,
+      routeSink,
+      advertisedCapabilities: [],
+      clientDialects: ["tw-relay.v2"],
+      dialectAdapters: Object.freeze({}),
+    });
+  } catch (error) {
+    bridgeActive = false;
+    bindings.clear();
+    try { runtime.dispose(); } catch {}
+    throw error;
+  }
+
+  const carrier: RelayV2HostCarrierRuntimeFacade = Object.freeze({
+    status: () => actor!.status(),
+    connect: (transport, credentialReference) => actor!.connect(
+      transport,
+      credentialReference,
+    ),
+    requestReauthentication: (requestId, credentialReference) => (
+      actor!.requestReauthentication(requestId, credentialReference)
+    ),
+  });
+
+  return Object.freeze({
+    carrier,
+    readiness: runtime.readiness,
+    sendTerminalFrame: (
+      route: RelayV2TerminalRuntimeBinding,
+      frame: RelayV2JsonObject,
+      responseLineage?: RelayV2TerminalOpenResponseLineage,
+    ) => runtime.routeSink.sendTerminalFrame(route, frame, responseLineage),
+    dispose(): void {
+      if (lifecycleDisposed) return;
+      lifecycleDisposed = true;
+      acceptingBindings = false;
+      try {
+        runtime.dispose();
+      } finally {
+        try {
+          actor!.dispose();
+        } finally {
+          bridgeActive = false;
+          bindings.clear();
+        }
+      }
     },
   });
 }
