@@ -25,6 +25,14 @@ import type {
   RelayV2HostRuntimeWelcomeSerializer,
   RelayV2RequiredCapability,
 } from "./hostRuntime.js";
+import { createRelayV2HostH2ReadinessActivation } from "./hostH2ReadinessActivation.js";
+import type {
+  RelayV2HostH2ReadinessLifecycle,
+  RelayV2HostH2ReadinessSnapshotSpool,
+} from "./hostH2ReadinessActivation.js";
+import type {
+  RelayV2StateSnapshotHostH2Authority,
+} from "./stateSnapshotSpool.js";
 import type {
   RelayV2TerminalOpenResponseLineage,
   RelayV2TerminalRuntimeBinding,
@@ -32,23 +40,15 @@ import type {
 
 type NonH2ReadinessSource = Exclude<RelayV2HostCapabilityReadinessSource, "h2">;
 
-/**
- * H2 has no ready ingress in this slice. The existing H2 and spool owners do
- * not issue one opaque, owner-verified subscription/receipt that exact-binds
- * hostId, hostEpoch, hostInstanceId, owner fence, cut source and the same cut.
- * A consumer may only withdraw the already-false source until that owner seam
- * exists in a later slice.
- */
-export interface RelayV2HostRuntimeCompositionH2ReadinessWithdrawal {
-  close(): void;
-}
+export type RelayV2HostRuntimeCompositionH2ReadinessLifecycle =
+  RelayV2HostH2ReadinessLifecycle;
 
 export interface RelayV2HostRuntimeCompositionReadinessLifecycle {
   readonly codec: RelayV2HostCapabilityReadinessSourceSink<"codec">;
   readonly carrier: RelayV2HostCapabilityReadinessSourceSink<"carrier">;
   readonly h0: RelayV2HostCapabilityReadinessSourceSink<"h0">;
   readonly h1: RelayV2HostCapabilityReadinessSourceSink<"h1">;
-  readonly h2: RelayV2HostRuntimeCompositionH2ReadinessWithdrawal;
+  readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
   readonly h3: RelayV2HostCapabilityReadinessSourceSink<"h3">;
   current(): RelayV2HostReadinessSnapshot;
   advertisedCapabilities(): readonly RelayV2RequiredCapability[];
@@ -64,11 +64,21 @@ export interface RelayV2HostRuntimeCompositionRouteSink
   ): Promise<void>;
 }
 
+export type RelayV2HostRuntimeCompositionSnapshotSpool =
+  RelayV2HostH2ReadinessSnapshotSpool;
+
+export type RelayV2HostRuntimeCompositionAuthorities = Omit<
+  RelayV2HostRuntimeActualAuthorityInput,
+  "h2" | "snapshotSpool"
+> & Readonly<{
+  h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
+}>;
+
 export interface RelayV2HostRuntimeCompositionOptions {
   hostId: string;
   hostEpoch: string;
   hostInstanceId: string;
-  authorities: RelayV2HostRuntimeActualAuthorityInput;
+  authorities: RelayV2HostRuntimeCompositionAuthorities;
   welcome: RelayV2HostRuntimeWelcomeSerializer;
   outbound: RelayV2HostRuntimeOutboundPort;
   /** Tests may only make the existing runtime limits stricter. */
@@ -95,6 +105,41 @@ function guardedSource<Source extends NonH2ReadinessSource>(
   });
 }
 
+function captureRuntimeAuthorities(
+  value: RelayV2HostRuntimeCompositionAuthorities,
+): Readonly<{
+  h0: RelayV2HostRuntimeActualAuthorityInput["h0"];
+  h1: RelayV2HostRuntimeActualAuthorityInput["h1"];
+  h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
+  h3: RelayV2HostRuntimeActualAuthorityInput["h3"];
+  nextDedupeWindowBounds: RelayV2HostRuntimeActualAuthorityInput["nextDedupeWindowBounds"];
+  nextDedupeWindowBoundsReceiver: object;
+}> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const fields = ["h0", "h1", "h2SnapshotAuthority", "h3", "nextDedupeWindowBounds"] as const;
+  const descriptors: Partial<Record<typeof fields[number], PropertyDescriptor>> = {};
+  try {
+    for (const field of fields) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field);
+      if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return null;
+      descriptors[field] = descriptor;
+    }
+  } catch {
+    return null;
+  }
+  const nextDedupeWindowBounds = descriptors.nextDedupeWindowBounds!.value;
+  if (typeof nextDedupeWindowBounds !== "function") return null;
+  return Object.freeze({
+    h0: descriptors.h0!.value as RelayV2HostRuntimeActualAuthorityInput["h0"],
+    h1: descriptors.h1!.value as RelayV2HostRuntimeActualAuthorityInput["h1"],
+    h2SnapshotAuthority: descriptors.h2SnapshotAuthority!.value as
+      RelayV2StateSnapshotHostH2Authority,
+    h3: descriptors.h3!.value as RelayV2HostRuntimeActualAuthorityInput["h3"],
+    nextDedupeWindowBounds,
+    nextDedupeWindowBoundsReceiver: value,
+  });
+}
+
 /**
  * Default-off, unwired host composition foundation.
  *
@@ -105,6 +150,13 @@ function guardedSource<Source extends NonH2ReadinessSource>(
 export function createRelayV2HostRuntimeComposition(
   options: RelayV2HostRuntimeCompositionOptions,
 ): RelayV2HostRuntimeComposition {
+  const hostId = options.hostId;
+  const hostEpoch = options.hostEpoch;
+  const hostInstanceId = options.hostInstanceId;
+  const capturedAuthorities = captureRuntimeAuthorities(options.authorities);
+  if (capturedAuthorities === null) {
+    throw new Error("invalid Relay v2 host composition authority input");
+  }
   const readinessOwner = new RelayV2HostCapabilityReadiness();
   const rawSources = Object.freeze({
     codec: readinessOwner.source("codec"),
@@ -114,11 +166,32 @@ export function createRelayV2HostRuntimeComposition(
     h2: readinessOwner.source("h2"),
     h3: readinessOwner.source("h3"),
   });
-  const authorityPorts = createRelayV2HostRuntimeAuthorityPorts(options.authorities);
+  const h2Activation = createRelayV2HostH2ReadinessActivation({
+    hostId,
+    hostEpoch,
+    hostInstanceId,
+    authority: capturedAuthorities.h2SnapshotAuthority,
+    readinessSink: rawSources.h2,
+  });
+  const nextDedupeWindowBounds = capturedAuthorities.nextDedupeWindowBounds;
+  const nextDedupeWindowBoundsReceiver = capturedAuthorities.nextDedupeWindowBoundsReceiver;
+  const runtimeAuthorities: RelayV2HostRuntimeActualAuthorityInput = Object.freeze({
+    h0: capturedAuthorities.h0,
+    h1: capturedAuthorities.h1,
+    h2: h2Activation.runtimeH2,
+    snapshotSpool: h2Activation.snapshotSpool,
+    h3: capturedAuthorities.h3,
+    nextDedupeWindowBounds: () => Reflect.apply(
+      nextDedupeWindowBounds,
+      nextDedupeWindowBoundsReceiver,
+      [],
+    ),
+  });
+  const authorityPorts = createRelayV2HostRuntimeAuthorityPorts(runtimeAuthorities);
   const runtime = new RelayV2HostRuntime({
-    hostId: options.hostId,
-    hostEpoch: options.hostEpoch,
-    hostInstanceId: options.hostInstanceId,
+    hostId,
+    hostEpoch,
+    hostInstanceId,
     ...authorityPorts,
     capabilityIntersection: readinessOwner,
     welcome: options.welcome,
@@ -128,18 +201,12 @@ export function createRelayV2HostRuntimeComposition(
   let disposed = false;
   const isDisposed = () => disposed;
 
-  const h2: RelayV2HostRuntimeCompositionH2ReadinessWithdrawal = Object.freeze({
-    close(): void {
-      if (!disposed) rawSources.h2.close();
-    },
-  });
-
   const readiness: RelayV2HostRuntimeCompositionReadinessLifecycle = Object.freeze({
     codec: guardedSource(rawSources.codec, isDisposed),
     carrier: guardedSource(rawSources.carrier, isDisposed),
     h0: guardedSource(rawSources.h0, isDisposed),
     h1: guardedSource(rawSources.h1, isDisposed),
-    h2,
+    h2: h2Activation.lifecycle,
     h3: guardedSource(rawSources.h3, isDisposed),
     current: () => readinessOwner.current(),
     advertisedCapabilities: () => runtime.advertisedCapabilities(),
@@ -176,7 +243,10 @@ export function createRelayV2HostRuntimeComposition(
     dispose(): void {
       if (disposed) return;
       disposed = true;
-      for (const source of Object.values(rawSources)) source.close();
+      h2Activation.dispose();
+      for (const [source, sink] of Object.entries(rawSources)) {
+        if (source !== "h2") sink.close();
+      }
       runtime.dispose();
     },
   });

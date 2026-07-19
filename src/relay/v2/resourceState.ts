@@ -471,6 +471,35 @@ export interface RelayV2MaterializedStateCutSource {
   releaseCandidate(lease: RelayV2MaterializedStateCutCandidateLease): void;
 }
 
+declare const relayV2MaterializedStateSnapshotAuthorityBrand: unique symbol;
+
+/**
+ * Exact process-local proof that one materialized-state owner supplied both
+ * the snapshot cut source and the runtime H2 methods. The function identity is
+ * deliberately opaque: copying its shape or wrapping it in a Proxy grants no
+ * authority.
+ */
+export interface RelayV2MaterializedStateSnapshotAuthorityBundle {
+  readonly [relayV2MaterializedStateSnapshotAuthorityBrand]: true;
+}
+
+export type RelayV2MaterializedStateRuntimeH2Port = Pick<
+  RelayV2MaterializedStateFoundation,
+  "linearizeWelcome" | "scopesSnapshot" | "sessionsSnapshot" | "unsubscribe"
+>;
+
+interface RelayV2MaterializedStateSnapshotAuthorityBinding {
+  readonly cutSource: RelayV2MaterializedStateCutSource;
+  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
+}
+
+const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER = Symbol.for(
+  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-issuer",
+);
+const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE = Symbol.for(
+  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-capture",
+);
+
 export type RelayV2MaterializedErrorCode =
   | "BUSY"
   | "CAPABILITY_UNAVAILABLE"
@@ -2864,6 +2893,7 @@ export class RelayV2MaterializedStateFoundation {
   readonly reservationLimits: ResourceReservationLimits;
   readonly commandResourceMutationOwner: RelayV2CommandResourceMutationOwner;
   readonly snapshotCutSource: RelayV2MaterializedStateCutSource;
+  readonly snapshotAuthorityBundle: RelayV2MaterializedStateSnapshotAuthorityBundle;
   readonly canonicalTargetResolver: RelayV2CanonicalResourceResolverPort;
 
   private readonly discovery: RelayV2ResourceDiscovery;
@@ -2975,7 +3005,10 @@ export class RelayV2MaterializedStateFoundation {
         this.withdrawReadiness(snapshot, "materialized_authority_conflict");
       },
     });
-    this.snapshotCutSource = Object.freeze({
+    let snapshotAuthorityBundle: RelayV2MaterializedStateSnapshotAuthorityBundle | null = null;
+    let snapshotAuthorityBinding:
+      Readonly<RelayV2MaterializedStateSnapshotAuthorityBinding> | null = null;
+    const snapshotCutSource = {
       currentHostEpoch: () => this.currentSnapshotHostEpoch(),
       withHostEpochFence: <T>(
         expectedHostEpoch: string,
@@ -3017,7 +3050,47 @@ export class RelayV2MaterializedStateFoundation {
       releaseCandidate: (lease: RelayV2MaterializedStateCutCandidateLease) => {
         this.releaseMaterializedStateCutCandidate(lease);
       },
+    } as RelayV2MaterializedStateCutSource & Record<PropertyKey, unknown>;
+    Object.defineProperty(snapshotCutSource, MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: function captureSnapshotAuthority(
+        this: object,
+        candidate: unknown,
+      ): Readonly<RelayV2MaterializedStateSnapshotAuthorityBinding> | null {
+        return this === snapshotCutSource && candidate === snapshotAuthorityBundle
+          ? snapshotAuthorityBinding
+          : null;
+      },
     });
+    this.snapshotCutSource = Object.freeze(snapshotCutSource);
+    const runtimeH2: RelayV2MaterializedStateRuntimeH2Port = Object.freeze({
+      linearizeWelcome: (subscriberId, sink, buildWelcome) => (
+        this.linearizeWelcome(subscriberId, sink, buildWelcome)
+      ),
+      scopesSnapshot: (requestId, expectedHostEpoch) => (
+        this.scopesSnapshot(requestId, expectedHostEpoch)
+      ),
+      sessionsSnapshot: (requestId, expectedHostEpoch, scopeIds) => (
+        this.sessionsSnapshot(requestId, expectedHostEpoch, scopeIds)
+      ),
+      unsubscribe: (subscriberId) => this.unsubscribe(subscriberId),
+    });
+    const issuedBundle = () => undefined;
+    Object.defineProperty(issuedBundle, MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: this.snapshotCutSource,
+    });
+    snapshotAuthorityBundle = Object.freeze(issuedBundle) as unknown as
+      RelayV2MaterializedStateSnapshotAuthorityBundle;
+    snapshotAuthorityBinding = Object.freeze({
+      cutSource: this.snapshotCutSource,
+      runtimeH2,
+    });
+    this.snapshotAuthorityBundle = snapshotAuthorityBundle;
     this.canonicalTargetResolver = Object.freeze({
       captureToken: (expectedHostEpoch: string) => (
         this.captureCanonicalResolverToken(expectedHostEpoch)

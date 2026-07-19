@@ -20,6 +20,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import type {
   RelayV2JsonObject,
+  RelayV2MaterializedStateRuntimeH2Port,
+  RelayV2MaterializedStateSnapshotAuthorityBundle,
   RelayV2MaterializedStateCutActivationLease,
   RelayV2MaterializedStateCut,
   RelayV2MaterializedStateCutAdmissionEstimate,
@@ -135,15 +137,28 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
   beforeReadinessReceiptOwnerRecheck?: (
     issue: RelayV2StateSnapshotReadinessReceiptIssue,
   ) => void;
+  beforeReadinessReceiptVerify?: (receipt: unknown, expected: unknown) => void;
+  beforeReadinessReceiptActivation?: (receipt: unknown) => void;
+  wrapReadinessActivationSink?: (
+    sink: RelayV2StateEventSink<RelayV2JsonObject>,
+  ) => RelayV2StateEventSink<RelayV2JsonObject>;
   /** Runs after H0 attached the sink but before the spool commits activation. */
   afterReadinessActivationAttached?: (
     receipt: RelayV2StateSnapshotReadinessReceipt,
   ) => void;
+  /** Runs after the exact spool activation has been synchronously revoked. */
+  afterReadinessActivationRelease?: (activation: unknown, released: boolean) => unknown;
 }
 
 export interface RelayV2StateSnapshotSpoolOptions {
   hostId: string;
-  cutSource: RelayV2MaterializedStateCutSource;
+  /** Existing standalone spool seam; it cannot mint host H2 composition authority. */
+  cutSource?: RelayV2MaterializedStateCutSource;
+  /**
+   * Bound host-composition seam. Exactly one of this or cutSource is required.
+   * Only the materialized-state owner can issue a valid exact bundle.
+   */
+  materializedStateAuthority?: RelayV2MaterializedStateSnapshotAuthorityBundle;
   home?: string;
   root?: string;
   now?: () => number;
@@ -234,6 +249,98 @@ declare const relayV2StateSnapshotActivationLeaseBrand: unique symbol;
 /** Exact, live-process lease for one successfully attached route sink. */
 export interface RelayV2StateSnapshotActivationLease {
   readonly [relayV2StateSnapshotActivationLeaseBrand]: true;
+}
+
+export interface RelayV2StateSnapshotHostSpoolPort {
+  get(request: RelayV2StateSnapshotGet): Promise<RelayV2StateSnapshotChunk>;
+  release(request: RelayV2StateSnapshotRelease): Promise<RelayV2StateSnapshotReleased>;
+  verifyReadinessReceipt(
+    receipt: unknown,
+    expected: RelayV2StateSnapshotReadinessReceiptBinding,
+  ): Promise<boolean>;
+  activateReadinessReceipt(
+    receipt: unknown,
+    sink: RelayV2StateEventSink<RelayV2JsonObject>,
+  ): Promise<RelayV2StateSnapshotActivationLease>;
+  /** `undefined` or an exact native Promise are the only valid release results. */
+  releaseReadinessActivation(activation: unknown): unknown;
+}
+
+declare const relayV2StateSnapshotHostH2AuthorityBrand: unique symbol;
+
+/** Exact spool-issued proof joining one runtime H2 owner to this spool. */
+export interface RelayV2StateSnapshotHostH2Authority {
+  readonly [relayV2StateSnapshotHostH2AuthorityBrand]: true;
+}
+
+interface RelayV2StateSnapshotHostH2AuthorityBinding {
+  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
+  readonly snapshotSpool: RelayV2StateSnapshotHostSpoolPort;
+}
+
+const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER = Symbol.for(
+  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-issuer",
+);
+const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE = Symbol.for(
+  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-capture",
+);
+const STATE_SNAPSHOT_HOST_H2_AUTHORITY_ISSUER = Symbol.for(
+  "tmux-worktree.relay-v2.state-snapshot-host-h2-authority-issuer",
+);
+const STATE_SNAPSHOT_HOST_H2_AUTHORITY_CAPTURE = Symbol.for(
+  "tmux-worktree.relay-v2.state-snapshot-host-h2-authority-capture",
+);
+
+function exactHostAuthorityDataDescriptor(
+  owner: object,
+  property: PropertyKey,
+): PropertyDescriptor | null {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, property);
+    if (descriptor === undefined
+      || !Object.hasOwn(descriptor, "value")
+      || descriptor.get !== undefined
+      || descriptor.set !== undefined
+      || descriptor.configurable !== false
+      || descriptor.writable !== false) return null;
+    return descriptor;
+  } catch {
+    return null;
+  }
+}
+
+interface MaterializedStateSnapshotAuthorityBinding {
+  readonly cutSource: RelayV2MaterializedStateCutSource;
+  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
+}
+
+/** Private cross-entry verifier; no dist entry exposes the split binding. */
+function captureMaterializedStateSnapshotAuthority(
+  authority: unknown,
+): Readonly<MaterializedStateSnapshotAuthorityBinding> | null {
+  if (((typeof authority !== "object" || authority === null)
+    && typeof authority !== "function")) return null;
+  const authorityObject = authority as object;
+  const issuerDescriptor = exactHostAuthorityDataDescriptor(
+    authorityObject,
+    MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER,
+  );
+  if (issuerDescriptor === null
+    || ((typeof issuerDescriptor.value !== "object" || issuerDescriptor.value === null)
+      && typeof issuerDescriptor.value !== "function")) return null;
+  const issuer = issuerDescriptor.value as object;
+  const captureDescriptor = exactHostAuthorityDataDescriptor(
+    issuer,
+    MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE,
+  );
+  if (captureDescriptor === null || typeof captureDescriptor.value !== "function") return null;
+  try {
+    const binding = Reflect.apply(captureDescriptor.value, issuer, [authority]);
+    if (!binding || typeof binding !== "object") return null;
+    return binding as Readonly<MaterializedStateSnapshotAuthorityBinding>;
+  } catch {
+    return null;
+  }
 }
 
 export type RelayV2StateSnapshotSpoolErrorCode =
@@ -1565,6 +1672,8 @@ export class RelayV2StateSnapshotSpool {
   readonly paths: RelayV2StateSnapshotSpoolPaths;
   readonly limits: Readonly<SnapshotLimits>;
   readonly ownerInstanceId: string;
+  /** Null for the backwards-compatible standalone `{ cutSource }` open path. */
+  readonly hostH2Authority: RelayV2StateSnapshotHostH2Authority | null;
 
   private readonly cutSource: RelayV2MaterializedStateCutSource;
   private readonly now: () => number;
@@ -1611,7 +1720,86 @@ export class RelayV2StateSnapshotSpool {
     }
     this.verifyTrustedAncestors = true;
     this.takeoverExistingOwner = options.takeoverExistingOwner ?? false;
-    this.cutSource = options.cutSource;
+    const hasStandaloneCutSource = options.cutSource !== undefined;
+    const hasMaterializedStateAuthority = options.materializedStateAuthority !== undefined;
+    if (hasStandaloneCutSource === hasMaterializedStateAuthority) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INVALID_ARGUMENT",
+        "snapshot spool requires exactly one materialized authority input",
+      );
+    }
+    const materializedBinding = hasMaterializedStateAuthority
+      ? captureMaterializedStateSnapshotAuthority(options.materializedStateAuthority)
+      : null;
+    if (hasMaterializedStateAuthority && materializedBinding === null) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INVALID_ARGUMENT",
+        "snapshot spool materialized authority is invalid",
+      );
+    }
+    this.cutSource = materializedBinding?.cutSource ?? options.cutSource!;
+    let issuedHostH2Authority: RelayV2StateSnapshotHostH2Authority | null = null;
+    let hostH2Binding: Readonly<RelayV2StateSnapshotHostH2AuthorityBinding> | null = null;
+    const issuer = this;
+    Object.defineProperty(this, STATE_SNAPSHOT_HOST_H2_AUTHORITY_CAPTURE, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: function captureHostH2Authority(
+        this: object,
+        candidate: unknown,
+      ): Readonly<RelayV2StateSnapshotHostH2AuthorityBinding> | null {
+        return this === issuer && candidate === issuedHostH2Authority
+          ? hostH2Binding
+          : null;
+      },
+    });
+    if (materializedBinding === null) {
+      this.hostH2Authority = null;
+    } else {
+      const receiver = this;
+      const methods = Object.freeze({
+        get: RelayV2StateSnapshotSpool.prototype.get,
+        release: RelayV2StateSnapshotSpool.prototype.release,
+        verifyReadinessReceipt: RelayV2StateSnapshotSpool.prototype.verifyReadinessReceipt,
+        activateReadinessReceipt: RelayV2StateSnapshotSpool.prototype.activateReadinessReceipt,
+        releaseReadinessActivation:
+          RelayV2StateSnapshotSpool.prototype.releaseReadinessActivation,
+      });
+      const snapshotSpool: RelayV2StateSnapshotHostSpoolPort = Object.freeze({
+        get: (request) => Reflect.apply(methods.get, receiver, [request]),
+        release: (request) => Reflect.apply(methods.release, receiver, [request]),
+        verifyReadinessReceipt: (receipt, expected) => Reflect.apply(
+          methods.verifyReadinessReceipt,
+          receiver,
+          [receipt, expected],
+        ),
+        activateReadinessReceipt: (receipt, sink) => Reflect.apply(
+          methods.activateReadinessReceipt,
+          receiver,
+          [receipt, sink],
+        ),
+        releaseReadinessActivation: (activation) => Reflect.apply(
+          methods.releaseReadinessActivation,
+          receiver,
+          [activation],
+        ),
+      });
+      const authority = () => undefined;
+      Object.defineProperty(authority, STATE_SNAPSHOT_HOST_H2_AUTHORITY_ISSUER, {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: this,
+      });
+      issuedHostH2Authority = Object.freeze(authority) as unknown as
+        RelayV2StateSnapshotHostH2Authority;
+      hostH2Binding = Object.freeze({
+        runtimeH2: materializedBinding.runtimeH2,
+        snapshotSpool,
+      });
+      this.hostH2Authority = issuedHostH2Authority;
+    }
     this.now = options.now ?? Date.now;
     this.testHooks = options.testHooks;
     this.processIncarnationProbe = options.testHooks?.processIncarnationForPid
@@ -1950,6 +2138,11 @@ export class RelayV2StateSnapshotSpool {
     receipt: unknown,
     expected: unknown,
   ): Promise<boolean> {
+    try {
+      this.testHooks?.beforeReadinessReceiptVerify?.(receipt, expected);
+    } catch {
+      return false;
+    }
     const binding = normalizeReadinessReceiptBinding(expected);
     if (binding === null
       || ((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)) {
@@ -1997,7 +2190,17 @@ export class RelayV2StateSnapshotSpool {
     let installed: ReadinessActivationRecord | undefined;
     let receiptRecord: ReadinessReceiptRecord | undefined;
     let sourceAttempted = false;
+    let sourceSink = sink;
     try {
+      this.testHooks?.beforeReadinessReceiptActivation?.(receipt);
+      sourceSink = this.testHooks?.wrapReadinessActivationSink?.(sink) ?? sink;
+      if (((typeof sourceSink !== "object" && typeof sourceSink !== "function")
+        || sourceSink === null)) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "INVALID_ARGUMENT",
+          "snapshot readiness activation sink adapter is invalid",
+        );
+      }
       return await this.serializeMetadata(async () => {
         const now = this.readNow();
         this.cleanupExpiredAt(now);
@@ -2027,7 +2230,7 @@ export class RelayV2StateSnapshotSpool {
           sourceAttempted = true;
           sourceActivation = await this.cutSource.activateCandidate(
             record.candidate,
-            sink,
+            sourceSink,
             assertActivationFence,
             (candidate, activation) => {
               sourceActivation = activation;
@@ -2072,7 +2275,7 @@ export class RelayV2StateSnapshotSpool {
           spoolGeneration: this.spoolGeneration,
           receiptNonce: record.nonce,
           activationNonce: randomBytes(32).toString("base64url"),
-          sinkIdentity: sink as object,
+          sinkIdentity: sourceSink as object,
         };
         this.readinessActivations.set(activation as object, installed);
         record.cut.readinessActivation = activation;
@@ -2096,11 +2299,18 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
-  releaseReadinessActivation(activation: unknown): void {
+  releaseReadinessActivation(activation: unknown): unknown {
+    let released = false;
     if ((typeof activation !== "object" && typeof activation !== "function")
-      || activation === null) return;
+      || activation === null) {
+      return this.testHooks?.afterReadinessActivationRelease?.(activation, released);
+    }
     const record = this.readinessActivations.get(activation as object);
-    if (record !== undefined) this.revokeReadinessActivation(record);
+    if (record !== undefined) {
+      this.revokeReadinessActivation(record);
+      released = true;
+    }
+    return this.testHooks?.afterReadinessActivationRelease?.(activation, released);
   }
 
   close(): Promise<void> {
