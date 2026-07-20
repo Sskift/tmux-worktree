@@ -90,6 +90,7 @@ export default defineConfig({
     "./codexAppServerProcessControllerAuthority.js",
     // These owner entries carry module-private WeakMap brands. Keep every
     // dist consumer on the same canonical module instances.
+    "./brokerTransportCloseCoordinator.js",
     "./hostCarrier.js",
     "./hostConnectorController.js",
     "./hostCredentialAuthority.js",

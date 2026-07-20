@@ -5,6 +5,7 @@ import test from "node:test";
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
 const adapterModule = await import("../dist/relay/v2/brokerClientSocketTransport.js");
 const producerModule = await import("../dist/relay/v2/brokerProducerRegistry.js");
+const closeOwner = await import("../dist/relay/v2/brokerTransportCloseCoordinator.js");
 const codec = await import("../dist/relay/v2/codec.js");
 
 const HOST_ID = "mac-admin";
@@ -821,4 +822,43 @@ test("only current uncompressed text reaches Broker; invalid and stale input fai
     { opcode: "text", compressed: false },
   ).accepted, false);
   assert.equal(forwarded.length, 1);
+});
+
+test("managed client transport consumes the coordinator incarnation lease exactly once", async () => {
+  const base = await createBaseComposition();
+  const coordinator = new closeOwner.RelayV2BrokerTransportCloseCoordinator();
+  const socket = createSocket();
+  const closeRegistration = coordinator.registerManagedClientSocket({
+    connectionKind: "client",
+    connectionId: "managed-client-transport",
+    close: socket.port.close,
+    forceDestroy: socket.port.forceDestroy,
+  });
+  const registration = base.transport.registerManagedClientSocket(
+    closeRegistration.lease,
+    {
+      connectionId: "managed-client-transport",
+      authContext: authContext("client", { jti: "managed-client-transport-jti" }),
+      hostProducerTarget: base.producer.registration.target,
+      socket: socket.port,
+    },
+  );
+  assert.equal(
+    registration.connectionIncarnation,
+    closeRegistration.connectionIncarnation,
+  );
+  assert.throws(() => base.transport.registerManagedClientSocket(
+    closeRegistration.lease,
+    {
+      connectionId: "managed-client-transport-replay",
+      authContext: authContext("client", { jti: "managed-client-transport-replay-jti" }),
+      hostProducerTarget: base.producer.registration.target,
+      socket: createSocket().port,
+    },
+  ));
+  registration.closed();
+  assert.equal(
+    coordinator.terminalAndUnregisterManagedSocket(closeRegistration.lease),
+    true,
+  );
 });

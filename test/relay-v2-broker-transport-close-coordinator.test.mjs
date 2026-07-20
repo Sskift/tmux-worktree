@@ -396,4 +396,62 @@ test("Relay v2 broker transport close coordinator foundation", async (t) => {
     assert.deepEqual(closeLatchStates, ["latched_fail_closed"]);
     assert.equal(scheduler.scheduled.size, 0);
   });
+
+  await t.test("managed client lease is exact, one-shot, and retained until terminal", async () => {
+    const scheduler = new ManualDeadlineScheduler();
+    const coordinator = new closeOwner.RelayV2BrokerTransportCloseCoordinator({
+      deadlineScheduler: scheduler,
+    });
+    let destroys = 0;
+    const registration = coordinator.registerManagedClientSocket({
+      connectionKind: "client",
+      connectionId: "managed-client",
+      close() {},
+      forceDestroy() { destroys += 1; },
+    });
+    assert.throws(() => closeOwner.consumeRelayV2BrokerClientTransportCloseLease(
+      Object.freeze({}),
+      "managed-client",
+    ));
+    assert.equal(
+      closeOwner.consumeRelayV2BrokerClientTransportCloseLease(
+        registration.lease,
+        "managed-client",
+      ),
+      registration.connectionIncarnation,
+    );
+    assert.throws(() => closeOwner.consumeRelayV2BrokerClientTransportCloseLease(
+      registration.lease,
+      "managed-client",
+    ));
+    assert.equal(coordinator.forceDestroyManagedSocket(registration.lease), true);
+    assert.equal(coordinator.forceDestroyManagedSocket(registration.lease), true);
+    assert.equal(destroys, 1, "force request is once-only but is not terminal");
+    assert.throws(() => coordinator.registerManagedClientSocket({
+      connectionKind: "client",
+      connectionId: "managed-client",
+      close() {},
+      forceDestroy() {},
+    }));
+    assert.equal(coordinator.terminalAndUnregisterManagedSocket(registration.lease), true);
+
+    const unclaimed = coordinator.registerManagedClientSocket({
+      connectionKind: "client",
+      connectionId: "managed-client",
+      close() {},
+      forceDestroy() {},
+    });
+    assert.equal(coordinator.terminalAndUnregisterManagedSocket(unclaimed.lease), false);
+    assert.throws(() => coordinator.registerManagedClientSocket({
+      connectionKind: "client",
+      connectionId: "managed-client",
+      close() {},
+      forceDestroy() {},
+    }));
+    closeOwner.consumeRelayV2BrokerClientTransportCloseLease(
+      unclaimed.lease,
+      "managed-client",
+    );
+    assert.equal(coordinator.terminalAndUnregisterManagedSocket(unclaimed.lease), true);
+  });
 });

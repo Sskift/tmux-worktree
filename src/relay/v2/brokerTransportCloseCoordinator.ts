@@ -31,6 +31,22 @@ export interface RelayV2BrokerTransportSocketRegistration {
   unregister(): void;
 }
 
+declare const relayV2BrokerTransportCloseLeaseBrand: unique symbol;
+
+/**
+ * Process-local proof that the close coordinator, rather than a caller,
+ * selected the exact socket incarnation. Its facts are available only through
+ * the brand-checked consume operation below.
+ */
+export type RelayV2BrokerTransportCloseLease = Readonly<{
+  readonly [relayV2BrokerTransportCloseLeaseBrand]: true;
+}>;
+
+export interface RelayV2BrokerManagedTransportSocketRegistration {
+  readonly lease: RelayV2BrokerTransportCloseLease;
+  readonly connectionIncarnation: string;
+}
+
 export interface RelayV2BrokerTransportCloseDeadlineScheduler {
   schedule(callback: () => void, delayMs: number): unknown;
   cancel(handle: unknown): void;
@@ -58,6 +74,15 @@ type ParsedCloseSignal = {
   connectionIncarnation: string;
   reason: RelayV2LiveAuthorizationCloseReason;
 };
+
+type ManagedLeaseState = {
+  readonly owner: RelayV2BrokerTransportCloseCoordinator;
+  readonly entry: SocketEntry;
+  claimed: boolean;
+  terminal: boolean;
+};
+
+const managedLeaseStates = new WeakMap<object, ManagedLeaseState>();
 
 const defaultDeadlineScheduler: RelayV2BrokerTransportCloseDeadlineScheduler = Object.freeze({
   schedule(callback: () => void, delayMs: number): unknown {
@@ -123,6 +148,32 @@ function closeCodeFor(
 }
 
 /**
+ * One-shot managed transport claim. The transport receives no caller-selected
+ * incarnation and a lease cannot be replayed for a replacement connection.
+ */
+export function consumeRelayV2BrokerClientTransportCloseLease(
+  lease: RelayV2BrokerTransportCloseLease,
+  connectionId: string,
+): string {
+  if (lease === null || typeof lease !== "object" || !isIdentifier(connectionId)) {
+    throw new Error("invalid Relay v2 Broker client transport close lease");
+  }
+  const state = managedLeaseStates.get(lease);
+  if (
+    !state
+    || state.claimed
+    || state.terminal
+    || state.entry.connectionKind !== "client"
+    || state.entry.connectionId !== connectionId
+    || state.entry.state === "unregistered"
+  ) {
+    throw new Error("stale Relay v2 Broker client transport close lease");
+  }
+  state.claimed = true;
+  return state.entry.connectionIncarnation;
+}
+
+/**
  * Unwired transport owner for Relay v2 credential-fence close delivery.
  * BrokerCore has already synchronously fenced business admission/data before
  * it emits the signal consumed here; socket close work always starts later.
@@ -141,46 +192,58 @@ export class RelayV2BrokerTransportCloseCoordinator {
   registerSocket(
     socket: RelayV2BrokerTransportSocket,
   ): RelayV2BrokerTransportSocketRegistration {
-    const connectionKind = socket.connectionKind;
-    if (connectionKind !== "client" && connectionKind !== "host") {
-      throw new Error("invalid Relay v2 transport socket connection kind");
-    }
-    const connectionId = connectionKind === "client" ? socket.connectionId : socket.transportId;
-    const close = socket.close;
-    const forceDestroy = socket.forceDestroy;
-    if (
-      !isIdentifier(connectionId)
-      || typeof close !== "function"
-      || typeof forceDestroy !== "function"
-    ) {
-      throw new Error("invalid Relay v2 transport socket registration");
-    }
-    const registry = this.registryFor(connectionKind);
-    if (registry.has(connectionId)) {
-      throw new Error("duplicate Relay v2 transport socket registration");
-    }
-    const entry: SocketEntry = {
-      connectionKind,
-      connectionId,
-      connectionIncarnation: randomUUID(),
-      close: (code, reason) => Reflect.apply(close, socket, [code, reason]),
-      forceDestroy: () => Reflect.apply(forceDestroy, socket, []),
-      state: "open",
-      closeRequested: false,
-      forceDestroyRequested: false,
-      deadlineInstalled: false,
-      deadlineHandle: undefined,
-    };
-    registry.set(connectionId, entry);
+    const entry = this.registerEntry(socket);
+    const registry = this.registryFor(entry.connectionKind);
     return Object.freeze({
       connectionIncarnation: entry.connectionIncarnation,
       unregister: () => {
         if (entry.state === "unregistered") return;
         entry.state = "unregistered";
-        if (registry.get(connectionId) === entry) registry.delete(connectionId);
+        if (registry.get(entry.connectionId) === entry) registry.delete(entry.connectionId);
         this.cancelDeadline(entry);
       },
     });
+  }
+
+  registerManagedClientSocket(
+    socket: Extract<RelayV2BrokerTransportSocket, { connectionKind: "client" }>,
+  ): RelayV2BrokerManagedTransportSocketRegistration {
+    const entry = this.registerEntry(socket);
+    const lease = Object.freeze(Object.create(null)) as RelayV2BrokerTransportCloseLease;
+    managedLeaseStates.set(lease, {
+      owner: this,
+      entry,
+      claimed: false,
+      terminal: false,
+    });
+    return Object.freeze({
+      lease,
+      connectionIncarnation: entry.connectionIncarnation,
+    });
+  }
+
+  /**
+   * Force-destroy is only a request. The managed registration remains current
+   * until terminalAndUnregisterManagedSocket observes a real adapter terminal.
+   */
+  forceDestroyManagedSocket(lease: RelayV2BrokerTransportCloseLease): boolean {
+    const state = this.managedLeaseState(lease);
+    if (!state || state.terminal) return false;
+    this.forceDestroy(state.entry);
+    return true;
+  }
+
+  terminalAndUnregisterManagedSocket(lease: RelayV2BrokerTransportCloseLease): boolean {
+    const state = this.managedLeaseState(lease);
+    if (!state || !state.claimed) return false;
+    if (state.terminal) return true;
+    state.terminal = true;
+    const { entry } = state;
+    entry.state = "unregistered";
+    const registry = this.registryFor(entry.connectionKind);
+    if (registry.get(entry.connectionId) === entry) registry.delete(entry.connectionId);
+    this.cancelDeadline(entry);
+    return true;
   }
 
   /**
@@ -234,6 +297,49 @@ export class RelayV2BrokerTransportCloseCoordinator {
 
   private registryFor(connectionKind: RelayV2TransportConnectionKind): Map<string, SocketEntry> {
     return connectionKind === "client" ? this.clients : this.hosts;
+  }
+
+  private registerEntry(socket: RelayV2BrokerTransportSocket): SocketEntry {
+    const connectionKind = socket.connectionKind;
+    if (connectionKind !== "client" && connectionKind !== "host") {
+      throw new Error("invalid Relay v2 transport socket connection kind");
+    }
+    const connectionId = connectionKind === "client" ? socket.connectionId : socket.transportId;
+    const close = socket.close;
+    const forceDestroy = socket.forceDestroy;
+    if (
+      !isIdentifier(connectionId)
+      || typeof close !== "function"
+      || typeof forceDestroy !== "function"
+    ) {
+      throw new Error("invalid Relay v2 transport socket registration");
+    }
+    const registry = this.registryFor(connectionKind);
+    if (registry.has(connectionId)) {
+      throw new Error("duplicate Relay v2 transport socket registration");
+    }
+    const entry: SocketEntry = {
+      connectionKind,
+      connectionId,
+      connectionIncarnation: randomUUID(),
+      close: (code, reason) => Reflect.apply(close, socket, [code, reason]),
+      forceDestroy: () => Reflect.apply(forceDestroy, socket, []),
+      state: "open",
+      closeRequested: false,
+      forceDestroyRequested: false,
+      deadlineInstalled: false,
+      deadlineHandle: undefined,
+    };
+    registry.set(connectionId, entry);
+    return entry;
+  }
+
+  private managedLeaseState(
+    lease: RelayV2BrokerTransportCloseLease,
+  ): ManagedLeaseState | undefined {
+    if (lease === null || typeof lease !== "object") return undefined;
+    const state = managedLeaseStates.get(lease);
+    return state?.owner === this ? state : undefined;
   }
 
   private requestClose(entry: SocketEntry, reason: RelayV2LiveAuthorizationCloseReason): void {

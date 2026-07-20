@@ -19,6 +19,10 @@ import {
   type RelayV2BrokerProducerRegistry,
   type RelayV2BrokerProducerTarget,
 } from "./brokerProducerRegistry.js";
+import {
+  consumeRelayV2BrokerClientTransportCloseLease,
+  type RelayV2BrokerTransportCloseLease,
+} from "./brokerTransportCloseCoordinator.js";
 import { encodeRelayV2WebSocketFrame } from "./codec.js";
 
 const DEFAULT_DELIVERY_TIMEOUT_MS = 5_000;
@@ -104,9 +108,18 @@ export interface RelayV2BrokerClientSocketTransport {
   applyBrokerAction(action: RelayV2BrokerAction): RelayV2BrokerClientSocketEffectReceipt;
 }
 
+export interface RelayV2BrokerManagedClientSocketTransport
+extends RelayV2BrokerClientSocketTransport {
+  registerManagedClientSocket(
+    lease: RelayV2BrokerTransportCloseLease,
+    input: RelayV2BrokerClientSocketRegistrationInput,
+  ): RelayV2BrokerClientSocketRegistration;
+  retireManagedClientSocket(lease: RelayV2BrokerTransportCloseLease): RelayV2BrokerResult;
+}
+
 export interface RelayV2BrokerClientSocketTransportComposition {
   readonly broker: RelayV2BrokerCore;
-  readonly clientSocketTransport: RelayV2BrokerClientSocketTransport;
+  readonly clientSocketTransport: RelayV2BrokerManagedClientSocketTransport;
 }
 
 type CapturedSocket = {
@@ -140,6 +153,7 @@ type ClientEntry = {
   readonly connectionIncarnation: string;
   readonly hostProducerTarget: RelayV2BrokerProducerTarget;
   readonly socket: CapturedSocket;
+  readonly managed: boolean;
   phase: "open" | "closing" | "closed";
   routeOpened: boolean;
   paused: boolean;
@@ -293,7 +307,7 @@ function isHostProducerTarget(value: unknown): value is RelayV2BrokerProducerTar
  * this class. `host_output_ready` requires the later B7c port-to-Pump binding.
  */
 class RelayV2BrokerClientSocketTransportImpl
-implements RelayV2BrokerClientSocketTransport {
+implements RelayV2BrokerManagedClientSocketTransport {
   private broker!: RelayV2BrokerCore;
   private brokerBound = false;
   private readonly producerRegistry: RelayV2BrokerProducerRegistry;
@@ -303,6 +317,7 @@ implements RelayV2BrokerClientSocketTransport {
   private readonly deliveryTimeoutMs: number;
   private readonly closeTimeoutMs: number;
   private readonly clients = new Map<string, ClientEntry>();
+  private readonly managedClients = new WeakMap<object, ClientEntry>();
   private readonly hostReady = new Map<string, HostReadyEntry>();
 
   constructor(
@@ -339,6 +354,36 @@ implements RelayV2BrokerClientSocketTransport {
   registerClientSocket(
     input: RelayV2BrokerClientSocketRegistrationInput,
   ): RelayV2BrokerClientSocketRegistration {
+    return this.registerClientSocketWithIncarnation(input, randomUUID());
+  }
+
+  registerManagedClientSocket(
+    lease: RelayV2BrokerTransportCloseLease,
+    input: RelayV2BrokerClientSocketRegistrationInput,
+  ): RelayV2BrokerClientSocketRegistration {
+    const connectionIncarnation = consumeRelayV2BrokerClientTransportCloseLease(
+      lease,
+      input.connectionId,
+    );
+    return this.registerClientSocketWithIncarnation(input, connectionIncarnation, lease);
+  }
+
+  retireManagedClientSocket(
+    lease: RelayV2BrokerTransportCloseLease,
+  ): RelayV2BrokerResult {
+    if (lease === null || typeof lease !== "object") return rejectedBrokerResult();
+    const entry = this.managedClients.get(lease);
+    if (!entry) return rejectedBrokerResult();
+    const result = this.unbindOnce(entry, "broker_shutdown");
+    this.finalize(entry);
+    return result;
+  }
+
+  private registerClientSocketWithIncarnation(
+    input: RelayV2BrokerClientSocketRegistrationInput,
+    connectionIncarnation: string,
+    lease?: RelayV2BrokerTransportCloseLease,
+  ): RelayV2BrokerClientSocketRegistration {
     if (!isIdentifier(input.connectionId) || this.clients.has(input.connectionId)) {
       throw new Error("invalid or duplicate Relay v2 client socket connection ID");
     }
@@ -349,12 +394,13 @@ implements RelayV2BrokerClientSocketTransport {
     if (!socket) throw new Error("invalid Relay v2 client socket port");
     const entry: ClientEntry = {
       connectionId: input.connectionId,
-      connectionIncarnation: randomUUID(),
+      connectionIncarnation,
       hostProducerTarget: Object.freeze({
         transportId: input.hostProducerTarget.transportId,
         generation: input.hostProducerTarget.generation,
       }),
       socket,
+      managed: lease !== undefined,
       phase: "open",
       routeOpened: false,
       paused: false,
@@ -371,6 +417,7 @@ implements RelayV2BrokerClientSocketTransport {
       forceDestroyRequested: false,
     };
     this.clients.set(entry.connectionId, entry);
+    if (lease) this.managedClients.set(lease, entry);
 
     let openResult: RelayV2RouteOpenResult;
     try {
@@ -380,6 +427,7 @@ implements RelayV2BrokerClientSocketTransport {
         entry.connectionIncarnation,
       ));
     } catch (error) {
+      if (entry.managed) this.unbindOnce(entry, "broker_shutdown");
       this.finalize(entry);
       throw error;
     }
@@ -1156,10 +1204,18 @@ implements RelayV2BrokerClientSocketTransport {
   }
 
   private errored(entry: ClientEntry): RelayV2BrokerResult {
-    if (entry.phase === "open") {
-      this.beginBoundedClose(entry, 1013, "client_socket_error");
+    if (!entry.managed) {
+      if (entry.phase === "open") {
+        this.beginBoundedClose(entry, 1013, "client_socket_error");
+      }
+      return this.unbindOnce(entry, "protocol_error");
     }
-    return this.unbindOnce(entry, "protocol_error");
+    if (this.clients.get(entry.connectionId) === entry && entry.phase === "open") {
+      entry.phase = "closing";
+    }
+    const result = this.unbindOnce(entry, "protocol_error");
+    this.finalize(entry);
+    return result;
   }
 
   private unbindOnce(
