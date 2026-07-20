@@ -351,9 +351,9 @@ internal sealed interface RelayV2OutboxExactGenerationSendResult {
 }
 
 /**
- * Port implemented by the serialized actor owner in a future composition. It compares the full
- * authority and returns Stale before transport. The byte array is a defensive copy for the one
- * synchronous send call; the implementation must neither retain nor log it.
+ * Port implemented by the serialized actor owner. It compares the full authority and returns
+ * Stale before transport. The byte array is a defensive copy for the one synchronous send call;
+ * the implementation must neither retain nor log it.
  */
 internal fun interface RelayV2OutboxExactGenerationSendPort {
     fun sendIfCurrent(

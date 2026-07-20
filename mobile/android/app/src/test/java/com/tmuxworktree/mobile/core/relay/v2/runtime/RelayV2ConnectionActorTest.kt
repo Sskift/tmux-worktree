@@ -1755,6 +1755,408 @@ class RelayV2ConnectionActorTest {
         }
 
     @Test
+    fun `outbox send is online only and preserves exact synchronous transport result`() =
+        runBlocking {
+            val harness = Harness()
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val recovery = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                val authority = recovery.repositoryAuthority
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.QUERYING)
+                val beforeQuerying = transport.sendAttemptCount.get()
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    harness.actor.sendIfCurrent(authority, "querying".toByteArray()),
+                )
+                assertEquals(beforeQuerying, transport.sendAttemptCount.get())
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        recovery,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = recovery.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+
+                val mismatches = listOf(
+                    authority.copy(
+                        generation = authority.generation.copy(profileId = "other-profile"),
+                        profileId = "other-profile",
+                    ),
+                    authority.copy(
+                        generation = authority.generation.copy(
+                            profileGeneration = authority.generation.profileGeneration + 1,
+                        ),
+                        profileActivationGeneration =
+                            authority.profileActivationGeneration + 1,
+                    ),
+                    authority.copy(principalId = "other-principal"),
+                    authority.copy(clientInstanceId = "other-client"),
+                    authority.copy(hostId = "other-host"),
+                    authority.copy(hostEpoch = "other-host-epoch"),
+                    authority.copy(
+                        generation = authority.generation.copy(
+                            connectionGeneration =
+                                authority.generation.connectionGeneration + 1,
+                        ),
+                    ),
+                )
+                val beforeMismatches = transport.sendAttemptCount.get()
+                mismatches.forEach { mismatch ->
+                    assertEquals(
+                        RelayV2OutboxExactGenerationSendResult.Stale,
+                        harness.actor.sendIfCurrent(mismatch, "stale".toByteArray()),
+                    )
+                }
+                assertEquals(beforeMismatches, transport.sendAttemptCount.get())
+
+                val callerBytes = "defensive-outbox-payload".toByteArray()
+                val originalBytes = callerBytes.copyOf()
+                transport.beforeSend = { delivered ->
+                    assertFalse(delivered === callerBytes)
+                    delivered[0] = 'X'.code.toByte()
+                }
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Sent,
+                    harness.actor.sendIfCurrent(authority, callerBytes),
+                )
+                assertTrue(callerBytes.contentEquals(originalBytes))
+                transport.beforeSend = null
+
+                transport.sendResult = false
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.NotSent,
+                    harness.actor.sendIfCurrent(authority, "not-sent".toByteArray()),
+                )
+
+                val failure = IllegalStateException("transport send failed")
+                transport.sendFailure = failure
+                assertSame(
+                    failure,
+                    runCatching {
+                        harness.actor.sendIfCurrent(authority, "throw".toByteArray())
+                    }.exceptionOrNull(),
+                )
+                transport.sendFailure = null
+                assertEquals(beforeMismatches + 3, transport.sendAttemptCount.get())
+
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    harness.actor.sendIfCurrent(
+                        authority,
+                        ByteArray(RelayV2Codec.PUBLIC_FRAME_BYTES + 1),
+                    ),
+                )
+                assertEquals(beforeMismatches + 3, transport.sendAttemptCount.get())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `outbox send and disconnect fence share one actor owned serial segment`() = runBlocking {
+        val sendEntered = CountDownLatch(1)
+        val releaseSend = CountDownLatch(1)
+        val disconnectStarted = CountDownLatch(1)
+        val disconnectOwnerSealed = CountDownLatch(1)
+        val harness = Harness(
+            afterDisconnectOwnerSeal = { disconnectOwnerSealed.countDown() },
+        )
+        try {
+            val hello = harness.connectThroughRelayWelcome(
+                RelayV2ResumeCursor(HOST_EPOCH, "91"),
+            )
+            val transport = harness.transport()
+            transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+            val recovery = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.QueryPendingCommands
+            val authority = recovery.repositoryAuthority
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.QUERYING)
+            assertTrue(
+                harness.actor.commitRecoveryReceipt(
+                    recovery,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = recovery.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = emptyList(),
+                    ),
+                ),
+            )
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+            val beforeSend = transport.sendAttemptCount.get()
+            transport.beforeSend = {
+                sendEntered.countDown()
+                check(releaseSend.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            }
+
+            val sending = async(Dispatchers.Default) {
+                harness.actor.sendIfCurrent(authority, "serialized".toByteArray())
+            }
+            assertTrue(sendEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val disconnect = async(Dispatchers.Default) {
+                disconnectStarted.countDown()
+                harness.actor.disconnectAndDrain(
+                    harness.profile.identity,
+                    "outbox-send-fence",
+                )
+            }
+            assertTrue(disconnectStarted.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            assertEquals(1L, disconnectOwnerSealed.count)
+            assertFalse(disconnect.isCompleted)
+
+            releaseSend.countDown()
+            assertEquals(
+                RelayV2OutboxExactGenerationSendResult.Sent,
+                withTimeout(TIMEOUT_MS) { sending.await() },
+            )
+            assertEquals(
+                "outbox-send-fence",
+                withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+            )
+            assertEquals(beforeSend + 1, transport.sendAttemptCount.get())
+        } finally {
+            releaseSend.countDown()
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `outbox send is stale when disconnect fence wins the concurrent race`() = runBlocking {
+        val sendCallerReady = CountDownLatch(1)
+        val releaseSendCaller = CountDownLatch(1)
+        val disconnectOwnerSealed = CountDownLatch(1)
+        val releaseDisconnect = CountDownLatch(1)
+        val harness = Harness(
+            afterDisconnectOwnerSeal = {
+                disconnectOwnerSealed.countDown()
+                check(releaseDisconnect.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            },
+        )
+        try {
+            val hello = harness.connectThroughRelayWelcome(
+                RelayV2ResumeCursor(HOST_EPOCH, "91"),
+            )
+            val transport = harness.transport()
+            transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+            val recovery = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.QueryPendingCommands
+            val authority = recovery.repositoryAuthority
+            assertTrue(
+                harness.actor.commitRecoveryReceipt(
+                    recovery,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = recovery.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = emptyList(),
+                    ),
+                ),
+            )
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+            val beforeSend = transport.sendAttemptCount.get()
+            val sending = async(Dispatchers.Default) {
+                sendCallerReady.countDown()
+                check(releaseSendCaller.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                harness.actor.sendIfCurrent(authority, "disconnect-first".toByteArray())
+            }
+            assertTrue(sendCallerReady.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val disconnect = async(start = CoroutineStart.UNDISPATCHED) {
+                harness.actor.disconnectAndDrain(
+                    harness.profile.identity,
+                    "outbox-disconnect-first",
+                )
+            }
+            assertTrue(disconnectOwnerSealed.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+            releaseSendCaller.countDown()
+            assertEquals(
+                RelayV2OutboxExactGenerationSendResult.Stale,
+                withTimeout(TIMEOUT_MS) { sending.await() },
+            )
+            assertEquals(beforeSend, transport.sendAttemptCount.get())
+
+            releaseDisconnect.countDown()
+            assertEquals(
+                "outbox-disconnect-first",
+                withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+            )
+        } finally {
+            releaseSendCaller.countDown()
+            releaseDisconnect.countDown()
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `outbox send is stale when close fence wins with current online authority`() = runBlocking {
+        val executeReadyReadEntered = CountDownLatch(1)
+        val releaseExecuteReadyRead = CountDownLatch(1)
+        val closeFenceCompleted = CountDownLatch(1)
+        val harness = Harness(
+            beforeOutboxExecuteReadyRead = {
+                executeReadyReadEntered.countDown()
+                check(releaseExecuteReadyRead.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            },
+        )
+        try {
+            val hello = harness.connectThroughRelayWelcome(
+                RelayV2ResumeCursor(HOST_EPOCH, "91"),
+            )
+            val transport = harness.transport()
+            transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+            val recovery = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.QueryPendingCommands
+            val authority = recovery.repositoryAuthority
+            assertTrue(
+                harness.actor.commitRecoveryReceipt(
+                    recovery,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = recovery.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = emptyList(),
+                    ),
+                ),
+            )
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+            transport.completeTerminationOnCancel = false
+            val beforeSend = transport.sendAttemptCount.get()
+            val sending = async(Dispatchers.Default) {
+                harness.actor.sendIfCurrent(authority, "close-first".toByteArray())
+            }
+            assertTrue(executeReadyReadEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val closing = async(Dispatchers.Default) {
+                harness.actor.close()
+                // close() returns only after SHUTTING_DOWN and ready/owner withdrawal commit.
+                closeFenceCompleted.countDown()
+            }
+            assertTrue(closeFenceCompleted.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            withTimeout(TIMEOUT_MS) { closing.await() }
+
+            releaseExecuteReadyRead.countDown()
+            assertEquals(
+                RelayV2OutboxExactGenerationSendResult.Stale,
+                withTimeout(TIMEOUT_MS) { sending.await() },
+            )
+            assertEquals(beforeSend, transport.sendAttemptCount.get())
+
+            transport.completeTermination()
+            assertEquals(
+                RelayV2ConnectionPhase.CLOSED,
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.CLOSED).phase,
+            )
+        } finally {
+            releaseExecuteReadyRead.countDown()
+            harness.factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `outbox send rejects handshake initial resync and reconnect before transport`() =
+        runBlocking {
+            val handshake = Harness()
+            try {
+                val hello = handshake.connectThroughRelayWelcome(null)
+                val transport = handshake.transport()
+                val state = handshake.actor.awaitPhase(
+                    RelayV2ConnectionPhase.AWAITING_HOST_WELCOME,
+                )
+                val authority = RelayV2RepositoryEffectAuthority(
+                    generation = RelayV2EffectGeneration(
+                        handshake.profile.profileId,
+                        handshake.profile.activationGeneration,
+                        state.connectionGeneration,
+                    ),
+                    profileId = handshake.profile.profileId,
+                    profileActivationGeneration = handshake.profile.activationGeneration,
+                    principalId = handshake.profile.principalId,
+                    clientInstanceId = handshake.profile.clientInstanceId,
+                    hostId = handshake.profile.hostId,
+                    hostEpoch = HOST_EPOCH,
+                )
+                val before = transport.sendAttemptCount.get()
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    handshake.actor.sendIfCurrent(authority, "handshake".toByteArray()),
+                )
+                assertEquals(before, transport.sendAttemptCount.get())
+
+                transport.sendFixture(
+                    "host-welcome-snapshot-required",
+                    hello.stringValue("requestId"),
+                )
+                val resync = withTimeout(TIMEOUT_MS) { handshake.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+                handshake.actor.awaitPhase(RelayV2ConnectionPhase.RESYNCING)
+                val beforeResync = transport.sendAttemptCount.get()
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    handshake.actor.sendIfCurrent(
+                        resync.repositoryAuthority,
+                        "initial-resync".toByteArray(),
+                    ),
+                )
+                assertEquals(beforeResync, transport.sendAttemptCount.get())
+            } finally {
+                handshake.close()
+            }
+
+            val reconnect = Harness()
+            try {
+                val hello = reconnect.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val oldTransport = reconnect.transport()
+                oldTransport.sendFixture(
+                    "host-welcome-caught-up",
+                    hello.stringValue("requestId"),
+                )
+                val recovery = withTimeout(TIMEOUT_MS) { reconnect.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                val oldAuthority = recovery.repositoryAuthority
+                assertTrue(
+                    reconnect.actor.commitRecoveryReceipt(
+                        recovery,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = recovery.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                reconnect.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+                val oldAttempts = oldTransport.sendAttemptCount.get()
+
+                assertTrue(reconnect.actor.connect(reconnect.profile))
+                reconnect.awaitTransport(1)
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    reconnect.actor.sendIfCurrent(oldAuthority, "reconnect".toByteArray()),
+                )
+                assertEquals(oldAttempts, oldTransport.sendAttemptCount.get())
+            } finally {
+                reconnect.close()
+            }
+        }
+
+    @Test
     fun `disconnect and close reject committed query receipt before transport send`() = runBlocking {
         listOf("disconnect", "close").forEach { terminal ->
             val harness = Harness()
@@ -1839,7 +2241,15 @@ class RelayV2ConnectionActorTest {
                 repository.completeSnapshotReleaseUnderApplyLease(committed.release)?.release,
             )
             val adapter = recoveryAdapter(repository)
-            val harness = Harness(durableConnectPlanSource = adapter)
+            val executeReadyReadEntered = CountDownLatch(1)
+            val releaseExecuteReadyRead = CountDownLatch(1)
+            val harness = Harness(
+                durableConnectPlanSource = adapter,
+                beforeOutboxExecuteReadyRead = {
+                    executeReadyReadEntered.countDown()
+                    check(releaseExecuteReadyRead.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                },
+            )
             try {
                 val hello = harness.connectThroughRelayWelcome(
                     RelayV2ResumeCursor(HOST_EPOCH, "91"),
@@ -1860,6 +2270,13 @@ class RelayV2ConnectionActorTest {
                 } as RelayV2EffectApplyResult.Applied
                 assertTrue(harness.actor.submitRecoveryReceipt(helloReceipt.value))
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+                val racingExecute = async(Dispatchers.Default) {
+                    harness.actor.sendIfCurrent(
+                        helloEffect.repositoryAuthority,
+                        "racing-online-gap-execute".toByteArray(),
+                    )
+                }
+                assertTrue(executeReadyReadEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
 
                 val gapFrame = fixture("sessions-changed-upsert")
                 gapFrame["eventSeq"] = "93"
@@ -1909,6 +2326,23 @@ class RelayV2ConnectionActorTest {
                 assertEquals("state.snapshot.get", snapshot.stringValue("type"))
                 assertEquals(null, snapshot.payload()["snapshotId"])
                 assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+                assertEquals(helloEffect.generation, delivery.generation)
+                assertEquals(helloEffect.repositoryAuthority, delivery.repositoryAuthority)
+                val beforeDelayedExecute = transport.sendAttemptCount.get()
+                releaseExecuteReadyRead.countDown()
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    withTimeout(TIMEOUT_MS) { racingExecute.await() },
+                )
+                assertEquals(beforeDelayedExecute, transport.sendAttemptCount.get())
+                assertEquals(
+                    RelayV2OutboxExactGenerationSendResult.Stale,
+                    harness.actor.sendIfCurrent(
+                        delivery.repositoryAuthority,
+                        "delayed-online-gap-execute".toByteArray(),
+                    ),
+                )
+                assertEquals(beforeDelayedExecute, transport.sendAttemptCount.get())
 
                 val bufferedFrame = deepClone(gapFrame)
                 bufferedFrame["eventSeq"] = "94"
@@ -1937,6 +2371,7 @@ class RelayV2ConnectionActorTest {
                     chunkEffect.snapshotRequestId,
                 )
             } finally {
+                releaseExecuteReadyRead.countDown()
                 harness.close()
             }
         }
@@ -6281,6 +6716,7 @@ class RelayV2ConnectionActorTest {
         betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
         afterCallbackAdmission: (RelayV2Transport) -> Unit = {},
         afterDisconnectOwnerSeal: () -> Unit = {},
+        beforeOutboxExecuteReadyRead: () -> Unit = {},
         durableConnectPlanSource: RelayV2ConnectPlanSource? = null,
         optionalCapabilities: Set<String> = emptySet(),
         private val queryAdmissionComposition: RelayV2OutboxQueryAdmissionComposition? =
@@ -6310,6 +6746,7 @@ class RelayV2ConnectionActorTest {
                 betweenTerminalCauseReadAndOwnerRevoke,
             afterCallbackAdmission = afterCallbackAdmission,
             afterDisconnectOwnerSeal = afterDisconnectOwnerSeal,
+            beforeOutboxExecuteReadyRead = beforeOutboxExecuteReadyRead,
             normalActionCapacity = normalActionCapacity,
             reservedActionCapacity = reservedActionCapacity,
             eventCapacity = eventCapacity,
@@ -6713,6 +7150,7 @@ class RelayV2ConnectionActorTest {
     ) : RelayV2Transport {
         val sent = CopyOnWriteArrayList<ByteArray>()
         val closeCodes = CopyOnWriteArrayList<Int>()
+        val sendAttemptCount = AtomicInteger()
         val awaitTerminationCount = AtomicInteger()
         @Volatile
         var cancelCount: Int = 0
@@ -6735,11 +7173,20 @@ class RelayV2ConnectionActorTest {
         @Volatile
         var sendResult: Boolean = true
 
+        @Volatile
+        var sendFailure: RuntimeException? = null
+
+        @Volatile
+        var beforeSend: ((ByteArray) -> Unit)? = null
+
         override fun send(bytes: ByteArray): Boolean {
+            sendAttemptCount.incrementAndGet()
             if (blockFirstSend && sendCount++ == 0) {
                 sendEntered.countDown()
                 check(releaseSend.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
             }
+            sendFailure?.let { throw it }
+            beforeSend?.invoke(bytes)
             sent += bytes.copyOf()
             return sendResult
         }

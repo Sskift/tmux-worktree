@@ -97,6 +97,7 @@ internal class RelayV2ConnectionActor(
     private val betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
     private val afterCallbackAdmission: (RelayV2Transport) -> Unit = {},
     private val afterDisconnectOwnerSeal: () -> Unit = {},
+    private val beforeOutboxExecuteReadyRead: () -> Unit = {},
     private val relayWelcomeTimeoutMs: Long = RELAY_WELCOME_TIMEOUT_MS,
     private val hostWelcomeTimeoutMs: Long = HOST_WELCOME_TIMEOUT_MS,
     private val recoveryStepTimeoutMs: Long = RECOVERY_STEP_TIMEOUT_MS,
@@ -116,6 +117,7 @@ internal class RelayV2ConnectionActor(
 ) : RelayProfileDisconnectBarrier,
     RelayV2RepositoryEffectApplyLeasePort,
     RelayV2CurrentRepositoryReadAuthorityPort,
+    RelayV2OutboxExactGenerationSendPort,
     AgentTranscriptLifecycleExtensionRequestSender,
     AgentTranscriptLifecycleDurableHandoffPort,
     Closeable {
@@ -170,6 +172,8 @@ internal class RelayV2ConnectionActor(
     private var activeConnectToken: ConnectToken? = null
     private var provisionalCallbackOwner: ProvisionalCallbackOwner? = null
     private var committedCallbackOwner: CommittedCallbackOwner? = null
+    /** Guarded by lifecycleLock; this is the sole Execute mutation-readiness fact. */
+    private var outboxExecuteReadyCut: OutboxExecuteReadyCut? = null
     private var pendingTerminalIntent: PendingTerminalIntent? = null
     private val pendingBarriers = linkedMapOf<
         CompletableDeferred<RelayProfileDisconnectReceipt>,
@@ -220,6 +224,56 @@ internal class RelayV2ConnectionActor(
             RelayV2EffectApplyResult.Applied(block())
         } finally {
             lease.close()
+        }
+    }
+
+    /**
+     * Atomically checks the actor-issued ONLINE Execute-ready cut and complete authority, then
+     * performs its sole transport attempt under the same lifecycle fence. The caller-owned bytes
+     * are bounded and detached before the fence; neither array is retained.
+     */
+    override fun sendIfCurrent(
+        authority: RelayV2RepositoryEffectAuthority,
+        canonicalWireBytes: ByteArray,
+    ): RelayV2OutboxExactGenerationSendResult {
+        if (canonicalWireBytes.isEmpty() ||
+            canonicalWireBytes.size > RelayV2Codec.PUBLIC_FRAME_BYTES
+        ) {
+            return RelayV2OutboxExactGenerationSendResult.Stale
+        }
+        val detachedWireBytes = canonicalWireBytes.copyOf()
+        beforeOutboxExecuteReadyRead()
+        return synchronized(lifecycleLock) {
+            val ready = outboxExecuteReadyCut
+                ?: return@synchronized RelayV2OutboxExactGenerationSendResult.Stale
+            val profile = activeProfile
+                ?: return@synchronized RelayV2OutboxExactGenerationSendResult.Stale
+            val context = onlineContext
+                ?: return@synchronized RelayV2OutboxExactGenerationSendResult.Stale
+            val source = activeTransport
+                ?: return@synchronized RelayV2OutboxExactGenerationSendResult.Stale
+            val committed = committedCallbackOwner
+                ?: return@synchronized RelayV2OutboxExactGenerationSendResult.Stale
+            if (ready.authority != authority ||
+                ready.owner != committed.key ||
+                ready.source !== source ||
+                detachedWireBytes.size.toLong() > context.negotiatedLimits.maxPublicFrameBytes ||
+                committed.effectGeneration != authority.generation ||
+                publishedEffectGeneration.get() != authority.generation ||
+                !isCurrentCallbackLocked(committed.key, source) ||
+                profile.identity != context.profile ||
+                profile.principalId != context.principalId ||
+                profile.clientInstanceId != context.clientInstanceId ||
+                profile.hostId != context.hostId ||
+                context.repositoryEffectAuthority(authority.generation) != authority
+            ) {
+                return@synchronized RelayV2OutboxExactGenerationSendResult.Stale
+            }
+            if (source.send(detachedWireBytes)) {
+                RelayV2OutboxExactGenerationSendResult.Sent
+            } else {
+                RelayV2OutboxExactGenerationSendResult.NotSent
+            }
         }
     }
 
@@ -3288,7 +3342,7 @@ internal class RelayV2ConnectionActor(
             }
             recovery.clearQueryWindow()
             clearRecoveryAttempt()
-            updateState(RelayV2ConnectionPhase.ONLINE, activeProfile)
+            enterOnlineIfCurrent(recovery.context, recovery.generation, activeProfile)
             return
         }
         if (commandQueryAdmissionReceiver == null) {
@@ -4515,6 +4569,45 @@ internal class RelayV2ConnectionActor(
         profile: RelayV2Profile?,
         failure: RelayV2ConnectionFailure? = null,
     ) {
+        synchronized(lifecycleLock) { withdrawOutboxExecuteReadyLocked() }
+        publishState(phase, profile, failure)
+    }
+
+    private fun enterOnlineIfCurrent(
+        context: RelayV2HandshakeContext,
+        generation: RelayV2EffectGeneration,
+        profile: RelayV2Profile?,
+    ): Boolean = synchronized(lifecycleLock) {
+        val currentProfile = profile ?: return@synchronized false
+        val committed = committedCallbackOwner ?: return@synchronized false
+        val source = activeTransport ?: return@synchronized false
+        val authority = context.repositoryEffectAuthority(generation)
+        if (activeProfile != currentProfile ||
+            onlineContext != context ||
+            committed.effectGeneration != generation ||
+            publishedEffectGeneration.get() != generation ||
+            !isCurrentCallbackLocked(committed.key, source) ||
+            currentProfile.identity != context.profile ||
+            currentProfile.principalId != context.principalId ||
+            currentProfile.clientInstanceId != context.clientInstanceId ||
+            currentProfile.hostId != context.hostId
+        ) {
+            return@synchronized false
+        }
+        outboxExecuteReadyCut = OutboxExecuteReadyCut(
+            authority = authority,
+            owner = committed.key,
+            source = source,
+        )
+        publishState(RelayV2ConnectionPhase.ONLINE, currentProfile)
+        true
+    }
+
+    private fun publishState(
+        phase: RelayV2ConnectionPhase,
+        profile: RelayV2Profile?,
+        failure: RelayV2ConnectionFailure? = null,
+    ) {
         _state.value = RelayV2ConnectionState(
             phase = phase,
             profileId = profile?.profileId,
@@ -4578,6 +4671,7 @@ internal class RelayV2ConnectionActor(
         }
 
     private fun clearPublishedEffectAuthorityLocked() {
+        withdrawOutboxExecuteReadyLocked()
         onlineContext = null
         agentExtensionSendFence.set(null)
         publishedEffectGeneration.set(null)
@@ -4589,10 +4683,15 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun revokeCallbackOwnersLocked() {
+        withdrawOutboxExecuteReadyLocked()
         provisionalCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
         committedCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
         provisionalCallbackOwner = null
         committedCallbackOwner = null
+    }
+
+    private fun withdrawOutboxExecuteReadyLocked() {
+        outboxExecuteReadyCut = null
     }
 
     private fun activateEffectGenerationIfCurrent(
@@ -4816,6 +4915,12 @@ internal class RelayV2ConnectionActor(
     private data class AgentExtensionSendFence(
         val authority: RelayV2RepositoryEffectAuthority,
         val negotiatedCapabilities: Set<String>,
+    )
+
+    private data class OutboxExecuteReadyCut(
+        val authority: RelayV2RepositoryEffectAuthority,
+        val owner: CallbackOwnerKey,
+        val source: RelayV2Transport,
     )
 
     private class ActorCurrentRepositoryReadCut(
