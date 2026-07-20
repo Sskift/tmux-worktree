@@ -22,6 +22,7 @@ internal sealed interface AgentTranscriptLifecycleRuntimeCompositionResult {
     data class Consumed(
         val consumption: AgentTranscriptLifecycleRuntimeConsumeResult,
         val notificationDispatches: List<AgentTranscriptLifecycleNotificationDispatchResult>,
+        val requestSyncDispatches: List<AgentTranscriptLifecycleRequestSyncResult>,
     ) : AgentTranscriptLifecycleRuntimeCompositionResult
 }
 
@@ -38,6 +39,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
     durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
     notificationPlatform: AgentTranscriptLifecycleNotificationPlatformPort,
     private val enabled: Boolean = false,
+    requestSender: AgentTranscriptLifecycleExtensionRequestSender? = null,
     nextRequestToken: () -> String = { java.util.UUID.randomUUID().toString() },
 ) : AgentTranscriptLifecycleRuntimeHandlePort {
     private val runtimeConsumer = AgentTranscriptLifecycleRuntimeConsumer(
@@ -51,6 +53,15 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
         durableClaims = durableRepository,
         platform = notificationPlatform,
     )
+    private val requestSync = requestSender?.let { sender ->
+        AgentTranscriptLifecycleRequestSyncCoordinator(
+            applyLease = applyLease,
+            durableRepository = durableRepository,
+            requestSender = sender,
+            durableHandoff = durableHandoff,
+            requestToken = nextRequestToken,
+        )
+    }
     private val readProjection = AgentTranscriptLifecycleRoomReadProjection(durableRepository)
 
     companion object {
@@ -130,7 +141,9 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
         // stale generation performs no mutation. Its durable transaction then re-loads and
         // exact-matches the namespace. After a frame commit, notification dispatch takes another
         // generation lease and exact claim transaction; namespace changes close as conflict or
-        // not-executable before any platform call.
+        // not-executable before any platform call. When the default-off sender is installed, the
+        // existing RequestSync owner consumes the remaining effects only after this durable
+        // consume and handoff return.
         val namespace = durableRepository.load(consumer)?.namespace
             ?: return AgentTranscriptLifecycleRuntimeCompositionResult.DurableNamespaceUnavailable
         val fence = AgentTranscriptLifecycleRuntimeFence(
@@ -142,20 +155,33 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
         )
         val consumption = runtimeConsumer.consume(effect.artifact, fence)
         val postCommitEffects = consumption.postCommitEffects()
-        val notificationResults = postCommitEffects
-            .filterIsInstance<AgentTranscriptLifecycleRuntimePostCommitEffect.Notification>()
-            .map { notification ->
-                notificationDispatch.dispatch(
-                    AgentTranscriptLifecycleNotificationDispatchRequest(
-                        authority = effect.repositoryAuthority,
-                        expectedNamespace = namespace,
-                        intent = notification.intent,
-                    ),
-                )
+        val notificationResults = mutableListOf<AgentTranscriptLifecycleNotificationDispatchResult>()
+        val requestSyncResults = mutableListOf<AgentTranscriptLifecycleRequestSyncResult>()
+        postCommitEffects.forEach { postCommitEffect ->
+            when (postCommitEffect) {
+                is AgentTranscriptLifecycleRuntimePostCommitEffect.Notification -> {
+                    notificationResults += notificationDispatch.dispatch(
+                        AgentTranscriptLifecycleNotificationDispatchRequest(
+                            authority = effect.repositoryAuthority,
+                            expectedNamespace = namespace,
+                            intent = postCommitEffect.intent,
+                        ),
+                    )
+                }
+                else -> requestSync?.let { coordinator ->
+                    requestSyncResults += coordinator.dispatchPostCommitEffect(
+                        fence,
+                        postCommitEffect,
+                    )
+                }
             }
+        }
         return AgentTranscriptLifecycleRuntimeCompositionResult.Consumed(
-            consumption = consumption.withoutNotificationEffects(),
+            consumption = consumption.withoutDispatchedEffects(
+                requestSyncEnabled = requestSync != null,
+            ),
             notificationDispatches = notificationResults,
+            requestSyncDispatches = requestSyncResults,
         )
     }
 }
@@ -169,17 +195,20 @@ private fun AgentTranscriptLifecycleRuntimeConsumeResult.postCommitEffects():
     -> emptyList()
 }
 
-private fun AgentTranscriptLifecycleRuntimeConsumeResult.withoutNotificationEffects():
-    AgentTranscriptLifecycleRuntimeConsumeResult {
-    fun List<AgentTranscriptLifecycleRuntimePostCommitEffect>.withoutNotifications() =
-        filterNot { it is AgentTranscriptLifecycleRuntimePostCommitEffect.Notification }
+private fun AgentTranscriptLifecycleRuntimeConsumeResult.withoutDispatchedEffects(
+    requestSyncEnabled: Boolean,
+): AgentTranscriptLifecycleRuntimeConsumeResult {
+    fun List<AgentTranscriptLifecycleRuntimePostCommitEffect>.withoutDispatched() = filter { effect ->
+        effect !is AgentTranscriptLifecycleRuntimePostCommitEffect.Notification &&
+            !requestSyncEnabled
+    }
 
     return when (this) {
         is AgentTranscriptLifecycleRuntimeConsumeResult.Applied -> copy(
-            postCommitEffects = postCommitEffects.withoutNotifications(),
+            postCommitEffects = postCommitEffects.withoutDispatched(),
         )
         is AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionFault -> copy(
-            postCommitEffects = postCommitEffects.withoutNotifications(),
+            postCommitEffects = postCommitEffects.withoutDispatched(),
         )
         AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionNotNegotiated,
         is AgentTranscriptLifecycleRuntimeConsumeResult.Unavailable,

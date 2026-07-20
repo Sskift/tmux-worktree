@@ -444,11 +444,15 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         val failClosedPlatform = AgentTranscriptLifecycleNotificationPlatformPort {
             error("Platform must not be reached before an enabled negotiated frame")
         }
+        val failClosedRequestSender = AgentTranscriptLifecycleExtensionRequestSender {
+            error("Request sender must not be reached before an enabled negotiated frame")
+        }
         val disabled = AgentTranscriptLifecycleRuntimeComposition(
             harness.lease,
             harness.operations,
             harness.handoff,
             failClosedPlatform,
+            requestSender = failClosedRequestSender,
         )
         val guarded = AgentTranscriptLifecycleRuntimeComposition(
             harness.lease,
@@ -456,6 +460,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             harness.handoff,
             failClosedPlatform,
             enabled = true,
+            requestSender = failClosedRequestSender,
         )
         suspend fun assertNotOwned(effect: RelayV2RuntimeEffect) = assertSame(
             effect,
@@ -508,6 +513,8 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
                 ),
             ),
         )
+        assertEquals(0, harness.operations.applyCount)
+        assertTrue(harness.handoff.accepted.isEmpty())
 
         harness.operations.compositionNamespace = harness.namespace
         val enabled = AgentTranscriptLifecycleRuntimeComposition(
@@ -538,11 +545,165 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             ),
             handled.notificationDispatches,
         )
+        assertTrue(handled.requestSyncDispatches.isEmpty())
 
         val read = enabled.read(compositionReadRequest(harness.namespace))
             as AgentTranscriptLifecycleReadState.Page
         assertEquals(harness.namespace, read.namespace)
     }
+
+    @Test
+    fun `composition lower dispatches sync only after durable consume and handoff`() =
+        runBlocking {
+            val harness = Harness(
+                sessionId = "session-1",
+                statusRequestId = "agent-status-1",
+                timelineEpoch = "timeline-1",
+            )
+            harness.operations.compositionNamespace = harness.namespace
+            harness.operations.forcedControlDirective = AgentTimelineSyncDirective.StatusRefresh
+            val prepared = AgentTranscriptLifecycleDurablePreparedRequest.Status(
+                AgentLocalRequestFence("2", "sync-token"),
+            )
+            harness.operations.nextPreparedRequest = prepared
+            var sent: AgentTranscriptLifecycleActorRequest? = null
+            val composition = AgentTranscriptLifecycleRuntimeComposition(
+                harness.lease,
+                harness.operations,
+                harness.handoff,
+                AgentTranscriptLifecycleNotificationPlatformPort {
+                    error("status sync must not produce a notification")
+                },
+                enabled = true,
+                requestSender = AgentTranscriptLifecycleExtensionRequestSender { request ->
+                    check(!harness.lease.insideBlock)
+                    harness.events += "send"
+                    sent = request
+                    harness.admission(request.kind, request.requestId, sequence = 2)
+                },
+                nextRequestToken = { "sync-token" },
+            )
+            val handled = composition.handle(
+                RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
+                    context = compositionHandshakeContext(),
+                    artifact = artifact("status-available"),
+                    ingress = AgentTranscriptLifecycleTrustedIngress.CorrelatedStatus(
+                        AgentLocalRequestFence("1", "agent-status-1"),
+                    ),
+                    requestAdmission = harness.admission(
+                        AgentTranscriptLifecycleRequestKind.STATUS,
+                        "agent-status-1",
+                    ),
+                    generation = RelayV2EffectGeneration("profile-1", 7, 11),
+                ),
+            ) as AgentTranscriptLifecycleRuntimeCompositionResult.Consumed
+            val dispatched = handled.requestSyncDispatches.single()
+                as AgentTranscriptLifecycleRequestSyncResult.Dispatched
+
+            assertEquals(listOf("consume", "handoff", "prepare", "send"), harness.events)
+            assertEquals(prepared.toActorRequest(harness.fence()), dispatched.request)
+            assertEquals(dispatched.request, sent)
+            assertTrue(
+                (handled.consumption as AgentTranscriptLifecycleRuntimeConsumeResult.Applied)
+                    .postCommitEffects.isEmpty(),
+            )
+        }
+
+    @Test
+    fun `composition sends prepared continuation without reprepare and fences stale sync`() =
+        runBlocking {
+            val replayFinal = artifact("replay-page-lifecycle-and-entry").frame
+                as AgentTimelineReplayPageFrame
+            val replayArtifact = PUBLIC_CODEC.decodePublicFrameArtifact(
+                PUBLIC_CODEC.encodePublicFrame(
+                    replayFinal.copy(
+                        page = replayFinal.page.copy(
+                            replayThroughAgentSeq = "12",
+                            isLast = false,
+                            nextCursor = "replay-cursor-next",
+                        ),
+                    ),
+                ),
+            )
+            suspend fun consume(
+                harness: Harness,
+                sender: AgentTranscriptLifecycleExtensionRequestSender,
+            ): AgentTranscriptLifecycleRuntimeCompositionResult.Consumed {
+                harness.operations.compositionNamespace = harness.namespace
+                val composition = AgentTranscriptLifecycleRuntimeComposition(
+                    harness.lease,
+                    harness.operations,
+                    harness.handoff,
+                    AgentTranscriptLifecycleNotificationPlatformPort {
+                        error("replay continuation must not produce a notification")
+                    },
+                    enabled = true,
+                    requestSender = sender,
+                    nextRequestToken = { "next-page-token" },
+                )
+                return composition.handle(
+                    RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
+                        context = compositionHandshakeContext(),
+                        artifact = replayArtifact,
+                        ingress = AgentTranscriptLifecycleTrustedIngress.Replay,
+                        requestAdmission = harness.admission(
+                            AgentTranscriptLifecycleRequestKind.REPLAY,
+                            replayFinal.requestId,
+                        ),
+                        generation = RelayV2EffectGeneration("profile-1", 7, 11),
+                    ),
+                ) as AgentTranscriptLifecycleRuntimeCompositionResult.Consumed
+            }
+
+            val harness = Harness("session-1", "agent-status-1", "timeline-1")
+            var sent: AgentTranscriptLifecycleActorRequest? = null
+            val handled = consume(
+                harness,
+                AgentTranscriptLifecycleExtensionRequestSender { request ->
+                    harness.events += "send"
+                    sent = request
+                    harness.admission(request.kind, request.requestId, sequence = 2)
+                },
+            )
+            val dispatched = handled.requestSyncDispatches.single()
+                as AgentTranscriptLifecycleRequestSyncResult.Dispatched
+            val durable = harness.operations.replayCommands.single()
+                as AgentTranscriptLifecycleDurableReplayPageCommand.NonFinal
+            assertEquals(listOf("consume", "handoff", "send"), harness.events)
+            assertEquals(dispatched.request, sent)
+            assertEquals(durable.nextRequestNetworkToken, dispatched.request.requestId)
+            assertTrue(harness.operations.prepareCommands.isEmpty())
+            assertTrue(
+                (handled.consumption as AgentTranscriptLifecycleRuntimeConsumeResult.Applied)
+                    .postCommitEffects.isEmpty(),
+            )
+
+            val staleHarness = Harness(
+                sessionId = "session-1",
+                statusRequestId = "agent-status-1",
+                timelineEpoch = "timeline-1",
+            )
+            staleHarness.operations.compositionNamespace = staleHarness.namespace
+            staleHarness.operations.forcedPageDirective = AgentTimelineSyncDirective.StatusRefresh
+            staleHarness.lease.staleAfterBlockCount = 1
+            var staleSenderCalls = 0
+            val staleHandled = consume(
+                staleHarness,
+                AgentTranscriptLifecycleExtensionRequestSender {
+                    staleSenderCalls += 1
+                    null
+                },
+            )
+
+            assertEquals(
+                AgentTranscriptLifecycleRequestSyncResult.StaleGeneration,
+                staleHandled.requestSyncDispatches.single(),
+            )
+            assertEquals(0, staleSenderCalls)
+            assertEquals(0, staleHarness.operations.prepareCommands.size)
+            assertEquals(listOf("consume", "handoff"), staleHarness.events)
+            assertEquals(1, staleHarness.operations.replayCommands.size)
+        }
 
     private class Harness(
         sessionId: String,
@@ -570,9 +731,10 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             hostId = "mac-admin",
             hostEpoch = "host-epoch-1",
         )
-        val operations = RecordingDurableOperationPort()
+        val events = mutableListOf<String>()
+        val operations = RecordingDurableOperationPort(events)
         val lease = RecordingApplyLease(authority, staleLease)
-        val handoff = RecordingDurableHandoff { lease.insideBlock }
+        val handoff = RecordingDurableHandoff(events) { lease.insideBlock }
         val runtime = AgentTranscriptLifecycleRuntimeConsumer(
             lease,
             operations,
@@ -644,19 +806,22 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
 
 private class RecordingApplyLease(
     private val expectedAuthority: RelayV2RepositoryEffectAuthority,
-    private val stale: Boolean = false,
+    stale: Boolean = false,
 ) : RelayV2RepositoryEffectApplyLeasePort {
     var blockCount: Int = 0
         private set
     var insideBlock: Boolean = false
         private set
+    var staleAfterBlockCount: Int? = if (stale) 0 else null
 
     override suspend fun <T> withEffectApplyLease(
         authority: RelayV2RepositoryEffectAuthority,
         block: suspend () -> T,
     ): RelayV2EffectApplyResult<T> {
         check(authority == expectedAuthority)
-        if (stale) return RelayV2EffectApplyResult.Stale
+        if (staleAfterBlockCount?.let { blockCount >= it } == true) {
+            return RelayV2EffectApplyResult.Stale
+        }
         blockCount += 1
         insideBlock = true
         return try {
@@ -667,7 +832,9 @@ private class RecordingApplyLease(
     }
 }
 
-private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDurableRepository {
+private class RecordingDurableOperationPort(
+    private val events: MutableList<String> = mutableListOf(),
+) : AgentTranscriptLifecycleRuntimeDurableRepository {
     data class ApplyGate(
         val entered: CompletableDeferred<Unit> = CompletableDeferred(),
         val release: CompletableDeferred<Unit> = CompletableDeferred(),
@@ -680,12 +847,15 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDur
     val replayCommands = mutableListOf<AgentTranscriptLifecycleDurableReplayPageCommand>()
     val snapshotRequestCommands = mutableListOf<AgentTranscriptLifecycleDurableSnapshotRequestCommand>()
     val snapshotPageCommands = mutableListOf<AgentTranscriptLifecycleDurableSnapshotPageCommand>()
+    val prepareCommands = mutableListOf<AgentTranscriptLifecycleDurablePrepareRequestCommand>()
     val applyCount: Int
         get() = controlCommands.size + liveCommands.size + correlatedErrorCommands.size +
             replayCommands.size +
-            snapshotRequestCommands.size + snapshotPageCommands.size
+            snapshotRequestCommands.size + snapshotPageCommands.size + prepareCommands.size
     private var nextApplyGate: ApplyGate? = null
     var forcedPageDirective: AgentTimelineSyncDirective? = null
+    var forcedControlDirective: AgentTimelineSyncDirective? = null
+    var nextPreparedRequest: AgentTranscriptLifecycleDurablePreparedRequest? = null
     var failCorrelatedError: Boolean = false
     var compositionNamespace: AgentTranscriptLifecycleDurableNamespace? = null
 
@@ -760,19 +930,32 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDur
     override suspend fun prepareRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
         limits: AgentClientReducerLimits,
-    ) = error("Not used by runtime consumer")
+    ): AgentTranscriptLifecycleDurablePrepareRequestResult {
+        events += "prepare"
+        prepareCommands += command
+        val prepared = requireNotNull(nextPreparedRequest)
+        check(prepared.requestKind == command.requestKind)
+        return AgentTranscriptLifecycleDurablePrepareRequestResult(
+            reduction(command.fence).reduction,
+            prepared,
+        )
+    }
 
     override suspend fun loadPreparedRequestsUnderApplyLease(
         fence: AgentTranscriptLifecycleDurableOperationFence,
-    ) = error("Not used by runtime consumer")
+    ) = error("Not used by runtime consumer composition")
 
     override suspend fun applyControlUnderApplyLease(
         command: AgentTranscriptLifecycleDurableControlCommand,
         limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult {
         awaitGate()
+        events += "consume"
         controlCommands += command
-        return reduction(command.fence)
+        return reduction(
+            command.fence,
+            forcedControlDirective ?: AgentTimelineSyncDirective.None,
+        )
     }
 
     override suspend fun consumeLiveEventUnderApplyLease(
@@ -831,6 +1014,7 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDur
         command: AgentTranscriptLifecycleDurableReplayPageCommand,
         limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult {
+        events += "consume"
         replayCommands += command
         return reduction(
             command.fence,
@@ -860,6 +1044,7 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDur
         command: AgentTranscriptLifecycleDurableSnapshotPageCommand,
         limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult {
+        events += "consume"
         snapshotPageCommands += command
         return reduction(
             command.fence,
@@ -899,6 +1084,7 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDur
 }
 
 private class RecordingDurableHandoff(
+    private val events: MutableList<String> = mutableListOf(),
     private val insideApplyLease: () -> Boolean,
 ) : AgentTranscriptLifecycleDurableHandoffPort {
     val accepted = mutableListOf<AgentTranscriptLifecycleRequestAdmission>()
@@ -911,6 +1097,7 @@ private class RecordingDurableHandoff(
     ): Boolean {
         check(insideApplyLease()) { "durable handoff escaped the apply lease" }
         if (accept) {
+            events += "handoff"
             singleReceipts += receipt
             accepted += receipt.admission
         }
@@ -922,6 +1109,7 @@ private class RecordingDurableHandoff(
     ): Boolean {
         check(insideApplyLease()) { "durable handoff escaped the apply lease" }
         if (accept) {
+            events += "handoff"
             receipts += receipt
             accepted += receipt.triggeringAdmission
         }
