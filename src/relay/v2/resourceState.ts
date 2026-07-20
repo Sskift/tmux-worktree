@@ -24,6 +24,10 @@ import {
   type RelayV2HostStateStore,
   type RelayV2HostStateTransaction,
 } from "./hostState.js";
+import type {
+  RelayV2StateSnapshotSpool,
+  RelayV2StateSnapshotSpoolOptions,
+} from "./stateSnapshotSpool.js";
 
 /**
  * Relay v2 H2 materialized-state foundation only.
@@ -471,34 +475,28 @@ export interface RelayV2MaterializedStateCutSource {
   releaseCandidate(lease: RelayV2MaterializedStateCutCandidateLease): void;
 }
 
-declare const relayV2MaterializedStateSnapshotAuthorityBrand: unique symbol;
-
-/**
- * Exact process-local proof that one materialized-state owner supplied both
- * the snapshot cut source and the runtime H2 methods. The function identity is
- * deliberately opaque: copying its shape or wrapping it in a Proxy grants no
- * authority.
- */
-export interface RelayV2MaterializedStateSnapshotAuthorityBundle {
-  readonly [relayV2MaterializedStateSnapshotAuthorityBrand]: true;
-}
-
 export type RelayV2MaterializedStateRuntimeH2Port = Pick<
   RelayV2MaterializedStateFoundation,
   "linearizeWelcome" | "scopesSnapshot" | "sessionsSnapshot" | "unsubscribe"
 >;
 
-interface RelayV2MaterializedStateSnapshotAuthorityBinding {
-  readonly cutSource: RelayV2MaterializedStateCutSource;
-  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
-}
+/**
+ * A single exact materialized owner used only while its owner opens a bound
+ * snapshot spool. The live instance is never published by the foundation, so
+ * ordinary callers cannot split its cut and runtime methods.
+ */
+export interface RelayV2MaterializedStateSnapshotOwner
+  extends RelayV2MaterializedStateCutSource, RelayV2MaterializedStateRuntimeH2Port {}
 
-const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER = Symbol.for(
-  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-issuer",
-);
-const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE = Symbol.for(
-  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-capture",
-);
+const materializedStateSnapshotOwners = new WeakSet<object>();
+
+/** Exact-identity check used by the canonical snapshot-spool entry. */
+export function isRelayV2MaterializedStateSnapshotOwner(
+  value: unknown,
+): value is RelayV2MaterializedStateSnapshotOwner {
+  return ((typeof value === "object" && value !== null) || typeof value === "function")
+    && materializedStateSnapshotOwners.has(value as object);
+}
 
 export type RelayV2MaterializedErrorCode =
   | "BUSY"
@@ -2893,8 +2891,8 @@ export class RelayV2MaterializedStateFoundation {
   readonly reservationLimits: ResourceReservationLimits;
   readonly commandResourceMutationOwner: RelayV2CommandResourceMutationOwner;
   readonly snapshotCutSource: RelayV2MaterializedStateCutSource;
-  readonly snapshotAuthorityBundle: RelayV2MaterializedStateSnapshotAuthorityBundle;
   readonly canonicalTargetResolver: RelayV2CanonicalResourceResolverPort;
+  readonly #snapshotSpoolOwner: RelayV2MaterializedStateSnapshotOwner;
 
   private readonly discovery: RelayV2ResourceDiscovery;
   private readonly reservationSettlementAuthority: RelayV2ReservationSettlementAuthority | undefined;
@@ -3005,10 +3003,7 @@ export class RelayV2MaterializedStateFoundation {
         this.withdrawReadiness(snapshot, "materialized_authority_conflict");
       },
     });
-    let snapshotAuthorityBundle: RelayV2MaterializedStateSnapshotAuthorityBundle | null = null;
-    let snapshotAuthorityBinding:
-      Readonly<RelayV2MaterializedStateSnapshotAuthorityBinding> | null = null;
-    const snapshotCutSource = {
+    const snapshotCutSource: RelayV2MaterializedStateCutSource = Object.freeze({
       currentHostEpoch: () => this.currentSnapshotHostEpoch(),
       withHostEpochFence: <T>(
         expectedHostEpoch: string,
@@ -3050,22 +3045,10 @@ export class RelayV2MaterializedStateFoundation {
       releaseCandidate: (lease: RelayV2MaterializedStateCutCandidateLease) => {
         this.releaseMaterializedStateCutCandidate(lease);
       },
-    } as RelayV2MaterializedStateCutSource & Record<PropertyKey, unknown>;
-    Object.defineProperty(snapshotCutSource, MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE, {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: function captureSnapshotAuthority(
-        this: object,
-        candidate: unknown,
-      ): Readonly<RelayV2MaterializedStateSnapshotAuthorityBinding> | null {
-        return this === snapshotCutSource && candidate === snapshotAuthorityBundle
-          ? snapshotAuthorityBinding
-          : null;
-      },
     });
-    this.snapshotCutSource = Object.freeze(snapshotCutSource);
-    const runtimeH2: RelayV2MaterializedStateRuntimeH2Port = Object.freeze({
+    this.snapshotCutSource = snapshotCutSource;
+    const snapshotSpoolOwner: RelayV2MaterializedStateSnapshotOwner = Object.freeze({
+      ...snapshotCutSource,
       linearizeWelcome: (subscriberId, sink, buildWelcome) => (
         this.linearizeWelcome(subscriberId, sink, buildWelcome)
       ),
@@ -3077,20 +3060,8 @@ export class RelayV2MaterializedStateFoundation {
       ),
       unsubscribe: (subscriberId) => this.unsubscribe(subscriberId),
     });
-    const issuedBundle = () => undefined;
-    Object.defineProperty(issuedBundle, MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER, {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: this.snapshotCutSource,
-    });
-    snapshotAuthorityBundle = Object.freeze(issuedBundle) as unknown as
-      RelayV2MaterializedStateSnapshotAuthorityBundle;
-    snapshotAuthorityBinding = Object.freeze({
-      cutSource: this.snapshotCutSource,
-      runtimeH2,
-    });
-    this.snapshotAuthorityBundle = snapshotAuthorityBundle;
+    materializedStateSnapshotOwners.add(snapshotSpoolOwner as object);
+    this.#snapshotSpoolOwner = snapshotSpoolOwner;
     this.canonicalTargetResolver = Object.freeze({
       captureToken: (expectedHostEpoch: string) => (
         this.captureCanonicalResolverToken(expectedHostEpoch)
@@ -3119,6 +3090,27 @@ export class RelayV2MaterializedStateFoundation {
         transaction,
         fence,
       ),
+    });
+  }
+
+  /**
+   * Opens the only bound spool form without publishing the exact materialized
+   * owner. Standalone cut-source spools remain available on the spool class,
+   * but cannot issue recovered host H2 authority.
+   */
+  async openStateSnapshotSpool(
+    options: Omit<
+      RelayV2StateSnapshotSpoolOptions,
+      "cutSource" | "materializedStateOwner"
+    >,
+  ): Promise<RelayV2StateSnapshotSpool> {
+    const canonicalSpoolUrl = new URL("./stateSnapshotSpool.js", import.meta.url).href;
+    const canonicalSpool = await import(canonicalSpoolUrl) as typeof import(
+      "./stateSnapshotSpool.js"
+    );
+    return canonicalSpool.RelayV2StateSnapshotSpool.open({
+      ...options,
+      materializedStateOwner: this.#snapshotSpoolOwner,
     });
   }
 

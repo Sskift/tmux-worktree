@@ -116,13 +116,29 @@ async function createHarness({
   });
   discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
   const seeded = await foundation.reconcile();
-  const spool = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+  const spoolRoot = join(home, "snapshot-spool");
+  const publisherSpool = await foundation.openStateSnapshotSpool({
     hostId: HOST_ID,
-    materializedStateAuthority: foundation.snapshotAuthorityBundle,
-    root: join(home, "snapshot-spool"),
+    root: spoolRoot,
     ownerInstanceId: store.hostInstanceId,
   });
-  assert.notEqual(spool.hostH2Authority, null);
+  await publisherSpool.get({
+    principalId: "carrier-runtime-readiness-principal",
+    clientInstanceId: "composition-client",
+    expectedHostEpoch: seeded.snapshot.hostEpoch,
+    snapshotRequestId: "carrier-runtime-readiness",
+    snapshotId: null,
+    cursor: null,
+    nextChunkIndex: 0,
+  });
+  await publisherSpool.close();
+  const spool = await foundation.openStateSnapshotSpool({
+    hostId: HOST_ID,
+    root: spoolRoot,
+    ownerInstanceId: store.hostInstanceId,
+  });
+  const h2RecoveryCandidate = await spool.issueRecoveredHostH2Candidate();
+  assert.notEqual(h2RecoveryCandidate, null);
 
   const identity = {
     hostEpoch: seeded.snapshot.hostEpoch,
@@ -174,7 +190,7 @@ async function createHarness({
   assert.notEqual(h1RecoveryCandidate, null);
   const statusObservations = [];
   const identityReads = { hostId: 0, hostEpoch: 0, hostInstanceId: 0 };
-  composition = compositionModule.createRelayV2HostCarrierRuntimeComposition({
+  composition = await compositionModule.openRelayV2HostCarrierRuntimeComposition({
     runtime: {
       get hostId() {
         if (++identityReads.hostId > 1) throw new Error("hostId was captured twice");
@@ -193,7 +209,7 @@ async function createHarness({
       authorities: {
         h0: store.h0ReadinessPort,
         h1RecoveryCandidate,
-        h2SnapshotAuthority: spool.hostH2Authority,
+        h2RecoveryCandidate,
         h3RecoveryCandidate,
         nextDedupeWindowBounds() {
           return {
@@ -263,18 +279,7 @@ async function createHarness({
   assert.equal(composition.readiness.h1.issueDedupeWindow, undefined);
   assert.equal(composition.readiness.h3.apply, undefined);
   assert.equal(composition.readiness.h3.activate(), true);
-  const principalId = "carrier-runtime-readiness-principal";
-  const chunk = await spool.get({
-    principalId,
-    clientInstanceId: "composition-client",
-    expectedHostEpoch: identity.hostEpoch,
-    snapshotRequestId: "carrier-runtime-readiness",
-    snapshotId: null,
-    cursor: null,
-    nextChunkIndex: 0,
-  });
-  const issue = await spool.issueReadinessReceipt(chunk.snapshotId);
-  assert.equal(await composition.readiness.h2.activate(issue), true);
+  assert.deepEqual(Object.keys(composition.readiness.h2), ["close"]);
 
   return {
     home,

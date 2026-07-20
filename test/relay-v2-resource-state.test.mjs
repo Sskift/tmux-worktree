@@ -3439,6 +3439,20 @@ test("snapshot candidate is owner-issued at W and its provisional queue closes t
       source.withCandidateFence(lease, () => undefined),
       assertMaterializedError("INVALID_ARGUMENT"),
     );
+    assert.equal(h.foundation.snapshotAuthorityBundle, undefined);
+    assert.equal(source.linearizeWelcome, undefined);
+    assert.equal(source.scopesSnapshot, undefined);
+    assert.equal(source.sessionsSnapshot, undefined);
+    const spool = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: join(h.home, "bound-snapshot-spool"),
+      ownerInstanceId: h.store.hostInstanceId,
+    });
+    assert.equal(spool.issueReadinessReceipt, undefined);
+    assert.equal(spool.verifyReadinessReceipt, undefined);
+    assert.equal(spool.activateReadinessReceipt, undefined);
+    assert.equal(spool.releaseReadinessActivation, undefined);
+    await spool.close();
   } finally {
     h.cleanup();
   }

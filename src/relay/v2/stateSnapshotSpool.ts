@@ -18,10 +18,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
+import { isPromise } from "node:util/types";
 import type {
   RelayV2JsonObject,
+  RelayV2MaterializedStateSnapshotOwner,
   RelayV2MaterializedStateRuntimeH2Port,
-  RelayV2MaterializedStateSnapshotAuthorityBundle,
   RelayV2MaterializedStateCutActivationLease,
   RelayV2MaterializedStateCut,
   RelayV2MaterializedStateCutAdmissionEstimate,
@@ -59,6 +60,8 @@ const MAX_ROOT_ENTRIES = 16;
 const MAX_LOCK_CANDIDATES = 1_024;
 const MAX_LOCK_QUARANTINES = 1_024;
 const MAX_TOMBSTONES = 16_384;
+const NATIVE_PROMISE_PROTOTYPE = Promise.prototype;
+const NATIVE_PROMISE_THEN = Promise.prototype.then;
 
 export interface RelayV2StateSnapshotLimits {
   maxChunkRecords: number;
@@ -137,7 +140,13 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
   beforeReadinessReceiptOwnerRecheck?: (
     issue: RelayV2StateSnapshotReadinessReceiptIssue,
   ) => void;
+  /** Advances an in-flight recovery issuance before its fresh fenced clock read. */
+  beforeRecoveredHostH2CandidateFence?: () => void | Promise<void>;
+  /** Observes exact cancellation of a claimed recovered candidate. */
+  afterRecoveredHostH2CandidateCancel?: () => void;
   beforeReadinessReceiptVerify?: (receipt: unknown, expected: unknown) => void;
+  /** Advances an internal receipt verifier after its initial clock read. */
+  beforeReadinessReceiptCandidateFence?: () => void | Promise<void>;
   beforeReadinessReceiptActivation?: (receipt: unknown) => void;
   wrapReadinessActivationSink?: (
     sink: RelayV2StateEventSink<RelayV2JsonObject>,
@@ -155,10 +164,10 @@ export interface RelayV2StateSnapshotSpoolOptions {
   /** Existing standalone spool seam; it cannot mint host H2 composition authority. */
   cutSource?: RelayV2MaterializedStateCutSource;
   /**
-   * Bound host-composition seam. Exactly one of this or cutSource is required.
-   * Only the materialized-state owner can issue a valid exact bundle.
+   * Exact bound owner installed only by
+   * RelayV2MaterializedStateFoundation.openStateSnapshotSpool().
    */
-  materializedStateAuthority?: RelayV2MaterializedStateSnapshotAuthorityBundle;
+  materializedStateOwner?: RelayV2MaterializedStateSnapshotOwner;
   home?: string;
   root?: string;
   now?: () => number;
@@ -227,71 +236,91 @@ declare const relayV2StateSnapshotReadinessReceiptBrand: unique symbol;
  * Owner-issued H2 proof with no wire or persisted representation. Exact object
  * identity is meaningful only to the live spool instance that signed it.
  */
-export interface RelayV2StateSnapshotReadinessReceipt {
+interface RelayV2StateSnapshotReadinessReceipt {
   readonly [relayV2StateSnapshotReadinessReceiptBrand]: true;
 }
 
-export interface RelayV2StateSnapshotReadinessReceiptBinding {
+interface RelayV2StateSnapshotReadinessReceiptBinding {
   hostId: string;
   hostEpoch: string;
   hostInstanceId: string;
   materializedCutIdentity: string;
 }
 
-export interface RelayV2StateSnapshotReadinessReceiptIssue {
+interface RelayV2StateSnapshotReadinessReceiptIssue {
   receipt: RelayV2StateSnapshotReadinessReceipt;
   /** Descriptive only; exact receipt identity remains the sole authority. */
   binding: Readonly<RelayV2StateSnapshotReadinessReceiptBinding>;
 }
 
+declare const relayV2HostH2RecoveryCandidateBrand: unique symbol;
+
+/**
+ * One-shot, process-local proof that this spool recovered an exact current
+ * materialized cut. Its frozen empty exterior carries no transferable data.
+ */
+export interface RelayV2HostH2RecoveryCandidate {
+  readonly [relayV2HostH2RecoveryCandidateBrand]: true;
+}
+
 declare const relayV2StateSnapshotActivationLeaseBrand: unique symbol;
 
 /** Exact, live-process lease for one successfully attached route sink. */
-export interface RelayV2StateSnapshotActivationLease {
+interface RelayV2StateSnapshotActivationLease {
   readonly [relayV2StateSnapshotActivationLeaseBrand]: true;
 }
 
 export interface RelayV2StateSnapshotHostSpoolPort {
   get(request: RelayV2StateSnapshotGet): Promise<RelayV2StateSnapshotChunk>;
   release(request: RelayV2StateSnapshotRelease): Promise<RelayV2StateSnapshotReleased>;
-  verifyReadinessReceipt(
-    receipt: unknown,
-    expected: RelayV2StateSnapshotReadinessReceiptBinding,
-  ): Promise<boolean>;
-  activateReadinessReceipt(
-    receipt: unknown,
-    sink: RelayV2StateEventSink<RelayV2JsonObject>,
-  ): Promise<RelayV2StateSnapshotActivationLease>;
-  /** `undefined` or an exact native Promise are the only valid release results. */
-  releaseReadinessActivation(activation: unknown): unknown;
 }
 
-declare const relayV2StateSnapshotHostH2AuthorityBrand: unique symbol;
+export type RelayV2RecoveredHostH2SnapshotSpoolPort = Pick<
+  RelayV2StateSnapshotHostSpoolPort,
+  "get" | "release"
+>;
 
-/** Exact spool-issued proof joining one runtime H2 owner to this spool. */
-export interface RelayV2StateSnapshotHostH2Authority {
-  readonly [relayV2StateSnapshotHostH2AuthorityBrand]: true;
-}
-
-interface RelayV2StateSnapshotHostH2AuthorityBinding {
+interface RelayV2RecoveredHostH2Activation {
   readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
-  readonly snapshotSpool: RelayV2StateSnapshotHostSpoolPort;
+  readonly snapshotSpool: RelayV2RecoveredHostH2SnapshotSpoolPort;
+  readonly lifecycle: Readonly<{ close(): void }>;
+  cancelConstruction(): void;
+  dispose(): void;
 }
 
-const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER = Symbol.for(
-  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-issuer",
-);
-const MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE = Symbol.for(
-  "tmux-worktree.relay-v2.materialized-state-snapshot-authority-capture",
-);
-const STATE_SNAPSHOT_HOST_H2_AUTHORITY_ISSUER = Symbol.for(
-  "tmux-worktree.relay-v2.state-snapshot-host-h2-authority-issuer",
-);
-const STATE_SNAPSHOT_HOST_H2_AUTHORITY_CAPTURE = Symbol.for(
-  "tmux-worktree.relay-v2.state-snapshot-host-h2-authority-capture",
-);
+interface RelayV2HostH2RecoveryCandidateRecord {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly ownerFence: string;
+  readonly spoolGeneration: string;
+  readonly snapshotId: string;
+  readonly materializedCutIdentity: string;
+  readonly readinessIssue: RelayV2StateSnapshotReadinessReceiptIssue;
+  readonly compositionPair: object;
+  claimReadiness(
+    readinessSink: RelayV2RecoveredHostH2ReadinessSink,
+  ): Promise<RelayV2RecoveredHostH2Activation | null>;
+  release(): void;
+}
 
-function exactHostAuthorityDataDescriptor(
+interface RelayV2RecoveredHostH2ReadinessSink {
+  apply(snapshot: Readonly<{
+    source: "h2";
+    generation: string;
+    ready: boolean;
+  }>): boolean;
+  close(): void;
+}
+
+const recoveredHostH2Candidates = new WeakMap<
+  object,
+  Readonly<RelayV2HostH2RecoveryCandidateRecord>
+>();
+let recoveredHostH2ActivationGeneration = 0n;
+const MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION = 18_446_744_073_709_551_615n;
+
+function exactDataDescriptor(
   owner: object,
   property: PropertyKey,
 ): PropertyDescriptor | null {
@@ -300,45 +329,154 @@ function exactHostAuthorityDataDescriptor(
     if (descriptor === undefined
       || !Object.hasOwn(descriptor, "value")
       || descriptor.get !== undefined
-      || descriptor.set !== undefined
-      || descriptor.configurable !== false
-      || descriptor.writable !== false) return null;
+      || descriptor.set !== undefined) return null;
     return descriptor;
   } catch {
     return null;
   }
 }
 
-interface MaterializedStateSnapshotAuthorityBinding {
-  readonly cutSource: RelayV2MaterializedStateCutSource;
-  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
+async function issueCanonicalHostRuntimeCompositionPair(): Promise<object> {
+  const entryUrl = new URL("./hostRuntimeComposition.js", import.meta.url).href;
+  const entry = await import(entryUrl) as Record<PropertyKey, unknown>;
+  const issuePair = entry.issueRelayV2RecoveredHostH2CompositionPair;
+  if (typeof issuePair !== "function") {
+    throw new RelayV2StateSnapshotSpoolError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical recovered H2 composition pair issuer is unavailable",
+    );
+  }
+  const pair = Reflect.apply(issuePair, entry, []) as unknown;
+  if (typeof pair !== "object" || pair === null) {
+    throw new RelayV2StateSnapshotSpoolError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical recovered H2 composition pair is invalid",
+    );
+  }
+  return pair;
 }
 
-/** Private cross-entry verifier; no dist entry exposes the split binding. */
-function captureMaterializedStateSnapshotAuthority(
-  authority: unknown,
-): Readonly<MaterializedStateSnapshotAuthorityBinding> | null {
-  if (((typeof authority !== "object" || authority === null)
-    && typeof authority !== "function")) return null;
-  const authorityObject = authority as object;
-  const issuerDescriptor = exactHostAuthorityDataDescriptor(
-    authorityObject,
-    MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_ISSUER,
+interface CapturedCompositionCandidate {
+  readonly candidate: RelayV2HostH2RecoveryCandidate;
+  readonly hostId: unknown;
+  readonly hostEpoch: unknown;
+  readonly hostInstanceId: unknown;
+}
+
+function captureCompositionCandidate(options: unknown): CapturedCompositionCandidate | null {
+  if (typeof options !== "object" || options === null) return null;
+  const hostId = exactDataDescriptor(options, "hostId");
+  const hostEpoch = exactDataDescriptor(options, "hostEpoch");
+  const hostInstanceId = exactDataDescriptor(options, "hostInstanceId");
+  const authoritiesDescriptor = exactDataDescriptor(options, "authorities");
+  if (hostId === null
+    || hostEpoch === null
+    || hostInstanceId === null
+    || authoritiesDescriptor === null
+    || typeof authoritiesDescriptor.value !== "object"
+    || authoritiesDescriptor.value === null) return null;
+  const candidateDescriptor = exactDataDescriptor(
+    authoritiesDescriptor.value as object,
+    "h2RecoveryCandidate",
   );
-  if (issuerDescriptor === null
-    || ((typeof issuerDescriptor.value !== "object" || issuerDescriptor.value === null)
-      && typeof issuerDescriptor.value !== "function")) return null;
-  const issuer = issuerDescriptor.value as object;
-  const captureDescriptor = exactHostAuthorityDataDescriptor(
-    issuer,
-    MATERIALIZED_STATE_SNAPSHOT_AUTHORITY_CAPTURE,
-  );
-  if (captureDescriptor === null || typeof captureDescriptor.value !== "function") return null;
+  if (candidateDescriptor === null
+    || typeof candidateDescriptor.value !== "object"
+    || candidateDescriptor.value === null) return null;
+  const candidate = candidateDescriptor.value as RelayV2HostH2RecoveryCandidate;
   try {
-    const binding = Reflect.apply(captureDescriptor.value, issuer, [authority]);
-    if (!binding || typeof binding !== "object") return null;
-    return binding as Readonly<MaterializedStateSnapshotAuthorityBinding>;
+    return Object.isFrozen(candidate)
+      && Object.getPrototypeOf(candidate) === null
+      && Reflect.ownKeys(candidate).length === 0
+      ? Object.freeze({
+        candidate,
+        hostId: hostId.value,
+        hostEpoch: hostEpoch.value,
+        hostInstanceId: hostInstanceId.value,
+      })
+      : null;
   } catch {
+    return null;
+  }
+}
+
+/**
+ * The canonical candidate registry delivers only a complete host runtime
+ * composition. No caller supplies an H2 readiness sink or receives H2/spool
+ * ports outside that composition.
+ */
+export async function openRelayV2RecoveredHostRuntimeComposition(
+  options: unknown,
+): Promise<unknown | null> {
+  const captured = captureCompositionCandidate(options);
+  if (captured === null) return null;
+  const { candidate } = captured;
+  const record = recoveredHostH2Candidates.get(candidate as object);
+  if (record === undefined) return null;
+  if (captured.hostId !== record.hostId
+    || captured.hostEpoch !== record.hostEpoch
+    || captured.hostInstanceId !== record.hostInstanceId) return null;
+  const entryUrl = new URL("./hostRuntimeComposition.js", import.meta.url).href;
+  const entry = await import(entryUrl) as Record<PropertyKey, unknown>;
+  const complete = entry.completeRelayV2HostRuntimeCompositionFromRecoveredH2;
+  if (typeof complete !== "function") return null;
+  const result = await Reflect.apply(complete, entry, [
+    record.compositionPair,
+    candidate,
+    options,
+  ]);
+  return result === null || (typeof result !== "object" && typeof result !== "function")
+    ? null
+    : result;
+}
+
+/** Boolean-only preflight; it neither claims nor exposes the private pair. */
+export function matchesRelayV2RecoveredHostH2CompositionPair(
+  pair: unknown,
+  candidate: unknown,
+): boolean {
+  if (typeof pair !== "object" || pair === null
+    || typeof candidate !== "object" || candidate === null) return false;
+  const record = recoveredHostH2Candidates.get(candidate);
+  return record?.compositionPair === pair;
+}
+
+/**
+ * Receiver-bound activation called only after the composition has created its
+ * private readiness source. Foreign pair identities fail without claiming the
+ * candidate.
+ */
+export async function activateRelayV2RecoveredHostH2CompositionReceiver(
+  receiverIdentity: unknown,
+  candidate: unknown,
+): Promise<RelayV2RecoveredHostH2Activation | null> {
+  if (typeof candidate !== "object" || candidate === null
+    || typeof receiverIdentity !== "function") return null;
+  const record = recoveredHostH2Candidates.get(candidate);
+  if (record === undefined) return null;
+  const entryUrl = new URL("./hostRuntimeComposition.js", import.meta.url).href;
+  const entry = await import(entryUrl) as Record<PropertyKey, unknown>;
+  const matchesReceiver = entry.matchesRelayV2RecoveredHostH2CompositionReceiver;
+  if (typeof matchesReceiver !== "function"
+    || Reflect.apply(matchesReceiver, entry, [
+      record.compositionPair,
+      receiverIdentity,
+    ]) !== true
+    || recoveredHostH2Candidates.get(candidate) !== record) return null;
+  recoveredHostH2Candidates.delete(candidate);
+  try {
+    const consumeReadinessSink = Object.freeze(async (readinessSink: unknown) => {
+      if (typeof readinessSink !== "object" || readinessSink === null) return null;
+      return record.claimReadiness(
+        readinessSink as RelayV2RecoveredHostH2ReadinessSink,
+      );
+    });
+    const activation = await Reflect.apply(receiverIdentity, receiverIdentity, [
+      consumeReadinessSink,
+    ]) as RelayV2RecoveredHostH2Activation | null;
+    if (activation === null) record.release();
+    return activation;
+  } catch {
+    record.release();
     return null;
   }
 }
@@ -494,6 +632,8 @@ interface ActiveCut {
   readinessCandidate: RelayV2MaterializedStateCutCandidateLease | null;
   readinessReceipt: RelayV2StateSnapshotReadinessReceipt | null;
   readinessActivation: RelayV2StateSnapshotActivationLease | null;
+  recoveredByOpen: boolean;
+  recoveryCandidateIssued: boolean;
 }
 
 interface ReadinessReceiptRecord extends RelayV2StateSnapshotReadinessReceiptBinding {
@@ -1672,29 +1812,29 @@ export class RelayV2StateSnapshotSpool {
   readonly paths: RelayV2StateSnapshotSpoolPaths;
   readonly limits: Readonly<SnapshotLimits>;
   readonly ownerInstanceId: string;
-  /** Null for the backwards-compatible standalone `{ cutSource }` open path. */
-  readonly hostH2Authority: RelayV2StateSnapshotHostH2Authority | null;
+  /** Null for the standalone `{ cutSource }` open path. */
+  readonly #runtimeH2: RelayV2MaterializedStateRuntimeH2Port | null;
 
-  private readonly cutSource: RelayV2MaterializedStateCutSource;
+  readonly #cutSource: RelayV2MaterializedStateCutSource;
   private readonly now: () => number;
   private readonly readinessReceiptLimits: Readonly<ReadinessReceiptLimits>;
   private readonly trustedBoundary: string;
   private readonly verifyTrustedAncestors: boolean;
   private readonly takeoverExistingOwner: boolean;
   private readonly testHooks: RelayV2StateSnapshotSpoolTestHooks | undefined;
-  private readonly processIncarnationProbe: (pid: number) => string | null | undefined;
-  private readonly processIncarnation: string;
-  private readonly ownerFence = randomBytes(32).toString("base64url");
-  private readonly spoolIdentity = Object.freeze(Object.create(null)) as object;
-  private readonly spoolGeneration = randomBytes(32).toString("base64url");
-  private readonly activeById = new Map<string, ActiveCut>();
-  private readonly activeByLogicalKey = new Map<string, ActiveCut>();
+  readonly #processIncarnationProbe: (pid: number) => string | null | undefined;
+  readonly #processIncarnation: string;
+  readonly #ownerFence = randomBytes(32).toString("base64url");
+  readonly #spoolIdentity = Object.freeze(Object.create(null)) as object;
+  readonly #spoolGeneration = randomBytes(32).toString("base64url");
+  readonly #activeById = new Map<string, ActiveCut>();
+  readonly #activeByLogicalKey = new Map<string, ActiveCut>();
   private readonly reservationsById = new Map<string, PersistedReservation>();
   private readonly tombstonesById = new Map<string, SnapshotTombstone>();
   private readonly tombstonesByLogicalKey = new Map<string, SnapshotTombstone>();
   private readonly buildsByLogicalKey = new Map<string, BuildEntry>();
-  private readonly readinessReceipts = new Map<object, ReadinessReceiptRecord>();
-  private readonly readinessActivations = new Map<object, ReadinessActivationRecord>();
+  readonly #readinessReceipts = new Map<object, ReadinessReceiptRecord>();
+  readonly #readinessActivations = new Map<object, ReadinessActivationRecord>();
   private readinessReceiptRetainedBytes = 0;
   private metadataTail: Promise<void> = Promise.resolve();
   private closeBarrier: Promise<void> | null = null;
@@ -1721,93 +1861,23 @@ export class RelayV2StateSnapshotSpool {
     this.verifyTrustedAncestors = true;
     this.takeoverExistingOwner = options.takeoverExistingOwner ?? false;
     const hasStandaloneCutSource = options.cutSource !== undefined;
-    const hasMaterializedStateAuthority = options.materializedStateAuthority !== undefined;
-    if (hasStandaloneCutSource === hasMaterializedStateAuthority) {
+    const hasMaterializedStateOwner = options.materializedStateOwner !== undefined;
+    if (hasStandaloneCutSource === hasMaterializedStateOwner) {
       throw new RelayV2StateSnapshotSpoolError(
         "INVALID_ARGUMENT",
         "snapshot spool requires exactly one materialized authority input",
       );
     }
-    const materializedBinding = hasMaterializedStateAuthority
-      ? captureMaterializedStateSnapshotAuthority(options.materializedStateAuthority)
-      : null;
-    if (hasMaterializedStateAuthority && materializedBinding === null) {
-      throw new RelayV2StateSnapshotSpoolError(
-        "INVALID_ARGUMENT",
-        "snapshot spool materialized authority is invalid",
-      );
-    }
-    this.cutSource = materializedBinding?.cutSource ?? options.cutSource!;
-    let issuedHostH2Authority: RelayV2StateSnapshotHostH2Authority | null = null;
-    let hostH2Binding: Readonly<RelayV2StateSnapshotHostH2AuthorityBinding> | null = null;
-    const issuer = this;
-    Object.defineProperty(this, STATE_SNAPSHOT_HOST_H2_AUTHORITY_CAPTURE, {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: function captureHostH2Authority(
-        this: object,
-        candidate: unknown,
-      ): Readonly<RelayV2StateSnapshotHostH2AuthorityBinding> | null {
-        return this === issuer && candidate === issuedHostH2Authority
-          ? hostH2Binding
-          : null;
-      },
-    });
-    if (materializedBinding === null) {
-      this.hostH2Authority = null;
-    } else {
-      const receiver = this;
-      const methods = Object.freeze({
-        get: RelayV2StateSnapshotSpool.prototype.get,
-        release: RelayV2StateSnapshotSpool.prototype.release,
-        verifyReadinessReceipt: RelayV2StateSnapshotSpool.prototype.verifyReadinessReceipt,
-        activateReadinessReceipt: RelayV2StateSnapshotSpool.prototype.activateReadinessReceipt,
-        releaseReadinessActivation:
-          RelayV2StateSnapshotSpool.prototype.releaseReadinessActivation,
-      });
-      const snapshotSpool: RelayV2StateSnapshotHostSpoolPort = Object.freeze({
-        get: (request) => Reflect.apply(methods.get, receiver, [request]),
-        release: (request) => Reflect.apply(methods.release, receiver, [request]),
-        verifyReadinessReceipt: (receipt, expected) => Reflect.apply(
-          methods.verifyReadinessReceipt,
-          receiver,
-          [receipt, expected],
-        ),
-        activateReadinessReceipt: (receipt, sink) => Reflect.apply(
-          methods.activateReadinessReceipt,
-          receiver,
-          [receipt, sink],
-        ),
-        releaseReadinessActivation: (activation) => Reflect.apply(
-          methods.releaseReadinessActivation,
-          receiver,
-          [activation],
-        ),
-      });
-      const authority = () => undefined;
-      Object.defineProperty(authority, STATE_SNAPSHOT_HOST_H2_AUTHORITY_ISSUER, {
-        configurable: false,
-        enumerable: false,
-        writable: false,
-        value: this,
-      });
-      issuedHostH2Authority = Object.freeze(authority) as unknown as
-        RelayV2StateSnapshotHostH2Authority;
-      hostH2Binding = Object.freeze({
-        runtimeH2: materializedBinding.runtimeH2,
-        snapshotSpool,
-      });
-      this.hostH2Authority = issuedHostH2Authority;
-    }
+    this.#cutSource = options.materializedStateOwner ?? options.cutSource!;
+    this.#runtimeH2 = options.materializedStateOwner ?? null;
     this.now = options.now ?? Date.now;
     this.testHooks = options.testHooks;
-    this.processIncarnationProbe = options.testHooks?.processIncarnationForPid
+    this.#processIncarnationProbe = options.testHooks?.processIncarnationForPid
       ?? ((pid) => processIncarnationForPid(
         pid,
         options.testHooks?.bootSessionIdentity ?? productionBootSessionIdentity,
       ));
-    const incarnation = this.processIncarnationProbe(process.pid);
+    const incarnation = this.#processIncarnationProbe(process.pid);
     if (incarnation === null || incarnation === undefined) {
       throw new RelayV2StateSnapshotSpoolError(
         "INTERNAL",
@@ -1815,7 +1885,7 @@ export class RelayV2StateSnapshotSpool {
       );
     }
     assertOpaqueId(incarnation, "processIncarnation");
-    this.processIncarnation = incarnation;
+    this.#processIncarnation = incarnation;
     this.limits = Object.freeze({
       ...RELAY_V2_STATE_SNAPSHOT_LIMITS,
       ...options.testLimits,
@@ -1831,6 +1901,20 @@ export class RelayV2StateSnapshotSpool {
     options: RelayV2StateSnapshotSpoolOptions,
   ): Promise<RelayV2StateSnapshotSpool> {
     try {
+      if (options.materializedStateOwner !== undefined) {
+        const canonicalResourceUrl = new URL("./resourceState.js", import.meta.url).href;
+        const canonicalResource = await import(canonicalResourceUrl) as typeof import(
+          "./resourceState.js"
+        );
+        if (!canonicalResource.isRelayV2MaterializedStateSnapshotOwner(
+          options.materializedStateOwner,
+        )) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "INVALID_ARGUMENT",
+            "snapshot spool materialized owner is invalid",
+          );
+        }
+      }
       const spool = new RelayV2StateSnapshotSpool(options);
       ensureSpoolDirectories(
         spool.paths,
@@ -1903,7 +1987,7 @@ export class RelayV2StateSnapshotSpool {
     }
     const active = decision.kind === "active"
       ? decision.cut
-      : await this.serializeMetadata(() => this.activeByLogicalKey.get(key));
+      : await this.serializeMetadata(() => this.#activeByLogicalKey.get(key));
     if (!active) throw expiredError();
     return this.serveExisting(request, active.manifest.snapshotId);
   }
@@ -1938,7 +2022,7 @@ export class RelayV2StateSnapshotSpool {
           "snapshot spool recovery stopped at a frozen resource boundary",
         );
       }
-      const active = this.activeById.get(request.snapshotId);
+      const active = this.#activeById.get(request.snapshotId);
       if (!active || !sameBinding(active.manifest.binding, binding)) throw expiredError();
       const expiresAtMs = Math.min(
         now + this.limits.releaseTombstoneMs,
@@ -1998,143 +2082,307 @@ export class RelayV2StateSnapshotSpool {
     });
   }
 
-  async issueReadinessReceipt(
-    snapshotId: string,
-  ): Promise<RelayV2StateSnapshotReadinessReceiptIssue> {
-    assertOpaqueId(snapshotId, "snapshotId");
-    let installed: ReadinessReceiptRecord | undefined;
+  async issueRecoveredHostH2Candidate(): Promise<RelayV2HostH2RecoveryCandidate | null> {
+    if (this.#runtimeH2 === null) return null;
+    const compositionPair = await issueCanonicalHostRuntimeCompositionPair();
+    let provisional: RelayV2MaterializedStateCutCandidateLease | null = null;
+    let transferredCut: ActiveCut | null = null;
+    let issued: RelayV2HostH2RecoveryCandidate | null = null;
     try {
       return await this.serializeMetadata(async () => {
-        const now = this.readNow();
-        this.cleanupExpiredAt(now);
-        this.pruneExpiredReadinessReceipts(now);
-        const cut = this.activeById.get(snapshotId);
-        if (!cut || cut.readinessCandidate === null) {
-          throw new RelayV2StateSnapshotSpoolError(
-            "CAPABILITY_UNAVAILABLE",
-            "snapshot cut has no live owner-issued readiness candidate",
-          );
+        if (this.fatalUnavailable
+          || this.recoveredQuotaExceeded
+          || this.recoveryIncomplete) return null;
+        const hostEpoch = await this.readCurrentHostEpoch();
+        try {
+          provisional = await this.#cutSource.captureCandidate(hostEpoch);
+        } catch (error) {
+          throw mapSourceError(error);
         }
-        const candidateLease = cut.readinessCandidate;
-        const receipt = await this.withCandidateFence(candidateLease, (candidate) => {
+        const candidateLease = provisional;
+        await this.testHooks?.beforeRecoveredHostH2CandidateFence?.();
+        const candidate = await this.withCandidateFence(candidateLease, (materialized) => {
           this.assertCurrentOwner();
-          if (this.activeById.get(snapshotId) !== cut
-            || cut.readinessCandidate !== candidateLease
-            || this.ownerInstanceId !== candidate.hostInstanceId
-            || !candidateMatchesManifest(candidate, cut.manifest, this.hostId)) {
-            throw new RelayV2StateSnapshotSpoolError(
-              "CAPABILITY_UNAVAILABLE",
-              "snapshot cut no longer matches its materialized owner candidate",
-            );
-          }
-          if (cut.readinessReceipt !== null) {
-            const existing = this.readinessReceipts.get(cut.readinessReceipt as object);
-            if (existing !== undefined
-              && this.readinessReceiptRecordMatches(existing, candidate, cut, now)) {
-              return cut.readinessReceipt;
+          const freshNow = this.readNow();
+          this.cleanupExpiredAt(freshNow);
+          this.pruneExpiredReadinessReceipts(freshNow);
+          if (this.fatalUnavailable
+            || this.recoveredQuotaExceeded
+            || this.recoveryIncomplete) return null;
+          if (this.ownerInstanceId !== materialized.hostInstanceId
+            || materialized.hostId !== this.hostId
+            || materialized.hostEpoch !== hostEpoch) return null;
+          const matching = [...this.#activeById.values()].filter((cut) => (
+            cut.recoveredByOpen
+            && !cut.recoveryCandidateIssued
+            && cut.readinessCandidate === null
+            && cut.readinessReceipt === null
+            && cut.readinessActivation === null
+            && cut.manifest.binding.hostEpoch === hostEpoch
+            && freshNow < cut.lease.snapshotLeaseExpiresAtMs
+            && freshNow < cut.manifest.snapshotAbsoluteExpiresAtMs
+            && candidateMatchesManifest(materialized, cut.manifest, this.hostId)
+          ));
+          matching.sort((left, right) => {
+            if (left.manifest.snapshotCreatedAtMs !== right.manifest.snapshotCreatedAtMs) {
+              return left.manifest.snapshotCreatedAtMs > right.manifest.snapshotCreatedAtMs
+                ? -1
+                : 1;
             }
-            if (existing !== undefined) this.revokeReadinessReceipt(existing);
-          }
-          const expiresAtMs = Math.min(
-            now + this.readinessReceiptLimits.receiptTtlMs,
-            cut.lease.snapshotLeaseExpiresAtMs,
-            cut.manifest.snapshotAbsoluteExpiresAtMs,
-          );
-          if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= now) {
-            throw new RelayV2StateSnapshotSpoolError(
-              "CAPABILITY_UNAVAILABLE",
-              "snapshot readiness candidate expired before receipt issuance",
-            );
-          }
-          const nonce = randomBytes(32).toString("base64url");
-          const manifestDigest = manifestIdentityDigest(cut.manifest);
-          const retainedBytes = Buffer.byteLength(canonicalizeSnapshotJson({
-            hostId: candidate.hostId,
-            hostEpoch: candidate.hostEpoch,
-            hostInstanceId: candidate.hostInstanceId,
-            materializedSourceGeneration: candidate.materializedSourceGeneration,
-            materializedGeneration: candidate.materializedGeneration,
-            materializedCutIdentity: candidate.materializedCutIdentity,
-            throughEventSeq: candidate.cut.throughEventSeq,
-            scopesRevision: candidate.cut.scopesRevision,
-            cutRecordCount: candidate.cutRecordCount,
-            cutCanonicalBytes: candidate.cutCanonicalBytes,
-            cutDigest: cut.manifest.cutDigest,
-            snapshotId,
-            manifestDigest,
-            subscriptionQueueGeneration: candidate.subscriptionQueueGeneration,
-            ownerFence: this.ownerFence,
-            ownerInstanceId: this.ownerInstanceId,
-            processIncarnation: this.processIncarnation,
-            spoolGeneration: this.spoolGeneration,
-            nonce,
-            issuedAtMs: now,
-            expiresAtMs,
-          }), "utf8");
-          if (this.readinessReceipts.size >= this.readinessReceiptLimits.maxReceipts
-            || this.readinessReceiptRetainedBytes + retainedBytes
-              > this.readinessReceiptLimits.maxRetainedBytes) {
-            throw new RelayV2StateSnapshotSpoolError(
-              "BUSY",
-              "snapshot readiness receipt capacity is exhausted",
-            );
-          }
-          const receipt = Object.freeze(() => undefined) as unknown as
-            RelayV2StateSnapshotReadinessReceipt;
-          installed = {
-            receipt,
-            hostId: candidate.hostId,
-            hostEpoch: candidate.hostEpoch,
-            hostInstanceId: candidate.hostInstanceId,
-            materializedCutIdentity: candidate.materializedCutIdentity,
-            snapshotId,
-            ownerFence: this.ownerFence,
-            ownerInstanceId: this.ownerInstanceId,
-            processIncarnation: this.processIncarnation,
-            spoolIdentity: this.spoolIdentity,
-            spoolGeneration: this.spoolGeneration,
-            source: this.cutSource,
-            materializedSourceGeneration: candidate.materializedSourceGeneration,
-            materializedGeneration: candidate.materializedGeneration,
-            throughEventSeq: candidate.cut.throughEventSeq,
-            scopesRevision: candidate.cut.scopesRevision,
-            cutRecordCount: candidate.cutRecordCount,
-            cutCanonicalBytes: candidate.cutCanonicalBytes,
-            cutDigest: cut.manifest.cutDigest,
-            manifestIdentity: cut.manifest,
-            manifestDigest,
-            subscriptionQueueGeneration: candidate.subscriptionQueueGeneration,
-            candidate: candidateLease,
+            if (left.manifest.snapshotId === right.manifest.snapshotId) return 0;
+            return left.manifest.snapshotId < right.manifest.snapshotId ? -1 : 1;
+          });
+          const cut = matching[0];
+          if (cut === undefined) return null;
+          cut.readinessCandidate = candidateLease;
+          transferredCut = cut;
+          const receipt = this.installReadinessReceiptRecord(
+            cut.manifest.snapshotId,
             cut,
-            nonce,
-            issuedAtMs: now,
-            expiresAtMs,
-            retainedBytes,
-          };
-          this.readinessReceipts.set(receipt as object, installed);
-          this.readinessReceiptRetainedBytes += retainedBytes;
-          cut.readinessReceipt = receipt;
-          return receipt;
-        });
-        const record = this.readinessReceipts.get(receipt as object);
-        if (record === undefined) {
-          throw new RelayV2StateSnapshotSpoolError(
-            "CAPABILITY_UNAVAILABLE",
-            "snapshot readiness receipt was withdrawn before return",
+            candidateLease,
+            materialized,
+            freshNow,
           );
+          cut.recoveryCandidateIssued = true;
+          const token = Object.freeze(Object.create(null)) as
+            RelayV2HostH2RecoveryCandidate;
+          const issue = this.readinessReceiptIssue(receipt.record);
+          let cancelled = false;
+          const record: RelayV2HostH2RecoveryCandidateRecord = Object.freeze({
+            hostId: materialized.hostId,
+            hostEpoch: materialized.hostEpoch,
+            hostInstanceId: materialized.hostInstanceId,
+            ownerFence: this.#ownerFence,
+            spoolGeneration: this.#spoolGeneration,
+            snapshotId: cut.manifest.snapshotId,
+            materializedCutIdentity: materialized.materializedCutIdentity,
+            readinessIssue: issue,
+            compositionPair,
+            claimReadiness: (readinessSink) => (
+              this.#activateRecoveredHostH2Candidate(record, readinessSink)
+            ),
+            release: () => {
+              if (cancelled) return;
+              cancelled = true;
+              this.retireActiveCutReadinessAuthority(cut);
+              cut.recoveryCandidateIssued = false;
+              try { this.testHooks?.afterRecoveredHostH2CandidateCancel?.(); } catch {}
+            },
+          });
+          recoveredHostH2Candidates.set(token as object, record);
+          issued = token;
+          this.testHooks?.beforeReadinessReceiptOwnerRecheck?.(issue);
+          this.assertCurrentOwner();
+          return token;
+        });
+        if (candidate === null) {
+          this.#cutSource.releaseCandidate(candidateLease);
+          provisional = null;
+          return null;
         }
-        const issue = this.readinessReceiptIssue(record);
-        this.testHooks?.beforeReadinessReceiptOwnerRecheck?.(issue);
-        this.assertCurrentOwner();
-        return issue;
+        const finalNow = this.readNow();
+        this.cleanupExpiredAt(finalNow);
+        this.pruneExpiredReadinessReceipts(finalNow);
+        if (transferredCut === null
+          || this.#activeById.get(transferredCut.manifest.snapshotId) !== transferredCut
+          || transferredCut.readinessCandidate !== candidateLease
+          || transferredCut.readinessReceipt === null
+          || finalNow >= transferredCut.lease.snapshotLeaseExpiresAtMs
+          || finalNow >= transferredCut.manifest.snapshotAbsoluteExpiresAtMs) {
+          recoveredHostH2Candidates.delete(candidate as object);
+          if (transferredCut !== null) {
+            this.retireActiveCutReadinessAuthority(transferredCut);
+          }
+          issued = null;
+          transferredCut = null;
+          provisional = null;
+          return null;
+        }
+        provisional = null;
+        return candidate;
       });
     } catch (error) {
-      if (installed !== undefined) this.revokeReadinessReceipt(installed);
+      if (issued !== null) {
+        const record = recoveredHostH2Candidates.get(issued as object);
+        recoveredHostH2Candidates.delete(issued as object);
+        record?.release();
+      } else if (provisional !== null) {
+        this.#cutSource.releaseCandidate(provisional);
+      }
       throw error;
     }
   }
 
-  async verifyReadinessReceipt(
+  async #activateRecoveredHostH2Candidate(
+    record: RelayV2HostH2RecoveryCandidateRecord,
+    readinessSink: RelayV2RecoveredHostH2ReadinessSink,
+  ): Promise<RelayV2RecoveredHostH2Activation | null> {
+    const applyDescriptor = exactDataDescriptor(readinessSink, "apply");
+    const closeDescriptor = exactDataDescriptor(readinessSink, "close");
+    const runtimeH2 = this.#runtimeH2;
+    const issue = record.readinessIssue;
+    if (runtimeH2 === null
+      || applyDescriptor === null
+      || closeDescriptor === null
+      || typeof applyDescriptor.value !== "function"
+      || typeof closeDescriptor.value !== "function"
+      || record.ownerFence !== this.#ownerFence
+      || record.spoolGeneration !== this.#spoolGeneration
+      || issue.binding.hostId !== record.hostId
+      || issue.binding.hostEpoch !== record.hostEpoch
+      || issue.binding.hostInstanceId !== record.hostInstanceId
+      || issue.binding.materializedCutIdentity !== record.materializedCutIdentity) {
+      record.release();
+      return null;
+    }
+    const applyReadiness = applyDescriptor.value as (
+      snapshot: Readonly<{ source: "h2"; generation: string; ready: boolean }>,
+    ) => boolean;
+    const closeReadiness = closeDescriptor.value as () => void;
+    let accepting = true;
+    let readinessPublished = false;
+    let activation: RelayV2StateSnapshotActivationLease | null = null;
+    let activationReleaseStarted = false;
+    const withdrawReadiness = (): void => {
+      if (!readinessPublished) return;
+      readinessPublished = false;
+      try { Reflect.apply(closeReadiness, readinessSink, []); } catch {}
+    };
+    const closeFromSource = (): void => {
+      accepting = false;
+      withdrawReadiness();
+    };
+    const releaseActivation = (): void => {
+      if (activation === null || activationReleaseStarted) return;
+      activationReleaseStarted = true;
+      let result: unknown;
+      try {
+        result = this.#releaseReadinessActivation(activation);
+      } catch {
+        accepting = false;
+        withdrawReadiness();
+        return;
+      }
+      if (result === undefined) return;
+      if (!isPromise(result)
+        || Object.getPrototypeOf(result) !== NATIVE_PROMISE_PROTOTYPE
+        || Object.getOwnPropertyDescriptor(result, "constructor") !== undefined) {
+        accepting = false;
+        withdrawReadiness();
+        return;
+      }
+      try {
+        Reflect.apply(NATIVE_PROMISE_THEN, result, [
+          undefined,
+          () => {
+            accepting = false;
+            withdrawReadiness();
+          },
+        ]);
+      } catch {
+        accepting = false;
+        withdrawReadiness();
+      }
+    };
+    const close = (): void => {
+      if (!accepting && activationReleaseStarted) return;
+      accepting = false;
+      withdrawReadiness();
+      releaseActivation();
+    };
+    try {
+      if (await this.#verifyReadinessReceipt(issue.receipt, issue.binding) !== true) {
+        record.release();
+        return null;
+      }
+      const sourceSink: RelayV2StateEventSink<RelayV2JsonObject> = Object.freeze({
+        enqueue: () => accepting,
+        close: closeFromSource,
+      });
+      activation = await this.#activateReadinessReceipt(issue.receipt, sourceSink);
+      if (!accepting || activation === null
+        || ((typeof activation !== "object" || activation === null)
+          && typeof activation !== "function")) {
+        close();
+        record.release();
+        return null;
+      }
+      if (recoveredHostH2ActivationGeneration
+        >= MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION) {
+        close();
+        record.release();
+        return null;
+      }
+      recoveredHostH2ActivationGeneration += 1n;
+      readinessPublished = true;
+      let applied = false;
+      try {
+        applied = Reflect.apply(applyReadiness, readinessSink, [Object.freeze({
+          source: "h2",
+          generation: recoveredHostH2ActivationGeneration.toString(10),
+          ready: true,
+        })]) === true;
+      } catch {}
+      if (!applied || !accepting || !readinessPublished) {
+        close();
+        record.release();
+        return null;
+      }
+    } catch {
+      close();
+      record.release();
+      return null;
+    }
+
+    const assertAccepting = (): void => {
+      if (!accepting) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "CAPABILITY_UNAVAILABLE",
+          "recovered H2 activation is closed",
+        );
+      }
+    };
+    const gatedRuntimeH2: RelayV2MaterializedStateRuntimeH2Port = Object.freeze({
+      linearizeWelcome: (subscriberId, sink, buildWelcome) => {
+        assertAccepting();
+        return runtimeH2.linearizeWelcome(subscriberId, sink, buildWelcome);
+      },
+      scopesSnapshot: (requestId, expectedHostEpoch) => {
+        assertAccepting();
+        return runtimeH2.scopesSnapshot(requestId, expectedHostEpoch);
+      },
+      sessionsSnapshot: (requestId, expectedHostEpoch, scopeIds) => {
+        assertAccepting();
+        return runtimeH2.sessionsSnapshot(requestId, expectedHostEpoch, scopeIds);
+      },
+      unsubscribe: (subscriberId) => {
+        assertAccepting();
+        return runtimeH2.unsubscribe(subscriberId);
+      },
+    });
+    const snapshotSpool: RelayV2RecoveredHostH2SnapshotSpoolPort = Object.freeze({
+      get: (request) => {
+        assertAccepting();
+        return this.get(request);
+      },
+      release: (request) => {
+        assertAccepting();
+        return this.release(request);
+      },
+    });
+    return Object.freeze({
+      runtimeH2: gatedRuntimeH2,
+      snapshotSpool,
+      lifecycle: Object.freeze({ close }),
+      cancelConstruction: () => {
+        close();
+        record.release();
+      },
+      dispose: close,
+    });
+  }
+
+  async #verifyReadinessReceipt(
     receipt: unknown,
     expected: unknown,
   ): Promise<boolean> {
@@ -2148,7 +2396,7 @@ export class RelayV2StateSnapshotSpool {
       || ((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)) {
       return false;
     }
-    const record = this.readinessReceipts.get(receipt as object);
+    const record = this.#readinessReceipts.get(receipt as object);
     if (record === undefined
       || record.hostId !== binding.hostId
       || record.hostEpoch !== binding.hostEpoch
@@ -2157,22 +2405,35 @@ export class RelayV2StateSnapshotSpool {
     try {
       return await this.serializeMetadata(async () => {
         const now = this.readNow();
+        this.cleanupExpiredAt(now);
         this.pruneExpiredReadinessReceipts(now);
-        if (this.readinessReceipts.get(receipt as object) !== record) return false;
-        return this.withCandidateFence(record.candidate, (candidate) => {
+        if (this.#readinessReceipts.get(receipt as object) !== record) return false;
+        await this.testHooks?.beforeReadinessReceiptCandidateFence?.();
+        const verified = await this.withCandidateFence(record.candidate, (candidate) => {
           this.assertCurrentOwner();
-          return this.readinessReceiptRecordMatches(record, candidate, record.cut, now);
+          const freshNow = this.readNow();
+          this.cleanupExpiredAt(freshNow);
+          this.pruneExpiredReadinessReceipts(freshNow);
+          return this.readinessReceiptRecordMatches(record, candidate, record.cut, freshNow);
         });
+        const finalNow = this.readNow();
+        this.cleanupExpiredAt(finalNow);
+        this.pruneExpiredReadinessReceipts(finalNow);
+        return verified
+          && this.#readinessReceipts.get(receipt as object) === record
+          && finalNow < record.expiresAtMs
+          && finalNow < record.cut.lease.snapshotLeaseExpiresAtMs
+          && finalNow < record.cut.manifest.snapshotAbsoluteExpiresAtMs;
       });
     } catch {
-      if (this.readinessReceipts.get(receipt as object) === record) {
+      if (this.#readinessReceipts.get(receipt as object) === record) {
         this.retireActiveCutReadinessAuthority(record.cut);
       }
       return false;
     }
   }
 
-  async activateReadinessReceipt(
+  async #activateReadinessReceipt(
     receipt: unknown,
     sink: RelayV2StateEventSink<RelayV2JsonObject>,
   ): Promise<RelayV2StateSnapshotActivationLease> {
@@ -2205,7 +2466,7 @@ export class RelayV2StateSnapshotSpool {
         const now = this.readNow();
         this.cleanupExpiredAt(now);
         this.pruneExpiredReadinessReceipts(now);
-        receiptRecord = this.readinessReceipts.get(receipt as object);
+        receiptRecord = this.#readinessReceipts.get(receipt as object);
         if (receiptRecord === undefined
           || receiptRecord.cut.readinessActivation !== null) {
           throw new RelayV2StateSnapshotSpoolError(
@@ -2228,7 +2489,7 @@ export class RelayV2StateSnapshotSpool {
         };
         try {
           sourceAttempted = true;
-          sourceActivation = await this.cutSource.activateCandidate(
+          sourceActivation = await this.#cutSource.activateCandidate(
             record.candidate,
             sourceSink,
             assertActivationFence,
@@ -2244,17 +2505,23 @@ export class RelayV2StateSnapshotSpool {
 
         this.testHooks?.afterReadinessActivationAttached?.(record.receipt);
         this.assertCurrentOwner();
-        if (this.readinessReceipts.get(record.receipt as object) !== record
-          || this.activeById.get(record.snapshotId) !== record.cut
+        const finalNow = this.readNow();
+        this.cleanupExpiredAt(finalNow);
+        this.pruneExpiredReadinessReceipts(finalNow);
+        if (this.#readinessReceipts.get(record.receipt as object) !== record
+          || this.#activeById.get(record.snapshotId) !== record.cut
           || record.cut.readinessReceipt !== record.receipt
           || record.cut.readinessCandidate !== record.candidate
           || record.cut.readinessActivation !== null
-          || record.ownerFence !== this.ownerFence
+          || record.ownerFence !== this.#ownerFence
           || record.ownerInstanceId !== this.ownerInstanceId
-          || record.processIncarnation !== this.processIncarnation
-          || record.spoolIdentity !== this.spoolIdentity
-          || record.spoolGeneration !== this.spoolGeneration
-          || record.source !== this.cutSource) {
+          || record.processIncarnation !== this.#processIncarnation
+          || record.spoolIdentity !== this.#spoolIdentity
+          || record.spoolGeneration !== this.#spoolGeneration
+          || record.source !== this.#cutSource
+          || finalNow >= record.expiresAtMs
+          || finalNow >= record.cut.lease.snapshotLeaseExpiresAtMs
+          || finalNow >= record.cut.manifest.snapshotAbsoluteExpiresAtMs) {
           throw new RelayV2StateSnapshotSpoolError(
             "CAPABILITY_UNAVAILABLE",
             "snapshot owner changed while activation was being committed",
@@ -2265,19 +2532,19 @@ export class RelayV2StateSnapshotSpool {
         installed = {
           activation,
           sourceActivation: sourceActivation!,
-          source: this.cutSource,
+          source: this.#cutSource,
           cut: record.cut,
           snapshotId: record.snapshotId,
-          ownerFence: this.ownerFence,
+          ownerFence: this.#ownerFence,
           ownerInstanceId: this.ownerInstanceId,
-          processIncarnation: this.processIncarnation,
-          spoolIdentity: this.spoolIdentity,
-          spoolGeneration: this.spoolGeneration,
+          processIncarnation: this.#processIncarnation,
+          spoolIdentity: this.#spoolIdentity,
+          spoolGeneration: this.#spoolGeneration,
           receiptNonce: record.nonce,
           activationNonce: randomBytes(32).toString("base64url"),
           sinkIdentity: sourceSink as object,
         };
-        this.readinessActivations.set(activation as object, installed);
+        this.#readinessActivations.set(activation as object, installed);
         record.cut.readinessActivation = activation;
         this.consumeReadinessReceiptForActivation(record);
         return activation;
@@ -2286,12 +2553,12 @@ export class RelayV2StateSnapshotSpool {
       if (installed !== undefined) {
         this.revokeReadinessActivation(installed);
       } else if (sourceActivation !== undefined) {
-        this.cutSource.releaseCandidateActivation(sourceActivation);
+        this.#cutSource.releaseCandidateActivation(sourceActivation);
       } else if (!sourceAttempted) {
         closeReadinessActivationSink(sink, "snapshot readiness receipt was rejected");
       }
       if (receiptRecord !== undefined
-        && (this.readinessReceipts.get(receiptRecord.receipt as object) === receiptRecord
+        && (this.#readinessReceipts.get(receiptRecord.receipt as object) === receiptRecord
           || receiptRecord.cut.readinessCandidate !== null)) {
         this.retireActiveCutReadinessAuthority(receiptRecord.cut);
       }
@@ -2299,13 +2566,13 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
-  releaseReadinessActivation(activation: unknown): unknown {
+  #releaseReadinessActivation(activation: unknown): unknown {
     let released = false;
     if ((typeof activation !== "object" && typeof activation !== "function")
       || activation === null) {
       return this.testHooks?.afterReadinessActivationRelease?.(activation, released);
     }
-    const record = this.readinessActivations.get(activation as object);
+    const record = this.#readinessActivations.get(activation as object);
     if (record !== undefined) {
       this.revokeReadinessActivation(record);
       released = true;
@@ -2329,8 +2596,8 @@ export class RelayV2StateSnapshotSpool {
         this.markFatalUnavailable();
         throw error;
       }
-      this.activeById.clear();
-      this.activeByLogicalKey.clear();
+      this.#activeById.clear();
+      this.#activeByLogicalKey.clear();
       this.reservationsById.clear();
       this.tombstonesById.clear();
       this.tombstonesByLogicalKey.clear();
@@ -2382,7 +2649,7 @@ export class RelayV2StateSnapshotSpool {
 
   private async readCurrentHostEpoch(): Promise<string> {
     try {
-      const hostEpoch = await this.cutSource.currentHostEpoch();
+      const hostEpoch = await this.#cutSource.currentHostEpoch();
       assertOpaqueId(hostEpoch, "hostEpoch");
       return hostEpoch;
     } catch (error) {
@@ -2392,7 +2659,7 @@ export class RelayV2StateSnapshotSpool {
 
   private async withdrawPriorSnapshotOwnerAuthority(): Promise<void> {
     try {
-      await this.cutSource.withdrawSnapshotOwnerAuthority();
+      await this.#cutSource.withdrawSnapshotOwnerAuthority();
     } catch (error) {
       throw mapSourceError(error);
     }
@@ -2403,7 +2670,7 @@ export class RelayV2StateSnapshotSpool {
     operation: () => T | Promise<T>,
   ): Promise<T> {
     try {
-      return await this.cutSource.withHostEpochFence(expectedHostEpoch, async () => {
+      return await this.#cutSource.withHostEpochFence(expectedHostEpoch, async () => {
         try {
           return await operation();
         } catch (error) {
@@ -2421,7 +2688,7 @@ export class RelayV2StateSnapshotSpool {
     operation: (candidate: RelayV2MaterializedStateCutCandidate) => T | Promise<T>,
   ): Promise<T> {
     try {
-      return await this.cutSource.withCandidateFence(lease, async (candidate) => {
+      return await this.#cutSource.withCandidateFence(lease, async (candidate) => {
         try {
           return await operation(candidate);
         } catch (error) {
@@ -2439,7 +2706,7 @@ export class RelayV2StateSnapshotSpool {
   ): Promise<RelayV2MaterializedStateCutAdmissionEstimate> {
     let estimate: RelayV2MaterializedStateCutAdmissionEstimate;
     try {
-      estimate = await this.cutSource.admissionEstimate(expectedHostEpoch);
+      estimate = await this.#cutSource.admissionEstimate(expectedHostEpoch);
     } catch (error) {
       throw mapSourceError(error);
     }
@@ -2517,7 +2784,7 @@ export class RelayV2StateSnapshotSpool {
         version: LOCK_VERSION,
         token,
         pid: process.pid,
-        processIncarnation: this.processIncarnation,
+        processIncarnation: this.#processIncarnation,
       };
       writePrivateFile(candidate, jsonFile(holder));
       fsyncDirectory(this.paths.lockCandidates);
@@ -2546,7 +2813,7 @@ export class RelayV2StateSnapshotSpool {
             && Date.now() - observed.mtimeMs < LOCK_WAIT_TIMEOUT_MS;
           const holderIsCurrentIncarnation = observed.holder === undefined
             ? false
-            : this.processIncarnationMatches(observed.holder);
+            : this.#processIncarnationMatches(observed.holder);
           if (!incompleteStillPublishing
             && (observed.holder === undefined || holderIsCurrentIncarnation === false)) {
             await this.testHooks?.beforeStaleLockQuarantine?.(observed.identity);
@@ -2686,7 +2953,7 @@ export class RelayV2StateSnapshotSpool {
     const observed = this.observeMetadataLock();
     if (observed.holder?.token !== token
       || observed.holder.pid !== process.pid
-      || observed.holder.processIncarnation !== this.processIncarnation) {
+      || observed.holder.processIncarnation !== this.#processIncarnation) {
       this.markFatalUnavailable();
       throw new RelayV2StateSnapshotSpoolError(
         "INTERNAL",
@@ -2712,7 +2979,7 @@ export class RelayV2StateSnapshotSpool {
       if (previous.hostId !== this.hostId) {
         throw new Error("snapshot spool owner host does not match");
       }
-      const previousIsCurrentIncarnation = this.processIncarnationMatches(previous);
+      const previousIsCurrentIncarnation = this.#processIncarnationMatches(previous);
       if (previousIsCurrentIncarnation !== false && !this.takeoverExistingOwner) {
         throw new RelayV2StateSnapshotSpoolError(
           "BUSY",
@@ -2724,10 +2991,10 @@ export class RelayV2StateSnapshotSpool {
       version: OWNER_VERSION,
       hostId: this.hostId,
       ownerInstanceId: this.ownerInstanceId,
-      fence: this.ownerFence,
+      fence: this.#ownerFence,
       acquiredAtMs: this.readNow(),
       pid: process.pid,
-      processIncarnation: this.processIncarnation,
+      processIncarnation: this.#processIncarnation,
     };
     this.persistAtomic(this.paths.owner, jsonFile(owner));
     this.ownerMetadataBytes = jsonFile(owner).byteLength
@@ -2748,9 +3015,9 @@ export class RelayV2StateSnapshotSpool {
     }
     if (owner.hostId !== this.hostId
       || owner.ownerInstanceId !== this.ownerInstanceId
-      || owner.fence !== this.ownerFence
+      || owner.fence !== this.#ownerFence
       || owner.pid !== process.pid
-      || owner.processIncarnation !== this.processIncarnation) {
+      || owner.processIncarnation !== this.#processIncarnation) {
       this.invalidateAllReadinessAuthority();
       throw ownerFencedError();
     }
@@ -2765,10 +3032,10 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
-  private processIncarnationMatches(
+  #processIncarnationMatches(
     holder: Pick<PersistedSpoolOwner, "pid" | "processIncarnation">,
   ): boolean | undefined {
-    const observed = this.processIncarnationProbe(holder.pid);
+    const observed = this.#processIncarnationProbe(holder.pid);
     if (observed === undefined) return undefined;
     return observed !== null && observed === holder.processIncarnation;
   }
@@ -2812,8 +3079,8 @@ export class RelayV2StateSnapshotSpool {
     assertOwnedDirectory(this.paths.lockCandidates, true);
     assertOwnedDirectory(this.paths.lockQuarantine, true);
     this.invalidateAllReadinessAuthority();
-    this.activeById.clear();
-    this.activeByLogicalKey.clear();
+    this.#activeById.clear();
+    this.#activeByLogicalKey.clear();
     this.reservationsById.clear();
     this.tombstonesById.clear();
     this.tombstonesByLogicalKey.clear();
@@ -3025,7 +3292,7 @@ export class RelayV2StateSnapshotSpool {
       const principal = identity.binding.principalId;
       const nextPrincipalCount = (principalCounts.get(principal) ?? 0) + 1;
       const quotaWouldBeExceeded = this.recoveredQuotaExceeded
-        || this.activeById.size + 1 > this.limits.maxCutsPerHost
+        || this.#activeById.size + 1 > this.limits.maxCutsPerHost
         || nextPrincipalCount > this.limits.maxCutsPerPrincipal
         || (this.wouldAddTombstoneObligation(identity.binding)
           && this.tombstoneObligationCount() >= this.limits.maxTombstones)
@@ -3060,11 +3327,11 @@ export class RelayV2StateSnapshotSpool {
         return;
       }
       const key = logicalKey(cut.manifest.binding);
-      if (this.activeByLogicalKey.has(key) || this.activeById.has(cut.manifest.snapshotId)) {
+      if (this.#activeByLogicalKey.has(key) || this.#activeById.has(cut.manifest.snapshotId)) {
         throw new Error("snapshot cut binding is duplicated");
       }
-      this.activeById.set(cut.manifest.snapshotId, cut);
-      this.activeByLogicalKey.set(key, cut);
+      this.#activeById.set(cut.manifest.snapshotId, cut);
+      this.#activeByLogicalKey.set(key, cut);
       principalCounts.set(principal, nextPrincipalCount);
       recoveredCanonicalBytes += cut.manifest.totalCanonicalBytes;
       recoveredActiveMetadataBytes += cut.manifest.metadataBytes;
@@ -3072,7 +3339,7 @@ export class RelayV2StateSnapshotSpool {
 
     if (!this.recoveryIncomplete) {
       for (const reservation of [...this.reservationsById.values()]) {
-        const active = this.activeById.get(reservation.snapshotId);
+        const active = this.#activeById.get(reservation.snapshotId);
         if (active && sameBinding(active.manifest.binding, reservation.binding)
           && active.manifest.snapshotCreatedAtMs === reservation.snapshotCreatedAtMs
           && active.manifest.snapshotAbsoluteExpiresAtMs
@@ -3083,7 +3350,7 @@ export class RelayV2StateSnapshotSpool {
         }
       }
       for (const staging of stagingDirectories) {
-        if (!this.activeById.has(staging.snapshotId)
+        if (!this.#activeById.has(staging.snapshotId)
           && !this.tombstonesById.has(staging.snapshotId)) {
           const recovered = this.readRecoverableIdentity(
             staging.directory,
@@ -3091,7 +3358,7 @@ export class RelayV2StateSnapshotSpool {
           );
           this.recordExpiredBinding(recovered.identity, now, true);
         }
-        if (!this.activeById.has(staging.snapshotId)
+        if (!this.#activeById.has(staging.snapshotId)
           && !this.tombstonesById.has(staging.snapshotId)) {
           throw new Error("snapshot staging state lacks durable logical evidence");
         }
@@ -3301,26 +3568,28 @@ export class RelayV2StateSnapshotSpool {
       readinessCandidate: null,
       readinessReceipt: null,
       readinessActivation: null,
+      recoveredByOpen: true,
+      recoveryCandidateIssued: false,
     };
   }
 
   private enforceRecoveredQuota(): void {
     const principalCounts = new Map<string, number>();
-    for (const cut of this.activeById.values()) {
+    for (const cut of this.#activeById.values()) {
       const principal = cut.manifest.binding.principalId;
       principalCounts.set(principal, (principalCounts.get(principal) ?? 0) + 1);
     }
-    const activeMetadata = [...this.activeById.values()].reduce((sum, cut) => (
+    const activeMetadata = [...this.#activeById.values()].reduce((sum, cut) => (
       sum + cut.manifest.metadataBytes
     ), 0);
     const tombstoneMetadata = [...this.tombstonesById.values()].reduce((sum, tombstone) => (
       sum + tombstone.record.metadataBytes
     ), 0);
-    const invalidActiveQuota = this.activeById.size > this.limits.maxCutsPerHost
+    const invalidActiveQuota = this.#activeById.size > this.limits.maxCutsPerHost
       || [...principalCounts.values()].some((count) => count > this.limits.maxCutsPerPrincipal)
       || this.tombstonesById.size > this.limits.maxTombstones
       || this.tombstoneObligationCount() > this.limits.maxTombstones
-      || [...this.activeById.values()].reduce((sum, cut) => (
+      || [...this.#activeById.values()].reduce((sum, cut) => (
         sum + cut.manifest.totalCanonicalBytes
       ), 0) > this.limits.maxSpoolCanonicalBytes;
     this.recoveredQuotaExceeded = this.recoveredQuotaExceeded
@@ -3331,7 +3600,7 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private existingFirst(key: string): FirstDecision | null {
-    const active = this.activeByLogicalKey.get(key);
+    const active = this.#activeByLogicalKey.get(key);
     if (active) return { kind: "active", cut: active };
     const build = this.buildsByLogicalKey.get(key);
     if (build) return { kind: "wait", build };
@@ -3360,7 +3629,7 @@ export class RelayV2StateSnapshotSpool {
     }
 
     const usage = this.usage();
-    const principalCuts = [...this.activeById.values()].filter((cut) => (
+    const principalCuts = [...this.#activeById.values()].filter((cut) => (
       cut.manifest.binding.principalId === binding.principalId
     )).length + [...this.reservationsById.values()].filter((reservation) => (
       reservation.binding.principalId === binding.principalId
@@ -3370,7 +3639,7 @@ export class RelayV2StateSnapshotSpool {
       this.limits.maxMetadataBytes,
     );
     if (principalCuts >= this.limits.maxCutsPerPrincipal
-      || this.activeById.size + this.reservationsById.size >= this.limits.maxCutsPerHost
+      || this.#activeById.size + this.reservationsById.size >= this.limits.maxCutsPerHost
       || (this.wouldAddTombstoneObligation(binding)
         && this.tombstoneObligationCount() >= this.limits.maxTombstones)
       || usage.canonicalBytes + estimate.totalCanonicalBytes
@@ -3388,7 +3657,7 @@ export class RelayV2StateSnapshotSpool {
       reservationId: newReservationId(),
       snapshotId: newSnapshotId(),
       hostId: this.hostId,
-      ownerFence: this.ownerFence,
+      ownerFence: this.#ownerFence,
       binding: clone(binding),
       snapshotCreatedAtMs: now,
       snapshotAbsoluteExpiresAtMs: now + this.limits.absoluteLeaseMs,
@@ -3418,12 +3687,12 @@ export class RelayV2StateSnapshotSpool {
 
   private usage(): { canonicalBytes: number; metadataBytes: number } {
     return {
-      canonicalBytes: [...this.activeById.values()].reduce((sum, cut) => (
+      canonicalBytes: [...this.#activeById.values()].reduce((sum, cut) => (
         sum + cut.manifest.totalCanonicalBytes
       ), 0) + [...this.reservationsById.values()].reduce((sum, reservation) => (
         sum + reservation.reservedCanonicalBytes
       ), 0),
-      metadataBytes: [...this.activeById.values()].reduce((sum, cut) => (
+      metadataBytes: [...this.#activeById.values()].reduce((sum, cut) => (
         sum + cut.manifest.metadataBytes
       ), this.ownerMetadataBytes) + [...this.reservationsById.values()].reduce((sum, reservation) => (
         sum + reservation.reservedMetadataBytes
@@ -3435,7 +3704,7 @@ export class RelayV2StateSnapshotSpool {
 
   private tombstoneObligationCount(): number {
     const keys = new Set(this.tombstonesByLogicalKey.keys());
-    for (const cut of this.activeById.values()) {
+    for (const cut of this.#activeById.values()) {
       keys.add(logicalKey(cut.manifest.binding));
     }
     for (const reservation of this.reservationsById.values()) {
@@ -3447,7 +3716,7 @@ export class RelayV2StateSnapshotSpool {
   private wouldAddTombstoneObligation(binding: SnapshotBinding): boolean {
     const key = logicalKey(binding);
     return !this.tombstonesByLogicalKey.has(key)
-      && !this.activeByLogicalKey.has(key)
+      && !this.#activeByLogicalKey.has(key)
       && ![...this.reservationsById.values()].some((reservation) => (
         logicalKey(reservation.binding) === key
       ));
@@ -3458,11 +3727,11 @@ export class RelayV2StateSnapshotSpool {
     let candidate: RelayV2MaterializedStateCutCandidate;
     let cut: RelayV2MaterializedStateCut;
     try {
-      candidateLease = await this.cutSource.captureCandidate(reservation.binding.hostEpoch);
-      candidate = this.cutSource.inspectCandidate(candidateLease);
+      candidateLease = await this.#cutSource.captureCandidate(reservation.binding.hostEpoch);
+      candidate = this.#cutSource.inspectCandidate(candidateLease);
       cut = candidate.cut;
     } catch (error) {
-      if (candidateLease !== undefined) this.cutSource.releaseCandidate(candidateLease);
+      if (candidateLease !== undefined) this.#cutSource.releaseCandidate(candidateLease);
       const sourceError = mapSourceError(error);
       await this.serializeMetadata(() => this.expireReservation(reservation, sourceError));
       throw sourceError;
@@ -3503,7 +3772,7 @@ export class RelayV2StateSnapshotSpool {
         );
       }
     } catch (error) {
-      this.cutSource.releaseCandidate(candidateLease!);
+      this.#cutSource.releaseCandidate(candidateLease!);
       const failure = structuredSpoolError(error);
       await this.serializeMetadata(() => this.expireReservation(reservation, failure));
       throw failure;
@@ -3532,7 +3801,7 @@ export class RelayV2StateSnapshotSpool {
         try {
         const activeReservation = this.reservationsById.get(reservation.reservationId);
         if (!activeReservation
-          || activeReservation.ownerFence !== this.ownerFence
+          || activeReservation.ownerFence !== this.#ownerFence
           || logicalKey(activeReservation.binding) !== logicalKey(reservation.binding)) {
           throw expiredError();
         }
@@ -3563,7 +3832,7 @@ export class RelayV2StateSnapshotSpool {
         }
         await this.withLineageFence(reservation.binding.hostEpoch, () => {
           const stillReserved = this.reservationsById.get(reservation.reservationId);
-          if (!stillReserved || stillReserved.ownerFence !== this.ownerFence
+          if (!stillReserved || stillReserved.ownerFence !== this.#ownerFence
             || this.readNow() >= reservation.snapshotAbsoluteExpiresAtMs) {
             throw expiredError();
           }
@@ -3581,9 +3850,11 @@ export class RelayV2StateSnapshotSpool {
             readinessCandidate: candidateLease!,
             readinessReceipt: null,
             readinessActivation: null,
+            recoveredByOpen: false,
+            recoveryCandidateIssued: false,
           };
-          this.activeById.set(reservation.snapshotId, cutRecord);
-          this.activeByLogicalKey.set(logicalKey(reservation.binding), cutRecord);
+          this.#activeById.set(reservation.snapshotId, cutRecord);
+          this.#activeByLogicalKey.set(logicalKey(reservation.binding), cutRecord);
           candidateTransferred = true;
           removePublishedReservation();
         });
@@ -3617,12 +3888,12 @@ export class RelayV2StateSnapshotSpool {
               "snapshot publication committed with uncertain metadata cleanup",
             );
           }
-          this.cutSource.releaseCandidate(candidateLease!);
+          this.#cutSource.releaseCandidate(candidateLease!);
           throw failure;
         }
       });
     } catch (error) {
-      if (!candidateTransferred) this.cutSource.releaseCandidate(candidateLease);
+      if (!candidateTransferred) this.#cutSource.releaseCandidate(candidateLease);
       throw error;
     }
   }
@@ -3772,7 +4043,7 @@ export class RelayV2StateSnapshotSpool {
       }
       const now = this.readNow();
       this.cleanupExpiredAt(now);
-      const cut = this.activeById.get(snapshotId);
+      const cut = this.#activeById.get(snapshotId);
       const binding = bindingFor(request);
       if (!cut || !sameBinding(cut.manifest.binding, binding)) throw expiredError();
       const chunk = cut.manifest.chunks[request.nextChunkIndex];
@@ -3850,7 +4121,7 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private cleanupExpiredAt(now: number): void {
-    for (const cut of [...this.activeById.values()]) {
+    for (const cut of [...this.#activeById.values()]) {
       if (cut.lease.snapshotLeaseExpiresAtMs <= now
         || cut.manifest.snapshotAbsoluteExpiresAtMs <= now) {
         this.expireActiveCut(cut, now);
@@ -3874,7 +4145,7 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private dropOtherLineages(hostEpoch: string): void {
-    for (const cut of [...this.activeById.values()]) {
+    for (const cut of [...this.#activeById.values()]) {
       if (cut.manifest.binding.hostEpoch !== hostEpoch) this.removeActiveCut(cut);
     }
     for (const [snapshotId, tombstone] of this.tombstonesById) {
@@ -3979,23 +4250,129 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
+  private installReadinessReceiptRecord(
+    snapshotId: string,
+    cut: ActiveCut,
+    candidateLease: RelayV2MaterializedStateCutCandidateLease,
+    candidate: RelayV2MaterializedStateCutCandidate,
+    now: number,
+  ): Readonly<{ record: ReadinessReceiptRecord; installed: boolean }> {
+    if (this.#activeById.get(snapshotId) !== cut
+      || cut.readinessCandidate !== candidateLease
+      || this.ownerInstanceId !== candidate.hostInstanceId
+      || !candidateMatchesManifest(candidate, cut.manifest, this.hostId)) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "CAPABILITY_UNAVAILABLE",
+        "snapshot cut no longer matches its materialized owner candidate",
+      );
+    }
+    if (cut.readinessReceipt !== null) {
+      const existing = this.#readinessReceipts.get(cut.readinessReceipt as object);
+      if (existing !== undefined
+        && this.readinessReceiptRecordMatches(existing, candidate, cut, now)) {
+        return Object.freeze({ record: existing, installed: false });
+      }
+      if (existing !== undefined) this.revokeReadinessReceipt(existing);
+    }
+    const expiresAtMs = Math.min(
+      now + this.readinessReceiptLimits.receiptTtlMs,
+      cut.lease.snapshotLeaseExpiresAtMs,
+      cut.manifest.snapshotAbsoluteExpiresAtMs,
+    );
+    if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= now) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "CAPABILITY_UNAVAILABLE",
+        "snapshot readiness candidate expired before receipt issuance",
+      );
+    }
+    const nonce = randomBytes(32).toString("base64url");
+    const manifestDigest = manifestIdentityDigest(cut.manifest);
+    const retainedBytes = Buffer.byteLength(canonicalizeSnapshotJson({
+      hostId: candidate.hostId,
+      hostEpoch: candidate.hostEpoch,
+      hostInstanceId: candidate.hostInstanceId,
+      materializedSourceGeneration: candidate.materializedSourceGeneration,
+      materializedGeneration: candidate.materializedGeneration,
+      materializedCutIdentity: candidate.materializedCutIdentity,
+      throughEventSeq: candidate.cut.throughEventSeq,
+      scopesRevision: candidate.cut.scopesRevision,
+      cutRecordCount: candidate.cutRecordCount,
+      cutCanonicalBytes: candidate.cutCanonicalBytes,
+      cutDigest: cut.manifest.cutDigest,
+      snapshotId,
+      manifestDigest,
+      subscriptionQueueGeneration: candidate.subscriptionQueueGeneration,
+      ownerFence: this.#ownerFence,
+      ownerInstanceId: this.ownerInstanceId,
+      processIncarnation: this.#processIncarnation,
+      spoolGeneration: this.#spoolGeneration,
+      nonce,
+      issuedAtMs: now,
+      expiresAtMs,
+    }), "utf8");
+    if (this.#readinessReceipts.size >= this.readinessReceiptLimits.maxReceipts
+      || this.readinessReceiptRetainedBytes + retainedBytes
+        > this.readinessReceiptLimits.maxRetainedBytes) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "BUSY",
+        "snapshot readiness receipt capacity is exhausted",
+      );
+    }
+    const receipt = Object.freeze(() => undefined) as unknown as
+      RelayV2StateSnapshotReadinessReceipt;
+    const record: ReadinessReceiptRecord = {
+      receipt,
+      hostId: candidate.hostId,
+      hostEpoch: candidate.hostEpoch,
+      hostInstanceId: candidate.hostInstanceId,
+      materializedCutIdentity: candidate.materializedCutIdentity,
+      snapshotId,
+      ownerFence: this.#ownerFence,
+      ownerInstanceId: this.ownerInstanceId,
+      processIncarnation: this.#processIncarnation,
+      spoolIdentity: this.#spoolIdentity,
+      spoolGeneration: this.#spoolGeneration,
+      source: this.#cutSource,
+      materializedSourceGeneration: candidate.materializedSourceGeneration,
+      materializedGeneration: candidate.materializedGeneration,
+      throughEventSeq: candidate.cut.throughEventSeq,
+      scopesRevision: candidate.cut.scopesRevision,
+      cutRecordCount: candidate.cutRecordCount,
+      cutCanonicalBytes: candidate.cutCanonicalBytes,
+      cutDigest: cut.manifest.cutDigest,
+      manifestIdentity: cut.manifest,
+      manifestDigest,
+      subscriptionQueueGeneration: candidate.subscriptionQueueGeneration,
+      candidate: candidateLease,
+      cut,
+      nonce,
+      issuedAtMs: now,
+      expiresAtMs,
+      retainedBytes,
+    };
+    this.#readinessReceipts.set(receipt as object, record);
+    this.readinessReceiptRetainedBytes += retainedBytes;
+    cut.readinessReceipt = receipt;
+    return Object.freeze({ record, installed: true });
+  }
+
   private readinessReceiptRecordMatches(
     record: ReadinessReceiptRecord,
     candidate: RelayV2MaterializedStateCutCandidate,
     cut: ActiveCut,
     now: number,
   ): boolean {
-    return this.readinessReceipts.get(record.receipt as object) === record
-      && this.activeById.get(record.snapshotId) === cut
+    return this.#readinessReceipts.get(record.receipt as object) === record
+      && this.#activeById.get(record.snapshotId) === cut
       && cut === record.cut
       && cut.readinessCandidate === record.candidate
       && cut.readinessReceipt === record.receipt
-      && record.ownerFence === this.ownerFence
+      && record.ownerFence === this.#ownerFence
       && record.ownerInstanceId === this.ownerInstanceId
-      && record.processIncarnation === this.processIncarnation
-      && record.spoolIdentity === this.spoolIdentity
-      && record.spoolGeneration === this.spoolGeneration
-      && record.source === this.cutSource
+      && record.processIncarnation === this.#processIncarnation
+      && record.spoolIdentity === this.#spoolIdentity
+      && record.spoolGeneration === this.#spoolGeneration
+      && record.source === this.#cutSource
       && record.nonce.length === 43
       && now >= record.issuedAtMs
       && now < record.expiresAtMs
@@ -4031,7 +4408,7 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private pruneExpiredReadinessReceipts(now: number): void {
-    for (const record of [...this.readinessReceipts.values()]) {
+    for (const record of [...this.#readinessReceipts.values()]) {
       if (now >= record.expiresAtMs
         || now >= record.cut.lease.snapshotLeaseExpiresAtMs
         || now >= record.cut.manifest.snapshotAbsoluteExpiresAtMs) {
@@ -4041,13 +4418,13 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private consumeReadinessReceiptForActivation(record: ReadinessReceiptRecord): void {
-    if (this.readinessReceipts.get(record.receipt as object) !== record) {
+    if (this.#readinessReceipts.get(record.receipt as object) !== record) {
       throw new RelayV2StateSnapshotSpoolError(
         "CAPABILITY_UNAVAILABLE",
         "snapshot readiness receipt was consumed concurrently",
       );
     }
-    this.readinessReceipts.delete(record.receipt as object);
+    this.#readinessReceipts.delete(record.receipt as object);
     this.readinessReceiptRetainedBytes = Math.max(
       0,
       this.readinessReceiptRetainedBytes - record.retainedBytes,
@@ -4061,8 +4438,8 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private revokeReadinessReceipt(record: ReadinessReceiptRecord): void {
-    if (this.readinessReceipts.get(record.receipt as object) !== record) return;
-    this.readinessReceipts.delete(record.receipt as object);
+    if (this.#readinessReceipts.get(record.receipt as object) !== record) return;
+    this.#readinessReceipts.delete(record.receipt as object);
     this.readinessReceiptRetainedBytes = Math.max(
       0,
       this.readinessReceiptRetainedBytes - record.retainedBytes,
@@ -4073,8 +4450,8 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private revokeReadinessActivation(record: ReadinessActivationRecord): void {
-    if (this.readinessActivations.get(record.activation as object) !== record) return;
-    this.readinessActivations.delete(record.activation as object);
+    if (this.#readinessActivations.get(record.activation as object) !== record) return;
+    this.#readinessActivations.delete(record.activation as object);
     if (record.cut.readinessActivation === record.activation) {
       record.cut.readinessActivation = null;
     }
@@ -4083,30 +4460,30 @@ export class RelayV2StateSnapshotSpool {
 
   private retireActiveCutReadinessAuthority(cut: ActiveCut): void {
     if (cut.readinessActivation !== null) {
-      const activation = this.readinessActivations.get(cut.readinessActivation as object);
+      const activation = this.#readinessActivations.get(cut.readinessActivation as object);
       if (activation !== undefined) this.revokeReadinessActivation(activation);
       cut.readinessActivation = null;
     }
     if (cut.readinessReceipt !== null) {
-      const record = this.readinessReceipts.get(cut.readinessReceipt as object);
+      const record = this.#readinessReceipts.get(cut.readinessReceipt as object);
       if (record !== undefined) this.revokeReadinessReceipt(record);
       cut.readinessReceipt = null;
     }
     if (cut.readinessCandidate !== null) {
-      this.cutSource.releaseCandidate(cut.readinessCandidate);
+      this.#cutSource.releaseCandidate(cut.readinessCandidate);
       cut.readinessCandidate = null;
     }
   }
 
   private invalidateAllReadinessAuthority(): void {
-    for (const cut of this.activeById.values()) {
+    for (const cut of this.#activeById.values()) {
       this.retireActiveCutReadinessAuthority(cut);
     }
-    for (const activation of [...this.readinessActivations.values()]) {
+    for (const activation of [...this.#readinessActivations.values()]) {
       this.revokeReadinessActivation(activation);
     }
-    this.readinessActivations.clear();
-    this.readinessReceipts.clear();
+    this.#readinessActivations.clear();
+    this.#readinessReceipts.clear();
     this.readinessReceiptRetainedBytes = 0;
   }
 
@@ -4129,13 +4506,13 @@ export class RelayV2StateSnapshotSpool {
       throw error;
     }
     this.retireActiveCutReadinessAuthority(cut);
-    this.activeById.delete(cut.manifest.snapshotId);
+    this.#activeById.delete(cut.manifest.snapshotId);
     const key = logicalKey(cut.manifest.binding);
-    if (this.activeByLogicalKey.get(key) === cut) this.activeByLogicalKey.delete(key);
+    if (this.#activeByLogicalKey.get(key) === cut) this.#activeByLogicalKey.delete(key);
   }
 
   private removeCutIfPresent(snapshotId: string): void {
-    const cut = this.activeById.get(snapshotId);
+    const cut = this.#activeById.get(snapshotId);
     if (cut) this.removeActiveCut(cut);
   }
 

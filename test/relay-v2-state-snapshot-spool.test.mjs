@@ -131,6 +131,7 @@ async function realHarness({
   now,
   foundationOptions = {},
   spoolOptions = {},
+  bound = false,
 } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-spool-"));
   const paths = hostState.relayV2HostStatePaths(home);
@@ -149,16 +150,21 @@ async function realHarness({
     scopes: scopes ?? [scope(sessions)],
   });
   const seeded = await foundation.reconcile();
-  const spool = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+  const spoolOptionsInput = {
     hostId: "mac-admin",
-    cutSource: foundation.snapshotCutSource,
     root: join(home, "snapshot-spool"),
     ownerInstanceId: store.hostInstanceId,
     now,
     testLimits: spoolLimits,
     testReadinessReceiptLimits: receiptLimits,
     ...spoolOptions,
-  });
+  };
+  const spool = bound
+    ? await foundation.openStateSnapshotSpool(spoolOptionsInput)
+    : await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      ...spoolOptionsInput,
+      cutSource: foundation.snapshotCutSource,
+    });
   return {
     home,
     paths,
@@ -392,6 +398,207 @@ async function fakeSpool({ cut = staticCut(), limits, now, source, options = {} 
   };
 }
 
+test("recovered H2 candidates are exact, deterministic, empty, and canonical-entry one-shot", async () => {
+  let now = 1_000;
+  const h = await realHarness({
+    bound: true,
+    now: () => now,
+    sessions: [terminal("pane:a", "alpha")],
+  });
+  let recovered;
+  try {
+    assert.equal(await h.spool.issueRecoveredHostH2Candidate(), null);
+    const first = await h.spool.get(firstRequest(
+      h.seeded.snapshot.hostEpoch,
+      "recovered-h2-first",
+    ));
+    now += 1;
+    const second = await h.spool.get(firstRequest(
+      h.seeded.snapshot.hostEpoch,
+      "recovered-h2-second",
+      { principalId: "principal-two", clientInstanceId: "client-two" },
+    ));
+    assert.notEqual(first.snapshotId, second.snapshotId);
+    assert.equal(await h.spool.issueRecoveredHostH2Candidate(), null);
+    await h.spool.close();
+
+    recovered = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: h.spool.paths.root,
+      ownerInstanceId: h.store.hostInstanceId,
+      now: () => now,
+    });
+    const candidate = await recovered.issueRecoveredHostH2Candidate();
+    assert.notEqual(candidate, null);
+    assert.equal(Object.isFrozen(candidate), true);
+    assert.equal(Object.getPrototypeOf(candidate), null);
+    assert.deepEqual(Reflect.ownKeys(candidate), []);
+    assert.equal(JSON.stringify(candidate), "{}");
+
+    const foreignEntry = await import(new URL(
+      `../dist/relay/v2/stateSnapshotSpool.js?foreign=${Date.now()}`,
+      import.meta.url,
+    ));
+    assert.equal(snapshotSpool.captureRelayV2HostH2RecoveryCandidate, undefined);
+    assert.equal(snapshotSpool.openRelayV2RecoveredHostH2Activation, undefined);
+    assert.equal(candidate.receiver, undefined);
+    assert.equal(candidate.activate, undefined);
+    const compositionEntry = await import("../dist/relay/v2/hostRuntimeComposition.js");
+    const openOptions = (value) => ({
+      hostId: "mac-admin",
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      authorities: {
+        h2RecoveryCandidate: value,
+      },
+    });
+    assert.equal(
+      await foreignEntry.openRelayV2RecoveredHostRuntimeComposition(openOptions(candidate)),
+      null,
+    );
+    assert.equal(
+      await snapshotSpool.openRelayV2RecoveredHostRuntimeComposition(
+        openOptions(Object.create(candidate)),
+      ),
+      null,
+    );
+    assert.equal(
+      await snapshotSpool.openRelayV2RecoveredHostRuntimeComposition(
+        openOptions(new Proxy(candidate, {})),
+      ),
+      null,
+    );
+    const foreignPair = compositionEntry.issueRelayV2RecoveredHostH2CompositionPair();
+    assert.equal(
+      await compositionEntry.completeRelayV2HostRuntimeCompositionFromRecoveredH2(
+        foreignPair,
+        candidate,
+        openOptions(candidate),
+      ),
+      null,
+    );
+    const nextCandidate = await recovered.issueRecoveredHostH2Candidate();
+    assert.notEqual(nextCandidate, null);
+    assert.equal(Object.isFrozen(nextCandidate), true);
+    assert.deepEqual(Reflect.ownKeys(nextCandidate), []);
+  } finally {
+    await recovered?.close().catch(() => undefined);
+    h.store.close();
+    h.cleanup();
+  }
+});
+
+test("bound spool instance does not expose materialized or readiness authorities", async () => {
+  const h = await realHarness({
+    bound: true,
+    sessions: [terminal("pane:private-owner", "private-owner")],
+  });
+  let recovered;
+  let bypass;
+  try {
+    await h.spool.get(firstRequest(
+      h.seeded.snapshot.hostEpoch,
+      "private-owner-cut",
+    ));
+    await h.spool.close();
+    recovered = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: h.spool.paths.root,
+      ownerInstanceId: h.store.hostInstanceId,
+    });
+    assert.notEqual(await recovered.issueRecoveredHostH2Candidate(), null);
+
+    const descriptors = Object.getOwnPropertyDescriptors(recovered);
+    const leakedOwner = descriptors.cutSource?.value ?? recovered.cutSource;
+    let bypassed = false;
+    if (leakedOwner !== undefined) {
+      bypass = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+        hostId: "mac-admin",
+        materializedStateOwner: leakedOwner,
+        root: join(h.home, "leaked-owner-spool"),
+        ownerInstanceId: h.store.hostInstanceId,
+      });
+      bypassed = true;
+      await bypass.close();
+      bypass = undefined;
+    }
+    assert.equal(bypassed, false);
+
+    for (const field of [
+      "cutSource",
+      "runtimeH2",
+      "activeById",
+      "activeByLogicalKey",
+      "readinessReceipts",
+      "readinessActivations",
+      "ownerFence",
+      "spoolIdentity",
+      "spoolGeneration",
+      "processIncarnation",
+      "processIncarnationProbe",
+    ]) {
+      assert.equal(recovered[field], undefined);
+      assert.equal(descriptors[field], undefined);
+    }
+
+    const reflectedValues = Object.values(descriptors)
+      .filter((descriptor) => Object.hasOwn(descriptor, "value"))
+      .map((descriptor) => descriptor.value);
+    assert.equal(reflectedValues.some((value) => (
+      value !== null
+      && typeof value === "object"
+      && typeof value.captureCandidate === "function"
+      && typeof value.activateCandidate === "function"
+      && typeof value.linearizeWelcome === "function"
+    )), false);
+    assert.equal(reflectedValues.some((value) => (
+      value instanceof Map
+      && [...value.values()].some((record) => (
+        record !== null
+        && typeof record === "object"
+        && (Object.hasOwn(record, "readinessCandidate")
+          || (Object.hasOwn(record, "receipt") && Object.hasOwn(record, "source"))
+          || (Object.hasOwn(record, "sourceActivation")
+            && Object.hasOwn(record, "source")))
+      ))
+    )), false);
+  } finally {
+    await bypass?.close().catch(() => undefined);
+    await recovered?.close().catch(() => undefined);
+    h.store.close();
+    h.cleanup();
+  }
+});
+
+test("recovered H2 issuance re-reads time inside the candidate fence", async () => {
+  let now = 2_000;
+  const h = await realHarness({
+    bound: true,
+    now: () => now,
+    spoolLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
+  });
+  let recovered;
+  try {
+    await h.spool.get(firstRequest(h.seeded.snapshot.hostEpoch, "recovered-h2-expiry"));
+    await h.spool.close();
+    recovered = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: h.spool.paths.root,
+      ownerInstanceId: h.store.hostInstanceId,
+      now: () => now,
+      testLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
+      testHooks: {
+        beforeRecoveredHostH2CandidateFence() { now += 10; },
+      },
+    });
+    assert.equal(await recovered.issueRecoveredHostH2Candidate(), null);
+  } finally {
+    await recovered?.close().catch(() => undefined);
+    h.store.close();
+    h.cleanup();
+  }
+});
+
 test("materialized cut admission is conservative while H1 reservations never become snapshot records", async () => {
   const h = await realHarness();
   try {
@@ -493,369 +700,6 @@ test("exact first retry remains pinned after live materialized state changes", a
   } finally {
     h.cleanup();
   }
-});
-
-test("spool receipt carries its non-authoritative binding and activates one gapless exact sink", async () => {
-  const h = await realHarness({ sessions: [terminal("pane:a", "alpha")] });
-  try {
-    const epoch = h.seeded.snapshot.hostEpoch;
-    const chunk = await h.spool.get(firstRequest(epoch, "readiness-authentic"));
-    const issue = await h.spool.issueReadinessReceipt(chunk.snapshotId);
-    const { receipt, binding: expected } = issue;
-
-    assert.equal(Object.isFrozen(issue), true);
-    assert.equal(Object.isFrozen(expected), true);
-    assert.equal(expected.hostId, "mac-admin");
-    assert.equal(expected.hostEpoch, chunk.hostEpoch);
-    assert.equal(expected.hostInstanceId, h.store.hostInstanceId);
-    assert.match(expected.materializedCutIdentity, /^twh2cut1\./);
-    assert.equal(typeof receipt, "function");
-    assert.equal(Object.isFrozen(receipt), true);
-    assert.equal(JSON.stringify(receipt), undefined);
-    assert.throws(() => structuredClone(receipt));
-    assert.equal(await h.spool.verifyReadinessReceipt(receipt, expected), true);
-
-    const copied = () => undefined;
-    Object.setPrototypeOf(copied, Object.getPrototypeOf(receipt));
-    assert.equal(await h.spool.verifyReadinessReceipt(copied, expected), false);
-    const copiedSinkClosed = [];
-    await assert.rejects(
-      h.spool.activateReadinessReceipt(copied, {
-        enqueue: () => true,
-        close(error) { copiedSinkClosed.push(error); },
-      }),
-      assertSpoolError("CAPABILITY_UNAVAILABLE"),
-    );
-    assert.equal(copiedSinkClosed.length, 1);
-    assert.equal(
-      await h.spool.verifyReadinessReceipt(Object.create(receipt), expected),
-      false,
-    );
-    assert.equal(await h.spool.verifyReadinessReceipt({}, expected), false);
-    for (const field of Object.keys(expected)) {
-      assert.equal(await h.spool.verifyReadinessReceipt(receipt, {
-        ...expected,
-        [field]: `${expected[field]}-mismatch`,
-      }), false, `${field} mismatch was accepted`);
-    }
-    let getterRead = false;
-    const accessorBinding = { ...expected };
-    Object.defineProperty(accessorBinding, "hostId", {
-      enumerable: true,
-      get() { getterRead = true; return expected.hostId; },
-    });
-    assert.equal(await h.spool.verifyReadinessReceipt(receipt, accessorBinding), false);
-    assert.equal(getterRead, false);
-
-    h.discovery.push({
-      coverage: "complete",
-      scopes: [scope([
-        terminal("pane:a", "alpha", 1_783_700_000_100),
-        terminal("pane:b", "beta"),
-      ])],
-    });
-    const committed = await h.foundation.reconcile();
-    assert.ok(BigInt(committed.snapshot.eventSeq) > BigInt(chunk.throughEventSeq));
-    assert.equal(
-      await h.spool.verifyReadinessReceipt(receipt, expected),
-      true,
-      "the provisional subscription must bridge every event after W",
-    );
-
-    const delivered = [];
-    const closed = [];
-    const activation = await h.spool.activateReadinessReceipt(receipt, {
-      enqueue(event) { delivered.push(structuredClone(event)); return true; },
-      close(error) { closed.push(error); },
-    });
-    assert.equal(typeof activation, "function");
-    assert.equal(Object.isFrozen(activation), true);
-    assert.equal(JSON.stringify(activation), undefined);
-    assert.throws(() => structuredClone(activation));
-    assert.deepEqual(
-      delivered.map((event) => event.eventSeq),
-      committed.events.map((event) => event.eventSeq),
-      "every buffered W+1 event must drain before live attachment",
-    );
-    assert.equal(await h.spool.verifyReadinessReceipt(receipt, expected), false);
-
-    const rejectedClosed = [];
-    await assert.rejects(
-      h.spool.activateReadinessReceipt(receipt, {
-        enqueue: () => true,
-        close(error) { rejectedClosed.push(error); },
-      }),
-      assertSpoolError("CAPABILITY_UNAVAILABLE"),
-    );
-    assert.equal(rejectedClosed.length, 1, "a consumed receipt must close the rejected sink");
-
-    h.discovery.push({
-      coverage: "complete",
-      scopes: [scope([
-        terminal("pane:a", "alpha", 1_783_700_000_200),
-        terminal("pane:b", "beta"),
-        terminal("pane:c", "charlie"),
-      ])],
-    });
-    const liveCommit = await h.foundation.reconcile();
-    assert.deepEqual(
-      delivered.slice(committed.events.length).map((event) => event.eventSeq),
-      liveCommit.events.map((event) => event.eventSeq),
-      "the exact drained sink must receive future events without a handoff gap",
-    );
-
-    const forgedActivation = () => undefined;
-    Object.setPrototypeOf(forgedActivation, Object.getPrototypeOf(activation));
-    h.spool.releaseReadinessActivation(forgedActivation);
-    assert.equal(closed.length, 0);
-    h.spool.releaseReadinessActivation(activation);
-    assert.equal(closed.length, 1);
-    h.spool.releaseReadinessActivation(activation);
-    assert.equal(closed.length, 1);
-
-    h.foundation.commandResourceMutationOwner.fenceCommitUncertain(await h.store.read());
-    assert.equal(await h.spool.verifyReadinessReceipt(receipt, expected), false);
-    await h.spool.release(releaseRequest(chunk));
-  } finally {
-    h.cleanup();
-  }
-});
-
-test("receipt capacity, bytes, TTL, owner recheck, restart, takeover, and close revoke authority", async (t) => {
-  await t.test("count, bytes, and TTL are hard bounds", async () => {
-    let now = 1_000;
-    const h = await realHarness({
-      now: () => now,
-      receiptLimits: { maxReceipts: 1, receiptTtlMs: 10 },
-    });
-    try {
-      const epoch = h.seeded.snapshot.hostEpoch;
-      const first = await h.spool.get(firstRequest(epoch, "receipt-count-one"));
-      const second = await h.spool.get(firstRequest(epoch, "receipt-count-two", {
-        principalId: "principal-two",
-        clientInstanceId: "client-two",
-      }));
-      const firstIssue = await h.spool.issueReadinessReceipt(first.snapshotId);
-      const firstReceipt = firstIssue.receipt;
-      await assert.rejects(
-        h.spool.issueReadinessReceipt(second.snapshotId),
-        assertSpoolError("BUSY"),
-      );
-      await h.spool.release(releaseRequest(first));
-      const secondIssue = await h.spool.issueReadinessReceipt(second.snapshotId);
-      const secondReceipt = secondIssue.receipt;
-      assert.equal(await h.spool.verifyReadinessReceipt(firstReceipt, firstIssue.binding), false);
-      assert.equal(await h.spool.verifyReadinessReceipt(secondReceipt, secondIssue.binding), true);
-      now += 10;
-      assert.equal(await h.spool.verifyReadinessReceipt(secondReceipt, secondIssue.binding), false);
-    } finally {
-      h.cleanup();
-    }
-
-    const byteBound = await realHarness({
-      receiptLimits: { maxRetainedBytes: 1 },
-    });
-    try {
-      const chunk = await byteBound.spool.get(firstRequest(
-        byteBound.seeded.snapshot.hostEpoch,
-        "receipt-byte-bound",
-      ));
-      await assert.rejects(
-        byteBound.spool.issueReadinessReceipt(chunk.snapshotId),
-        assertSpoolError("BUSY"),
-      );
-    } finally {
-      byteBound.cleanup();
-    }
-
-    let leaseNow = 2_000;
-    const leaseBound = await realHarness({
-      now: () => leaseNow,
-      foundationOptions: {
-        testSnapshotCandidateLimits: { maxCandidates: 1 },
-      },
-      spoolLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
-    });
-    try {
-      const epoch = leaseBound.seeded.snapshot.hostEpoch;
-      const first = await leaseBound.spool.get(firstRequest(epoch, "lease-bound-first"));
-      await leaseBound.spool.issueReadinessReceipt(first.snapshotId);
-      await assert.rejects(
-        leaseBound.spool.get(firstRequest(epoch, "lease-bound-plus-one", {
-          principalId: "principal-two",
-          clientInstanceId: "client-two",
-        })),
-        assertSpoolError("BUSY"),
-      );
-      leaseNow += 10;
-      await leaseBound.spool.cleanupExpired();
-      const afterExpiry = await leaseBound.spool.get(firstRequest(
-        epoch,
-        "lease-bound-after-expiry",
-        { principalId: "principal-three", clientInstanceId: "client-three" },
-      ));
-      assert.equal(afterExpiry.hostEpoch, epoch, "lease expiry must free candidate count and bytes");
-      const afterExpiryIssue = await leaseBound.spool.issueReadinessReceipt(
-        afterExpiry.snapshotId,
-      );
-      const activationClosed = [];
-      await leaseBound.spool.activateReadinessReceipt(afterExpiryIssue.receipt, {
-        enqueue: () => true,
-        close(error) { activationClosed.push(error); },
-      });
-      leaseNow += 10;
-      await leaseBound.spool.cleanupExpired();
-      assert.equal(
-        activationClosed.length,
-        1,
-        "lease expiry must synchronously retire the live subscriber",
-      );
-    } finally {
-      leaseBound.cleanup();
-    }
-  });
-
-  await t.test("the final owner recheck withdraws an attempted receipt", async () => {
-    let attemptedReceipt;
-    let originalOwner;
-    const h = await realHarness({
-      spoolOptions: {
-        testHooks: {
-          beforeReadinessReceiptOwnerRecheck(issue) {
-            attemptedReceipt = issue;
-            originalOwner = readFileSync(h.spool.paths.owner, "utf8");
-            const owner = JSON.parse(originalOwner);
-            owner.fence = "withdrawn-owner-fence";
-            writeFileSync(h.spool.paths.owner, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
-          },
-        },
-      },
-    });
-    try {
-      const epoch = h.seeded.snapshot.hostEpoch;
-      const chunk = await h.spool.get(firstRequest(epoch, "receipt-owner-recheck"));
-      await assert.rejects(
-        h.spool.issueReadinessReceipt(chunk.snapshotId),
-        assertSpoolError("INTERNAL"),
-      );
-      assert.ok(attemptedReceipt);
-      writeFileSync(h.spool.paths.owner, originalOwner, { mode: 0o600 });
-      assert.equal(
-        await h.spool.verifyReadinessReceipt(
-          attemptedReceipt.receipt,
-          attemptedReceipt.binding,
-        ),
-        false,
-      );
-      await assert.rejects(
-        h.spool.issueReadinessReceipt(chunk.snapshotId),
-        assertSpoolError("CAPABILITY_UNAVAILABLE"),
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  await t.test("an outer owner failure after H0 attach rolls back and closes the exact sink", async () => {
-    let originalOwner;
-    const h = await realHarness({
-      spoolOptions: {
-        testHooks: {
-          afterReadinessActivationAttached() {
-            originalOwner = readFileSync(h.spool.paths.owner, "utf8");
-            const owner = JSON.parse(originalOwner);
-            owner.fence = "activation-owner-withdrawn";
-            writeFileSync(h.spool.paths.owner, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
-          },
-        },
-      },
-    });
-    try {
-      const epoch = h.seeded.snapshot.hostEpoch;
-      const chunk = await h.spool.get(firstRequest(epoch, "activation-owner-recheck"));
-      const issue = await h.spool.issueReadinessReceipt(chunk.snapshotId);
-      const delivered = [];
-      const closed = [];
-      await assert.rejects(
-        h.spool.activateReadinessReceipt(issue.receipt, {
-          enqueue(event) { delivered.push(event.eventSeq); return true; },
-          close(error) { closed.push(error); },
-        }),
-        assertSpoolError("INTERNAL"),
-      );
-      assert.equal(closed.length, 1);
-      const deliveredAtFailure = delivered.length;
-      h.discovery.push({ coverage: "complete", scopes: [] });
-      await h.foundation.reconcile();
-      assert.equal(delivered.length, deliveredAtFailure, "owner failure left a subscriber");
-      writeFileSync(h.spool.paths.owner, originalOwner, { mode: 0o600 });
-      assert.equal(
-        await h.spool.verifyReadinessReceipt(issue.receipt, issue.binding),
-        false,
-      );
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  await t.test("restart and takeover cannot recover a receipt", async () => {
-    const h = await realHarness();
-    try {
-      const epoch = h.seeded.snapshot.hostEpoch;
-      const chunk = await h.spool.get(firstRequest(epoch, "receipt-takeover"));
-      const issue = await h.spool.issueReadinessReceipt(chunk.snapshotId);
-      const receipt = issue.receipt;
-      const closed = [];
-      await h.spool.activateReadinessReceipt(receipt, {
-        enqueue: () => true,
-        close(error) { closed.push(error); },
-      });
-      const successor = await snapshotSpool.RelayV2StateSnapshotSpool.open({
-        hostId: "mac-admin",
-        cutSource: h.foundation.snapshotCutSource,
-        root: h.spool.paths.root,
-        ownerInstanceId: h.store.hostInstanceId,
-        takeoverExistingOwner: true,
-      });
-      assert.equal(closed.length, 1, "takeover must synchronously close the attached sink");
-      assert.equal(await h.spool.verifyReadinessReceipt(receipt, issue.binding), false);
-      await assert.rejects(
-        successor.issueReadinessReceipt(chunk.snapshotId),
-        assertSpoolError("CAPABILITY_UNAVAILABLE"),
-      );
-      await successor.close();
-    } finally {
-      h.cleanup();
-    }
-  });
-
-  await t.test("close latches revocation before owner cleanup and is idempotent", async () => {
-    const h = await realHarness();
-    try {
-      const epoch = h.seeded.snapshot.hostEpoch;
-      const chunk = await h.spool.get(firstRequest(epoch, "receipt-close"));
-      const issue = await h.spool.issueReadinessReceipt(chunk.snapshotId);
-      const receipt = issue.receipt;
-      const firstClose = h.spool.close();
-      const concurrentClose = h.spool.close();
-      assert.strictEqual(firstClose, concurrentClose);
-      await Promise.all([firstClose, concurrentClose]);
-      assert.equal(await h.spool.verifyReadinessReceipt(receipt, issue.binding), false);
-      const restarted = await snapshotSpool.RelayV2StateSnapshotSpool.open({
-        hostId: "mac-admin",
-        cutSource: h.foundation.snapshotCutSource,
-        root: h.spool.paths.root,
-        ownerInstanceId: h.store.hostInstanceId,
-      });
-      await assert.rejects(
-        restarted.issueReadinessReceipt(chunk.snapshotId),
-        assertSpoolError("CAPABILITY_UNAVAILABLE"),
-      );
-      await restarted.close();
-    } finally {
-      h.cleanup();
-    }
-  });
 });
 
 test("chunking accounts for canonical array delimiters and empty cuts digest as []", async (t) => {
@@ -1741,11 +1585,6 @@ test("a post-rename fsync failure rolls back final and permanently expires the a
     assert.deepEqual(readdirSync(h.spool.paths.staging), []);
     assert.deepEqual(readdirSync(h.spool.paths.reservations), []);
     assert.equal(readdirSync(h.spool.paths.tombstones).length, 1);
-    const failedSnapshotId = readdirSync(h.spool.paths.tombstones)[0].replace(/\.json$/, "");
-    await assert.rejects(
-      h.spool.issueReadinessReceipt(failedSnapshotId),
-      assertSpoolError("CAPABILITY_UNAVAILABLE"),
-    );
     await assert.rejects(h.spool.get(request), assertSpoolError("SNAPSHOT_EXPIRED"));
     assert.deepEqual(readdirSync(h.spool.paths.cuts), []);
   } finally {

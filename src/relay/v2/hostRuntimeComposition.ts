@@ -40,15 +40,15 @@ import { createRelayV2HostH1ReadinessActivation } from "./hostH1ReadinessActivat
 import type {
   RelayV2HostH1ReadinessLifecycle,
 } from "./hostH1ReadinessActivation.js";
-import { createRelayV2HostH2ReadinessActivation } from "./hostH2ReadinessActivation.js";
 import type {
+  RelayV2HostH2ReadinessActivation,
   RelayV2HostH2ReadinessLifecycle,
   RelayV2HostH2ReadinessSnapshotSpool,
 } from "./hostH2ReadinessActivation.js";
 import { createRelayV2HostH3ReadinessActivation } from "./hostH3ReadinessActivation.js";
 import type { RelayV2HostH3ReadinessLifecycle } from "./hostH3ReadinessActivation.js";
 import type {
-  RelayV2StateSnapshotHostH2Authority,
+  RelayV2HostH2RecoveryCandidate,
 } from "./stateSnapshotSpool.js";
 import type { RelayV2HostH0ReadinessPort } from "./hostState.js";
 import type {
@@ -66,6 +66,60 @@ type ManualReadinessSource = Exclude<
 >;
 
 const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
+
+declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
+
+/** Opaque issuer half; its receiver identity never leaves this module. */
+export interface RelayV2RecoveredHostH2CompositionPair {
+  readonly [relayV2RecoveredHostH2CompositionPairBrand]: true;
+}
+
+interface RecoveredHostH2CompositionPairRecord {
+  readonly receiverIdentity: (
+    consumer: (readinessSink: unknown) => Promise<unknown>,
+  ) => Promise<unknown> | null;
+  readinessSink: RelayV2HostCapabilityReadinessSourceSink<"h2"> | null;
+  activationInFlight: boolean;
+}
+
+const recoveredHostH2CompositionPairs = new WeakMap<
+  object,
+  RecoveredHostH2CompositionPairRecord
+>();
+
+export function issueRelayV2RecoveredHostH2CompositionPair(
+): RelayV2RecoveredHostH2CompositionPair {
+  const pair = Object.freeze(Object.create(null)) as RelayV2RecoveredHostH2CompositionPair;
+  let record: RecoveredHostH2CompositionPairRecord;
+  const receiverIdentity = Object.freeze(async function recoveredHostH2PrivateReceiver(
+    this: unknown,
+    consumer: (readinessSink: unknown) => Promise<unknown>,
+  ): Promise<unknown> {
+    if (this !== receiverIdentity
+      || typeof consumer !== "function"
+      || record.readinessSink === null) return null;
+    const readinessSink = record.readinessSink;
+    record.readinessSink = null;
+    return Reflect.apply(consumer, undefined, [readinessSink]);
+  });
+  record = {
+    receiverIdentity,
+    readinessSink: null,
+    activationInFlight: false,
+  };
+  recoveredHostH2CompositionPairs.set(pair as object, record);
+  return pair;
+}
+
+/** Boolean-only verifier used by the canonical spool activation entry. */
+export function matchesRelayV2RecoveredHostH2CompositionReceiver(
+  pair: unknown,
+  receiverIdentity: unknown,
+): boolean {
+  if (typeof pair !== "object" || pair === null
+    || typeof receiverIdentity !== "function") return false;
+  return recoveredHostH2CompositionPairs.get(pair)?.receiverIdentity === receiverIdentity;
+}
 
 export type RelayV2HostRuntimeCompositionH2ReadinessLifecycle =
   RelayV2HostH2ReadinessLifecycle;
@@ -106,7 +160,7 @@ export type RelayV2HostRuntimeCompositionAuthorities = Omit<
 > & Readonly<{
   h0: RelayV2HostH0ReadinessPort;
   h1RecoveryCandidate: RelayV2HostCommandPlaneReadinessCandidate;
-  h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
+  h2RecoveryCandidate: RelayV2HostH2RecoveryCandidate;
   h3RecoveryCandidate: RelayV2HostH3RecoveryCandidate;
 }>;
 
@@ -219,7 +273,7 @@ function captureRuntimeAuthorities(
 ): Readonly<{
   h0: RelayV2HostH0ReadinessPort;
   h1RecoveryCandidate: RelayV2HostCommandPlaneReadinessCandidate;
-  h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
+  h2RecoveryCandidate: RelayV2HostH2RecoveryCandidate;
   h3RecoveryCandidate: RelayV2HostH3RecoveryCandidate;
   nextDedupeWindowBounds: RelayV2HostRuntimeActualAuthorityInput["nextDedupeWindowBounds"];
   nextDedupeWindowBoundsReceiver: object;
@@ -228,7 +282,7 @@ function captureRuntimeAuthorities(
   const fields = [
     "h0",
     "h1RecoveryCandidate",
-    "h2SnapshotAuthority",
+    "h2RecoveryCandidate",
     "h3RecoveryCandidate",
     "nextDedupeWindowBounds",
   ] as const;
@@ -248,8 +302,8 @@ function captureRuntimeAuthorities(
     h0: descriptors.h0!.value as RelayV2HostH0ReadinessPort,
     h1RecoveryCandidate: descriptors.h1RecoveryCandidate!.value as
       RelayV2HostCommandPlaneReadinessCandidate,
-    h2SnapshotAuthority: descriptors.h2SnapshotAuthority!.value as
-      RelayV2StateSnapshotHostH2Authority,
+    h2RecoveryCandidate: descriptors.h2RecoveryCandidate!.value as
+      RelayV2HostH2RecoveryCandidate,
     h3RecoveryCandidate: descriptors.h3RecoveryCandidate!.value as
       RelayV2HostH3RecoveryCandidate,
     nextDedupeWindowBounds,
@@ -384,9 +438,27 @@ function carrierCloseForRuntime(close: RelayV2HostRuntimeClose): RelayV2HostCarr
  * bounded runtime. It does not construct a carrier, reconnect, advertise to a
  * broker, or infer readiness from an authority object's existence.
  */
-export function createRelayV2HostRuntimeComposition(
-  options: RelayV2HostRuntimeCompositionOptions,
-): RelayV2HostRuntimeComposition {
+export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
+  pair: unknown,
+  candidate: unknown,
+  rawOptions: unknown,
+): Promise<RelayV2HostRuntimeComposition | null> {
+  if (typeof pair !== "object"
+    || pair === null
+    || typeof candidate !== "object"
+    || candidate === null
+    || typeof rawOptions !== "object"
+    || rawOptions === null) return null;
+  const pairRecord = recoveredHostH2CompositionPairs.get(pair);
+  if (pairRecord === undefined) return null;
+  const canonicalSpoolUrl = new URL("./stateSnapshotSpool.js", import.meta.url).href;
+  const canonicalSpool = await import(canonicalSpoolUrl) as typeof import(
+    "./stateSnapshotSpool.js"
+  );
+  if (!canonicalSpool.matchesRelayV2RecoveredHostH2CompositionPair(pair, candidate)) {
+    return null;
+  }
+  const options = rawOptions as RelayV2HostRuntimeCompositionOptions;
   const hostId = options.hostId;
   const hostEpoch = options.hostEpoch;
   const hostInstanceId = options.hostInstanceId;
@@ -403,35 +475,30 @@ export function createRelayV2HostRuntimeComposition(
     h2: readinessOwner.source("h2"),
     h3: readinessOwner.source("h3"),
   });
-  let h2Activation: ReturnType<typeof createRelayV2HostH2ReadinessActivation> | null = null;
+  let h2Activation: RelayV2HostH2ReadinessActivation | null = null;
   let h0Activation: ReturnType<typeof createRelayV2HostH0ReadinessActivation> | null = null;
   let h1Activation: ReturnType<typeof createRelayV2HostH1ReadinessActivation> = null;
   let h3Activation: ReturnType<typeof createRelayV2HostH3ReadinessActivation> | null = null;
-  const abandonConstruction = (): void => {
+  const abandonConstruction = async (): Promise<void> => {
+    const barriers: Promise<unknown>[] = [];
     if (h1Activation !== null) {
-      try { void h1Activation.close().catch(() => undefined); } catch {}
+      try { barriers.push(h1Activation.close()); } catch {}
     }
     if (h3Activation !== null) {
-      try { void h3Activation.dispose().catch(() => undefined); } catch {}
+      try { barriers.push(h3Activation.dispose()); } catch {}
     }
     if (h0Activation !== null) {
       try { h0Activation.dispose(); } catch {}
     }
     if (h2Activation !== null) {
-      try { h2Activation.dispose(); } catch {}
+      try { h2Activation.cancelConstruction(); } catch {}
     }
     for (const sink of Object.values(rawSources)) {
       try { sink.close(); } catch {}
     }
+    await Promise.allSettled(barriers);
   };
   try {
-    h2Activation = createRelayV2HostH2ReadinessActivation({
-      hostId,
-      hostEpoch,
-      hostInstanceId,
-      authority: capturedAuthorities.h2SnapshotAuthority,
-      readinessSink: rawSources.h2,
-    });
     h0Activation = createRelayV2HostH0ReadinessActivation({
       hostEpoch,
       hostInstanceId,
@@ -455,8 +522,26 @@ export function createRelayV2HostRuntimeComposition(
     if (h1Activation === null) {
       throw new Error("invalid Relay v2 H1 recovery candidate");
     }
+    if (pairRecord.activationInFlight) {
+      throw new Error("recovered H2 composition receiver is already active");
+    }
+    pairRecord.activationInFlight = true;
+    pairRecord.readinessSink = rawSources.h2;
+    try {
+      h2Activation = await canonicalSpool.activateRelayV2RecoveredHostH2CompositionReceiver(
+        pairRecord.receiverIdentity,
+        capturedAuthorities.h2RecoveryCandidate,
+      ) as RelayV2HostH2ReadinessActivation | null;
+    } finally {
+      pairRecord.readinessSink = null;
+      pairRecord.activationInFlight = false;
+    }
+    if (h2Activation === null) {
+      throw new Error("invalid Relay v2 recovered H2 composition receiver");
+    }
+    recoveredHostH2CompositionPairs.delete(pair);
   } catch (error) {
-    abandonConstruction();
+    await abandonConstruction();
     throw error;
   }
   const nextDedupeWindowBounds = capturedAuthorities.nextDedupeWindowBounds;
@@ -487,7 +572,7 @@ export function createRelayV2HostRuntimeComposition(
       testLimits: options.testLimits,
     });
   } catch (error) {
-    abandonConstruction();
+    await abandonConstruction();
     throw error;
   }
   let disposed = false;
@@ -569,13 +654,31 @@ export function createRelayV2HostRuntimeComposition(
 }
 
 /**
+ * Public construction delegates candidate claim to the canonical spool entry.
+ * A successful call returns only the complete, already activated composition.
+ */
+export async function openRelayV2HostRuntimeComposition(
+  options: RelayV2HostRuntimeCompositionOptions,
+): Promise<RelayV2HostRuntimeComposition> {
+  const canonicalSpoolUrl = new URL("./stateSnapshotSpool.js", import.meta.url).href;
+  const canonicalSpool = await import(canonicalSpoolUrl) as typeof import(
+    "./stateSnapshotSpool.js"
+  );
+  const composition = await canonicalSpool.openRelayV2RecoveredHostRuntimeComposition(options);
+  if (composition === null) {
+    throw new Error("invalid Relay v2 recovered H2 candidate or composition receiver");
+  }
+  return composition as RelayV2HostRuntimeComposition;
+}
+
+/**
  * Default-off carrier/runtime composition. The public carrier is a frozen
  * transport lifecycle facade; route binding and outbound ownership remain
  * private so callers cannot bypass exact provenance or receipt accounting.
  */
-export function createRelayV2HostCarrierRuntimeComposition(
+export async function openRelayV2HostCarrierRuntimeComposition(
   options: RelayV2HostCarrierRuntimeCompositionOptions,
-): RelayV2HostCarrierRuntimeComposition {
+): Promise<RelayV2HostCarrierRuntimeComposition> {
   const runtimeOptions = options.runtime;
   const hostId = runtimeOptions.hostId;
   const hostEpoch = runtimeOptions.hostEpoch;
@@ -634,7 +737,7 @@ export function createRelayV2HostCarrierRuntimeComposition(
     },
   });
 
-  const runtime = createRelayV2HostRuntimeComposition({
+  const runtime = await openRelayV2HostRuntimeComposition({
     hostId,
     hostEpoch,
     hostInstanceId,
@@ -712,7 +815,7 @@ export function createRelayV2HostCarrierRuntimeComposition(
     carrierReadinessActive = false;
     bridgeActive = false;
     bindings.clear();
-    void runtime.dispose().catch(() => undefined);
+    await runtime.dispose().catch(() => undefined);
     throw error;
   }
 

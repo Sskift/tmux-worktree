@@ -136,11 +136,11 @@ function commandExecutor(overrides = {}) {
   };
 }
 
-function baseAuthorities(snapshotAuthority, hostEpoch, hostInstanceId, overrides = {}) {
+function baseAuthorities(h2RecoveryCandidate, hostEpoch, hostInstanceId, overrides = {}) {
   return {
     h0: overrides.h0,
     h1RecoveryCandidate: overrides.h1RecoveryCandidate,
-    h2SnapshotAuthority: snapshotAuthority,
+    h2RecoveryCandidate,
     h3RecoveryCandidate: overrides.h3RecoveryCandidate,
     nextDedupeWindowBounds: overrides.nextDedupeWindowBounds ?? function () {
       throw new Error("unexpected dedupe policy");
@@ -148,10 +148,10 @@ function baseAuthorities(snapshotAuthority, hostEpoch, hostInstanceId, overrides
   };
 }
 
-function createComposition(snapshotAuthority, hostEpoch, hostInstanceId, overrides = {}) {
-  const authorities = baseAuthorities(snapshotAuthority, hostEpoch, hostInstanceId, overrides);
+function openComposition(h2RecoveryCandidate, hostEpoch, hostInstanceId, overrides = {}) {
+  const authorities = baseAuthorities(h2RecoveryCandidate, hostEpoch, hostInstanceId, overrides);
   overrides.captureAuthorities?.(authorities);
-  return compositionModule.createRelayV2HostRuntimeComposition({
+  return compositionModule.openRelayV2HostRuntimeComposition({
     hostId: HOST_ID,
     hostEpoch,
     hostInstanceId,
@@ -196,6 +196,10 @@ async function realCompositionHarness({
   compositionOverrides,
   h3ManagerOverrides,
   activateH0 = true,
+  beforeCompositionOpen,
+  concurrentCompositionOpen = false,
+  openInitialComposition = true,
+  expectCompositionFailure = false,
 } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-composition-"));
   const store = await hostState.RelayV2HostStateStore.open({
@@ -215,16 +219,31 @@ async function realCompositionHarness({
   });
   const seeded = await foundation.reconcile();
   const wrapped = wrapSpool?.() ?? null;
-  const spool = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+  const spoolRoot = join(home, "snapshot-spool");
+  const publisherSpool = await foundation.openStateSnapshotSpool({
     hostId: HOST_ID,
-    materializedStateAuthority: foundation.snapshotAuthorityBundle,
-    root: join(home, "snapshot-spool"),
+    root: spoolRoot,
+    ownerInstanceId: store.hostInstanceId,
+    now,
+    testLimits: spoolLimits,
+  });
+  const recoveredPrincipalId = "composition-recovered-principal";
+  const recoveredChunk = await publisherSpool.get(firstSnapshotRequest(
+    seeded.snapshot.hostEpoch,
+    "composition-recovered-h2",
+    recoveredPrincipalId,
+  ));
+  await publisherSpool.close();
+  const spool = await foundation.openStateSnapshotSpool({
+    hostId: HOST_ID,
+    root: spoolRoot,
     ownerInstanceId: store.hostInstanceId,
     now,
     testLimits: spoolLimits,
     testHooks: { ...spoolHooks, ...wrapped?.testHooks },
   });
-  assert.notEqual(spool.hostH2Authority, null);
+  const h2RecoveryCandidate = await spool.issueRecoveredHostH2Candidate();
+  assert.notEqual(h2RecoveryCandidate, null);
   const terminalLineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({ store });
   const h3Manager = new terminalManagerModule.RelayV2TerminalManager({
     hostId: HOST_ID,
@@ -246,8 +265,13 @@ async function realCompositionHarness({
       now: () => 1_783_700_000_000,
     });
   assert.notEqual(h1RecoveryCandidate, null);
-  const composition = createComposition(
-    spool.hostH2Authority,
+  await beforeCompositionOpen?.({
+    candidate: h2RecoveryCandidate,
+    hostEpoch: seeded.snapshot.hostEpoch,
+    hostInstanceId: store.hostInstanceId,
+  });
+  const openRecoveredComposition = () => openComposition(
+    h2RecoveryCandidate,
     seeded.snapshot.hostEpoch,
     store.hostInstanceId,
     {
@@ -257,8 +281,29 @@ async function realCompositionHarness({
       h3RecoveryCandidate,
     },
   );
-  if (activateH0) assert.equal(await composition.readiness.h0.activate(), true);
-  wrapped?.attach?.(composition);
+  let compositionAttempts = null;
+  let composition = null;
+  let constructionError = null;
+  try {
+    compositionAttempts = !openInitialComposition
+      ? null
+      : concurrentCompositionOpen
+        ? await Promise.allSettled([openRecoveredComposition(), openRecoveredComposition()])
+        : null;
+    composition = !openInitialComposition
+      ? null
+      : compositionAttempts === null
+        ? await openRecoveredComposition()
+        : compositionAttempts.find((attempt) => attempt.status === "fulfilled")?.value;
+    if (openInitialComposition) assert.notEqual(composition, undefined);
+  } catch (error) {
+    if (!expectCompositionFailure) throw error;
+    constructionError = error;
+  }
+  if (activateH0 && composition !== null) {
+    assert.equal(await composition.readiness.h0.activate(), true);
+  }
+  if (composition !== null) wrapped?.attach?.(composition);
   let readinessPrincipalOrdinal = 0;
   return {
     home,
@@ -268,9 +313,15 @@ async function realCompositionHarness({
     seeded,
     terminalLineage,
     h3Manager,
+    h3RecoveryCandidate,
     h1RecoveryCandidate,
+    h2RecoveryCandidate,
+    recoveredChunk,
+    recoveredPrincipalId,
     spool,
     composition,
+    compositionAttempts,
+    constructionError,
     wrapped,
     nextReadinessPrincipalId() {
       readinessPrincipalOrdinal += 1;
@@ -281,9 +332,9 @@ async function realCompositionHarness({
       return `composition-readiness-principal-${readinessPrincipalOrdinal}`;
     },
     async cleanup({ closeSpool = true } = {}) {
-      composition.dispose();
-      store.close();
+      await composition?.dispose();
       if (closeSpool) await spool.close().catch(() => undefined);
+      store.close();
       rmSync(home, { recursive: true, force: true });
     },
   };
@@ -334,20 +385,6 @@ function descriptorReentryProxy(target, callback) {
   };
 }
 
-async function issueReadiness(harness, snapshotRequestId) {
-  const principalId = harness.nextReadinessPrincipalId();
-  const chunk = await harness.spool.get(firstSnapshotRequest(
-    harness.seeded.snapshot.hostEpoch,
-    snapshotRequestId,
-    principalId,
-  ));
-  return {
-    chunk,
-    principalId,
-    issue: await harness.spool.issueReadinessReceipt(chunk.snapshotId),
-  };
-}
-
 function delayedActivationCloseAdapter() {
   const pendingCloses = [];
   const releaseCounts = new Map();
@@ -373,51 +410,7 @@ function delayedActivationCloseAdapter() {
   };
 }
 
-function forgeOpaqueAuthority(authority, { issuerMode = "same", fields = {} } = {}) {
-  const issuerKey = Object.getOwnPropertySymbols(authority).find((key) => {
-    const descriptor = Object.getOwnPropertyDescriptor(authority, key);
-    return descriptor
-      && Object.hasOwn(descriptor, "value")
-      && ((typeof descriptor.value === "object" && descriptor.value !== null)
-        || typeof descriptor.value === "function");
-  });
-  assert.notEqual(issuerKey, undefined);
-  const issuerDescriptor = Object.getOwnPropertyDescriptor(authority, issuerKey);
-  const exactIssuer = issuerDescriptor.value;
-  let issuer = exactIssuer;
-  if (issuerMode === "proxy") issuer = new Proxy(exactIssuer, {});
-  if (issuerMode === "copied_verifier") {
-    const verifierKey = Object.getOwnPropertySymbols(exactIssuer).find((key) => {
-      const descriptor = Object.getOwnPropertyDescriptor(exactIssuer, key);
-      return descriptor && Object.hasOwn(descriptor, "value")
-        && typeof descriptor.value === "function";
-    });
-    assert.notEqual(verifierKey, undefined);
-    issuer = {};
-    Object.defineProperty(
-      issuer,
-      verifierKey,
-      Object.getOwnPropertyDescriptor(exactIssuer, verifierKey),
-    );
-    Object.freeze(issuer);
-  }
-  const forged = () => undefined;
-  Object.defineProperty(forged, issuerKey, {
-    ...issuerDescriptor,
-    value: issuer,
-  });
-  for (const [key, value] of Object.entries(fields)) {
-    Object.defineProperty(forged, key, {
-      configurable: false,
-      enumerable: true,
-      writable: false,
-      value,
-    });
-  }
-  return Object.freeze(forged);
-}
-
-test("default-off host composition requires exact H0 and H2 activation", async () => {
+test("async host composition returns only after exact recovered H2 activation", async () => {
   const h = await realCompositionHarness({ activateH0: false });
   try {
     assert.equal(h.composition.readiness.h0.apply, undefined);
@@ -425,26 +418,6 @@ test("default-off host composition requires exact H0 and H2 activation", async (
     assert.equal(h.composition.readiness.h1.execute, undefined);
     assert.equal(h.composition.readiness.h1.query, undefined);
     assert.equal(h.composition.readiness.h1.issueDedupeWindow, undefined);
-    assert.throws(
-      () => compositionModule.createRelayV2HostRuntimeComposition({
-        hostId: HOST_ID,
-        hostEpoch: h.seeded.snapshot.hostEpoch,
-        hostInstanceId: h.store.hostInstanceId,
-        authorities: {
-          h0: h.store.h0ReadinessPort,
-          h1: {},
-          h2SnapshotAuthority: h.spool.hostH2Authority,
-          h3RecoveryCandidate: {},
-          nextDedupeWindowBounds() { throw new Error("unreachable"); },
-        },
-        welcome: { build() { throw new Error("unreachable"); } },
-        outbound: {
-          trySend() { return false; },
-          close() {},
-        },
-      }),
-      /invalid Relay v2 host composition authority input/,
-    );
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     applyFiveReadySources(h.composition);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -452,20 +425,11 @@ test("default-off host composition requires exact H0 and H2 activation", async (
       h.composition.routeSink.onRouteBound(binding()).code,
       "CAPABILITY_UNAVAILABLE",
     );
-    const h2 = await issueReadiness(h, "composition-default-off-h2");
-    assert.equal(await h.composition.readiness.h2.activate(h2.issue), true);
+    assert.equal(Object.isFrozen(h.composition.readiness.h2), true);
+    assert.deepEqual(Object.keys(h.composition.readiness.h2), ["close"]);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     assert.equal(await h.composition.readiness.h0.activate(), true);
     assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
-    assert.throws(
-      () => createComposition(
-        h.spool.hostH2Authority,
-        h.seeded.snapshot.hostEpoch,
-        h.store.hostInstanceId,
-        { h0: { read: () => h.store.read() } },
-      ),
-      /invalid Relay v2 H0 readiness port/,
-    );
   } finally {
     await h.cleanup();
   }
@@ -473,7 +437,10 @@ test("default-off host composition requires exact H0 and H2 activation", async (
 
 test("composition burns mismatched recovered H1 and retires already-created owners", async () => {
   let shutdownCalls = 0;
-  const h = await realCompositionHarness({ activateH0: false });
+  const h = await realCompositionHarness({
+    activateH0: false,
+    openInitialComposition: false,
+  });
   try {
     const replacementLineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
       store: h.store,
@@ -499,9 +466,9 @@ test("composition burns mismatched recovered H1 and retires already-created owne
         now: () => 1_783_700_000_000,
       });
     assert.notEqual(mismatchedCandidate, null);
-    assert.throws(
-      () => createComposition(
-        h.spool.hostH2Authority,
+    await assert.rejects(
+      openComposition(
+        h.h2RecoveryCandidate,
         h.seeded.snapshot.hostEpoch,
         h.store.hostInstanceId,
         {
@@ -532,13 +499,11 @@ test("composition burns mismatched recovered H1 and retires already-created owne
 });
 
 test("composition rejects a complete self-signing forged H0 port", async () => {
-  const h = await realCompositionHarness({ activateH0: false });
+  const h = await realCompositionHarness({
+    activateH0: false,
+    openInitialComposition: false,
+  });
   try {
-    applyFiveReadySources(h.composition);
-    const h2 = await issueReadiness(h, "composition-forged-h0-h2");
-    assert.equal(await h.composition.readiness.h2.activate(h2.issue), true);
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-
     let forgedCalls = 0;
     const forgedReceipt = Object.freeze(() => undefined);
     const forgedLease = Object.freeze(() => undefined);
@@ -580,9 +545,9 @@ test("composition rejects a complete self-signing forged H0 port", async () => {
     }
     Object.freeze(forgedPort);
 
-    assert.throws(
-      () => createComposition(
-        h.spool.hostH2Authority,
+    await assert.rejects(
+      openComposition(
+        h.h2RecoveryCandidate,
         h.seeded.snapshot.hostEpoch,
         h.store.hostInstanceId,
         { h0: forgedPort },
@@ -590,64 +555,167 @@ test("composition rejects a complete self-signing forged H0 port", async () => {
       /invalid Relay v2 H0 readiness port/,
     );
     assert.equal(forgedCalls, 0);
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
   } finally {
     await h.cleanup();
   }
 });
 
-test("cross-entry H2 authority accepts only both exact issuer bundles", async () => {
-  const h = await realCompositionHarness();
+test("recovered H2 candidate is bound to the canonical private composition receiver", async () => {
+  let foreignResult;
+  const h = await realCompositionHarness({
+    concurrentCompositionOpen: true,
+    async beforeCompositionOpen({ candidate }) {
+      assert.equal(Object.isFrozen(candidate), true);
+      assert.equal(Object.getPrototypeOf(candidate), null);
+      assert.deepEqual(Reflect.ownKeys(candidate), []);
+      assert.equal(candidate.receiver, undefined);
+      assert.equal(candidate.activate, undefined);
+      const foreignCompositionEntry = await import(new URL(
+        `../dist/relay/v2/hostRuntimeComposition.js?foreign-pair=${Date.now()}`,
+        import.meta.url,
+      ));
+      const foreignPair = foreignCompositionEntry
+        .issueRelayV2RecoveredHostH2CompositionPair();
+      foreignResult = await foreignCompositionEntry
+        .completeRelayV2HostRuntimeCompositionFromRecoveredH2(
+          foreignPair,
+          candidate,
+          {},
+        );
+    },
+  });
   try {
-    const independentH2 = new resourceState.RelayV2MaterializedStateFoundation({
-      hostId: HOST_ID,
-      discovery: new QueueDiscovery(),
-      store: h.store,
-      readinessSink: { apply: () => true },
-    });
-    const materializedForgeries = [
-      forgeOpaqueAuthority(h.foundation.snapshotAuthorityBundle),
-      forgeOpaqueAuthority(h.foundation.snapshotAuthorityBundle, {
-        issuerMode: "copied_verifier",
-      }),
-      forgeOpaqueAuthority(h.foundation.snapshotAuthorityBundle, { issuerMode: "proxy" }),
-      forgeOpaqueAuthority(h.foundation.snapshotAuthorityBundle, {
-        fields: { runtimeH2: independentH2 },
-      }),
-      new Proxy(h.foundation.snapshotAuthorityBundle, {}),
-    ];
-    for (const [index, materializedStateAuthority] of materializedForgeries.entries()) {
-      await assert.rejects(
-        snapshotSpool.RelayV2StateSnapshotSpool.open({
-          hostId: HOST_ID,
-          materializedStateAuthority,
-          root: join(h.home, `forged-materialized-${index}`),
-          ownerInstanceId: h.store.hostInstanceId,
-        }),
-        (error) => error?.code === "INVALID_ARGUMENT",
-      );
-    }
+    assert.equal(foreignResult, null);
+    assert.equal(
+      h.compositionAttempts.filter((attempt) => attempt.status === "fulfilled").length,
+      1,
+    );
+    assert.equal(
+      h.compositionAttempts.filter((attempt) => attempt.status === "rejected").length,
+      1,
+    );
+    await assert.rejects(
+      openComposition(
+        h.h2RecoveryCandidate,
+        h.seeded.snapshot.hostEpoch,
+        h.store.hostInstanceId,
+        {
+          h0: h.store.h0ReadinessPort,
+          h1RecoveryCandidate: h.h1RecoveryCandidate,
+        },
+      ),
+      /invalid Relay v2 recovered H2 candidate or composition receiver/,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
 
-    const hostForgeries = [
-      forgeOpaqueAuthority(h.spool.hostH2Authority),
-      forgeOpaqueAuthority(h.spool.hostH2Authority, { issuerMode: "copied_verifier" }),
-      forgeOpaqueAuthority(h.spool.hostH2Authority, { issuerMode: "proxy" }),
-      forgeOpaqueAuthority(h.spool.hostH2Authority, {
-        fields: { runtimeH2: independentH2 },
-      }),
-      new Proxy(h.spool.hostH2Authority, {}),
-    ];
-    for (const hostAuthority of hostForgeries) {
-      assert.throws(
-        () => createComposition(
-          hostAuthority,
-          h.seeded.snapshot.hostEpoch,
-          h.store.hostInstanceId,
-          { h0: h.store.h0ReadinessPort },
-        ),
-        /invalid Relay v2 bound H2 snapshot authority/,
-      );
-    }
+test("recovered H2 claim rejects accessors before claim and cancels once after claim", async () => {
+  let cancellations = 0;
+  let activationReleases = 0;
+  const h = await realCompositionHarness({
+    openInitialComposition: false,
+    spoolHooks: {
+      afterRecoveredHostH2CandidateCancel() { cancellations += 1; },
+      afterReadinessActivationRelease(_activation, released) {
+        if (released) activationReleases += 1;
+      },
+    },
+  });
+  try {
+    const authorities = baseAuthorities(
+      h.h2RecoveryCandidate,
+      h.seeded.snapshot.hostEpoch,
+      h.store.hostInstanceId,
+      {
+        h0: h.store.h0ReadinessPort,
+        h1RecoveryCandidate: h.h1RecoveryCandidate,
+        h3RecoveryCandidate: h.h3RecoveryCandidate,
+      },
+    );
+    const beforeClaim = {
+      hostId: HOST_ID,
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+    };
+    Object.defineProperty(beforeClaim, "authorities", {
+      enumerable: true,
+      get() { throw new Error("preclaim authority accessor"); },
+    });
+    await assert.rejects(
+      compositionModule.openRelayV2HostRuntimeComposition(beforeClaim),
+      /invalid Relay v2 recovered H2 candidate or composition receiver/,
+    );
+    assert.equal(cancellations, 0);
+    const proxyBeforeClaim = new Proxy({
+      hostId: HOST_ID,
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      authorities,
+    }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "authorities") throw new Error("preclaim descriptor trap");
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    await assert.rejects(
+      compositionModule.openRelayV2HostRuntimeComposition(proxyBeforeClaim),
+      /invalid Relay v2 recovered H2 candidate or composition receiver/,
+    );
+    assert.equal(cancellations, 0);
+
+    const afterClaim = {
+      hostId: HOST_ID,
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      authorities,
+      outbound: { trySend() { return false; }, close() {} },
+    };
+    Object.defineProperty(afterClaim, "welcome", {
+      enumerable: true,
+      get() { throw new Error("claimed welcome accessor"); },
+    });
+    await assert.rejects(
+      compositionModule.openRelayV2HostRuntimeComposition(afterClaim),
+      /claimed welcome accessor/,
+    );
+    assert.equal(cancellations, 1);
+    assert.equal(activationReleases, 1);
+    await assert.rejects(
+      compositionModule.openRelayV2HostRuntimeComposition(afterClaim),
+      /invalid Relay v2 recovered H2 candidate or composition receiver/,
+    );
+    assert.equal(cancellations, 1);
+    assert.equal(activationReleases, 1);
+    const replacement = await h.spool.issueRecoveredHostH2Candidate();
+    assert.notEqual(replacement, null);
+    assert.deepEqual(Reflect.ownKeys(replacement), []);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("recovered H2 internal receipt rejects a fence wait crossing cut expiry", async () => {
+  let now = 2_000;
+  let cancellations = 0;
+  const h = await realCompositionHarness({
+    now: () => now,
+    spoolLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
+    expectCompositionFailure: true,
+    spoolHooks: {
+      beforeReadinessReceiptCandidateFence() { now += 10; },
+      afterRecoveredHostH2CandidateCancel() { cancellations += 1; },
+    },
+  });
+  try {
+    assert.equal(h.composition, null);
+    assert.match(
+      String(h.constructionError),
+      /invalid Relay v2 recovered H2 composition receiver/,
+    );
+    assert.equal(cancellations, 1);
+    assert.equal(await h.spool.issueRecoveredHostH2Candidate(), null);
   } finally {
     await h.cleanup();
   }
@@ -700,8 +768,6 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
   });
   try {
     applyFiveReadySources(h.composition);
-    const active = await issueReadiness(h, "composition-dedupe-receiver");
-    assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
     const route = binding();
     assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
     const hello = fixture("client-hello-fresh");
@@ -774,8 +840,6 @@ test("fatal recovered H1 withdrawal fences an active route with 4406", async () 
   });
   try {
     applyFiveReadySources(h.composition);
-    const active = await issueReadiness(h, "composition-fatal-h1");
-    assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
     const route = binding();
     assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
     const hello = fixture("client-hello-fresh");
@@ -807,348 +871,15 @@ test("fatal recovered H1 withdrawal fences an active route with 4406", async () 
   }
 });
 
-test("H2 readiness accepts only the exact same-spool owner receipt and completed activation", async () => {
-  const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-  try {
-    applyFiveReadySources(h.composition);
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-    assert.equal(await h.composition.readiness.h2.activate(null), false);
-
-    let { issue } = await issueReadiness(h, "composition-exact-receipt");
-    const copiedReceipt = () => undefined;
-    Object.setPrototypeOf(copiedReceipt, Object.getPrototypeOf(issue.receipt));
-    assert.equal(await h.composition.readiness.h2.activate({
-      receipt: copiedReceipt,
-      binding: issue.binding,
-    }), false);
-    assert.equal(await h.composition.readiness.h2.activate({
-      receipt: Object.create(issue.receipt),
-      binding: issue.binding,
-    }), false);
-
-    const foreignSpool = await snapshotSpool.RelayV2StateSnapshotSpool.open({
-      hostId: HOST_ID,
-      cutSource: h.foundation.snapshotCutSource,
-      root: join(h.home, "foreign-snapshot-spool"),
-      ownerInstanceId: h.store.hostInstanceId,
-    });
-    try {
-      const foreignChunk = await foreignSpool.get(firstSnapshotRequest(
-        h.seeded.snapshot.hostEpoch,
-        "composition-foreign-spool",
-      ));
-      const foreignIssue = await foreignSpool.issueReadinessReceipt(foreignChunk.snapshotId);
-      assert.deepEqual(foreignIssue.binding, issue.binding);
-      assert.equal(await h.composition.readiness.h2.activate(foreignIssue), false);
-    } finally {
-      await foreignSpool.close();
-    }
-
-    ({ issue } = await issueReadiness(h, "composition-fresh-local-after-foreign"));
-
-    let outerAccessorRead = false;
-    const accessorIssue = { binding: issue.binding };
-    Object.defineProperty(accessorIssue, "receipt", {
-      enumerable: true,
-      get() { outerAccessorRead = true; return issue.receipt; },
-    });
-    assert.equal(await h.composition.readiness.h2.activate(accessorIssue), false);
-    assert.equal(outerAccessorRead, false);
-
-    let bindingAccessorRead = false;
-    const accessorBinding = { ...issue.binding };
-    Object.defineProperty(accessorBinding, "hostId", {
-      enumerable: true,
-      get() { bindingAccessorRead = true; return issue.binding.hostId; },
-    });
-    assert.equal(await h.composition.readiness.h2.activate({
-      receipt: issue.receipt,
-      binding: accessorBinding,
-    }), false);
-    assert.equal(bindingAccessorRead, false);
-
-    let reentrantProxyActivation = null;
-    const outerProxy = descriptorReentryProxy(issue, () => {
-      reentrantProxyActivation = h.composition.readiness.h2.activate(null);
-    });
-    assert.equal(await h.composition.readiness.h2.activate(outerProxy.proxy), false);
-    assert.equal(await reentrantProxyActivation, false);
-    assert.equal(outerProxy.fired(), true);
-
-    const bindingProxy = descriptorReentryProxy(issue.binding, () => {
-      h.composition.readiness.h2.close();
-    });
-    assert.equal(await h.composition.readiness.h2.activate({
-      receipt: issue.receipt,
-      binding: bindingProxy.proxy,
-    }), false);
-    assert.equal(bindingProxy.fired(), true);
-
-    const receiptProxy = descriptorReentryProxy(issue.receipt, () => {
-      h.composition.readiness.h2.close();
-    });
-    h.wrapped.controls.beforeVerify = (receipt) => {
-      Object.getOwnPropertyDescriptors(receipt);
-    };
-    assert.equal(await h.composition.readiness.h2.activate({
-      receipt: receiptProxy.proxy,
-      binding: issue.binding,
-    }), false);
-    assert.equal(receiptProxy.fired(), true);
-
-    for (const field of Object.keys(issue.binding)) {
-      assert.equal(await h.composition.readiness.h2.activate({
-        receipt: issue.receipt,
-        binding: { ...issue.binding, [field]: `${issue.binding[field]}-mismatch` },
-      }), false, `${field} mismatch was accepted`);
-    }
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-
-    h.spool.verifyReadinessReceipt = async () => {
-      throw new Error("mutated spool method must not replace the captured primitive");
-    };
-    assert.equal(await h.composition.readiness.h2.activate(issue), true);
-    assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
-    assert.equal(
-      Object.values(h.composition.readiness.current().capabilities).every(Boolean),
-      true,
-    );
-
-    const disposeProxy = descriptorReentryProxy(issue.receipt, () => {
-      h.composition.dispose();
-    });
-    h.wrapped.controls.beforeVerify = (receipt) => {
-      Object.getOwnPropertyDescriptors(receipt);
-    };
-    assert.equal(await h.composition.readiness.h2.activate({
-      receipt: disposeProxy.proxy,
-      binding: issue.binding,
-    }), false);
-    assert.equal(disposeProxy.fired(), true);
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-  } finally {
-    await h.cleanup();
-  }
-});
-
-test("H2 activation rolls back when its exact attempt is lost before drain or after attach", async (t) => {
-  await t.test("before drain", async () => {
-    const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-    try {
-      applyFiveReadySources(h.composition);
-      const active = await issueReadiness(h, "composition-before-drain-reentry");
-      h.discovery.push({
-        coverage: "complete",
-        scopes: [scope([
-          terminal("pane:a", "alpha"),
-          terminal("pane:b", "beta"),
-        ])],
-      });
-      await h.foundation.reconcile();
-      h.wrapped.controls.beforeActivate = () => {
-        h.composition.readiness.h2.close();
-      };
-      assert.equal(await h.composition.readiness.h2.activate(active.issue), false);
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()], []);
-      assert.equal(
-        await h.spool.verifyReadinessReceipt(active.issue.receipt, active.issue.binding),
-        false,
-      );
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  await t.test("after attach but before spool commit", async () => {
-    let composition;
-    const h = await realCompositionHarness({
-      wrapSpool: controlledSpoolAdapter,
-      spoolHooks: {
-        afterReadinessActivationAttached() {
-          composition.readiness.h2.close();
-        },
-      },
-    });
-    composition = h.composition;
-    try {
-      applyFiveReadySources(h.composition);
-      const active = await issueReadiness(h, "composition-after-attach-reentry");
-      assert.equal(await h.composition.readiness.h2.activate(active.issue), false);
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()], [1]);
-      assert.equal(
-        await h.spool.verifyReadinessReceipt(active.issue.receipt, active.issue.binding),
-        false,
-      );
-    } finally {
-      await h.cleanup();
-    }
-  });
-});
-
-test("H2 replacement rejects stale success under reentrant release callbacks", async (t) => {
-  for (const action of ["close", "dispose", "activate"]) {
-    await t.test(action, async () => {
-      const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-      let reentrantActivation = null;
-      try {
-        applyFiveReadySources(h.composition);
-        const first = await issueReadiness(h, `composition-release-${action}-first`);
-        assert.equal(await h.composition.readiness.h2.activate(first.issue), true);
-        const replacement = await issueReadiness(
-          h,
-          `composition-release-${action}-replacement`,
-        );
-        const reentrant = action === "activate"
-          ? await issueReadiness(h, "composition-release-reentrant-activation")
-          : null;
-        h.wrapped.controls.onRelease = () => {
-          assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-          if (action === "close") h.composition.readiness.h2.close();
-          if (action === "dispose") h.composition.dispose();
-          if (action === "activate") {
-            reentrantActivation = h.composition.readiness.h2.activate(reentrant.issue);
-          }
-        };
-
-        assert.equal(await h.composition.readiness.h2.activate(replacement.issue), false);
-        if (reentrantActivation !== null) assert.equal(await reentrantActivation, false);
-        assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-        assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-      } finally {
-        await h.cleanup();
-      }
-    });
-  }
-});
-
-test("release authority failures poison the whole H2 owner without retry", async (t) => {
-  await t.test("synchronous throw", async () => {
-    const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-    try {
-      applyFiveReadySources(h.composition);
-      const first = await issueReadiness(h, "composition-release-throw-first");
-      const replacement = await issueReadiness(h, "composition-release-throw-replacement");
-      assert.equal(await h.composition.readiness.h2.activate(first.issue), true);
-      h.wrapped.controls.onRelease = () => {
-        assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-        throw new Error("injected release failure");
-      };
-      assert.equal(await h.composition.readiness.h2.activate(replacement.issue), false);
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-      const afterFailure = await issueReadiness(h, "composition-release-throw-poisoned");
-      assert.equal(await h.composition.readiness.h2.activate(afterFailure.issue), false);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  await t.test("hostile thenable getter and reentry", async () => {
-    const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-    let getterReads = 0;
-    let reentrantActivation = null;
-    try {
-      applyFiveReadySources(h.composition);
-      const first = await issueReadiness(h, "composition-release-thenable-first");
-      const replacement = await issueReadiness(h, "composition-release-thenable-replacement");
-      const reentrant = await issueReadiness(h, "composition-release-thenable-reentrant");
-      assert.equal(await h.composition.readiness.h2.activate(first.issue), true);
-      const hostileThenable = {};
-      Object.defineProperty(hostileThenable, "then", {
-        get() {
-          getterReads += 1;
-          throw new Error("hostile then getter must not run");
-        },
-      });
-      h.wrapped.controls.onRelease = () => {
-        assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-        reentrantActivation = h.composition.readiness.h2.activate(reentrant.issue);
-        return hostileThenable;
-      };
-      assert.equal(await h.composition.readiness.h2.activate(replacement.issue), false);
-      assert.equal(await reentrantActivation, false);
-      assert.equal(getterReads, 0);
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-    } finally {
-      await h.cleanup();
-    }
-  });
-
-  await t.test("previous lease native Promise rejects after replacement", async () => {
-    const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-    const unhandled = [];
-    const onUnhandled = (reason) => unhandled.push(reason);
-    process.on("unhandledRejection", onUnhandled);
-    let rejectRelease;
-    try {
-      applyFiveReadySources(h.composition);
-      const first = await issueReadiness(h, "composition-release-async-first");
-      const replacement = await issueReadiness(h, "composition-release-async-replacement");
-      assert.equal(await h.composition.readiness.h2.activate(first.issue), true);
-      const releaseResult = new Promise((_resolve, reject) => {
-        rejectRelease = reject;
-      });
-      h.wrapped.controls.onRelease = () => {
-        assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-        return releaseResult;
-      };
-      assert.equal(await h.composition.readiness.h2.activate(replacement.issue), true);
-      assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
-      rejectRelease(new Error("injected late release rejection"));
-      await settle(8);
-      assert.deepEqual(unhandled, []);
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-      const afterFailure = await issueReadiness(h, "composition-release-async-poisoned");
-      assert.equal(await h.composition.readiness.h2.activate(afterFailure.issue), false);
-      assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-    } finally {
-      process.off("unhandledRejection", onUnhandled);
-      await h.cleanup();
-    }
-  });
-});
-
-test("H2 close rejects activation reentered from activation-lease release", async () => {
-  const h = await realCompositionHarness({ wrapSpool: controlledSpoolAdapter });
-  let reentrantActivation = null;
-  try {
-    applyFiveReadySources(h.composition);
-    const active = await issueReadiness(h, "composition-close-active");
-    const rejected = await issueReadiness(h, "composition-close-reentrant");
-    assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
-    h.wrapped.controls.onRelease = () => {
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      reentrantActivation = h.composition.readiness.h2.activate(rejected.issue);
-    };
-    h.composition.readiness.h2.close();
-    assert.equal(await reentrantActivation, false);
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-    assert.deepEqual([...h.wrapped.releaseCounts.values()], [1]);
-  } finally {
-    await h.cleanup();
-  }
-});
-
 test("active H2 receipt authority is withdrawn by every owning lease boundary", async (t) => {
-  await t.test("explicit composition release fences the old generation and permits a new cut", async () => {
+  await t.test("explicit composition close permanently fences the recovered generation", async () => {
     const h = await realCompositionHarness();
     try {
       applyFiveReadySources(h.composition);
-      const first = await issueReadiness(h, "composition-release-first");
-      assert.equal(await h.composition.readiness.h2.activate(first.issue), true);
+      assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
       h.composition.readiness.h2.close();
       h.composition.readiness.h2.close();
       assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-      assert.equal(await h.composition.readiness.h2.activate(first.issue), false);
-
-      const replacement = await issueReadiness(h, "composition-release-replacement");
-      assert.equal(await h.composition.readiness.h2.activate(replacement.issue), true);
-      assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
     } finally {
       await h.cleanup();
     }
@@ -1158,9 +889,10 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
     const h = await realCompositionHarness();
     try {
       applyFiveReadySources(h.composition);
-      const active = await issueReadiness(h, "composition-snapshot-release");
-      assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
-      await h.spool.release(releaseSnapshotRequest(active.chunk, active.principalId));
+      await h.spool.release(releaseSnapshotRequest(
+        h.recoveredChunk,
+        h.recoveredPrincipalId,
+      ));
       assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     } finally {
       await h.cleanup();
@@ -1175,8 +907,6 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
     });
     try {
       applyFiveReadySources(h.composition);
-      const active = await issueReadiness(h, "composition-snapshot-expiry");
-      assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
       now += 10;
       await h.spool.cleanupExpired();
       assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -1190,8 +920,6 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
     let successor;
     try {
       applyFiveReadySources(h.composition);
-      const active = await issueReadiness(h, "composition-owner-takeover");
-      assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
       successor = await snapshotSpool.RelayV2StateSnapshotSpool.open({
         hostId: HOST_ID,
         cutSource: h.foundation.snapshotCutSource,
@@ -1210,47 +938,12 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
     const h = await realCompositionHarness();
     try {
       applyFiveReadySources(h.composition);
-      const active = await issueReadiness(h, "composition-spool-close");
-      assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
       await h.spool.close();
       assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     } finally {
       await h.cleanup({ closeSpool: false });
     }
   });
-});
-
-test("replacement generation ignores old late close and dispose releases each lease once", async () => {
-  const h = await realCompositionHarness({ wrapSpool: delayedActivationCloseAdapter });
-  try {
-    applyFiveReadySources(h.composition);
-    const first = await issueReadiness(h, "composition-replacement-first");
-    const second = await issueReadiness(h, "composition-replacement-second");
-    assert.equal(await h.composition.readiness.h2.activate(first.issue), true);
-    assert.equal(await h.composition.readiness.h2.activate(second.issue), true);
-    assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
-    assert.equal(
-      [...h.wrapped.releaseCounts.values()].reduce((sum, count) => sum + count, 0),
-      1,
-    );
-
-    h.wrapped.flushLateCloses();
-    assert.equal(
-      h.composition.readiness.advertisedCapabilities().length,
-      6,
-      "the superseded activation's late close must not withdraw its replacement",
-    );
-
-    h.composition.dispose();
-    h.composition.dispose();
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-    assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-    h.wrapped.flushLateCloses();
-    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-    assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
-  } finally {
-    await h.cleanup();
-  }
 });
 
 test("composition dispose publishes one reentrant barrier and waits for H1 and H3", async () => {
@@ -1309,8 +1002,6 @@ test("composition dispose publishes one reentrant barrier and waits for H1 and H
   });
   try {
     applyFiveReadySources(h.composition);
-    const active = await issueReadiness(h, "composition-dispose-reentrant");
-    assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
     const route = binding();
     assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
     const hello = fixture("client-hello-fresh");
