@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.app
 
 import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
+import com.tmuxworktree.mobile.core.model.DeliveryState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleFailure
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleIdentity
@@ -25,6 +26,9 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionKind
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
+import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyReadState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyRow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -307,6 +311,126 @@ class RelayV2SelectedSessionTimelineProjectionTest {
             timelineState.agentEvidenceAvailability,
         )
     }
+
+    @Test
+    fun `local reply rows map states preserve source groups and survive Agent unavailable`() =
+        runBlocking {
+            val sessionStableId = "12:profile-part:17:session-part"
+            val states = listOf(
+                RelayV2OutboxStateTag.QUEUED to DeliveryState.QUEUED,
+                RelayV2OutboxStateTag.SENDING to DeliveryState.SENDING,
+                RelayV2OutboxStateTag.ACCEPTED to DeliveryState.ACCEPTED,
+                RelayV2OutboxStateTag.CONFIRMING to DeliveryState.CONFIRMING,
+                RelayV2OutboxStateTag.SUCCEEDED to DeliveryState.SUCCEEDED,
+                RelayV2OutboxStateTag.FAILED_FINAL to DeliveryState.FAILED_FINAL,
+                RelayV2OutboxStateTag.AMBIGUOUS to DeliveryState.AMBIGUOUS,
+            )
+            val replyRows = states.mapIndexed { index, (state, _) ->
+                SelectedSessionReplyRow(
+                    commandId = "command-$index",
+                    message = "local-$index",
+                    createdAtMillis = 2_000L - index,
+                    state = state,
+                )
+            } + SelectedSessionReplyRow(
+                commandId = "reissued-parent",
+                message = "must not display",
+                createdAtMillis = 3_000,
+                state = RelayV2OutboxStateTag.REISSUED,
+            )
+            val timelineState = projectRelayV2SelectedSessionTimeline(
+                sessionStableId = sessionStableId,
+                readPresentation = {
+                    projectionContent(
+                        listOf(
+                            transcript(
+                                entryId = "agent-entry",
+                                runId = "agent-run",
+                                turnId = "agent-turn",
+                                role = AgentTimelineEntryRole.AGENT,
+                                content = AgentTranscriptEntryContent.Visible("agent item"),
+                                createdAtMs = 1,
+                                agentEventSeq = "1",
+                            ),
+                        ),
+                    )
+                },
+                readReplies = {
+                    SelectedSessionReplyReadState.Content(
+                        revision = 19,
+                        rows = replyRows,
+                    )
+                },
+                stillCurrent = { true },
+            )
+
+            assertEquals(
+                AgentEvidenceAvailability.AVAILABLE,
+                timelineState.agentEvidenceAvailability,
+            )
+            assertEquals(
+                states.map { it.second } + null,
+                timelineState.events.map { it.deliveryState },
+            )
+            assertEquals(
+                states.indices.map { "local-$it" } + "agent item",
+                timelineState.events.map { it.body },
+            )
+            assertEquals(
+                List(states.size) { TimelineActor.USER } + TimelineActor.AGENT,
+                timelineState.events.map { it.actor },
+            )
+            assertTrue(timelineState.events.all { it.sessionId == sessionStableId })
+            assertTrue(timelineState.events.all { it.eventId.contains(sessionStableId) })
+            assertTrue(timelineState.events.none { it.body == "must not display" })
+
+            val unavailableTimeline = projectRelayV2SelectedSessionTimeline(
+                sessionStableId = sessionStableId,
+                readPresentation = {
+                    AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable
+                },
+                readReplies = {
+                    SelectedSessionReplyReadState.Content(revision = 19, rows = replyRows)
+                },
+                stillCurrent = { true },
+            )
+            assertEquals(
+                AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE,
+                unavailableTimeline.agentEvidenceAvailability,
+            )
+            assertEquals(
+                states.indices.map { "local-$it" },
+                unavailableTimeline.events.map { it.body },
+            )
+
+            var current = true
+            val staleTimeline = projectRelayV2SelectedSessionTimeline(
+                sessionStableId = sessionStableId,
+                readPresentation = {
+                    AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable
+                },
+                readReplies = {
+                    current = false
+                    SelectedSessionReplyReadState.Content(
+                        revision = 20,
+                        rows = listOf(
+                            SelectedSessionReplyRow(
+                                commandId = "stale-command",
+                                message = "stale local reply",
+                                createdAtMillis = 3_000,
+                                state = RelayV2OutboxStateTag.SENDING,
+                            ),
+                        ),
+                    )
+                },
+                stillCurrent = { current },
+            )
+            assertTrue(staleTimeline.events.isEmpty())
+            assertEquals(
+                AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE,
+                staleTimeline.agentEvidenceAvailability,
+            )
+        }
 }
 
 private fun projectionContent(

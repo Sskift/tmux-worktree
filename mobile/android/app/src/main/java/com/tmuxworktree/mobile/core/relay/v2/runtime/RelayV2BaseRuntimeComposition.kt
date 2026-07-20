@@ -20,6 +20,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
@@ -113,6 +114,24 @@ internal fun interface RelayV2SessionReplyCommandPort {
     ): RelayV2SessionReplyResult
 }
 
+internal data class SelectedSessionReplyRow(
+    val commandId: String,
+    val message: String,
+    val createdAtMillis: Long,
+    val state: RelayV2OutboxStateTag,
+)
+
+internal sealed interface SelectedSessionReplyReadState {
+    data class Content(
+        val revision: Long,
+        val rows: List<SelectedSessionReplyRow>,
+    ) : SelectedSessionReplyReadState
+
+    data object Unavailable : SelectedSessionReplyReadState
+
+    data object Stale : SelectedSessionReplyReadState
+}
+
 /**
  * Production base-sync owner for one already-admitted Relay v2 profile activation.
  *
@@ -159,6 +178,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val agentRecoveryJobs = LinkedHashSet<Job>()
     private val connectionLock = Any()
     private val productMutationLock = Mutex()
+    private val outboxTimelineRevisionLock = Any()
     private var reconnectEnabled = profile.autoConnect
     private var retryFence: Any = Any()
     private var connectionAttemptJob: Job? = null
@@ -228,6 +248,8 @@ internal class RelayV2BaseRuntimeComposition(
     val state: StateFlow<RelayV2BaseRuntimeState> = _state.asStateFlow()
     private val _sessions = MutableStateFlow<List<RelayV2ProductSession>>(emptyList())
     val sessions: StateFlow<List<RelayV2ProductSession>> = _sessions.asStateFlow()
+    private val _outboxTimelineRevision = MutableStateFlow(0L)
+    val outboxTimelineRevision: StateFlow<Long> = _outboxTimelineRevision.asStateFlow()
 
     init {
         val completionHandle = parentScope.coroutineContext[Job]?.invokeOnCompletion { close() }
@@ -378,6 +400,65 @@ internal class RelayV2BaseRuntimeComposition(
             }
             else -> result
         }
+    }
+
+    /**
+     * Reads the latest bounded local send_agent_message rows for one exact product Session cut.
+     *
+     * The existing activation Outbox port performs the full namespace strict restore. This
+     * composition only applies the current product-cut/revision fence and projects non-sensitive
+     * reply fields; it never reads Room or a DAO directly.
+     */
+    suspend fun readSelectedSessionReplies(
+        sessionCut: RelayV2SessionReplyCut,
+        expectedRevision: Long,
+    ): SelectedSessionReplyReadState {
+        val issuedSession = currentIssuedSession(sessionCut)
+            ?: return SelectedSessionReplyReadState.Unavailable
+        if (_outboxTimelineRevision.value != expectedRevision) {
+            return SelectedSessionReplyReadState.Stale
+        }
+        val rows = try {
+            val snapshot = activationOutbox.readSnapshot(profile)
+            check(snapshot.entries.all { entry ->
+                entry.profileId == profile.profileId &&
+                    entry.principalId == profile.principalId
+            }) { "Relay v2 selected Session Outbox escaped the activation namespace" }
+            snapshot.entries.asSequence()
+                .filter { entry ->
+                    entry.hostId == issuedSession.materialized.namespace.hostId &&
+                        entry.expectedHostEpoch == issuedSession.materialized.namespace.hostEpoch &&
+                        entry.scopeId == issuedSession.materialized.session.scopeId &&
+                        entry.sessionId == issuedSession.materialized.session.sessionId &&
+                        entry.operation == RelayV2OutboxOperation.SEND_AGENT_MESSAGE &&
+                        entry.state != RelayV2OutboxStateTag.REISSUED
+                }
+                .sortedWith(compareBy<RelayV2OutboxEntry> { it.createdOrder }
+                    .thenBy { it.commandId })
+                .toList()
+                .takeLast(MAX_SELECTED_SESSION_REPLY_ROWS)
+                .map { entry ->
+                    val arguments = entry.canonicalRequestArguments.value
+                        as? RelayV2OutboxArguments.SendAgentMessage
+                        ?: error("Relay v2 reply row does not contain send_agent_message arguments")
+                    SelectedSessionReplyRow(
+                        commandId = entry.commandId,
+                        message = arguments.message,
+                        createdAtMillis = entry.createdAtMillis,
+                        state = entry.state,
+                    )
+                }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return SelectedSessionReplyReadState.Unavailable
+        }
+        if (currentIssuedSession(sessionCut) !== issuedSession ||
+            _outboxTimelineRevision.value != expectedRevision
+        ) {
+            return SelectedSessionReplyReadState.Stale
+        }
+        return SelectedSessionReplyReadState.Content(expectedRevision, rows)
     }
 
     private fun currentIssuedSession(
@@ -641,7 +722,10 @@ internal class RelayV2BaseRuntimeComposition(
             return
         }
         when (result) {
-            is RelayV2OutboxQueryAdmissionApplyResult.Committed -> submitRecovery(result.receipt)
+            is RelayV2OutboxQueryAdmissionApplyResult.Committed -> {
+                markOutboxTimelineCommit()
+                submitRecovery(result.receipt)
+            }
             is RelayV2OutboxQueryAdmissionApplyResult.NotOwned ->
                 failRuntimeIncomplete("COMMAND_OUTBOX_QUERY_NOT_OWNED")
             is RelayV2OutboxQueryAdmissionApplyResult.Rejected,
@@ -662,6 +746,7 @@ internal class RelayV2BaseRuntimeComposition(
         }
         when (result) {
             is RelayV2OutboxRecoveryApplyResult.Committed -> {
+                markOutboxTimelineCommit()
                 val commit = result.commit
                 if (commit is RelayV2OutboxRecoveryCommit.CommandStatuses) {
                     applyRecoveredCommandStatuses(effect, commit, result.dispatchIssuance)
@@ -812,6 +897,7 @@ internal class RelayV2BaseRuntimeComposition(
                     return
                 }
                 is RelayV2OutboxFreshDispatchProduction.Issued -> {
+                    markOutboxTimelineCommit()
                     val capabilities = production.capabilities
                     if (issuedCount + capabilities.size > RelayV2OutboxLimits.MAX_ENTRIES ||
                         capabilities.any {
@@ -894,8 +980,10 @@ internal class RelayV2BaseRuntimeComposition(
             return ReplyCommit.Rejected(RelayV2SessionReplyFailure.STORE_FAILURE)
         }
         return when (enqueue) {
-            is RelayV2OutboxEnqueueResult.Committed ->
+            is RelayV2OutboxEnqueueResult.Committed -> {
+                markOutboxTimelineCommit()
                 ReplyCommit.Committed(authority, enqueue.receipt)
+            }
             is RelayV2OutboxEnqueueResult.Rejected -> ReplyCommit.Rejected(
                 when (enqueue.failure) {
                     RelayV2OutboxEnqueueFailure.DUPLICATE_COMMAND ->
@@ -973,6 +1061,13 @@ internal class RelayV2BaseRuntimeComposition(
 
     private fun clearRecoveredDispatch() {
         synchronized(recoveredDispatchLock) { recoveredDispatch = null }
+    }
+
+    /** The sole publication marker for a successfully completed durable Outbox transaction. */
+    private fun markOutboxTimelineCommit() {
+        synchronized(outboxTimelineRevisionLock) {
+            _outboxTimelineRevision.value = _outboxTimelineRevision.value + 1L
+        }
     }
 
     private fun RelayV2OutboxState.toActivationSnapshot(
@@ -1429,6 +1524,7 @@ internal class RelayV2BaseRuntimeComposition(
         const val CLOSE_BARRIER_ID = "relay-v2-base-runtime-close"
         const val MAX_RECOVERED_DISPATCH_CAPABILITIES = 4_096
         const val SELECTED_SESSION_PRESENTATION_PAGE_LIMIT = 64
+        const val MAX_SELECTED_SESSION_REPLY_ROWS = 256
         const val RETRY_BASE_DELAY_MS = 1_000L
         const val RETRY_MAX_DELAY_MS = 30_000L
         const val MAX_RETRY_EXPONENT = 5

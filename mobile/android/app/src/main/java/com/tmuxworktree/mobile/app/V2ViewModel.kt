@@ -19,6 +19,9 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyReadState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyRow
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
 import com.tmuxworktree.mobile.core.data.OutboxInFlightMessage
@@ -53,6 +56,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -147,20 +151,25 @@ class V2ViewModel(
                 }
             } ?: return@transformLatest
             val (composition, cut) = selected
-            val timelineState = projectRelayV2SelectedSessionTimeline(
-                sessionStableId = sessionId,
-                readPresentation = { composition.readSelectedSession(cut) },
-                stillCurrent = {
+            composition.outboxTimelineRevision.collectLatest { expectedRevision ->
+                val replies = composition.readSelectedSessionReplies(cut, expectedRevision)
+                if (replies == SelectedSessionReplyReadState.Stale) return@collectLatest
+                val stillCurrent = {
                     synchronized(relayV2UiFenceLock) {
                         relayV2Composition === composition &&
                             _uiState.value.relayStartupAdmission ==
                             RelayStartupAdmissionState.RELAY_V2 &&
-                            relayV2SessionReplyCuts.value[sessionId] === cut
+                            relayV2SessionReplyCuts.value[sessionId] === cut &&
+                            composition.outboxTimelineRevision.value == expectedRevision
                     }
-                },
-            )
-            if (timelineState.agentEvidenceAvailability == AgentEvidenceAvailability.AVAILABLE) {
-                emit(timelineState)
+                }
+                val timelineState = projectRelayV2SelectedSessionTimeline(
+                    sessionStableId = sessionId,
+                    readPresentation = { composition.readSelectedSession(cut) },
+                    readReplies = { replies },
+                    stillCurrent = stillCurrent,
+                )
+                if (stillCurrent()) emit(timelineState)
             }
         }
     } else {
@@ -1833,11 +1842,50 @@ internal suspend fun projectRelayV2SelectedSessionTimeline(
     sessionStableId: String,
     readPresentation: suspend () ->
         AgentTranscriptLifecycleSelectedSessionPresentationState,
+    readReplies: suspend () -> SelectedSessionReplyReadState = {
+        SelectedSessionReplyReadState.Content(revision = 0L, rows = emptyList())
+    },
     stillCurrent: () -> Boolean,
 ): SessionTimelineState {
     val presentation = readPresentation()
     if (!stillCurrent()) return relayV2AgentEvidenceUnavailableState()
-    return presentation.toTimelineState(sessionStableId)
+    val replies = readReplies()
+    if (!stillCurrent()) return relayV2AgentEvidenceUnavailableState()
+    val agentTimeline = presentation.toTimelineState(sessionStableId)
+    val replyEvents = when (replies) {
+        is SelectedSessionReplyReadState.Content -> replies.rows.mapNotNull { row ->
+            row.toTimelineEvent(sessionStableId)
+        }
+        SelectedSessionReplyReadState.Stale,
+        SelectedSessionReplyReadState.Unavailable,
+        -> emptyList()
+    }
+    return agentTimeline.copy(
+        events = replyEvents + agentTimeline.events,
+    )
+}
+
+private fun SelectedSessionReplyRow.toTimelineEvent(
+    sessionStableId: String,
+): TimelineEvent? {
+    val delivery = when (state) {
+        RelayV2OutboxStateTag.QUEUED -> DeliveryState.QUEUED
+        RelayV2OutboxStateTag.SENDING -> DeliveryState.SENDING
+        RelayV2OutboxStateTag.ACCEPTED -> DeliveryState.ACCEPTED
+        RelayV2OutboxStateTag.CONFIRMING -> DeliveryState.CONFIRMING
+        RelayV2OutboxStateTag.SUCCEEDED -> DeliveryState.SUCCEEDED
+        RelayV2OutboxStateTag.FAILED_FINAL -> DeliveryState.FAILED_FINAL
+        RelayV2OutboxStateTag.AMBIGUOUS -> DeliveryState.AMBIGUOUS
+        RelayV2OutboxStateTag.REISSUED -> return null
+    }
+    return TimelineEvent(
+        eventId = relayV2SessionReplyUiStableId(sessionStableId, commandId),
+        sessionId = sessionStableId,
+        actor = TimelineActor.USER,
+        body = message,
+        createdAtMillis = createdAtMillis,
+        deliveryState = delivery,
+    )
 }
 
 /** Injective UI identity that retains the transcript's exact Session/run/turn scope. */
@@ -1849,6 +1897,16 @@ private fun relayV2TranscriptUiStableId(vararg opaqueParts: String): String = bu
         append(':')
         append(part)
     }
+}
+
+/** Injective UI identity retaining the full local Session identity and durable commandId. */
+private fun relayV2SessionReplyUiStableId(
+    sessionStableId: String,
+    commandId: String,
+): String = buildString {
+    append("relay-v2-session-reply")
+    appendRelayV2UiStringPart(sessionStableId)
+    appendRelayV2UiStringPart(commandId)
 }
 
 private fun relayV2LifecycleUiStableId(

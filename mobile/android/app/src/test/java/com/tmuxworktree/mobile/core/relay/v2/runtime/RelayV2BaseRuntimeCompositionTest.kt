@@ -43,10 +43,16 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAcceptanceEvidence
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandDisposition
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusEvidence
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusSource
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAttemptKind
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRecovery
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
@@ -274,6 +280,83 @@ class RelayV2BaseRuntimeCompositionTest {
             foreign.close()
         }
     }
+
+    @Test
+    fun `selected Session replies isolate bounded rows omit reissued parent and fence revision`() =
+        runBlocking {
+            val readGate = BlockingOutboxReadGate(blockAtRead = 4)
+            val harness = Harness(
+                autoConnect = true,
+                newCommandId = { "revision-reply" },
+                beforeOutboxRead = readGate::intercept,
+            )
+            try {
+                harness.connectOnline()
+                val product = withTimeout(TIMEOUT_MS) {
+                    harness.composition.sessions.first { it.isNotEmpty() }.single()
+                }
+                harness.authority.replaceOutbox(selectedSessionReplyOutbox())
+
+                val bounded = harness.composition.readSelectedSessionReplies(
+                    product.replyCut,
+                    expectedRevision = 0L,
+                ) as SelectedSessionReplyReadState.Content
+
+                assertEquals(0L, bounded.revision)
+                assertEquals(256, bounded.rows.size)
+                assertEquals(
+                    (4 until 260).map { "exact-${it.toString().padStart(3, '0')}" },
+                    bounded.rows.map { it.commandId },
+                )
+                assertEquals(
+                    bounded.rows.map { it.commandId.removePrefix("exact-").toLong() },
+                    bounded.rows.map { it.createdAtMillis },
+                )
+                assertTrue(bounded.rows.all { it.state == RelayV2OutboxStateTag.QUEUED })
+                assertTrue(bounded.rows.all { it.message == "message-${it.commandId}" })
+
+                harness.authority.replaceOutbox(reissuedSelectedSessionReplyOutbox())
+                val reissued = harness.composition.readSelectedSessionReplies(
+                    product.replyCut,
+                    expectedRevision = 0L,
+                ) as SelectedSessionReplyReadState.Content
+
+                assertEquals(listOf("replacement-command"), reissued.rows.map { it.commandId })
+                assertEquals(listOf("replacement body"), reissued.rows.map { it.message })
+                assertEquals(listOf(RelayV2OutboxStateTag.QUEUED), reissued.rows.map { it.state })
+
+                harness.authority.replaceOutbox(RelayV2OutboxState.empty())
+                assertEquals(0L, harness.composition.outboxTimelineRevision.value)
+                val staleRead = async(Dispatchers.Default) {
+                    harness.composition.readSelectedSessionReplies(
+                        product.replyCut,
+                        expectedRevision = 0L,
+                    )
+                }
+                withTimeout(TIMEOUT_MS) { readGate.entered.await() }
+
+                assertTrue(
+                    harness.composition.submitReply(product.replyCut, "revision body") is
+                        RelayV2SessionReplyResult.Committed,
+                )
+                assertEquals(2L, harness.composition.outboxTimelineRevision.value)
+                readGate.release.complete(Unit)
+
+                assertEquals(
+                    SelectedSessionReplyReadState.Stale,
+                    withTimeout(TIMEOUT_MS) { staleRead.await() },
+                )
+                val current = harness.composition.readSelectedSessionReplies(
+                    product.replyCut,
+                    expectedRevision = 2L,
+                ) as SelectedSessionReplyReadState.Content
+                assertEquals(listOf("revision-reply"), current.rows.map { it.commandId })
+                assertEquals(listOf(RelayV2OutboxStateTag.SENDING), current.rows.map { it.state })
+            } finally {
+                readGate.release.complete(Unit)
+                harness.close()
+            }
+        }
 
     @Test
     fun `stale generation and disconnect barrier reject late Agent mutation`() = runBlocking {
@@ -662,6 +745,7 @@ class RelayV2BaseRuntimeCompositionTest {
             harness.authority.releaseQueryCommit.complete(Unit)
             val query = transport.awaitSentType("command.query")
             assertEquals(1, harness.authority.queryCommits.get())
+            assertEquals(1L, harness.composition.outboxTimelineRevision.value)
             assertEquals(1, transport.framesOfType("command.query").size)
             assertEquals(
                 listOf("command-b", "command-a"),
@@ -671,10 +755,15 @@ class RelayV2BaseRuntimeCompositionTest {
 
             harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
             assertEquals(1, harness.authority.statusCommits.get())
+            assertEquals(2L, harness.composition.outboxTimelineRevision.value)
             transport.sendCommandResult("command-b")
             withTimeout(TIMEOUT_MS) {
                 while (harness.authority.statusCommits.get() != 2) delay(1)
             }
+            withTimeout(TIMEOUT_MS) {
+                while (harness.composition.outboxTimelineRevision.value != 3L) delay(1)
+            }
+            assertEquals(3L, harness.composition.outboxTimelineRevision.value)
             assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
             assertTrue(transport.framesOfType("command.execute").isEmpty())
         } finally {
@@ -727,6 +816,7 @@ class RelayV2BaseRuntimeCompositionTest {
                         .map { it.stringValue("commandId") },
                 )
                 assertEquals(listOf(2), harness.authority.freshBatchSizes)
+                assertEquals(1L, harness.composition.outboxTimelineRevision.value)
                 assertTrue(
                     harness.authority.outboxState().entries.all {
                         it.state == RelayV2OutboxStateTag.SENDING
@@ -764,6 +854,7 @@ class RelayV2BaseRuntimeCompositionTest {
             val execute = harness.transport().awaitSentType("command.execute")
             assertEquals("reply-command", execute.stringValue("commandId"))
             assertEquals(1, harness.authority.enqueueCommits.get())
+            assertEquals(2L, harness.composition.outboxTimelineRevision.value)
         } finally {
             harness.close()
         }
@@ -2122,6 +2213,19 @@ class RelayV2BaseRuntimeCompositionTest {
         }
     }
 
+    private class BlockingOutboxReadGate(private val blockAtRead: Int) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+
+        suspend fun intercept(readNumber: Int) {
+            if (readNumber != blockAtRead) return
+            withContext(NonCancellable) {
+                entered.complete(Unit)
+                release.await()
+            }
+        }
+    }
+
     private class ActorConnectAdmissionHandoffGate {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -2717,6 +2821,156 @@ class RelayV2BaseRuntimeCompositionTest {
             ),
         ).state
     }
+
+    private fun selectedSessionReplyOutbox(): RelayV2OutboxState {
+        val core = RelayV2OutboxAuthorityCore()
+        var state = RelayV2OutboxState.empty()
+        repeat(260) { index ->
+            val commandId = "exact-${index.toString().padStart(3, '0')}"
+            state = enqueueSelectedSessionReply(
+                core = core,
+                state = state,
+                commandId = commandId,
+                message = "message-$commandId",
+                createdAtMillis = index.toLong(),
+            )
+        }
+        state = enqueueSelectedSessionReply(
+            core,
+            state,
+            commandId = "wrong-host",
+            message = "wrong host",
+            createdAtMillis = 300,
+            hostId = "other-host",
+        )
+        state = enqueueSelectedSessionReply(
+            core,
+            state,
+            commandId = "wrong-epoch",
+            message = "wrong epoch",
+            createdAtMillis = 301,
+            hostEpoch = "other-epoch",
+        )
+        state = enqueueSelectedSessionReply(
+            core,
+            state,
+            commandId = "wrong-scope",
+            message = "wrong scope",
+            createdAtMillis = 302,
+            scopeId = "scope-b",
+        )
+        state = enqueueSelectedSessionReply(
+            core,
+            state,
+            commandId = "wrong-session",
+            message = "wrong Session",
+            createdAtMillis = 303,
+            sessionId = "session-b",
+        )
+        return applied(
+            core.reduce(
+                state,
+                RelayV2OutboxAction.Enqueue(
+                    RelayV2OutboxDraft(
+                        profileId = PROFILE_ID,
+                        principalId = PRINCIPAL_ID,
+                        hostId = HOST_ID,
+                        expectedHostEpoch = HOST_EPOCH,
+                        dedupeWindowId = "window-other-operation",
+                        commandId = "other-operation",
+                        scopeId = "scope-a",
+                        sessionId = "session-a",
+                        arguments = RelayV2OutboxArguments.killSession(),
+                    ),
+                    createdAtMillis = 304,
+                ),
+            ),
+        ).state
+    }
+
+    private fun reissuedSelectedSessionReplyOutbox(): RelayV2OutboxState {
+        val core = RelayV2OutboxAuthorityCore()
+        var state = enqueueSelectedSessionReply(
+            core = core,
+            state = RelayV2OutboxState.empty(),
+            commandId = "parent-command",
+            message = "replacement body",
+            createdAtMillis = 1,
+        )
+        val parent = state.entries.single()
+        state = applied(
+            core.reduce(
+                state,
+                RelayV2OutboxAction.DispatchEligible(
+                    attemptRequestIds = mapOf(parent.id to "parent-attempt"),
+                    effectBudget = 1,
+                ),
+            ),
+        ).state
+        val attemptedParent = state.entries.single()
+        return applied(
+            core.reduce(
+                state,
+                RelayV2OutboxAction.ReconcileStatus(
+                    evidence = RelayV2CommandStatusEvidence(
+                        entryId = attemptedParent.id,
+                        dedupeWindowId = attemptedParent.dedupeWindowId,
+                        hostEpoch = attemptedParent.expectedHostEpoch,
+                        scopeId = attemptedParent.scopeId,
+                        sessionId = attemptedParent.sessionId,
+                        operation = attemptedParent.operation,
+                        source = RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+                        attemptKind = RelayV2OutboxAttemptKind.EXECUTE,
+                        state = RelayV2CommandStatusState.NOT_ACCEPTED,
+                        attemptRequestId = "parent-attempt",
+                        reissueRequired = true,
+                        errorCode = "COMMAND_WINDOW_EXPIRED",
+                        commandDisposition = RelayV2CommandDisposition.NOT_ACCEPTED,
+                        detailsReissueRequired = true,
+                    ),
+                    recovery = RelayV2OutboxRecovery.Reissue(
+                        replacementCommandId = "replacement-command",
+                        newDedupeWindowId = "replacement-window",
+                        replacementCreatedAtMillis = 2,
+                    ),
+                ),
+            ),
+        ).state
+    }
+
+    private fun enqueueSelectedSessionReply(
+        core: RelayV2OutboxAuthorityCore,
+        state: RelayV2OutboxState,
+        commandId: String,
+        message: String,
+        createdAtMillis: Long,
+        hostId: String = HOST_ID,
+        hostEpoch: String = HOST_EPOCH,
+        scopeId: String = "scope-a",
+        sessionId: String = "session-a",
+    ): RelayV2OutboxState = applied(
+        core.reduce(
+            state,
+            RelayV2OutboxAction.Enqueue(
+                RelayV2OutboxDraft(
+                    profileId = PROFILE_ID,
+                    principalId = PRINCIPAL_ID,
+                    hostId = hostId,
+                    expectedHostEpoch = hostEpoch,
+                    dedupeWindowId = "window-$commandId",
+                    commandId = commandId,
+                    scopeId = scopeId,
+                    sessionId = sessionId,
+                    arguments = RelayV2OutboxArguments.sendAgentMessage(
+                        pane = 0,
+                        message = message,
+                        submit = true,
+                    ),
+                ),
+                createdAtMillis = createdAtMillis,
+            ),
+        ),
+    ).state
 
     private fun outbox(
         commandIds: List<String>,
