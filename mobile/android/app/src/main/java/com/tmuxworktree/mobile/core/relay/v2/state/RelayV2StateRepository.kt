@@ -29,6 +29,13 @@ internal class RelayV2StateRepository(
         RoomRelayV2DurableStateStore(database),
     )
 
+    suspend fun readMaterializedSessionCut(
+        namespace: RelayV2StateNamespace,
+        scopeId: String,
+        sessionId: String,
+    ): RelayV2MaterializedSessionReadCut? =
+        core.readMaterializedSessionCut(namespace, scopeId, sessionId)
+
     override suspend fun loadConnectPlan(
         identity: RelayV2StateConnectIdentity,
     ): RelayV2StateConnectPlan = core.loadConnectPlan(identity)

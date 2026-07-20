@@ -1102,6 +1102,264 @@ class RelayV2StateSyncRepositoryCoreTest {
         assertNotNull(store.snapshot(namespace))
     }
 
+    @Test
+    fun `materialized session read returns one exact committed cut and ignores staging`() =
+        runBlocking {
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            val namespace = namespace()
+            val committedSession = session("session-a", "committed")
+            repository.applyHelloForTest(
+                hello(namespace, "1", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            commitCut(repository, namespace, "1", committedSession)
+
+            val committedCut = RelayV2MaterializedSessionReadCut(
+                namespace = namespace,
+                cursor = RelayV2AppliedCursor(namespace.hostEpoch, "1"),
+                scopesRevision = "1",
+                scope = scope(),
+                sessionsRevision = "1",
+                session = committedSession,
+            )
+            assertEquals(
+                committedCut,
+                repository.readMaterializedSessionCut(namespace, "scope-a", "session-a"),
+            )
+
+            repository.applyHelloForTest(
+                hello(
+                    namespace,
+                    "2",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "1"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            )
+            stageCut(repository, namespace, "2", session("session-a", "staged-newer"))
+
+            assertNotNull(store.snapshot(namespace))
+            assertEquals(
+                committedCut,
+                repository.readMaterializedSessionCut(namespace, "scope-a", "session-a"),
+            )
+        }
+
+    @Test
+    fun `materialized session read requires all seven opaque identity dimensions`() = runBlocking {
+        val store = FakeStateStore()
+        val repository = RelayV2StateSyncRepositoryCore(store)
+        val namespace = namespace()
+        val selected = session("session-a", "same-display-name")
+        repository.applyHelloForTest(
+            hello(namespace, "1", null, RelayV2StateHelloDisposition.FRESH),
+        )
+        commitCut(repository, namespace, "1", selected)
+        repository.applyStateEventUnderApplyLease(
+            event(
+                namespace,
+                seq = "2",
+                revision = "2",
+                RelayV2StateChange.SessionUpsert(
+                    session("same-name-other-id", "same-display-name"),
+                ),
+            ),
+        )
+
+        val exact = requireNotNull(
+            repository.readMaterializedSessionCut(namespace, "scope-a", "session-a"),
+        )
+        assertEquals(RelayV2AppliedCursor(namespace.hostEpoch, "2"), exact.cursor)
+        assertEquals("1", exact.scopesRevision)
+        assertEquals("2", exact.sessionsRevision)
+        assertEquals(selected, exact.session)
+
+        val mismatches = listOf(
+            "profileId" to Triple(namespace.copy(profileId = "profile-other"), "scope-a", "session-a"),
+            "principalId" to Triple(
+                namespace.copy(principalId = "principal-other"),
+                "scope-a",
+                "session-a",
+            ),
+            "clientInstanceId" to Triple(
+                namespace.copy(clientInstanceId = "client-other"),
+                "scope-a",
+                "session-a",
+            ),
+            "hostId" to Triple(namespace.copy(hostId = "host-other"), "scope-a", "session-a"),
+            "hostEpoch" to Triple(
+                namespace.copy(hostEpoch = "epoch-other"),
+                "scope-a",
+                "session-a",
+            ),
+            "scopeId" to Triple(namespace, "scope-other", "session-a"),
+            "sessionId" to Triple(namespace, "scope-a", "session-other"),
+        )
+        mismatches.forEach { (dimension, lookup) ->
+            assertNull(
+                dimension,
+                repository.readMaterializedSessionCut(lookup.first, lookup.second, lookup.third),
+            )
+        }
+    }
+
+    @Test
+    fun `materialized session read distinguishes normal absence from contradictory rows`() =
+        runBlocking {
+            val emptyStore = FakeStateStore()
+            val emptyRepository = RelayV2StateSyncRepositoryCore(emptyStore)
+            val emptyNamespace = namespace(profileId = "profile-empty")
+            assertNull(
+                emptyRepository.readMaterializedSessionCut(
+                    emptyNamespace,
+                    "scope-a",
+                    "session-a",
+                ),
+            )
+            emptyRepository.applyHelloForTest(
+                hello(emptyNamespace, "1", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            assertNull(
+                emptyRepository.readMaterializedSessionCut(
+                    emptyNamespace,
+                    "scope-a",
+                    "session-a",
+                ),
+            )
+
+            val committedStore = FakeStateStore()
+            val committedRepository = RelayV2StateSyncRepositoryCore(committedStore)
+            val committedNamespace = namespace(profileId = "profile-committed")
+            committedRepository.applyHelloForTest(
+                hello(committedNamespace, "1", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            commitCut(
+                committedRepository,
+                committedNamespace,
+                "1",
+                session("session-a", "committed"),
+            )
+            assertNull(
+                committedRepository.readMaterializedSessionCut(
+                    committedNamespace,
+                    "scope-missing",
+                    "session-a",
+                ),
+            )
+            assertNull(
+                committedRepository.readMaterializedSessionCut(
+                    committedNamespace,
+                    "scope-a",
+                    "session-missing",
+                ),
+            )
+
+            val noAuthority = FakeStateStore()
+            val noAuthorityNamespace = namespace(profileId = "profile-no-authority")
+            noAuthority.transaction {
+                putScope(storedScopeForTest(noAuthorityNamespace))
+            }
+
+            val orphanSession = FakeStateStore()
+            val orphanNamespace = namespace(profileId = "profile-orphan")
+            orphanSession.transaction {
+                putAuthority(storedAuthorityForTest(orphanNamespace))
+                putSession(storedSessionForTest(orphanNamespace, session("session-a", "orphan")))
+            }
+
+            val uncommittedRows = FakeStateStore()
+            val uncommittedNamespace = namespace(profileId = "profile-uncommitted")
+            uncommittedRows.transaction {
+                putAuthority(
+                    storedAuthorityForTest(
+                        uncommittedNamespace,
+                        cursorEventSeq = null,
+                        scopesRevision = null,
+                        phase = RelayV2StoredSyncPhase.RESYNCING,
+                    ),
+                )
+                putScope(storedScopeForTest(uncommittedNamespace))
+                putSession(
+                    storedSessionForTest(
+                        uncommittedNamespace,
+                        session("session-a", "uncommitted"),
+                    ),
+                )
+            }
+
+            val invalidRelease = FakeStateStore()
+            val invalidReleaseNamespace = namespace(profileId = "profile-invalid-release")
+            invalidRelease.transaction {
+                putAuthority(
+                    storedAuthorityForTest(
+                        invalidReleaseNamespace,
+                        phase = RelayV2StoredSyncPhase.RESYNCING,
+                    ).copy(afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT),
+                )
+            }
+
+            val invalidCursor = FakeStateStore()
+            val invalidCursorNamespace = namespace(profileId = "profile-invalid-cursor")
+            invalidCursor.transaction {
+                putAuthority(
+                    storedAuthorityForTest(
+                        invalidCursorNamespace,
+                        cursorEventSeq = "not-a-counter",
+                    ),
+                )
+            }
+
+            val invalidScopesRevision = FakeStateStore()
+            val invalidScopesNamespace = namespace(profileId = "profile-invalid-scopes")
+            invalidScopesRevision.transaction {
+                putAuthority(
+                    storedAuthorityForTest(
+                        invalidScopesNamespace,
+                        scopesRevision = "not-a-counter",
+                    ),
+                )
+            }
+
+            val invalidSessionsRevision = FakeStateStore()
+            val invalidSessionsNamespace = namespace(profileId = "profile-invalid-sessions")
+            invalidSessionsRevision.transaction {
+                putAuthority(storedAuthorityForTest(invalidSessionsNamespace))
+                putScope(
+                    storedScopeForTest(invalidSessionsNamespace).copy(
+                        sessionsRevision = "not-a-counter",
+                    ),
+                )
+            }
+
+            listOf(
+                Triple(noAuthority, noAuthorityNamespace, "scope without authority"),
+                Triple(orphanSession, orphanNamespace, "session without scope"),
+                Triple(uncommittedRows, uncommittedNamespace, "rows without committed cut"),
+                Triple(invalidRelease, invalidReleaseNamespace, "invalid release journal"),
+                Triple(invalidCursor, invalidCursorNamespace, "invalid cursor before scope miss"),
+                Triple(
+                    invalidScopesRevision,
+                    invalidScopesNamespace,
+                    "invalid scopes revision before scope miss",
+                ),
+                Triple(
+                    invalidSessionsRevision,
+                    invalidSessionsNamespace,
+                    "invalid sessions revision before session miss",
+                ),
+            ).forEach { (store, namespace, contradiction) ->
+                assertTrue(
+                    contradiction,
+                    runCatching {
+                        RelayV2StateSyncRepositoryCore(store).readMaterializedSessionCut(
+                            namespace,
+                            "scope-a",
+                            "session-a",
+                        )
+                    }.isFailure,
+                )
+            }
+        }
+
     private suspend fun commitCut(
         repository: RelayV2StateSyncRepositoryCore,
         namespace: RelayV2StateNamespace,
@@ -1265,6 +1523,45 @@ class RelayV2StateSyncRepositoryCoreTest {
         windowCount = 1,
         createdAtMs = 1,
         activityAtMs = 2,
+    )
+
+    private fun storedAuthorityForTest(
+        namespace: RelayV2StateNamespace,
+        cursorEventSeq: String? = "1",
+        scopesRevision: String? = "1",
+        phase: RelayV2StoredSyncPhase = RelayV2StoredSyncPhase.LIVE,
+    ) = RelayV2StoredAuthority(
+        namespace = namespace,
+        cursorEventSeq = cursorEventSeq,
+        requiredThroughEventSeq = "1",
+        scopesRevision = scopesRevision,
+        phase = phase,
+        cacheRecordCount = 3,
+        cacheCanonicalBytes = 3,
+    )
+
+    private fun storedScopeForTest(
+        namespace: RelayV2StateNamespace,
+        item: RelayV2ScopeResource = scope(),
+        sessionsRevision: String = "1",
+    ) = RelayV2StoredScope(
+        namespace = namespace,
+        item = item,
+        sessionsRevision = sessionsRevision,
+        scopeRecordCanonicalJson = RelayV2SnapshotRecord.Scope(item).canonicalJson(),
+        sessionsScopeRecordCanonicalJson = RelayV2SnapshotRecord.SessionsScope(
+            item.scopeId,
+            sessionsRevision,
+        ).canonicalJson(),
+    )
+
+    private fun storedSessionForTest(
+        namespace: RelayV2StateNamespace,
+        item: RelayV2SessionResource,
+    ) = RelayV2StoredSession(
+        namespace = namespace,
+        item = item,
+        recordCanonicalJson = RelayV2SnapshotRecord.Session(item.scopeId, item).canonicalJson(),
     )
 
     private fun assertOldState(store: FakeStateStore, namespace: RelayV2StateNamespace) {

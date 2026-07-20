@@ -6,6 +6,22 @@ import java.security.MessageDigest
 import java.util.Base64
 import kotlin.math.max
 
+internal data class RelayV2MaterializedSessionReadCut(
+    val namespace: RelayV2StateNamespace,
+    val cursor: RelayV2AppliedCursor,
+    val scopesRevision: String,
+    val scope: RelayV2ScopeResource,
+    val sessionsRevision: String,
+    val session: RelayV2SessionResource,
+) {
+    init {
+        require(cursor.hostEpoch == namespace.hostEpoch)
+        requireRelayV2Counter(scopesRevision)
+        requireRelayV2Counter(sessionsRevision)
+        require(scope.scopeId == session.scopeId)
+    }
+}
+
 /**
  * Android-free state-sync transaction/reducer boundary.
  *
@@ -17,6 +33,77 @@ import kotlin.math.max
 internal class RelayV2StateSyncRepositoryCore(
     private val store: RelayV2StateStore,
 ) : RelayV2StateSyncAuthority {
+    /**
+     * Reads one exact committed materialized session cut. A RESYNCING authority may still expose
+     * its last committed cut; that is durable cache history, not an attestation that the network
+     * source is current. Snapshot staging is deliberately outside this read path.
+     */
+    suspend fun readMaterializedSessionCut(
+        namespace: RelayV2StateNamespace,
+        scopeId: String,
+        sessionId: String,
+    ): RelayV2MaterializedSessionReadCut? {
+        requireRelayV2Id(scopeId)
+        requireRelayV2Id(sessionId)
+        return store.transaction {
+            val storedAuthority = authority(namespace)
+            val storedScope = scope(namespace, scopeId)
+            val storedSession = session(namespace, scopeId, sessionId)
+
+            if (storedAuthority == null) {
+                check(storedScope == null && storedSession == null) {
+                    "Relay v2 materialized session exists without authority"
+                }
+                return@transaction null
+            }
+            check(storedAuthority.namespace == namespace) {
+                "Relay v2 materialized session crossed authority namespace"
+            }
+            storedAuthority.validatedPendingRelease()
+            val cursorEventSeq = storedAuthority.cursorEventSeq
+            val scopesRevision = storedAuthority.scopesRevision
+            check((cursorEventSeq == null) == (scopesRevision == null)) {
+                "Relay v2 committed cursor and scopes revision disagree"
+            }
+            if (cursorEventSeq == null) {
+                check(storedAuthority.phase == RelayV2StoredSyncPhase.RESYNCING) {
+                    "Relay v2 LIVE authority has no committed materialized cut"
+                }
+                check(storedScope == null && storedSession == null) {
+                    "Relay v2 materialized session exists without a committed cut"
+                }
+                return@transaction null
+            }
+            val committedScopesRevision = checkNotNull(scopesRevision)
+            requireRelayV2Counter(cursorEventSeq)
+            requireRelayV2Counter(committedScopesRevision)
+            check(storedScope != null || storedSession == null) {
+                "Relay v2 materialized session is orphaned from its scope"
+            }
+            val exactScope = storedScope ?: return@transaction null
+            check(exactScope.namespace == namespace && exactScope.item.scopeId == scopeId) {
+                "Relay v2 materialized scope crossed its exact identity"
+            }
+            requireRelayV2Counter(exactScope.sessionsRevision)
+            val exactSession = storedSession ?: return@transaction null
+            check(exactSession.namespace == namespace &&
+                exactSession.item.scopeId == scopeId &&
+                exactSession.item.sessionId == sessionId &&
+                exactSession.item.scopeId == exactScope.item.scopeId
+            ) {
+                "Relay v2 materialized session crossed its exact scope identity"
+            }
+            RelayV2MaterializedSessionReadCut(
+                namespace = namespace,
+                cursor = RelayV2AppliedCursor(namespace.hostEpoch, cursorEventSeq),
+                scopesRevision = committedScopesRevision,
+                scope = exactScope.item,
+                sessionsRevision = exactScope.sessionsRevision,
+                session = exactSession.item,
+            )
+        }
+    }
+
     override suspend fun loadConnectPlan(
         identity: RelayV2StateConnectIdentity,
     ): RelayV2StateConnectPlan = store.transaction {
