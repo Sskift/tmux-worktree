@@ -74,6 +74,183 @@ class RelayV2DurableStateRepositoryCoreTest {
     }
 
     @Test
+    fun `enqueue authority commits exact drafts in creation order before returning receipts`() =
+        runBlocking {
+            val store = MemoryStore()
+            val repository = RelayV2DurableStateRepositoryCore(store)
+            val namespace = outboxNamespace()
+            val first = outboxDraft(namespace, "command-a", "session-a")
+            val second = outboxDraft(namespace, "command-b", "session-b")
+
+            val firstResult = repository.enqueueOutbox(namespace, first, createdAtMillis = 11)
+            val secondResult = repository.enqueueOutbox(namespace, second, createdAtMillis = 12)
+
+            assertEquals(
+                RelayV2OutboxEnqueueReceipt("host-a", "epoch-a", "command-a", 0),
+                (firstResult as RelayV2OutboxEnqueueResult.Committed).receipt,
+            )
+            assertEquals(
+                RelayV2OutboxEnqueueReceipt("host-a", "epoch-a", "command-b", 1),
+                (secondResult as RelayV2OutboxEnqueueResult.Committed).receipt,
+            )
+            val committed = repository.loadOutbox(namespace)
+            assertEquals(2L, committed.nextCreationOrder)
+            assertEquals(listOf(0L, 1L), committed.entries.map { it.createdOrder })
+            assertEquals(listOf("command-a", "command-b"), committed.entries.map { it.commandId })
+            assertTrue(committed.entries.all { it.state == RelayV2OutboxStateTag.QUEUED })
+            assertEquals(first.scopeId, committed.entries.first().scopeId)
+            assertEquals(first.sessionId, committed.entries.first().sessionId)
+            assertEquals(first.arguments, committed.entries.first().canonicalRequestArguments.value)
+        }
+
+    @Test
+    fun `enqueue authority rejects duplicate capacity and foreign activation without writes`() =
+        runBlocking {
+            val namespace = outboxNamespace()
+
+            val duplicateStore = MemoryStore()
+            val duplicateRepository = RelayV2DurableStateRepositoryCore(duplicateStore)
+            val duplicateDraft = outboxDraft(namespace, "command-a", "session-a")
+            duplicateRepository.enqueueOutbox(namespace, duplicateDraft, createdAtMillis = 1)
+            val duplicateWrites = duplicateStore.writeCount
+            assertEnqueueRejected(
+                RelayV2OutboxEnqueueFailure.DUPLICATE_COMMAND,
+                duplicateRepository.enqueueOutbox(namespace, duplicateDraft, createdAtMillis = 2),
+            )
+            assertEquals(duplicateWrites, duplicateStore.writeCount)
+            assertEquals(
+                listOf("command-a"),
+                duplicateRepository.loadOutbox(namespace).entries.map { it.commandId },
+            )
+
+            val capacityStore = MemoryStore()
+            val capacityRepository = RelayV2DurableStateRepositoryCore(
+                capacityStore,
+                RelayV2OutboxAuthorityCore(RelayV2OutboxCapacity(maxEntries = 1)),
+            )
+            capacityRepository.enqueueOutbox(
+                namespace,
+                outboxDraft(namespace, "command-a", "session-a"),
+                createdAtMillis = 1,
+            )
+            val capacityWrites = capacityStore.writeCount
+            assertEnqueueRejected(
+                RelayV2OutboxEnqueueFailure.CAPACITY_EXCEEDED,
+                capacityRepository.enqueueOutbox(
+                    namespace,
+                    outboxDraft(namespace, "command-b", "session-b"),
+                    createdAtMillis = 2,
+                ),
+            )
+            assertEquals(capacityWrites, capacityStore.writeCount)
+            assertEquals(
+                listOf("command-a"),
+                capacityRepository.loadOutbox(namespace).entries.map { it.commandId },
+            )
+
+            val foreignStore = MemoryStore()
+            val foreignRepository = RelayV2DurableStateRepositoryCore(foreignStore)
+            foreignRepository.enqueueOutbox(
+                namespace,
+                outboxDraft(namespace, "command-a", "session-a"),
+                createdAtMillis = 1,
+            )
+            val secondHostResult = foreignRepository.enqueueOutbox(
+                namespace,
+                outboxDraft(
+                    namespace,
+                    commandId = "command-b",
+                    sessionId = "session-b",
+                    hostId = "host-b",
+                ),
+                createdAtMillis = 2,
+            )
+            assertEquals(
+                RelayV2OutboxEnqueueReceipt("host-b", "epoch-a", "command-b", 1),
+                (secondHostResult as RelayV2OutboxEnqueueResult.Committed).receipt,
+            )
+            val foreignWrites = foreignStore.writeCount
+            assertEnqueueRejected(
+                RelayV2OutboxEnqueueFailure.FOREIGN_LINEAGE,
+                foreignRepository.enqueueOutbox(
+                    namespace,
+                    outboxDraft(
+                        namespace,
+                        commandId = "command-c",
+                        sessionId = "session-c",
+                        profileId = "profile-foreign",
+                    ),
+                    createdAtMillis = 3,
+                ),
+            )
+            assertEquals(foreignWrites, foreignStore.writeCount)
+            assertEquals(
+                listOf("host-a" to "command-a", "host-b" to "command-b"),
+                foreignRepository.loadOutbox(namespace).entries.map { it.hostId to it.commandId },
+            )
+        }
+
+    @Test
+    fun `enqueue authority returns no receipt for corrupt unknown or failed store commits`() =
+        runBlocking {
+            val namespace = outboxNamespace()
+
+            val failedStore = MemoryStore().apply { failNextCommit = true }
+            val failedRepository = RelayV2DurableStateRepositoryCore(failedStore)
+            assertEnqueueRejected(
+                RelayV2OutboxEnqueueFailure.STORE_FAILURE,
+                failedRepository.enqueueOutbox(
+                    namespace,
+                    outboxDraft(namespace, "command-a", "session-a"),
+                    createdAtMillis = 1,
+                ),
+            )
+            assertTrue(failedRepository.loadOutbox(namespace).entries.isEmpty())
+
+            val corruptStore = MemoryStore()
+            val corruptRepository = RelayV2DurableStateRepositoryCore(corruptStore)
+            corruptRepository.enqueueOutbox(
+                namespace,
+                outboxDraft(namespace, "command-a", "session-a"),
+                createdAtMillis = 1,
+            )
+            corruptStore.corruptEntry(namespace, "command-a")
+            val corruptWrites = corruptStore.writeCount
+            repeat(2) { attempt ->
+                assertEnqueueRejected(
+                    RelayV2OutboxEnqueueFailure.CORRUPT_STATE,
+                    corruptRepository.enqueueOutbox(
+                        namespace,
+                        outboxDraft(namespace, "command-corrupt-$attempt", "session-corrupt"),
+                        createdAtMillis = attempt.toLong() + 2,
+                    ),
+                )
+            }
+            assertEquals(corruptWrites, corruptStore.writeCount)
+
+            val unknownStore = MemoryStore()
+            val unknownRepository = RelayV2DurableStateRepositoryCore(unknownStore)
+            unknownRepository.enqueueOutbox(
+                namespace,
+                outboxDraft(namespace, "command-a", "session-a"),
+                createdAtMillis = 1,
+            )
+            unknownStore.rewriteMetaCodecVersion(namespace, 2)
+            val unknownWrites = unknownStore.writeCount
+            repeat(2) { attempt ->
+                assertEnqueueRejected(
+                    RelayV2OutboxEnqueueFailure.UNKNOWN_STATE,
+                    unknownRepository.enqueueOutbox(
+                        namespace,
+                        outboxDraft(namespace, "command-unknown-$attempt", "session-unknown"),
+                        createdAtMillis = attempt.toLong() + 2,
+                    ),
+                )
+            }
+            assertEquals(unknownWrites, unknownStore.writeCount)
+        }
+
+    @Test
     fun `atomic reissue commits original replacement and creation cursor together`() = runBlocking {
         val store = MemoryStore()
         val repository = RelayV2DurableStateRepositoryCore(store)
@@ -678,6 +855,7 @@ class RelayV2DurableStateRepositoryCoreTest {
             RelayV2PersistedTerminalCheckpoint
             >()
         var failNextInsertCommandId: String? = null
+        var failNextCommit = false
         var commitCount = 0
             private set
         var writeCount = 0
@@ -689,7 +867,13 @@ class RelayV2DurableStateRepositoryCoreTest {
             val terminalsBefore = LinkedHashMap(terminals)
             val writesBefore = writeCount
             return try {
-                block(this).also { commitCount += 1 }
+                val result = block(this)
+                if (failNextCommit) {
+                    failNextCommit = false
+                    error("injected commit failure")
+                }
+                commitCount += 1
+                result
             } catch (failure: Throwable) {
                 metas = metasBefore
                 entries = entriesBefore
@@ -764,6 +948,16 @@ class RelayV2DurableStateRepositoryCoreTest {
             }
             entries[key] = value.copy(
                 payload = value.payload.copy(sha256 = "0".repeat(64)),
+            )
+        }
+
+        fun rewriteMetaCodecVersion(
+            namespace: RelayV2OutboxAuthorityNamespace,
+            codecVersion: Int,
+        ) {
+            val value = requireNotNull(metas[namespace])
+            metas[namespace] = value.copy(
+                payload = value.payload.copy(codecVersion = codecVersion),
             )
         }
 
@@ -878,6 +1072,24 @@ class RelayV2DurableStateRepositoryCoreTest {
         clientInstanceId = "android-install-v2",
     )
 
+    private fun outboxDraft(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        commandId: String,
+        sessionId: String,
+        hostId: String = "host-a",
+        profileId: String = namespace.profileId,
+    ) = RelayV2OutboxDraft(
+        profileId = profileId,
+        principalId = namespace.principalId,
+        hostId = hostId,
+        expectedHostEpoch = "epoch-a",
+        dedupeWindowId = "window-a",
+        commandId = commandId,
+        scopeId = "scope-a",
+        sessionId = sessionId,
+        arguments = RelayV2OutboxArguments.sendAgentMessage(0, "continue", true),
+    )
+
     private fun terminalIdentity() = RelayV2TerminalIdentity(
         profileId = "profile-v2",
         profileActivationGeneration = 7,
@@ -918,6 +1130,14 @@ class RelayV2DurableStateRepositoryCoreTest {
             val failure = runCatching(block).exceptionOrNull()
             assertTrue(failure is RelayV2StorageException)
             assertEquals(expected, (failure as RelayV2StorageException).failure)
+        }
+
+        fun assertEnqueueRejected(
+            expected: RelayV2OutboxEnqueueFailure,
+            result: RelayV2OutboxEnqueueResult,
+        ) {
+            assertTrue(result is RelayV2OutboxEnqueueResult.Rejected)
+            assertEquals(expected, (result as RelayV2OutboxEnqueueResult.Rejected).failure)
         }
 
         fun sha256(value: ByteArray): String = MessageDigest.getInstance("SHA-256")

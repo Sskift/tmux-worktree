@@ -14,6 +14,7 @@
 - Node 的 default-off host composition 已唯一装配 host codec readiness producer：它静态绑定现有 production strict codec，generation 固定为 `"1"`，只接受 literal true，并且 base/carrier 可见生命周期均是 frozen `close()`；不存在公开 `apply`、`activate`、issuer、receipt 或内部 owner。该 producer、composition、production carrier 与 capability advertisement 仍未接 `src/relayHost.ts` 或其他 production root，carrier 固定广告空 capability，因此当前仍不具备 production Relay v2 readiness/capability。
 - Node 另有未接线的 B4 credential HTTPS ingress foundation，覆盖冻结的 enrollment redeem、client/host refresh 与 self-revoke 四端点，并复用 B1 的 method/path/header/body admission、严格 codec 与 response mapping boundary。B4 只调用 credential authority 的窄 port，未注册 production listener/router/composition/E0，不产生 ready/capability，也不创建 v1 fallback。
 - Relay v1 没有 Agent 入站时间线、Waiting/Failed/Completed 状态或通知事件。Android Session detail 当前只能可靠展示本机发出的消息及投递状态；不得用本地推断伪造远端 Agent 回复或状态。
+- Android Relay v2 Outbox 的现有 core + Room repository 另提供独立 internal durable enqueue authority：调用方必须提交已稳定的 exact activation namespace、host lineage、command/Scope/Session identity 与 arguments draft；repository 在单个事务 strict restore、执行唯一 `Enqueue` plan并提交 meta/entry 后，只返回非敏感 row correlation。该 port 未接 `V2ViewModel`、`AppContainer`、Compose 或其他 command producer，不发送、不连接、不签发 capability，也不表示 UI command runtime 已交付。
 - 构建成功不等于完成生产发布：Tauri 构建、Android unsigned Release 验证、签名、TLS、上传和渠道发布是不同步骤。
 
 当前运行关系：

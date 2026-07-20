@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.relay.v2.state
 
 import androidx.room.withTransaction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
@@ -18,14 +19,16 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheck
 /**
  * Room-backed Relay v2 state repository used by the admitted explicit-v2 base composition.
  *
- * Every generation-scoped method must be called while the caller holds the actor apply lease. The
- * method then keeps the complete reducer operation inside one Room transaction. No method consults
+ * Generation-scoped actor effect methods require the actor apply lease. The independent enqueue
+ * port instead requires its caller to provide an already-stable activation namespace and draft.
+ * Every reducer operation remains inside one Room transaction. No method consults
  * `matchesGeneration`, connects a socket, touches the v1 database, or clears credentials.
  */
 internal class RelayV2StateRepository(
     database: RelayV2StateDatabase,
 ) : RelayV2StateSyncAuthority,
-    RelayV2OutboxRuntimeAuthority {
+    RelayV2OutboxRuntimeAuthority,
+    RelayV2OutboxEnqueueAuthority {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
     private val durableCore = RelayV2DurableStateRepositoryCore(
         RoomRelayV2DurableStateStore(database),
@@ -83,6 +86,16 @@ internal class RelayV2StateRepository(
     suspend fun loadOutbox(
         namespace: RelayV2OutboxAuthorityNamespace,
     ): RelayV2OutboxState = durableCore.loadOutbox(namespace)
+
+    override suspend fun enqueueOutbox(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        draft: RelayV2OutboxDraft,
+        createdAtMillis: Long,
+    ): RelayV2OutboxEnqueueResult = durableCore.enqueueOutbox(
+        namespace,
+        draft,
+        createdAtMillis,
+    )
 
     /** Exact activation snapshot; runtime support policy remains in the composition owner. */
     suspend fun readActivationOutbox(profile: RelayV2Profile): RelayV2OutboxState =

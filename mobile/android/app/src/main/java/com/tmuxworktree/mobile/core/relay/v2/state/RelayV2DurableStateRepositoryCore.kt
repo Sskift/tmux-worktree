@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.relay.v2.state
 
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
@@ -10,6 +11,8 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxMutation
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRejection
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxTransactionPlan
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpointReducer
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
@@ -22,6 +25,7 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalRestoreInvalidity
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CancellationException
 
 internal class RelayV2TerminalRestoreRequiredException :
     IllegalStateException("Terminal checkpoint must pass the restore barrier before reduction")
@@ -125,6 +129,46 @@ internal interface RelayV2OutboxFreshDispatchAuthority {
     ): RelayV2OutboxFreshDispatchResult
 }
 
+internal data class RelayV2OutboxEnqueueReceipt(
+    val hostId: String,
+    val expectedHostEpoch: String,
+    val commandId: String,
+    val createdOrder: Long,
+)
+
+internal enum class RelayV2OutboxEnqueueFailure {
+    DUPLICATE_COMMAND,
+    CAPACITY_EXCEEDED,
+    FOREIGN_LINEAGE,
+    CORRUPT_STATE,
+    UNKNOWN_STATE,
+    STORE_FAILURE,
+}
+
+internal sealed interface RelayV2OutboxEnqueueResult {
+    data class Committed(
+        val receipt: RelayV2OutboxEnqueueReceipt,
+    ) : RelayV2OutboxEnqueueResult
+
+    data class Rejected(
+        val failure: RelayV2OutboxEnqueueFailure,
+    ) : RelayV2OutboxEnqueueResult
+}
+
+/**
+ * Narrow durable command-producer port for an already-stable activation namespace and draft.
+ *
+ * A committed receipt is only non-sensitive row correlation. This authority never exposes the
+ * durable state or arguments and never sends, connects, or mints a dispatch capability.
+ */
+internal interface RelayV2OutboxEnqueueAuthority {
+    suspend fun enqueueOutbox(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        draft: RelayV2OutboxDraft,
+        createdAtMillis: Long,
+    ): RelayV2OutboxEnqueueResult
+}
+
 /** Single production Outbox owner paired into query/recovery and fresh dispatch adapters. */
 internal interface RelayV2OutboxRuntimeAuthority :
     RelayV2OutboxRecoveryAuthority,
@@ -146,14 +190,17 @@ internal interface RelayV2TerminalRuntimeAuthority {
 /**
  * Single transaction owner for the accepted pure Outbox and terminal authorities.
  *
- * The actor apply lease is an entry precondition; this core deliberately does not inspect actor
- * generation state itself. Pure reducer effects in returned results become dispatchable only after
- * their transaction has committed. External side effects are never invoked in these transactions.
+ * The actor apply lease is an entry precondition for effect/recovery methods; enqueue instead
+ * requires its caller to supply the already-stable activation namespace and draft. This core
+ * deliberately does not inspect actor generation state itself. Pure reducer effects in returned
+ * results become dispatchable only after their transaction has committed. External side effects
+ * are never invoked in these transactions.
  */
 internal class RelayV2DurableStateRepositoryCore(
     private val store: RelayV2DurableStateStore,
     private val outboxAuthority: RelayV2OutboxAuthorityCore = RelayV2OutboxAuthorityCore(),
 ) : RelayV2OutboxRuntimeAuthority,
+    RelayV2OutboxEnqueueAuthority,
     RelayV2TerminalRuntimeAuthority {
     private val restoredTerminalKeys = ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
     private val resetAuthorizedTerminalKeys =
@@ -163,6 +210,85 @@ internal class RelayV2DurableStateRepositoryCore(
         namespace: RelayV2OutboxAuthorityNamespace,
     ): RelayV2OutboxState = store.transaction {
         decodeOutbox(namespace)
+    }
+
+    override suspend fun enqueueOutbox(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        draft: RelayV2OutboxDraft,
+        createdAtMillis: Long,
+    ): RelayV2OutboxEnqueueResult {
+        val action = RelayV2OutboxAction.Enqueue(draft, createdAtMillis)
+        val transactionResult = try {
+            store.transaction {
+                val current = decodeOutbox(namespace)
+                if (draft.profileId != namespace.profileId ||
+                    draft.principalId != namespace.principalId
+                ) {
+                    return@transaction RelayV2OutboxEnqueueTransactionResult.Rejected(
+                        RelayV2OutboxEnqueueFailure.FOREIGN_LINEAGE,
+                    )
+                }
+                when (val result = outboxAuthority.reduce(current, action)) {
+                    is RelayV2OutboxResult.Rejected ->
+                        RelayV2OutboxEnqueueTransactionResult.Rejected(
+                            result.reason.toEnqueueFailure(),
+                        )
+                    is RelayV2OutboxResult.Applied -> {
+                        when (val validation = validateEnqueueResult(
+                            current,
+                            draft,
+                            createdAtMillis,
+                            result,
+                        )) {
+                            is RelayV2OutboxEnqueueValidation.Rejected ->
+                                RelayV2OutboxEnqueueTransactionResult.Rejected(
+                                    validation.failure,
+                                )
+                            is RelayV2OutboxEnqueueValidation.Accepted -> {
+                                applyOutboxPlan(namespace, current, result)
+                                putOutboxMeta(
+                                    RelayV2PersistedOutboxMeta(
+                                        namespace,
+                                        result.state.nextCreationOrder,
+                                        RelayV2OutboxStorageCodec.encodeMeta(
+                                            namespace,
+                                            result.state.nextCreationOrder,
+                                        ),
+                                    ),
+                                )
+                                RelayV2OutboxEnqueueTransactionResult.Committed(
+                                    hostId = validation.entry.hostId,
+                                    expectedHostEpoch = validation.entry.expectedHostEpoch,
+                                    commandId = validation.entry.commandId,
+                                    createdOrder = validation.entry.createdOrder,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: RelayV2StorageException) {
+            return RelayV2OutboxEnqueueResult.Rejected(failure.toEnqueueFailure())
+        } catch (_: Exception) {
+            return RelayV2OutboxEnqueueResult.Rejected(
+                RelayV2OutboxEnqueueFailure.STORE_FAILURE,
+            )
+        }
+        return when (transactionResult) {
+            is RelayV2OutboxEnqueueTransactionResult.Rejected ->
+                RelayV2OutboxEnqueueResult.Rejected(transactionResult.failure)
+            is RelayV2OutboxEnqueueTransactionResult.Committed ->
+                RelayV2OutboxEnqueueResult.Committed(
+                    RelayV2OutboxEnqueueReceipt(
+                        hostId = transactionResult.hostId,
+                        expectedHostEpoch = transactionResult.expectedHostEpoch,
+                        commandId = transactionResult.commandId,
+                        createdOrder = transactionResult.createdOrder,
+                    ),
+                )
+        }
     }
 
     suspend fun reduceOutboxUnderApplyLease(
@@ -465,6 +591,44 @@ internal class RelayV2DurableStateRepositoryCore(
         }
     }
 
+    private fun validateEnqueueResult(
+        current: RelayV2OutboxState,
+        draft: RelayV2OutboxDraft,
+        createdAtMillis: Long,
+        result: RelayV2OutboxResult.Applied,
+    ): RelayV2OutboxEnqueueValidation {
+        val plan = result.transaction as? RelayV2OutboxTransactionPlan.MutationSet
+            ?: return unknownEnqueueState()
+        val mutation = plan.mutations.singleOrNull() as? RelayV2OutboxMutation.Insert
+            ?: return unknownEnqueueState()
+        val entry = mutation.entry
+        if (result.effects.isNotEmpty() ||
+            result.state.nextCreationOrder != current.nextCreationOrder + 1 ||
+            result.state.entries.size != current.entries.size + 1 ||
+            result.state.entry(entry.id) != entry ||
+            entry.profileId != draft.profileId ||
+            entry.principalId != draft.principalId ||
+            entry.hostId != draft.hostId ||
+            entry.expectedHostEpoch != draft.expectedHostEpoch ||
+            entry.dedupeWindowId != draft.dedupeWindowId ||
+            entry.commandId != draft.commandId ||
+            entry.scopeId != draft.scopeId ||
+            entry.sessionId != draft.sessionId ||
+            entry.operation != draft.operation ||
+            entry.canonicalRequestArguments.value != draft.arguments ||
+            entry.requestFingerprint.schemaVersion != draft.requestFingerprintSchemaVersion ||
+            entry.state != RelayV2OutboxStateTag.QUEUED ||
+            entry.createdOrder != current.nextCreationOrder ||
+            entry.createdAtMillis != createdAtMillis
+        ) {
+            return unknownEnqueueState()
+        }
+        return RelayV2OutboxEnqueueValidation.Accepted(entry)
+    }
+
+    private fun unknownEnqueueState(): RelayV2OutboxEnqueueValidation =
+        RelayV2OutboxEnqueueValidation.Rejected(RelayV2OutboxEnqueueFailure.UNKNOWN_STATE)
+
     private fun RelayV2OutboxEntry.toPersisted(
         namespace: RelayV2OutboxAuthorityNamespace,
     ): RelayV2PersistedOutboxEntry = RelayV2PersistedOutboxEntry(
@@ -486,6 +650,24 @@ internal class RelayV2DurableStateRepositoryCore(
             restoredTerminalKeys -= key
         }
     }
+
+    private fun RelayV2OutboxRejection.toEnqueueFailure(): RelayV2OutboxEnqueueFailure = when (this) {
+        RelayV2OutboxRejection.DUPLICATE_COMMAND ->
+            RelayV2OutboxEnqueueFailure.DUPLICATE_COMMAND
+        RelayV2OutboxRejection.CAPACITY_EXCEEDED ->
+            RelayV2OutboxEnqueueFailure.CAPACITY_EXCEEDED
+        else -> RelayV2OutboxEnqueueFailure.UNKNOWN_STATE
+    }
+
+    private fun RelayV2StorageException.toEnqueueFailure(): RelayV2OutboxEnqueueFailure =
+        when (failure) {
+            RelayV2StorageFailure.SCHEMA_INCOMPATIBLE ->
+                RelayV2OutboxEnqueueFailure.UNKNOWN_STATE
+            RelayV2StorageFailure.MISSING_REQUIRED_FIELD,
+            RelayV2StorageFailure.MALFORMED,
+            RelayV2StorageFailure.LIMIT_EXCEEDED,
+            -> RelayV2OutboxEnqueueFailure.CORRUPT_STATE
+        }
 
     private fun RelayV2TerminalReduction.rememberRestoreOutcome(
         key: RelayV2TerminalCheckpointKey,
@@ -570,4 +752,27 @@ internal class RelayV2DurableStateRepositoryCore(
             -> RelayV2StorageFailure.MALFORMED
         },
     )
+}
+
+private sealed interface RelayV2OutboxEnqueueTransactionResult {
+    data class Committed(
+        val hostId: String,
+        val expectedHostEpoch: String,
+        val commandId: String,
+        val createdOrder: Long,
+    ) : RelayV2OutboxEnqueueTransactionResult
+
+    data class Rejected(
+        val failure: RelayV2OutboxEnqueueFailure,
+    ) : RelayV2OutboxEnqueueTransactionResult
+}
+
+private sealed interface RelayV2OutboxEnqueueValidation {
+    data class Accepted(
+        val entry: RelayV2OutboxEntry,
+    ) : RelayV2OutboxEnqueueValidation
+
+    data class Rejected(
+        val failure: RelayV2OutboxEnqueueFailure,
+    ) : RelayV2OutboxEnqueueValidation
 }

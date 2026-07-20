@@ -465,9 +465,13 @@ Android's admitted explicit-v2 base composition also owns a limited durable
 Outbox path: attempted commands are queried, recovered Execute capabilities are
 flushed in commit order, and only then are creation-ordered fresh `QUEUED`
 batches committed to `SENDING` and sent through the actor's exact-generation
-gate. There is still no v2 Outbox UI/enqueue source, end-to-end server/host v2
-runtime, capability advertisement, enrollment, reconnect, terminal, or Agent
-delivery, so Relay v2 remains unavailable as a complete production feature.
+gate. The same Room owner now exposes an internal durable enqueue authority for
+an already-stable activation namespace and exact draft; it commits the sole
+Outbox mutation before returning non-sensitive row correlation. No UI or
+command producer is wired to that authority, and there is still no end-to-end
+server/host v2 runtime, capability advertisement, enrollment, reconnect,
+terminal, or Agent delivery, so Relay v2 remains unavailable as a complete
+production feature.
 
 ## License
 
