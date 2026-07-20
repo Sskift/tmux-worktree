@@ -10,9 +10,7 @@ import { CliError } from "./tmux";
 // ============================================
 
 function readVersion(): string {
-  return typeof packageMetadata.version === "string" && packageMetadata.version.trim()
-    ? packageMetadata.version
-    : "unknown";
+  return typeof packageMetadata.version === "string" ? packageMetadata.version : "";
 }
 
 function printHelp(): void {
@@ -141,6 +139,17 @@ async function main() {
     case "relay-host": {
       const { run } = await import("./relayHost.js");
       await run();
+      return;
+    }
+    case "__relay-v2-dashboard-management-stdio": {
+      if (process.argv.length !== 3) {
+        process.exitCode = 1;
+        return;
+      }
+      const {
+        runRelayV2DashboardManagementStdio,
+      } = await import("./relay/v2/relayV2DashboardManagementStdio.js");
+      process.exitCode = await runRelayV2DashboardManagementStdio(readVersion());
       return;
     }
     case "terminal-control": {
