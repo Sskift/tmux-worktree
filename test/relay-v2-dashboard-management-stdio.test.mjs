@@ -3,6 +3,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  createRelayV2DashboardManagementProtocolV2StdioSession,
+} from "../dist/relay/v2/relayV2DashboardManagementStdio.js";
 
 const contractRoot = new URL(
   "../contracts/dashboard-relay-v2-management/v1/",
@@ -327,4 +330,60 @@ test("valid request hitting a broken stdout channel exits ordinary non-64/non-78
   assert.notEqual(exit.status, cases.constants.supersededExitCode);
   assert.deepEqual(stderrBytes, Buffer.alloc(0));
   assert.deepEqual(decodeFrames(readyBytes), [readyValue()]);
+});
+
+test("injectable v2 session selects one protocol and awaits each response before the next request", async () => {
+  const v2Root = new URL(
+    "../contracts/dashboard-relay-v2-management/v2/",
+    import.meta.url,
+  );
+  const v2Cases = JSON.parse(readFileSync(new URL("cases.json", v2Root), "utf8"));
+  const exchanges = v2Cases.goldenExchanges.slice(0, 2);
+  const inputBytes = Buffer.from(exchanges.map((item) => item.requestFrame).join(""), "utf8");
+  const writes = [];
+  const events = [];
+  let releaseFirst;
+  const firstBarrier = new Promise((resolve) => { releaseFirst = resolve; });
+  const session = createRelayV2DashboardManagementProtocolV2StdioSession({
+    runtimeVersion: v2Cases.constants.runtimeVersion,
+    handler: {
+      async handle(request) {
+        events.push(`start:${request.operation}`);
+        if (request.operation === "status") await firstBarrier;
+        const exchange = exchanges.find((item) => item.operation === request.operation);
+        assert.ok(exchange);
+        events.push(`finish:${request.operation}`);
+        return JSON.parse(exchange.responseFrame);
+      },
+    },
+    io: {
+      input: {
+        async *[Symbol.asyncIterator]() {
+          yield inputBytes;
+        },
+      },
+      async writeFrame(frame) {
+        writes.push(frame);
+        events.push(`write:${JSON.parse(frame).protocolVersion}`);
+      },
+    },
+  });
+  const running = session.run();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["write:2", "start:status"]);
+  releaseFirst();
+  assert.equal(await running, 0);
+  assert.deepEqual(events, [
+    "write:2",
+    "start:status",
+    "finish:status",
+    "write:2",
+    "start:bootstrap_host",
+    "finish:bootstrap_host",
+    "write:2",
+  ]);
+  assert.deepEqual(writes, [
+    v2Cases.startupReadyFrame,
+    ...exchanges.map((item) => item.responseFrame),
+  ]);
 });
