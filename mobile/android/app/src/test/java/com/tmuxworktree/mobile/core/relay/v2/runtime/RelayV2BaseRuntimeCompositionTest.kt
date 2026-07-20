@@ -22,10 +22,22 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueFailure
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxFreshDispatchResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ResyncReason
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeKind
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeReachability
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionKind
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotChunk
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseCompletion
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseObligation
@@ -224,6 +236,162 @@ class RelayV2BaseRuntimeCompositionTest {
                 harness.close()
             }
         }
+
+    @Test
+    fun `online Session reply commits fixed command once before fresh dispatch`() = runBlocking {
+        val harness = Harness(autoConnect = true, newCommandId = { "reply-command" })
+        try {
+            harness.connectOnline()
+            val product = withTimeout(TIMEOUT_MS) {
+                harness.composition.sessions.first { it.size == 1 }.single()
+            }
+
+            val result = harness.composition.submitReply(product.replyCut, "hello\r\nagent")
+
+            assertTrue(result is RelayV2SessionReplyResult.Committed)
+            val entry = harness.authority.outboxState().entries.single()
+            assertEquals("reply-command", entry.commandId)
+            assertEquals("scope-a", entry.scopeId)
+            assertEquals("session-a", entry.sessionId)
+            assertEquals(HOST_EPOCH, entry.expectedHostEpoch)
+            assertEquals("dedupe-window-uuid", entry.dedupeWindowId)
+            assertEquals(RelayV2OutboxStateTag.SENDING, entry.state)
+            val arguments = entry.canonicalRequestArguments.value
+                as RelayV2OutboxArguments.SendAgentMessage
+            assertEquals(0, arguments.pane)
+            assertTrue(arguments.submit)
+            assertEquals("hello\nagent", arguments.message)
+            val execute = harness.transport().awaitSentType("command.execute")
+            assertEquals("reply-command", execute.stringValue("commandId"))
+            assertEquals(1, harness.authority.enqueueCommits.get())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `disconnect withdraws reply admission and waits an entered enqueue transaction`() =
+        runBlocking {
+            val harness = Harness(autoConnect = true, newCommandId = { "reply-race" })
+            try {
+                harness.connectOnline()
+                val product = withTimeout(TIMEOUT_MS) {
+                    harness.composition.sessions.first { it.size == 1 }.single()
+                }
+                harness.authority.blockReplyEnqueue = true
+                val reply = async {
+                    harness.composition.submitReply(product.replyCut, "held reply")
+                }
+                withTimeout(TIMEOUT_MS) { harness.authority.enqueueEntered.await() }
+
+                val disconnect = async {
+                    harness.composition.disconnectAndDrain(
+                        harness.profile.identity,
+                        "reply-profile-switch",
+                    )
+                }
+                assertEquals(null, withTimeoutOrNull(200) { disconnect.await() })
+
+                harness.authority.releaseEnqueue.complete(Unit)
+                assertTrue(
+                    withTimeout(TIMEOUT_MS) { reply.await() } is
+                        RelayV2SessionReplyResult.Committed,
+                )
+                assertEquals(
+                    "reply-profile-switch",
+                    withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+                )
+                assertEquals(
+                    RelayV2OutboxStateTag.QUEUED,
+                    harness.authority.outboxState().entries.single().state,
+                )
+                assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+                assertTrue(harness.composition.sessions.value.isEmpty())
+            } finally {
+                harness.authority.releaseEnqueue.complete(Unit)
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `disconnect barrier prevents a late Session projection from reviving`() = runBlocking {
+        val projectionGate = BeforeHelloAdmissionGate()
+        val harness = Harness(
+            autoConnect = true,
+            beforeSessionProjectionPublish = projectionGate::awaitRelease,
+        )
+        try {
+            harness.connectOnline()
+            withTimeout(TIMEOUT_MS) { projectionGate.entered.await() }
+
+            val disconnect = async {
+                harness.composition.disconnectAndDrain(
+                    harness.profile.identity,
+                    "projection-disconnect",
+                )
+            }
+            assertEquals(null, withTimeoutOrNull(200) { disconnect.await() })
+
+            projectionGate.release.complete(Unit)
+            assertEquals(
+                "projection-disconnect",
+                withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+            )
+            assertTrue(harness.composition.sessions.value.isEmpty())
+        } finally {
+            projectionGate.release.complete(Unit)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `resync snapshot mutation waits for an entered reply enqueue commit`() = runBlocking {
+        val resyncGate = BeforeHelloAdmissionGate()
+        val harness = Harness(
+            autoConnect = true,
+            newCommandId = { "reply-before-resync" },
+            beforeOnlineResyncReceiptSubmit = resyncGate::awaitRelease,
+        )
+        try {
+            harness.connectOnline()
+            val product = withTimeout(TIMEOUT_MS) {
+                harness.composition.sessions.first { it.size == 1 }.single()
+            }
+            harness.authority.forceNextEventGap = true
+            harness.transport().sendFixture("sessions-changed-upsert")
+            withTimeout(TIMEOUT_MS) { resyncGate.entered.await() }
+
+            harness.authority.blockReplyEnqueue = true
+            val reply = async {
+                harness.composition.submitReply(product.replyCut, "commit before snapshot")
+            }
+            withTimeout(TIMEOUT_MS) { harness.authority.enqueueEntered.await() }
+
+            resyncGate.release.complete(Unit)
+            val snapshot = harness.transport().awaitSentType("state.snapshot.get")
+            val chunk = fixture("state-snapshot-chunk")
+            chunk["requestId"] = snapshot.stringValue("requestId")
+            chunk.payload()["snapshotRequestId"] =
+                snapshot.payload().stringValue("snapshotRequestId")
+            harness.transport().sendFrame(chunk)
+            assertEquals(
+                null,
+                withTimeoutOrNull(200) { harness.authority.snapshotApplyEntered.await() },
+            )
+
+            harness.authority.releaseEnqueue.complete(Unit)
+            assertTrue(
+                withTimeout(TIMEOUT_MS) { reply.await() } is RelayV2SessionReplyResult.Committed,
+            )
+            withTimeout(TIMEOUT_MS) { harness.authority.snapshotApplyEntered.await() }
+            assertEquals(1, harness.authority.enqueueCommits.get())
+            assertEquals(1, harness.authority.snapshotCommits.get())
+        } finally {
+            resyncGate.release.complete(Unit)
+            harness.authority.releaseEnqueue.complete(Unit)
+            harness.close()
+        }
+    }
 
     @Test
     fun `thirty three fresh commands use bounded durable batches`() = runBlocking {
@@ -864,8 +1032,11 @@ class RelayV2BaseRuntimeCompositionTest {
         autoConnect: Boolean,
         outbox: RelayV2OutboxState = RelayV2OutboxState.empty(),
         outboxReadFailure: Throwable? = null,
+        newCommandId: () -> String = { "reply-${System.nanoTime()}" },
         retryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
         beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
+        beforeSessionProjectionPublish: suspend () -> Unit = {},
+        beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
         afterRetryableFailureAdmissionDetached: () -> Unit = {},
         beforeOutboxRead: suspend (Int) -> Unit = {},
         transportOpenFailure: Throwable? = null,
@@ -914,11 +1085,17 @@ class RelayV2BaseRuntimeCompositionTest {
                 profile = profile,
                 credentialStore = credentials,
                 stateSyncAuthority = authority,
+                materializedSessions = authority,
                 activationOutbox = RelayV2ActivationOutboxReadPort(authority::readOutbox),
                 outboxAuthority = authority,
+                outboxEnqueueAuthority = authority,
                 transportFactory = factory,
+                newCommandId = newCommandId,
+                clock = { NOW_MS },
                 retryDelay = retryDelayBlock,
                 beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
+                beforeSessionProjectionPublish = beforeSessionProjectionPublish,
+                beforeOnlineResyncReceiptSubmit = beforeOnlineResyncReceiptSubmit,
                 afterRetryableFailureAdmissionDetached =
                     afterRetryableFailureAdmissionDetached,
                 afterActorConnectAdmissionHandoff = afterActorConnectAdmissionHandoff,
@@ -1035,7 +1212,9 @@ class RelayV2BaseRuntimeCompositionTest {
         private val outboxReadFailure: Throwable?,
         private val beforeOutboxRead: suspend (Int) -> Unit,
     ) : RelayV2StateSyncAuthority,
-        RelayV2OutboxRuntimeAuthority {
+        RelayV2OutboxRuntimeAuthority,
+        RelayV2OutboxEnqueueAuthority,
+        RelayV2MaterializedSessionReadAuthority {
         private val outboxCore = RelayV2OutboxAuthorityCore()
 
         @Volatile
@@ -1046,6 +1225,7 @@ class RelayV2BaseRuntimeCompositionTest {
         val outboxReads = AtomicInteger()
         val queryCommits = AtomicInteger()
         val statusCommits = AtomicInteger()
+        val enqueueCommits = AtomicInteger()
         val freshBatchSizes = CopyOnWriteArrayList<Int>()
         val stateEventApplyEntered = CompletableDeferred<Unit>()
         val releaseStateEventApply = CompletableDeferred<Unit>()
@@ -1055,6 +1235,10 @@ class RelayV2BaseRuntimeCompositionTest {
         val releaseAfterStatusCommit = CompletableDeferred<Unit>()
         val freshCommitCompleted = CompletableDeferred<Unit>()
         val releaseAfterFreshCommit = CompletableDeferred<Unit>()
+        val enqueueEntered = CompletableDeferred<Unit>()
+        val releaseEnqueue = CompletableDeferred<Unit>()
+        val snapshotApplyEntered = CompletableDeferred<Unit>()
+        val snapshotCommits = AtomicInteger()
 
         @Volatile
         var blockStateEvents: Boolean = false
@@ -1071,6 +1255,9 @@ class RelayV2BaseRuntimeCompositionTest {
         @Volatile
         var forceNextEventGap: Boolean = false
 
+        @Volatile
+        var blockReplyEnqueue: Boolean = false
+
         suspend fun readOutbox(profile: RelayV2Profile): RelayV2OutboxState {
             val readNumber = outboxReads.incrementAndGet()
             beforeOutboxRead(readNumber)
@@ -1084,6 +1271,100 @@ class RelayV2BaseRuntimeCompositionTest {
 
         fun replaceOutbox(replacement: RelayV2OutboxState) {
             outbox = replacement
+        }
+
+        override suspend fun readMaterializedSessionCuts(
+            namespace: RelayV2StateNamespace,
+        ): List<RelayV2MaterializedSessionReadCut> = listOf(materializedSession(namespace))
+
+        override suspend fun readMaterializedSessionCut(
+            namespace: RelayV2StateNamespace,
+            scopeId: String,
+            sessionId: String,
+        ): RelayV2MaterializedSessionReadCut? = materializedSession(namespace).takeIf {
+            it.session.scopeId == scopeId && it.session.sessionId == sessionId
+        }
+
+        override suspend fun enqueueOutbox(
+            namespace: RelayV2OutboxAuthorityNamespace,
+            draft: RelayV2OutboxDraft,
+            createdAtMillis: Long,
+        ): RelayV2OutboxEnqueueResult {
+            check(namespace.profileId == PROFILE_ID)
+            check(namespace.profileActivationGeneration == 1L)
+            check(namespace.principalId == PRINCIPAL_ID)
+            check(namespace.clientInstanceId == CLIENT_INSTANCE_ID)
+            if (blockReplyEnqueue) {
+                withContext(NonCancellable) {
+                    enqueueEntered.complete(Unit)
+                    releaseEnqueue.await()
+                }
+            }
+            return when (val reduced = outboxCore.reduce(
+                outbox,
+                RelayV2OutboxAction.Enqueue(draft, createdAtMillis),
+            )) {
+                is RelayV2OutboxResult.Rejected -> RelayV2OutboxEnqueueResult.Rejected(
+                    when (reduced.reason) {
+                        com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRejection.DUPLICATE_COMMAND ->
+                            RelayV2OutboxEnqueueFailure.DUPLICATE_COMMAND
+                        com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRejection.CAPACITY_EXCEEDED ->
+                            RelayV2OutboxEnqueueFailure.CAPACITY_EXCEEDED
+                        else -> RelayV2OutboxEnqueueFailure.CORRUPT_STATE
+                    },
+                )
+                is RelayV2OutboxResult.Applied -> {
+                    outbox = reduced.state
+                    val entry = reduced.state.entries.single { it.commandId == draft.commandId }
+                    enqueueCommits.incrementAndGet()
+                    RelayV2OutboxEnqueueResult.Committed(
+                        RelayV2OutboxEnqueueReceipt(
+                            hostId = entry.hostId,
+                            expectedHostEpoch = entry.expectedHostEpoch,
+                            commandId = entry.commandId,
+                            createdOrder = entry.createdOrder,
+                        ),
+                    )
+                }
+            }
+        }
+
+        private fun materializedSession(
+            namespace: RelayV2StateNamespace,
+        ): RelayV2MaterializedSessionReadCut {
+            check(namespace == RelayV2StateNamespace(
+                profileId = PROFILE_ID,
+                principalId = PRINCIPAL_ID,
+                clientInstanceId = CLIENT_INSTANCE_ID,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+            ))
+            val scope = RelayV2ScopeResource(
+                scopeId = "scope-a",
+                displayName = "Local",
+                kind = RelayV2ScopeKind.LOCAL,
+                reachability = RelayV2ScopeReachability.ONLINE,
+            )
+            return RelayV2MaterializedSessionReadCut(
+                namespace = namespace,
+                cursor = RelayV2AppliedCursor(HOST_EPOCH, "91"),
+                scopesRevision = "13",
+                scope = scope,
+                sessionsRevision = "13",
+                session = RelayV2SessionResource(
+                    scopeId = scope.scopeId,
+                    sessionId = "session-a",
+                    kind = RelayV2SessionKind.WORKTREE,
+                    displayName = "Session A",
+                    project = "project-a",
+                    label = null,
+                    cwd = "/work/project-a",
+                    attached = false,
+                    windowCount = 1,
+                    createdAtMs = 1,
+                    activityAtMs = 2,
+                ),
+            )
         }
 
         override suspend fun reduceOutboxBatchUnderApplyLease(
@@ -1203,7 +1484,17 @@ class RelayV2BaseRuntimeCompositionTest {
 
         override suspend fun stageSnapshotChunkUnderApplyLease(
             chunk: RelayV2SnapshotChunk,
-        ): RelayV2StateSyncResult = error("snapshot is outside matched base-sync test")
+        ): RelayV2StateSyncResult {
+            snapshotApplyEntered.complete(Unit)
+            snapshotCommits.incrementAndGet()
+            return RelayV2StateSyncResult.SnapshotStaged(
+                namespace = chunk.namespace,
+                snapshotId = chunk.snapshotId,
+                nextChunkIndex = chunk.chunkIndex + 1,
+                nextCursor = "next-snapshot-cursor",
+                complete = false,
+            )
+        }
 
         override suspend fun commitSnapshotUnderApplyLease(
             namespace: RelayV2StateNamespace,

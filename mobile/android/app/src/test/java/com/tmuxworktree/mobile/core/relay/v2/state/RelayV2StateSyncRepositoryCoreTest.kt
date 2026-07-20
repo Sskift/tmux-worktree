@@ -1145,6 +1145,50 @@ class RelayV2StateSyncRepositoryCoreTest {
         }
 
     @Test
+    fun `materialized Session projection returns only the exact committed namespace cut`() =
+        runBlocking {
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            val selectedNamespace = namespace()
+            val foreignNamespace = namespace(profileId = "profile-foreign")
+            repository.applyHelloForTest(
+                hello(selectedNamespace, "1", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            commitCut(repository, selectedNamespace, "1", session("session-a", "committed"))
+            repository.applyHelloForTest(
+                hello(foreignNamespace, "1", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            commitCut(
+                repository,
+                foreignNamespace,
+                "1",
+                session("session-foreign", "foreign"),
+                snapshotSuffix = "foreign",
+            )
+            repository.applyHelloForTest(
+                hello(
+                    selectedNamespace,
+                    "2",
+                    RelayV2AppliedCursor(selectedNamespace.hostEpoch, "1"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            )
+            stageCut(
+                repository,
+                selectedNamespace,
+                "2",
+                session("session-a", "staged-newer"),
+            )
+
+            val projection = repository.readMaterializedSessionCuts(selectedNamespace)
+
+            assertEquals(1, projection.size)
+            assertEquals(selectedNamespace, projection.single().namespace)
+            assertEquals("session-a", projection.single().session.sessionId)
+            assertEquals("committed", projection.single().session.displayName)
+        }
+
+    @Test
     fun `materialized session read requires all seven opaque identity dimensions`() = runBlocking {
         val store = FakeStateStore()
         val repository = RelayV2StateSyncRepositoryCore(store)
@@ -1688,6 +1732,11 @@ private class FakeTransaction(
 
     override fun scope(namespace: RelayV2StateNamespace, scopeId: String) = state.scopes[namespace to scopeId]
 
+    override fun scopes(namespace: RelayV2StateNamespace) = state.scopes
+        .filterKeys { it.first == namespace }
+        .values
+        .sortedBy { it.item.scopeId }
+
     override fun putScope(scope: RelayV2StoredScope) {
         state.scopes[scope.namespace to scope.item.scopeId] = scope
     }
@@ -1702,6 +1751,11 @@ private class FakeTransaction(
 
     override fun session(namespace: RelayV2StateNamespace, scopeId: String, sessionId: String) =
         state.sessions[SessionKey(namespace, scopeId, sessionId)]
+
+    override fun sessions(namespace: RelayV2StateNamespace) = state.sessions
+        .filterKeys { it.namespace == namespace }
+        .values
+        .sortedWith(compareBy({ it.item.scopeId }, { it.item.sessionId }))
 
     override fun putSession(session: RelayV2StoredSession) {
         beforeSessionWrite()

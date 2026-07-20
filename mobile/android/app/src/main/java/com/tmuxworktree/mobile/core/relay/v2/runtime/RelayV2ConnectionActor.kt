@@ -116,6 +116,7 @@ internal class RelayV2ConnectionActor(
     private val afterAgentExtensionRedriveEnqueuedBeforeSwap: () -> Unit = {},
 ) : RelayProfileDisconnectBarrier,
     RelayV2RepositoryEffectApplyLeasePort,
+    RelayV2CurrentOnlineCommandAuthorityPort,
     RelayV2CurrentRepositoryReadAuthorityPort,
     RelayV2OutboxExactGenerationSendPort,
     AgentTranscriptLifecycleExtensionRequestSender,
@@ -225,6 +226,87 @@ internal class RelayV2ConnectionActor(
         } finally {
             lease.close()
         }
+    }
+
+    override fun currentOnlineCommandCut(): RelayV2CurrentOnlineCommandCutResult =
+        synchronized(lifecycleLock) {
+            val ready = currentOnlineCommandReadyLocked()
+                ?: return@synchronized RelayV2CurrentOnlineCommandCutResult.Unavailable
+            RelayV2CurrentOnlineCommandCutResult.Available(
+                ActorCurrentOnlineCommandCut(
+                    originActor = this,
+                    originReady = ready.first,
+                    context = ready.second,
+                ),
+            )
+        }
+
+    override suspend fun <T> withCurrentOnlineCommandLease(
+        cut: RelayV2CurrentOnlineCommandCut,
+        block: suspend (RelayV2CurrentOnlineCommandContext) -> T,
+    ): RelayV2CurrentOnlineCommandLeaseResult<T> {
+        val actorCut = cut as? ActorCurrentOnlineCommandCut
+            ?: return RelayV2CurrentOnlineCommandLeaseResult.Stale
+        val leased = synchronized(lifecycleLock) {
+            if (actorCut.originActor !== this) return@synchronized null
+            val ready = currentOnlineCommandReadyLocked() ?: return@synchronized null
+            if (ready.first !== actorCut.originReady || ready.second != actorCut.context) {
+                return@synchronized null
+            }
+            val applyLease = effectApplyGate.begin(
+                actorCut.context.authority.generation,
+                actorCut.context.authority,
+            ) ?: return@synchronized null
+            applyLease to actorCut.context
+        } ?: return RelayV2CurrentOnlineCommandLeaseResult.Stale
+        return try {
+            RelayV2CurrentOnlineCommandLeaseResult.Current(block(leased.second))
+        } finally {
+            leased.first.close()
+        }
+    }
+
+    override fun runIfCurrent(
+        cut: RelayV2CurrentOnlineCommandCut,
+        block: () -> Unit,
+    ): Boolean {
+        val actorCut = cut as? ActorCurrentOnlineCommandCut ?: return false
+        return synchronized(lifecycleLock) {
+            if (actorCut.originActor !== this) return@synchronized false
+            val ready = currentOnlineCommandReadyLocked() ?: return@synchronized false
+            if (ready.first !== actorCut.originReady || ready.second != actorCut.context) {
+                return@synchronized false
+            }
+            block()
+            true
+        }
+    }
+
+    private fun currentOnlineCommandReadyLocked():
+        Pair<OutboxExecuteReadyCut, RelayV2CurrentOnlineCommandContext>? {
+        if (lifecycleState != LifecycleState.OPEN ||
+            _state.value.phase != RelayV2ConnectionPhase.ONLINE
+        ) return null
+        val ready = outboxExecuteReadyCut ?: return null
+        val committed = committedCallbackOwner ?: return null
+        val context = onlineContext ?: return null
+        val profile = activeProfile ?: return null
+        if (ready.owner != committed.key ||
+            ready.source !== committed.source ||
+            activeTransport !== committed.source ||
+            ready.authority.generation != committed.effectGeneration ||
+            publishedEffectGeneration.get() != ready.authority.generation ||
+            !isCurrentCallbackLocked(committed.key, committed.source) ||
+            profile.identity != context.profile ||
+            profile.principalId != context.principalId ||
+            profile.clientInstanceId != context.clientInstanceId ||
+            profile.hostId != context.hostId ||
+            context.repositoryEffectAuthority(ready.authority.generation) != ready.authority
+        ) return null
+        return ready to RelayV2CurrentOnlineCommandContext(
+            authority = ready.authority,
+            dedupeWindow = context.commandDedupeWindow,
+        )
     }
 
     /**
@@ -5024,6 +5106,12 @@ internal class RelayV2ConnectionActor(
         val owner: CallbackOwnerKey,
         val source: RelayV2Transport,
     )
+
+    private class ActorCurrentOnlineCommandCut(
+        val originActor: RelayV2ConnectionActor,
+        val originReady: OutboxExecuteReadyCut,
+        val context: RelayV2CurrentOnlineCommandContext,
+    ) : RelayV2CurrentOnlineCommandCut
 
     private class ActorCurrentRepositoryReadCut(
         val originActor: RelayV2ConnectionActor,

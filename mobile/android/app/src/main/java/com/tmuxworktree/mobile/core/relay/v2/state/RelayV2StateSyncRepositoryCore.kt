@@ -22,6 +22,19 @@ internal data class RelayV2MaterializedSessionReadCut(
     }
 }
 
+/** Exact committed Session projection consumed only behind an actor-issued current lease. */
+internal interface RelayV2MaterializedSessionReadAuthority {
+    suspend fun readMaterializedSessionCuts(
+        namespace: RelayV2StateNamespace,
+    ): List<RelayV2MaterializedSessionReadCut>
+
+    suspend fun readMaterializedSessionCut(
+        namespace: RelayV2StateNamespace,
+        scopeId: String,
+        sessionId: String,
+    ): RelayV2MaterializedSessionReadCut?
+}
+
 /**
  * Android-free state-sync transaction/reducer boundary.
  *
@@ -32,13 +45,76 @@ internal data class RelayV2MaterializedSessionReadCut(
  */
 internal class RelayV2StateSyncRepositoryCore(
     private val store: RelayV2StateStore,
-) : RelayV2StateSyncAuthority {
+) : RelayV2StateSyncAuthority,
+    RelayV2MaterializedSessionReadAuthority {
+    /** Reads the complete committed Session projection for one exact durable namespace. */
+    override suspend fun readMaterializedSessionCuts(
+        namespace: RelayV2StateNamespace,
+    ): List<RelayV2MaterializedSessionReadCut> = store.transaction {
+        val storedAuthority = authority(namespace)
+        val storedScopes = scopes(namespace)
+        val storedSessions = sessions(namespace)
+        if (storedAuthority == null) {
+            check(storedScopes.isEmpty() && storedSessions.isEmpty()) {
+                "Relay v2 materialized projection exists without authority"
+            }
+            return@transaction emptyList()
+        }
+        check(storedAuthority.namespace == namespace) {
+            "Relay v2 materialized projection crossed authority namespace"
+        }
+        storedAuthority.validatedPendingRelease()
+        val cursorEventSeq = storedAuthority.cursorEventSeq
+        val scopesRevision = storedAuthority.scopesRevision
+        check((cursorEventSeq == null) == (scopesRevision == null)) {
+            "Relay v2 committed cursor and scopes revision disagree"
+        }
+        if (cursorEventSeq == null) {
+            check(storedAuthority.phase == RelayV2StoredSyncPhase.RESYNCING) {
+                "Relay v2 LIVE authority has no committed materialized cut"
+            }
+            check(storedScopes.isEmpty() && storedSessions.isEmpty()) {
+                "Relay v2 materialized projection exists without a committed cut"
+            }
+            return@transaction emptyList()
+        }
+        val committedScopesRevision = checkNotNull(scopesRevision)
+        requireRelayV2Counter(cursorEventSeq)
+        requireRelayV2Counter(committedScopesRevision)
+        val scopesById = storedScopes.associateBy { storedScope ->
+            check(storedScope.namespace == namespace) {
+                "Relay v2 materialized scope crossed its exact namespace"
+            }
+            requireRelayV2Counter(storedScope.sessionsRevision)
+            storedScope.item.scopeId
+        }
+        check(scopesById.size == storedScopes.size) {
+            "Relay v2 materialized projection contains duplicate scopes"
+        }
+        storedSessions.map { storedSession ->
+            check(storedSession.namespace == namespace) {
+                "Relay v2 materialized session crossed its exact namespace"
+            }
+            val exactScope = checkNotNull(scopesById[storedSession.item.scopeId]) {
+                "Relay v2 materialized session is orphaned from its scope"
+            }
+            RelayV2MaterializedSessionReadCut(
+                namespace = namespace,
+                cursor = RelayV2AppliedCursor(namespace.hostEpoch, cursorEventSeq),
+                scopesRevision = committedScopesRevision,
+                scope = exactScope.item,
+                sessionsRevision = exactScope.sessionsRevision,
+                session = storedSession.item,
+            )
+        }.sortedWith(compareBy({ it.session.scopeId }, { it.session.sessionId }))
+    }
+
     /**
      * Reads one exact committed materialized session cut. A RESYNCING authority may still expose
      * its last committed cut; that is durable cache history, not an attestation that the network
      * source is current. Snapshot staging is deliberately outside this read path.
      */
-    suspend fun readMaterializedSessionCut(
+    override suspend fun readMaterializedSessionCut(
         namespace: RelayV2StateNamespace,
         scopeId: String,
         sessionId: String,

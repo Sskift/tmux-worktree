@@ -115,6 +115,19 @@ internal interface RelayV2StateDao {
         scopeId: String,
     ): RelayV2ScopeEntity?
 
+    @Query(
+        "SELECT * FROM relay_v2_scopes WHERE profileId = :profileId " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch ORDER BY scopeId",
+    )
+    fun scopes(
+        profileId: String,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+    ): List<RelayV2ScopeEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun putScope(scope: RelayV2ScopeEntity)
 
@@ -160,6 +173,19 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
     ): RelayV2SessionEntity?
+
+    @Query(
+        "SELECT * FROM relay_v2_sessions WHERE profileId = :profileId " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch ORDER BY scopeId, sessionId",
+    )
+    fun sessions(
+        profileId: String,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+    ): List<RelayV2SessionEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun putSession(session: RelayV2SessionEntity)

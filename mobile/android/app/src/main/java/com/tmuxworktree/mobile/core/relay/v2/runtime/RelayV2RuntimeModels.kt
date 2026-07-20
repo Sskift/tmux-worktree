@@ -194,6 +194,42 @@ internal interface RelayV2RepositoryEffectApplyLeasePort {
     ): RelayV2EffectApplyResult<T>
 }
 
+/** Opaque actor-issued identity for one exact current ONLINE command admission. */
+internal interface RelayV2CurrentOnlineCommandCut
+
+internal data class RelayV2CurrentOnlineCommandContext(
+    val authority: RelayV2RepositoryEffectAuthority,
+    val dedupeWindow: RelayV2CommandDedupeWindow,
+)
+
+internal sealed interface RelayV2CurrentOnlineCommandCutResult {
+    data object Unavailable : RelayV2CurrentOnlineCommandCutResult
+    data class Available(
+        val cut: RelayV2CurrentOnlineCommandCut,
+    ) : RelayV2CurrentOnlineCommandCutResult
+}
+
+internal sealed interface RelayV2CurrentOnlineCommandLeaseResult<out T> {
+    data object Stale : RelayV2CurrentOnlineCommandLeaseResult<Nothing>
+    data class Current<T>(val value: T) : RelayV2CurrentOnlineCommandLeaseResult<T>
+}
+
+/** Actor-owned ONLINE context and drain lease used by the product command producer. */
+internal interface RelayV2CurrentOnlineCommandAuthorityPort {
+    fun currentOnlineCommandCut(): RelayV2CurrentOnlineCommandCutResult
+
+    suspend fun <T> withCurrentOnlineCommandLease(
+        cut: RelayV2CurrentOnlineCommandCut,
+        block: suspend (RelayV2CurrentOnlineCommandContext) -> T,
+    ): RelayV2CurrentOnlineCommandLeaseResult<T>
+
+    /** Final non-blocking publication fence, executed atomically with the actor's ONLINE recheck. */
+    fun runIfCurrent(
+        cut: RelayV2CurrentOnlineCommandCut,
+        block: () -> Unit,
+    ): Boolean
+}
+
 internal enum class RelayV2HelloOutcome {
     FRESH,
     MATCHED,

@@ -64,10 +64,12 @@ class AppContainer(context: Context) {
         profile = profile,
         credentialStore = relayV2Credentials,
         stateSyncAuthority = relayV2StateRepository,
+        materializedSessions = relayV2StateRepository,
         activationOutbox = RelayV2ActivationOutboxReadPort(
             relayV2StateRepository::readActivationOutbox,
         ),
         outboxAuthority = relayV2StateRepository,
+        outboxEnqueueAuthority = relayV2StateRepository,
         transportFactory = BoundedRelayV2TransportFactory(),
     )
 }

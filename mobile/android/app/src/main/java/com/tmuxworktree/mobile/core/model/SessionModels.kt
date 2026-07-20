@@ -26,8 +26,10 @@ data class RelaySession(
     val agentState: AgentState = AgentState.UNKNOWN,
     val summary: String = "",
     val branch: String = "",
+    /** Optional UI-only identity for protocols whose opaque identity is not the v1 host/name pair. */
+    val stableIdOverride: String? = null,
 ) {
-    val stableId: String get() = "$hostId:$name"
+    val stableId: String get() = stableIdOverride ?: "$hostId:$name"
     val title: String get() = label.ifBlank { rawName.ifBlank { name } }
     val projectName: String
         get() = project.ifBlank {

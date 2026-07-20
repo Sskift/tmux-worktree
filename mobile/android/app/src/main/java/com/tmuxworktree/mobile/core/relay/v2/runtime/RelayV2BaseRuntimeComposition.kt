@@ -5,13 +5,23 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectRecei
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueFailure
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
 import java.io.Closeable
+import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -28,6 +38,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** The explicit v2 profile's connection state, not product readiness or capability availability. */
 internal enum class RelayV2BaseRuntimePhase {
@@ -54,6 +66,43 @@ internal fun interface RelayV2ActivationOutboxReadPort {
     suspend fun readSnapshot(profile: RelayV2Profile): RelayV2OutboxState
 }
 
+/** Opaque product cut; only its issuing base composition can consume it. */
+internal interface RelayV2SessionReplyCut
+
+internal data class RelayV2ProductSession(
+    val materialized: RelayV2MaterializedSessionReadCut,
+    val replyCut: RelayV2SessionReplyCut,
+)
+
+internal enum class RelayV2SessionReplyFailure {
+    NOT_ONLINE,
+    PROFILE_BARRIER,
+    SESSION_STALE,
+    INVALID_MESSAGE,
+    DUPLICATE_COMMAND,
+    CAPACITY_EXCEEDED,
+    FOREIGN_LINEAGE,
+    CORRUPT_STATE,
+    STORE_FAILURE,
+}
+
+internal sealed interface RelayV2SessionReplyResult {
+    data class Committed(
+        val receipt: RelayV2OutboxEnqueueReceipt,
+    ) : RelayV2SessionReplyResult
+
+    data class Rejected(
+        val failure: RelayV2SessionReplyFailure,
+    ) : RelayV2SessionReplyResult
+}
+
+internal fun interface RelayV2SessionReplyCommandPort {
+    suspend fun submitReply(
+        sessionCut: RelayV2SessionReplyCut,
+        message: String,
+    ): RelayV2SessionReplyResult
+}
+
 /**
  * Production base-sync owner for one already-admitted Relay v2 profile activation.
  *
@@ -69,20 +118,28 @@ internal class RelayV2BaseRuntimeComposition(
     private val profile: RelayV2Profile,
     credentialStore: RelayV2CredentialStore,
     stateSyncAuthority: RelayV2StateSyncAuthority,
+    private val materializedSessions: RelayV2MaterializedSessionReadAuthority,
     private val activationOutbox: RelayV2ActivationOutboxReadPort,
     outboxAuthority: RelayV2OutboxRuntimeAuthority,
+    private val outboxEnqueueAuthority: RelayV2OutboxEnqueueAuthority,
     transportFactory: RelayV2TransportFactory = BoundedRelayV2TransportFactory(),
+    private val newCommandId: () -> String = { UUID.randomUUID().toString() },
+    private val clock: () -> Long = System::currentTimeMillis,
     private val retryDelay: suspend (Long) -> Unit = { delay(it) },
     private val beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
+    private val beforeSessionProjectionPublish: suspend () -> Unit = {},
+    private val beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
     private val afterRetryableFailureAdmissionDetached: () -> Unit = {},
     private val afterActorConnectAdmissionHandoff: () -> Unit = {},
-) : Closeable {
+) : RelayV2SessionReplyCommandPort,
+    Closeable {
     private val closed = AtomicBoolean(false)
     private val terminalFailure = AtomicReference<RelayV2BaseRuntimeFailure?>(null)
     private val stateLock = Any()
     private val recoveredDispatchLock = Any()
     private var recoveredDispatch: RecoveredDispatchBuffer? = null
     private val connectionLock = Any()
+    private val productMutationLock = Mutex()
     private var reconnectEnabled = profile.autoConnect
     private var retryFence: Any = Any()
     private var connectionAttemptJob: Job? = null
@@ -121,6 +178,8 @@ internal class RelayV2BaseRuntimeComposition(
     private val outboxDispatcher = outboxDispatchComposition.dispatcher(actor)
     private val _state = MutableStateFlow(RelayV2BaseRuntimeState())
     val state: StateFlow<RelayV2BaseRuntimeState> = _state.asStateFlow()
+    private val _sessions = MutableStateFlow<List<RelayV2ProductSession>>(emptyList())
+    val sessions: StateFlow<List<RelayV2ProductSession>> = _sessions.asStateFlow()
 
     init {
         val completionHandle = parentScope.coroutineContext[Job]?.invokeOnCompletion { close() }
@@ -160,6 +219,7 @@ internal class RelayV2BaseRuntimeComposition(
         connectionAttempt?.cancelAndJoin()
         clearRecoveredDispatch()
         val receipt = actor.disconnectAndDrain(expectedProfile, barrierId)
+        clearSessionProjection()
         retireConnectionAdmissions()
         return receipt
     }
@@ -168,12 +228,65 @@ internal class RelayV2BaseRuntimeComposition(
         if (!closed.compareAndSet(false, true)) return
         fenceConnectionAttempts()
         clearRecoveredDispatch()
+        clearSessionProjection()
         beginActorShutdown()
         synchronized(stateLock) {
             if (terminalFailure.get() == null) {
                 _state.value = RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED)
             }
         }
+    }
+
+    override suspend fun submitReply(
+        sessionCut: RelayV2SessionReplyCut,
+        message: String,
+    ): RelayV2SessionReplyResult {
+        if (closed.get() || terminalFailure.get() != null) {
+            return RelayV2SessionReplyResult.Rejected(
+                RelayV2SessionReplyFailure.PROFILE_BARRIER,
+            )
+        }
+        val issuedSession = sessionCut as? CompositionSessionReplyCut
+            ?: return RelayV2SessionReplyResult.Rejected(
+                RelayV2SessionReplyFailure.SESSION_STALE,
+            )
+        if (issuedSession.origin !== this) {
+            return RelayV2SessionReplyResult.Rejected(
+                RelayV2SessionReplyFailure.SESSION_STALE,
+            )
+        }
+        val normalized = message.trim()
+        val arguments = try {
+            if (normalized.isEmpty()) error("empty reply")
+            RelayV2OutboxArguments.sendAgentMessage(
+                pane = 0,
+                message = normalized,
+                submit = true,
+            ) as RelayV2OutboxArguments.SendAgentMessage
+        } catch (_: Exception) {
+            return RelayV2SessionReplyResult.Rejected(
+                RelayV2SessionReplyFailure.INVALID_MESSAGE,
+            )
+        }
+        val leased = actor.withCurrentOnlineCommandLease(issuedSession.onlineCut) { current ->
+            productMutationLock.withLock {
+                enqueueReplyUnderLease(issuedSession, current, arguments)
+            }
+        }
+        val committed = when (leased) {
+            RelayV2CurrentOnlineCommandLeaseResult.Stale ->
+                return RelayV2SessionReplyResult.Rejected(
+                    RelayV2SessionReplyFailure.NOT_ONLINE,
+                )
+            is RelayV2CurrentOnlineCommandLeaseResult.Current -> leased.value
+        }
+        if (committed is ReplyCommit.Committed) {
+            // The actor lease is deliberately released first. A concurrent generation/profile
+            // fence may now make dispatch stale; the committed row remains for successor recovery.
+            dispatchFresh(committed.authority)
+            return RelayV2SessionReplyResult.Committed(committed.receipt)
+        }
+        return RelayV2SessionReplyResult.Rejected((committed as ReplyCommit.Rejected).failure)
     }
 
     private fun startInitialConnectionAttempt() {
@@ -266,6 +379,7 @@ internal class RelayV2BaseRuntimeComposition(
                 fenceConnectionAttempts()
                 retireConnectionAdmissions()
                 clearRecoveredDispatch()
+                clearSessionProjection()
                 if (terminalFailure.get() == null) {
                     _state.value = RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED)
                 }
@@ -282,9 +396,12 @@ internal class RelayV2BaseRuntimeComposition(
     private suspend fun applyHello(effect: RelayV2RuntimeEffect.GenerationScoped) {
         clearRecoveredDispatch()
         when (val applied = actor.withEffectApplyLease(effect) {
-            beforeHelloOutboxAdmissionRead()
-            val pendingCommands = admitPendingCommands(effect) ?: return@withEffectApplyLease null
-            recoveryAdapter.applyHello(effect, pendingCommands)
+            productMutationLock.withLock {
+                beforeHelloOutboxAdmissionRead()
+                val pendingCommands = admitPendingCommands(effect)
+                    ?: return@withLock null
+                recoveryAdapter.applyHello(effect, pendingCommands)
+            }
         }) {
             is RelayV2EffectApplyResult.Applied -> applied.value?.let { submitRecovery(it) }
             RelayV2EffectApplyResult.Stale -> Unit
@@ -296,8 +413,10 @@ internal class RelayV2BaseRuntimeComposition(
     ) {
         clearRecoveredDispatch()
         when (val applied = actor.withEffectApplyLease(effect) {
-            val pendingCommands = requireOutboxAdmission(effect.generation)
-            recoveryAdapter.applySnapshotChunk(effect, pendingCommands)
+            productMutationLock.withLock {
+                val pendingCommands = requireOutboxAdmission(effect.generation)
+                recoveryAdapter.applySnapshotChunk(effect, pendingCommands)
+            }
         }) {
             is RelayV2EffectApplyResult.Applied -> submitRecovery(applied.value)
             RelayV2EffectApplyResult.Stale -> Unit
@@ -309,8 +428,10 @@ internal class RelayV2BaseRuntimeComposition(
     ) {
         clearRecoveredDispatch()
         when (val applied = actor.withEffectApplyLease(effect) {
-            checkNotNull(recoveryAdapter.completeRelease(effect)) {
-                "Durable snapshot release did not match the actor effect"
+            productMutationLock.withLock {
+                checkNotNull(recoveryAdapter.completeRelease(effect)) {
+                    "Durable snapshot release did not match the actor effect"
+                }
             }
         }) {
             is RelayV2EffectApplyResult.Applied -> submitRecovery(applied.value)
@@ -323,10 +444,12 @@ internal class RelayV2BaseRuntimeComposition(
     ) {
         clearRecoveredDispatch()
         when (val applied = actor.withEffectApplyLease(effect) {
-            val pendingCommands = requireOutboxAdmission(effect.generation)
-            checkNotNull(
-                recoveryAdapter.expireContinuation(effect, pendingCommands),
-            ) { "Durable snapshot expiry did not match the actor effect" }
+            productMutationLock.withLock {
+                val pendingCommands = requireOutboxAdmission(effect.generation)
+                checkNotNull(
+                    recoveryAdapter.expireContinuation(effect, pendingCommands),
+                ) { "Durable snapshot expiry did not match the actor effect" }
+            }
         }) {
             is RelayV2EffectApplyResult.Applied -> submitRecovery(applied.value)
             RelayV2EffectApplyResult.Stale -> Unit
@@ -347,19 +470,28 @@ internal class RelayV2BaseRuntimeComposition(
         }
         clearRecoveredDispatch()
         if (effect.recovery == null) {
-            when (val applied = actor.withEffectApplyLease(effect) {
-                val pendingCommands = requireOutboxAdmission(effect.generation)
-                recoveryAdapter.applyOnlineStateEvent(effect, pendingCommands)
-            }) {
-                is RelayV2EffectApplyResult.Applied -> applied.value?.let {
-                    submitOnlineResync(it)
+            val applied = actor.withEffectApplyLease(effect) {
+                productMutationLock.withLock {
+                    val pendingCommands = requireOutboxAdmission(effect.generation)
+                    recoveryAdapter.applyOnlineStateEvent(effect, pendingCommands)
+                }
+            }
+            when (applied) {
+                is RelayV2EffectApplyResult.Applied -> if (applied.value == null) {
+                    refreshSessionProjection()
+                } else {
+                    clearSessionProjection()
+                    beforeOnlineResyncReceiptSubmit()
+                    submitOnlineResync(applied.value)
                 }
                 RelayV2EffectApplyResult.Stale -> Unit
             }
         } else {
             when (val applied = actor.withEffectApplyLease(effect) {
-                val pendingCommands = requireOutboxAdmission(effect.generation)
-                recoveryAdapter.applyRecoveryStateEvent(effect, pendingCommands)
+                productMutationLock.withLock {
+                    val pendingCommands = requireOutboxAdmission(effect.generation)
+                    recoveryAdapter.applyRecoveryStateEvent(effect, pendingCommands)
+                }
             }) {
                 is RelayV2EffectApplyResult.Applied -> applied.value?.let {
                     submitRecovery(it)
@@ -451,6 +583,7 @@ internal class RelayV2BaseRuntimeComposition(
                     failRuntimeIncomplete("DURABLE_OUTBOX_ADMISSION_STALE")
                     return
                 }
+                refreshSessionProjection()
                 if (flushRecoveredDispatch(queryLineage, processed.authority)) {
                     dispatchFresh(processed.authority)
                 }
@@ -575,16 +708,150 @@ internal class RelayV2BaseRuntimeComposition(
                     issuedCount += capabilities.size
                     for (capability in capabilities) {
                         if (closed.get() || terminalFailure.get() != null) return
-                        if (outboxDispatcher.dispatch(capability) !is
-                            RelayV2OutboxDispatchOutcome.Submitted
-                        ) {
-                            failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_FAILED")
-                            return
+                        when (outboxDispatcher.dispatch(capability)) {
+                            is RelayV2OutboxDispatchOutcome.Submitted -> Unit
+                            is RelayV2OutboxDispatchOutcome.Stale -> return
+                            else -> {
+                                failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_FAILED")
+                                return
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    private suspend fun enqueueReplyUnderLease(
+        sessionCut: CompositionSessionReplyCut,
+        current: RelayV2CurrentOnlineCommandContext,
+        arguments: RelayV2OutboxArguments.SendAgentMessage,
+    ): ReplyCommit {
+        if (closed.get() || terminalFailure.get() != null) {
+            return ReplyCommit.Rejected(RelayV2SessionReplyFailure.PROFILE_BARRIER)
+        }
+        val authority = current.authority
+        val namespace = authority.stateNamespace()
+        val issued = sessionCut.materialized
+        if (namespace != issued.namespace ||
+            issued.cursor.hostEpoch != authority.hostEpoch
+        ) {
+            return ReplyCommit.Rejected(RelayV2SessionReplyFailure.SESSION_STALE)
+        }
+        val materialized = try {
+            materializedSessions.readMaterializedSessionCut(
+                namespace,
+                issued.session.scopeId,
+                issued.session.sessionId,
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: IllegalStateException) {
+            return ReplyCommit.Rejected(RelayV2SessionReplyFailure.CORRUPT_STATE)
+        } catch (_: Exception) {
+            return ReplyCommit.Rejected(RelayV2SessionReplyFailure.STORE_FAILURE)
+        }
+        if (materialized != issued) {
+            return ReplyCommit.Rejected(RelayV2SessionReplyFailure.SESSION_STALE)
+        }
+        val enqueue = try {
+            val commandId = newCommandId()
+            outboxEnqueueAuthority.enqueueOutbox(
+                namespace = authority.outboxNamespace(),
+                draft = RelayV2OutboxDraft(
+                    profileId = authority.profileId,
+                    principalId = authority.principalId,
+                    hostId = authority.hostId,
+                    expectedHostEpoch = authority.hostEpoch,
+                    dedupeWindowId = current.dedupeWindow.windowId,
+                    commandId = commandId,
+                    scopeId = materialized.session.scopeId,
+                    sessionId = materialized.session.sessionId,
+                    arguments = arguments,
+                ),
+                createdAtMillis = clock(),
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return ReplyCommit.Rejected(RelayV2SessionReplyFailure.STORE_FAILURE)
+        }
+        return when (enqueue) {
+            is RelayV2OutboxEnqueueResult.Committed ->
+                ReplyCommit.Committed(authority, enqueue.receipt)
+            is RelayV2OutboxEnqueueResult.Rejected -> ReplyCommit.Rejected(
+                when (enqueue.failure) {
+                    RelayV2OutboxEnqueueFailure.DUPLICATE_COMMAND ->
+                        RelayV2SessionReplyFailure.DUPLICATE_COMMAND
+                    RelayV2OutboxEnqueueFailure.CAPACITY_EXCEEDED ->
+                        RelayV2SessionReplyFailure.CAPACITY_EXCEEDED
+                    RelayV2OutboxEnqueueFailure.FOREIGN_LINEAGE ->
+                        RelayV2SessionReplyFailure.FOREIGN_LINEAGE
+                    RelayV2OutboxEnqueueFailure.CORRUPT_STATE,
+                    RelayV2OutboxEnqueueFailure.UNKNOWN_STATE,
+                    -> RelayV2SessionReplyFailure.CORRUPT_STATE
+                    RelayV2OutboxEnqueueFailure.STORE_FAILURE ->
+                        RelayV2SessionReplyFailure.STORE_FAILURE
+                },
+            )
+        }
+    }
+
+    private suspend fun refreshSessionProjection() {
+        if (closed.get() || terminalFailure.get() != null) {
+            clearSessionProjection()
+            return
+        }
+        val issued = when (val result = actor.currentOnlineCommandCut()) {
+            RelayV2CurrentOnlineCommandCutResult.Unavailable -> {
+                clearSessionProjection()
+                return
+            }
+            is RelayV2CurrentOnlineCommandCutResult.Available -> result.cut
+        }
+        val published = try {
+            actor.withCurrentOnlineCommandLease(issued) { current ->
+                productMutationLock.withLock {
+                    val projection = materializedSessions.readMaterializedSessionCuts(
+                        current.authority.stateNamespace(),
+                    ).map { materialized ->
+                        check(materialized.namespace == current.authority.stateNamespace()) {
+                            "Relay v2 Session projection crossed current actor authority"
+                        }
+                        RelayV2ProductSession(
+                            materialized = materialized,
+                            replyCut = CompositionSessionReplyCut(
+                                origin = this,
+                                onlineCut = issued,
+                                materialized = materialized,
+                            ),
+                        )
+                    }
+                    beforeSessionProjectionPublish()
+                    val published = !closed.get() && terminalFailure.get() == null &&
+                        actor.runIfCurrent(issued) {
+                            _sessions.value = projection
+                        }
+                    if (!published) {
+                        clearSessionProjection()
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            clearSessionProjection()
+            failRuntimeIncomplete("SESSION_PROJECTION_READ_FAILED")
+            return
+        }
+        when (published) {
+            RelayV2CurrentOnlineCommandLeaseResult.Stale -> clearSessionProjection()
+            is RelayV2CurrentOnlineCommandLeaseResult.Current -> Unit
+        }
+    }
+
+    private fun clearSessionProjection() {
+        _sessions.value = emptyList()
     }
 
     private fun clearRecoveredDispatch() {
@@ -691,6 +958,7 @@ internal class RelayV2BaseRuntimeComposition(
                     failRuntimeIncomplete("DURABLE_OUTBOX_ADMISSION_STALE")
                     return
                 }
+                refreshSessionProjection()
                 dispatchFresh(processed.authority)
             }
             RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal -> {
@@ -868,6 +1136,7 @@ internal class RelayV2BaseRuntimeComposition(
         if (closed.get() || !terminalFailure.compareAndSet(null, failure)) return
         fenceConnectionAttempts()
         clearRecoveredDispatch()
+        clearSessionProjection()
         synchronized(stateLock) {
             _state.value = RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.FAILED, failure)
         }
@@ -877,6 +1146,9 @@ internal class RelayV2BaseRuntimeComposition(
     private fun beginActorShutdown() {
         if (!actorShutdownStarted.compareAndSet(false, true)) return
         actor.close()
+        // actor.close() withdraws ONLINE publication under lifecycleLock; this synchronous clear
+        // therefore cannot be followed by a cut that was current before shutdown.
+        clearSessionProjection()
         pumpJob.cancel()
         actorScope.launch {
             try {
@@ -884,6 +1156,7 @@ internal class RelayV2BaseRuntimeComposition(
             } catch (_: Throwable) {
                 // A forced transport-fence close completes the same shutdown barrier exceptionally.
             } finally {
+                clearSessionProjection()
                 retireConnectionAdmissions()
                 parentCompletionHandle.getAndSet(null)?.dispose()
                 actorOwnerJob.cancel()
@@ -917,6 +1190,7 @@ internal class RelayV2BaseRuntimeComposition(
         } else {
             actorState.failure?.let(RelayV2BaseRuntimeFailure::Connection)
         }
+        if (phase != RelayV2BaseRuntimePhase.ONLINE) clearSessionProjection()
         synchronized(stateLock) {
             if (!closed.get() && terminalFailure.get() == null) {
                 _state.value = RelayV2BaseRuntimeState(phase, failure)
@@ -989,4 +1263,36 @@ internal class RelayV2BaseRuntimeComposition(
         val lineage: RecoveredDispatchLineage,
         val capabilities: ArrayList<RelayV2OutboxDispatchCapability>,
     )
+
+    private class CompositionSessionReplyCut(
+        val origin: RelayV2BaseRuntimeComposition,
+        val onlineCut: RelayV2CurrentOnlineCommandCut,
+        val materialized: RelayV2MaterializedSessionReadCut,
+    ) : RelayV2SessionReplyCut
+
+    private sealed interface ReplyCommit {
+        data class Committed(
+            val authority: RelayV2RepositoryEffectAuthority,
+            val receipt: RelayV2OutboxEnqueueReceipt,
+        ) : ReplyCommit
+
+        data class Rejected(val failure: RelayV2SessionReplyFailure) : ReplyCommit
+    }
 }
+
+private fun RelayV2RepositoryEffectAuthority.stateNamespace() =
+    com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace(
+        profileId = profileId,
+        principalId = principalId,
+        clientInstanceId = clientInstanceId,
+        hostId = hostId,
+        hostEpoch = hostEpoch,
+    )
+
+private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
+    RelayV2OutboxAuthorityNamespace(
+        profileId = profileId,
+        profileActivationGeneration = profileActivationGeneration,
+        principalId = principalId,
+        clientInstanceId = clientInstanceId,
+    )

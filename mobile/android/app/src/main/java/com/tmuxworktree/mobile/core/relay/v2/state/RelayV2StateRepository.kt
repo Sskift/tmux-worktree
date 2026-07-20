@@ -28,18 +28,24 @@ internal class RelayV2StateRepository(
     database: RelayV2StateDatabase,
 ) : RelayV2StateSyncAuthority,
     RelayV2OutboxRuntimeAuthority,
-    RelayV2OutboxEnqueueAuthority {
+    RelayV2OutboxEnqueueAuthority,
+    RelayV2MaterializedSessionReadAuthority {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
     private val durableCore = RelayV2DurableStateRepositoryCore(
         RoomRelayV2DurableStateStore(database),
     )
 
-    suspend fun readMaterializedSessionCut(
+    override suspend fun readMaterializedSessionCut(
         namespace: RelayV2StateNamespace,
         scopeId: String,
         sessionId: String,
     ): RelayV2MaterializedSessionReadCut? =
         core.readMaterializedSessionCut(namespace, scopeId, sessionId)
+
+    override suspend fun readMaterializedSessionCuts(
+        namespace: RelayV2StateNamespace,
+    ): List<RelayV2MaterializedSessionReadCut> =
+        core.readMaterializedSessionCuts(namespace)
 
     override suspend fun loadConnectPlan(
         identity: RelayV2StateConnectIdentity,
@@ -448,6 +454,14 @@ private class RoomTransaction(
             scopeId,
         )?.toStored()
 
+    override fun scopes(namespace: RelayV2StateNamespace): List<RelayV2StoredScope> = dao.scopes(
+        namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
+        namespace.hostId,
+        namespace.hostEpoch,
+    ).map { it.toStored() }
+
     override fun putScope(scope: RelayV2StoredScope) {
         dao.putScope(scope.toEntity())
     }
@@ -486,6 +500,15 @@ private class RoomTransaction(
         scopeId,
         sessionId,
     )?.toStored()
+
+    override fun sessions(namespace: RelayV2StateNamespace): List<RelayV2StoredSession> =
+        dao.sessions(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        ).map { it.toStored() }
 
     override fun putSession(session: RelayV2StoredSession) {
         dao.putSession(session.toEntity())

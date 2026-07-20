@@ -178,6 +178,7 @@ internal interface RelayV2StateTransaction {
     fun deleteProfileState(profileId: String)
 
     fun scope(namespace: RelayV2StateNamespace, scopeId: String): RelayV2StoredScope?
+    fun scopes(namespace: RelayV2StateNamespace): List<RelayV2StoredScope>
     fun putScope(scope: RelayV2StoredScope)
     fun deleteScope(namespace: RelayV2StateNamespace, scopeId: String)
     fun deleteScopes(namespace: RelayV2StateNamespace)
@@ -187,6 +188,8 @@ internal interface RelayV2StateTransaction {
         scopeId: String,
         sessionId: String,
     ): RelayV2StoredSession?
+
+    fun sessions(namespace: RelayV2StateNamespace): List<RelayV2StoredSession>
 
     fun putSession(session: RelayV2StoredSession)
     fun deleteSession(namespace: RelayV2StateNamespace, scopeId: String, sessionId: String)

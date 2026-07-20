@@ -9,9 +9,10 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarri
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
-import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
-import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
-import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyFailure
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyResult
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
 import com.tmuxworktree.mobile.core.data.OutboxInFlightMessage
@@ -44,6 +45,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
@@ -61,21 +63,6 @@ internal fun shouldPersistRelaySelectedHost(
     selectedHostId != preferredHostId &&
     preferredHostId !in availableHostIds
 
-private fun RelayV2BaseRuntimeState.toUiConnectionState(): RelayV2ProfileConnectionState =
-    when (phase) {
-        RelayV2BaseRuntimePhase.STOPPED -> RelayV2ProfileConnectionState.STOPPED
-        RelayV2BaseRuntimePhase.CONNECTING -> RelayV2ProfileConnectionState.CONNECTING
-        RelayV2BaseRuntimePhase.RESYNCING -> RelayV2ProfileConnectionState.RESYNCING
-        RelayV2BaseRuntimePhase.ONLINE -> RelayV2ProfileConnectionState.ONLINE
-        RelayV2BaseRuntimePhase.FAILED -> RelayV2ProfileConnectionState.FAILED
-    }
-
-private fun RelayV2BaseRuntimeFailure?.codeOrNull(): String? = when (this) {
-    is RelayV2BaseRuntimeFailure.Connection -> failure.code
-    is RelayV2BaseRuntimeFailure.RuntimeIncomplete -> code
-    null -> null
-}
-
 class V2ViewModel(
     private val container: AppContainer,
     private val demoMode: Boolean = false,
@@ -89,7 +76,11 @@ class V2ViewModel(
     }
     private val relay: RelayV1ConnectionActor
         get() = relayOwner.value
+    @Volatile
     private var relayV2Composition: RelayV2BaseRuntimeComposition? = null
+    @Volatile
+    private var relayV2SessionReplyCuts: Map<String, RelayV2SessionReplyCut> = emptyMap()
+    private val relayV2UiFenceLock = Any()
     private val outboxMutex = Mutex()
     private val inFlightMessages = OutboxInFlightRegistry()
     private val profileMutationMutex = Mutex()
@@ -124,6 +115,8 @@ class V2ViewModel(
 
     fun timeline(sessionId: String): Flow<List<TimelineEvent>> = if (demoMode) {
         uiState.map { state -> state.demoTimelines[sessionId].orEmpty() }
+    } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+        flowOf(emptyList())
     } else {
         repository.timeline(sessionId)
     }
@@ -525,9 +518,54 @@ class V2ViewModel(
             }
             return
         }
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val admittedReply = synchronized(relayV2UiFenceLock) {
+                val composition = relayV2Composition
+                val sessionCut = relayV2SessionReplyCuts[session.stableId]
+                if (composition == null || sessionCut == null) null else composition to sessionCut
+            }
+            if (admittedReply == null) {
+                _uiState.update {
+                    it.copy(actionError = "Relay v2 Session is no longer current")
+                }
+                return
+            }
+            val (composition, sessionCut) = admittedReply
+            val callbackFence = RelayV2ReplyUiCallbackFence(
+                composition = composition,
+                sessionStableId = session.stableId,
+                sessionCut = sessionCut,
+            )
+            // SessionDetailScreen submits the normalized body. Preserve the exact raw draft so a
+            // later commit cannot erase typing that happened while the Room transaction ran.
+            val submittedRawDraft = _uiState.value.drafts[session.stableId]
+                ?.takeIf { it.trim() == normalized }
+            viewModelScope.launch {
+                when (val result = composition.submitReply(sessionCut, normalized)) {
+                    is RelayV2SessionReplyResult.Committed -> {
+                        // The receipt exists only after the durable Room transaction commits.
+                        updateCurrentRelayV2Reply(callbackFence) { state ->
+                            state.afterCommittedReply(
+                                sessionId = session.stableId,
+                                submittedRawDraft = submittedRawDraft,
+                            )
+                        }
+                    }
+                    is RelayV2SessionReplyResult.Rejected -> {
+                        val current = updateCurrentRelayV2Reply(callbackFence) {
+                            it.copy(actionError = result.failure.userMessage())
+                        }
+                        if (current) {
+                            emit(V2UiEffect.Notice("Message was not queued"))
+                        }
+                    }
+                }
+            }
+            return
+        }
         if (relayV1IfAdmitted() == null) {
             _uiState.update {
-                it.copy(actionError = "Relay v2 command Outbox is not connected yet")
+                it.copy(actionError = "The current profile cannot send this message")
             }
             return
         }
@@ -728,6 +766,9 @@ class V2ViewModel(
             appendLine("attempt=${state.health.attempt}")
             appendLine("errorCode=${state.health.errorCode.ifBlank { "none" }}")
             appendLine("protocol=${state.health.protocolLabel}")
+            if (state.health.protocolLabel == RELAY_V2_TRANSPORT_LABEL) {
+                appendLine("capabilityReadiness=not-advertised")
+            }
         }.trim()
     }
 
@@ -737,7 +778,10 @@ class V2ViewModel(
 
     override fun onCleared() {
         relayV2Composition?.close()
-        relayV2Composition = null
+        synchronized(relayV2UiFenceLock) {
+            relayV2SessionReplyCuts = emptyMap()
+            relayV2Composition = null
+        }
         if (relayOwner.isInitialized()) relay.close()
         effectsClosed = true
         effectInputChannel.close()
@@ -852,8 +896,12 @@ class V2ViewModel(
     }
 
     private fun applyStartupAdmission(admission: RelayStartupAdmission) {
-        _uiState.update { current ->
-            when {
+        synchronized(relayV2UiFenceLock) {
+            if (admission.state != RelayStartupAdmissionState.RELAY_V2) {
+                relayV2SessionReplyCuts = emptyMap()
+            }
+            val current = _uiState.value
+            _uiState.value = when {
                 admission.allowsRelayV1 -> current.copy(
                     relayStartupAdmission = admission.state,
                 )
@@ -890,14 +938,22 @@ class V2ViewModel(
                                 relay.disconnectAndAwait(barrierId)
                                 RelayProfileDisconnectReceipt(profile, barrierId)
                             }
-                            RelayProfileDialect.V2 -> relayV2Composition?.disconnectAndDrain(
-                                profile,
-                                barrierId,
-                            ) ?: noLiveRelayV2RuntimeReceipt(profile, barrierId)
+                            RelayProfileDialect.V2 -> {
+                                synchronized(relayV2UiFenceLock) {
+                                    relayV2SessionReplyCuts = emptyMap()
+                                }
+                                relayV2Composition?.disconnectAndDrain(
+                                    profile,
+                                    barrierId,
+                                ) ?: noLiveRelayV2RuntimeReceipt(profile, barrierId)
+                            }
                         }
                     },
                     clearEphemeralAfterDisconnect = {
-                        _uiState.value = V2UiState()
+                        synchronized(relayV2UiFenceLock) {
+                            relayV2SessionReplyCuts = emptyMap()
+                            _uiState.value = V2UiState()
+                        }
                     },
                 ).admitStartup()
             } catch (error: Throwable) {
@@ -960,23 +1016,83 @@ class V2ViewModel(
     private fun startRelayV2BaseRuntime(profile: RelayV2Profile) {
         check(relayV2Composition == null) { "Relay v2 base runtime already exists" }
         val composition = container.createRelayV2BaseRuntimeComposition(viewModelScope, profile)
-        relayV2Composition = composition
+        synchronized(relayV2UiFenceLock) {
+            relayV2Composition = composition
+            relayV2SessionReplyCuts = emptyMap()
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                preferences = state.preferences.copy(preferredHostId = profile.hostId),
+                hosts = listOf(
+                    RelayHost(
+                        hostId = profile.hostId,
+                        displayName = profile.hostId,
+                        status = ConnectionStatus.UNKNOWN,
+                    ),
+                ),
+            )
+        }
         viewModelScope.launch {
             composition.state.collect { runtime ->
-                val connection = runtime.toUiConnectionState()
-                val failureCode = runtime.failure.codeOrNull()
-                _uiState.update {
-                    it.copy(
-                        relayV2ProfileConnection = connection,
-                        relayV2ProfileFailureCode = failureCode,
-                        isConnecting = connection == RelayV2ProfileConnectionState.CONNECTING,
-                        pairingError = failureCode?.let { code ->
-                            "Relay v2 connection failed ($code); Relay v1 fallback is disabled."
-                        },
+                synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized
+                    val projected = projectRelayV2RuntimeState(
+                        state = _uiState.value,
+                        runtime = runtime,
+                        nowMillis = System.currentTimeMillis(),
+                    )
+                    rawHealth = projected.health
+                    _uiState.value = projected.copy(
+                        health = decorateHealth(projected.health, projected),
                     )
                 }
             }
         }
+        viewModelScope.launch {
+            composition.sessions.collect { projection ->
+                val projected = projection.map { product -> product.toUiSession() to product.replyCut }
+                val sessions = projected.map { it.first }
+                val cuts = projected.associate { (session, cut) -> session.stableId to cut }
+                val scopes = projection
+                    .groupBy { it.materialized.scope.scopeId }
+                    .values
+                    .map { rows ->
+                        val scope = rows.first().materialized.scope
+                        RelayScope(
+                            hostId = profile.hostId,
+                            scopeId = scope.scopeId,
+                            label = scope.displayName,
+                            kind = scope.kind.wireValue,
+                            reachable = scope.reachability.wireValue == "online",
+                            sessionCount = rows.size,
+                        )
+                    }
+                    .sortedBy { it.scopeId }
+                synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized
+                    relayV2SessionReplyCuts = cuts
+                    _uiState.value = _uiState.value.copy(scopes = scopes, sessions = sessions)
+                }
+            }
+        }
+    }
+
+    private inline fun updateCurrentRelayV2Reply(
+        fence: RelayV2ReplyUiCallbackFence,
+        update: (V2UiState) -> V2UiState,
+    ): Boolean = synchronized(relayV2UiFenceLock) {
+        val current = _uiState.value
+        val mutation = fence.applyIfCurrent(
+            state = current,
+            currentComposition = relayV2Composition,
+            currentCuts = relayV2SessionReplyCuts,
+            update = update,
+        )
+        if (mutation.applied) _uiState.value = mutation.state
+        mutation.applied
     }
 
     private fun noLiveRelayV2RuntimeReceipt(
@@ -1425,6 +1541,7 @@ class V2ViewModel(
 
     private fun decorateHealth(base: ConnectionHealth, state: V2UiState): ConnectionHealth {
         if (demoMode) return base
+        val isRelayV2Transport = base.protocolLabel == RELAY_V2_TRANSPORT_LABEL
         val overall = if (state.networkAvailable) base.overall else ConnectionStatus.PAUSED
         val phase = if (state.networkAvailable) base.phase else TransportPhase.WAITING_FOR_NETWORK
         val hostId = state.activeHostId
@@ -1438,6 +1555,7 @@ class V2ViewModel(
             else -> ConnectionStatus.OFFLINE
         }
         val hostStatus = when {
+            isRelayV2Transport && host != null -> host.status
             base.overall != ConnectionStatus.ONLINE -> ConnectionStatus.PAUSED
             host != null -> ConnectionStatus.ONLINE
             else -> ConnectionStatus.RECOVERING
@@ -1463,7 +1581,13 @@ class V2ViewModel(
                     id = "relay",
                     label = "Relay",
                     status = relayStatus,
-                    detail = base.errorMessage.ifBlank { relayStatus.label() },
+                    detail = when {
+                        base.errorMessage.isNotBlank() -> base.errorMessage
+                        isRelayV2Transport && base.overall == ConnectionStatus.ONLINE ->
+                            "Relay v2 transport online; capability readiness is not advertised"
+                        isRelayV2Transport -> "Relay v2 transport ${relayStatus.label()}"
+                        else -> relayStatus.label()
+                    },
                     lastSuccessAtMillis = base.lastSyncedAtMillis,
                 ),
                 HealthLayer(
@@ -1561,4 +1685,50 @@ class V2ViewModel(
                 }
             }
     }
+}
+
+private fun RelayV2ProductSession.toUiSession(): RelaySession {
+    val cut = materialized
+    val session = cut.session
+    return RelaySession(
+        hostId = cut.namespace.hostId,
+        hostName = cut.namespace.hostId,
+        name = session.displayName,
+        rawName = session.displayName,
+        scopeId = session.scopeId,
+        scopeLabel = cut.scope.displayName,
+        kind = session.kind.wireValue,
+        project = session.project.orEmpty(),
+        label = session.label.orEmpty(),
+        cwd = session.cwd.orEmpty(),
+        attached = session.attached,
+        windows = session.windowCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+        createdAtSeconds = session.createdAtMs / 1_000L,
+        activityAtSeconds = session.activityAtMs / 1_000L,
+        agentState = AgentState.UNKNOWN,
+        summary = "",
+        branch = "",
+        stableIdOverride = relayV2SessionUiStableId(
+            cut.namespace.profileId,
+            cut.namespace.principalId,
+            cut.namespace.clientInstanceId,
+            cut.namespace.hostId,
+            cut.namespace.hostEpoch,
+            session.scopeId,
+            session.sessionId,
+        ),
+    )
+}
+
+private fun RelayV2SessionReplyFailure.userMessage(): String = when (this) {
+    RelayV2SessionReplyFailure.NOT_ONLINE -> "Relay v2 is not online"
+    RelayV2SessionReplyFailure.PROFILE_BARRIER -> "The Relay v2 profile is changing"
+    RelayV2SessionReplyFailure.SESSION_STALE -> "The Relay v2 Session is no longer current"
+    RelayV2SessionReplyFailure.INVALID_MESSAGE -> "The message is empty or too large"
+    RelayV2SessionReplyFailure.CAPACITY_EXCEEDED -> "The Relay v2 Outbox is full"
+    RelayV2SessionReplyFailure.DUPLICATE_COMMAND,
+    RelayV2SessionReplyFailure.FOREIGN_LINEAGE,
+    RelayV2SessionReplyFailure.CORRUPT_STATE,
+    RelayV2SessionReplyFailure.STORE_FAILURE,
+    -> "The message could not be committed to the Relay v2 Outbox"
 }

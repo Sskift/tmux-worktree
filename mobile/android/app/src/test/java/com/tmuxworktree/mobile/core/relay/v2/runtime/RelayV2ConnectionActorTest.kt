@@ -2280,6 +2280,10 @@ class RelayV2ConnectionActorTest {
                 } as RelayV2EffectApplyResult.Applied
                 assertTrue(harness.actor.submitRecoveryReceipt(helloReceipt.value))
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+                val publicationCut = (
+                    harness.actor.currentOnlineCommandCut() as
+                        RelayV2CurrentOnlineCommandCutResult.Available
+                    ).cut
                 val racingExecute = async(Dispatchers.Default) {
                     harness.actor.sendIfCurrent(
                         helloEffect.repositoryAuthority,
@@ -2336,6 +2340,13 @@ class RelayV2ConnectionActorTest {
                 assertEquals("state.snapshot.get", snapshot.stringValue("type"))
                 assertEquals(null, snapshot.payload()["snapshotId"])
                 assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+                var staleProjectionPublished = false
+                assertFalse(
+                    harness.actor.runIfCurrent(publicationCut) {
+                        staleProjectionPublished = true
+                    },
+                )
+                assertFalse(staleProjectionPublished)
                 assertEquals(helloEffect.generation, delivery.generation)
                 assertEquals(helloEffect.repositoryAuthority, delivery.repositoryAuthority)
                 val beforeDelayedExecute = transport.sendAttemptCount.get()
