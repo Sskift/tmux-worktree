@@ -9,6 +9,7 @@ import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 const codec = await import("../dist/relay/v2/codec.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
+const credentialAuthorityModule = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const terminalDurable = await import("../dist/relay/v2/terminalDurableLineage.js");
@@ -173,6 +174,149 @@ function createTransportLifecycleFactory(options, records) {
   });
 }
 
+function hostAccessToken({ hostId = HOST_ID, jti = "managed-wss-access-jti" } = {}) {
+  const payload = Buffer.from(JSON.stringify({
+    v: 2,
+    iss: "managed-wss-issuer",
+    aud: "tw-relay-ws",
+    kid: "managed-wss-kid",
+    tokenUse: "access",
+    role: "host",
+    hostId,
+    principalId: "managed-wss-principal",
+    grantId: "managed-wss-grant",
+    iat: 1_783_700_000,
+    nbf: 1_783_700_000,
+    exp: 1_783_703_600,
+    jti,
+  })).toString("base64url");
+  return `twcap2.${payload}.${Buffer.alloc(32, 7).toString("base64url")}`;
+}
+
+function createManagedWssCredentialAuthority() {
+  const accessToken = hostAccessToken();
+  let revision = 1;
+  let state = {
+    credentialVersion: "1",
+    hostId: HOST_ID,
+    principalId: "managed-wss-principal",
+    grantId: "managed-wss-grant",
+    accessToken,
+    accessExpiresAtMs: 1_783_703_600_000,
+    refreshToken: "twref2.managed-wss-refresh",
+    refreshExpiresAtMs: 1_786_292_000_000,
+    accessJti: "managed-wss-access-jti",
+    pendingCredentialAttempt: null,
+    pendingReauthentication: null,
+  };
+  const activity = {
+    references: [],
+    reads: 0,
+    writes: 0,
+    secretResolutions: 0,
+  };
+  const authority = new credentialAuthorityModule.RelayV2HostCredentialAuthority({
+    storage: {
+      runExclusive(reference, operation) {
+        activity.references.push(reference);
+        return operation({
+          read() {
+            activity.reads += 1;
+            return { state: structuredClone(state), revision };
+          },
+          compareAndSwap(expected, replacement) {
+            if (expected !== revision) {
+              return {
+                status: "conflict",
+                current: { state: structuredClone(state), revision },
+              };
+            }
+            state = structuredClone(replacement);
+            revision += 1;
+            activity.writes += 1;
+            return { status: "swapped" };
+          },
+        });
+      },
+    },
+    secretResolver: {
+      resolve() {
+        activity.secretResolutions += 1;
+        throw new Error("managed WSS composition must not resolve refresh/bootstrap secrets");
+      },
+    },
+  });
+  return { authority, accessToken, activity };
+}
+
+function createManagedWssConstructor(records, effects) {
+  return class FakeManagedWss {
+    readyState = 1;
+    protocol = "tw-relay.host.v2";
+    extensions = "";
+    listeners = new Map();
+
+    constructor(address, protocols, options) {
+      effects.socketConstructions += 1;
+      const record = {
+        sequence: records.length + 1,
+        address,
+        protocols: [...protocols],
+        options,
+        headers: [],
+        requestEnds: 0,
+        requestDestroys: 0,
+        sent: [],
+        closes: [],
+        socket: this,
+        hello: null,
+      };
+      records.push(record);
+      const request = {
+        setHeader(name, value) { record.headers.push([name, value]); },
+        end() { record.requestEnds += 1; },
+        destroy() { record.requestDestroys += 1; },
+      };
+      options.finishRequest(request, this);
+    }
+
+    on(event, listener) {
+      const listeners = this.listeners.get(event) ?? [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+    }
+
+    removeListener(event, listener) {
+      const listeners = this.listeners.get(event) ?? [];
+      this.listeners.set(event, listeners.filter((candidate) => candidate !== listener));
+    }
+
+    send(bytes, options, callback) {
+      const record = records.find((candidate) => candidate.socket === this);
+      const copy = Uint8Array.from(bytes);
+      record.sent.push({ bytes: copy, options });
+      record.hello ??= decodeCarrier(copy);
+      queueMicrotask(() => callback());
+    }
+
+    close(code, reason) {
+      const record = records.find((candidate) => candidate.socket === this);
+      record.closes.push({ code, reason });
+      this.readyState = 3;
+      for (const listener of this.listeners.get("close") ?? []) listener(code);
+    }
+
+    terminate() {
+      this.readyState = 3;
+      for (const listener of this.listeners.get("close") ?? []) listener(1006);
+    }
+
+    receive(bytes) {
+      for (const listener of this.listeners.get("message") ?? []) listener(bytes, true);
+    }
+  };
+}
+
 async function createHarness(options = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-managed-runtime-"));
   const store = await hostState.RelayV2HostStateStore.open({
@@ -248,85 +392,118 @@ async function createHarness(options = {}) {
   assert.notEqual(h1RecoveryCandidate, null);
 
   const records = [];
-  const transportLifecycleFactory = createTransportLifecycleFactory(options, records);
+  const transportLifecycleFactory = options.managedWss
+    ? null
+    : createTransportLifecycleFactory(options, records);
+  const managedWssCredential = options.managedWss
+    ? createManagedWssCredentialAuthority()
+    : null;
+  const managedWssEffects = {
+    socketConstructions: 0,
+    timerSchedules: 0,
+  };
+  const managedWssConstructor = options.managedWss
+    ? createManagedWssConstructor(records, managedWssEffects)
+    : null;
   let helloSequence = 0;
   let credentialReadCount = 0;
   const reauthenticationPreparations = [];
   const reauthenticationAcknowledgements = [];
-  composition = await compositionModule.openRelayV2HostManagedConnectorRuntimeComposition({
-    runtime: {
-      hostId: HOST_ID,
-      hostEpoch: identity.hostEpoch,
-      hostInstanceId: identity.hostInstanceId,
-      authorities: {
-        h0: store.h0ReadinessPort,
-        h1RecoveryCandidate,
-        h2RecoveryCandidate,
-        h3RecoveryCandidate,
-        nextDedupeWindowBounds() {
-          return {
-            acceptUntilMs: 1_783_786_400_000,
-            queryUntilMs: 1_784_391_200_000,
-          };
-        },
-      },
-      welcome: {
-        build(input) {
-          const welcome = fixture("host-welcome-snapshot-required");
-          welcome.requestId = input.hello.requestId;
-          welcome.hostId = HOST_ID;
-          welcome.hostEpoch = input.cut.hostEpoch;
-          welcome.hostInstanceId = input.cut.hostInstanceId;
-          welcome.payload.eventSeq = input.cut.eventSeq;
-          welcome.payload.capabilities = [...input.capabilities];
-          welcome.payload.commandDedupeWindow = structuredClone(input.commandDedupeWindow);
-          expectedWelcome = structuredClone(welcome);
-          return welcome;
-        },
+  const runtimeOptions = {
+    hostId: HOST_ID,
+    hostEpoch: identity.hostEpoch,
+    hostInstanceId: identity.hostInstanceId,
+    authorities: {
+      h0: store.h0ReadinessPort,
+      h1RecoveryCandidate,
+      h2RecoveryCandidate,
+      h3RecoveryCandidate,
+      nextDedupeWindowBounds() {
+        return {
+          acceptUntilMs: 1_783_786_400_000,
+          queryUntilMs: 1_784_391_200_000,
+        };
       },
     },
-    connector: {
-      credentialReference: CREDENTIAL_REFERENCE,
-      carrier: {
-        credentialReferences: {
-          read(reference) {
-            credentialReadCount += 1;
-            if (options.rejectCredentialRead?.(credentialReadCount) === true) {
-              throw new Error("injected credential read rejection");
-            }
-            return {
-              reference,
-              version: "1",
-              grantId: "managed-host-grant",
-              accessJti: "managed-host-access-jti",
-              accessToken: "twcap2.host.payload.mac",
-            };
+    welcome: {
+      build(input) {
+        const welcome = fixture("host-welcome-snapshot-required");
+        welcome.requestId = input.hello.requestId;
+        welcome.hostId = HOST_ID;
+        welcome.hostEpoch = input.cut.hostEpoch;
+        welcome.hostInstanceId = input.cut.hostInstanceId;
+        welcome.payload.eventSeq = input.cut.eventSeq;
+        welcome.payload.capabilities = [...input.capabilities];
+        welcome.payload.commandDedupeWindow = structuredClone(input.commandDedupeWindow);
+        expectedWelcome = structuredClone(welcome);
+        return welcome;
+      },
+    },
+  };
+  const carrierOptions = {
+    idFactory: () => `managed-host-hello-${++helloSequence}`,
+    clock: () => 1_783_700_100_000,
+  };
+  composition = options.managedWss
+    ? await compositionModule.openRelayV2HostManagedWssConnectorRuntimeComposition({
+      runtime: runtimeOptions,
+      connector: {
+        credentialAuthority: managedWssCredential.authority,
+        credentialReference: CREDENTIAL_REFERENCE,
+        carrier: carrierOptions,
+        wss: {
+          relayUrl: "wss://relay.example.com/",
+          webSocketConstructor: managedWssConstructor,
+          scheduleCloseDrain() {
+            managedWssEffects.timerSchedules += 1;
+            return () => undefined;
           },
-          prepareReauthentication(input) {
-            reauthenticationPreparations.push(structuredClone(input));
-            const prepared = {
-              fence: {
-                reference: CREDENTIAL_REFERENCE,
-                version: "2",
-                requestId: "managed-reauth-authority-winner",
+        },
+      },
+    })
+    : await compositionModule.openRelayV2HostManagedConnectorRuntimeComposition({
+      runtime: runtimeOptions,
+      connector: {
+        credentialReference: CREDENTIAL_REFERENCE,
+        carrier: {
+          credentialReferences: {
+            read(reference) {
+              credentialReadCount += 1;
+              if (options.rejectCredentialRead?.(credentialReadCount) === true) {
+                throw new Error("injected credential read rejection");
+              }
+              return {
+                reference,
+                version: "1",
                 grantId: "managed-host-grant",
-                accessJti: "managed-host-access-jti-2",
-              },
-              accessToken: "twcap2.managed-reauth.payload.mac",
-            };
-            return options.prepareReauthentication?.(input, prepared) ?? prepared;
+                accessJti: "managed-host-access-jti",
+                accessToken: "twcap2.host.payload.mac",
+              };
+            },
+            prepareReauthentication(input) {
+              reauthenticationPreparations.push(structuredClone(input));
+              const prepared = {
+                fence: {
+                  reference: CREDENTIAL_REFERENCE,
+                  version: "2",
+                  requestId: "managed-reauth-authority-winner",
+                  grantId: "managed-host-grant",
+                  accessJti: "managed-host-access-jti-2",
+                },
+                accessToken: "twcap2.managed-reauth.payload.mac",
+              };
+              return options.prepareReauthentication?.(input, prepared) ?? prepared;
+            },
+            acknowledgeReauthentication(fence) {
+              reauthenticationAcknowledgements.push(structuredClone(fence));
+              return true;
+            },
           },
-          acknowledgeReauthentication(fence) {
-            reauthenticationAcknowledgements.push(structuredClone(fence));
-            return true;
-          },
+          ...carrierOptions,
         },
-        idFactory: () => `managed-host-hello-${++helloSequence}`,
-        clock: () => 1_783_700_100_000,
+        transportLifecycleFactory,
       },
-      transportLifecycleFactory,
-    },
-  });
+    });
 
   assert.equal(await composition.readiness.h0.activate(), true);
   assert.equal(composition.readiness.h3.activate(), true);
@@ -346,6 +523,8 @@ async function createHarness(options = {}) {
     }),
     reauthenticationPreparations,
     reauthenticationAcknowledgements,
+    managedWssCredential,
+    managedWssEffects,
     async cleanup() {
       for (const record of records) record.factoryGate?.resolve();
       for (const record of records) record.drainGate?.resolve();
@@ -367,6 +546,16 @@ async function startRegistered(harness, requestId = "managed.start") {
   assert.notEqual(record, undefined);
   assert.notEqual(record.connection, null);
   return { result, record };
+}
+
+async function startManagedWssRegistered(harness, requestId = "managed.wss.start") {
+  const pending = harness.composition.start(startInput(requestId));
+  await settle();
+  const record = harness.records.at(-1);
+  assert.notEqual(record, undefined);
+  assert.notEqual(record.hello, null);
+  record.socket.receive(registeredFrame(record));
+  return { result: await pending, record };
 }
 
 function stopInput(cut, requestId = "managed.stop") {
@@ -445,6 +634,174 @@ function hostDataFrames(record) {
       Uint8Array.from(Buffer.from(frame.payload.data, "base64")),
     ).frame);
 }
+
+test("managed WSS composition keeps construction inert and binds one credential owner cut", async (t) => {
+  await t.test("construction and close before start", async () => {
+    const h = await createHarness({ managedWss: true });
+    try {
+      assert.deepEqual(h.composition.inspect(), {
+        status: "stopped",
+        controllerGeneration: "0",
+      });
+      assert.deepEqual(h.managedWssEffects, {
+        socketConstructions: 0,
+        timerSchedules: 0,
+      });
+      assert.deepEqual(h.managedWssCredential.activity, {
+        references: [],
+        reads: 0,
+        writes: 0,
+        secretResolutions: 0,
+      });
+      assert.deepEqual(Reflect.ownKeys(h.composition), [
+        "inspect",
+        "start",
+        "requestReauthentication",
+        "stopAndDrain",
+        "readiness",
+        "sendTerminalFrame",
+        "closeAndDrain",
+      ]);
+      for (const forbidden of [
+        "credentialAuthority", "credentialReference", "credentialReferences",
+        "transportLifecycleFactory", "webSocketConstructor", "accessToken", "token",
+        "actor", "transport", "fallback",
+      ]) assert.equal(h.composition[forbidden], undefined);
+
+      await h.composition.closeAndDrain();
+      assert.deepEqual(h.managedWssEffects, {
+        socketConstructions: 0,
+        timerSchedules: 0,
+      });
+      assert.deepEqual(h.managedWssCredential.activity, {
+        references: [],
+        reads: 0,
+        writes: 0,
+        secretResolutions: 0,
+      });
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  await t.test("start, registration, and explicit reauthentication", async () => {
+    const h = await createHarness({ managedWss: true });
+    try {
+      const { result, record } = await startManagedWssRegistered(h);
+      assert.equal(record.address, "wss://relay.example.com/host");
+      assert.deepEqual(record.protocols, ["tw-relay.host.v2"]);
+      assert.deepEqual(record.headers, [[
+        "Authorization",
+        `Bearer ${h.managedWssCredential.accessToken}`,
+      ]]);
+      assert.equal(record.requestEnds, 1);
+      assert.equal(record.requestDestroys, 0);
+      assert.deepEqual(record.hello.payload.capabilities, []);
+      assert.deepEqual(record.hello.payload.clientDialects, ["tw-relay.v2"]);
+      assert.deepEqual(h.composition.inspect(), {
+        status: "registered_incomplete",
+        controllerGeneration: result.controllerGeneration,
+        connectorId: result.connectorId,
+        acknowledgement: "host.registered",
+        negotiatedCapabilityIntersection: [],
+      });
+      assert.equal(h.managedWssCredential.activity.secretResolutions, 0);
+      assert.equal(
+        h.managedWssCredential.activity.references.every(
+          (reference) => reference === CREDENTIAL_REFERENCE,
+        ),
+        true,
+      );
+
+      assert.equal(h.composition.requestReauthentication(
+        reauthenticationInput(h.composition.inspect(), "managed.wss.reauthenticate"),
+      ), true);
+      const frames = record.sent.map(({ bytes }) => decodeCarrier(bytes));
+      const reauthentication = frames.find((frame) => frame.type === "host.reauthenticate");
+      assert.notEqual(reauthentication, undefined);
+      assert.equal(reauthentication.payload.accessToken, h.managedWssCredential.accessToken);
+      assert.equal(h.managedWssCredential.activity.writes, 1);
+      assert.equal(h.managedWssCredential.activity.secretResolutions, 0);
+      assert.equal(
+        h.managedWssCredential.activity.references.every(
+          (reference) => reference === CREDENTIAL_REFERENCE,
+        ),
+        true,
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+test("managed WSS composition rejects malformed or foreign ownership input before side effects", async () => {
+  const credential = createManagedWssCredentialAuthority();
+  const effects = { socketConstructions: 0, timerSchedules: 0 };
+  const records = [];
+  const webSocketConstructor = createManagedWssConstructor(records, effects);
+  const validConnector = {
+    credentialAuthority: credential.authority,
+    credentialReference: CREDENTIAL_REFERENCE,
+    carrier: {},
+    wss: { relayUrl: "wss://relay.example.com/", webSocketConstructor },
+  };
+  const inertRuntime = {
+    hostId: HOST_ID,
+    hostEpoch: "managed-wss-malformed-host-epoch",
+    hostInstanceId: "managed-wss-malformed-host-instance",
+    authorities: {},
+    welcome: {},
+  };
+  const cases = [
+    ["malformed runtime", { runtime: null, connector: validConnector }],
+    ["foreign authority", {
+      runtime: inertRuntime,
+      connector: { ...validConnector, credentialAuthority: {} },
+    }],
+    ["unknown carrier key", {
+      runtime: inertRuntime,
+      connector: {
+        ...validConnector,
+        carrier: { accessToken: credential.accessToken },
+      },
+    }],
+    ["second carrier owner", {
+      runtime: inertRuntime,
+      connector: {
+        ...validConnector,
+        carrier: { credentialReferences: credential.authority },
+      },
+    }],
+    ["second WSS owner", {
+      runtime: inertRuntime,
+      connector: {
+        ...validConnector,
+        wss: {
+          ...validConnector.wss,
+          credentialAuthority: credential.authority,
+        },
+      },
+    }],
+  ];
+  for (const [name, options] of cases) {
+    await assert.rejects(
+      compositionModule.openRelayV2HostManagedWssConnectorRuntimeComposition(options),
+      (error) => {
+        assert.equal(error.name, "RelayV2HostConnectorControllerError", name);
+        assert.equal(error.code, "OPERATION_FAILED", name);
+        return true;
+      },
+    );
+  }
+  assert.deepEqual(effects, { socketConstructions: 0, timerSchedules: 0 });
+  assert.deepEqual(records, []);
+  assert.deepEqual(credential.activity, {
+    references: [],
+    reads: 0,
+    writes: 0,
+    secretResolutions: 0,
+  });
+});
 
 test("managed composition bridges the exact actor route and projects empty capability registration", async () => {
   const h = await createHarness();

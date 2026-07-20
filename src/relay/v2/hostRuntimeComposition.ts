@@ -74,11 +74,20 @@ import type {
   RelayV2HostH2RecoveryCandidate,
 } from "./stateSnapshotSpool.js";
 import type {
+  RelayV2HostCredentialAuthority,
   RelayV2HostCredentialConnectionAdmission,
 } from "./hostCredentialAuthority.js";
 import {
+  isRelayV2HostCredentialAuthority,
+  RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE,
+} from "./hostCredentialAuthority.js";
+import {
   prepareRelayV2HostWssTransportLifecycleAttempt,
+  RelayV2HostWssTransportLifecycleFactory,
   releaseRelayV2HostWssTransportLifecyclePreparedAttempt,
+} from "./hostWssTransportLifecycle.js";
+import type {
+  RelayV2HostWssTransportLifecycleFactoryOptions,
 } from "./hostWssTransportLifecycle.js";
 import type { RelayV2HostH0ReadinessPort } from "./hostState.js";
 import type {
@@ -296,6 +305,31 @@ export interface RelayV2HostManagedConnectorRuntimeCompositionOptions {
     credentialReference: string;
     carrier: RelayV2HostManagedConnectorCarrierOptions;
     transportLifecycleFactory: RelayV2HostManagedConnectorTransportLifecycleFactoryPort;
+  }>;
+}
+
+export type RelayV2HostManagedWssConnectorCarrierOptions = Omit<
+  RelayV2HostManagedConnectorCarrierOptions,
+  "credentialReferences"
+> & Readonly<{ credentialReferences?: never }>;
+
+export type RelayV2HostManagedWssTransportLifecycleOptions = Omit<
+  RelayV2HostWssTransportLifecycleFactoryOptions,
+  "credentialAuthority"
+> & Readonly<{ credentialAuthority?: never }>;
+
+/**
+ * Closed input for the default-off managed WSS seam. The credential authority
+ * appears exactly once; the composition privately gives that same owner to the
+ * carrier metadata path and the WSS Authorization path.
+ */
+export interface RelayV2HostManagedWssConnectorRuntimeCompositionOptions {
+  readonly runtime: Omit<RelayV2HostRuntimeCompositionOptions, "outbound">;
+  readonly connector: Readonly<{
+    credentialAuthority: RelayV2HostCredentialAuthority;
+    credentialReference: string;
+    carrier: RelayV2HostManagedWssConnectorCarrierOptions;
+    wss: RelayV2HostManagedWssTransportLifecycleOptions;
   }>;
 }
 
@@ -1234,6 +1268,126 @@ function captureManagedTransportLifecycle(
   });
 }
 
+function captureManagedWssCarrierOptions(
+  value: unknown,
+): RelayV2HostManagedWssConnectorCarrierOptions {
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || nodeTypes.isProxy(value)) throw managedCompositionFailure();
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw managedCompositionFailure();
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch (error) {
+    if (error instanceof RelayV2HostConnectorControllerError) throw error;
+    throw managedCompositionFailure();
+  }
+  const allowed = new Set([
+    "publicPayloadDecoder",
+    "maxFrameBytes",
+    "terminalMaxFrameBytes",
+    "clock",
+    "schedule",
+    "idFactory",
+    "queueLimits",
+    "onAuthExpiring",
+    "onReauthenticationError",
+  ]);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string"
+    || !allowed.has(key)
+    || !Object.hasOwn(descriptors[key], "value"))) {
+    throw managedCompositionFailure();
+  }
+  return Object.freeze(Object.fromEntries(
+    (keys as string[]).map((key) => [key, descriptors[key].value]),
+  )) as RelayV2HostManagedWssConnectorCarrierOptions;
+}
+
+function captureManagedWssOptions(
+  value: unknown,
+): RelayV2HostManagedWssTransportLifecycleOptions {
+  const required = ["relayUrl"] as const;
+  const optional = [
+    "webSocketConstructor",
+    "maxBufferedBytes",
+    "closeDrainDeadlineMs",
+    "scheduleCloseDrain",
+  ] as const;
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || nodeTypes.isProxy(value)) throw managedCompositionFailure();
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw managedCompositionFailure();
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch (error) {
+    if (error instanceof RelayV2HostConnectorControllerError) throw error;
+    throw managedCompositionFailure();
+  }
+  const allowed = new Set<string>([...required, ...optional]);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string"
+    || !allowed.has(key)
+    || !Object.hasOwn(descriptors[key], "value"))
+    || required.some((key) => !Object.hasOwn(descriptors, key))) {
+    throw managedCompositionFailure();
+  }
+  return Object.freeze(Object.fromEntries(
+    (keys as string[]).map((key) => [key, descriptors[key].value]),
+  )) as RelayV2HostManagedWssTransportLifecycleOptions;
+}
+
+function captureManagedWssRuntimeOptions(
+  value: unknown,
+): Omit<RelayV2HostRuntimeCompositionOptions, "outbound"> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || nodeTypes.isProxy(value)) throw managedCompositionFailure();
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw managedCompositionFailure();
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch (error) {
+    if (error instanceof RelayV2HostConnectorControllerError) throw error;
+    throw managedCompositionFailure();
+  }
+  const required = [
+    "hostId", "hostEpoch", "hostInstanceId", "authorities", "welcome",
+  ] as const;
+  const allowed = new Set<string>([...required, "testLimits"]);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string"
+    || !allowed.has(key)
+    || !Object.hasOwn(descriptors[key], "value"))
+    || required.some((key) => !Object.hasOwn(descriptors, key))) {
+    throw managedCompositionFailure();
+  }
+  for (const key of ["hostId", "hostEpoch", "hostInstanceId"] as const) {
+    if (!isRelayV2AuthIdentifier(descriptors[key].value)) {
+      throw managedCompositionFailure();
+    }
+  }
+  return Object.freeze(Object.fromEntries(
+    (keys as string[]).map((key) => [key, descriptors[key].value]),
+  )) as Omit<RelayV2HostRuntimeCompositionOptions, "outbound">;
+}
+
+function isManagedWssCredentialReference(value: unknown): value is string {
+  if (typeof value !== "string"
+    || !value.startsWith(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE)
+    || Buffer.byteLength(value, "utf8") > 128) return false;
+  const identifier = value.slice(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE.length);
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(identifier)
+    && !/^(?:twcap2|twref2|twenroll2|twhostboot2)\./.test(identifier);
+}
+
 function captureManagedStartInput(value: unknown): RelayV2HostManagedConnectorStartInput {
   const fields = exactManagedDataObject(value, ["requestId", "signal"]);
   if (typeof fields.requestId !== "string" || !(fields.signal instanceof AbortSignal)) {
@@ -1697,4 +1851,65 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
       return published.promise;
     },
   });
+}
+
+/**
+ * Default-off managed Host WSS composition seam.
+ *
+ * Construction only closes the existing managed composition and WSS factory
+ * over one canonical credential authority/reference. It does not open a
+ * socket, resolve credential material, start a process/timer/retry, advertise
+ * capabilities, or provide a Relay v1 fallback.
+ */
+export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
+  rawOptions: RelayV2HostManagedWssConnectorRuntimeCompositionOptions,
+): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
+  let fields: Record<string, unknown>;
+  let connectorFields: Record<string, unknown>;
+  let runtime: Omit<RelayV2HostRuntimeCompositionOptions, "outbound">;
+  let carrier: RelayV2HostManagedWssConnectorCarrierOptions;
+  let wss: RelayV2HostManagedWssTransportLifecycleOptions;
+  try {
+    fields = exactManagedDataObject(rawOptions, ["runtime", "connector"]);
+    runtime = captureManagedWssRuntimeOptions(fields.runtime);
+    connectorFields = exactManagedDataObject(fields.connector, [
+      "credentialAuthority",
+      "credentialReference",
+      "carrier",
+      "wss",
+    ]);
+    if (!isRelayV2HostCredentialAuthority(connectorFields.credentialAuthority)
+      || !isManagedWssCredentialReference(connectorFields.credentialReference)) {
+      throw managedCompositionFailure();
+    }
+    carrier = captureManagedWssCarrierOptions(connectorFields.carrier);
+    wss = captureManagedWssOptions(connectorFields.wss);
+  } catch (error) {
+    if (error instanceof RelayV2HostConnectorControllerError) throw error;
+    throw managedCompositionFailure();
+  }
+
+  const credentialAuthority = connectorFields.credentialAuthority as
+    RelayV2HostCredentialAuthority;
+  let transportLifecycleFactory: RelayV2HostWssTransportLifecycleFactory;
+  try {
+    transportLifecycleFactory = new RelayV2HostWssTransportLifecycleFactory({
+      ...wss,
+      credentialAuthority,
+    });
+  } catch {
+    throw managedCompositionFailure();
+  }
+
+  return openRelayV2HostManagedConnectorRuntimeComposition(Object.freeze({
+    runtime,
+    connector: Object.freeze({
+      credentialReference: connectorFields.credentialReference as string,
+      carrier: Object.freeze({
+        ...carrier,
+        credentialReferences: credentialAuthority,
+      }),
+      transportLifecycleFactory,
+    }),
+  }));
 }
