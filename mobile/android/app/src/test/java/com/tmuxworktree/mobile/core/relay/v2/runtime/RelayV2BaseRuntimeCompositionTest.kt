@@ -2,15 +2,30 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentClientDisposition
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLocalRequestFence
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptDurableStorageAccounting
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientReduction
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedHandoffReceipt
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLiveEventCommand
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableNamespace
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableOperationResult
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableOperationFence
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurablePreparedRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRecord
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableHandoffPort
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExactRedriveReplacement
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExtensionRequestSender
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExtensionState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePersistedRequestRecoveryResult
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRecoveryCatalogAuthority
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRecoveryCatalogCursor
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRecoveryCatalogPort
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRecoveryNamespacePage
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestAdmission
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeConsumeResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
@@ -79,10 +94,12 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -348,6 +365,245 @@ class RelayV2BaseRuntimeCompositionTest {
                 assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
             } finally {
                 harness.close()
+            }
+        }
+
+    @Test
+    fun `exact OnlineReady hands off bounded Agent recovery after Outbox and fences every generation`() =
+        runBlocking {
+            data class ReadyPath(
+                val name: String,
+                val outbox: RelayV2OutboxState,
+                val expectedCommands: List<String>,
+                val recovered: Boolean,
+            )
+
+            val paths = listOf(
+                ReadyPath("direct ready", queuedOutbox("fresh"), listOf("fresh"), false),
+                ReadyPath(
+                    "query ready",
+                    recoveredAndFreshOutbox(),
+                    listOf("recovered", "fresh"),
+                    true,
+                ),
+            )
+            paths.forEachIndexed { index, path ->
+                val probe = PostReadyRecoveryProbe()
+                val harness = Harness(
+                    autoConnect = true,
+                    outbox = path.outbox,
+                    agentRuntimeFactory = { probe.runtime },
+                )
+                try {
+                    if (path.recovered) {
+                        val query = harness.connectToCommandQuery()
+                        assertEquals(
+                            "${path.name} before OnlineReady",
+                            null,
+                            withTimeoutOrNull(100) { probe.started.await() },
+                        )
+                        harness.transport().sendCommandStatuses(query, StatusMode.RETRY_IMMEDIATE)
+                    } else {
+                        harness.connectOnline()
+                    }
+                    withTimeout(TIMEOUT_MS) { probe.started.await() }
+
+                    assertEquals(
+                        path.name,
+                        path.expectedCommands,
+                        harness.transport().framesOfType("command.execute")
+                            .map { it.stringValue("commandId") },
+                    )
+                    assertEquals(
+                        path.name,
+                        RelayV2BaseRuntimePhase.ONLINE,
+                        harness.composition.state.value.phase,
+                    )
+                    assertEquals(path.name, 1, probe.authorities.size)
+                    assertEquals(path.name, 1L, probe.authorities.single().generation.connectionGeneration)
+                    assertEquals(
+                        path.name,
+                        null,
+                        withTimeoutOrNull(100) { probe.finished.await() },
+                    )
+
+                    if (index == 0) {
+                        harness.composition.consume(harness.staleHello(connectionGeneration = 77))
+                        assertEquals("stale Hello", 1, probe.authorities.size)
+                        assertEquals(
+                            "stale Hello",
+                            null,
+                            withTimeoutOrNull(100) { probe.finished.await() },
+                        )
+                    }
+                } finally {
+                    probe.release.complete(Unit)
+                    withTimeout(TIMEOUT_MS) { probe.finished.await() }
+                    harness.close()
+                }
+            }
+
+            val lateAppliedGate = BeforeHelloAdmissionGate()
+            val lateAppliedProbe = PostReadyRecoveryProbe()
+            val lateAppliedHarness = Harness(
+                autoConnect = true,
+                beforeHelloOutboxAdmissionRead = lateAppliedGate::awaitRelease,
+                agentRuntimeFactory = { lateAppliedProbe.runtime },
+            )
+            try {
+                lateAppliedHarness.openThroughHostWelcome()
+                withTimeout(TIMEOUT_MS) { lateAppliedGate.entered.await() }
+                val disconnect = async {
+                    lateAppliedHarness.composition.disconnectAndDrain(
+                        lateAppliedHarness.profile.identity,
+                        "post-fence-applied-hello",
+                    )
+                }
+                assertEquals(null, withTimeoutOrNull(100) { disconnect.await() })
+
+                // The admitted Hello completes after disconnect took its recovery-job snapshot.
+                // Its Applied branch must observe the permanent admission fence, so the later
+                // OnlineReady/StaleOrTerminal processing cannot create an unjoined recovery job.
+                lateAppliedGate.release.complete(Unit)
+                assertEquals(
+                    "post-fence-applied-hello",
+                    withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+                )
+                assertTrue(lateAppliedProbe.authorities.isEmpty())
+                assertEquals(
+                    null,
+                    withTimeoutOrNull(100) { lateAppliedProbe.started.await() },
+                )
+                assertEquals(
+                    RelayV2BaseRuntimePhase.STOPPED,
+                    lateAppliedHarness.composition.state.value.phase,
+                )
+            } finally {
+                lateAppliedGate.release.complete(Unit)
+                lateAppliedProbe.release.complete(Unit)
+                lateAppliedHarness.close()
+            }
+
+            val paging = PersistedRecoveryPagingFixture(candidateCount = 66, capacity = 64)
+            assertEquals(
+                AgentTranscriptLifecyclePersistedRequestRecoveryResult
+                    .SynchronousAdmissionRejected,
+                paging.runtime.recoverPersistedRequestsAfterOnlineReady(
+                    paging.authority,
+                    paging.readAuthority,
+                ),
+            )
+            assertEquals(listOf(32, 32, 32), paging.requestedLimits)
+            assertEquals(3, paging.catalogAuthorities.size)
+            assertTrue(paging.catalogAuthorities.all { it == paging.catalogAuthority })
+            assertEquals(3, paging.readCuts.get())
+            assertEquals(3, paging.readLeases.get())
+            assertEquals(65, paging.preparedReads.get())
+            assertEquals(65, paging.sendAttempts.get())
+            assertEquals(64, paging.admissions.get())
+
+            val fault = PostReadyRecoveryProbe(
+                failure = IllegalStateException("namespace recovery fault"),
+            )
+            val faultHarness = Harness(
+                autoConnect = true,
+                outbox = queuedOutbox("base-command"),
+                agentRuntimeFactory = { fault.runtime },
+            )
+            try {
+                faultHarness.connectOnline()
+                withTimeout(TIMEOUT_MS) { fault.finished.await() }
+                assertEquals(
+                    listOf("base-command"),
+                    faultHarness.transport().framesOfType("command.execute")
+                        .map { it.stringValue("commandId") },
+                )
+                faultHarness.transport().sendFixture("sessions-changed-upsert")
+                withTimeout(TIMEOUT_MS) {
+                    while (faultHarness.authority.stateEventCommits.get() != 1) delay(1)
+                }
+                assertEquals(
+                    RelayV2BaseRuntimePhase.ONLINE,
+                    faultHarness.composition.state.value.phase,
+                )
+            } finally {
+                fault.release.complete(Unit)
+                faultHarness.close()
+            }
+
+            val retry = ControlledRetryDelay()
+            val generations = MultiGenerationRecoveryProbe(3)
+            val generationHarness = Harness(
+                autoConnect = true,
+                retryDelayBlock = retry::awaitDelay,
+                agentRuntimeFactory = { generations.runtime },
+            )
+            try {
+                generationHarness.connectOnline(0)
+                generations.awaitStarted(1)
+                generationHarness.authority.replaceOutbox(
+                    sendingOutbox("generation-2-pending"),
+                )
+                generationHarness.transport(0).fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(1))
+                retry.release(0)
+
+                val generation2 = generationHarness.openThroughHostWelcome(1)
+                val generation2Query = generation2.awaitSentType("command.query")
+                generations.awaitCancelled(1)
+                assertEquals(
+                    "Applied QueryPendingCommands must not start recovery before OnlineReady",
+                    1,
+                    generations.authorities.size,
+                )
+                assertEquals(
+                    RelayV2BaseRuntimePhase.CONNECTING,
+                    generationHarness.composition.state.value.phase,
+                )
+                generation2.sendCommandStatuses(
+                    generation2Query,
+                    StatusMode.RETRY_IMMEDIATE,
+                )
+                generations.awaitStarted(2)
+                generationHarness.authority.replaceOutbox(RelayV2OutboxState.empty())
+                generationHarness.transport(1).fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(2))
+                retry.release(1)
+
+                generationHarness.connectOnline(2)
+                generations.awaitStarted(3)
+                assertEquals(
+                    listOf(1L, 2L, 3L),
+                    generations.authorities.map { it.generation.connectionGeneration },
+                )
+
+                val disconnect = async {
+                    generationHarness.composition.disconnectAndDrain(
+                        generationHarness.profile.identity,
+                        "three-generation-agent-barrier",
+                    )
+                }
+                assertEquals(null, withTimeoutOrNull(100) { disconnect.await() })
+                generations.release(0)
+                generations.release(1)
+                assertEquals(null, withTimeoutOrNull(100) { disconnect.await() })
+                generations.release(2)
+                assertEquals(
+                    "three-generation-agent-barrier",
+                    withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+                )
+                assertEquals(3, generations.exits.get())
+                assertEquals(
+                    RelayV2BaseRuntimePhase.STOPPED,
+                    generationHarness.composition.state.value.phase,
+                )
+            } finally {
+                generations.releaseAll()
+                generationHarness.close()
             }
         }
 
@@ -1382,6 +1638,36 @@ class RelayV2BaseRuntimeCompositionTest {
             )
         }
 
+        fun staleHello(
+            connectionGeneration: Long,
+        ): RelayV2RuntimeEffect.QueryPendingCommands {
+            val generation = RelayV2EffectGeneration(
+                profileId = PROFILE_ID,
+                profileGeneration = profile.activationGeneration,
+                connectionGeneration = connectionGeneration,
+            )
+            return RelayV2RuntimeEffect.QueryPendingCommands(
+                context = agentContext(emptySet()),
+                generation = generation,
+                connectionAttempt = RelayV2ConnectionAttemptIdentity(profile.identity),
+                recovery = RelayV2RecoveryBinding(
+                    generation = generation,
+                    step = 1,
+                    requestId = "stale-hello-recovery",
+                ),
+                connectPlan = RelayV2ConnectPlan(
+                    profileId = PROFILE_ID,
+                    principalId = PRINCIPAL_ID,
+                    clientInstanceId = CLIENT_INSTANCE_ID,
+                    hostId = HOST_ID,
+                    requestedResume = null,
+                    recovery = RelayV2ConnectRecovery.EMPTY,
+                    durableHostEpoch = null,
+                    requiredThroughEventSeq = null,
+                ),
+            )
+        }
+
         private fun agentContext(
             negotiatedCapabilities: Set<String>,
         ) = RelayV2HandshakeContext(
@@ -1548,6 +1834,253 @@ class RelayV2BaseRuntimeCompositionTest {
 
         fun releaseLoad() {
             loadRelease.countDown()
+        }
+    }
+
+    private class PostReadyRecoveryProbe(
+        private val failure: Throwable? = null,
+    ) {
+        val authorities = CopyOnWriteArrayList<RelayV2RepositoryEffectAuthority>()
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val finished = CompletableDeferred<Unit>()
+        val runtime = object : AgentTranscriptLifecycleRuntimeHandlePort {
+            override suspend fun handle(
+                effect: RelayV2RuntimeEffect,
+            ): AgentTranscriptLifecycleRuntimeCompositionResult =
+                AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
+
+            override suspend fun recoverPersistedRequestsAfterOnlineReady(
+                authority: RelayV2RepositoryEffectAuthority,
+                readAuthority: RelayV2CurrentRepositoryReadAuthorityPort,
+            ): AgentTranscriptLifecyclePersistedRequestRecoveryResult = try {
+                authorities += authority
+                started.complete(Unit)
+                failure?.let { throw it }
+                release.await()
+                AgentTranscriptLifecyclePersistedRequestRecoveryResult.Completed
+            } finally {
+                finished.complete(Unit)
+            }
+        }
+    }
+
+    private class MultiGenerationRecoveryProbe(count: Int) {
+        val authorities = CopyOnWriteArrayList<RelayV2RepositoryEffectAuthority>()
+        val exits = AtomicInteger()
+        private val next = AtomicInteger()
+        private val started = List(count) { CompletableDeferred<Unit>() }
+        private val cancelled = List(count) { CompletableDeferred<Unit>() }
+        private val releases = List(count) { CompletableDeferred<Unit>() }
+        val runtime = object : AgentTranscriptLifecycleRuntimeHandlePort {
+            override suspend fun handle(
+                effect: RelayV2RuntimeEffect,
+            ): AgentTranscriptLifecycleRuntimeCompositionResult =
+                AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
+
+            override suspend fun recoverPersistedRequestsAfterOnlineReady(
+                authority: RelayV2RepositoryEffectAuthority,
+                readAuthority: RelayV2CurrentRepositoryReadAuthorityPort,
+            ): AgentTranscriptLifecyclePersistedRequestRecoveryResult {
+                val index = next.getAndIncrement()
+                check(index < started.size)
+                authorities += authority
+                started[index].complete(Unit)
+                val ownerJob = checkNotNull(currentCoroutineContext()[Job])
+                try {
+                    withContext(NonCancellable) {
+                        while (!ownerJob.isCancelled) delay(1)
+                        cancelled[index].complete(Unit)
+                        releases[index].await()
+                    }
+                } finally {
+                    exits.incrementAndGet()
+                }
+                return AgentTranscriptLifecyclePersistedRequestRecoveryResult.Completed
+            }
+        }
+
+        suspend fun awaitStarted(count: Int) {
+            withTimeout(TIMEOUT_MS) { started[count - 1].await() }
+        }
+
+        suspend fun awaitCancelled(count: Int) {
+            withTimeout(TIMEOUT_MS) { cancelled[count - 1].await() }
+        }
+
+        fun release(index: Int) {
+            releases[index].complete(Unit)
+        }
+
+        fun releaseAll() {
+            releases.forEach { it.complete(Unit) }
+        }
+    }
+
+    private class PersistedRecoveryPagingFixture(
+        candidateCount: Int,
+        private val capacity: Int,
+    ) {
+        val authority = RelayV2RepositoryEffectAuthority(
+            generation = RelayV2EffectGeneration(PROFILE_ID, 1, 9),
+            profileId = PROFILE_ID,
+            profileActivationGeneration = 1,
+            principalId = PRINCIPAL_ID,
+            clientInstanceId = CLIENT_INSTANCE_ID,
+            hostId = HOST_ID,
+            hostEpoch = HOST_EPOCH,
+        )
+        val catalogAuthority = AgentTranscriptLifecycleRecoveryCatalogAuthority(
+            profileId = PROFILE_ID,
+            profileActivationGeneration = 1,
+            principalId = PRINCIPAL_ID,
+            clientInstanceId = CLIENT_INSTANCE_ID,
+            hostId = HOST_ID,
+            hostEpoch = HOST_EPOCH,
+        )
+        val catalogAuthorities = CopyOnWriteArrayList<AgentTranscriptLifecycleRecoveryCatalogAuthority>()
+        val requestedLimits = CopyOnWriteArrayList<Int>()
+        val readCuts = AtomicInteger()
+        val readLeases = AtomicInteger()
+        val preparedReads = AtomicInteger()
+        val sendAttempts = AtomicInteger()
+        val admissions = AtomicInteger()
+        private val catalogReads = AtomicInteger()
+        private val catalogIssuer = Any()
+        private val candidates = List(candidateCount) { index ->
+            AgentTranscriptLifecycleDurableNamespace(
+                consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
+                    profileId = PROFILE_ID,
+                    profileActivationGeneration = 1,
+                    principalId = PRINCIPAL_ID,
+                    clientInstanceId = CLIENT_INSTANCE_ID,
+                    hostId = HOST_ID,
+                    hostEpoch = HOST_EPOCH,
+                    scopeId = "scope-${index.toString().padStart(3, '0')}",
+                    sessionId = "session-${index.toString().padStart(3, '0')}",
+                ),
+                timelineEpoch = "timeline-${index.toString().padStart(3, '0')}",
+            )
+        }
+        private var expectedCursor: AgentTranscriptLifecycleRecoveryCatalogCursor? = null
+        private val repository = Proxy.newProxyInstance(
+            AgentTranscriptLifecycleRuntimeDurableRepository::class.java.classLoader,
+            arrayOf(
+                AgentTranscriptLifecycleRuntimeDurableRepository::class.java,
+                AgentTranscriptLifecycleRecoveryCatalogPort::class.java,
+            ),
+        ) { proxy, method, arguments ->
+            when (method.name) {
+                "readRecoveryNamespacePage" -> {
+                    val requestedAuthority = arguments!![0]
+                        as AgentTranscriptLifecycleRecoveryCatalogAuthority
+                    val cursor = arguments[1] as AgentTranscriptLifecycleRecoveryCatalogCursor?
+                    val limit = arguments[2] as Int
+                    check(requestedAuthority == catalogAuthority)
+                    check(cursor === expectedCursor)
+                    check(limit == 32)
+                    catalogAuthorities += requestedAuthority
+                    requestedLimits += limit
+                    val pageIndex = catalogReads.getAndIncrement()
+                    val start = pageIndex * limit
+                    val end = minOf(start + limit, candidates.size)
+                    val page = candidates.subList(start, end)
+                    expectedCursor = if (end < candidates.size) {
+                        AgentTranscriptLifecycleRecoveryCatalogCursor.issue(
+                            requestedAuthority,
+                            page.last(),
+                            catalogIssuer,
+                        )
+                    } else {
+                        null
+                    }
+                    AgentTranscriptLifecycleRecoveryNamespacePage(page, expectedCursor)
+                }
+                "loadPreparedRequestsUnderApplyLease" -> {
+                    val fence = arguments!![0]
+                        as AgentTranscriptLifecycleDurableOperationFence
+                    check(fence.authority == fence.expectedNamespace.consumer)
+                    val index = candidates.indexOf(fence.expectedNamespace)
+                    check(index >= 0)
+                    preparedReads.incrementAndGet()
+                    listOf(
+                        AgentTranscriptLifecycleDurablePreparedRequest.Status(
+                            AgentLocalRequestFence("1", "request-$index"),
+                        ),
+                    )
+                }
+                "toString" -> "PersistedRecoveryPagingRepository"
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === arguments?.firstOrNull()
+                else -> error("Unexpected persisted recovery repository call ${method.name}")
+            }
+        } as AgentTranscriptLifecycleRuntimeDurableRepository
+        private val applyLease = object : RelayV2RepositoryEffectApplyLeasePort {
+            override suspend fun <T> withEffectApplyLease(
+                authority: RelayV2RepositoryEffectAuthority,
+                block: suspend () -> T,
+            ): RelayV2EffectApplyResult<T> =
+                if (authority == this@PersistedRecoveryPagingFixture.authority) {
+                    RelayV2EffectApplyResult.Applied(block())
+                } else {
+                    RelayV2EffectApplyResult.Stale
+                }
+        }
+        private val handoff = object : AgentTranscriptLifecycleDurableHandoffPort {
+            override fun acceptDurableHandoff(
+                receipt: AgentTranscriptLifecycleCompletedHandoffReceipt,
+            ): Boolean = false
+
+            override fun acceptDurableHandoff(
+                receipt: AgentTranscriptLifecycleCompletedBatchHandoffReceipt,
+            ): Boolean = false
+
+            override fun replaceForExactRedrive(
+                replacement: AgentTranscriptLifecycleExactRedriveReplacement,
+            ): AgentTranscriptLifecycleRequestAdmission? = null
+        }
+        private val requestSender = AgentTranscriptLifecycleExtensionRequestSender { request ->
+                    val attempt = sendAttempts.incrementAndGet()
+                    if (attempt > capacity) {
+                        null
+                    } else {
+                        admissions.incrementAndGet()
+                        AgentTranscriptLifecycleRequestAdmission(
+                            authority = request.authority,
+                            requestKind = request.kind,
+                            requestId = request.requestId,
+                            admissionSequence = attempt.toLong(),
+                        )
+                    }
+                }
+        val runtime = AgentTranscriptLifecycleRuntimeComposition.dormant(
+            applyLease = applyLease,
+            durableRepository = repository,
+            durableHandoff = handoff,
+            requestSender = requestSender,
+        )
+        private val cut = object : RelayV2CurrentRepositoryReadCut {
+            override val authority = this@PersistedRecoveryPagingFixture.authority
+            override val capability =
+                RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE
+        }
+        val readAuthority = object : RelayV2CurrentRepositoryReadAuthorityPort {
+            override fun currentRepositoryReadCut(
+                capability: RelayV2RepositoryReadCapability,
+            ): RelayV2CurrentRepositoryReadCutResult {
+                check(capability == RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE)
+                readCuts.incrementAndGet()
+                return RelayV2CurrentRepositoryReadCutResult.Available(cut)
+            }
+
+            override suspend fun <T> withCurrentRepositoryReadLease(
+                cut: RelayV2CurrentRepositoryReadCut,
+                block: suspend () -> T,
+            ): RelayV2CurrentRepositoryReadLeaseResult<T> {
+                check(cut === this@PersistedRecoveryPagingFixture.cut)
+                readLeases.incrementAndGet()
+                return RelayV2CurrentRepositoryReadLeaseResult.Current(block())
+            }
         }
     }
 

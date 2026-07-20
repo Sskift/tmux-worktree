@@ -42,6 +42,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -151,6 +152,11 @@ internal class RelayV2BaseRuntimeComposition(
     private val stateLock = Any()
     private val recoveredDispatchLock = Any()
     private var recoveredDispatch: RecoveredDispatchBuffer? = null
+    private val agentRecoveryLock = Any()
+    private var agentRecoveryAdmissionFenced = false
+    private var agentRecoveryGeneration: RelayV2EffectGeneration? = null
+    private var agentRecoveryStartedGeneration: RelayV2EffectGeneration? = null
+    private val agentRecoveryJobs = LinkedHashSet<Job>()
     private val connectionLock = Any()
     private val productMutationLock = Mutex()
     private var reconnectEnabled = profile.autoConnect
@@ -190,6 +196,7 @@ internal class RelayV2BaseRuntimeComposition(
                     applyLease = actor,
                     durableRepository = it,
                     durableHandoff = actor,
+                    requestSender = actor,
                 )
             }
     }
@@ -257,12 +264,19 @@ internal class RelayV2BaseRuntimeComposition(
             "Relay v2 base runtime disconnect profile does not match its activation"
         }
         val connectionAttempt = fenceConnectionAttempts()
+        val agentRecoveryJobs = fenceAgentRecovery()
         connectionAttempt?.cancelAndJoin()
         clearRecoveredDispatch()
-        val receipt = actor.disconnectAndDrain(expectedProfile, barrierId)
-        clearSessionProjection()
-        retireConnectionAdmissions()
-        return receipt
+        try {
+            return actor.disconnectAndDrain(expectedProfile, barrierId).also {
+                clearSessionProjection()
+                retireConnectionAdmissions()
+            }
+        } finally {
+            // The actor first drains transport/apply authority. Only then may the explicit
+            // disconnect barrier complete after its generation-scoped Agent extension job.
+            agentRecoveryJobs.forEach { it.cancelAndJoin() }
+        }
     }
 
     override fun close() {
@@ -469,9 +483,11 @@ internal class RelayV2BaseRuntimeComposition(
             )
             is RelayV2RuntimeEffect.Disconnected -> {
                 fenceConnectionAttempts()
+                val agentRecoveryJobs = fenceAgentRecovery()
                 retireConnectionAdmissions()
                 clearRecoveredDispatch()
                 clearSessionProjection()
+                agentRecoveryJobs.forEach { it.cancelAndJoin() }
                 if (terminalFailure.get() == null) {
                     _state.value = RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED)
                 }
@@ -510,7 +526,12 @@ internal class RelayV2BaseRuntimeComposition(
                 recoveryAdapter.applyHello(effect, pendingCommands)
             }
         }) {
-            is RelayV2EffectApplyResult.Applied -> applied.value?.let { submitRecovery(it) }
+            is RelayV2EffectApplyResult.Applied -> {
+                // Only the actor's exact apply lease may advance Agent recovery generation.
+                // Late/forged Hello effects close as Stale below without touching job ownership.
+                activateAgentRecoveryGeneration(effect.generation)
+                applied.value?.let { submitRecovery(it) }
+            }
             RelayV2EffectApplyResult.Stale -> Unit
         }
     }
@@ -679,22 +700,11 @@ internal class RelayV2BaseRuntimeComposition(
         }
         when (val processed = actor.processRecoveryReceipt(commit.receipt)) {
             RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery -> Unit
-            is RelayV2RecoveryReceiptProcessingResult.OnlineReady -> {
-                if (processed.authority != statuses.repositoryAuthority) {
-                    clearRecoveredDispatch()
-                    failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_STALE")
-                    return
-                }
-                if (!markOnline(processed.authority.generation)) {
-                    clearRecoveredDispatch()
-                    failRuntimeIncomplete("DURABLE_OUTBOX_ADMISSION_STALE")
-                    return
-                }
-                refreshSessionProjection()
-                if (flushRecoveredDispatch(queryLineage, processed.authority)) {
-                    dispatchFresh(processed.authority)
-                }
-            }
+            is RelayV2RecoveryReceiptProcessingResult.OnlineReady -> completeOnlineReady(
+                authority = processed.authority,
+                expectedAuthority = statuses.repositoryAuthority,
+                recoveredDispatch = { flushRecoveredDispatch(queryLineage, it) },
+            )
             RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal -> {
                 clearRecoveredDispatch()
             }
@@ -1060,17 +1070,99 @@ internal class RelayV2BaseRuntimeComposition(
     private suspend fun submitRecovery(receipt: RelayV2RecoveryReceipt) {
         when (val processed = actor.processRecoveryReceipt(receipt)) {
             RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery -> Unit
-            is RelayV2RecoveryReceiptProcessingResult.OnlineReady -> {
-                if (!markOnline(processed.authority.generation)) {
-                    failRuntimeIncomplete("DURABLE_OUTBOX_ADMISSION_STALE")
-                    return
-                }
-                refreshSessionProjection()
-                dispatchFresh(processed.authority)
-            }
+            is RelayV2RecoveryReceiptProcessingResult.OnlineReady ->
+                completeOnlineReady(processed.authority)
             RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal -> {
                 clearRecoveredDispatch()
             }
+        }
+    }
+
+    private suspend fun completeOnlineReady(
+        authority: RelayV2RepositoryEffectAuthority,
+        expectedAuthority: RelayV2RepositoryEffectAuthority = authority,
+        recoveredDispatch: (RelayV2RepositoryEffectAuthority) -> Boolean = { true },
+    ) {
+        // OnlineReady is the sole handoff. Its actor-issued authority is never reconstructed or
+        // inferred from the ordinary ONLINE projection.
+        if (authority != expectedAuthority) {
+            clearRecoveredDispatch()
+            failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_STALE")
+            return
+        }
+        if (!markOnline(authority.generation)) {
+            clearRecoveredDispatch()
+            failRuntimeIncomplete("DURABLE_OUTBOX_ADMISSION_STALE")
+            return
+        }
+        refreshSessionProjection()
+        if (!recoveredDispatch(authority)) return
+        dispatchFresh(authority)
+        startAgentRecovery(authority)
+    }
+
+    private fun activateAgentRecoveryGeneration(generation: RelayV2EffectGeneration) {
+        synchronized(agentRecoveryLock) {
+            if (agentRecoveryAdmissionFenced) return
+            if (agentRecoveryGeneration == generation) return
+            agentRecoveryGeneration = generation
+            agentRecoveryStartedGeneration = null
+            agentRecoveryJobs.forEach(Job::cancel)
+        }
+    }
+
+    private fun startAgentRecovery(authority: RelayV2RepositoryEffectAuthority) {
+        val runtime = agentRuntime ?: return
+        var recovery: Job? = null
+        synchronized(agentRecoveryLock) {
+            if (agentRecoveryAdmissionFenced || closed.get() || terminalFailure.get() != null ||
+                agentRecoveryGeneration != authority.generation ||
+                agentRecoveryStartedGeneration == authority.generation
+            ) return
+            val job = pumpScope.launch(start = CoroutineStart.LAZY) {
+                currentCoroutineContext().ensureActive()
+                val ownJob = currentCoroutineContext()[Job]
+                val current = synchronized(agentRecoveryLock) {
+                    ownJob in agentRecoveryJobs &&
+                        agentRecoveryGeneration == authority.generation &&
+                        agentRecoveryStartedGeneration == authority.generation
+                }
+                if (!current) return@launch
+                try {
+                    runtime.recoverPersistedRequestsAfterOnlineReady(authority, actor)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    // Agent recovery is extension-scoped. Base ONLINE, command Outbox, terminal
+                    // routing, and credential authority are deliberately unaffected.
+                }
+            }
+            agentRecoveryStartedGeneration = authority.generation
+            agentRecoveryJobs += job
+            job.invokeOnCompletion {
+                synchronized(agentRecoveryLock) {
+                    agentRecoveryJobs.remove(job)
+                }
+            }
+            recovery = job
+        }
+        recovery?.start()
+    }
+
+    private fun fenceAgentRecovery(): List<Job> = synchronized(agentRecoveryLock) {
+        agentRecoveryAdmissionFenced = true
+        agentRecoveryGeneration = null
+        agentRecoveryStartedGeneration = null
+        agentRecoveryJobs.toList().also { jobs -> jobs.forEach(Job::cancel) }
+    }
+
+    private fun cancelAgentRecoveryGeneration(generation: RelayV2EffectGeneration?) {
+        if (generation == null) return
+        synchronized(agentRecoveryLock) {
+            if (agentRecoveryGeneration != generation) return
+            agentRecoveryGeneration = null
+            agentRecoveryStartedGeneration = null
+            agentRecoveryJobs.forEach(Job::cancel)
         }
     }
 
@@ -1089,13 +1181,17 @@ internal class RelayV2BaseRuntimeComposition(
             when (scheduleReconnect(connectionAttempt, effect.generation, effect.failure)) {
                 RetryScheduleResult.SCHEDULED,
                 RetryScheduleResult.FENCED,
-                -> clearRecoveredDispatch()
+                -> {
+                    cancelAgentRecoveryGeneration(effect.generation)
+                    clearRecoveredDispatch()
+                }
                 RetryScheduleResult.STALE -> Unit
             }
             return
         }
         val exactAttempt = detachConnectionAttempt(connectionAttempt, effect.generation)
         if (!exactAttempt) return
+        cancelAgentRecoveryGeneration(effect.generation)
         clearRecoveredDispatch()
         failConnection(effect.failure)
     }
@@ -1252,6 +1348,7 @@ internal class RelayV2BaseRuntimeComposition(
 
     private fun beginActorShutdown() {
         if (!actorShutdownStarted.compareAndSet(false, true)) return
+        val agentRecoveryJobs = fenceAgentRecovery()
         actor.close()
         // actor.close() withdraws ONLINE publication under lifecycleLock; this synchronous clear
         // therefore cannot be followed by a cut that was current before shutdown.
@@ -1263,6 +1360,7 @@ internal class RelayV2BaseRuntimeComposition(
             } catch (_: Throwable) {
                 // A forced transport-fence close completes the same shutdown barrier exceptionally.
             } finally {
+                agentRecoveryJobs.forEach { it.cancelAndJoin() }
                 clearSessionProjection()
                 retireConnectionAdmissions()
                 parentCompletionHandle.getAndSet(null)?.dispose()

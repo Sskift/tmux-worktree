@@ -1,13 +1,41 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1InboundFrame
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CurrentRepositoryReadAuthorityPort
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CurrentRepositoryReadCutResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CurrentRepositoryReadLeaseResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectApplyLeasePort
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryReadCapability
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RuntimeEffect
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 internal fun interface AgentTranscriptLifecycleRuntimeHandlePort {
     suspend fun handle(
         effect: RelayV2RuntimeEffect,
     ): AgentTranscriptLifecycleRuntimeCompositionResult
+
+    /**
+     * Optional post-OnlineReady recovery seam. The default keeps existing lambda/fake handles
+     * dormant; only the real Agent composition owns catalog paging and exact durable resume.
+     */
+    suspend fun recoverPersistedRequestsAfterOnlineReady(
+        authority: RelayV2RepositoryEffectAuthority,
+        readAuthority: RelayV2CurrentRepositoryReadAuthorityPort,
+    ): AgentTranscriptLifecyclePersistedRequestRecoveryResult =
+        AgentTranscriptLifecyclePersistedRequestRecoveryResult.Disabled
+}
+
+internal sealed interface AgentTranscriptLifecyclePersistedRequestRecoveryResult {
+    data object Completed : AgentTranscriptLifecyclePersistedRequestRecoveryResult
+    data object SynchronousAdmissionRejected :
+        AgentTranscriptLifecyclePersistedRequestRecoveryResult
+    data object ExtensionNotNegotiated : AgentTranscriptLifecyclePersistedRequestRecoveryResult
+    data object StaleGeneration : AgentTranscriptLifecyclePersistedRequestRecoveryResult
+    data object ExtensionFault : AgentTranscriptLifecyclePersistedRequestRecoveryResult
+    data object Disabled : AgentTranscriptLifecyclePersistedRequestRecoveryResult
 }
 
 internal sealed interface AgentTranscriptLifecycleRuntimeCompositionResult {
@@ -66,6 +94,8 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             requestToken = nextRequestToken,
         )
     }
+    private val recoveryCatalog =
+        durableRepository as? AgentTranscriptLifecycleRecoveryCatalogPort
     private val failedAdmissionRedrive =
         AgentTranscriptLifecycleFailedAdmissionRedriveCoordinator(
             applyLease = applyLease,
@@ -85,6 +115,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             applyLease: RelayV2RepositoryEffectApplyLeasePort,
             durableRepository: AgentTranscriptLifecycleRuntimeDurableRepository,
             durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
+            requestSender: AgentTranscriptLifecycleExtensionRequestSender? = null,
         ): AgentTranscriptLifecycleRuntimeComposition =
             AgentTranscriptLifecycleRuntimeComposition(
                 applyLease = applyLease,
@@ -97,6 +128,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
                     )
                 },
                 enabled = true,
+                requestSender = requestSender,
             )
     }
 
@@ -113,6 +145,103 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
         is RelayV2RuntimeEffect.AgentExtensionUnavailable ->
             handleAgentUnavailable(effect)
         else -> AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
+    }
+
+    override suspend fun recoverPersistedRequestsAfterOnlineReady(
+        authority: RelayV2RepositoryEffectAuthority,
+        readAuthority: RelayV2CurrentRepositoryReadAuthorityPort,
+    ): AgentTranscriptLifecyclePersistedRequestRecoveryResult {
+        if (!enabled) return AgentTranscriptLifecyclePersistedRequestRecoveryResult.Disabled
+        val catalog = recoveryCatalog
+            ?: return AgentTranscriptLifecyclePersistedRequestRecoveryResult.Disabled
+        val coordinator = requestSync
+            ?: return AgentTranscriptLifecyclePersistedRequestRecoveryResult.Disabled
+        val catalogAuthority = AgentTranscriptLifecycleRecoveryCatalogAuthority(
+            profileId = authority.profileId,
+            profileActivationGeneration = authority.profileActivationGeneration,
+            principalId = authority.principalId,
+            clientInstanceId = authority.clientInstanceId,
+            hostId = authority.hostId,
+            hostEpoch = authority.hostEpoch,
+        )
+        var cursor: AgentTranscriptLifecycleRecoveryCatalogCursor? = null
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val cut = when (val current = readAuthority.currentRepositoryReadCut(
+                RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+            )) {
+                RelayV2CurrentRepositoryReadCutResult.Unavailable ->
+                    return AgentTranscriptLifecyclePersistedRequestRecoveryResult
+                        .ExtensionNotNegotiated
+                is RelayV2CurrentRepositoryReadCutResult.Available -> current.cut
+            }
+            if (cut.authority != authority) {
+                return AgentTranscriptLifecyclePersistedRequestRecoveryResult.StaleGeneration
+            }
+            val leasedPage = try {
+                readAuthority.withCurrentRepositoryReadLease(cut) {
+                    catalog.readRecoveryNamespacePage(
+                        authority = catalogAuthority,
+                        cursor = cursor,
+                        limit = AGENT_TRANSCRIPT_LIFECYCLE_RECOVERY_CATALOG_PAGE_LIMIT,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                return AgentTranscriptLifecyclePersistedRequestRecoveryResult.ExtensionFault
+            }
+            val page = when (leasedPage) {
+                RelayV2CurrentRepositoryReadLeaseResult.Stale ->
+                    return AgentTranscriptLifecyclePersistedRequestRecoveryResult.StaleGeneration
+                is RelayV2CurrentRepositoryReadLeaseResult.Current -> leasedPage.value
+            }
+
+            // The catalog lease has been released. Each candidate now re-enters the existing A3f
+            // exact prepared-request read; a catalog row is never treated as prepared evidence.
+            for (candidate in page.candidates) {
+                currentCoroutineContext().ensureActive()
+                if (!catalogAuthority.owns(candidate.consumer)) {
+                    return AgentTranscriptLifecyclePersistedRequestRecoveryResult.ExtensionFault
+                }
+                val results = try {
+                    coordinator.resumePersistedRequests(
+                        AgentTranscriptLifecyclePersistedRequestResumeContext(
+                            authority = authority,
+                            expectedNamespace = candidate,
+                        ),
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    return AgentTranscriptLifecyclePersistedRequestRecoveryResult.ExtensionFault
+                }
+                for (result in results) {
+                    when (result) {
+                        is AgentTranscriptLifecycleRequestSyncResult.Dispatched ->
+                            if (result.admission == null) {
+                                return AgentTranscriptLifecyclePersistedRequestRecoveryResult
+                                    .SynchronousAdmissionRejected
+                            }
+                        AgentTranscriptLifecycleRequestSyncResult.StaleGeneration ->
+                            return AgentTranscriptLifecyclePersistedRequestRecoveryResult
+                                .StaleGeneration
+                        AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated ->
+                            return AgentTranscriptLifecyclePersistedRequestRecoveryResult
+                                .ExtensionNotNegotiated
+                        AgentTranscriptLifecycleRequestSyncResult.NoRequest,
+                        is AgentTranscriptLifecycleRequestSyncResult.NotificationReady,
+                        -> Unit
+                    }
+                }
+            }
+            val next = page.nextCursor
+                ?: return AgentTranscriptLifecyclePersistedRequestRecoveryResult.Completed
+            if (page.candidates.isEmpty()) {
+                return AgentTranscriptLifecyclePersistedRequestRecoveryResult.ExtensionFault
+            }
+            cursor = next
+        }
     }
 
     suspend fun read(
