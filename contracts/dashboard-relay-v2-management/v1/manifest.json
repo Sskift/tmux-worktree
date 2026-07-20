@@ -1,0 +1,497 @@
+{
+  "contract": "tmux-worktree-dashboard-relay-v2-management-ipc",
+  "contractVersion": 1,
+  "protocolVersion": 1,
+  "fixtureFormatVersion": 1,
+  "status": "frozen-permanent-default-off",
+  "scope": "dashboard-to-bundled-node-default-off-observable-management-ipc-and-child-lifecycle-only",
+  "productionCapabilityEffect": "none",
+  "evolution": {
+    "v1DefaultOffIsPermanent": true,
+    "v1MutationSuccessAllowed": false,
+    "v1NonEmptyCapabilitiesAllowed": false,
+    "v1EnrollmentCodeAllowed": false,
+    "futureSuccessEnrollmentOrConnectorOrchestrationFrozenByV1": false,
+    "futureSuccessRequiresContractVersion": 2,
+    "futureSuccessRequiresProtocolVersion": 2
+  },
+  "consumers": [
+    {
+      "name": "node-relay-v2-management-ipc",
+      "roles": [
+        "startup-ready-frame-encoder",
+        "request-frame-decoder",
+        "default-off-response-encoder",
+        "bad-request-exit-64-owner",
+        "post-handshake-production-owner-superseded-exit-78-signal"
+      ],
+      "fixture": "cases.json"
+    },
+    {
+      "name": "dashboard-rust-relay-v2-management-child-manager",
+      "roles": [
+        "absolute-tauri-resource-child-selection",
+        "compile-time-expected-version-owner",
+        "startup-handshake-validator",
+        "request-id-csprng-owner",
+        "request-serializer",
+        "response-frame-decoder",
+        "single-in-flight-deadline-owner",
+        "poison-kill-and-wait-owner",
+        "child-exit-classifier",
+        "local-closed-manager-outcome-owner"
+      ],
+      "fixture": "cases.json"
+    }
+  ],
+  "ownership": {
+    "nodeManagementComposition": "future-sole-production-authority-for-credential-readiness-enrollment-grants-host-bootstrap-and-connector-state",
+    "dashboardRustChildManager": "child-selection-startup-handshake-request-id-child-lifecycle-byte-framing-correlation-deadline-and-local-closed-outcomes-only",
+    "rendererAndTauriCommands": "presentation-and-call-forwarding-only",
+    "rendererOrTauriCommandOwnsCredentialReadinessEnrollmentGrantOrConnectorFact": false,
+    "brokerOwnsManagementFact": false
+  },
+  "artifact": {
+    "selection": "absolute-path-returned-by-tauri-resource-resolver-for-bundled-tw-cli/cli.cjs-only",
+    "resourceRelativePath": "tw-cli/cli.cjs",
+    "resolvedPathMustBeAbsolute": true,
+    "expectedVersion": {
+      "owner": "dashboard-rust-child-manager",
+      "soleSource": "compile-time-CARGO_PKG_VERSION",
+      "environmentOverrideAllowed": false,
+      "callerOverrideAllowed": false,
+      "rendererOverrideAllowed": false,
+      "devOverrideAllowed": false
+    },
+    "runtimeVersion": {
+      "owner": "bundled-node-cli",
+      "soleSource": "bundled-cli-package-version-constant",
+      "environmentOverrideAllowed": false,
+      "argvOverrideAllowed": false,
+      "callerOverrideAllowed": false,
+      "devOverrideAllowed": false
+    },
+    "versionComparison": "exact-case-sensitive-ascii-semver-bytes-without-normalization",
+    "pathLookupAllowed": false,
+    "environmentExecutableOverrideAllowed": false,
+    "developmentExecutableOverrideAllowed": false,
+    "globallyInstalledTwAllowed": false,
+    "globalTwFallbackAllowed": false,
+    "alternateCliFallbackAllowed": false,
+    "missingArtifactDisposition": "management-unavailable-without-spawn-or-fallback",
+    "versionMismatchDisposition": "parent-poison-kill-and-wait-never-exit-78"
+  },
+  "transport": {
+    "kind": "dashboard-rust-parent-and-bundled-node-child-stdio",
+    "requestStream": "child-stdin",
+    "responseStream": "child-stdout",
+    "encoding": "strict-utf-8",
+    "framing": "exactly-one-json-object-per-lf-terminated-line",
+    "lineTerminator": "LF-only",
+    "byteOrderMarkAllowed": false,
+    "outerWhitespaceAllowed": false,
+    "emptyLineAllowed": false,
+    "topLevelJsonType": "object",
+    "objectKeyOrderSignificant": false,
+    "duplicateKeysAllowedAtAnyDepth": false,
+    "unknownKeysAllowedAtAnyDepth": false,
+    "schema": "closed",
+    "maxFramePayloadBytes": 16384,
+    "maxFrameWireBytes": 16385,
+    "framePayloadByteCounting": "raw-bytes-before-the-single-terminating-lf",
+    "stdoutNonFrameBytesAllowed": false,
+    "normalizationOrCoercionAllowed": false
+  },
+  "startupHandshake": {
+    "requiredBeforeAnyRequest": true,
+    "firstStdoutFrameMustBe": "exact-startupReady-frame",
+    "schema": {
+      "exactKeys": ["contract", "protocolVersion", "runtimeVersion"],
+      "fields": {
+        "contract": "string-const-tmux-worktree-dashboard-relay-v2-management-ipc",
+        "protocolVersion": "integer-const-1",
+        "runtimeVersion": "scalar:asciiSemVer-from-bundled-cli-package-version-constant"
+      }
+    },
+    "timeoutMs": 5000,
+    "timeoutStarts": "immediately-before-the-child-spawn-attempt",
+    "timeoutEnds": "after-the-complete-first-frame-is-closed-decoded-and-runtimeVersion-exactly-matches-expectedVersion",
+    "successRequires": [
+      "child-started-from-the-exact-absolute-tauri-resource-path",
+      "first-stdout-frame-is-the-exact-closed-startupReady-shape",
+      "contract-exactly-matches",
+      "protocolVersion-is-1",
+      "runtimeVersion-is-valid-canonical-ascii-semver",
+      "runtimeVersion-bytes-exactly-equal-compile-time-CARGO_PKG_VERSION-bytes"
+    ],
+    "requestBeforeSuccessAllowed": false,
+    "mismatchOrMalformedActionOrder": [
+      "mark-startup-channel-poisoned",
+      "discard-buffered-or-late-frames",
+      "kill-child-if-still-live",
+      "wait-for-and-reap-the-exact-child"
+    ],
+    "versionMismatchMayUseExit78": false,
+    "parseFailureMayUseExit78": false,
+    "unexpectedFrameMayUseExit78": false,
+    "automaticRestartAllowed": false,
+    "fallbackAllowed": false
+  },
+  "requestIdentity": {
+    "owner": "dashboard-rust-child-manager",
+    "generation": "16-bytes-from-operating-system-csprng-encoded-as-unpadded-canonical-base64url",
+    "entropyBits": 128,
+    "wirePrefix": "dmgmt1.",
+    "wirePattern": "^dmgmt1\\.[A-Za-z0-9_-]{21}[AQgw]$",
+    "wireUtf8Bytes": 29,
+    "canonicalValidation": "decode-unpadded-base64url-suffix-to-exactly-16-bytes-then-reencode-identically",
+    "generatedAfterSuccessfulHandshake": true,
+    "generatedBeforeOperationDeadlineStarts": true,
+    "generatedOncePerRequest": true,
+    "reuseAllowed": false,
+    "callerSuppliedAllowed": false,
+    "rendererSuppliedAllowed": false,
+    "tauriCommandInputAllowed": false,
+    "derivedFromCallerInputAllowed": false,
+    "derivedFromOperationAllowed": false,
+    "derivedFromTimeCounterPidOrPathAllowed": false,
+    "derivedFromAnySecretAllowed": false,
+    "classification": "non-sensitive-correlation-id",
+    "responseRule": "child-must-copy-the-exact-id-and-no-other-request-value"
+  },
+  "coordination": {
+    "maxInFlightRequests": 1,
+    "requestPipeliningAllowed": false,
+    "responsesPerRequest": 1,
+    "responseBeforeRequestAllowed": false,
+    "extraResponseFrameAllowed": false,
+    "requestIdCorrelation": "response-requestId-must-exactly-equal-the-sole-in-flight-rust-generated-requestId",
+    "automaticRequestRetryAllowed": false,
+    "automaticRequestReplayAllowed": false,
+    "operationDeadlineMs": 5000,
+    "deadlineStarts": "immediately-before-the-first-attempt-to-write-any-byte-of-the-request-frame-to-child-stdin",
+    "deadlineEnds": "after-the-complete-correlated-response-frame-has-been-received-and-validated",
+    "deadlineIncludes": [
+      "first-write-attempt",
+      "all-partial-or-blocking-stdin-writes",
+      "complete-request-frame-write",
+      "child-processing",
+      "complete-response-frame-read",
+      "closed-response-decode-and-correlation"
+    ],
+    "partialWriteAllowed": false,
+    "writeFailureDisposition": "channel-poison-kill-if-live-wait-and-reap-without-replay",
+    "timeoutDisposition": "channel-poison-kill-if-live-wait-and-reap-without-replay"
+  },
+  "requestSchema": {
+    "exactKeys": ["protocolVersion", "requestId", "operation"],
+    "fields": {
+      "protocolVersion": "integer-const-1",
+      "requestId": "scalar:requestId-generated-by-rust-child-manager",
+      "operation": "enum:operations"
+    },
+    "operations": [
+      "status",
+      "bootstrap_host",
+      "refresh_host",
+      "start_connector",
+      "stop_connector",
+      "create_enrollment",
+      "revoke_client_grant"
+    ],
+    "mutationOperations": [
+      "bootstrap_host",
+      "refresh_host",
+      "start_connector",
+      "stop_connector",
+      "create_enrollment",
+      "revoke_client_grant"
+    ],
+    "operationArgumentsAllowed": false,
+    "reasonNoArguments": "v1-is-permanently-default-off-and-must-not-predefine-future-success-orchestration"
+  },
+  "scalarSchemas": {
+    "requestId": {
+      "jsonType": "string",
+      "utf8Bytes": 29,
+      "rule": "ascii-regexp-^dmgmt1\\.[A-Za-z0-9_-]{21}[AQgw]$-plus-canonical-16-byte-base64url-round-trip",
+      "caseSensitive": true,
+      "unicodeNormalizationAllowed": false
+    },
+    "asciiSemVer": {
+      "jsonType": "string",
+      "minimumAsciiBytes": 5,
+      "maximumAsciiBytes": 128,
+      "rule": "canonical-semver-2.0.0-with-ascii-identifiers-no-leading-zero-in-numeric-identifiers",
+      "caseSensitive": true,
+      "byteComparison": true,
+      "unicodeNormalizationAllowed": false
+    }
+  },
+  "responseSchema": {
+    "scope": "child-stdout-wire-frames-only",
+    "exactKeys": ["protocolVersion", "requestId", "ok", "result", "error"],
+    "fields": {
+      "protocolVersion": "integer-const-1",
+      "requestId": "scalar:requestId-exact-rust-generated-request-match",
+      "ok": "boolean-by-operation-outcome",
+      "result": "object:defaultOffStatus-or-null-by-operation",
+      "error": "object:unavailableError-or-null-by-operation"
+    },
+    "unions": {
+      "status": {
+        "operation": "status",
+        "ok": true,
+        "result": "exact-defaultOffStatus",
+        "error": null
+      },
+      "mutation": {
+        "operations": [
+          "bootstrap_host",
+          "refresh_host",
+          "start_connector",
+          "stop_connector",
+          "create_enrollment",
+          "revoke_client_grant"
+        ],
+        "ok": false,
+        "result": null,
+        "error": "exact-unavailableError"
+      }
+    },
+    "supervisorErrorsAllowedOnChildStdout": false
+  },
+  "managerOutcomeSchema": {
+    "scope": "rust-local-outcome-returned-after-child-lifecycle-barrier-never-serialized-on-child-stdout",
+    "exactKeys": ["protocolVersion", "requestId", "ok", "result", "error"],
+    "common": {
+      "protocolVersion": 1,
+      "requestId": "exact-in-flight-rust-generated-requestId",
+      "ok": false,
+      "result": null
+    },
+    "unions": {
+      "superseded": {
+        "source": "exit-78-after-successful-same-version-startup-handshake",
+        "completionBarrier": "wait-and-reap-exact-child-before-return",
+        "error": "exact-supersededError"
+      },
+      "channelClosed": {
+        "source": "any-other-in-flight-channel-poison-or-non-78-exit",
+        "completionBarrier": "kill-if-live-then-wait-and-reap-exact-child-before-return",
+        "error": "exact-channelClosedError"
+      }
+    }
+  },
+  "defaultOffStatus": {
+    "exactKeys": ["availability", "capabilities", "reason"],
+    "value": {
+      "availability": "unavailable",
+      "capabilities": [],
+      "reason": "default_off"
+    },
+    "observedFact": "management-ipc-v1-is-permanently-default-off",
+    "unknownFactsMustBeAbsent": [
+      "credential-state",
+      "known-client-grant-state",
+      "enrollment-state",
+      "connector-state",
+      "authority-readiness"
+    ],
+    "sensitiveMaterialIncluded": false,
+    "productionReadinessOrCapabilityImplied": false
+  },
+  "errors": {
+    "exactKeys": ["code", "message", "retryable"],
+    "unavailableError": {
+      "code": "UNAVAILABLE",
+      "message": "Relay v2 management is unavailable",
+      "retryable": false
+    },
+    "supersededError": {
+      "code": "SUPERSEDED",
+      "message": "Relay v2 management owner was superseded",
+      "retryable": false
+    },
+    "channelClosedError": {
+      "code": "CHANNEL_CLOSED",
+      "message": "Relay v2 management channel closed",
+      "retryable": false
+    },
+    "inputReflectionAllowed": false,
+    "detailsAllowed": false,
+    "dynamicMessageAllowed": false
+  },
+  "defaultOffBehavior": {
+    "statusUnderlyingAuthorityObservationAllowed": false,
+    "mutationUnderlyingActionAllowed": false,
+    "credentialReadOrWriteAllowed": false,
+    "connectorStartOrStopAllowed": false,
+    "hostBootstrapOrRefreshAllowed": false,
+    "enrollmentCreationAllowed": false,
+    "clientGrantRevocationAllowed": false,
+    "capabilityAdvertisementAllowed": false,
+    "fallbackToRelayV1Allowed": false
+  },
+  "secretPolicy": {
+    "appliesTo": "startup-ready-request-response-manager-outcome-error-log-and-trace-values-at-every-depth",
+    "closedSchemasAloneAreSufficientToPreventArbitraryScalarSecrets": false,
+    "closedSchemaPurpose": "reject-unknown-structure-only",
+    "allowedFreeFormCallerOrRendererScalarFields": [],
+    "scalarValueControls": [
+      "contract-protocol-operation-status-reason-capability-and-error-values-are-closed-constants-or-enums",
+      "expectedVersion-is-compile-time-CARGO_PKG_VERSION-only",
+      "runtimeVersion-is-bundled-cli-package-version-constant-only",
+      "requestId-is-rust-child-manager-csprng-output-only-and-non-sensitive",
+      "response-requestId-only-echoes-that-non-sensitive-generated-id",
+      "errors-are-fixed-and-never-reflect-input"
+    ],
+    "requestIdDerivedFromSecretAllowed": false,
+    "rawFrameLoggingAllowed": false,
+    "rawFrameInErrorsAllowed": false,
+    "rawFrameInTracesAllowed": false,
+    "forbiddenMaterial": [
+      "bootstrap-token",
+      "access-token",
+      "refresh-token",
+      "relay-v1-shared-secret",
+      "credential-blob",
+      "credential-reference",
+      "private-key",
+      "bearer-credential"
+    ],
+    "forbiddenRepresentativeFieldNames": [
+      "bootstrapToken",
+      "accessToken",
+      "refreshToken",
+      "sharedSecret",
+      "v1SharedSecret",
+      "credentialBlob",
+      "credentialReference"
+    ],
+    "errorInputReflectionAllowed": false,
+    "futureEnrollmentCodePolicy": "enrollmentCode-is-forbidden-in-v1-and-requires-contract-and-protocol-v2-before-use"
+  },
+  "channelPoison": {
+    "triggers": [
+      "malformed-utf8",
+      "malformed-json",
+      "bom",
+      "missing-lf-before-eof",
+      "crlf",
+      "outer-whitespace",
+      "empty-line",
+      "non-object-json",
+      "multiple-json-values-in-one-frame",
+      "duplicate-key-at-any-depth",
+      "unknown-key-at-any-depth",
+      "closed-schema-or-type-or-enum-violation",
+      "frame-payload-over-16384-bytes",
+      "unexpected-eof",
+      "startup-handshake-unexpected-frame",
+      "startup-handshake-version-mismatch",
+      "startup-handshake-timeout",
+      "startup-handshake-exit",
+      "request-id-generation-failure",
+      "partial-stdin-write",
+      "stdin-write-error",
+      "stdin-epipe",
+      "stdin-closed",
+      "request-timeout",
+      "request-pipelining",
+      "response-without-one-in-flight-request",
+      "extra-response-frame",
+      "response-requestId-mismatch",
+      "unexpected-non-78-child-exit"
+    ],
+    "rustActionOrder": [
+      "mark-channel-terminally-poisoned",
+      "discard-all-buffered-or-late-frames",
+      "kill-child-if-still-live",
+      "wait-for-and-reap-the-exact-child",
+      "only-then-return-exact-channelClosed-manager-outcome-for-an-in-flight-request"
+    ],
+    "nodeBadRequestAction": "emit-no-response-and-exit-64",
+    "furtherFramesAllowed": false,
+    "furtherRequestsOnSameChannelAllowed": false,
+    "automaticRestartAllowed": false,
+    "automaticRequestReplayAllowed": false,
+    "automaticFallbackAllowed": false
+  },
+  "childLifecycle": {
+    "owner": "dashboard-rust-child-manager",
+    "oneChannelPerChild": true,
+    "disposeActionOrder": ["mark-channel-closed", "kill-child-if-still-live", "wait-for-and-reap-the-exact-child"],
+    "exitCodes": {
+      "64": {
+        "meaning": "node-rejected-bad-or-malformed-request-frame",
+        "allowedFor": [
+          "malformed-utf8",
+          "malformed-json",
+          "framing-violation",
+          "duplicate-key",
+          "unknown-key",
+          "oversize-frame",
+          "closed-request-schema-violation"
+        ],
+        "allowedForVersionMismatch": false,
+        "allowedForProductionOwnerSuperseded": false,
+        "wireResponse": false,
+        "rustClassification": "non-78-channel-poison"
+      },
+      "78": {
+        "meaning": "node-production-management-owner-superseded",
+        "allowedOnlyAfterSuccessfulSameVersionStartupHandshake": true,
+        "allowedForBadRequestOrParseFailure": false,
+        "allowedForVersionMismatch": false,
+        "wireResponse": false,
+        "waitAndReapRequiredBeforeOutcome": true,
+        "supersessionScope": {
+          "rustChildManagerOwnerIncarnation": "exact-losing-owner-incarnation-only",
+          "spawnedChildProcess": "exact-child-and-process-incarnation-owned-by-that-losing-owner",
+          "connectorLifecycle": "exact-old-connector-lifecycle-owned-by-that-losing-owner"
+        },
+        "losingOwnerMayRestartOrReconnect": false,
+        "newExplicitOwnerTakeoverRequired": true,
+        "sameBundledArtifactAllowedForNewExplicitOwner": true,
+        "artifactIdentityDeterminesTakeoverAuthorization": false,
+        "binaryUpgradeAutomaticallyClearsSupersession": false,
+        "binaryUpgradeAutomaticallyGrantsTakeover": false,
+        "automaticRestartAllowed": false,
+        "globalTwFallbackAllowed": false
+      }
+    },
+    "preHandshakeExit78": {
+      "classification": "startup-handshake-protocol-violation-not-superseded",
+      "ownerIncarnationSupersededStateAllowed": false,
+      "action": "poison-kill-if-live-wait-and-reap",
+      "automaticRestartAllowed": false
+    },
+    "postHandshakeExit78": {
+      "state": "losing-owner-incarnation-superseded",
+      "scope": "exact-losing-owner-incarnation-spawned-child-process-and-old-connector-lifecycle",
+      "inFlightOutcome": "exact-supersededError-after-wait-and-reap",
+      "idleOutcome": "no-request-outcome",
+      "losingOwnerAutomaticRestartOrReconnectAllowed": false,
+      "newExplicitOwnerTakeoverRequired": true,
+      "sameBundledArtifactAllowedForNewExplicitOwner": true,
+      "artifactOrBinaryVersionChangeHasAuthorityEffect": false
+    },
+    "otherExit": {
+      "meaning": "channel-closed",
+      "state": "terminally-poisoned",
+      "inFlightOutcome": "exact-channelClosedError-after-wait-and-reap",
+      "waitAndReapRequired": true,
+      "automaticRestartAllowed": false,
+      "automaticRequestReplayAllowed": false,
+      "globalTwFallbackAllowed": false
+    }
+  },
+  "fixtureInputKinds": {
+    "utf8": "value-is-encoded-as-the-exact-utf8-bytes-shown",
+    "base64": "value-is-decoded-to-the-exact-input-bytes",
+    "repeat-ascii": "ascii-is-repeated-count-times-then-the-optional-terminator-is-appended",
+    "partial-then-eof": "value-is-encoded-as-utf8-and-eof-occurs-without-any-more-bytes"
+  },
+  "fixture": "cases.json"
+}

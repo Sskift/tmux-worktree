@@ -1,0 +1,637 @@
+{
+  "fixtureFormatVersion": 1,
+  "constants": {
+    "contract": "tmux-worktree-dashboard-relay-v2-management-ipc",
+    "protocolVersion": 1,
+    "expectedVersion": "1.2.3",
+    "runtimeVersion": "1.2.3",
+    "badRequestExitCode": 64,
+    "supersededExitCode": 78,
+    "operationDeadlineMs": 5000,
+    "maxFramePayloadBytes": 16384
+  },
+  "startupHandshakeCases": [
+    {
+      "name": "same-version-absolute-bundled-resource-ready",
+      "input": {
+        "selectedArtifact": {
+          "source": "tauri-resource-resolver",
+          "absolutePath": "/Applications/Tmux Worktree.app/Contents/Resources/tw-cli/cli.cjs"
+        },
+        "expectedVersion": { "source": "compile-time-CARGO_PKG_VERSION", "value": "1.2.3" },
+        "runtimeVersion": { "source": "bundled-cli-package-version-constant", "value": "1.2.3" },
+        "firstStdoutFrame": "{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}\n"
+      },
+      "expected": {
+        "state": "ready-default-off",
+        "requestAllowed": true,
+        "versionComparison": "exact-ascii-bytes",
+        "childExit": null,
+        "fallback": "none"
+      }
+    },
+    {
+      "name": "runtime-version-mismatch-is-parent-poison-not-exit-78",
+      "input": {
+        "expectedVersion": { "source": "compile-time-CARGO_PKG_VERSION", "value": "1.2.3" },
+        "runtimeVersion": { "source": "bundled-cli-package-version-constant", "value": "1.2.4" },
+        "firstStdoutFrame": "{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.4\"}\n"
+      },
+      "reason": "startup-handshake-version-mismatch",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "childTermination": "parent-kill-signal-or-observed-non-78-never-78",
+        "exit78Allowed": false,
+        "ownerIncarnationSuperseded": false,
+        "requestAllowed": false,
+        "automaticRestart": false,
+        "fallback": "none"
+      }
+    },
+    {
+      "name": "malformed-ready-frame-poisons-without-exit-78",
+      "input": {
+        "firstStdoutFrame": "{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":}\n"
+      },
+      "reason": "malformed-json",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "exit78Allowed": false,
+        "requestAllowed": false
+      }
+    },
+    {
+      "name": "duplicate-ready-key-poisons",
+      "input": {
+        "firstStdoutFrame": "{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\",\"runtimeVersion\":\"1.2.3\"}\n"
+      },
+      "reason": "duplicate-key-at-any-depth",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "exit78Allowed": false,
+        "requestAllowed": false
+      }
+    },
+    {
+      "name": "non-semver-runtime-version-poisons",
+      "input": {
+        "firstStdoutFrame": "{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"fixture-release-1\"}\n"
+      },
+      "reason": "closed-schema-or-type-or-enum-violation",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "exit78Allowed": false,
+        "requestAllowed": false
+      }
+    },
+    {
+      "name": "unexpected-first-stdout-frame-poisons",
+      "input": {
+        "firstStdoutFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\"},\"error\":null}\n"
+      },
+      "reason": "startup-handshake-unexpected-frame",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "requestAllowed": false
+      }
+    },
+    {
+      "name": "startup-handshake-timeout-covers-spawn-through-validated-ready",
+      "steps": [
+        { "event": "start-deadline-immediately-before-child-spawn-attempt", "atMs": 0 },
+        { "event": "no-complete-valid-ready-frame", "throughMs": 5000 }
+      ],
+      "reason": "startup-handshake-timeout",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "requestAllowed": false,
+        "automaticRestart": false
+      }
+    },
+    {
+      "name": "startup-eof-before-ready-poisons",
+      "steps": [
+        { "event": "start-deadline-immediately-before-child-spawn-attempt", "atMs": 0 },
+        { "event": "child-stdout-eof", "atMs": 20 }
+      ],
+      "reason": "unexpected-eof",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"],
+        "requestAllowed": false
+      }
+    }
+  ],
+  "requestIdentityCases": [
+    {
+      "name": "rust-child-manager-generates-canonical-id-from-16-csprng-bytes",
+      "input": {
+        "owner": "dashboard-rust-child-manager",
+        "source": "operating-system-csprng",
+        "sourceBytes": 16,
+        "candidate": "dmgmt1.5qWwmtHIv_Y-jq1eMCQMHw",
+        "derivedFromCallerInput": false,
+        "derivedFromSecret": false
+      },
+      "expected": {
+        "classification": "valid-non-sensitive-requestId",
+        "decodedSuffixBytes": 16,
+        "canonicalRoundTrip": true
+      }
+    },
+    {
+      "name": "renderer-cannot-supply-even-a-canonical-looking-id",
+      "input": {
+        "owner": "renderer",
+        "source": "caller-input",
+        "candidate": "dmgmt1.uCv_oXhWq3FQv_ItDRfABw"
+      },
+      "expected": {
+        "classification": "invalid-origin",
+        "requestFrameWritten": false
+      }
+    },
+    {
+      "name": "tauri-command-caller-cannot-supply-id",
+      "input": {
+        "owner": "tauri-command-input",
+        "source": "caller-input",
+        "candidate": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ"
+      },
+      "expected": {
+        "classification": "invalid-origin",
+        "requestFrameWritten": false
+      }
+    },
+    {
+      "name": "secret-derived-id-is-forbidden",
+      "input": {
+        "owner": "dashboard-rust-child-manager",
+        "source": "hash-of-refresh-token",
+        "candidate": "dmgmt1.Mx5wpoPOS7Cifkzexeh6Bw"
+      },
+      "expected": {
+        "classification": "invalid-origin",
+        "requestFrameWritten": false,
+        "rawCandidateLogged": false
+      }
+    },
+    {
+      "name": "legacy-free-form-id-is-invalid",
+      "input": { "owner": "dashboard-rust-child-manager", "source": "operating-system-csprng", "candidate": "req-status-001" },
+      "expected": { "classification": "invalid-pattern", "requestFrameWritten": false }
+    },
+    {
+      "name": "base64url-padding-is-not-canonical",
+      "input": { "owner": "dashboard-rust-child-manager", "source": "operating-system-csprng", "candidate": "dmgmt1.AquZUdkZ9FXG7OEIfRHmjw==" },
+      "expected": { "classification": "invalid-pattern", "requestFrameWritten": false }
+    },
+    {
+      "name": "noncanonical-final-base64url-character-is-invalid",
+      "input": { "owner": "dashboard-rust-child-manager", "source": "operating-system-csprng", "candidate": "dmgmt1.AquZUdkZ9FXG7OEIfRHmjx" },
+      "expected": { "classification": "invalid-canonical-base64url", "requestFrameWritten": false }
+    },
+    {
+      "name": "wrong-length-suffix-is-invalid",
+      "input": { "owner": "dashboard-rust-child-manager", "source": "operating-system-csprng", "candidate": "dmgmt1.short" },
+      "expected": { "classification": "invalid-pattern", "requestFrameWritten": false }
+    },
+    {
+      "name": "non-ascii-id-is-invalid",
+      "input": { "owner": "dashboard-rust-child-manager", "source": "operating-system-csprng", "candidate": "dmgmt1.请求" },
+      "expected": { "classification": "invalid-pattern", "requestFrameWritten": false }
+    }
+  ],
+  "goldenExchanges": [
+    {
+      "name": "status-default-off-management-availability-only",
+      "operation": "status",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AquZUdkZ9FXG7OEIfRHmjw\",\"operation\":\"status\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.AquZUdkZ9FXG7OEIfRHmjw", "operation": "status" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\"},\"error\":null}\n",
+      "normalizedResponse": {
+        "protocolVersion": 1,
+        "requestId": "dmgmt1.AquZUdkZ9FXG7OEIfRHmjw",
+        "ok": true,
+        "result": { "availability": "unavailable", "capabilities": [], "reason": "default_off" },
+        "error": null
+      },
+      "expectedUnderlyingObservations": [],
+      "expectedUnderlyingActions": []
+    },
+    {
+      "name": "bootstrap-host-default-off-unavailable",
+      "operation": "bootstrap_host",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.wkHofchV36_U1sOtXF-hvA\",\"operation\":\"bootstrap_host\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.wkHofchV36_U1sOtXF-hvA", "operation": "bootstrap_host" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.wkHofchV36_U1sOtXF-hvA\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n",
+      "normalizedResponse": { "protocolVersion": 1, "requestId": "dmgmt1.wkHofchV36_U1sOtXF-hvA", "ok": false, "result": null, "error": { "code": "UNAVAILABLE", "message": "Relay v2 management is unavailable", "retryable": false } },
+      "expectedUnderlyingActions": []
+    },
+    {
+      "name": "refresh-host-default-off-unavailable",
+      "operation": "refresh_host",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.m-XajdYifbX8v1Dvxfua9g\",\"operation\":\"refresh_host\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.m-XajdYifbX8v1Dvxfua9g", "operation": "refresh_host" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.m-XajdYifbX8v1Dvxfua9g\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n",
+      "normalizedResponse": { "protocolVersion": 1, "requestId": "dmgmt1.m-XajdYifbX8v1Dvxfua9g", "ok": false, "result": null, "error": { "code": "UNAVAILABLE", "message": "Relay v2 management is unavailable", "retryable": false } },
+      "expectedUnderlyingActions": []
+    },
+    {
+      "name": "start-connector-default-off-unavailable",
+      "operation": "start_connector",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.GGg3IoUgDIXzfENx8QbHlw\",\"operation\":\"start_connector\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.GGg3IoUgDIXzfENx8QbHlw", "operation": "start_connector" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.GGg3IoUgDIXzfENx8QbHlw\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n",
+      "normalizedResponse": { "protocolVersion": 1, "requestId": "dmgmt1.GGg3IoUgDIXzfENx8QbHlw", "ok": false, "result": null, "error": { "code": "UNAVAILABLE", "message": "Relay v2 management is unavailable", "retryable": false } },
+      "expectedUnderlyingActions": []
+    },
+    {
+      "name": "stop-connector-default-off-unavailable",
+      "operation": "stop_connector",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.XXdOhONQuogS0f2jMdFnOQ\",\"operation\":\"stop_connector\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.XXdOhONQuogS0f2jMdFnOQ", "operation": "stop_connector" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.XXdOhONQuogS0f2jMdFnOQ\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n",
+      "normalizedResponse": { "protocolVersion": 1, "requestId": "dmgmt1.XXdOhONQuogS0f2jMdFnOQ", "ok": false, "result": null, "error": { "code": "UNAVAILABLE", "message": "Relay v2 management is unavailable", "retryable": false } },
+      "expectedUnderlyingActions": []
+    },
+    {
+      "name": "create-enrollment-default-off-unavailable",
+      "operation": "create_enrollment",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.ocsJ9anwzHRz4iyXdA5cjA\",\"operation\":\"create_enrollment\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.ocsJ9anwzHRz4iyXdA5cjA", "operation": "create_enrollment" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.ocsJ9anwzHRz4iyXdA5cjA\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n",
+      "normalizedResponse": { "protocolVersion": 1, "requestId": "dmgmt1.ocsJ9anwzHRz4iyXdA5cjA", "ok": false, "result": null, "error": { "code": "UNAVAILABLE", "message": "Relay v2 management is unavailable", "retryable": false } },
+      "expectedUnderlyingActions": []
+    },
+    {
+      "name": "revoke-client-grant-default-off-unavailable",
+      "operation": "revoke_client_grant",
+      "requestFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1._rgZ2FBzDmkt9MwqnM3uDg\",\"operation\":\"revoke_client_grant\"}\n",
+      "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1._rgZ2FBzDmkt9MwqnM3uDg", "operation": "revoke_client_grant" },
+      "responseFrame": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1._rgZ2FBzDmkt9MwqnM3uDg\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n",
+      "normalizedResponse": { "protocolVersion": 1, "requestId": "dmgmt1._rgZ2FBzDmkt9MwqnM3uDg", "ok": false, "result": null, "error": { "code": "UNAVAILABLE", "message": "Relay v2 management is unavailable", "retryable": false } },
+      "expectedUnderlyingActions": []
+    }
+  ],
+  "validSequenceCases": [
+    {
+      "name": "handshake-then-two-requests-are-serialized-on-one-child",
+      "steps": [
+        { "event": "receive-and-validate-ready", "runtimeVersion": "1.2.3", "expectedVersion": "1.2.3" },
+        { "event": "rust-generate-requestId", "requestId": "dmgmt1.9xwYIHJqpCY46LE1lOqUYg" },
+        { "event": "send-request", "requestId": "dmgmt1.9xwYIHJqpCY46LE1lOqUYg", "operation": "status" },
+        { "event": "receive-valid-correlated-response", "requestId": "dmgmt1.9xwYIHJqpCY46LE1lOqUYg" },
+        { "event": "rust-generate-requestId", "requestId": "dmgmt1.ByxfeV83tfMTur4B3b6Nqw" },
+        { "event": "send-request", "requestId": "dmgmt1.ByxfeV83tfMTur4B3b6Nqw", "operation": "stop_connector" },
+        { "event": "receive-valid-correlated-response", "requestId": "dmgmt1.ByxfeV83tfMTur4B3b6Nqw" }
+      ],
+      "expected": { "channelState": "healthy-idle-default-off", "maximumObservedInFlight": 1, "childRestarts": 0, "underlyingActions": [] }
+    },
+    {
+      "name": "json-object-key-order-does-not-change-meaning",
+      "requestFrame": "{\"operation\":\"status\",\"requestId\":\"dmgmt1.5qWwmtHIv_Y-jq1eMCQMHw\",\"protocolVersion\":1}\n",
+      "expected": {
+        "classification": "valid-request",
+        "normalizedRequest": { "protocolVersion": 1, "requestId": "dmgmt1.5qWwmtHIv_Y-jq1eMCQMHw", "operation": "status" }
+      }
+    }
+  ],
+  "invalidRequestFrameCases": [
+    { "name": "invalid-utf8", "input": { "kind": "base64", "value": "/wo=" }, "reason": "malformed-utf8" },
+    { "name": "utf8-bom", "input": { "kind": "utf8", "value": "﻿{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\"}\n" }, "reason": "bom" },
+    { "name": "crlf-is-not-lf-only", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\"}\r\n" }, "reason": "crlf" },
+    { "name": "leading-outer-whitespace", "input": { "kind": "utf8", "value": " {\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\"}\n" }, "reason": "outer-whitespace" },
+    { "name": "empty-line", "input": { "kind": "utf8", "value": "\n" }, "reason": "empty-line" },
+    { "name": "top-level-array", "input": { "kind": "utf8", "value": "[]\n" }, "reason": "non-object-json" },
+    { "name": "malformed-json-in-complete-frame", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":}\n" }, "reason": "malformed-json" },
+    { "name": "two-json-values-in-one-frame", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\"}{}\n" }, "reason": "multiple-json-values-in-one-frame" },
+    { "name": "duplicate-request-id", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"requestId\":\"dmgmt1.IWRqi4-mmVj95qmXyE_9gQ\",\"operation\":\"status\"}\n" }, "reason": "duplicate-key-at-any-depth" },
+    { "name": "unknown-request-field", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\",\"extra\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "protocol-version-two", "input": { "kind": "utf8", "value": "{\"protocolVersion\":2,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\"}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "unknown-operation", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"rotate_keys\"}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "legacy-request-id", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"req-status-001\",\"operation\":\"status\"}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "noncanonical-request-id", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AquZUdkZ9FXG7OEIfRHmjx\",\"operation\":\"status\"}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "mutation-arguments-are-not-v1", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"create_enrollment\",\"arguments\":{}}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "bootstrap-token-field-forbidden", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"bootstrap_host\",\"bootstrapToken\":\"forbidden-marker\"}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "access-token-field-forbidden", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"refresh_host\",\"accessToken\":\"forbidden-marker\"}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "refresh-token-field-forbidden", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"refresh_host\",\"refreshToken\":\"forbidden-marker\"}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "v1-shared-secret-field-forbidden", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"status\",\"v1SharedSecret\":\"forbidden-marker\"}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "credential-blob-field-forbidden", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"bootstrap_host\",\"credentialBlob\":\"forbidden-marker\"}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "credential-reference-field-forbidden", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.uCv_oXhWq3FQv_ItDRfABw\",\"operation\":\"refresh_host\",\"credentialReference\":\"forbidden-marker\"}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "frame-over-maximum", "input": { "kind": "repeat-ascii", "ascii": "a", "count": 16385, "terminator": "LF" }, "reason": "frame-payload-over-16384-bytes" }
+  ],
+  "invalidRequestFrameExpected": {
+    "precondition": "successful-same-version-startup-handshake",
+    "classification": "channel-poison",
+    "responseFrames": [],
+    "nodeExitCode": 64,
+    "nodeExit78Allowed": false,
+    "rustActionOrder": ["mark-channel-terminally-poisoned", "kill-child-if-still-live", "wait-for-and-reap-exact-child", "only-then-return-channelClosed-manager-outcome-if-a-request-is-in-flight"],
+    "automaticRestart": false,
+    "automaticReplay": false,
+    "fallback": "none"
+  },
+  "invalidResponseFrameCases": [
+    { "name": "response-invalid-utf8", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "status", "input": { "kind": "base64", "value": "/wo=" }, "reason": "malformed-utf8" },
+    { "name": "response-top-level-null", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "status", "input": { "kind": "utf8", "value": "null\n" }, "reason": "non-object-json" },
+    { "name": "response-malformed-json", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.IWRqi4-mmVj95qmXyE_9gQ\",\"ok\":true,\"result\":}\n" }, "reason": "malformed-json" },
+    { "name": "response-duplicate-nested-error-key", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "stop_connector", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.IWRqi4-mmVj95qmXyE_9gQ\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false,\"retryable\":false}}\n" }, "reason": "duplicate-key-at-any-depth" },
+    { "name": "response-unknown-root-field", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "stop_connector", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.IWRqi4-mmVj95qmXyE_9gQ\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false},\"extra\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "response-request-id-mismatch", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "stop_connector", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.Mx5wpoPOS7Cifkzexeh6Bw\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n" }, "reason": "response-requestId-mismatch" },
+    { "name": "response-request-id-not-canonical", "inFlightRequestId": "dmgmt1.IWRqi4-mmVj95qmXyE_9gQ", "operation": "stop_connector", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"req-old\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "status-advertises-capability", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[\"relay-v2\"],\"reason\":\"default_off\"},\"error\":null}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "status-claims-management-available", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"available\",\"capabilities\":[],\"reason\":\"default_off\"},\"error\":null}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "status-must-not-claim-unobserved-credential-state", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\",\"credentialState\":\"missing\"},\"error\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "status-must-not-claim-unobserved-connector-state", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\",\"connectorState\":\"stopped\"},\"error\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "status-must-not-claim-unobserved-enrollment-state", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\",\"enrollmentState\":\"idle\"},\"error\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "status-must-not-claim-unobserved-known-grant-state", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\",\"knownClientGrantState\":\"none\"},\"error\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "status-includes-future-enrollment-code", "inFlightRequestId": "dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.AcN2K8ytCQGMG_CBxBE4QQ\",\"ok\":true,\"result\":{\"availability\":\"unavailable\",\"capabilities\":[],\"reason\":\"default_off\",\"enrollmentCode\":\"not-part-of-v1\"},\"error\":null}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "mutation-success-is-not-v1", "inFlightRequestId": "dmgmt1.X7TU1JYwUOiYc3iTfObgpQ", "operation": "create_enrollment", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.X7TU1JYwUOiYc3iTfObgpQ\",\"ok\":true,\"result\":{},\"error\":null}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "mutation-unavailable-must-be-non-retryable", "inFlightRequestId": "dmgmt1.X7TU1JYwUOiYc3iTfObgpQ", "operation": "start_connector", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.X7TU1JYwUOiYc3iTfObgpQ\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":true}}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "child-cannot-send-supervisor-superseded-outcome", "inFlightRequestId": "dmgmt1.X7TU1JYwUOiYc3iTfObgpQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.X7TU1JYwUOiYc3iTfObgpQ\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"SUPERSEDED\",\"message\":\"Relay v2 management owner was superseded\",\"retryable\":false}}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "child-cannot-send-supervisor-channel-closed-outcome", "inFlightRequestId": "dmgmt1.X7TU1JYwUOiYc3iTfObgpQ", "operation": "status", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.X7TU1JYwUOiYc3iTfObgpQ\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"CHANNEL_CLOSED\",\"message\":\"Relay v2 management channel closed\",\"retryable\":false}}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "error-must-not-reflect-input", "inFlightRequestId": "dmgmt1.gOQTO42L9nRQB14s5WAfeA", "operation": "bootstrap_host", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.gOQTO42L9nRQB14s5WAfeA\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"rejected forbidden-marker from input\",\"retryable\":false}}\n" }, "reason": "closed-schema-or-type-or-enum-violation" },
+    { "name": "error-includes-refresh-token", "inFlightRequestId": "dmgmt1.gOQTO42L9nRQB14s5WAfeA", "operation": "refresh_host", "input": { "kind": "utf8", "value": "{\"protocolVersion\":1,\"requestId\":\"dmgmt1.gOQTO42L9nRQB14s5WAfeA\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false,\"refreshToken\":\"forbidden-marker\"}}\n" }, "reason": "unknown-key-at-any-depth" },
+    { "name": "response-frame-over-maximum", "inFlightRequestId": "dmgmt1.gOQTO42L9nRQB14s5WAfeA", "operation": "status", "input": { "kind": "repeat-ascii", "ascii": "a", "count": 16385, "terminator": "LF" }, "reason": "frame-payload-over-16384-bytes" }
+  ],
+  "invalidResponseFrameExpected": {
+    "classification": "channel-poison",
+    "rustActionOrder": ["mark-channel-terminally-poisoned", "discard-buffered-or-late-frames", "kill-child-if-live", "wait-for-and-reap-exact-child", "only-then-return-exact-channelClosed-manager-outcome"],
+    "automaticRestart": false,
+    "automaticReplay": false,
+    "fallback": "none"
+  },
+  "poisonSequenceCases": [
+    {
+      "name": "request-id-generation-failure-poisons-before-any-write",
+      "steps": [
+        { "event": "successful-same-version-handshake" },
+        { "event": "operating-system-csprng-failure" }
+      ],
+      "reason": "request-id-generation-failure",
+      "expected": { "bytesWritten": 0, "actionOrder": ["kill-child-if-live", "wait-for-and-reap-exact-child"], "automaticReplay": false }
+    },
+    {
+      "name": "second-request-before-first-response-poisons",
+      "steps": [
+        { "event": "send-request", "requestId": "dmgmt1.DvyXan7XIGZ3fz6mqwWq_g", "operation": "status" },
+        { "event": "attempt-send-request", "requestId": "dmgmt1.5ekPRgxvSpZ7D-H3m_fUwQ", "operation": "status" }
+      ],
+      "reason": "request-pipelining",
+      "expected": "channel-poison-kill-wait-then-channelClosed-without-replay"
+    },
+    {
+      "name": "response-without-request-poisons",
+      "steps": [{ "event": "receive-response-frame", "requestId": "dmgmt1.GTzonvaNChswh03gP4DiNA" }],
+      "reason": "response-without-one-in-flight-request",
+      "expected": "channel-poison-kill-and-wait-with-no-request-outcome"
+    },
+    {
+      "name": "extra-response-frame-after-valid-response-poisons",
+      "steps": [
+        { "event": "send-request", "requestId": "dmgmt1.A8CQ5Iw73q0YETJaLei0Vg", "operation": "status" },
+        { "event": "receive-valid-correlated-response", "requestId": "dmgmt1.A8CQ5Iw73q0YETJaLei0Vg" },
+        { "event": "receive-response-frame", "requestId": "dmgmt1.A8CQ5Iw73q0YETJaLei0Vg" }
+      ],
+      "reason": "extra-response-frame",
+      "expected": "channel-poison-kill-and-wait-with-no-second-outcome"
+    },
+    {
+      "name": "partial-response-frame-then-eof-poisons",
+      "steps": [
+        { "event": "send-request", "requestId": "dmgmt1.XqHy35-KntT1A6CzVN4PXA", "operation": "status" },
+        { "event": "receive", "input": { "kind": "partial-then-eof", "value": "{\"protocolVersion\":1" } }
+      ],
+      "reason": "missing-lf-before-eof",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed"
+    },
+    {
+      "name": "stdin-epipe-on-first-write-poisons",
+      "steps": [
+        { "event": "start-operation-deadline-before-first-stdin-write-attempt", "requestId": "dmgmt1.ZDawuAUTKTPyv5AjhHKLMQ", "atMs": 0 },
+        { "event": "stdin-write-epipe", "bytesWritten": 0, "atMs": 1 }
+      ],
+      "reason": "stdin-epipe",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed-without-replay"
+    },
+    {
+      "name": "closed-stdin-before-first-write-poisons",
+      "steps": [
+        { "event": "start-operation-deadline-before-first-stdin-write-attempt", "requestId": "dmgmt1.SBBtmDlkyxmGmBzmg_axTQ", "atMs": 0 },
+        { "event": "stdin-observed-closed", "bytesWritten": 0, "atMs": 1 }
+      ],
+      "reason": "stdin-closed",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed-without-replay"
+    },
+    {
+      "name": "partial-write-poisons-immediately-without-another-write-attempt",
+      "steps": [
+        { "event": "start-operation-deadline-before-first-stdin-write-attempt", "requestId": "dmgmt1.lY7nQBqJ8KA4A5pDMsbwYw", "atMs": 0 },
+        { "event": "stdin-partial-write", "bytesWritten": 17, "atMs": 3 },
+        { "event": "no-further-stdin-write-attempt" }
+      ],
+      "reason": "partial-stdin-write",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed-without-replay"
+    },
+    {
+      "name": "generic-stdin-write-error-before-any-byte-poisons",
+      "steps": [
+        { "event": "start-operation-deadline-before-first-stdin-write-attempt", "requestId": "dmgmt1.Y7fqnFroav0ZyM1bmFyL2Q", "atMs": 0 },
+        { "event": "stdin-write-error", "bytesWritten": 0, "atMs": 1 }
+      ],
+      "reason": "stdin-write-error",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed-without-replay"
+    },
+    {
+      "name": "blocking-first-write-consumes-the-single-five-second-deadline",
+      "steps": [
+        { "event": "start-operation-deadline-before-first-stdin-write-attempt", "requestId": "dmgmt1.3MJETvUp8ogSKIrhL3gfDA", "atMs": 0 },
+        { "event": "first-stdin-write-attempt-remains-blocked", "bytesWritten": 0, "throughMs": 5000 }
+      ],
+      "reason": "request-timeout",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed-without-replay"
+    },
+    {
+      "name": "slow-complete-write-does-not-reset-response-deadline",
+      "steps": [
+        { "event": "start-operation-deadline-before-first-stdin-write-attempt", "requestId": "dmgmt1.68K4QyuRLWQPY4O05g8Iqg", "atMs": 0 },
+        { "event": "complete-request-frame-written", "atMs": 4900 },
+        { "event": "no-complete-valid-response", "throughMs": 5000 }
+      ],
+      "reason": "request-timeout",
+      "expected": "channel-poison-kill-if-live-wait-then-channelClosed-without-replay"
+    }
+  ],
+  "childLifecycleCases": [
+    {
+      "name": "only-absolute-tauri-resource-cli-is-selected",
+      "input": {
+        "tauriResourcePath": "/Applications/Tmux Worktree.app/Contents/Resources/tw-cli/cli.cjs",
+        "tauriResourcePathIsAbsolute": true,
+        "environmentOverride": "/tmp/tw-cli/cli.cjs",
+        "developmentOverride": "/workspace/dist/cli.cjs",
+        "pathTwPresent": true,
+        "globalTwPresent": true
+      },
+      "expected": {
+        "selectedArtifact": "/Applications/Tmux Worktree.app/Contents/Resources/tw-cli/cli.cjs",
+        "environmentOverrideObserved": false,
+        "developmentOverrideObserved": false,
+        "pathOrGlobalTwObservedOrSpawned": false
+      }
+    },
+    {
+      "name": "missing-bundled-resource-never-falls-back",
+      "input": { "tauriResourcePresent": false, "environmentOverridePresent": true, "pathTwPresent": true, "globalTwPresent": true },
+      "expected": { "state": "management-unavailable", "spawnCount": 0, "pathOrGlobalTwObservedOrSpawned": false, "automaticRetry": false }
+    },
+    {
+      "name": "bad-request-after-handshake-exits-64-never-78",
+      "steps": [
+        { "event": "successful-same-version-startup-handshake" },
+        { "event": "rust-send-invalid-request-frame", "internalRequestId": "dmgmt1.Yam2ZwMR47g-Whhlxb40lA" },
+        { "event": "child-exit", "exitCode": 64 }
+      ],
+      "expected": {
+        "state": "terminally-poisoned",
+        "childResponseFrames": [],
+        "exit78Allowed": false,
+        "waitAndReapExactChildBeforeOutcome": true,
+        "requestOutcome": { "protocolVersion": 1, "requestId": "dmgmt1.Yam2ZwMR47g-Whhlxb40lA", "ok": false, "result": null, "error": { "code": "CHANNEL_CLOSED", "message": "Relay v2 management channel closed", "retryable": false } },
+        "automaticRestart": false,
+        "automaticReplay": false
+      }
+    },
+    {
+      "name": "exit-78-before-successful-handshake-is-not-superseded",
+      "steps": [{ "event": "child-exit-before-ready-validation", "exitCode": 78 }],
+      "reason": "startup-handshake-exit",
+      "expected": {
+        "state": "startup-channel-poisoned",
+        "childProtocolViolation": true,
+        "ownerIncarnationSuperseded": false,
+        "waitAndReapExactChild": true,
+        "automaticRestart": false,
+        "requestOutcome": null
+      }
+    },
+    {
+      "name": "post-handshake-in-flight-exit-78-waits-then-returns-superseded",
+      "steps": [
+        { "event": "successful-same-version-startup-handshake", "ownerIncarnation": "owner-incarnation-losing-1", "spawnedChildProcess": "child-process-incarnation-1", "connectorLifecycle": "connector-lifecycle-old-1" },
+        { "event": "send-request", "requestId": "dmgmt1.7Y21B2J_c-qCCHjKxl1nVA", "operation": "status" },
+        { "event": "child-production-owner-superseded" },
+        { "event": "child-exit", "exitCode": 78 },
+        { "event": "wait-for-and-reap-exact-child-completes" },
+        { "event": "return-manager-outcome" }
+      ],
+      "expected": {
+        "state": "losing-owner-incarnation-superseded",
+        "supersededScope": {
+          "ownerIncarnation": "owner-incarnation-losing-1",
+          "spawnedChildProcess": "child-process-incarnation-1",
+          "connectorLifecycle": "connector-lifecycle-old-1"
+        },
+        "sameOwnerRespawnCount": 0,
+        "sameOwnerReconnectCount": 0,
+        "newExplicitOwnerRequired": true,
+        "sameArtifactAllowedForNewExplicitOwner": true,
+        "artifactIdentityDeterminesTakeoverAuthorization": false,
+        "binaryUpgradeAutomaticallyClearsOrGrantsTakeover": false,
+        "requestOutcome": { "protocolVersion": 1, "requestId": "dmgmt1.7Y21B2J_c-qCCHjKxl1nVA", "ok": false, "result": null, "error": { "code": "SUPERSEDED", "message": "Relay v2 management owner was superseded", "retryable": false } },
+        "outcomeReturnedAfterWaitAndReap": true,
+        "automaticRestart": false,
+        "automaticReplay": false,
+        "fallback": "none"
+      }
+    },
+    {
+      "name": "post-handshake-idle-exit-78-supersedes-exact-owner-lifecycle-without-request-outcome",
+      "steps": [
+        { "event": "successful-same-version-startup-handshake", "ownerIncarnation": "owner-incarnation-losing-2", "spawnedChildProcess": "child-process-incarnation-2", "connectorLifecycle": "connector-lifecycle-old-2" },
+        { "event": "child-production-owner-superseded" },
+        { "event": "child-exit", "exitCode": 78 }
+      ],
+      "expected": {
+        "state": "losing-owner-incarnation-superseded",
+        "supersededScope": {
+          "ownerIncarnation": "owner-incarnation-losing-2",
+          "spawnedChildProcess": "child-process-incarnation-2",
+          "connectorLifecycle": "connector-lifecycle-old-2"
+        },
+        "waitAndReapExactChild": true,
+        "requestOutcome": null,
+        "sameOwnerRespawnCount": 0,
+        "sameOwnerReconnectCount": 0,
+        "newExplicitOwnerRequired": true,
+        "sameArtifactAllowedForNewExplicitOwner": true,
+        "artifactIdentityDeterminesTakeoverAuthorization": false,
+        "binaryUpgradeAutomaticallyClearsOrGrantsTakeover": false,
+        "automaticRestart": false
+      }
+    },
+    {
+      "name": "ordinary-non-78-exit-waits-then-returns-channel-closed",
+      "steps": [
+        { "event": "successful-same-version-startup-handshake" },
+        { "event": "send-request", "requestId": "dmgmt1.RQ1c1ABJQmfKHRUhFEAuXg", "operation": "status" },
+        { "event": "child-exit", "exitCode": 1 },
+        { "event": "wait-for-and-reap-exact-child-completes" },
+        { "event": "return-manager-outcome" }
+      ],
+      "expected": {
+        "state": "terminally-poisoned",
+        "ownerIncarnationSuperseded": false,
+        "requestOutcome": { "protocolVersion": 1, "requestId": "dmgmt1.RQ1c1ABJQmfKHRUhFEAuXg", "ok": false, "result": null, "error": { "code": "CHANNEL_CLOSED", "message": "Relay v2 management channel closed", "retryable": false } },
+        "outcomeReturnedAfterWaitAndReap": true,
+        "automaticRestart": false,
+        "automaticReplay": false,
+        "fallback": "none"
+      }
+    },
+    {
+      "name": "signal-exit-is-channel-closed-not-superseded",
+      "steps": [
+        { "event": "successful-same-version-startup-handshake" },
+        { "event": "send-request", "requestId": "dmgmt1.ZDMRlP3VUpswCljVbMAtHA", "operation": "status" },
+        { "event": "child-exit", "signal": "SIGTERM" },
+        { "event": "wait-for-and-reap-exact-child-completes" }
+      ],
+      "expected": {
+        "state": "terminally-poisoned",
+        "ownerIncarnationSuperseded": false,
+        "requestOutcome": { "protocolVersion": 1, "requestId": "dmgmt1.ZDMRlP3VUpswCljVbMAtHA", "ok": false, "result": null, "error": { "code": "CHANNEL_CLOSED", "message": "Relay v2 management channel closed", "retryable": false } },
+        "automaticRestart": false
+      }
+    },
+    {
+      "name": "owner-dispose-kills-and-waits-without-wire-shutdown",
+      "steps": [{ "event": "dashboard-rust-child-manager-dispose" }],
+      "expected": { "state": "closed", "wireShutdownRequestSent": false, "killChildIfLive": true, "waitAndReapExactChild": true, "automaticRestart": false, "pathOrGlobalTwObservedOrSpawned": false }
+    }
+  ],
+  "unionCoverage": {
+    "wireStatus": ["status-default-off-management-availability-only"],
+    "wireMutationUnavailable": [
+      "bootstrap-host-default-off-unavailable",
+      "refresh-host-default-off-unavailable",
+      "start-connector-default-off-unavailable",
+      "stop-connector-default-off-unavailable",
+      "create-enrollment-default-off-unavailable",
+      "revoke-client-grant-default-off-unavailable"
+    ],
+    "rustLocalSuperseded": ["post-handshake-in-flight-exit-78-waits-then-returns-superseded"],
+    "rustLocalChannelClosed": [
+      "bad-request-after-handshake-exits-64-never-78",
+      "ordinary-non-78-exit-waits-then-returns-channel-closed",
+      "signal-exit-is-channel-closed-not-superseded"
+    ]
+  }
+}
