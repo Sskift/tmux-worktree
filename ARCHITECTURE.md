@@ -65,7 +65,7 @@ cross-surface implementation ──> versioned RPC / wire / storage contract
 | `src/relayHost.ts` | Mac admin connector；聚合 local 与显式配置的 SSH scope |
 | `src/relayServer.ts`, `src/relay/broker/` | Relay v1 鉴权、Host/Client 路由和连接生命周期 |
 | `src/relay/v1/` | Relay v1 wire model 与消息类型 |
-| `src/relay/v2/` | 未接入生产 runtime 的 Relay v2 strict codec、Broker/Host carrier foundations、H0 事务状态库、H1 command-plane core、H2 materialized-state 与 persistent pinned snapshot spool、process-scoped H3 terminal core、HostState-backed H3 durable terminal lineage authority、只翻译现有 terminal-control protocol 的无状态 H3 authority adapter、bounded host route/runtime core与default-off typed readiness composition foundation，以及独立 broker credential native state-store port/raw N-API closed decoder/wrapper、显式 target/N-API/fixed-artifact optional loader、credential authority/external-continuity source foundation、durable credential invalidation与ready-loss驱动的Broker live-authorization/fence foundation、严格 host-bootstrap 与四端点 credential HTTP ingress foundations及未接线 external continuity HTTPS adapter foundation；host composition只可消费H1 final recovery cut签发的exact one-shot candidate，以及canonical snapshot spool为exact recovered pinned cut签发的H2 one-shot candidate；H2异步open完成receipt verify、activation lease与readiness后才返回。仍无真实production readiness producer、HostCarrier或advertisement wiring，native foundations 位于下列独立 crates，尚无完整 production composition wiring或 capability |
+| `src/relay/v2/` | 未接入生产 runtime 的 Relay v2 strict codec、Broker/Host carrier foundations、H0 事务状态库、H1 command-plane core、H2 materialized-state 与 persistent pinned snapshot spool、process-scoped H3 terminal core、HostState-backed H3 durable terminal lineage authority、只翻译现有 terminal-control protocol 的无状态 H3 authority adapter、bounded host route/runtime core与default-off typed readiness composition foundation，以及独立 broker credential native state-store port/raw N-API closed decoder/wrapper、显式 target/N-API/fixed-artifact optional loader、credential authority/external-continuity source foundation、durable credential invalidation与ready-loss驱动的Broker live-authorization/fence foundation、严格 host-bootstrap 与四端点 credential HTTP ingress foundations及未接线 external continuity HTTPS adapter foundation；host composition只可消费H1 final recovery cut签发的exact one-shot candidate，以及canonical snapshot spool为exact recovered pinned cut签发的H2 one-shot candidate；H2异步open完成receipt verify、activation lease与readiness后才返回。composition 已拥有静态绑定 production strict codec、固定 generation 且只公开 frozen `close()` 的 codec readiness producer；该 producer 与 composition 均未接 `relay-host` production root，carrier 仍固定广告空 capability，其他 production readiness/capability wiring 也未交付。native foundations 位于下列独立 crates，尚无完整 production composition wiring或 capability |
 | `src/relay/extensions/agentTranscriptLifecycle/v1/` | 未接入production runtime的可选Agent transcript/lifecycle authority、public codec、durable store/replay runtime、Codex `0.144.5` schema 2 producer、bounded LF notification source、injectable/default-off process-controller lease authority、trusted-source composition与one-shot activation foundations。activation只接受controller、既有runtime与canonical resolver，私有构造issuer/receiver/authority/composition并固定执行controller/source claim→opaque lease→独立H2 evidence校验→attach；联合close在handoff前后分别由authority/composition唯一drain同一raw source，并等待producer/ingress FIFO。built activation entry复用direct controller/source entry的进程registry，关闭或失败后不可重领。controller lease不能替代H2；这些模块不启动、发现或认证真实Codex进程，也不是production app-server ingress、external continuity backend、route或capability wiring |
 | `contracts/relay/v2/external-continuity-authority-v1/` | frozen future external authority互操作/安全contract与compact machine fixture；定义rollback-independent linearizable read/CAS、provisioning/ACL、closed internal error mapping、恢复、namespace lifecycle和ready-loss fence准入，不包含backend/transport adapter、secret material或production wiring |
 | `native/relay-v2-broker-credential-state-store-core/` | 独立未接线的纯 Rust broker credential binary/publication core；拥有 bounded absolute-range selector、owned FIFO admission/transaction lease、opaque revision、两阶段 publication/uncertain poison/close barrier，不属于根 Cargo workspace，也不实现 N-API、path/JSON、OS secure-open/identity/kernel-lock/真实 durability 或业务 schema |
@@ -353,10 +353,14 @@ Android 使用自己的 Gradle wrapper、依赖图、测试和 Lint。根 npm bu
 
 历史重构计划、一次性 QA 记录、临时截图路径和已经完成的迁移清单不应伪装成当前架构基线；需要追溯时使用 Git 历史。新增文档前先判断它属于用户手册、当前架构、专题运维、未来 contract 还是 Agent 规程，避免复制同一事实到多个位置。
 
-## Relay v2 host H1/H2/H3 composition foundation
+## Relay v2 host codec/H1/H2/H3 composition foundation
 
-The default-off Relay v2 host composition closes the isolated H1, recovered-H2,
-and H3 authority chains. H1 accepts only the opaque one-shot candidate signed
+The default-off Relay v2 host composition owns one codec readiness producer
+statically bound to the production strict codec. It publishes only fixed
+generation `1` with literal synchronous readiness, while base and carrier
+composition expose only its frozen `close()` lifecycle. The same composition
+closes the isolated H1, recovered-H2, and H3 authority chains. H1 accepts only
+the opaque one-shot candidate signed
 inside the command plane's final recovered HostState audit cut. H2 accepts only
 the canonical snapshot spool's one-shot candidate for an exact recovered pinned
 cut and completes its private receipt/lease/readiness activation before async
@@ -365,5 +369,6 @@ recovery candidate. Runtime receives private gated facades; public H1 and H2
 each expose only `close()`, while H3 has no readiness `apply` path. Close,
 disposal, owner/cut withdrawal, or fatal authority failure synchronously
 withdraws readiness and applies the existing 4406 route fence. This foundation
-remains outside `relay-host` production composition and does not advertise
-Relay v2 capabilities.
+remains outside `relay-host` production composition, the carrier still uses an
+empty advertised capability set, and the codec producer alone does not
+advertise Relay v2 capabilities.

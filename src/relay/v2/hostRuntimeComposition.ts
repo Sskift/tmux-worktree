@@ -19,6 +19,10 @@ import type {
   RelayV2HostCapabilityReadinessSourceSink,
   RelayV2HostCapabilityReadinessSourceSnapshot,
 } from "./hostCapabilityReadiness.js";
+import { createRelayV2HostCodecReadinessActivation } from "./hostCodecReadinessActivation.js";
+import type {
+  RelayV2HostCodecReadinessLifecycle,
+} from "./hostCodecReadinessActivation.js";
 import {
   createRelayV2HostRuntimeAuthorityPorts,
   RelayV2HostRuntime,
@@ -62,7 +66,7 @@ import type {
 
 type ManualReadinessSource = Exclude<
   RelayV2HostCapabilityReadinessSource,
-  "h0" | "h1" | "h2" | "h3"
+  "codec" | "h0" | "h1" | "h2" | "h3"
 >;
 
 const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
@@ -131,7 +135,7 @@ export { createRelayV2HostH0ReadinessActivation };
 export { createRelayV2HostH1ReadinessActivation };
 
 export interface RelayV2HostRuntimeCompositionReadinessLifecycle {
-  readonly codec: RelayV2HostCapabilityReadinessSourceSink<"codec">;
+  readonly codec: RelayV2HostCodecReadinessLifecycle;
   readonly carrier: RelayV2HostCapabilityReadinessSourceSink<"carrier">;
   readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostH1ReadinessLifecycle;
@@ -215,7 +219,7 @@ export interface RelayV2HostCarrierRuntimeFacade {
 }
 
 export interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
-  readonly codec: RelayV2HostCapabilityReadinessSourceSink<"codec">;
+  readonly codec: RelayV2HostCodecReadinessLifecycle;
   readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostH1ReadinessLifecycle;
   readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
@@ -476,11 +480,17 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
     h3: readinessOwner.source("h3"),
   });
   let h2Activation: RelayV2HostH2ReadinessActivation | null = null;
+  let codecActivation: RelayV2HostCodecReadinessLifecycle | null = null;
   let h0Activation: ReturnType<typeof createRelayV2HostH0ReadinessActivation> | null = null;
   let h1Activation: ReturnType<typeof createRelayV2HostH1ReadinessActivation> = null;
   let h3Activation: ReturnType<typeof createRelayV2HostH3ReadinessActivation> | null = null;
   const abandonConstruction = async (): Promise<void> => {
     const barriers: Promise<unknown>[] = [];
+    if (codecActivation !== null) {
+      try { codecActivation.close(); } catch {}
+    } else {
+      try { rawSources.codec.close(); } catch {}
+    }
     if (h1Activation !== null) {
       try { barriers.push(h1Activation.close()); } catch {}
     }
@@ -493,12 +503,19 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
     if (h2Activation !== null) {
       try { h2Activation.cancelConstruction(); } catch {}
     }
-    for (const sink of Object.values(rawSources)) {
+    for (const [source, sink] of Object.entries(rawSources)) {
+      if (source === "codec") continue;
       try { sink.close(); } catch {}
     }
     await Promise.allSettled(barriers);
   };
   try {
+    codecActivation = createRelayV2HostCodecReadinessActivation({
+      readinessSink: rawSources.codec,
+    });
+    if (codecActivation === null) {
+      throw new Error("Relay v2 production codec readiness activation failed");
+    }
     h0Activation = createRelayV2HostH0ReadinessActivation({
       hostEpoch,
       hostInstanceId,
@@ -579,7 +596,7 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
   const isDisposed = () => disposed;
 
   const readiness: RelayV2HostRuntimeCompositionReadinessLifecycle = Object.freeze({
-    codec: guardedSource(rawSources.codec, isDisposed),
+    codec: codecActivation,
     carrier: guardedSource(rawSources.carrier, isDisposed),
     h0: h0Activation.lifecycle,
     h1: Object.freeze({ close: () => h1Activation.close() }),
@@ -633,8 +650,13 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       try { h3Barrier = h3Activation.dispose(); } catch (error) { rememberFailure(error); }
       try { h0Activation.dispose(); } catch (error) { rememberFailure(error); }
       try { h2Activation.dispose(); } catch (error) { rememberFailure(error); }
+      try { codecActivation.close(); } catch (error) { rememberFailure(error); }
       for (const [source, sink] of Object.entries(rawSources)) {
-        if (source === "h0" || source === "h1" || source === "h2" || source === "h3") continue;
+        if (source === "codec"
+          || source === "h0"
+          || source === "h1"
+          || source === "h2"
+          || source === "h3") continue;
         try { sink.close(); } catch (error) { rememberFailure(error); }
       }
       try { runtime.dispose(); } catch (error) { rememberFailure(error); }

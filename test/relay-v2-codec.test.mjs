@@ -6,6 +6,9 @@ import {
 } from "./support/relayV2Fixtures.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
+const codecReadiness = await import(
+  "../dist/relay/v2/hostCodecReadinessActivation.js"
+);
 const corpus = loadRelayV2FixtureCorpus();
 
 function decodeGolden(fixture, bytes) {
@@ -61,6 +64,85 @@ test("Node Relay v2 production codec rejects every shared invalid vector", () =>
       vector.name,
     );
   }
+});
+
+test("host codec readiness owns one fixed production generation and exposes only close", () => {
+  let observed = null;
+  let closeCalls = 0;
+  const lifecycle = codecReadiness.createRelayV2HostCodecReadinessActivation({
+    readinessSink: {
+      apply(snapshot) {
+        observed = structuredClone(snapshot);
+        return true;
+      },
+      close() { closeCalls += 1; },
+    },
+  });
+
+  assert.notEqual(lifecycle, null);
+  assert.deepEqual(observed, {
+    source: "codec",
+    generation: "1",
+    ready: true,
+  });
+  assert.equal(Object.isFrozen(lifecycle), true);
+  assert.deepEqual(Object.keys(lifecycle), ["close"]);
+  assert.equal(lifecycle.apply, undefined);
+  assert.equal(lifecycle.activate, undefined);
+  assert.equal(lifecycle.issuer, undefined);
+  assert.equal(lifecycle.receipt, undefined);
+  lifecycle.close();
+  lifecycle.close();
+  assert.equal(closeCalls, 1);
+});
+
+test("host codec readiness rejects non-literal success, injection, and reentry", async () => {
+  for (const conclusion of [false, Object.freeze({}), Promise.resolve(true)]) {
+    let closeCalls = 0;
+    const lifecycle = codecReadiness.createRelayV2HostCodecReadinessActivation({
+      readinessSink: {
+        apply() { return conclusion; },
+        close() { closeCalls += 1; },
+      },
+    });
+    assert.equal(lifecycle, null);
+    assert.equal(closeCalls, 1);
+  }
+
+  let injectedApplyCalls = 0;
+  const injected = codecReadiness.createRelayV2HostCodecReadinessActivation({
+    readinessSink: {
+      apply() { injectedApplyCalls += 1; return true; },
+      close() {},
+    },
+    codec: { ready: true },
+    hostRuntime: { ready: true },
+    ready: true,
+  });
+  assert.equal(injected, null);
+  assert.equal(injectedApplyCalls, 0);
+
+  let outerCloseCalls = 0;
+  let nestedCloseCalls = 0;
+  let nested = undefined;
+  const outer = codecReadiness.createRelayV2HostCodecReadinessActivation({
+    readinessSink: {
+      apply() {
+        nested = codecReadiness.createRelayV2HostCodecReadinessActivation({
+          readinessSink: {
+            apply() { return true; },
+            close() { nestedCloseCalls += 1; },
+          },
+        });
+        return true;
+      },
+      close() { outerCloseCalls += 1; },
+    },
+  });
+  assert.equal(nested, null);
+  assert.equal(outer, null);
+  assert.equal(nestedCloseCalls, 1);
+  assert.equal(outerCloseCalls, 1);
 });
 
 test("Node Relay v2 route-envelope decoder defers command arguments until after authorization", () => {

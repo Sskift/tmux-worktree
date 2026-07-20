@@ -166,14 +166,12 @@ function openComposition(h2RecoveryCandidate, hostEpoch, hostInstanceId, overrid
   });
 }
 
-function applyFiveReadySources(composition, generation = "1") {
-  for (const source of ["codec", "carrier"]) {
-    assert.equal(composition.readiness[source].apply({
-      source,
-      generation,
-      ready: true,
-    }), true);
-  }
+function activateRemainingReadinessSources(composition, generation = "1") {
+  assert.equal(composition.readiness.carrier.apply({
+    source: "carrier",
+    generation,
+    ready: true,
+  }), true);
   assert.equal(composition.readiness.h1.apply, undefined);
   assert.equal(composition.readiness.h1.execute, undefined);
   assert.equal(composition.readiness.h1.query, undefined);
@@ -418,8 +416,12 @@ test("async host composition returns only after exact recovered H2 activation", 
     assert.equal(h.composition.readiness.h1.execute, undefined);
     assert.equal(h.composition.readiness.h1.query, undefined);
     assert.equal(h.composition.readiness.h1.issueDedupeWindow, undefined);
+    assert.equal(Object.isFrozen(h.composition.readiness.codec), true);
+    assert.deepEqual(Object.keys(h.composition.readiness.codec), ["close"]);
+    assert.equal(h.composition.readiness.codec.apply, undefined);
+    assert.equal(h.composition.readiness.codec.activate, undefined);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
-    applyFiveReadySources(h.composition);
+    activateRemainingReadinessSources(h.composition);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     assert.equal(
       h.composition.routeSink.onRouteBound(binding()).code,
@@ -430,6 +432,27 @@ test("async host composition returns only after exact recovered H2 activation", 
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     assert.equal(await h.composition.readiness.h0.activate(), true);
     assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("production codec readiness is close-only and cannot re-enter after withdrawal", async () => {
+  const h = await realCompositionHarness();
+  try {
+    activateRemainingReadinessSources(h.composition);
+    assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
+    const readyGeneration = BigInt(h.composition.readiness.current().generation);
+    h.composition.readiness.codec.close();
+    const withdrawn = h.composition.readiness.current();
+    assert.ok(BigInt(withdrawn.generation) > readyGeneration);
+    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
+    h.composition.readiness.codec.close();
+    assert.equal(h.composition.readiness.current(), withdrawn);
+    assert.equal(
+      h.composition.routeSink.onRouteBound(binding()).code,
+      "CAPABILITY_UNAVAILABLE",
+    );
   } finally {
     await h.cleanup();
   }
@@ -767,7 +790,7 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
     },
   });
   try {
-    applyFiveReadySources(h.composition);
+    activateRemainingReadinessSources(h.composition);
     const route = binding();
     assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
     const hello = fixture("client-hello-fresh");
@@ -839,7 +862,7 @@ test("fatal recovered H1 withdrawal fences an active route with 4406", async () 
     },
   });
   try {
-    applyFiveReadySources(h.composition);
+    activateRemainingReadinessSources(h.composition);
     const route = binding();
     assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
     const hello = fixture("client-hello-fresh");
@@ -875,7 +898,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
   await t.test("explicit composition close permanently fences the recovered generation", async () => {
     const h = await realCompositionHarness();
     try {
-      applyFiveReadySources(h.composition);
+      activateRemainingReadinessSources(h.composition);
       assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
       h.composition.readiness.h2.close();
       h.composition.readiness.h2.close();
@@ -888,7 +911,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
   await t.test("snapshot release closes the activation sink and withdraws H2", async () => {
     const h = await realCompositionHarness();
     try {
-      applyFiveReadySources(h.composition);
+      activateRemainingReadinessSources(h.composition);
       await h.spool.release(releaseSnapshotRequest(
         h.recoveredChunk,
         h.recoveredPrincipalId,
@@ -906,7 +929,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
       spoolLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
     });
     try {
-      applyFiveReadySources(h.composition);
+      activateRemainingReadinessSources(h.composition);
       now += 10;
       await h.spool.cleanupExpired();
       assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -919,7 +942,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
     const h = await realCompositionHarness();
     let successor;
     try {
-      applyFiveReadySources(h.composition);
+      activateRemainingReadinessSources(h.composition);
       successor = await snapshotSpool.RelayV2StateSnapshotSpool.open({
         hostId: HOST_ID,
         cutSource: h.foundation.snapshotCutSource,
@@ -937,7 +960,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
   await t.test("snapshot spool close withdraws H2 before owner cleanup completes", async () => {
     const h = await realCompositionHarness();
     try {
-      applyFiveReadySources(h.composition);
+      activateRemainingReadinessSources(h.composition);
       await h.spool.close();
       assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     } finally {
@@ -1001,7 +1024,7 @@ test("composition dispose publishes one reentrant barrier and waits for H1 and H
     },
   });
   try {
-    applyFiveReadySources(h.composition);
+    activateRemainingReadinessSources(h.composition);
     const route = binding();
     assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
     const hello = fixture("client-hello-fresh");
