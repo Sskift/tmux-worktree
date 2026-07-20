@@ -1,12 +1,22 @@
 import type {
   RelayV2HostBootstrapPreparation,
   RelayV2HostBootstrapResponse,
+  RelayV2HostCredentialCapturedExchangeCut,
   RelayV2HostCredentialAttemptFence,
+  RelayV2HostCredentialExchangeCut,
+  RelayV2HostCredentialExchangeCutInput,
+  RelayV2HostCredentialInspection,
   RelayV2HostCredentialResponseCommit,
   RelayV2HostPreparedBootstrap,
+  RelayV2HostPreparedBootstrapFromCut,
   RelayV2HostPreparedRefresh,
+  RelayV2HostPreparedRefreshFromCut,
   RelayV2HostRefreshPreparation,
   RelayV2HostRefreshResponse,
+} from "./hostCredentialAuthority.js";
+import {
+  isRelayV2HostCredentialAuthority,
+  RelayV2HostCredentialAuthority,
 } from "./hostCredentialAuthority.js";
 import type {
   RelayV2HostBootstrapHttpsRequest,
@@ -55,6 +65,39 @@ export interface RelayV2HostCredentialExchangeCoordinatorOptions {
   readonly httpsAdapter: RelayV2HostCredentialExchangeHttpsAdapter;
 }
 
+export interface RelayV2HostCredentialOwnerBoundExchangePort {
+  inspect(reference: string): RelayV2HostCredentialInspection | null;
+  capture(input: RelayV2HostCredentialExchangeCutInput): RelayV2HostCredentialCapturedExchangeCut;
+  release(cut: RelayV2HostCredentialExchangeCut): void;
+  bootstrap(
+    cut: RelayV2HostCredentialExchangeCut,
+    input: RelayV2HostCredentialBootstrapExchangeInput,
+    signal: AbortSignal,
+  ): Promise<RelayV2HostCredentialResponseCommit>;
+  refresh(
+    cut: RelayV2HostCredentialExchangeCut,
+    input: RelayV2HostCredentialRefreshExchangeInput,
+    signal: AbortSignal,
+  ): Promise<RelayV2HostCredentialResponseCommit>;
+}
+
+const ownerBoundExchangePorts = new WeakSet<object>();
+
+export function isRelayV2HostCredentialOwnerBoundExchangePort(
+  value: unknown,
+): value is RelayV2HostCredentialOwnerBoundExchangePort {
+  return typeof value === "object"
+    && value !== null
+    && ownerBoundExchangePorts.has(value);
+}
+
+export class RelayV2HostCredentialOwnerBindingError extends Error {
+  constructor() {
+    super("Relay v2 host credential exchange owner binding is unavailable");
+    this.name = "RelayV2HostCredentialOwnerBindingError";
+  }
+}
+
 /**
  * Unwired, default-off orchestration seam for one host credential exchange.
  * Attempt ownership and response fencing remain entirely in the authority;
@@ -63,10 +106,41 @@ export interface RelayV2HostCredentialExchangeCoordinatorOptions {
 export class RelayV2HostCredentialExchangeCoordinator {
   private readonly authority: RelayV2HostCredentialExchangeAuthority;
   private readonly httpsAdapter: RelayV2HostCredentialExchangeHttpsAdapter;
+  private ownerBoundPort: RelayV2HostCredentialOwnerBoundExchangePort | null = null;
 
   constructor(options: RelayV2HostCredentialExchangeCoordinatorOptions) {
     this.authority = options.authority;
     this.httpsAdapter = options.httpsAdapter;
+  }
+
+  createOwnerBoundPort(): RelayV2HostCredentialOwnerBoundExchangePort {
+    if (this.ownerBoundPort !== null) return this.ownerBoundPort;
+    if (!isRelayV2HostCredentialAuthority(this.authority)) {
+      throw new RelayV2HostCredentialOwnerBindingError();
+    }
+    const authority: RelayV2HostCredentialAuthority = this.authority;
+    const port = Object.freeze({
+      inspect: (reference: string) => authority.inspect(reference),
+      capture: (input: RelayV2HostCredentialExchangeCutInput) => (
+        authority.captureExchangeCut(input)
+      ),
+      release: (cut: RelayV2HostCredentialExchangeCut) => {
+        authority.releaseIssuedExchangeCut(cut);
+      },
+      bootstrap: (
+        cut: RelayV2HostCredentialExchangeCut,
+        input: RelayV2HostCredentialBootstrapExchangeInput,
+        signal: AbortSignal,
+      ) => this.bootstrapFromCut(authority, cut, input, signal),
+      refresh: (
+        cut: RelayV2HostCredentialExchangeCut,
+        input: RelayV2HostCredentialRefreshExchangeInput,
+        signal: AbortSignal,
+      ) => this.refreshFromCut(authority, cut, input, signal),
+    });
+    ownerBoundExchangePorts.add(port);
+    this.ownerBoundPort = port;
+    return port;
   }
 
   async bootstrap(
@@ -79,6 +153,37 @@ export class RelayV2HostCredentialExchangeCoordinator {
       attemptId: input.attemptId,
       oldSecretReference: input.oldSecretReference,
     });
+    return this.exchangeBootstrap(prepared, input, signal);
+  }
+
+  private async bootstrapFromCut(
+    authority: RelayV2HostCredentialAuthority,
+    cut: RelayV2HostCredentialExchangeCut,
+    input: RelayV2HostCredentialBootstrapExchangeInput,
+    signal: AbortSignal,
+  ): Promise<RelayV2HostCredentialResponseCommit> {
+    let preparedFromCut: RelayV2HostPreparedBootstrapFromCut | null = null;
+    try {
+      preparedFromCut = authority.prepareBootstrapFromCut(cut, {
+        credentialReference: input.credentialReference,
+        hostId: input.hostId,
+        attemptId: input.attemptId,
+        oldSecretReference: input.oldSecretReference,
+      });
+      return await this.exchangeBootstrap(preparedFromCut.prepared, input, signal);
+    } finally {
+      authority.releaseIssuedExchangeCut(cut);
+      if (preparedFromCut !== null) {
+        authority.releaseExchangeLease(preparedFromCut.lease);
+      }
+    }
+  }
+
+  private async exchangeBootstrap(
+    prepared: RelayV2HostPreparedBootstrap,
+    input: RelayV2HostCredentialBootstrapExchangeInput,
+    signal: AbortSignal,
+  ): Promise<RelayV2HostCredentialResponseCommit> {
     const fence = prepared.fence;
     const credential = prepared.credential;
     const bootstrapAttemptId = fence.attemptId;
@@ -105,6 +210,36 @@ export class RelayV2HostCredentialExchangeCoordinator {
       attemptId: input.attemptId,
       oldSecretReference: input.oldSecretReference,
     });
+    return this.exchangeRefresh(prepared, input, signal);
+  }
+
+  private async refreshFromCut(
+    authority: RelayV2HostCredentialAuthority,
+    cut: RelayV2HostCredentialExchangeCut,
+    input: RelayV2HostCredentialRefreshExchangeInput,
+    signal: AbortSignal,
+  ): Promise<RelayV2HostCredentialResponseCommit> {
+    let preparedFromCut: RelayV2HostPreparedRefreshFromCut | null = null;
+    try {
+      preparedFromCut = authority.prepareRefreshFromCut(cut, {
+        credentialReference: input.credentialReference,
+        attemptId: input.attemptId,
+        oldSecretReference: input.oldSecretReference,
+      });
+      return await this.exchangeRefresh(preparedFromCut.prepared, input, signal);
+    } finally {
+      authority.releaseIssuedExchangeCut(cut);
+      if (preparedFromCut !== null) {
+        authority.releaseExchangeLease(preparedFromCut.lease);
+      }
+    }
+  }
+
+  private async exchangeRefresh(
+    prepared: RelayV2HostPreparedRefresh,
+    input: RelayV2HostCredentialRefreshExchangeInput,
+    signal: AbortSignal,
+  ): Promise<RelayV2HostCredentialResponseCommit> {
     const fence = prepared.fence;
     const credential = prepared.credential;
     const refreshAttemptId = fence.attemptId;

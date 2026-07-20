@@ -3,10 +3,14 @@ import test from "node:test";
 import { build } from "esbuild";
 
 const compiled = await build({
-  entryPoints: [new URL(
-    "../src/relay/v2/hostCredentialExchangeCoordinator.ts",
-    import.meta.url,
-  ).pathname],
+  stdin: {
+    contents: [
+      'export * from "./hostCredentialAuthority.ts";',
+      'export * from "./hostCredentialExchangeCoordinator.ts";',
+    ].join("\n"),
+    resolveDir: new URL("../src/relay/v2/", import.meta.url).pathname,
+    sourcefile: "host-credential-owner-bound-test-entry.ts",
+  },
   bundle: true,
   format: "esm",
   platform: "node",
@@ -110,6 +114,39 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+class OwnerBoundStorage {
+  state = null;
+  revision = 0;
+  revisions = new WeakMap();
+  compareAttempts = 0;
+
+  runExclusive(reference, operation) {
+    const read = () => {
+      const revision = Object.freeze({ ownerBoundRevision: true });
+      this.revisions.set(revision, { reference, revision: this.revision });
+      return {
+        state: this.state === null ? null : structuredClone(this.state),
+        revision,
+      };
+    };
+    return operation({
+      read,
+      compareAndSwap: (expected, replacement) => {
+        this.compareAttempts += 1;
+        const observed = this.revisions.get(expected);
+        if (!observed
+          || observed.reference !== reference
+          || observed.revision !== this.revision) {
+          return { status: "conflict", current: read() };
+        }
+        this.state = structuredClone(replacement);
+        this.revision += 1;
+        return { status: "swapped" };
+      },
+    });
+  }
 }
 
 test("bootstrap and refresh strictly order prepare, one exchange, and exact apply", async (t) => {
@@ -499,4 +536,183 @@ test("concurrent late responses return the authority's exact winner and stale de
     [prepared.fence, responses[1]],
     [prepared.fence, responses[0]],
   ]);
+});
+
+test("foreign owner cut with colliding values closes before mutation, secret, or network", async () => {
+  const firstStorage = new OwnerBoundStorage();
+  const secondStorage = new OwnerBoundStorage();
+  const firstSecretResolutions = [];
+  const secondSecretResolutions = [];
+  const createAuthority = (storage, resolutions) => (
+    new coordinatorModule.RelayV2HostCredentialAuthority({
+      storage,
+      secretResolver: {
+        resolve(reference) {
+          resolutions.push(reference);
+          return "twhostboot2.foreign-owner-bootstrap-secret";
+        },
+      },
+    })
+  );
+  const firstAuthority = createAuthority(firstStorage, firstSecretResolutions);
+  const secondAuthority = createAuthority(secondStorage, secondSecretResolutions);
+  const preparation = {
+    credentialReference: BOOTSTRAP_INPUT.credentialReference,
+    hostId: "colliding-owner-host",
+    attemptId: "colliding-durable-attempt",
+    oldSecretReference: "colliding-bootstrap-secret-reference",
+  };
+  firstAuthority.prepareBootstrap(preparation);
+  secondAuthority.prepareBootstrap(preparation);
+  const captured = firstAuthority.captureExchangeCut({
+    credentialReference: preparation.credentialReference,
+    hostId: preparation.hostId,
+  });
+  assert.equal(captured.inspection.credentialVersion, "0");
+  assert.equal(captured.inspection.pendingCredentialAttempt.attemptId,
+    preparation.attemptId);
+
+  let networkCalls = 0;
+  const secondOwner = coordinator(secondAuthority, {
+    bootstrap() {
+      networkCalls += 1;
+      return Promise.reject(new Error("foreign cut must not reach network"));
+    },
+  }).createOwnerBoundPort();
+  const stateBefore = structuredClone(secondStorage.state);
+  const comparesBefore = secondStorage.compareAttempts;
+  const secretsBefore = secondSecretResolutions.length;
+  await assert.rejects(
+    secondOwner.bootstrap(captured.cut, {
+      ...BOOTSTRAP_INPUT,
+      ...preparation,
+    }, new AbortController().signal),
+    (error) => error?.code === "RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT",
+  );
+  assert.deepEqual(secondStorage.state, stateBefore);
+  assert.equal(secondStorage.compareAttempts, comparesBefore);
+  assert.equal(secondSecretResolutions.length, secretsBefore);
+  assert.equal(networkCalls, 0);
+});
+
+test("owner-bound cut has one network winner and one exact durable-pending replay winner", async () => {
+  const storage = new OwnerBoundStorage();
+  const secretResolutions = [];
+  const authority = new coordinatorModule.RelayV2HostCredentialAuthority({
+    storage,
+    secretResolver: {
+      resolve(reference) {
+        secretResolutions.push(reference);
+        return "twhostboot2.owner-bound-bootstrap-secret";
+      },
+    },
+  });
+  const exchanges = [];
+  const networkInputs = [];
+  const observedSignals = [];
+  const httpsAdapter = {
+    bootstrap(input, signal) {
+      networkInputs.push(structuredClone(input));
+      observedSignals.push(signal);
+      const exchange = deferred();
+      exchanges.push(exchange);
+      return exchange.promise;
+    },
+  };
+  const boundCoordinator = coordinator(authority, httpsAdapter);
+  const owner = boundCoordinator.createOwnerBoundPort();
+  assert.strictEqual(boundCoordinator.createOwnerBoundPort(), owner);
+  const cutInput = {
+    credentialReference: BOOTSTRAP_INPUT.credentialReference,
+    hostId: "owner-bound-host",
+  };
+  const firstCapture = owner.capture(cutInput);
+  const concurrentCapture = owner.capture(cutInput);
+  assert.notStrictEqual(concurrentCapture.cut, firstCapture.cut);
+  const firstSignal = new AbortController().signal;
+  const first = owner.bootstrap(firstCapture.cut, {
+    ...BOOTSTRAP_INPUT,
+    hostId: cutInput.hostId,
+  }, firstSignal);
+  assert.equal(exchanges.length, 1);
+  await assert.rejects(
+    owner.bootstrap(firstCapture.cut, {
+      ...BOOTSTRAP_INPUT,
+      hostId: cutInput.hostId,
+      attemptId: "exact-cut-replay-must-not-release-winner",
+    }, new AbortController().signal),
+    (error) => error?.code === "RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT",
+  );
+  assert.equal(exchanges.length, 1);
+  await assert.rejects(
+    owner.bootstrap(concurrentCapture.cut, {
+      ...BOOTSTRAP_INPUT,
+      hostId: cutInput.hostId,
+      attemptId: "concurrent-attempt-must-not-win",
+    }, new AbortController().signal),
+    (error) => error?.code === "RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT",
+  );
+  assert.equal(exchanges.length, 1);
+  assert.equal(storage.compareAttempts, 1);
+  assert.equal(secretResolutions.length, 1);
+  assert.strictEqual(observedSignals[0], firstSignal);
+
+  const foreignAuthority = new coordinatorModule.RelayV2HostCredentialAuthority({
+    storage: new OwnerBoundStorage(),
+    secretResolver: {
+      resolve() {
+        return "twhostboot2.foreign-release-secret-must-not-be-resolved";
+      },
+    },
+  });
+  const foreignOwner = coordinator(foreignAuthority, {}).createOwnerBoundPort();
+  const foreignCapture = foreignOwner.capture(cutInput);
+  owner.release(Object.freeze({ ...firstCapture.cut }));
+  owner.release(foreignCapture.cut);
+  const whileWinner = owner.capture(cutInput);
+  await assert.rejects(
+    owner.bootstrap(whileWinner.cut, {
+      ...BOOTSTRAP_INPUT,
+      hostId: cutInput.hostId,
+      attemptId: "fresh-cut-must-wait-for-winner-settlement",
+    }, new AbortController().signal),
+    (error) => error?.code === "RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT",
+  );
+  assert.equal(exchanges.length, 1);
+  assert.equal(storage.compareAttempts, 1);
+  assert.equal(secretResolutions.length, 1);
+
+  const firstFailure = Object.assign(new Error("first exchange stopped at barrier"), {
+    code: "EXCHANGE_FAILED",
+  });
+  exchanges[0].reject(firstFailure);
+  await assert.rejects(first, (error) => error === firstFailure);
+
+  const pendingCapture = owner.capture(cutInput);
+  const pendingReplayCapture = owner.capture(cutInput);
+  assert.notStrictEqual(pendingReplayCapture.cut, pendingCapture.cut);
+  const replay = owner.bootstrap(pendingCapture.cut, {
+    ...BOOTSTRAP_INPUT,
+    hostId: cutInput.hostId,
+    attemptId: "new-request-must-reuse-durable-attempt",
+  }, new AbortController().signal);
+  assert.equal(exchanges.length, 2);
+  assert.equal(networkInputs[1].bootstrapAttemptId, networkInputs[0].bootstrapAttemptId);
+  await assert.rejects(
+    owner.bootstrap(pendingReplayCapture.cut, {
+      ...BOOTSTRAP_INPUT,
+      hostId: cutInput.hostId,
+      attemptId: "pending-concurrent-attempt-must-not-win",
+    }, new AbortController().signal),
+    (error) => error?.code === "RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT",
+  );
+  assert.equal(exchanges.length, 2);
+  assert.equal(storage.compareAttempts, 1);
+  assert.equal(secretResolutions.length, 2);
+
+  const replayFailure = Object.assign(new Error("replay stopped at barrier"), {
+    code: "EXCHANGE_FAILED",
+  });
+  exchanges[1].reject(replayFailure);
+  await assert.rejects(replay, (error) => error === replayFailure);
 });

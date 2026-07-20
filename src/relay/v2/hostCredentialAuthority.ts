@@ -186,6 +186,42 @@ export interface RelayV2HostCredentialInspection {
   pendingReauthentication: RelayV2HostPendingReauthentication | null;
 }
 
+declare const RELAY_V2_HOST_CREDENTIAL_EXCHANGE_CUT: unique symbol;
+
+/**
+ * Opaque, process-local, one-shot authority cut. Only the issuing authority may
+ * consume it; the value carries no credential or secret material.
+ */
+export interface RelayV2HostCredentialExchangeCut {
+  readonly [RELAY_V2_HOST_CREDENTIAL_EXCHANGE_CUT]: never;
+}
+
+export interface RelayV2HostCredentialExchangeCutInput {
+  credentialReference: string;
+  hostId: string;
+}
+
+export interface RelayV2HostCredentialCapturedExchangeCut {
+  inspection: RelayV2HostCredentialInspection | null;
+  cut: RelayV2HostCredentialExchangeCut;
+}
+
+declare const RELAY_V2_HOST_CREDENTIAL_EXCHANGE_LEASE: unique symbol;
+
+export interface RelayV2HostCredentialExchangeLease {
+  readonly [RELAY_V2_HOST_CREDENTIAL_EXCHANGE_LEASE]: never;
+}
+
+export interface RelayV2HostPreparedBootstrapFromCut {
+  prepared: RelayV2HostPreparedBootstrap;
+  lease: RelayV2HostCredentialExchangeLease;
+}
+
+export interface RelayV2HostPreparedRefreshFromCut {
+  prepared: RelayV2HostPreparedRefresh;
+  lease: RelayV2HostCredentialExchangeLease;
+}
+
 export type RelayV2HostCredentialAuthorityErrorCode =
   | "RELAY_V2_HOST_CREDENTIAL_STATE_INVALID"
   | "RELAY_V2_HOST_CREDENTIAL_NOT_FOUND"
@@ -212,6 +248,59 @@ export interface RelayV2HostCredentialAuthorityOptions {
 type Transition<T> =
   | { kind: "unchanged"; value: T }
   | { kind: "replace"; value: T; replacement: RelayV2HostCredentialState };
+
+interface RelayV2HostCredentialExchangeCutBinding {
+  credentialReference: string;
+  hostId: string;
+  statePresent: boolean;
+  oldCredentialVersion: string;
+  pendingCredentialAttempt: RelayV2HostPendingCredentialAttempt | null;
+}
+
+interface RelayV2HostCredentialExchangeCutRecord {
+  owner: RelayV2HostCredentialAuthority;
+  cut: RelayV2HostCredentialExchangeCut;
+  group: RelayV2HostCredentialExchangeCutGroup;
+  phase: "issued" | "consumed" | "released";
+  consumer: object | null;
+}
+
+interface RelayV2HostCredentialExchangeCutGroup {
+  owner: RelayV2HostCredentialAuthority;
+  binding: RelayV2HostCredentialExchangeCutBinding;
+  phase: "issued" | "consumed" | "released";
+  candidate: RelayV2HostCredentialExchangeCutRecord | null;
+  winner: RelayV2HostCredentialExchangeCutRecord | null;
+  members: Set<RelayV2HostCredentialExchangeCutRecord>;
+}
+
+interface RelayV2HostCredentialExchangeCutConsumption {
+  cut: RelayV2HostCredentialExchangeCut;
+  consumer: object;
+}
+
+interface RelayV2HostCredentialExchangeLeaseRecord {
+  owner: RelayV2HostCredentialAuthority;
+  lease: RelayV2HostCredentialExchangeLease;
+  cutRecord: RelayV2HostCredentialExchangeCutRecord;
+  consumer: object;
+  released: boolean;
+}
+
+const hostCredentialAuthorities = new WeakSet<object>();
+const hostCredentialExchangeCuts = new WeakMap<object, RelayV2HostCredentialExchangeCutRecord>();
+const hostCredentialExchangeLeases = new WeakMap<
+object,
+RelayV2HostCredentialExchangeLeaseRecord
+>();
+
+export function isRelayV2HostCredentialAuthority(
+  value: unknown,
+): value is RelayV2HostCredentialAuthority {
+  return typeof value === "object"
+    && value !== null
+    && hostCredentialAuthorities.has(value);
+}
 
 function messageForCode(code: RelayV2HostCredentialAuthorityErrorCode): string {
   switch (code) {
@@ -551,6 +640,63 @@ function copyPendingReauthentication(
   return value ? { ...value } : null;
 }
 
+function inspectCredentialState(
+  state: RelayV2HostCredentialState,
+): RelayV2HostCredentialInspection {
+  return {
+    credentialVersion: state.credentialVersion,
+    hostId: state.hostId,
+    principalId: state.principalId,
+    grantId: state.grantId,
+    accessJti: state.accessJti,
+    accessExpiresAtMs: state.accessExpiresAtMs,
+    refreshExpiresAtMs: state.refreshExpiresAtMs,
+    pendingCredentialAttempt: copyCredentialAttempt(state.pendingCredentialAttempt),
+    pendingReauthentication: copyPendingReauthentication(state.pendingReauthentication),
+  };
+}
+
+function sameCredentialAttempt(
+  left: RelayV2HostPendingCredentialAttempt | null,
+  right: RelayV2HostPendingCredentialAttempt | null,
+): boolean {
+  return left === null
+    ? right === null
+    : right !== null
+      && left.kind === right.kind
+      && left.attemptId === right.attemptId
+      && left.oldCredentialVersion === right.oldCredentialVersion
+      && left.oldSecretReference === right.oldSecretReference;
+}
+
+function sameExchangeCutBinding(
+  left: RelayV2HostCredentialExchangeCutBinding,
+  right: RelayV2HostCredentialExchangeCutBinding,
+): boolean {
+  return left.credentialReference === right.credentialReference
+    && left.hostId === right.hostId
+    && left.statePresent === right.statePresent
+    && left.oldCredentialVersion === right.oldCredentialVersion
+    && sameCredentialAttempt(
+      left.pendingCredentialAttempt,
+      right.pendingCredentialAttempt,
+    );
+}
+
+function stateMatchesExchangeCut(
+  current: RelayV2HostCredentialState | null,
+  binding: RelayV2HostCredentialExchangeCutBinding,
+): boolean {
+  if (!binding.statePresent) return current === null;
+  return current !== null
+    && current.hostId === binding.hostId
+    && current.credentialVersion === binding.oldCredentialVersion
+    && sameCredentialAttempt(
+      current.pendingCredentialAttempt,
+      binding.pendingCredentialAttempt,
+    );
+}
+
 /**
  * Pure transactional owner for relay-host v2 credentials and pending attempts.
  * The module has no production composition and performs no filesystem,
@@ -560,6 +706,10 @@ export class RelayV2HostCredentialAuthority
 implements RelayV2HostCarrierCredentialReferences {
   private readonly storage: RelayV2HostCredentialStorage;
   private readonly secretResolver: RelayV2HostCredentialSecretResolver;
+  private readonly activeExchangeCuts = new Map<
+  string,
+  RelayV2HostCredentialExchangeCutGroup
+  >();
 
   constructor(options: RelayV2HostCredentialAuthorityOptions) {
     if (!isRecord(options)
@@ -571,6 +721,7 @@ implements RelayV2HostCarrierCredentialReferences {
     }
     this.storage = options.storage;
     this.secretResolver = options.secretResolver;
+    hostCredentialAuthorities.add(this);
   }
 
   read(reference: string): RelayV2HostCredentialRecord {
@@ -604,20 +755,106 @@ implements RelayV2HostCarrierCredentialReferences {
     if (!isCredentialReference(reference)) return null;
     const state = this.readState(reference);
     if (!state) return null;
-    return {
-      credentialVersion: state.credentialVersion,
-      hostId: state.hostId,
-      principalId: state.principalId,
-      grantId: state.grantId,
-      accessJti: state.accessJti,
-      accessExpiresAtMs: state.accessExpiresAtMs,
-      refreshExpiresAtMs: state.refreshExpiresAtMs,
-      pendingCredentialAttempt: copyCredentialAttempt(state.pendingCredentialAttempt),
-      pendingReauthentication: copyPendingReauthentication(state.pendingReauthentication),
-    };
+    return inspectCredentialState(state);
+  }
+
+  captureExchangeCut(
+    input: RelayV2HostCredentialExchangeCutInput,
+  ): RelayV2HostCredentialCapturedExchangeCut {
+    if (!isRecord(input)
+      || !hasExactKeys(input, ["credentialReference", "hostId"])
+      || !isCredentialReference(input.credentialReference)
+      || !isRelayV2AuthIdentifier(input.hostId)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    return this.exclusive(input.credentialReference, (transaction) => {
+      const read = this.validateRead(transaction.read());
+      const current = read.state === null
+        ? null
+        : parseState(read.state, input.credentialReference);
+      if (current !== null && current.hostId !== input.hostId) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+      const binding: RelayV2HostCredentialExchangeCutBinding = {
+        credentialReference: input.credentialReference,
+        hostId: input.hostId,
+        statePresent: current !== null,
+        oldCredentialVersion: current?.credentialVersion ?? "0",
+        pendingCredentialAttempt: copyCredentialAttempt(
+          current?.pendingCredentialAttempt ?? null,
+        ),
+      };
+      let group = this.activeExchangeCuts.get(input.credentialReference);
+      if (!group
+        || group.phase === "released"
+        || !sameExchangeCutBinding(group.binding, binding)) {
+        group = {
+          owner: this,
+          binding,
+          phase: "issued",
+          candidate: null,
+          winner: null,
+          members: new Set(),
+        };
+        this.activeExchangeCuts.set(input.credentialReference, group);
+      }
+      const cut = Object.freeze(Object.create(null)) as RelayV2HostCredentialExchangeCut;
+      const record: RelayV2HostCredentialExchangeCutRecord = {
+        owner: this,
+        cut,
+        group,
+        phase: "issued",
+        consumer: null,
+      };
+      group.members.add(record);
+      if (group.phase === "issued" && group.candidate === null) group.candidate = record;
+      hostCredentialExchangeCuts.set(cut, record);
+      return {
+        inspection: current === null ? null : inspectCredentialState(current),
+        cut,
+      };
+    });
+  }
+
+  releaseIssuedExchangeCut(cut: RelayV2HostCredentialExchangeCut): void {
+    const record = typeof cut === "object" && cut !== null
+      ? hostCredentialExchangeCuts.get(cut)
+      : undefined;
+    if (!record || record.owner !== this || record.phase !== "issued") return;
+    record.phase = "released";
+    const group = record.group;
+    group.members.delete(record);
+    if (group.phase === "issued" && group.candidate === record) {
+      this.releaseExchangeCutGroup(group);
+    }
   }
 
   prepareBootstrap(input: RelayV2HostBootstrapPreparation): RelayV2HostPreparedBootstrap {
+    return this.prepareBootstrapAtCut(null, input);
+  }
+
+  prepareBootstrapFromCut(
+    cut: RelayV2HostCredentialExchangeCut,
+    input: RelayV2HostBootstrapPreparation,
+  ): RelayV2HostPreparedBootstrapFromCut {
+    const consumption = { cut, consumer: Object.freeze({}) };
+    try {
+      const prepared = this.prepareBootstrapAtCut(consumption, input);
+      return {
+        prepared,
+        lease: this.createExchangeLease(consumption),
+      };
+    } catch (error) {
+      this.releaseExchangeCutForConsumer(consumption);
+      this.releaseIssuedExchangeCut(cut);
+      throw error;
+    }
+  }
+
+  private prepareBootstrapAtCut(
+    consumption: RelayV2HostCredentialExchangeCutConsumption | null,
+    input: RelayV2HostBootstrapPreparation,
+  ): RelayV2HostPreparedBootstrap {
     validateAttemptInput(input);
     if (!isRelayV2AuthIdentifier(input.hostId)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
@@ -659,7 +896,10 @@ implements RelayV2HostCarrierCredentialReferences {
           pendingReauthentication: null,
         },
       };
-    });
+    }, consumption);
+    if (consumption !== null) {
+      this.bindConsumedCutToFence(consumption.cut, fence, input.hostId);
+    }
     const bootstrapToken = this.resolveBootstrapSecret(fence.oldSecretReference);
     return {
       fence,
@@ -717,6 +957,31 @@ implements RelayV2HostCarrierCredentialReferences {
   }
 
   prepareRefresh(input: RelayV2HostRefreshPreparation): RelayV2HostPreparedRefresh {
+    return this.prepareRefreshAtCut(null, input);
+  }
+
+  prepareRefreshFromCut(
+    cut: RelayV2HostCredentialExchangeCut,
+    input: RelayV2HostRefreshPreparation,
+  ): RelayV2HostPreparedRefreshFromCut {
+    const consumption = { cut, consumer: Object.freeze({}) };
+    try {
+      const prepared = this.prepareRefreshAtCut(consumption, input);
+      return {
+        prepared,
+        lease: this.createExchangeLease(consumption),
+      };
+    } catch (error) {
+      this.releaseExchangeCutForConsumer(consumption);
+      this.releaseIssuedExchangeCut(cut);
+      throw error;
+    }
+  }
+
+  private prepareRefreshAtCut(
+    consumption: RelayV2HostCredentialExchangeCutConsumption | null,
+    input: RelayV2HostRefreshPreparation,
+  ): RelayV2HostPreparedRefresh {
     validateAttemptInput(input);
     let observedCredentialVersion: string | null = null;
     const winner = this.transition(input.credentialReference, (current) => {
@@ -761,7 +1026,18 @@ implements RelayV2HostCarrierCredentialReferences {
         },
         replacement: { ...current, pendingCredentialAttempt: pending },
       };
-    });
+    }, consumption);
+    if (consumption !== null) {
+      const record = hostCredentialExchangeCuts.get(consumption.cut);
+      if (!record || record.owner !== this) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+      this.bindConsumedCutToFence(
+        consumption.cut,
+        winner.fence,
+        record.group.binding.hostId,
+      );
+    }
     const refreshToken = this.resolveRefreshSecret(winner.fence.oldSecretReference);
     if (refreshToken !== winner.expectedRefreshToken) {
       return fail("RELAY_V2_HOST_CREDENTIAL_SECRET_UNAVAILABLE");
@@ -925,11 +1201,19 @@ implements RelayV2HostCarrierCredentialReferences {
   private transition<T>(
     reference: string,
     reduce: (current: RelayV2HostCredentialState | null) => Transition<T>,
+    consumption: RelayV2HostCredentialExchangeCutConsumption | null = null,
   ): T {
     return this.exclusive(reference, (transaction) => {
+      const cutRecord = consumption === null
+        ? null
+        : this.consumeExchangeCut(consumption, reference);
       let read = this.validateRead(transaction.read());
       for (let conflicts = 0; conflicts <= MAX_CAS_CONFLICTS; conflicts += 1) {
         const current = read.state === null ? null : parseState(read.state, reference);
+        if (cutRecord !== null
+          && !stateMatchesExchangeCut(current, cutRecord.group.binding)) {
+          return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+        }
         const transition = reduce(current);
         if (transition.kind === "unchanged") return transition.value;
         const replacement = parseState(transition.replacement, reference);
@@ -956,6 +1240,120 @@ implements RelayV2HostCarrierCredentialReferences {
       }
       return fail("RELAY_V2_HOST_CREDENTIAL_CAS_CONFLICT");
     });
+  }
+
+  private consumeExchangeCut(
+    consumption: RelayV2HostCredentialExchangeCutConsumption,
+    reference: string,
+  ): RelayV2HostCredentialExchangeCutRecord {
+    const cut = consumption.cut;
+    const record = typeof cut === "object" && cut !== null
+      ? hostCredentialExchangeCuts.get(cut)
+      : undefined;
+    if (!record
+      || record.owner !== this
+      || record.phase !== "issued"
+      || record.group.owner !== this
+      || record.group.phase !== "issued"
+      || record.group.candidate !== record
+      || record.group.binding.credentialReference !== reference
+      || this.activeExchangeCuts.get(reference) !== record.group) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    record.phase = "consumed";
+    record.consumer = consumption.consumer;
+    record.group.phase = "consumed";
+    record.group.winner = record;
+    return record;
+  }
+
+  private releaseExchangeCutForConsumer(
+    consumption: RelayV2HostCredentialExchangeCutConsumption,
+  ): void {
+    const record = hostCredentialExchangeCuts.get(consumption.cut);
+    if (!record
+      || record.owner !== this
+      || record.consumer !== consumption.consumer) return;
+    this.releaseExchangeCutGroup(record.group);
+  }
+
+  releaseExchangeLease(lease: RelayV2HostCredentialExchangeLease): void {
+    const leaseRecord = typeof lease === "object" && lease !== null
+      ? hostCredentialExchangeLeases.get(lease)
+      : undefined;
+    if (!leaseRecord
+      || leaseRecord.owner !== this
+      || leaseRecord.released
+      || leaseRecord.cutRecord.consumer !== leaseRecord.consumer
+      || leaseRecord.cutRecord.group.winner !== leaseRecord.cutRecord) return;
+    leaseRecord.released = true;
+    this.releaseExchangeCutGroup(leaseRecord.cutRecord.group);
+  }
+
+  private createExchangeLease(
+    consumption: RelayV2HostCredentialExchangeCutConsumption,
+  ): RelayV2HostCredentialExchangeLease {
+    const record = hostCredentialExchangeCuts.get(consumption.cut);
+    if (!record
+      || record.owner !== this
+      || record.phase !== "consumed"
+      || record.consumer !== consumption.consumer
+      || record.group.winner !== record) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const lease = Object.freeze(Object.create(null)) as RelayV2HostCredentialExchangeLease;
+    hostCredentialExchangeLeases.set(lease, {
+      owner: this,
+      lease,
+      cutRecord: record,
+      consumer: consumption.consumer,
+      released: false,
+    });
+    return lease;
+  }
+
+  private releaseExchangeCutGroup(group: RelayV2HostCredentialExchangeCutGroup): void {
+    if (group.owner !== this || group.phase === "released") return;
+    group.phase = "released";
+    for (const member of group.members) {
+      member.phase = "released";
+      member.consumer = null;
+    }
+    group.members.clear();
+    group.candidate = null;
+    group.winner = null;
+    if (this.activeExchangeCuts.get(group.binding.credentialReference) === group) {
+      this.activeExchangeCuts.delete(group.binding.credentialReference);
+    }
+  }
+
+  private bindConsumedCutToFence(
+    cut: RelayV2HostCredentialExchangeCut,
+    fence: RelayV2HostCredentialAttemptFence,
+    hostId: string,
+  ): void {
+    const record = hostCredentialExchangeCuts.get(cut);
+    if (!record
+      || record.owner !== this
+      || record.phase !== "consumed"
+      || record.group.winner !== record
+      || record.group.binding.credentialReference !== fence.credentialReference
+      || record.group.binding.hostId !== hostId
+      || record.group.binding.oldCredentialVersion !== fence.oldCredentialVersion) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    record.group.binding = {
+      credentialReference: fence.credentialReference,
+      hostId,
+      statePresent: true,
+      oldCredentialVersion: fence.oldCredentialVersion,
+      pendingCredentialAttempt: {
+        kind: fence.kind,
+        attemptId: fence.attemptId,
+        oldCredentialVersion: fence.oldCredentialVersion,
+        oldSecretReference: fence.oldSecretReference,
+      },
+    };
   }
 
   private exclusive<T>(

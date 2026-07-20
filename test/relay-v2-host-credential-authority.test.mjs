@@ -341,6 +341,64 @@ test("bootstrap and refresh persist exact attempts before secret/network use and
   assert.deepEqual(h.storage.snapshot(REFERENCE), beforeLateV2);
 });
 
+test("owner-bound one-shot cuts reject foreign value collisions and admit one exact pending reuse", () => {
+  const first = authority();
+  const second = authority();
+  installBootstrap(first, tokenIssuer());
+  installBootstrap(second, tokenIssuer());
+
+  const foreign = first.authority.captureExchangeCut({
+    credentialReference: REFERENCE,
+    hostId: HOST_ID,
+  });
+  assert.equal(foreign.inspection.credentialVersion, "1");
+  assert.equal(second.authority.inspect(REFERENCE).credentialVersion, "1");
+  const secondBefore = second.storage.snapshot(REFERENCE);
+  const secondCompareAttempts = second.storage.compareAttempts;
+  const secondSecretResolutions = second.secrets.resolutions.length;
+  assert.throws(
+    () => second.authority.prepareRefreshFromCut(
+      foreign.cut,
+      refreshPreparation(2),
+    ),
+    assertAuthorityError("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT"),
+  );
+  assert.deepEqual(second.storage.snapshot(REFERENCE), secondBefore);
+  assert.equal(second.storage.compareAttempts, secondCompareAttempts);
+  assert.equal(second.secrets.resolutions.length, secondSecretResolutions);
+
+  const durable = first.authority.prepareRefresh(refreshPreparation(2));
+  const firstCut = first.authority.captureExchangeCut({
+    credentialReference: REFERENCE,
+    hostId: HOST_ID,
+  });
+  const replayCut = first.authority.captureExchangeCut({
+    credentialReference: REFERENCE,
+    hostId: HOST_ID,
+  });
+  assert.notStrictEqual(replayCut.cut, firstCut.cut);
+  const comparesBeforeReuse = first.storage.compareAttempts;
+  const secretsBeforeReuse = first.secrets.resolutions.length;
+  const reused = first.authority.prepareRefreshFromCut(
+    firstCut.cut,
+    refreshPreparation(2, {
+      attemptId: "must-not-replace-durable-attempt",
+    }),
+  );
+  assert.equal(reused.prepared.fence.attemptId, durable.fence.attemptId);
+  assert.equal(reused.prepared.fence.oldSecretReference, durable.fence.oldSecretReference);
+  assert.throws(
+    () => first.authority.prepareRefreshFromCut(
+      replayCut.cut,
+      refreshPreparation(2),
+    ),
+    assertAuthorityError("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT"),
+  );
+  assert.equal(first.storage.compareAttempts, comparesBeforeReuse);
+  assert.equal(first.secrets.resolutions.length, secretsBeforeReuse + 1);
+  first.authority.releaseExchangeLease(reused.lease);
+});
+
 test("reauthentication retries reuse requestId/token/jti and five-field ACK fences newer credentials", () => {
   const h = authority();
   const issueToken = tokenIssuer();
