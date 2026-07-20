@@ -13,12 +13,14 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DeliveryState
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.model.SessionTimelineState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
 import com.tmuxworktree.mobile.designsystem.TwTheme
@@ -113,7 +115,10 @@ class CoreScreensInstrumentedTest {
                 SessionDetailScreen(
                     session = session,
                     connectionStatus = ConnectionStatus.ONLINE,
-                    timeline = emptyList(),
+                    timelineState = SessionTimelineState(
+                        events = emptyList(),
+                        agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
+                    ),
                     draft = "",
                     nowMillis = 1_000,
                     onDraftChange = {},
@@ -145,7 +150,10 @@ class CoreScreensInstrumentedTest {
                 SessionDetailScreen(
                     session = session,
                     connectionStatus = ConnectionStatus.ONLINE,
-                    timeline = emptyList(),
+                    timelineState = SessionTimelineState(
+                        events = emptyList(),
+                        agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
+                    ),
                     draft = draft,
                     nowMillis = 1_000,
                     onDraftChange = { draft = it },
@@ -196,7 +204,7 @@ class CoreScreensInstrumentedTest {
     }
 
     @Test
-    fun relayV1SessionExplainsMissingAgentDataAndExposesSafeMessageActions() {
+    fun sessionAgentEvidenceAvailabilityUsesDialectSpecificNoticesAndKeepsReplyAvailable() {
         val session = RelaySession(
             hostId = "host",
             name = "local:demo",
@@ -212,13 +220,19 @@ class CoreScreensInstrumentedTest {
             deliveryState = DeliveryState.QUEUED,
         )
         var cancelled: TimelineEvent? = null
+        var agentEvidenceAvailability by mutableStateOf(
+            AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED,
+        )
         composeRule.setContent {
             TwTheme {
                 SessionDetailScreen(
                     session = session,
                     connectionStatus = ConnectionStatus.ONLINE,
-                    timeline = listOf(queued),
-                    draft = "",
+                    timelineState = SessionTimelineState(
+                        events = listOf(queued),
+                        agentEvidenceAvailability = agentEvidenceAvailability,
+                    ),
+                    draft = "Reply remains available",
                     nowMillis = 1_000,
                     onDraftChange = {},
                     onBack = {},
@@ -234,6 +248,12 @@ class CoreScreensInstrumentedTest {
 
         composeRule.onNodeWithTag("relay_v1_session_limitation")
             .assertIsDisplayed()
+        composeRule.onNodeWithTag("relay_v2_agent_evidence_unavailable")
+            .assertDoesNotExist()
+        composeRule.onNodeWithTag("reply_input")
+            .assertIsEnabled()
+        composeRule.onNodeWithTag("send_reply")
+            .assertIsEnabled()
         composeRule.onNodeWithTag("session_attachment")
             .performClick()
         composeRule.onNodeWithText("Attachments need Relay v2")
@@ -247,7 +267,35 @@ class CoreScreensInstrumentedTest {
             .performScrollTo()
             .performClick()
 
-        composeRule.runOnIdle { assertSame(queued, cancelled) }
+        composeRule.runOnIdle {
+            assertSame(queued, cancelled)
+            agentEvidenceAvailability = AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
+        }
+        composeRule.onNodeWithTag("relay_v1_session_limitation")
+            .assertDoesNotExist()
+        composeRule.onNodeWithTag("relay_v2_agent_evidence_unavailable")
+            .assertIsDisplayed()
+        composeRule.onNodeWithText(
+            "Agent transcript and lifecycle evidence are unavailable for this Relay v2 session. " +
+                "You can still compose a reply; sending uses the separate command path and " +
+                "requires the session to be currently online.",
+        ).assertIsDisplayed()
+        composeRule.onNodeWithTag("reply_input")
+            .assertIsEnabled()
+        composeRule.onNodeWithTag("send_reply")
+            .assertIsEnabled()
+
+        composeRule.runOnIdle {
+            agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE
+        }
+        composeRule.onNodeWithTag("relay_v1_session_limitation")
+            .assertDoesNotExist()
+        composeRule.onNodeWithTag("relay_v2_agent_evidence_unavailable")
+            .assertDoesNotExist()
+        composeRule.onNodeWithTag("reply_input")
+            .assertIsEnabled()
+        composeRule.onNodeWithTag("send_reply")
+            .assertIsEnabled()
     }
 
     @Test

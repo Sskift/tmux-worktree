@@ -24,6 +24,7 @@ import com.tmuxworktree.mobile.core.data.NotificationKind
 import com.tmuxworktree.mobile.core.data.OutboxInFlightMessage
 import com.tmuxworktree.mobile.core.data.OutboxInFlightRegistry
 import com.tmuxworktree.mobile.core.data.OutboxDispatchPlanner
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionHealth
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
@@ -33,6 +34,7 @@ import com.tmuxworktree.mobile.core.model.HealthLayer
 import com.tmuxworktree.mobile.core.model.RelayHost
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.model.SessionTimelineState
 import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
@@ -53,8 +55,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -121,10 +123,16 @@ class V2ViewModel(
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    fun timeline(sessionId: String): Flow<List<TimelineEvent>> = if (demoMode) {
-        uiState.map { state -> state.demoTimelines[sessionId].orEmpty() }
+    fun timeline(sessionId: String): Flow<SessionTimelineState> = if (demoMode) {
+        uiState.map { state ->
+            SessionTimelineState(
+                events = state.demoTimelines[sessionId].orEmpty(),
+                agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
+            )
+        }
     } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-        relayV2SessionReplyCuts.mapLatest { observedCuts ->
+        relayV2SessionReplyCuts.transformLatest { observedCuts ->
+            emit(relayV2AgentEvidenceUnavailableState())
             val selected = synchronized(relayV2UiFenceLock) {
                 val composition = relayV2Composition
                 val cut = observedCuts[sessionId]
@@ -137,9 +145,9 @@ class V2ViewModel(
                 } else {
                     composition to cut
                 }
-            } ?: return@mapLatest emptyList()
+            } ?: return@transformLatest
             val (composition, cut) = selected
-            projectRelayV2SelectedSessionTimeline(
+            val timelineState = projectRelayV2SelectedSessionTimeline(
                 sessionStableId = sessionId,
                 readPresentation = { composition.readSelectedSession(cut) },
                 stillCurrent = {
@@ -151,9 +159,17 @@ class V2ViewModel(
                     }
                 },
             )
+            if (timelineState.agentEvidenceAvailability == AgentEvidenceAvailability.AVAILABLE) {
+                emit(timelineState)
+            }
         }
     } else {
-        repository.timeline(sessionId)
+        repository.timeline(sessionId).map { events ->
+            SessionTimelineState(
+                events = events,
+                agentEvidenceAvailability = AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED,
+            )
+        }
     }
 
     fun setPairingRelayUrl(value: String) {
@@ -1755,65 +1771,73 @@ private fun RelayV2ProductSession.toUiSession(): RelaySession {
     )
 }
 
-private fun AgentTranscriptLifecycleSelectedSessionPresentationState.toTimeline(
+private fun AgentTranscriptLifecycleSelectedSessionPresentationState.toTimelineState(
     sessionStableId: String,
-): List<TimelineEvent> = when (this) {
+): SessionTimelineState = when (this) {
     AgentTranscriptLifecycleSelectedSessionPresentationState.Disabled,
     AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
     AgentTranscriptLifecycleSelectedSessionPresentationState.Stale,
-    -> emptyList()
+    -> relayV2AgentEvidenceUnavailableState()
     is AgentTranscriptLifecycleSelectedSessionPresentationState.Content -> {
         val timelineEpoch = checkNotNull(presentation.revision.namespace.timelineEpoch)
-        presentation.items.map { item ->
-            when (item) {
-                is AgentTranscriptLifecyclePresentationItem.Transcript -> TimelineEvent(
-                    eventId = relayV2TranscriptUiStableId(
-                        sessionStableId,
-                        item.runId,
-                        item.turnId,
-                        item.entryId,
-                    ),
-                    sessionId = sessionStableId,
-                    actor = when (item.role) {
-                        AgentTimelineEntryRole.USER -> TimelineActor.USER
-                        AgentTimelineEntryRole.AGENT -> TimelineActor.AGENT
-                    },
-                    body = when (val content = item.content) {
-                        is AgentTranscriptEntryContent.Visible -> content.text
-                        is AgentTranscriptEntryContent.Redacted -> "Message redacted"
-                    },
-                    createdAtMillis = item.createdAtMs,
-                )
-                is AgentTranscriptLifecyclePresentationItem.Lifecycle -> TimelineEvent(
-                    eventId = relayV2LifecycleUiStableId(
-                        sessionStableId = sessionStableId,
-                        timelineEpoch = timelineEpoch,
-                        sourceEpoch = item.sourceEpoch,
-                        scope = item.identity.scope,
-                        runId = item.identity.runId,
-                        turnId = item.identity.turnId,
-                        lifecycleEventId = item.lifecycleEventId,
-                    ),
-                    sessionId = sessionStableId,
-                    actor = TimelineActor.SYSTEM,
-                    body = item.lifecycleTimelineBody(),
-                    createdAtMillis = item.occurredAtMs,
-                    deliveryState = null,
-                )
-            }
-        }
+        SessionTimelineState(
+            events = presentation.items.map { item ->
+                when (item) {
+                    is AgentTranscriptLifecyclePresentationItem.Transcript -> TimelineEvent(
+                        eventId = relayV2TranscriptUiStableId(
+                            sessionStableId,
+                            item.runId,
+                            item.turnId,
+                            item.entryId,
+                        ),
+                        sessionId = sessionStableId,
+                        actor = when (item.role) {
+                            AgentTimelineEntryRole.USER -> TimelineActor.USER
+                            AgentTimelineEntryRole.AGENT -> TimelineActor.AGENT
+                        },
+                        body = when (val content = item.content) {
+                            is AgentTranscriptEntryContent.Visible -> content.text
+                            is AgentTranscriptEntryContent.Redacted -> "Message redacted"
+                        },
+                        createdAtMillis = item.createdAtMs,
+                    )
+                    is AgentTranscriptLifecyclePresentationItem.Lifecycle -> TimelineEvent(
+                        eventId = relayV2LifecycleUiStableId(
+                            sessionStableId = sessionStableId,
+                            timelineEpoch = timelineEpoch,
+                            sourceEpoch = item.sourceEpoch,
+                            scope = item.identity.scope,
+                            runId = item.identity.runId,
+                            turnId = item.identity.turnId,
+                            lifecycleEventId = item.lifecycleEventId,
+                        ),
+                        sessionId = sessionStableId,
+                        actor = TimelineActor.SYSTEM,
+                        body = item.lifecycleTimelineBody(),
+                        createdAtMillis = item.occurredAtMs,
+                        deliveryState = null,
+                    )
+                }
+            },
+            agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
+        )
     }
 }
+
+private fun relayV2AgentEvidenceUnavailableState() = SessionTimelineState(
+    events = emptyList(),
+    agentEvidenceAvailability = AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE,
+)
 
 internal suspend fun projectRelayV2SelectedSessionTimeline(
     sessionStableId: String,
     readPresentation: suspend () ->
         AgentTranscriptLifecycleSelectedSessionPresentationState,
     stillCurrent: () -> Boolean,
-): List<TimelineEvent> {
+): SessionTimelineState {
     val presentation = readPresentation()
-    if (!stillCurrent()) return emptyList()
-    return presentation.toTimeline(sessionStableId)
+    if (!stillCurrent()) return relayV2AgentEvidenceUnavailableState()
+    return presentation.toTimelineState(sessionStableId)
 }
 
 /** Injective UI identity that retains the transcript's exact Session/run/turn scope. */

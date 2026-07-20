@@ -52,6 +52,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -79,12 +80,15 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.tmuxworktree.mobile.BuildConfig
 import com.tmuxworktree.mobile.app.NewWorktreeRequest
+import com.tmuxworktree.mobile.app.RelayStartupAdmissionState
 import com.tmuxworktree.mobile.app.V2UiEffect
 import com.tmuxworktree.mobile.app.V2UiState
 import com.tmuxworktree.mobile.app.V2ViewModel
 import com.tmuxworktree.mobile.app.shouldShowTargetLoading
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.model.SessionTimelineState
 import com.tmuxworktree.mobile.core.terminal.TerminalWebView
 import com.tmuxworktree.mobile.core.terminal.TerminalWebViewController
 import com.tmuxworktree.mobile.core.terminal.rememberTerminalWebViewController
@@ -504,8 +508,30 @@ private fun SessionRoute(
     onTerminal: () -> Unit,
     autoFocusReply: Boolean,
 ) {
-    val timelineFlow = remember(session.stableId) { viewModel.timeline(session.stableId) }
-    val timeline by timelineFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val timelineFlow = remember(
+        session.stableId,
+        state.demoMode,
+        state.relayStartupAdmission,
+    ) {
+        viewModel.timeline(session.stableId)
+    }
+    val timelineState by key(
+        session.stableId,
+        state.demoMode,
+        state.relayStartupAdmission,
+    ) {
+        timelineFlow.collectAsStateWithLifecycle(
+            initialValue = SessionTimelineState(
+                events = emptyList(),
+                agentEvidenceAvailability = when {
+                    state.demoMode -> AgentEvidenceAvailability.AVAILABLE
+                    state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 ->
+                        AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
+                    else -> AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED
+                },
+            ),
+        )
+    }
     var showActions by rememberSaveable(session.stableId) { mutableStateOf(false) }
     var confirmEndSession by rememberSaveable(session.stableId) { mutableStateOf(false) }
     val context = LocalContext.current
@@ -513,7 +539,7 @@ private fun SessionRoute(
     SessionDetailScreen(
         session = session,
         connectionStatus = state.health.overall,
-        timeline = timeline,
+        timelineState = timelineState,
         draft = state.drafts[session.stableId].orEmpty(),
         nowMillis = rememberNowMillis(),
         onDraftChange = { viewModel.updateDraft(session.stableId, it) },

@@ -77,10 +77,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DeliveryState
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.model.SessionTimelineState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
 import com.tmuxworktree.mobile.designsystem.*
@@ -89,7 +91,7 @@ import com.tmuxworktree.mobile.designsystem.*
 fun SessionDetailScreen(
     session: RelaySession,
     connectionStatus: ConnectionStatus,
-    timeline: List<TimelineEvent>,
+    timelineState: SessionTimelineState,
     draft: String,
     nowMillis: Long,
     onDraftChange: (String) -> Unit,
@@ -139,8 +141,10 @@ fun SessionDetailScreen(
                 agentStateAvailable = agentStateAvailable,
                 onOpenTerminal = onOpenTerminal,
             )
-            if (!agentStateAvailable) {
-                RelayV1SessionNotice()
+            when (timelineState.agentEvidenceAvailability) {
+                AgentEvidenceAvailability.AVAILABLE -> Unit
+                AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED -> RelayV1SessionNotice()
+                AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE -> RelayV2AgentEvidenceNotice()
             }
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = 20.dp),
@@ -169,13 +173,13 @@ fun SessionDetailScreen(
                     )
                 }
                 itemsIndexed(
-                    items = timeline,
+                    items = timelineState.events,
                     key = { _, event -> event.eventId },
                 ) { index, event ->
                     TimelineEventRow(
                         event = event,
                         nowMillis = nowMillis,
-                        isLast = index == timeline.lastIndex,
+                        isLast = index == timelineState.events.lastIndex,
                         onCancelMessage = onCancelMessage,
                     )
                 }
@@ -276,7 +280,11 @@ private fun SessionSummary(
 ) {
     val visual = session.agentState.visual()
     val statusLabel = if (agentStateAvailable) visual.label else "Agent state unavailable"
-    val statusDescription = if (agentStateAvailable) visual.accessibleLabel else "unavailable with Relay version 1"
+    val statusDescription = if (agentStateAvailable) {
+        visual.accessibleLabel
+    } else {
+        "session-wide agent state unavailable"
+    }
     val statusColor = if (agentStateAvailable) visual.color else TwTextMuted
     Box(
         modifier = Modifier
@@ -367,6 +375,37 @@ private fun RelayV1SessionNotice() {
             Spacer(Modifier.width(10.dp))
             Text(
                 text = "Relay v1 does not provide agent transcript or lifecycle state. Timeline shows only messages queued from this phone.",
+                color = TwTextSecondary,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RelayV2AgentEvidenceNotice() {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
+            .testTag("relay_v2_agent_evidence_unavailable"),
+        shape = RoundedCornerShape(12.dp),
+        color = TwSurface,
+        border = BorderStroke(1.dp, TwBorder),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Info,
+                contentDescription = null,
+                tint = TwTextSecondary,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = "Agent transcript and lifecycle evidence are unavailable for this Relay v2 session. You can still compose a reply; sending uses the separate command path and requires the session to be currently online.",
                 color = TwTextSecondary,
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -742,7 +781,10 @@ private fun SessionDetailScreenPreview() {
         SessionDetailScreen(
             session = session,
             connectionStatus = ConnectionStatus.ONLINE,
-            timeline = DemoData.timeline(session.stableId),
+            timelineState = SessionTimelineState(
+                events = DemoData.timeline(session.stableId),
+                agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
+            ),
             draft = "",
             nowMillis = System.currentTimeMillis(),
             onDraftChange = {},

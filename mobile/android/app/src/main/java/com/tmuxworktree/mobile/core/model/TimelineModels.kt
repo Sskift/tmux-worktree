@@ -6,6 +6,12 @@ enum class TimelineActor {
     SYSTEM,
 }
 
+enum class AgentEvidenceAvailability {
+    AVAILABLE,
+    RELAY_V1_UNSUPPORTED,
+    RELAY_V2_UNAVAILABLE,
+}
+
 data class TimelineEvent(
     val eventId: String,
     val sessionId: String,
@@ -14,4 +20,9 @@ data class TimelineEvent(
     val createdAtMillis: Long,
     val code: String = "",
     val deliveryState: DeliveryState? = null,
+)
+
+data class SessionTimelineState(
+    val events: List<TimelineEvent>,
+    val agentEvidenceAvailability: AgentEvidenceAvailability,
 )

@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.app
 
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleFailure
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleIdentity
@@ -68,12 +69,14 @@ class RelayV2SelectedSessionTimelineProjectionTest {
             ),
         )
 
-        val timeline = projectRelayV2SelectedSessionTimeline(
+        val timelineState = projectRelayV2SelectedSessionTimeline(
             sessionStableId = "s",
             readPresentation = { content },
             stillCurrent = { true },
         )
+        val timeline = timelineState.events
 
+        assertEquals(AgentEvidenceAvailability.AVAILABLE, timelineState.agentEvidenceAvailability)
         assertEquals(3, timeline.size)
         assertEquals(TimelineActor.USER, timeline[0].actor)
         assertEquals("hello", timeline[0].body)
@@ -90,7 +93,7 @@ class RelayV2SelectedSessionTimelineProjectionTest {
 
     @Test
     fun `lifecycle states use only structured evidence and mark historical sources`() = runBlocking {
-        val timeline = projectRelayV2SelectedSessionTimeline(
+        val timelineState = projectRelayV2SelectedSessionTimeline(
             sessionStableId = "session-ui",
             readPresentation = {
                 projectionContent(
@@ -167,7 +170,9 @@ class RelayV2SelectedSessionTimelineProjectionTest {
             },
             stillCurrent = { true },
         )
+        val timeline = timelineState.events
 
+        assertEquals(AgentEvidenceAvailability.AVAILABLE, timelineState.agentEvidenceAvailability)
         assertEquals(
             listOf(
                 "Run lifecycle: Running",
@@ -214,7 +219,7 @@ class RelayV2SelectedSessionTimelineProjectionTest {
                     )
                 },
                 stillCurrent = { true },
-            ).single().eventId
+            ).events.single().eventId
 
             val identities = listOf(
                 eventId(),
@@ -233,30 +238,45 @@ class RelayV2SelectedSessionTimelineProjectionTest {
         }
 
     @Test
-    fun `non content presentation states stay empty`() = runBlocking {
-        val states = listOf(
-            AgentTranscriptLifecycleSelectedSessionPresentationState.Disabled,
-            AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
-            AgentTranscriptLifecycleSelectedSessionPresentationState.Stale,
-        )
+    fun `content availability is independent from items while non content states are unavailable`() =
+        runBlocking {
+            val states = listOf(
+                AgentTranscriptLifecycleSelectedSessionPresentationState.Disabled,
+                AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
+                AgentTranscriptLifecycleSelectedSessionPresentationState.Stale,
+            )
 
-        states.forEach { state ->
-            assertTrue(
-                projectRelayV2SelectedSessionTimeline(
+            states.forEach { state ->
+                val timelineState = projectRelayV2SelectedSessionTimeline(
                     sessionStableId = "session-ui",
                     readPresentation = { state },
                     stillCurrent = { true },
-                ).isEmpty(),
+                )
+                assertTrue(timelineState.events.isEmpty())
+                assertEquals(
+                    AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE,
+                    timelineState.agentEvidenceAvailability,
+                )
+            }
+
+            val emptyContent = projectRelayV2SelectedSessionTimeline(
+                sessionStableId = "session-ui",
+                readPresentation = { projectionContent(emptyList()) },
+                stillCurrent = { true },
+            )
+            assertTrue(emptyContent.events.isEmpty())
+            assertEquals(
+                AgentEvidenceAvailability.AVAILABLE,
+                emptyContent.agentEvidenceAvailability,
             )
         }
-    }
 
     @Test
     fun `post read stale fence clears content`() = runBlocking {
         var current = true
         var readCompleted = false
 
-        val timeline = projectRelayV2SelectedSessionTimeline(
+        val timelineState = projectRelayV2SelectedSessionTimeline(
             sessionStableId = "session-ui",
             readPresentation = {
                 current = false
@@ -281,7 +301,11 @@ class RelayV2SelectedSessionTimelineProjectionTest {
             },
         )
 
-        assertTrue(timeline.isEmpty())
+        assertTrue(timelineState.events.isEmpty())
+        assertEquals(
+            AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE,
+            timelineState.agentEvidenceAvailability,
+        )
     }
 }
 
