@@ -8,6 +8,16 @@ const pumpModule = await import("../dist/relay/v2/carrierPump.js");
 
 const NOW_MS = 1_783_700_000_000;
 
+function deferredValue() {
+  let resolve;
+  let reject;
+  const promise = new Promise((settle, fail) => {
+    resolve = settle;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 function authContext(role, hostId) {
   return {
     scheme: "twcap2",
@@ -192,10 +202,197 @@ function prepareLiveClient(shared, pump, hostId, connectionId) {
   return { client, socket };
 }
 
+test("one Core activates one credential authority before publishing the shared runtime", async () => {
+  const scheduler = new ManualScheduler();
+  const opened = deferredValue();
+  const authorityEntered = deferredValue();
+  const authorityDecision = deferredValue();
+  const authorityRequests = [];
+  const authorityLifecycle = [];
+  let authorityCloseCalls = 0;
+  const authority = {
+    authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+    async handle(request) {
+      authorityRequests.push(request);
+      authorityLifecycle.push("handle:started");
+      authorityEntered.resolve();
+      assert.equal(request.type, "host.reauthenticate");
+      await authorityDecision.promise;
+      authorityLifecycle.push("handle:completed");
+      const nextAuthContext = Object.freeze({
+        ...request.currentAuthContext,
+        jti: "host-reauthenticated-jti",
+        expiresAtMs: NOW_MS + 7_200_000,
+        authorizationRevision: "2",
+        authorizationFence: "authorization-fence-2",
+      });
+      return {
+        outcome: "success",
+        response: {
+          carrierVersion: 1,
+          type: "host.reauthenticated",
+          requestId: request.requestId,
+          connectorId: request.connectorId,
+          payload: {
+            grantId: nextAuthContext.grantId,
+            jti: nextAuthContext.jti,
+            expiresAtMs: nextAuthContext.expiresAtMs,
+            deduplicated: false,
+          },
+        },
+        replayed: false,
+        nextAuthContext,
+      };
+    },
+    async close() {
+      authorityCloseCalls += 1;
+      authorityLifecycle.push("authority:closed");
+    },
+  };
+  let openerCalls = 0;
+  let capturedFence;
+  const activationPromise = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({
+    brokerOptions: { now: () => NOW_MS },
+    clientSocketScheduler: scheduler,
+    authorizationExpiryScheduleAt: () => () => {},
+    async openCredentialAuthority(input) {
+      assert.equal(this, undefined);
+      assert.throws(() => Reflect.get(this, "producerRegistry"), TypeError);
+      openerCalls += 1;
+      assert.equal(Object.isFrozen(input), true);
+      assert.deepEqual(Reflect.ownKeys(input), ["liveAuthorizationFence"]);
+      capturedFence = input.liveAuthorizationFence;
+      return await opened.promise;
+    },
+  });
+
+  let activationSettled = false;
+  void activationPromise.then(
+    () => { activationSettled = true; },
+    () => { activationSettled = true; },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(openerCalls, 1);
+  assert.equal(activationSettled, false);
+  assert.equal(typeof capturedFence.begin, "function");
+  assert.equal(typeof capturedFence.failClosed, "function");
+
+  opened.resolve(authority);
+  const activation = await activationPromise;
+  assert.equal(Object.isFrozen(activation), true);
+  assert.deepEqual(Reflect.ownKeys(activation), ["sharedRuntime"]);
+  assert.equal(Object.isFrozen(activation.sharedRuntime), true);
+  assert.equal(activation.credentialAuthority, undefined);
+  assert.equal(activation.authority, undefined);
+  assert.equal(activation.sharedRuntime.hostPumpBrokerAuthority, undefined);
+  assert.equal(activation.sharedRuntime.producerRegistry, undefined);
+  assert.equal(activation.sharedRuntime.runtime, undefined);
+
+  const shared = activation.sharedRuntime;
+  const entry = createPump(
+    shared,
+    scheduler,
+    "activated-shared-producer-host",
+    "activated-shared-producer-transport",
+  );
+  await startPumps(scheduler, entry);
+
+  const defaultClient = shared.clientWssRuntime.prepareClientWss({
+    connectionId: "activated-default-client",
+    trustedAuthContext: authContext("client", entry.host.hostId),
+    hostProducerTarget: entry.pump.producerComposition.target,
+  });
+  assert.equal(defaultClient.outcome, "reject");
+  assert.equal(defaultClient.status, 426);
+
+  const registered = entry.host.frames.find((frame) => frame.type === "host.registered");
+  assert.ok(registered);
+  const reauthenticate = codec.encodeRelayV2WebSocketFrame("carrier", {
+    carrierVersion: 1,
+    type: "host.reauthenticate",
+    requestId: "activated-host-reauthentication",
+    connectorId: registered.connectorId,
+    payload: { accessToken: "twcap2.replacement.signature" },
+  });
+  assert.equal(entry.pump.trySend(reauthenticate, "activated-host-reauthentication"), true);
+  await scheduler.flushReady();
+  await authorityEntered.promise;
+  assert.equal(authorityRequests.length, 1);
+
+  const close = shared.closeAndDrain();
+  assert.strictEqual(shared.closeAndDrain(), close);
+  await scheduler.flushReady();
+  let closeSettled = false;
+  void close.then(
+    () => { closeSettled = true; },
+    () => { closeSettled = true; },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeSettled, false);
+  assert.equal(authorityCloseCalls, 0);
+  authorityDecision.resolve();
+  await close;
+  assert.equal(authorityCloseCalls, 1);
+  assert.deepEqual(authorityLifecycle, [
+    "handle:started",
+    "handle:completed",
+    "authority:closed",
+  ]);
+
+  let failClosedAuthorityCloseCalls = 0;
+  let failClosedFence;
+  const failClosedActivation = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({
+    brokerOptions: { now: () => NOW_MS },
+    clientSocketScheduler: new ManualScheduler(),
+    authorizationExpiryScheduleAt: () => () => {},
+    async openCredentialAuthority({ liveAuthorizationFence }) {
+      failClosedFence = liveAuthorizationFence;
+      liveAuthorizationFence.failClosed();
+      return {
+        authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+        async handle() {
+          throw new Error("fail-closed authority must remain unreachable");
+        },
+        async close() {
+          failClosedAuthorityCloseCalls += 1;
+        },
+      };
+    },
+  });
+  await assert.rejects(failClosedActivation, /credential authority is not ready/);
+  assert.equal(failClosedAuthorityCloseCalls, 1);
+  assert.throws(() => failClosedFence.begin({
+    reason: "kid_removed",
+    kid: "fail-closed-opener-kid",
+  }), /live-authorization close signal is unavailable/);
+
+  let rejectedFence;
+  let rejectedOpenerCalls = 0;
+  const rejectedActivation = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({
+    brokerOptions: { now: () => NOW_MS },
+    clientSocketScheduler: new ManualScheduler(),
+    authorizationExpiryScheduleAt: () => () => {},
+    async openCredentialAuthority({ liveAuthorizationFence }) {
+      rejectedOpenerCalls += 1;
+      rejectedFence = liveAuthorizationFence;
+      throw new Error("deferred credential opener rejected");
+    },
+  });
+  await assert.rejects(rejectedActivation, /deferred credential opener rejected/);
+  assert.equal(rejectedOpenerCalls, 1);
+  assert.throws(() => rejectedFence.begin({
+    reason: "kid_removed",
+    kid: "rejected-opener-kid",
+  }), /live-authorization close signal is unavailable/);
+});
+
 test("total close seals both admissions, starts every tracked Pump, then drains the live client", async () => {
   const scheduler = new ManualScheduler();
   const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
-    brokerOptions: { now: () => NOW_MS },
+    brokerOptions: {
+      now: () => NOW_MS,
+      baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
     clientSocketScheduler: scheduler,
     authorizationExpiryScheduleAt: () => () => {},
   });
@@ -361,7 +558,10 @@ test("construction reservations survive reentrant close and terminal Pump failur
   {
     const scheduler = new ManualScheduler();
     const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
-      brokerOptions: { now: () => NOW_MS },
+      brokerOptions: {
+        now: () => NOW_MS,
+        baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+      },
       clientSocketScheduler: scheduler,
       authorizationExpiryScheduleAt: () => () => {},
     });
@@ -419,7 +619,10 @@ test("construction reservations survive reentrant close and terminal Pump failur
   {
     const scheduler = new ManualScheduler();
     const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
-      brokerOptions: { now: () => NOW_MS },
+      brokerOptions: {
+        now: () => NOW_MS,
+        baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+      },
       clientSocketScheduler: scheduler,
       authorizationExpiryScheduleAt: () => () => {},
     });

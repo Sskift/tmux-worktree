@@ -21,8 +21,11 @@ import {
   type RelayV2BrokerProducerTerminalFailure,
 } from "./brokerProducerRegistry.js";
 import {
+  activateRelayV2BrokerClientWssRuntimeComposition,
   createRelayV2BrokerClientWssRuntimeComposition,
+  type RelayV2BrokerActivatedCredentialAuthority,
   type RelayV2BrokerClientWssRuntimeComposition,
+  type RelayV2BrokerClientWssRuntimeActivationOptions,
   type RelayV2BrokerClientWssRuntimeCompositionOptions,
 } from "./brokerClientWssRuntimeComposition.js";
 import {
@@ -120,6 +123,14 @@ export type RelayV2BrokerSharedProducerRuntimeCompositionOptions = Omit<
   "producerRegistry" | "resolveHostProducerBinding"
 >;
 
+export type RelayV2BrokerSharedProducerRuntimeActivationOptions<
+  Authority extends RelayV2BrokerActivatedCredentialAuthority =
+    RelayV2BrokerActivatedCredentialAuthority,
+> = Omit<
+  RelayV2BrokerClientWssRuntimeActivationOptions<Authority>,
+  "producerRegistry" | "resolveHostProducerBinding"
+>;
+
 export type RelayV2BrokerManagedHostCarrierPump = Readonly<Pick<
   RelayV2BrokerHostCarrierPump,
   | "producerComposition"
@@ -141,6 +152,10 @@ export type RelayV2BrokerSharedProducerRuntimeComposition = Readonly<{
     options: RelayV2BrokerSharedProducerHostPumpOptions,
   ): RelayV2BrokerManagedHostCarrierPump;
   closeAndDrain(): Promise<void>;
+}>;
+
+export type RelayV2BrokerSharedProducerRuntimeActivation = Readonly<{
+  sharedRuntime: RelayV2BrokerSharedProducerRuntimeComposition;
 }>;
 
 export type RelayV2BrokerHostCarrierPumpProducerComposition = Readonly<{
@@ -2658,7 +2673,7 @@ function createRelayV2BrokerSharedProducerPumpConstructionReservation(
 class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
   readonly clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
 
-  private readonly producerRegistry = new RelayV2BrokerProducerRegistry();
+  private readonly producerRegistry: RelayV2BrokerProducerRegistry;
   private readonly runtime: RelayV2BrokerClientWssRuntimeComposition;
   private readonly hostPumpOwner: RelayV2BrokerSharedProducerHostPumpOwner;
   private readonly hostPumps = new Set<RelayV2BrokerHostCarrierPump>();
@@ -2673,18 +2688,35 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
   private hostPumpAdmissionOpen = true;
   private closeDrain: Promise<void> | null = null;
 
-  constructor(options: RelayV2BrokerSharedProducerRuntimeCompositionOptions) {
-    this.runtime = createRelayV2BrokerClientWssRuntimeComposition({
-      ...options,
-      producerRegistry: this.producerRegistry,
-      resolveHostProducerBinding: (fence) => {
-        const owner = this.producerRegistry.inspectHostProducerOwner(
-          fence.transportId,
-          fence.connectionIncarnation,
-        );
-        return owner.status === "current" ? owner.binding : undefined;
-      },
-    });
+  constructor(input: Readonly<
+    | {
+        kind: "create";
+        options: RelayV2BrokerSharedProducerRuntimeCompositionOptions;
+      }
+    | {
+        kind: "activated";
+        producerRegistry: RelayV2BrokerProducerRegistry;
+        runtime: RelayV2BrokerClientWssRuntimeComposition;
+      }
+  >) {
+    if (input.kind === "create") {
+      const producerRegistry = new RelayV2BrokerProducerRegistry();
+      this.producerRegistry = producerRegistry;
+      this.runtime = createRelayV2BrokerClientWssRuntimeComposition({
+        ...input.options,
+        producerRegistry,
+        resolveHostProducerBinding: (fence) => {
+          const owner = producerRegistry.inspectHostProducerOwner(
+            fence.transportId,
+            fence.connectionIncarnation,
+          );
+          return owner.status === "current" ? owner.binding : undefined;
+        },
+      });
+    } else {
+      this.producerRegistry = input.producerRegistry;
+      this.runtime = input.runtime;
+    }
     this.hostPumpOwner = Object.freeze({
       broker: this.runtime.hostPumpBrokerAuthority,
       producerRegistry: this.producerRegistry,
@@ -2867,6 +2899,18 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
   }
 }
 
+function createRelayV2BrokerSharedProducerRuntimeFacade(
+  owner: RelayV2BrokerSharedProducerRuntimeCompositionOwner,
+): RelayV2BrokerSharedProducerRuntimeComposition {
+  return Object.freeze({
+    clientWssRuntime: owner.clientWssRuntime,
+    createHostCarrierPump: (
+      pumpOptions: RelayV2BrokerSharedProducerHostPumpOptions,
+    ) => owner.createHostCarrierPump(pumpOptions),
+    closeAndDrain: () => owner.closeAndDrain(),
+  });
+}
+
 /**
  * Default-off shared-producer composition and total in-process lifecycle
  * owner. Construction still creates no Pump, listener, server, credential,
@@ -2875,12 +2919,58 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
 export function createRelayV2BrokerSharedProducerRuntimeComposition(
   options: RelayV2BrokerSharedProducerRuntimeCompositionOptions = {},
 ): RelayV2BrokerSharedProducerRuntimeComposition {
-  const owner = new RelayV2BrokerSharedProducerRuntimeCompositionOwner(options);
-  return Object.freeze({
-    clientWssRuntime: owner.clientWssRuntime,
-    createHostCarrierPump: (
-      pumpOptions: RelayV2BrokerSharedProducerHostPumpOptions,
-    ) => owner.createHostCarrierPump(pumpOptions),
-    closeAndDrain: () => owner.closeAndDrain(),
+  const owner = new RelayV2BrokerSharedProducerRuntimeCompositionOwner({
+    kind: "create",
+    options,
   });
+  return createRelayV2BrokerSharedProducerRuntimeFacade(owner);
+}
+
+/**
+ * Default-off, listener-free shared activation. The registry passed into the
+ * activated client runtime is the same registry used by every managed Pump;
+ * the runtime's single close owner drains the exact credential authority.
+ */
+export async function activateRelayV2BrokerSharedProducerRuntimeComposition<
+  Authority extends RelayV2BrokerActivatedCredentialAuthority,
+>(
+  options: RelayV2BrokerSharedProducerRuntimeActivationOptions<Authority>,
+): Promise<RelayV2BrokerSharedProducerRuntimeActivation> {
+  const producerRegistry = new RelayV2BrokerProducerRegistry();
+  const activation = await activateRelayV2BrokerClientWssRuntimeComposition({
+    ...options,
+    producerRegistry,
+    resolveHostProducerBinding: (fence) => {
+      const owner = producerRegistry.inspectHostProducerOwner(
+        fence.transportId,
+        fence.connectionIncarnation,
+      );
+      return owner.status === "current" ? owner.binding : undefined;
+    },
+  });
+
+  try {
+    const owner = new RelayV2BrokerSharedProducerRuntimeCompositionOwner({
+      kind: "activated",
+      producerRegistry,
+      runtime: activation.runtime,
+    });
+    return Object.freeze({
+      sharedRuntime: createRelayV2BrokerSharedProducerRuntimeFacade(owner),
+    });
+  } catch (error) {
+    let cleanupFailure: unknown;
+    try {
+      await activation.runtime.closeAndDrain();
+    } catch (cleanupError) {
+      cleanupFailure = cleanupError;
+    }
+    if (cleanupFailure !== undefined) {
+      throw new AggregateError(
+        [error, cleanupFailure],
+        "Relay v2 shared-producer credential activation rollback failed",
+      );
+    }
+    throw error;
+  }
 }

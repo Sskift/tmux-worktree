@@ -23,9 +23,13 @@ import {
 import {
   RelayV2BrokerCore,
   type RelayV2BrokerAction,
+  type RelayV2AuthControlDecision,
+  type RelayV2AuthControlRequest,
+  type RelayV2BrokerAuthControlAuthority,
   type RelayV2BrokerConnectionAuthorization,
   type RelayV2ClientAdmission,
   type RelayV2BrokerResult,
+  type RelayV2LiveAuthorizationFencePort,
   type RelayV2RouteOpenResult,
   type RelayV2StructuredError,
 } from "./brokerCore.js";
@@ -83,6 +87,30 @@ export interface RelayV2BrokerClientWssRuntimeCompositionOptions {
   authorizationExpiryScheduleAt?: RelayV2BrokerAuthorizationExpiryScheduleAt;
   transportCloseDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
 }
+
+/** The credential owner admitted by the default-off one-shot activation. */
+export interface RelayV2BrokerActivatedCredentialAuthority
+extends RelayV2BrokerAuthControlAuthority {
+  readonly authorityContinuityReadiness: Readonly<{ status: string }>;
+  close(): Promise<void>;
+}
+
+export type RelayV2BrokerClientWssRuntimeActivationOptions<
+  Authority extends RelayV2BrokerActivatedCredentialAuthority =
+    RelayV2BrokerActivatedCredentialAuthority,
+> = Omit<RelayV2BrokerClientWssRuntimeCompositionOptions, "brokerOptions"> & {
+  brokerOptions?: Omit<
+    RelayV2BrokerCoreOptions,
+    "outputReadyPort" | "onLiveAuthorizationClose" | "authControlAuthority"
+  >;
+  openCredentialAuthority(input: Readonly<{
+    liveAuthorizationFence: RelayV2LiveAuthorizationFencePort;
+  }>): Promise<Authority>;
+};
+
+export type RelayV2BrokerClientWssRuntimeActivation = Readonly<{
+  runtime: RelayV2BrokerClientWssRuntimeComposition;
+}>;
 
 export interface RelayV2BrokerClientWssPrepareInput {
   connectionId: string;
@@ -179,6 +207,11 @@ type NativeTerminalSocket = {
 
 type RegistrationTerminalKind = "closed" | "errored";
 
+type CapturedCredentialAuthority = Readonly<{
+  receiver: object;
+  handle: Function;
+}>;
+
 function deferred(): Deferred {
   let resolve!: () => void;
   let reject!: (error: unknown) => void;
@@ -196,6 +229,132 @@ function isRejectedProxy(value: unknown): boolean {
     return nodeUtilTypes.isProxy(value);
   } catch {
     return true;
+  }
+}
+
+function captureMethod(value: object, name: string): Function | null {
+  let owner: object | null = value;
+  try {
+    while (owner) {
+      if (isRejectedProxy(owner)) return null;
+      const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+      if (descriptor) {
+        return Object.hasOwn(descriptor, "value") && typeof descriptor.value === "function"
+          ? descriptor.value
+          : null;
+      }
+      owner = Object.getPrototypeOf(owner);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+class CredentialAuthorityCloseOwner {
+  private closeBarrier: Promise<void> | null = null;
+
+  constructor(
+    private readonly receiver: object,
+    private readonly closeMethod: Function,
+  ) {}
+
+  close(): Promise<void> {
+    if (this.closeBarrier) return this.closeBarrier;
+    try {
+      this.closeBarrier = Promise.resolve(
+        Reflect.apply(this.closeMethod, this.receiver, []),
+      ).then(() => undefined);
+    } catch (error) {
+      this.closeBarrier = Promise.reject(error);
+    }
+    void this.closeBarrier.catch(() => {});
+    return this.closeBarrier;
+  }
+}
+
+function captureCredentialAuthorityCloseOwner(
+  value: unknown,
+): CredentialAuthorityCloseOwner | null {
+  if (value === null || typeof value !== "object" || isRejectedProxy(value)) return null;
+  const closeMethod = captureMethod(value, "close");
+  return closeMethod ? new CredentialAuthorityCloseOwner(value, closeMethod) : null;
+}
+
+function captureReadyCredentialAuthority(value: unknown): CapturedCredentialAuthority | null {
+  if (value === null || typeof value !== "object" || isRejectedProxy(value)) return null;
+  const handle = captureMethod(value, "handle");
+  if (!handle) return null;
+  try {
+    const readiness = (value as { authorityContinuityReadiness?: unknown })
+      .authorityContinuityReadiness;
+    if (
+      readiness === null
+      || typeof readiness !== "object"
+      || isRejectedProxy(readiness)
+      || (readiness as { status?: unknown }).status !== "ready"
+    ) return null;
+  } catch {
+    return null;
+  }
+  return Object.freeze({
+    receiver: value,
+    handle,
+  });
+}
+
+/**
+ * The Core must exist before its exact live fence can open the credential
+ * owner. This bridge remains dormant until that owner is ready and is sealed
+ * before either rollback or normal close can begin.
+ */
+class DormantRelayV2BrokerAuthControlAuthority
+implements RelayV2BrokerAuthControlAuthority {
+  private installed: CapturedCredentialAuthority | null = null;
+  private phase: "dormant" | "bound" | "sealed" = "dormant";
+  private readonly active = new Set<Promise<unknown>>();
+  private drainBarrier: Promise<void> | null = null;
+
+  bind(authority: CapturedCredentialAuthority): void {
+    if (this.phase !== "dormant" || this.installed !== null) {
+      throw new Error("Relay v2 Broker credential bridge is not dormant");
+    }
+    this.installed = authority;
+    this.phase = "bound";
+  }
+
+  handle(request: RelayV2AuthControlRequest): Promise<RelayV2AuthControlDecision> {
+    const installed = this.installed;
+    if (this.phase !== "bound" || installed === null) {
+      throw new Error("Relay v2 Broker credential authority is unavailable");
+    }
+    let result: RelayV2AuthControlDecision | Promise<RelayV2AuthControlDecision>;
+    try {
+      result = Reflect.apply(installed.handle, installed.receiver, [request]) as (
+        RelayV2AuthControlDecision | Promise<RelayV2AuthControlDecision>
+      );
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    const task = Promise.resolve(result);
+    this.active.add(task);
+    void task.then(
+      () => { this.active.delete(task); },
+      () => { this.active.delete(task); },
+    );
+    return task;
+  }
+
+  seal(): void {
+    if (this.phase === "sealed") return;
+    this.phase = "sealed";
+  }
+
+  drain(): Promise<void> {
+    this.seal();
+    if (this.drainBarrier) return this.drainBarrier;
+    this.drainBarrier = Promise.allSettled([...this.active]).then(() => undefined);
+    return this.drainBarrier;
   }
 }
 
@@ -629,6 +788,18 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     });
   }
 
+  credentialActivationFence(): RelayV2LiveAuthorizationFencePort {
+    return this.broker.liveAuthorizationFencePort;
+  }
+
+  credentialActivationPublishable(): boolean {
+    return this.clientAdmissionOpen
+      && this.clientEffectsOpen
+      && this.closeDrain === null
+      && this.broker.inspectLiveAuthCompositionLatch() === "open"
+      && this.broker.outputReadyCompositionState === "open";
+  }
+
   sealClientAdmission(): void {
     this.clientAdmissionOpen = false;
   }
@@ -1026,14 +1197,10 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   }
 }
 
-/**
- * Default-off only: this creates no listener, credential authority, E0 store,
- * process, retry owner, capability advertisement, or protocol fallback.
- */
-export function createRelayV2BrokerClientWssRuntimeComposition(
-  options: RelayV2BrokerClientWssRuntimeCompositionOptions,
+function createRelayV2BrokerClientWssRuntimeFacade(
+  owner: RelayV2BrokerClientWssRuntimeCompositionImpl,
+  closeAndDrain: () => Promise<void>,
 ): RelayV2BrokerClientWssRuntimeComposition {
-  const owner = new RelayV2BrokerClientWssRuntimeCompositionImpl(options);
   const sealClientAdmission = () => owner.sealClientAdmission();
   return Object.freeze({
     hostPumpBrokerAuthority: owner.hostPumpBrokerAuthority,
@@ -1045,6 +1212,192 @@ export function createRelayV2BrokerClientWssRuntimeComposition(
       owner.attachPreparedClientWss(input)
     ),
     applyBrokerAction: (action: RelayV2BrokerAction) => owner.applyBrokerAction(action),
-    closeAndDrain: () => owner.closeAndDrain(),
+    closeAndDrain,
   });
+}
+
+class RelayV2BrokerActivatedCredentialRuntimeCloseOwner {
+  private closeDrain: Promise<void> | null = null;
+  private authorityCloseOwner: CredentialAuthorityCloseOwner | null = null;
+  private authorityCloseOwnerInstalled = false;
+
+  constructor(
+    private readonly runtimeOwner: RelayV2BrokerClientWssRuntimeCompositionImpl,
+    private readonly bridge: DormantRelayV2BrokerAuthControlAuthority,
+  ) {}
+
+  installAuthorityCloseOwner(
+    authorityCloseOwner: CredentialAuthorityCloseOwner | null,
+  ): void {
+    if (this.authorityCloseOwnerInstalled || this.closeDrain !== null) {
+      throw new Error("Relay v2 Broker credential authority close owner is already installed");
+    }
+    this.authorityCloseOwner = authorityCloseOwner;
+    this.authorityCloseOwnerInstalled = true;
+  }
+
+  closeAndDrain(): Promise<void> {
+    if (this.closeDrain) return this.closeDrain;
+    if (!this.authorityCloseOwnerInstalled) {
+      this.authorityCloseOwnerInstalled = true;
+    }
+    const published = deferred();
+    this.closeDrain = published.promise;
+
+    // Both public admission and the private auth-control handoff are fenced in
+    // this turn, before Core close signals can invoke an external socket owner.
+    this.bridge.seal();
+    this.runtimeOwner.sealClientAdmission();
+    void this.finishCloseAndDrain().then(published.resolve, published.reject);
+    return published.promise;
+  }
+
+  private async finishCloseAndDrain(): Promise<void> {
+    const failures: unknown[] = [];
+    const settle = async (barrier: Promise<unknown>): Promise<void> => {
+      try {
+        await barrier;
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+
+    let runtimeBarrier: Promise<void>;
+    try {
+      runtimeBarrier = this.runtimeOwner.closeAndDrain();
+    } catch (error) {
+      runtimeBarrier = Promise.reject(error);
+    }
+    await settle(runtimeBarrier);
+    await settle(this.bridge.drain());
+    if (this.authorityCloseOwner) {
+      await settle(this.authorityCloseOwner.close());
+    }
+
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        "Relay v2 Broker activated credential runtime close failed",
+      );
+    }
+  }
+}
+
+async function rollbackRelayV2BrokerClientWssRuntimeActivation(
+  closeOwner: RelayV2BrokerActivatedCredentialRuntimeCloseOwner,
+  activationFailure: unknown,
+): Promise<never> {
+  try {
+    await closeOwner.closeAndDrain();
+  } catch (cleanupFailure) {
+    throw new AggregateError(
+      [activationFailure, cleanupFailure],
+      "Relay v2 Broker credential activation rollback failed",
+    );
+  }
+  throw activationFailure;
+}
+
+/**
+ * Default-off only: this creates no listener, credential authority, E0 store,
+ * process, retry owner, capability advertisement, or protocol fallback.
+ */
+export function createRelayV2BrokerClientWssRuntimeComposition(
+  options: RelayV2BrokerClientWssRuntimeCompositionOptions,
+): RelayV2BrokerClientWssRuntimeComposition {
+  const owner = new RelayV2BrokerClientWssRuntimeCompositionImpl(options);
+  return createRelayV2BrokerClientWssRuntimeFacade(
+    owner,
+    () => owner.closeAndDrain(),
+  );
+}
+
+/**
+ * Default-off, listener-free one-shot credential activation. The existing
+ * registry/output-ready/Core/client owner is constructed exactly once. Only
+ * that Core's live-authorization fence crosses into the opener; no runtime is
+ * published until the returned authority is ready and bound to the dormant
+ * auth-control bridge.
+ */
+export async function activateRelayV2BrokerClientWssRuntimeComposition<
+  Authority extends RelayV2BrokerActivatedCredentialAuthority,
+>(
+  options: RelayV2BrokerClientWssRuntimeActivationOptions<Authority>,
+): Promise<RelayV2BrokerClientWssRuntimeActivation> {
+  if (
+    options === null
+    || typeof options !== "object"
+    || isRejectedProxy(options)
+  ) throw new Error("invalid Relay v2 Broker credential activation options");
+
+  let openCredentialAuthority: Function;
+  let runtimeOptions: Omit<
+    RelayV2BrokerClientWssRuntimeCompositionOptions,
+    "brokerOptions"
+  > & { brokerOptions?: RelayV2BrokerClientWssRuntimeCompositionOptions["brokerOptions"] };
+  try {
+    openCredentialAuthority = options.openCredentialAuthority;
+    if (typeof openCredentialAuthority !== "function") {
+      throw new Error("invalid credential authority opener");
+    }
+    const brokerOptions = options.brokerOptions;
+    if (brokerOptions && Object.hasOwn(brokerOptions, "authControlAuthority")) {
+      throw new Error("credential auth-control authority must be activation-owned");
+    }
+    runtimeOptions = {
+      producerRegistry: options.producerRegistry,
+      resolveHostProducerBinding: options.resolveHostProducerBinding,
+      clientSocketScheduler: options.clientSocketScheduler,
+      deliveryTimeoutMs: options.deliveryTimeoutMs,
+      closeTimeoutMs: options.closeTimeoutMs,
+      authorizationExpiryScheduleAt: options.authorizationExpiryScheduleAt,
+      transportCloseDeadlineScheduler: options.transportCloseDeadlineScheduler,
+      brokerOptions: {
+        ...brokerOptions,
+      },
+    };
+  } catch {
+    throw new Error("invalid Relay v2 Broker credential activation options");
+  }
+
+  const bridge = new DormantRelayV2BrokerAuthControlAuthority();
+  const owner = new RelayV2BrokerClientWssRuntimeCompositionImpl({
+    ...runtimeOptions,
+    brokerOptions: {
+      ...runtimeOptions.brokerOptions,
+      authControlAuthority: bridge,
+    },
+  });
+  const closeOwner = new RelayV2BrokerActivatedCredentialRuntimeCloseOwner(
+    owner,
+    bridge,
+  );
+  try {
+    const openerInput = Object.freeze({
+      liveAuthorizationFence: owner.credentialActivationFence(),
+    });
+    const opened = await Reflect.apply(openCredentialAuthority, undefined, [openerInput]);
+    const authorityCloseOwner = captureCredentialAuthorityCloseOwner(opened);
+    closeOwner.installAuthorityCloseOwner(authorityCloseOwner);
+    const authority = captureReadyCredentialAuthority(opened);
+    if (!authorityCloseOwner || !authority || !owner.credentialActivationPublishable()) {
+      throw new Error("Relay v2 Broker credential authority is not ready");
+    }
+    bridge.bind(authority);
+    if (!owner.credentialActivationPublishable()) {
+      throw new Error("Relay v2 Broker credential activation crossed a fail-closed cut");
+    }
+
+    const runtime = createRelayV2BrokerClientWssRuntimeFacade(
+      owner,
+      () => closeOwner.closeAndDrain(),
+    );
+    return Object.freeze({ runtime });
+  } catch (error) {
+    return await rollbackRelayV2BrokerClientWssRuntimeActivation(
+      closeOwner,
+      error,
+    );
+  }
 }

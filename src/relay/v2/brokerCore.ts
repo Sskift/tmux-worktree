@@ -1168,7 +1168,7 @@ export class RelayV2BrokerCore {
       clientDialect: "tw-relay.v2",
       hostDialects: carrier.hello.clientDialects,
       requiredCapabilities: RELAY_V2_REQUIRED_CAPABILITIES,
-      hostCapabilities: completeBaseReadiness(carrier.hello),
+      hostCapabilities: this.advertisedBaseCapabilities(carrier.hello),
     });
     if (dialect.outcome === "reject") {
       return {
