@@ -16,6 +16,7 @@ export default defineConfig({
     "src/relay/v2/hostConnectorController.ts",
     "src/relay/v2/hostCredentialAuthority.ts",
     "src/relay/v2/hostCredentialExchangeCoordinator.ts",
+    "src/relay/v2/hostWssTransportLifecycle.ts",
     "src/relay/v2/hostConnectorCarrierAttemptAdapter.ts",
     "src/relay/v2/hostCapabilityReadiness.ts",
     "src/relay/v2/hostCodecReadinessActivation.ts",
@@ -96,6 +97,7 @@ export default defineConfig({
     // owners through their real dist entries rather than rebundled copies.
     "./relayV2DashboardManagementComposition.js",
     "./relayV2DashboardManagementStdio.js",
+    "./hostWssTransportLifecycle.js",
   ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',

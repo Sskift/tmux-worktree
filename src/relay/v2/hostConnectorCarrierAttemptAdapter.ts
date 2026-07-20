@@ -370,7 +370,7 @@ export class RelayV2HostConnectorCarrierAttemptDrainHandle {
     handle: RelayV2HostConnectorCarrierAttemptDrainHandle,
     transport: RelayV2HostCarrierTransport,
   ): Promise<void> {
-    if (!this.matches(adapterKey, handle, transport) || !handle.#bound) {
+    if (!this.matches(adapterKey, handle, transport)) {
       return Promise.reject(failure());
     }
     if (handle.#drainPromise !== null) return handle.#drainPromise;
@@ -546,7 +546,6 @@ implements RelayV2HostConnectorAttemptFactoryPort {
     let capturedTransport: CapturedTransport | null = null;
     let gate: TransportGate | null = null;
     let drainHandle: RelayV2HostConnectorCarrierAttemptDrainHandle | null = null;
-    let drainBound = false;
 
     try {
       const pendingResult = Reflect.apply(
@@ -589,7 +588,6 @@ implements RelayV2HostConnectorAttemptFactoryPort {
       if (!Number.isSafeInteger(connection.generation) || connection.generation <= 0) {
         throw failure();
       }
-      drainBound = true;
       RelayV2HostConnectorCarrierAttemptDrainHandle.bind(
         drainHandleAdapterKey,
         drainHandle,
@@ -619,7 +617,7 @@ implements RelayV2HostConnectorAttemptFactoryPort {
         try { Reflect.apply(RelayV2HostCarrierActor.prototype.dispose, actor, []); } catch {}
       }
       gate?.close(1000, "host_shutdown");
-      if (drainBound && drainHandle !== null && transport !== null) {
+      if (drainHandle !== null && transport !== null) {
         try {
           await RelayV2HostConnectorCarrierAttemptDrainHandle.drain(
             drainHandleAdapterKey,

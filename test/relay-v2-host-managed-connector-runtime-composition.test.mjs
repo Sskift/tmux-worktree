@@ -547,7 +547,8 @@ test("a rejection before drain binding detaches its actor and permits a later st
     );
     assert.equal(readinessReady(h.composition.readiness.current()), false);
     assert.equal(h.records[0].connection, null);
-    assert.equal(h.records[0].drainCalls, 0);
+    assert.equal(h.records[0].drainCalls, 1);
+    assert.equal(Object.isFrozen(h.records[0].drainProofs[0]), true);
     assert.deepEqual(h.records[0].transport.closes, [{
       code: 1000,
       reason: "host_shutdown",

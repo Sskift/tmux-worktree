@@ -11,6 +11,11 @@ import {
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
+  consumeRelayV2HostCredentialConnectionAdmissionForCarrier,
+  type RelayV2HostCredentialConnectionAdmission,
+  type RelayV2HostCredentialConnectionMetadata,
+} from "./hostCredentialAuthority.js";
+import {
   RelayV2DashboardManagementHostCarrierControlAdapter,
 } from "./relayV2DashboardManagementHostCarrierControlAdapter.js";
 
@@ -245,6 +250,8 @@ export interface RelayV2HostCarrierOptions {
   hostEpoch: string;
   hostInstanceId: string;
   credentialReferences: RelayV2HostCarrierCredentialReferences;
+  /** Internal managed-connector cut; ordinary carrier callers continue to use read(). */
+  credentialConnectionAdmission?: RelayV2HostCredentialConnectionAdmission;
   routeSink: RelayV2HostCarrierRouteSink;
   clientDialects?: readonly RelayV2HostCarrierClientDialect[];
   dialectAdapters?: Partial<Record<RelayV2HostCarrierClientDialect, RelayV2HostCarrierDialectAdapter>>;
@@ -667,6 +674,30 @@ function validateCredentialRecord(
   }
   if (!record.accessToken || Buffer.byteLength(record.accessToken, "utf8") > 8_192) {
     throw new Error("Relay v2 host credential token is invalid");
+  }
+}
+
+function validateCredentialMetadata(
+  requestedReference: string,
+  record: RelayV2HostCredentialConnectionMetadata,
+): void {
+  if (record.reference !== requestedReference) {
+    throw new Error("Relay v2 host credential reference changed during lookup");
+  }
+  if (!/^(?:0|[1-9][0-9]*)$/.test(record.version)) {
+    throw new Error("Relay v2 host credential version is not canonical");
+  }
+  if (BigInt(record.version) > MAX_COUNTER) {
+    throw new Error("Relay v2 host credential version overflowed");
+  }
+  for (const [name, value] of [
+    ["reference", record.reference],
+    ["grantId", record.grantId],
+    ["accessJti", record.accessJti],
+  ] as const) {
+    if (!value || Buffer.byteLength(value, "utf8") > 128 || /[\0\r\n]/.test(value)) {
+      throw new Error(`Relay v2 host credential ${name} is invalid`);
+    }
   }
 }
 
@@ -1308,9 +1339,24 @@ export class RelayV2HostCarrierActor {
     if (this.permanentlySuperseded) {
       throw new Error("Relay v2 host carrier was superseded and cannot reconnect");
     }
-    const credential = this.options.credentialReferences.read(credentialReference);
-    validateCredentialRecord(credentialReference, credential);
-    const credentialMetadata = copyCredentialMetadata(credential);
+    let credentialMetadata: RelayV2HostCredentialConnectionMetadata;
+    if (this.options.credentialConnectionAdmission === undefined) {
+      const credential = this.options.credentialReferences.read(credentialReference);
+      validateCredentialRecord(credentialReference, credential);
+      credentialMetadata = copyCredentialMetadata(credential);
+    } else {
+      credentialMetadata = consumeRelayV2HostCredentialConnectionAdmissionForCarrier(
+        this.options.credentialReferences,
+        this.options.credentialConnectionAdmission,
+        Object.freeze({
+          hostId: this.#hostId,
+          hostEpoch: this.#hostEpoch,
+          hostInstanceId: this.#hostInstanceId,
+          credentialReference,
+        }),
+      );
+      validateCredentialMetadata(credentialReference, credentialMetadata);
+    }
     const helloRequestId = this.idFactory();
     // Credential/id adapters are synchronous but may reenter arbitrary actor
     // lifecycle. Never publish a connector after such reentry disposed or

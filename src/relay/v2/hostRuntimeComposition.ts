@@ -73,6 +73,13 @@ import type { RelayV2HostH3ReadinessLifecycle } from "./hostH3ReadinessActivatio
 import type {
   RelayV2HostH2RecoveryCandidate,
 } from "./stateSnapshotSpool.js";
+import type {
+  RelayV2HostCredentialConnectionAdmission,
+} from "./hostCredentialAuthority.js";
+import {
+  prepareRelayV2HostWssTransportLifecycleAttempt,
+  releaseRelayV2HostWssTransportLifecyclePreparedAttempt,
+} from "./hostWssTransportLifecycle.js";
 import type { RelayV2HostH0ReadinessPort } from "./hostState.js";
 import type {
   RelayV2HostCommandPlaneReadinessCandidate,
@@ -210,6 +217,7 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   | "hostEpoch"
   | "hostInstanceId"
   | "routeSink"
+  | "credentialConnectionAdmission"
   | "advertisedCapabilities"
   | "clientDialects"
   | "dialectAdapters"
@@ -218,6 +226,7 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   hostEpoch?: never;
   hostInstanceId?: never;
   routeSink?: never;
+  credentialConnectionAdmission?: never;
   advertisedCapabilities?: never;
   clientDialects?: never;
   dialectAdapters?: never;
@@ -1327,18 +1336,34 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         if (runtimeBinding === undefined || runtimeBinding.actor !== null) {
           throw managedCompositionFailure();
         }
-        const actor = new RelayV2HostCarrierActor({
-          ...carrierOptions,
-          hostId: input.hostId,
-          hostEpoch: input.hostEpoch,
-          hostInstanceId: input.hostInstanceId,
-          routeSink: bridge.routeSink,
-          advertisedCapabilities: [],
-          clientDialects: ["tw-relay.v2"],
-          dialectAdapters: Object.freeze({}),
-          onStatus: input.onCarrierStatus,
-        });
+        let actor: RelayV2HostCarrierActor | null = null;
+        let connectionAdmission: RelayV2HostCredentialConnectionAdmission | null = null;
         try {
+          connectionAdmission = prepareRelayV2HostWssTransportLifecycleAttempt(
+            transportLifecycleFactory.receiver,
+            Object.freeze({
+              requestId: input.requestId,
+              controllerGeneration: input.controllerGeneration,
+              hostId: input.hostId,
+              hostEpoch: input.hostEpoch,
+              hostInstanceId: input.hostInstanceId,
+              credentialReference: input.credentialReference,
+              signal: input.signal,
+              credentialReferences: carrierOptions.credentialReferences,
+            }),
+          );
+          actor = new RelayV2HostCarrierActor({
+            ...carrierOptions,
+            hostId: input.hostId,
+            hostEpoch: input.hostEpoch,
+            hostInstanceId: input.hostInstanceId,
+            routeSink: bridge.routeSink,
+            credentialConnectionAdmission: connectionAdmission ?? undefined,
+            advertisedCapabilities: [],
+            clientDialects: ["tw-relay.v2"],
+            dialectAdapters: Object.freeze({}),
+            onStatus: input.onCarrierStatus,
+          });
           runtimeBinding.attach(actor);
           const lifecycleInput = Object.freeze({
             requestId: input.requestId,
@@ -1393,7 +1418,11 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             drainHandle,
           });
         } catch {
-          try { actor.dispose(); } catch {}
+          releaseRelayV2HostWssTransportLifecyclePreparedAttempt(
+            transportLifecycleFactory.receiver,
+            connectionAdmission,
+          );
+          try { actor?.dispose(); } catch {}
           runtimeBinding.reject();
           throw managedCompositionFailure();
         }

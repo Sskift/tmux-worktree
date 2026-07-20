@@ -212,6 +212,58 @@ export interface RelayV2HostCredentialExchangeLease {
   readonly [RELAY_V2_HOST_CREDENTIAL_EXCHANGE_LEASE]: never;
 }
 
+declare const RELAY_V2_HOST_CREDENTIAL_CONNECTION_ADMISSION: unique symbol;
+
+/**
+ * Process-local, owner-bound connection cut. It deliberately has no runtime
+ * fields: the exact credential material remains inside this authority.
+ */
+export interface RelayV2HostCredentialConnectionAdmission {
+  readonly [RELAY_V2_HOST_CREDENTIAL_CONNECTION_ADMISSION]: never;
+}
+
+declare const RELAY_V2_HOST_CREDENTIAL_CONNECTION_TRANSPORT_OWNER: unique symbol;
+
+/** Opaque transport-lifecycle owner retained only by the WSS factory. */
+export interface RelayV2HostCredentialConnectionTransportOwner {
+  readonly [RELAY_V2_HOST_CREDENTIAL_CONNECTION_TRANSPORT_OWNER]: never;
+}
+
+declare const RELAY_V2_HOST_CREDENTIAL_CONNECTION_AUTHORIZATION: unique symbol;
+
+/** One-shot secretless capability retained only until request finalization. */
+export interface RelayV2HostCredentialConnectionAuthorization {
+  readonly [RELAY_V2_HOST_CREDENTIAL_CONNECTION_AUTHORIZATION]: never;
+}
+
+export interface RelayV2HostCredentialConnectionRequestFinalizationPort {
+  /** The lifecycle writes this value directly to the captured request and ends it. */
+  readonly finalize: (authorizationValue: string) => void;
+}
+
+export interface RelayV2HostCredentialConnectionAttemptBinding {
+  readonly requestId: string;
+  readonly controllerGeneration: string;
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly credentialReference: string;
+}
+
+export interface RelayV2HostCredentialConnectionCarrierBinding {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly credentialReference: string;
+}
+
+export interface RelayV2HostCredentialConnectionMetadata {
+  readonly reference: string;
+  readonly version: string;
+  readonly grantId: string;
+  readonly accessJti: string;
+}
+
 export interface RelayV2HostPreparedBootstrapFromCut {
   prepared: RelayV2HostPreparedBootstrap;
   lease: RelayV2HostCredentialExchangeLease;
@@ -287,12 +339,55 @@ interface RelayV2HostCredentialExchangeLeaseRecord {
   released: boolean;
 }
 
+interface RelayV2HostCredentialConnectionCut {
+  readonly reference: string;
+  readonly version: string;
+  readonly hostId: string;
+  readonly grantId: string;
+  readonly accessJti: string;
+  readonly accessExpiresAtMs: number;
+}
+
+interface RelayV2HostCredentialConnectionAdmissionRecord {
+  readonly owner: RelayV2HostCredentialAuthority;
+  readonly transportOwner: RelayV2HostCredentialConnectionTransportOwner;
+  readonly binding: RelayV2HostCredentialConnectionAttemptBinding;
+  readonly cut: RelayV2HostCredentialConnectionCut;
+  carrierConsumed: boolean;
+  phase: "issued" | "released";
+}
+
+interface RelayV2HostCredentialConnectionTransportOwnerRecord {
+  readonly owner: RelayV2HostCredentialAuthority;
+}
+
+interface RelayV2HostCredentialConnectionAuthorizationRecord {
+  readonly owner: RelayV2HostCredentialAuthority;
+  readonly transportOwner: RelayV2HostCredentialConnectionTransportOwner;
+  readonly cut: RelayV2HostCredentialConnectionCut;
+}
+
 const hostCredentialAuthorities = new WeakSet<object>();
 const hostCredentialExchangeCuts = new WeakMap<object, RelayV2HostCredentialExchangeCutRecord>();
 const hostCredentialExchangeLeases = new WeakMap<
 object,
 RelayV2HostCredentialExchangeLeaseRecord
 >();
+const hostCredentialConnectionAdmissions = new WeakMap<
+object,
+RelayV2HostCredentialConnectionAdmissionRecord
+>();
+const hostCredentialConnectionSecrets = new WeakMap<object, string>();
+const hostCredentialConnectionTransportOwners = new WeakMap<
+object,
+RelayV2HostCredentialConnectionTransportOwnerRecord
+>();
+const hostCredentialConnectionAuthorizations = new WeakMap<
+object,
+RelayV2HostCredentialConnectionAuthorizationRecord
+>();
+const hostCredentialConnectionAuthorizationSecrets = new WeakMap<object, string>();
+const connectionAdmissionAuthorityKey = Object.freeze({});
 
 export function isRelayV2HostCredentialAuthority(
   value: unknown,
@@ -697,10 +792,199 @@ function stateMatchesExchangeCut(
     );
 }
 
+function validateConnectionAttemptBinding(
+  value: unknown,
+): RelayV2HostCredentialConnectionAttemptBinding {
+  if (!isRecord(value)
+    || !hasExactKeys(value, [
+      "requestId", "controllerGeneration", "hostId", "hostEpoch",
+      "hostInstanceId", "credentialReference",
+    ])
+    || !isRelayV2AuthIdentifier(value.requestId)
+    || !isCanonicalCounter(value.controllerGeneration)
+    || value.controllerGeneration === "0"
+    || !isRelayV2AuthIdentifier(value.hostId)
+    || !isRelayV2AuthIdentifier(value.hostEpoch)
+    || !isRelayV2AuthIdentifier(value.hostInstanceId)
+    || !isCredentialReference(value.credentialReference)) {
+    return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+  }
+  return Object.freeze({
+    requestId: value.requestId,
+    controllerGeneration: value.controllerGeneration,
+    hostId: value.hostId,
+    hostEpoch: value.hostEpoch,
+    hostInstanceId: value.hostInstanceId,
+    credentialReference: value.credentialReference,
+  });
+}
+
+function validateConnectionCarrierBinding(
+  value: unknown,
+): RelayV2HostCredentialConnectionCarrierBinding {
+  if (!isRecord(value)
+    || !hasExactKeys(value, [
+      "hostId", "hostEpoch", "hostInstanceId", "credentialReference",
+    ])
+    || !isRelayV2AuthIdentifier(value.hostId)
+    || !isRelayV2AuthIdentifier(value.hostEpoch)
+    || !isRelayV2AuthIdentifier(value.hostInstanceId)
+    || !isCredentialReference(value.credentialReference)) {
+    return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+  }
+  return Object.freeze({
+    hostId: value.hostId,
+    hostEpoch: value.hostEpoch,
+    hostInstanceId: value.hostInstanceId,
+    credentialReference: value.credentialReference,
+  });
+}
+
+function connectionCutFromState(
+  reference: string,
+  state: RelayV2HostCredentialState | null,
+): RelayV2HostCredentialConnectionCut {
+  if (state === null) return fail("RELAY_V2_HOST_CREDENTIAL_NOT_FOUND");
+  if (state.credentialVersion === "0"
+    || state.grantId === null
+    || state.accessJti === null
+    || state.accessToken === null
+    || state.accessExpiresAtMs === null) {
+    return fail("RELAY_V2_HOST_CREDENTIAL_NOT_READY");
+  }
+  return {
+    reference,
+    version: state.credentialVersion,
+    hostId: state.hostId,
+    grantId: state.grantId,
+    accessJti: state.accessJti,
+    accessExpiresAtMs: state.accessExpiresAtMs,
+  };
+}
+
+function stateMatchesConnectionCut(
+  state: RelayV2HostCredentialState | null,
+  cut: RelayV2HostCredentialConnectionCut,
+  accessToken: string | undefined,
+): boolean {
+  return state !== null
+    && accessToken !== undefined
+    && state.credentialVersion === cut.version
+    && state.hostId === cut.hostId
+    && state.grantId === cut.grantId
+    && state.accessJti === cut.accessJti
+    && state.accessToken === accessToken
+    && state.accessExpiresAtMs === cut.accessExpiresAtMs;
+}
+
+function sameConnectionCarrierBinding(
+  attempt: RelayV2HostCredentialConnectionAttemptBinding,
+  carrier: RelayV2HostCredentialConnectionCarrierBinding,
+): boolean {
+  return attempt.hostId === carrier.hostId
+    && attempt.hostEpoch === carrier.hostEpoch
+    && attempt.hostInstanceId === carrier.hostInstanceId
+    && attempt.credentialReference === carrier.credentialReference;
+}
+
+export function captureRelayV2HostCredentialConnectionAdmission(
+  authority: RelayV2HostCredentialAuthority,
+  transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+  binding: RelayV2HostCredentialConnectionAttemptBinding,
+): RelayV2HostCredentialConnectionAdmission {
+  return RelayV2HostCredentialAuthority.captureConnectionAdmission(
+    connectionAdmissionAuthorityKey,
+    authority,
+    transportOwner,
+    binding,
+  );
+}
+
+export function createRelayV2HostCredentialConnectionTransportOwner(
+  authority: RelayV2HostCredentialAuthority,
+): RelayV2HostCredentialConnectionTransportOwner {
+  return RelayV2HostCredentialAuthority.createConnectionTransportOwner(
+    connectionAdmissionAuthorityKey,
+    authority,
+  );
+}
+
+export function consumeRelayV2HostCredentialConnectionAdmissionForCarrier(
+  authority: RelayV2HostCarrierCredentialReferences,
+  admission: RelayV2HostCredentialConnectionAdmission,
+  binding: RelayV2HostCredentialConnectionCarrierBinding,
+): RelayV2HostCredentialConnectionMetadata {
+  if (!isRelayV2HostCredentialAuthority(authority)) {
+    return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+  }
+  return RelayV2HostCredentialAuthority.consumeConnectionAdmissionForCarrier(
+    connectionAdmissionAuthorityKey,
+    authority,
+    admission,
+    binding,
+  );
+}
+
+export function claimRelayV2HostCredentialConnectionAuthorization(
+  authority: RelayV2HostCredentialAuthority,
+  transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+  admission: RelayV2HostCredentialConnectionAdmission,
+): RelayV2HostCredentialConnectionAuthorization {
+  return RelayV2HostCredentialAuthority.claimConnectionAuthorization(
+    connectionAdmissionAuthorityKey,
+    authority,
+    transportOwner,
+    admission,
+  );
+}
+
+export function finalizeRelayV2HostCredentialConnectionAuthorization(
+  authority: RelayV2HostCredentialAuthority,
+  transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+  authorization: RelayV2HostCredentialConnectionAuthorization,
+  finalizationPort: RelayV2HostCredentialConnectionRequestFinalizationPort,
+): void {
+  RelayV2HostCredentialAuthority.finalizeConnectionAuthorization(
+    connectionAdmissionAuthorityKey,
+    authority,
+    transportOwner,
+    authorization,
+    finalizationPort,
+  );
+}
+
+export function releaseRelayV2HostCredentialConnectionAuthorization(
+  authority: RelayV2HostCredentialAuthority,
+  transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+  authorization: RelayV2HostCredentialConnectionAuthorization,
+): void {
+  RelayV2HostCredentialAuthority.releaseConnectionAuthorization(
+    connectionAdmissionAuthorityKey,
+    authority,
+    transportOwner,
+    authorization,
+  );
+}
+
+export function releaseRelayV2HostCredentialConnectionAdmission(
+  authority: RelayV2HostCredentialAuthority,
+  transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+  admission: RelayV2HostCredentialConnectionAdmission,
+): void {
+  RelayV2HostCredentialAuthority.releaseConnectionAdmission(
+    connectionAdmissionAuthorityKey,
+    authority,
+    transportOwner,
+    admission,
+  );
+}
+
 /**
- * Pure transactional owner for relay-host v2 credentials and pending attempts.
- * The module has no production composition and performs no filesystem,
- * keychain, network, carrier, capability, or fallback work.
+ * Transactional owner for relay-host v2 credentials and pending attempts. Its
+ * connection-admission seam performs only the exact, one-shot Authorization
+ * write through a bound request-finalization port. The module has no socket or
+ * production composition, filesystem, keychain, listener, retry, capability,
+ * or fallback work.
  */
 export class RelayV2HostCredentialAuthority
 implements RelayV2HostCarrierCredentialReferences {
@@ -722,6 +1006,251 @@ implements RelayV2HostCarrierCredentialReferences {
     this.storage = options.storage;
     this.secretResolver = options.secretResolver;
     hostCredentialAuthorities.add(this);
+  }
+
+  static createConnectionTransportOwner(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+  ): RelayV2HostCredentialConnectionTransportOwner {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const owner = Object.freeze(
+      Object.create(null),
+    ) as RelayV2HostCredentialConnectionTransportOwner;
+    hostCredentialConnectionTransportOwners.set(owner, {
+      owner: authority,
+    });
+    return owner;
+  }
+
+  static captureConnectionAdmission(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+    transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+    rawBinding: RelayV2HostCredentialConnectionAttemptBinding,
+  ): RelayV2HostCredentialConnectionAdmission {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)
+      || hostCredentialConnectionTransportOwners.get(transportOwner)?.owner !== authority) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const binding = validateConnectionAttemptBinding(rawBinding);
+    return authority.exclusive(binding.credentialReference, (transaction) => {
+      const read = authority.validateRead(transaction.read());
+      const state = read.state === null
+        ? null
+        : parseState(read.state, binding.credentialReference);
+      const cut = connectionCutFromState(binding.credentialReference, state);
+      if (cut.hostId !== binding.hostId) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+      const admission = Object.freeze(
+        Object.create(null),
+      ) as RelayV2HostCredentialConnectionAdmission;
+      hostCredentialConnectionAdmissions.set(admission, {
+        owner: authority,
+        transportOwner,
+        binding,
+        cut,
+        carrierConsumed: false,
+        phase: "issued",
+      });
+      hostCredentialConnectionSecrets.set(admission, state!.accessToken!);
+      return admission;
+    });
+  }
+
+  static consumeConnectionAdmissionForCarrier(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+    admission: RelayV2HostCredentialConnectionAdmission,
+    rawBinding: RelayV2HostCredentialConnectionCarrierBinding,
+  ): RelayV2HostCredentialConnectionMetadata {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const binding = validateConnectionCarrierBinding(rawBinding);
+    const record = typeof admission === "object" && admission !== null
+      ? hostCredentialConnectionAdmissions.get(admission)
+      : undefined;
+    if (!record
+      || record.owner !== authority
+      || record.phase !== "issued"
+      || record.carrierConsumed
+      || !sameConnectionCarrierBinding(record.binding, binding)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    return authority.exclusive(binding.credentialReference, (transaction) => {
+      const read = authority.validateRead(transaction.read());
+      const state = read.state === null
+        ? null
+        : parseState(read.state, binding.credentialReference);
+      if (!stateMatchesConnectionCut(
+        state,
+        record.cut,
+        hostCredentialConnectionSecrets.get(admission),
+      )) {
+        record.phase = "released";
+        hostCredentialConnectionAdmissions.delete(admission);
+        hostCredentialConnectionSecrets.delete(admission);
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+      record.carrierConsumed = true;
+      return Object.freeze({
+        reference: record.cut.reference,
+        version: record.cut.version,
+        grantId: record.cut.grantId,
+        accessJti: record.cut.accessJti,
+      });
+    });
+  }
+
+  static claimConnectionAuthorization(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+    transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+    admission: RelayV2HostCredentialConnectionAdmission,
+  ): RelayV2HostCredentialConnectionAuthorization {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const transport = hostCredentialConnectionTransportOwners.get(transportOwner);
+    const record = typeof admission === "object" && admission !== null
+      ? hostCredentialConnectionAdmissions.get(admission)
+      : undefined;
+    if (!transport
+      || transport.owner !== authority
+      || !record
+      || record.owner !== authority
+      || record.transportOwner !== transportOwner
+      || record.phase !== "issued"
+      || !record.carrierConsumed) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    return authority.exclusive(
+      record.binding.credentialReference,
+      (transaction) => {
+        const read = authority.validateRead(transaction.read());
+        const state = read.state === null
+          ? null
+          : parseState(read.state, record.binding.credentialReference);
+        record.phase = "released";
+        hostCredentialConnectionAdmissions.delete(admission);
+        const accessToken = hostCredentialConnectionSecrets.get(admission);
+        hostCredentialConnectionSecrets.delete(admission);
+        if (!stateMatchesConnectionCut(state, record.cut, accessToken)) {
+          return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+        }
+        const authorization = Object.freeze(
+          Object.create(null),
+        ) as RelayV2HostCredentialConnectionAuthorization;
+        hostCredentialConnectionAuthorizations.set(authorization, {
+          owner: authority,
+          transportOwner,
+          cut: record.cut,
+        });
+        hostCredentialConnectionAuthorizationSecrets.set(authorization, accessToken!);
+        return authorization;
+      },
+    );
+  }
+
+  static finalizeConnectionAuthorization(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+    transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+    authorization: RelayV2HostCredentialConnectionAuthorization,
+    finalizationPort: RelayV2HostCredentialConnectionRequestFinalizationPort,
+  ): void {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const record = typeof authorization === "object" && authorization !== null
+      ? hostCredentialConnectionAuthorizations.get(authorization)
+      : undefined;
+    let descriptors: PropertyDescriptorMap;
+    try {
+      if (typeof finalizationPort !== "object"
+        || finalizationPort === null
+        || Object.getPrototypeOf(finalizationPort) !== null
+        || !Object.isFrozen(finalizationPort)) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+      descriptors = Object.getOwnPropertyDescriptors(finalizationPort);
+    } catch {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const descriptor = descriptors.finalize;
+    if (!record
+      || record.owner !== authority
+      || record.transportOwner !== transportOwner
+      || Reflect.ownKeys(descriptors).length !== 1
+      || !descriptor
+      || descriptor.enumerable !== false
+      || descriptor.configurable !== false
+      || descriptor.writable !== false
+      || typeof descriptor.value !== "function") {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const accessToken = hostCredentialConnectionAuthorizationSecrets.get(authorization);
+    hostCredentialConnectionAuthorizations.delete(authorization);
+    hostCredentialConnectionAuthorizationSecrets.delete(authorization);
+    if (accessToken === undefined) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    const validationProof = Object.freeze(Object.create(null));
+    const validated = authority.exclusive(record.cut.reference, (transaction) => {
+      const read = authority.validateRead(transaction.read());
+      const state = read.state === null
+        ? null
+        : parseState(read.state, record.cut.reference);
+      if (!stateMatchesConnectionCut(state, record.cut, accessToken)) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+      return validationProof;
+    });
+    if (validated !== validationProof) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+    }
+    Reflect.apply(descriptor.value, finalizationPort, [`Bearer ${accessToken}`]);
+  }
+
+  static releaseConnectionAuthorization(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+    transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+    authorization: RelayV2HostCredentialConnectionAuthorization,
+  ): void {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)) return;
+    const record = typeof authorization === "object" && authorization !== null
+      ? hostCredentialConnectionAuthorizations.get(authorization)
+      : undefined;
+    if (!record || record.owner !== authority || record.transportOwner !== transportOwner) return;
+    hostCredentialConnectionAuthorizations.delete(authorization);
+    hostCredentialConnectionAuthorizationSecrets.delete(authorization);
+  }
+
+  static releaseConnectionAdmission(
+    authorityKey: unknown,
+    authority: RelayV2HostCredentialAuthority,
+    transportOwner: RelayV2HostCredentialConnectionTransportOwner,
+    admission: RelayV2HostCredentialConnectionAdmission,
+  ): void {
+    if (authorityKey !== connectionAdmissionAuthorityKey
+      || !isRelayV2HostCredentialAuthority(authority)) return;
+    const record = typeof admission === "object" && admission !== null
+      ? hostCredentialConnectionAdmissions.get(admission)
+      : undefined;
+    if (!record || record.owner !== authority || record.transportOwner !== transportOwner) return;
+    record.phase = "released";
+    hostCredentialConnectionAdmissions.delete(admission);
+    hostCredentialConnectionSecrets.delete(admission);
   }
 
   read(reference: string): RelayV2HostCredentialRecord {
