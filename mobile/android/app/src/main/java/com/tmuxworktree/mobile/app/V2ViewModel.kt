@@ -3,6 +3,8 @@ package com.tmuxworktree.mobile.app
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleScope
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleState
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTimelineEntryRole
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptEntryContent
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePresentationItem
@@ -1760,29 +1762,47 @@ private fun AgentTranscriptLifecycleSelectedSessionPresentationState.toTimeline(
     AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
     AgentTranscriptLifecycleSelectedSessionPresentationState.Stale,
     -> emptyList()
-    is AgentTranscriptLifecycleSelectedSessionPresentationState.Content ->
-        presentation.items.mapNotNull { item ->
-            val transcript = item as? AgentTranscriptLifecyclePresentationItem.Transcript
-                ?: return@mapNotNull null
-            TimelineEvent(
-                eventId = relayV2TranscriptUiStableId(
-                    sessionStableId,
-                    transcript.runId,
-                    transcript.turnId,
-                    transcript.entryId,
-                ),
-                sessionId = sessionStableId,
-                actor = when (transcript.role) {
-                    AgentTimelineEntryRole.USER -> TimelineActor.USER
-                    AgentTimelineEntryRole.AGENT -> TimelineActor.AGENT
-                },
-                body = when (val content = transcript.content) {
-                    is AgentTranscriptEntryContent.Visible -> content.text
-                    is AgentTranscriptEntryContent.Redacted -> "Message redacted"
-                },
-                createdAtMillis = transcript.createdAtMs,
-            )
+    is AgentTranscriptLifecycleSelectedSessionPresentationState.Content -> {
+        val timelineEpoch = checkNotNull(presentation.revision.namespace.timelineEpoch)
+        presentation.items.map { item ->
+            when (item) {
+                is AgentTranscriptLifecyclePresentationItem.Transcript -> TimelineEvent(
+                    eventId = relayV2TranscriptUiStableId(
+                        sessionStableId,
+                        item.runId,
+                        item.turnId,
+                        item.entryId,
+                    ),
+                    sessionId = sessionStableId,
+                    actor = when (item.role) {
+                        AgentTimelineEntryRole.USER -> TimelineActor.USER
+                        AgentTimelineEntryRole.AGENT -> TimelineActor.AGENT
+                    },
+                    body = when (val content = item.content) {
+                        is AgentTranscriptEntryContent.Visible -> content.text
+                        is AgentTranscriptEntryContent.Redacted -> "Message redacted"
+                    },
+                    createdAtMillis = item.createdAtMs,
+                )
+                is AgentTranscriptLifecyclePresentationItem.Lifecycle -> TimelineEvent(
+                    eventId = relayV2LifecycleUiStableId(
+                        sessionStableId = sessionStableId,
+                        timelineEpoch = timelineEpoch,
+                        sourceEpoch = item.sourceEpoch,
+                        scope = item.identity.scope,
+                        runId = item.identity.runId,
+                        turnId = item.identity.turnId,
+                        lifecycleEventId = item.lifecycleEventId,
+                    ),
+                    sessionId = sessionStableId,
+                    actor = TimelineActor.SYSTEM,
+                    body = item.lifecycleTimelineBody(),
+                    createdAtMillis = item.occurredAtMs,
+                    deliveryState = null,
+                )
+            }
         }
+    }
 }
 
 internal suspend fun projectRelayV2SelectedSessionTimeline(
@@ -1805,6 +1825,63 @@ private fun relayV2TranscriptUiStableId(vararg opaqueParts: String): String = bu
         append(':')
         append(part)
     }
+}
+
+private fun relayV2LifecycleUiStableId(
+    sessionStableId: String,
+    timelineEpoch: String,
+    sourceEpoch: String,
+    scope: AgentLifecycleScope,
+    runId: String,
+    turnId: String?,
+    lifecycleEventId: String,
+): String = buildString {
+    append("relay-v2-agent-lifecycle")
+    appendRelayV2UiStringPart(sessionStableId)
+    appendRelayV2UiStringPart(timelineEpoch)
+    appendRelayV2UiStringPart(sourceEpoch)
+    appendRelayV2UiStringPart(scope.name)
+    appendRelayV2UiStringPart(runId)
+    if (turnId == null) {
+        append(":null")
+    } else {
+        append(":value")
+        appendRelayV2UiStringPart(turnId)
+    }
+    appendRelayV2UiStringPart(lifecycleEventId)
+}
+
+private fun StringBuilder.appendRelayV2UiStringPart(value: String) {
+    append(":string:")
+    append(value.length)
+    append(':')
+    append(value)
+}
+
+private fun AgentTranscriptLifecyclePresentationItem.Lifecycle.lifecycleTimelineBody(): String {
+    val scopeLabel = when (identity.scope) {
+        AgentLifecycleScope.RUN -> "Run"
+        AgentLifecycleScope.TURN -> "Turn"
+    }
+    val lifecycleLabel = when (state) {
+        AgentLifecycleState.RUNNING -> "Running"
+        AgentLifecycleState.WAITING_FOR_USER -> "Waiting for user"
+        AgentLifecycleState.FAILED -> buildString {
+            append("Failed")
+            failure?.let { structuredFailure ->
+                append(" (")
+                append(structuredFailure.code)
+                structuredFailure.summary?.takeIf { it.isNotBlank() }?.let { summary ->
+                    append(": ")
+                    append(summary)
+                }
+                append(')')
+            }
+        }
+        AgentLifecycleState.COMPLETED -> "Completed"
+    }
+    val evidence = "$scopeLabel lifecycle: $lifecycleLabel"
+    return if (isCurrentSource) evidence else "Historical source evidence · $evidence"
 }
 
 private fun RelayV2SessionReplyFailure.userMessage(): String = when (this) {
