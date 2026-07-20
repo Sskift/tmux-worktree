@@ -1356,17 +1356,21 @@ class RelayV2ConnectionActorTest {
 
                 assertEquals(RelayV2ConnectionPhase.QUERYING, harness.actor.state.value.phase)
                 assertEquals(1, transport.sent.size)
-                assertTrue(
-                    harness.actor.commitRecoveryReceipt(
-                        effect,
-                        RelayV2RecoveryReceipt.HelloApplied(
-                            binding = effect.recovery,
-                            hostId = HOST_ID,
-                            hostEpoch = HOST_EPOCH,
-                            durableCursorEventSeq = "91",
-                            pendingCommands = emptyList(),
-                        ),
+                val ready = harness.actor.processCommittedRecoveryReceipt(
+                    effect,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = effect.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = emptyList(),
                     ),
+                )
+                assertEquals(
+                    RelayV2RecoveryReceiptProcessingResult.OnlineReady(
+                        effect.repositoryAuthority,
+                    ),
+                    ready,
                 )
 
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
@@ -1386,8 +1390,9 @@ class RelayV2ConnectionActorTest {
             transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
             val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                 as RelayV2RuntimeEffect.QueryPendingCommands
-            assertTrue(
-                harness.actor.commitRecoveryReceipt(
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal,
+                harness.actor.processCommittedRecoveryReceipt(
                     helloEffect,
                     RelayV2RecoveryReceipt.HelloApplied(
                         binding = helloEffect.recovery,
@@ -1469,8 +1474,9 @@ class RelayV2ConnectionActorTest {
                 val wrongBinding = helloEffect.recovery.copy(
                     requestId = "00000000-0000-0000-0000-000000000099",
                 )
-                assertTrue(
-                    harness.actor.commitRecoveryReceipt(
+                assertEquals(
+                    RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal,
+                    harness.actor.processCommittedRecoveryReceipt(
                         helloEffect,
                         RelayV2RecoveryReceipt.HelloApplied(
                             binding = helloEffect.recovery,
@@ -1608,8 +1614,9 @@ class RelayV2ConnectionActorTest {
                     commands = firstItems,
                 )
                 assertEquals(null, withTimeoutOrNull(50) { harness.actor.effects.first() })
-                assertTrue(
-                    harness.actor.commitRecoveryReceipt(
+                assertEquals(
+                    RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery,
+                    harness.actor.processCommittedRecoveryReceipt(
                         firstApply,
                         RelayV2RecoveryReceipt.CommandStatusesApplied(
                             binding = firstApply.recovery,
@@ -1633,8 +1640,11 @@ class RelayV2ConnectionActorTest {
                 )
                 val secondApply = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                     as RelayV2RuntimeEffect.ApplyCommandStatuses
-                assertTrue(
-                    harness.actor.commitRecoveryReceipt(
+                assertEquals(
+                    RelayV2RecoveryReceiptProcessingResult.OnlineReady(
+                        secondApply.repositoryAuthority,
+                    ),
+                    harness.actor.processCommittedRecoveryReceipt(
                         secondApply,
                         RelayV2RecoveryReceipt.CommandStatusesApplied(
                             binding = secondApply.recovery,
@@ -3086,8 +3096,9 @@ class RelayV2ConnectionActorTest {
             val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                 as RelayV2RuntimeEffect.QueryPendingCommands
             val pending = listOf(RelayV2PendingCommand("unknown-id-command", "window-id"))
-            assertTrue(
-                harness.actor.commitRecoveryReceipt(
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery,
+                harness.actor.processCommittedRecoveryReceipt(
                     helloEffect,
                     RelayV2RecoveryReceipt.HelloApplied(
                         helloEffect.recovery,
@@ -3237,7 +3248,12 @@ class RelayV2ConnectionActorTest {
                 transport.sendFrame(released)
                 val complete = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                     as RelayV2RuntimeEffect.CompleteSnapshotRelease
-                assertTrue(harness.completeSnapshotRelease(complete))
+                assertEquals(
+                    RelayV2RecoveryReceiptProcessingResult.OnlineReady(
+                        complete.repositoryAuthority,
+                    ),
+                    harness.processSnapshotRelease(complete),
+                )
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
 
                 transport.sendFrame(chunk)
@@ -3299,8 +3315,9 @@ class RelayV2ConnectionActorTest {
             val firstStage = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                 as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
             val snapshotId = firstChunk.payload().stringValue("snapshotId")
-            assertTrue(
-                harness.actor.commitRecoveryReceipt(
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery,
+                harness.actor.processCommittedRecoveryReceipt(
                     firstStage,
                     RelayV2RecoveryReceipt.SnapshotChunkApplied(
                         binding = firstStage.recovery,
@@ -3332,8 +3349,9 @@ class RelayV2ConnectionActorTest {
             val finalStage = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                 as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
 
-            assertTrue(
-                harness.actor.commitRecoveryReceipt(
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal,
+                harness.actor.processCommittedRecoveryReceipt(
                     finalStage,
                     RelayV2RecoveryReceipt.SnapshotChunkApplied(
                         binding = finalStage.recovery,
@@ -3357,8 +3375,9 @@ class RelayV2ConnectionActorTest {
             assertEquals(3, transport.sent.size)
             assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
 
-            assertTrue(
-                harness.actor.commitRecoveryReceipt(
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery,
+                harness.actor.processCommittedRecoveryReceipt(
                     finalStage,
                     RelayV2RecoveryReceipt.SnapshotChunkApplied(
                         binding = finalStage.recovery,
@@ -3394,7 +3413,10 @@ class RelayV2ConnectionActorTest {
             val releaseCommit = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                 as RelayV2RuntimeEffect.CompleteSnapshotRelease
             assertEquals(RelayV2ReleaseAuthorityProof.RELEASED, releaseCommit.proof)
-            assertTrue(harness.completeSnapshotRelease(releaseCommit))
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery,
+                harness.processSnapshotRelease(releaseCommit),
+            )
 
             assertTrue(harness.commitCommandQueryRegistration())
             val query = transport.awaitSentFrame(4)
@@ -3403,8 +3425,11 @@ class RelayV2ConnectionActorTest {
             transport.sendCommandStatuses(query.stringValue("requestId"), pending)
             val commandApply = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                 as RelayV2RuntimeEffect.ApplyCommandStatuses
-            assertTrue(
-                harness.actor.commitRecoveryReceipt(
+            assertEquals(
+                RelayV2RecoveryReceiptProcessingResult.OnlineReady(
+                    commandApply.repositoryAuthority,
+                ),
+                harness.actor.processCommittedRecoveryReceipt(
                     commandApply,
                     RelayV2RecoveryReceipt.CommandStatusesApplied(
                         binding = commandApply.recovery,
@@ -6917,6 +6942,19 @@ class RelayV2ConnectionActorTest {
             ),
         )
 
+        suspend fun processSnapshotRelease(
+            effect: RelayV2RuntimeEffect.CompleteSnapshotRelease,
+        ): RelayV2RecoveryReceiptProcessingResult = actor.processCommittedRecoveryReceipt(
+            effect,
+            RelayV2RecoveryReceipt.SnapshotReleaseCompleted(
+                binding = effect.recovery,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+                release = effect.release,
+                restart = effect.expectedRestart,
+            ),
+        )
+
         suspend fun issueCommandQueryReceipt(
             effect: RelayV2RuntimeEffect.RegisterCommandQueryAttempt,
             forceApply: Boolean = false,
@@ -7725,6 +7763,16 @@ class RelayV2ConnectionActorTest {
         is RelayV2EffectApplyResult.Applied -> submitRecoveryReceipt(applied.value)
         RelayV2EffectApplyResult.Stale -> false
     }
+
+    private suspend fun RelayV2ConnectionActor.processCommittedRecoveryReceipt(
+        effect: RelayV2RuntimeEffect.GenerationScoped,
+        receipt: RelayV2RecoveryReceipt,
+    ): RelayV2RecoveryReceiptProcessingResult =
+        when (val applied = withEffectApplyLease(effect) { receipt }) {
+            is RelayV2EffectApplyResult.Applied -> processRecoveryReceipt(applied.value)
+            RelayV2EffectApplyResult.Stale ->
+                RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal
+        }
 
     private suspend fun Harness.awaitCommandQueryRegistration() =
         withTimeout(TIMEOUT_MS) {

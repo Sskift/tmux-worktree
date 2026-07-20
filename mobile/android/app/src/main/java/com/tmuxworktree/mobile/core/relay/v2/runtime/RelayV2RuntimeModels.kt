@@ -337,6 +337,17 @@ internal data class RelayV2QueryRecoveryLineage(
     }
 }
 
+/** One-shot result produced only after the actor serially consumes a recovery receipt. */
+internal sealed interface RelayV2RecoveryReceiptProcessingResult {
+    data object ContinuedRecovery : RelayV2RecoveryReceiptProcessingResult
+
+    data class OnlineReady(
+        val authority: RelayV2RepositoryEffectAuthority,
+    ) : RelayV2RecoveryReceiptProcessingResult
+
+    data object StaleOrTerminal : RelayV2RecoveryReceiptProcessingResult
+}
+
 internal data class RelayV2PendingCommand(
     val commandId: String,
     val dedupeWindowId: String,
@@ -885,10 +896,15 @@ internal sealed interface RelayV2RuntimeEffect {
         val message: RelayV2DecodedMessage,
         val expectedCommands: List<RelayV2PendingCommand>,
         val recovery: RelayV2RecoveryBinding,
+        val queryLineage: RelayV2QueryRecoveryLineage? = null,
         override val generation: RelayV2EffectGeneration = recovery.generation,
         override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
             context.repositoryEffectAuthority(generation),
-    ) : RepositoryScoped
+    ) : RepositoryScoped {
+        init {
+            queryLineage?.let { require(it.generation == generation) }
+        }
+    }
 
     data class ApplyStateSnapshotChunk(
         val context: RelayV2HandshakeContext,

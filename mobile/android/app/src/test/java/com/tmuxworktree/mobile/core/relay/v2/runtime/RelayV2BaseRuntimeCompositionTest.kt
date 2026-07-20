@@ -24,6 +24,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRecoveryAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ResyncReason
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotChunk
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseCompletion
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseObligation
@@ -159,7 +160,7 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `retry Execute remains durable but closes before receipt or transport`() = runBlocking {
+    fun `recovered retry dispatches only after actor publishes online ready`() = runBlocking {
         val harness = Harness(
             autoConnect = true,
             outbox = sendingOutbox("command-a"),
@@ -168,22 +169,103 @@ class RelayV2BaseRuntimeCompositionTest {
             val query = harness.connectToCommandQuery()
             harness.transport().sendCommandStatuses(query, StatusMode.RETRY_IMMEDIATE)
 
-            val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
-            assertEquals(
-                RelayV2BaseRuntimeFailure.RuntimeIncomplete(
-                    "COMMAND_OUTBOX_EXECUTE_RUNTIME_UNAVAILABLE",
-                ),
-                failed.failure,
-            )
+            harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+            val execute = harness.transport().awaitSentType("command.execute")
             assertEquals(1, harness.authority.statusCommits.get())
             assertEquals(
                 RelayV2OutboxStateTag.SENDING,
                 harness.authority.outboxState().entries.single().state,
             )
-            assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
-            assertTrue(harness.composition.state.value.phase != RelayV2BaseRuntimePhase.ONLINE)
+            assertEquals("command-a", execute.stringValue("commandId"))
+            harness.closeAndAwaitTransportDrain()
+            assertEquals(1, harness.transport().framesOfType("command.execute").size)
         } finally {
             harness.close()
+        }
+    }
+
+    @Test
+    fun `two recovered batches wait for final online ready then dispatch once in commit order`() =
+        runBlocking {
+            val commandIds = (1..33).map { "command-${it.toString().padStart(2, '0')}" }
+            val harness = Harness(
+                autoConnect = true,
+                outbox = sendingOutbox(*commandIds.toTypedArray()),
+            )
+            try {
+                val firstQuery = harness.connectToCommandQuery()
+                assertEquals(32, firstQuery.payloadReadOnly().objectList("items").size)
+                harness.transport().sendCommandStatuses(firstQuery, StatusMode.RETRY_IMMEDIATE)
+
+                val secondQuery = harness.transport().awaitSentType("command.query", index = 1)
+                assertEquals(1, secondQuery.payloadReadOnly().objectList("items").size)
+                assertEquals(1, harness.authority.statusCommits.get())
+                assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+
+                harness.transport().sendCommandStatuses(secondQuery, StatusMode.RETRY_IMMEDIATE)
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.transport().framesOfType("command.execute").size != 33) delay(1)
+                }
+                val executes = harness.transport().framesOfType("command.execute")
+                assertEquals(commandIds, executes.map { it.stringValue("commandId") })
+                assertEquals(33, executes.map { it.stringValue("requestId") }.distinct().size)
+                assertEquals(2, harness.authority.statusCommits.get())
+                harness.closeAndAwaitTransportDrain()
+                assertEquals(33, harness.transport().framesOfType("command.execute").size)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `gap after a recovered batch clears capabilities without dispatch`() = runBlocking {
+        val commandIds = (1..33).map { "gap-command-$it" }
+        val harness = Harness(
+            autoConnect = true,
+            outbox = sendingOutbox(*commandIds.toTypedArray()),
+        )
+        try {
+            val firstQuery = harness.connectToCommandQuery()
+            harness.transport().sendCommandStatuses(firstQuery, StatusMode.RETRY_IMMEDIATE)
+            harness.transport().awaitSentType("command.query", index = 1)
+            assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+
+            harness.authority.forceNextEventGap = true
+            val gap = fixture("sessions-changed-upsert")
+            gap["eventSeq"] = "93"
+            harness.transport().sendFrame(gap)
+            harness.transport().awaitSentType("state.snapshot.get")
+            assertEquals(1, harness.authority.stateEventCommits.get())
+            assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `rebuild after durable retry commit does not blind dispatch`() = runBlocking {
+        val first = Harness(autoConnect = true, outbox = sendingOutbox("command-a"))
+        var rebuilt: Harness? = null
+        try {
+            first.authority.blockAfterStatusCommit = true
+            val query = first.connectToCommandQuery()
+            first.transport().sendCommandStatuses(query, StatusMode.RETRY_IMMEDIATE)
+            withTimeout(TIMEOUT_MS) { first.authority.statusCommitCompleted.await() }
+            val durableAttempted = first.authority.outboxState()
+
+            first.composition.close()
+            first.authority.releaseAfterStatusCommit.complete(Unit)
+            first.awaitTransportDrain()
+            assertTrue(first.transport().framesOfType("command.execute").isEmpty())
+
+            rebuilt = Harness(autoConnect = true, outbox = durableAttempted)
+            rebuilt.connectToCommandQuery()
+            assertTrue(rebuilt.transport().framesOfType("command.execute").isEmpty())
+        } finally {
+            first.authority.releaseAfterStatusCommit.complete(Unit)
+            first.close()
+            rebuilt?.close()
         }
     }
 
@@ -420,6 +502,17 @@ class RelayV2BaseRuntimeCompositionTest {
 
         fun transport(): FakeTransport = factory.transports.single()
 
+        suspend fun closeAndAwaitTransportDrain() {
+            composition.close()
+            awaitTransportDrain()
+        }
+
+        suspend fun awaitTransportDrain() {
+            withTimeout(TIMEOUT_MS) {
+                while (transport().cancelCount != 1) delay(1)
+            }
+        }
+
         private suspend fun awaitTransport(): FakeTransport = withTimeout(TIMEOUT_MS) {
             while (factory.transports.isEmpty()) delay(1)
             factory.transports.single()
@@ -449,12 +542,20 @@ class RelayV2BaseRuntimeCompositionTest {
         val releaseStateEventApply = CompletableDeferred<Unit>()
         val queryCommitEntered = CompletableDeferred<Unit>()
         val releaseQueryCommit = CompletableDeferred<Unit>()
+        val statusCommitCompleted = CompletableDeferred<Unit>()
+        val releaseAfterStatusCommit = CompletableDeferred<Unit>()
 
         @Volatile
         var blockStateEvents: Boolean = false
 
         @Volatile
         var blockQueryCommit: Boolean = false
+
+        @Volatile
+        var blockAfterStatusCommit: Boolean = false
+
+        @Volatile
+        var forceNextEventGap: Boolean = false
 
         suspend fun readOutbox(profile: RelayV2Profile): RelayV2OutboxState {
             outboxReads.incrementAndGet()
@@ -498,6 +599,10 @@ class RelayV2BaseRuntimeCompositionTest {
             }
             outbox = reduced
             if (isQuery) queryCommits.incrementAndGet() else statusCommits.incrementAndGet()
+            if (!isQuery && blockAfterStatusCommit) {
+                statusCommitCompleted.complete(Unit)
+                releaseAfterStatusCommit.await()
+            }
             return RelayV2OutboxBatchResult.Applied(reduced, effects)
         }
 
@@ -528,6 +633,16 @@ class RelayV2BaseRuntimeCompositionTest {
                 releaseStateEventApply.await()
             }
             stateEventCommits.incrementAndGet()
+            if (forceNextEventGap) {
+                forceNextEventGap = false
+                return RelayV2StateSyncResult.ResyncRequired(
+                    namespace = event.namespace,
+                    reason = RelayV2ResyncReason.EVENT_GAP,
+                    durableCursorEventSeq = "91",
+                    requiredThroughEventSeq = event.eventSeq,
+                    supersedesQueryCompletion = true,
+                )
+            }
             return RelayV2StateSyncResult.Live(event.namespace, event.eventSeq)
         }
 
@@ -620,10 +735,13 @@ class RelayV2BaseRuntimeCompositionTest {
                 ))
             }
 
-        suspend fun awaitSentType(type: String): MutableMap<String, Any?> =
+        suspend fun awaitSentType(
+            type: String,
+            index: Int = 0,
+        ): MutableMap<String, Any?> =
             withTimeout(TIMEOUT_MS) {
                 while (true) {
-                    framesOfType(type).firstOrNull()?.let { return@withTimeout it }
+                    framesOfType(type).getOrNull(index)?.let { return@withTimeout it }
                     delay(1)
                 }
                 error("unreachable")
