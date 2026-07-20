@@ -252,6 +252,8 @@ React -> Tauri/Rust -> SSH Host
 
 远端 UI identity 使用 `<hostId>:<rawTmuxName>`；实际远端命令始终使用 `rawTmuxName`，不能把展示用 composite key 直接传给 tmux。
 
+同一 B7e shared owner 现另有 default-off Native Host WSS adapter/runtime foundation，只消费已升级且精确协商 `tw-relay.host.v2` 的 socket，并复用唯一 Core、producer registry、transport-close、expiry 与 client-effect owner；它不创建 listener、WebSocketServer、端口或 HTTP 101，也未接 production server/E0/capability。
+
 ### Android：Relay v1
 
 ```text

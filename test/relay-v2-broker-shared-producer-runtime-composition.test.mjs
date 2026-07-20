@@ -129,16 +129,32 @@ class FakeHostCarrier {
   }
 }
 
+const TRUSTED_UPGRADED_SOCKETS = new WeakSet();
+const trustedUpgradedSocketBrand = (socket) => TRUSTED_UPGRADED_SOCKETS.has(socket);
+
 class FakeClientSocket {
-  constructor() {
-    this.readyState = 1;
-    this.protocol = "tw-relay.v2";
-    this.extensions = "";
-    this.bufferedAmount = 0;
+  constructor(protocol = "tw-relay.v2") {
+    TRUSTED_UPGRADED_SOCKETS.add(this);
+    this._readyState = 1;
+    this._protocol = protocol;
+    this._extensions = "";
+    this._bufferedAmount = 0;
+    Object.defineProperties(this, {
+      readyState: { value: 1, writable: true, configurable: true, enumerable: true },
+      protocol: { value: protocol, writable: true, configurable: true, enumerable: true },
+      extensions: { value: "", writable: true, configurable: true, enumerable: true },
+      bufferedAmount: { value: 0, writable: true, configurable: true, enumerable: true },
+    });
     this.listeners = new Map();
     this.closes = [];
     this.terminates = 0;
+    this.removeListenerReceipt = this;
   }
+
+  get readyState() { return this._readyState; }
+  get protocol() { return this._protocol; }
+  get extensions() { return this._extensions; }
+  get bufferedAmount() { return this._bufferedAmount; }
 
   on(event, listener) {
     const listeners = this.listeners.get(event) ?? [];
@@ -150,7 +166,7 @@ class FakeClientSocket {
   removeListener(event, listener) {
     const listeners = this.listeners.get(event) ?? [];
     this.listeners.set(event, listeners.filter((candidate) => candidate !== listener));
-    return this;
+    return this.removeListenerReceipt;
   }
 
   emit(event, ...args) {
@@ -252,6 +268,8 @@ test("one Core activates one credential authority before publishing the shared r
   let openerCalls = 0;
   let capturedFence;
   const activationPromise = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
     brokerOptions: { now: () => NOW_MS },
     clientSocketScheduler: scheduler,
     authorizationExpiryScheduleAt: () => () => {},
@@ -342,6 +360,8 @@ test("one Core activates one credential authority before publishing the shared r
   let failClosedAuthorityCloseCalls = 0;
   let failClosedFence;
   const failClosedActivation = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
     brokerOptions: { now: () => NOW_MS },
     clientSocketScheduler: new ManualScheduler(),
     authorizationExpiryScheduleAt: () => () => {},
@@ -369,6 +389,8 @@ test("one Core activates one credential authority before publishing the shared r
   let rejectedFence;
   let rejectedOpenerCalls = 0;
   const rejectedActivation = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
     brokerOptions: { now: () => NOW_MS },
     clientSocketScheduler: new ManualScheduler(),
     authorizationExpiryScheduleAt: () => () => {},
@@ -386,9 +408,12 @@ test("one Core activates one credential authority before publishing the shared r
   }), /live-authorization close signal is unavailable/);
 });
 
-test("total close seals both admissions, starts every tracked Pump, then drains the live client", async () => {
+test("total close seals all admissions, starts tracked Pump/WSS siblings, then drains the live client", async (t) => {
+  await t.test("mixed Pump/WSS/client close waits for every native owner", async () => {
   const scheduler = new ManualScheduler();
   const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
     brokerOptions: {
       now: () => NOW_MS,
       baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
@@ -422,6 +447,15 @@ test("total close seals both admissions, starts every tracked Pump, then drains 
     first.host.hostId,
     "shared-producer-client",
   );
+  const preparedHostWss = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext("host", "shared-native-wss-host"),
+  });
+  assert.equal(preparedHostWss.outcome, "accept");
+  const hostWssSocket = new FakeClientSocket("tw-relay.host.v2");
+  const hostWss = shared.hostWssRuntime.attachPreparedHostWss({
+    receipt: preparedHostWss.receipt,
+    alreadyUpgradedSocket: hostWssSocket,
+  });
   const pending = shared.clientWssRuntime.prepareClientWss({
     connectionId: "shared-producer-pending-client",
     trustedAuthContext: authContext("client", first.host.hostId),
@@ -438,6 +472,7 @@ test("total close seals both admissions, starts every tracked Pump, then drains 
   assert.strictEqual(shared.closeAndDrain(), close);
   assert.equal(first.pump.snapshot().phase, "closing");
   assert.equal(second.pump.snapshot().phase, "closing");
+  assert.deepEqual(hostWssSocket.closes, [{ code: 1013, reason: "broker_shutdown" }]);
 
   let hostilePumpReads = 0;
   const hostilePumpOptions = new Proxy({}, {
@@ -501,6 +536,21 @@ test("total close seals both admissions, starts every tracked Pump, then drains 
   );
   assert.equal(hostileAttachReads, 0);
 
+  let hostileHostPrepareReads = 0;
+  const rejectedHostPrepare = shared.hostWssRuntime.prepareHostWss(new Proxy({}, {
+    ownKeys() {
+      hostileHostPrepareReads += 1;
+      throw new Error("sealed Host WSS prepare must stay untouched");
+    },
+    get() {
+      hostileHostPrepareReads += 1;
+      throw new Error("sealed Host WSS prepare must stay untouched");
+    },
+  }));
+  assert.equal(rejectedHostPrepare.outcome, "reject");
+  assert.equal(rejectedHostPrepare.status, 503);
+  assert.equal(hostileHostPrepareReads, 0);
+
   let hostileSocketReads = 0;
   const hostileSocket = new Proxy({}, {
     ownKeys() {
@@ -543,8 +593,11 @@ test("total close seals both admissions, starts every tracked Pump, then drains 
 
   socket.emit("error", new Error("live client terminal evidence"));
   await scheduler.flushReady();
+  assert.equal(closeSettled, false, "Host WSS native terminal remains outstanding");
+  hostWssSocket.emit("close", 1000);
   await close;
   await client.drained;
+  await hostWss.drained;
   assert.equal(closeSettled, true);
   assert.equal(first.host.phase, "offline");
   assert.equal(second.host.phase, "offline");
@@ -552,12 +605,14 @@ test("total close seals both admissions, starts every tracked Pump, then drains 
     [...socket.listeners.values()].every((listeners) => listeners.length === 0),
     true,
   );
-});
+  });
 
-test("construction reservations survive reentrant close and terminal Pump failure cannot skip sibling or client drain", async () => {
+  await t.test("construction reservations and rejected siblings cannot skip later drains", async () => {
   {
     const scheduler = new ManualScheduler();
     const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+      hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+      hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
       brokerOptions: {
         now: () => NOW_MS,
         baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
@@ -619,6 +674,8 @@ test("construction reservations survive reentrant close and terminal Pump failur
   {
     const scheduler = new ManualScheduler();
     const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+      hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+      hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
       brokerOptions: {
         now: () => NOW_MS,
         baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
@@ -645,6 +702,16 @@ test("construction reservations survive reentrant close and terminal Pump failur
       healthy.host.hostId,
       "shared-producer-healthy-client",
     );
+    const preparedHostWss = shared.hostWssRuntime.prepareHostWss({
+      trustedAuthContext: authContext("host", "shared-rejecting-host-wss"),
+    });
+    assert.equal(preparedHostWss.outcome, "accept");
+    const rejectingHostSocket = new FakeClientSocket("tw-relay.host.v2");
+    const rejectingHost = shared.hostWssRuntime.attachPreparedHostWss({
+      receipt: preparedHostWss.receipt,
+      alreadyUpgradedSocket: rejectingHostSocket,
+    });
+    rejectingHostSocket.removeListenerReceipt = Object.freeze({});
     await scheduler.flushReady();
 
     failing.pump.acceptBrokerResult({
@@ -667,6 +734,10 @@ test("construction reservations survive reentrant close and terminal Pump failur
     const close = shared.closeAndDrain();
     assert.equal(failing.pump.snapshot().phase, "terminal_failure");
     assert.equal(healthy.pump.snapshot().phase, "closing");
+    assert.deepEqual(rejectingHostSocket.closes, [{
+      code: 1013,
+      reason: "broker_shutdown",
+    }]);
 
     let closeRejected = false;
     void close.then(
@@ -683,11 +754,24 @@ test("construction reservations survive reentrant close and terminal Pump failur
       "terminal Pump failure is retained while the healthy client still awaits evidence",
     );
 
+    rejectingHostSocket.emit("close", 1000);
+    await assert.rejects(rejectingHost.drained, /Relay v2 Broker Host WSS closed/);
+    assert.equal(closeRejected, false, "one rejected sibling cannot skip the live client");
     socket.emit("close", 1000);
     await scheduler.flushReady();
     await assert.rejects(
       close,
-      /tracked Host Pump terminal failure \(1\): mandatory_force_rejected/,
+      (error) => {
+        assert.equal(error instanceof AggregateError, true);
+        const messages = error.errors.map((entry) => String(entry?.message ?? entry));
+        assert.equal(messages.some((message) => (
+          /Relay v2 Broker Host WSS closed/.test(message)
+        )), true);
+        assert.equal(messages.some((message) => (
+          /tracked Host Pump terminal failure \(1\): mandatory_force_rejected/.test(message)
+        )), true);
+        return true;
+      },
     );
     await client.drained;
     assert.equal(closeRejected, true);
@@ -698,4 +782,5 @@ test("construction reservations survive reentrant close and terminal Pump failur
       true,
     );
   }
+  });
 });

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { types as nodeUtilTypes } from "node:util";
 
 import {
@@ -20,6 +21,7 @@ import {
   type RelayV2BrokerClientWssSocket,
   type RelayV2BrokerClientWssTerminalEvidence,
 } from "./brokerClientWssAdapter.js";
+import type { RelayV2BrokerHostWssTrustedSocketBrand } from "./brokerHostWssAdapter.js";
 import {
   RelayV2BrokerCore,
   type RelayV2BrokerAction,
@@ -35,14 +37,25 @@ import {
 } from "./brokerCore.js";
 import {
   type RelayV2BrokerHostProducerBinding,
+  type RelayV2BrokerPreparedCall,
+  type RelayV2BrokerProducerHandoff,
+  type RelayV2BrokerProducerPort,
+  type RelayV2BrokerProducerReceipt,
+  type RelayV2BrokerProducerRegistration,
   type RelayV2BrokerProducerRegistry,
   type RelayV2BrokerProducerTarget,
 } from "./brokerProducerRegistry.js";
+import {
+  bindRelayV2BrokerHostWssRuntimeFacade,
+  type RelayV2BrokerHostWssRuntimeFacade,
+  type RelayV2BrokerHostWssRuntimeOwnerBinding,
+} from "./brokerHostWssRuntimeComposition.js";
 import type { RelayV2CarrierPumpBrokerPort } from "./carrierPump.js";
 import {
   RelayV2BrokerTransportCloseCoordinator,
   type RelayV2BrokerTransportCloseDeadlineScheduler,
   type RelayV2BrokerTransportCloseLease,
+  type RelayV2BrokerTransportSocketRegistration,
 } from "./brokerTransportCloseCoordinator.js";
 
 type RelayV2BrokerCoreOptions = NonNullable<
@@ -703,14 +716,263 @@ class ManagedRegistrationTerminalOwner {
   }
 }
 
+function relayV2HostProducerAction(action: RelayV2BrokerAction): boolean {
+  return action.kind === "host_output_ready"
+    || action.kind === "send_host"
+    || action.kind === "close_host"
+    || action.kind === "pause_host_route"
+    || action.kind === "resume_host_route";
+}
+
+interface RelayV2BrokerHostWssOwnerSession {
+  readonly transportId: string;
+  readonly connectionIncarnation: string;
+  readonly producerGeneration: string;
+  attach(authContext: RelayV2BrokerConnectionAuthorization): void;
+  registerExpiry(): void;
+  receiveHostFrame(bytes: Uint8Array, signal: AbortSignal): Promise<RelayV2BrokerProducerReceipt>;
+  drainHostCarrier(options: Readonly<{
+    maxFrames: number;
+    maxBytes: number;
+    controlOnly?: boolean;
+  }>): readonly import("./brokerCore.js").RelayV2CarrierDelivery[];
+  acknowledgeHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
+  rejectHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
+  acknowledgeHostDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
+  disconnectHost(): RelayV2BrokerProducerReceipt;
+  beginProducerClose(barrier: Promise<unknown>): void;
+  terminalAndUnregister(): Promise<void>;
+  rollbackConstruction(): Promise<void>;
+}
+
+class RelayV2BrokerHostWssOwnerSessionImpl
+implements RelayV2BrokerHostWssOwnerSession {
+  readonly transportId: string;
+  readonly connectionIncarnation: string;
+  readonly producerGeneration: string;
+
+  private expiry: RelayV2BrokerAuthorizationExpiryDeadlineRegistration | null = null;
+  private attached = false;
+  private disconnected = false;
+  private producerClosing = false;
+  private terminalCleaned = false;
+  private closeUnregistered = false;
+  private terminalCleanup: Promise<void> | null = null;
+
+  constructor(
+    private readonly broker: RelayV2BrokerCore,
+    private readonly transport: RelayV2BrokerManagedClientSocketTransport,
+    private readonly expiryOwner: RelayV2BrokerAuthorizationExpiryDeadlineOwner,
+    private readonly closeRegistration: RelayV2BrokerTransportSocketRegistration,
+    private readonly producerRegistration: RelayV2BrokerProducerRegistration,
+  ) {
+    this.transportId = producerRegistration.target.transportId;
+    this.connectionIncarnation = closeRegistration.connectionIncarnation;
+    this.producerGeneration = producerRegistration.target.generation;
+  }
+
+  attach(authContext: RelayV2BrokerConnectionAuthorization): void {
+    if (this.attached || this.disconnected || this.producerClosing) {
+      throw new Error("Relay v2 Broker Host WSS owner session cannot attach");
+    }
+    this.broker.attachHostCarrier(
+      this.transportId,
+      authContext,
+      this.connectionIncarnation,
+    );
+    this.attached = true;
+  }
+
+  registerExpiry(): void {
+    if (!this.attached || this.expiry || this.disconnected) {
+      throw new Error("Relay v2 Broker Host WSS expiry cannot register");
+    }
+    this.expiry = this.expiryOwner.register(
+      "host",
+      this.transportId,
+      this.connectionIncarnation,
+    );
+  }
+
+  async receiveHostFrame(
+    bytes: Uint8Array,
+    signal: AbortSignal,
+  ): Promise<RelayV2BrokerProducerReceipt> {
+    if (!this.attached || this.disconnected || this.terminalCleaned) return "rejected";
+    let prepared: RelayV2BrokerPreparedCall;
+    try {
+      prepared = this.producerRegistration.prepareBrokerCall();
+    } catch {
+      return "rejected";
+    }
+    let result: RelayV2BrokerResult;
+    try {
+      result = await this.broker.receiveHostFrame(this.transportId, bytes, signal);
+    } catch (error) {
+      prepared.abandon();
+      throw error;
+    }
+    return prepared.settle(result, (settled, handoff) => (
+      this.settleBrokerResult(settled, handoff)
+    ));
+  }
+
+  drainHostCarrier(options: Readonly<{
+    maxFrames: number;
+    maxBytes: number;
+    controlOnly?: boolean;
+  }>): readonly import("./brokerCore.js").RelayV2CarrierDelivery[] {
+    if (!this.attached || this.disconnected || this.terminalCleaned) return [];
+    return this.broker.drainHostCarrier(this.transportId, options);
+  }
+
+  acknowledgeHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt {
+    return this.runBrokerCall(() => (
+      this.broker.acknowledgeHostControlDelivery(this.transportId, deliveryId)
+    ));
+  }
+
+  rejectHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt {
+    return this.runBrokerCall(() => (
+      this.broker.rejectHostControlDelivery(this.transportId, deliveryId)
+    ));
+  }
+
+  acknowledgeHostDelivery(deliveryId: string): RelayV2BrokerProducerReceipt {
+    return this.runBrokerCall(() => (
+      this.broker.acknowledgeHostDelivery(this.transportId, deliveryId)
+    ));
+  }
+
+  disconnectHost(): RelayV2BrokerProducerReceipt {
+    if (this.disconnected) return "applied";
+    this.disconnected = true;
+    if (!this.attached) return "applied";
+    return this.runBrokerCall(() => this.broker.disconnectHost(this.transportId), true);
+  }
+
+  beginProducerClose(barrier: Promise<unknown>): void {
+    if (this.producerClosing) return;
+    this.producerClosing = true;
+    this.producerRegistration.beginClose(barrier);
+  }
+
+  terminalAndUnregister(): Promise<void> {
+    if (this.terminalCleanup) return this.terminalCleanup;
+    this.terminalCleaned = true;
+    this.terminalCleanup = this.cleanupOwnerRegistrations();
+    void this.terminalCleanup.catch(() => {});
+    return this.terminalCleanup;
+  }
+
+  rollbackConstruction(): Promise<void> {
+    if (!this.producerClosing) {
+      this.producerClosing = true;
+      this.producerRegistration.beginClose(Promise.resolve());
+    }
+    if (!this.disconnected) this.disconnectHost();
+    this.terminalCleaned = true;
+    return this.cleanupOwnerRegistrations();
+  }
+
+  private async cleanupOwnerRegistrations(): Promise<void> {
+    const failures: unknown[] = [];
+    if (this.expiry) {
+      try {
+        await this.expiry.unregister();
+        this.expiry = null;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (!this.closeUnregistered) {
+      try {
+        this.closeRegistration.unregister();
+        this.closeUnregistered = true;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "Relay v2 Broker Host WSS owner cleanup failed");
+    }
+  }
+
+  private runBrokerCall(
+    invoke: () => RelayV2BrokerResult,
+    allowDisconnected = false,
+  ): RelayV2BrokerProducerReceipt {
+    if (
+      !this.attached
+      || this.terminalCleaned
+      || (this.disconnected && !allowDisconnected)
+    ) return "rejected";
+    try {
+      return this.producerRegistration.runBrokerCall(
+        invoke,
+        (result, handoff) => this.settleBrokerResult(result, handoff),
+      );
+    } catch {
+      return "rejected";
+    }
+  }
+
+  private settleBrokerResult(
+    result: RelayV2BrokerResult,
+    handoff: RelayV2BrokerProducerHandoff,
+  ): RelayV2BrokerProducerReceipt {
+    let receipt: RelayV2BrokerProducerReceipt = "applied";
+    const hostGroups = new Map<
+      string,
+      {
+        target: RelayV2BrokerProducerTarget;
+        actions: Array<Extract<RelayV2BrokerAction, { transportId: string }>>;
+      }
+    >();
+    for (const action of result.actions) {
+      if (!relayV2HostProducerAction(action)) {
+        if (this.transport.applyBrokerAction(action) !== "applied") receipt = "rejected";
+        continue;
+      }
+      const resolution = handoff.resolveHostActionTarget(action);
+      if (resolution.status !== "resolved") {
+        receipt = "rejected";
+        continue;
+      }
+      const key = `${resolution.target.transportId}\0${resolution.target.generation}`;
+      const group = hostGroups.get(key) ?? {
+        target: resolution.target,
+        actions: [],
+      };
+      group.actions.push(action as Extract<RelayV2BrokerAction, { transportId: string }>);
+      hostGroups.set(key, group);
+    }
+    for (const group of hostGroups.values()) {
+      if (handoff.apply(group.target, group.actions) !== "applied") {
+        handoff.forceTerminal({
+          kind: "target_failure",
+          target: group.target,
+          reason: "host_wss_broker_action_rejected",
+        });
+        receipt = "rejected";
+      }
+    }
+    return receipt;
+  }
+}
+
 class RelayV2BrokerClientWssRuntimeCompositionImpl
 implements RelayV2BrokerClientWssRuntimeComposition {
   readonly hostPumpBrokerAuthority: RelayV2CarrierPumpBrokerPort;
 
   private readonly broker: RelayV2BrokerCore;
   private readonly transport: RelayV2BrokerManagedClientSocketTransport;
+  private readonly producerRegistry: RelayV2BrokerProducerRegistry;
   private readonly closeCoordinator: RelayV2BrokerTransportCloseCoordinator;
   private readonly expiryOwner: RelayV2BrokerAuthorizationExpiryDeadlineOwner;
+  private readonly hostWssOwnerBinding: RelayV2BrokerHostWssRuntimeOwnerBinding;
+  private hostWssRuntime: RelayV2BrokerHostWssRuntimeFacade | null = null;
   private readonly connections = new Map<string, ConnectionRecord>();
   private readonly attachingConnectionIds = new Set<string>();
   private readonly pendingAttaches = new Set<Deferred>();
@@ -728,6 +990,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   private closeDrain: Promise<void> | null = null;
 
   constructor(options: RelayV2BrokerClientWssRuntimeCompositionOptions) {
+    this.producerRegistry = options.producerRegistry;
     this.closeCoordinator = new RelayV2BrokerTransportCloseCoordinator({
       deadlineScheduler: options.transportCloseDeadlineScheduler,
     });
@@ -786,6 +1049,70 @@ implements RelayV2BrokerClientWssRuntimeComposition {
       scheduleAt: options.authorizationExpiryScheduleAt
         ?? defaultAuthorizationExpiryScheduleAt,
     });
+    this.hostWssOwnerBinding = Object.freeze({
+      createSession: (input: Readonly<{
+        producerPort: RelayV2BrokerProducerPort;
+        close(code: number, reason: string): unknown;
+        forceDestroy(): unknown;
+      }>): RelayV2BrokerHostWssOwnerSession => {
+        const transportId = randomUUID();
+        let closeRegistration: RelayV2BrokerTransportSocketRegistration | null = null;
+        let producerRegistration: RelayV2BrokerProducerRegistration | null = null;
+        try {
+          closeRegistration = this.closeCoordinator.registerSocket({
+            connectionKind: "host",
+            transportId,
+            close: (code, reason) => input.close(code, reason),
+            forceDestroy: () => input.forceDestroy(),
+          });
+          producerRegistration = this.producerRegistry.registerHostProducer(
+            transportId,
+            input.producerPort,
+          );
+          producerRegistration.bindConnectionIncarnation(
+            closeRegistration.connectionIncarnation,
+          );
+        } catch (error) {
+          if (producerRegistration) {
+            try { producerRegistration.beginClose(Promise.resolve()); } catch {}
+          }
+          try { closeRegistration?.unregister(); } catch {}
+          try { input.forceDestroy(); } catch {}
+          throw error;
+        }
+        if (!closeRegistration || !producerRegistration) {
+          if (producerRegistration) {
+            try { producerRegistration.beginClose(Promise.resolve()); } catch {}
+          }
+          try { closeRegistration?.unregister(); } catch {}
+          try { input.forceDestroy(); } catch {}
+          throw new Error("Relay v2 Broker Host WSS owner session did not open");
+        }
+        return new RelayV2BrokerHostWssOwnerSessionImpl(
+          this.broker,
+          this.transport,
+          this.expiryOwner,
+          closeRegistration,
+          producerRegistration,
+        );
+      },
+    });
+  }
+
+  installHostWssRuntime(
+    trustedSocketPrototype: object,
+    trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
+  ): RelayV2BrokerHostWssRuntimeFacade {
+    if (this.hostWssRuntime || this.closeDrain) {
+      throw new Error("Relay v2 Broker Host WSS runtime was already installed or closed");
+    }
+    const runtime = bindRelayV2BrokerHostWssRuntimeFacade(
+      this.hostWssOwnerBinding,
+      trustedSocketPrototype,
+      trustedSocketBrand,
+    );
+    this.hostWssRuntime = runtime;
+    return runtime;
   }
 
   credentialActivationFence(): RelayV2LiveAuthorizationFencePort {
@@ -1040,14 +1367,25 @@ implements RelayV2BrokerClientWssRuntimeComposition {
 
   closeAndDrain(): Promise<void> {
     if (this.closeDrain) return this.closeDrain;
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    const published = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    void published.catch(() => {});
+    this.closeDrain = published;
     this.sealClientAdmission();
     this.clientEffectsOpen = false;
+    const hostWssClosed = this.hostWssRuntime
+      ? observeBarrier(() => this.hostWssRuntime!.closeAndDrain())
+      : Promise.resolve();
     const failClosed = observeBarrier(() => this.serialize(() => {
       this.broker.liveAuthorizationFencePort.failClosed();
     }));
     const expiryClosed = observeBarrier(() => this.expiryOwner.close());
     const pending = [...this.pendingAttaches].map((attach) => attach.promise);
-    this.closeDrain = (async () => {
+    void (async () => {
       let firstError: unknown;
       let failed = false;
       const settle = async (barriers: readonly Promise<unknown>[]): Promise<void> => {
@@ -1059,7 +1397,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
           }
         }
       };
-      await settle([failClosed, expiryClosed]);
+      await settle([hostWssClosed, failClosed, expiryClosed]);
       await settle(pending);
       await settle([...this.partialDrains]);
       if (this.partialDrainFailed && !failed) {
@@ -1070,9 +1408,8 @@ implements RelayV2BrokerClientWssRuntimeComposition {
         await settle([...this.connections.values()].map((record) => record.drained));
       }
       if (failed) throw firstError;
-    })();
-    void this.closeDrain.catch(() => {});
-    return this.closeDrain;
+    })().then(resolveClose, rejectClose);
+    return published;
   }
 
   private installConnectionRecord(
@@ -1197,12 +1534,40 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   }
 }
 
+const HOST_WSS_RUNTIME_INSTALLATIONS = new WeakMap<
+  object,
+  {
+    claimed: boolean;
+    install(
+      trustedSocketPrototype: object,
+      trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
+    ): RelayV2BrokerHostWssRuntimeFacade;
+  }
+>();
+
+/** One-shot safe facade installation; no Core/registry/close seam is returned. */
+export function installRelayV2BrokerHostWssRuntime(
+  runtime: RelayV2BrokerClientWssRuntimeComposition,
+  trustedSocketPrototype: object,
+  trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
+): RelayV2BrokerHostWssRuntimeFacade {
+  if (runtime === null || typeof runtime !== "object" || isRejectedProxy(runtime)) {
+    throw new Error("invalid Relay v2 Broker Host WSS runtime installation");
+  }
+  const state = HOST_WSS_RUNTIME_INSTALLATIONS.get(runtime);
+  if (!state || state.claimed) {
+    throw new Error("Relay v2 Broker Host WSS runtime was already installed");
+  }
+  state.claimed = true;
+  return state.install(trustedSocketPrototype, trustedSocketBrand);
+}
+
 function createRelayV2BrokerClientWssRuntimeFacade(
   owner: RelayV2BrokerClientWssRuntimeCompositionImpl,
   closeAndDrain: () => Promise<void>,
 ): RelayV2BrokerClientWssRuntimeComposition {
   const sealClientAdmission = () => owner.sealClientAdmission();
-  return Object.freeze({
+  const facade = Object.freeze({
     hostPumpBrokerAuthority: owner.hostPumpBrokerAuthority,
     sealClientAdmission,
     prepareClientWss: (input: RelayV2BrokerClientWssPrepareInput) => (
@@ -1214,6 +1579,14 @@ function createRelayV2BrokerClientWssRuntimeFacade(
     applyBrokerAction: (action: RelayV2BrokerAction) => owner.applyBrokerAction(action),
     closeAndDrain,
   });
+  HOST_WSS_RUNTIME_INSTALLATIONS.set(facade, {
+    claimed: false,
+    install: (trustedSocketPrototype, trustedSocketBrand) => owner.installHostWssRuntime(
+      trustedSocketPrototype,
+      trustedSocketBrand,
+    ),
+  });
+  return facade;
 }
 
 class RelayV2BrokerActivatedCredentialRuntimeCloseOwner {

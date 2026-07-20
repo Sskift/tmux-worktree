@@ -23,11 +23,16 @@ import {
 import {
   activateRelayV2BrokerClientWssRuntimeComposition,
   createRelayV2BrokerClientWssRuntimeComposition,
+  installRelayV2BrokerHostWssRuntime,
   type RelayV2BrokerActivatedCredentialAuthority,
   type RelayV2BrokerClientWssRuntimeComposition,
   type RelayV2BrokerClientWssRuntimeActivationOptions,
   type RelayV2BrokerClientWssRuntimeCompositionOptions,
 } from "./brokerClientWssRuntimeComposition.js";
+import {
+  type RelayV2BrokerHostWssRuntimeFacade,
+} from "./brokerHostWssRuntimeComposition.js";
+import type { RelayV2BrokerHostWssTrustedSocketBrand } from "./brokerHostWssAdapter.js";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
@@ -121,7 +126,10 @@ export type RelayV2BrokerSharedProducerClientWssRuntime = Readonly<Pick<
 export type RelayV2BrokerSharedProducerRuntimeCompositionOptions = Omit<
   RelayV2BrokerClientWssRuntimeCompositionOptions,
   "producerRegistry" | "resolveHostProducerBinding"
->;
+> & Readonly<{
+  hostWssTrustedSocketPrototype: object;
+  hostWssTrustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand;
+}>;
 
 export type RelayV2BrokerSharedProducerRuntimeActivationOptions<
   Authority extends RelayV2BrokerActivatedCredentialAuthority =
@@ -129,7 +137,10 @@ export type RelayV2BrokerSharedProducerRuntimeActivationOptions<
 > = Omit<
   RelayV2BrokerClientWssRuntimeActivationOptions<Authority>,
   "producerRegistry" | "resolveHostProducerBinding"
->;
+> & Readonly<{
+  hostWssTrustedSocketPrototype: object;
+  hostWssTrustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand;
+}>;
 
 export type RelayV2BrokerManagedHostCarrierPump = Readonly<Pick<
   RelayV2BrokerHostCarrierPump,
@@ -148,6 +159,7 @@ export type RelayV2BrokerManagedHostCarrierPump = Readonly<Pick<
 
 export type RelayV2BrokerSharedProducerRuntimeComposition = Readonly<{
   clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
+  hostWssRuntime: RelayV2BrokerHostWssRuntimeFacade;
   createHostCarrierPump(
     options: RelayV2BrokerSharedProducerHostPumpOptions,
   ): RelayV2BrokerManagedHostCarrierPump;
@@ -2672,6 +2684,7 @@ function createRelayV2BrokerSharedProducerPumpConstructionReservation(
 
 class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
   readonly clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
+  readonly hostWssRuntime: RelayV2BrokerHostWssRuntimeFacade;
 
   private readonly producerRegistry: RelayV2BrokerProducerRegistry;
   private readonly runtime: RelayV2BrokerClientWssRuntimeComposition;
@@ -2697,13 +2710,20 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
         kind: "activated";
         producerRegistry: RelayV2BrokerProducerRegistry;
         runtime: RelayV2BrokerClientWssRuntimeComposition;
+        hostWssTrustedSocketPrototype: object;
+        hostWssTrustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand;
       }
   >) {
     if (input.kind === "create") {
+      const {
+        hostWssTrustedSocketPrototype,
+        hostWssTrustedSocketBrand,
+        ...runtimeOptions
+      } = input.options;
       const producerRegistry = new RelayV2BrokerProducerRegistry();
       this.producerRegistry = producerRegistry;
       this.runtime = createRelayV2BrokerClientWssRuntimeComposition({
-        ...input.options,
+        ...runtimeOptions,
         producerRegistry,
         resolveHostProducerBinding: (fence) => {
           const owner = producerRegistry.inspectHostProducerOwner(
@@ -2713,9 +2733,19 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
           return owner.status === "current" ? owner.binding : undefined;
         },
       });
+      this.hostWssRuntime = installRelayV2BrokerHostWssRuntime(
+        this.runtime,
+        hostWssTrustedSocketPrototype,
+        hostWssTrustedSocketBrand,
+      );
     } else {
       this.producerRegistry = input.producerRegistry;
       this.runtime = input.runtime;
+      this.hostWssRuntime = installRelayV2BrokerHostWssRuntime(
+        this.runtime,
+        input.hostWssTrustedSocketPrototype,
+        input.hostWssTrustedSocketBrand,
+      );
     }
     this.hostPumpOwner = Object.freeze({
       broker: this.runtime.hostPumpBrokerAuthority,
@@ -2783,11 +2813,17 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     this.closeDrain = published;
     this.hostPumpAdmissionOpen = false;
 
-    let sealFailure: unknown;
+    const sealFailures: unknown[] = [];
+    let hostWssBarrier: Promise<void>;
+    try {
+      hostWssBarrier = this.hostWssRuntime.closeAndDrain();
+    } catch (error) {
+      hostWssBarrier = Promise.reject(error);
+    }
     try {
       this.runtime.sealClientAdmission();
     } catch (error) {
-      sealFailure = error;
+      sealFailures.push(error);
     }
 
     // Every Pump present at the close cut begins shutdown in this turn. No
@@ -2799,8 +2835,7 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     for (const reservation of this.constructionReservations) {
       pumpBarriers.push(reservation.barrier);
     }
-
-    void this.finishCloseAndDrain(pumpBarriers, sealFailure).then(
+    void this.finishCloseAndDrain(pumpBarriers, hostWssBarrier, sealFailures).then(
       resolveClose,
       rejectClose,
     );
@@ -2857,18 +2892,30 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
 
   private async finishCloseAndDrain(
     pumpBarriers: readonly Promise<RelayV2CarrierPumpCloseReceipt | null>[],
-    sealFailure: unknown,
+    hostWssBarrier: Promise<void>,
+    sealFailures: readonly unknown[],
   ): Promise<void> {
-    const failures: unknown[] = [];
-    if (sealFailure !== undefined) failures.push(sealFailure);
+    const failures: unknown[] = [...sealFailures];
 
-    const pumpSettlements = await Promise.allSettled(pumpBarriers);
-    for (const settlement of pumpSettlements) {
+    const siblingSettlements = await Promise.allSettled([
+      ...pumpBarriers,
+      hostWssBarrier,
+    ]);
+    for (let index = 0; index < pumpBarriers.length; index += 1) {
+      const settlement = siblingSettlements[index] as PromiseSettledResult<
+        RelayV2CarrierPumpCloseReceipt | null
+      >;
       if (settlement.status === "rejected") {
         failures.push(settlement.reason);
       } else if (settlement.value !== null) {
         this.observePumpCloseReceipt(settlement.value);
       }
+    }
+    const hostWssSettlement = siblingSettlements[pumpBarriers.length];
+    let hostWssFailure: unknown;
+    if (hostWssSettlement?.status === "rejected") {
+      hostWssFailure = hostWssSettlement.reason;
+      failures.push(hostWssFailure);
     }
     if (this.terminalPumpFailureCount > 0) {
       failures.push(new Error(
@@ -2886,7 +2933,10 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     }
     const [clientSettlement] = await Promise.allSettled([clientBarrier]);
     if (clientSettlement.status === "rejected") {
-      failures.push(clientSettlement.reason);
+      if (
+        hostWssSettlement?.status !== "rejected"
+        || clientSettlement.reason !== hostWssFailure
+      ) failures.push(clientSettlement.reason);
     }
 
     if (failures.length === 1) throw failures[0];
@@ -2904,6 +2954,7 @@ function createRelayV2BrokerSharedProducerRuntimeFacade(
 ): RelayV2BrokerSharedProducerRuntimeComposition {
   return Object.freeze({
     clientWssRuntime: owner.clientWssRuntime,
+    hostWssRuntime: owner.hostWssRuntime,
     createHostCarrierPump: (
       pumpOptions: RelayV2BrokerSharedProducerHostPumpOptions,
     ) => owner.createHostCarrierPump(pumpOptions),
@@ -2917,7 +2968,7 @@ function createRelayV2BrokerSharedProducerRuntimeFacade(
  * process, timer, capability advertisement, or protocol fallback.
  */
 export function createRelayV2BrokerSharedProducerRuntimeComposition(
-  options: RelayV2BrokerSharedProducerRuntimeCompositionOptions = {},
+  options: RelayV2BrokerSharedProducerRuntimeCompositionOptions,
 ): RelayV2BrokerSharedProducerRuntimeComposition {
   const owner = new RelayV2BrokerSharedProducerRuntimeCompositionOwner({
     kind: "create",
@@ -2936,9 +2987,14 @@ export async function activateRelayV2BrokerSharedProducerRuntimeComposition<
 >(
   options: RelayV2BrokerSharedProducerRuntimeActivationOptions<Authority>,
 ): Promise<RelayV2BrokerSharedProducerRuntimeActivation> {
+  const {
+    hostWssTrustedSocketPrototype,
+    hostWssTrustedSocketBrand,
+    ...runtimeOptions
+  } = options;
   const producerRegistry = new RelayV2BrokerProducerRegistry();
   const activation = await activateRelayV2BrokerClientWssRuntimeComposition({
-    ...options,
+    ...runtimeOptions,
     producerRegistry,
     resolveHostProducerBinding: (fence) => {
       const owner = producerRegistry.inspectHostProducerOwner(
@@ -2954,6 +3010,8 @@ export async function activateRelayV2BrokerSharedProducerRuntimeComposition<
       kind: "activated",
       producerRegistry,
       runtime: activation.runtime,
+      hostWssTrustedSocketPrototype,
+      hostWssTrustedSocketBrand,
     });
     return Object.freeze({
       sharedRuntime: createRelayV2BrokerSharedProducerRuntimeFacade(owner),
