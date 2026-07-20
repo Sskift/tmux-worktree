@@ -15,11 +15,16 @@ import {
   type RelayV2BrokerProducerPort,
   type RelayV2BrokerProducerReceipt,
   type RelayV2BrokerProducerRegistration,
-  type RelayV2BrokerProducerRegistry,
+  RelayV2BrokerProducerRegistry,
   type RelayV2BrokerProducerHandoff,
   type RelayV2BrokerProducerTarget,
   type RelayV2BrokerProducerTerminalFailure,
 } from "./brokerProducerRegistry.js";
+import {
+  createRelayV2BrokerClientWssRuntimeComposition,
+  type RelayV2BrokerClientWssRuntimeComposition,
+  type RelayV2BrokerClientWssRuntimeCompositionOptions,
+} from "./brokerClientWssRuntimeComposition.js";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
@@ -62,6 +67,42 @@ export type RelayV2CarrierPumpBrokerPort = Readonly<Pick<
   | "disconnectHost"
 >>;
 
+declare const RELAY_V2_BROKER_SHARED_PRODUCER_HOST_PUMP_AUTHORITY: unique symbol;
+
+/** Process-local proof that one Pump and one client WSS runtime share a registry. */
+export interface RelayV2BrokerSharedProducerHostPumpAuthority {
+  readonly [RELAY_V2_BROKER_SHARED_PRODUCER_HOST_PUMP_AUTHORITY]: never;
+}
+
+type RelayV2BrokerSharedProducerHostPumpOwner = Readonly<{
+  broker: RelayV2CarrierPumpBrokerPort;
+  producerRegistry: RelayV2BrokerProducerRegistry;
+}>;
+
+const SHARED_PRODUCER_HOST_PUMP_AUTHORITIES = new WeakMap<
+  object,
+  RelayV2BrokerSharedProducerHostPumpOwner
+>();
+
+/**
+ * Composition-only receipt issuer. The receipt has no visible state; the
+ * canonical Pump factory recovers both exact owners from this module's lexical
+ * WeakMap, so neither can be substituted through a copied or wrapped value.
+ */
+function issueRelayV2BrokerSharedProducerHostPumpAuthority(
+  broker: RelayV2CarrierPumpBrokerPort,
+  producerRegistry: RelayV2BrokerProducerRegistry,
+): RelayV2BrokerSharedProducerHostPumpAuthority {
+  const authority = Object.freeze(
+    Object.create(null),
+  ) as RelayV2BrokerSharedProducerHostPumpAuthority;
+  SHARED_PRODUCER_HOST_PUMP_AUTHORITIES.set(authority, Object.freeze({
+    broker,
+    producerRegistry,
+  }));
+  return authority;
+}
+
 export interface RelayV2CarrierPumpOptions {
   broker: RelayV2CarrierPumpBrokerPort;
   host: RelayV2HostCarrierActor;
@@ -93,6 +134,29 @@ export interface RelayV2CarrierPumpOptions {
    */
   producerRegistry?: RelayV2BrokerProducerRegistry;
 }
+
+export type RelayV2BrokerSharedProducerHostPumpOptions = Omit<
+  RelayV2CarrierPumpOptions,
+  "broker" | "producerRegistry"
+>;
+
+export type RelayV2BrokerSharedProducerClientWssRuntime = Readonly<Pick<
+  RelayV2BrokerClientWssRuntimeComposition,
+  | "prepareClientWss"
+  | "attachPreparedClientWss"
+  | "applyBrokerAction"
+  | "closeAndDrain"
+>>;
+
+export type RelayV2BrokerSharedProducerRuntimeCompositionOptions = Omit<
+  RelayV2BrokerClientWssRuntimeCompositionOptions,
+  "producerRegistry" | "resolveHostProducerBinding"
+>;
+
+export type RelayV2BrokerSharedProducerRuntimeComposition = Readonly<{
+  clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
+  hostPumpAuthority: RelayV2BrokerSharedProducerHostPumpAuthority;
+}>;
 
 export type RelayV2BrokerHostCarrierPumpProducerComposition = Readonly<{
   target: RelayV2BrokerProducerTarget;
@@ -2491,4 +2555,61 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.phase = "closed";
     this.settleCloseBarrier("closed");
   }
+}
+
+/**
+ * Canonical shared-producer Pump construction. Authority lookup happens before
+ * any Pump option is read or any producer/Host side effect can begin.
+ */
+export function createRelayV2BrokerSharedProducerHostCarrierPump(
+  authority: RelayV2BrokerSharedProducerHostPumpAuthority,
+  options: RelayV2BrokerSharedProducerHostPumpOptions,
+): RelayV2BrokerHostCarrierPump {
+  const owner = authority !== null
+      && (typeof authority === "object" || typeof authority === "function")
+    ? SHARED_PRODUCER_HOST_PUMP_AUTHORITIES.get(authority as object)
+    : undefined;
+  if (!owner) {
+    throw new Error("invalid Relay v2 shared-producer Host Pump authority");
+  }
+  return new RelayV2BrokerHostCarrierPump({
+    ...options,
+    broker: owner.broker,
+    producerRegistry: owner.producerRegistry,
+  });
+}
+
+/**
+ * Default-off shared-producer composition. This module creates the sole
+ * registry, closes the resolver over it, and signs the paired Pump authority
+ * without exposing any raw owner or receipt issuer.
+ */
+export function createRelayV2BrokerSharedProducerRuntimeComposition(
+  options: RelayV2BrokerSharedProducerRuntimeCompositionOptions = {},
+): RelayV2BrokerSharedProducerRuntimeComposition {
+  const producerRegistry = new RelayV2BrokerProducerRegistry();
+  const runtime = createRelayV2BrokerClientWssRuntimeComposition({
+    ...options,
+    producerRegistry,
+    resolveHostProducerBinding: (fence) => {
+      const owner = producerRegistry.inspectHostProducerOwner(
+        fence.transportId,
+        fence.connectionIncarnation,
+      );
+      return owner.status === "current" ? owner.binding : undefined;
+    },
+  });
+  const clientWssRuntime = Object.freeze({
+    prepareClientWss: runtime.prepareClientWss,
+    attachPreparedClientWss: runtime.attachPreparedClientWss,
+    applyBrokerAction: runtime.applyBrokerAction,
+    closeAndDrain: runtime.closeAndDrain,
+  });
+  return Object.freeze({
+    clientWssRuntime,
+    hostPumpAuthority: issueRelayV2BrokerSharedProducerHostPumpAuthority(
+      runtime.hostPumpBrokerAuthority,
+      producerRegistry,
+    ),
+  });
 }
