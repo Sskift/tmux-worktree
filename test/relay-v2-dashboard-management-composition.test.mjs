@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   RelayV2DashboardManagementCompositionClosedError,
+  claimRelayV2DashboardManagementCompositionForProtocolV2Session,
   createRelayV2DashboardManagementComposition,
 } from "../dist/relay/v2/relayV2DashboardManagementComposition.js";
 import {
@@ -588,6 +589,16 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
         ...h.compositionOptions,
         hostCarrierActor: replacementActor,
       }),
+      RelayV2DashboardManagementCompositionClosedError,
+    );
+  });
+
+  await t.test("exclusive protocol-v2 session claim rejects an existing activation", () => {
+    const h = harness();
+    assert.throws(
+      () => claimRelayV2DashboardManagementCompositionForProtocolV2Session(
+        h.compositionOptions,
+      ),
       RelayV2DashboardManagementCompositionClosedError,
     );
   });

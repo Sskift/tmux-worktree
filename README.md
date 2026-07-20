@@ -463,6 +463,13 @@ capabilities, and no protocol fallback is added. The isolated Host connector
 attempt adapter and its closed managed connector/runtime composition likewise
 have no concrete WSS transport factory or production composition callsite.
 
+Node also has a default-off Dashboard management protocol-v2 composition
+session owner. It constructs the accepted real-adapter composition through the
+canonical dist owner entries, binds it to the existing serial stdio v2 session,
+and exposes only one-shot run and close-and-drain. It has no CLI/Tauri callsite,
+does not alter the hidden child's protocol-v1 default, and creates no connector,
+credential, enrollment, capability, process, socket, retry, or fallback path.
+
 Android's admitted explicit-v2 base composition also owns a limited durable
 Outbox path: attempted commands are queried, recovered Execute capabilities are
 flushed in commit order, and only then are creation-ordered fresh `QUEUED`

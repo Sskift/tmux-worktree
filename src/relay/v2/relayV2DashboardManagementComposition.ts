@@ -64,6 +64,7 @@ export class RelayV2DashboardManagementCompositionClosedError extends Error {
 interface ActivationSignature extends RelayV2DashboardManagementCompositionOptions {}
 
 interface ActivationRecord {
+  readonly ownership: "standalone" | "protocol_v2_session";
   readonly signature: ActivationSignature;
   readonly handle: RelayV2DashboardManagementComposition;
 }
@@ -232,12 +233,10 @@ function createControllerPort(
  * It chooses no protocol and owns no process, socket, transport, credential,
  * enrollment, capability, or fallback lifecycle.
  */
-export function createRelayV2DashboardManagementComposition(
-  options: RelayV2DashboardManagementCompositionOptions,
+function activateComposition(
+  signature: ActivationSignature,
+  ownership: ActivationRecord["ownership"],
 ): RelayV2DashboardManagementComposition {
-  const signature = captureOptions(options);
-  const existing = existingActivation(signature);
-  if (existing !== null) return existing.handle;
   validateOwners(signature);
 
   let credentialOwner: RelayV2HostCredentialOwnerBoundExchangePort;
@@ -314,10 +313,36 @@ export function createRelayV2DashboardManagementComposition(
     handleRequest,
     closeAndDrain,
   })) as RelayV2DashboardManagementComposition;
-  const record: ActivationRecord = Object.freeze({ signature, handle });
+  const record: ActivationRecord = Object.freeze({ ownership, signature, handle });
   credentialAuthorityActivations.set(signature.credentialAuthority, record);
   credentialCoordinatorActivations.set(signature.credentialExchangeCoordinator, record);
   connectorControllerActivations.set(signature.connectorController, record);
   hostCarrierActorActivations.set(signature.hostCarrierActor, record);
   return handle;
+}
+
+export function createRelayV2DashboardManagementComposition(
+  options: RelayV2DashboardManagementCompositionOptions,
+): RelayV2DashboardManagementComposition {
+  const signature = captureOptions(options);
+  const existing = existingActivation(signature);
+  if (existing !== null) {
+    if (existing.ownership !== "standalone") return closed();
+    return existing.handle;
+  }
+  return activateComposition(signature, "standalone");
+}
+
+/**
+ * Atomically reserves a fresh composition activation for the canonical
+ * protocol-v2 session owner. Any prior activation, including an exact closed
+ * standalone activation, is terminal; the public idempotent factory cannot
+ * reacquire the resulting handle.
+ */
+export function claimRelayV2DashboardManagementCompositionForProtocolV2Session(
+  options: RelayV2DashboardManagementCompositionOptions,
+): RelayV2DashboardManagementComposition {
+  const signature = captureOptions(options);
+  if (existingActivation(signature) !== null) return closed();
+  return activateComposition(signature, "protocol_v2_session");
 }

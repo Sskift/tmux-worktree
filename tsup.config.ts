@@ -50,6 +50,7 @@ export default defineConfig({
     "src/relay/v2/relayV2DashboardManagementHostCarrierControlAdapter.ts",
     "src/relay/v2/relayV2DashboardManagementComposition.ts",
     "src/relay/v2/relayV2DashboardManagementStdio.ts",
+    "src/relay/v2/relayV2DashboardManagementProtocolV2CompositionSession.ts",
     "src/relay/v2/codec.ts",
     "src/relay/v2/brokerCore.ts",
     "src/relay/v2/brokerProducerRegistry.ts",
@@ -90,6 +91,10 @@ export default defineConfig({
     "./hostConnectorController.js",
     "./hostCredentialAuthority.js",
     "./hostCredentialExchangeCoordinator.js",
+    // The protocol-v2 session must consume the accepted composition and stdio
+    // owners through their real dist entries rather than rebundled copies.
+    "./relayV2DashboardManagementComposition.js",
+    "./relayV2DashboardManagementStdio.js",
   ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
