@@ -122,6 +122,12 @@ export interface RelayV2BrokerClientSocketTransportComposition {
   readonly clientSocketTransport: RelayV2BrokerManagedClientSocketTransport;
 }
 
+export interface RelayV2BrokerClientSocketTransportOwnerHooks {
+  onLiveAuthorizationClose?: NonNullable<
+    RelayV2BrokerCoreOptions["onLiveAuthorizationClose"]
+  >;
+}
+
 type CapturedSocket = {
   readonly receiver: object;
   readonly bufferedState: (...args: unknown[]) => unknown;
@@ -424,7 +430,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
       openResult = this.runEntryBrokerCall(entry, () => this.broker.openClientRoute(
         entry.connectionId,
         input.authContext,
-        entry.connectionIncarnation,
+        entry.connectionIncarnation as ReturnType<typeof randomUUID>,
       ));
     } catch (error) {
       if (entry.managed) this.unbindOnce(entry, "broker_shutdown");
@@ -1285,6 +1291,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
  */
 export function createRelayV2BrokerClientSocketTransportComposition(
   options: RelayV2BrokerClientSocketTransportCompositionOptions,
+  ownerHooks: RelayV2BrokerClientSocketTransportOwnerHooks = {},
 ): RelayV2BrokerClientSocketTransportComposition {
   let readyConsumer: ((fence: RelayV2BrokerOutputReadyFence) => void) | null = null;
   const transport = new RelayV2BrokerClientSocketTransportImpl(options, (consumer) => {
@@ -1302,6 +1309,8 @@ export function createRelayV2BrokerClientSocketTransportComposition(
   const broker = new RelayV2BrokerCore({
     ...options.brokerOptions,
     outputReadyPort,
+    onLiveAuthorizationClose: ownerHooks.onLiveAuthorizationClose
+      ?? options.brokerOptions?.onLiveAuthorizationClose,
   });
   transport.bindBroker(broker);
   return Object.freeze({
