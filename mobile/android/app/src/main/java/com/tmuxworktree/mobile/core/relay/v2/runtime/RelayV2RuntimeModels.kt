@@ -163,6 +163,17 @@ internal data class RelayV2EffectGeneration(
     val connectionGeneration: Long,
 )
 
+/**
+ * Opaque caller-issued identity for the durable facts frozen before one connect request.
+ *
+ * The actor echoes the exact instance into that request's first repository-visible effect. This
+ * lets its composition bind a pre-connect Room snapshot to the actor-selected socket generation
+ * without observing [RelayV2ConnectionActor.state] or predicting a generation number.
+ */
+internal class RelayV2ConnectionAttemptIdentity(
+    val profile: RelayActiveProfileIdentity,
+)
+
 /** Result of entering the actor-owned repository apply gate. */
 internal sealed interface RelayV2EffectApplyResult<out T> {
     data class Applied<T>(val value: T) : RelayV2EffectApplyResult<T>
@@ -849,6 +860,7 @@ internal sealed interface RelayV2RuntimeEffect {
     data class QueryPendingCommands(
         val context: RelayV2HandshakeContext,
         override val generation: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         val recovery: RelayV2RecoveryBinding,
         val connectPlan: RelayV2ConnectPlan,
         val outcome: RelayV2HelloOutcome = RelayV2HelloOutcome.MATCHED,
@@ -879,6 +891,7 @@ internal sealed interface RelayV2RuntimeEffect {
     data class BeginStateResync(
         val context: RelayV2HandshakeContext,
         override val generation: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         val outcome: RelayV2HelloOutcome,
         val discardPriorResourceLineage: Boolean,
         val recovery: RelayV2RecoveryBinding,
@@ -1019,11 +1032,13 @@ internal sealed interface RelayV2RuntimeEffect {
     data class ConnectionFailed(
         val profile: RelayActiveProfileIdentity?,
         val generation: RelayV2EffectGeneration?,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity?,
         val failure: RelayV2ConnectionFailure,
     ) : RelayV2RuntimeEffect
 
     data class ConnectRejected(
         val requestedProfile: RelayActiveProfileIdentity,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         val failure: RelayV2ConnectionFailure,
     ) : RelayV2RuntimeEffect
 

@@ -38,15 +38,21 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
@@ -91,7 +97,8 @@ class RelayV2BaseRuntimeCompositionTest {
 
     @Test
     fun `auto-connect false remains stopped without opening a socket`() = runBlocking {
-        val harness = Harness(autoConnect = false)
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = false, retryDelayBlock = retry::awaitDelay)
         try {
             assertEquals(
                 null,
@@ -101,6 +108,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 },
             )
             assertEquals(0, harness.authority.outboxReads.get())
+            assertTrue(retry.delays.isEmpty())
             assertEquals(RelayV2BaseRuntimePhase.STOPPED, harness.composition.state.value.phase)
         } finally {
             harness.close()
@@ -108,8 +116,9 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `an unowned effect still fails closed`() = runBlocking {
-        val unowned = Harness(autoConnect = true)
+    fun `an unowned effect still fails closed without retry`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val unowned = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
         try {
             unowned.connectOnline()
             unowned.transport().sendFixture("host-presence-online")
@@ -118,6 +127,8 @@ class RelayV2BaseRuntimeCompositionTest {
                 RelayV2BaseRuntimeFailure.RuntimeIncomplete("UNOWNED_EFFECT_host.presence"),
                 failed.failure,
             )
+            assertFalse(retry.awaitCount(1, 200))
+            assertEquals(1, unowned.factory.requests.size)
         } finally {
             unowned.close()
         }
@@ -445,19 +456,45 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `v2 failure never retries another dialect or advertises Agent capability`() = runBlocking {
-        val harness = Harness(autoConnect = true)
+    fun `retry backoff resets only after exact online and never changes dialect`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
         try {
-            val hello = harness.connectOnline()
+            val first = harness.awaitTransport(0)
+            first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            first.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+            assertTrue(retry.awaitCount(1))
+            delay(50)
+            assertEquals(
+                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
+                harness.composition.state.value,
+            )
+            assertEquals(listOf(1_000L), retry.delays)
+            assertEquals(1, harness.factory.requests.size)
+
+            retry.release(0)
+            val second = harness.awaitTransport(1)
+            second.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            second.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+            assertTrue(retry.awaitCount(2))
+            delay(50)
+            assertEquals(
+                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
+                harness.composition.state.value,
+            )
+            assertEquals(listOf(1_000L, 2_000L), retry.delays)
+
+            retry.release(1)
+            val hello = harness.connectOnline(2)
             val capabilities = hello.payload().stringList("capabilities")
             assertFalse(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in capabilities)
             assertEquals(RelayV2ConnectionActor.REQUIRED_CAPABILITIES, capabilities)
 
-            harness.transport().fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
-            val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
-            assertTrue(failed.failure is RelayV2BaseRuntimeFailure.Connection)
-            delay(100)
-            assertEquals(1, harness.factory.requests.size)
+            harness.transport(2).fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            assertTrue(retry.awaitCount(3))
+            assertEquals(listOf(1_000L, 2_000L, 1_000L), retry.delays)
             assertTrue(
                 harness.factory.requests.all {
                     it.offeredSubprotocols == listOf(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
@@ -469,8 +506,243 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `transport failure racing a committed apply keeps the actor terminal cause`() = runBlocking {
-        val harness = Harness(autoConnect = true)
+    fun `non-retryable connection failure never schedules a successor`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
+        try {
+            harness.awaitTransport(0).fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.TLS_VALIDATION),
+            )
+            val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+            val cause = failed.failure as RelayV2BaseRuntimeFailure.Connection
+            assertFalse(cause.failure.retryable)
+            assertFalse(retry.awaitCount(1, 200))
+            assertEquals(failed, harness.composition.state.value)
+            assertEquals(1, harness.factory.requests.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `close during retry delay fences the pending successor`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
+        try {
+            harness.awaitTransport(0).fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            assertTrue(retry.awaitCount(1))
+            harness.composition.close()
+            retry.release(0)
+            delay(100)
+            assertEquals(1, harness.factory.requests.size)
+            assertEquals(RelayV2BaseRuntimePhase.STOPPED, harness.composition.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `disconnect racing retry ownership cannot terminalize the barrier`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val retryClaim = RetryScheduleClaimGate()
+        val harness = Harness(
+            autoConnect = true,
+            retryDelayBlock = retry::awaitDelay,
+            afterRetryableFailureAdmissionDetached = retryClaim::awaitRelease,
+        )
+        try {
+            harness.connectOnline()
+            harness.transport().fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            assertTrue(retryClaim.entered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+            val disconnectThread = AtomicReference<Thread>()
+            val disconnect = async(Dispatchers.Default) {
+                disconnectThread.set(Thread.currentThread())
+                harness.composition.disconnectAndDrain(
+                    harness.profile.identity,
+                    "profile-switch-during-retry-claim",
+                )
+            }
+            withTimeout(TIMEOUT_MS) {
+                while (disconnectThread.get()?.state != Thread.State.BLOCKED) delay(1)
+            }
+
+            retryClaim.release.countDown()
+            assertEquals(
+                "profile-switch-during-retry-claim",
+                withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+            )
+            withTimeout(TIMEOUT_MS) {
+                harness.composition.state.first {
+                    it == RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED)
+                }
+            }
+            delay(50)
+
+            assertEquals(
+                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED),
+                harness.composition.state.value,
+            )
+            assertEquals(1, harness.factory.requests.size)
+        } finally {
+            retryClaim.release.countDown()
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `disconnect joins initial and retry snapshot reads before returning its barrier`() =
+        runBlocking {
+            val initialRead = BlockingFailingOutboxRead(blockAtRead = 1)
+            val initialHarness = Harness(
+                autoConnect = true,
+                beforeOutboxRead = initialRead::intercept,
+            )
+            try {
+                withTimeout(TIMEOUT_MS) { initialRead.entered.await() }
+                val disconnect = async {
+                    initialHarness.composition.disconnectAndDrain(
+                        initialHarness.profile.identity,
+                        "initial-read-profile-switch",
+                    )
+                }
+                assertEquals(null, withTimeoutOrNull(200) { disconnect.await() })
+
+                initialRead.release.complete(Unit)
+                assertEquals(
+                    "initial-read-profile-switch",
+                    withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+                )
+                delay(50)
+                assertEquals(
+                    RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED),
+                    initialHarness.composition.state.value,
+                )
+                assertTrue(initialHarness.factory.requests.isEmpty())
+            } finally {
+                initialRead.release.complete(Unit)
+                initialHarness.close()
+            }
+
+            val retry = ControlledRetryDelay()
+            val retryRead = BlockingFailingOutboxRead(blockAtRead = 2)
+            val retryHarness = Harness(
+                autoConnect = true,
+                retryDelayBlock = retry::awaitDelay,
+                beforeOutboxRead = retryRead::intercept,
+            )
+            try {
+                retryHarness.connectOnline()
+                retryHarness.transport().fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(1))
+                retry.release(0)
+                withTimeout(TIMEOUT_MS) { retryRead.entered.await() }
+
+                val disconnect = async {
+                    retryHarness.composition.disconnectAndDrain(
+                        retryHarness.profile.identity,
+                        "retry-read-profile-switch",
+                    )
+                }
+                assertEquals(null, withTimeoutOrNull(200) { disconnect.await() })
+
+                retryRead.release.complete(Unit)
+                assertEquals(
+                    "retry-read-profile-switch",
+                    withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+                )
+                withTimeout(TIMEOUT_MS) {
+                    retryHarness.composition.state.first {
+                        it == RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED)
+                    }
+                }
+                delay(50)
+                assertEquals(
+                    RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED),
+                    retryHarness.composition.state.value,
+                )
+                assertEquals(1, retryHarness.factory.requests.size)
+            } finally {
+                retryRead.release.complete(Unit)
+                retryHarness.close()
+            }
+        }
+
+    @Test
+    fun `immediate retryable transport open failure claims successor after actor handoff`() =
+        runBlocking {
+            val retry = ControlledRetryDelay()
+            val actorHandoff = ActorConnectAdmissionHandoffGate()
+            val harness = Harness(
+                autoConnect = true,
+                retryDelayBlock = retry::awaitDelay,
+                transportOpenFailure = IllegalStateException("relay offline"),
+                afterActorConnectAdmissionHandoff = actorHandoff::awaitRelease,
+            )
+            try {
+                assertTrue(actorHandoff.entered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                assertTrue(retry.awaitCount(1))
+
+                assertEquals(listOf(1_000L), retry.delays)
+                assertEquals(1, harness.factory.requests.size)
+                assertTrue(harness.factory.transports.isEmpty())
+                assertEquals(
+                    RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
+                    harness.composition.state.value,
+                )
+            } finally {
+                actorHandoff.release.countDown()
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `reconnect rereads attempted outbox and old callbacks cannot consume successor admission`() =
+        runBlocking {
+            val retry = ControlledRetryDelay()
+            val harness = Harness(
+                autoConnect = true,
+                outbox = sendingOutbox("old-command"),
+                retryDelayBlock = retry::awaitDelay,
+            )
+            try {
+                val oldTransport = harness.awaitTransport(0)
+                oldTransport.fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(1))
+                harness.authority.replaceOutbox(sendingOutbox("successor-command"))
+
+                retry.release(0)
+                harness.awaitTransport(1)
+                oldTransport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                oldTransport.sendFixture("relay-welcome")
+                oldTransport.sendFixture("host-welcome-caught-up")
+
+                val successor = harness.openThroughHostWelcome(1)
+                val query = successor.awaitSentType("command.query")
+                assertEquals(
+                    listOf("successor-command"),
+                    query.payload().objectList("items").map { it.stringValue("commandId") },
+                )
+                assertEquals(2, harness.authority.outboxReads.get())
+                assertEquals(1, harness.authority.helloCommits.get())
+                assertTrue(successor.framesOfType("command.execute").isEmpty())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `transport failure racing a committed apply enters retry after the commit`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
         try {
             harness.connectOnline()
             harness.authority.blockStateEvents = true
@@ -482,15 +754,81 @@ class RelayV2BaseRuntimeCompositionTest {
             )
             harness.authority.releaseStateEventApply.complete(Unit)
 
-            val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
-            val cause = failed.failure as RelayV2BaseRuntimeFailure.Connection
-            assertEquals(RelayV2FailureKind.TRANSPORT, cause.failure.kind)
+            assertTrue(retry.awaitCount(1))
+            delay(50)
             assertEquals(1, harness.authority.stateEventCommits.get())
+            assertEquals(
+                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
+                harness.composition.state.value,
+            )
         } finally {
             harness.authority.releaseStateEventApply.complete(Unit)
             harness.close()
         }
     }
+
+    @Test
+    fun `disconnect and close retire outbox admission only after admitted apply drains`() =
+        runBlocking {
+            val disconnectGate = BeforeHelloAdmissionGate()
+            val disconnectHarness = Harness(
+                autoConnect = true,
+                beforeHelloOutboxAdmissionRead = disconnectGate::awaitRelease,
+            )
+            try {
+                disconnectHarness.openThroughHostWelcome()
+                withTimeout(TIMEOUT_MS) { disconnectGate.entered.await() }
+
+                val disconnect = async {
+                    disconnectHarness.composition.disconnectAndDrain(
+                        disconnectHarness.profile.identity,
+                        "profile-switch",
+                    )
+                }
+                assertEquals(null, withTimeoutOrNull(200) { disconnect.await() })
+                assertEquals(0, disconnectHarness.authority.helloCommits.get())
+
+                disconnectGate.release.complete(Unit)
+                assertEquals(
+                    "profile-switch",
+                    withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
+                )
+                assertEquals(1, disconnectHarness.authority.helloCommits.get())
+                assertEquals(
+                    RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED),
+                    disconnectHarness.composition.state.value,
+                )
+            } finally {
+                disconnectGate.release.complete(Unit)
+                disconnectHarness.close()
+            }
+
+            val closeGate = BeforeHelloAdmissionGate()
+            val closeHarness = Harness(
+                autoConnect = true,
+                beforeHelloOutboxAdmissionRead = closeGate::awaitRelease,
+            )
+            try {
+                closeHarness.openThroughHostWelcome()
+                withTimeout(TIMEOUT_MS) { closeGate.entered.await() }
+
+                closeHarness.composition.close()
+                assertEquals(0, closeHarness.authority.helloCommits.get())
+                closeGate.release.complete(Unit)
+                withTimeout(TIMEOUT_MS) {
+                    while (closeHarness.authority.helloCommits.get() != 1) delay(1)
+                }
+                closeHarness.awaitTransportDrain()
+
+                assertEquals(
+                    RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.STOPPED),
+                    closeHarness.composition.state.value,
+                )
+            } finally {
+                closeGate.release.complete(Unit)
+                closeHarness.close()
+            }
+        }
 
     @Test
     fun `close fences queued old-generation effects before durable commit`() = runBlocking {
@@ -526,11 +864,17 @@ class RelayV2BaseRuntimeCompositionTest {
         autoConnect: Boolean,
         outbox: RelayV2OutboxState = RelayV2OutboxState.empty(),
         outboxReadFailure: Throwable? = null,
+        retryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
+        beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
+        afterRetryableFailureAdmissionDetached: () -> Unit = {},
+        beforeOutboxRead: suspend (Int) -> Unit = {},
+        transportOpenFailure: Throwable? = null,
+        afterActorConnectAdmissionHandoff: () -> Unit = {},
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
-        val authority = FakeDurableAuthority(outbox, outboxReadFailure)
-        val factory = FakeTransportFactory()
+        val authority = FakeDurableAuthority(outbox, outboxReadFailure, beforeOutboxRead)
+        val factory = FakeTransportFactory(transportOpenFailure)
         val profile = RelayV2Profile(
             profileId = PROFILE_ID,
             issuerUrl = "https://relay.example.com",
@@ -573,11 +917,16 @@ class RelayV2BaseRuntimeCompositionTest {
                 activationOutbox = RelayV2ActivationOutboxReadPort(authority::readOutbox),
                 outboxAuthority = authority,
                 transportFactory = factory,
+                retryDelay = retryDelayBlock,
+                beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
+                afterRetryableFailureAdmissionDetached =
+                    afterRetryableFailureAdmissionDetached,
+                afterActorConnectAdmissionHandoff = afterActorConnectAdmissionHandoff,
             )
         }
 
-        suspend fun connectOnline(): MutableMap<String, Any?> {
-            val transport = awaitTransport()
+        suspend fun connectOnline(index: Int = 0): MutableMap<String, Any?> {
+            val transport = awaitTransport(index)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             transport.sendFixture("relay-welcome")
             val hello = transport.awaitSentFrame()
@@ -588,8 +937,8 @@ class RelayV2BaseRuntimeCompositionTest {
             return hello
         }
 
-        suspend fun openThroughHostWelcome(): FakeTransport {
-            val transport = awaitTransport()
+        suspend fun openThroughHostWelcome(index: Int = 0): FakeTransport {
+            val transport = awaitTransport(index)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             transport.sendFixture("relay-welcome")
             val hello = transport.awaitSentFrame()
@@ -607,7 +956,7 @@ class RelayV2BaseRuntimeCompositionTest {
         suspend fun awaitPhase(phase: RelayV2BaseRuntimePhase): RelayV2BaseRuntimeState =
             withTimeout(TIMEOUT_MS) { composition.state.first { it.phase == phase } }
 
-        fun transport(): FakeTransport = factory.transports.single()
+        fun transport(index: Int = 0): FakeTransport = factory.transports[index]
 
         suspend fun closeAndAwaitTransportDrain() {
             composition.close()
@@ -620,9 +969,9 @@ class RelayV2BaseRuntimeCompositionTest {
             }
         }
 
-        private suspend fun awaitTransport(): FakeTransport = withTimeout(TIMEOUT_MS) {
-            while (factory.transports.isEmpty()) delay(1)
-            factory.transports.single()
+        suspend fun awaitTransport(index: Int = 0): FakeTransport = withTimeout(TIMEOUT_MS) {
+            while (factory.transports.size <= index) delay(1)
+            factory.transports[index]
         }
 
         fun close() {
@@ -631,9 +980,60 @@ class RelayV2BaseRuntimeCompositionTest {
         }
     }
 
+    private class BeforeHelloAdmissionGate {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+
+        suspend fun awaitRelease() {
+            withContext(NonCancellable) {
+                entered.complete(Unit)
+                release.await()
+            }
+        }
+    }
+
+    private class RetryScheduleClaimGate {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+
+        fun awaitRelease() {
+            entered.countDown()
+            check(release.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                "Timed out holding retryable failure admission claim"
+            }
+        }
+    }
+
+    private class BlockingFailingOutboxRead(private val blockAtRead: Int) {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+
+        suspend fun intercept(readNumber: Int) {
+            if (readNumber != blockAtRead) return
+            withContext(NonCancellable) {
+                entered.complete(Unit)
+                release.await()
+                throw IllegalStateException("post-fence Outbox read failure")
+            }
+        }
+    }
+
+    private class ActorConnectAdmissionHandoffGate {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+
+        fun awaitRelease() {
+            entered.countDown()
+            check(release.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                "Timed out holding admitted actor-connect wrapper"
+            }
+        }
+    }
+
     private class FakeDurableAuthority(
         initialOutbox: RelayV2OutboxState,
         private val outboxReadFailure: Throwable?,
+        private val beforeOutboxRead: suspend (Int) -> Unit,
     ) : RelayV2StateSyncAuthority,
         RelayV2OutboxRuntimeAuthority {
         private val outboxCore = RelayV2OutboxAuthorityCore()
@@ -672,7 +1072,8 @@ class RelayV2BaseRuntimeCompositionTest {
         var forceNextEventGap: Boolean = false
 
         suspend fun readOutbox(profile: RelayV2Profile): RelayV2OutboxState {
-            outboxReads.incrementAndGet()
+            val readNumber = outboxReads.incrementAndGet()
+            beforeOutboxRead(readNumber)
             outboxReadFailure?.let { throw it }
             check(profile.profileId == PROFILE_ID)
             check(profile.principalId == PRINCIPAL_ID)
@@ -680,6 +1081,10 @@ class RelayV2BaseRuntimeCompositionTest {
         }
 
         fun outboxState(): RelayV2OutboxState = outbox
+
+        fun replaceOutbox(replacement: RelayV2OutboxState) {
+            outbox = replacement
+        }
 
         override suspend fun reduceOutboxBatchUnderApplyLease(
             namespace: com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace,
@@ -816,7 +1221,9 @@ class RelayV2BaseRuntimeCompositionTest {
         ): RelayV2StateSyncResult = error("expiry is outside matched base-sync test")
     }
 
-    private inner class FakeTransportFactory : RelayV2TransportFactory {
+    private inner class FakeTransportFactory(
+        private val openFailure: Throwable?,
+    ) : RelayV2TransportFactory {
         val requests = CopyOnWriteArrayList<RelayV2TransportOpenRequest>()
         val transports = CopyOnWriteArrayList<FakeTransport>()
 
@@ -825,6 +1232,7 @@ class RelayV2BaseRuntimeCompositionTest {
             listener: RelayV2TransportListener,
         ): RelayV2Transport {
             requests += request
+            openFailure?.let { throw it }
             return FakeTransport(listener).also(transports::add)
         }
     }
@@ -984,6 +1392,28 @@ class RelayV2BaseRuntimeCompositionTest {
                     "details" to null,
                 ) else null,
             )
+        }
+    }
+
+    private class ControlledRetryDelay {
+        val delays = CopyOnWriteArrayList<Long>()
+        private val releases = CopyOnWriteArrayList<CompletableDeferred<Unit>>()
+
+        suspend fun awaitDelay(delayMs: Long) {
+            val release = CompletableDeferred<Unit>()
+            releases += release
+            delays += delayMs
+            release.await()
+        }
+
+        suspend fun awaitCount(count: Int, timeoutMs: Long = TIMEOUT_MS): Boolean =
+            withTimeoutOrNull(timeoutMs) {
+                while (delays.size < count) delay(1)
+                true
+            } ?: false
+
+        fun release(index: Int) {
+            releases[index].complete(Unit)
         }
     }
 

@@ -459,12 +459,23 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    fun connect(profile: RelayV2Profile): Boolean {
+    fun connect(profile: RelayV2Profile): Boolean = connect(
+        profile,
+        RelayV2ConnectionAttemptIdentity(profile.identity),
+    )
+
+    fun connect(
+        profile: RelayV2Profile,
+        connectionAttempt: RelayV2ConnectionAttemptIdentity,
+    ): Boolean {
+        require(connectionAttempt.profile == profile.identity) {
+            "Relay v2 connection attempt does not match the requested profile activation"
+        }
         val overloadOwner = synchronized(lifecycleLock) {
             if (lifecycleState != LifecycleState.OPEN || isActivationFencedLocked(profile.identity)) {
                 return false
             }
-            if (actions.trySendNormal(Action.Connect(profile))) return true
+            if (actions.trySendNormal(Action.Connect(profile, connectionAttempt))) return true
             currentCallbackOwnerKeyLocked()
         }
         signalQueueSaturation(overloadOwner, source = null)
@@ -821,7 +832,7 @@ internal class RelayV2ConnectionActor(
 
     private suspend fun handle(action: Action) {
         when (action) {
-            is Action.Connect -> connectNow(action.profile)
+            is Action.Connect -> connectNow(action.profile, action.connectionAttempt)
             is Action.Disconnect -> disconnectNow(action)
             is Action.TransportOpened -> transportOpened(action)
             is Action.TransportFrame -> transportFrame(action)
@@ -845,12 +856,16 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    private suspend fun connectNow(profile: RelayV2Profile) {
-        val token = claimConnectToken(profile) ?: run {
+    private suspend fun connectNow(
+        profile: RelayV2Profile,
+        connectionAttempt: RelayV2ConnectionAttemptIdentity,
+    ) {
+        val token = claimConnectToken(profile, connectionAttempt) ?: run {
             if (isLifecycleOpen()) {
                 emitEffect(
                     RelayV2RuntimeEffect.ConnectRejected(
                         requestedProfile = profile.identity,
+                        connectionAttempt = connectionAttempt,
                         failure = RelayV2ConnectionFailure(
                             RelayV2FailureKind.CONFIGURATION,
                             "PROFILE_GENERATION_FENCED",
@@ -867,6 +882,7 @@ internal class RelayV2ConnectionActor(
             emitEffect(
                 RelayV2RuntimeEffect.ConnectRejected(
                     requestedProfile = profile.identity,
+                    connectionAttempt = connectionAttempt,
                     failure = RelayV2ConnectionFailure(
                         RelayV2FailureKind.CONFIGURATION,
                         "BUSY",
@@ -1038,6 +1054,7 @@ internal class RelayV2ConnectionActor(
                         committedCallbackOwner = CommittedCallbackOwner(
                             connectTokenId = token.id,
                             effectGeneration = effectGeneration,
+                            connectionAttempt = token.connectionAttempt,
                             source = opened,
                         )
                         provisionalCallbackOwner = null
@@ -1117,7 +1134,10 @@ internal class RelayV2ConnectionActor(
         return null
     }
 
-    private fun claimConnectToken(profile: RelayV2Profile): ConnectToken? =
+    private fun claimConnectToken(
+        profile: RelayV2Profile,
+        connectionAttempt: RelayV2ConnectionAttemptIdentity,
+    ): ConnectToken? =
         synchronized(lifecycleLock) {
             if (lifecycleState != LifecycleState.OPEN ||
                 isActivationFencedLocked(profile.identity)
@@ -1129,6 +1149,7 @@ internal class RelayV2ConnectionActor(
                 id = ++nextConnectTokenId,
                 profileId = profile.profileId,
                 activationGeneration = profile.activationGeneration,
+                connectionAttempt = connectionAttempt,
             ).also { activeConnectToken = it }
         }
 
@@ -1313,6 +1334,7 @@ internal class RelayV2ConnectionActor(
             RelayV2RuntimeEffect.ConnectionFailed(
                 profile.identity,
                 currentEffectGeneration(profile),
+                token.connectionAttempt,
                 failure,
             ),
         )
@@ -2744,6 +2766,11 @@ internal class RelayV2ConnectionActor(
         val helloRequestId = requireNotNull(pendingHelloRequestId)
         pendingHelloRequestId = null
         val effectGeneration = currentEffectGeneration(profile)
+        val connectionAttempt = synchronized(lifecycleLock) {
+            committedCallbackOwner?.takeIf {
+                it.effectGeneration == effectGeneration
+            }?.connectionAttempt
+        } ?: return
         if (!activateEffectGenerationIfCurrent(
                 context,
                 effectGeneration,
@@ -2775,6 +2802,7 @@ internal class RelayV2ConnectionActor(
                     RelayV2RuntimeEffect.QueryPendingCommands(
                         context,
                         effectGeneration,
+                        connectionAttempt,
                         recovery,
                         requireNotNull(activeConnectPlan),
                     ),
@@ -2796,6 +2824,7 @@ internal class RelayV2ConnectionActor(
                     RelayV2RuntimeEffect.BeginStateResync(
                         context = context,
                         generation = effectGeneration,
+                        connectionAttempt = connectionAttempt,
                         outcome = outcome,
                         discardPriorResourceLineage =
                             outcome == RelayV2HelloOutcome.HOST_EPOCH_CHANGED,
@@ -3915,6 +3944,9 @@ internal class RelayV2ConnectionActor(
         }
         val profile = activeProfile
         val terminalSource = activeTransport ?: source
+        val connectionAttempt = committedCallbackOwner?.takeIf {
+            it.key == owner
+        }?.connectionAttempt
         betweenTerminalCauseReadAndOwnerRevoke()
         withdrawPublishedRepositoryAuthorityAndDrainLocked()
         revokeCallbackOwnersLocked()
@@ -3929,6 +3961,7 @@ internal class RelayV2ConnectionActor(
             cause = terminalCause,
             profile = profile,
             effectGeneration = owner.effectGeneration,
+            connectionAttempt = connectionAttempt,
             retirementCommand = retirementCommand,
         )
     }
@@ -3943,6 +3976,7 @@ internal class RelayV2ConnectionActor(
             RelayV2RuntimeEffect.ConnectionFailed(
                 claim.profile?.identity,
                 claim.effectGeneration,
+                claim.connectionAttempt,
                 disposition.failure,
             ),
             (claim.cause as? TerminalIntentCause.DirectFailure)?.rawBytes ?: 0,
@@ -4871,6 +4905,7 @@ internal class RelayV2ConnectionActor(
 
         data class Connect(
             val profile: RelayV2Profile,
+            val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         ) : Action
 
         data class Disconnect(
@@ -5001,6 +5036,7 @@ internal class RelayV2ConnectionActor(
         val cause: TerminalIntentCause,
         val profile: RelayV2Profile?,
         val effectGeneration: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity?,
         val retirementCommand: TransportRetirementCommand?,
     )
 
@@ -5128,6 +5164,7 @@ internal class RelayV2ConnectionActor(
         val id: Long,
         val profileId: String,
         val activationGeneration: Long,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
     )
 
     private data class ConnectPreparation(
@@ -5300,6 +5337,7 @@ internal class RelayV2ConnectionActor(
     private data class CommittedCallbackOwner(
         val connectTokenId: Long,
         val effectGeneration: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         val source: RelayV2Transport,
     ) {
         val key = CallbackOwnerKey(connectTokenId, effectGeneration)
