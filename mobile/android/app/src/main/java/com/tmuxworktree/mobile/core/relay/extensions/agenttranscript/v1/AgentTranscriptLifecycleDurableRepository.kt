@@ -18,11 +18,15 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentLifecycleEventWit
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentNotificationLedgerEntity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentRecentEventEvidenceEntity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2EncodedPayload
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectApplyResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectApplyLeasePort
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageException
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageFailure
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateDao
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateDatabase
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
+import kotlinx.coroutines.CancellationException
 
 /** Room adapter for the Agent transcript/lifecycle durable consumer. */
 internal class AgentTranscriptLifecycleDurableRepository(
@@ -48,6 +52,11 @@ internal class AgentTranscriptLifecycleDurableRepository(
         state: AgentTranscriptLifecycleClientState,
     ): AgentTranscriptLifecycleInitializeResult =
         core.initializeUnderApplyLease(namespace, state)
+
+    suspend fun loadOrInitializeStatusNamespaceUnderApplyLease(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): AgentTranscriptLifecycleDurableRecord =
+        core.loadOrInitializeStatusNamespaceUnderApplyLease(namespace)
 
     override suspend fun claimNotificationUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
@@ -102,6 +111,62 @@ internal class AgentTranscriptLifecycleDurableRepository(
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.consumeSnapshotPageUnderApplyLease(command, limits)
 }
+
+/**
+ * Default-off actor-fenced bridge for selected-Session status admission.
+ *
+ * The actor owns generation/disconnect fencing through [applyLease]. The injected operation is the
+ * existing durable repository/core transaction and remains the only owner of persisted state.
+ */
+internal class AgentTranscriptLifecycleDurableLoadOrInitializeAdapter(
+    private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
+    private val loadOrInitializeUnderApplyLease:
+        suspend (AgentTranscriptLifecycleDurableNamespace) ->
+            AgentTranscriptLifecycleDurableRecord,
+) : AgentTranscriptLifecycleDurableLoadOrInitializePort {
+    constructor(
+        applyLease: RelayV2RepositoryEffectApplyLeasePort,
+        repository: AgentTranscriptLifecycleDurableRepository,
+    ) : this(applyLease, repository::loadOrInitializeStatusNamespaceUnderApplyLease)
+
+    override suspend fun loadOrInitialize(
+        authority: RelayV2RepositoryEffectAuthority,
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): AgentTranscriptLifecycleDurableLoadOrInitializeResult {
+        if (!authority.matchesExactly(namespace.consumer)) {
+            return AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable
+        }
+        return try {
+            when (
+                applyLease.withEffectApplyLease(authority) {
+                    loadOrInitializeUnderApplyLease(namespace)
+                }
+            ) {
+                is RelayV2EffectApplyResult.Applied ->
+                    AgentTranscriptLifecycleDurableLoadOrInitializeResult.Ready
+                RelayV2EffectApplyResult.Stale ->
+                    AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: AgentTranscriptLifecyclePersistenceConflictException) {
+            AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable
+        } catch (_: RelayV2StorageException) {
+            AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable
+        }
+    }
+}
+
+private fun RelayV2RepositoryEffectAuthority.matchesExactly(
+    consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+): Boolean = generation.profileId == consumer.profileId &&
+    generation.profileGeneration == consumer.profileActivationGeneration &&
+    profileId == consumer.profileId &&
+    profileActivationGeneration == consumer.profileActivationGeneration &&
+    principalId == consumer.principalId &&
+    clientInstanceId == consumer.clientInstanceId &&
+    hostId == consumer.hostId &&
+    hostEpoch == consumer.hostEpoch
 
 private class RoomAgentTranscriptLifecycleDurableStore(
     private val database: RelayV2StateDatabase,

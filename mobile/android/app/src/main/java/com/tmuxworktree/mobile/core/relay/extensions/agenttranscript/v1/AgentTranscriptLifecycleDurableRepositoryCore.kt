@@ -615,6 +615,30 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     }
 
     /**
+     * Atomically restores the exact status namespace or creates its canonical pre-lineage state.
+     * A missing progressed lineage is never synthesized, and an existing exact record is audited
+     * without replacing reducer progress.
+     */
+    suspend fun loadOrInitializeStatusNamespaceUnderApplyLease(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): AgentTranscriptLifecycleDurableRecord = store.transaction {
+        val existing = loadSingle(namespace.consumer)
+        if (existing != null) {
+            if (existing.namespace != namespace) {
+                throw AgentTranscriptLifecyclePersistenceConflictException()
+            }
+            return@transaction auditSingle(existing).record
+        }
+        if (namespace.timelineEpoch != null) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        insertMissingState(
+            namespace,
+            AgentTranscriptLifecycleClientState(namespace.consumer.sessionIdentity),
+        )
+    }
+
+    /**
      * Reads one immutable projection page from the same transaction as its complete durable audit.
      * A continuation first compares the complete parent revision and source cut, so any changed
      * cut returns no content without touching entry/lifecycle materialization.
@@ -676,6 +700,17 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             }
             throw AgentTranscriptLifecyclePersistenceConflictException()
         }
+        AgentTranscriptLifecycleInitializeResult(
+            insertMissingState(namespace, state),
+            AgentTranscriptLifecycleInitializeDisposition.CREATED,
+        )
+    }
+
+    private fun AgentTranscriptLifecycleDurableTransaction.insertMissingState(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        state: AgentTranscriptLifecycleClientState,
+    ): AgentTranscriptLifecycleDurableRecord {
+        requireNamespaceState(namespace, state)
         val consumerStats = transcriptConsumerStats(namespace.consumer)
         if (consumerStats.entryCount != 0L || consumerStats.snapshotCount != 0L ||
             consumerStats.snapshotRecordCount != 0L || consumerStats.pendingEventCount != 0L
@@ -695,10 +730,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             AgentTranscriptLifecycleDurableStateCodec.encode(namespace, state, accounting),
         )
         insertState(persisted)
-        AgentTranscriptLifecycleInitializeResult(
-            AgentTranscriptLifecycleDurableRecord(namespace, state, accounting),
-            AgentTranscriptLifecycleInitializeDisposition.CREATED,
-        )
+        return AgentTranscriptLifecycleDurableRecord(namespace, state, accounting)
     }
 
     override suspend fun applyControlUnderApplyLease(
