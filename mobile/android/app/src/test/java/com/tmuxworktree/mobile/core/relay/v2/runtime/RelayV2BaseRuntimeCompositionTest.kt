@@ -1,9 +1,28 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentClientDisposition
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptDurableStorageAccounting
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientReduction
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLiveEventCommand
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableNamespace
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableOperationResult
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRecord
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExtensionState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeConsumeResult
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeHandlePort
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeUnavailableReason
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAcceptanceEvidence
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
@@ -49,6 +68,8 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHello
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult
+import java.lang.reflect.Proxy
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -96,6 +117,158 @@ class RelayV2BaseRuntimeCompositionTest {
                     hello.payload().stringList("requiredCapabilities"),
                 )
                 assertEquals(1, harness.authority.helloCommits.get())
+
+                harness.transport().sendFixture("sessions-changed-upsert")
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.authority.stateEventCommits.get() != 1) delay(1)
+                }
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `exact current generation delegates Agent effect without degrading base`() = runBlocking {
+        val agent = SeededAgentDurableRepository()
+        val harness = Harness(
+            autoConnect = true,
+            agentDurableRepository = agent.repository,
+        )
+        try {
+            harness.connectOnline()
+            val effect = harness.agentEffect()
+
+            val result = harness.composition.consume(effect)
+
+            val consumed = result as AgentTranscriptLifecycleRuntimeCompositionResult.Consumed
+            assertTrue(consumed.consumption is AgentTranscriptLifecycleRuntimeConsumeResult.Applied)
+            assertEquals(agent.namespace, agent.record().namespace)
+            assertEquals("12", agent.record().state.extensionLane.lastAgentSeq)
+            assertEquals(1, agent.mutationCommits.get())
+            assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `empty negotiated capabilities keep dormant Agent consumer inert`() = runBlocking {
+        val agent = SeededAgentDurableRepository()
+        val harness = Harness(
+            autoConnect = true,
+            agentDurableRepository = agent.repository,
+        )
+        try {
+            val hello = harness.connectOnline()
+            val result = harness.composition.consume(
+                harness.agentEffect(negotiatedCapabilities = emptySet()),
+            )
+
+            assertEquals(
+                RelayV2ConnectionActor.REQUIRED_CAPABILITIES,
+                hello.payload().stringList("capabilities"),
+            )
+            assertFalse(
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in
+                    hello.payload().stringList("capabilities"),
+            )
+            assertEquals(
+                AgentTranscriptLifecycleRuntimeCompositionResult.ExtensionNotNegotiated,
+                result,
+            )
+            assertEquals(0, agent.loadCalls.get())
+            assertEquals(0, agent.mutationCommits.get())
+            assertEquals("11", agent.record().state.extensionLane.lastAgentSeq)
+            assertEquals(1, harness.transport().sendCount())
+            assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `stale generation and disconnect barrier reject late Agent mutation`() = runBlocking {
+        data class Case(
+            val name: String,
+            val connectionGeneration: Long,
+            val disconnectBeforeLease: Boolean,
+        )
+
+        for (case in listOf(
+            Case("stale generation", 2, false),
+            Case("disconnect late callback", 1, true),
+        )) {
+            val agent = SeededAgentDurableRepository(
+                blockLoad = case.disconnectBeforeLease,
+            )
+            val harness = Harness(
+                autoConnect = true,
+                agentDurableRepository = agent.repository,
+            )
+            try {
+                harness.connectOnline()
+                val pending = async(Dispatchers.Default) {
+                    harness.composition.consume(
+                        harness.agentEffect(
+                            connectionGeneration = case.connectionGeneration,
+                        ),
+                    )
+                }
+                if (case.disconnectBeforeLease) {
+                    assertTrue(case.name, agent.awaitLoad())
+                    harness.composition.disconnectAndDrain(
+                        harness.profile.identity,
+                        "agent-disconnect-barrier",
+                    )
+                    agent.releaseLoad()
+                }
+
+                val result = pending.await()
+                    as AgentTranscriptLifecycleRuntimeCompositionResult.Consumed
+                assertEquals(
+                    case.name,
+                    AgentTranscriptLifecycleRuntimeConsumeResult.Unavailable(
+                        AgentTranscriptLifecycleRuntimeUnavailableReason.STALE_GENERATION,
+                    ),
+                    result.consumption,
+                )
+                assertEquals(case.name, 0, agent.mutationCommits.get())
+                assertEquals(case.name, "11", agent.record().state.extensionLane.lastAgentSeq)
+                assertEquals(
+                    case.name,
+                    if (case.disconnectBeforeLease) {
+                        RelayV2BaseRuntimePhase.STOPPED
+                    } else {
+                        RelayV2BaseRuntimePhase.ONLINE
+                    },
+                    harness.composition.state.value.phase,
+                )
+            } finally {
+                agent.releaseLoad()
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun `Agent fault stays extension scoped while base state sync continues`() =
+        runBlocking {
+            val harness = Harness(
+                autoConnect = true,
+                agentRuntimeFactory = {
+                    AgentTranscriptLifecycleRuntimeHandlePort {
+                        error("injected Agent extension fault")
+                    }
+                },
+            )
+            try {
+                harness.connectOnline()
+                assertEquals(
+                    AgentTranscriptLifecycleRuntimeCompositionResult.RuntimeFault,
+                    harness.composition.consume(harness.agentEffect()),
+                )
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
 
                 harness.transport().sendFixture("sessions-changed-upsert")
                 withTimeout(TIMEOUT_MS) {
@@ -1041,6 +1214,9 @@ class RelayV2BaseRuntimeCompositionTest {
         beforeOutboxRead: suspend (Int) -> Unit = {},
         transportOpenFailure: Throwable? = null,
         afterActorConnectAdmissionHandoff: () -> Unit = {},
+        agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
+        agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
+            AgentTranscriptLifecycleRuntimeHandlePort)? = null,
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -1089,6 +1265,8 @@ class RelayV2BaseRuntimeCompositionTest {
                 activationOutbox = RelayV2ActivationOutboxReadPort(authority::readOutbox),
                 outboxAuthority = authority,
                 outboxEnqueueAuthority = authority,
+                agentDurableRepository = agentDurableRepository,
+                agentRuntimeFactory = agentRuntimeFactory,
                 transportFactory = factory,
                 newCommandId = newCommandId,
                 clock = { NOW_MS },
@@ -1113,6 +1291,63 @@ class RelayV2BaseRuntimeCompositionTest {
             awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
             return hello
         }
+
+        fun agentEffect(
+            negotiatedCapabilities: Set<String> =
+                setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            connectionGeneration: Long = 1,
+        ): RelayV2RuntimeEffect.DeliverAgentExtensionFrame {
+            val generation = RelayV2EffectGeneration(
+                profileId = PROFILE_ID,
+                profileGeneration = profile.activationGeneration,
+                connectionGeneration = connectionGeneration,
+            )
+            return RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
+                context = agentContext(negotiatedCapabilities),
+                artifact = agentArtifact(),
+                ingress = AgentTranscriptLifecycleTrustedIngress.Live,
+                requestAdmission = null,
+                generation = generation,
+            )
+        }
+
+        private fun agentContext(
+            negotiatedCapabilities: Set<String>,
+        ) = RelayV2HandshakeContext(
+            profile = profile.identity,
+            principalId = PRINCIPAL_ID,
+            clientInstanceId = CLIENT_INSTANCE_ID,
+            hostId = HOST_ID,
+            brokerEpoch = "broker-process-uuid",
+            hostEpoch = HOST_EPOCH,
+            hostInstanceId = "host-process-uuid",
+            eventSeq = "91",
+            negotiatedCapabilities = negotiatedCapabilities,
+            negotiatedLimits = RelayV2NegotiatedLimits(
+                1_048_576,
+                1_500_000,
+                1_048_576,
+                524_288,
+                256,
+                64,
+                32,
+                262_144,
+                256,
+                67_108_864,
+                100_000,
+                4_194_304,
+                16_777_216,
+                1_048_576,
+                262_144,
+                emptyMap(),
+            ),
+            commandDedupeWindow = RelayV2CommandDedupeWindow(
+                windowId = "dedupe-window-uuid",
+                windowSeq = "42",
+                acceptUntilMs = NOW_MS + 5_000,
+                queryUntilMs = NOW_MS + 10_000,
+            ),
+        )
 
         suspend fun openThroughHostWelcome(index: Int = 0): FakeTransport {
             val transport = awaitTransport(index)
@@ -1154,6 +1389,94 @@ class RelayV2BaseRuntimeCompositionTest {
         fun close() {
             composition.close()
             parent.cancel()
+        }
+    }
+
+    private class SeededAgentDurableRepository(
+        private val blockLoad: Boolean = false,
+    ) {
+        val namespace = AgentTranscriptLifecycleDurableNamespace(
+            consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
+                profileId = PROFILE_ID,
+                profileActivationGeneration = 1,
+                principalId = PRINCIPAL_ID,
+                clientInstanceId = CLIENT_INSTANCE_ID,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+                scopeId = "scope-local",
+                sessionId = "session-1",
+            ),
+            timelineEpoch = "timeline-1",
+        )
+        val loadCalls = AtomicInteger()
+        val mutationCommits = AtomicInteger()
+        private val current = AtomicReference(
+            AgentTranscriptLifecycleDurableRecord(
+                namespace = namespace,
+                state = AgentTranscriptLifecycleClientState(
+                    identity = namespace.consumer.sessionIdentity,
+                    extensionLane = AgentTranscriptLifecycleExtensionState(
+                        localGeneration = "1",
+                        timelineEpoch = namespace.timelineEpoch,
+                        lastAgentSeq = "11",
+                    ),
+                ),
+                storageAccounting = AgentTranscriptDurableStorageAccounting.EMPTY,
+            ),
+        )
+        private val loadEntered = CountDownLatch(if (blockLoad) 1 else 0)
+        private val loadRelease = CountDownLatch(if (blockLoad) 1 else 0)
+
+        val repository: AgentTranscriptLifecycleRuntimeDurableRepository =
+            Proxy.newProxyInstance(
+                AgentTranscriptLifecycleRuntimeDurableRepository::class.java.classLoader,
+                arrayOf(AgentTranscriptLifecycleRuntimeDurableRepository::class.java),
+            ) { proxy, method, arguments ->
+                when (method.name) {
+                    "load" -> {
+                        loadCalls.incrementAndGet()
+                        if (blockLoad) {
+                            loadEntered.countDown()
+                            check(loadRelease.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                                "Agent durable load release timed out"
+                            }
+                        }
+                        current.get().takeIf {
+                            it.namespace.consumer == arguments!![0]
+                        }
+                    }
+                    "consumeLiveEventUnderApplyLease" -> {
+                        val command = arguments!![0]
+                            as AgentTranscriptLifecycleDurableLiveEventCommand
+                        val before = current.get()
+                        check(command.fence.expectedNamespace == before.namespace)
+                        val nextState = before.state.copy(
+                            extensionLane = before.state.extensionLane.copy(
+                                lastAgentSeq = command.frame.event.agentEventSeq,
+                            ),
+                        )
+                        current.set(before.copy(state = nextState))
+                        mutationCommits.incrementAndGet()
+                        AgentTranscriptLifecycleDurableOperationResult(
+                            AgentTranscriptLifecycleClientReduction(
+                                state = nextState,
+                                disposition = AgentClientDisposition.APPLIED,
+                            ),
+                        )
+                    }
+                    "toString" -> "SeededAgentDurableRepository"
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === arguments?.firstOrNull()
+                    else -> error("Unexpected Agent durable repository call ${method.name}")
+                }
+            } as AgentTranscriptLifecycleRuntimeDurableRepository
+
+        fun record(): AgentTranscriptLifecycleDurableRecord = current.get()
+
+        fun awaitLoad(): Boolean = loadEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+
+        fun releaseLoad() {
+            loadRelease.countDown()
         }
     }
 
@@ -1737,6 +2060,32 @@ class RelayV2BaseRuntimeCompositionTest {
     private fun fixture(name: String): MutableMap<String, Any?> = deepClone(
         fixtures.golden.single { it.name == name }.frame,
     )
+
+    private fun agentArtifact() = AgentTranscriptLifecycleV1Codec().decodePublicFrameArtifact(
+        agentFixtureWire("live-entry-redacted"),
+    )
+
+    private fun agentFixtureWire(name: String): ByteArray {
+        val resource = "extensions/agent-transcript-lifecycle/v1/golden-frames.json"
+        val source = requireNotNull(
+            RelayV2BaseRuntimeCompositionTest::class.java.classLoader
+                ?.getResourceAsStream(resource),
+        ).bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+        val wrapper = RelayV2StrictJson.parseObject(
+            "{\"fixtures\":$source}",
+            RelayV2JsonLimits(64, 1_024, 100_000, 200_000),
+        )
+        val fixture = (wrapper["fixtures"] as List<*>)
+            .filterIsInstance<Map<String, Any?>>()
+            .single { it["name"] == name }
+        val wire = fixture["wire"] as String
+        val oldEpoch = "\"hostEpoch\":\"host-epoch-1\""
+        check(wire.indexOf(oldEpoch) >= 0 && wire.indexOf(oldEpoch) == wire.lastIndexOf(oldEpoch))
+        return wire.replace(
+            oldEpoch,
+            "\"hostEpoch\":\"$HOST_EPOCH\"",
+        ).toByteArray(StandardCharsets.UTF_8)
+    }
 
     private fun sendingOutbox(
         vararg commandIds: String,

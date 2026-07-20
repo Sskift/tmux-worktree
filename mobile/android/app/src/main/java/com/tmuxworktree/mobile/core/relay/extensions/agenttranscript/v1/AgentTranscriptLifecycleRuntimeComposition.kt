@@ -4,6 +4,12 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectApplyLeasePort
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RuntimeEffect
 
+internal fun interface AgentTranscriptLifecycleRuntimeHandlePort {
+    suspend fun handle(
+        effect: RelayV2RuntimeEffect,
+    ): AgentTranscriptLifecycleRuntimeCompositionResult
+}
+
 internal sealed interface AgentTranscriptLifecycleRuntimeCompositionResult {
     data class NotOwned(
         val effect: RelayV2RuntimeEffect,
@@ -11,6 +17,7 @@ internal sealed interface AgentTranscriptLifecycleRuntimeCompositionResult {
     data object Disabled : AgentTranscriptLifecycleRuntimeCompositionResult
     data object ExtensionNotNegotiated : AgentTranscriptLifecycleRuntimeCompositionResult
     data object DurableNamespaceUnavailable : AgentTranscriptLifecycleRuntimeCompositionResult
+    data object RuntimeFault : AgentTranscriptLifecycleRuntimeCompositionResult
 
     data class Consumed(
         val consumption: AgentTranscriptLifecycleRuntimeConsumeResult,
@@ -32,7 +39,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
     notificationPlatform: AgentTranscriptLifecycleNotificationPlatformPort,
     private val enabled: Boolean = false,
     nextRequestToken: () -> String = { java.util.UUID.randomUUID().toString() },
-) {
+) : AgentTranscriptLifecycleRuntimeHandlePort {
     private val runtimeConsumer = AgentTranscriptLifecycleRuntimeConsumer(
         applyLease = applyLease,
         durableRepository = durableRepository,
@@ -46,7 +53,33 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
     )
     private val readProjection = AgentTranscriptLifecycleRoomReadProjection(durableRepository)
 
-    suspend fun handle(
+    companion object {
+        /**
+         * Production durable-consumer seam while capability advertisement remains disabled.
+         *
+         * The base runtime remains the only effect pump and supplies its actor-owned apply and
+         * handoff authorities. System notification delivery deliberately stays disconnected.
+         */
+        fun dormant(
+            applyLease: RelayV2RepositoryEffectApplyLeasePort,
+            durableRepository: AgentTranscriptLifecycleRuntimeDurableRepository,
+            durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
+        ): AgentTranscriptLifecycleRuntimeComposition =
+            AgentTranscriptLifecycleRuntimeComposition(
+                applyLease = applyLease,
+                durableRepository = durableRepository,
+                durableHandoff = durableHandoff,
+                notificationPlatform = AgentTranscriptLifecycleNotificationPlatformPort {
+                    AgentTranscriptLifecycleNotificationPlatformResult.Suppressed(
+                        AgentTranscriptLifecycleNotificationSuppressionReason
+                            .NOTIFICATIONS_DISABLED,
+                    )
+                },
+                enabled = true,
+            )
+    }
+
+    override suspend fun handle(
         effect: RelayV2RuntimeEffect,
     ): AgentTranscriptLifecycleRuntimeCompositionResult = when (effect) {
         is RelayV2RuntimeEffect.DeliverAgentExtensionFrame -> {

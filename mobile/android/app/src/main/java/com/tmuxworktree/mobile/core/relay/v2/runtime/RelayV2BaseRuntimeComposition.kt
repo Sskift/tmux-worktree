@@ -1,5 +1,9 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeComposition
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeHandlePort
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
@@ -110,8 +114,9 @@ internal fun interface RelayV2SessionReplyCommandPort {
  * state-sync plus durable command query/status recovery. After the actor publishes the exact ONLINE
  * ready cut, it flushes recovered Execute capabilities in commit order and then asks the durable
  * Outbox producer for bounded fresh QUEUED batches. Retryable connection failures are redriven by
- * one bounded backoff owner after the actor's prior transport/apply fence. Agent extensions,
- * refresh, and capability advertisement remain unowned.
+ * one bounded backoff owner after the actor's prior transport/apply fence. The Agent durable
+ * consumer remains dormant behind empty optional capabilities; refresh and advertisement remain
+ * unowned.
  */
 internal class RelayV2BaseRuntimeComposition(
     parentScope: CoroutineScope,
@@ -122,6 +127,9 @@ internal class RelayV2BaseRuntimeComposition(
     private val activationOutbox: RelayV2ActivationOutboxReadPort,
     outboxAuthority: RelayV2OutboxRuntimeAuthority,
     private val outboxEnqueueAuthority: RelayV2OutboxEnqueueAuthority,
+    agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
+    agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
+        AgentTranscriptLifecycleRuntimeHandlePort)? = null,
     transportFactory: RelayV2TransportFactory = BoundedRelayV2TransportFactory(),
     private val newCommandId: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = System::currentTimeMillis,
@@ -167,6 +175,19 @@ internal class RelayV2BaseRuntimeComposition(
         commandQueryAdmissionComposition = queryAdmissionComposition,
         optionalCapabilities = emptySet(),
     )
+    private val agentRuntime = run {
+        require(agentRuntimeFactory == null || agentDurableRepository == null) {
+            "Agent runtime factory and durable repository are mutually exclusive"
+        }
+        agentRuntimeFactory?.invoke(actor)
+            ?: agentDurableRepository?.let {
+                AgentTranscriptLifecycleRuntimeComposition.dormant(
+                    applyLease = actor,
+                    durableRepository = it,
+                    durableHandoff = actor,
+                )
+            }
+    }
     private val queryAdmissionAdapter = queryAdmissionComposition.adapter(actor, outboxAuthority)
     private val outboxDispatchComposition =
         RelayV2OutboxDispatchAuthority.recoveryComposition(
@@ -357,7 +378,9 @@ internal class RelayV2BaseRuntimeComposition(
         afterActorConnectAdmissionHandoff()
     }
 
-    internal suspend fun consume(effect: RelayV2RuntimeEffect) {
+    internal suspend fun consume(
+        effect: RelayV2RuntimeEffect,
+    ): AgentTranscriptLifecycleRuntimeCompositionResult? {
         when (effect) {
             is RelayV2RuntimeEffect.QueryPendingCommands -> applyHello(effect)
             is RelayV2RuntimeEffect.BeginStateResync -> applyHello(effect)
@@ -389,7 +412,22 @@ internal class RelayV2BaseRuntimeComposition(
             is RelayV2RuntimeEffect.ApplyCommandStatuses -> applyOutboxRecovery(effect)
             is RelayV2RuntimeEffect.DeliverAgentExtensionFrame,
             is RelayV2RuntimeEffect.AgentExtensionUnavailable,
-            -> failRuntimeIncomplete("AGENT_EXTENSION_RUNTIME_UNAVAILABLE")
+            -> return consumeAgentEffect(effect)
+        }
+        return null
+    }
+
+    private suspend fun consumeAgentEffect(
+        effect: RelayV2RuntimeEffect,
+    ): AgentTranscriptLifecycleRuntimeCompositionResult {
+        val runtime = agentRuntime
+            ?: return AgentTranscriptLifecycleRuntimeCompositionResult.Disabled
+        return try {
+            runtime.handle(effect)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            AgentTranscriptLifecycleRuntimeCompositionResult.RuntimeFault
         }
     }
 

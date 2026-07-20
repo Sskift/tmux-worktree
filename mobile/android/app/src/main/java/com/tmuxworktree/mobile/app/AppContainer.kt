@@ -8,6 +8,7 @@ import com.tmuxworktree.mobile.core.data.PreferencesStore
 import com.tmuxworktree.mobile.core.data.TwDatabase
 import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.network.NetworkMonitor
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRepository
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
@@ -30,8 +31,14 @@ class AppContainer(context: Context) {
     private val relayV2Credentials: AndroidKeystoreRelayV2CredentialStore by lazy {
         AndroidKeystoreRelayV2CredentialStore(appContext)
     }
+    private val relayV2StateDatabase: RelayV2StateDatabase by lazy {
+        RelayV2StateDatabase.build(appContext)
+    }
     private val relayV2StateRepository: RelayV2StateRepository by lazy {
-        RelayV2StateRepository(RelayV2StateDatabase.build(appContext))
+        RelayV2StateRepository(relayV2StateDatabase)
+    }
+    private val agentTranscriptLifecycleRepository by lazy {
+        AgentTranscriptLifecycleDurableRepository(relayV2StateDatabase)
     }
     val legacyIdentityImporter: LegacyIdentityImporter by lazy {
         LegacyIdentityImporter(
@@ -70,6 +77,7 @@ class AppContainer(context: Context) {
         ),
         outboxAuthority = relayV2StateRepository,
         outboxEnqueueAuthority = relayV2StateRepository,
+        agentDurableRepository = agentTranscriptLifecycleRepository,
         transportFactory = BoundedRelayV2TransportFactory(),
     )
 }
