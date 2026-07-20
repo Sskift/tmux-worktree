@@ -14,11 +14,18 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
     @Test
     fun `unnegotiated request has zero durable operation and zero actor send`() = runBlocking {
         val harness = CoordinatorHarness()
+        val fence = harness.fence(negotiated = false)
 
-        val result = harness.coordinator.requestStatus(harness.fence(negotiated = false))
+        val result = harness.coordinator.requestStatus(fence)
+        val resumed = harness.coordinator.resumePersistedRequests(fence)
 
         assertEquals(AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated, result)
+        assertEquals(
+            listOf(AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated),
+            resumed,
+        )
         assertEquals(0, harness.operations.applyCount)
+        assertEquals(0, harness.operations.preparedReadCount)
         assertTrue(harness.sent.isEmpty())
     }
 
@@ -98,9 +105,16 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
     fun `post commit retry and reconnect reuse exact replay and snapshot identities`() =
         runBlocking {
             val harness = CoordinatorHarness(
+                tokens = ArrayDeque(),
                 admitSends = false,
             )
             val lineage = AgentTimelineLineage(harness.consumer.sessionIdentity, "timeline-1")
+            val resumeContext = harness.resumeContext()
+
+            val empty = harness.coordinator.resumePersistedRequests(resumeContext)
+            assertTrue(empty.isEmpty())
+            assertTrue(harness.sent.isEmpty())
+
             harness.operations.seedPrepared(
                 AgentTranscriptLifecycleDurablePreparedRequest.Replay(
                     lineage = lineage,
@@ -123,7 +137,7 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
                 ),
             )
 
-            val postCommitCrash = harness.coordinator.resumePersistedRequests(harness.fence())
+            val postCommitCrash = harness.coordinator.resumePersistedRequests(resumeContext)
             assertTrue(
                 postCommitCrash.all {
                     it is AgentTranscriptLifecycleRequestSyncResult.Dispatched &&
@@ -132,8 +146,8 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
             )
 
             harness.admitSends = true
-            val firstReconnect = harness.coordinator.resumePersistedRequests(harness.fence())
-            val secondReconnect = harness.coordinator.resumePersistedRequests(harness.fence())
+            val firstReconnect = harness.coordinator.resumePersistedRequests(resumeContext)
+            val secondReconnect = harness.coordinator.resumePersistedRequests(resumeContext)
 
             assertTrue(
                 firstReconnect.all {
@@ -180,6 +194,7 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
                 harness.operations.committedTokens,
             )
             assertEquals(0, harness.operations.applyCount)
+            assertEquals(4, harness.operations.preparedReadCount)
             assertFalse(harness.lease.insideBlock)
         }
 
@@ -238,7 +253,7 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
         val harness = CoordinatorHarness(staleLease = true)
 
         val result = harness.coordinator.requestStatus(harness.fence())
-        val resumed = harness.coordinator.resumePersistedRequests(harness.fence())
+        val resumed = harness.coordinator.resumePersistedRequests(harness.resumeContext())
         val notification = harness.coordinator.dispatchPostCommitEffect(
             harness.fence(),
             AgentTranscriptLifecycleRuntimePostCommitEffect.Notification(
@@ -336,6 +351,14 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
             },
             ingress = AgentTranscriptLifecycleTrustedIngress.Live,
         )
+
+        fun resumeContext() = AgentTranscriptLifecyclePersistedRequestResumeContext(
+            authority = authority,
+            expectedNamespace = AgentTranscriptLifecycleDurableNamespace(
+                consumer,
+                "timeline-1",
+            ),
+        )
     }
 }
 
@@ -407,6 +430,8 @@ private class CoordinatorDurableOperations(
         >()
     var applyCount = 0
         private set
+    var preparedReadCount = 0
+        private set
 
     fun seedPrepared(vararg requests: AgentTranscriptLifecycleDurablePreparedRequest) {
         requests.forEach { request ->
@@ -472,6 +497,9 @@ private class CoordinatorDurableOperations(
         fence: AgentTranscriptLifecycleDurableOperationFence,
     ): List<AgentTranscriptLifecycleDurablePreparedRequest> {
         check(lease.insideBlock)
+        check(fence.authority == consumer)
+        check(fence.expectedNamespace.consumer == consumer)
+        preparedReadCount += 1
         return prepared.values.toList()
     }
 

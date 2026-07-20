@@ -209,6 +209,28 @@ internal data class AgentTranscriptLifecycleFailedAdmissionRedriveContext(
 }
 
 /**
+ * Actor-derived authority for re-reading requests already prepared by the durable owner.
+ *
+ * This context intentionally carries neither negotiated capabilities, trusted ingress, nor a
+ * caller-assembled runtime fence. The actor apply lease and exact durable namespace are the only
+ * authority needed to resume previously committed request identities.
+ */
+internal data class AgentTranscriptLifecyclePersistedRequestResumeContext(
+    val authority: RelayV2RepositoryEffectAuthority,
+    val expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+) {
+    init {
+        val consumer = expectedNamespace.consumer
+        require(authority.profileId == consumer.profileId)
+        require(authority.profileActivationGeneration == consumer.profileActivationGeneration)
+        require(authority.principalId == consumer.principalId)
+        require(authority.clientInstanceId == consumer.clientInstanceId)
+        require(authority.hostId == consumer.hostId)
+        require(authority.hostEpoch == consumer.hostEpoch)
+    }
+}
+
+/**
  * Replaces a failed volatile admission only while its exact durable request remains prepared.
  *
  * This owner never prepares a request, generates a token, calls the ordinary request sender, or
@@ -373,15 +395,33 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
         if (!fence.isNegotiated()) {
             return listOf(AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated)
         }
-        return when (val applied = applyLease.withEffectApplyLease(fence.authority) {
-            durableRepository.loadPreparedRequestsUnderApplyLease(fence.durableOperationFence())
+        return resumePersistedRequests(
+            context = AgentTranscriptLifecyclePersistedRequestResumeContext(
+                authority = fence.authority,
+                expectedNamespace = fence.expectedNamespace,
+            ),
+            requestKind = requestKind,
+        )
+    }
+
+    suspend fun resumePersistedRequests(
+        context: AgentTranscriptLifecyclePersistedRequestResumeContext,
+        requestKind: AgentTranscriptLifecycleRequestKind? = null,
+    ): List<AgentTranscriptLifecycleRequestSyncResult> {
+        return when (val applied = applyLease.withEffectApplyLease(context.authority) {
+            durableRepository.loadPreparedRequestsUnderApplyLease(
+                context.durableOperationFence(),
+            )
         }) {
             RelayV2EffectApplyResult.Stale ->
                 listOf(AgentTranscriptLifecycleRequestSyncResult.StaleGeneration)
             is RelayV2EffectApplyResult.Applied -> applied.value
                 .filter { requestKind == null || it.requestKind == requestKind }
                 .map { prepared ->
-                    val request = prepared.toActorRequest(fence)
+                    val request = prepared.toActorRequest(
+                        authority = context.authority,
+                        expectedNamespace = context.expectedNamespace,
+                    )
                     AgentTranscriptLifecycleRequestSyncResult.Dispatched(
                         reduction = null,
                         request = request,
@@ -563,6 +603,12 @@ private fun AgentTranscriptLifecycleOutboundStatusRequestContext.durableOperatio
     )
 
 private fun AgentTranscriptLifecycleFailedAdmissionRedriveContext.durableOperationFence() =
+    AgentTranscriptLifecycleDurableOperationFence(
+        authority = expectedNamespace.consumer,
+        expectedNamespace = expectedNamespace,
+    )
+
+private fun AgentTranscriptLifecyclePersistedRequestResumeContext.durableOperationFence() =
     AgentTranscriptLifecycleDurableOperationFence(
         authority = expectedNamespace.consumer,
         expectedNamespace = expectedNamespace,
