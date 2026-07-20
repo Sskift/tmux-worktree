@@ -928,6 +928,10 @@ function legacyRouteClose(
 }
 
 export class RelayV2HostCarrierActor {
+  readonly #hostId: string;
+  readonly #hostEpoch: string;
+  readonly #hostInstanceId: string;
+  readonly #statusObserver: RelayV2HostCarrierOptions["onStatus"];
   private readonly clock: () => number;
   private readonly schedule: (delayMs: number, callback: () => void) => () => void;
   private readonly idFactory: () => string;
@@ -959,6 +963,10 @@ export class RelayV2HostCarrierActor {
     RelayV2DashboardManagementHostCarrierControlAdapter | null = null;
 
   constructor(private readonly options: RelayV2HostCarrierOptions) {
+    this.#hostId = options.hostId;
+    this.#hostEpoch = options.hostEpoch;
+    this.#hostInstanceId = options.hostInstanceId;
+    this.#statusObserver = options.onStatus;
     this.clock = options.clock ?? Date.now;
     this.schedule = options.schedule ?? ((delayMs, callback) => {
       const timer = setTimeout(callback, delayMs);
@@ -1001,6 +1009,35 @@ export class RelayV2HostCarrierActor {
       hostInstanceId: options.hostInstanceId,
       credentialReferences: options.credentialReferences,
     }));
+  }
+
+  /**
+   * Boolean-only construction proof for the default-off connector attempt
+   * adapter. It reveals neither the observer nor actor state and cannot be
+   * used to install a later subscriber.
+   */
+  static isCanonicalConnectorAttemptActor(
+    value: unknown,
+    input: Readonly<{
+      hostId: string;
+      hostEpoch: string;
+      hostInstanceId: string;
+      onCarrierStatus: (status: Readonly<RelayV2HostCarrierStatus>) => void;
+    }>,
+  ): value is RelayV2HostCarrierActor {
+    if (typeof value !== "object" || value === null) return false;
+    try {
+      return Object.getPrototypeOf(value) === RelayV2HostCarrierActor.prototype
+        && (value as RelayV2HostCarrierActor).#hostId === input.hostId
+        && (value as RelayV2HostCarrierActor).#hostEpoch === input.hostEpoch
+        && (value as RelayV2HostCarrierActor).#hostInstanceId === input.hostInstanceId
+        && (value as RelayV2HostCarrierActor).#statusObserver === input.onCarrierStatus
+        && (value as RelayV2HostCarrierActor).capabilities.length === 0
+        && (value as RelayV2HostCarrierActor).clientDialects.length === 1
+        && (value as RelayV2HostCarrierActor).clientDialects[0] === "tw-relay.v2";
+    } catch {
+      return false;
+    }
   }
 
   status(): RelayV2HostCarrierStatus | null {
@@ -1113,7 +1150,7 @@ export class RelayV2HostCarrierActor {
       || !connector
       || connector.phase !== "registered"
       || connector.connectorId === null
-      || input.hostId !== this.options.hostId
+      || input.hostId !== this.#hostId
       || input.connectorId !== connector.connectorId) {
       return Promise.reject(
         new RelayV2HostCarrierDashboardManagementControlError("NOT_REGISTERED"),
@@ -1332,9 +1369,9 @@ export class RelayV2HostCarrierActor {
         type: "host.hello",
         requestId: connector.helloRequestId,
         payload: {
-          hostId: this.options.hostId,
-          hostEpoch: this.options.hostEpoch,
-          hostInstanceId: this.options.hostInstanceId,
+          hostId: this.#hostId,
+          hostEpoch: this.#hostEpoch,
+          hostInstanceId: this.#hostInstanceId,
           clientDialects: [...this.clientDialects],
           capabilities: [...this.capabilities],
           limits: {
@@ -1684,7 +1721,7 @@ export class RelayV2HostCarrierActor {
         || enrollmentCode.length === "twenroll2.".length
         || Buffer.byteLength(enrollmentCode, "utf8") > 512
         || /[\0\r\n]/.test(enrollmentCode)
-        || stringField(payload, "hostId") !== this.options.hostId) {
+        || stringField(payload, "hostId") !== this.#hostId) {
         throw new Error("invalid enrollment response");
       }
       const result: RelayV2HostCarrierDashboardManagementEnrollmentResult = Object.freeze({
@@ -1692,7 +1729,7 @@ export class RelayV2HostCarrierActor {
         requestId: pending.requestId,
         connectorGeneration: pending.connectorGeneration,
         connectorId: pending.connectorId,
-        hostId: this.options.hostId,
+        hostId: this.#hostId,
         deduplicated: payload.deduplicated as boolean,
         enrollmentId: stringField(payload, "enrollmentId"),
         enrollmentCode,
@@ -1727,7 +1764,7 @@ export class RelayV2HostCarrierActor {
       requestId: pending.requestId,
       connectorGeneration: pending.connectorGeneration,
       connectorId: pending.connectorId,
-      hostId: this.options.hostId,
+      hostId: this.#hostId,
       grantId: pending.grantId,
       revokedAtMs: payload.revokedAtMs as number,
       alreadyRevoked: payload.alreadyRevoked as boolean,
@@ -1808,8 +1845,8 @@ export class RelayV2HostCarrierActor {
   private handleSuperseded(connector: ConnectorState, frame: RelayV2JsonObject): void {
     const payload = objectField(frame, "payload");
     if (stringField(payload, "losingConnectorId") !== connector.connectorId
-      || stringField(payload, "losingHostInstanceId") !== this.options.hostInstanceId
-      || stringField(payload, "hostId") !== this.options.hostId) return;
+      || stringField(payload, "losingHostInstanceId") !== this.#hostInstanceId
+      || stringField(payload, "hostId") !== this.#hostId) return;
     this.permanentlySuperseded = true;
     this.current = null;
     connector.phase = "closed";
@@ -1854,7 +1891,7 @@ export class RelayV2HostCarrierActor {
       return;
     }
     const auth = objectField(payload, "authContext");
-    if (stringField(auth, "hostId") !== this.options.hostId) {
+    if (stringField(auth, "hostId") !== this.#hostId) {
       this.rejectRoute(
         connector,
         frame,
@@ -2795,7 +2832,7 @@ export class RelayV2HostCarrierActor {
   private publishStatus(status: RelayV2HostCarrierStatus): void {
     this.latestStatus = { ...status };
     try {
-      this.options.onStatus?.({ ...status });
+      this.#statusObserver?.({ ...status });
     } catch {
       // Status observation cannot own connector lifecycle.
     }

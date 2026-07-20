@@ -16,6 +16,7 @@ export default defineConfig({
     "src/relay/v2/hostConnectorController.ts",
     "src/relay/v2/hostCredentialAuthority.ts",
     "src/relay/v2/hostCredentialExchangeCoordinator.ts",
+    "src/relay/v2/hostConnectorCarrierAttemptAdapter.ts",
     "src/relay/v2/hostCapabilityReadiness.ts",
     "src/relay/v2/hostCodecReadinessActivation.ts",
     "src/relay/v2/hostRuntime.ts",
