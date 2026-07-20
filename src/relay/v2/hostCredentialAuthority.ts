@@ -652,6 +652,25 @@ function parseState(
   };
 }
 
+/**
+ * Canonical strict defensive decoder for the authority's complete durable
+ * state. It is pure and maps every malformed input to the authority's
+ * redacted state-invalid error.
+ */
+export function decodeRelayV2HostCredentialState(
+  value: unknown,
+  credentialReference: string,
+): RelayV2HostCredentialState {
+  try {
+    if (!isCredentialReference(credentialReference)) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
+    }
+    return parseState(value, credentialReference);
+  } catch {
+    return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
+  }
+}
+
 function validateReference(value: unknown): string {
   if (!isCredentialReference(value)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
@@ -1041,7 +1060,7 @@ implements RelayV2HostCarrierCredentialReferences {
       const read = authority.validateRead(transaction.read());
       const state = read.state === null
         ? null
-        : parseState(read.state, binding.credentialReference);
+        : decodeRelayV2HostCredentialState(read.state, binding.credentialReference);
       const cut = connectionCutFromState(binding.credentialReference, state);
       if (cut.hostId !== binding.hostId) {
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
@@ -1087,7 +1106,7 @@ implements RelayV2HostCarrierCredentialReferences {
       const read = authority.validateRead(transaction.read());
       const state = read.state === null
         ? null
-        : parseState(read.state, binding.credentialReference);
+        : decodeRelayV2HostCredentialState(read.state, binding.credentialReference);
       if (!stateMatchesConnectionCut(
         state,
         record.cut,
@@ -1137,7 +1156,7 @@ implements RelayV2HostCarrierCredentialReferences {
         const read = authority.validateRead(transaction.read());
         const state = read.state === null
           ? null
-          : parseState(read.state, record.binding.credentialReference);
+          : decodeRelayV2HostCredentialState(read.state, record.binding.credentialReference);
         record.phase = "released";
         hostCredentialConnectionAdmissions.delete(admission);
         const accessToken = hostCredentialConnectionSecrets.get(admission);
@@ -1208,7 +1227,7 @@ implements RelayV2HostCarrierCredentialReferences {
       const read = authority.validateRead(transaction.read());
       const state = read.state === null
         ? null
-        : parseState(read.state, record.cut.reference);
+        : decodeRelayV2HostCredentialState(read.state, record.cut.reference);
       if (!stateMatchesConnectionCut(state, record.cut, accessToken)) {
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
       }
@@ -1300,7 +1319,7 @@ implements RelayV2HostCarrierCredentialReferences {
       const read = this.validateRead(transaction.read());
       const current = read.state === null
         ? null
-        : parseState(read.state, input.credentialReference);
+        : decodeRelayV2HostCredentialState(read.state, input.credentialReference);
       if (current !== null && current.hostId !== input.hostId) {
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
       }
@@ -1723,7 +1742,9 @@ implements RelayV2HostCarrierCredentialReferences {
   private readState(reference: string): RelayV2HostCredentialState | null {
     return this.exclusive(reference, (transaction) => {
       const read = this.validateRead(transaction.read());
-      return read.state === null ? null : parseState(read.state, reference);
+      return read.state === null
+        ? null
+        : decodeRelayV2HostCredentialState(read.state, reference);
     });
   }
 
@@ -1738,14 +1759,19 @@ implements RelayV2HostCarrierCredentialReferences {
         : this.consumeExchangeCut(consumption, reference);
       let read = this.validateRead(transaction.read());
       for (let conflicts = 0; conflicts <= MAX_CAS_CONFLICTS; conflicts += 1) {
-        const current = read.state === null ? null : parseState(read.state, reference);
+        const current = read.state === null
+          ? null
+          : decodeRelayV2HostCredentialState(read.state, reference);
         if (cutRecord !== null
           && !stateMatchesExchangeCut(current, cutRecord.group.binding)) {
           return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
         }
         const transition = reduce(current);
         if (transition.kind === "unchanged") return transition.value;
-        const replacement = parseState(transition.replacement, reference);
+        const replacement = decodeRelayV2HostCredentialState(
+          transition.replacement,
+          reference,
+        );
         let result: RelayV2HostCredentialStorageCasResult;
         try {
           result = transaction.compareAndSwap(read.revision, replacement);

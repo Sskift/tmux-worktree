@@ -15,6 +15,7 @@ export default defineConfig({
     "src/relay/v2/hostCarrier.ts",
     "src/relay/v2/hostConnectorController.ts",
     "src/relay/v2/hostCredentialAuthority.ts",
+    "src/relay/v2/hostCredentialVault.ts",
     "src/relay/v2/hostCredentialExchangeCoordinator.ts",
     "src/relay/v2/hostWssTransportLifecycle.ts",
     "src/relay/v2/hostConnectorCarrierAttemptAdapter.ts",
@@ -96,6 +97,8 @@ export default defineConfig({
     "./carrierPump.js",
     "./hostCarrier.js",
     "./hostConnectorController.js",
+    // The vault consumes the authority's strict decoder from this canonical
+    // entry and must not bundle a second module-private authority instance.
     "./hostCredentialAuthority.js",
     "./hostCredentialExchangeCoordinator.js",
     // The protocol-v2 session must consume the accepted composition and stdio
