@@ -165,6 +165,28 @@ internal sealed interface AgentTranscriptLifecycleRequestSyncResult {
 }
 
 /**
+ * Actor-derived authority for one selected-Session outbound status request.
+ *
+ * Capability admission happened when the selection controller entered the actor's exact
+ * repository read cut. This context intentionally carries no caller-assembled negotiated set or
+ * inbound ingress provenance; the apply lease and actor sender fence the authority again.
+ */
+internal data class AgentTranscriptLifecycleOutboundStatusRequestContext(
+    val authority: RelayV2RepositoryEffectAuthority,
+    val expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+) {
+    init {
+        val consumer = expectedNamespace.consumer
+        require(authority.profileId == consumer.profileId)
+        require(authority.profileActivationGeneration == consumer.profileActivationGeneration)
+        require(authority.principalId == consumer.principalId)
+        require(authority.clientInstanceId == consumer.clientInstanceId)
+        require(authority.hostId == consumer.hostId)
+        require(authority.hostEpoch == consumer.hostEpoch)
+    }
+}
+
+/**
  * Persists extension request fences through the existing durable owner, then asks the actor to
  * send under its current generation/authority fence. This coordinator never owns a WebSocket.
  */
@@ -176,19 +198,33 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
     private val requestToken: () -> String = { UUID.randomUUID().toString() },
 ) {
     suspend fun requestStatus(
-        fence: AgentTranscriptLifecycleRuntimeFence,
+        context: AgentTranscriptLifecycleOutboundStatusRequestContext,
     ): AgentTranscriptLifecycleRequestSyncResult {
-        if (!fence.isNegotiated()) return AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated
         val token = requestToken()
-        val applied = applyLease.withEffectApplyLease(fence.authority) {
+        val applied = applyLease.withEffectApplyLease(context.authority) {
             durableRepository.prepareRequestUnderApplyLease(
                 AgentTranscriptLifecycleDurablePrepareRequestCommand.Status(
-                    fence.durableOperationFence(),
+                    context.durableOperationFence(),
                     token,
                 ),
             )
         }
-        return applied.dispatchPreparedAfterCommit(fence)
+        return applied.dispatchPreparedAfterCommit(
+            authority = context.authority,
+            expectedNamespace = context.expectedNamespace,
+        )
+    }
+
+    suspend fun requestStatus(
+        fence: AgentTranscriptLifecycleRuntimeFence,
+    ): AgentTranscriptLifecycleRequestSyncResult {
+        if (!fence.isNegotiated()) return AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated
+        return requestStatus(
+            AgentTranscriptLifecycleOutboundStatusRequestContext(
+                authority = fence.authority,
+                expectedNamespace = fence.expectedNamespace,
+            ),
+        )
     }
 
     suspend fun requestReplay(
@@ -209,7 +245,10 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
                 ),
             )
         }
-        return applied.dispatchPreparedAfterCommit(fence)
+        return applied.dispatchPreparedAfterCommit(
+            authority = fence.authority,
+            expectedNamespace = fence.expectedNamespace,
+        )
     }
 
     suspend fun requestSnapshot(
@@ -232,7 +271,10 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
                 ),
             )
         }
-        return applied.dispatchPreparedAfterCommit(fence)
+        return applied.dispatchPreparedAfterCommit(
+            authority = fence.authority,
+            expectedNamespace = fence.expectedNamespace,
+        )
     }
 
     suspend fun resumePersistedRequests(
@@ -355,12 +397,16 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
 
     private fun RelayV2EffectApplyResult<AgentTranscriptLifecycleDurablePrepareRequestResult>
         .dispatchPreparedAfterCommit(
-            fence: AgentTranscriptLifecycleRuntimeFence,
+            authority: RelayV2RepositoryEffectAuthority,
+            expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         ): AgentTranscriptLifecycleRequestSyncResult = when (this) {
         RelayV2EffectApplyResult.Stale ->
             AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
         is RelayV2EffectApplyResult.Applied -> {
-            val prepared = value.preparedRequest.toActorRequest(fence)
+            val prepared = value.preparedRequest.toActorRequest(
+                authority = authority,
+                expectedNamespace = expectedNamespace,
+            )
             AgentTranscriptLifecycleRequestSyncResult.Dispatched(
                 reduction = value.reduction,
                 request = prepared,
@@ -372,9 +418,16 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
 
 internal fun AgentTranscriptLifecycleDurablePreparedRequest.toActorRequest(
     fence: AgentTranscriptLifecycleRuntimeFence,
+): AgentTranscriptLifecycleActorRequest = toActorRequest(
+    authority = fence.authority,
+    expectedNamespace = fence.expectedNamespace,
+)
+
+private fun AgentTranscriptLifecycleDurablePreparedRequest.toActorRequest(
+    authority: RelayV2RepositoryEffectAuthority,
+    expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
 ): AgentTranscriptLifecycleActorRequest {
-    val authority = fence.authority
-    val consumer = fence.expectedNamespace.consumer
+    val consumer = expectedNamespace.consumer
     return when (this) {
         is AgentTranscriptLifecycleDurablePreparedRequest.Status ->
             AgentTranscriptLifecycleActorRequest.Status(
@@ -441,6 +494,12 @@ private fun AgentTranscriptLifecycleRuntimeFence.durableOperationFence() =
             sessionId = expectedNamespace.consumer.sessionId,
         ),
         expectedNamespace,
+    )
+
+private fun AgentTranscriptLifecycleOutboundStatusRequestContext.durableOperationFence() =
+    AgentTranscriptLifecycleDurableOperationFence(
+        authority = expectedNamespace.consumer,
+        expectedNamespace = expectedNamespace,
     )
 
 private fun AgentTranscriptLifecycleDurableNamespace.lineageOrNull(): AgentTimelineLineage? =

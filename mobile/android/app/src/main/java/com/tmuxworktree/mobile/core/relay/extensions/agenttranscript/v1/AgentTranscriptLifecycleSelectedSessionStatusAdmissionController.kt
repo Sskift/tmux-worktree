@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
@@ -28,7 +29,7 @@ internal sealed interface AgentTranscriptLifecycleDurableLoadOrInitializeResult 
 /** Narrow view of the existing request-sync owner; it alone prepares a token and sends. */
 internal fun interface AgentTranscriptLifecycleStatusRequestPort {
     suspend fun requestStatus(
-        fence: AgentTranscriptLifecycleRuntimeFence,
+        context: AgentTranscriptLifecycleOutboundStatusRequestContext,
     ): AgentTranscriptLifecycleRequestSyncResult
 }
 
@@ -43,13 +44,16 @@ internal sealed interface AgentTranscriptLifecycleSelectedSessionStatusAdmission
 /**
  * Default-off lower composition for one selected-Session Agent status request.
  *
- * Selection remains owned by [AgentTranscriptLifecycleSessionSelectionController], durable state
- * by [AgentTranscriptLifecycleDurableLoadOrInitializePort], and request token commit plus actor
- * send by [AgentTranscriptLifecycleStatusRequestPort]. This controller owns only their ordering and
- * an exact-selection single flight.
+ * Selection and capability admission remain owned by
+ * [AgentTranscriptLifecycleSessionSelectionController]. The same durable repository chooses the
+ * existing namespace for the actor-derived consumer, while
+ * [AgentTranscriptLifecycleDurableLoadOrInitializePort] and
+ * [AgentTranscriptLifecycleStatusRequestPort] revalidate that exact authority before mutation and
+ * send. This controller owns only their ordering and an exact-selection single flight.
  */
 internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
     private val sessionSelection: AgentTranscriptLifecycleSessionSelectionController,
+    private val durableRepository: AgentTranscriptLifecycleRuntimeDurableRepository,
     private val durableLoadOrInitialize: AgentTranscriptLifecycleDurableLoadOrInitializePort,
     private val requestSync: AgentTranscriptLifecycleStatusRequestPort,
     private val enabled: Boolean = false,
@@ -59,16 +63,13 @@ internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
 
     suspend fun requestStatus(
         intent: AgentTranscriptLifecycleSessionSelectionIntent,
-        authority: AgentTranscriptLifecycleRuntimeFence,
     ): AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult {
-        if (!enabled || AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in authority.negotiatedCapabilities) {
+        if (!enabled) {
             return AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
         }
 
         val selected = sessionSelection.withCurrentSession(intent) { current ->
-            val key = current.exactSelectionKey(intent, authority)
-                ?: return@withCurrentSession LeasedStatusAdmission.Unavailable
-            LeasedStatusAdmission.Claimed(key, claimFlight(key))
+            selectInsideActorReadLease(current, intent)
         }
         return when (selected) {
             AgentTranscriptLifecycleCurrentSessionResult.Unavailable,
@@ -79,9 +80,39 @@ internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
             ) {
                 LeasedStatusAdmission.Unavailable ->
                     AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
-                is LeasedStatusAdmission.Claimed -> executeClaim(value, authority)
+                is LeasedStatusAdmission.Claimed -> executeClaim(value)
             }
         }
+    }
+
+    private suspend fun selectInsideActorReadLease(
+        current: AgentTranscriptLifecycleCurrentSession,
+        intent: AgentTranscriptLifecycleSessionSelectionIntent,
+    ): LeasedStatusAdmission {
+        val consumer = current.exactConsumer(intent)
+            ?: return LeasedStatusAdmission.Unavailable
+        val existing = try {
+            durableRepository.load(consumer)
+        } catch (_: AgentTranscriptLifecyclePersistenceConflictException) {
+            return LeasedStatusAdmission.Unavailable
+        } catch (_: RelayV2StorageException) {
+            return LeasedStatusAdmission.Unavailable
+        }
+        val namespace = when {
+            existing == null -> AgentTranscriptLifecycleDurableNamespace(consumer, null)
+            existing.matchesExactly(consumer) -> existing.namespace
+            else -> return LeasedStatusAdmission.Unavailable
+        }
+        val context = AgentTranscriptLifecycleOutboundStatusRequestContext(
+            authority = current.authority,
+            expectedNamespace = namespace,
+        )
+        val key = SelectionKey(context)
+        return LeasedStatusAdmission.Claimed(
+            key = key,
+            context = context,
+            flight = claimFlight(key),
+        )
     }
 
     private suspend fun claimFlight(
@@ -99,7 +130,6 @@ internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
 
     private suspend fun executeClaim(
         claim: LeasedStatusAdmission.Claimed,
-        authority: AgentTranscriptLifecycleRuntimeFence,
     ): AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult {
         val claimed = claim.flight
         if (!claimed.leader) return claimed.flight.result.await()
@@ -107,14 +137,14 @@ internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
         try {
             val result = when (
                 durableLoadOrInitialize.loadOrInitialize(
-                    authority = authority.authority,
-                    namespace = authority.expectedNamespace,
+                    authority = claim.context.authority,
+                    namespace = claim.context.expectedNamespace,
                 )
             ) {
                 AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable ->
                     AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
                 AgentTranscriptLifecycleDurableLoadOrInitializeResult.Ready -> when (
-                    val synced = requestSync.requestStatus(authority)
+                    val synced = requestSync.requestStatus(claim.context)
                 ) {
                     is AgentTranscriptLifecycleRequestSyncResult.Dispatched ->
                         AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Requested(
@@ -142,12 +172,24 @@ internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
     }
 }
 
-private fun AgentTranscriptLifecycleCurrentSession.exactSelectionKey(
+private fun AgentTranscriptLifecycleCurrentSession.exactConsumer(
     intent: AgentTranscriptLifecycleSessionSelectionIntent,
-    requested: AgentTranscriptLifecycleRuntimeFence,
-): SelectionKey? {
-    if (authority != requested.authority) return null
-    val consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
+): AgentTranscriptLifecycleDurableConsumerIdentity? {
+    val namespace = intent.namespace
+    val cut = materializedCut
+    if (authority.profileId != namespace.profileId ||
+        authority.principalId != namespace.principalId ||
+        authority.clientInstanceId != namespace.clientInstanceId ||
+        authority.hostId != namespace.hostId ||
+        authority.hostEpoch != namespace.hostEpoch ||
+        cut.namespace != namespace ||
+        cut.cursor.hostEpoch != namespace.hostEpoch ||
+        cut.scope.scopeId != intent.scopeId ||
+        cut.session.scopeId != intent.scopeId ||
+        cut.session.sessionId != intent.sessionId
+    ) return null
+
+    return AgentTranscriptLifecycleDurableConsumerIdentity(
         profileId = authority.profileId,
         profileActivationGeneration = authority.profileActivationGeneration,
         principalId = authority.principalId,
@@ -157,18 +199,16 @@ private fun AgentTranscriptLifecycleCurrentSession.exactSelectionKey(
         scopeId = intent.scopeId,
         sessionId = intent.sessionId,
     )
-    if (requested.expectedNamespace.consumer != consumer) return null
-    return SelectionKey(
-        intent = intent,
-        authority = authority,
-        namespace = requested.expectedNamespace,
-    )
 }
 
+private fun AgentTranscriptLifecycleDurableRecord.matchesExactly(
+    consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+): Boolean = namespace.consumer == consumer &&
+    state.identity == consumer.sessionIdentity &&
+    state.extensionLane.timelineEpoch == namespace.timelineEpoch
+
 private data class SelectionKey(
-    val intent: AgentTranscriptLifecycleSessionSelectionIntent,
-    val authority: RelayV2RepositoryEffectAuthority,
-    val namespace: AgentTranscriptLifecycleDurableNamespace,
+    val context: AgentTranscriptLifecycleOutboundStatusRequestContext,
 )
 
 private class StatusFlight {
@@ -186,6 +226,7 @@ private sealed interface LeasedStatusAdmission {
 
     data class Claimed(
         val key: SelectionKey,
+        val context: AgentTranscriptLifecycleOutboundStatusRequestContext,
         val flight: ClaimedFlight,
     ) : LeasedStatusAdmission
 }

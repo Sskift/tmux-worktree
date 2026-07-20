@@ -15,49 +15,81 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionKind
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
+import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AgentTranscriptLifecycleSelectedSessionStatusAdmissionControllerTest {
     @Test
-    fun `unnegotiated and stale selection never materialize initialize or request status`() =
+    fun `invalid admission closes but unexpected load failure propagates before side effects`() =
         runBlocking {
             val fixture = StatusAdmissionFixture()
-            listOf(
+            val foreignConsumer = fixture.consumer.copy(sessionId = "session-foreign")
+            val unexpectedLoadFailure = IllegalStateException("unexpected durable load failure")
+            val scenarios = listOf(
                 StatusAdmissionScenario(
-                    negotiated = false,
-                    readAuthority = FakeStatusAdmissionReadAuthority(
-                        RelayV2CurrentRepositoryReadCutResult.Available(
-                            statusAdmissionReadCut(fixture.authority),
-                        ),
-                    ),
+                    acquired = RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    expectedMaterializedReads = 0,
+                    expectedDurableReads = 0,
                 ),
                 StatusAdmissionScenario(
-                    negotiated = true,
-                    readAuthority = FakeStatusAdmissionReadAuthority(
-                        RelayV2CurrentRepositoryReadCutResult.Available(
-                            statusAdmissionReadCut(fixture.authority),
-                        ),
-                        staleLease = true,
-                    ),
+                    acquired = statusAdmissionAvailableCut(fixture.authority),
+                    staleLease = true,
+                    expectedMaterializedReads = 0,
+                    expectedDurableReads = 0,
                 ),
-            ).forEach { scenario ->
+                StatusAdmissionScenario(
+                    acquired = statusAdmissionAvailableCut(fixture.authority),
+                    materialized = fixture.materialized.copy(
+                        session = fixture.materialized.session.copy(
+                            sessionId = "session-foreign",
+                        ),
+                    ),
+                    expectedMaterializedReads = 1,
+                    expectedDurableReads = 0,
+                ),
+                StatusAdmissionScenario(
+                    acquired = statusAdmissionAvailableCut(fixture.authority),
+                    durableRecord = statusAdmissionDurableRecord(foreignConsumer, null),
+                    expectedMaterializedReads = 1,
+                    expectedDurableReads = 1,
+                ),
+                StatusAdmissionScenario(
+                    acquired = statusAdmissionAvailableCut(fixture.authority),
+                    durableFailure = unexpectedLoadFailure,
+                    expectedMaterializedReads = 1,
+                    expectedDurableReads = 1,
+                ),
+            )
+
+            scenarios.forEach { scenario ->
                 val materializedReads = AtomicInteger(0)
                 val initializeCalls = AtomicInteger(0)
                 val coordinatorCalls = AtomicInteger(0)
+                val readAuthority = FakeStatusAdmissionReadAuthority(
+                    acquired = scenario.acquired,
+                    staleLease = scenario.staleLease,
+                )
+                val durableRepository = RecordingStatusAdmissionDurableRepository(
+                    inActorLease = { readAuthority.leaseActive },
+                    record = scenario.durableRecord,
+                    loadFailure = scenario.durableFailure,
+                )
                 val controller = AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
                     sessionSelection = AgentTranscriptLifecycleSessionSelectionController(
-                        readAuthority = scenario.readAuthority,
+                        readAuthority = readAuthority,
                         stateRepositoryRead = { _, _, _ ->
                             materializedReads.incrementAndGet()
-                            fixture.materialized
+                            scenario.materialized ?: fixture.materialized
                         },
                     ),
+                    durableRepository = durableRepository.repository,
                     durableLoadOrInitialize = AgentTranscriptLifecycleDurableLoadOrInitializePort {
                             _, _ ->
                         initializeCalls.incrementAndGet()
@@ -70,77 +102,113 @@ class AgentTranscriptLifecycleSelectedSessionStatusAdmissionControllerTest {
                     enabled = true,
                 )
 
-                assertSame(
-                    AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable,
-                    controller.requestStatus(
-                        fixture.intent,
-                        fixture.runtimeFence(negotiated = scenario.negotiated),
-                    ),
-                )
-                assertEquals(0, materializedReads.get())
+                if (scenario.durableFailure == null) {
+                    assertSame(
+                        AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable,
+                        controller.requestStatus(fixture.intent),
+                    )
+                } else {
+                    assertSame(
+                        scenario.durableFailure,
+                        runCatching { controller.requestStatus(fixture.intent) }.exceptionOrNull(),
+                    )
+                }
+                assertEquals(scenario.expectedMaterializedReads, materializedReads.get())
+                assertEquals(scenario.expectedDurableReads, durableRepository.loadCalls)
                 assertEquals(0, initializeCalls.get())
                 assertEquals(0, coordinatorCalls.get())
             }
         }
 
     @Test
-    fun `concurrent exact selection single flights initialize before status request`() =
+    fun `actor cut selects progressed or canonical namespace before single flight status`() =
         runBlocking {
             val fixture = StatusAdmissionFixture()
-            val readAuthority = FakeStatusAdmissionReadAuthority(
-                RelayV2CurrentRepositoryReadCutResult.Available(
-                    statusAdmissionReadCut(fixture.authority),
-                ),
-                expectedLeaseBlocks = 2,
+            val progressedNamespace = AgentTranscriptLifecycleDurableNamespace(
+                fixture.consumer,
+                "timeline-progressed",
             )
-            val initializeStarted = CompletableDeferred<Unit>()
-            val releaseInitialize = CompletableDeferred<Unit>()
-            val order = mutableListOf<String>()
-            val initializedNamespaces = mutableListOf<AgentTranscriptLifecycleDurableNamespace>()
-            val coordinatorFences = mutableListOf<AgentTranscriptLifecycleRuntimeFence>()
-            val controller = AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
-                sessionSelection = AgentTranscriptLifecycleSessionSelectionController(
-                    readAuthority = readAuthority,
-                    stateRepositoryRead = { _, _, _ -> fixture.materialized },
-                ),
-                durableLoadOrInitialize = AgentTranscriptLifecycleDurableLoadOrInitializePort {
-                        _, namespace ->
-                    order += "initialize:start"
-                    initializedNamespaces += namespace
-                    initializeStarted.complete(Unit)
-                    releaseInitialize.await()
-                    order += "initialize:committed"
-                    AgentTranscriptLifecycleDurableLoadOrInitializeResult.Ready
-                },
-                requestSync = AgentTranscriptLifecycleStatusRequestPort { fence ->
-                    order += "coordinator"
-                    coordinatorFences += fence
-                    AgentTranscriptLifecycleRequestSyncResult.NoRequest
-                },
-                enabled = true,
-            )
-            val fence = fixture.runtimeFence(negotiated = true)
+            listOf(
+                statusAdmissionDurableRecord(
+                    fixture.consumer,
+                    progressedNamespace.timelineEpoch,
+                ) to progressedNamespace,
+                null to AgentTranscriptLifecycleDurableNamespace(fixture.consumer, null),
+            ).forEach { (existing, expectedNamespace) ->
+                val readAuthority = FakeStatusAdmissionReadAuthority(
+                    acquired = statusAdmissionAvailableCut(fixture.authority),
+                    expectedLeaseBlocks = 2,
+                )
+                val durableRepository = RecordingStatusAdmissionDurableRepository(
+                    inActorLease = { readAuthority.leaseActive },
+                    record = existing,
+                )
+                val initializeStarted = CompletableDeferred<Unit>()
+                val releaseInitialize = CompletableDeferred<Unit>()
+                val order = mutableListOf<String>()
+                val initializedNamespaces = mutableListOf<AgentTranscriptLifecycleDurableNamespace>()
+                val coordinatorContexts =
+                    mutableListOf<AgentTranscriptLifecycleOutboundStatusRequestContext>()
+                val controller = AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
+                    sessionSelection = AgentTranscriptLifecycleSessionSelectionController(
+                        readAuthority = readAuthority,
+                        stateRepositoryRead = { _, _, _ -> fixture.materialized },
+                    ),
+                    durableRepository = durableRepository.repository,
+                    durableLoadOrInitialize = AgentTranscriptLifecycleDurableLoadOrInitializePort {
+                            authority, namespace ->
+                        assertEquals(fixture.authority, authority)
+                        order += "initialize:start"
+                        initializedNamespaces += namespace
+                        initializeStarted.complete(Unit)
+                        releaseInitialize.await()
+                        order += "initialize:committed"
+                        AgentTranscriptLifecycleDurableLoadOrInitializeResult.Ready
+                    },
+                    requestSync = AgentTranscriptLifecycleStatusRequestPort { context ->
+                        order += "coordinator"
+                        coordinatorContexts += context
+                        AgentTranscriptLifecycleRequestSyncResult.NoRequest
+                    },
+                    enabled = true,
+                )
 
-            val first = async { controller.requestStatus(fixture.intent, fence) }
-            initializeStarted.await()
-            val second = async { controller.requestStatus(fixture.intent, fence) }
-            readAuthority.allExpectedLeaseBlocks.await()
-            releaseInitialize.complete(Unit)
-            first.await()
-            second.await()
+                val first = async { controller.requestStatus(fixture.intent) }
+                initializeStarted.await()
+                val second = async { controller.requestStatus(fixture.intent) }
+                readAuthority.allExpectedLeaseBlocks.await()
+                releaseInitialize.complete(Unit)
+                first.await()
+                second.await()
 
-            assertEquals(listOf(fence.expectedNamespace), initializedNamespaces)
-            assertEquals(listOf(fence), coordinatorFences)
-            assertEquals(
-                listOf("initialize:start", "initialize:committed", "coordinator"),
-                order,
-            )
+                assertEquals(2, durableRepository.loadCalls)
+                assertTrue(durableRepository.allLoadsInsideActorLease)
+                assertEquals(listOf(expectedNamespace), initializedNamespaces)
+                assertEquals(
+                    listOf(
+                        AgentTranscriptLifecycleOutboundStatusRequestContext(
+                            fixture.authority,
+                            expectedNamespace,
+                        ),
+                    ),
+                    coordinatorContexts,
+                )
+                assertEquals(
+                    listOf("initialize:start", "initialize:committed", "coordinator"),
+                    order,
+                )
+            }
         }
 }
 
 private data class StatusAdmissionScenario(
-    val negotiated: Boolean,
-    val readAuthority: FakeStatusAdmissionReadAuthority,
+    val acquired: RelayV2CurrentRepositoryReadCutResult,
+    val staleLease: Boolean = false,
+    val materialized: RelayV2MaterializedSessionReadCut? = null,
+    val durableRecord: AgentTranscriptLifecycleDurableRecord? = null,
+    val durableFailure: Throwable? = null,
+    val expectedMaterializedReads: Int,
+    val expectedDurableReads: Int,
 )
 
 private class StatusAdmissionFixture {
@@ -204,17 +272,6 @@ private class StatusAdmissionFixture {
             activityAtMs = 2,
         ),
     )
-
-    fun runtimeFence(negotiated: Boolean) = AgentTranscriptLifecycleRuntimeFence(
-        authority = authority,
-        expectedNamespace = AgentTranscriptLifecycleDurableNamespace(consumer, null),
-        negotiatedCapabilities = if (negotiated) {
-            setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
-        } else {
-            emptySet()
-        },
-        ingress = AgentTranscriptLifecycleTrustedIngress.Live,
-    )
 }
 
 private class FakeStatusAdmissionReadAuthority(
@@ -223,6 +280,8 @@ private class FakeStatusAdmissionReadAuthority(
     expectedLeaseBlocks: Int = 0,
 ) : RelayV2CurrentRepositoryReadAuthorityPort {
     private val leaseBlocks = AtomicInteger(0)
+    var leaseActive: Boolean = false
+        private set
     val allExpectedLeaseBlocks = CompletableDeferred<Unit>().also { completion ->
         if (expectedLeaseBlocks == 0) completion.complete(Unit)
     }
@@ -240,12 +299,48 @@ private class FakeStatusAdmissionReadAuthority(
         block: suspend () -> T,
     ): RelayV2CurrentRepositoryReadLeaseResult<T> {
         if (staleLease) return RelayV2CurrentRepositoryReadLeaseResult.Stale
-        if (leaseBlocks.incrementAndGet() == expectedLeaseBlocks) {
-            allExpectedLeaseBlocks.complete(Unit)
+        leaseActive = true
+        return try {
+            if (leaseBlocks.incrementAndGet() == expectedLeaseBlocks) {
+                allExpectedLeaseBlocks.complete(Unit)
+            }
+            RelayV2CurrentRepositoryReadLeaseResult.Current(block())
+        } finally {
+            leaseActive = false
         }
-        return RelayV2CurrentRepositoryReadLeaseResult.Current(block())
     }
 }
+
+private class RecordingStatusAdmissionDurableRepository(
+    private val inActorLease: () -> Boolean,
+    var record: AgentTranscriptLifecycleDurableRecord?,
+    var loadFailure: Throwable? = null,
+) {
+    var loadCalls = 0
+    var allLoadsInsideActorLease = true
+
+    val repository: AgentTranscriptLifecycleRuntimeDurableRepository = Proxy.newProxyInstance(
+        AgentTranscriptLifecycleRuntimeDurableRepository::class.java.classLoader,
+        arrayOf(AgentTranscriptLifecycleRuntimeDurableRepository::class.java),
+    ) { proxy, method, arguments ->
+        when (method.name) {
+            "load" -> {
+                loadCalls++
+                allLoadsInsideActorLease = allLoadsInsideActorLease && inActorLease()
+                loadFailure?.let { throw it }
+                record
+            }
+            "toString" -> "RecordingStatusAdmissionDurableRepository"
+            "hashCode" -> System.identityHashCode(proxy)
+            "equals" -> proxy === arguments?.firstOrNull()
+            else -> error("Unexpected durable repository call ${method.name}")
+        }
+    } as AgentTranscriptLifecycleRuntimeDurableRepository
+}
+
+private fun statusAdmissionAvailableCut(
+    authority: RelayV2RepositoryEffectAuthority,
+) = RelayV2CurrentRepositoryReadCutResult.Available(statusAdmissionReadCut(authority))
 
 private fun statusAdmissionReadCut(
     authority: RelayV2RepositoryEffectAuthority,
@@ -253,6 +348,26 @@ private fun statusAdmissionReadCut(
     override val authority = authority
     override val capability = RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE
 }
+
+private fun statusAdmissionDurableRecord(
+    consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    timelineEpoch: String?,
+) = AgentTranscriptLifecycleDurableRecord(
+    namespace = AgentTranscriptLifecycleDurableNamespace(consumer, timelineEpoch),
+    state = AgentTranscriptLifecycleClientState(
+        identity = consumer.sessionIdentity,
+        extensionLane = if (timelineEpoch == null) {
+            AgentTranscriptLifecycleExtensionState()
+        } else {
+            AgentTranscriptLifecycleExtensionState(
+                support = AgentExtensionSupport.UNKNOWN,
+                unavailableReason = null,
+                timelineEpoch = timelineEpoch,
+            )
+        },
+    ),
+    storageAccounting = AgentTranscriptDurableStorageAccounting.EMPTY,
+)
 
 private const val STATUS_ADMISSION_SCOPE_ID = "scope-status"
 private const val STATUS_ADMISSION_SESSION_ID = "session-status"
