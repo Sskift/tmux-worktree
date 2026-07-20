@@ -56,6 +56,7 @@ export default defineConfig({
     "src/relay/v2/brokerCore.ts",
     "src/relay/v2/brokerProducerRegistry.ts",
     "src/relay/v2/brokerClientSocketTransport.ts",
+    "src/relay/v2/brokerClientWssAdapter.ts",
     "src/relay/v2/brokerTransportCloseCoordinator.ts",
     "src/relay/v2/brokerAuthorizationExpiryDeadlineOwner.ts",
     "src/relay/v2/carrierPump.ts",
