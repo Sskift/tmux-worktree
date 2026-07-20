@@ -1,5 +1,7 @@
 # tmux-worktree 架构
 
+Relay v2 Broker client WSS runtime composition 前现有唯一独立、default-off 的 Upgrade dispatch owner。它只把 closed Upgrade metadata 交给现有 `dispatchRelayBrokerUpgrade`，对合法 role=client v2 结果由 owner 生成不可见 connectionId，并把可信 auth snapshot 与调用方已有的 exact Host producer target 交给现有 `prepareClientWss`；dispatch 或 Core preflight 的 400/401/403/404/426/503 reject 原样返回。成功公开结果只有固定 `tw-relay.v2` 与既有 opaque admission receipt，不暴露 token、auth context、producer target、connectionId 或 Broker Core。该 owner 不解析或持久 credential，不创建 listener/socket/HTTP 101/Host Pump/E0/store/capability/enrollment/retry/fallback，也未接 `relayServer` 或其他 production root；production client Upgrade wiring 继续 NO-GO，当前生产 Relay 路径仍是 v1。
+
 本文描述当前源码已经实现的边界。用户安装与开发命令见 `README.md`，Agent 的阅读顺序和变更门禁见 `AGENTS.md`。如果文档、contract、源码和测试冲突，先以当前可观察生产行为与版本化 contract 确认兼容承诺；源码和测试都是证据，不能仅凭某个内部结构测试反推架构。确认后在同一变更同步修正冲突项。
 
 ## 架构结论

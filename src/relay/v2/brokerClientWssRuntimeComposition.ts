@@ -271,7 +271,10 @@ function captureAuthorizationSnapshot(
   }
 }
 
-function captureHostProducerTarget(value: unknown): RelayV2BrokerProducerTarget | null {
+/** Canonical strict capture for the exact two-field Host producer target. */
+export function captureRelayV2BrokerProducerTarget(
+  value: unknown,
+): RelayV2BrokerProducerTarget | null {
   if (value === null || typeof value !== "object" || isRejectedProxy(value)) return null;
   try {
     const descriptors = Object.getOwnPropertyDescriptors(value);
@@ -324,7 +327,9 @@ function capturePrepareInput(
       values[key] = descriptor.value;
     }
     if (!isIdentifier(values.connectionId)) throw new Error("invalid connection ID");
-    const hostProducerTarget = captureHostProducerTarget(values.hostProducerTarget);
+    const hostProducerTarget = captureRelayV2BrokerProducerTarget(
+      values.hostProducerTarget,
+    );
     if (!hostProducerTarget) throw new Error("invalid Host producer target");
     return Object.freeze({
       connectionId: values.connectionId,
