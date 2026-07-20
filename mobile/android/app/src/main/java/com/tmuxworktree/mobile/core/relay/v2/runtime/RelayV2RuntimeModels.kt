@@ -12,6 +12,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.Collections
 
 internal data class RelayV2ResumeCursor(
     val hostEpoch: String,
@@ -346,6 +347,43 @@ internal data class RelayV2PendingCommand(
     }
 }
 
+/**
+ * Actor-frozen command-query batch shared by durable admission and its exact receipt.
+ *
+ * The constructor takes a bounded defensive copy so a repository consumer cannot observe a
+ * caller-owned list changing between durable registration and transport dispatch.
+ */
+internal class RelayV2CommandQueryBatch(commands: List<RelayV2PendingCommand>) {
+    val commands: List<RelayV2PendingCommand>
+
+    init {
+        val size = commands.size
+        require(size in 1..32) { "Command query batch is invalid" }
+        val snapshot = ArrayList<RelayV2PendingCommand>(size)
+        repeat(size) { index ->
+            val command = commands[index]
+            snapshot += RelayV2PendingCommand(command.commandId, command.dedupeWindowId)
+        }
+        require(commands.size == size) { "Command query batch changed while snapshotting" }
+        repeat(size) { index ->
+            require(commands[index] == snapshot[index]) {
+                "Command query batch changed while snapshotting"
+            }
+        }
+        require(snapshot.distinctBy { it.commandId }.size == snapshot.size) {
+            "Command query command IDs must be unique"
+        }
+        this.commands = Collections.unmodifiableList(snapshot)
+    }
+
+    override fun equals(other: Any?): Boolean =
+        other is RelayV2CommandQueryBatch && commands == other.commands
+
+    override fun hashCode(): Int = commands.hashCode()
+
+    override fun toString(): String = "RelayV2CommandQueryBatch(commands=${commands.size})"
+}
+
 /** Durable continuation proof for a pinned snapshot that survived a prior route. */
 internal data class RelayV2SnapshotContinuation(
     val snapshotRequestId: String,
@@ -577,6 +615,12 @@ internal sealed interface RelayV2RecoveryReceipt {
         }
     }
 
+    /** Opaque one-shot proof issued only by the paired post-commit query authority. */
+    sealed interface CommandQueryAttemptRegistered : RelayV2RecoveryReceipt {
+        /** Bounded byte accounting only; the frozen command batch remains opaque. */
+        val estimatedCommandBytes: Int
+    }
+
     data class CommandStatusesApplied(
         override val binding: RelayV2RecoveryBinding,
         override val hostId: String,
@@ -802,6 +846,23 @@ internal sealed interface RelayV2RuntimeEffect {
     ) : RepositoryScoped {
         val requestedResume: RelayV2ResumeCursor?
             get() = connectPlan.requestedResume
+    }
+
+    /** Durable admission request that must commit before the actor may send command.query. */
+    data class RegisterCommandQueryAttempt(
+        val recovery: RelayV2RecoveryBinding,
+        val hostId: String,
+        val hostEpoch: String,
+        val commandBatch: RelayV2CommandQueryBatch,
+        override val generation: RelayV2EffectGeneration = recovery.generation,
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority,
+    ) : RepositoryScoped {
+        init {
+            require(generation == recovery.generation)
+            require(repositoryAuthority.generation == generation)
+            require(repositoryAuthority.hostId == hostId)
+            require(repositoryAuthority.hostEpoch == hostEpoch)
+        }
     }
 
     data class BeginStateResync(

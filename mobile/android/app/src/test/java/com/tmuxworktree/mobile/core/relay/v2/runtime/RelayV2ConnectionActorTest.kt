@@ -31,6 +31,12 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialBlob
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasExpectation
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasResult
@@ -38,6 +44,9 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.state.FakeStateStore
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRecoveryAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeKind
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeReachability
@@ -1369,6 +1378,79 @@ class RelayV2ConnectionActorTest {
         }
 
     @Test
+    fun `pending command query fails closed when no admission authority is bound`() = runBlocking {
+        val harness = Harness(queryAdmissionComposition = null)
+        try {
+            val hello = harness.connectThroughRelayWelcome(RelayV2ResumeCursor(HOST_EPOCH, "91"))
+            val transport = harness.transport()
+            transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+            val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.QueryPendingCommands
+            assertTrue(
+                harness.actor.commitRecoveryReceipt(
+                    helloEffect,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = helloEffect.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = listOf(
+                            RelayV2PendingCommand("default-off-command", "default-off-window"),
+                        ),
+                    ),
+                ),
+            )
+
+            val failure = harness.actor.awaitFailure(RelayV2FailureKind.CONFIGURATION)
+            assertEquals("COMMAND_QUERY_ADMISSION_UNAVAILABLE", failure.failure?.code)
+            assertEquals(1, transport.sent.size)
+            val emitted = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+            assertTrue(emitted is RelayV2RuntimeEffect.ConnectionFailed)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `one admission composition binds exactly one actor receiver`() = runBlocking {
+        val composition = RelayV2OutboxQueryAdmissionAuthority.composition()
+        val owner = Harness(queryAdmissionComposition = composition)
+        val contender = Harness(queryAdmissionComposition = composition)
+        try {
+            val hello = contender.connectThroughRelayWelcome(
+                RelayV2ResumeCursor(HOST_EPOCH, "91"),
+            )
+            val transport = contender.transport()
+            transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+            val helloEffect = withTimeout(TIMEOUT_MS) { contender.actor.effects.first() }
+                as RelayV2RuntimeEffect.QueryPendingCommands
+            assertTrue(
+                contender.actor.commitRecoveryReceipt(
+                    helloEffect,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = helloEffect.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = listOf(
+                            RelayV2PendingCommand("claimed-command", "claimed-window"),
+                        ),
+                    ),
+                ),
+            )
+
+            val failure = contender.actor.awaitFailure(RelayV2FailureKind.CONFIGURATION)
+            assertEquals("COMMAND_QUERY_ADMISSION_UNAVAILABLE", failure.failure?.code)
+            assertEquals(1, transport.sent.size)
+            val emitted = withTimeout(TIMEOUT_MS) { contender.actor.effects.first() }
+            assertTrue(emitted is RelayV2RuntimeEffect.ConnectionFailed)
+        } finally {
+            contender.close()
+            owner.close()
+        }
+    }
+
+    @Test
     fun `matched recovery queries all pending commands in durable batches of at most 32`() =
         runBlocking {
             val harness = Harness()
@@ -1411,7 +1493,7 @@ class RelayV2ConnectionActorTest {
                         ),
                     ),
                 )
-                delay(25)
+                harness.acknowledgeActorActionsWithStateEvent("92", "2")
                 assertEquals(1, transport.sent.size)
                 assertEquals(RelayV2ConnectionPhase.QUERYING, harness.actor.state.value.phase)
 
@@ -1427,11 +1509,91 @@ class RelayV2ConnectionActorTest {
                         ),
                     ),
                 )
+                val firstRegistration = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first()
+                } as RelayV2RuntimeEffect.RegisterCommandQueryAttempt
+                assertEquals(pending.take(32), firstRegistration.commandBatch.commands)
+                assertEquals(1, transport.sent.size)
+
+                val staleGeneration = firstRegistration.recovery.generation.copy(
+                    connectionGeneration =
+                        firstRegistration.recovery.generation.connectionGeneration + 1,
+                )
+                val staleEffect = firstRegistration.copy(
+                    recovery = firstRegistration.recovery.copy(generation = staleGeneration),
+                    generation = staleGeneration,
+                    repositoryAuthority = firstRegistration.repositoryAuthority.copy(
+                        generation = staleGeneration,
+                    ),
+                )
+                assertFalse(
+                    harness.actor.submitRecoveryReceipt(
+                        harness.issueCommandQueryReceipt(
+                            staleEffect,
+                            forceApply = true,
+                        ),
+                    ),
+                )
+                val foreignComposition = RelayV2OutboxQueryAdmissionAuthority.composition()
+                val wrongReceipts = listOf(
+                    issueIndependentCommandQueryReceipt(
+                        firstRegistration,
+                        composition = foreignComposition,
+                        applyLease = harness.actor,
+                    ),
+                    harness.issueCommandQueryReceipt(
+                        firstRegistration.copy(
+                            recovery = firstRegistration.recovery.copy(
+                                step = firstRegistration.recovery.step + 1,
+                            ),
+                        ),
+                    ),
+                    harness.issueCommandQueryReceipt(
+                        firstRegistration.copy(
+                            recovery = firstRegistration.recovery.copy(
+                                requestId = "00000000-0000-0000-0000-000000000098",
+                            ),
+                        ),
+                    ),
+                    harness.issueCommandQueryReceipt(
+                        firstRegistration.copy(
+                            commandBatch = RelayV2CommandQueryBatch(
+                                listOf(
+                                    RelayV2PendingCommand("wrong-command", "wrong-window"),
+                                ),
+                            ),
+                        ),
+                    ),
+                    harness.issueCommandQueryReceipt(
+                        firstRegistration.copy(
+                            hostEpoch = "wrong-query-epoch",
+                            repositoryAuthority = firstRegistration.repositoryAuthority.copy(
+                                hostEpoch = "wrong-query-epoch",
+                            ),
+                        ),
+                        forceApply = true,
+                    ),
+                )
+                wrongReceipts.forEach { wrongReceipt ->
+                    assertTrue(harness.actor.submitRecoveryReceipt(wrongReceipt))
+                }
+                harness.acknowledgeActorActionsWithStateEvent("93", "3")
+                assertEquals(1, transport.sent.size)
+                val firstReceipt = harness.issueCommandQueryReceipt(firstRegistration)
+                assertTrue(harness.actor.submitRecoveryReceipt(firstReceipt))
                 val firstQuery = transport.awaitSentFrame(1)
                 assertEquals("command.query", firstQuery.stringValue("type"))
+                assertEquals(
+                    firstRegistration.recovery.requestId,
+                    firstQuery.stringValue("requestId"),
+                )
+                assertEquals(HOST_ID, firstQuery.stringValue("hostId"))
                 assertEquals(HOST_EPOCH, firstQuery.stringValue("expectedHostEpoch"))
                 val firstItems = firstQuery.payload().commandItems()
-                assertEquals(pending.take(32), firstItems)
+                assertEquals(firstRegistration.commandBatch.commands, firstItems)
+                assertTrue(harness.actor.submitRecoveryReceipt(firstReceipt))
+                harness.acknowledgeActorActionsWithStateEvent("94", "4")
+                assertEquals(2, transport.sent.size)
 
                 transport.sendCommandStatuses(
                     requestId = firstQuery.stringValue("requestId"),
@@ -1458,9 +1620,13 @@ class RelayV2ConnectionActorTest {
                     ),
                 )
 
+                val secondRegistration = harness.awaitCommandQueryRegistration()
+                assertEquals(pending.drop(32), secondRegistration.commandBatch.commands)
+                assertEquals(2, transport.sent.size)
+                assertTrue(harness.commitCommandQueryRegistration(secondRegistration))
                 val secondQuery = transport.awaitSentFrame(2)
                 val secondItems = secondQuery.payload().commandItems()
-                assertEquals(pending.drop(32), secondItems)
+                assertEquals(secondRegistration.commandBatch.commands, secondItems)
                 transport.sendCommandStatuses(
                     secondQuery.stringValue("requestId"),
                     secondItems,
@@ -1486,6 +1652,158 @@ class RelayV2ConnectionActorTest {
                 harness.close()
             }
         }
+
+    @Test
+    fun `command query admission effect saturation fails closed before transport send`() =
+        runBlocking {
+            val harness = Harness(eventCapacity = 1)
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                val pending = listOf(RelayV2PendingCommand("effect-full", "effect-window"))
+
+                // This recovery event occupies the sole effect slot before the FIFO hello receipt
+                // tries to publish command-query admission.
+                transport.sendFrame(sessionUpsertFrame("92", "2"))
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        helloEffect,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            helloEffect.recovery,
+                            HOST_ID,
+                            HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = pending,
+                        ),
+                    ),
+                )
+
+                val failure = harness.actor.awaitFailure(RelayV2FailureKind.QUEUE_SATURATED)
+                assertEquals("SLOW_CONSUMER", failure.failure?.code)
+                assertEquals(1, transport.sent.size)
+                assertEquals(listOf(1013), transport.closeCodes)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `command query admission receipt saturation fails closed before transport send`() =
+        runBlocking {
+            val watchdog = ManualWatchdog()
+            val timeoutClaimEntered = CountDownLatch(1)
+            val releaseTimeoutClaim = CountDownLatch(1)
+            val harness = Harness(
+                normalActionCapacity = 1,
+                recoveryWatchdogDelay = watchdog::await,
+                beforeRecoveryTimeoutClaim = {
+                    timeoutClaimEntered.countDown()
+                    check(releaseTimeoutClaim.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                },
+            )
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        helloEffect,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            helloEffect.recovery,
+                            HOST_ID,
+                            HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = listOf(
+                                RelayV2PendingCommand("receipt-full", "receipt-window"),
+                            ),
+                        ),
+                    ),
+                )
+                val registration = harness.awaitCommandQueryRegistration()
+                assertEquals(1, transport.sent.size)
+                val wrongReceipt = harness.issueCommandQueryReceipt(
+                    registration.copy(
+                        recovery = registration.recovery.copy(
+                            requestId = "00000000-0000-0000-0000-000000000097",
+                        ),
+                    ),
+                )
+                val exactReceipt = harness.issueCommandQueryReceipt(registration)
+
+                watchdog.fire(1)
+                assertTrue(timeoutClaimEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                assertTrue(harness.actor.submitRecoveryReceipt(wrongReceipt))
+                assertFalse(harness.actor.submitRecoveryReceipt(exactReceipt))
+                releaseTimeoutClaim.countDown()
+
+                val failure = harness.actor.awaitPhase(RelayV2ConnectionPhase.FAILED).failure
+                assertTrue(failure?.code in setOf("SLOW_CONSUMER", "RECOVERY_TIMEOUT"))
+                assertEquals(1, transport.sent.size)
+            } finally {
+                releaseTimeoutClaim.countDown()
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `disconnect and close reject committed query receipt before transport send`() = runBlocking {
+        listOf("disconnect", "close").forEach { terminal ->
+            val harness = Harness()
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        helloEffect,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            helloEffect.recovery,
+                            HOST_ID,
+                            HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = listOf(
+                                RelayV2PendingCommand("terminal-$terminal", "terminal-window"),
+                            ),
+                        ),
+                    ),
+                )
+                val registration = harness.awaitCommandQueryRegistration()
+                val committedReceipt = harness.issueCommandQueryReceipt(registration)
+                assertEquals(1, transport.sent.size)
+
+                if (terminal == "disconnect") {
+                    withTimeout(TIMEOUT_MS) {
+                        harness.actor.disconnectAndDrain(
+                            harness.profile.identity,
+                            "query-admission-disconnect",
+                        )
+                    }
+                } else {
+                    harness.actor.close()
+                    harness.actor.awaitPhase(RelayV2ConnectionPhase.CLOSED)
+                }
+                assertFalse(
+                    harness.actor.submitRecoveryReceipt(committedReceipt),
+                )
+                assertEquals(1, transport.sent.size)
+            } finally {
+                harness.close()
+            }
+        }
+    }
 
     @Test
     fun `online live gap uses repository proof to reenter resync and request a snapshot`() =
@@ -2013,6 +2331,7 @@ class RelayV2ConnectionActorTest {
                             assertTrue(
                                 race.harness.actor.submitRecoveryReceipt(race.oldCompletion),
                             )
+                            assertTrue(race.harness.commitCommandQueryRegistration())
                             val staleQuery = race.transport.awaitSentFrame(baselineCount)
                             assertEquals("command.query", staleQuery.stringValue("type"))
                             race.transport.sendCommandStatuses(
@@ -2117,6 +2436,7 @@ class RelayV2ConnectionActorTest {
             try {
                 val queryFrameIndex = race.transport.sent.size
                 assertTrue(race.harness.actor.submitRecoveryReceipt(race.oldCompletion))
+                assertTrue(race.harness.commitCommandQueryRegistration())
                 val query = race.transport.awaitSentFrame(queryFrameIndex)
                 race.transport.sendCommandStatuses(query.stringValue("requestId"), pending)
                 val commandApply = withTimeout(TIMEOUT_MS) {
@@ -2170,6 +2490,7 @@ class RelayV2ConnectionActorTest {
                             assertTrue(
                                 race.harness.actor.submitRecoveryReceipt(race.helloReceipt),
                             )
+                            assertTrue(race.harness.commitCommandQueryRegistration())
                             val query = race.transport.awaitSentFrame(1)
                             race.transport.sendCommandStatuses(
                                 query.stringValue("requestId"),
@@ -2256,6 +2577,7 @@ class RelayV2ConnectionActorTest {
                 assertTrue(harness.actor.submitRecoveryReceipt(completed.value))
 
                 repeat(128) { batchIndex ->
+                    assertTrue(harness.commitCommandQueryRegistration())
                     val query = transport.awaitSentFrame(batchIndex + 2)
                     val commands = query.payload().commandItems()
                     assertEquals(32, commands.size)
@@ -2341,6 +2663,7 @@ class RelayV2ConnectionActorTest {
                     ),
                 ),
             )
+            assertTrue(harness.commitCommandQueryRegistration())
             val query = transport.awaitSentFrame(1)
             assertEquals("command.query", query.stringValue("type"))
 
@@ -2401,6 +2724,7 @@ class RelayV2ConnectionActorTest {
                 assertTrue("unexpected release effect: $nextEffect", nextEffect is RelayV2RuntimeEffect.CompleteSnapshotRelease)
                 val complete = nextEffect as RelayV2RuntimeEffect.CompleteSnapshotRelease
                 assertTrue(harness.completeSnapshotRelease(complete))
+                assertTrue(harness.commitCommandQueryRegistration())
                 transport.awaitSentFrame(2)
                 assertEquals(RelayV2ConnectionPhase.QUERYING, harness.actor.state.value.phase)
 
@@ -2637,6 +2961,7 @@ class RelayV2ConnectionActorTest {
             assertEquals(RelayV2ReleaseAuthorityProof.RELEASED, releaseCommit.proof)
             assertTrue(harness.completeSnapshotRelease(releaseCommit))
 
+            assertTrue(harness.commitCommandQueryRegistration())
             val query = transport.awaitSentFrame(4)
             assertEquals("command.query", query.stringValue("type"))
             assertEquals(pending, query.payload().commandItems())
@@ -2856,6 +3181,7 @@ class RelayV2ConnectionActorTest {
                     as RelayV2RuntimeEffect.CompleteSnapshotRelease
                 assertTrue(harness.completeSnapshotRelease(releaseCommit))
 
+                assertTrue(harness.commitCommandQueryRegistration())
                 val query = transport.awaitSentFrame(3)
                 assertEquals("command.query", query.stringValue("type"))
                 assertEquals(pending, query.payload().commandItems())
@@ -5957,6 +6283,8 @@ class RelayV2ConnectionActorTest {
         afterDisconnectOwnerSeal: () -> Unit = {},
         durableConnectPlanSource: RelayV2ConnectPlanSource? = null,
         optionalCapabilities: Set<String> = emptySet(),
+        private val queryAdmissionComposition: RelayV2OutboxQueryAdmissionComposition? =
+            RelayV2OutboxQueryAdmissionAuthority.composition(),
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -5968,6 +6296,7 @@ class RelayV2ConnectionActorTest {
             credentialStore = credentials,
             connectPlanSource = durableConnectPlanSource ?: connectPlans,
             codec = codec,
+            commandQueryAdmissionComposition = queryAdmissionComposition,
             optionalCapabilities = optionalCapabilities,
             clock = { NOW_MS },
             watchdogDelay = watchdogDelay,
@@ -5996,6 +6325,25 @@ class RelayV2ConnectionActorTest {
             afterAgentExtensionRedriveEnqueuedBeforeSwap =
                 afterAgentExtensionRedriveEnqueuedBeforeSwap,
         )
+        private val queryAdmissionRepository = CommittingQueryAdmissionRepository()
+        private val queryAdmissionLease = object : RelayV2RepositoryEffectApplyLeasePort {
+            var forceApply = false
+
+            override suspend fun <T> withEffectApplyLease(
+                authority: RelayV2RepositoryEffectAuthority,
+                block: suspend () -> T,
+            ): RelayV2EffectApplyResult<T> = if (forceApply) {
+                RelayV2EffectApplyResult.Applied(block())
+            } else {
+                actor.withEffectApplyLease(authority, block)
+            }
+        }
+        private val queryAdmissionAdapter by lazy {
+            requireNotNull(queryAdmissionComposition).adapter(
+                queryAdmissionLease,
+                queryAdmissionRepository,
+            )
+        }
 
         fun installProfile(suffix: String, activationGeneration: Long): RelayV2Profile {
             val reference = RelayV2CredentialReference("credential-$suffix")
@@ -6132,6 +6480,31 @@ class RelayV2ConnectionActorTest {
             ),
         )
 
+        suspend fun issueCommandQueryReceipt(
+            effect: RelayV2RuntimeEffect.RegisterCommandQueryAttempt,
+            forceApply: Boolean = false,
+        ): RelayV2RecoveryReceipt.CommandQueryAttemptRegistered {
+            queryAdmissionRepository.prepare(effect)
+            queryAdmissionLease.forceApply = forceApply
+            val result = try {
+                queryAdmissionAdapter.handle(effect)
+            } finally {
+                queryAdmissionLease.forceApply = false
+            }
+            assertEquals(1, queryAdmissionRepository.commitCount)
+            return (result as RelayV2OutboxQueryAdmissionApplyResult.Committed).receipt
+        }
+
+        suspend fun acknowledgeActorActionsWithStateEvent(
+            eventSeq: String,
+            resultingRevision: String,
+        ) {
+            transport().sendFrame(sessionUpsertFrame(eventSeq, resultingRevision))
+            withTimeout(TIMEOUT_MS) {
+                actor.effects.first { it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame }
+            }
+        }
+
         fun credentialReadCount(): Int = credentials.readCount.get()
 
         fun publishConnectPlan(plan: RelayV2ConnectPlan) {
@@ -6154,6 +6527,100 @@ class RelayV2ConnectionActorTest {
             actor.close()
             parent.cancel()
         }
+    }
+
+    private class CommittingQueryAdmissionRepository : RelayV2OutboxRecoveryAuthority {
+        private val core = RelayV2OutboxAuthorityCore()
+        private var state = RelayV2OutboxState.empty()
+        private lateinit var expected: RelayV2RuntimeEffect.RegisterCommandQueryAttempt
+
+        var commitCount = 0
+            private set
+
+        fun prepare(effect: RelayV2RuntimeEffect.RegisterCommandQueryAttempt) {
+            expected = effect
+            state = RelayV2OutboxState.empty()
+            commitCount = 0
+            expected.commandBatch.commands.forEachIndexed { index, command ->
+                state = applied(
+                    core.reduce(
+                        state,
+                        RelayV2OutboxAction.Enqueue(
+                            draft = RelayV2OutboxDraft(
+                                profileId = expected.repositoryAuthority.profileId,
+                                principalId = expected.repositoryAuthority.principalId,
+                                hostId = expected.hostId,
+                                expectedHostEpoch = expected.hostEpoch,
+                                dedupeWindowId = command.dedupeWindowId,
+                                commandId = command.commandId,
+                                scopeId = "scope-query-admission",
+                                sessionId = "session-query-admission-$index",
+                                arguments = RelayV2OutboxArguments.sendAgentMessage(
+                                    pane = 0,
+                                    message = "continue",
+                                    submit = true,
+                                ),
+                            ),
+                            createdAtMillis = index.toLong() + 1,
+                        ),
+                    ),
+                ).state
+            }
+            state = applied(
+                core.reduce(
+                    state,
+                    RelayV2OutboxAction.DispatchEligible(
+                        attemptRequestIds = state.entries.associate { entry ->
+                            entry.id to "execute-query-admission-${entry.createdOrder}"
+                        },
+                        effectBudget = state.entries.size,
+                    ),
+                ),
+            ).state
+        }
+
+        override suspend fun reduceOutboxBatchUnderApplyLease(
+            namespace: RelayV2OutboxAuthorityNamespace,
+            actionSource: (RelayV2OutboxState) -> List<RelayV2OutboxAction>?,
+        ): RelayV2OutboxBatchResult {
+            check(namespace.profileId == expected.repositoryAuthority.profileId)
+            check(
+                namespace.profileActivationGeneration ==
+                    expected.repositoryAuthority.profileActivationGeneration,
+            )
+            check(namespace.principalId == expected.repositoryAuthority.principalId)
+            check(namespace.clientInstanceId == expected.repositoryAuthority.clientInstanceId)
+            val actions = actionSource(state)
+                ?: return RelayV2OutboxBatchResult.Rejected(state, null)
+            check(actions.size == 1)
+            val result = core.reduce(state, actions.single())
+            return when (result) {
+                is RelayV2OutboxResult.Rejected ->
+                    RelayV2OutboxBatchResult.Rejected(state, result.reason)
+                is RelayV2OutboxResult.Applied -> {
+                    state = result.state
+                    commitCount += 1
+                    RelayV2OutboxBatchResult.Applied(state, result.effects)
+                }
+            }
+        }
+
+        private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied {
+            check(result is RelayV2OutboxResult.Applied)
+            return result
+        }
+    }
+
+    private suspend fun issueIndependentCommandQueryReceipt(
+        effect: RelayV2RuntimeEffect.RegisterCommandQueryAttempt,
+        composition: RelayV2OutboxQueryAdmissionComposition,
+        applyLease: RelayV2RepositoryEffectApplyLeasePort,
+    ): RelayV2RecoveryReceipt.CommandQueryAttemptRegistered {
+        val repository = CommittingQueryAdmissionRepository()
+        repository.prepare(effect)
+        val result = composition.adapter(applyLease, repository).handle(effect)
+        assertEquals(1, repository.commitCount)
+        return (result as RelayV2OutboxQueryAdmissionApplyResult.Committed).receipt
     }
 
     private class MutableConnectPlanSource : RelayV2ConnectPlanSource {
@@ -6810,6 +7277,18 @@ class RelayV2ConnectionActorTest {
     ): Boolean = when (val applied = withEffectApplyLease(effect) { receipt }) {
         is RelayV2EffectApplyResult.Applied -> submitRecoveryReceipt(applied.value)
         RelayV2EffectApplyResult.Stale -> false
+    }
+
+    private suspend fun Harness.awaitCommandQueryRegistration() =
+        withTimeout(TIMEOUT_MS) {
+            actor.effects.first { it is RelayV2RuntimeEffect.RegisterCommandQueryAttempt }
+        } as RelayV2RuntimeEffect.RegisterCommandQueryAttempt
+
+    private suspend fun Harness.commitCommandQueryRegistration(
+        effect: RelayV2RuntimeEffect.RegisterCommandQueryAttempt? = null,
+    ): Boolean {
+        val registration = effect ?: awaitCommandQueryRegistration()
+        return actor.submitRecoveryReceipt(issueCommandQueryReceipt(registration))
     }
 
     private fun assertNegotiatedHello(context: RelayV2HandshakeContext) {
