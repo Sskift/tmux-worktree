@@ -4,7 +4,6 @@ import { types as nodeUtilTypes } from "node:util";
 import {
   dispatchRelayBrokerUpgrade,
   type RelayBrokerUpgradeDependencies,
-  type RelayBrokerUpgradeRequest,
   type RelayBrokerUpgradeResult,
 } from "./brokerCore.js";
 import {
@@ -16,18 +15,12 @@ import {
 import type {
   RelayV2BrokerProducerTarget,
 } from "./brokerProducerRegistry.js";
+import {
+  captureRelayV2BrokerUpgradeMetadata,
+  type RelayV2BrokerUpgradeMetadata,
+} from "./brokerUpgradeBoundary.js";
 
-const UPGRADE_METADATA_KEYS = Object.freeze([
-  "pathname",
-  "search",
-  "authorizationHeaders",
-  "legacyQuerySecret",
-  "offeredProtocols",
-] as const);
-
-export interface RelayV2BrokerClientUpgradeMetadata extends RelayBrokerUpgradeRequest {
-  legacyQuerySecret: string | null;
-}
+export interface RelayV2BrokerClientUpgradeMetadata extends RelayV2BrokerUpgradeMetadata {}
 
 export type RelayV2BrokerClientUpgradeVerifyPort = Pick<
   RelayBrokerUpgradeDependencies,
@@ -56,78 +49,6 @@ function isRejectedProxy(value: unknown): boolean {
     return nodeUtilTypes.isProxy(value);
   } catch {
     return true;
-  }
-}
-
-function captureStringArray(value: unknown): readonly string[] | null {
-  if (!Array.isArray(value) || isRejectedProxy(value)) return null;
-  try {
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const length = descriptors.length;
-    if (
-      !length
-      || !Object.hasOwn(length, "value")
-      || !Number.isSafeInteger(length.value)
-      || length.value < 0
-      || Reflect.ownKeys(descriptors).length !== length.value + 1
-    ) return null;
-    const captured: string[] = [];
-    for (let index = 0; index < length.value; index += 1) {
-      const descriptor = descriptors[String(index)];
-      if (
-        !descriptor
-        || !Object.hasOwn(descriptor, "value")
-        || typeof descriptor.value !== "string"
-      ) return null;
-      captured.push(descriptor.value);
-    }
-    return Object.freeze(captured);
-  } catch {
-    return null;
-  }
-}
-
-function captureUpgradeMetadata(
-  metadata: RelayV2BrokerClientUpgradeMetadata,
-): Readonly<RelayV2BrokerClientUpgradeMetadata> {
-  if (metadata === null || typeof metadata !== "object" || isRejectedProxy(metadata)) {
-    throw new Error("invalid Relay v2 Broker client Upgrade metadata");
-  }
-  try {
-    const descriptors = Object.getOwnPropertyDescriptors(metadata);
-    const keys = Reflect.ownKeys(descriptors);
-    if (
-      keys.length !== UPGRADE_METADATA_KEYS.length
-      || !keys.every((key) => typeof key === "string" && UPGRADE_METADATA_KEYS.includes(
-        key as (typeof UPGRADE_METADATA_KEYS)[number],
-      ))
-    ) throw new Error("invalid Upgrade metadata shape");
-    const values = Object.create(null) as Record<string, unknown>;
-    for (const key of UPGRADE_METADATA_KEYS) {
-      const descriptor = descriptors[key];
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) {
-        throw new Error("invalid Upgrade metadata descriptor");
-      }
-      values[key] = descriptor.value;
-    }
-    const authorizationHeaders = captureStringArray(values.authorizationHeaders);
-    const offeredProtocols = captureStringArray(values.offeredProtocols);
-    if (
-      typeof values.pathname !== "string"
-      || typeof values.search !== "string"
-      || (values.legacyQuerySecret !== null && typeof values.legacyQuerySecret !== "string")
-      || !authorizationHeaders
-      || !offeredProtocols
-    ) throw new Error("invalid Upgrade metadata value");
-    return Object.freeze({
-      pathname: values.pathname,
-      search: values.search,
-      authorizationHeaders,
-      legacyQuerySecret: values.legacyQuerySecret,
-      offeredProtocols,
-    }) as Readonly<RelayV2BrokerClientUpgradeMetadata>;
-  } catch {
-    throw new Error("invalid Relay v2 Broker client Upgrade metadata");
   }
 }
 
@@ -192,7 +113,7 @@ export class RelayV2BrokerClientUpgradeDispatchOwner {
     if (!capturedHostProducerTarget) {
       throw new Error("invalid Relay v2 Broker Host producer target");
     }
-    const request = captureUpgradeMetadata(metadata);
+    const request = captureRelayV2BrokerUpgradeMetadata(metadata, "client");
     const upgrade = await dispatchRelayBrokerUpgrade(request, {
       verifyLegacySecret: () => false,
       verifyV2AccessToken: (token, expectedRole) => {
