@@ -386,6 +386,17 @@ export interface RelayV2LiveAuthorizationCommitReceipt {
   authorizationFence: string;
 }
 
+export type RelayV2BrokerConnectionAccessExpiryResult = Readonly<
+  | {
+      outcome: "active";
+      /** Captured only from BrokerCore's installed authorization. */
+      expiresAtMs: number;
+    }
+  | { outcome: "expired" }
+  | { outcome: "stale" }
+  | { outcome: "fail_closed" }
+>;
+
 export type RelayV2LiveAuthorizationCloseReason =
   | RelayV2LiveAuthorizationInvalidation["reason"]
   | "credential_authority_unavailable"
@@ -1194,7 +1205,10 @@ export class RelayV2BrokerCore {
     connectionKind: "client" | "host",
     connectionId: string,
     connectionIncarnation: string,
-  ): void {
+  ): RelayV2BrokerConnectionAccessExpiryResult {
+    if (this.liveAuthCompositionLatched) {
+      return Object.freeze({ outcome: "fail_closed" });
+    }
     const connection = connectionKind === "client"
       ? this.clients.get(connectionId)
       : connectionKind === "host"
@@ -1204,35 +1218,50 @@ export class RelayV2BrokerCore {
       !connection
       || connection.connectionIncarnation !== connectionIncarnation
       || connection.authorizationState !== "active"
-    ) return;
+    ) return Object.freeze({ outcome: "stale" });
 
     let expired: boolean;
     try {
       expired = this.isAuthorizationExpired(connection.authContext);
     } catch {
       this.latchCredentialAuthorityUnavailable();
-      return;
+      return Object.freeze({ outcome: "fail_closed" });
     }
-    if (!expired) return;
-
+    if (this.liveAuthCompositionLatched) {
+      return Object.freeze({ outcome: "fail_closed" });
+    }
     if (connectionKind === "client") {
       const current = this.clients.get(connectionId);
       if (
         current !== connection
         || current.connectionIncarnation !== connectionIncarnation
         || current.authorizationState !== "active"
-      ) return;
+      ) return Object.freeze({ outcome: "stale" });
+      if (!expired) {
+        return Object.freeze({
+          outcome: "active",
+          expiresAtMs: current.authContext.expiresAtMs,
+        });
+      }
       this.fenceClientAuthorization(current, "access_expired", undefined, false);
-      return;
+    } else {
+      const current = this.carriers.get(connectionId);
+      if (
+        current !== connection
+        || current.connectionIncarnation !== connectionIncarnation
+        || current.authorizationState !== "active"
+      ) return Object.freeze({ outcome: "stale" });
+      if (!expired) {
+        return Object.freeze({
+          outcome: "active",
+          expiresAtMs: current.authContext.expiresAtMs,
+        });
+      }
+      this.fenceHostAuthorization(current, "access_expired");
     }
-
-    const current = this.carriers.get(connectionId);
-    if (
-      current !== connection
-      || current.connectionIncarnation !== connectionIncarnation
-      || current.authorizationState !== "active"
-    ) return;
-    this.fenceHostAuthorization(current, "access_expired");
+    return this.liveAuthCompositionLatched
+      ? Object.freeze({ outcome: "fail_closed" })
+      : Object.freeze({ outcome: "expired" });
   }
 
   /**

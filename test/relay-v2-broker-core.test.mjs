@@ -1174,29 +1174,29 @@ test("exact expiry cut fences only the current connection at the trusted-time bo
   );
 
   now = NOW_MS + 1;
-  core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "client",
     expiringClient.connectionId,
     expiringClient.connectionIncarnation,
-  );
+  ), { outcome: "active", expiresAtMs: NOW_MS + 2 });
   assert.equal(closeSignals.length, 0, "pre-expiry is a strict no-op");
 
   now = NOW_MS + 2;
-  core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "client",
     expiringClient.connectionId,
     "wrong-client-incarnation",
-  );
-  core.recheckConnectionAccessExpiry(
+  ), { outcome: "stale" });
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "client",
     expiringClient.connectionId,
     expiringClient.connectionIncarnation,
-  );
-  core.recheckConnectionAccessExpiry(
+  ), { outcome: "expired" });
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "client",
     expiringClient.connectionId,
     expiringClient.connectionIncarnation,
-  );
+  ), { outcome: "stale" });
   assert.deepEqual(closeSignals.map((signal) => [
     signal.connectionKind,
     signal.connectionId,
@@ -1214,21 +1214,21 @@ test("exact expiry cut fences only the current connection at the trusted-time bo
     publicBytes(clientTerminalAck("fenced-at-expiry")),
   ).accepted, false);
 
-  core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "host",
     "host-exact-expiry",
     "wrong-host-incarnation",
-  );
-  core.recheckConnectionAccessExpiry(
+  ), { outcome: "stale" });
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "host",
     "host-exact-expiry",
     target.connectionIncarnation,
-  );
-  core.recheckConnectionAccessExpiry(
+  ), { outcome: "stale" });
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "host",
     "host-exact-expiry",
     target.connectionIncarnation,
-  );
+  ), { outcome: "stale" });
   assert.deepEqual(closeSignals.map((signal) => [
     signal.connectionKind,
     signal.connectionKind === "host" ? signal.transportId : signal.connectionId,
@@ -1253,20 +1253,20 @@ test("exact expiry cut fences only the current connection at the trusted-time bo
     { expiresAtMs: NOW_MS + 7_200_000 },
     "host-replacement-incarnation",
   );
-  core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "host",
     "host-exact-expiry",
     target.connectionIncarnation,
-  );
+  ), { outcome: "stale" });
   assert.equal(closeSignals.length, signalCountBeforeReplacement);
   assert.equal(core.inspectHost(HOST_ID).connectorId, replacement.connectorId);
 
   core.disconnectHost("host-exact-expiry");
-  core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "host",
     "host-exact-expiry",
     replacement.connectionIncarnation,
-  );
+  ), { outcome: "stale" });
   assert.equal(closeSignals.length, signalCountBeforeReplacement);
   assert.equal(core.inspectHost(HOST_ID).state, "offline");
 });
@@ -1289,11 +1289,11 @@ test("exact expiry cut sends a throwing trusted clock through the existing fail-
   );
 
   throwClock = true;
-  assert.doesNotThrow(() => core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "client",
     client.connectionId,
     client.connectionIncarnation,
-  ));
+  ), { outcome: "fail_closed" });
   assert.equal(core.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
   assert.deepEqual(
     closeSignals.map((signal) => [signal.connectionKind, signal.reason]).sort(),
@@ -1302,11 +1302,11 @@ test("exact expiry cut sends a throwing trusted clock through the existing fail-
       ["host", "credential_authority_unavailable"],
     ],
   );
-  core.recheckConnectionAccessExpiry(
+  assert.deepEqual(core.recheckConnectionAccessExpiry(
     "host",
     "host-expiry-clock-throw",
     host.connectionIncarnation,
-  );
+  ), { outcome: "fail_closed" });
   assert.equal(closeSignals.length, 2, "the fail-closed latch and close signals are once-only");
   assert.equal(core.drainHostCarrier("host-expiry-clock-throw").length, 0);
   assert.equal(core.drainClient(client.connectionId).length, 0);
