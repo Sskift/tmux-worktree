@@ -7,6 +7,7 @@ import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
+const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
@@ -115,14 +116,30 @@ function releaseSnapshotRequest(chunk, principalId = "composition-principal") {
   };
 }
 
+function commandExecutor(overrides = {}) {
+  return {
+    async resolve(request) {
+      if (overrides.resolve) return overrides.resolve(request);
+      throw new Error("unexpected composition command resolution");
+    },
+    fenceResolution(transaction, request, fence) {
+      return overrides.fenceResolution?.(transaction, request, fence);
+    },
+    async executeTwRpc(plan) {
+      if (overrides.executeTwRpc) return overrides.executeTwRpc(plan);
+      throw new Error("unexpected composition TW RPC execution");
+    },
+    async executeTerminalControl(plan) {
+      if (overrides.executeTerminalControl) return overrides.executeTerminalControl(plan);
+      throw new Error("unexpected composition terminal-control execution");
+    },
+  };
+}
+
 function baseAuthorities(snapshotAuthority, hostEpoch, hostInstanceId, overrides = {}) {
   return {
     h0: overrides.h0,
-    h1: overrides.h1 ?? {
-      async execute() { throw new Error("unexpected H1 execute"); },
-      async query() { throw new Error("unexpected H1 query"); },
-      async issueDedupeWindow() { throw new Error("unexpected H1 window"); },
-    },
+    h1RecoveryCandidate: overrides.h1RecoveryCandidate,
     h2SnapshotAuthority: snapshotAuthority,
     h3RecoveryCandidate: overrides.h3RecoveryCandidate,
     nextDedupeWindowBounds: overrides.nextDedupeWindowBounds ?? function () {
@@ -150,13 +167,17 @@ function createComposition(snapshotAuthority, hostEpoch, hostInstanceId, overrid
 }
 
 function applyFiveReadySources(composition, generation = "1") {
-  for (const source of ["codec", "carrier", "h1"]) {
+  for (const source of ["codec", "carrier"]) {
     assert.equal(composition.readiness[source].apply({
       source,
       generation,
       ready: true,
     }), true);
   }
+  assert.equal(composition.readiness.h1.apply, undefined);
+  assert.equal(composition.readiness.h1.execute, undefined);
+  assert.equal(composition.readiness.h1.query, undefined);
+  assert.equal(composition.readiness.h1.issueDedupeWindow, undefined);
   assert.equal(composition.readiness.h3.apply, undefined);
   assert.equal(composition.readiness.h3.activate(), true);
 }
@@ -217,11 +238,24 @@ async function realCompositionHarness({
   });
   Object.assign(h3Manager, h3ManagerOverrides);
   const h3RecoveryCandidate = await terminalLineage.recoverForHostH3(h3Manager);
+  const h1RecoveryCandidate = await commandPlane.RelayV2HostCommandPlane
+    .openRecoveredAuthority({
+      store,
+      hostId: HOST_ID,
+      executor: commandExecutor(compositionOverrides?.h1Executor),
+      now: () => 1_783_700_000_000,
+    });
+  assert.notEqual(h1RecoveryCandidate, null);
   const composition = createComposition(
     spool.hostH2Authority,
     seeded.snapshot.hostEpoch,
     store.hostInstanceId,
-    { ...compositionOverrides, h0: store.h0ReadinessPort, h3RecoveryCandidate },
+    {
+      ...compositionOverrides,
+      h0: store.h0ReadinessPort,
+      h1RecoveryCandidate,
+      h3RecoveryCandidate,
+    },
   );
   if (activateH0) assert.equal(await composition.readiness.h0.activate(), true);
   wrapped?.attach?.(composition);
@@ -232,6 +266,9 @@ async function realCompositionHarness({
     discovery,
     foundation,
     seeded,
+    terminalLineage,
+    h3Manager,
+    h1RecoveryCandidate,
     spool,
     composition,
     wrapped,
@@ -384,6 +421,30 @@ test("default-off host composition requires exact H0 and H2 activation", async (
   const h = await realCompositionHarness({ activateH0: false });
   try {
     assert.equal(h.composition.readiness.h0.apply, undefined);
+    assert.equal(h.composition.readiness.h1.apply, undefined);
+    assert.equal(h.composition.readiness.h1.execute, undefined);
+    assert.equal(h.composition.readiness.h1.query, undefined);
+    assert.equal(h.composition.readiness.h1.issueDedupeWindow, undefined);
+    assert.throws(
+      () => compositionModule.createRelayV2HostRuntimeComposition({
+        hostId: HOST_ID,
+        hostEpoch: h.seeded.snapshot.hostEpoch,
+        hostInstanceId: h.store.hostInstanceId,
+        authorities: {
+          h0: h.store.h0ReadinessPort,
+          h1: {},
+          h2SnapshotAuthority: h.spool.hostH2Authority,
+          h3RecoveryCandidate: {},
+          nextDedupeWindowBounds() { throw new Error("unreachable"); },
+        },
+        welcome: { build() { throw new Error("unreachable"); } },
+        outbound: {
+          trySend() { return false; },
+          close() {},
+        },
+      }),
+      /invalid Relay v2 host composition authority input/,
+    );
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     applyFiveReadySources(h.composition);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -405,6 +466,66 @@ test("default-off host composition requires exact H0 and H2 activation", async (
       ),
       /invalid Relay v2 H0 readiness port/,
     );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("composition burns mismatched recovered H1 and retires already-created owners", async () => {
+  let shutdownCalls = 0;
+  const h = await realCompositionHarness({ activateH0: false });
+  try {
+    const replacementLineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store: h.store,
+    });
+    const replacementManager = new terminalManagerModule.RelayV2TerminalManager({
+      hostId: HOST_ID,
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      resolver: { async resolve() { throw new Error("unexpected terminal resolve"); } },
+      lineage: replacementLineage,
+      backend: { async open() { throw new Error("unexpected terminal backend open"); } },
+      terminalControl: {},
+      async send() { throw new Error("unexpected terminal frame"); },
+    });
+    replacementManager.shutdown = async () => { shutdownCalls += 1; };
+    const h3RecoveryCandidate = await replacementLineage
+      .recoverForHostH3(replacementManager);
+    const mismatchedCandidate = await commandPlane.RelayV2HostCommandPlane
+      .openRecoveredAuthority({
+        store: h.store,
+        hostId: `${HOST_ID}-wrong`,
+        executor: commandExecutor(),
+        now: () => 1_783_700_000_000,
+      });
+    assert.notEqual(mismatchedCandidate, null);
+    assert.throws(
+      () => createComposition(
+        h.spool.hostH2Authority,
+        h.seeded.snapshot.hostEpoch,
+        h.store.hostInstanceId,
+        {
+          h0: h.store.h0ReadinessPort,
+          h1RecoveryCandidate: mismatchedCandidate,
+          h3RecoveryCandidate,
+        },
+      ),
+      /invalid Relay v2 H1 recovery candidate/,
+    );
+    await settle();
+    assert.equal(shutdownCalls, 1);
+    const readinessState = { applied: 0, closed: 0 };
+    assert.equal(compositionModule.createRelayV2HostH1ReadinessActivation({
+      hostId: `${HOST_ID}-wrong`,
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      candidate: mismatchedCandidate,
+      readinessSink: {
+        apply() { readinessState.applied += 1; return true; },
+        close() { readinessState.closed += 1; },
+      },
+    }), null);
+    assert.deepEqual(readinessState, { applied: 0, closed: 0 });
   } finally {
     await h.cleanup();
   }
@@ -536,6 +657,7 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
   let expectedReceiver = null;
   let observedReceiver = null;
   let policyCalls = 0;
+  const outboundFrames = [];
   const acceptUntilMs = 1_783_786_400_000;
   const queryUntilMs = 1_784_391_200_000;
   const h = await realCompositionHarness({
@@ -548,21 +670,13 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
         policyCalls += 1;
         return { acceptUntilMs, queryUntilMs };
       },
-      h1: {
-        async execute() { throw new Error("unexpected H1 execute"); },
-        async query() { throw new Error("unexpected H1 query"); },
-        async issueDedupeWindow(bounds) {
-          assert.deepEqual(bounds, { acceptUntilMs, queryUntilMs });
-          return {
-            windowId: "composition-dedupe-window",
-            windowSeq: "1",
-            acceptUntilMs,
-            queryUntilMs,
-          };
-        },
-      },
       welcome: {
         build(input) {
+          assert.equal(typeof input.commandDedupeWindow.windowId, "string");
+          assert.deepEqual({
+            acceptUntilMs: input.commandDedupeWindow.acceptUntilMs,
+            queryUntilMs: input.commandDedupeWindow.queryUntilMs,
+          }, { acceptUntilMs, queryUntilMs });
           const welcome = fixture("host-welcome-snapshot-required");
           welcome.requestId = input.hello.requestId;
           welcome.hostId = HOST_ID;
@@ -575,7 +689,8 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
         },
       },
       outbound: {
-        trySend(_route, _payload, receipt) {
+        trySend(_route, payload, receipt) {
+          outboundFrames.push(codec.decodeRelayV2WebSocketFrame("public", payload).frame);
           receipt.settle(true);
           return true;
         },
@@ -599,6 +714,94 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
     await settle();
     assert.equal(policyCalls, 1);
     assert.equal(observedReceiver, expectedReceiver);
+    const query = fixture("command-query");
+    query.expectedHostEpoch = h.seeded.snapshot.hostEpoch;
+    h.composition.routeSink.onClientFrame(
+      route,
+      codec.encodeRelayV2WebSocketFrame("public", query),
+    );
+    await settle();
+    assert.equal(outboundFrames.at(-1).type, "command.statuses");
+    assert.equal(outboundFrames.at(-1).requestId, query.requestId);
+    assert.equal(outboundFrames.at(-1).hostEpoch, h.seeded.snapshot.hostEpoch);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("fatal recovered H1 withdrawal fences an active route with 4406", async () => {
+  const outboundFrames = [];
+  const routeCloses = [];
+  const h = await realCompositionHarness({
+    compositionOverrides: {
+      h1Executor: {
+        resolve() {
+          throw new commandPlane.RelayV2HostCommandPlaneStateError(
+            "fatal composed H1 state",
+          );
+        },
+      },
+      nextDedupeWindowBounds() {
+        return {
+          acceptUntilMs: 1_783_786_400_000,
+          queryUntilMs: 1_784_391_200_000,
+        };
+      },
+      welcome: {
+        build(input) {
+          const welcome = fixture("host-welcome-snapshot-required");
+          welcome.requestId = input.hello.requestId;
+          welcome.hostId = HOST_ID;
+          welcome.hostEpoch = input.cut.hostEpoch;
+          welcome.hostInstanceId = input.cut.hostInstanceId;
+          welcome.payload.eventSeq = input.cut.eventSeq;
+          welcome.payload.capabilities = [...input.capabilities];
+          welcome.payload.commandDedupeWindow = structuredClone(input.commandDedupeWindow);
+          return welcome;
+        },
+      },
+      outbound: {
+        trySend(_route, payload, receipt) {
+          outboundFrames.push(codec.decodeRelayV2WebSocketFrame("public", payload).frame);
+          receipt.settle(true);
+          return true;
+        },
+        close(_route, close) {
+          routeCloses.push(structuredClone(close));
+        },
+      },
+    },
+  });
+  try {
+    applyFiveReadySources(h.composition);
+    const active = await issueReadiness(h, "composition-fatal-h1");
+    assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
+    const route = binding();
+    assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
+    const hello = fixture("client-hello-fresh");
+    hello.hostId = HOST_ID;
+    hello.payload.clientInstanceId = route.authContext.clientInstanceId;
+    h.composition.routeSink.onClientFrame(
+      route,
+      codec.encodeRelayV2WebSocketFrame("public", hello),
+    );
+    await settle();
+    const welcome = outboundFrames.at(-1);
+    assert.equal(welcome.type, "host.welcome");
+
+    const execute = fixture("command-execute-send-agent-message");
+    execute.expectedHostEpoch = h.seeded.snapshot.hostEpoch;
+    execute.payload.dedupeWindowId = welcome.payload.commandDedupeWindow.windowId;
+    h.composition.routeSink.onClientFrame(
+      route,
+      codec.encodeRelayV2WebSocketFrame("public", execute),
+    );
+    await settle();
+    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
+    assert.deepEqual(routeCloses[0], {
+      code: 4406,
+      reason: "capability_withdrawn",
+    });
   } finally {
     await h.cleanup();
   }
@@ -1050,10 +1253,14 @@ test("replacement generation ignores old late close and dispose releases each le
   }
 });
 
-test("composition dispose publishes one reentrant barrier and waits for H3 shutdown", async () => {
+test("composition dispose publishes one reentrant barrier and waits for H1 and H3", async () => {
   let releaseShutdown;
+  let rejectH1;
+  let signalH1Entered;
   const shutdownBarrier = new Promise((resolve) => { releaseShutdown = resolve; });
+  const h1Entered = new Promise((resolve) => { signalH1Entered = resolve; });
   let shutdownCalls = 0;
+  let issuedWindow = null;
   const h = await realCompositionHarness({
     wrapSpool: controlledSpoolAdapter,
     h3ManagerOverrides: {
@@ -1062,11 +1269,67 @@ test("composition dispose publishes one reentrant barrier and waits for H3 shutd
         return shutdownBarrier;
       },
     },
+    compositionOverrides: {
+      h1Executor: {
+        resolve() {
+          return new Promise((_resolve, reject) => {
+            rejectH1 = reject;
+            signalH1Entered();
+          });
+        },
+      },
+      nextDedupeWindowBounds() {
+        return {
+          acceptUntilMs: 1_783_786_400_000,
+          queryUntilMs: 1_784_391_200_000,
+        };
+      },
+      welcome: {
+        build(input) {
+          issuedWindow = structuredClone(input.commandDedupeWindow);
+          const welcome = fixture("host-welcome-snapshot-required");
+          welcome.requestId = input.hello.requestId;
+          welcome.hostId = HOST_ID;
+          welcome.hostEpoch = input.cut.hostEpoch;
+          welcome.hostInstanceId = input.cut.hostInstanceId;
+          welcome.payload.eventSeq = input.cut.eventSeq;
+          welcome.payload.capabilities = [...input.capabilities];
+          welcome.payload.commandDedupeWindow = structuredClone(input.commandDedupeWindow);
+          return welcome;
+        },
+      },
+      outbound: {
+        trySend(_route, _payload, receipt) {
+          receipt.settle(true);
+          return true;
+        },
+        close() {},
+      },
+    },
   });
   try {
     applyFiveReadySources(h.composition);
     const active = await issueReadiness(h, "composition-dispose-reentrant");
     assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
+    const route = binding();
+    assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
+    const hello = fixture("client-hello-fresh");
+    hello.hostId = HOST_ID;
+    hello.payload.clientInstanceId = route.authContext.clientInstanceId;
+    h.composition.routeSink.onClientFrame(
+      route,
+      codec.encodeRelayV2WebSocketFrame("public", hello),
+    );
+    await settle();
+    assert.notEqual(issuedWindow, null);
+    const execute = fixture("command-execute-send-agent-message");
+    execute.expectedHostEpoch = h.seeded.snapshot.hostEpoch;
+    execute.payload.dedupeWindowId = issuedWindow.windowId;
+    h.composition.routeSink.onClientFrame(
+      route,
+      codec.encodeRelayV2WebSocketFrame("public", execute),
+    );
+    await h1Entered;
     let reentrantDispose = null;
     h.wrapped.controls.onRelease = () => {
       reentrantDispose = h.composition.dispose();
@@ -1083,10 +1346,14 @@ test("composition dispose publishes one reentrant barrier and waits for H3 shutd
     assert.equal(settled, false);
 
     releaseShutdown();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "H1 admitted command must drain before disposal settles");
+    rejectH1(new TypeError("release admitted H1 command"));
     await firstDispose;
     assert.equal(settled, true);
   } finally {
     releaseShutdown?.();
+    rejectH1?.(new TypeError("cleanup admitted H1 command"));
     await h.cleanup();
   }
 });

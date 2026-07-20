@@ -380,6 +380,9 @@ export interface RelayV2HostCommandPlaneReadinessCandidate {
 }
 
 export interface RelayV2HostH1ReadinessActivationOptions {
+  hostId: string;
+  hostEpoch: string;
+  hostInstanceId: string;
   candidate: RelayV2HostCommandPlaneReadinessCandidate;
   readinessSink: RelayV2HostCapabilityReadinessSourceSink<"h1">;
 }
@@ -2080,8 +2083,9 @@ export class RelayV2HostCommandPlane {
     if (options.recover === false) return null;
     await plane.recoverInterrupted();
     return plane.store.serialize((section) => {
-      auditRecoveredH1Cut(section.read(), plane.hostId);
-      return issueRecoveredH1ReadinessCandidate(plane);
+      const snapshot = section.read();
+      auditRecoveredH1Cut(snapshot, plane.hostId);
+      return issueRecoveredH1ReadinessCandidate(plane, snapshot);
     });
   }
 
@@ -3180,6 +3184,9 @@ export class RelayV2HostCommandPlane {
 interface RecoveredH1CandidateBinding {
   readonly plane: RelayV2HostCommandPlane;
   readonly sourceGeneration: string;
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
 }
 
 const recoveredH1OriginalMethods = Object.freeze({
@@ -3192,6 +3199,7 @@ let recoveredH1SourceGeneration = 0n;
 
 function issueRecoveredH1ReadinessCandidate(
   plane: RelayV2HostCommandPlane,
+  snapshot: RelayV2HostStateSnapshot,
 ): RelayV2HostCommandPlaneReadinessCandidate {
   if (recoveredH1SourceGeneration >= MAX_H1_READINESS_GENERATION) {
     throw new RelayV2HostCommandPlaneStateError(
@@ -3202,6 +3210,9 @@ function issueRecoveredH1ReadinessCandidate(
   const binding: RecoveredH1CandidateBinding = Object.freeze({
     plane,
     sourceGeneration: recoveredH1SourceGeneration.toString(10),
+    hostId: plane.hostId,
+    hostEpoch: snapshot.hostEpoch,
+    hostInstanceId: snapshot.hostInstanceId,
   });
   const candidate = Object.create(null) as object;
   recoveredH1Candidates.set(candidate, binding);
@@ -3359,10 +3370,19 @@ export function createRelayV2HostH1ReadinessActivation(
   h1ActivationAttempt = attempt;
 
   try {
-    const optionFields = h1ExactOwnDataDescriptors(options, ["candidate", "readinessSink"]);
+    const optionFields = h1ExactOwnDataDescriptors(options, [
+      "hostId",
+      "hostEpoch",
+      "hostInstanceId",
+      "candidate",
+      "readinessSink",
+    ]);
     if (optionFields === null) return null;
     const binding = consumeRecoveredH1Candidate(optionFields.get("candidate")!.value);
     if (binding === null) return null;
+    if (optionFields.get("hostId")!.value !== binding.hostId
+      || optionFields.get("hostEpoch")!.value !== binding.hostEpoch
+      || optionFields.get("hostInstanceId")!.value !== binding.hostInstanceId) return null;
 
     const sink = optionFields.get("readinessSink")!.value;
     const sinkFields = h1ExactOwnDataDescriptors(sink, ["apply", "close"]);

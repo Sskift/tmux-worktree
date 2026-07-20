@@ -7,6 +7,7 @@ import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
+const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
@@ -100,6 +101,7 @@ async function createHarness({
   throwStatusObserver = false,
   reenterDisposeOnOffline = false,
   terminalManagerOverrides,
+  h1ExecutorOverrides = {},
 } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-carrier-runtime-"));
   const store = await hostState.RelayV2HostStateStore.open({
@@ -127,7 +129,6 @@ async function createHarness({
     hostInstanceId: store.hostInstanceId,
   };
   let expectedWelcome = null;
-  let expectedQuery = null;
   let composition = null;
   let reentrantDispose = null;
   const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({ store });
@@ -145,6 +146,32 @@ async function createHarness({
   });
   Object.assign(terminalManager, terminalManagerOverrides);
   const h3RecoveryCandidate = await lineage.recoverForHostH3(terminalManager);
+  const h1RecoveryCandidate = await commandPlane.RelayV2HostCommandPlane
+    .openRecoveredAuthority({
+      store,
+      hostId: HOST_ID,
+      now: () => 1_783_700_000_000,
+      executor: {
+        async resolve(request) {
+          if (h1ExecutorOverrides.resolve) return h1ExecutorOverrides.resolve(request);
+          throw new Error("unexpected carrier command resolution");
+        },
+        fenceResolution(transaction, request, fence) {
+          return h1ExecutorOverrides.fenceResolution?.(transaction, request, fence);
+        },
+        async executeTwRpc(plan) {
+          if (h1ExecutorOverrides.executeTwRpc) return h1ExecutorOverrides.executeTwRpc(plan);
+          throw new Error("unexpected carrier TW RPC execution");
+        },
+        async executeTerminalControl(plan) {
+          if (h1ExecutorOverrides.executeTerminalControl) {
+            return h1ExecutorOverrides.executeTerminalControl(plan);
+          }
+          throw new Error("unexpected carrier terminal-control execution");
+        },
+      },
+    });
+  assert.notEqual(h1RecoveryCandidate, null);
   const statusObservations = [];
   const identityReads = { hostId: 0, hostEpoch: 0, hostInstanceId: 0 };
   composition = compositionModule.createRelayV2HostCarrierRuntimeComposition({
@@ -165,25 +192,7 @@ async function createHarness({
       },
       authorities: {
         h0: store.h0ReadinessPort,
-        h1: {
-          async execute() { throw new Error("unexpected command execute"); },
-          async query(_auth, request) {
-            const response = fixture("command-statuses-all-states");
-            response.requestId = request.requestId;
-            response.hostId = HOST_ID;
-            response.hostEpoch = identity.hostEpoch;
-            expectedQuery = structuredClone(response);
-            return response;
-          },
-          async issueDedupeWindow(bounds) {
-            return {
-              windowId: "carrier-runtime-window",
-              windowSeq: "1",
-              acceptUntilMs: bounds.acceptUntilMs,
-              queryUntilMs: bounds.queryUntilMs,
-            };
-          },
-        },
+        h1RecoveryCandidate,
         h2SnapshotAuthority: spool.hostH2Authority,
         h3RecoveryCandidate,
         nextDedupeWindowBounds() {
@@ -243,13 +252,15 @@ async function createHarness({
   });
 
   assert.equal(await composition.readiness.h0.activate(), true);
-  for (const source of ["codec", "h1"]) {
-    assert.equal(composition.readiness[source].apply({
-      source,
-      generation: "1",
-      ready: true,
-    }), true);
-  }
+  assert.equal(composition.readiness.codec.apply({
+    source: "codec",
+    generation: "1",
+    ready: true,
+  }), true);
+  assert.equal(composition.readiness.h1.apply, undefined);
+  assert.equal(composition.readiness.h1.execute, undefined);
+  assert.equal(composition.readiness.h1.query, undefined);
+  assert.equal(composition.readiness.h1.issueDedupeWindow, undefined);
   assert.equal(composition.readiness.h3.apply, undefined);
   assert.equal(composition.readiness.h3.activate(), true);
   const principalId = "carrier-runtime-readiness-principal";
@@ -273,7 +284,6 @@ async function createHarness({
     identity,
     statusObservations,
     expectedWelcome: () => expectedWelcome,
-    expectedQuery: () => expectedQuery,
     reentrantDispose: () => reentrantDispose,
     async cleanup() {
       await composition.dispose();
@@ -455,11 +465,17 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
     assert.equal(delivered.length, 2);
     assert.deepEqual(delivered.map(({ carrier }) => carrier.seq), ["1", "2"]);
     assert.deepEqual(delivered[0].bytes, publicWire(h.expectedWelcome()));
-    assert.deepEqual(delivered[1].bytes, publicWire(h.expectedQuery()));
+    const queryResponse = codec.decodeRelayV2WebSocketFrame(
+      "public",
+      delivered[1].bytes,
+    ).frame;
+    assert.equal(queryResponse.type, "command.statuses");
+    assert.equal(queryResponse.requestId, query.requestId);
+    assert.equal(queryResponse.hostEpoch, h.identity.hostEpoch);
 
     route.connection.acknowledge(route.transport.confirmNext());
     await settle();
-    const h3Close = h.composition.readiness.h3.close();
+    const h1Close = h.composition.readiness.h1.close();
     await settle();
     const close = route.transport.sent.map(decodeCarrier).findLast((frame) => (
       frame.type === "route.close"
@@ -476,15 +492,18 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
       retryable: false,
     });
     assert.equal(h.composition.carrier.status().phase, "registered");
-    await h3Close;
+    await h1Close;
   } finally {
     await h.cleanup();
   }
 });
 
-test("combined dispose keeps the bridge alive through receipt cleanup and then closes once", async () => {
+test("combined dispose publishes one barrier and waits for H1 drain plus H3 shutdown", async () => {
   let releaseShutdown;
+  let rejectH1;
+  let signalH1Entered;
   const shutdownBarrier = new Promise((resolve) => { releaseShutdown = resolve; });
+  const h1Entered = new Promise((resolve) => { signalH1Entered = resolve; });
   let shutdownCalls = 0;
   const h = await createHarness({
     reenterDisposeOnOffline: true,
@@ -492,6 +511,14 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
       shutdown() {
         shutdownCalls += 1;
         return shutdownBarrier;
+      },
+    },
+    h1ExecutorOverrides: {
+      resolve() {
+        return new Promise((_resolve, reject) => {
+          rejectH1 = reject;
+          signalH1Entered();
+        });
       },
     },
   });
@@ -504,6 +531,12 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
     await settle();
     assert.equal(hostDataFrames(route.transport).length, 1);
     assert.equal(route.transport.pending.length, 1);
+    route.connection.acknowledge(route.transport.confirmNext());
+    const execute = fixture("command-execute-send-agent-message");
+    execute.expectedHostEpoch = h.identity.hostEpoch;
+    execute.payload.dedupeWindowId = h.expectedWelcome().payload.commandDedupeWindow.windowId;
+    sendClientFrame(route, execute);
+    await h1Entered;
 
     const observationsBeforeDispose = h.statusObservations.length;
     const firstDispose = h.composition.dispose();
@@ -526,6 +559,9 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
     assert.equal(shutdownCalls, 1);
     assert.equal(disposed, false);
     releaseShutdown();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(disposed, false, "H1 admitted command must keep disposal pending");
+    rejectH1(new TypeError("release admitted H1 command"));
     await firstDispose;
     assert.equal(disposed, true);
     assert.throws(
@@ -542,6 +578,7 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
     assert.deepEqual(route.transport.closes, [{ code: 1000, reason: "host_shutdown" }]);
   } finally {
     releaseShutdown?.();
+    rejectH1?.(new TypeError("cleanup admitted H1 command"));
     await h.cleanup();
   }
 });

@@ -8,7 +8,7 @@ import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
-const activationModule = commandPlane;
+const activationModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 
 const corpus = loadRelayV2FixtureCorpus();
@@ -188,14 +188,33 @@ function readinessHarness(apply = () => true) {
 async function context() {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-h1-readiness-"));
   const store = await hostState.RelayV2HostStateStore.open({ home });
+  const snapshot = await store.read();
   return {
     home,
     store,
+    hostEpoch: snapshot.hostEpoch,
+    hostInstanceId: snapshot.hostInstanceId,
     now: () => BASE_TIME,
     cleanup() {
       rmSync(home, { recursive: true, force: true });
     },
   };
+}
+
+function activationOptions(ctx, candidate, readinessSink, identity = {}) {
+  return {
+    hostId: identity.hostId ?? HOST_ID,
+    hostEpoch: identity.hostEpoch ?? ctx.hostEpoch,
+    hostInstanceId: identity.hostInstanceId ?? ctx.hostInstanceId,
+    candidate,
+    readinessSink,
+  };
+}
+
+function activate(ctx, candidate, readinessSink, identity) {
+  return activationModule.createRelayV2HostH1ReadinessActivation(
+    activationOptions(ctx, candidate, readinessSink, identity),
+  );
 }
 
 async function openCandidate(ctx, executor, recover = true) {
@@ -251,10 +270,7 @@ test("recovered H1 authority audits one final cut and exposes only three capture
     });
 
     const readiness = readinessHarness();
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: readiness.sink,
-    });
+    const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     assert.equal(Object.isFrozen(activation), true);
     assert.equal(activation.plane, undefined);
@@ -356,10 +372,7 @@ test("recovery-time prototype mutation cannot replace the captured H1 authority"
       },
     });
     const readiness = readinessHarness();
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: readiness.sink,
-    });
+    const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
     const window = await activation.issueDedupeWindow({
@@ -526,10 +539,7 @@ test("recovered opening settles a residual RUNNING record before issuing its aud
     ), false);
 
     const readiness = readinessHarness();
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: readiness.sink,
-    });
+    const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     await activation.close();
 
@@ -542,7 +552,7 @@ test("recovered opening settles a residual RUNNING record before issuing its aud
   }
 });
 
-test("candidate provenance rejects forgery, replay, proxy, and a foreign module owner", async () => {
+test("candidate provenance and exact host identity reject copy, proxy, replay, mismatch, and foreign owner", async (t) => {
   const ctx = await context();
   try {
     const fake = executorHarness();
@@ -554,17 +564,11 @@ test("candidate provenance rejects forgery, replay, proxy, and a foreign module 
       recover: false,
     });
     const rawReadiness = readinessHarness();
-    assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate: rawPlane,
-      readinessSink: rawReadiness.sink,
-    }), null);
+    assert.equal(activate(ctx, rawPlane, rawReadiness.sink), null);
     assert.deepEqual(rawReadiness.state, { applied: [], closes: 0 });
 
     const forgedReadiness = readinessHarness();
-    assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate: {},
-      readinessSink: forgedReadiness.sink,
-    }), null);
+    assert.equal(activate(ctx, {}, forgedReadiness.sink), null);
     assert.deepEqual(forgedReadiness.state, { applied: [], closes: 0 });
 
     const candidate = await openCandidate(ctx, fake.executor);
@@ -577,26 +581,46 @@ test("candidate provenance rejects forgery, replay, proxy, and a foreign module 
       Symbol.for("tmux-worktree.relay-v2.host-command-plane-readiness-candidate-issuer"),
     ), undefined);
     assert.deepEqual(Reflect.ownKeys(candidate), []);
+    const copiedReadiness = readinessHarness();
+    assert.equal(activate(ctx, { ...candidate }, copiedReadiness.sink), null);
+    assert.deepEqual(copiedReadiness.state, { applied: [], closes: 0 });
     const proxiedReadiness = readinessHarness();
-    assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate: new Proxy(candidate, {}),
-      readinessSink: proxiedReadiness.sink,
-    }), null);
+    assert.equal(activate(ctx, new Proxy(candidate, {}), proxiedReadiness.sink), null);
     assert.deepEqual(proxiedReadiness.state, { applied: [], closes: 0 });
 
     const readiness = readinessHarness();
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: readiness.sink,
-    });
+    const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const replayReadiness = readinessHarness();
-    assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: replayReadiness.sink,
-    }), null);
+    assert.equal(activate(ctx, candidate, replayReadiness.sink), null);
     assert.deepEqual(replayReadiness.state, { applied: [], closes: 0 });
     await activation.close();
+
+    for (const entry of [
+      { name: "hostId", identity: { hostId: `${HOST_ID}-wrong` } },
+      { name: "hostEpoch", identity: { hostEpoch: `${ctx.hostEpoch}-wrong` } },
+      {
+        name: "hostInstanceId",
+        identity: { hostInstanceId: `${ctx.hostInstanceId}-wrong` },
+      },
+    ]) {
+      await t.test(entry.name, async () => {
+        const mismatchedCandidate = await openCandidate(ctx, fake.executor);
+        const mismatchedReadiness = readinessHarness();
+        assert.equal(activate(
+          ctx,
+          mismatchedCandidate,
+          mismatchedReadiness.sink,
+          entry.identity,
+        ), null);
+        assert.deepEqual(mismatchedReadiness.state, { applied: [], closes: 0 });
+        assert.equal(
+          activate(ctx, mismatchedCandidate, readinessHarness().sink),
+          null,
+          "identity mismatch must burn the one-shot candidate",
+        );
+      });
+    }
 
     const foreignCommandPlane = await import(
       "../dist/relay/v2/hostCommandPlane.js?h1-readiness-foreign-owner"
@@ -609,10 +633,7 @@ test("candidate provenance rejects forgery, replay, proxy, and a foreign module 
         now: ctx.now,
       });
     const foreignReadiness = readinessHarness();
-    assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate: foreignCandidate,
-      readinessSink: foreignReadiness.sink,
-    }), null);
+    assert.equal(activate(ctx, foreignCandidate, foreignReadiness.sink), null);
     assert.deepEqual(foreignReadiness.state, { applied: [], closes: 0 });
   } finally {
     ctx.cleanup();
@@ -647,10 +668,7 @@ test("ordinary TypeError and safely finalized command failures do not withdraw H
     });
     const candidate = await openCandidate(ctx, fake.executor);
     const readiness = readinessHarness();
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: readiness.sink,
-    });
+    const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
     const window = await activation.issueDedupeWindow({
@@ -708,10 +726,7 @@ test("exact command-plane StateError withdraws H1 before its rejection is observ
         events.push("withdrawn");
       },
     });
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: sink,
-    });
+    const activation = activate(ctx, candidate, sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
     const window = await activation.issueDedupeWindow({
@@ -845,10 +860,7 @@ test("publication StateError survives ordinary fencing failure and withdraws bef
         events.push("withdrawn");
       },
     });
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: sink,
-    });
+    const activation = activate(ctx, candidate, sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
     const window = await activation.issueDedupeWindow({
@@ -884,10 +896,7 @@ test("close withdraws synchronously, returns one barrier, and drains an already 
     });
     const candidate = await openCandidate(ctx, fake.executor);
     const readiness = readinessHarness();
-    const activation = activationModule.createRelayV2HostH1ReadinessActivation({
-      candidate,
-      readinessSink: readiness.sink,
-    });
+    const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
     const window = await activation.issueDedupeWindow({
@@ -930,15 +939,9 @@ test("sink rejection, throw, Promise, and reentry fail closed after one-shot con
         const fake = executorHarness();
         const candidate = await openCandidate(ctx, fake.executor);
         const readiness = readinessHarness(entry.apply);
-        assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-          candidate,
-          readinessSink: readiness.sink,
-        }), null);
+        assert.equal(activate(ctx, candidate, readiness.sink), null);
         assert.equal(readiness.state.closes, 1);
-        assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-          candidate,
-          readinessSink: readinessHarness().sink,
-        }), null);
+        assert.equal(activate(ctx, candidate, readinessHarness().sink), null);
         await Promise.resolve();
       } finally {
         ctx.cleanup();
@@ -952,7 +955,7 @@ test("sink rejection, throw, Promise, and reentry fail closed after one-shot con
       const fake = executorHarness();
       const candidate = await openCandidate(ctx, fake.executor);
       const readiness = readinessHarness();
-      const plain = { candidate, readinessSink: readiness.sink };
+      const plain = activationOptions(ctx, candidate, readiness.sink);
       let nested = "not-called";
       let trapped = false;
       const options = new Proxy(plain, {
@@ -988,24 +991,15 @@ test("sink rejection, throw, Promise, and reentry fail closed after one-shot con
         getOwnPropertyDescriptor(target, property) {
           if (!trapped) {
             trapped = true;
-            nested = activationModule.createRelayV2HostH1ReadinessActivation({
-              candidate,
-              readinessSink: readiness.sink,
-            });
+            nested = activate(ctx, candidate, readiness.sink);
           }
           return Reflect.getOwnPropertyDescriptor(target, property);
         },
       });
-      assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-        candidate,
-        readinessSink: sink,
-      }), null);
+      assert.equal(activate(ctx, candidate, sink), null);
       assert.equal(nested, null);
       assert.equal(readiness.state.closes, 1);
-      assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-        candidate,
-        readinessSink: readiness.sink,
-      }), null);
+      assert.equal(activate(ctx, candidate, readiness.sink), null);
     } finally {
       ctx.cleanup();
     }
@@ -1018,22 +1012,13 @@ test("sink rejection, throw, Promise, and reentry fail closed after one-shot con
       const candidate = await openCandidate(ctx, fake.executor);
       let sink;
       const readiness = readinessHarness(() => {
-        assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-          candidate,
-          readinessSink: sink,
-        }), null);
+        assert.equal(activate(ctx, candidate, sink), null);
         return true;
       });
       sink = readiness.sink;
-      assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-        candidate,
-        readinessSink: sink,
-      }), null);
+      assert.equal(activate(ctx, candidate, sink), null);
       assert.equal(readiness.state.closes, 1);
-      assert.equal(activationModule.createRelayV2HostH1ReadinessActivation({
-        candidate,
-        readinessSink: readinessHarness().sink,
-      }), null);
+      assert.equal(activate(ctx, candidate, readinessHarness().sink), null);
     } finally {
       ctx.cleanup();
     }
