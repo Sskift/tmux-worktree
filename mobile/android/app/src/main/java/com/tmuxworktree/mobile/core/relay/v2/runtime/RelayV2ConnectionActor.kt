@@ -114,6 +114,7 @@ internal class RelayV2ConnectionActor(
     private val afterAgentExtensionRedriveEnqueuedBeforeSwap: () -> Unit = {},
 ) : RelayProfileDisconnectBarrier,
     RelayV2RepositoryEffectApplyLeasePort,
+    RelayV2CurrentRepositoryReadAuthorityPort,
     AgentTranscriptLifecycleExtensionRequestSender,
     AgentTranscriptLifecycleDurableHandoffPort,
     Closeable {
@@ -218,7 +219,7 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    internal fun currentRepositoryReadCut(
+    override fun currentRepositoryReadCut(
         capability: RelayV2RepositoryReadCapability,
     ): RelayV2CurrentRepositoryReadCutResult = synchronized(lifecycleLock) {
         val fence = currentRepositoryReadFenceLocked(capability)
@@ -233,7 +234,7 @@ internal class RelayV2ConnectionActor(
         )
     }
 
-    internal suspend fun <T> withCurrentRepositoryReadLease(
+    override suspend fun <T> withCurrentRepositoryReadLease(
         cut: RelayV2CurrentRepositoryReadCut,
         block: suspend () -> T,
     ): RelayV2CurrentRepositoryReadLeaseResult<T> {

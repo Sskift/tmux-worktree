@@ -302,6 +302,18 @@ internal sealed interface RelayV2CurrentRepositoryReadLeaseResult<out T> {
     ) : RelayV2CurrentRepositoryReadLeaseResult<T>
 }
 
+/** Narrow authority boundary for acquiring and consuming actor-owned current repository reads. */
+internal interface RelayV2CurrentRepositoryReadAuthorityPort {
+    fun currentRepositoryReadCut(
+        capability: RelayV2RepositoryReadCapability,
+    ): RelayV2CurrentRepositoryReadCutResult
+
+    suspend fun <T> withCurrentRepositoryReadLease(
+        cut: RelayV2CurrentRepositoryReadCut,
+        block: suspend () -> T,
+    ): RelayV2CurrentRepositoryReadLeaseResult<T>
+}
+
 /** Exact actor-owned recovery step that a durable repository receipt must acknowledge. */
 internal data class RelayV2RecoveryBinding(
     val generation: RelayV2EffectGeneration,
