@@ -5,6 +5,7 @@ mod files;
 mod git;
 mod layout;
 mod mobile_relay;
+mod mobile_relay_v2;
 mod pty;
 mod sessions;
 mod terminal_control;
