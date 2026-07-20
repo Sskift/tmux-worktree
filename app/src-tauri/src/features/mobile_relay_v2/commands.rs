@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use super::management_child::{
-    ManagementCallError, ManagementChildManager, ManagementError, ManagementOperation,
-    ManagementOutcome, ManagementStartError,
+    ManagementCallError, ManagementChildManager, ManagementError, ManagementInput,
+    ManagementOperation, ManagementOutcome, ManagementStartError,
 };
 
 const UNAVAILABLE_CODE: &str = "UNAVAILABLE";
@@ -14,6 +14,8 @@ const CHANNEL_CLOSED_CODE: &str = "CHANNEL_CLOSED";
 const CHANNEL_CLOSED_MESSAGE: &str = "Relay v2 management channel closed";
 const SUPERSEDED_CODE: &str = "SUPERSEDED";
 const SUPERSEDED_MESSAGE: &str = "Relay v2 management owner was superseded";
+const INVALID_ARGUMENT_CODE: &str = "INVALID_ARGUMENT";
+const INVALID_ARGUMENT_MESSAGE: &str = "Relay v2 management input is invalid";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -70,13 +72,21 @@ impl MobileRelayV2ManagementCommandState {
         &self,
         operation: MobileRelayV2ManagementOperation,
     ) -> Result<ManagementOutcome, ManagementError> {
+        self.call_with_input(operation, ManagementInput::None)
+    }
+
+    fn call_with_input(
+        &self,
+        operation: MobileRelayV2ManagementOperation,
+        input: ManagementInput,
+    ) -> Result<ManagementOutcome, ManagementError> {
         if self.disposed.load(Ordering::Acquire) {
             return Err(channel_closed_error());
         }
         match &self.owner {
-            ManagementCommandOwner::Ready(manager) => {
-                manager.request(operation.into()).map_err(map_call_error)
-            }
+            ManagementCommandOwner::Ready(manager) => manager
+                .request_with_input(operation.into(), input)
+                .map_err(map_call_error),
             ManagementCommandOwner::StartFailed(error) => Err(map_start_error(*error)),
         }
     }
@@ -100,12 +110,73 @@ impl Drop for MobileRelayV2ManagementCommandState {
 #[tauri::command]
 pub(crate) async fn mobile_relay_v2_management_call(
     operation: MobileRelayV2ManagementOperation,
+    input: serde_json::Value,
     state: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
 ) -> Result<ManagementOutcome, ManagementError> {
+    let input = decode_command_input(operation, input)?;
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.call(operation))
+    tauri::async_runtime::spawn_blocking(move || state.call_with_input(operation, input))
         .await
         .map_err(|_| channel_closed_error())?
+}
+
+fn decode_command_input(
+    operation: MobileRelayV2ManagementOperation,
+    value: serde_json::Value,
+) -> Result<ManagementInput, ManagementError> {
+    match operation {
+        MobileRelayV2ManagementOperation::Status
+        | MobileRelayV2ManagementOperation::BootstrapHost
+        | MobileRelayV2ManagementOperation::RefreshHost
+        | MobileRelayV2ManagementOperation::StartConnector
+        | MobileRelayV2ManagementOperation::StopConnector => {
+            if value.is_null() {
+                Ok(ManagementInput::None)
+            } else {
+                Err(invalid_argument_error())
+            }
+        }
+        MobileRelayV2ManagementOperation::CreateEnrollment => {
+            let object = value.as_object().ok_or_else(invalid_argument_error)?;
+            if object.len() != 1 || !object.contains_key("deviceLabel") {
+                return Err(invalid_argument_error());
+            }
+            let device_label = match &object["deviceLabel"] {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(label) if valid_opaque(label, 128) => Some(label.clone()),
+                _ => return Err(invalid_argument_error()),
+            };
+            Ok(ManagementInput::CreateEnrollment { device_label })
+        }
+        MobileRelayV2ManagementOperation::RevokeClientGrant => {
+            let object = value.as_object().ok_or_else(invalid_argument_error)?;
+            if object.len() != 2
+                || !object.contains_key("grantId")
+                || object.get("reason").and_then(serde_json::Value::as_str) != Some("user_revoked")
+            {
+                return Err(invalid_argument_error());
+            }
+            let grant_id = object["grantId"]
+                .as_str()
+                .filter(|grant_id| valid_opaque(grant_id, 128))
+                .ok_or_else(invalid_argument_error)?;
+            Ok(ManagementInput::RevokeClientGrant {
+                grant_id: grant_id.to_string(),
+            })
+        }
+    }
+}
+
+fn valid_opaque(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && !['\0', '\r', '\n']
+            .iter()
+            .any(|forbidden| value.contains(*forbidden))
+        && !["twcap2.", "twref2.", "twenroll2.", "twhostboot2."]
+            .iter()
+            .any(|prefix| value.to_ascii_lowercase().contains(prefix))
 }
 
 fn fixed_error(code: &str, message: &str) -> ManagementError {
@@ -126,6 +197,10 @@ fn channel_closed_error() -> ManagementError {
 
 fn superseded_error() -> ManagementError {
     fixed_error(SUPERSEDED_CODE, SUPERSEDED_MESSAGE)
+}
+
+fn invalid_argument_error() -> ManagementError {
+    fixed_error(INVALID_ARGUMENT_CODE, INVALID_ARGUMENT_MESSAGE)
 }
 
 fn map_start_error(error: ManagementStartError) -> ManagementError {
@@ -235,5 +310,60 @@ mod tests {
             map_call_error(ManagementCallError::Superseded),
             superseded_error()
         );
+    }
+
+    #[test]
+    fn dashboard_management_v2_command_inputs_are_closed_and_non_sensitive() {
+        assert_eq!(
+            decode_command_input(
+                MobileRelayV2ManagementOperation::Status,
+                serde_json::Value::Null
+            )
+            .unwrap(),
+            ManagementInput::None
+        );
+        assert_eq!(
+            decode_command_input(
+                MobileRelayV2ManagementOperation::CreateEnrollment,
+                serde_json::json!({ "deviceLabel": "Pixel" }),
+            )
+            .unwrap(),
+            ManagementInput::CreateEnrollment {
+                device_label: Some("Pixel".to_string())
+            }
+        );
+        assert_eq!(
+            decode_command_input(
+                MobileRelayV2ManagementOperation::RevokeClientGrant,
+                serde_json::json!({ "grantId": "client-grant-1", "reason": "user_revoked" }),
+            )
+            .unwrap(),
+            ManagementInput::RevokeClientGrant {
+                grant_id: "client-grant-1".to_string()
+            }
+        );
+        for (operation, input) in [
+            (
+                MobileRelayV2ManagementOperation::Status,
+                serde_json::json!({}),
+            ),
+            (
+                MobileRelayV2ManagementOperation::CreateEnrollment,
+                serde_json::json!({ "deviceLabel": null, "intent": "retry" }),
+            ),
+            (
+                MobileRelayV2ManagementOperation::CreateEnrollment,
+                serde_json::json!({ "deviceLabel": "twcap2.forbidden" }),
+            ),
+            (
+                MobileRelayV2ManagementOperation::RevokeClientGrant,
+                serde_json::json!({ "grantId": "client-grant-1", "reason": "admin" }),
+            ),
+        ] {
+            assert_eq!(
+                decode_command_input(operation, input).unwrap_err(),
+                invalid_argument_error()
+            );
+        }
     }
 }

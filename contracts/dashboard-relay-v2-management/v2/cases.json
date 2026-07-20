@@ -1,0 +1,165 @@
+{
+  "fixtureFormatVersion": 1,
+  "constants": {
+    "contract": "tmux-worktree-dashboard-relay-v2-management-ipc",
+    "protocolVersion": 2,
+    "expectedVersion": "1.2.3",
+    "runtimeVersion": "1.2.3",
+    "operationDeadlineMs": 5000,
+    "maxFramePayloadBytes": 16384
+  },
+  "startupReadyFrame": "{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}\n",
+  "goldenExchanges": [
+    {
+      "name": "status-success",
+      "operation": "status",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"operation\":\"status\",\"input\":null}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw", "operation": "status", "input": null },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"missing\"},\"connector\":{\"status\":\"stopped\"},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}\n"
+    },
+    {
+      "name": "bootstrap-host-success",
+      "operation": "bootstrap_host",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.wkHofchV36_U1sOtXF-hvA\",\"operation\":\"bootstrap_host\",\"input\":null}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2.wkHofchV36_U1sOtXF-hvA", "operation": "bootstrap_host", "input": null },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.wkHofchV36_U1sOtXF-hvA\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-1\",\"expiresAtMs\":1783703600000},\"connector\":{\"status\":\"stopped\"},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}\n"
+    },
+    {
+      "name": "refresh-host-success",
+      "operation": "refresh_host",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.m-XajdYifbX8v1Dvxfua9g\",\"operation\":\"refresh_host\",\"input\":null}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2.m-XajdYifbX8v1Dvxfua9g", "operation": "refresh_host", "input": null },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.m-XajdYifbX8v1Dvxfua9g\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"stopped\"},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}\n"
+    },
+    {
+      "name": "start-connector-success",
+      "operation": "start_connector",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.GGg3IoUgDIXzfENx8QbHlw\",\"operation\":\"start_connector\",\"input\":null}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2.GGg3IoUgDIXzfENx8QbHlw", "operation": "start_connector", "input": null },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.GGg3IoUgDIXzfENx8QbHlw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}\n"
+    },
+    {
+      "name": "stop-connector-success",
+      "operation": "stop_connector",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.XXdOhONQuogS0f2jMdFnOQ\",\"operation\":\"stop_connector\",\"input\":null}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2.XXdOhONQuogS0f2jMdFnOQ", "operation": "stop_connector", "input": null },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.XXdOhONQuogS0f2jMdFnOQ\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"stopped\"},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}\n"
+    },
+    {
+      "name": "create-enrollment-success",
+      "operation": "create_enrollment",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.ocsJ9anwzHRz4iyXdA5cjA\",\"operation\":\"create_enrollment\",\"input\":{\"deviceLabel\":\"Pixel\"}}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2.ocsJ9anwzHRz4iyXdA5cjA", "operation": "create_enrollment", "input": { "deviceLabel": "Pixel" } },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.ocsJ9anwzHRz4iyXdA5cjA\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"active\",\"review\":{\"enrollment\":{\"enrollmentId\":\"enrollment-1\",\"enrollmentCode\":\"twenroll2.one-time-code\",\"expiresAtMs\":1783700300000},\"display\":{\"issuerUrl\":\"https://relay.example.com\",\"relayUrl\":\"wss://relay.example.com/client\",\"hostId\":\"mac-admin\",\"deviceLabel\":\"Pixel\"}}},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}\n"
+    },
+    {
+      "name": "revoke-client-grant-success",
+      "operation": "revoke_client_grant",
+      "requestFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2._rgZ2FBzDmkt9MwqnM3uDg\",\"operation\":\"revoke_client_grant\",\"input\":{\"grantId\":\"client-grant-1\",\"reason\":\"user_revoked\"}}\n",
+      "normalizedRequest": { "protocolVersion": 2, "requestId": "dmgmt2._rgZ2FBzDmkt9MwqnM3uDg", "operation": "revoke_client_grant", "input": { "grantId": "client-grant-1", "reason": "user_revoked" } },
+      "responseFrame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2._rgZ2FBzDmkt9MwqnM3uDg\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"revoked\",\"grantId\":\"client-grant-1\",\"revokedAtMs\":1783700200000,\"alreadyRevoked\":false}},\"error\":null}\n"
+    }
+  ],
+  "projectionCases": {
+    "registeredIncomplete": {
+      "protocolVersion": 2,
+      "requestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "ok": true,
+      "result": {
+        "authority": { "kind": "node", "reason": null },
+        "hostCredential": { "status": "ready", "credentialReference": "host-credential-ref-2", "expiresAtMs": 1783707200000 },
+        "connector": { "status": "registered_incomplete", "acknowledgement": "host.registered", "hostId": "mac-admin", "connectorId": "connector-1", "negotiatedCapabilityIntersection": ["error.structured.v1", "command.ledger.v1", "command.query.v1", "snapshot.revision.v1", "event.sequence.v1"] },
+        "enrollment": { "status": "idle" },
+        "knownClientGrant": { "status": "unknown" }
+      },
+      "error": null
+    },
+    "incompleteWithEnrollment": {
+      "protocolVersion": 2,
+      "requestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "ok": true,
+      "result": {
+        "authority": { "kind": "node", "reason": null },
+        "hostCredential": { "status": "ready", "credentialReference": "host-credential-ref-2", "expiresAtMs": 1783707200000 },
+        "connector": { "status": "registered_incomplete", "acknowledgement": "host.registered", "hostId": "mac-admin", "connectorId": "connector-1", "negotiatedCapabilityIntersection": ["error.structured.v1"] },
+        "enrollment": { "status": "active", "review": { "enrollment": { "enrollmentId": "enrollment-1", "enrollmentCode": "twenroll2.one-time-code", "expiresAtMs": 1783700300000 }, "display": { "issuerUrl": "https://relay.example.com", "relayUrl": "wss://relay.example.com/client", "hostId": "mac-admin", "deviceLabel": null } } },
+        "knownClientGrant": { "status": "unknown" }
+      },
+      "error": null
+    }
+  },
+  "invalidResponseFrameCases": [
+    {
+      "name": "malformed-json",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2"
+    },
+    {
+      "name": "unknown-root-field",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false},\"extra\":null}"
+    },
+    {
+      "name": "request-id-mismatch",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.Mx5wpoPOS7Cifkzexeh6Bw\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"UNAVAILABLE\",\"message\":\"Relay v2 management is unavailable\",\"retryable\":false}}"
+    },
+    {
+      "name": "credential-like-forbidden-field",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"missing\",\"accessToken\":\"forbidden-marker\"},\"connector\":{\"status\":\"stopped\"},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "credential-like-value-outside-enrollment-code",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"starting\",\"hostId\":\"twref2.forbidden\"},\"enrollment\":{\"status\":\"idle\"},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "issuer-url-malformed-authority",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"active\",\"review\":{\"enrollment\":{\"enrollmentId\":\"enrollment-1\",\"enrollmentCode\":\"twenroll2.one-time-code\",\"expiresAtMs\":1783700300000},\"display\":{\"issuerUrl\":\"https://:\",\"relayUrl\":\"wss://relay.example.com/client\",\"hostId\":\"mac-admin\",\"deviceLabel\":null}}},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "relay-url-malformed-authority",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"active\",\"review\":{\"enrollment\":{\"enrollmentId\":\"enrollment-1\",\"enrollmentCode\":\"twenroll2.one-time-code\",\"expiresAtMs\":1783700300000},\"display\":{\"issuerUrl\":\"https://relay.example.com\",\"relayUrl\":\"wss://:/client\",\"hostId\":\"mac-admin\",\"deviceLabel\":null}}},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "relay-url-invalid-port",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"active\",\"review\":{\"enrollment\":{\"enrollmentId\":\"enrollment-1\",\"enrollmentCode\":\"twenroll2.one-time-code\",\"expiresAtMs\":1783700300000},\"display\":{\"issuerUrl\":\"https://relay.example.com\",\"relayUrl\":\"wss://relay.example.com:65536/client\",\"hostId\":\"mac-admin\",\"deviceLabel\":null}}},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "issuer-url-trailing-space",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"active\",\"review\":{\"enrollment\":{\"enrollmentId\":\"enrollment-1\",\"enrollmentCode\":\"twenroll2.one-time-code\",\"expiresAtMs\":1783700300000},\"display\":{\"issuerUrl\":\"https://relay.example.com \",\"relayUrl\":\"wss://relay.example.com/client\",\"hostId\":\"mac-admin\",\"deviceLabel\":null}}},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "relay-url-trailing-space",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":true,\"result\":{\"authority\":{\"kind\":\"node\",\"reason\":null},\"hostCredential\":{\"status\":\"ready\",\"credentialReference\":\"host-credential-ref-2\",\"expiresAtMs\":1783707200000},\"connector\":{\"status\":\"registered\",\"acknowledgement\":\"host.registered\",\"hostId\":\"mac-admin\",\"connectorId\":\"connector-1\",\"negotiatedCapabilityIntersection\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"]},\"enrollment\":{\"status\":\"active\",\"review\":{\"enrollment\":{\"enrollmentId\":\"enrollment-1\",\"enrollmentCode\":\"twenroll2.one-time-code\",\"expiresAtMs\":1783700300000},\"display\":{\"issuerUrl\":\"https://relay.example.com\",\"relayUrl\":\"wss://relay.example.com/client \",\"hostId\":\"mac-admin\",\"deviceLabel\":null}}},\"knownClientGrant\":{\"status\":\"unknown\"}},\"error\":null}"
+    },
+    {
+      "name": "child-cannot-forge-channel-closed",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"CHANNEL_CLOSED\",\"message\":\"Relay v2 management channel closed\",\"retryable\":false}}"
+    },
+    {
+      "name": "child-cannot-forge-superseded",
+      "operation": "status",
+      "expectedRequestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "frame": "{\"protocolVersion\":2,\"requestId\":\"dmgmt2.AquZUdkZ9FXG7OEIfRHmjw\",\"ok\":false,\"result\":null,\"error\":{\"code\":\"SUPERSEDED\",\"message\":\"Relay v2 management owner was superseded\",\"retryable\":false}}"
+    }
+  ]
+}

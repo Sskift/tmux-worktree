@@ -11,14 +11,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
+use super::management_protocol_v2;
 use crate::features::control_plane::node_bin;
 
 const CONTRACT: &str = "tmux-worktree-dashboard-relay-v2-management-ipc";
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION_V1: u32 = 1;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_ID_PREFIX: &str = "dmgmt1.";
+const REQUEST_ID_PREFIX_V1: &str = "dmgmt1.";
 const SUPERSEDED_EXIT_CODE: i32 = 78;
 const HIDDEN_MANAGEMENT_ENTRY: &str = "__relay-v2-dashboard-management-stdio";
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -198,7 +199,11 @@ enum StdoutEvent {
 struct ObservationState {
     events: VecDeque<StdoutEvent>,
     partial: bool,
-    draining: bool,
+    drain_started_generation: u64,
+    drain_ack_generation: u64,
+    requested_drain_generation: u64,
+    #[cfg(test)]
+    pause_unsolicited_drains: bool,
     discarded: bool,
 }
 
@@ -213,7 +218,11 @@ impl BoundedObservationQueue {
             state: Mutex::new(ObservationState {
                 events: VecDeque::new(),
                 partial: false,
-                draining: false,
+                drain_started_generation: 0,
+                drain_ack_generation: 0,
+                requested_drain_generation: 0,
+                #[cfg(test)]
+                pause_unsolicited_drains: false,
                 discarded: false,
             }),
             changed: Condvar::new(),
@@ -243,19 +252,52 @@ impl BoundedObservationQueue {
         true
     }
 
-    fn begin_drain(&self) -> bool {
+    fn begin_drain(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
-        if state.discarded {
-            return false;
+        loop {
+            if state.discarded {
+                return None;
+            }
+            #[cfg(test)]
+            if state.pause_unsolicited_drains
+                && state.requested_drain_generation <= state.drain_started_generation
+            {
+                state = self.changed.wait(state).unwrap();
+                continue;
+            }
+            let generation = state.drain_started_generation.checked_add(1)?;
+            state.drain_started_generation = generation;
+            return Some(generation);
         }
-        state.draining = true;
-        true
     }
 
-    fn end_drain(&self) {
+    fn end_drain(&self, generation: u64) {
         let mut state = self.state.lock().unwrap();
-        state.draining = false;
+        state.drain_ack_generation = state.drain_ack_generation.max(generation);
         self.changed.notify_all();
+    }
+
+    fn wait_for_next_drain(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.discarded {
+                return false;
+            }
+            if state.requested_drain_generation > state.drain_started_generation {
+                return true;
+            }
+            #[cfg(test)]
+            if state.pause_unsolicited_drains {
+                state = self.changed.wait(state).unwrap();
+                continue;
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, SUPERVISOR_POLL_INTERVAL)
+                .unwrap();
+            return !next.discarded;
+        }
     }
 
     fn recv_until(&self, deadline: Instant) -> Option<StdoutEvent> {
@@ -299,6 +341,12 @@ impl BoundedObservationQueue {
 
     fn poll_protocol_after_response(&self, deadline: Instant) -> ChildPoll {
         let mut state = self.state.lock().unwrap();
+        let Some(required_generation) = state.drain_started_generation.checked_add(1) else {
+            return ChildPoll::Failed;
+        };
+        state.requested_drain_generation =
+            state.requested_drain_generation.max(required_generation);
+        self.changed.notify_all();
         loop {
             if state.discarded {
                 return ChildPoll::Failed;
@@ -310,8 +358,12 @@ impl BoundedObservationQueue {
                 Some(StdoutEvent::Frame(_) | StdoutEvent::Violation | StdoutEvent::Failed) => {
                     return ChildPoll::Output;
                 }
-                Some(StdoutEvent::Eof | StdoutEvent::Exited(_)) => return ChildPoll::Pending,
-                None if !state.draining => return ChildPoll::Pending,
+                Some(StdoutEvent::Eof | StdoutEvent::Exited(_)) | None
+                    if state.drain_ack_generation >= required_generation =>
+                {
+                    return ChildPoll::Pending;
+                }
+                Some(StdoutEvent::Eof | StdoutEvent::Exited(_)) => {}
                 None => {}
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -329,13 +381,30 @@ impl BoundedObservationQueue {
         let mut state = self.state.lock().unwrap();
         state.discarded = true;
         state.partial = false;
-        state.draining = false;
         state.events.clear();
         self.changed.notify_all();
     }
 
-    fn is_discarded(&self) -> bool {
-        self.state.lock().unwrap().discarded
+    #[cfg(test)]
+    fn pause_unsolicited_drains_after_current_ack(&self, deadline: Instant) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.pause_unsolicited_drains = true;
+        loop {
+            if state.discarded {
+                return false;
+            }
+            if state.drain_started_generation == state.drain_ack_generation {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() {
+                return false;
+            }
+        }
     }
 }
 
@@ -514,9 +583,9 @@ fn run_stdout_owner(
     let mut frame = Vec::with_capacity(MAX_FRAME_PAYLOAD_BYTES.min(1_024));
     let mut read_buffer = [0u8; 4_096];
     loop {
-        if observations.is_discarded() || !observations.begin_drain() {
+        let Some(drain_generation) = observations.begin_drain() else {
             return;
-        }
+        };
         let mut drained = 0usize;
         let reached_would_block = loop {
             if drained >= STDOUT_DRAIN_BYTES {
@@ -540,7 +609,7 @@ fn run_stdout_owner(
                             }
                         }
                     }
-                    observations.end_drain();
+                    observations.end_drain(drain_generation);
                     return;
                 }
                 Ok(read) => {
@@ -554,7 +623,7 @@ fn run_stdout_owner(
                         } else if frame.len() == MAX_FRAME_PAYLOAD_BYTES {
                             observations.set_partial(false);
                             observations.push(StdoutEvent::Violation);
-                            observations.end_drain();
+                            observations.end_drain(drain_generation);
                             return;
                         } else {
                             frame.push(*byte);
@@ -569,12 +638,13 @@ fn run_stdout_owner(
                 Err(_) => {
                     observations.set_partial(false);
                     observations.push(StdoutEvent::Failed);
-                    observations.end_drain();
+                    observations.end_drain(drain_generation);
                     return;
                 }
             }
         };
         if !reached_would_block {
+            observations.end_drain(drain_generation);
             continue;
         }
         match probe.try_exit() {
@@ -585,17 +655,19 @@ fn run_stdout_owner(
                 } else {
                     observations.push(StdoutEvent::Exited(exit));
                 }
-                observations.end_drain();
+                observations.end_drain(drain_generation);
                 return;
             }
             Ok(None) => {
-                observations.end_drain();
-                thread::sleep(Duration::from_millis(1));
+                observations.end_drain(drain_generation);
+                if !observations.wait_for_next_drain() {
+                    return;
+                }
             }
             Err(()) => {
                 observations.set_partial(false);
                 observations.push(StdoutEvent::Failed);
-                observations.end_drain();
+                observations.end_drain(drain_generation);
                 return;
             }
         }
@@ -807,9 +879,38 @@ impl ManagementOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagementProtocol {
+    V1,
+    V2,
+}
+
+impl ManagementProtocol {
+    fn version(self) -> u32 {
+        match self {
+            Self::V1 => PROTOCOL_VERSION_V1,
+            Self::V2 => management_protocol_v2::PROTOCOL_VERSION,
+        }
+    }
+
+    fn request_id_prefix(self) -> &'static str {
+        match self {
+            Self::V1 => REQUEST_ID_PREFIX_V1,
+            Self::V2 => management_protocol_v2::REQUEST_ID_PREFIX,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagementInput {
+    None,
+    CreateEnrollment { device_label: Option<String> },
+    RevokeClientGrant { grant_id: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RequestFrame<'a> {
+struct RequestFrameV1<'a> {
     protocol_version: u32,
     request_id: &'a str,
     operation: ManagementOperation,
@@ -845,7 +946,7 @@ pub(crate) struct ManagementOutcome {
     pub(crate) protocol_version: u32,
     pub(crate) request_id: String,
     pub(crate) ok: bool,
-    pub(crate) result: Option<DefaultOffStatus>,
+    pub(crate) result: Option<serde_json::Value>,
     pub(crate) error: Option<ManagementError>,
 }
 
@@ -989,6 +1090,7 @@ pub(crate) struct ManagementChildManager {
 struct ManagerInner {
     artifact: BundledManagementArtifact,
     child: Arc<dyn ManagementChildProcess>,
+    protocol: ManagementProtocol,
     request_ids: Arc<dyn RequestIdGenerator>,
     in_flight: AtomicBool,
     observation: Mutex<()>,
@@ -1031,14 +1133,19 @@ impl ManagementChildManager {
     ) -> Result<Self, ManagementStartError> {
         let deadline = Instant::now() + startup_timeout;
         let child = spawn_before_deadline(factory, artifact.clone(), deadline)?;
-        let ready = if Instant::now() < deadline {
+        let protocol = if Instant::now() < deadline {
             read_frame(child.as_ref(), deadline)
                 .ok()
                 .and_then(|payload| decode_startup_ready(&payload, expected_version).ok())
         } else {
             None
         };
-        if ready.is_none() || Instant::now() >= deadline {
+        let Some(protocol) = protocol else {
+            child.kill_if_live();
+            child.wait_and_reap();
+            return Err(ManagementStartError::ChannelClosed);
+        };
+        if Instant::now() >= deadline {
             child.kill_if_live();
             child.wait_and_reap();
             return Err(ManagementStartError::ChannelClosed);
@@ -1046,6 +1153,7 @@ impl ManagementChildManager {
         let inner = Arc::new(ManagerInner {
             artifact,
             child,
+            protocol,
             request_ids,
             in_flight: AtomicBool::new(false),
             observation: Mutex::new(()),
@@ -1078,6 +1186,14 @@ impl ManagementChildManager {
         &self,
         operation: ManagementOperation,
     ) -> Result<ManagementOutcome, ManagementCallError> {
+        self.request_with_input(operation, ManagementInput::None)
+    }
+
+    pub(crate) fn request_with_input(
+        &self,
+        operation: ManagementOperation,
+        input: ManagementInput,
+    ) -> Result<ManagementOutcome, ManagementCallError> {
         if self
             .inner
             .in_flight
@@ -1109,10 +1225,11 @@ impl ManagementChildManager {
                 return Err(ManagementCallError::RequestIdUnavailable);
             }
         };
-        let frame = encode_request(&request_id, operation).map_err(|_| {
-            self.inner.terminalize(LifecycleKind::Poisoned, true);
-            ManagementCallError::ChannelClosed
-        })?;
+        let frame =
+            encode_request(self.inner.protocol, &request_id, operation, &input).map_err(|_| {
+                self.inner.terminalize(LifecycleKind::Poisoned, true);
+                ManagementCallError::ChannelClosed
+            })?;
 
         // This is the only operation deadline. It begins immediately before
         // the sole stdin write attempt and is never reset.
@@ -1121,46 +1238,59 @@ impl ManagementChildManager {
             ChildWrite::Written(written) if written == frame.len() => {}
             ChildWrite::Exited(exit) => {
                 let kind = self.inner.classify_post_handshake_exit(exit);
-                return Ok(local_terminal_outcome(request_id, kind));
+                return Ok(local_terminal_outcome(
+                    self.inner.protocol,
+                    request_id,
+                    kind,
+                ));
             }
             ChildWrite::Written(_) | ChildWrite::TimedOut | ChildWrite::Failed => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(request_id));
+                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
             }
         }
         if Instant::now() >= deadline {
             self.inner.terminalize(LifecycleKind::Poisoned, true);
-            return Ok(channel_closed_outcome(request_id));
+            return Ok(channel_closed_outcome(self.inner.protocol, request_id));
         }
 
         let payload = match read_frame(self.inner.child.as_ref(), deadline) {
             Ok(payload) => payload,
             Err(FrameFailure::Exited(exit)) => {
                 let kind = self.inner.classify_post_handshake_exit(exit);
-                return Ok(local_terminal_outcome(request_id, kind));
+                return Ok(local_terminal_outcome(
+                    self.inner.protocol,
+                    request_id,
+                    kind,
+                ));
             }
             Err(_) => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(request_id));
+                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
             }
         };
-        let response = match decode_response(&payload, &request_id, operation) {
+        let response = match decode_response(self.inner.protocol, &payload, &request_id, operation)
+        {
             Ok(response) if Instant::now() < deadline => response,
             _ => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(request_id));
+                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
             }
         };
         match self.inner.child.poll_after_response(deadline) {
             ChildPoll::Output | ChildPoll::Failed => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(request_id));
+                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
             }
             ChildPoll::Pending | ChildPoll::Eof | ChildPoll::Exited(_) => {}
         }
         match self.inner.lifecycle_kind_after_barrier() {
             LifecycleKind::Ready => Ok(response),
-            kind => Ok(local_terminal_outcome(request_id, kind)),
+            kind => Ok(local_terminal_outcome(
+                self.inner.protocol,
+                request_id,
+                kind,
+            )),
         }
     }
 
@@ -1178,7 +1308,8 @@ impl ManagerInner {
         let mut bytes = [0u8; 16];
         self.request_ids.fill(&mut bytes)?;
         Ok(format!(
-            "{REQUEST_ID_PREFIX}{}",
+            "{}{}",
+            self.protocol.request_id_prefix(),
             URL_SAFE_NO_PAD.encode(bytes)
         ))
     }
@@ -1334,29 +1465,42 @@ fn closed_object_payload(payload: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-fn decode_startup_ready(payload: &[u8], expected_version: &str) -> Result<(), ()> {
+fn decode_startup_ready(payload: &[u8], expected_version: &str) -> Result<ManagementProtocol, ()> {
     closed_object_payload(payload)?;
     let ready: StartupReady = serde_json::from_slice(payload).map_err(|_| ())?;
     if ready.contract != CONTRACT
-        || ready.protocol_version != PROTOCOL_VERSION
         || !valid_ascii_semver(&ready.runtime_version)
         || ready.runtime_version.as_bytes() != expected_version.as_bytes()
     {
         return Err(());
     }
-    Ok(())
+    match ready.protocol_version {
+        PROTOCOL_VERSION_V1 => Ok(ManagementProtocol::V1),
+        management_protocol_v2::PROTOCOL_VERSION => Ok(ManagementProtocol::V2),
+        _ => Err(()),
+    }
 }
 
-fn encode_request(request_id: &str, operation: ManagementOperation) -> Result<Vec<u8>, ()> {
-    if !valid_request_id(request_id) {
+fn encode_request(
+    protocol: ManagementProtocol,
+    request_id: &str,
+    operation: ManagementOperation,
+    input: &ManagementInput,
+) -> Result<Vec<u8>, ()> {
+    if !valid_request_id(protocol, request_id) {
         return Err(());
     }
-    let mut frame = serde_json::to_vec(&RequestFrame {
-        protocol_version: PROTOCOL_VERSION,
-        request_id,
-        operation,
-    })
-    .map_err(|_| ())?;
+    let mut frame = match protocol {
+        ManagementProtocol::V1 => serde_json::to_vec(&RequestFrameV1 {
+            protocol_version: PROTOCOL_VERSION_V1,
+            request_id,
+            operation,
+        })
+        .map_err(|_| ())?,
+        ManagementProtocol::V2 => {
+            management_protocol_v2::encode_request(request_id, operation, input)?
+        }
+    };
     if frame.len() > MAX_FRAME_PAYLOAD_BYTES {
         return Err(());
     }
@@ -1365,29 +1509,34 @@ fn encode_request(request_id: &str, operation: ManagementOperation) -> Result<Ve
 }
 
 fn decode_response(
+    protocol: ManagementProtocol,
     payload: &[u8],
     expected_request_id: &str,
     operation: ManagementOperation,
 ) -> Result<ManagementOutcome, ()> {
     closed_object_payload(payload)?;
+    match protocol {
+        ManagementProtocol::V1 => decode_v1_response(payload, expected_request_id, operation),
+        ManagementProtocol::V2 => decode_v2_response(payload, expected_request_id, operation),
+    }
+}
+
+fn decode_v1_response(
+    payload: &[u8],
+    expected_request_id: &str,
+    operation: ManagementOperation,
+) -> Result<ManagementOutcome, ()> {
     let wire: ManagementOutcomeWire = serde_json::from_slice(payload).map_err(|_| ())?;
-    let response = ManagementOutcome {
-        protocol_version: wire.protocol_version,
-        request_id: wire.request_id,
-        ok: wire.ok,
-        result: wire.result,
-        error: wire.error,
-    };
-    if response.protocol_version != PROTOCOL_VERSION
-        || !valid_request_id(&response.request_id)
-        || response.request_id.as_bytes() != expected_request_id.as_bytes()
+    if wire.protocol_version != PROTOCOL_VERSION_V1
+        || !valid_request_id(ManagementProtocol::V1, &wire.request_id)
+        || wire.request_id.as_bytes() != expected_request_id.as_bytes()
     {
         return Err(());
     }
     if operation.is_status() {
-        let result = response.result.as_ref().ok_or(())?;
-        if !response.ok
-            || response.error.is_some()
+        let result = wire.result.as_ref().ok_or(())?;
+        if !wire.ok
+            || wire.error.is_some()
             || result.availability != "unavailable"
             || !result.capabilities.is_empty()
             || result.reason != "default_off"
@@ -1395,9 +1544,9 @@ fn decode_response(
             return Err(());
         }
     } else {
-        let error = response.error.as_ref().ok_or(())?;
-        if response.ok
-            || response.result.is_some()
+        let error = wire.error.as_ref().ok_or(())?;
+        if wire.ok
+            || wire.result.is_some()
             || error.code != "UNAVAILABLE"
             || error.message != "Relay v2 management is unavailable"
             || error.retryable
@@ -1405,11 +1554,44 @@ fn decode_response(
             return Err(());
         }
     }
+    let response = ManagementOutcome {
+        protocol_version: wire.protocol_version,
+        request_id: wire.request_id,
+        ok: wire.ok,
+        result: wire
+            .result
+            .map(|result| serde_json::to_value(result).map_err(|_| ()))
+            .transpose()?,
+        error: wire.error,
+    };
     Ok(response)
 }
 
-fn valid_request_id(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix(REQUEST_ID_PREFIX) else {
+fn decode_v2_response(
+    payload: &[u8],
+    expected_request_id: &str,
+    operation: ManagementOperation,
+) -> Result<ManagementOutcome, ()> {
+    let response =
+        management_protocol_v2::decode_response(payload, expected_request_id, operation)?;
+    Ok(ManagementOutcome {
+        protocol_version: management_protocol_v2::PROTOCOL_VERSION,
+        request_id: expected_request_id.to_string(),
+        ok: response.result.is_some(),
+        result: response
+            .result
+            .map(|result| serde_json::to_value(result).map_err(|_| ()))
+            .transpose()?,
+        error: response.error.map(|error| ManagementError {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        }),
+    })
+}
+
+fn valid_request_id(protocol: ManagementProtocol, value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(protocol.request_id_prefix()) else {
         return false;
     };
     if value.len() != 29
@@ -1480,9 +1662,9 @@ fn fixed_error(code: &str, message: &str) -> ManagementError {
     }
 }
 
-fn channel_closed_outcome(request_id: String) -> ManagementOutcome {
+fn channel_closed_outcome(protocol: ManagementProtocol, request_id: String) -> ManagementOutcome {
     ManagementOutcome {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: protocol.version(),
         request_id,
         ok: false,
         result: None,
@@ -1493,9 +1675,9 @@ fn channel_closed_outcome(request_id: String) -> ManagementOutcome {
     }
 }
 
-fn superseded_outcome(request_id: String) -> ManagementOutcome {
+fn superseded_outcome(protocol: ManagementProtocol, request_id: String) -> ManagementOutcome {
     ManagementOutcome {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: protocol.version(),
         request_id,
         ok: false,
         result: None,
@@ -1506,11 +1688,15 @@ fn superseded_outcome(request_id: String) -> ManagementOutcome {
     }
 }
 
-fn local_terminal_outcome(request_id: String, kind: LifecycleKind) -> ManagementOutcome {
+fn local_terminal_outcome(
+    protocol: ManagementProtocol,
+    request_id: String,
+    kind: LifecycleKind,
+) -> ManagementOutcome {
     if kind == LifecycleKind::Superseded {
-        superseded_outcome(request_id)
+        superseded_outcome(protocol, request_id)
     } else {
-        channel_closed_outcome(request_id)
+        channel_closed_outcome(protocol, request_id)
     }
 }
 
@@ -1534,6 +1720,8 @@ mod tests {
 
     const CASES: &str =
         include_str!("../../../../../contracts/dashboard-relay-v2-management/v1/cases.json");
+    const CASES_V2: &str =
+        include_str!("../../../../../contracts/dashboard-relay-v2-management/v2/cases.json");
 
     #[derive(Clone, Copy)]
     enum WriteAction {
@@ -1874,6 +2062,29 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn production_script_process(script: &str) -> Arc<ProductionProcess> {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let authority = Arc::new(ExactChildAuthority::new(child));
+        match ProductionProcess::new(authority.clone(), stdin, stdout) {
+            Ok(process) => Arc::new(process),
+            Err(_) => {
+                authority.kill_if_live();
+                authority.wait_and_reap();
+                panic!("script child setup failed")
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn start_script(
         script: impl Into<String>,
         ids: Vec<[u8; 16]>,
@@ -1930,6 +2141,13 @@ mod tests {
         .into_bytes()
     }
 
+    fn ready_frame_v2(version: &str) -> Vec<u8> {
+        format!(
+            "{{\"contract\":\"{CONTRACT}\",\"protocolVersion\":2,\"runtimeVersion\":\"{version}\"}}\n"
+        )
+        .into_bytes()
+    }
+
     fn artifact() -> BundledManagementArtifact {
         BundledManagementArtifact {
             path: PathBuf::from(
@@ -1940,7 +2158,7 @@ mod tests {
 
     fn id_bytes(request_id: &str) -> [u8; 16] {
         let decoded = URL_SAFE_NO_PAD
-            .decode(request_id.strip_prefix(REQUEST_ID_PREFIX).unwrap())
+            .decode(request_id.split_once('.').unwrap().1)
             .unwrap();
         decoded.try_into().unwrap()
     }
@@ -2074,6 +2292,174 @@ mod tests {
                     .as_bytes()
                     .to_vec()]
             );
+        }
+    }
+
+    #[test]
+    fn dashboard_management_v2_startup_selects_v2_and_all_successes_cross_the_supervisor() {
+        let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
+        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
+        let ready = fixture["startupReadyFrame"].as_str().unwrap();
+        assert_eq!(
+            decode_startup_ready(ready.trim_end_matches('\n').as_bytes(), version).unwrap(),
+            ManagementProtocol::V2
+        );
+
+        for exchange in fixture["goldenExchanges"].as_array().unwrap() {
+            let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+            let child = FakeChild::sequenced(vec![
+                (0, ChildRead::Bytes(ready.as_bytes().to_vec())),
+                (
+                    1,
+                    ChildRead::Bytes(
+                        exchange["responseFrame"]
+                            .as_str()
+                            .unwrap()
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                ),
+            ]);
+            let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
+            let operation = operation(exchange["operation"].as_str().unwrap());
+            let outcome = manager
+                .request_with_input(
+                    operation,
+                    management_input(&exchange["normalizedRequest"]["input"]),
+                )
+                .unwrap();
+            let expected: Value =
+                serde_json::from_str(exchange["responseFrame"].as_str().unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(outcome).unwrap(), expected);
+            assert_eq!(
+                child.state.lock().unwrap().writes,
+                vec![exchange["requestFrame"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_management_v2_real_v1_selection_stays_default_off_and_drops_v2_inputs() {
+        let fixture = fixture();
+        let exchange = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "create_enrollment")
+            .unwrap();
+        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+        let child = FakeChild::ready_then(
+            "1.2.3",
+            vec![ChildRead::Bytes(
+                exchange["responseFrame"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            )],
+        );
+        let manager = start_fake(child.clone(), vec![id_bytes(request_id)], "1.2.3");
+        let outcome = manager
+            .request_with_input(
+                ManagementOperation::CreateEnrollment,
+                ManagementInput::CreateEnrollment {
+                    device_label: Some("Pixel".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.protocol_version, 1);
+        assert_eq!(outcome.error.unwrap().code, "UNAVAILABLE");
+        assert_eq!(
+            child.state.lock().unwrap().writes,
+            vec![exchange["requestFrame"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec()]
+        );
+    }
+
+    #[test]
+    fn dashboard_management_v2_invalid_or_forged_stdout_poisons_without_switching_protocol() {
+        let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
+        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
+        for case in fixture["invalidResponseFrameCases"].as_array().unwrap() {
+            let request_id = case["expectedRequestId"].as_str().unwrap();
+            let mut response = case["frame"].as_str().unwrap().as_bytes().to_vec();
+            response.push(b'\n');
+            let child = FakeChild::sequenced(vec![
+                (0, ChildRead::Bytes(ready_frame_v2(version))),
+                (1, ChildRead::Bytes(response)),
+            ]);
+            let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
+            let outcome = manager
+                .request(operation(case["operation"].as_str().unwrap()))
+                .unwrap();
+            assert_eq!(outcome.protocol_version, 2, "{}", case["name"]);
+            assert_eq!(
+                outcome.error.unwrap().code,
+                "CHANNEL_CLOSED",
+                "{}",
+                case["name"]
+            );
+            let state = child.state.lock().unwrap();
+            assert_eq!(state.writes.len(), 1, "{}", case["name"]);
+            assert_eq!(
+                state.events,
+                ["write", "kill-if-live", "wait-and-reap"],
+                "{}",
+                case["name"]
+            );
+            assert!(state.writes[0].starts_with(b"{\"protocolVersion\":2"));
+        }
+    }
+
+    #[test]
+    fn dashboard_management_v2_extra_stdout_frame_poisons_and_clears_the_channel() {
+        let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
+        let exchange = &fixture["goldenExchanges"][0];
+        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
+        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+        let child = FakeChild::sequenced(vec![
+            (0, ChildRead::Bytes(ready_frame_v2(version))),
+            (
+                1,
+                ChildRead::Bytes(
+                    exchange["responseFrame"]
+                        .as_str()
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec(),
+                ),
+            ),
+            (1, ChildRead::Bytes(b"{}\n".to_vec())),
+        ]);
+        let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
+        let outcome = manager.request(ManagementOperation::Status).unwrap();
+        assert_eq!(outcome.protocol_version, 2);
+        assert_eq!(outcome.error.unwrap().code, "CHANNEL_CLOSED");
+        assert_eq!(
+            child.state.lock().unwrap().events,
+            ["write", "kill-if-live", "wait-and-reap"]
+        );
+    }
+
+    fn management_input(value: &Value) -> ManagementInput {
+        match value {
+            Value::Null => ManagementInput::None,
+            Value::Object(object) if object.contains_key("deviceLabel") => {
+                ManagementInput::CreateEnrollment {
+                    device_label: object["deviceLabel"].as_str().map(str::to_string),
+                }
+            }
+            Value::Object(object) => ManagementInput::RevokeClientGrant {
+                grant_id: object["grantId"].as_str().unwrap().to_string(),
+            },
+            _ => panic!("unknown management input"),
         }
     }
 
@@ -2267,6 +2653,41 @@ mod tests {
             process.read_stdout(Instant::now() + Duration::from_secs(2)),
             ChildRead::Failed
         );
+        process.kill_if_live();
+        process.wait_and_reap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_management_v2_production_post_response_requires_a_fresh_drain_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("extra-written");
+        let script = format!(
+            "printf 'response\\n'; IFS= read -r signal; printf 'extra\\n'; : > '{}'; IFS= read -r hold",
+            marker.display()
+        );
+        let process = production_script_process(&script);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            process.read_stdout(deadline),
+            ChildRead::Bytes(b"response\n".to_vec())
+        );
+        assert!(process
+            .observations
+            .pause_unsolicited_drains_after_current_ack(deadline));
+        assert_eq!(
+            process.write_stdin_once(b"continue\n", deadline),
+            ChildWrite::Written(b"continue\n".len())
+        );
+        while !marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "child did not write the extra frame"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(process.poll_after_response(deadline), ChildPoll::Output);
         process.kill_if_live();
         process.wait_and_reap();
     }

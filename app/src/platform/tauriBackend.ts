@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { createDashboardBackend } from "./dashboardBackend";
-import { createRelayV2ManagementV1Adapter } from "./relayV2ManagementV1Adapter";
+import { createRelayV2ManagementAdapter } from "./relayV2ManagementAdapter";
 import { createTauriTransport } from "./tauriTransportFactory";
 
 const currentWindow = getCurrentWindow();
@@ -33,7 +33,7 @@ export const tauriTransport = createTauriTransport({
 });
 
 export const tauriDashboardBackend = createDashboardBackend(tauriTransport, {
-  relayV2: createRelayV2ManagementV1Adapter(
+  relayV2: createRelayV2ManagementAdapter(
     (command, args) => tauriTransport.invoke(command, args),
   ),
 });

@@ -1,0 +1,143 @@
+{
+  "contract": "tmux-worktree-dashboard-relay-v2-management-ipc",
+  "contractVersion": 2,
+  "protocolVersion": 2,
+  "fixtureFormatVersion": 1,
+  "status": "frozen-consumer-path-only",
+  "scope": "future-node-authority-to-dashboard-non-sensitive-management-projection",
+  "productionCapabilityEffect": "none-until-a-bundled-node-child-selects-v2-and-a-real-authority-is-wired",
+  "compatibility": {
+    "startupFrameSelectsExactlyOneProtocol": true,
+    "selectedProtocolMayChangeOnChannel": false,
+    "retryWithOtherProtocolAllowed": false,
+    "fallbackAllowed": false,
+    "v1RemainsPermanentDefaultOff": true
+  },
+  "ownership": {
+    "node": "sole-authority-for-host-credential-enrollment-grant-and-connector-facts",
+    "rust": "startup-negotiation-framing-request-id-single-in-flight-timeout-and-exact-child-lifecycle",
+    "tauri": "closed-operation-and-non-sensitive-input-forwarding-only",
+    "renderer": "closed-projection-mapping-only",
+    "rustOrRendererPersistenceAllowed": false
+  },
+  "transport": {
+    "kind": "dashboard-rust-parent-and-bundled-node-child-stdio",
+    "encoding": "strict-utf-8",
+    "framing": "one-closed-json-object-per-lf-line",
+    "maxFramePayloadBytes": 16384,
+    "maxFrameWireBytes": 16385,
+    "unknownKeysAllowedAtAnyDepth": false,
+    "duplicateKeysAllowedAtAnyDepth": false,
+    "extraStdoutFrameAllowed": false
+  },
+  "startupHandshake": {
+    "exactKeys": ["contract", "protocolVersion", "runtimeVersion"],
+    "contract": "tmux-worktree-dashboard-relay-v2-management-ipc",
+    "protocolVersion": 2,
+    "runtimeVersion": "exact-compile-time-CARGO_PKG_VERSION-match",
+    "selectionIsPermanentForChildLifetime": true
+  },
+  "requestIdentity": {
+    "owner": "dashboard-rust-child-manager",
+    "source": "16-operating-system-csprng-bytes",
+    "prefix": "dmgmt2.",
+    "pattern": "^dmgmt2\\.[A-Za-z0-9_-]{21}[AQgw]$",
+    "callerSuppliedAllowed": false
+  },
+  "coordination": {
+    "maxInFlightRequests": 1,
+    "operationDeadlineMs": 5000,
+    "automaticRetryAllowed": false,
+    "automaticReplayAllowed": false,
+    "callerAbortChangesNativeCompletionBarrier": false
+  },
+  "requestSchema": {
+    "exactKeys": ["protocolVersion", "requestId", "operation", "input"],
+    "operations": [
+      "status",
+      "bootstrap_host",
+      "refresh_host",
+      "start_connector",
+      "stop_connector",
+      "create_enrollment",
+      "revoke_client_grant"
+    ],
+    "inputByOperation": {
+      "status": null,
+      "bootstrap_host": null,
+      "refresh_host": null,
+      "start_connector": null,
+      "stop_connector": null,
+      "create_enrollment": {
+        "exactKeys": ["deviceLabel"],
+        "deviceLabel": "null-or-nonempty-trimmed-utf8-up-to-128-bytes"
+      },
+      "revoke_client_grant": {
+        "exactKeys": ["grantId", "reason"],
+        "grantId": "nonempty-trimmed-opaque-utf8-up-to-128-bytes",
+        "reason": "user_revoked"
+      }
+    },
+    "rendererIntentOnWireAllowed": false
+  },
+  "responseSchema": {
+    "exactKeys": ["protocolVersion", "requestId", "ok", "result", "error"],
+    "success": "closed-dashboardProjection-with-error-null",
+    "failure": "result-null-and-closed-node-error",
+    "rustLocalErrors": ["CHANNEL_CLOSED", "SUPERSEDED"],
+    "rustLocalErrorsAllowedOnChildStdout": false
+  },
+  "dashboardProjection": {
+    "exactKeys": [
+      "authority",
+      "hostCredential",
+      "connector",
+      "enrollment",
+      "knownClientGrant"
+    ],
+    "authority": { "kind": "node", "reason": null },
+    "requiredCapabilities": [
+      "error.structured.v1",
+      "command.ledger.v1",
+      "command.query.v1",
+      "snapshot.revision.v1",
+      "event.sequence.v1",
+      "terminal.stream.resume.v1"
+    ],
+    "registeredRequiresAllSix": true,
+    "registeredIncompleteRequiresMissingCapability": true,
+    "activeEnrollmentRequiresRegisteredAndAllSix": true,
+    "knownGrantIsSingleClosedProjectionNotDeviceList": true,
+    "persistenceAllowed": false
+  },
+  "secretPolicy": {
+    "forbiddenFieldsAtAnyDepth": [
+      "bootstrapToken",
+      "accessToken",
+      "refreshToken",
+      "sharedSecret",
+      "v1SharedSecret",
+      "credentialBlob",
+      "privateKey",
+      "bearerCredential"
+    ],
+    "allowedSensitiveRendererField": "enrollment.review.enrollment.enrollmentCode-only",
+    "enrollmentCodeMustStartWith": "twenroll2.",
+    "credentialReferenceIsOpaqueNonSensitiveReference": true,
+    "urlQueryAllowed": false,
+    "rawFrameLoggingAllowed": false,
+    "rawFrameInErrorAllowed": false
+  },
+  "channelPoison": {
+    "triggers": [
+      "malformed-frame",
+      "unknown-or-duplicate-field",
+      "requestId-mismatch",
+      "forbidden-credential-field",
+      "projection-invariant-violation",
+      "extra-stdout-frame"
+    ],
+    "action": "clear-readiness-kill-if-live-wait-and-reap-without-version-switch-retry-or-fallback"
+  },
+  "fixture": "cases.json"
+}

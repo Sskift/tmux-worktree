@@ -101,7 +101,7 @@ DashboardBackend interface
 
 React 持有选择、打开面板、草稿和轮询状态；它不持有 managed session 的权威状态。
 
-Dashboard 已有一个通过 `DashboardBackend` 驱动的 Relay v2 enrollment/process 领域切片，用于区分 Relay v1 shared-secret profile 与 v2 host credential reference，并建模 host bootstrap/refresh、`host.registered`、六项基础 capability、一次性 enrollment、已知 client grant revoke、过期和 SUPERSEDED。浏览器 preview 使用明确标记的内存 fake；生产 Tauri adapter 在 Node issuer/credential 本地管理接口交付前只返回 unavailable，不经 renderer IPC 传递 bootstrap/access/refresh secret，也不宣告真实 capability 或生成生产二维码。因此当前生产 Relay runtime 仍然只有 v1。
+Dashboard 已有一个通过 `DashboardBackend` 驱动的 Relay v2 enrollment/process 领域切片，用于区分 Relay v1 shared-secret profile 与 v2 host credential reference，并建模 host bootstrap/refresh、`host.registered`、六项基础 capability、一次性 enrollment、已知 client grant revoke、过期和 SUPERSEDED。浏览器 preview 使用明确标记的内存 fake。独立的 Dashboard management IPC v2 consumer foundation 现已闭合 future Node authority → Rust child supervisor → Tauri command → TypeScript adapter → 现有领域模型的非敏感投影路径：startup 首帧一次性选择永久 default-off 的 v1 或显式 v2，Rust 独占 `dmgmt2.*` requestId、单 in-flight、deadline、framing 与 exact child lifecycle，Tauri 只接受 closed operation/input，renderer intent 不进入 wire；bootstrap/access/refresh/v1 shared secret 永不进入 IPC，只有成功 enrollment 的一次性 code 可以进入非持久 renderer state。malformed、correlation/capability矛盾、credential-like未知字段或额外 stdout frame会 poison 同一 channel，不换版、不重试、不 fallback。当前 bundled Node child 仍只选择 management protocol v1，且没有 production v2 management authority/composition，因此真实 Dashboard 仍返回 unavailable，不启动 v2 connector、不生成真实 enrollment、不宣告 ready；当前生产 Relay runtime 仍然只有 v1。
 
 ### macOS 后端：模块化 Rust/Tauri
 
