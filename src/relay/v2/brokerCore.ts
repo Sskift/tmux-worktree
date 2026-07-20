@@ -1185,6 +1185,57 @@ export class RelayV2BrokerCore {
   }
 
   /**
+   * Synchronous serialized-transport cut for one exact current connection.
+   * The Broker-owned captured authorization and trusted clock are the only
+   * expiry inputs; socket close and route-unbind wire policy remain outside
+   * this cut.
+   */
+  recheckConnectionAccessExpiry(
+    connectionKind: "client" | "host",
+    connectionId: string,
+    connectionIncarnation: string,
+  ): void {
+    const connection = connectionKind === "client"
+      ? this.clients.get(connectionId)
+      : connectionKind === "host"
+        ? this.carriers.get(connectionId)
+        : undefined;
+    if (
+      !connection
+      || connection.connectionIncarnation !== connectionIncarnation
+      || connection.authorizationState !== "active"
+    ) return;
+
+    let expired: boolean;
+    try {
+      expired = this.isAuthorizationExpired(connection.authContext);
+    } catch {
+      this.latchCredentialAuthorityUnavailable();
+      return;
+    }
+    if (!expired) return;
+
+    if (connectionKind === "client") {
+      const current = this.clients.get(connectionId);
+      if (
+        current !== connection
+        || current.connectionIncarnation !== connectionIncarnation
+        || current.authorizationState !== "active"
+      ) return;
+      this.fenceClientAuthorization(current, "access_expired", undefined, false);
+      return;
+    }
+
+    const current = this.carriers.get(connectionId);
+    if (
+      current !== connection
+      || current.connectionIncarnation !== connectionIncarnation
+      || current.authorizationState !== "active"
+    ) return;
+    this.fenceHostAuthorization(current, "access_expired");
+  }
+
+  /**
    * Call inspectClientAdmission before sending HTTP 101 so known offline and
    * dialect failures stay HTTP 503/426. This second admission closes the race
    * between 101 and route.open. It opens only the carrier route: route_opened

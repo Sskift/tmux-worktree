@@ -102,12 +102,13 @@ async function openRoute(
   openedMaxFrameBytes = 1_048_576,
   hostId = HOST_ID,
   authOverrides = {},
+  connectionIncarnation = randomUUID(),
 ) {
   const opened = core.openClientRoute(connectionId, authContext("client", {
     hostId,
     jti: `${connectionId}-jti`,
     ...authOverrides,
-  }));
+  }), connectionIncarnation);
   assert.equal(opened.accepted, true);
   const deliveries = core.drainHostCarrier(transportId, { maxFrames: 1 });
   assert.equal(deliveries.length, 1);
@@ -128,7 +129,7 @@ async function openRoute(
   }));
   assert.equal(acknowledged.accepted, true);
   assert.equal(acknowledged.actions[0].kind, "route_opened");
-  return { connectionId, routeOpen, acknowledged };
+  return { connectionId, connectionIncarnation, routeOpen, acknowledged };
 }
 
 function publicBytes(frame) {
@@ -1125,6 +1126,190 @@ test("queued dispatch and host route admission recheck injected expiry", async (
       ["host", "access_expired"],
     ],
   );
+});
+
+test("exact expiry cut fences only the current connection at the trusted-time boundary", async () => {
+  let now = NOW_MS;
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => now,
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
+  });
+  const target = await registerHost(
+    core,
+    "host-exact-expiry",
+    hostHello(),
+    { expiresAtMs: NOW_MS + 2 },
+    "host-expiring-incarnation",
+  );
+  const expiringClient = await openRoute(
+    core,
+    "host-exact-expiry",
+    "client-exact-expiry",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs: NOW_MS + 2 },
+    "client-expiring-incarnation",
+  );
+  const otherTargetClient = await openRoute(
+    core,
+    "host-exact-expiry",
+    "client-on-expiring-host",
+  );
+  const otherHostId = "other-host";
+  await registerHost(
+    core,
+    "host-unrelated-to-expiry",
+    hostHello({ hostId: otherHostId }),
+    { expiresAtMs: NOW_MS + 7_200_000 },
+    "host-unrelated-incarnation",
+  );
+  const unrelatedClient = await openRoute(
+    core,
+    "host-unrelated-to-expiry",
+    "client-on-unrelated-host",
+    1_048_576,
+    otherHostId,
+    { expiresAtMs: NOW_MS + 7_200_000 },
+  );
+
+  now = NOW_MS + 1;
+  core.recheckConnectionAccessExpiry(
+    "client",
+    expiringClient.connectionId,
+    expiringClient.connectionIncarnation,
+  );
+  assert.equal(closeSignals.length, 0, "pre-expiry is a strict no-op");
+
+  now = NOW_MS + 2;
+  core.recheckConnectionAccessExpiry(
+    "client",
+    expiringClient.connectionId,
+    "wrong-client-incarnation",
+  );
+  core.recheckConnectionAccessExpiry(
+    "client",
+    expiringClient.connectionId,
+    expiringClient.connectionIncarnation,
+  );
+  core.recheckConnectionAccessExpiry(
+    "client",
+    expiringClient.connectionId,
+    expiringClient.connectionIncarnation,
+  );
+  assert.deepEqual(closeSignals.map((signal) => [
+    signal.connectionKind,
+    signal.connectionId,
+    signal.connectionIncarnation,
+    signal.reason,
+  ]), [[
+    "client",
+    expiringClient.connectionId,
+    expiringClient.connectionIncarnation,
+    "access_expired",
+  ]]);
+  assert.equal(core.drainHostCarrier("host-exact-expiry").length, 0);
+  assert.equal(core.forwardClientFrame(
+    expiringClient.connectionId,
+    publicBytes(clientTerminalAck("fenced-at-expiry")),
+  ).accepted, false);
+
+  core.recheckConnectionAccessExpiry(
+    "host",
+    "host-exact-expiry",
+    "wrong-host-incarnation",
+  );
+  core.recheckConnectionAccessExpiry(
+    "host",
+    "host-exact-expiry",
+    target.connectionIncarnation,
+  );
+  core.recheckConnectionAccessExpiry(
+    "host",
+    "host-exact-expiry",
+    target.connectionIncarnation,
+  );
+  assert.deepEqual(closeSignals.map((signal) => [
+    signal.connectionKind,
+    signal.connectionKind === "host" ? signal.transportId : signal.connectionId,
+    signal.reason,
+  ]).sort(), [
+    ["client", expiringClient.connectionId, "access_expired"],
+    ["client", otherTargetClient.connectionId, "host_authorization_fenced"],
+    ["host", "host-exact-expiry", "access_expired"],
+  ].sort());
+  assert.equal(core.drainHostCarrier("host-exact-expiry").length, 0);
+  assert.equal(core.inspectHost(otherHostId).state, "online");
+  assert.equal(core.forwardClientFrame(
+    unrelatedClient.connectionId,
+    publicBytes(clientTerminalAck("unrelated-host-stays-current")),
+  ).accepted, true);
+
+  const signalCountBeforeReplacement = closeSignals.length;
+  const replacement = await registerHost(
+    core,
+    "host-exact-expiry",
+    hostHello(),
+    { expiresAtMs: NOW_MS + 7_200_000 },
+    "host-replacement-incarnation",
+  );
+  core.recheckConnectionAccessExpiry(
+    "host",
+    "host-exact-expiry",
+    target.connectionIncarnation,
+  );
+  assert.equal(closeSignals.length, signalCountBeforeReplacement);
+  assert.equal(core.inspectHost(HOST_ID).connectorId, replacement.connectorId);
+
+  core.disconnectHost("host-exact-expiry");
+  core.recheckConnectionAccessExpiry(
+    "host",
+    "host-exact-expiry",
+    replacement.connectionIncarnation,
+  );
+  assert.equal(closeSignals.length, signalCountBeforeReplacement);
+  assert.equal(core.inspectHost(HOST_ID).state, "offline");
+});
+
+test("exact expiry cut sends a throwing trusted clock through the existing fail-closed latch", async () => {
+  let throwClock = false;
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => {
+      if (throwClock) throw new Error("trusted clock unavailable");
+      return NOW_MS;
+    },
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
+  });
+  const host = await registerHost(core, "host-expiry-clock-throw");
+  const client = await openRoute(
+    core,
+    "host-expiry-clock-throw",
+    "client-expiry-clock-throw",
+  );
+
+  throwClock = true;
+  assert.doesNotThrow(() => core.recheckConnectionAccessExpiry(
+    "client",
+    client.connectionId,
+    client.connectionIncarnation,
+  ));
+  assert.equal(core.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  assert.deepEqual(
+    closeSignals.map((signal) => [signal.connectionKind, signal.reason]).sort(),
+    [
+      ["client", "credential_authority_unavailable"],
+      ["host", "credential_authority_unavailable"],
+    ],
+  );
+  core.recheckConnectionAccessExpiry(
+    "host",
+    "host-expiry-clock-throw",
+    host.connectionIncarnation,
+  );
+  assert.equal(closeSignals.length, 2, "the fail-closed latch and close signals are once-only");
+  assert.equal(core.drainHostCarrier("host-expiry-clock-throw").length, 0);
+  assert.equal(core.drainClient(client.connectionId).length, 0);
 });
 
 test("throwing receipt and callback cleanup failures latch all dispatch gates", async () => {
