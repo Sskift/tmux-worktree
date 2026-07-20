@@ -489,18 +489,9 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
                 generation.connectionGeneration,
             ),
         )
-        val failedAdmission = harness.admission(
-            AgentTranscriptLifecycleRequestKind.STATUS,
-            "agent-status-1",
-        )
-        val failedRequest = AgentTranscriptLifecycleDurablePreparedRequest.Status(
-            AgentLocalRequestFence("1", "agent-status-1"),
-        ).toActorRequest(harness.fence())
         val unavailable = RelayV2RuntimeEffect.AgentExtensionUnavailable(
             context = context,
             reason = RelayV2AgentExtensionUnavailableReason.REQUEST_TIMEOUT,
-            failedRequest = failedRequest,
-            requestAdmission = failedAdmission,
             generation = generation,
         )
         assertNotOwned(unavailable)
@@ -513,6 +504,10 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
                 ),
             ),
         )
+        assertEquals(0, harness.operations.loadCount)
+        assertEquals(0, harness.operations.loadPreparedCount)
+        assertEquals(0, harness.lease.blockCount)
+        assertTrue(harness.handoff.replacements.isEmpty())
         assertEquals(0, harness.operations.applyCount)
         assertTrue(harness.handoff.accepted.isEmpty())
 
@@ -550,6 +545,139 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         val read = enabled.read(compositionReadRequest(harness.namespace))
             as AgentTranscriptLifecycleReadState.Page
         assertEquals(harness.namespace, read.namespace)
+    }
+
+    @Test
+    fun `composition redrives only negotiated exact failed admission evidence`() = runBlocking {
+        data class Calls(
+            var sender: Int = 0,
+            var token: Int = 0,
+            var notification: Int = 0,
+        )
+
+        fun composition(
+            harness: Harness,
+            calls: Calls,
+        ) = AgentTranscriptLifecycleRuntimeComposition(
+            harness.lease,
+            harness.operations,
+            harness.handoff,
+            AgentTranscriptLifecycleNotificationPlatformPort {
+                calls.notification += 1
+                AgentTranscriptLifecycleNotificationPlatformResult.Posted
+            },
+            enabled = true,
+            requestSender = AgentTranscriptLifecycleExtensionRequestSender {
+                calls.sender += 1
+                error("failed-admission redrive must not use the ordinary sender")
+            },
+            nextRequestToken = {
+                calls.token += 1
+                error("failed-admission redrive must not mint a request token")
+            },
+        )
+
+        fun failedEffect(
+            harness: Harness,
+            negotiated: Boolean = true,
+        ): Triple<
+            RelayV2RuntimeEffect.AgentExtensionUnavailable,
+            AgentTranscriptLifecycleActorRequest,
+            AgentTranscriptLifecycleRequestAdmission,
+        > {
+            val prepared = AgentTranscriptLifecycleDurablePreparedRequest.Status(
+                AgentLocalRequestFence("1", "agent-status-1"),
+            )
+            val request = prepared.toActorRequest(harness.fence())
+            val admission = harness.admission(
+                AgentTranscriptLifecycleRequestKind.STATUS,
+                request.requestId,
+            )
+            return Triple(
+                RelayV2RuntimeEffect.AgentExtensionUnavailable(
+                    context = compositionHandshakeContext(
+                        if (negotiated) {
+                            setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
+                        } else {
+                            emptySet()
+                        },
+                    ),
+                    reason = RelayV2AgentExtensionUnavailableReason.REQUEST_TIMEOUT,
+                    failedRequest = request,
+                    requestAdmission = admission,
+                    generation = RelayV2EffectGeneration("profile-1", 7, 11),
+                ),
+                request,
+                admission,
+            )
+        }
+
+        run {
+            val harness = Harness("session-1", "agent-status-1", "timeline-1")
+            val calls = Calls()
+            harness.operations.compositionNamespace = harness.namespace
+            val (effect, failedRequest, failedAdmission) = failedEffect(harness)
+            harness.operations.seedPrepared(
+                AgentTranscriptLifecycleDurablePreparedRequest.Status(
+                    AgentLocalRequestFence("1", "agent-status-1"),
+                ),
+            )
+
+            val result = composition(harness, calls).handle(effect)
+                as AgentTranscriptLifecycleRuntimeCompositionResult.RequestRedrive
+            val dispatched = result.result
+                as AgentTranscriptLifecycleRequestSyncResult.Dispatched
+            val replacement = harness.handoff.replacements.single()
+
+            assertSame(failedRequest, dispatched.request)
+            assertSame(failedRequest, replacement.exactRequest)
+            assertSame(failedRequest.frame, replacement.exactRequest.frame)
+            assertEquals(failedRequest.requestId, replacement.exactRequest.requestId)
+            assertSame(failedAdmission, replacement.oldAdmission)
+            assertEquals(failedRequest.requestId, dispatched.admission?.requestId)
+            assertEquals(1, harness.operations.loadCount)
+            assertEquals(1, harness.operations.loadPreparedCount)
+            assertEquals(1, harness.lease.blockCount)
+            assertEquals(0, harness.operations.applyCount)
+            assertEquals(Calls(), calls)
+        }
+
+        run {
+            val harness = Harness("session-1", "agent-status-1", "timeline-1")
+            val calls = Calls()
+            harness.operations.compositionNamespace = harness.namespace
+            val (effect, _, _) = failedEffect(harness, negotiated = false)
+
+            assertEquals(
+                AgentTranscriptLifecycleRuntimeCompositionResult.ExtensionNotNegotiated,
+                composition(harness, calls).handle(effect),
+            )
+            assertEquals(0, harness.operations.loadCount)
+            assertEquals(0, harness.operations.loadPreparedCount)
+            assertEquals(0, harness.lease.blockCount)
+            assertTrue(harness.handoff.replacements.isEmpty())
+            assertEquals(Calls(), calls)
+        }
+
+        run {
+            val harness = Harness("session-1", "agent-status-1", "timeline-1")
+            val calls = Calls()
+            harness.operations.compositionNamespace = harness.namespace
+            val (effect, _, failedAdmission) = failedEffect(harness)
+
+            assertEquals(
+                AgentTranscriptLifecycleRuntimeCompositionResult.RequestRedrive(
+                    AgentTranscriptLifecycleRequestSyncResult.StaleGeneration,
+                ),
+                composition(harness, calls).handle(effect),
+            )
+            assertEquals(1, harness.operations.loadCount)
+            assertEquals(1, harness.operations.loadPreparedCount)
+            assertEquals(1, harness.lease.blockCount)
+            assertTrue(harness.handoff.replacements.isEmpty())
+            assertSame(failedAdmission, effect.requestAdmission)
+            assertEquals(Calls(), calls)
+        }
     }
 
     @Test
@@ -848,6 +976,12 @@ private class RecordingDurableOperationPort(
     val snapshotRequestCommands = mutableListOf<AgentTranscriptLifecycleDurableSnapshotRequestCommand>()
     val snapshotPageCommands = mutableListOf<AgentTranscriptLifecycleDurableSnapshotPageCommand>()
     val prepareCommands = mutableListOf<AgentTranscriptLifecycleDurablePrepareRequestCommand>()
+    private val preparedRequests =
+        mutableListOf<AgentTranscriptLifecycleDurablePreparedRequest>()
+    var loadCount: Int = 0
+        private set
+    var loadPreparedCount: Int = 0
+        private set
     val applyCount: Int
         get() = controlCommands.size + liveCommands.size + correlatedErrorCommands.size +
             replayCommands.size +
@@ -861,9 +995,14 @@ private class RecordingDurableOperationPort(
 
     fun blockNextApply(): ApplyGate = ApplyGate().also { nextApplyGate = it }
 
+    fun seedPrepared(vararg requests: AgentTranscriptLifecycleDurablePreparedRequest) {
+        preparedRequests += requests
+    }
+
     override suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? {
+        loadCount += 1
         val namespace = compositionNamespace ?: return null
         if (namespace.consumer != consumer) return null
         return AgentTranscriptLifecycleDurableRecord(
@@ -943,7 +1082,11 @@ private class RecordingDurableOperationPort(
 
     override suspend fun loadPreparedRequestsUnderApplyLease(
         fence: AgentTranscriptLifecycleDurableOperationFence,
-    ) = error("Not used by runtime consumer composition")
+    ): List<AgentTranscriptLifecycleDurablePreparedRequest> {
+        loadPreparedCount += 1
+        if (fence.expectedNamespace != compositionNamespace) return emptyList()
+        return preparedRequests.toList()
+    }
 
     override suspend fun applyControlUnderApplyLease(
         command: AgentTranscriptLifecycleDurableControlCommand,
@@ -1090,7 +1233,9 @@ private class RecordingDurableHandoff(
     val accepted = mutableListOf<AgentTranscriptLifecycleRequestAdmission>()
     val singleReceipts = mutableListOf<AgentTranscriptLifecycleCompletedHandoffReceipt>()
     val receipts = mutableListOf<AgentTranscriptLifecycleCompletedBatchHandoffReceipt>()
+    val replacements = mutableListOf<AgentTranscriptLifecycleExactRedriveReplacement>()
     var accept = true
+    private var replacementSequence = 100L
 
     override fun acceptDurableHandoff(
         receipt: AgentTranscriptLifecycleCompletedHandoffReceipt,
@@ -1118,7 +1263,17 @@ private class RecordingDurableHandoff(
 
     override fun replaceForExactRedrive(
         replacement: AgentTranscriptLifecycleExactRedriveReplacement,
-    ): AgentTranscriptLifecycleRequestAdmission? = error("runtime consumer cannot redrive")
+    ): AgentTranscriptLifecycleRequestAdmission? {
+        check(insideApplyLease()) { "durable redrive escaped the apply lease" }
+        replacements += replacement
+        replacementSequence += 1
+        return AgentTranscriptLifecycleRequestAdmission(
+            authority = replacement.exactRequest.authority,
+            requestKind = replacement.exactRequest.kind,
+            requestId = replacement.exactRequest.requestId,
+            admissionSequence = replacementSequence,
+        )
+    }
 }
 
 private fun AgentTranscriptLifecycleDurableNamespace.lineage(): AgentTimelineLineage =

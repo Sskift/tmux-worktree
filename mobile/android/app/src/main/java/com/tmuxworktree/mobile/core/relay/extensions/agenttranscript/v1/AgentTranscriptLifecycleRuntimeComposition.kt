@@ -19,6 +19,10 @@ internal sealed interface AgentTranscriptLifecycleRuntimeCompositionResult {
     data object DurableNamespaceUnavailable : AgentTranscriptLifecycleRuntimeCompositionResult
     data object RuntimeFault : AgentTranscriptLifecycleRuntimeCompositionResult
 
+    data class RequestRedrive(
+        val result: AgentTranscriptLifecycleRequestSyncResult,
+    ) : AgentTranscriptLifecycleRuntimeCompositionResult
+
     data class Consumed(
         val consumption: AgentTranscriptLifecycleRuntimeConsumeResult,
         val notificationDispatches: List<AgentTranscriptLifecycleNotificationDispatchResult>,
@@ -62,6 +66,12 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             requestToken = nextRequestToken,
         )
     }
+    private val failedAdmissionRedrive =
+        AgentTranscriptLifecycleFailedAdmissionRedriveCoordinator(
+            applyLease = applyLease,
+            durableRepository = durableRepository,
+            durableHandoff = durableHandoff,
+        )
     private val readProjection = AgentTranscriptLifecycleRoomReadProjection(durableRepository)
 
     companion object {
@@ -100,11 +110,8 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
                 handleAgentFrame(effect)
             }
         }
-        // The upper-layer dispatcher owns unavailable routing. If the effect carries an exact
-        // failed request/admission identity, that dispatcher can return it to RequestSync's
-        // redrive owner without losing its generation fence.
         is RelayV2RuntimeEffect.AgentExtensionUnavailable ->
-            AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
+            handleAgentUnavailable(effect)
         else -> AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
     }
 
@@ -183,6 +190,47 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             notificationDispatches = notificationResults,
             requestSyncDispatches = requestSyncResults,
         )
+    }
+
+    private suspend fun handleAgentUnavailable(
+        effect: RelayV2RuntimeEffect.AgentExtensionUnavailable,
+    ): AgentTranscriptLifecycleRuntimeCompositionResult {
+        val failedRequest = effect.failedRequest
+            ?: return AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
+        val failedAdmission = effect.requestAdmission
+            ?: return AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned(effect)
+        if (!enabled) return AgentTranscriptLifecycleRuntimeCompositionResult.Disabled
+        if (AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in effect.context.negotiatedCapabilities) {
+            return AgentTranscriptLifecycleRuntimeCompositionResult.ExtensionNotNegotiated
+        }
+
+        val consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
+            profileId = effect.repositoryAuthority.profileId,
+            profileActivationGeneration =
+                effect.repositoryAuthority.profileActivationGeneration,
+            principalId = effect.repositoryAuthority.principalId,
+            clientInstanceId = effect.repositoryAuthority.clientInstanceId,
+            hostId = effect.repositoryAuthority.hostId,
+            hostEpoch = effect.repositoryAuthority.hostEpoch,
+            scopeId = failedRequest.scopeId,
+            sessionId = failedRequest.sessionId,
+        )
+        val namespace = durableRepository.load(consumer)?.namespace
+            ?: return AgentTranscriptLifecycleRuntimeCompositionResult
+                .DurableNamespaceUnavailable
+        if (namespace.consumer != consumer) {
+            return AgentTranscriptLifecycleRuntimeCompositionResult
+                .DurableNamespaceUnavailable
+        }
+        val result = failedAdmissionRedrive.retryFailedAdmission(
+            context = AgentTranscriptLifecycleFailedAdmissionRedriveContext(
+                authority = effect.repositoryAuthority,
+                expectedNamespace = namespace,
+            ),
+            failedRequest = failedRequest,
+            failedAdmission = failedAdmission,
+        )
+        return AgentTranscriptLifecycleRuntimeCompositionResult.RequestRedrive(result)
     }
 }
 

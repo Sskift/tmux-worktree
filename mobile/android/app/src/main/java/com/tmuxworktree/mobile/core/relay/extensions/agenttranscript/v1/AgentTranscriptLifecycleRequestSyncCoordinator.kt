@@ -187,6 +187,88 @@ internal data class AgentTranscriptLifecycleOutboundStatusRequestContext(
 }
 
 /**
+ * Actor-derived authority for replacing one exact failed request admission.
+ *
+ * Capability negotiation remains at the actor/composition boundary. This context deliberately
+ * carries neither trusted ingress nor a caller-assembled capability set; the redrive owner only
+ * needs the current repository authority and the exact durable namespace it must re-read.
+ */
+internal data class AgentTranscriptLifecycleFailedAdmissionRedriveContext(
+    val authority: RelayV2RepositoryEffectAuthority,
+    val expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+) {
+    init {
+        val consumer = expectedNamespace.consumer
+        require(authority.profileId == consumer.profileId)
+        require(authority.profileActivationGeneration == consumer.profileActivationGeneration)
+        require(authority.principalId == consumer.principalId)
+        require(authority.clientInstanceId == consumer.clientInstanceId)
+        require(authority.hostId == consumer.hostId)
+        require(authority.hostEpoch == consumer.hostEpoch)
+    }
+}
+
+/**
+ * Replaces a failed volatile admission only while its exact durable request remains prepared.
+ *
+ * This owner never prepares a request, generates a token, calls the ordinary request sender, or
+ * owns a WebSocket. The actor apply lease covers both the durable re-read and the exact handoff
+ * replacement, so stale or missing evidence leaves the old admission actor-owned.
+ */
+internal class AgentTranscriptLifecycleFailedAdmissionRedriveCoordinator(
+    private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
+    private val durableRepository: AgentTranscriptLifecycleDurableOperationPort,
+    private val durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
+) {
+    suspend fun retryFailedAdmission(
+        context: AgentTranscriptLifecycleFailedAdmissionRedriveContext,
+        failedRequest: AgentTranscriptLifecycleActorRequest,
+        failedAdmission: AgentTranscriptLifecycleRequestAdmission,
+    ): AgentTranscriptLifecycleRequestSyncResult {
+        if (!failedAdmission.matches(failedRequest) ||
+            failedRequest.authority != context.authority ||
+            failedRequest.scopeId != context.expectedNamespace.consumer.scopeId ||
+            failedRequest.sessionId != context.expectedNamespace.consumer.sessionId
+        ) return AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
+
+        val recovered = applyLease.withEffectApplyLease(context.authority) {
+            val exact = durableRepository
+                .loadPreparedRequestsUnderApplyLease(context.durableOperationFence())
+                .singleOrNull {
+                    it.requestKind == failedAdmission.requestKind &&
+                        it.requestNetworkToken == failedAdmission.requestId
+                }
+                ?.toActorRequest(
+                    authority = context.authority,
+                    expectedNamespace = context.expectedNamespace,
+                )
+                ?.takeIf { it == failedRequest }
+            exact?.let {
+                failedRequest to durableHandoff.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(
+                        oldAdmission = failedAdmission,
+                        exactRequest = failedRequest,
+                    ),
+                )
+            }
+        }
+        return when (recovered) {
+            RelayV2EffectApplyResult.Stale ->
+                AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
+            is RelayV2EffectApplyResult.Applied -> {
+                val (request, admission) = recovered.value
+                    ?: return AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
+                AgentTranscriptLifecycleRequestSyncResult.Dispatched(
+                    reduction = null,
+                    request = request,
+                    admission = admission,
+                )
+            }
+        }
+    }
+}
+
+/**
  * Persists extension request fences through the existing durable owner, then asks the actor to
  * send under its current generation/authority fence. This coordinator never owns a WebSocket.
  */
@@ -197,6 +279,13 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
     private val durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
     private val requestToken: () -> String = { UUID.randomUUID().toString() },
 ) {
+    private val failedAdmissionRedrive =
+        AgentTranscriptLifecycleFailedAdmissionRedriveCoordinator(
+            applyLease = applyLease,
+            durableRepository = durableRepository,
+            durableHandoff = durableHandoff,
+        )
+
     suspend fun requestStatus(
         context: AgentTranscriptLifecycleOutboundStatusRequestContext,
     ): AgentTranscriptLifecycleRequestSyncResult {
@@ -311,43 +400,14 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
         if (!fence.isNegotiated()) {
             return AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated
         }
-        if (!failedAdmission.matches(failedRequest) ||
-            failedRequest.authority != fence.authority ||
-            failedRequest.scopeId != fence.expectedNamespace.consumer.scopeId ||
-            failedRequest.sessionId != fence.expectedNamespace.consumer.sessionId
-        ) return AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
-
-        val recovered = applyLease.withEffectApplyLease(fence.authority) {
-            val exact = durableRepository
-                .loadPreparedRequestsUnderApplyLease(fence.durableOperationFence())
-                .singleOrNull {
-                    it.requestKind == failedAdmission.requestKind &&
-                        it.requestNetworkToken == failedAdmission.requestId
-                }
-                ?.toActorRequest(fence)
-                ?.takeIf { it == failedRequest }
-            exact?.let { request ->
-                request to durableHandoff.replaceForExactRedrive(
-                    AgentTranscriptLifecycleExactRedriveReplacement(
-                        oldAdmission = failedAdmission,
-                        exactRequest = request,
-                    ),
-                )
-            }
-        }
-        return when (recovered) {
-            RelayV2EffectApplyResult.Stale ->
-                AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
-            is RelayV2EffectApplyResult.Applied -> {
-                val (request, admission) = recovered.value
-                    ?: return AgentTranscriptLifecycleRequestSyncResult.StaleGeneration
-                AgentTranscriptLifecycleRequestSyncResult.Dispatched(
-                    reduction = null,
-                    request = request,
-                    admission = admission,
-                )
-            }
-        }
+        return failedAdmissionRedrive.retryFailedAdmission(
+            context = AgentTranscriptLifecycleFailedAdmissionRedriveContext(
+                authority = fence.authority,
+                expectedNamespace = fence.expectedNamespace,
+            ),
+            failedRequest = failedRequest,
+            failedAdmission = failedAdmission,
+        )
     }
 
     suspend fun dispatchPostCommitEffect(
@@ -497,6 +557,12 @@ private fun AgentTranscriptLifecycleRuntimeFence.durableOperationFence() =
     )
 
 private fun AgentTranscriptLifecycleOutboundStatusRequestContext.durableOperationFence() =
+    AgentTranscriptLifecycleDurableOperationFence(
+        authority = expectedNamespace.consumer,
+        expectedNamespace = expectedNamespace,
+    )
+
+private fun AgentTranscriptLifecycleFailedAdmissionRedriveContext.durableOperationFence() =
     AgentTranscriptLifecycleDurableOperationFence(
         authority = expectedNamespace.consumer,
         expectedNamespace = expectedNamespace,
