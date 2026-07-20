@@ -1,0 +1,168 @@
+{
+  "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
+  "contractVersion": 1,
+  "fixtureFormatVersion": 1,
+  "status": "frozen",
+  "scope": "host-credential-internal-native-abi-only",
+  "productionCapabilityEffect": "none",
+  "businessOwner": "RelayV2HostCredentialVault",
+  "nativeOwner": "future-host-credential-atomic-file-cell-native-lifecycle",
+  "nativeModuleAuthority": {
+    "source": "future-production-composition-single-trusted-factory",
+    "binding": "pre-bound-exact-host-credential-cell-directory-descriptor-capability",
+    "futureNativeHolder": "4b2-host-native-cell",
+    "wrapperOpenConsumesBoundCapabilityOnly": true,
+    "pathOrDescriptorArgumentInAbi": false,
+    "homePathEnvironmentOrGlobalLookupAllowed": false,
+    "factoryLoaderOrPathImplementedIn4b1": false
+  },
+  "nativeInterface": {
+    "abi": "napi",
+    "abiVersion": 1,
+    "moduleMethods": ["openRelayV2HostCredentialAtomicFileCellV1"],
+    "handleMethods": ["read", "compareAndSwap", "close"],
+    "methodProperties": "exact-own-data-methods",
+    "synchronousOnly": true,
+    "proxyAllowed": false,
+    "accessorAllowed": false,
+    "asyncFunctionAllowed": false,
+    "promiseOrThenableAllowed": false,
+    "implicitAddonLoadAllowed": false,
+    "implicitHomePathOrEnvironmentReadAllowed": false
+  },
+  "requests": {
+    "discriminators": { "abiVersion": 1, "operation": true },
+    "variants": {
+      "open": ["abiVersion", "operation"],
+      "read": ["abiVersion", "operation"],
+      "compare_and_swap": ["abiVersion", "operation", "revision", "bytes"],
+      "close": ["abiVersion", "operation"]
+    },
+    "exactFields": true
+  },
+  "results": {
+    "discriminators": ["abiVersion", "operation", "outcome"],
+    "open": {
+      "opened": ["abiVersion", "operation", "outcome", "handle"],
+      "error": ["abiVersion", "operation", "outcome", "error"]
+    },
+    "read": {
+      "ok": ["abiVersion", "operation", "outcome", "current"],
+      "error": ["abiVersion", "operation", "outcome", "error"]
+    },
+    "compare_and_swap": {
+      "swapped": ["abiVersion", "operation", "outcome"],
+      "conflict": ["abiVersion", "operation", "outcome", "current"],
+      "uncertain": ["abiVersion", "operation", "outcome"],
+      "error": ["abiVersion", "operation", "outcome", "error"]
+    },
+    "close": {
+      "closed": ["abiVersion", "operation", "outcome"],
+      "error": ["abiVersion", "operation", "outcome", "error"]
+    },
+    "current": {
+      "empty": ["state", "revision"],
+      "present": ["state", "revision", "bytes"]
+    },
+    "exactFields": true
+  },
+  "bytes": {
+    "type": "real-Uint8Array",
+    "maximumBytes": 65536,
+    "readOwnership": "fresh-node-copy",
+    "compareAndSwapOwnership": "synchronous-node-copy-before-native-mutation"
+  },
+  "revision": {
+    "raw": "opaque-native-owner-bound-token",
+    "rawEscapesNodeWrapper": false,
+    "public": "empty-frozen-node-owner-bound-token",
+    "publicFields": [],
+    "acceptedByCompareAndSwap": "same-wrapper-current-unconsumed-exact-token-only",
+    "rejectedBeforeRawMutation": ["foreign", "copy", "replay", "stale", "forged"]
+  },
+  "rawErrorUnion": {
+    "shape": ["code"],
+    "codes": [
+      "NATIVE_INTERFACE_INVALID",
+      "CELL_BUSY",
+      "CELL_CLOSED",
+      "CELL_CORRUPT",
+      "CELL_IDENTITY_UNCERTAIN",
+      "CELL_IO",
+      "CELL_PERMISSION_INVALID",
+      "CELL_DURABILITY_UNSUPPORTED",
+      "CELL_RECOVERY_REQUIRED",
+      "INVALID_ARGUMENT",
+      "INVALID_REVISION",
+      "VALUE_TOO_LARGE"
+    ],
+    "dynamicMessageOrCauseAllowed": false,
+    "unknownOrExtra": "NATIVE_INTERFACE_INVALID-and-permanent-wrapper-fence",
+    "rawThrow": "always-NATIVE_INTERFACE_INVALID-without-inspection-or-reflection"
+  },
+  "nodeWrapperErrorUnion": {
+    "shape": ["code"],
+    "codes": [
+      "NATIVE_INTERFACE_INVALID",
+      "CELL_BUSY",
+      "CELL_CLOSED",
+      "CELL_CORRUPT",
+      "CELL_IDENTITY_UNCERTAIN",
+      "CELL_IO",
+      "CELL_PERMISSION_INVALID",
+      "CELL_DURABILITY_UNSUPPORTED",
+      "CELL_RECOVERY_REQUIRED",
+      "INVALID_ARGUMENT",
+      "INVALID_REVISION",
+      "VALUE_TOO_LARGE",
+      "REENTRANT",
+      "ASYNC_OPERATION_UNSUPPORTED",
+      "UNCERTAIN_FENCED"
+    ],
+    "dynamicMessageOrCauseAllowed": false,
+    "rawThrowCodeReflectionAllowed": false
+  },
+  "lifecycle": {
+    "nodeOwnsRawHandle": true,
+    "openFailureAfterHandleCapture": "exactly-once-raw-close-before-no-publication",
+    "unknownNativeError": "permanent-wrapper-fence",
+    "uncertain": "permanent-wrapper-fence-without-current-or-revision",
+    "fallbackAllowed": false,
+    "closeAndDrain": {
+      "stablePromise": true,
+      "rejectsNewOperationsAtBarrierStart": true,
+      "rawCloseCount": "exactly-once",
+      "rawCloseRetryAllowed": false,
+      "resolveRequires": "exact-closed-result"
+    }
+  },
+  "ownershipIsolation": {
+    "vaultOwns": ["credential-envelope", "business-binding", "secret-semantics"],
+    "futureNativeOwns": ["descriptor", "lock", "identity", "cas", "durability", "recovery", "final-close"],
+    "forbiddenReuse": [
+      "RelayV2BrokerCredentialStateStoreV1-logical-store-kind",
+      "broker-134217984-byte-dual-slot-container",
+      "broker-private-location-or-spec",
+      "broker-native-owner-or-registry",
+      "broker-artifact-or-loader",
+      "broker-continuity-namespace",
+      "H4a-production-fallback",
+      "Relay-v1-fallback"
+    ]
+  },
+  "notImplemented": [
+    "native-rust-or-syscall-open",
+    "real-home-or-filesystem",
+    "orphan-cleanup-or-recovery",
+    "durability-qualification",
+    "continuity",
+    "loader-or-packaging",
+    "vault-injection",
+    "relay-host-production-composition",
+    "capability-advertisement"
+  ],
+  "files": [
+    { "role": "specification", "path": "README.md" },
+    { "role": "native-interface", "path": "native-interface-cases.json" }
+  ]
+}

@@ -1,0 +1,154 @@
+{
+  "fixtureFormatVersion": 1,
+  "abiVersion": 1,
+  "canonicalRequests": {
+    "open": { "abiVersion": 1, "operation": "open" },
+    "read": { "abiVersion": 1, "operation": "read" },
+    "compareAndSwap": {
+      "abiVersion": 1,
+      "operation": "compare_and_swap",
+      "revision": "materialize-native-revision",
+      "bytesBase64": "AAEC"
+    },
+    "close": { "abiVersion": 1, "operation": "close" }
+  },
+  "openCases": [
+    {
+      "name": "exact-opened-handle",
+      "rawResult": { "abiVersion": 1, "operation": "open", "outcome": "opened", "handle": "materialize-handle" },
+      "expected": { "outcome": "opened" }
+    },
+    {
+      "name": "exact-open-error",
+      "rawResult": { "abiVersion": 1, "operation": "open", "outcome": "error", "error": { "code": "CELL_BUSY" } },
+      "expected": { "errorCode": "CELL_BUSY" }
+    },
+    {
+      "name": "open-extra-field-closes-unpublished-handle",
+      "rawResult": { "abiVersion": 1, "operation": "open", "outcome": "opened", "handle": "materialize-handle", "fallback": "forbidden" },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "rawCloseCount": 1 }
+    },
+    {
+      "name": "open-wrong-version-is-closed",
+      "rawResult": { "abiVersion": 2, "operation": "open", "outcome": "opened", "handle": "materialize-handle" },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "rawCloseCount": 1 }
+    },
+    {
+      "name": "open-missing-outcome-closes-unpublished-handle",
+      "rawResult": { "abiVersion": 1, "operation": "open", "handle": "materialize-handle" },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "rawCloseCount": 1 }
+    },
+    {
+      "name": "open-unknown-outcome-closes-unpublished-handle",
+      "rawResult": { "abiVersion": 1, "operation": "open", "outcome": "future", "handle": "materialize-handle" },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "rawCloseCount": 1 }
+    }
+  ],
+  "readCases": [
+    {
+      "name": "exact-empty-read",
+      "rawResult": { "abiVersion": 1, "operation": "read", "outcome": "ok", "current": { "state": "empty", "revision": "materialize-native-revision" } },
+      "expected": { "state": "empty" }
+    },
+    {
+      "name": "exact-present-read",
+      "rawResult": { "abiVersion": 1, "operation": "read", "outcome": "ok", "current": { "state": "present", "revision": "materialize-native-revision", "bytesBase64": "AAEC" } },
+      "expected": { "state": "present", "bytesBase64": "AAEC" }
+    },
+    {
+      "name": "exact-read-error",
+      "rawResult": { "abiVersion": 1, "operation": "read", "outcome": "error", "error": { "code": "CELL_IO" } },
+      "expected": { "errorCode": "CELL_IO" }
+    },
+    {
+      "name": "read-extra-field-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "read", "outcome": "ok", "current": { "state": "empty", "revision": "materialize-native-revision" }, "detail": null },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "fenced": true }
+    },
+    {
+      "name": "read-wrong-bytes-type-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "read", "outcome": "ok", "current": { "state": "present", "revision": "materialize-native-revision", "bytes": [0, 1, 2] } },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "fenced": true }
+    },
+    {
+      "name": "read-wrong-operation-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "future_read", "outcome": "ok", "current": { "state": "empty", "revision": "materialize-native-revision" } },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "fenced": true }
+    }
+  ],
+  "compareAndSwapCases": [
+    {
+      "name": "exact-swapped",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "swapped" },
+      "expected": { "status": "swapped" }
+    },
+    {
+      "name": "exact-empty-conflict",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "conflict", "current": { "state": "empty", "revision": "materialize-native-revision" } },
+      "expected": { "status": "conflict", "state": "empty" }
+    },
+    {
+      "name": "exact-present-conflict",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "conflict", "current": { "state": "present", "revision": "materialize-native-revision", "bytesBase64": "AwQF" } },
+      "expected": { "status": "conflict", "state": "present", "bytesBase64": "AwQF" }
+    },
+    {
+      "name": "exact-uncertain",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "uncertain" },
+      "expected": { "status": "uncertain", "fenced": true }
+    },
+    {
+      "name": "exact-cas-error",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "error", "error": { "code": "INVALID_REVISION" } },
+      "expected": { "errorCode": "INVALID_REVISION" }
+    },
+    {
+      "name": "cas-extra-field-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "swapped", "current": null },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "fenced": true }
+    },
+    {
+      "name": "cas-missing-current-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "compare_and_swap", "outcome": "conflict" },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID", "fenced": true }
+    }
+  ],
+  "closeCases": [
+    {
+      "name": "exact-closed",
+      "rawResult": { "abiVersion": 1, "operation": "close", "outcome": "closed" },
+      "expected": { "outcome": "closed" }
+    },
+    {
+      "name": "exact-close-error",
+      "rawResult": { "abiVersion": 1, "operation": "close", "outcome": "error", "error": { "code": "CELL_IO" } },
+      "expected": { "errorCode": "CELL_IO" }
+    },
+    {
+      "name": "close-extra-field-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "close", "outcome": "closed", "retry": true },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID" }
+    },
+    {
+      "name": "close-missing-outcome-is-closed",
+      "rawResult": { "abiVersion": 1, "operation": "close" },
+      "expected": { "errorCode": "NATIVE_INTERFACE_INVALID" }
+    }
+  ],
+  "errorCases": [
+    { "name": "native-interface-invalid", "input": { "code": "NATIVE_INTERFACE_INVALID" }, "expectedCode": "NATIVE_INTERFACE_INVALID" },
+    { "name": "cell-busy", "input": { "code": "CELL_BUSY" }, "expectedCode": "CELL_BUSY" },
+    { "name": "cell-closed", "input": { "code": "CELL_CLOSED" }, "expectedCode": "CELL_CLOSED" },
+    { "name": "cell-corrupt", "input": { "code": "CELL_CORRUPT" }, "expectedCode": "CELL_CORRUPT" },
+    { "name": "cell-identity-uncertain", "input": { "code": "CELL_IDENTITY_UNCERTAIN" }, "expectedCode": "CELL_IDENTITY_UNCERTAIN" },
+    { "name": "cell-io", "input": { "code": "CELL_IO" }, "expectedCode": "CELL_IO" },
+    { "name": "cell-permission-invalid", "input": { "code": "CELL_PERMISSION_INVALID" }, "expectedCode": "CELL_PERMISSION_INVALID" },
+    { "name": "cell-durability-unsupported", "input": { "code": "CELL_DURABILITY_UNSUPPORTED" }, "expectedCode": "CELL_DURABILITY_UNSUPPORTED" },
+    { "name": "cell-recovery-required", "input": { "code": "CELL_RECOVERY_REQUIRED" }, "expectedCode": "CELL_RECOVERY_REQUIRED" },
+    { "name": "invalid-argument", "input": { "code": "INVALID_ARGUMENT" }, "expectedCode": "INVALID_ARGUMENT" },
+    { "name": "invalid-revision", "input": { "code": "INVALID_REVISION" }, "expectedCode": "INVALID_REVISION" },
+    { "name": "value-too-large", "input": { "code": "VALUE_TOO_LARGE" }, "expectedCode": "VALUE_TOO_LARGE" },
+    { "name": "unknown-code", "input": { "code": "UNKNOWN" }, "expectedCode": "NATIVE_INTERFACE_INVALID", "fenced": true },
+    { "name": "error-extra-field", "input": { "code": "CELL_IO", "message": "forbidden" }, "expectedCode": "NATIVE_INTERFACE_INVALID", "fenced": true }
+  ]
+}
