@@ -60,6 +60,7 @@ export default defineConfig({
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerProducer.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerNotificationSource.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerProcessControllerAuthority.ts",
+    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerTrustedSourceActivation.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexTrustedSourceComposition.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
@@ -73,7 +74,10 @@ export default defineConfig({
   outDir: "dist",
   clean: true,
   splitting: false,
-  external: ["./codexAppServerNotificationSource.js"],
+  external: [
+    "./codexAppServerNotificationSource.js",
+    "./codexAppServerProcessControllerAuthority.js",
+  ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
   },
