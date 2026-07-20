@@ -82,6 +82,10 @@ export interface RelayV2HostCredentialOwnerBoundExchangePort {
 }
 
 const ownerBoundExchangePorts = new WeakSet<object>();
+const hostCredentialExchangeCoordinatorAuthorities = new WeakMap<
+object,
+RelayV2HostCredentialAuthority
+>();
 
 export function isRelayV2HostCredentialOwnerBoundExchangePort(
   value: unknown,
@@ -89,6 +93,16 @@ export function isRelayV2HostCredentialOwnerBoundExchangePort(
   return typeof value === "object"
     && value !== null
     && ownerBoundExchangePorts.has(value);
+}
+
+export function isRelayV2HostCredentialExchangeCoordinatorForAuthority(
+  value: unknown,
+  authority: RelayV2HostCredentialAuthority,
+): value is RelayV2HostCredentialExchangeCoordinator {
+  return typeof value === "object"
+    && value !== null
+    && isRelayV2HostCredentialAuthority(authority)
+    && hostCredentialExchangeCoordinatorAuthorities.get(value) === authority;
 }
 
 export class RelayV2HostCredentialOwnerBindingError extends Error {
@@ -111,6 +125,9 @@ export class RelayV2HostCredentialExchangeCoordinator {
   constructor(options: RelayV2HostCredentialExchangeCoordinatorOptions) {
     this.authority = options.authority;
     this.httpsAdapter = options.httpsAdapter;
+    if (isRelayV2HostCredentialAuthority(options.authority)) {
+      hostCredentialExchangeCoordinatorAuthorities.set(this, options.authority);
+    }
   }
 
   createOwnerBoundPort(): RelayV2HostCredentialOwnerBoundExchangePort {

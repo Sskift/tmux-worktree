@@ -164,6 +164,24 @@ interface AttemptRecord extends RelayV2HostConnectorControllerIdentity {
 
 interface DrainedBinding extends RelayV2HostConnectorControllerBinding {}
 
+const hostConnectorControllerIdentities = new WeakMap<
+object,
+Readonly<RelayV2HostConnectorControllerIdentity>
+>();
+
+export function isRelayV2HostConnectorControllerForIdentity(
+  value: unknown,
+  identity: Readonly<RelayV2HostConnectorControllerIdentity>,
+): value is RelayV2HostConnectorController {
+  if (typeof value !== "object" || value === null) return false;
+  const registered = hostConnectorControllerIdentities.get(value);
+  return registered !== undefined
+    && registered.hostId === identity.hostId
+    && registered.hostEpoch === identity.hostEpoch
+    && registered.hostInstanceId === identity.hostInstanceId
+    && registered.credentialReference === identity.credentialReference;
+}
+
 interface ParsedCarrierStatus {
   readonly phase: "connecting" | "registered" | "offline" | "superseded";
   readonly generation: number;
@@ -377,6 +395,12 @@ implements RelayV2HostConnectorControllerPort {
     this.#hostEpoch = identifier(fields.hostEpoch);
     this.#hostInstanceId = identifier(fields.hostInstanceId);
     this.#credentialReference = credentialReference(fields.credentialReference);
+    hostConnectorControllerIdentities.set(this, Object.freeze({
+      hostId: this.#hostId,
+      hostEpoch: this.#hostEpoch,
+      hostInstanceId: this.#hostInstanceId,
+      credentialReference: this.#credentialReference,
+    }));
   }
 
   inspectCut(): RelayV2HostConnectorControllerCut {

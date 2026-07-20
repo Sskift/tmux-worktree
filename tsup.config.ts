@@ -14,6 +14,8 @@ export default defineConfig({
     "src/relayServer.ts",
     "src/relay/v2/hostCarrier.ts",
     "src/relay/v2/hostConnectorController.ts",
+    "src/relay/v2/hostCredentialAuthority.ts",
+    "src/relay/v2/hostCredentialExchangeCoordinator.ts",
     "src/relay/v2/hostCapabilityReadiness.ts",
     "src/relay/v2/hostCodecReadinessActivation.ts",
     "src/relay/v2/hostRuntime.ts",
@@ -45,6 +47,7 @@ export default defineConfig({
     "src/relay/v2/relayV2DashboardManagementHostCredentialAdapter.ts",
     "src/relay/v2/relayV2DashboardManagementHostConnectorAdapter.ts",
     "src/relay/v2/relayV2DashboardManagementHostCarrierControlAdapter.ts",
+    "src/relay/v2/relayV2DashboardManagementComposition.ts",
     "src/relay/v2/relayV2DashboardManagementStdio.ts",
     "src/relay/v2/codec.ts",
     "src/relay/v2/brokerCore.ts",
@@ -80,6 +83,12 @@ export default defineConfig({
   external: [
     "./codexAppServerNotificationSource.js",
     "./codexAppServerProcessControllerAuthority.js",
+    // These owner entries carry module-private WeakMap brands. Keep every
+    // dist consumer on the same canonical module instances.
+    "./hostCarrier.js",
+    "./hostConnectorController.js",
+    "./hostCredentialAuthority.js",
+    "./hostCredentialExchangeCoordinator.js",
   ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',

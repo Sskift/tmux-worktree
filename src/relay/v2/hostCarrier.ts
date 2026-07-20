@@ -574,6 +574,31 @@ function makeQueueLimits(input: RelayV2HostCarrierQueueLimits = {}): QueueLimits
   };
 }
 
+export interface RelayV2HostCarrierDashboardManagementBinding {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly credentialReferences: RelayV2HostCarrierCredentialReferences;
+}
+
+const hostCarrierDashboardManagementBindings = new WeakMap<
+object,
+RelayV2HostCarrierDashboardManagementBinding
+>();
+
+export function isRelayV2HostCarrierActorForDashboardManagement(
+  value: unknown,
+  binding: Readonly<RelayV2HostCarrierDashboardManagementBinding>,
+): value is RelayV2HostCarrierActor {
+  if (typeof value !== "object" || value === null) return false;
+  const registered = hostCarrierDashboardManagementBindings.get(value);
+  return registered !== undefined
+    && registered.hostId === binding.hostId
+    && registered.hostEpoch === binding.hostEpoch
+    && registered.hostInstanceId === binding.hostInstanceId
+    && registered.credentialReferences === binding.credentialReferences;
+}
+
 function safeNow(clock: () => number): number {
   const value = clock();
   if (!Number.isSafeInteger(value) || value < 0) {
@@ -970,6 +995,12 @@ export class RelayV2HostCarrierActor {
     if (this.terminalMaxFrameBytes > DEFAULT_TERMINAL_FRAME_BYTES) {
       throw new Error("Relay v2 host carrier terminalMaxFrameBytes exceeds the contract");
     }
+    hostCarrierDashboardManagementBindings.set(this, Object.freeze({
+      hostId: options.hostId,
+      hostEpoch: options.hostEpoch,
+      hostInstanceId: options.hostInstanceId,
+      credentialReferences: options.credentialReferences,
+    }));
   }
 
   status(): RelayV2HostCarrierStatus | null {
