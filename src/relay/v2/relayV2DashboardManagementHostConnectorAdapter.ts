@@ -11,6 +11,17 @@ import {
 import {
   RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE,
 } from "./hostCredentialAuthority.js";
+import type {
+  RelayV2HostConnectorControllerBinding,
+  RelayV2HostConnectorControllerCut,
+  RelayV2HostConnectorControllerErrorCode,
+  RelayV2HostConnectorControllerIdentity,
+  RelayV2HostConnectorControllerPort,
+  RelayV2HostConnectorControllerStartInput,
+  RelayV2HostConnectorControllerStartResult,
+  RelayV2HostConnectorControllerStopInput,
+  RelayV2HostConnectorControllerStopResult,
+} from "./hostConnectorController.js";
 import { isRelayV2AuthIdentifier } from "./token.js";
 
 const MAX_IDENTIFIER_BYTES = 128;
@@ -19,91 +30,14 @@ const MAX_COUNTER = 18_446_744_073_709_551_615n;
 type MaybePromise<T> = T | Promise<T>;
 type DataRecord = Record<string, unknown>;
 
-interface RelayV2DashboardManagementHostConnectorBinding {
-  readonly controllerGeneration: string;
-  readonly connectorId: string;
-  readonly hostId: string;
-  readonly hostEpoch: string;
-  readonly hostInstanceId: string;
-  readonly credentialReference: string;
-}
-
-export type RelayV2DashboardManagementHostConnectorControllerCut =
-  | Readonly<{
-      status: "stopped";
-      controllerGeneration: string;
-    }>
-  | (Readonly<{ status: "starting" }> & RelayV2DashboardManagementHostConnectorBinding)
-  | (Readonly<{
-      status: "registered";
-      acknowledgement: "host.registered";
-      negotiatedCapabilityIntersection: readonly string[];
-    }> & RelayV2DashboardManagementHostConnectorBinding)
-  | (Readonly<{
-      status: "failed";
-      retryable: boolean;
-    }> & RelayV2DashboardManagementHostConnectorBinding)
-  | (Readonly<{ status: "superseded" }> & RelayV2DashboardManagementHostConnectorBinding);
-
-export interface RelayV2DashboardManagementHostConnectorControllerStartInput {
-  readonly requestId: string;
-  readonly hostId: string;
-  readonly hostEpoch: string;
-  readonly hostInstanceId: string;
-  readonly credentialReference: string;
-  readonly signal: AbortSignal;
-}
-
-export interface RelayV2DashboardManagementHostConnectorControllerStartResult
-extends RelayV2DashboardManagementHostConnectorBinding {
-  readonly status: "started";
-  readonly requestId: string;
-}
-
-export interface RelayV2DashboardManagementHostConnectorControllerStopInput
-extends RelayV2DashboardManagementHostConnectorBinding {
-  readonly requestId: string;
-  readonly signal: AbortSignal;
-}
-
-export interface RelayV2DashboardManagementHostConnectorControllerStopResult
-extends RelayV2DashboardManagementHostConnectorBinding {
-  readonly status: "stopped_and_drained";
-  readonly requestId: string;
-}
-
-export interface RelayV2DashboardManagementHostConnectorControllerPort {
-  inspectCut(): MaybePromise<RelayV2DashboardManagementHostConnectorControllerCut>;
-  start(
-    input: Readonly<RelayV2DashboardManagementHostConnectorControllerStartInput>,
-  ): MaybePromise<RelayV2DashboardManagementHostConnectorControllerStartResult>;
-  stopAndDrain(
-    input: Readonly<RelayV2DashboardManagementHostConnectorControllerStopInput>,
-  ): MaybePromise<RelayV2DashboardManagementHostConnectorControllerStopResult>;
-}
-
 export interface RelayV2DashboardManagementHostConnectorAdapterOptions {
-  readonly controller: RelayV2DashboardManagementHostConnectorControllerPort;
+  readonly controller: RelayV2HostConnectorControllerPort;
   readonly hostId: string;
   readonly hostEpoch: string;
   readonly hostInstanceId: string;
   readonly credentialReference: string;
   /** Caller-owned cancellation. This adapter never creates another deadline. */
   readonly signal: AbortSignal;
-}
-
-export type RelayV2DashboardManagementHostConnectorControllerErrorCode =
-  | "ABORTED"
-  | "BUSY"
-  | "UNAVAILABLE"
-  | "SUPERSEDED"
-  | "OPERATION_FAILED";
-
-export class RelayV2DashboardManagementHostConnectorControllerError extends Error {
-  constructor(readonly code: RelayV2DashboardManagementHostConnectorControllerErrorCode) {
-    super("Relay v2 host connector controller operation failed");
-    this.name = "RelayV2DashboardManagementHostConnectorControllerError";
-  }
 }
 
 export class RelayV2DashboardManagementHostConnectorAdapterClosedError extends Error {
@@ -169,6 +103,28 @@ function ownData(value: unknown, key: string): unknown {
   }
 }
 
+function dataMethod(value: unknown, key: string): ((...args: unknown[]) => unknown) | null {
+  if (!isObject(value)) return null;
+  try {
+    const own = Object.getOwnPropertyDescriptor(value, key);
+    if (own !== undefined) {
+      return Object.hasOwn(own, "value") && typeof own.value === "function"
+        ? own.value as (...args: unknown[]) => unknown
+        : null;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (!isObject(prototype)) return null;
+    const inherited = Object.getOwnPropertyDescriptor(prototype, key);
+    return inherited !== undefined
+      && Object.hasOwn(inherited, "value")
+      && typeof inherited.value === "function"
+      ? inherited.value as (...args: unknown[]) => unknown
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function identifier(value: unknown): string {
   if (!isRelayV2AuthIdentifier(value)
     || Buffer.byteLength(value, "utf8") > MAX_IDENTIFIER_BYTES
@@ -183,6 +139,10 @@ function credentialReference(value: unknown): string {
     return closed();
   }
   return reference;
+}
+
+function nullableIdentifier(value: unknown): string | null {
+  return value === null ? null : identifier(value);
 }
 
 function counter(value: unknown): string {
@@ -227,10 +187,10 @@ const BINDING_KEYS = Object.freeze([
   "credentialReference",
 ]);
 
-function parseBinding(fields: DataRecord): RelayV2DashboardManagementHostConnectorBinding {
+function parseBinding(fields: DataRecord): RelayV2HostConnectorControllerBinding {
   return Object.freeze({
     controllerGeneration: counter(fields.controllerGeneration),
-    connectorId: identifier(fields.connectorId),
+    connectorId: nullableIdentifier(fields.connectorId),
     hostId: identifier(fields.hostId),
     hostEpoch: identifier(fields.hostEpoch),
     hostInstanceId: identifier(fields.hostInstanceId),
@@ -259,6 +219,7 @@ function parseControllerCut(value: unknown): ParsedControllerCut {
   if (status === "starting" || status === "superseded") {
     const fields = exactDataObject(value, ["status", ...BINDING_KEYS]);
     const binding = parseBinding(fields);
+    if (status === "starting" && binding.connectorId !== null) return closed();
     return Object.freeze({
       status,
       ...binding,
@@ -287,6 +248,7 @@ function parseControllerCut(value: unknown): ParsedControllerCut {
     ]);
     if (fields.acknowledgement !== "host.registered") return closed();
     const binding = parseBinding(fields);
+    if (binding.connectorId === null) return closed();
     return Object.freeze({
       status,
       ...binding,
@@ -305,17 +267,20 @@ function parseRequestId(value: unknown): string {
   return identifier(fields.requestId);
 }
 
-function parseStartResult(value: unknown): RelayV2DashboardManagementHostConnectorControllerStartResult {
+function parseStartResult(value: unknown): RelayV2HostConnectorControllerStartResult {
   const fields = exactDataObject(value, ["status", "requestId", ...BINDING_KEYS]);
   if (fields.status !== "started") return closed();
+  const binding = parseBinding(fields);
+  if (binding.connectorId === null) return closed();
   return Object.freeze({
     status: "started",
     requestId: identifier(fields.requestId),
-    ...parseBinding(fields),
+    ...binding,
+    connectorId: binding.connectorId,
   });
 }
 
-function parseStopResult(value: unknown): RelayV2DashboardManagementHostConnectorControllerStopResult {
+function parseStopResult(value: unknown): RelayV2HostConnectorControllerStopResult {
   const fields = exactDataObject(value, ["status", "requestId", ...BINDING_KEYS]);
   if (fields.status !== "stopped_and_drained") return closed();
   return Object.freeze({
@@ -327,8 +292,8 @@ function parseStopResult(value: unknown): RelayV2DashboardManagementHostConnecto
 
 function controllerErrorCode(
   error: unknown,
-): RelayV2DashboardManagementHostConnectorControllerErrorCode | null {
-  if (ownData(error, "name") !== "RelayV2DashboardManagementHostConnectorControllerError") {
+): RelayV2HostConnectorControllerErrorCode | null {
+  if (ownData(error, "name") !== "RelayV2HostConnectorControllerError") {
     return null;
   }
   const code = ownData(error, "code");
@@ -371,14 +336,14 @@ function mappedProtocolCode(
 export class RelayV2DashboardManagementHostConnectorAdapter
 implements RelayV2DashboardManagementConnectorPort {
   private readonly inspectControllerCut!: () => MaybePromise<
-    RelayV2DashboardManagementHostConnectorControllerCut
+    RelayV2HostConnectorControllerCut
   >;
   private readonly startController!: (
-    input: Readonly<RelayV2DashboardManagementHostConnectorControllerStartInput>,
-  ) => MaybePromise<RelayV2DashboardManagementHostConnectorControllerStartResult>;
+    input: Readonly<RelayV2HostConnectorControllerStartInput>,
+  ) => MaybePromise<RelayV2HostConnectorControllerStartResult>;
   private readonly stopControllerAndDrain!: (
-    input: Readonly<RelayV2DashboardManagementHostConnectorControllerStopInput>,
-  ) => MaybePromise<RelayV2DashboardManagementHostConnectorControllerStopResult>;
+    input: Readonly<RelayV2HostConnectorControllerStopInput>,
+  ) => MaybePromise<RelayV2HostConnectorControllerStopResult>;
   private readonly hostId!: string;
   private readonly hostEpoch!: string;
   private readonly hostInstanceId!: string;
@@ -399,18 +364,30 @@ implements RelayV2DashboardManagementConnectorPort {
       "credentialReference",
       "signal",
     ]);
-    const inspectCut = ownData(fields.controller, "inspectCut");
-    const start = ownData(fields.controller, "start");
-    const stopAndDrain = ownData(fields.controller, "stopAndDrain");
+    const inspectCut = dataMethod(fields.controller, "inspectCut");
+    const start = dataMethod(fields.controller, "start");
+    const stopAndDrain = dataMethod(fields.controller, "stopAndDrain");
     if (!isObject(fields.controller)
       || typeof inspectCut !== "function"
       || typeof start !== "function"
       || typeof stopAndDrain !== "function"
       || !(fields.signal instanceof AbortSignal)) return closed();
     const controller = fields.controller;
-    this.inspectControllerCut = () => Reflect.apply(inspectCut, controller, []);
-    this.startController = (input) => Reflect.apply(start, controller, [input]);
-    this.stopControllerAndDrain = (input) => Reflect.apply(stopAndDrain, controller, [input]);
+    this.inspectControllerCut = () => Reflect.apply(
+      inspectCut as RelayV2HostConnectorControllerPort["inspectCut"],
+      controller,
+      [],
+    );
+    this.startController = (input) => Reflect.apply(
+      start as RelayV2HostConnectorControllerPort["start"],
+      controller,
+      [input],
+    );
+    this.stopControllerAndDrain = (input) => Reflect.apply(
+      stopAndDrain as RelayV2HostConnectorControllerPort["stopAndDrain"],
+      controller,
+      [input],
+    );
     this.hostId = identifier(fields.hostId);
     this.hostEpoch = identifier(fields.hostEpoch);
     this.hostInstanceId = identifier(fields.hostInstanceId);
@@ -488,7 +465,6 @@ implements RelayV2DashboardManagementConnectorPort {
       if (captured.status === "superseded") {
         throw new RelayV2DashboardManagementAuthorityFailure("NOT_READY");
       }
-      if (captured.connectorId === null) return closed();
       const capturedGeneration = captured.controllerGeneration;
       const capturedConnectorId = captured.connectorId;
       const result = parseStopResult(await this.stopControllerAndDrain(Object.freeze({
@@ -518,7 +494,7 @@ implements RelayV2DashboardManagementConnectorPort {
     if (this.terminallyClosed) return closed();
   }
 
-  private validateBinding(binding: RelayV2DashboardManagementHostConnectorBinding): void {
+  private validateBinding(binding: RelayV2HostConnectorControllerIdentity): void {
     if (binding.hostId !== this.hostId
       || binding.hostEpoch !== this.hostEpoch
       || binding.hostInstanceId !== this.hostInstanceId
@@ -528,8 +504,8 @@ implements RelayV2DashboardManagementConnectorPort {
   private observe(cut: ParsedControllerCut): void {
     const generation = BigInt(cut.controllerGeneration);
     if (cut.status !== "stopped") {
-      this.validateBinding(cut as ParsedControllerCut & RelayV2DashboardManagementHostConnectorBinding);
-      if (cut.connectorId === null) return closed();
+      this.validateBinding(cut as ParsedControllerCut & RelayV2HostConnectorControllerIdentity);
+      if (cut.status === "registered" && cut.connectorId === null) return closed();
     }
     if (this.lastGeneration !== null) {
       if (generation < this.lastGeneration) return closed();
@@ -551,10 +527,18 @@ implements RelayV2DashboardManagementConnectorPort {
 
   private observeResult(controllerGeneration: string, connectorId: string): void {
     const generation = BigInt(controllerGeneration);
-    if (this.lastGeneration !== null && generation <= this.lastGeneration) return closed();
+    if (this.lastGeneration !== null) {
+      if (generation < this.lastGeneration) return closed();
+      if (generation === this.lastGeneration
+        && this.lastStatus !== "starting"
+        && this.lastStatus !== "registered") return closed();
+      if (generation === this.lastGeneration
+        && this.lastConnectorId !== null
+        && this.lastConnectorId !== connectorId) return closed();
+    }
     this.lastGeneration = generation;
     this.lastConnectorId = connectorId;
-    this.lastStatus = "starting";
+    this.lastStatus = "registered";
   }
 
   private project(cut: ParsedControllerCut): RelayV2DashboardManagementConnectorCut {

@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   RelayV2DashboardManagementHostConnectorAdapter,
   RelayV2DashboardManagementHostConnectorAdapterClosedError,
-  RelayV2DashboardManagementHostConnectorControllerError,
 } from "../dist/relay/v2/relayV2DashboardManagementHostConnectorAdapter.js";
+import {
+  RelayV2HostConnectorControllerError,
+} from "../dist/relay/v2/hostConnectorController.js";
 import {
   RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2.js";
@@ -50,8 +52,8 @@ function registeredCut(
   };
 }
 
-function startingCut(controllerGeneration = "1", connectorId = "connector-one") {
-  return { status: "starting", ...binding(controllerGeneration, connectorId) };
+function startingCut(controllerGeneration = "1") {
+  return { status: "starting", ...binding(controllerGeneration, null) };
 }
 
 function startResult(
@@ -170,11 +172,11 @@ test("inspectCut consumes one atomic controller cut and canonicalizes only the f
 
 test("the adapter captures one controller and rejects foreign lineage, generation, and connector cuts", async (t) => {
   await t.test("captured controller method cannot be replaced", async () => {
-    const h = harness({ cut: startingCut("1", "captured-connector") });
+    const h = harness({ cut: startingCut("1") });
     let replacementCalls = 0;
     h.controller.inspectCut = () => {
       replacementCalls += 1;
-      return startingCut("99", "foreign-connector");
+      return startingCut("99");
     };
     assert.deepEqual(await h.adapter.inspectCut(), {
       status: "starting",
@@ -334,7 +336,7 @@ test("controller failures map one-for-one and malformed output closes without fa
     await t.test(controllerCode, async () => {
       const h = harness({
         start: () => Promise.reject(
-          new RelayV2DashboardManagementHostConnectorControllerError(controllerCode),
+          new RelayV2HostConnectorControllerError(controllerCode),
         ),
       });
       await assert.rejects(
