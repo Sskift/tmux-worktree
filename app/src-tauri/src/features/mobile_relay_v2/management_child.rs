@@ -882,6 +882,7 @@ impl ManagementOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagementProtocol {
     V1,
+    #[cfg_attr(not(test), allow(dead_code))]
     V2,
 }
 
@@ -900,6 +901,8 @@ impl ManagementProtocol {
         }
     }
 }
+
+const PRODUCTION_EXPECTED_PROTOCOL: ManagementProtocol = ManagementProtocol::V1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagementInput {
@@ -1117,6 +1120,7 @@ impl ManagementChildManager {
             artifact,
             Arc::new(ProductionFactory { node }),
             Arc::new(OsRequestIdGenerator),
+            PRODUCTION_EXPECTED_PROTOCOL,
             env!("CARGO_PKG_VERSION"),
             STARTUP_TIMEOUT,
             OPERATION_TIMEOUT,
@@ -1127,24 +1131,27 @@ impl ManagementChildManager {
         artifact: BundledManagementArtifact,
         factory: Arc<dyn ChildFactory>,
         request_ids: Arc<dyn RequestIdGenerator>,
+        expected_protocol: ManagementProtocol,
         expected_version: &str,
         startup_timeout: Duration,
         operation_timeout: Duration,
     ) -> Result<Self, ManagementStartError> {
         let deadline = Instant::now() + startup_timeout;
         let child = spawn_before_deadline(factory, artifact.clone(), deadline)?;
-        let protocol = if Instant::now() < deadline {
+        let ready_matches = if Instant::now() < deadline {
             read_frame(child.as_ref(), deadline)
                 .ok()
-                .and_then(|payload| decode_startup_ready(&payload, expected_version).ok())
+                .is_some_and(|payload| {
+                    decode_startup_ready(&payload, expected_version, expected_protocol).is_ok()
+                })
         } else {
-            None
+            false
         };
-        let Some(protocol) = protocol else {
+        if !ready_matches {
             child.kill_if_live();
             child.wait_and_reap();
             return Err(ManagementStartError::ChannelClosed);
-        };
+        }
         if Instant::now() >= deadline {
             child.kill_if_live();
             child.wait_and_reap();
@@ -1153,7 +1160,7 @@ impl ManagementChildManager {
         let inner = Arc::new(ManagerInner {
             artifact,
             child,
-            protocol,
+            protocol: expected_protocol,
             request_ids,
             in_flight: AtomicBool::new(false),
             observation: Mutex::new(()),
@@ -1465,20 +1472,21 @@ fn closed_object_payload(payload: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-fn decode_startup_ready(payload: &[u8], expected_version: &str) -> Result<ManagementProtocol, ()> {
+fn decode_startup_ready(
+    payload: &[u8],
+    expected_version: &str,
+    expected_protocol: ManagementProtocol,
+) -> Result<(), ()> {
     closed_object_payload(payload)?;
     let ready: StartupReady = serde_json::from_slice(payload).map_err(|_| ())?;
     if ready.contract != CONTRACT
         || !valid_ascii_semver(&ready.runtime_version)
         || ready.runtime_version.as_bytes() != expected_version.as_bytes()
+        || ready.protocol_version != expected_protocol.version()
     {
         return Err(());
     }
-    match ready.protocol_version {
-        PROTOCOL_VERSION_V1 => Ok(ManagementProtocol::V1),
-        management_protocol_v2::PROTOCOL_VERSION => Ok(ManagementProtocol::V2),
-        _ => Err(()),
-    }
+    Ok(())
 }
 
 fn encode_request(
@@ -2095,6 +2103,7 @@ mod tests {
                 script: script.into(),
             }),
             Arc::new(FixedIds(Mutex::new(ids.into()))),
+            ManagementProtocol::V1,
             "1.2.3",
             Duration::from_secs(2),
             Duration::from_secs(2),
@@ -2126,6 +2135,16 @@ mod tests {
     impl RequestIdGenerator for FixedIds {
         fn fill(&self, bytes: &mut [u8; 16]) -> Result<(), ()> {
             *bytes = self.0.lock().unwrap().pop_front().ok_or(())?;
+            Ok(())
+        }
+    }
+
+    struct CountingIds(Mutex<usize>);
+
+    impl RequestIdGenerator for CountingIds {
+        fn fill(&self, bytes: &mut [u8; 16]) -> Result<(), ()> {
+            *self.0.lock().unwrap() += 1;
+            bytes.fill(0);
             Ok(())
         }
     }
@@ -2181,13 +2200,25 @@ mod tests {
         ids: Vec<[u8; 16]>,
         expected_version: &str,
     ) -> ManagementChildManager {
-        start_fake_with_timeouts(
-            child,
-            ids,
+        start_fake_for_protocol(child, ids, expected_version, ManagementProtocol::V1)
+    }
+
+    fn start_fake_for_protocol(
+        child: Arc<FakeChild>,
+        ids: Vec<[u8; 16]>,
+        expected_version: &str,
+        expected_protocol: ManagementProtocol,
+    ) -> ManagementChildManager {
+        ManagementChildManager::start_with_factory(
+            artifact(),
+            FakeFactory::new(child, FakeSpawnAction::Ready),
+            Arc::new(FixedIds(Mutex::new(ids.into()))),
+            expected_protocol,
             expected_version,
             Duration::from_millis(100),
             Duration::from_millis(100),
         )
+        .expect("start fake management child")
     }
 
     fn start_fake_with_timeouts(
@@ -2201,6 +2232,7 @@ mod tests {
             artifact(),
             FakeFactory::new(child, FakeSpawnAction::Ready),
             Arc::new(FixedIds(Mutex::new(ids.into()))),
+            ManagementProtocol::V1,
             expected_version,
             startup_timeout,
             operation_timeout,
@@ -2259,7 +2291,12 @@ mod tests {
         let ready = fixture["startupHandshakeCases"][0]["input"]["firstStdoutFrame"]
             .as_str()
             .unwrap();
-        decode_startup_ready(ready.trim_end_matches('\n').as_bytes(), version).unwrap();
+        decode_startup_ready(
+            ready.trim_end_matches('\n').as_bytes(),
+            version,
+            ManagementProtocol::V1,
+        )
+        .unwrap();
 
         for exchange in fixture["goldenExchanges"].as_array().unwrap() {
             let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
@@ -2296,14 +2333,16 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_management_v2_startup_selects_v2_and_all_successes_cross_the_supervisor() {
+    fn private_expected_v2_accepts_v2_and_all_successes_cross_the_supervisor() {
         let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
         let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
         let ready = fixture["startupReadyFrame"].as_str().unwrap();
-        assert_eq!(
-            decode_startup_ready(ready.trim_end_matches('\n').as_bytes(), version).unwrap(),
-            ManagementProtocol::V2
-        );
+        decode_startup_ready(
+            ready.trim_end_matches('\n').as_bytes(),
+            version,
+            ManagementProtocol::V2,
+        )
+        .unwrap();
 
         for exchange in fixture["goldenExchanges"].as_array().unwrap() {
             let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
@@ -2320,7 +2359,12 @@ mod tests {
                     ),
                 ),
             ]);
-            let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
+            let manager = start_fake_for_protocol(
+                child.clone(),
+                vec![id_bytes(request_id)],
+                version,
+                ManagementProtocol::V2,
+            );
             let operation = operation(exchange["operation"].as_str().unwrap());
             let outcome = manager
                 .request_with_input(
@@ -2339,6 +2383,43 @@ mod tests {
                     .as_bytes()
                     .to_vec()]
             );
+        }
+    }
+
+    #[test]
+    fn protocol_mismatch_kills_and_reaps_before_request_id_or_stdin_write() {
+        for (name, expected_protocol, ready) in [
+            (
+                "expected-v1-child-v2",
+                ManagementProtocol::V1,
+                ready_frame_v2("1.2.3"),
+            ),
+            (
+                "expected-v2-child-v1",
+                ManagementProtocol::V2,
+                ready_frame("1.2.3"),
+            ),
+        ] {
+            let child = FakeChild::sequenced(vec![(0, ChildRead::Bytes(ready))]);
+            let request_ids = Arc::new(CountingIds(Mutex::new(0)));
+            let result = ManagementChildManager::start_with_factory(
+                artifact(),
+                FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
+                request_ids.clone(),
+                expected_protocol,
+                "1.2.3",
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            );
+            assert_eq!(
+                result.err(),
+                Some(ManagementStartError::ChannelClosed),
+                "{name}"
+            );
+            assert_eq!(*request_ids.0.lock().unwrap(), 0, "{name}");
+            let state = child.state.lock().unwrap();
+            assert!(state.writes.is_empty(), "{name}");
+            assert_eq!(state.events, ["kill-if-live", "wait-and-reap"], "{name}");
         }
     }
 
@@ -2395,7 +2476,12 @@ mod tests {
                 (0, ChildRead::Bytes(ready_frame_v2(version))),
                 (1, ChildRead::Bytes(response)),
             ]);
-            let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
+            let manager = start_fake_for_protocol(
+                child.clone(),
+                vec![id_bytes(request_id)],
+                version,
+                ManagementProtocol::V2,
+            );
             let outcome = manager
                 .request(operation(case["operation"].as_str().unwrap()))
                 .unwrap();
@@ -2438,7 +2524,12 @@ mod tests {
             ),
             (1, ChildRead::Bytes(b"{}\n".to_vec())),
         ]);
-        let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
+        let manager = start_fake_for_protocol(
+            child.clone(),
+            vec![id_bytes(request_id)],
+            version,
+            ManagementProtocol::V2,
+        );
         let outcome = manager.request(ManagementOperation::Status).unwrap();
         assert_eq!(outcome.protocol_version, 2);
         assert_eq!(outcome.error.unwrap().code, "CHANNEL_CLOSED");
@@ -2544,6 +2635,7 @@ mod tests {
                     artifact(),
                     FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
                     Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
+                    ManagementProtocol::V1,
                     version,
                     Duration::from_millis(100),
                     Duration::from_millis(100),
@@ -2573,6 +2665,7 @@ mod tests {
                 artifact(),
                 start_factory,
                 Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
+                ManagementProtocol::V1,
                 "1.2.3",
                 Duration::ZERO,
                 Duration::from_millis(100),
@@ -2599,6 +2692,7 @@ mod tests {
             artifact(),
             FakeFactory::new(child.clone(), FakeSpawnAction::FailedAfterChild),
             Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
+            ManagementProtocol::V1,
             "1.2.3",
             Duration::from_millis(100),
             Duration::from_millis(100),
