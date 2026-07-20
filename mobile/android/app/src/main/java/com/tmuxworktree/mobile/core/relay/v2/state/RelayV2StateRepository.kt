@@ -6,6 +6,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
@@ -81,6 +82,23 @@ internal class RelayV2StateRepository(
     suspend fun loadOutbox(
         namespace: RelayV2OutboxAuthorityNamespace,
     ): RelayV2OutboxState = durableCore.loadOutbox(namespace)
+
+    /**
+     * Narrow cold-start admission read for the base Relay v2 runtime.
+     *
+     * The existing Outbox decoder remains the only authority for missing, corrupt, oversized, or
+     * non-empty state. A decode failure therefore fails startup closed instead of being treated as
+     * an empty activation.
+     */
+    suspend fun isActivationOutboxEmpty(profile: RelayV2Profile): Boolean =
+        durableCore.loadOutbox(
+            RelayV2OutboxAuthorityNamespace(
+                profileId = profile.profileId,
+                profileActivationGeneration = profile.activationGeneration,
+                principalId = profile.principalId,
+                clientInstanceId = profile.clientInstanceId,
+            ),
+        ).entries.isEmpty()
 
     suspend fun reduceOutboxUnderApplyLease(
         namespace: RelayV2OutboxAuthorityNamespace,

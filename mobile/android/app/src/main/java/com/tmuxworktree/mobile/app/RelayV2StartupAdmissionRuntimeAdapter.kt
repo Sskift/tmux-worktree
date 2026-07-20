@@ -13,6 +13,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentExchangeRequest
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentExchangeResponse
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileRepository
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileSwitchStateMachine
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshRequest
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshResponse
@@ -23,7 +24,14 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateRepository
 internal data class RelayStartupAdmission(
     val state: RelayStartupAdmissionState,
     val message: String? = null,
+    val relayV2Profile: RelayV2Profile? = null,
 ) {
+    init {
+        require((state == RelayStartupAdmissionState.RELAY_V2) == (relayV2Profile != null)) {
+            "Only a verified Relay v2 startup admission may carry its profile"
+        }
+    }
+
     val allowsRelayV1: Boolean
         get() = state == RelayStartupAdmissionState.RELAY_V1
 }
@@ -87,8 +95,8 @@ internal class RelayV2StartupAdmissionRuntimeAdapter(
             )
 
             is RelayV2StartupAdmissionResult.Ready -> RelayStartupAdmission(
-                state = RelayStartupAdmissionState.RELAY_V2_RUNTIME_UNAVAILABLE,
-                message = "Relay v2 profile verified, but the base Relay v2 runtime is not enabled yet.",
+                state = RelayStartupAdmissionState.RELAY_V2,
+                relayV2Profile = result.profile,
             )
 
             is RelayV2StartupAdmissionResult.ReenrollmentRequired -> RelayStartupAdmission(

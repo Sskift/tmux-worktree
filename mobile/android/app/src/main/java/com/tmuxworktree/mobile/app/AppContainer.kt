@@ -10,8 +10,13 @@ import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.network.NetworkMonitor
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.runtime.BoundedRelayV2TransportFactory
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ActivationOutboxReadPort
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateDatabase
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateRepository
+import kotlinx.coroutines.CoroutineScope
 
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
@@ -49,5 +54,19 @@ class AppContainer(context: Context) {
         clientInstanceId = preferences.getOrCreateRelayV2ClientInstanceId(),
         disconnectBarrier = disconnectBarrier,
         clearEphemeralAfterDisconnect = clearEphemeralAfterDisconnect,
+    )
+
+    internal fun createRelayV2BaseRuntimeComposition(
+        parentScope: CoroutineScope,
+        profile: RelayV2Profile,
+    ): RelayV2BaseRuntimeComposition = RelayV2BaseRuntimeComposition(
+        parentScope = parentScope,
+        profile = profile,
+        credentialStore = relayV2Credentials,
+        stateSyncAuthority = relayV2StateRepository,
+        activationOutbox = RelayV2ActivationOutboxReadPort(
+            relayV2StateRepository::isActivationOutboxEmpty,
+        ),
+        transportFactory = BoundedRelayV2TransportFactory(),
     )
 }

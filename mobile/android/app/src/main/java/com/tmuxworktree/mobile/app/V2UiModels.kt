@@ -12,7 +12,7 @@ import com.tmuxworktree.mobile.core.model.TimelineEvent
 enum class RelayStartupAdmissionState {
     CHECKING,
     RELAY_V1,
-    RELAY_V2_RUNTIME_UNAVAILABLE,
+    RELAY_V2,
     RELAY_V2_REENROLLMENT_REQUIRED,
     RELAY_V2_RECOVERY_REQUIRED,
     RELAY_V2_CREDENTIAL_MISSING,
@@ -22,8 +22,20 @@ enum class RelayStartupAdmissionState {
     RELAY_V2_ADMISSION_FAILED,
 }
 
+/** Explicit Relay v2 profile connection state; this is not product readiness or a capability. */
+enum class RelayV2ProfileConnectionState {
+    STOPPED,
+    CONNECTING,
+    RESYNCING,
+    ONLINE,
+    FAILED,
+}
+
 data class V2UiState(
     val relayStartupAdmission: RelayStartupAdmissionState = RelayStartupAdmissionState.CHECKING,
+    val relayV2ProfileConnection: RelayV2ProfileConnectionState =
+        RelayV2ProfileConnectionState.STOPPED,
+    val relayV2ProfileFailureCode: String? = null,
     val initialized: Boolean = false,
     val demoMode: Boolean = false,
     val networkAvailable: Boolean = true,
@@ -82,6 +94,7 @@ data class V2UiState(
         "V2UiState(" +
             "initialized=$initialized, demoMode=$demoMode, networkAvailable=$networkAvailable, " +
             "paired=$paired, pairingRequired=$pairingRequired, pairingInput=<redacted>, " +
+            "relayV2ProfileConnection=$relayV2ProfileConnection, " +
             "isConnecting=$isConnecting, hosts=${hosts.size}, scopes=${scopes.size}, " +
             "sessions=${sessions.size}, health=$health)"
 }
