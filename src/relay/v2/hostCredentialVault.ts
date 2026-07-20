@@ -15,7 +15,8 @@ import { isRelayV2AuthIdentifier } from "./token.js";
 
 const ENVELOPE_MAGIC = Buffer.from("tw-hcv1\0", "ascii");
 const ENVELOPE_HEADER_BYTES = ENVELOPE_MAGIC.byteLength + 4 + 32;
-const MAX_ENVELOPE_BYTES = 65_536;
+export const RELAY_V2_HOST_CREDENTIAL_VAULT_MAX_ENVELOPE_BYTES = 65_536;
+const MAX_ENVELOPE_BYTES = RELAY_V2_HOST_CREDENTIAL_VAULT_MAX_ENVELOPE_BYTES;
 const MAX_SECRET_BYTES = 8_192;
 const MAX_PROVISION_CONFLICTS = 4;
 
