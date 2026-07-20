@@ -83,14 +83,8 @@ internal class RelayV2StateRepository(
         namespace: RelayV2OutboxAuthorityNamespace,
     ): RelayV2OutboxState = durableCore.loadOutbox(namespace)
 
-    /**
-     * Narrow cold-start admission read for the base Relay v2 runtime.
-     *
-     * The existing Outbox decoder remains the only authority for missing, corrupt, oversized, or
-     * non-empty state. A decode failure therefore fails startup closed instead of being treated as
-     * an empty activation.
-     */
-    suspend fun isActivationOutboxEmpty(profile: RelayV2Profile): Boolean =
+    /** Exact activation snapshot; runtime support policy remains in the composition owner. */
+    suspend fun readActivationOutbox(profile: RelayV2Profile): RelayV2OutboxState =
         durableCore.loadOutbox(
             RelayV2OutboxAuthorityNamespace(
                 profileId = profile.profileId,
@@ -98,7 +92,7 @@ internal class RelayV2StateRepository(
                 principalId = profile.principalId,
                 clientInstanceId = profile.clientInstanceId,
             ),
-        ).entries.isEmpty()
+        )
 
     suspend fun reduceOutboxUnderApplyLease(
         namespace: RelayV2OutboxAuthorityNamespace,

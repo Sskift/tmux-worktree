@@ -65,8 +65,9 @@ class AppContainer(context: Context) {
         credentialStore = relayV2Credentials,
         stateSyncAuthority = relayV2StateRepository,
         activationOutbox = RelayV2ActivationOutboxReadPort(
-            relayV2StateRepository::isActivationOutboxEmpty,
+            relayV2StateRepository::readActivationOutbox,
         ),
+        outboxAuthority = relayV2StateRepository,
         transportFactory = BoundedRelayV2TransportFactory(),
     )
 }
