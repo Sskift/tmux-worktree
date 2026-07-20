@@ -73,10 +73,14 @@ export interface RelayV2DashboardManagementGrantRevocationReceipt {
 export interface RelayV2DashboardManagementCarrierControlPort {
   createEnrollment(input: Readonly<{
     requestId: string;
+    hostId: string;
+    connectorId: string;
     deviceLabel: string | null;
   }>): MaybePromise<RelayV2DashboardManagementEnrollmentReceipt>;
   revokeGrant(input: Readonly<{
     requestId: string;
+    hostId: string;
+    connectorId: string;
     grantId: string;
     reason: "user_revoked";
   }>): MaybePromise<RelayV2DashboardManagementGrantRevocationReceipt>;
@@ -498,6 +502,8 @@ implements RelayV2DashboardManagementProtocolV2Handler {
     }
     const receipt = enrollmentReceipt(await this.carrierControl.createEnrollment({
       requestId: request.requestId,
+      hostId: gate.hostId,
+      connectorId: gate.connectorId,
       deviceLabel: request.input.deviceLabel,
     }), request.input.deviceLabel);
     const observedAtMs = this.now();
@@ -533,6 +539,8 @@ implements RelayV2DashboardManagementProtocolV2Handler {
     }
     const receipt = revocationReceipt(await this.carrierControl.revokeGrant({
       requestId: request.requestId,
+      hostId: gate.hostId,
+      connectorId: gate.connectorId,
       grantId: request.input.grantId,
       reason: "user_revoked",
     }), request.input.grantId);

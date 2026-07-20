@@ -44,6 +44,7 @@ export default defineConfig({
     "src/relay/v2/relayV2DashboardManagementAuthority.ts",
     "src/relay/v2/relayV2DashboardManagementHostCredentialAdapter.ts",
     "src/relay/v2/relayV2DashboardManagementHostConnectorAdapter.ts",
+    "src/relay/v2/relayV2DashboardManagementHostCarrierControlAdapter.ts",
     "src/relay/v2/relayV2DashboardManagementStdio.ts",
     "src/relay/v2/codec.ts",
     "src/relay/v2/brokerCore.ts",

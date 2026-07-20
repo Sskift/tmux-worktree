@@ -293,7 +293,12 @@ test("each authority operation invokes its mutation port once with only the clos
         connector: registeredConnector(),
       },
       input: { deviceLabel: "Pixel" },
-      expectedCall: ["createEnrollment", { requestId: IDS.create, deviceLabel: "Pixel" }],
+      expectedCall: ["createEnrollment", {
+        requestId: IDS.create,
+        hostId: "mac-admin",
+        connectorId: "connector-1",
+        deviceLabel: "Pixel",
+      }],
       expected: cases.goldenExchanges[5].responseFrame,
     },
     {
@@ -305,6 +310,8 @@ test("each authority operation invokes its mutation port once with only the clos
       input: { grantId: "client-grant-1", reason: "user_revoked" },
       expectedCall: ["revokeGrant", {
         requestId: IDS.revoke,
+        hostId: "mac-admin",
+        connectorId: "connector-1",
         grantId: "client-grant-1",
         reason: "user_revoked",
       }],

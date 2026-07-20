@@ -10,6 +10,9 @@ import {
   type RelayV2FrameMetadata,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import {
+  RelayV2DashboardManagementHostCarrierControlAdapter,
+} from "./relayV2DashboardManagementHostCarrierControlAdapter.js";
 
 export const RELAY_V2_HOST_SUPERSEDED_EXIT_CODE = 78;
 
@@ -268,6 +271,115 @@ export interface RelayV2HostCarrierOptions {
   }) => void;
 }
 
+export interface RelayV2HostCarrierDashboardManagementEnrollmentResult {
+  readonly type: "enrollment.created";
+  readonly requestId: string;
+  readonly connectorGeneration: number;
+  readonly connectorId: string;
+  readonly hostId: string;
+  readonly deduplicated: boolean;
+  readonly enrollmentId: string;
+  readonly enrollmentCode: string;
+  readonly issuerUrl: string;
+  readonly relayUrl: string;
+  readonly expiresAtMs: number;
+  readonly deviceLabel: string | null;
+}
+
+export interface RelayV2HostCarrierDashboardManagementRevocationResult {
+  readonly type: "grant.revoked";
+  readonly requestId: string;
+  readonly connectorGeneration: number;
+  readonly connectorId: string;
+  readonly hostId: string;
+  readonly grantId: string;
+  readonly revokedAtMs: number;
+  readonly alreadyRevoked: boolean;
+}
+
+export type RelayV2HostCarrierDashboardManagementControlOperation =
+  | Readonly<{
+      operation: "create_enrollment";
+      input: Readonly<{
+        requestId: string;
+        hostId: string;
+        connectorId: string;
+        deviceLabel: string | null;
+      }>;
+    }>
+  | Readonly<{
+      operation: "revoke_grant";
+      input: Readonly<{
+        requestId: string;
+        hostId: string;
+        connectorId: string;
+        grantId: string;
+        reason: "user_revoked";
+      }>;
+    }>;
+
+export type RelayV2HostCarrierDashboardManagementControlResult =
+  | RelayV2HostCarrierDashboardManagementEnrollmentResult
+  | RelayV2HostCarrierDashboardManagementRevocationResult;
+
+const dashboardManagementControlOwnerConstructionKey = Object.freeze({});
+
+/**
+ * Actor-created, native-private bridge used only while constructing the NDM4
+ * adapter in this HostCarrier module closure. It exposes one closed operation,
+ * never a frame sender or connector handle.
+ */
+export class RelayV2HostCarrierDashboardManagementControlOwner {
+  readonly #invoke: (
+    operation: RelayV2HostCarrierDashboardManagementControlOperation,
+  ) => Promise<RelayV2HostCarrierDashboardManagementControlResult>;
+
+  constructor(
+    constructionKey: unknown,
+    invoke: (
+      operation: RelayV2HostCarrierDashboardManagementControlOperation,
+    ) => Promise<RelayV2HostCarrierDashboardManagementControlResult>,
+  ) {
+    if (constructionKey !== dashboardManagementControlOwnerConstructionKey
+      || typeof invoke !== "function") {
+      throw new Error("Relay v2 HostCarrier Dashboard management owner is closed");
+    }
+    this.#invoke = invoke;
+  }
+
+  static isOwner(
+    value: unknown,
+  ): value is RelayV2HostCarrierDashboardManagementControlOwner {
+    if (typeof value !== "object" || value === null) return false;
+    try {
+      return typeof (value as RelayV2HostCarrierDashboardManagementControlOwner).#invoke
+        === "function";
+    } catch {
+      return false;
+    }
+  }
+
+  invoke(
+    operation: RelayV2HostCarrierDashboardManagementControlOperation,
+  ): Promise<RelayV2HostCarrierDashboardManagementControlResult> {
+    return this.#invoke(operation);
+  }
+}
+
+export type RelayV2HostCarrierDashboardManagementControlErrorCode =
+  | "NOT_REGISTERED"
+  | "BUSY"
+  | "QUEUE_REFUSED"
+  | "CARRIER_UNAVAILABLE"
+  | "CARRIER_REJECTED";
+
+export class RelayV2HostCarrierDashboardManagementControlError extends Error {
+  constructor(readonly code: RelayV2HostCarrierDashboardManagementControlErrorCode) {
+    super("Relay v2 host carrier Dashboard management control failed");
+    this.name = "RelayV2HostCarrierDashboardManagementControlError";
+  }
+}
+
 export interface RelayV2HostCarrierConnection {
   readonly generation: number;
   receive(frame: Uint8Array, metadata?: RelayV2FrameMetadata): void;
@@ -301,6 +413,29 @@ interface QueueLimits {
 
 interface PendingReauthentication extends RelayV2HostCredentialAckFence {
   queueKey: string;
+}
+
+type DashboardManagementControlKind = "enrollment.create" | "grant.revoke";
+
+interface PendingDashboardManagementControl {
+  readonly kind: DashboardManagementControlKind;
+  readonly requestId: string;
+  readonly fingerprint: string;
+  readonly connectorGeneration: number;
+  readonly connectorId: string;
+  readonly queueKey: string;
+  readonly deviceLabel: string | null;
+  readonly grantId: string | null;
+  readonly promise: Promise<
+    RelayV2HostCarrierDashboardManagementEnrollmentResult
+    | RelayV2HostCarrierDashboardManagementRevocationResult
+  >;
+  readonly resolve: (value:
+    RelayV2HostCarrierDashboardManagementEnrollmentResult
+    | RelayV2HostCarrierDashboardManagementRevocationResult
+  ) => void;
+  readonly reject: (error: Error) => void;
+  settled: boolean;
 }
 
 interface OutboundReceiptCallback {
@@ -355,6 +490,7 @@ interface ConnectorState {
   connectorId: string | null;
   credential: Omit<RelayV2HostCredentialRecord, "accessToken">;
   pendingReauthentication: PendingReauthentication | null;
+  pendingDashboardManagementControl: PendingDashboardManagementControl | null;
   routes: Map<string, RouteState>;
   seenRouteIds: Set<string>;
   nextDeliveryToken: bigint;
@@ -512,11 +648,12 @@ function validateCredentialRecord(
 function captureExactOwnDataValues(
   value: unknown,
   fields: readonly string[],
+  expectedPrototype: object | null = Object.prototype,
 ): readonly unknown[] | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
   let descriptors: PropertyDescriptorMap;
   try {
-    if (Object.getPrototypeOf(value) !== Object.prototype) return null;
+    if (Object.getPrototypeOf(value) !== expectedPrototype) return null;
     descriptors = Object.getOwnPropertyDescriptors(value);
   } catch {
     return null;
@@ -532,6 +669,97 @@ function captureExactOwnDataValues(
     values.push(descriptor.value);
   }
   return values;
+}
+
+function dashboardControlIdentifier(value: unknown): string {
+  if (typeof value !== "string"
+    || value.length === 0
+    || Buffer.byteLength(value, "utf8") > 128
+    || value.trim() !== value
+    || /[\0\r\n]/.test(value)
+    || /(?:twcap2|twref2|twenroll2|twhostboot2)\./i.test(value)) {
+    throw new RelayV2HostCarrierDashboardManagementControlError("CARRIER_REJECTED");
+  }
+  return value;
+}
+
+function dashboardControlDeviceLabel(value: unknown): string | null {
+  if (value === null) return null;
+  return dashboardControlIdentifier(value);
+}
+
+function dashboardManagementUrl(
+  value: unknown,
+  protocol: "https:" | "wss:",
+  pathname: "/" | "/client",
+): string {
+  if (typeof value !== "string"
+    || Buffer.byteLength(value, "utf8") > 2_048
+    || !/^[\x21-\x7e]+$/.test(value)
+    || /(?:twcap2|twref2|twenroll2|twhostboot2)\./i.test(value)) {
+    throw new Error("Relay v2 host carrier management URL is invalid");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Relay v2 host carrier management URL is invalid");
+  }
+  const prefix = protocol === "https:" ? "https://" : "wss://";
+  const authority = value.startsWith(prefix)
+    ? value.slice(prefix.length).split("/", 1)[0]
+    : "";
+  if (parsed.protocol !== protocol
+    || parsed.hostname.length === 0
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.search !== ""
+    || parsed.hash !== ""
+    || authority.endsWith(":")
+    || parsed.pathname !== pathname) {
+    throw new Error("Relay v2 host carrier management URL is invalid");
+  }
+  return value;
+}
+
+function dashboardControlCarrierError(
+  value: unknown,
+): RelayV2HostCarrierDashboardManagementControlError | null {
+  const fields = captureExactOwnDataValues(value, [
+    "code",
+    "message",
+    "retryable",
+    "retryAfterMs",
+    "commandDisposition",
+    "details",
+  ], null);
+  if (!fields) return null;
+  const [code, message, retryable, retryAfterMs, commandDisposition, details] = fields;
+  if (typeof message !== "string"
+    || typeof retryable !== "boolean"
+    || commandDisposition !== "not_applicable"
+    || details !== null
+    || (retryAfterMs !== null
+      && (!Number.isSafeInteger(retryAfterMs) || (retryAfterMs as number) < 0))) return null;
+  if (code === "BUSY" && retryable === true) {
+    return new RelayV2HostCarrierDashboardManagementControlError("BUSY");
+  }
+  if (code === "CAPABILITY_UNAVAILABLE"
+    && retryable === false
+    && retryAfterMs === null) {
+    return new RelayV2HostCarrierDashboardManagementControlError("CARRIER_UNAVAILABLE");
+  }
+  if ((code === "AUTH_INVALID"
+      || code === "GRANT_NOT_FOUND"
+      || code === "ROLE_MISMATCH"
+      || code === "PERMISSION_DENIED"
+      || code === "IDEMPOTENCY_CONFLICT"
+      || code === "INVALID_ENVELOPE")
+    && retryable === false
+    && retryAfterMs === null) {
+    return new RelayV2HostCarrierDashboardManagementControlError("CARRIER_REJECTED");
+  }
+  return null;
 }
 
 type PreparedReauthenticationSnapshot = Readonly<
@@ -702,6 +930,8 @@ export class RelayV2HostCarrierActor {
     outcome: boolean;
   }>> = [];
   private latestStatus: RelayV2HostCarrierStatus | null = null;
+  private dashboardManagementControlAdapter:
+    RelayV2DashboardManagementHostCarrierControlAdapter | null = null;
 
   constructor(private readonly options: RelayV2HostCarrierOptions) {
     this.clock = options.clock ?? Date.now;
@@ -744,6 +974,191 @@ export class RelayV2HostCarrierActor {
 
   status(): RelayV2HostCarrierStatus | null {
     return this.latestStatus ? { ...this.latestStatus } : null;
+  }
+
+  createDashboardManagementCarrierControlAdapter():
+  RelayV2DashboardManagementHostCarrierControlAdapter {
+    if (this.dashboardManagementControlAdapter !== null) {
+      return this.dashboardManagementControlAdapter;
+    }
+    const owner = Object.freeze(new RelayV2HostCarrierDashboardManagementControlOwner(
+      dashboardManagementControlOwnerConstructionKey,
+      (operation) => operation.operation === "create_enrollment"
+        ? this.requestDashboardEnrollment(operation.input)
+        : this.requestDashboardGrantRevocation(operation.input),
+    ));
+    const adapter = new RelayV2DashboardManagementHostCarrierControlAdapter({ owner });
+    this.dashboardManagementControlAdapter = adapter;
+    return adapter;
+  }
+
+  private requestDashboardEnrollment(input: Readonly<{
+    requestId: string;
+    hostId: string;
+    connectorId: string;
+    deviceLabel: string | null;
+  }>): Promise<RelayV2HostCarrierDashboardManagementEnrollmentResult> {
+    const values = captureExactOwnDataValues(input, [
+      "requestId", "hostId", "connectorId", "deviceLabel",
+    ]);
+    if (!values) {
+      return Promise.reject(
+        new RelayV2HostCarrierDashboardManagementControlError("CARRIER_REJECTED"),
+      );
+    }
+    let requestId: string;
+    let hostId: string;
+    let connectorId: string;
+    let deviceLabel: string | null;
+    try {
+      requestId = dashboardControlIdentifier(values[0]);
+      hostId = dashboardControlIdentifier(values[1]);
+      connectorId = dashboardControlIdentifier(values[2]);
+      deviceLabel = dashboardControlDeviceLabel(values[3]);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.submitDashboardManagementControl({
+      kind: "enrollment.create",
+      requestId,
+      hostId,
+      connectorId,
+      deviceLabel,
+      grantId: null,
+    }) as Promise<RelayV2HostCarrierDashboardManagementEnrollmentResult>;
+  }
+
+  private requestDashboardGrantRevocation(input: Readonly<{
+    requestId: string;
+    hostId: string;
+    connectorId: string;
+    grantId: string;
+    reason: "user_revoked";
+  }>): Promise<RelayV2HostCarrierDashboardManagementRevocationResult> {
+    const values = captureExactOwnDataValues(input, [
+      "requestId", "hostId", "connectorId", "grantId", "reason",
+    ]);
+    if (!values || values[4] !== "user_revoked") {
+      return Promise.reject(
+        new RelayV2HostCarrierDashboardManagementControlError("CARRIER_REJECTED"),
+      );
+    }
+    let requestId: string;
+    let hostId: string;
+    let connectorId: string;
+    let grantId: string;
+    try {
+      requestId = dashboardControlIdentifier(values[0]);
+      hostId = dashboardControlIdentifier(values[1]);
+      connectorId = dashboardControlIdentifier(values[2]);
+      grantId = dashboardControlIdentifier(values[3]);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.submitDashboardManagementControl({
+      kind: "grant.revoke",
+      requestId,
+      hostId,
+      connectorId,
+      deviceLabel: null,
+      grantId,
+    }) as Promise<RelayV2HostCarrierDashboardManagementRevocationResult>;
+  }
+
+  private submitDashboardManagementControl(input: Readonly<{
+    kind: DashboardManagementControlKind;
+    requestId: string;
+    hostId: string;
+    connectorId: string;
+    deviceLabel: string | null;
+    grantId: string | null;
+  }>): Promise<
+    RelayV2HostCarrierDashboardManagementEnrollmentResult
+    | RelayV2HostCarrierDashboardManagementRevocationResult
+  > {
+    const connector = this.current;
+    if (this.disposed
+      || this.permanentlySuperseded
+      || !connector
+      || connector.phase !== "registered"
+      || connector.connectorId === null
+      || input.hostId !== this.options.hostId
+      || input.connectorId !== connector.connectorId) {
+      return Promise.reject(
+        new RelayV2HostCarrierDashboardManagementControlError("NOT_REGISTERED"),
+      );
+    }
+    const fingerprint = JSON.stringify([
+      input.kind,
+      input.requestId,
+      input.hostId,
+      input.connectorId,
+      input.deviceLabel,
+      input.grantId,
+    ]);
+    const existing = connector.pendingDashboardManagementControl;
+    if (existing !== null) {
+      if (existing.fingerprint === fingerprint) return existing.promise;
+      return Promise.reject(
+        new RelayV2HostCarrierDashboardManagementControlError("BUSY"),
+      );
+    }
+
+    let resolve!: PendingDashboardManagementControl["resolve"];
+    let reject!: PendingDashboardManagementControl["reject"];
+    const promise = new Promise<
+      RelayV2HostCarrierDashboardManagementEnrollmentResult
+      | RelayV2HostCarrierDashboardManagementRevocationResult
+    >((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const pending: PendingDashboardManagementControl = {
+      kind: input.kind,
+      requestId: input.requestId,
+      fingerprint,
+      connectorGeneration: connector.generation,
+      connectorId: connector.connectorId,
+      queueKey: `dashboard:${connector.generation}:${input.kind}:${input.requestId}`,
+      deviceLabel: input.deviceLabel,
+      grantId: input.grantId,
+      promise,
+      resolve,
+      reject,
+      settled: false,
+    };
+    connector.pendingDashboardManagementControl = pending;
+    const frame: RelayV2JsonObject = input.kind === "enrollment.create"
+      ? {
+          carrierVersion: 1,
+          type: "enrollment.create",
+          requestId: input.requestId,
+          connectorId: input.connectorId,
+          payload: {
+            expiresInMs: 300_000,
+            deviceLabel: input.deviceLabel,
+          },
+        }
+      : {
+          carrierVersion: 1,
+          type: "grant.revoke",
+          requestId: input.requestId,
+          connectorId: input.connectorId,
+          payload: {
+            grantId: input.grantId!,
+            reason: "user_revoked",
+          },
+        };
+    const accepted = this.enqueueControl(connector, frame, { queueKey: pending.queueKey });
+    if (!accepted && connector.pendingDashboardManagementControl === pending) {
+      this.removeControlItems(connector, (item) => item.queueKey === pending.queueKey);
+      this.rejectDashboardManagementControl(
+        connector,
+        pending,
+        new RelayV2HostCarrierDashboardManagementControlError("QUEUE_REFUSED"),
+      );
+    }
+    return promise;
   }
 
   private newReceiptCell(
@@ -848,6 +1263,7 @@ export class RelayV2HostCarrierActor {
       connectorId: null,
       credential: credentialMetadata,
       pendingReauthentication: null,
+      pendingDashboardManagementControl: null,
       routes: new Map(),
       seenRouteIds: new Set(),
       nextDeliveryToken: 0n,
@@ -1147,6 +1563,12 @@ export class RelayV2HostCarrierActor {
       return;
     }
     switch (type) {
+      case "enrollment.created":
+        this.handleEnrollmentCreated(connector, frame);
+        return;
+      case "grant.revoked":
+        this.handleGrantRevoked(connector, frame);
+        return;
       case "host.reauthenticated":
         this.handleReauthenticated(connector, frame);
         return;
@@ -1197,7 +1619,97 @@ export class RelayV2HostCarrierActor {
     });
   }
 
+  private exactDashboardManagementPending(
+    connector: ConnectorState,
+    frame: RelayV2JsonObject,
+    kind: DashboardManagementControlKind,
+  ): PendingDashboardManagementControl | null {
+    const pending = connector.pendingDashboardManagementControl;
+    if (!pending
+      || pending.kind !== kind
+      || pending.requestId !== stringField(frame, "requestId")
+      || pending.connectorGeneration !== connector.generation
+      || pending.connectorId !== connector.connectorId) {
+      this.failConnector(connector, 4400, "invalid_dashboard_control_correlation");
+      return null;
+    }
+    return pending;
+  }
+
+  private handleEnrollmentCreated(
+    connector: ConnectorState,
+    frame: RelayV2JsonObject,
+  ): void {
+    const pending = this.exactDashboardManagementPending(
+      connector,
+      frame,
+      "enrollment.create",
+    );
+    if (!pending) return;
+    try {
+      const payload = objectField(frame, "payload");
+      const enrollmentCode = stringField(payload, "enrollmentCode");
+      if (!enrollmentCode.startsWith("twenroll2.")
+        || enrollmentCode.length === "twenroll2.".length
+        || Buffer.byteLength(enrollmentCode, "utf8") > 512
+        || /[\0\r\n]/.test(enrollmentCode)
+        || stringField(payload, "hostId") !== this.options.hostId) {
+        throw new Error("invalid enrollment response");
+      }
+      const result: RelayV2HostCarrierDashboardManagementEnrollmentResult = Object.freeze({
+        type: "enrollment.created",
+        requestId: pending.requestId,
+        connectorGeneration: pending.connectorGeneration,
+        connectorId: pending.connectorId,
+        hostId: this.options.hostId,
+        deduplicated: payload.deduplicated as boolean,
+        enrollmentId: stringField(payload, "enrollmentId"),
+        enrollmentCode,
+        issuerUrl: dashboardManagementUrl(payload.issuerUrl, "https:", "/"),
+        relayUrl: dashboardManagementUrl(payload.relayUrl, "wss:", "/client"),
+        expiresAtMs: payload.expiresAtMs as number,
+        deviceLabel: pending.deviceLabel,
+      });
+      this.resolveDashboardManagementControl(connector, pending, result);
+    } catch {
+      this.failConnector(connector, 4400, "invalid_dashboard_control_response");
+    }
+  }
+
+  private handleGrantRevoked(
+    connector: ConnectorState,
+    frame: RelayV2JsonObject,
+  ): void {
+    const pending = this.exactDashboardManagementPending(
+      connector,
+      frame,
+      "grant.revoke",
+    );
+    if (!pending) return;
+    const payload = objectField(frame, "payload");
+    if (pending.grantId === null || stringField(payload, "grantId") !== pending.grantId) {
+      this.failConnector(connector, 4400, "invalid_dashboard_control_response");
+      return;
+    }
+    const result: RelayV2HostCarrierDashboardManagementRevocationResult = Object.freeze({
+      type: "grant.revoked",
+      requestId: pending.requestId,
+      connectorGeneration: pending.connectorGeneration,
+      connectorId: pending.connectorId,
+      hostId: this.options.hostId,
+      grantId: pending.grantId,
+      revokedAtMs: payload.revokedAtMs as number,
+      alreadyRevoked: payload.alreadyRevoked as boolean,
+    });
+    this.resolveDashboardManagementControl(connector, pending, result);
+  }
+
   private handleReauthenticated(connector: ConnectorState, frame: RelayV2JsonObject): void {
+    const managementPending = connector.pendingDashboardManagementControl;
+    if (managementPending?.requestId === stringField(frame, "requestId")) {
+      this.failConnector(connector, 4400, "invalid_dashboard_control_correlation");
+      return;
+    }
     const pending = connector.pendingReauthentication;
     if (!pending || stringField(frame, "requestId") !== pending.requestId) return;
     const payload = objectField(frame, "payload");
@@ -1233,7 +1745,25 @@ export class RelayV2HostCarrierActor {
 
   private handleCarrierError(connector: ConnectorState, frame: RelayV2JsonObject): void {
     const payload = objectField(frame, "payload");
-    if (stringField(payload, "failedType") !== "host.reauthenticate") return;
+    const failedType = stringField(payload, "failedType");
+    const managementPending = connector.pendingDashboardManagementControl;
+    if (managementPending?.requestId === stringField(frame, "requestId")
+      && failedType !== managementPending.kind) {
+      this.failConnector(connector, 4400, "invalid_dashboard_control_correlation");
+      return;
+    }
+    if (failedType === "enrollment.create" || failedType === "grant.revoke") {
+      const pending = this.exactDashboardManagementPending(connector, frame, failedType);
+      if (!pending) return;
+      const error = dashboardControlCarrierError(objectField(frame, "error"));
+      if (!error) {
+        this.failConnector(connector, 4400, "invalid_dashboard_control_error");
+        return;
+      }
+      this.rejectDashboardManagementControl(connector, pending, error);
+      return;
+    }
+    if (failedType !== "host.reauthenticate") return;
     const pending = connector.pendingReauthentication;
     if (!pending || stringField(frame, "requestId") !== pending.requestId) return;
     const error = objectField(frame, "error");
@@ -2110,6 +2640,14 @@ export class RelayV2HostCarrierActor {
     connector: ConnectorState,
     reason: RelayV2HostLocalUnbindReason,
   ): void {
+    const pendingControl = connector.pendingDashboardManagementControl;
+    if (pendingControl !== null) {
+      this.rejectDashboardManagementControl(
+        connector,
+        pendingControl,
+        new RelayV2HostCarrierDashboardManagementControlError("NOT_REGISTERED"),
+      );
+    }
     const routes = [...connector.routes.values()];
     for (const route of routes) route.phase = "closing";
     connector.routes.clear();
@@ -2122,6 +2660,29 @@ export class RelayV2HostCarrierActor {
       }
     }
     this.settleDetached(detached, false);
+  }
+
+  private resolveDashboardManagementControl(
+    connector: ConnectorState,
+    pending: PendingDashboardManagementControl,
+    result: RelayV2HostCarrierDashboardManagementEnrollmentResult
+      | RelayV2HostCarrierDashboardManagementRevocationResult,
+  ): void {
+    if (pending.settled || connector.pendingDashboardManagementControl !== pending) return;
+    connector.pendingDashboardManagementControl = null;
+    pending.settled = true;
+    pending.resolve(result);
+  }
+
+  private rejectDashboardManagementControl(
+    connector: ConnectorState,
+    pending: PendingDashboardManagementControl,
+    error: RelayV2HostCarrierDashboardManagementControlError,
+  ): void {
+    if (pending.settled || connector.pendingDashboardManagementControl !== pending) return;
+    connector.pendingDashboardManagementControl = null;
+    pending.settled = true;
+    pending.reject(error);
   }
 
   private detachQueuedDataForRoute(
@@ -2196,6 +2757,7 @@ export class RelayV2HostCarrierActor {
     connector.carrierPressureSinceMs = null;
     connector.orphanedInFlightSinceMs = null;
     connector.pendingReauthentication = null;
+    connector.pendingDashboardManagementControl = null;
     return detached;
   }
 
