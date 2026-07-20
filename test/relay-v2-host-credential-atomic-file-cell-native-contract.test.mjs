@@ -13,6 +13,12 @@ const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot),
 const fixture = JSON.parse(
   readFileSync(new URL("native-interface-cases.json", contractRoot), "utf8"),
 );
+const platformFixture = JSON.parse(
+  readFileSync(new URL("platform-resource-cases.json", contractRoot), "utf8"),
+);
+const claimJournalFixture = JSON.parse(
+  readFileSync(new URL("claim-journal-v1.json", contractRoot), "utf8"),
+);
 
 const ABI_VERSION = nativeCell.RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_ABI_VERSION;
 const OPEN_METHOD = nativeCell.RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_OPEN_METHOD;
@@ -96,10 +102,26 @@ function assertRequest(request, operation, keys) {
   assert.equal(request.operation, operation);
 }
 
+function assertSameMembers(actual, expected) {
+  assert.equal(actual.every((value) => expected.includes(value)), true);
+  assert.equal(expected.every((value) => actual.includes(value)), true);
+}
+
 test("Host credential native ABI manifest and every machine case stay closed", async () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-host-credential-atomic-file-cell");
-  assert.equal(manifest.contractVersion, 1);
+  assert.equal(manifest.contractVersion, 2);
+  assert.equal(
+    manifest.scope,
+    "host-credential-native-abi-and-isolated-platform-admission-contract-foundation",
+  );
+  assert.equal(manifest.productionWired, false);
   assert.equal(manifest.fixtureFormatVersion, fixture.fixtureFormatVersion);
+  assert.deepEqual(manifest.files, [
+    { role: "specification", path: "README.md" },
+    { role: "native-interface", path: "native-interface-cases.json" },
+    { role: "platform-resource-cases", path: "platform-resource-cases.json" },
+    { role: "claim-journal-golden", path: "claim-journal-v1.json" },
+  ]);
   assert.equal(manifest.nativeInterface.abiVersion, ABI_VERSION);
   assert.deepEqual(manifest.nativeInterface.moduleMethods, [OPEN_METHOD]);
   assert.deepEqual(manifest.nativeInterface.handleMethods, ["read", "compareAndSwap", "close"]);
@@ -108,11 +130,13 @@ test("Host credential native ABI manifest and every machine case stay closed", a
   assert.deepEqual(manifest.nativeModuleAuthority, {
     source: "future-production-composition-single-trusted-factory",
     binding: "pre-bound-exact-host-credential-cell-directory-descriptor-capability",
-    futureNativeHolder: "4b2-host-native-cell",
+    futureNativeHolder: "4b2a-host-platform-common-admission-owner",
     wrapperOpenConsumesBoundCapabilityOnly: true,
     pathOrDescriptorArgumentInAbi: false,
     homePathEnvironmentOrGlobalLookupAllowed: false,
     factoryLoaderOrPathImplementedIn4b1: false,
+    platformAdmissionImplementedIn4b2a: true,
+    platformAdmissionProductionWired: false,
   });
   assert.equal(manifest.bytes.maximumBytes, 65_536);
   assert.deepEqual(manifest.revision.publicFields, []);
@@ -126,6 +150,100 @@ test("Host credential native ABI manifest and every machine case stay closed", a
   assert.equal(JSON.stringify(fixture).includes("twref2."), false);
   assert.equal(JSON.stringify(fixture).includes("twhostboot2."), false);
 
+  assert.equal(manifest.platformResources.contractVersion, 1);
+  assert.equal(
+    manifest.platformResources.implementation,
+    "native/relay-v2-host-credential-atomic-file-cell-platform-common",
+  );
+  assert.equal(
+    manifest.platformResources.fileOperations,
+    "injected-descriptor-relative-trait-only",
+  );
+  assert.equal(manifest.platformResources.realDarwinOrLinuxSyscallsImplemented, false);
+  assert.equal(platformFixture.fixtureFormatVersion, 1);
+  assert.equal(
+    platformFixture.platformResourceContractVersion,
+    manifest.platformResources.contractVersion,
+  );
+  assert.deepEqual(manifest.platformResources.durabilityQualification.qualifiedRecords, []);
+  assert.equal(
+    manifest.platformResources.durabilityQualification.productionProofConstructible,
+    false,
+  );
+  assert.equal(
+    manifest.platformResources.durabilityQualification.productionFailure,
+    "CELL_DURABILITY_UNSUPPORTED",
+  );
+  assert.deepEqual(platformFixture.resourceNames, {
+    credential: manifest.platformResources.relativeNames.credential,
+    lock: manifest.platformResources.relativeNames.lock,
+    claim: manifest.platformResources.relativeNames.claim,
+  });
+  for (const component of Object.values(platformFixture.resourceNames)) {
+    assert.equal(component.includes("/"), false);
+    assert.equal(component.toLowerCase().includes("broker"), false);
+  }
+  assert.deepEqual(
+    manifest.platformResources.processRegistry.key,
+    [
+      "verified-directory-device",
+      "verified-directory-inode",
+      "RelayV2HostCredentialAtomicFileCellAdmissionV1",
+    ],
+  );
+  assert.equal(manifest.platformResources.processRegistry.sharedWithBrokerRegistry, false);
+  assert.equal(manifest.platformResources.processRegistry.childCleanupAllowed, false);
+  assert.equal(manifest.platformResources.lock.primitive, "traditional-process-owned-F_SETLK");
+  assert.equal(manifest.platformResources.lock.nonblocking, true);
+  assert.equal(manifest.platformResources.lock.explicitUnlockAllowed, false);
+  assert.deepEqual(manifest.platformResources.lock.busyErrnos, ["EACCES", "EAGAIN"]);
+  assert.equal(manifest.platformResources.claim.existingOpenAllowed, false);
+  assert.deepEqual(
+    manifest.platformResources.claim.createOpen,
+    ["O_RDWR", "O_CREAT", "O_EXCL", "O_NOFOLLOW", "O_CLOEXEC"],
+  );
+  assert.equal(
+    manifest.platformResources.claim.requiredPostOpenDescriptorFlag,
+    "FD_CLOEXEC",
+  );
+  assert.deepEqual(manifest.platformResources.claim.forbiddenOpenFlags, ["O_TRUNC"]);
+  assert.equal(manifest.platformResources.claimJournal.formatVersion, 1);
+  assert.equal(
+    manifest.platformResources.claimJournal.byteLength,
+    claimJournalFixture.byteLength,
+  );
+  assert.equal(
+    manifest.platformResources.claimJournal.magicAscii,
+    claimJournalFixture.fields[0].valueAscii,
+  );
+  assert.equal(claimJournalFixture.fixtureFormatVersion, 1);
+  assert.equal(
+    claimJournalFixture.journalFormatVersion,
+    manifest.platformResources.claimJournal.formatVersion,
+  );
+  assert.equal(
+    claimJournalFixture.golden.bytesHex.length,
+    claimJournalFixture.byteLength * 2,
+  );
+  assert.equal(claimJournalFixture.golden.claimIdHex.length, 64);
+  assert.equal(claimJournalFixture.golden.integrityDigestHex.length, 64);
+  for (const entry of platformFixture.errorMapping) {
+    assert.equal(manifest.rawErrorUnion.codes.includes(entry.code), true, entry.condition);
+  }
+  assert.equal(platformFixture.preservation.existingClaim, true);
+  assert.equal(platformFixture.preservation.foreignClaim, true);
+  assert.equal(platformFixture.preservation.corruptClaim, true);
+  assert.equal(platformFixture.preservation.failureAfterClaimDurableCut, true);
+  assert.equal(platformFixture.forbidden.includes("H4a-or-Relay-v1-fallback"), true);
+  assert.equal(
+    JSON.stringify(manifest.platformResources).includes("TWV2BCS1"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(manifest.platformResources).includes("RelayV2BrokerCredentialStateStoreV1"),
+    false,
+  );
+
   assert.deepEqual(manifest.requests.variants, {
     open: ["abiVersion", "operation"],
     read: ["abiVersion", "operation"],
@@ -136,20 +254,20 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     empty: ["state", "revision"],
     present: ["state", "revision", "bytes"],
   });
-  assert.deepEqual(
-    new Set(fixture.errorCases.slice(0, -2).map((entry) => entry.expectedCode)),
-    new Set(manifest.rawErrorUnion.codes),
+  assertSameMembers(
+    fixture.errorCases.slice(0, -2).map((entry) => entry.expectedCode),
+    manifest.rawErrorUnion.codes,
   );
   assert.equal(manifest.rawErrorUnion.rawThrow,
     "always-NATIVE_INTERFACE_INVALID-without-inspection-or-reflection");
-  assert.deepEqual(
-    new Set(manifest.nodeWrapperErrorUnion.codes),
-    new Set([
+  assertSameMembers(
+    manifest.nodeWrapperErrorUnion.codes,
+    [
       ...manifest.rawErrorUnion.codes,
       "REENTRANT",
       "ASYNC_OPERATION_UNSUPPORTED",
       "UNCERTAIN_FENCED",
-    ]),
+    ],
   );
   assert.equal(manifest.nodeWrapperErrorUnion.rawThrowCodeReflectionAllowed, false);
 

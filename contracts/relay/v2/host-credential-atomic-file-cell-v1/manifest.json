@@ -1,20 +1,23 @@
 {
   "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
-  "contractVersion": 1,
+  "contractVersion": 2,
   "fixtureFormatVersion": 1,
   "status": "frozen",
-  "scope": "host-credential-internal-native-abi-only",
+  "scope": "host-credential-native-abi-and-isolated-platform-admission-contract-foundation",
+  "productionWired": false,
   "productionCapabilityEffect": "none",
   "businessOwner": "RelayV2HostCredentialVault",
-  "nativeOwner": "future-host-credential-atomic-file-cell-native-lifecycle",
+  "nativeOwner": "relay-v2-host-credential-atomic-file-cell-platform-common-admission-owner",
   "nativeModuleAuthority": {
     "source": "future-production-composition-single-trusted-factory",
     "binding": "pre-bound-exact-host-credential-cell-directory-descriptor-capability",
-    "futureNativeHolder": "4b2-host-native-cell",
+    "futureNativeHolder": "4b2a-host-platform-common-admission-owner",
     "wrapperOpenConsumesBoundCapabilityOnly": true,
     "pathOrDescriptorArgumentInAbi": false,
     "homePathEnvironmentOrGlobalLookupAllowed": false,
-    "factoryLoaderOrPathImplementedIn4b1": false
+    "factoryLoaderOrPathImplementedIn4b1": false,
+    "platformAdmissionImplementedIn4b2a": true,
+    "platformAdmissionProductionWired": false
   },
   "nativeInterface": {
     "abi": "napi",
@@ -150,12 +153,154 @@
       "Relay-v1-fallback"
     ]
   },
+  "platformResources": {
+    "contractVersion": 1,
+    "implementation": "native/relay-v2-host-credential-atomic-file-cell-platform-common",
+    "scope": "pre-bound-directory-descriptor-to-process-registry-lock-claim-and-close-only",
+    "directoryCapability": {
+      "source": "future-production-composition-single-trusted-factory",
+      "preBoundBeforeNativeAbiOpen": true,
+      "soleDescriptor": true,
+      "pathHomeEnvironmentOrGlobalLookupAllowed": false,
+      "requiredType": "directory",
+      "requiredOwner": "effective-uid-and-effective-gid",
+      "requiredModeOctal": "0700",
+      "requiredDescriptorFlag": "FD_CLOEXEC",
+      "identity": ["device", "inode"]
+    },
+    "relativeNames": {
+      "credential": "relay-v2-host-credential.cell",
+      "lock": ".relay-v2-host-credential.cell.admission-lock-v1",
+      "claim": ".relay-v2-host-credential.cell.admission-claim-v1",
+      "singleComponentsOnly": true,
+      "callerOverrideAllowed": false,
+      "alternateCandidateLookupAllowed": false
+    },
+    "durabilityQualification": {
+      "policyVersion": 1,
+      "qualifiedRecords": [],
+      "productionProofConstructible": false,
+      "testProof": "cfg(test)-only",
+      "runtimeProbeCreatesQualification": false,
+      "failureBefore": ["process-registry-reservation", "namespace-mutation"],
+      "productionFailure": "CELL_DURABILITY_UNSUPPORTED",
+      "firstQualifiedRecordRequiresNewContractRevision": true
+    },
+    "processRegistry": {
+      "owner": "host-platform-common-only",
+      "key": [
+        "verified-directory-device",
+        "verified-directory-inode",
+        "RelayV2HostCredentialAtomicFileCellAdmissionV1"
+      ],
+      "phases": ["Opening", "Open", "Closing", "CloseUncertain"],
+      "activeCollision": "CELL_BUSY-before-second-lock-descriptor",
+      "closeUncertainCollision": "CELL_CLOSED-permanent",
+      "openerPidFence": true,
+      "childCleanupAllowed": false,
+      "sharedWithBrokerRegistry": false
+    },
+    "admissionOrder": [
+      "adopt-pre-bound-directory-descriptor",
+      "fstat-directory-type-owner-0700-and-FD_CLOEXEC",
+      "reserve-host-process-registry",
+      "recheck-directory-identity-and-safety",
+      "fstatat-lock-AT_SYMLINK_NOFOLLOW",
+      "open-existing-lock-or-create-O_CREAT-O_EXCL-never-O_TRUNC",
+      "lock-final-A-B-C-identity-safety-and-FD_CLOEXEC-proof",
+      "nonblocking-traditional-whole-file-F_SETLK-write-lock",
+      "fstatat-claim-AT_SYMLINK_NOFOLLOW",
+      "reject-and-preserve-existing-claim",
+      "create-claim-O_CREAT-O_EXCL-0600",
+      "write-fixed-claim-journal-v1",
+      "fsync-claim",
+      "claim-final-A-B-C-identity-safety-and-FD_CLOEXEC-proof",
+      "fsync-directory",
+      "mark-registry-open"
+    ],
+    "stableProof": {
+      "sequence": [
+        "A=fstat(descriptor)",
+        "B=fstatat(directory,name,AT_SYMLINK_NOFOLLOW)",
+        "C=fstat(descriptor)"
+      ],
+      "mustRemainEqual": ["device", "inode", "type", "uid", "gid", "mode", "nlink", "size"],
+      "lock": { "type": "regular", "modeOctal": "0600", "nlink": 1, "sizeBytes": 0 },
+      "claim": { "type": "regular", "modeOctal": "0600", "nlink": 1, "sizeBytes": 192 }
+    },
+    "lock": {
+      "descriptorCount": 1,
+      "existingOpen": ["O_RDWR", "O_NOFOLLOW", "O_CLOEXEC"],
+      "createOpen": ["O_RDWR", "O_NOFOLLOW", "O_CLOEXEC", "O_CREAT", "O_EXCL"],
+      "createModeOctal": "0600",
+      "forbiddenOpenFlags": ["O_TRUNC", "O_EXLOCK"],
+      "primitive": "traditional-process-owned-F_SETLK",
+      "record": { "type": "F_WRLCK", "whence": "SEEK_SET", "start": 0, "length": 0 },
+      "nonblocking": true,
+      "busyErrnos": ["EACCES", "EAGAIN"],
+      "forbiddenPrimitives": ["F_SETLKW", "flock", "F_OFD_GETLK", "F_OFD_SETLK", "F_OFD_SETLKW"],
+      "explicitUnlockAllowed": false,
+      "release": "exactly-once-raw-close-only"
+    },
+    "claim": {
+      "descriptorCount": 1,
+      "existingOpenAllowed": false,
+      "createOpen": ["O_RDWR", "O_CREAT", "O_EXCL", "O_NOFOLLOW", "O_CLOEXEC"],
+      "createModeOctal": "0600",
+      "requiredPostOpenDescriptorFlag": "FD_CLOEXEC",
+      "forbiddenOpenFlags": ["O_TRUNC"],
+      "write": "fixed-journal-from-offset-zero",
+      "read": "same-sole-descriptor-exact-journal-on-close",
+      "release": "unlinkat-claim-then-exactly-once-raw-close"
+    },
+    "claimJournal": {
+      "formatVersion": 1,
+      "byteOrder": "little-endian",
+      "byteLength": 192,
+      "magicAscii": "TWV2HAC1",
+      "state": "ADMISSION_HELD_NO_CREDENTIAL_MUTATION",
+      "claimIdBytes": 32,
+      "integrity": "SHA-256-over-bytes-0-through-159",
+      "reservedMustBeZero": true,
+      "credentialOrSecretAllowed": false,
+      "homePathOrBusinessReferenceAllowed": false
+    },
+    "close": {
+      "operationGate": "parent-pid-plus-registry-poison-and-exact-entry-fence",
+      "cleanupGate": "parent-pid-only",
+      "samePidRegistryEntryOrBeginCloseFailure": "global-poison-or-CloseUncertain-then-raw-close-each-owned-descriptor-at-most-once",
+      "forkChildCleanupAllowed": false,
+      "normalOrder": [
+        "fence-new-operations",
+        "verify-parent-process",
+        "recheck-directory-lock-and-claim-fd-path-identities",
+        "decode-and-match-exact-claim-journal-and-claimId",
+        "unlinkat-only-exact-claim",
+        "fsync-directory",
+        "raw-close-claim-once",
+        "raw-close-lock-once-without-explicit-unlock",
+        "raw-close-directory-once",
+        "release-registry-only-after-all-success"
+      ],
+      "rawCloseRetryAllowed": false,
+      "credentialUnlinkAllowed": false,
+      "lockUnlinkAllowed": false,
+      "identityDurabilityOrCloseUncertain": "permanent-CloseUncertain-tombstone",
+      "foreignCorruptOrExistingClaimCleanupAllowed": false
+    },
+    "fileOperations": "injected-descriptor-relative-trait-only",
+    "realDarwinOrLinuxSyscallsImplemented": false
+  },
   "notImplemented": [
-    "native-rust-or-syscall-open",
+    "trusted-production-factory",
+    "real-darwin-or-linux-syscalls",
     "real-home-or-filesystem",
+    "credential-cell-read-cas-temp-or-rename",
+    "csprng-claim-id-source",
     "orphan-cleanup-or-recovery",
-    "durability-qualification",
+    "production-durability-qualification",
     "continuity",
+    "napi-binding",
     "loader-or-packaging",
     "vault-injection",
     "relay-host-production-composition",
@@ -163,6 +308,8 @@
   ],
   "files": [
     { "role": "specification", "path": "README.md" },
-    { "role": "native-interface", "path": "native-interface-cases.json" }
+    { "role": "native-interface", "path": "native-interface-cases.json" },
+    { "role": "platform-resource-cases", "path": "platform-resource-cases.json" },
+    { "role": "claim-journal-golden", "path": "claim-journal-v1.json" }
   ]
 }

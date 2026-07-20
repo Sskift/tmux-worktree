@@ -1,0 +1,55 @@
+{
+  "fixtureFormatVersion": 1,
+  "platformResourceContractVersion": 1,
+  "resourceNames": {
+    "credential": "relay-v2-host-credential.cell",
+    "lock": ".relay-v2-host-credential.cell.admission-lock-v1",
+    "claim": ".relay-v2-host-credential.cell.admission-claim-v1"
+  },
+  "canonicalAdmission": {
+    "directory": { "device": "11", "inode": "12", "type": "directory", "uid": 501, "gid": 20, "modeOctal": "0700", "nlink": 1, "sizeBytes": 0, "cloexec": true },
+    "lock": { "device": "21", "inode": "22", "type": "regular", "uid": 501, "gid": 20, "modeOctal": "0600", "nlink": 1, "sizeBytes": 0, "cloexec": true },
+    "claim": { "device": "31", "inode": "32", "type": "regular", "uid": 501, "gid": 20, "modeOctal": "0600", "nlink": 1, "sizeBytes": 192, "cloexec": true },
+    "process": { "pid": 4242, "euid": 501, "egid": 20 }
+  },
+  "errorMapping": [
+    { "condition": "same-process-active-registry-key", "code": "CELL_BUSY", "retryable": true },
+    { "condition": "F_SETLK-EACCES-or-EAGAIN", "code": "CELL_BUSY", "retryable": true },
+    { "condition": "foreign-pid-or-close-uncertain-registry-key", "code": "CELL_CLOSED", "retryable": false },
+    { "condition": "claim-fixed-safe-existing", "code": "CELL_RECOVERY_REQUIRED", "retryable": false },
+    { "condition": "owned-claim-journal-malformed-digest-reserved-or-length", "code": "CELL_CORRUPT", "retryable": false },
+    { "condition": "observed-descriptor-path-type-link-or-inode-race", "code": "CELL_IDENTITY_UNCERTAIN", "retryable": false },
+    { "condition": "owner-or-mode-invalid", "code": "CELL_PERMISSION_INVALID", "retryable": false },
+    { "condition": "qualification-absent", "code": "CELL_DURABILITY_UNSUPPORTED", "retryable": false },
+    { "condition": "descriptor-operation-or-raw-close-failure", "code": "CELL_IO", "retryable": false }
+  ],
+  "failureCloseBounds": [
+    { "failureCut": "before-registry-reservation", "directory": 1, "lock": 0, "claim": 0 },
+    { "failureCut": "after-registry-before-lock-descriptor", "directory": 1, "lock": 0, "claim": 0 },
+    { "failureCut": "after-lock-descriptor-before-claim-descriptor", "directory": 1, "lock": 1, "claim": 0 },
+    { "failureCut": "after-claim-descriptor", "directory": 1, "lock": 1, "claim": 1 },
+    { "failureCut": "normal-close", "directory": 1, "lock": 1, "claim": 1 }
+  ],
+  "preservation": {
+    "existingClaim": true,
+    "foreignClaim": true,
+    "corruptClaim": true,
+    "failureAfterClaimDurableCut": true,
+    "credentialAlways": true,
+    "lockAlways": true
+  },
+  "forbidden": [
+    "broker-N0-namespace-path-format-registry-or-owner",
+    "F_SETLKW",
+    "flock",
+    "F_OFD_GETLK",
+    "F_OFD_SETLK",
+    "F_OFD_SETLKW",
+    "O_TRUNC",
+    "explicit-unlock",
+    "descriptor-dup-or-reopen",
+    "claim-repair-or-orphan-recovery",
+    "credential-temp-rename-or-CAS",
+    "H4a-or-Relay-v1-fallback"
+  ]
+}

@@ -1,6 +1,6 @@
 # Relay v2 Host Credential Atomic File Cell v1
 
-状态：**Frozen internal native ABI；default-off、injected-only，未实现 native addon、真实文件系统或 production wiring。**
+状态：**Frozen contract revision 2；native ABI、fixture 与 claim journal format 各为 v1。default-off、injected-only，未接 native addon、真实 Darwin/Linux syscall 或 production wiring。**
 
 本目录冻结 Relay v2 Host credential vault 的专属 atomic byte-cell native seam。它不修改 Relay public wire，不产生 readiness/capability，也不复用 broker credential state store 的 logical store kind、binary container、private location、artifact、loader、lifecycle owner 或 continuity namespace。
 
@@ -8,9 +8,39 @@
 
 `RelayV2HostCredentialVault` 继续唯一拥有 credential envelope、Host/credential reference binding 和 secret 业务语义。未来 Host native cell 只拥有一个 cell 的 descriptor、lock、object identity、CAS、durability、recovery 和 final-close lifecycle。Node wrapper 只 closed-decode 本 ABI，并实现既有 `RelayV2HostCredentialAtomicByteCell` port。
 
-未来 production composition 必须通过唯一 trusted factory 创建 `nativeModule`，并在进入本 ABI 前把它预绑定到 exact Host credential cell directory descriptor capability；未来 4b2 native 实现持有并验证该 descriptor authority。Wrapper 与本 ABI 的 `open` request 只消费这项已绑定 capability，不能选择或接收 HOME/path/env，也不能做 global lookup。
+未来 production composition 必须通过唯一 trusted factory 创建 `nativeModule`，并在进入本 ABI 前把它预绑定到 exact Host credential cell directory descriptor capability；4b2a 的独立 platform-common crate 只持有并验证该 descriptor authority。Wrapper 与本 ABI 的 `open` request 只消费这项已绑定 capability，不能选择或接收 HOME/path/env，也不能做 global lookup。
 
-本 4b1 revision 不实现上述 factory、native Rust/syscall、descriptor open、HOME/path/env 输入、global lookup、loader/packaging、orphan recovery、durability qualification、continuity、Vault injection、`relay-host` composition 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 的 production fallback。
+4b2a 新增的 `native/relay-v2-host-credential-atomic-file-cell-platform-common` 是 Host 专属、未接线的 admission owner。它只消费预绑定 directory descriptor、调用 descriptor-relative platform trait，并独占 process registry、lock descriptor、claim journal 和 final close。它不依赖、导入或复用 broker N0 的 namespace、path component、container/binary format、registry、lifecycle owner、artifact、loader 或 continuity namespace。
+
+本 revision 仍不实现 trusted factory、Darwin/Linux syscall adapter、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell CAS/temp/rename、orphan recovery、CSPRNG、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
+
+## Platform-common admission owner
+
+Production durability qualification v1 是 deny-by-default：`qualifiedRecords=[]`，且没有 public constructor、template、wildcard 或 runtime-probe 通道。实现只在 `cfg(test)` 内能构造 test qualification；未来真实 platform adapter 必须在 process registry 和任何 namespace mutation 前返回 `CELL_DURABILITY_UNSUPPORTED`，直到新 contract revision 显式加入 qualified record。Syscall 成功或 runtime probe 不能自行产生 qualification。
+
+测试可达的 exact admission 顺序冻结为：
+
+1. adopt 调用方预绑定的 sole directory descriptor；`fstat` 必须证明 directory、effective uid/effective gid owner、exact `0700` 和 `FD_CLOEXEC`。
+2. 以 `(directory dev, directory ino, RelayV2HostCredentialAtomicFileCellAdmissionV1)` 在 Host 专属 process registry 中 reserve；随后立即重做 directory identity/safety 证明。第二个同进程 owner 必须在产生第二个 lock descriptor 前返回 `CELL_BUSY`。
+3. `fstatat(directory, lock, AT_SYMLINK_NOFOLLOW)`。Existing 只能以 `openat(..., O_RDWR|O_NOFOLLOW|O_CLOEXEC)` 打开；absent 只能以 `O_RDWR|O_NOFOLLOW|O_CLOEXEC|O_CREAT|O_EXCL` 和 `0600` 创建。禁止 `O_TRUNC`、reopen、dup 或辅助 lock descriptor。
+4. lock 文件完成 `A=fstat(fd) / B=fstatat(directory, lock, NOFOLLOW) / C=fstat(fd)` stable proof；A/B/C 必须是同一 dev+ino、regular、euid/egid owner、exact `0600`、`nlink=1`、size `0`，且 descriptor 必须 `FD_CLOEXEC`。
+5. 只在该 lock fd 上执行 nonblocking traditional process-owned whole-file `fcntl(F_SETLK, {F_WRLCK, SEEK_SET, start=0, len=0})`。只有 `EACCES`/`EAGAIN` 映射 `CELL_BUSY`；禁止 `F_SETLKW`、`flock`、Linux `F_OFD_*` 和显式 unlock。锁只由 final raw close 释放。
+6. `fstatat(directory, claim, AT_SYMLINK_NOFOLLOW)`。安全、fixed-length 的 existing claim 表示 `CELL_RECOVERY_REQUIRED`；foreign owner/mode、symlink/special/link、wrong length/corrupt observation 都原样保留，绝不修复或删除。Absent claim 只能在同一次 `openat` 以 exact `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` 和 `0600` 创建，禁止 `O_TRUNC`；不得以事后 `F_SETFD` 替代 atomic `O_CLOEXEC`，但仍必须独立验证 sole descriptor 已有 `FD_CLOEXEC`，以便 normal close 从同一 descriptor 读回 exact journal。若 preflight 为 absent、但 exclusive create 返回 `EEXIST`，必须再次以 `fstatat(..., AT_SYMLINK_NOFOLLOW)` 观察并执行同一完整 type/link/owner/mode/fixed-length 分类；只有合格的 192-byte existing claim 返回 `CELL_RECOVERY_REQUIRED`，type/link/identity race 返回 `CELL_IDENTITY_UNCERTAIN`，wrong length 返回 `CELL_CORRUPT`，owner/mode invalid 返回 `CELL_PERMISSION_INVALID`，且所有分支 unlink 次数都为零。
+7. 向 sole claim fd 从 offset 0 写入 exact fixed journal，执行 claim `fsync`，再完成 claim A/B/C stable proof，最后 directory `fsync`。只有这些全部成功才把 registry 转为 `Open`。Durable cut 后的任何 failure 必须保留 claim。
+
+Registry 只有 `Opening / Open / Closing / CloseUncertain`。Owner 捕获 opener PID，并在每个 descriptor-relative operation 前检查 PID。Fork 后 inherited owner 的所有 operation 只返回 `CELL_CLOSED`；child 不得 unlink、unlock、fsync 或 close 任何 inherited descriptor。
+
+## Claim journal v1
+
+Claim 是 exact 192-byte little-endian binary record，magic 为 `TWV2HAC1`。它只表达 `ADMISSION_HELD_NO_CREDENTIAL_MUTATION`，并包含 journal version/length、32-byte claimId、directory/lock/claim 的 dev+ino、opener PID、euid、egid、必须为零的 reserved bytes和对前 160 bytes 的 SHA-256 integrity digest。它不得包含 credential bytes、secret、HOME、path、business credential reference、hostId 或 continuity state。Exact layout 与 golden bytes 见 [`claim-journal-v1.json`](claim-journal-v1.json)。
+
+## Close
+
+Normal close 先永久 fence 新操作，再重做 directory、lock 和 claim 的 descriptor/path A/B/C identity/safety proof，从 sole claim fd 读回并严格解码 journal，并且只接受当前 owner 捕获的 exact claimId 和全部 identity。成功后只对 claim 执行一次 descriptor-relative `unlinkat`，再 directory `fsync`；永远不显式 unlock，不删除 credential 或 lock 文件。
+
+claim、lock、directory 三个 descriptor 各自只 raw-close 一次，不 retry。只有 identity/journal/unlink/directory-fsync 和三次 raw close 全部成功才删除 registry entry。任何 identity、durability 或 close 不确定都转为永久 `CloseUncertain` tombstone，之后同一 process registry key 只返回 `CELL_CLOSED`。Foreign/corrupt/existing claim 始终保留；本 revision 没有 orphan recovery 或 cleanup API。每个 failure path 的 descriptor close 上限与 closed error mapping 由 [`platform-resource-cases.json`](platform-resource-cases.json) 冻结。
+
+正常 open/mutation gate 必须同时验证 parent PID、registry poison 和 exact entry fence；cleanup gate 则只先验证 parent PID。Same-PID 的 registry poison、entry missing/mismatch 或 `begin_close` failure 不能阻止 `OpenAttempt`/owner 把每个已持有 descriptor 各 raw-close 最多一次：failure 必须留下 global poison 或 `CloseUncertain`、返回稳定 closed error，并阻断下一次 open。唯一例外是 fork child；PID fence 失败时不得 cleanup 任何 inherited descriptor。
 
 ## Frozen module and handle
 

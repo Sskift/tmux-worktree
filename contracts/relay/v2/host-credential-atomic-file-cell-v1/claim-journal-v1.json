@@ -1,0 +1,46 @@
+{
+  "fixtureFormatVersion": 1,
+  "journalFormatVersion": 1,
+  "byteOrder": "little-endian",
+  "byteLength": 192,
+  "integrityCoveredBytes": 160,
+  "fields": [
+    { "name": "magic", "offset": 0, "length": 8, "valueAscii": "TWV2HAC1" },
+    { "name": "journalFormatVersion", "offset": 8, "length": 4, "encoding": "u32-le", "value": 1 },
+    { "name": "recordLength", "offset": 12, "length": 4, "encoding": "u32-le", "value": 192 },
+    { "name": "state", "offset": 16, "length": 4, "encoding": "u32-le", "value": 1, "symbol": "ADMISSION_HELD_NO_CREDENTIAL_MUTATION" },
+    { "name": "reservedHeader", "offset": 20, "length": 4, "encoding": "zero" },
+    { "name": "claimId", "offset": 24, "length": 32, "encoding": "opaque-bytes" },
+    { "name": "directoryDevice", "offset": 56, "length": 8, "encoding": "u64-le" },
+    { "name": "directoryInode", "offset": 64, "length": 8, "encoding": "u64-le" },
+    { "name": "lockDevice", "offset": 72, "length": 8, "encoding": "u64-le" },
+    { "name": "lockInode", "offset": 80, "length": 8, "encoding": "u64-le" },
+    { "name": "claimDevice", "offset": 88, "length": 8, "encoding": "u64-le" },
+    { "name": "claimInode", "offset": 96, "length": 8, "encoding": "u64-le" },
+    { "name": "openerPid", "offset": 104, "length": 4, "encoding": "u32-le" },
+    { "name": "effectiveUid", "offset": 108, "length": 4, "encoding": "u32-le" },
+    { "name": "effectiveGid", "offset": 112, "length": 4, "encoding": "u32-le" },
+    { "name": "reserved", "offset": 116, "length": 44, "encoding": "zero" },
+    { "name": "integrityDigest", "offset": 160, "length": 32, "encoding": "sha256", "covers": [0, 160] }
+  ],
+  "golden": {
+    "claimIdHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "directory": { "device": "11", "inode": "12" },
+    "lock": { "device": "21", "inode": "22" },
+    "claim": { "device": "31", "inode": "32" },
+    "openerPid": 4242,
+    "effectiveUid": 501,
+    "effectiveGid": 20,
+    "bytesHex": "545756324841433101000000c00000000100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0b000000000000000c00000000000000150000000000000016000000000000001f00000000000000200000000000000092100000f50100001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d99d9fd9e2b0652036e52c348d583ac7e2d78b372b40028dbfbfccae3240e43",
+    "integrityDigestHex": "0d99d9fd9e2b0652036e52c348d583ac7e2d78b372b40028dbfbfccae3240e43"
+  },
+  "forbiddenContent": [
+    "credential",
+    "secret",
+    "HOME",
+    "path",
+    "business-credential-reference",
+    "hostId",
+    "continuity"
+  ]
+}
