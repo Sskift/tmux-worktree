@@ -115,9 +115,7 @@ function releaseSnapshotRequest(chunk, principalId = "composition-principal") {
 
 function baseAuthorities(snapshotAuthority, hostEpoch, hostInstanceId, overrides = {}) {
   return {
-    h0: overrides.h0 ?? {
-      async read() { return { hostEpoch, hostInstanceId }; },
-    },
+    h0: overrides.h0,
     h1: overrides.h1 ?? {
       async execute() { throw new Error("unexpected H1 execute"); },
       async query() { throw new Error("unexpected H1 query"); },
@@ -158,7 +156,7 @@ function createComposition(snapshotAuthority, hostEpoch, hostInstanceId, overrid
 }
 
 function applyFiveReadySources(composition, generation = "1") {
-  for (const source of ["codec", "carrier", "h0", "h1", "h3"]) {
+  for (const source of ["codec", "carrier", "h1", "h3"]) {
     assert.equal(composition.readiness[source].apply({
       source,
       generation,
@@ -179,6 +177,7 @@ async function realCompositionHarness({
   spoolHooks,
   wrapSpool,
   compositionOverrides,
+  activateH0 = true,
 } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-composition-"));
   const store = await hostState.RelayV2HostStateStore.open({
@@ -212,8 +211,9 @@ async function realCompositionHarness({
     spool.hostH2Authority,
     seeded.snapshot.hostEpoch,
     store.hostInstanceId,
-    { ...compositionOverrides, h0: store },
+    { ...compositionOverrides, h0: store.h0ReadinessPort },
   );
+  if (activateH0) assert.equal(await composition.readiness.h0.activate(), true);
   wrapped?.attach?.(composition);
   let readinessPrincipalOrdinal = 0;
   return {
@@ -235,6 +235,7 @@ async function realCompositionHarness({
     },
     async cleanup({ closeSpool = true } = {}) {
       composition.dispose();
+      store.close();
       if (closeSpool) await spool.close().catch(() => undefined);
       rmSync(home, { recursive: true, force: true });
     },
@@ -369,9 +370,10 @@ function forgeOpaqueAuthority(authority, { issuerMode = "same", fields = {} } = 
   return Object.freeze(forged);
 }
 
-test("default-off host composition cannot advertise before exact H2 activation", async () => {
-  const h = await realCompositionHarness();
+test("default-off host composition requires exact H0 and H2 activation", async () => {
+  const h = await realCompositionHarness({ activateH0: false });
   try {
+    assert.equal(h.composition.readiness.h0.apply, undefined);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     applyFiveReadySources(h.composition);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -379,6 +381,85 @@ test("default-off host composition cannot advertise before exact H2 activation",
       h.composition.routeSink.onRouteBound(binding()).code,
       "CAPABILITY_UNAVAILABLE",
     );
+    const h2 = await issueReadiness(h, "composition-default-off-h2");
+    assert.equal(await h.composition.readiness.h2.activate(h2.issue), true);
+    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
+    assert.equal(await h.composition.readiness.h0.activate(), true);
+    assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
+    assert.throws(
+      () => createComposition(
+        h.spool.hostH2Authority,
+        h.seeded.snapshot.hostEpoch,
+        h.store.hostInstanceId,
+        { h0: { read: () => h.store.read() } },
+      ),
+      /invalid Relay v2 H0 readiness port/,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("composition rejects a complete self-signing forged H0 port", async () => {
+  const h = await realCompositionHarness({ activateH0: false });
+  try {
+    applyFiveReadySources(h.composition);
+    const h2 = await issueReadiness(h, "composition-forged-h0-h2");
+    assert.equal(await h.composition.readiness.h2.activate(h2.issue), true);
+    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
+
+    let forgedCalls = 0;
+    const forgedReceipt = Object.freeze(() => undefined);
+    const forgedLease = Object.freeze(() => undefined);
+    const forgedBinding = Object.freeze({
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      commitSeq: "18446744073709551615",
+      proofGeneration: "18446744073709551615",
+    });
+    const forgedPort = Object.create(null);
+    for (const [name, value] of Object.entries({
+      async read() {
+        forgedCalls += 1;
+        return h.store.read();
+      },
+      async issueReadinessReceipt() {
+        forgedCalls += 1;
+        return { receipt: forgedReceipt, binding: forgedBinding };
+      },
+      consumeReadinessReceipt() {
+        forgedCalls += 1;
+        return forgedLease;
+      },
+      discardReadinessReceipt() {
+        forgedCalls += 1;
+        return true;
+      },
+      releaseReadinessLease() {
+        forgedCalls += 1;
+        return true;
+      },
+    })) {
+      Object.defineProperty(forgedPort, name, {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value,
+      });
+    }
+    Object.freeze(forgedPort);
+
+    assert.throws(
+      () => createComposition(
+        h.spool.hostH2Authority,
+        h.seeded.snapshot.hostEpoch,
+        h.store.hostInstanceId,
+        { h0: forgedPort },
+      ),
+      /invalid Relay v2 H0 readiness port/,
+    );
+    assert.equal(forgedCalls, 0);
+    assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
   } finally {
     await h.cleanup();
   }
@@ -431,7 +512,7 @@ test("cross-entry H2 authority accepts only both exact issuer bundles", async ()
           hostAuthority,
           h.seeded.snapshot.hostEpoch,
           h.store.hostInstanceId,
-          { h0: h.store },
+          { h0: h.store.h0ReadinessPort },
         ),
         /invalid Relay v2 bound H2 snapshot authority/,
       );

@@ -32,6 +32,10 @@ import type {
   RelayV2HostRuntimeWelcomeSerializer,
   RelayV2RequiredCapability,
 } from "./hostRuntime.js";
+import { createRelayV2HostH0ReadinessActivation } from "./hostH0ReadinessActivation.js";
+import type {
+  RelayV2HostH0ReadinessLifecycle,
+} from "./hostH0ReadinessActivation.js";
 import { createRelayV2HostH2ReadinessActivation } from "./hostH2ReadinessActivation.js";
 import type {
   RelayV2HostH2ReadinessLifecycle,
@@ -40,22 +44,31 @@ import type {
 import type {
   RelayV2StateSnapshotHostH2Authority,
 } from "./stateSnapshotSpool.js";
+import type { RelayV2HostH0ReadinessPort } from "./hostState.js";
 import type {
   RelayV2TerminalOpenResponseLineage,
   RelayV2TerminalRuntimeBinding,
 } from "./terminalManager.js";
 
-type NonH2ReadinessSource = Exclude<RelayV2HostCapabilityReadinessSource, "h2">;
+type ManualReadinessSource = Exclude<
+  RelayV2HostCapabilityReadinessSource,
+  "h0" | "h2"
+>;
 
 const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
 
 export type RelayV2HostRuntimeCompositionH2ReadinessLifecycle =
   RelayV2HostH2ReadinessLifecycle;
 
+// Standalone construction is exported for authority-level behavior tests and
+// other internal composition roots; this composition never accepts an injected
+// activation instance and exposes only its lifecycle.
+export { createRelayV2HostH0ReadinessActivation };
+
 export interface RelayV2HostRuntimeCompositionReadinessLifecycle {
   readonly codec: RelayV2HostCapabilityReadinessSourceSink<"codec">;
   readonly carrier: RelayV2HostCapabilityReadinessSourceSink<"carrier">;
-  readonly h0: RelayV2HostCapabilityReadinessSourceSink<"h0">;
+  readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostCapabilityReadinessSourceSink<"h1">;
   readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
   readonly h3: RelayV2HostCapabilityReadinessSourceSink<"h3">;
@@ -78,8 +91,9 @@ export type RelayV2HostRuntimeCompositionSnapshotSpool =
 
 export type RelayV2HostRuntimeCompositionAuthorities = Omit<
   RelayV2HostRuntimeActualAuthorityInput,
-  "h2" | "snapshotSpool"
+  "h0" | "h2" | "snapshotSpool"
 > & Readonly<{
+  h0: RelayV2HostH0ReadinessPort;
   h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
 }>;
 
@@ -135,7 +149,7 @@ export interface RelayV2HostCarrierRuntimeFacade {
 
 export interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
   readonly codec: RelayV2HostCapabilityReadinessSourceSink<"codec">;
-  readonly h0: RelayV2HostCapabilityReadinessSourceSink<"h0">;
+  readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostCapabilityReadinessSourceSink<"h1">;
   readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
   readonly h3: RelayV2HostCapabilityReadinessSourceSink<"h3">;
@@ -153,7 +167,7 @@ export interface RelayV2HostCarrierRuntimeComposition {
   dispose(): void;
 }
 
-function guardedSource<Source extends NonH2ReadinessSource>(
+function guardedSource<Source extends ManualReadinessSource>(
   sink: RelayV2HostCapabilityReadinessSourceSink<Source>,
   disposed: () => boolean,
 ): RelayV2HostCapabilityReadinessSourceSink<Source> {
@@ -170,7 +184,7 @@ function guardedSource<Source extends NonH2ReadinessSource>(
 function captureRuntimeAuthorities(
   value: RelayV2HostRuntimeCompositionAuthorities,
 ): Readonly<{
-  h0: RelayV2HostRuntimeActualAuthorityInput["h0"];
+  h0: RelayV2HostH0ReadinessPort;
   h1: RelayV2HostRuntimeActualAuthorityInput["h1"];
   h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
   h3: RelayV2HostRuntimeActualAuthorityInput["h3"];
@@ -192,7 +206,7 @@ function captureRuntimeAuthorities(
   const nextDedupeWindowBounds = descriptors.nextDedupeWindowBounds!.value;
   if (typeof nextDedupeWindowBounds !== "function") return null;
   return Object.freeze({
-    h0: descriptors.h0!.value as RelayV2HostRuntimeActualAuthorityInput["h0"],
+    h0: descriptors.h0!.value as RelayV2HostH0ReadinessPort,
     h1: descriptors.h1!.value as RelayV2HostRuntimeActualAuthorityInput["h1"],
     h2SnapshotAuthority: descriptors.h2SnapshotAuthority!.value as
       RelayV2StateSnapshotHostH2Authority,
@@ -355,10 +369,16 @@ export function createRelayV2HostRuntimeComposition(
     authority: capturedAuthorities.h2SnapshotAuthority,
     readinessSink: rawSources.h2,
   });
+  const h0Activation = createRelayV2HostH0ReadinessActivation({
+    hostEpoch,
+    hostInstanceId,
+    h0Port: capturedAuthorities.h0,
+    readinessSink: rawSources.h0,
+  });
   const nextDedupeWindowBounds = capturedAuthorities.nextDedupeWindowBounds;
   const nextDedupeWindowBoundsReceiver = capturedAuthorities.nextDedupeWindowBoundsReceiver;
   const runtimeAuthorities: RelayV2HostRuntimeActualAuthorityInput = Object.freeze({
-    h0: capturedAuthorities.h0,
+    h0: h0Activation.runtimeH0,
     h1: capturedAuthorities.h1,
     h2: h2Activation.runtimeH2,
     snapshotSpool: h2Activation.snapshotSpool,
@@ -386,7 +406,7 @@ export function createRelayV2HostRuntimeComposition(
   const readiness: RelayV2HostRuntimeCompositionReadinessLifecycle = Object.freeze({
     codec: guardedSource(rawSources.codec, isDisposed),
     carrier: guardedSource(rawSources.carrier, isDisposed),
-    h0: guardedSource(rawSources.h0, isDisposed),
+    h0: h0Activation.lifecycle,
     h1: guardedSource(rawSources.h1, isDisposed),
     h2: h2Activation.lifecycle,
     h3: guardedSource(rawSources.h3, isDisposed),
@@ -425,9 +445,10 @@ export function createRelayV2HostRuntimeComposition(
     dispose(): void {
       if (disposed) return;
       disposed = true;
+      h0Activation.dispose();
       h2Activation.dispose();
       for (const [source, sink] of Object.entries(rawSources)) {
-        if (source !== "h2") sink.close();
+        if (source !== "h0" && source !== "h2") sink.close();
       }
       runtime.dispose();
     },

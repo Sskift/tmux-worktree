@@ -68,6 +68,50 @@ export interface RelayV2HostStateCommit<T> {
   snapshot: RelayV2HostStateSnapshot;
 }
 
+declare const relayV2HostH0ReadinessReceiptBrand: unique symbol;
+
+/** Process-local proof. Its TypeScript brand is descriptive, never authority. */
+export interface RelayV2HostH0ReadinessReceipt {
+  readonly [relayV2HostH0ReadinessReceiptBrand]: true;
+}
+
+export interface RelayV2HostH0ReadinessReceiptBinding {
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly commitSeq: string;
+  readonly proofGeneration: string;
+}
+
+export interface RelayV2HostH0ReadinessReceiptIssue {
+  readonly receipt: RelayV2HostH0ReadinessReceipt;
+  /** Descriptive only; the owner validates its private receipt record. */
+  readonly binding: RelayV2HostH0ReadinessReceiptBinding;
+}
+
+declare const relayV2HostH0ReadinessLeaseBrand: unique symbol;
+
+/** Exact lease for one consumed H0 proof. */
+export interface RelayV2HostH0ReadinessLease {
+  readonly [relayV2HostH0ReadinessLeaseBrand]: true;
+}
+
+export interface RelayV2HostH0ReadinessLeaseSink {
+  close(): void;
+}
+
+/** Narrow H0 owner port; it exposes no transaction or raw store mutation. */
+export interface RelayV2HostH0ReadinessPort {
+  read(): Promise<RelayV2HostStateSnapshot>;
+  issueReadinessReceipt(): Promise<RelayV2HostH0ReadinessReceiptIssue>;
+  consumeReadinessReceipt(
+    receipt: unknown,
+    binding: unknown,
+    sink: RelayV2HostH0ReadinessLeaseSink,
+  ): RelayV2HostH0ReadinessLease | null;
+  discardReadinessReceipt(receipt: unknown): boolean;
+  releaseReadinessLease(lease: unknown): boolean;
+}
+
 export interface RelayV2HostStateTransaction {
   readonly hostEpoch: string;
   getCommandRecord(key: string): RelayV2HostJson | undefined;
@@ -99,8 +143,23 @@ export interface RelayV2HostStateStoreOptions {
   home?: string;
   paths?: RelayV2HostStatePaths;
   renameFile?: (source: string, destination: string) => void;
+  /** Tests may fault only post-proof H0 lifecycle seams, never skip its no-op. */
+  testH0ReadinessHooks?: RelayV2HostH0ReadinessTestHooks;
   /** Tests may only shrink the frozen exact serialized state-file budget. */
   testMaxPersistedBytes?: number;
+}
+
+export interface RelayV2HostH0ReadinessTestHooks {
+  afterReadinessReceiptIssue?(issue: RelayV2HostH0ReadinessReceiptIssue): unknown;
+  beforeReadinessReceiptConsume?(): void;
+  beforeReadinessLeaseReturn?(
+    lease: RelayV2HostH0ReadinessLease,
+    sink: RelayV2HostH0ReadinessLeaseSink,
+  ): void;
+  afterReadinessLeaseRelease?(
+    lease: RelayV2HostH0ReadinessLease,
+    released: true,
+  ): boolean | void;
 }
 
 interface PersistedHostStateUnsigned {
@@ -140,6 +199,286 @@ interface StoreLockOwner {
   owner: string;
   pid: number;
   createdAt: number;
+}
+
+interface H0ReadinessReceiptRecord {
+  readonly receipt: RelayV2HostH0ReadinessReceipt;
+  readonly storeIdentity: object;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly commitSeq: string;
+  readonly proofGeneration: bigint;
+}
+
+interface H0ReadinessLeaseRecord extends H0ReadinessReceiptRecord {
+  readonly lease: RelayV2HostH0ReadinessLease;
+  readonly closeSink: () => void;
+  live: boolean;
+}
+
+interface H0ReadinessOwnerState {
+  readonly storeIdentity: object;
+  readonly receipts: Map<object, H0ReadinessReceiptRecord>;
+  readonly leases: Map<object, H0ReadinessLeaseRecord>;
+  proofGeneration: bigint;
+  observedHostEpoch: string | null;
+  closed: boolean;
+  readonly testHooks: RelayV2HostH0ReadinessTestHooks | undefined;
+}
+
+// Runtime authority stays in this module-local lexical owner. None of these
+// maps, identities, or generations are properties of a public store/port.
+const H0_READINESS_OWNERS = new WeakMap<RelayV2HostStateStore, H0ReadinessOwnerState>();
+const H0_REGISTERED_PORTS = new WeakMap<object, RelayV2HostH0ReadinessPort>();
+
+/** Exact lexical-owner lookup; it never probes candidate properties. */
+export function captureRelayV2HostH0ReadinessPort(
+  candidate: unknown,
+): RelayV2HostH0ReadinessPort | null {
+  if ((typeof candidate !== "object" && typeof candidate !== "function")
+    || candidate === null) return null;
+  return H0_REGISTERED_PORTS.get(candidate as object) ?? null;
+}
+
+function h0OwnerFor(store: RelayV2HostStateStore): H0ReadinessOwnerState {
+  const owner = H0_READINESS_OWNERS.get(store);
+  if (owner === undefined) throw new Error("invalid Relay v2 H0 owner receiver");
+  return owner;
+}
+
+function bindingMatchesH0Record(
+  value: unknown,
+  record: H0ReadinessReceiptRecord,
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const expected = ["hostEpoch", "hostInstanceId", "commitSeq", "proofGeneration"];
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.length !== expected.length
+      || keys.some((key) => typeof key !== "string" || !expected.includes(key))) return false;
+    return expected.every((key) => {
+      const descriptor = descriptors[key];
+      return descriptor !== undefined
+        && Object.hasOwn(descriptor, "value")
+        && descriptor.get === undefined
+        && descriptor.set === undefined;
+    })
+      && descriptors.hostEpoch!.value === record.hostEpoch
+      && descriptors.hostInstanceId!.value === record.hostInstanceId
+      && descriptors.commitSeq!.value === record.commitSeq
+      && descriptors.proofGeneration!.value === record.proofGeneration.toString(10);
+  } catch {
+    return false;
+  }
+}
+
+function invalidateH0ProofsFor(store: RelayV2HostStateStore): void {
+  const owner = h0OwnerFor(store);
+  owner.receipts.clear();
+  const sinks: Array<() => void> = [];
+  for (const [lease, record] of owner.leases) {
+    if (!record.live) continue;
+    record.live = false;
+    owner.leases.delete(lease);
+    sinks.push(record.closeSink);
+  }
+  for (const closeSink of sinks) {
+    try { closeSink(); } catch {}
+  }
+}
+
+function observeH0LineageFor(store: RelayV2HostStateStore, hostEpoch: string): void {
+  const owner = h0OwnerFor(store);
+  if (owner.observedHostEpoch !== null && owner.observedHostEpoch !== hostEpoch) {
+    invalidateH0ProofsFor(store);
+  }
+  owner.observedHostEpoch = hostEpoch;
+}
+
+interface HostStateOwnerPrimitives {
+  readonly serialize: RelayV2HostStateStore["serialize"];
+  readonly loadOrCreateState: (this: RelayV2HostStateStore) => PersistedHostState;
+  readonly publishState: (
+    this: RelayV2HostStateStore,
+    state: PersistedHostState,
+    emergencyFence: boolean,
+  ) => void;
+}
+
+let HOST_STATE_OWNER_PRIMITIVES: HostStateOwnerPrimitives | null = null;
+
+function installHostStateOwnerPrimitives(primitives: HostStateOwnerPrimitives): void {
+  if (HOST_STATE_OWNER_PRIMITIVES !== null) {
+    throw new Error("Relay v2 host state owner primitives were installed twice");
+  }
+  HOST_STATE_OWNER_PRIMITIVES = Object.freeze(primitives);
+}
+
+function hostStateOwnerPrimitives(): HostStateOwnerPrimitives {
+  if (HOST_STATE_OWNER_PRIMITIVES === null) {
+    throw new Error("Relay v2 host state owner primitives are unavailable");
+  }
+  return HOST_STATE_OWNER_PRIMITIVES;
+}
+
+function serializeHostStateOwnerFor<T>(
+  store: RelayV2HostStateStore,
+  operation: (section: RelayV2HostStateCriticalSection) => T | Promise<T>,
+): Promise<T> {
+  return Reflect.apply(
+    hostStateOwnerPrimitives().serialize,
+    store,
+    [operation],
+  ) as Promise<T>;
+}
+
+function readH0OwnerFor(store: RelayV2HostStateStore): Promise<RelayV2HostStateSnapshot> {
+  return serializeHostStateOwnerFor(store, (section) => section.read());
+}
+
+async function issueH0ReadinessReceiptFor(
+  store: RelayV2HostStateStore,
+): Promise<RelayV2HostH0ReadinessReceiptIssue> {
+  const issue = await serializeHostStateOwnerFor(store, (section) => {
+    const committed = section.transaction(() => undefined);
+
+    // section.transaction returns only after both state publication and the
+    // existing local continuity witness publication have completed.
+    invalidateH0ProofsFor(store);
+    const owner = h0OwnerFor(store);
+    if (owner.proofGeneration >= MAX_COUNTER) {
+      throw new Error("Relay v2 H0 readiness proof generation exhausted");
+    }
+    owner.proofGeneration += 1n;
+    const receipt = Object.freeze(() => undefined) as unknown as
+      RelayV2HostH0ReadinessReceipt;
+    const record: H0ReadinessReceiptRecord = {
+      receipt,
+      storeIdentity: owner.storeIdentity,
+      hostEpoch: committed.snapshot.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+      commitSeq: committed.snapshot.commitSeq,
+      proofGeneration: owner.proofGeneration,
+    };
+    owner.observedHostEpoch = record.hostEpoch;
+    owner.receipts.set(receipt as object, record);
+    return Object.freeze({
+      receipt,
+      binding: Object.freeze({
+        hostEpoch: record.hostEpoch,
+        hostInstanceId: record.hostInstanceId,
+        commitSeq: record.commitSeq,
+        proofGeneration: record.proofGeneration.toString(10),
+      }),
+    });
+  });
+  try {
+    const hook = h0OwnerFor(store).testHooks?.afterReadinessReceiptIssue;
+    return hook === undefined
+      ? issue
+      : await Reflect.apply(
+        hook,
+        h0OwnerFor(store).testHooks,
+        [issue],
+      ) as RelayV2HostH0ReadinessReceiptIssue;
+  } catch (error) {
+    invalidateH0ProofsFor(store);
+    throw error;
+  }
+}
+
+function consumeH0ReadinessReceiptFor(
+  store: RelayV2HostStateStore,
+  receipt: unknown,
+  binding: unknown,
+  sink: RelayV2HostH0ReadinessLeaseSink,
+): RelayV2HostH0ReadinessLease | null {
+  const owner = h0OwnerFor(store);
+  if (owner.closed
+    || ((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)) {
+    return null;
+  }
+  const record = owner.receipts.get(receipt as object);
+  if (record === undefined
+    || record.storeIdentity !== owner.storeIdentity
+    || record.hostEpoch !== owner.observedHostEpoch
+    || record.hostInstanceId !== store.hostInstanceId
+    || record.proofGeneration !== owner.proofGeneration
+    || !bindingMatchesH0Record(binding, record)) return null;
+
+  owner.testHooks?.beforeReadinessReceiptConsume?.();
+
+  let closeSink: (() => void) | null = null;
+  try {
+    if (!sink || typeof sink !== "object" || Array.isArray(sink)) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(sink);
+    if (Reflect.ownKeys(descriptors).length !== 1) return null;
+    const close = descriptors.close;
+    if (!close
+      || !Object.hasOwn(close, "value")
+      || close.get !== undefined
+      || close.set !== undefined
+      || typeof close.value !== "function") return null;
+    closeSink = () => { Reflect.apply(close.value, sink, []); };
+  } catch {
+    return null;
+  }
+  if (owner.receipts.get(receipt as object) !== record
+    || record.proofGeneration !== owner.proofGeneration) return null;
+
+  const lease = Object.freeze(() => undefined) as unknown as RelayV2HostH0ReadinessLease;
+  const leaseRecord: H0ReadinessLeaseRecord = {
+    ...record,
+    lease,
+    closeSink,
+    live: true,
+  };
+  owner.receipts.delete(receipt as object);
+  owner.leases.set(lease as object, leaseRecord);
+  try {
+    owner.testHooks?.beforeReadinessLeaseReturn?.(lease, sink);
+  } catch (error) {
+    leaseRecord.live = false;
+    owner.leases.delete(lease as object);
+    throw error;
+  }
+  return lease;
+}
+
+function discardH0ReadinessReceiptFor(
+  store: RelayV2HostStateStore,
+  receipt: unknown,
+): boolean {
+  if (((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)) {
+    return false;
+  }
+  const owner = h0OwnerFor(store);
+  const record = owner.receipts.get(receipt as object);
+  if (record === undefined || record.storeIdentity !== owner.storeIdentity) return false;
+  owner.receipts.delete(receipt as object);
+  return true;
+}
+
+function releaseH0ReadinessLeaseFor(
+  store: RelayV2HostStateStore,
+  lease: unknown,
+): boolean {
+  if (((typeof lease !== "object" && typeof lease !== "function") || lease === null)) {
+    return false;
+  }
+  const owner = h0OwnerFor(store);
+  const record = owner.leases.get(lease as object);
+  if (record === undefined
+    || record.storeIdentity !== owner.storeIdentity
+    || !record.live) return false;
+  record.live = false;
+  owner.leases.delete(lease as object);
+  const hookResult = owner.testHooks?.afterReadinessLeaseRelease?.(
+    record.lease,
+    true,
+  );
+  return hookResult === undefined ? true : hookResult;
 }
 
 type FileInspection<T> =
@@ -866,6 +1205,7 @@ class HostStateCriticalSection implements RelayV2HostStateCriticalSection {
 export class RelayV2HostStateStore {
   readonly paths: RelayV2HostStatePaths;
   readonly hostInstanceId: string;
+  declare readonly h0ReadinessPort: RelayV2HostH0ReadinessPort;
 
   private readonly renameFile: (source: string, destination: string) => void;
   private readonly maxPersistedBytes: number;
@@ -884,24 +1224,92 @@ export class RelayV2HostStateStore {
     // One store instance represents one relay-host process lifetime. This ID is
     // intentionally absent from every persisted schema.
     this.hostInstanceId = randomUUID();
+    H0_READINESS_OWNERS.set(this, {
+      storeIdentity: Object.freeze(Object.create(null)) as object,
+      receipts: new Map(),
+      leases: new Map(),
+      proofGeneration: 0n,
+      observedHostEpoch: null,
+      closed: false,
+      testHooks: options.testH0ReadinessHooks,
+    });
+
+    const receiver = this;
+    const port = Object.create(null) as RelayV2HostH0ReadinessPort;
+    const portMethods: Record<keyof RelayV2HostH0ReadinessPort, unknown> = {
+      read: function read(this: unknown) {
+        if (this !== port) throw new Error("invalid Relay v2 H0 readiness port receiver");
+        return readH0OwnerFor(receiver);
+      },
+      issueReadinessReceipt: function issueReadinessReceipt(this: unknown) {
+        if (this !== port) throw new Error("invalid Relay v2 H0 readiness port receiver");
+        return issueH0ReadinessReceiptFor(receiver);
+      },
+      consumeReadinessReceipt: function consumeReadinessReceipt(
+        this: unknown,
+        receipt: unknown,
+        binding: unknown,
+        sink: RelayV2HostH0ReadinessLeaseSink,
+      ) {
+        if (this !== port) return null;
+        return consumeH0ReadinessReceiptFor(receiver, receipt, binding, sink);
+      },
+      discardReadinessReceipt: function discardReadinessReceipt(
+        this: unknown,
+        receipt: unknown,
+      ) {
+        if (this !== port) return false;
+        return discardH0ReadinessReceiptFor(receiver, receipt);
+      },
+      releaseReadinessLease: function releaseReadinessLease(
+        this: unknown,
+        lease: unknown,
+      ) {
+        if (this !== port) return false;
+        return releaseH0ReadinessLeaseFor(receiver, lease);
+      },
+    };
+    for (const [name, value] of Object.entries(portMethods)) {
+      Object.defineProperty(port, name, {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value,
+      });
+    }
+    const registeredPort = Object.freeze(port);
+    H0_REGISTERED_PORTS.set(registeredPort, registeredPort);
+    Object.defineProperty(this, "h0ReadinessPort", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: registeredPort,
+    });
   }
 
   static async open(
     options: RelayV2HostStateStoreOptions = {},
   ): Promise<RelayV2HostStateStore> {
     const store = new RelayV2HostStateStore(options);
-    await store.serialize(() => undefined);
+    await serializeHostStateOwnerFor(store, () => undefined);
     return store;
   }
 
   async read(): Promise<RelayV2HostStateSnapshot> {
-    return this.serialize((section) => section.read());
+    return readH0OwnerFor(this);
   }
 
   async transaction<T>(
     mutation: (transaction: RelayV2HostStateTransaction) => T,
   ): Promise<RelayV2HostStateCommit<T>> {
-    return this.serialize((section) => section.transaction(mutation));
+    return serializeHostStateOwnerFor(this, (section) => section.transaction(mutation));
+  }
+
+  close(): void {
+    const owner = h0OwnerFor(this);
+    if (owner.closed) return;
+    owner.closed = true;
+    invalidateH0ProofsFor(this);
   }
 
   /**
@@ -914,6 +1322,7 @@ export class RelayV2HostStateStore {
   async serialize<T>(
     operation: (section: RelayV2HostStateCriticalSection) => T | Promise<T>,
   ): Promise<T> {
+    if (h0OwnerFor(this).closed) throw new Error("Relay v2 host state store is closed");
     let releaseTurn!: () => void;
     const previous = this.serializerTail;
     this.serializerTail = new Promise<void>((resolve) => { releaseTurn = resolve; });
@@ -921,14 +1330,31 @@ export class RelayV2HostStateStore {
 
     let lock: StoreLock | undefined;
     try {
+      // A queued operation may have passed the first check before close().
+      // Recheck only once it owns the serializer turn so close is a real
+      // barrier and no late H0 transaction can sign a receipt.
+      if (h0OwnerFor(this).closed) throw new Error("Relay v2 host state store is closed");
       lock = await acquireStoreLock(this.paths.lock);
-      const state = this.loadOrCreateState();
+      // Lock acquisition can itself yield while another lifecycle closes the
+      // owner, so publication is fenced again after the last await.
+      if (h0OwnerFor(this).closed) throw new Error("Relay v2 host state store is closed");
+      const primitives = hostStateOwnerPrimitives();
+      const state = Reflect.apply(primitives.loadOrCreateState, this, []);
+      observeH0LineageFor(this, state.hostEpoch);
       const section = new HostStateCriticalSection(
         state,
         this.hostInstanceId,
-        (next, emergencyFence) => this.publishState(next, emergencyFence),
+        (next, emergencyFence) => {
+          Reflect.apply(primitives.publishState, this, [next, emergencyFence]);
+        },
       );
       return await operation(section);
+    } catch (error) {
+      // Any owner-critical-section failure makes a live H0 proof unusable.
+      // Normal successful transactions do not revoke H0; fatal load,
+      // publication, or owner-operation failures always do.
+      invalidateH0ProofsFor(this);
+      throw error;
     } finally {
       if (lock) releaseStoreLock(lock);
       releaseTurn();
@@ -1004,5 +1430,15 @@ export class RelayV2HostStateStore {
         "Relay v2 host state transaction committed, but continuity witness publication must be repaired",
       );
     }
+  }
+
+  static {
+    // Captured while this module is evaluating, before any external caller can
+    // invoke open() or replace a mutable public prototype method.
+    installHostStateOwnerPrimitives({
+      serialize: this.prototype.serialize,
+      loadOrCreateState: this.prototype.loadOrCreateState,
+      publishState: this.prototype.publishState,
+    });
   }
 }

@@ -142,9 +142,7 @@ async function createHarness({ throwStatusObserver = false } = {}) {
         return identity.hostInstanceId;
       },
       authorities: {
-        h0: {
-          async read() { return structuredClone(identity); },
-        },
+        h0: store.h0ReadinessPort,
         h1: {
           async execute() { throw new Error("unexpected command execute"); },
           async query(_auth, request) {
@@ -227,7 +225,8 @@ async function createHarness({ throwStatusObserver = false } = {}) {
     },
   });
 
-  for (const source of ["codec", "h0", "h1", "h3"]) {
+  assert.equal(await composition.readiness.h0.activate(), true);
+  for (const source of ["codec", "h1", "h3"]) {
     assert.equal(composition.readiness[source].apply({
       source,
       generation: "1",
@@ -250,6 +249,7 @@ async function createHarness({ throwStatusObserver = false } = {}) {
   return {
     home,
     spool,
+    store,
     composition,
     identity,
     statusObservations,
@@ -257,6 +257,7 @@ async function createHarness({ throwStatusObserver = false } = {}) {
     expectedQuery: () => expectedQuery,
     async cleanup() {
       composition.dispose();
+      store.close();
       await spool.close().catch(() => undefined);
       rmSync(home, { recursive: true, force: true });
     },
@@ -334,6 +335,7 @@ test("combined composition owns carrier readiness transitions before status obse
   const h = await createHarness({ throwStatusObserver: true });
   try {
     assert.equal(h.composition.readiness.carrier, undefined);
+    assert.equal(h.composition.readiness.h0.apply, undefined);
     assert.equal(readinessReady(h.composition.readiness.current()), false);
     let previousCutGeneration = BigInt(h.composition.readiness.current().generation);
     let observationCount = 0;
@@ -437,11 +439,7 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
 
     route.connection.acknowledge(route.transport.confirmNext());
     await settle();
-    h.identity.hostInstanceId = "replacement-host-instance";
-    const stale = fixture("command-query");
-    stale.requestId = "carrier-runtime-stale-process";
-    stale.expectedHostEpoch = h.identity.hostEpoch;
-    sendClientFrame(route, stale);
+    h.composition.readiness.h0.close();
     await settle();
     const close = route.transport.sent.map(decodeCarrier).findLast((frame) => (
       frame.type === "route.close"
@@ -452,9 +450,9 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
       errorCode: close.payload.error.code,
       retryable: close.payload.error.retryable,
     }, {
-      closeCode: 4409,
-      reason: "host_shutdown",
-      errorCode: "HOST_SUPERSEDED",
+      closeCode: 4406,
+      reason: "protocol_error",
+      errorCode: "CAPABILITY_UNAVAILABLE",
       retryable: false,
     });
     assert.equal(h.composition.carrier.status().phase, "registered");
