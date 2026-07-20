@@ -32,28 +32,23 @@ export interface RelayV2DashboardManagementCredentialPort {
   refresh(input: Readonly<{ requestId: string }>): MaybePromise<void>;
 }
 
-export type RelayV2DashboardManagementConnectorInspection =
+export type RelayV2DashboardManagementConnectorCut =
   | Readonly<{ status: "stopped" }>
   | Readonly<{ status: "starting"; hostId: string | null }>
-  | Readonly<{ status: "registered"; hostId: string; connectorId: string }>
-  | Readonly<{ status: "failed"; retryable: boolean }>
-  | Readonly<{ status: "superseded" }>;
-
-export type RelayV2DashboardManagementReadinessCut =
-  | Readonly<{ status: "unavailable" }>
   | Readonly<{
       status: "registered";
       acknowledgement: "host.registered";
       hostId: string;
       connectorId: string;
       negotiatedCapabilityIntersection: readonly string[];
-    }>;
+    }>
+  | Readonly<{ status: "failed"; retryable: boolean }>
+  | Readonly<{ status: "superseded" }>;
 
 export interface RelayV2DashboardManagementConnectorPort {
-  inspect(): MaybePromise<RelayV2DashboardManagementConnectorInspection>;
+  inspectCut(): MaybePromise<RelayV2DashboardManagementConnectorCut>;
   start(input: Readonly<{ requestId: string }>): MaybePromise<void>;
   stop(input: Readonly<{ requestId: string }>): MaybePromise<void>;
-  readinessCut(): MaybePromise<RelayV2DashboardManagementReadinessCut>;
 }
 
 export interface RelayV2DashboardManagementEnrollmentReceipt {
@@ -110,8 +105,7 @@ export class RelayV2DashboardManagementAuthorityClosedError extends Error {
 
 interface PostOperationCut {
   credential: RelayV2DashboardManagementCredentialInspection;
-  connector: RelayV2DashboardManagementConnectorInspection;
-  readiness: RelayV2DashboardManagementReadinessCut;
+  connector: RelayV2DashboardManagementConnectorCut;
   observedAtMs: number;
 }
 
@@ -233,7 +227,7 @@ function inspectCredential(value: unknown): RelayV2DashboardManagementCredential
   return closed();
 }
 
-function inspectConnector(value: unknown): RelayV2DashboardManagementConnectorInspection {
+function inspectConnectorCut(value: unknown): RelayV2DashboardManagementConnectorCut {
   if (!isObject(value)) return closed();
   const status = Reflect.get(value, "status");
   if (status === "stopped" || status === "superseded") {
@@ -248,11 +242,22 @@ function inspectConnector(value: unknown): RelayV2DashboardManagementConnectorIn
     });
   }
   if (status === "registered") {
-    const fields = exactDataObject(value, ["status", "hostId", "connectorId"]);
+    const fields = exactDataObject(value, [
+      "status",
+      "acknowledgement",
+      "hostId",
+      "connectorId",
+      "negotiatedCapabilityIntersection",
+    ]);
+    if (fields.acknowledgement !== "host.registered") return closed();
     return Object.freeze({
       status,
+      acknowledgement: "host.registered",
       hostId: opaque(fields.hostId, 128),
       connectorId: opaque(fields.connectorId, 128),
+      negotiatedCapabilityIntersection: canonicalCapabilities(
+        fields.negotiatedCapabilityIntersection,
+      ),
     });
   }
   if (status === "failed") {
@@ -278,33 +283,6 @@ function canonicalCapabilities(value: unknown): readonly string[] {
   return Object.freeze(RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.filter(
     (capability) => seen.has(capability),
   ));
-}
-
-function inspectReadiness(value: unknown): RelayV2DashboardManagementReadinessCut {
-  if (!isObject(value)) return closed();
-  const status = Reflect.get(value, "status");
-  if (status === "unavailable") {
-    exactDataObject(value, ["status"]);
-    return Object.freeze({ status });
-  }
-  if (status !== "registered") return closed();
-  const fields = exactDataObject(value, [
-    "status",
-    "acknowledgement",
-    "hostId",
-    "connectorId",
-    "negotiatedCapabilityIntersection",
-  ]);
-  if (fields.acknowledgement !== "host.registered") return closed();
-  return Object.freeze({
-    status,
-    acknowledgement: "host.registered",
-    hostId: opaque(fields.hostId, 128),
-    connectorId: opaque(fields.connectorId, 128),
-    negotiatedCapabilityIntersection: canonicalCapabilities(
-      fields.negotiatedCapabilityIntersection,
-    ),
-  });
 }
 
 function enrollmentReceipt(
@@ -361,35 +339,16 @@ function revocationReceipt(
   });
 }
 
-function completeCapabilities(readiness: RelayV2DashboardManagementReadinessCut): boolean {
-  return readiness.status === "registered"
-    && readiness.negotiatedCapabilityIntersection.length
+function completeCapabilities(connector: RelayV2DashboardManagementConnectorCut): boolean {
+  return connector.status === "registered"
+    && connector.negotiatedCapabilityIntersection.length
       === RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.length;
 }
 
-function exactRegisteredBinding(cut: PostOperationCut): boolean {
-  const { connector, readiness } = cut;
-  return connector.status === "registered"
-    && readiness.status === "registered"
-    && connector.hostId === readiness.hostId
-    && connector.connectorId === readiness.connectorId;
-}
-
-function validateCutConsistency(cut: PostOperationCut): void {
-  if (cut.connector.status === "registered") {
-    if (!exactRegisteredBinding(cut)) return closed();
-  } else if (cut.readiness.status !== "unavailable") {
-    return closed();
-  }
-}
-
 function activeGate(cut: PostOperationCut): ReadyGate | null {
-  const { connector, readiness, credential } = cut;
+  const { connector, credential } = cut;
   if (connector.status !== "registered"
-    || readiness.status !== "registered"
-    || connector.hostId !== readiness.hostId
-    || connector.connectorId !== readiness.connectorId
-    || !completeCapabilities(readiness)
+    || !completeCapabilities(connector)
     || credential.status !== "ready"
     || credential.hostId !== connector.hostId) return null;
   return Object.freeze({
@@ -399,11 +358,8 @@ function activeGate(cut: PostOperationCut): ReadyGate | null {
 }
 
 function registeredCarrierGate(cut: PostOperationCut): ReadyGate | null {
-  const { connector, readiness, credential } = cut;
+  const { connector, credential } = cut;
   if (connector.status !== "registered"
-    || readiness.status !== "registered"
-    || connector.hostId !== readiness.hostId
-    || connector.connectorId !== readiness.connectorId
     || credential.status !== "ready"
     || credential.hostId !== connector.hostId) return null;
   return Object.freeze({
@@ -436,10 +392,9 @@ implements RelayV2DashboardManagementProtocolV2Handler {
       || typeof options.credential.bootstrap !== "function"
       || typeof options.credential.refresh !== "function"
       || !isObject(options.connector)
-      || typeof options.connector.inspect !== "function"
+      || typeof options.connector.inspectCut !== "function"
       || typeof options.connector.start !== "function"
       || typeof options.connector.stop !== "function"
-      || typeof options.connector.readinessCut !== "function"
       || !isObject(options.carrierControl)
       || typeof options.carrierControl.createEnrollment !== "function"
       || typeof options.carrierControl.revokeGrant !== "function"
@@ -599,15 +554,12 @@ implements RelayV2DashboardManagementProtocolV2Handler {
 
   private async readPostOperationCut(): Promise<PostOperationCut> {
     const credential = inspectCredential(await this.credential.inspect());
-    const connector = inspectConnector(await this.connector.inspect());
-    const readiness = inspectReadiness(await this.connector.readinessCut());
+    const connector = inspectConnectorCut(await this.connector.inspectCut());
     const cut = Object.freeze({
       credential,
       connector,
-      readiness,
       observedAtMs: this.now(),
     });
-    validateCutConsistency(cut);
     return cut;
   }
 
@@ -642,7 +594,7 @@ implements RelayV2DashboardManagementProtocolV2Handler {
 
   private project(cut: PostOperationCut): RelayV2DashboardManagementProjection {
     if (cut.connector.status === "registered"
-      && completeCapabilities(cut.readiness)
+      && completeCapabilities(cut.connector)
       && cut.credential.status !== "ready") return closed();
     const gate = activeGate(cut);
     let enrollment: RelayV2DashboardManagementEnrollmentProjection =
@@ -713,14 +665,13 @@ implements RelayV2DashboardManagementProtocolV2Handler {
     if (connector.status === "failed") {
       return Object.freeze({ status: "failed", retryable: connector.retryable });
     }
-    if (cut.readiness.status !== "registered") return closed();
-    const complete = completeCapabilities(cut.readiness);
+    const complete = completeCapabilities(connector);
     return Object.freeze({
       status: complete ? "registered" : "registered_incomplete",
       acknowledgement: "host.registered",
       hostId: connector.hostId,
       connectorId: connector.connectorId,
-      negotiatedCapabilityIntersection: cut.readiness.negotiatedCapabilityIntersection,
+      negotiatedCapabilityIntersection: connector.negotiatedCapabilityIntersection,
     });
   }
 }

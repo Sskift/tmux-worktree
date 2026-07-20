@@ -70,11 +70,7 @@ function readyCredential(
   };
 }
 
-function registeredConnector(hostId = "mac-admin", connectorId = "connector-1") {
-  return { status: "registered", hostId, connectorId };
-}
-
-function registeredReadiness(
+function registeredConnector(
   capabilities = REQUIRED,
   hostId = "mac-admin",
   connectorId = "connector-1",
@@ -92,7 +88,6 @@ function harness(options = {}) {
   let now = options.now ?? 1_783_700_000_000;
   let credentialState = structuredClone(options.credential ?? { status: "missing" });
   let connectorState = structuredClone(options.connector ?? { status: "stopped" });
-  let readinessState = structuredClone(options.readiness ?? { status: "unavailable" });
   const calls = [];
   const control = {
     createEnrollment: async (input) => {
@@ -142,25 +137,19 @@ function harness(options = {}) {
     },
   };
   const connectorPort = {
-    inspect: async () => {
-      calls.push(["connector.inspect"]);
+    inspectCut: async () => {
+      calls.push(["connector.inspectCut"]);
       return structuredClone(connectorState);
-    },
-    readinessCut: async () => {
-      calls.push(["connector.readinessCut"]);
-      return structuredClone(readinessState);
     },
     start: async (input) => {
       calls.push(["connector.start", structuredClone(input)]);
       if (options.operationFailure) throw options.operationFailure;
       connectorState = registeredConnector();
-      readinessState = registeredReadiness();
     },
     stop: async (input) => {
       calls.push(["connector.stop", structuredClone(input)]);
       if (options.operationFailure) throw options.operationFailure;
       connectorState = { status: "stopped" };
-      readinessState = { status: "unavailable" };
     },
   };
   const authority = new RelayV2DashboardManagementAuthority({
@@ -174,9 +163,8 @@ function harness(options = {}) {
     calls,
     setNow(value) { now = value; },
     setCredential(value) { credentialState = structuredClone(value); },
-    setConnector(value, readiness) {
+    setConnector(value) {
       connectorState = structuredClone(value);
-      readinessState = structuredClone(readiness);
     },
   };
 }
@@ -293,7 +281,6 @@ test("each authority operation invokes its mutation port once with only the clos
       setup: {
         credential: readyCredential(),
         connector: registeredConnector(),
-        readiness: registeredReadiness(),
       },
       input: null,
       expectedCall: ["connector.stop", { requestId: IDS.stop }],
@@ -304,7 +291,6 @@ test("each authority operation invokes its mutation port once with only the clos
       setup: {
         credential: readyCredential(),
         connector: registeredConnector(),
-        readiness: registeredReadiness(),
       },
       input: { deviceLabel: "Pixel" },
       expectedCall: ["createEnrollment", { requestId: IDS.create, deviceLabel: "Pixel" }],
@@ -315,7 +301,6 @@ test("each authority operation invokes its mutation port once with only the clos
       setup: {
         credential: readyCredential(),
         connector: registeredConnector(),
-        readiness: registeredReadiness(),
       },
       input: { grantId: "client-grant-1", reason: "user_revoked" },
       expectedCall: ["revokeGrant", {
@@ -332,8 +317,7 @@ test("each authority operation invokes its mutation port once with only the clos
       const decodedRequest = request(scenario.operation, scenario.input);
       const response = await h.authority.handle(decodedRequest);
       assert.deepEqual(response, JSON.parse(scenario.expected));
-      const mutationCalls = h.calls.filter(([name]) => !name.includes(".inspect")
-        && name !== "connector.readinessCut");
+      const mutationCalls = h.calls.filter(([name]) => !name.includes(".inspect"));
       assert.deepEqual(mutationCalls, scenario.expectedCall ? [scenario.expectedCall] : []);
       const serialized = JSON.stringify(response);
       assert.equal(serialized.includes("accessToken"), false);
@@ -347,7 +331,7 @@ test("enrollment control is gated by the exact registered six-capability credent
   const nonReady = [
     {
       name: "credential missing",
-      options: { connector: registeredConnector(), readiness: registeredReadiness() },
+      options: { connector: registeredConnector() },
     },
     {
       name: "connector stopped",
@@ -357,8 +341,7 @@ test("enrollment control is gated by the exact registered six-capability credent
       name: "missing capability",
       options: {
         credential: readyCredential(),
-        connector: registeredConnector(),
-        readiness: registeredReadiness(REQUIRED.slice(0, 5)),
+        connector: registeredConnector(REQUIRED.slice(0, 5)),
       },
     },
     {
@@ -366,13 +349,20 @@ test("enrollment control is gated by the exact registered six-capability credent
       options: {
         credential: readyCredential("host-credential-ref-2", "other-host"),
         connector: registeredConnector(),
-        readiness: registeredReadiness(),
       },
     },
   ];
   for (const scenario of nonReady) {
     await t.test(scenario.name, async () => {
       const h = harness(scenario.options);
+      if (scenario.name === "missing capability") {
+        const status = await h.authority.handle(request("status"));
+        assert.equal(status.result.connector.status, "registered_incomplete");
+        assert.deepEqual(
+          status.result.connector.negotiatedCapabilityIntersection,
+          REQUIRED.slice(0, 5),
+        );
+      }
       const response = await h.authority.handle(request(
         "create_enrollment",
         { deviceLabel: null },
@@ -391,7 +381,6 @@ test("expiry and gate loss synchronously clear the only retained enrollment code
   const h = harness({
     credential: readyCredential(),
     connector: registeredConnector(),
-    readiness: registeredReadiness(),
   });
   const created = await h.authority.handle(request(
     "create_enrollment",
@@ -413,7 +402,7 @@ test("expiry and gate loss synchronously clear the only retained enrollment code
 
   h.setNow(1_783_700_000_000);
   await h.authority.handle(request("create_enrollment", { deviceLabel: null }));
-  h.setConnector({ status: "stopped" }, { status: "unavailable" });
+  h.setConnector({ status: "stopped" });
   const lost = await h.authority.handle(request("status"));
   assert.deepEqual(lost.result.enrollment, { status: "idle" });
   assert.equal(JSON.stringify(lost).includes("twenroll2."), false);
@@ -451,8 +440,10 @@ test("typed failures use only the fixed D2 error table; unknown output closes si
 
   const contradictory = harness({
     credential: readyCredential(),
-    connector: registeredConnector(),
-    readiness: registeredReadiness(REQUIRED, "mac-admin", "other-connector"),
+    connector: {
+      ...registeredConnector(),
+      acknowledgement: "host.connected",
+    },
   });
   await assert.rejects(
     contradictory.authority.handle(request("status")),
@@ -469,7 +460,7 @@ test("typed failures use only the fixed D2 error table; unknown output closes si
   );
 });
 
-test("authority serializes concurrent requests through each post-operation cut", async () => {
+test("authority serializes concurrent requests through each atomic connector cut", async () => {
   let releaseBootstrap;
   const events = [];
   let credential = { status: "missing" };
@@ -486,8 +477,7 @@ test("authority serializes concurrent requests through each post-operation cut",
       refresh() {},
     },
     connector: {
-      inspect() { events.push("connector.inspect"); return { status: "stopped" }; },
-      readinessCut() { events.push("readiness.cut"); return { status: "unavailable" }; },
+      inspectCut() { events.push("connector.inspectCut"); return { status: "stopped" }; },
       start() {},
       stop() {},
     },
@@ -509,10 +499,8 @@ test("authority serializes concurrent requests through each post-operation cut",
     `bootstrap:${IDS.bootstrap}`,
     "bootstrap.done",
     "credential.inspect",
-    "connector.inspect",
-    "readiness.cut",
+    "connector.inspectCut",
     "credential.inspect",
-    "connector.inspect",
-    "readiness.cut",
+    "connector.inspectCut",
   ]);
 });
