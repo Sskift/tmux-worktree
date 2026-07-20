@@ -34,6 +34,15 @@ class ManualScheduler {
     return () => { task.cancelled = true; };
   };
 
+  runNext(delayMs) {
+    const task = this.tasks.find((candidate) => (
+      !candidate.cancelled && candidate.delayMs === delayMs
+    ));
+    if (!task) throw new Error(`no scheduled shared-producer task at ${delayMs}ms`);
+    task.cancelled = true;
+    task.callback();
+  }
+
   async flushReady(limit = 200) {
     for (let turn = 0; turn < limit; turn += 1) {
       const task = this.tasks.find((candidate) => (
@@ -125,6 +134,7 @@ class FakeClientSocket {
     this.bufferedAmount = 0;
     this.listeners = new Map();
     this.closes = [];
+    this.pauseCalls = 0;
     this.terminates = 0;
   }
 
@@ -148,7 +158,7 @@ class FakeClientSocket {
   }
 
   send(_bytes, _options, callback) { callback(); }
-  pause() {}
+  pause() { this.pauseCalls += 1; }
   resume() {}
   close(code, reason) { this.closes.push({ code, reason }); }
   terminate() { this.terminates += 1; }
@@ -156,7 +166,8 @@ class FakeClientSocket {
 
 test("shared composition routes a client frame through its one registry into the Host Pump", async () => {
   const scheduler = new ManualScheduler();
-  const brokerActions = [];
+  let callerBrokerActionCalls = 0;
+  let callerForceActionCalls = 0;
   const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
     brokerOptions: { now: () => NOW_MS },
     clientSocketScheduler: scheduler,
@@ -172,8 +183,11 @@ test("shared composition routes a client frame through its one registry into the
       credentialReference: "host-credential-reference",
       now: () => NOW_MS,
       schedule: scheduler.schedule,
-      onBrokerAction: (action) => { brokerActions.push(action); },
-      onForceBrokerAction: () => true,
+      onBrokerAction: () => { callerBrokerActionCalls += 1; },
+      onForceBrokerAction: () => {
+        callerForceActionCalls += 1;
+        return false;
+      },
     },
   );
   pump.start();
@@ -197,9 +211,8 @@ test("shared composition routes a client frame through its one registry into the
     host.frames.filter((frame) => frame.type === "route.open").length,
     1,
   );
-  const routeOpened = brokerActions.find((action) => action.kind === "route_opened");
-  assert.ok(routeOpened);
-  assert.equal(shared.clientWssRuntime.applyBrokerAction(routeOpened), "applied");
+  assert.equal(callerBrokerActionCalls, 0);
+  assert.equal(callerForceActionCalls, 0);
   const clientFrame = codec.encodeRelayV2WebSocketFrame("public", {
     protocolVersion: 2,
     kind: "request",
@@ -226,6 +239,8 @@ test("shared composition routes a client frame through its one registry into the
     Buffer.from(routeData[0].payload.data, "base64"),
     Buffer.from(clientFrame),
   );
+  assert.equal(callerBrokerActionCalls, 0);
+  assert.equal(callerForceActionCalls, 0);
 
   socket.emit("close", 1000);
   await client.drained;
@@ -235,9 +250,12 @@ test("shared composition routes a client frame through its one registry into the
   await shared.clientWssRuntime.closeAndDrain();
 });
 
-test("opaque Pump authority rejects forged derivatives before effects and exposes no raw owners", async () => {
+test("opaque authority stays closed and a timed-out client cleanup is forced exactly once", async () => {
+  const scheduler = new ManualScheduler();
   const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
     brokerOptions: { now: () => NOW_MS },
+    clientSocketScheduler: scheduler,
+    authorizationExpiryScheduleAt: () => () => {},
   });
   assert.deepEqual(Reflect.ownKeys(shared), ["clientWssRuntime", "hostPumpAuthority"]);
   assert.deepEqual(Reflect.ownKeys(shared.clientWssRuntime), [
@@ -270,18 +288,82 @@ test("opaque Pump authority rejects forged derivatives before effects and expose
       throw new Error("Pump options must not be inspected");
     },
   });
-  const forged = Object.assign(Object.create(null), shared.hostPumpAuthority);
-  const bound = Object.create(shared.hostPumpAuthority);
-  const proxied = new Proxy(shared.hostPumpAuthority, {});
-  for (const candidate of [forged, bound, proxied]) {
+  const authorityCases = [
+    ["copied", Object.assign(Object.create(null), shared.hostPumpAuthority)],
+    ["inherited", Object.create(shared.hostPumpAuthority)],
+    ["proxied", new Proxy(shared.hostPumpAuthority, {})],
+  ];
+  for (const [label, candidate] of authorityCases) {
     assert.throws(
       () => pumpModule.createRelayV2BrokerSharedProducerHostCarrierPump(
         candidate,
         hostileOptions,
       ),
       /invalid Relay v2 shared-producer Host Pump authority/,
+      label,
     );
   }
   assert.equal(optionReads, 0);
+
+  const host = new FakeHostCarrier();
+  const actionDeadlineMs = 17;
+  const pump = pumpModule.createRelayV2BrokerSharedProducerHostCarrierPump(
+    shared.hostPumpAuthority,
+    {
+      host,
+      transportId: "shared-producer-race-transport",
+      hostAuthContext: authContext("host"),
+      credentialReference: "host-credential-reference",
+      deliveryTimeoutMs: actionDeadlineMs,
+      now: () => NOW_MS,
+      schedule: scheduler.schedule,
+    },
+  );
+  pump.start();
+  await scheduler.flushReady();
+  assert.equal(host.phase, "registered");
+
+  const prepared = shared.clientWssRuntime.prepareClientWss({
+    connectionId: "shared-producer-race-client",
+    trustedAuthContext: authContext("client"),
+    hostProducerTarget: pump.producerComposition.target,
+  });
+  assert.equal(prepared.outcome, "accept");
+  const socket = new FakeClientSocket();
+  const client = shared.clientWssRuntime.attachPreparedClientWss({
+    admissionReceipt: prepared.admissionReceipt,
+    alreadyUpgradedSocket: socket,
+  });
+  assert.equal(client.openResult.accepted, true);
+  await scheduler.flushReady();
+
+  pump.acceptBrokerResult({
+    accepted: true,
+    actions: [{
+      kind: "pause_client",
+      connectionId: client.connectionId,
+      connectionIncarnation: client.incarnation,
+    }],
+  });
+  scheduler.runNext(0);
+  scheduler.runNext(actionDeadlineMs);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(socket.pauseCalls, 0);
+
+  scheduler.runNext(actionDeadlineMs);
+  const receipt = await pump.whenCloseSettled();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(socket.closes, [{
+    code: 1013,
+    reason: "host_offline",
+  }]);
+  assert.equal(socket.terminates, 0);
+  assert.equal(receipt.outcome, "closed");
+  assert.equal(receipt.failedMandatoryActions, 0);
+  assert.equal(pump.snapshot().closeActionFailures, 1);
+
+  socket.emit("close", 1000);
+  await client.drained;
   await shared.clientWssRuntime.closeAndDrain();
 });

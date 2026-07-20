@@ -77,6 +77,7 @@ export interface RelayV2BrokerSharedProducerHostPumpAuthority {
 type RelayV2BrokerSharedProducerHostPumpOwner = Readonly<{
   broker: RelayV2CarrierPumpBrokerPort;
   producerRegistry: RelayV2BrokerProducerRegistry;
+  applyBrokerAction: RelayV2BrokerClientWssRuntimeComposition["applyBrokerAction"];
 }>;
 
 const SHARED_PRODUCER_HOST_PUMP_AUTHORITIES = new WeakMap<
@@ -92,6 +93,7 @@ const SHARED_PRODUCER_HOST_PUMP_AUTHORITIES = new WeakMap<
 function issueRelayV2BrokerSharedProducerHostPumpAuthority(
   broker: RelayV2CarrierPumpBrokerPort,
   producerRegistry: RelayV2BrokerProducerRegistry,
+  applyBrokerAction: RelayV2BrokerClientWssRuntimeComposition["applyBrokerAction"],
 ): RelayV2BrokerSharedProducerHostPumpAuthority {
   const authority = Object.freeze(
     Object.create(null),
@@ -99,6 +101,7 @@ function issueRelayV2BrokerSharedProducerHostPumpAuthority(
   SHARED_PRODUCER_HOST_PUMP_AUTHORITIES.set(authority, Object.freeze({
     broker,
     producerRegistry,
+    applyBrokerAction,
   }));
   return authority;
 }
@@ -137,7 +140,7 @@ export interface RelayV2CarrierPumpOptions {
 
 export type RelayV2BrokerSharedProducerHostPumpOptions = Omit<
   RelayV2CarrierPumpOptions,
-  "broker" | "producerRegistry"
+  "broker" | "producerRegistry" | "onBrokerAction" | "onForceBrokerAction"
 >;
 
 export type RelayV2BrokerSharedProducerClientWssRuntime = Readonly<Pick<
@@ -2557,6 +2560,52 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   }
 }
 
+function applyRelayV2BrokerSharedProducerClientEffect(
+  owner: RelayV2BrokerSharedProducerHostPumpOwner,
+  action: RelayV2BrokerAction,
+  signal: AbortSignal,
+  fence: RelayV2BrokerActionFence,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    queueMicrotask(() => {
+      let current = false;
+      try {
+        current = !signal.aborted && fence.mayApply() === true;
+      } catch {
+        current = false;
+      }
+      if (!current) {
+        reject(new Error("stale Relay v2 shared-producer client effect"));
+        return;
+      }
+      try {
+        if (owner.applyBrokerAction(action) !== "applied") {
+          reject(new Error("Relay v2 shared-producer client effect was rejected"));
+          return;
+        }
+      } catch {
+        reject(new Error("Relay v2 shared-producer client effect failed"));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function forceRelayV2BrokerSharedProducerClientEffect(
+  owner: RelayV2BrokerSharedProducerHostPumpOwner,
+  action: RelayV2BrokerAction,
+): boolean {
+  if (action.kind !== "close_client" && action.kind !== "route_unavailable") {
+    return false;
+  }
+  try {
+    return owner.applyBrokerAction(action) === "applied";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Canonical shared-producer Pump construction. Authority lookup happens before
  * any Pump option is read or any producer/Host side effect can begin.
@@ -2576,6 +2625,14 @@ export function createRelayV2BrokerSharedProducerHostCarrierPump(
     ...options,
     broker: owner.broker,
     producerRegistry: owner.producerRegistry,
+    onBrokerAction: (action, signal, fence) => (
+      applyRelayV2BrokerSharedProducerClientEffect(owner, action, signal, fence)
+    ),
+    // Pump installs the irreversible identity fence before this synchronous
+    // outlet. The client runtime's own incarnation check is the stale gate.
+    onForceBrokerAction: (action) => (
+      forceRelayV2BrokerSharedProducerClientEffect(owner, action)
+    ),
   });
 }
 
@@ -2610,6 +2667,7 @@ export function createRelayV2BrokerSharedProducerRuntimeComposition(
     hostPumpAuthority: issueRelayV2BrokerSharedProducerHostPumpAuthority(
       runtime.hostPumpBrokerAuthority,
       producerRegistry,
+      runtime.applyBrokerAction,
     ),
   });
 }
