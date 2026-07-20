@@ -1784,6 +1784,42 @@ class RelayV2OutboxAuthorityCoreTest {
     }
 
     @Test
+    fun `fresh dispatch cut is creation ordered and bounded across thirty three rows`() {
+        var state = RelayV2OutboxState.empty()
+        repeat(33) { index ->
+            state = enqueue(
+                state,
+                draft(
+                    commandId = "fresh-$index",
+                    sessionId = "fresh-session-$index",
+                ),
+                index.toLong(),
+            ).state
+        }
+
+        val firstIds = core.dispatchEligibleEntryIds(
+            state,
+            RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH,
+        )
+        assertEquals(
+            (0 until 32).map { "fresh-$it" },
+            firstIds.map { it.commandId },
+        )
+        val first = dispatch(
+            state,
+            firstIds.associateWith { "attempt-${it.commandId}" },
+        )
+        assertEquals(32, first.effects.size)
+        assertEquals(
+            listOf("fresh-32"),
+            core.dispatchEligibleEntryIds(
+                first.state,
+                RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH,
+            ).map { it.commandId },
+        )
+    }
+
+    @Test
     fun `restore rejects duplicate mixed oversized and cross authority attempt ownership`() {
         var twoCommands = RelayV2OutboxState.empty()
         twoCommands = enqueue(

@@ -16,7 +16,7 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 
 /**
- * Unwired Room-backed Relay v2 state repository.
+ * Room-backed Relay v2 state repository used by the admitted explicit-v2 base composition.
  *
  * Every generation-scoped method must be called while the caller holds the actor apply lease. The
  * method then keeps the complete reducer operation inside one Room transaction. No method consults
@@ -24,7 +24,8 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheck
  */
 internal class RelayV2StateRepository(
     database: RelayV2StateDatabase,
-) : RelayV2StateSyncAuthority, RelayV2OutboxRecoveryAuthority {
+) : RelayV2StateSyncAuthority,
+    RelayV2OutboxRuntimeAuthority {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
     private val durableCore = RelayV2DurableStateRepositoryCore(
         RoomRelayV2DurableStateStore(database),
@@ -105,6 +106,14 @@ internal class RelayV2StateRepository(
     ): RelayV2OutboxBatchResult = durableCore.reduceOutboxBatchUnderApplyLease(
         namespace,
         actionSource,
+    )
+
+    override suspend fun dispatchFreshUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        attemptRequestIds: List<String>,
+    ): RelayV2OutboxFreshDispatchResult = durableCore.dispatchFreshUnderApplyLease(
+        namespace,
+        attemptRequestIds,
     )
 
     suspend fun loadTerminal(

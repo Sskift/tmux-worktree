@@ -88,13 +88,47 @@ internal sealed interface RelayV2OutboxBatchResult {
     ) : RelayV2OutboxBatchResult
 }
 
-/** Narrow durable port used by the unwired command-status recovery bridge. */
+/** Narrow durable port used by command-query and status-recovery adapters. */
 internal interface RelayV2OutboxRecoveryAuthority {
     suspend fun reduceOutboxBatchUnderApplyLease(
         namespace: RelayV2OutboxAuthorityNamespace,
         actionSource: (RelayV2OutboxState) -> List<RelayV2OutboxAction>?,
     ): RelayV2OutboxBatchResult
 }
+
+internal sealed interface RelayV2OutboxFreshDispatchResult {
+    data class Committed(
+        val state: RelayV2OutboxState,
+        val effects: List<RelayV2OutboxEffect.ExecuteCommand>,
+    ) : RelayV2OutboxFreshDispatchResult
+
+    data class Empty(
+        val state: RelayV2OutboxState,
+    ) : RelayV2OutboxFreshDispatchResult
+
+    data class Rejected(
+        val state: RelayV2OutboxState,
+        val reason: RelayV2OutboxRejection?,
+    ) : RelayV2OutboxFreshDispatchResult
+}
+
+/**
+ * Durable producer authority for one bounded, creation-ordered fresh dispatch transaction.
+ *
+ * Implementations select DispatchEligible rows and commit QUEUED -> SENDING before returning any
+ * Execute effects. The actor apply lease remains an entry precondition owned by the caller.
+ */
+internal interface RelayV2OutboxFreshDispatchAuthority {
+    suspend fun dispatchFreshUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        attemptRequestIds: List<String>,
+    ): RelayV2OutboxFreshDispatchResult
+}
+
+/** Single production Outbox owner paired into query/recovery and fresh dispatch adapters. */
+internal interface RelayV2OutboxRuntimeAuthority :
+    RelayV2OutboxRecoveryAuthority,
+    RelayV2OutboxFreshDispatchAuthority
 
 /**
  * Narrow durable authority used only by the default-off terminal runtime adapter.
@@ -119,7 +153,8 @@ internal interface RelayV2TerminalRuntimeAuthority {
 internal class RelayV2DurableStateRepositoryCore(
     private val store: RelayV2DurableStateStore,
     private val outboxAuthority: RelayV2OutboxAuthorityCore = RelayV2OutboxAuthorityCore(),
-) : RelayV2OutboxRecoveryAuthority, RelayV2TerminalRuntimeAuthority {
+) : RelayV2OutboxRuntimeAuthority,
+    RelayV2TerminalRuntimeAuthority {
     private val restoredTerminalKeys = ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
     private val resetAuthorizedTerminalKeys =
         ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
@@ -200,6 +235,65 @@ internal class RelayV2DurableStateRepositoryCore(
             reducedState,
             applied.flatMap { it.effects },
         )
+    }
+
+    override suspend fun dispatchFreshUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        attemptRequestIds: List<String>,
+    ): RelayV2OutboxFreshDispatchResult {
+        val requestIdCount = attemptRequestIds.size
+        require(requestIdCount in 1..RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH)
+        val requestIds = ArrayList<String>(requestIdCount)
+        repeat(requestIdCount) { index -> requestIds += attemptRequestIds[index] }
+        require(attemptRequestIds.size == requestIdCount)
+        return store.transaction {
+            val current = decodeOutbox(namespace)
+            val eligibleIds = outboxAuthority.dispatchEligibleEntryIds(
+                current,
+                requestIds.size,
+            )
+            if (eligibleIds.isEmpty()) {
+                return@transaction RelayV2OutboxFreshDispatchResult.Empty(current)
+            }
+            val attempts = LinkedHashMap<RelayV2OutboxEntryId, String>(eligibleIds.size)
+            eligibleIds.forEachIndexed { index, entryId ->
+                attempts[entryId] = requestIds[index]
+            }
+            when (val result = outboxAuthority.reduce(
+                current,
+                RelayV2OutboxAction.DispatchEligible(
+                    attemptRequestIds = attempts,
+                    effectBudget = eligibleIds.size,
+                ),
+            )) {
+                is RelayV2OutboxResult.Rejected ->
+                    RelayV2OutboxFreshDispatchResult.Rejected(current, result.reason)
+                is RelayV2OutboxResult.Applied -> {
+                    requireOutboxNamespace(namespace, result.state)
+                    val executeEffects = result.effects.mapNotNull {
+                        it as? RelayV2OutboxEffect.ExecuteCommand
+                    }
+                    check(executeEffects.size == eligibleIds.size &&
+                        executeEffects.size == result.effects.size
+                    ) { "Fresh Outbox dispatch produced an invalid effect cut" }
+                    applyOutboxPlan(namespace, current, result)
+                    putOutboxMeta(
+                        RelayV2PersistedOutboxMeta(
+                            namespace,
+                            result.state.nextCreationOrder,
+                            RelayV2OutboxStorageCodec.encodeMeta(
+                                namespace,
+                                result.state.nextCreationOrder,
+                            ),
+                        ),
+                    )
+                    RelayV2OutboxFreshDispatchResult.Committed(
+                        result.state,
+                        executeEffects,
+                    )
+                }
+            }
+        }
     }
 
     suspend fun loadTerminal(

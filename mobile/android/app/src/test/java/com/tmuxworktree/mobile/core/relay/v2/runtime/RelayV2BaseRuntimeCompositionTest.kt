@@ -23,7 +23,8 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
-import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRecoveryAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxFreshDispatchResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ResyncReason
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotChunk
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseCompletion
@@ -185,6 +186,87 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `empty recovery dispatches fresh queued commands in creation order without query`() =
+        runBlocking {
+            val harness = Harness(
+                autoConnect = true,
+                outbox = queuedOutbox("fresh-b", "fresh-a"),
+            )
+            try {
+                harness.connectOnline()
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.transport().framesOfType("command.execute").size != 2) delay(1)
+                }
+                assertTrue(harness.transport().framesOfType("command.query").isEmpty())
+                assertEquals(
+                    listOf("fresh-b", "fresh-a"),
+                    harness.transport().framesOfType("command.execute")
+                        .map { it.stringValue("commandId") },
+                )
+                assertEquals(listOf(2), harness.authority.freshBatchSizes)
+                assertTrue(
+                    harness.authority.outboxState().entries.all {
+                        it.state == RelayV2OutboxStateTag.SENDING
+                    },
+                )
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `thirty three fresh commands use bounded durable batches`() = runBlocking {
+        val commandIds = (1..33).map { "fresh-${it.toString().padStart(2, '0')}" }
+        val harness = Harness(
+            autoConnect = true,
+            outbox = queuedOutbox(*commandIds.toTypedArray()),
+        )
+        try {
+            harness.connectOnline()
+            withTimeout(TIMEOUT_MS) {
+                while (harness.transport().framesOfType("command.execute").size != 33) delay(1)
+            }
+            assertEquals(listOf(32, 1), harness.authority.freshBatchSizes)
+            assertEquals(
+                commandIds,
+                harness.transport().framesOfType("command.execute")
+                    .map { it.stringValue("commandId") },
+            )
+            assertTrue(harness.transport().framesOfType("command.query").isEmpty())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `recovered capabilities flush before fresh queued dispatch`() = runBlocking {
+        val harness = Harness(
+            autoConnect = true,
+            outbox = recoveredAndFreshOutbox(),
+        )
+        try {
+            val query = harness.connectToCommandQuery()
+            assertEquals(
+                listOf("recovered"),
+                query.payload().objectList("items").map { it.stringValue("commandId") },
+            )
+            harness.transport().sendCommandStatuses(query, StatusMode.RETRY_IMMEDIATE)
+            harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+            withTimeout(TIMEOUT_MS) {
+                while (harness.transport().framesOfType("command.execute").size != 2) delay(1)
+            }
+            assertEquals(
+                listOf("recovered", "fresh"),
+                harness.transport().framesOfType("command.execute")
+                    .map { it.stringValue("commandId") },
+            )
+            assertEquals(listOf(1), harness.authority.freshBatchSizes)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
     fun `two recovered batches wait for final online ready then dispatch once in commit order`() =
         runBlocking {
             val commandIds = (1..33).map { "command-${it.toString().padStart(2, '0')}" }
@@ -270,6 +352,43 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `close after fresh commit leaves sending for restart query with zero blind resend`() =
+        runBlocking {
+            val first = Harness(
+                autoConnect = true,
+                outbox = queuedOutbox("fresh-crash"),
+            )
+            var rebuilt: Harness? = null
+            try {
+                first.authority.blockAfterFreshCommit = true
+                first.openThroughHostWelcome()
+                withTimeout(TIMEOUT_MS) { first.authority.freshCommitCompleted.await() }
+                val durableAttempted = first.authority.outboxState()
+
+                first.composition.close()
+                first.authority.releaseAfterFreshCommit.complete(Unit)
+                first.awaitTransportDrain()
+                assertTrue(first.transport().framesOfType("command.execute").isEmpty())
+                assertEquals(
+                    RelayV2OutboxStateTag.SENDING,
+                    durableAttempted.entries.single().state,
+                )
+
+                rebuilt = Harness(autoConnect = true, outbox = durableAttempted)
+                val query = rebuilt.connectToCommandQuery()
+                assertEquals(
+                    listOf("fresh-crash"),
+                    query.payload().objectList("items").map { it.stringValue("commandId") },
+                )
+                assertTrue(rebuilt.transport().framesOfType("command.execute").isEmpty())
+            } finally {
+                first.authority.releaseAfterFreshCommit.complete(Unit)
+                first.close()
+                rebuilt?.close()
+            }
+        }
+
+    @Test
     fun `startup filters terminal rows and rejects unsupported activation facts`() = runBlocking {
         val filtered = Harness(
             autoConnect = true,
@@ -288,18 +407,6 @@ class RelayV2BaseRuntimeCompositionTest {
             )
         } finally {
             filtered.close()
-        }
-
-        val queued = Harness(autoConnect = true, outbox = queuedOutbox())
-        try {
-            val failed = queued.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
-            assertEquals(
-                RelayV2BaseRuntimeFailure.RuntimeIncomplete("DURABLE_OUTBOX_ADMISSION_FAILED"),
-                failed.failure,
-            )
-            assertTrue(queued.factory.requests.isEmpty())
-        } finally {
-            queued.close()
         }
 
         val foreign = Harness(
@@ -527,7 +634,8 @@ class RelayV2BaseRuntimeCompositionTest {
     private class FakeDurableAuthority(
         initialOutbox: RelayV2OutboxState,
         private val outboxReadFailure: Throwable?,
-    ) : RelayV2StateSyncAuthority, RelayV2OutboxRecoveryAuthority {
+    ) : RelayV2StateSyncAuthority,
+        RelayV2OutboxRuntimeAuthority {
         private val outboxCore = RelayV2OutboxAuthorityCore()
 
         @Volatile
@@ -538,12 +646,15 @@ class RelayV2BaseRuntimeCompositionTest {
         val outboxReads = AtomicInteger()
         val queryCommits = AtomicInteger()
         val statusCommits = AtomicInteger()
+        val freshBatchSizes = CopyOnWriteArrayList<Int>()
         val stateEventApplyEntered = CompletableDeferred<Unit>()
         val releaseStateEventApply = CompletableDeferred<Unit>()
         val queryCommitEntered = CompletableDeferred<Unit>()
         val releaseQueryCommit = CompletableDeferred<Unit>()
         val statusCommitCompleted = CompletableDeferred<Unit>()
         val releaseAfterStatusCommit = CompletableDeferred<Unit>()
+        val freshCommitCompleted = CompletableDeferred<Unit>()
+        val releaseAfterFreshCommit = CompletableDeferred<Unit>()
 
         @Volatile
         var blockStateEvents: Boolean = false
@@ -553,6 +664,9 @@ class RelayV2BaseRuntimeCompositionTest {
 
         @Volatile
         var blockAfterStatusCommit: Boolean = false
+
+        @Volatile
+        var blockAfterFreshCommit: Boolean = false
 
         @Volatile
         var forceNextEventGap: Boolean = false
@@ -604,6 +718,42 @@ class RelayV2BaseRuntimeCompositionTest {
                 releaseAfterStatusCommit.await()
             }
             return RelayV2OutboxBatchResult.Applied(reduced, effects)
+        }
+
+        override suspend fun dispatchFreshUnderApplyLease(
+            namespace: com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace,
+            attemptRequestIds: List<String>,
+        ): RelayV2OutboxFreshDispatchResult {
+            check(namespace.profileId == PROFILE_ID)
+            check(namespace.principalId == PRINCIPAL_ID)
+            check(namespace.clientInstanceId == CLIENT_INSTANCE_ID)
+            val current = outbox
+            val eligible = outboxCore.dispatchEligibleEntryIds(current, attemptRequestIds.size)
+            if (eligible.isEmpty()) return RelayV2OutboxFreshDispatchResult.Empty(current)
+            val result = outboxCore.reduce(
+                current,
+                RelayV2OutboxAction.DispatchEligible(
+                    eligible.mapIndexed { index, entryId ->
+                        entryId to attemptRequestIds[index]
+                    }.toMap(),
+                    eligible.size,
+                ),
+            )
+            if (result is RelayV2OutboxResult.Rejected) {
+                return RelayV2OutboxFreshDispatchResult.Rejected(current, result.reason)
+            }
+            result as RelayV2OutboxResult.Applied
+            val effects = result.effects.mapNotNull {
+                it as? RelayV2OutboxEffect.ExecuteCommand
+            }
+            check(effects.size == result.effects.size)
+            outbox = result.state
+            freshBatchSizes += effects.size
+            if (blockAfterFreshCommit) {
+                freshCommitCompleted.complete(Unit)
+                releaseAfterFreshCommit.await()
+            }
+            return RelayV2OutboxFreshDispatchResult.Committed(result.state, effects)
         }
 
         override suspend fun loadConnectPlan(
@@ -872,8 +1022,23 @@ class RelayV2BaseRuntimeCompositionTest {
         hostEpoch: String = HOST_EPOCH,
     ): RelayV2OutboxState = outbox(commandIds.toList(), hostEpoch, dispatch = true)
 
-    private fun queuedOutbox(): RelayV2OutboxState =
-        outbox(listOf("queued"), HOST_EPOCH, dispatch = false)
+    private fun queuedOutbox(vararg commandIds: String): RelayV2OutboxState =
+        outbox(commandIds.toList(), HOST_EPOCH, dispatch = false)
+
+    private fun recoveredAndFreshOutbox(): RelayV2OutboxState {
+        val core = RelayV2OutboxAuthorityCore()
+        val queued = outbox(listOf("recovered", "fresh"), HOST_EPOCH, dispatch = false)
+        val recovered = queued.entries.single { it.commandId == "recovered" }
+        return applied(
+            core.reduce(
+                queued,
+                RelayV2OutboxAction.DispatchEligible(
+                    mapOf(recovered.id to "initial-recovered"),
+                    effectBudget = 1,
+                ),
+            ),
+        ).state
+    }
 
     private fun outbox(
         commandIds: List<String>,
@@ -924,6 +1089,7 @@ class RelayV2BaseRuntimeCompositionTest {
             "confirming",
             "ambiguous",
             "succeeded",
+            "queued",
         )
         val transformed = state.entries.map { entry ->
             when (entry.commandId) {
@@ -936,6 +1102,11 @@ class RelayV2BaseRuntimeCompositionTest {
                 "succeeded" -> entry.copy(
                     state = RelayV2OutboxStateTag.SUCCEEDED,
                     acceptanceEvidence = RelayV2OutboxAcceptanceEvidence.DURABLE,
+                )
+                "queued" -> entry.copy(
+                    state = RelayV2OutboxStateTag.QUEUED,
+                    acceptanceEvidence = RelayV2OutboxAcceptanceEvidence.NONE,
+                    attempts = emptyList(),
                 )
                 else -> entry
             }

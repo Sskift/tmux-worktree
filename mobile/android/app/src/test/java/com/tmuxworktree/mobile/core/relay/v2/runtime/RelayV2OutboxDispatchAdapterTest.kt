@@ -364,6 +364,98 @@ class RelayV2OutboxDispatchAdapterTest {
         assertTrue(result.commit.effects.single() is RelayV2OutboxEffect.ExecuteCommand)
     }
 
+    @Test
+    fun `fresh producer commits thirty three commands in ordered bounded batches before send`() =
+        runBlocking {
+            val ids = ArrayDeque((1..64).map { "fresh-attempt-$it" })
+            val fixture = Fixture(ids)
+            val specs = (0 until 33).map { index ->
+                CommandSpec("fresh-$index", sessionId = "fresh-session-$index")
+            }
+            fixture.enqueueFresh(specs)
+
+            val first = fixture.composition.freshProducer.produceBatch(fixture.authority)
+                as RelayV2OutboxFreshDispatchProduction.Issued
+            assertEquals(32, first.capabilities.size)
+            assertEquals(
+                (0 until 32).map { "fresh-$it" },
+                first.capabilities.map { it.identity.commandId },
+            )
+            val afterFirstCommit = fixture.repository.loadOutbox(fixture.namespace)
+            assertEquals(
+                List(32) { RelayV2OutboxStateTag.SENDING } + RelayV2OutboxStateTag.QUEUED,
+                afterFirstCommit.entries.map { it.state },
+            )
+
+            val send = RecordingSendPort(fixture.authority)
+            val dispatcher = fixture.dispatcher(send)
+            first.capabilities.forEach { capability ->
+                assertTrue(dispatcher.dispatch(capability) is RelayV2OutboxDispatchOutcome.Submitted)
+            }
+            val second = fixture.composition.freshProducer.produceBatch(fixture.authority)
+                as RelayV2OutboxFreshDispatchProduction.Issued
+            assertEquals(listOf("fresh-32"), second.capabilities.map { it.identity.commandId })
+            second.capabilities.forEach { capability ->
+                assertTrue(dispatcher.dispatch(capability) is RelayV2OutboxDispatchOutcome.Submitted)
+            }
+            assertEquals(
+                RelayV2OutboxFreshDispatchProduction.Empty,
+                fixture.composition.freshProducer.produceBatch(fixture.authority),
+            )
+            assertEquals(specs.map { it.commandId }, send.frames.map { decode(it)["commandId"] })
+        }
+
+    @Test
+    fun `fresh commit without send restarts as queryable sending and never blind resends`() =
+        runBlocking {
+            val fixture = Fixture(ArrayDeque(listOf("fresh-crash-attempt")))
+            fixture.enqueueFresh(listOf(CommandSpec("fresh-crash")))
+
+            val committed = fixture.composition.freshProducer.produceBatch(fixture.authority)
+                as RelayV2OutboxFreshDispatchProduction.Issued
+            assertEquals(1, committed.capabilities.size)
+            assertEquals(
+                RelayV2OutboxStateTag.SENDING,
+                fixture.repository.loadOutbox(fixture.namespace).entries.single().state,
+            )
+
+            val restarted = RelayV2DurableStateRepositoryCore(fixture.store)
+            assertTrue(
+                restarted.dispatchFreshUnderApplyLease(
+                    fixture.namespace,
+                    List(32) { "restart-unused-$it" },
+                ) is RelayV2OutboxFreshDispatchResult.Empty,
+            )
+            val sending = restarted.loadOutbox(fixture.namespace).entries.single()
+            val query = restarted.reduceOutboxUnderApplyLease(
+                fixture.namespace,
+                RelayV2OutboxAction.BeginQueries(
+                    listOf(sending.id),
+                    listOf("restart-query"),
+                ),
+            ) as RelayV2OutboxResult.Applied
+            assertTrue(query.effects.single() is RelayV2OutboxEffect.QueryCommands)
+            assertEquals(0, RecordingSendPort(fixture.authority).transportCalls)
+        }
+
+    @Test
+    fun `stale fresh authority is fenced before durable commit or transport`() = runBlocking {
+        val fixture = Fixture()
+        fixture.enqueueFresh(listOf(CommandSpec("fresh-stale")))
+        val stale = fixture.authority.copy(
+            generation = fixture.authority.generation.copy(connectionGeneration = 2),
+        )
+
+        assertEquals(
+            RelayV2OutboxFreshDispatchProduction.Stale,
+            fixture.composition.freshProducer.produceBatch(stale),
+        )
+        assertEquals(
+            RelayV2OutboxStateTag.QUEUED,
+            fixture.repository.loadOutbox(fixture.namespace).entries.single().state,
+        )
+    }
+
     private class Fixture(
         private val ids: ArrayDeque<String> = ArrayDeque(),
         frameEncoder: RelayV2OutboxDispatchFrameEncoder? = null,
@@ -398,6 +490,29 @@ class RelayV2OutboxDispatchAdapterTest {
         }
 
         suspend fun seed(spec: CommandSpec): TestCommand = seedBatch(listOf(spec)).single()
+
+        suspend fun enqueueFresh(specs: List<CommandSpec>) {
+            require(specs.isNotEmpty())
+            specs.forEachIndexed { index, spec ->
+                repository.reduceOutboxUnderApplyLease(
+                    namespace,
+                    RelayV2OutboxAction.Enqueue(
+                        RelayV2OutboxDraft(
+                            profileId = authority.profileId,
+                            principalId = authority.principalId,
+                            hostId = authority.hostId,
+                            expectedHostEpoch = authority.hostEpoch,
+                            dedupeWindowId = spec.dedupeWindowId,
+                            commandId = spec.commandId,
+                            scopeId = "scope-a",
+                            sessionId = spec.sessionId,
+                            arguments = spec.arguments,
+                        ),
+                        index.toLong() + 1L,
+                    ),
+                ) as RelayV2OutboxResult.Applied
+            }
+        }
 
         suspend fun seedBatch(specs: List<CommandSpec>): List<TestCommand> {
             require(specs.isNotEmpty())
@@ -491,7 +606,7 @@ class RelayV2OutboxDispatchAdapterTest {
             authority: RelayV2RepositoryEffectAuthority,
             block: suspend () -> T,
         ): RelayV2EffectApplyResult<T> {
-            assertEquals(AUTHORITY, authority)
+            if (AUTHORITY != authority) return RelayV2EffectApplyResult.Stale
             check(!active)
             active = true
             return try {

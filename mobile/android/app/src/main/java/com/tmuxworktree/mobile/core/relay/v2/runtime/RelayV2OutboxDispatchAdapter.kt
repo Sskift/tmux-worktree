@@ -10,7 +10,10 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxCommand
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.canonicalRelayV2FingerprintRequest
-import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRecoveryAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxFreshDispatchAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxFreshDispatchResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.UUID
@@ -43,7 +46,7 @@ internal data class RelayV2OutboxDispatchIdentity(
     val commandId: String,
 )
 
-/** Why a durable recovery effect could not be sealed into dispatch authority. */
+/** Why a durable Outbox effect could not be sealed into dispatch authority. */
 internal enum class RelayV2OutboxDispatchIssueFailure {
     COMMIT_AUTHORITY_MISMATCH,
     COMMIT_EFFECT_MISMATCH,
@@ -104,10 +107,41 @@ private class RelayV2IssuedOutboxDispatchCapability(
  */
 internal interface RelayV2OutboxDispatchRecoveryComposition {
     val recoveryAdapter: RelayV2OutboxRecoveryAdapter
+    val freshProducer: RelayV2OutboxFreshDispatchProducer
 
     fun dispatcher(
         sendPort: RelayV2OutboxExactGenerationSendPort,
     ): RelayV2OutboxDispatcher
+}
+
+internal fun interface RelayV2OutboxFreshDispatchProducer {
+    suspend fun produceBatch(
+        authority: RelayV2RepositoryEffectAuthority,
+    ): RelayV2OutboxFreshDispatchProduction
+}
+
+internal sealed interface RelayV2OutboxFreshDispatchProduction {
+    data object Empty : RelayV2OutboxFreshDispatchProduction
+    data object Stale : RelayV2OutboxFreshDispatchProduction
+
+    data class Issued(
+        val capabilities: List<RelayV2OutboxDispatchCapability>,
+    ) : RelayV2OutboxFreshDispatchProduction {
+        init {
+            require(capabilities.isNotEmpty())
+            require(capabilities.size <= RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH)
+        }
+    }
+
+    data class Rejected(
+        val failure: RelayV2OutboxFreshDispatchFailure,
+    ) : RelayV2OutboxFreshDispatchProduction
+}
+
+internal enum class RelayV2OutboxFreshDispatchFailure {
+    DURABLE_REJECTED,
+    COMMIT_INVALID,
+    ISSUE_REJECTED,
 }
 
 internal fun interface RelayV2OutboxDispatcher {
@@ -119,7 +153,7 @@ internal fun interface RelayV2OutboxDispatcher {
 internal object RelayV2OutboxDispatchAuthority {
     fun recoveryComposition(
         applyLease: RelayV2RepositoryEffectApplyLeasePort,
-        outbox: RelayV2OutboxRecoveryAuthority,
+        outbox: RelayV2OutboxRuntimeAuthority,
         newId: () -> String = { UUID.randomUUID().toString() },
         clock: () -> Long = System::currentTimeMillis,
         frameEncoder: RelayV2OutboxDispatchFrameEncoder = STRICT_FRAME_ENCODER,
@@ -168,6 +202,23 @@ internal class RelayV2OutboxDispatchIssuePort private constructor(
         )
     }
 
+    fun sealFreshCommitted(
+        authority: RelayV2RepositoryEffectAuthority,
+        commit: RelayV2OutboxFreshDispatchCommit,
+    ): RelayV2OutboxDispatchCommittedSeal = try {
+        RelayV2ReadyOutboxDispatchCommittedSeal(
+            issuerKey,
+            Collections.unmodifiableList(commit.dispatchSnapshots(authority, frameEncoder)),
+        )
+    } catch (failure: RelayV2OutboxDispatchIssueException) {
+        RelayV2RejectedOutboxDispatchCommittedSeal(issuerKey, failure.reason)
+    } catch (_: Exception) {
+        RelayV2RejectedOutboxDispatchCommittedSeal(
+            issuerKey,
+            RelayV2OutboxDispatchIssueFailure.ENCODING_REJECTED,
+        )
+    }
+
     /** After sealing, issuance performs only pair verification, one CAS, and capability minting. */
     fun issue(
         seal: RelayV2OutboxDispatchCommittedSeal,
@@ -182,7 +233,7 @@ internal class RelayV2OutboxDispatchIssuePort private constructor(
     internal companion object {
         fun recoveryComposition(
             applyLease: RelayV2RepositoryEffectApplyLeasePort,
-            outbox: RelayV2OutboxRecoveryAuthority,
+            outbox: RelayV2OutboxRuntimeAuthority,
             newId: () -> String,
             clock: () -> Long,
             frameEncoder: RelayV2OutboxDispatchFrameEncoder,
@@ -197,6 +248,12 @@ internal class RelayV2OutboxDispatchIssuePort private constructor(
                     newId = newId,
                     clock = clock,
                     dispatchIssuer = issuePort,
+                ),
+                freshProducer = RelayV2OutboxFreshDispatchProducerImpl(
+                    applyLease = applyLease,
+                    outbox = outbox,
+                    issuePort = issuePort,
+                    newId = newId,
                 ),
                 consumePort = consumePort,
             )
@@ -268,11 +325,81 @@ private fun authorityMismatch() = RelayV2OutboxDispatchIssuance.Rejected(
 
 private class RelayV2OutboxDispatchRecoveryCompositionImpl(
     override val recoveryAdapter: RelayV2OutboxRecoveryAdapter,
+    override val freshProducer: RelayV2OutboxFreshDispatchProducer,
     private val consumePort: RelayV2OutboxDispatchConsumePort,
 ) : RelayV2OutboxDispatchRecoveryComposition {
     override fun dispatcher(
         sendPort: RelayV2OutboxExactGenerationSendPort,
     ): RelayV2OutboxDispatcher = RelayV2OutboxDispatchAdapter(consumePort, sendPort)
+}
+
+private class RelayV2OutboxFreshDispatchProducerImpl(
+    private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
+    private val outbox: RelayV2OutboxFreshDispatchAuthority,
+    private val issuePort: RelayV2OutboxDispatchIssuePort,
+    private val newId: () -> String,
+) : RelayV2OutboxFreshDispatchProducer {
+    override suspend fun produceBatch(
+        authority: RelayV2RepositoryEffectAuthority,
+    ): RelayV2OutboxFreshDispatchProduction {
+        val requestIds = List(RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH) { newId() }
+        return when (val leased = applyLease.withEffectApplyLease(authority) {
+            when (val committed = outbox.dispatchFreshUnderApplyLease(
+                authority.outboxNamespace(),
+                requestIds,
+            )) {
+                is RelayV2OutboxFreshDispatchResult.Empty -> FreshLeaseResult.Empty
+                is RelayV2OutboxFreshDispatchResult.Rejected -> FreshLeaseResult.Rejected
+                is RelayV2OutboxFreshDispatchResult.Committed -> {
+                    if (committed.effects.isEmpty() ||
+                        committed.effects.size > RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH
+                    ) {
+                        FreshLeaseResult.Invalid
+                    } else {
+                        val commit = RelayV2OutboxFreshDispatchCommit(
+                            authority.generation,
+                            authority.hostId,
+                            authority.hostEpoch,
+                            committed.effects,
+                        )
+                        FreshLeaseResult.Sealed(
+                            issuePort.sealFreshCommitted(authority, commit),
+                        )
+                    }
+                }
+            }
+        }) {
+            RelayV2EffectApplyResult.Stale -> RelayV2OutboxFreshDispatchProduction.Stale
+            is RelayV2EffectApplyResult.Applied -> when (val result = leased.value) {
+                FreshLeaseResult.Empty -> RelayV2OutboxFreshDispatchProduction.Empty
+                FreshLeaseResult.Rejected -> RelayV2OutboxFreshDispatchProduction.Rejected(
+                    RelayV2OutboxFreshDispatchFailure.DURABLE_REJECTED,
+                )
+                FreshLeaseResult.Invalid -> RelayV2OutboxFreshDispatchProduction.Rejected(
+                    RelayV2OutboxFreshDispatchFailure.COMMIT_INVALID,
+                )
+                is FreshLeaseResult.Sealed -> when (val issuance = issuePort.issue(result.seal)) {
+                    is RelayV2OutboxDispatchIssuance.Issued ->
+                        RelayV2OutboxFreshDispatchProduction.Issued(issuance.capabilities)
+                    RelayV2OutboxDispatchIssuance.Disabled,
+                    RelayV2OutboxDispatchIssuance.NoDispatch,
+                    is RelayV2OutboxDispatchIssuance.Rejected,
+                    -> RelayV2OutboxFreshDispatchProduction.Rejected(
+                        RelayV2OutboxFreshDispatchFailure.ISSUE_REJECTED,
+                    )
+                }
+            }
+        }
+    }
+
+    private sealed interface FreshLeaseResult {
+        data object Empty : FreshLeaseResult
+        data object Rejected : FreshLeaseResult
+        data object Invalid : FreshLeaseResult
+        data class Sealed(
+            val seal: RelayV2OutboxDispatchCommittedSeal,
+        ) : FreshLeaseResult
+    }
 }
 
 private fun interface RelayV2OutboxConsumedDelivery {
@@ -433,6 +560,13 @@ private data class RelayV2OutboxDispatchSnapshot(
     val provenanceSha256: ByteArray,
 )
 
+internal data class RelayV2OutboxFreshDispatchCommit(
+    val generation: RelayV2EffectGeneration,
+    val hostId: String,
+    val hostEpoch: String,
+    val effects: List<RelayV2OutboxEffect.ExecuteCommand>,
+)
+
 private sealed interface RelayV2OutboxCommitReceiptSnapshot {
     val generation: RelayV2EffectGeneration
     val hostId: String
@@ -481,6 +615,21 @@ private sealed interface RelayV2OutboxCommitReceiptSnapshot {
             "attemptRequestId" to receipt.attemptRequestId,
         )
     }
+
+    data class FreshDispatch(
+        override val generation: RelayV2EffectGeneration,
+        override val hostId: String,
+        override val hostEpoch: String,
+        override val orderedCommands: List<RelayV2PendingCommand>,
+    ) : RelayV2OutboxCommitReceiptSnapshot {
+        override fun canonicalValue(): Map<String, Any?> = linkedMapOf(
+            "kind" to "fresh_dispatch",
+            "generation" to generation.canonicalValue(),
+            "hostId" to hostId,
+            "hostEpoch" to hostEpoch,
+            "commands" to orderedCommands.map { it.canonicalValue() },
+        )
+    }
 }
 
 private class RelayV2OutboxDispatchIssueException(
@@ -502,6 +651,47 @@ private fun RelayV2OutboxRecoveryCommit.dispatchSnapshots(
     repeat(effectCount) { index ->
         val exactEffect = effectsSnapshot[index]
         exactEffect.dispatchSnapshot(authority, receipt, index, frameEncoder)?.let(snapshots::add)
+        if (effectsSnapshot.size != effectCount || effectsSnapshot[index] !== exactEffect) {
+            issueFailure(RelayV2OutboxDispatchIssueFailure.COMMIT_CHANGED)
+        }
+    }
+    if (snapshots.map { it.identity.requestId }.distinct().size != snapshots.size ||
+        snapshots.map { it.identity.commandId }.distinct().size != snapshots.size
+    ) issueFailure(RelayV2OutboxDispatchIssueFailure.COMMIT_EFFECT_MISMATCH)
+    return snapshots
+}
+
+private fun RelayV2OutboxFreshDispatchCommit.dispatchSnapshots(
+    authority: RelayV2RepositoryEffectAuthority,
+    frameEncoder: RelayV2OutboxDispatchFrameEncoder,
+): ArrayList<RelayV2OutboxDispatchSnapshot> {
+    val effectsSnapshot = effects
+    val effectCount = effectsSnapshot.size
+    if (effectCount !in 1..RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH) {
+        issueFailure(RelayV2OutboxDispatchIssueFailure.COMMIT_EFFECT_MISMATCH)
+    }
+    val commands = ArrayList<RelayV2PendingCommand>(effectCount)
+    repeat(effectCount) { index ->
+        val effect = effectsSnapshot[index]
+        commands += RelayV2PendingCommand(
+            effect.command.entryId.commandId,
+            effect.command.dedupeWindowId,
+        )
+        if (effectsSnapshot.size != effectCount || effectsSnapshot[index] !== effect) {
+            issueFailure(RelayV2OutboxDispatchIssueFailure.COMMIT_CHANGED)
+        }
+    }
+    val receipt = RelayV2OutboxCommitReceiptSnapshot.FreshDispatch(
+        generation,
+        hostId,
+        hostEpoch,
+        commands.privateSnapshot(),
+    )
+    receipt.requireAuthority(authority)
+    val snapshots = ArrayList<RelayV2OutboxDispatchSnapshot>(effectCount)
+    repeat(effectCount) { index ->
+        val exactEffect = effectsSnapshot[index]
+        snapshots += exactEffect.executeSnapshot(authority, receipt, index, frameEncoder)
         if (effectsSnapshot.size != effectCount || effectsSnapshot[index] !== exactEffect) {
             issueFailure(RelayV2OutboxDispatchIssueFailure.COMMIT_CHANGED)
         }
@@ -807,6 +997,14 @@ private fun RelayV2PendingCommand.canonicalValue(): Map<String, Any?> = linkedMa
     "commandId" to commandId,
     "dedupeWindowId" to dedupeWindowId,
 )
+
+private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
+    RelayV2OutboxAuthorityNamespace(
+        profileId,
+        profileActivationGeneration,
+        principalId,
+        clientInstanceId,
+    )
 
 private fun issueFailure(reason: RelayV2OutboxDispatchIssueFailure): Nothing =
     throw RelayV2OutboxDispatchIssueException(reason)

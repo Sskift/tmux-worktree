@@ -8,7 +8,8 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
-import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRecoveryAuthority
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
 import java.io.Closeable
 import java.util.concurrent.CancellationException
@@ -53,10 +54,10 @@ internal fun interface RelayV2ActivationOutboxReadPort {
  * Production base-sync owner for one already-admitted Relay v2 profile activation.
  *
  * This composition owns exactly one actor, its effect pump, and their close lifecycle. It consumes
- * state-sync plus durable command query/status recovery, and dispatches only Execute capabilities
- * recovered by that status flow after the actor publishes the exact ONLINE ready cut. Fresh command
- * production, terminal, Agent extensions, refresh, reconnect, and capability advertisement remain
- * unowned.
+ * state-sync plus durable command query/status recovery. After the actor publishes the exact ONLINE
+ * ready cut, it flushes recovered Execute capabilities in commit order and then asks the durable
+ * Outbox producer for bounded fresh QUEUED batches. Terminal, Agent extensions, refresh, reconnect,
+ * and capability advertisement remain unowned.
  */
 internal class RelayV2BaseRuntimeComposition(
     parentScope: CoroutineScope,
@@ -64,7 +65,7 @@ internal class RelayV2BaseRuntimeComposition(
     credentialStore: RelayV2CredentialStore,
     stateSyncAuthority: RelayV2StateSyncAuthority,
     private val activationOutbox: RelayV2ActivationOutboxReadPort,
-    outboxAuthority: RelayV2OutboxRecoveryAuthority,
+    outboxAuthority: RelayV2OutboxRuntimeAuthority,
     transportFactory: RelayV2TransportFactory = BoundedRelayV2TransportFactory(),
 ) : Closeable {
     private val closed = AtomicBoolean(false)
@@ -96,8 +97,12 @@ internal class RelayV2BaseRuntimeComposition(
     )
     private val queryAdmissionAdapter = queryAdmissionComposition.adapter(actor, outboxAuthority)
     private val outboxDispatchComposition =
-        RelayV2OutboxDispatchAuthority.recoveryComposition(actor, outboxAuthority)
+        RelayV2OutboxDispatchAuthority.recoveryComposition(
+            actor,
+            outboxAuthority,
+        )
     private val outboxRecoveryAdapter = outboxDispatchComposition.recoveryAdapter
+    private val freshOutboxProducer = outboxDispatchComposition.freshProducer
     private val outboxDispatcher = outboxDispatchComposition.dispatcher(actor)
     private val _state = MutableStateFlow(RelayV2BaseRuntimeState())
     val state: StateFlow<RelayV2BaseRuntimeState> = _state.asStateFlow()
@@ -365,7 +370,9 @@ internal class RelayV2BaseRuntimeComposition(
                     failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_STALE")
                     return
                 }
-                flushRecoveredDispatch(queryLineage, processed.authority)
+                if (flushRecoveredDispatch(queryLineage, processed.authority)) {
+                    dispatchFresh(processed.authority)
+                }
             }
             RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal -> {
                 clearRecoveredDispatch()
@@ -422,12 +429,12 @@ internal class RelayV2BaseRuntimeComposition(
     private fun flushRecoveredDispatch(
         queryLineage: RelayV2QueryRecoveryLineage,
         authority: RelayV2RepositoryEffectAuthority,
-    ) {
+    ): Boolean {
         var failureCode: String? = null
         synchronized(recoveredDispatchLock) {
             if (closed.get() || terminalFailure.get() != null) {
                 recoveredDispatch = null
-                return
+                return false
             }
             val buffer = recoveredDispatch
             if (buffer == null ||
@@ -448,6 +455,55 @@ internal class RelayV2BaseRuntimeComposition(
             }
         }
         failureCode?.let(::failRuntimeIncomplete)
+        return failureCode == null
+    }
+
+    private suspend fun dispatchFresh(
+        authority: RelayV2RepositoryEffectAuthority,
+    ) {
+        val issuedIdentities = HashSet<RelayV2OutboxDispatchIdentity>()
+        var issuedCount = 0
+        while (!closed.get() && terminalFailure.get() == null) {
+            val production = try {
+                freshOutboxProducer.produceBatch(authority)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_COMMIT_FAILED")
+                return
+            }
+            when (production) {
+                RelayV2OutboxFreshDispatchProduction.Empty,
+                RelayV2OutboxFreshDispatchProduction.Stale,
+                -> return
+                is RelayV2OutboxFreshDispatchProduction.Rejected -> {
+                    failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_REJECTED")
+                    return
+                }
+                is RelayV2OutboxFreshDispatchProduction.Issued -> {
+                    val capabilities = production.capabilities
+                    if (issuedCount + capabilities.size > RelayV2OutboxLimits.MAX_ENTRIES ||
+                        capabilities.any {
+                            it.identity.generation != authority.generation ||
+                                !issuedIdentities.add(it.identity)
+                        }
+                    ) {
+                        failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_OVERLIMIT")
+                        return
+                    }
+                    issuedCount += capabilities.size
+                    for (capability in capabilities) {
+                        if (closed.get() || terminalFailure.get() != null) return
+                        if (outboxDispatcher.dispatch(capability) !is
+                            RelayV2OutboxDispatchOutcome.Submitted
+                        ) {
+                            failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_FAILED")
+                            return
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun clearRecoveredDispatch() {
@@ -465,8 +521,7 @@ internal class RelayV2BaseRuntimeComposition(
                 error("Relay v2 Outbox escaped the exact activation namespace")
             }
             when (entry.state) {
-                RelayV2OutboxStateTag.QUEUED ->
-                    error("Queued Relay v2 Outbox commands have no production dispatcher")
+                RelayV2OutboxStateTag.QUEUED,
                 RelayV2OutboxStateTag.SENDING,
                 RelayV2OutboxStateTag.ACCEPTED,
                 RelayV2OutboxStateTag.CONFIRMING,
@@ -504,7 +559,9 @@ internal class RelayV2BaseRuntimeComposition(
             failRuntimeIncomplete("DURABLE_OUTBOX_FOREIGN_ACTIVE_LINEAGE")
             return null
         }
-        val pending = snapshot.activeEntries.map { entry ->
+        val pending = snapshot.activeEntries.filter {
+            it.state != RelayV2OutboxStateTag.QUEUED
+        }.map { entry ->
             RelayV2PendingCommand(entry.commandId, entry.dedupeWindowId)
         }
         val prior = admittedPendingCommands.get()
@@ -527,10 +584,10 @@ internal class RelayV2BaseRuntimeComposition(
         }
 
     private suspend fun submitRecovery(receipt: RelayV2RecoveryReceipt) {
-        when (actor.processRecoveryReceipt(receipt)) {
-            RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery,
-            is RelayV2RecoveryReceiptProcessingResult.OnlineReady,
-            -> Unit
+        when (val processed = actor.processRecoveryReceipt(receipt)) {
+            RelayV2RecoveryReceiptProcessingResult.ContinuedRecovery -> Unit
+            is RelayV2RecoveryReceiptProcessingResult.OnlineReady ->
+                dispatchFresh(processed.authority)
             RelayV2RecoveryReceiptProcessingResult.StaleOrTerminal -> {
                 clearRecoveredDispatch()
             }

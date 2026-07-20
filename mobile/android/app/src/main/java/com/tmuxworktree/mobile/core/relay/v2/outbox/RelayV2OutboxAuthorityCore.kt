@@ -6,6 +6,7 @@ import java.util.Collections
 internal object RelayV2OutboxLimits {
     const val MAX_ENTRIES = 4_096
     const val MAX_ATTEMPTS_PER_ENTRY = 64
+    const val MAX_DISPATCH_ITEMS_PER_BATCH = 32
     const val MAX_QUERY_ITEMS_PER_BATCH = 32
     const val MAX_QUERY_BATCHES =
         (MAX_ENTRIES + MAX_QUERY_ITEMS_PER_BATCH - 1) / MAX_QUERY_ITEMS_PER_BATCH
@@ -1155,6 +1156,22 @@ internal sealed interface RelayV2OutboxResult {
 internal class RelayV2OutboxAuthorityCore(
     private val capacity: RelayV2OutboxCapacity = RelayV2OutboxCapacity(),
 ) {
+    /**
+     * Returns the next creation-ordered fresh dispatch cut selected by this authority.
+     *
+     * The durable repository calls this only from inside its transaction, then feeds the exact
+     * selected ids back through [RelayV2OutboxAction.DispatchEligible] in that same transaction.
+     */
+    fun dispatchEligibleEntryIds(
+        state: RelayV2OutboxState,
+        effectBudget: Int,
+    ): List<RelayV2OutboxEntryId> {
+        require(effectBudget in 1..RelayV2OutboxLimits.MAX_DISPATCH_ITEMS_PER_BATCH)
+        return immutableListSnapshot(
+            dispatchEligibleEntries(state).take(effectBudget).map { it.id },
+        )
+    }
+
     fun reduce(
         state: RelayV2OutboxState,
         action: RelayV2OutboxAction,
@@ -1202,6 +1219,31 @@ internal class RelayV2OutboxAuthorityCore(
             return state.reject(RelayV2OutboxRejection.DUPLICATE_ATTEMPT_REQUEST_ID)
         }
 
+        val eligible = dispatchEligibleEntries(state)
+        if (!eligible.map { it.id }.toSet().containsAll(action.attemptRequestIds.keys)) {
+            return state.reject(RelayV2OutboxRejection.INVALID_TRANSITION)
+        }
+
+        val mutations = mutableListOf<RelayV2OutboxMutation>()
+        val effects = mutableListOf<RelayV2OutboxEffect>()
+        eligible.forEach { entry ->
+            if (effects.size >= action.effectBudget) return@forEach
+            val requestId = action.attemptRequestIds[entry.id] ?: return@forEach
+            val updated = entry.appendAttempt(
+                requestId,
+                RelayV2OutboxAttemptKind.EXECUTE,
+                RelayV2OutboxStateTag.SENDING,
+            )
+            val attempt = updated.attempts.last()
+            mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
+            effects += RelayV2OutboxEffect.ExecuteCommand(updated.command(), attempt)
+        }
+        return apply(state, mutations, effects)
+    }
+
+    private fun dispatchEligibleEntries(
+        state: RelayV2OutboxState,
+    ): List<RelayV2OutboxEntry> {
         val blocked = mutableSetOf<RelayV2OutboxLaneKey>()
         val eligible = mutableListOf<RelayV2OutboxEntry>()
         state.entries.forEach { entry ->
@@ -1222,25 +1264,7 @@ internal class RelayV2OutboxAuthorityCore(
                 -> Unit
             }
         }
-        if (!eligible.map { it.id }.toSet().containsAll(action.attemptRequestIds.keys)) {
-            return state.reject(RelayV2OutboxRejection.INVALID_TRANSITION)
-        }
-
-        val mutations = mutableListOf<RelayV2OutboxMutation>()
-        val effects = mutableListOf<RelayV2OutboxEffect>()
-        eligible.forEach { entry ->
-            if (effects.size >= action.effectBudget) return@forEach
-            val requestId = action.attemptRequestIds[entry.id] ?: return@forEach
-            val updated = entry.appendAttempt(
-                requestId,
-                RelayV2OutboxAttemptKind.EXECUTE,
-                RelayV2OutboxStateTag.SENDING,
-            )
-            val attempt = updated.attempts.last()
-            mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
-            effects += RelayV2OutboxEffect.ExecuteCommand(updated.command(), attempt)
-        }
-        return apply(state, mutations, effects)
+        return eligible
     }
 
     private fun beginQueries(
