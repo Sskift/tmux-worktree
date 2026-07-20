@@ -67,44 +67,11 @@ export type RelayV2CarrierPumpBrokerPort = Readonly<Pick<
   | "disconnectHost"
 >>;
 
-declare const RELAY_V2_BROKER_SHARED_PRODUCER_HOST_PUMP_AUTHORITY: unique symbol;
-
-/** Process-local proof that one Pump and one client WSS runtime share a registry. */
-export interface RelayV2BrokerSharedProducerHostPumpAuthority {
-  readonly [RELAY_V2_BROKER_SHARED_PRODUCER_HOST_PUMP_AUTHORITY]: never;
-}
-
 type RelayV2BrokerSharedProducerHostPumpOwner = Readonly<{
   broker: RelayV2CarrierPumpBrokerPort;
   producerRegistry: RelayV2BrokerProducerRegistry;
   applyBrokerAction: RelayV2BrokerClientWssRuntimeComposition["applyBrokerAction"];
 }>;
-
-const SHARED_PRODUCER_HOST_PUMP_AUTHORITIES = new WeakMap<
-  object,
-  RelayV2BrokerSharedProducerHostPumpOwner
->();
-
-/**
- * Composition-only receipt issuer. The receipt has no visible state; the
- * canonical Pump factory recovers both exact owners from this module's lexical
- * WeakMap, so neither can be substituted through a copied or wrapped value.
- */
-function issueRelayV2BrokerSharedProducerHostPumpAuthority(
-  broker: RelayV2CarrierPumpBrokerPort,
-  producerRegistry: RelayV2BrokerProducerRegistry,
-  applyBrokerAction: RelayV2BrokerClientWssRuntimeComposition["applyBrokerAction"],
-): RelayV2BrokerSharedProducerHostPumpAuthority {
-  const authority = Object.freeze(
-    Object.create(null),
-  ) as RelayV2BrokerSharedProducerHostPumpAuthority;
-  SHARED_PRODUCER_HOST_PUMP_AUTHORITIES.set(authority, Object.freeze({
-    broker,
-    producerRegistry,
-    applyBrokerAction,
-  }));
-  return authority;
-}
 
 export interface RelayV2CarrierPumpOptions {
   broker: RelayV2CarrierPumpBrokerPort;
@@ -145,11 +112,7 @@ export type RelayV2BrokerSharedProducerHostPumpOptions = Omit<
 
 export type RelayV2BrokerSharedProducerClientWssRuntime = Readonly<Pick<
   RelayV2BrokerClientWssRuntimeComposition,
-  | "sealClientAdmission"
-  | "prepareClientWss"
-  | "attachPreparedClientWss"
-  | "applyBrokerAction"
-  | "closeAndDrain"
+  "prepareClientWss" | "attachPreparedClientWss"
 >>;
 
 export type RelayV2BrokerSharedProducerRuntimeCompositionOptions = Omit<
@@ -157,9 +120,27 @@ export type RelayV2BrokerSharedProducerRuntimeCompositionOptions = Omit<
   "producerRegistry" | "resolveHostProducerBinding"
 >;
 
+export type RelayV2BrokerManagedHostCarrierPump = Readonly<Pick<
+  RelayV2BrokerHostCarrierPump,
+  | "producerComposition"
+  | "start"
+  | "snapshot"
+  | "acceptBrokerResult"
+  | "writable"
+  | "setWritable"
+  | "sweep"
+  | "whenCloseSettled"
+  | "trySend"
+  | "bufferedAmount"
+  | "close"
+>>;
+
 export type RelayV2BrokerSharedProducerRuntimeComposition = Readonly<{
   clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
-  hostPumpAuthority: RelayV2BrokerSharedProducerHostPumpAuthority;
+  createHostCarrierPump(
+    options: RelayV2BrokerSharedProducerHostPumpOptions,
+  ): RelayV2BrokerManagedHostCarrierPump;
+  closeAndDrain(): Promise<void>;
 }>;
 
 export type RelayV2BrokerHostCarrierPumpProducerComposition = Readonly<{
@@ -465,6 +446,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private mandatoryActionBytes = 0;
   private mandatoryActionCount = 0;
   private readonly ownerFenceStates = new Map<string, Set<OwnerFenceState>>();
+  private readonly hostTransport: RelayV2HostCarrierTransport;
   private hostConnection: RelayV2HostCarrierConnection | null = null;
   private phase: RelayV2CarrierPumpSnapshot["phase"] = "idle";
   private pumpTimer: { cancel: () => void } | null = null;
@@ -515,6 +497,13 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       const timer = setTimeout(callback, delayMs);
       timer.unref();
       return () => clearTimeout(timer);
+    });
+    this.hostTransport = Object.freeze({
+      trySend: (frame: Uint8Array, deliveryToken: string) => (
+        this.trySend(frame, deliveryToken)
+      ),
+      bufferedAmount: () => this.bufferedAmount(),
+      close: (code: number, reason: string) => this.close(code, reason),
     });
     this.closeBarrier = new Promise((resolve) => {
       this.resolveCloseBarrier = resolve;
@@ -571,7 +560,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       }
       attached = true;
       this.hostConnection = this.options.host.connect(
-        this,
+        this.hostTransport,
         this.options.credentialReference,
       );
     } catch (error) {
@@ -2608,20 +2597,13 @@ function forceRelayV2BrokerSharedProducerClientEffect(
 }
 
 /**
- * Canonical shared-producer Pump construction. Authority lookup happens before
- * any Pump option is read or any producer/Host side effect can begin.
+ * Canonical shared-producer Pump construction. Its owner is lexical to this
+ * module; callers cannot substitute the Broker, registry, or client outlet.
  */
-export function createRelayV2BrokerSharedProducerHostCarrierPump(
-  authority: RelayV2BrokerSharedProducerHostPumpAuthority,
+function createRelayV2BrokerSharedProducerHostCarrierPump(
+  owner: RelayV2BrokerSharedProducerHostPumpOwner,
   options: RelayV2BrokerSharedProducerHostPumpOptions,
 ): RelayV2BrokerHostCarrierPump {
-  const owner = authority !== null
-      && (typeof authority === "object" || typeof authority === "function")
-    ? SHARED_PRODUCER_HOST_PUMP_AUTHORITIES.get(authority as object)
-    : undefined;
-  if (!owner) {
-    throw new Error("invalid Relay v2 shared-producer Host Pump authority");
-  }
   return new RelayV2BrokerHostCarrierPump({
     ...options,
     broker: owner.broker,
@@ -2637,39 +2619,268 @@ export function createRelayV2BrokerSharedProducerHostCarrierPump(
   });
 }
 
+function createRelayV2BrokerManagedHostCarrierPump(
+  pump: RelayV2BrokerHostCarrierPump,
+): RelayV2BrokerManagedHostCarrierPump {
+  return Object.freeze({
+    producerComposition: pump.producerComposition,
+    start: pump.start.bind(pump),
+    snapshot: pump.snapshot.bind(pump),
+    acceptBrokerResult: pump.acceptBrokerResult.bind(pump),
+    writable: pump.writable.bind(pump),
+    setWritable: pump.setWritable.bind(pump),
+    sweep: pump.sweep.bind(pump),
+    whenCloseSettled: pump.whenCloseSettled.bind(pump),
+    trySend: pump.trySend.bind(pump),
+    bufferedAmount: pump.bufferedAmount.bind(pump),
+    close: pump.close.bind(pump),
+  });
+}
+
+type RelayV2BrokerSharedProducerPumpConstructionReservation = Readonly<{
+  barrier: Promise<RelayV2CarrierPumpCloseReceipt | null>;
+  resolve(receipt: RelayV2CarrierPumpCloseReceipt | null): void;
+  reject(error: unknown): void;
+}>;
+
+function createRelayV2BrokerSharedProducerPumpConstructionReservation(
+): RelayV2BrokerSharedProducerPumpConstructionReservation {
+  let resolve!: (receipt: RelayV2CarrierPumpCloseReceipt | null) => void;
+  let reject!: (error: unknown) => void;
+  const barrier = new Promise<RelayV2CarrierPumpCloseReceipt | null>((settle, fail) => {
+    resolve = settle;
+    reject = fail;
+  });
+  void barrier.catch(() => {});
+  return Object.freeze({ barrier, resolve, reject });
+}
+
+class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
+  readonly clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
+
+  private readonly producerRegistry = new RelayV2BrokerProducerRegistry();
+  private readonly runtime: RelayV2BrokerClientWssRuntimeComposition;
+  private readonly hostPumpOwner: RelayV2BrokerSharedProducerHostPumpOwner;
+  private readonly hostPumps = new Set<RelayV2BrokerHostCarrierPump>();
+  private readonly observedPumpCloseReceipts = new WeakSet<
+    RelayV2CarrierPumpCloseReceipt
+  >();
+  private readonly constructionReservations = new Set<
+    RelayV2BrokerSharedProducerPumpConstructionReservation
+  >();
+  private terminalPumpFailureCount = 0;
+  private firstTerminalPumpFailureReason: string | null = null;
+  private hostPumpAdmissionOpen = true;
+  private closeDrain: Promise<void> | null = null;
+
+  constructor(options: RelayV2BrokerSharedProducerRuntimeCompositionOptions) {
+    this.runtime = createRelayV2BrokerClientWssRuntimeComposition({
+      ...options,
+      producerRegistry: this.producerRegistry,
+      resolveHostProducerBinding: (fence) => {
+        const owner = this.producerRegistry.inspectHostProducerOwner(
+          fence.transportId,
+          fence.connectionIncarnation,
+        );
+        return owner.status === "current" ? owner.binding : undefined;
+      },
+    });
+    this.hostPumpOwner = Object.freeze({
+      broker: this.runtime.hostPumpBrokerAuthority,
+      producerRegistry: this.producerRegistry,
+      applyBrokerAction: this.runtime.applyBrokerAction,
+    });
+    this.clientWssRuntime = Object.freeze({
+      prepareClientWss: this.runtime.prepareClientWss,
+      attachPreparedClientWss: this.runtime.attachPreparedClientWss,
+    });
+  }
+
+  createHostCarrierPump(
+    options: RelayV2BrokerSharedProducerHostPumpOptions,
+  ): RelayV2BrokerManagedHostCarrierPump {
+    // This cut intentionally precedes reservation construction and every
+    // caller-owned reflection performed by the canonical Pump constructor.
+    if (!this.hostPumpAdmissionOpen) {
+      throw new Error("Relay v2 shared-producer Host Pump admission is closed");
+    }
+    const reservation = createRelayV2BrokerSharedProducerPumpConstructionReservation();
+    this.constructionReservations.add(reservation);
+
+    let pump: RelayV2BrokerHostCarrierPump;
+    try {
+      pump = createRelayV2BrokerSharedProducerHostCarrierPump(
+        this.hostPumpOwner,
+        options,
+      );
+    } catch (error) {
+      // The constructor publishes no Pump handle on failure. Its only
+      // registry mutation is the final successful construction step, so no
+      // lifecycle resource exists at this boundary.
+      this.constructionReservations.delete(reservation);
+      reservation.resolve(null);
+      throw error;
+    }
+
+    this.hostPumps.add(pump);
+    this.observeHostPumpClose(pump);
+    if (!this.hostPumpAdmissionOpen) {
+      // closeAndDrain may have reentered through hostile option capture. The
+      // construction reservation remains live through the Pump's real close
+      // receipt, and the caller never receives a live Pump.
+      this.settleConstructionReservationWithShutdown(reservation, pump);
+      throw new Error("Relay v2 shared-producer Host Pump construction crossed close");
+    }
+    this.constructionReservations.delete(reservation);
+    reservation.resolve(null);
+    return createRelayV2BrokerManagedHostCarrierPump(pump);
+  }
+
+  closeAndDrain(): Promise<void> {
+    if (this.closeDrain) return this.closeDrain;
+
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    const published = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    void published.catch(() => {});
+    // Publish the stable identity before either synchronous admission cut can
+    // invoke caller-controlled or nested lifecycle behavior.
+    this.closeDrain = published;
+    this.hostPumpAdmissionOpen = false;
+
+    let sealFailure: unknown;
+    try {
+      this.runtime.sealClientAdmission();
+    } catch (error) {
+      sealFailure = error;
+    }
+
+    // Every Pump present at the close cut begins shutdown in this turn. No
+    // receipt is awaited until all siblings have received their terminal cut.
+    const pumpBarriers: Array<Promise<RelayV2CarrierPumpCloseReceipt | null>> = [];
+    for (const pump of this.hostPumps) {
+      pumpBarriers.push(this.shutdownPump(pump));
+    }
+    for (const reservation of this.constructionReservations) {
+      pumpBarriers.push(reservation.barrier);
+    }
+
+    void this.finishCloseAndDrain(pumpBarriers, sealFailure).then(
+      resolveClose,
+      rejectClose,
+    );
+    return published;
+  }
+
+  private shutdownPump(
+    pump: RelayV2BrokerHostCarrierPump,
+  ): Promise<RelayV2CarrierPumpCloseReceipt> {
+    try {
+      return Promise.resolve(pump.shutdown());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  private settleConstructionReservationWithShutdown(
+    reservation: RelayV2BrokerSharedProducerPumpConstructionReservation,
+    pump: RelayV2BrokerHostCarrierPump,
+  ): void {
+    const shutdown = this.shutdownPump(pump);
+    void shutdown.then(
+      (receipt) => {
+        this.constructionReservations.delete(reservation);
+        reservation.resolve(receipt);
+      },
+      (error) => {
+        this.constructionReservations.delete(reservation);
+        reservation.reject(error);
+      },
+    );
+  }
+
+  private observeHostPumpClose(pump: RelayV2BrokerHostCarrierPump): void {
+    void pump.whenCloseSettled().then((receipt) => {
+      this.hostPumps.delete(pump);
+      this.observePumpCloseReceipt(receipt);
+    });
+  }
+
+  private observePumpCloseReceipt(receipt: RelayV2CarrierPumpCloseReceipt): void {
+    if (this.observedPumpCloseReceipts.has(receipt)) return;
+    this.observedPumpCloseReceipts.add(receipt);
+    if (receipt.outcome !== "terminal_failure") return;
+    this.terminalPumpFailureCount = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      this.terminalPumpFailureCount + 1,
+    );
+    if (this.firstTerminalPumpFailureReason !== null) return;
+    this.firstTerminalPumpFailureReason = /^[a-z0-9_]{1,128}$/.test(receipt.reason)
+      ? receipt.reason
+      : "carrier_pump_terminal_failure";
+  }
+
+  private async finishCloseAndDrain(
+    pumpBarriers: readonly Promise<RelayV2CarrierPumpCloseReceipt | null>[],
+    sealFailure: unknown,
+  ): Promise<void> {
+    const failures: unknown[] = [];
+    if (sealFailure !== undefined) failures.push(sealFailure);
+
+    const pumpSettlements = await Promise.allSettled(pumpBarriers);
+    for (const settlement of pumpSettlements) {
+      if (settlement.status === "rejected") {
+        failures.push(settlement.reason);
+      } else if (settlement.value !== null) {
+        this.observePumpCloseReceipt(settlement.value);
+      }
+    }
+    if (this.terminalPumpFailureCount > 0) {
+      failures.push(new Error(
+        "Relay v2 shared-producer tracked Host Pump terminal failure "
+          + `(${this.terminalPumpFailureCount}): `
+          + (this.firstTerminalPumpFailureReason ?? "carrier_pump_terminal_failure"),
+      ));
+    }
+
+    let clientBarrier: Promise<void>;
+    try {
+      clientBarrier = this.runtime.closeAndDrain();
+    } catch (error) {
+      clientBarrier = Promise.reject(error);
+    }
+    const [clientSettlement] = await Promise.allSettled([clientBarrier]);
+    if (clientSettlement.status === "rejected") {
+      failures.push(clientSettlement.reason);
+    }
+
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        "Relay v2 shared-producer runtime close failed",
+      );
+    }
+  }
+}
+
 /**
- * Default-off shared-producer composition. This module creates the sole
- * registry, closes the resolver over it, and signs the paired Pump authority
- * without exposing any raw owner or receipt issuer.
+ * Default-off shared-producer composition and total in-process lifecycle
+ * owner. Construction still creates no Pump, listener, server, credential,
+ * process, timer, capability advertisement, or protocol fallback.
  */
 export function createRelayV2BrokerSharedProducerRuntimeComposition(
   options: RelayV2BrokerSharedProducerRuntimeCompositionOptions = {},
 ): RelayV2BrokerSharedProducerRuntimeComposition {
-  const producerRegistry = new RelayV2BrokerProducerRegistry();
-  const runtime = createRelayV2BrokerClientWssRuntimeComposition({
-    ...options,
-    producerRegistry,
-    resolveHostProducerBinding: (fence) => {
-      const owner = producerRegistry.inspectHostProducerOwner(
-        fence.transportId,
-        fence.connectionIncarnation,
-      );
-      return owner.status === "current" ? owner.binding : undefined;
-    },
-  });
-  const clientWssRuntime = Object.freeze({
-    sealClientAdmission: runtime.sealClientAdmission,
-    prepareClientWss: runtime.prepareClientWss,
-    attachPreparedClientWss: runtime.attachPreparedClientWss,
-    applyBrokerAction: runtime.applyBrokerAction,
-    closeAndDrain: runtime.closeAndDrain,
-  });
+  const owner = new RelayV2BrokerSharedProducerRuntimeCompositionOwner(options);
   return Object.freeze({
-    clientWssRuntime,
-    hostPumpAuthority: issueRelayV2BrokerSharedProducerHostPumpAuthority(
-      runtime.hostPumpBrokerAuthority,
-      producerRegistry,
-      runtime.applyBrokerAction,
-    ),
+    clientWssRuntime: owner.clientWssRuntime,
+    createHostCarrierPump: (
+      pumpOptions: RelayV2BrokerSharedProducerHostPumpOptions,
+    ) => owner.createHostCarrierPump(pumpOptions),
+    closeAndDrain: () => owner.closeAndDrain(),
   });
 }
