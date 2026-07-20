@@ -12,15 +12,22 @@ import {
 import type {
   RelayV2DashboardManagementProtocolV2Request,
 } from "./relayV2DashboardManagementProtocolV2.js";
-
+import {
+  abortRelayV2HostDashboardManagementBinding,
+  claimRelayV2HostDashboardManagementPort,
+  type RelayV2HostDashboardManagementBinding,
+  type RelayV2HostDashboardManagementPort,
+} from "./hostRuntimeComposition.js";
 type DataRecord = Record<string, unknown>;
 type SessionCompositionOwnerOptions = Omit<
   RelayV2DashboardManagementCompositionOptions,
-  "signal"
+  "signal" | "hostManagementBinding"
 >;
 
 export interface RelayV2DashboardManagementProtocolV2CompositionSessionOptions
-extends RelayV2DashboardManagementCompositionOptions {
+extends SessionCompositionOwnerOptions {
+  readonly hostManagementPort: RelayV2HostDashboardManagementPort;
+  readonly signal: AbortSignal;
   readonly runtimeVersion: string;
   readonly io: RelayV2DashboardManagementStdioIo;
 }
@@ -40,6 +47,7 @@ export class RelayV2DashboardManagementProtocolV2CompositionSessionClosedError
 
 interface SessionSignature {
   readonly ownerOptions: SessionCompositionOwnerOptions;
+  readonly hostManagementPort: RelayV2HostDashboardManagementPort;
   readonly externalSignal: AbortSignal;
   readonly externalAbort: CapturedNativeAbortSignal;
   readonly runtimeVersion: string;
@@ -73,8 +81,7 @@ interface SessionOwnedAbortController {
 
 const credentialAuthoritySessions = new WeakMap<object, SessionActivation>();
 const credentialCoordinatorSessions = new WeakMap<object, SessionActivation>();
-const connectorControllerSessions = new WeakMap<object, SessionActivation>();
-const hostCarrierActorSessions = new WeakMap<object, SessionActivation>();
+const hostManagementPortSessions = new WeakMap<object, SessionActivation>();
 const INPUT_CLOSED = Symbol("relay-v2-dashboard-management-input-closed");
 const MAX_METHOD_PROTOTYPE_DEPTH = 32;
 
@@ -261,8 +268,7 @@ function captureOptions(
   const fields = exactDataObject(options, [
     "credentialAuthority",
     "credentialExchangeCoordinator",
-    "connectorController",
-    "hostCarrierActor",
+    "hostManagementPort",
     "hostId",
     "hostEpoch",
     "hostInstanceId",
@@ -279,8 +285,7 @@ function captureOptions(
   const externalAbort = captureNativeAbortSignal(fields.signal);
   if (!isObject(fields.credentialAuthority)
     || !isObject(fields.credentialExchangeCoordinator)
-    || !isObject(fields.connectorController)
-    || !isObject(fields.hostCarrierActor)
+    || typeof fields.hostManagementPort !== "function"
     || typeof fields.clock !== "function"
     || typeof fields.runtimeVersion !== "string"
     || !isObject(fields.io)
@@ -289,8 +294,6 @@ function captureOptions(
   const ownerOptions = Object.freeze({
     credentialAuthority: fields.credentialAuthority,
     credentialExchangeCoordinator: fields.credentialExchangeCoordinator,
-    connectorController: fields.connectorController,
-    hostCarrierActor: fields.hostCarrierActor,
     hostId: fields.hostId,
     hostEpoch: fields.hostEpoch,
     hostInstanceId: fields.hostInstanceId,
@@ -301,6 +304,7 @@ function captureOptions(
   }) as SessionCompositionOwnerOptions;
   return Object.freeze({
     ownerOptions,
+    hostManagementPort: fields.hostManagementPort as RelayV2HostDashboardManagementPort,
     externalSignal: fields.signal,
     externalAbort,
     runtimeVersion: fields.runtimeVersion,
@@ -316,8 +320,7 @@ function sameSignature(left: SessionSignature, right: SessionSignature): boolean
   const b = right.ownerOptions;
   return a.credentialAuthority === b.credentialAuthority
     && a.credentialExchangeCoordinator === b.credentialExchangeCoordinator
-    && a.connectorController === b.connectorController
-    && a.hostCarrierActor === b.hostCarrierActor
+    && left.hostManagementPort === right.hostManagementPort
     && a.hostId === b.hostId
     && a.hostEpoch === b.hostEpoch
     && a.hostInstanceId === b.hostInstanceId
@@ -338,8 +341,7 @@ function existingSession(signature: SessionSignature): SessionActivation | null 
   const records = [
     credentialAuthoritySessions.get(composition.credentialAuthority),
     credentialCoordinatorSessions.get(composition.credentialExchangeCoordinator),
-    connectorControllerSessions.get(composition.connectorController),
-    hostCarrierActorSessions.get(composition.hostCarrierActor),
+    hostManagementPortSessions.get(signature.hostManagementPort),
   ];
   const existing = records.filter(
     (record): record is SessionActivation => record !== undefined,
@@ -420,7 +422,14 @@ export function createRelayV2DashboardManagementProtocolV2CompositionSession(
   const existing = existingSession(signature);
   if (existing !== null) return existing.handle;
 
-  let composition: RelayV2DashboardManagementComposition;
+  let composition: RelayV2DashboardManagementComposition | null = null;
+  let hostManagementBinding: RelayV2HostDashboardManagementBinding | null = null;
+  const hostIdentity = Object.freeze({
+    hostId: signature.ownerOptions.hostId,
+    hostEpoch: signature.ownerOptions.hostEpoch,
+    hostInstanceId: signature.ownerOptions.hostInstanceId,
+    credentialReference: signature.ownerOptions.credentialReference,
+  });
   const ownerAbort = createSessionOwnedAbortController();
   let abortObserved = signature.externalAbort.initiallyAborted;
   let ownerAbortForwarded = false;
@@ -445,22 +454,6 @@ export function createRelayV2DashboardManagementProtocolV2CompositionSession(
       signature.externalAbort.removeAbortListener(abortListener);
     } catch {}
   };
-  try {
-    if (abortObserved) forwardOwnerAbort();
-    signature.externalAbort.addAbortListener(abortListener);
-    abortListenerInstalled = true;
-    if (signature.externalAbort.isCurrentlyAborted()) abortListener();
-    composition = claimRelayV2DashboardManagementCompositionForProtocolV2Session(
-      Object.freeze({
-        ...signature.ownerOptions,
-        signal: ownerAbort.signal,
-      }),
-    );
-  } catch {
-    removeAbortListener();
-    return closed();
-  }
-
   const closableInput = createClosableInput(
     signature.input,
     signature.inputIteratorFactory,
@@ -474,8 +467,15 @@ export function createRelayV2DashboardManagementProtocolV2CompositionSession(
     accepting = false;
     closableInput.close();
     if (closePromise !== null) return closePromise;
+    const activeComposition = composition;
+    if (activeComposition === null) {
+      closePromise = Promise.reject(
+        new RelayV2DashboardManagementProtocolV2CompositionSessionClosedError(),
+      );
+      return closePromise;
+    }
     closePromise = Promise.resolve().then(
-      () => composition.closeAndDrain(),
+      () => activeComposition.closeAndDrain(),
     ).catch(() => {
       throw new RelayV2DashboardManagementProtocolV2CompositionSessionClosedError();
     }).finally(() => {
@@ -491,12 +491,13 @@ export function createRelayV2DashboardManagementProtocolV2CompositionSession(
 
   const handler = Object.freeze(Object.assign(Object.create(null), {
     handle(request: RelayV2DashboardManagementProtocolV2Request) {
-      if (!accepting) {
+      const activeComposition = composition;
+      if (!accepting || activeComposition === null) {
         return Promise.reject(
           new RelayV2DashboardManagementProtocolV2CompositionSessionClosedError(),
         );
       }
-      return composition.handleRequest(request);
+      return activeComposition.handleRequest(request);
     },
   }));
   const stdio = createRelayV2DashboardManagementProtocolV2StdioSession({
@@ -542,21 +543,51 @@ export function createRelayV2DashboardManagementProtocolV2CompositionSession(
     externallyClosed = true;
     return beginCloseAndDrain();
   };
-
-  forwardAbort = onAbort;
-  if (abortObserved) onAbort();
-
   const handle = Object.freeze(Object.assign(Object.create(null), {
     run,
     closeAndDrain,
   })) as RelayV2DashboardManagementProtocolV2CompositionSession;
   const activation = Object.freeze({ signature, handle });
+
+  try {
+    if (abortObserved) forwardOwnerAbort();
+    signature.externalAbort.addAbortListener(abortListener);
+    abortListenerInstalled = true;
+    if (signature.externalAbort.isCurrentlyAborted()) abortListener();
+    hostManagementBinding = claimRelayV2HostDashboardManagementPort(
+      signature.hostManagementPort,
+      hostIdentity,
+      signature.ownerOptions.credentialAuthority,
+    );
+    if (hostManagementBinding === null) return closed();
+    composition = claimRelayV2DashboardManagementCompositionForProtocolV2Session(
+      Object.freeze({
+        ...signature.ownerOptions,
+        hostManagementBinding,
+        signal: ownerAbort.signal,
+      }),
+    );
+  } catch {
+    if (hostManagementBinding !== null) {
+      abortRelayV2HostDashboardManagementBinding(
+        hostManagementBinding,
+        hostIdentity,
+        signature.ownerOptions.credentialAuthority,
+      );
+    }
+    accepting = false;
+    closableInput.close();
+    removeAbortListener();
+    return closed();
+  }
+
   credentialAuthoritySessions.set(signature.ownerOptions.credentialAuthority, activation);
   credentialCoordinatorSessions.set(
     signature.ownerOptions.credentialExchangeCoordinator,
     activation,
   );
-  connectorControllerSessions.set(signature.ownerOptions.connectorController, activation);
-  hostCarrierActorSessions.set(signature.ownerOptions.hostCarrierActor, activation);
+  hostManagementPortSessions.set(signature.hostManagementPort, activation);
+  forwardAbort = onAbort;
+  if (abortObserved) onAbort();
   return handle;
 }

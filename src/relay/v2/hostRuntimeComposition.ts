@@ -26,6 +26,7 @@ import {
 } from "./hostConnectorController.js";
 import type {
   RelayV2HostConnectorControllerCut,
+  RelayV2HostConnectorControllerPort,
   RelayV2HostConnectorControllerStartResult,
   RelayV2HostConnectorControllerStopResult,
   RelayV2HostConnectorAttemptPort,
@@ -98,6 +99,15 @@ import type {
   RelayV2TerminalOpenResponseLineage,
   RelayV2TerminalRuntimeBinding,
 } from "./terminalManager.js";
+/*
+ * This import is intentionally the narrow Dashboard authority error/port
+ * boundary. The managed Host owner still never imports a Dashboard session,
+ * protocol, process, or renderer composition.
+ */
+import {
+  RelayV2DashboardManagementAuthorityFailure,
+  type RelayV2DashboardManagementCarrierControlPort,
+} from "./relayV2DashboardManagementAuthority.js";
 import { isRelayV2AuthIdentifier } from "./token.js";
 
 type ManualReadinessSource = Exclude<
@@ -106,8 +116,51 @@ type ManualReadinessSource = Exclude<
 >;
 
 const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
+const HOST_CARRIER_CREATE_DASHBOARD_MANAGEMENT_CONTROL =
+  RelayV2HostCarrierActor.prototype.createDashboardManagementCarrierControlAdapter;
 
 declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
+declare const relayV2HostDashboardManagementPortBrand: unique symbol;
+declare const relayV2HostDashboardManagementBindingBrand: unique symbol;
+
+/** Opaque, owner-bound claim token emitted by one managed Host composition. */
+export interface RelayV2HostDashboardManagementPort {
+  readonly [relayV2HostDashboardManagementPortBrand]: true;
+}
+
+/** Opaque result of the session owner's successful one-shot port claim. */
+export interface RelayV2HostDashboardManagementBinding {
+  readonly [relayV2HostDashboardManagementBindingBrand]: true;
+}
+
+export interface RelayV2HostDashboardManagementIdentity {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly credentialReference: string;
+}
+
+export interface RelayV2HostDashboardManagementClosedPorts {
+  readonly connectorLifecycle: RelayV2HostConnectorControllerPort;
+  readonly carrierControl: RelayV2DashboardManagementCarrierControlPort;
+}
+
+type RelayV2HostDashboardManagementPortCapability =
+  RelayV2HostDashboardManagementPort & ((
+    candidate: unknown,
+    expectedIdentity: RelayV2HostDashboardManagementIdentity,
+    expectedCredentialOwner: object,
+  ) => RelayV2HostDashboardManagementBinding | null);
+type RelayV2HostDashboardManagementBindingOperation = "consume" | "commit" | "abort";
+type RelayV2HostDashboardManagementBindingOperationResult =
+  RelayV2HostDashboardManagementClosedPorts | boolean | null;
+type RelayV2HostDashboardManagementBindingCapability =
+  RelayV2HostDashboardManagementBinding & ((
+    candidate: unknown,
+    operation: RelayV2HostDashboardManagementBindingOperation,
+    expectedIdentity: RelayV2HostDashboardManagementIdentity,
+    expectedCredentialOwner: object,
+  ) => RelayV2HostDashboardManagementBindingOperationResult);
 
 /** Opaque issuer half; its receiver identity never leaves this module. */
 export interface RelayV2RecoveredHostH2CompositionPair {
@@ -381,6 +434,7 @@ export type RelayV2HostManagedConnectorInspection =
     }>;
 
 export interface RelayV2HostManagedConnectorRuntimeComposition {
+  readonly dashboardManagementPort: RelayV2HostDashboardManagementPort;
   inspect(): RelayV2HostManagedConnectorInspection;
   start(
     input: Readonly<RelayV2HostManagedConnectorStartInput>,
@@ -1388,6 +1442,133 @@ function isManagedWssCredentialReference(value: unknown): value is string {
     && !/^(?:twcap2|twref2|twenroll2|twhostboot2)\./.test(identifier);
 }
 
+function captureDashboardManagementIdentity(
+  value: unknown,
+): RelayV2HostDashboardManagementIdentity | null {
+  let fields: Record<string, unknown>;
+  try {
+    fields = exactManagedDataObject(value, [
+      "hostId", "hostEpoch", "hostInstanceId", "credentialReference",
+    ]);
+  } catch {
+    return null;
+  }
+  if (!isRelayV2AuthIdentifier(fields.hostId)
+    || !isRelayV2AuthIdentifier(fields.hostEpoch)
+    || !isRelayV2AuthIdentifier(fields.hostInstanceId)
+    || !isManagedWssCredentialReference(fields.credentialReference)) return null;
+  return Object.freeze({
+    hostId: fields.hostId,
+    hostEpoch: fields.hostEpoch,
+    hostInstanceId: fields.hostInstanceId,
+    credentialReference: fields.credentialReference,
+  });
+}
+
+function sameDashboardManagementIdentity(
+  left: RelayV2HostDashboardManagementIdentity,
+  right: RelayV2HostDashboardManagementIdentity,
+): boolean {
+  return left.hostId === right.hostId
+    && left.hostEpoch === right.hostEpoch
+    && left.hostInstanceId === right.hostInstanceId
+    && left.credentialReference === right.credentialReference;
+}
+
+/**
+ * One-shot claim used only by the protocol-v2 session owner. The opaque port
+ * carries no reflective owner state; copies, proxies, foreign identities and
+ * replays do not reach the managed Host owner.
+ */
+export function claimRelayV2HostDashboardManagementPort(
+  port: unknown,
+  expectedIdentity: unknown,
+  expectedCredentialOwner: unknown,
+): RelayV2HostDashboardManagementBinding | null {
+  if (typeof port !== "function" || nodeTypes.isProxy(port)
+    || typeof expectedCredentialOwner !== "object" || expectedCredentialOwner === null
+    || nodeTypes.isProxy(expectedCredentialOwner)) return null;
+  const identity = captureDashboardManagementIdentity(expectedIdentity);
+  if (identity === null) return null;
+  try {
+    return Reflect.apply(
+      port as RelayV2HostDashboardManagementPortCapability,
+      undefined,
+      [port, identity, expectedCredentialOwner],
+    );
+  } catch {
+    return null;
+  }
+}
+
+function operateRelayV2HostDashboardManagementBinding(
+  binding: unknown,
+  operation: RelayV2HostDashboardManagementBindingOperation,
+  expectedIdentity: unknown,
+  expectedCredentialOwner: unknown,
+): RelayV2HostDashboardManagementBindingOperationResult {
+  if (typeof binding !== "function" || nodeTypes.isProxy(binding)
+    || typeof expectedCredentialOwner !== "object" || expectedCredentialOwner === null
+    || nodeTypes.isProxy(expectedCredentialOwner)) return null;
+  const identity = captureDashboardManagementIdentity(expectedIdentity);
+  if (identity === null) return null;
+  try {
+    return Reflect.apply(
+      binding as RelayV2HostDashboardManagementBindingCapability,
+      undefined,
+      [binding, operation, identity, expectedCredentialOwner],
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Transfers a claimed binding once into the Dashboard management composition.
+ * The returned ports are closed facades; neither raw owner is observable.
+ */
+export function consumeRelayV2HostDashboardManagementBinding(
+  binding: unknown,
+  expectedIdentity: unknown,
+  expectedCredentialOwner: unknown,
+): RelayV2HostDashboardManagementClosedPorts | null {
+  const result = operateRelayV2HostDashboardManagementBinding(
+    binding,
+    "consume",
+    expectedIdentity,
+    expectedCredentialOwner,
+  );
+  return typeof result === "object" && result !== null
+    ? result as RelayV2HostDashboardManagementClosedPorts
+    : null;
+}
+
+export function commitRelayV2HostDashboardManagementBinding(
+  binding: unknown,
+  expectedIdentity: unknown,
+  expectedCredentialOwner: unknown,
+): boolean {
+  return operateRelayV2HostDashboardManagementBinding(
+    binding,
+    "commit",
+    expectedIdentity,
+    expectedCredentialOwner,
+  ) === true;
+}
+
+export function abortRelayV2HostDashboardManagementBinding(
+  binding: unknown,
+  expectedIdentity: unknown,
+  expectedCredentialOwner: unknown,
+): boolean {
+  return operateRelayV2HostDashboardManagementBinding(
+    binding,
+    "abort",
+    expectedIdentity,
+    expectedCredentialOwner,
+  ) === true;
+}
+
 function captureManagedStartInput(value: unknown): RelayV2HostManagedConnectorStartInput {
   const fields = exactManagedDataObject(value, ["requestId", "signal"]);
   if (typeof fields.requestId !== "string" || !(fields.signal instanceof AbortSignal)) {
@@ -1513,6 +1694,9 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
     attach(actor: RelayV2HostCarrierActor): void;
     acceptAdapter(): void;
     admitController(connectorId: string): void;
+    managementCarrierControl(
+      connectorId: string,
+    ): RelayV2DashboardManagementCarrierControlPort | null;
     requestReauthentication(requestId: string, connectorId: string): boolean;
     fenceReauthentication(): void;
     observe(status: Readonly<RelayV2HostCarrierStatus>): void;
@@ -1662,6 +1846,24 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             controllerAdmitted = true;
             bridge.observeCarrierStatus(actor, latestStatus);
           },
+          managementCarrierControl(
+            connectorId: string,
+          ): RelayV2DashboardManagementCarrierControlPort | null {
+            if (rejected || !controllerAdmitted || actor === null
+              || latestStatus?.phase !== "registered"
+              || latestStatus.connectorId !== connectorId
+              || attemptRuntimeBindings.get(input.controllerGeneration)
+                !== runtimeBinding) return null;
+            try {
+              return Reflect.apply(
+                HOST_CARRIER_CREATE_DASHBOARD_MANAGEMENT_CONTROL,
+                actor,
+                [],
+              );
+            } catch {
+              return null;
+            }
+          },
           requestReauthentication(requestId: string, connectorId: string): boolean {
             if (rejected || reauthenticationFenced || reauthenticationInFlight
               || !controllerAdmitted || actor === null) return false;
@@ -1748,63 +1950,281 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
     hostInstanceId: runtimeOptions.hostInstanceId,
     credentialReference,
   });
+  let dashboardManagementPort!: RelayV2HostDashboardManagementPortCapability;
+  const dashboardManagementIssuedGeneration = controller.inspectCut().controllerGeneration;
+  const dashboardManagementAuthority = Object.freeze({});
+  let dashboardManagementClaimed = false;
+  let dashboardManagementPendingBinding: RelayV2HostDashboardManagementBinding | null = null;
+  let dashboardManagementPortFenced = false;
   let closeBarrier: Promise<void> | null = null;
-  return Object.freeze({
-    inspect: () => projectManagedConnectorCut(controller.inspectCut()),
-    start(rawInput): Promise<RelayV2HostConnectorControllerStartResult> {
-      let input: RelayV2HostManagedConnectorStartInput;
-      try {
-        input = captureManagedStartInput(rawInput);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      if (closing) {
-        return Promise.reject(new RelayV2HostConnectorControllerError("UNAVAILABLE"));
-      }
-      return controller.start(Object.freeze({ ...identity, ...input })).then((result) => {
-        attemptRuntimeBindings.get(result.controllerGeneration)?.admitController(
-          result.connectorId,
-        );
-        return result;
-      });
-    },
-    requestReauthentication(rawInput): boolean {
-      let input: RelayV2HostManagedConnectorReauthenticationInput;
-      try {
-        input = captureManagedReauthenticationInput(rawInput);
-      } catch {
-        return false;
-      }
-      try {
-        if (closing) return false;
-        const cut = controller.inspectCut();
-        if (cut.status !== "registered"
-          || cut.controllerGeneration !== input.controllerGeneration
-          || cut.connectorId !== input.connectorId) return false;
-        const runtimeBinding = attemptRuntimeBindings.get(input.controllerGeneration);
-        return runtimeBinding?.requestReauthentication(
-          input.requestId,
-          input.connectorId,
-        ) ?? false;
-      } catch {
-        return false;
-      }
-    },
-    stopAndDrain(rawInput): Promise<RelayV2HostConnectorControllerStopResult> {
-      let input: RelayV2HostManagedConnectorStopInput;
-      try {
-        input = captureManagedStopInput(rawInput);
-      } catch (error) {
-        return Promise.reject(error);
+
+  const hasDashboardManagementAuthority = (authority: unknown): boolean => (
+    (!dashboardManagementClaimed && dashboardManagementPendingBinding === null)
+      || authority === dashboardManagementAuthority
+  );
+  const startManagedConnector = (
+    rawInput: unknown,
+    authority?: unknown,
+  ): Promise<RelayV2HostConnectorControllerStartResult> => {
+    let input: RelayV2HostManagedConnectorStartInput;
+    try {
+      input = captureManagedStartInput(rawInput);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (closing || !hasDashboardManagementAuthority(authority)) {
+      return Promise.reject(new RelayV2HostConnectorControllerError("UNAVAILABLE"));
+    }
+    return controller.start(Object.freeze({ ...identity, ...input })).then((result) => {
+      attemptRuntimeBindings.get(result.controllerGeneration)?.admitController(
+        result.connectorId,
+      );
+      return result;
+    });
+  };
+  const requestManagedReauthentication = (
+    rawInput: unknown,
+    authority?: unknown,
+  ): boolean => {
+    let input: RelayV2HostManagedConnectorReauthenticationInput;
+    try {
+      input = captureManagedReauthenticationInput(rawInput);
+    } catch {
+      return false;
+    }
+    try {
+      if (closing || !hasDashboardManagementAuthority(authority)) return false;
+      const cut = controller.inspectCut();
+      if (cut.status !== "registered"
+        || cut.controllerGeneration !== input.controllerGeneration
+        || cut.connectorId !== input.connectorId) return false;
+      const runtimeBinding = attemptRuntimeBindings.get(input.controllerGeneration);
+      return runtimeBinding?.requestReauthentication(
+        input.requestId,
+        input.connectorId,
+      ) ?? false;
+    } catch {
+      return false;
+    }
+  };
+  const stopManagedConnector = (
+    rawInput: unknown,
+    authority?: unknown,
+  ): Promise<RelayV2HostConnectorControllerStopResult> => {
+    let input: RelayV2HostManagedConnectorStopInput;
+    try {
+      input = captureManagedStopInput(rawInput);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!hasDashboardManagementAuthority(authority)) {
+      return Promise.reject(new RelayV2HostConnectorControllerError("UNAVAILABLE"));
+    }
+    const cut = controller.inspectCut();
+    if (sameManagedStopCut(cut, input)) {
+      attemptRuntimeBindings.get(input.controllerGeneration)?.fenceReauthentication();
+      bridge.withdrawCarrierReadiness();
+    }
+    return controller.stopAndDrain(Object.freeze({ ...identity, ...input }));
+  };
+
+  dashboardManagementPort = Object.freeze(function claimDashboardManagementPort(
+    candidate: unknown,
+    claimedIdentity: RelayV2HostDashboardManagementIdentity,
+    claimedCredentialOwner: object,
+  ): RelayV2HostDashboardManagementBinding | null {
+    const requestedIdentity = captureDashboardManagementIdentity(claimedIdentity);
+    if (candidate !== dashboardManagementPort
+      || requestedIdentity === null
+      || !sameDashboardManagementIdentity(identity, requestedIdentity)
+      || claimedCredentialOwner !== carrierOptions.credentialReferences
+      || dashboardManagementClaimed
+      || dashboardManagementPendingBinding !== null
+      || dashboardManagementPortFenced
+      || closing) return null;
+    let authorizedGeneration: string;
+    try {
+      authorizedGeneration = controller.inspectCut().controllerGeneration;
+    } catch {
+      return null;
+    }
+    if (authorizedGeneration !== dashboardManagementIssuedGeneration) return null;
+
+    let transactionState: "pending" | "committed" | "aborted" = "pending";
+    let bindingConsumed = false;
+    let bindingFenced = false;
+    let binding!: RelayV2HostDashboardManagementBindingCapability;
+    const ensureExactGeneration = (): RelayV2HostConnectorControllerCut => {
+      if (transactionState !== "committed" || bindingFenced
+        || dashboardManagementPortFenced || closing) {
+        throw new RelayV2HostConnectorControllerError("UNAVAILABLE");
       }
       const cut = controller.inspectCut();
-      if (sameManagedStopCut(cut, input)) {
-        attemptRuntimeBindings.get(input.controllerGeneration)?.fenceReauthentication();
-        bridge.withdrawCarrierReadiness();
+      if (cut.controllerGeneration !== authorizedGeneration) {
+        bindingFenced = true;
+        throw managedCompositionFailure();
       }
-      const result = controller.stopAndDrain(Object.freeze({ ...identity, ...input }));
-      return result;
-    },
+      return cut;
+    };
+    const connectorLifecycle: RelayV2HostConnectorControllerPort = Object.freeze({
+      inspectCut(): RelayV2HostConnectorControllerCut {
+        return ensureExactGeneration();
+      },
+      start(rawInput): Promise<RelayV2HostConnectorControllerStartResult> {
+        let fields: Record<string, unknown>;
+        try {
+          fields = exactManagedDataObject(rawInput, [
+            "requestId", "hostId", "hostEpoch", "hostInstanceId",
+            "credentialReference", "signal",
+          ]);
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        const requestedStartIdentity = captureDashboardManagementIdentity({
+          hostId: fields.hostId,
+          hostEpoch: fields.hostEpoch,
+          hostInstanceId: fields.hostInstanceId,
+          credentialReference: fields.credentialReference,
+        });
+        if (requestedStartIdentity === null
+          || !sameDashboardManagementIdentity(identity, requestedStartIdentity)
+          || !(fields.signal instanceof AbortSignal)) {
+          return Promise.reject(managedCompositionFailure());
+        }
+        ensureExactGeneration();
+        const pending = startManagedConnector(Object.freeze({
+          requestId: fields.requestId,
+          signal: fields.signal,
+        }), dashboardManagementAuthority);
+        try {
+          authorizedGeneration = controller.inspectCut().controllerGeneration;
+        } catch {
+          bindingFenced = true;
+          return Promise.reject(managedCompositionFailure());
+        }
+        return pending.then((result) => {
+          if (bindingFenced || dashboardManagementPortFenced || closing
+            || result.controllerGeneration !== authorizedGeneration) {
+            bindingFenced = true;
+            throw managedCompositionFailure();
+          }
+          return result;
+        });
+      },
+      stopAndDrain(rawInput): Promise<RelayV2HostConnectorControllerStopResult> {
+        let fields: Record<string, unknown>;
+        try {
+          fields = exactManagedDataObject(rawInput, [
+            "requestId", "controllerGeneration", "connectorId", "hostId",
+            "hostEpoch", "hostInstanceId", "credentialReference", "signal",
+          ]);
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        const requestedStopIdentity = captureDashboardManagementIdentity({
+          hostId: fields.hostId,
+          hostEpoch: fields.hostEpoch,
+          hostInstanceId: fields.hostInstanceId,
+          credentialReference: fields.credentialReference,
+        });
+        if (requestedStopIdentity === null
+          || !sameDashboardManagementIdentity(identity, requestedStopIdentity)
+          || fields.controllerGeneration !== authorizedGeneration
+          || !(fields.signal instanceof AbortSignal)) {
+          return Promise.reject(managedCompositionFailure());
+        }
+        ensureExactGeneration();
+        return stopManagedConnector(Object.freeze({
+          requestId: fields.requestId,
+          controllerGeneration: fields.controllerGeneration,
+          connectorId: fields.connectorId,
+          signal: fields.signal,
+        }), dashboardManagementAuthority).then((result) => {
+          if (result.controllerGeneration !== authorizedGeneration) {
+            bindingFenced = true;
+            throw managedCompositionFailure();
+          }
+          return result;
+        });
+      },
+    });
+    const currentCarrierControl = (): RelayV2DashboardManagementCarrierControlPort => {
+      const cut = ensureExactGeneration();
+      if (cut.status !== "registered") {
+        throw new RelayV2DashboardManagementAuthorityFailure("NOT_READY");
+      }
+      const control = attemptRuntimeBindings.get(
+        authorizedGeneration,
+      )?.managementCarrierControl(cut.connectorId);
+      if (control === null || control === undefined) {
+        throw new RelayV2DashboardManagementAuthorityFailure("NOT_READY");
+      }
+      return control;
+    };
+    const carrierControl: RelayV2DashboardManagementCarrierControlPort = Object.freeze({
+      createEnrollment: (input) => currentCarrierControl().createEnrollment(input),
+      revokeGrant: (input) => currentCarrierControl().revokeGrant(input),
+    });
+    binding = Object.freeze(function operateDashboardManagementBinding(
+      bindingCandidate: unknown,
+      operation: RelayV2HostDashboardManagementBindingOperation,
+      consumedIdentity: RelayV2HostDashboardManagementIdentity,
+      consumedCredentialOwner: object,
+    ): RelayV2HostDashboardManagementBindingOperationResult {
+      const requestedConsumptionIdentity = captureDashboardManagementIdentity(
+        consumedIdentity,
+      );
+      if (bindingCandidate !== binding
+        || requestedConsumptionIdentity === null
+        || !sameDashboardManagementIdentity(identity, requestedConsumptionIdentity)
+        || consumedCredentialOwner !== carrierOptions.credentialReferences) return null;
+      if (operation === "abort") {
+        if (transactionState !== "pending") return false;
+        transactionState = "aborted";
+        let restorable = false;
+        try {
+          restorable = !dashboardManagementPortFenced
+            && !closing
+            && controller.inspectCut().controllerGeneration === authorizedGeneration
+            && authorizedGeneration === dashboardManagementIssuedGeneration
+            && dashboardManagementPendingBinding === binding;
+        } catch {}
+        if (restorable) dashboardManagementPendingBinding = null;
+        return restorable;
+      }
+      if (operation === "consume") {
+        if (transactionState !== "pending" || bindingConsumed
+          || dashboardManagementPendingBinding !== binding
+          || dashboardManagementPortFenced || closing) return null;
+        bindingConsumed = true;
+        return Object.freeze({ connectorLifecycle, carrierControl });
+      }
+      if (operation === "commit") {
+        let exactGeneration = false;
+        try {
+          exactGeneration = controller.inspectCut().controllerGeneration
+            === authorizedGeneration;
+        } catch {}
+        if (transactionState !== "pending" || !bindingConsumed
+          || dashboardManagementPendingBinding !== binding
+          || dashboardManagementPortFenced || closing || !exactGeneration) return false;
+        transactionState = "committed";
+        dashboardManagementPendingBinding = null;
+        dashboardManagementClaimed = true;
+        return true;
+      }
+      return null;
+    }) as RelayV2HostDashboardManagementBindingCapability;
+    dashboardManagementPendingBinding = binding;
+    return binding;
+  }) as RelayV2HostDashboardManagementPortCapability;
+
+  return Object.freeze({
+    dashboardManagementPort,
+    inspect: () => projectManagedConnectorCut(controller.inspectCut()),
+    start: (rawInput) => startManagedConnector(rawInput),
+    requestReauthentication: (rawInput) => requestManagedReauthentication(rawInput),
+    stopAndDrain: (rawInput) => stopManagedConnector(rawInput),
     readiness: bridge.readiness,
     sendTerminalFrame: (
       route: RelayV2TerminalRuntimeBinding,
@@ -1816,6 +2236,7 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
       const published = createDeferredBarrier();
       closeBarrier = published.promise;
       closing = true;
+      dashboardManagementPortFenced = true;
       const closingCut = controller.inspectCut();
       if (closingCut.status !== "stopped") {
         attemptRuntimeBindings.get(

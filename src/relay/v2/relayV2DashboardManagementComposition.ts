@@ -12,15 +12,6 @@ import type {
   RelayV2DashboardManagementProtocolV2Response,
 } from "./relayV2DashboardManagementProtocolV2.js";
 import {
-  isRelayV2HostCarrierActorForDashboardManagement,
-  RelayV2HostCarrierActor,
-} from "./hostCarrier.js";
-import {
-  isRelayV2HostConnectorControllerForIdentity,
-  RelayV2HostConnectorController,
-  type RelayV2HostConnectorControllerPort,
-} from "./hostConnectorController.js";
-import {
   isRelayV2HostCredentialAuthority,
   RelayV2HostCredentialAuthority,
 } from "./hostCredentialAuthority.js";
@@ -29,14 +20,19 @@ import {
   RelayV2HostCredentialExchangeCoordinator,
   type RelayV2HostCredentialOwnerBoundExchangePort,
 } from "./hostCredentialExchangeCoordinator.js";
+import {
+  abortRelayV2HostDashboardManagementBinding,
+  commitRelayV2HostDashboardManagementBinding,
+  consumeRelayV2HostDashboardManagementBinding,
+  type RelayV2HostDashboardManagementBinding,
+} from "./hostRuntimeComposition.js";
 
 type DataRecord = Record<string, unknown>;
 
 export interface RelayV2DashboardManagementCompositionOptions {
   readonly credentialAuthority: RelayV2HostCredentialAuthority;
   readonly credentialExchangeCoordinator: RelayV2HostCredentialExchangeCoordinator;
-  readonly connectorController: RelayV2HostConnectorController;
-  readonly hostCarrierActor: RelayV2HostCarrierActor;
+  readonly hostManagementBinding: RelayV2HostDashboardManagementBinding;
   readonly hostId: string;
   readonly hostEpoch: string;
   readonly hostInstanceId: string;
@@ -71,15 +67,8 @@ interface ActivationRecord {
 
 const credentialAuthorityActivations = new WeakMap<object, ActivationRecord>();
 const credentialCoordinatorActivations = new WeakMap<object, ActivationRecord>();
-const connectorControllerActivations = new WeakMap<object, ActivationRecord>();
-const hostCarrierActorActivations = new WeakMap<object, ActivationRecord>();
+const hostManagementBindingActivations = new WeakMap<object, ActivationRecord>();
 
-const CONTROLLER_INSPECT = RelayV2HostConnectorController.prototype.inspectCut;
-const CONTROLLER_START = RelayV2HostConnectorController.prototype.start;
-const CONTROLLER_STOP_AND_DRAIN = RelayV2HostConnectorController.prototype.stopAndDrain;
-const ACTOR_STATUS = RelayV2HostCarrierActor.prototype.status;
-const ACTOR_CREATE_CONTROL =
-  RelayV2HostCarrierActor.prototype.createDashboardManagementCarrierControlAdapter;
 const COORDINATOR_CREATE_OWNER =
   RelayV2HostCredentialExchangeCoordinator.prototype.createOwnerBoundPort;
 const COMPOSITION_CLOSE_REQUEST_ID = "dashboard-management-composition.close";
@@ -116,8 +105,7 @@ function sameSignature(
 ): boolean {
   return left.credentialAuthority === right.credentialAuthority
     && left.credentialExchangeCoordinator === right.credentialExchangeCoordinator
-    && left.connectorController === right.connectorController
-    && left.hostCarrierActor === right.hostCarrierActor
+    && left.hostManagementBinding === right.hostManagementBinding
     && left.hostId === right.hostId
     && left.hostEpoch === right.hostEpoch
     && left.hostInstanceId === right.hostInstanceId
@@ -132,8 +120,7 @@ function existingActivation(signature: ActivationSignature): ActivationRecord | 
   const records = [
     credentialAuthorityActivations.get(signature.credentialAuthority),
     credentialCoordinatorActivations.get(signature.credentialExchangeCoordinator),
-    connectorControllerActivations.get(signature.connectorController),
-    hostCarrierActorActivations.get(signature.hostCarrierActor),
+    hostManagementBindingActivations.get(signature.hostManagementBinding),
   ];
   const existing = records.filter((record): record is ActivationRecord => record !== undefined);
   if (existing.length === 0) return null;
@@ -148,8 +135,7 @@ function captureOptions(value: unknown): ActivationSignature {
   const fields = exactDataObject(value, [
     "credentialAuthority",
     "credentialExchangeCoordinator",
-    "connectorController",
-    "hostCarrierActor",
+    "hostManagementBinding",
     "hostId",
     "hostEpoch",
     "hostInstanceId",
@@ -166,8 +152,8 @@ function captureOptions(value: unknown): ActivationSignature {
     credentialAuthority: fields.credentialAuthority as RelayV2HostCredentialAuthority,
     credentialExchangeCoordinator:
       fields.credentialExchangeCoordinator as RelayV2HostCredentialExchangeCoordinator,
-    connectorController: fields.connectorController as RelayV2HostConnectorController,
-    hostCarrierActor: fields.hostCarrierActor as RelayV2HostCarrierActor,
+    hostManagementBinding:
+      fields.hostManagementBinding as RelayV2HostDashboardManagementBinding,
     hostId: fields.hostId as string,
     hostEpoch: fields.hostEpoch as string,
     hostInstanceId: fields.hostInstanceId as string,
@@ -180,52 +166,11 @@ function captureOptions(value: unknown): ActivationSignature {
 }
 
 function validateOwners(signature: ActivationSignature): void {
-  const identity = Object.freeze({
-    hostId: signature.hostId,
-    hostEpoch: signature.hostEpoch,
-    hostInstanceId: signature.hostInstanceId,
-    credentialReference: signature.credentialReference,
-  });
   if (!isRelayV2HostCredentialAuthority(signature.credentialAuthority)
     || !isRelayV2HostCredentialExchangeCoordinatorForAuthority(
       signature.credentialExchangeCoordinator,
       signature.credentialAuthority,
-    )
-    || !isRelayV2HostConnectorControllerForIdentity(
-      signature.connectorController,
-      identity,
-    )
-    || !isRelayV2HostCarrierActorForDashboardManagement(
-      signature.hostCarrierActor,
-      {
-        hostId: signature.hostId,
-        hostEpoch: signature.hostEpoch,
-        hostInstanceId: signature.hostInstanceId,
-        credentialReferences: signature.credentialAuthority,
-      },
     )) return closed();
-
-  let controllerCut: ReturnType<RelayV2HostConnectorController["inspectCut"]>;
-  let actorStatus: ReturnType<RelayV2HostCarrierActor["status"]>;
-  try {
-    controllerCut = Reflect.apply(CONTROLLER_INSPECT, signature.connectorController, []);
-    actorStatus = Reflect.apply(ACTOR_STATUS, signature.hostCarrierActor, []);
-  } catch {
-    return closed();
-  }
-  if (controllerCut.status !== "stopped"
-    || controllerCut.controllerGeneration !== "0"
-    || actorStatus !== null) return closed();
-}
-
-function createControllerPort(
-  controller: RelayV2HostConnectorController,
-): RelayV2HostConnectorControllerPort {
-  return Object.freeze({
-    inspectCut: () => Reflect.apply(CONTROLLER_INSPECT, controller, []),
-    start: (input) => Reflect.apply(CONTROLLER_START, controller, [input]),
-    stopAndDrain: (input) => Reflect.apply(CONTROLLER_STOP_AND_DRAIN, controller, [input]),
-  });
 }
 
 /**
@@ -237,88 +182,109 @@ function activateComposition(
   signature: ActivationSignature,
   ownership: ActivationRecord["ownership"],
 ): RelayV2DashboardManagementComposition {
-  validateOwners(signature);
-
-  let credentialOwner: RelayV2HostCredentialOwnerBoundExchangePort;
-  let carrierControl: ReturnType<
-    RelayV2HostCarrierActor["createDashboardManagementCarrierControlAdapter"]
-  >;
+  const hostIdentity = Object.freeze({
+    hostId: signature.hostId,
+    hostEpoch: signature.hostEpoch,
+    hostInstanceId: signature.hostInstanceId,
+    credentialReference: signature.credentialReference,
+  });
+  let committed = false;
   try {
-    credentialOwner = Reflect.apply(
+    validateOwners(signature);
+    const credentialOwner = Reflect.apply(
       COORDINATOR_CREATE_OWNER,
       signature.credentialExchangeCoordinator,
       [],
+    ) as RelayV2HostCredentialOwnerBoundExchangePort;
+    const credential = new RelayV2DashboardManagementHostCredentialAdapter({
+      owner: credentialOwner,
+      credentialReference: signature.credentialReference,
+      hostId: signature.hostId,
+      hostEpoch: signature.hostEpoch,
+      hostInstanceId: signature.hostInstanceId,
+      bootstrapSecretReference: signature.bootstrapSecretReference,
+      refreshSecretReference: signature.refreshSecretReference,
+      signal: signature.signal,
+    });
+    const hostPorts = consumeRelayV2HostDashboardManagementBinding(
+      signature.hostManagementBinding,
+      hostIdentity,
+      signature.credentialAuthority,
     );
-    carrierControl = Reflect.apply(ACTOR_CREATE_CONTROL, signature.hostCarrierActor, []);
+    if (hostPorts === null) return closed();
+    const connector = new RelayV2DashboardManagementHostConnectorAdapter({
+      controller: hostPorts.connectorLifecycle,
+      hostId: signature.hostId,
+      hostEpoch: signature.hostEpoch,
+      hostInstanceId: signature.hostInstanceId,
+      credentialReference: signature.credentialReference,
+      signal: signature.signal,
+    });
+    const authority = new RelayV2DashboardManagementAuthority({
+      credential,
+      connector,
+      carrierControl: hostPorts.carrierControl,
+      clock: signature.clock,
+    });
+
+    let accepting = true;
+    let closePromise: Promise<void> | null = null;
+    const pending = new Set<Promise<RelayV2DashboardManagementProtocolV2Response>>();
+    const handleRequest = (
+      request: RelayV2DashboardManagementProtocolV2Request,
+    ): Promise<RelayV2DashboardManagementProtocolV2Response> => {
+      if (!accepting) {
+        return Promise.reject(new RelayV2DashboardManagementCompositionClosedError());
+      }
+      const operation = Promise.resolve().then(() => authority.handle(request));
+      pending.add(operation);
+      void operation.then(
+        () => { pending.delete(operation); },
+        () => { pending.delete(operation); },
+      );
+      return operation;
+    };
+    const closeAndDrain = (): Promise<void> => {
+      if (closePromise !== null) return closePromise;
+      accepting = false;
+      closePromise = (async () => {
+        await Promise.allSettled([...pending]);
+        const cut = await connector.inspectCut();
+        if (cut.status !== "stopped") {
+          await connector.stop({ requestId: COMPOSITION_CLOSE_REQUEST_ID });
+          const drained = await connector.inspectCut();
+          if (drained.status !== "stopped") return closed();
+        }
+      })().catch(() => {
+        throw new RelayV2DashboardManagementCompositionClosedError();
+      });
+      return closePromise;
+    };
+    const handle = Object.freeze(Object.assign(Object.create(null), {
+      handleRequest,
+      closeAndDrain,
+    })) as RelayV2DashboardManagementComposition;
+    const record: ActivationRecord = Object.freeze({ ownership, signature, handle });
+    if (!commitRelayV2HostDashboardManagementBinding(
+      signature.hostManagementBinding,
+      hostIdentity,
+      signature.credentialAuthority,
+    )) return closed();
+    committed = true;
+    credentialAuthorityActivations.set(signature.credentialAuthority, record);
+    credentialCoordinatorActivations.set(signature.credentialExchangeCoordinator, record);
+    hostManagementBindingActivations.set(signature.hostManagementBinding, record);
+    return handle;
   } catch {
+    if (!committed) {
+      abortRelayV2HostDashboardManagementBinding(
+        signature.hostManagementBinding,
+        hostIdentity,
+        signature.credentialAuthority,
+      );
+    }
     return closed();
   }
-  const connector = new RelayV2DashboardManagementHostConnectorAdapter({
-    controller: createControllerPort(signature.connectorController),
-    hostId: signature.hostId,
-    hostEpoch: signature.hostEpoch,
-    hostInstanceId: signature.hostInstanceId,
-    credentialReference: signature.credentialReference,
-    signal: signature.signal,
-  });
-  const credential = new RelayV2DashboardManagementHostCredentialAdapter({
-    owner: credentialOwner,
-    credentialReference: signature.credentialReference,
-    hostId: signature.hostId,
-    hostEpoch: signature.hostEpoch,
-    hostInstanceId: signature.hostInstanceId,
-    bootstrapSecretReference: signature.bootstrapSecretReference,
-    refreshSecretReference: signature.refreshSecretReference,
-    signal: signature.signal,
-  });
-  const authority = new RelayV2DashboardManagementAuthority({
-    credential,
-    connector,
-    carrierControl,
-    clock: signature.clock,
-  });
-
-  let accepting = true;
-  let closePromise: Promise<void> | null = null;
-  const pending = new Set<Promise<RelayV2DashboardManagementProtocolV2Response>>();
-  const handleRequest = (
-    request: RelayV2DashboardManagementProtocolV2Request,
-  ): Promise<RelayV2DashboardManagementProtocolV2Response> => {
-    if (!accepting) return Promise.reject(new RelayV2DashboardManagementCompositionClosedError());
-    const operation = Promise.resolve().then(() => authority.handle(request));
-    pending.add(operation);
-    void operation.then(
-      () => { pending.delete(operation); },
-      () => { pending.delete(operation); },
-    );
-    return operation;
-  };
-  const closeAndDrain = (): Promise<void> => {
-    if (closePromise !== null) return closePromise;
-    accepting = false;
-    closePromise = (async () => {
-      await Promise.allSettled([...pending]);
-      const cut = await connector.inspectCut();
-      if (cut.status !== "stopped") {
-        await connector.stop({ requestId: COMPOSITION_CLOSE_REQUEST_ID });
-        const drained = await connector.inspectCut();
-        if (drained.status !== "stopped") return closed();
-      }
-    })().catch(() => {
-      throw new RelayV2DashboardManagementCompositionClosedError();
-    });
-    return closePromise;
-  };
-  const handle = Object.freeze(Object.assign(Object.create(null), {
-    handleRequest,
-    closeAndDrain,
-  })) as RelayV2DashboardManagementComposition;
-  const record: ActivationRecord = Object.freeze({ ownership, signature, handle });
-  credentialAuthorityActivations.set(signature.credentialAuthority, record);
-  credentialCoordinatorActivations.set(signature.credentialExchangeCoordinator, record);
-  connectorControllerActivations.set(signature.connectorController, record);
-  hostCarrierActorActivations.set(signature.hostCarrierActor, record);
-  return handle;
 }
 
 export function createRelayV2DashboardManagementComposition(
