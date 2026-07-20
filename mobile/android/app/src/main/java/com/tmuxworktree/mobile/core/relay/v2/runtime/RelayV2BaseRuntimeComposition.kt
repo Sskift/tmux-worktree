@@ -146,7 +146,7 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
-    private suspend fun consume(effect: RelayV2RuntimeEffect) {
+    internal suspend fun consume(effect: RelayV2RuntimeEffect) {
         when (effect) {
             is RelayV2RuntimeEffect.QueryPendingCommands -> applyHello(effect)
             is RelayV2RuntimeEffect.BeginStateResync -> applyHello(effect)
@@ -170,7 +170,9 @@ internal class RelayV2BaseRuntimeComposition(
                 }
             }
 
-            is RelayV2RuntimeEffect.ApplyCommandStatuses ->
+            is RelayV2RuntimeEffect.RegisterCommandQueryAttempt,
+            is RelayV2RuntimeEffect.ApplyCommandStatuses,
+            ->
                 failRuntimeIncomplete("COMMAND_OUTBOX_RUNTIME_UNAVAILABLE")
             is RelayV2RuntimeEffect.DeliverAgentExtensionFrame,
             is RelayV2RuntimeEffect.AgentExtensionUnavailable,

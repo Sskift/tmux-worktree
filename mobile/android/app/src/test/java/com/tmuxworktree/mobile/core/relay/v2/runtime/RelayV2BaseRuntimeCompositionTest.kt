@@ -123,6 +123,34 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `uncomposed command query registration fails closed without durable or network effects`() =
+        runBlocking {
+            val harness = Harness(autoConnect = true)
+            try {
+                harness.connectOnline()
+                val transport = harness.transport()
+                val helloCommits = harness.authority.helloCommits.get()
+                val stateEventCommits = harness.authority.stateEventCommits.get()
+                val networkSends = transport.sendCount()
+
+                harness.composition.consume(harness.commandQueryRegistration())
+
+                val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+                assertEquals(
+                    RelayV2BaseRuntimeFailure.RuntimeIncomplete(
+                        "COMMAND_OUTBOX_RUNTIME_UNAVAILABLE",
+                    ),
+                    failed.failure,
+                )
+                assertEquals(helloCommits, harness.authority.helloCommits.get())
+                assertEquals(stateEventCommits, harness.authority.stateEventCommits.get())
+                assertEquals(networkSends, transport.sendCount())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
     fun `v2 failure never retries another dialect or advertises Agent capability`() = runBlocking {
         val harness = Harness(autoConnect = true)
         try {
@@ -272,6 +300,40 @@ class RelayV2BaseRuntimeCompositionTest {
 
         fun transport(): FakeTransport = factory.transports.single()
 
+        fun commandQueryRegistration(): RelayV2RuntimeEffect.RegisterCommandQueryAttempt {
+            val generation = RelayV2EffectGeneration(
+                profileId = profile.profileId,
+                profileGeneration = profile.activationGeneration,
+                connectionGeneration = 1,
+            )
+            return RelayV2RuntimeEffect.RegisterCommandQueryAttempt(
+                recovery = RelayV2RecoveryBinding(
+                    generation = generation,
+                    step = 2,
+                    requestId = "query-registration-request",
+                ),
+                hostId = profile.hostId,
+                hostEpoch = HOST_EPOCH,
+                commandBatch = RelayV2CommandQueryBatch(
+                    listOf(
+                        RelayV2PendingCommand(
+                            commandId = "pending-command",
+                            dedupeWindowId = "dedupe-window",
+                        ),
+                    ),
+                ),
+                repositoryAuthority = RelayV2RepositoryEffectAuthority(
+                    generation = generation,
+                    profileId = profile.profileId,
+                    profileActivationGeneration = profile.activationGeneration,
+                    principalId = profile.principalId,
+                    clientInstanceId = profile.clientInstanceId,
+                    hostId = profile.hostId,
+                    hostEpoch = HOST_EPOCH,
+                ),
+            )
+        }
+
         fun close() {
             composition.close()
             parent.cancel()
@@ -410,6 +472,8 @@ class RelayV2BaseRuntimeCompositionTest {
                     ).frame,
                 ))
             }
+
+        fun sendCount(): Int = sent.size
 
         fun closeCount(): Int = closeCodes.size
     }
