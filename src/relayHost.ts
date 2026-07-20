@@ -5,7 +5,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { lookup as systemDnsLookup, promises as dnsPromises, type LookupOptions } from "node:dns";
-import type { LookupFunction } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
 import {
@@ -46,14 +46,21 @@ type RelayHostOptions = {
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
 
-type RelayDnsResolver = Pick<InstanceType<typeof dnsPromises.Resolver>, "resolve4" | "resolve6">;
+type RelayDnsResolver = Pick<InstanceType<typeof dnsPromises.Resolver>, "resolve4" | "resolve6">
+  & Partial<Pick<InstanceType<typeof dnsPromises.Resolver>, "cancel">>;
 
 type RelayLookupDependencies = {
   lookup: LookupFunction;
   platform: NodeJS.Platform;
   dnsServers: () => string[];
   createResolver: (server?: string) => RelayDnsResolver;
+  fetch: typeof fetch;
+  fallbackTimeoutMs: number;
 };
+
+const QUICK_TUNNEL_DOH_ENDPOINT = "https://doh.pub/dns-query";
+const QUICK_TUNNEL_DNS_FALLBACK_TIMEOUT_MS = 5_000;
+const MAX_QUICK_TUNNEL_DOH_RESPONSE_BYTES = 64 * 1024;
 
 function isQuickTunnelHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/\.$/, "");
@@ -68,25 +75,129 @@ function isRetryableSystemDnsError(error: NodeJS.ErrnoException): boolean {
   return error.code === "ENOTFOUND" || error.code === "EAI_AGAIN";
 }
 
+async function fetchQuickTunnelDnsJson(
+  url: URL,
+  signal: AbortSignal,
+  fetcher: typeof fetch,
+): Promise<unknown> {
+  const response = await fetcher(url, {
+    cache: "no-store",
+    credentials: "omit",
+    headers: { accept: "application/json" },
+    redirect: "error",
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`HTTPS DNS returned ${response.status}`);
+  }
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_QUICK_TUNNEL_DOH_RESPONSE_BYTES) {
+    throw new Error("HTTPS DNS response is too large");
+  }
+  const body = await response.text();
+  if (Buffer.byteLength(body, "utf8") > MAX_QUICK_TUNNEL_DOH_RESPONSE_BYTES) {
+    throw new Error("HTTPS DNS response is too large");
+  }
+  return JSON.parse(body) as unknown;
+}
+
+function withTimeout<T>(task: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref();
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function resolveQuickTunnelAddressesOverHttps(
+  hostname: string,
+  family: 4 | 6,
+  signal: AbortSignal,
+  dependencies: RelayLookupDependencies,
+): Promise<string[]> {
+  const url = new URL(QUICK_TUNNEL_DOH_ENDPOINT);
+  url.searchParams.set("name", hostname);
+  url.searchParams.set("type", family === 4 ? "A" : "AAAA");
+  const payload = await fetchQuickTunnelDnsJson(
+    url,
+    signal,
+    dependencies.fetch,
+  );
+  if (!payload || typeof payload !== "object") {
+    throw new Error("HTTPS DNS returned an invalid response");
+  }
+  const response = payload as { Status?: unknown; Answer?: unknown };
+  if (response.Status !== 0) {
+    throw new Error("HTTPS DNS lookup failed");
+  }
+  if (response.Answer === undefined) return [];
+  if (!Array.isArray(response.Answer)) {
+    throw new Error("HTTPS DNS returned invalid answers");
+  }
+  const recordType = family === 4 ? 1 : 28;
+  return [...new Set(response.Answer.flatMap((record) => {
+    if (!record || typeof record !== "object") return [];
+    const answer = record as { type?: unknown; data?: unknown };
+    return answer.type === recordType
+      && typeof answer.data === "string"
+      && isIP(answer.data) === family
+      ? [answer.data]
+      : [];
+  }))];
+}
+
 async function resolveQuickTunnelAddresses(
   hostname: string,
   family: LookupOptions["family"],
   dependencies: RelayLookupDependencies,
 ): Promise<Array<{ address: string; family: number }>> {
-  const families = family === 4 || family === "IPv4"
+  const families: Array<4 | 6> = family === 4 || family === "IPv4"
     ? [4]
     : family === 6 || family === "IPv6"
       ? [6]
       : [4, 6];
   const configuredServers = [...new Set(dependencies.dnsServers())];
   const servers = configuredServers.length > 0 ? configuredServers : [undefined];
-  const settled = await Promise.allSettled(families.map(async (candidate) => ({
-    family: candidate,
-    addresses: await Promise.any(servers.map(async (server) => {
-      const resolver = dependencies.createResolver(server);
-      return candidate === 4 ? resolver.resolve4(hostname) : resolver.resolve6(hostname);
-    })),
-  })));
+  const fallbackSignal = AbortSignal.timeout(dependencies.fallbackTimeoutMs);
+  const settled = await Promise.allSettled(families.map(async (candidate) => {
+    const resolvers: RelayDnsResolver[] = [];
+    const fetchController = new AbortController();
+    const familySignal = AbortSignal.any([fallbackSignal, fetchController.signal]);
+    try {
+      const direct = Promise.any(servers.map(async (server) => {
+        const resolver = dependencies.createResolver(server);
+        resolvers.push(resolver);
+        const addresses = candidate === 4
+          ? await resolver.resolve4(hostname)
+          : await resolver.resolve6(hostname);
+        if (addresses.length === 0) throw new Error("direct DNS returned no addresses");
+        return addresses;
+      }));
+      const addresses = await withTimeout(
+        Promise.any([
+          direct,
+          resolveQuickTunnelAddressesOverHttps(hostname, candidate, familySignal, dependencies),
+        ]),
+        dependencies.fallbackTimeoutMs,
+        "Quick Tunnel DNS fallback timed out",
+      );
+      return { family: candidate, addresses };
+    } finally {
+      fetchController.abort();
+      for (const resolver of resolvers) {
+        try { resolver.cancel?.(); } catch {}
+      }
+    }
+  }));
   return settled.flatMap((result) => result.status === "fulfilled"
     ? result.value.addresses.map((address) => ({ address, family: result.value.family }))
     : []);
@@ -104,6 +215,8 @@ export function createRelayLookup(
       if (server) resolver.setServers([server]);
       return resolver;
     }),
+    fetch: overrides.fetch ?? globalThis.fetch,
+    fallbackTimeoutMs: overrides.fallbackTimeoutMs ?? QUICK_TUNNEL_DNS_FALLBACK_TIMEOUT_MS,
   };
   return (hostname, options, callback) => {
     dependencies.lookup(hostname, options, (error, address, family) => {

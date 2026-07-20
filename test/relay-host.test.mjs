@@ -49,6 +49,8 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
   const negativeCacheError = Object.assign(new Error("stale system DNS result"), { code: "ENOTFOUND" });
   let directQueries = 0;
   let resolverCreations = 0;
+  let httpsFetches = 0;
+  const directWinnerFetchSignals = [];
   const lookup = createRelayLookup({
     lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
     platform: "darwin",
@@ -67,6 +69,13 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
           return ["2001:db8::10"];
         },
       };
+    },
+    fetch: async (_input, init) => {
+      httpsFetches += 1;
+      directWinnerFetchSignals.push(init.signal);
+      return new Promise((_, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
     },
   });
 
@@ -99,6 +108,8 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
   );
   assert.equal(directQueries, 8);
   assert.equal(resolverCreations, 8);
+  assert.equal(httpsFetches, 4);
+  assert.equal(directWinnerFetchSignals.every((signal) => signal.aborted), true);
 
   for (const hostname of [
     "relay.example.net",
@@ -115,6 +126,7 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
   }
   assert.equal(directQueries, 8);
   assert.equal(resolverCreations, 8);
+  assert.equal(httpsFetches, 4);
 
   const linuxLookup = createRelayLookup({
     lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
@@ -130,6 +142,10 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
         resolve6: async () => [],
       };
     },
+    fetch: async () => {
+      httpsFetches += 1;
+      return new Response(JSON.stringify({ Status: 0 }));
+    },
   });
   await assert.rejects(
     invokeLookup(linuxLookup, "fresh-tunnel.trycloudflare.com", { all: false }),
@@ -137,6 +153,22 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
   );
   assert.equal(directQueries, 8);
   assert.equal(resolverCreations, 8);
+  assert.equal(httpsFetches, 4);
+
+  const nonDnsFailure = Object.assign(new Error("lookup denied"), { code: "EACCES" });
+  const deniedLookup = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(nonDnsFailure, "", 0),
+    platform: "darwin",
+    fetch: async () => {
+      httpsFetches += 1;
+      return new Response(JSON.stringify({ Status: 0 }));
+    },
+  });
+  await assert.rejects(
+    invokeLookup(deniedLookup, "fresh-tunnel.trycloudflare.com", { all: false }),
+    (error) => error === nonDnsFailure,
+  );
+  assert.equal(httpsFetches, 4);
 
   const unavailableDirectDns = createRelayLookup({
     lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
@@ -146,11 +178,139 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
       resolve4: async () => { throw new Error("no A response"); },
       resolve6: async () => { throw new Error("no AAAA response"); },
     }),
+    fetch: async () => new Response(JSON.stringify({ Status: 2 })),
   });
   await assert.rejects(
     invokeLookup(unavailableDirectDns, "fresh-tunnel.trycloudflare.com", { all: true }),
     (error) => error === negativeCacheError,
   );
+});
+
+test("Quick Tunnel DNS uses bounded HTTPS lookup when UDP DNS is unavailable", async () => {
+  const negativeCacheError = Object.assign(new Error("system DNS unavailable"), { code: "ENOTFOUND" });
+  const httpsQueries = [];
+  let resolverCancels = 0;
+  const never = () => new Promise(() => {});
+  const lookup = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
+    platform: "darwin",
+    dnsServers: () => ["blocked-dns"],
+    createResolver: () => ({
+      resolve4: never,
+      resolve6: never,
+      cancel: () => { resolverCancels += 1; },
+    }),
+    fetch: async (input, init) => {
+      const url = input instanceof URL ? input : new URL(String(input));
+      assert.equal(init.signal.aborted, false);
+      assert.equal(init.cache, "no-store");
+      assert.equal(init.credentials, "omit");
+      assert.equal(init.headers.accept, "application/json");
+      assert.equal(init.redirect, "error");
+      httpsQueries.push({
+        origin: url.origin,
+        pathname: url.pathname,
+        name: url.searchParams.get("name"),
+        type: url.searchParams.get("type"),
+      });
+      const payload = url.searchParams.get("type") === "A"
+        ? {
+            Status: 0,
+            Answer: [
+              { type: 5, data: "edge.example.net." },
+              { type: 1, data: "104.16.230.132" },
+              { type: 1, data: "not-an-address" },
+            ],
+          }
+        : {
+            Status: 0,
+            Answer: [
+              { type: 28, data: "2606:4700::6810:e684" },
+              { type: 1, data: "104.16.230.132" },
+            ],
+          };
+      return new Response(JSON.stringify(payload), {
+        headers: { "content-type": "application/dns-json" },
+      });
+    },
+  });
+
+  assert.deepEqual(
+    await invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: true }),
+    {
+      address: [
+        { address: "104.16.230.132", family: 4 },
+        { address: "2606:4700::6810:e684", family: 6 },
+      ],
+      family: undefined,
+    },
+  );
+  assert.deepEqual(httpsQueries, [
+    {
+      origin: "https://doh.pub",
+      pathname: "/dns-query",
+      name: "fresh-tunnel.trycloudflare.com",
+      type: "A",
+    },
+    {
+      origin: "https://doh.pub",
+      pathname: "/dns-query",
+      name: "fresh-tunnel.trycloudflare.com",
+      type: "AAAA",
+    },
+  ]);
+  assert.equal(resolverCancels, 2);
+});
+
+test("Quick Tunnel DNS deadline survives fallback sources that ignore cancellation", async () => {
+  const negativeCacheError = Object.assign(new Error("system DNS unavailable"), { code: "ENOTFOUND" });
+  const never = () => new Promise(() => {});
+  const lookup = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
+    platform: "darwin",
+    dnsServers: () => ["blackhole-dns"],
+    createResolver: () => ({ resolve4: never, resolve6: never }),
+    fetch: never,
+    fallbackTimeoutMs: 20,
+  });
+
+  const outcome = await Promise.race([
+    invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: true }).then(
+      () => ({ kind: "resolved" }),
+      (error) => ({ kind: "rejected", error }),
+    ),
+    new Promise((resolve) => setTimeout(() => resolve({ kind: "test-timeout" }), 500)),
+  ]);
+  assert.equal(outcome.kind, "rejected");
+  assert.equal(outcome.error, negativeCacheError);
+});
+
+test("Quick Tunnel DNS accepts authoritative family NODATA without waiting for blocked UDP", async () => {
+  const negativeCacheError = Object.assign(new Error("system DNS unavailable"), { code: "ENOTFOUND" });
+  const never = () => new Promise(() => {});
+  const lookup = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
+    platform: "darwin",
+    dnsServers: () => ["blackhole-dns"],
+    createResolver: () => ({ resolve4: never, resolve6: never }),
+    fetch: async (input) => {
+      const url = input instanceof URL ? input : new URL(String(input));
+      const payload = url.searchParams.get("type") === "A"
+        ? { Status: 0, Answer: [{ type: 1, data: "104.16.230.132" }] }
+        : { Status: 0 };
+      return new Response(JSON.stringify(payload));
+    },
+    fallbackTimeoutMs: 100,
+  });
+
+  const outcome = await Promise.race([
+    invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: true }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("lookup did not accept NODATA")), 500)),
+  ]);
+  assert.deepEqual(outcome, {
+    address: [{ address: "104.16.230.132", family: 4 }],
+    family: undefined,
+  });
 });
 
 test("remote mutation requires an explicit hard-timeout RPC capability", () => {
