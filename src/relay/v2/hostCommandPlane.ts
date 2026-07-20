@@ -4,6 +4,9 @@ import {
   validateRelayV2CommandRouteEnvelope,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import type {
+  RelayV2HostCapabilityReadinessSourceSink,
+} from "./hostCapabilityReadiness.js";
 import {
   type RelayV2HostJson,
   type RelayV2MaterializedReadinessFence,
@@ -28,6 +31,7 @@ const COMMAND_RECORD_SCHEMA_VERSION = 1 as const;
 const COMMAND_WINDOW_REVISION_KEY = "command-windows";
 const COMMAND_KEY_PREFIX = "cmd:v1:";
 const WINDOW_KEY_PREFIX = "cmdwin:v1:";
+const MAX_H1_READINESS_GENERATION = 18_446_744_073_709_551_615n;
 
 export type RelayV2CommandOperation =
   | "create_worktree"
@@ -370,6 +374,34 @@ export interface RelayV2HostCommandPlaneOptions {
   recover?: boolean;
 }
 
+/** Opaque one-shot proof that one exact command plane recovered and audited H1. */
+export interface RelayV2HostCommandPlaneReadinessCandidate {
+  readonly __relayV2HostCommandPlaneReadinessCandidate?: never;
+}
+
+export interface RelayV2HostH1ReadinessActivationOptions {
+  candidate: RelayV2HostCommandPlaneReadinessCandidate;
+  readinessSink: RelayV2HostCapabilityReadinessSourceSink<"h1">;
+}
+
+/** Recovered H1 authority plus its synchronous-withdrawal lifecycle. */
+export interface RelayV2HostH1ReadinessActivation {
+  execute(
+    auth: RelayV2CommandAuthContext,
+    frame: RelayV2JsonObject,
+  ): Promise<RelayV2JsonObject>;
+  query(
+    auth: RelayV2CommandAuthContext,
+    frame: RelayV2JsonObject,
+  ): Promise<RelayV2JsonObject>;
+  issueDedupeWindow(input: {
+    acceptUntilMs: number;
+    queryUntilMs: number;
+  }): Promise<RelayV2CommandDedupeWindow>;
+  /** Stops admission and withdraws synchronously, then drains admitted calls. */
+  close(): Promise<void>;
+}
+
 interface NormalizedCommand {
   requestId: string;
   commandId: string;
@@ -477,6 +509,58 @@ export class RelayV2HostCommandPlaneStateError extends Error {
   }
 }
 
+function throwIfHostCommandPlaneStateError(error: unknown): void {
+  if (error instanceof RelayV2HostCommandPlaneStateError) throw error;
+}
+
+function captureCanonicalCommandExecutor(
+  executor: RelayV2CanonicalCommandExecutor,
+): RelayV2CanonicalCommandExecutor {
+  if (((typeof executor !== "object" || executor === null)
+    && typeof executor !== "function")) {
+    throw new TypeError("Relay v2 canonical command executor is invalid");
+  }
+  const receiver = executor as object;
+  let resolve: unknown;
+  let fenceResolution: unknown;
+  let executeTwRpc: unknown;
+  let executeTerminalControl: unknown;
+  try {
+    resolve = Reflect.get(receiver, "resolve");
+    fenceResolution = Reflect.get(receiver, "fenceResolution");
+    executeTwRpc = Reflect.get(receiver, "executeTwRpc");
+    executeTerminalControl = Reflect.get(receiver, "executeTerminalControl");
+  } catch {
+    throw new TypeError("Relay v2 canonical command executor is invalid");
+  }
+  if (typeof resolve !== "function"
+    || typeof fenceResolution !== "function"
+    || typeof executeTwRpc !== "function"
+    || typeof executeTerminalControl !== "function") {
+    throw new TypeError("Relay v2 canonical command executor is invalid");
+  }
+  return Object.freeze({
+    resolve: (request: RelayV2CanonicalCommandRequest) => (
+      Reflect.apply(resolve, receiver, [request])
+    ),
+    fenceResolution: (
+      transaction: RelayV2CommandResolutionTransaction,
+      request: RelayV2CanonicalCommandRequest,
+      fence: RelayV2CommandResolutionFence,
+    ) => (
+      Reflect.apply(fenceResolution, receiver, [transaction, request, fence])
+    ),
+    executeTwRpc: (plan: RelayV2TwRpcExecutionPlan) => (
+      Reflect.apply(executeTwRpc, receiver, [plan])
+    ),
+    executeTerminalControl: (plan: RelayV2TerminalControlExecutionPlan) => Reflect.apply(
+      executeTerminalControl,
+      receiver,
+      [plan],
+    ),
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -488,7 +572,8 @@ function isThenable(value: unknown): boolean {
       && typeof (value as { then?: unknown }).then === "function";
     if (thenable) void Promise.resolve(value).catch(() => undefined);
     return thenable;
-  } catch {
+  } catch (error) {
+    throwIfHostCommandPlaneStateError(error);
     return true;
   }
 }
@@ -1329,6 +1414,92 @@ function readWindow(
   return window;
 }
 
+function parseH1AuditCounter(value: unknown, label: string): bigint {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new RelayV2HostCommandPlaneStateError(`${label} is not canonical`);
+  }
+  let parsed: bigint;
+  try {
+    parsed = BigInt(value);
+  } catch {
+    throw new RelayV2HostCommandPlaneStateError(`${label} is not canonical`);
+  }
+  if (parsed > MAX_H1_READINESS_GENERATION) {
+    throw new RelayV2HostCommandPlaneStateError(`${label} exceeds uint64`);
+  }
+  return parsed;
+}
+
+function auditRecoveredH1Cut(
+  snapshot: RelayV2HostStateSnapshot,
+  hostId: string,
+): void {
+  for (const [key, value] of Object.entries(snapshot.commands)) {
+    const record = parseStoredCommand(value);
+    const identity: CommandIdentity = {
+      hostEpoch: record.hostEpoch,
+      principalId: record.principalId,
+      hostId: record.hostId,
+      commandId: record.commandId,
+    };
+    if (key !== commandStorageKey(identity)) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command ledger key does not match its record identity",
+      );
+    }
+    if (record.hostEpoch !== snapshot.hostEpoch || record.hostId !== hostId) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command ledger record does not belong to the current host epoch",
+      );
+    }
+    if (record.recordType === "command"
+      && (record.state === "accepted" || record.state === "running")) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command recovery left an active ledger record",
+      );
+    }
+  }
+
+  const windowRevision = parseH1AuditCounter(
+    snapshot.revisions[COMMAND_WINDOW_REVISION_KEY] ?? "0",
+    "Relay v2 command-window revision",
+  );
+  const windowSequences = new Set<string>();
+  for (const [key, value] of Object.entries(snapshot.materialized)) {
+    const recordType = isRecord(value) ? value.recordType : undefined;
+    if (!key.startsWith(WINDOW_KEY_PREFIX) && recordType !== "dedupe_window") continue;
+    const window = parseWindow(value);
+    if (key !== windowStorageKey(window.windowId)) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command dedupe-window key does not match its record identity",
+      );
+    }
+    if (window.hostEpoch !== snapshot.hostEpoch) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command dedupe window does not belong to the current host epoch",
+      );
+    }
+    const windowSequence = parseH1AuditCounter(
+      window.windowSeq,
+      "Relay v2 command-window sequence",
+    );
+    if (windowSequence === 0n
+      || windowSequence > windowRevision
+      || windowSequences.has(window.windowSeq)) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command-window sequence is not unique within its revision cut",
+      );
+    }
+    windowSequences.add(window.windowSeq);
+    if (window.queryUntilMs - window.acceptUntilMs
+      < RELAY_V2_COMMAND_DEDUPE_RETENTION_MS) {
+      throw new RelayV2HostCommandPlaneStateError(
+        "Relay v2 command dedupe-window retention is invalid",
+      );
+    }
+  }
+}
+
 function fingerprintsEqual(left: StoredFingerprint, right: StoredFingerprint): boolean {
   return left.schemaVersion === right.schemaVersion
     && left.algorithm === right.algorithm
@@ -1892,6 +2063,28 @@ export class RelayV2HostCommandPlane {
     this.clock = options.now ?? Date.now;
   }
 
+  static async openRecoveredAuthority(
+    options: RelayV2HostCommandPlaneOptions,
+  ): Promise<RelayV2HostCommandPlaneReadinessCandidate | null> {
+    // Capture all four executor callables before recovery can invoke caller
+    // code or expose any candidate backed by a changing executor object.
+    const executor = captureCanonicalCommandExecutor(options.executor);
+    const plane = new RelayV2HostCommandPlane({
+      store: options.store,
+      hostId: options.hostId,
+      executor,
+      resourceMutationOwner: options.resourceMutationOwner,
+      now: options.now,
+      recover: options.recover,
+    });
+    if (options.recover === false) return null;
+    await plane.recoverInterrupted();
+    return plane.store.serialize((section) => {
+      auditRecoveredH1Cut(section.read(), plane.hostId);
+      return issueRecoveredH1ReadinessCandidate(plane);
+    });
+  }
+
   static async open(options: RelayV2HostCommandPlaneOptions): Promise<RelayV2HostCommandPlane> {
     const plane = new RelayV2HostCommandPlane(options);
     if (options.recover !== false) await plane.recoverInterrupted();
@@ -1997,7 +2190,8 @@ export class RelayV2HostCommandPlane {
     let admission: RelayV2CommandAdmission;
     try {
       admission = await this.executor.resolve(canonicalRequest);
-    } catch {
+    } catch (error) {
+      throwIfHostCommandPlaneStateError(error);
       return this.preLedgerFailure(command, {
         code: "INTERNAL",
         message: "Command target could not be resolved",
@@ -2014,7 +2208,8 @@ export class RelayV2HostCommandPlane {
           admission.error,
           admission.authorityEvidence,
         ));
-      } catch {
+      } catch (error) {
+        throwIfHostCommandPlaneStateError(error);
         return this.preLedgerFailure(command, {
           code: "INTERNAL",
           message: "Command target evidence was invalid",
@@ -2033,7 +2228,8 @@ export class RelayV2HostCommandPlane {
           admission.error,
           admission.authorityEvidence,
         );
-      } catch {
+      } catch (error) {
+        throwIfHostCommandPlaneStateError(error);
         return this.preLedgerFailure(command, {
           code: "SCOPE_UNREACHABLE",
           message: "Canonical target authority is incomplete or unreachable",
@@ -2047,7 +2243,8 @@ export class RelayV2HostCommandPlane {
     let resolutionFence: RelayV2CommandResolutionFence;
     try {
       resolutionFence = validateResolutionFence(admission, canonicalRequest);
-    } catch {
+    } catch (error) {
+      throwIfHostCommandPlaneStateError(error);
       return this.preLedgerFailure(command, {
         code: "CAPABILITY_UNAVAILABLE",
         message: "Canonical target admission fence is unavailable",
@@ -2086,7 +2283,8 @@ export class RelayV2HostCommandPlane {
               if (isThenable(fenced)) {
                 throw new TypeError("canonical resolution fence must be synchronous");
               }
-            } catch {
+            } catch (error) {
+              throwIfHostCommandPlaneStateError(error);
               throw new AdmissionAbort({
                 kind: "resolution_rejected",
                 error: {
@@ -2511,13 +2709,15 @@ export class RelayV2HostCommandPlane {
       } else {
         throw new RelayV2HostCommandPlaneStateError("unknown Relay v2 command execution authority");
       }
-    } catch {
+    } catch (error) {
+      throwIfHostCommandPlaneStateError(error);
       return this.markInDoubt(identity, null);
     }
 
     try {
       return await this.finalizeRunning(identity, prepared);
-    } catch {
+    } catch (error) {
+      throwIfHostCommandPlaneStateError(error);
       // The side effect has already crossed its boundary. A failed or uncertain
       // final ledger commit can only converge to the committed final record or
       // IN_DOUBT; it never invokes the executor again.
@@ -2558,6 +2758,7 @@ export class RelayV2HostCommandPlane {
         if (error instanceof TransitionAbort) {
           return { claimed: false, record: error.record };
         }
+        throwIfHostCommandPlaneStateError(error);
         const observed = await this.readIdentity(identity);
         if (observed === undefined) throw error;
         if (isHostStateCommitUncertain(error)
@@ -2714,8 +2915,14 @@ export class RelayV2HostCommandPlane {
                 "Relay v2 resource publication must be a synchronous bounded enqueue",
               );
             }
-          } catch {
-            this.resourceMutationOwner.fenceCommitUncertain(committed.snapshot);
+          } catch (error) {
+            try {
+              this.resourceMutationOwner.fenceCommitUncertain(committed.snapshot);
+            } catch (cleanupError) {
+              if (error instanceof RelayV2HostCommandPlaneStateError) throw error;
+              throw cleanupError;
+            }
+            throwIfHostCommandPlaneStateError(error);
           }
         }
         return committed;
@@ -2967,5 +3174,225 @@ export class RelayV2HostCommandPlane {
         details: { finalState: record.finalState },
       }) as unknown as RelayV2HostJson,
     };
+  }
+}
+
+interface RecoveredH1CandidateBinding {
+  readonly plane: RelayV2HostCommandPlane;
+  readonly sourceGeneration: string;
+}
+
+const recoveredH1OriginalMethods = Object.freeze({
+  execute: RelayV2HostCommandPlane.prototype.execute,
+  query: RelayV2HostCommandPlane.prototype.query,
+  issueDedupeWindow: RelayV2HostCommandPlane.prototype.issueDedupeWindow,
+});
+const recoveredH1Candidates = new WeakMap<object, RecoveredH1CandidateBinding>();
+let recoveredH1SourceGeneration = 0n;
+
+function issueRecoveredH1ReadinessCandidate(
+  plane: RelayV2HostCommandPlane,
+): RelayV2HostCommandPlaneReadinessCandidate {
+  if (recoveredH1SourceGeneration >= MAX_H1_READINESS_GENERATION) {
+    throw new RelayV2HostCommandPlaneStateError(
+      "Relay v2 H1 readiness generation is exhausted",
+    );
+  }
+  recoveredH1SourceGeneration += 1n;
+  const binding: RecoveredH1CandidateBinding = Object.freeze({
+    plane,
+    sourceGeneration: recoveredH1SourceGeneration.toString(10),
+  });
+  const candidate = Object.create(null) as object;
+  recoveredH1Candidates.set(candidate, binding);
+  return Object.freeze(candidate) as unknown as RelayV2HostCommandPlaneReadinessCandidate;
+}
+
+function consumeRecoveredH1Candidate(candidate: unknown): RecoveredH1CandidateBinding | null {
+  if (((typeof candidate !== "object" || candidate === null)
+    && typeof candidate !== "function")) return null;
+  const binding = recoveredH1Candidates.get(candidate as object);
+  if (binding === undefined) return null;
+  // This is the only consume point, and it is lexically inseparable from the
+  // readiness publication and gated facade construction below.
+  recoveredH1Candidates.delete(candidate as object);
+  return binding;
+}
+
+interface H1ActivationAttempt {
+  faulted: boolean;
+}
+
+let h1ActivationAttempt: H1ActivationAttempt | null = null;
+
+function h1ExactOwnDataDescriptors(
+  value: unknown,
+  keys: readonly PropertyKey[],
+): Map<PropertyKey, PropertyDescriptor> | null {
+  if (((typeof value !== "object" || value === null)
+    && typeof value !== "function") || Array.isArray(value)) return null;
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const actualKeys = Reflect.ownKeys(descriptors);
+    if (actualKeys.length !== keys.length
+      || actualKeys.some((key) => !keys.includes(key))) return null;
+    const captured = new Map<PropertyKey, PropertyDescriptor>();
+    for (const key of keys) {
+      const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor | undefined;
+      if (descriptor === undefined
+        || !Object.hasOwn(descriptor, "value")
+        || descriptor.get !== undefined
+        || descriptor.set !== undefined) return null;
+      captured.set(key, descriptor);
+    }
+    return captured;
+  } catch {
+    return null;
+  }
+}
+
+function h1ObserveThenable(value: unknown): void {
+  if (((typeof value !== "object" || value === null)
+    && typeof value !== "function")) return;
+  try {
+    if (typeof (value as { then?: unknown }).then === "function") {
+      void Promise.resolve(value).catch(() => undefined);
+    }
+  } catch {}
+}
+
+function h1CloseSink(sink: object, close: (...args: never[]) => unknown): void {
+  try { h1ObserveThenable(Reflect.apply(close, sink, [])); } catch {}
+}
+
+function createRecoveredH1Facade(
+  binding: RecoveredH1CandidateBinding,
+  sink: object,
+  closeSink: (...args: never[]) => unknown,
+): RelayV2HostH1ReadinessActivation {
+  let accepting = true;
+  let inFlight = 0;
+  let sourceClosed = false;
+  let closeBarrier: Promise<void> | null = null;
+  let resolveCloseBarrier: (() => void) | null = null;
+
+  const beginClose = (): Promise<void> => {
+    if (closeBarrier !== null) return closeBarrier;
+    accepting = false;
+    closeBarrier = inFlight === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => { resolveCloseBarrier = resolve; });
+    if (!sourceClosed) {
+      sourceClosed = true;
+      h1CloseSink(sink, closeSink);
+    }
+    return closeBarrier;
+  };
+
+  const finishCall = (): void => {
+    inFlight -= 1;
+    if (inFlight === 0 && resolveCloseBarrier !== null) {
+      const resolve = resolveCloseBarrier;
+      resolveCloseBarrier = null;
+      resolve();
+    }
+  };
+
+  const invoke = <Result>(operation: () => Promise<Result>): Promise<Result> => {
+    if (!accepting) {
+      return Promise.reject(new TypeError("Relay v2 H1 readiness authority is closed"));
+    }
+    inFlight += 1;
+    let result: Promise<Result>;
+    try {
+      result = operation();
+    } catch (error) {
+      if (error instanceof RelayV2HostCommandPlaneStateError) beginClose();
+      finishCall();
+      return Promise.reject(error);
+    }
+    return Promise.resolve(result).then(
+      (value) => {
+        finishCall();
+        return value;
+      },
+      (error: unknown) => {
+        if (error instanceof RelayV2HostCommandPlaneStateError) beginClose();
+        finishCall();
+        throw error;
+      },
+    );
+  };
+
+  const facade: RelayV2HostH1ReadinessActivation = {
+    execute: (auth, frame) => invoke(() => Reflect.apply(
+      recoveredH1OriginalMethods.execute,
+      binding.plane,
+      [auth, frame],
+    )),
+    query: (auth, frame) => invoke(() => Reflect.apply(
+      recoveredH1OriginalMethods.query,
+      binding.plane,
+      [auth, frame],
+    )),
+    issueDedupeWindow: (input) => invoke(() => Reflect.apply(
+      recoveredH1OriginalMethods.issueDedupeWindow,
+      binding.plane,
+      [input],
+    )),
+    close: beginClose,
+  };
+  return Object.freeze(facade);
+}
+
+/**
+ * Consumes one recovered H1 candidate, publishes literal synchronous readiness,
+ * and returns only the resulting gated facade. Every step shares this lexical
+ * owner; no external bridge can retrieve the candidate's command plane.
+ */
+export function createRelayV2HostH1ReadinessActivation(
+  options: RelayV2HostH1ReadinessActivationOptions,
+): RelayV2HostH1ReadinessActivation | null {
+  const parentAttempt = h1ActivationAttempt;
+  if (parentAttempt !== null) parentAttempt.faulted = true;
+  const attempt: H1ActivationAttempt = { faulted: parentAttempt !== null };
+  h1ActivationAttempt = attempt;
+
+  try {
+    const optionFields = h1ExactOwnDataDescriptors(options, ["candidate", "readinessSink"]);
+    if (optionFields === null) return null;
+    const binding = consumeRecoveredH1Candidate(optionFields.get("candidate")!.value);
+    if (binding === null) return null;
+
+    const sink = optionFields.get("readinessSink")!.value;
+    const sinkFields = h1ExactOwnDataDescriptors(sink, ["apply", "close"]);
+    if (sinkFields === null) return null;
+    const apply = sinkFields.get("apply")!.value;
+    const close = sinkFields.get("close")!.value;
+    if (typeof apply !== "function" || typeof close !== "function") return null;
+    if (attempt.faulted) {
+      h1CloseSink(sink as object, close);
+      return null;
+    }
+
+    let applied: unknown;
+    try {
+      applied = Reflect.apply(apply, sink, [Object.freeze({
+        source: "h1",
+        generation: binding.sourceGeneration,
+        ready: true,
+      })]);
+    } catch {
+      applied = false;
+    }
+    if (applied !== true || attempt.faulted) {
+      h1ObserveThenable(applied);
+      h1CloseSink(sink as object, close);
+      return null;
+    }
+
+    return createRecoveredH1Facade(binding, sink as object, close);
+  } finally {
+    h1ActivationAttempt = parentAttempt;
   }
 }
