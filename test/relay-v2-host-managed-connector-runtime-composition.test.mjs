@@ -251,6 +251,8 @@ async function createHarness(options = {}) {
   const transportLifecycleFactory = createTransportLifecycleFactory(options, records);
   let helloSequence = 0;
   let credentialReadCount = 0;
+  const reauthenticationPreparations = [];
+  const reauthenticationAcknowledgements = [];
   composition = await compositionModule.openRelayV2HostManagedConnectorRuntimeComposition({
     runtime: {
       hostId: HOST_ID,
@@ -300,8 +302,24 @@ async function createHarness(options = {}) {
               accessToken: "twcap2.host.payload.mac",
             };
           },
-          prepareReauthentication() { throw new Error("unexpected reauthentication"); },
-          acknowledgeReauthentication() { return false; },
+          prepareReauthentication(input) {
+            reauthenticationPreparations.push(structuredClone(input));
+            const prepared = {
+              fence: {
+                reference: CREDENTIAL_REFERENCE,
+                version: "2",
+                requestId: "managed-reauth-authority-winner",
+                grantId: "managed-host-grant",
+                accessJti: "managed-host-access-jti-2",
+              },
+              accessToken: "twcap2.managed-reauth.payload.mac",
+            };
+            return options.prepareReauthentication?.(input, prepared) ?? prepared;
+          },
+          acknowledgeReauthentication(fence) {
+            reauthenticationAcknowledgements.push(structuredClone(fence));
+            return true;
+          },
         },
         idFactory: () => `managed-host-hello-${++helloSequence}`,
         clock: () => 1_783_700_100_000,
@@ -321,6 +339,13 @@ async function createHarness(options = {}) {
     identity,
     records,
     expectedWelcome: () => expectedWelcome,
+    credentialActivity: () => ({
+      reads: credentialReadCount,
+      preparations: reauthenticationPreparations.length,
+      acknowledgements: reauthenticationAcknowledgements.length,
+    }),
+    reauthenticationPreparations,
+    reauthenticationAcknowledgements,
     async cleanup() {
       for (const record of records) record.factoryGate?.resolve();
       for (const record of records) record.drainGate?.resolve();
@@ -351,6 +376,25 @@ function stopInput(cut, requestId = "managed.stop") {
     connectorId: cut.connectorId,
     signal: new AbortController().signal,
   };
+}
+
+function reauthenticationInput(cut, requestId = "managed.reauthenticate") {
+  return {
+    requestId,
+    controllerGeneration: cut.controllerGeneration,
+    connectorId: cut.connectorId,
+  };
+}
+
+function assertReauthenticationRejectedWithoutTouch(harness, input) {
+  const activity = harness.credentialActivity();
+  const sentCounts = harness.records.map((record) => record.transport.sent.length);
+  assert.equal(harness.composition.requestReauthentication(input), false);
+  assert.deepEqual(harness.credentialActivity(), activity);
+  assert.deepEqual(
+    harness.records.map((record) => record.transport.sent.length),
+    sentCounts,
+  );
 }
 
 function acknowledgeAll(record) {
@@ -454,6 +498,178 @@ test("managed composition bridges the exact actor route and projects empty capab
   }
 });
 
+test("managed reauthentication delegates one exact registered cut and closes hostile input before owner entry", async () => {
+  const h = await createHarness();
+  try {
+    const { result, record } = await startRegistered(h, "managed.reauth.start");
+    const cut = h.composition.inspect();
+    assert.equal(h.composition.requestReauthentication(
+      reauthenticationInput(cut, "managed.reauth.caller"),
+    ), true);
+    assert.deepEqual(h.reauthenticationPreparations, [{
+      credentialReference: CREDENTIAL_REFERENCE,
+      requestId: "managed.reauth.caller",
+    }]);
+    const reauthenticationFrames = record.transport.sent
+      .map(decodeCarrier)
+      .filter((frame) => frame.type === "host.reauthenticate");
+    assert.equal(reauthenticationFrames.length, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(reauthenticationFrames[0])), {
+      carrierVersion: 1,
+      type: "host.reauthenticate",
+      requestId: "managed-reauth-authority-winner",
+      connectorId: result.connectorId,
+      payload: {
+        accessToken: "twcap2.managed-reauth.payload.mac",
+      },
+    });
+
+    const acknowledged = fixture("host-reauthenticated");
+    acknowledged.requestId = reauthenticationFrames[0].requestId;
+    acknowledged.connectorId = result.connectorId;
+    acknowledged.payload.grantId = "managed-host-grant";
+    acknowledged.payload.jti = "managed-host-access-jti-2";
+    record.connection.receive(carrierWire(acknowledged));
+    assert.deepEqual(h.reauthenticationAcknowledgements, [{
+      reference: CREDENTIAL_REFERENCE,
+      version: "2",
+      requestId: "managed-reauth-authority-winner",
+      grantId: "managed-host-grant",
+      accessJti: "managed-host-access-jti-2",
+    }]);
+
+    const activityBeforeExpiring = h.credentialActivity();
+    const sentBeforeExpiring = record.transport.sent.length;
+    const authExpiring = fixture("host-auth-expiring");
+    authExpiring.connectorId = result.connectorId;
+    authExpiring.payload.grantId = "managed-host-grant";
+    record.connection.receive(carrierWire(authExpiring));
+    assert.deepEqual(h.credentialActivity(), activityBeforeExpiring);
+    assert.equal(record.transport.sent.length, sentBeforeExpiring);
+
+    const hostileState = { getterCalls: 0, proxyTrapCalls: 0 };
+    const accessorInput = {
+      controllerGeneration: cut.controllerGeneration,
+      connectorId: cut.connectorId,
+    };
+    Object.defineProperty(accessorInput, "requestId", {
+      enumerable: true,
+      get() {
+        hostileState.getterCalls += 1;
+        h.composition.requestReauthentication(
+          reauthenticationInput(cut, "managed.reauth.nested"),
+        );
+        return "managed.reauth.accessor";
+      },
+    });
+    const proxyTarget = reauthenticationInput(cut, "managed.reauth.proxy");
+    const proxyInput = new Proxy(proxyTarget, {
+      ownKeys(target) {
+        hostileState.proxyTrapCalls += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+    for (const input of [
+      accessorInput,
+      proxyInput,
+      { ...reauthenticationInput(cut), unknown: true },
+      { ...reauthenticationInput(cut), controllerGeneration: "0" },
+      { ...reauthenticationInput(cut), controllerGeneration: "999" },
+      { ...reauthenticationInput(cut), connectorId: "stale-managed-connector" },
+    ]) {
+      assertReauthenticationRejectedWithoutTouch(h, input);
+    }
+    assert.deepEqual(hostileState, { getterCalls: 0, proxyTrapCalls: 0 });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("managed reauthentication revalidates its exact cut after synchronous authority reentry", async (t) => {
+  for (const operation of ["stop", "close"]) {
+    await t.test(operation, async () => {
+      let h;
+      let cut;
+      let drain;
+      h = await createHarness({
+        manualDrain: true,
+        prepareReauthentication(_input, prepared) {
+          drain = operation === "stop"
+            ? h.composition.stopAndDrain(stopInput(cut, `managed.reauth.${operation}`))
+            : h.composition.closeAndDrain();
+          return prepared;
+        },
+      });
+      try {
+        const active = await startRegistered(h, `managed.reauth.${operation}.start`);
+        cut = h.composition.inspect();
+        const sentBefore = active.record.transport.sent.length;
+
+        assert.equal(h.composition.requestReauthentication(
+          reauthenticationInput(cut, `managed.reauth.${operation}.caller`),
+        ), false);
+        assert.equal(h.credentialActivity().preparations, 1);
+        assert.equal(active.record.transport.sent.length, sentBefore);
+        assert.equal(
+          active.record.transport.sent.map(decodeCarrier)
+            .some((frame) => frame.type === "host.reauthenticate"),
+          false,
+        );
+        assertReauthenticationRejectedWithoutTouch(
+          h,
+          reauthenticationInput(cut, `managed.reauth.${operation}.fenced`),
+        );
+
+        await settle();
+        assert.equal(active.record.drainCalls, 1);
+        active.record.drainGate.resolve();
+        await drain;
+        assert.deepEqual(h.composition.inspect(), {
+          status: "stopped",
+          controllerGeneration: cut.controllerGeneration,
+        });
+      } finally {
+        await h.cleanup();
+      }
+    });
+  }
+});
+
+test("managed reauthentication redacts synchronous credential authority failures", async () => {
+  const secret = "twcap2.sensitive-reauthentication-authority-detail";
+  const h = await createHarness({
+    prepareReauthentication() {
+      throw new Error(secret);
+    },
+  });
+  try {
+    const { record } = await startRegistered(h, "managed.reauth.throw.start");
+    const cut = h.composition.inspect();
+    const sentBefore = record.transport.sent.length;
+    let result;
+    assert.doesNotThrow(() => {
+      result = h.composition.requestReauthentication(
+        reauthenticationInput(cut, "managed.reauth.throw.caller"),
+      );
+    });
+    assert.equal(result, false);
+    assert.equal(String(result).includes(secret), false);
+    assert.deepEqual(h.credentialActivity(), {
+      reads: 1,
+      preparations: 1,
+      acknowledgements: 0,
+    });
+    assert.equal(record.transport.sent.length, sentBefore);
+    assert.equal(
+      record.transport.sent.map(decodeCarrier)
+        .some((frame) => frame.type === "host.reauthenticate"),
+      false,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("offline retry, replacement, superseded, and late callbacks converge on their exact actors", async () => {
   const h = await createHarness({
     registrationDisposition: (sequence) => sequence === 2 ? "replaced" : "connected",
@@ -476,6 +692,10 @@ test("offline retry, replacement, superseded, and late callbacks converge on the
     assert.notEqual(second.record.hello.requestId, first.record.hello.requestId);
     assert.equal(second.result.connectorId, "managed-connector-2");
     assert.equal(readinessReady(h.composition.readiness.current()), true);
+    assertReauthenticationRejectedWithoutTouch(
+      h,
+      reauthenticationInput(first.result, "managed.reauth.replaced"),
+    );
 
     first.record.connection.receive(registeredFrame(first.record));
     first.record.connection.closed(4409);
@@ -492,6 +712,10 @@ test("offline retry, replacement, superseded, and late callbacks converge on the
     });
     assert.equal(second.record.drainCalls, 1);
     assert.equal(readinessReady(h.composition.readiness.current()), false);
+    assertReauthenticationRejectedWithoutTouch(
+      h,
+      reauthenticationInput(second.result, "managed.reauth.superseded"),
+    );
     second.record.connection.receive(registeredFrame(second.record));
     second.record.connection.closed(1006);
     await settle();
@@ -508,6 +732,10 @@ test("stop waits for exact drain evidence, withdraws readiness, and releases rou
     openRoute(first.record, "reusable");
     const cut = h.composition.inspect();
     const stop = h.composition.stopAndDrain(stopInput(cut));
+    assertReauthenticationRejectedWithoutTouch(
+      h,
+      reauthenticationInput(cut, "managed.reauth.stopping"),
+    );
     let stopped = false;
     void stop.then(() => { stopped = true; });
     await settle();
@@ -522,6 +750,10 @@ test("stop waits for exact drain evidence, withdraws readiness, and releases rou
       status: "stopped",
       controllerGeneration: cut.controllerGeneration,
     });
+    assertReauthenticationRejectedWithoutTouch(
+      h,
+      reauthenticationInput(cut, "managed.reauth.stopped"),
+    );
 
     const secondStart = h.composition.start(startInput("managed.stop.second"));
     await settle();
@@ -621,6 +853,7 @@ test("close fences pending starts, converges concurrent close, and exposes no li
     assert.deepEqual(Reflect.ownKeys(h.composition), [
       "inspect",
       "start",
+      "requestReauthentication",
       "stopAndDrain",
       "readiness",
       "sendTerminalFrame",
@@ -628,6 +861,7 @@ test("close fences pending starts, converges concurrent close, and exposes no li
     ]);
     for (const forbidden of [
       "actor", "transport", "factory", "sender", "routeSink", "routeOwner", "controller",
+      "credentialReference", "credentialReferences", "accessToken", "token",
     ]) assert.equal(h.composition[forbidden], undefined);
 
     const pendingStart = h.composition.start(startInput("managed.pending"));
@@ -636,6 +870,11 @@ test("close fences pending starts, converges concurrent close, and exposes no li
     const firstClose = h.composition.closeAndDrain();
     const secondClose = h.composition.closeAndDrain();
     assert.equal(firstClose, secondClose);
+    assertReauthenticationRejectedWithoutTouch(h, {
+      requestId: "managed.reauth.closing",
+      controllerGeneration: "1",
+      connectorId: "managed-closing-connector",
+    });
     await assert.rejects(
       h.composition.start(startInput("managed.after-close")),
       (error) => error.name === "RelayV2HostConnectorControllerError"
@@ -656,6 +895,23 @@ test("close fences pending starts, converges concurrent close, and exposes no li
     assert.equal(readinessReady(h.composition.readiness.current()), false);
   } finally {
     await h.cleanup();
+  }
+
+  const registered = await createHarness({ manualDrain: true });
+  try {
+    const active = await startRegistered(registered, "managed.close.registered");
+    const cut = registered.composition.inspect();
+    const close = registered.composition.closeAndDrain();
+    assertReauthenticationRejectedWithoutTouch(
+      registered,
+      reauthenticationInput(cut, "managed.reauth.close-fenced"),
+    );
+    await settle();
+    assert.equal(active.record.drainCalls, 1);
+    active.record.drainGate.resolve();
+    await close;
+  } finally {
+    await registered.cleanup();
   }
 });
 

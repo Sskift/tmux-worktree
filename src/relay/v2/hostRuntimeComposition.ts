@@ -89,6 +89,7 @@ import type {
   RelayV2TerminalOpenResponseLineage,
   RelayV2TerminalRuntimeBinding,
 } from "./terminalManager.js";
+import { isRelayV2AuthIdentifier } from "./token.js";
 
 type ManualReadinessSource = Exclude<
   RelayV2HostCapabilityReadinessSource,
@@ -303,6 +304,12 @@ export interface RelayV2HostManagedConnectorStartInput {
   readonly signal: AbortSignal;
 }
 
+export interface RelayV2HostManagedConnectorReauthenticationInput {
+  readonly requestId: string;
+  readonly controllerGeneration: string;
+  readonly connectorId: string;
+}
+
 export interface RelayV2HostManagedConnectorStopInput {
   readonly requestId: string;
   readonly controllerGeneration: string;
@@ -344,6 +351,9 @@ export interface RelayV2HostManagedConnectorRuntimeComposition {
   start(
     input: Readonly<RelayV2HostManagedConnectorStartInput>,
   ): Promise<RelayV2HostConnectorControllerStartResult>;
+  requestReauthentication(
+    input: Readonly<RelayV2HostManagedConnectorReauthenticationInput>,
+  ): boolean;
   stopAndDrain(
     input: Readonly<RelayV2HostManagedConnectorStopInput>,
   ): Promise<RelayV2HostConnectorControllerStopResult>;
@@ -1235,6 +1245,35 @@ function captureManagedStartInput(value: unknown): RelayV2HostManagedConnectorSt
   });
 }
 
+function captureManagedReauthenticationInput(
+  value: unknown,
+): RelayV2HostManagedConnectorReauthenticationInput {
+  const fields = exactManagedDataObject(value, [
+    "requestId", "controllerGeneration", "connectorId",
+  ]);
+  if (!isRelayV2AuthIdentifier(fields.requestId)
+    || /(?:twcap2|twref2|twenroll2|twhostboot2)\./i.test(fields.requestId)
+    || typeof fields.controllerGeneration !== "string"
+    || !/^[1-9][0-9]*$/.test(fields.controllerGeneration)
+    || !isRelayV2AuthIdentifier(fields.connectorId)
+    || /(?:twcap2|twref2|twenroll2|twhostboot2)\./i.test(fields.connectorId)) {
+    throw managedCompositionFailure();
+  }
+  try {
+    if (BigInt(fields.controllerGeneration) > MAX_CARRIER_READINESS_GENERATION) {
+      throw managedCompositionFailure();
+    }
+  } catch (error) {
+    if (error instanceof RelayV2HostConnectorControllerError) throw error;
+    throw managedCompositionFailure();
+  }
+  return Object.freeze({
+    requestId: fields.requestId,
+    controllerGeneration: fields.controllerGeneration,
+    connectorId: fields.connectorId,
+  });
+}
+
 function captureManagedStopInput(value: unknown): RelayV2HostManagedConnectorStopInput {
   const fields = exactManagedDataObject(value, [
     "requestId", "controllerGeneration", "connectorId", "signal",
@@ -1320,11 +1359,14 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
     attach(actor: RelayV2HostCarrierActor): void;
     acceptAdapter(): void;
     admitController(connectorId: string): void;
+    requestReauthentication(requestId: string, connectorId: string): boolean;
+    fenceReauthentication(): void;
     observe(status: Readonly<RelayV2HostCarrierStatus>): void;
     reject(): void;
   }>>();
 
   let controller: RelayV2HostConnectorController;
+  let closing = false;
   try {
     const carrierAttemptFactory: RelayV2HostConnectorCarrierAttemptFactoryPort = Object.freeze({
       async createAttempt(input): Promise<Readonly<{
@@ -1436,6 +1478,8 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         let actor: RelayV2HostCarrierActor | null = null;
         let adapterAccepted = false;
         let controllerAdmitted = false;
+        let reauthenticationInFlight = false;
+        let reauthenticationFenced = false;
         let rejected = false;
         let latestStatus: Readonly<RelayV2HostCarrierStatus> | null = null;
         const pendingStatuses: Readonly<RelayV2HostCarrierStatus>[] = [];
@@ -1464,6 +1508,35 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             controllerAdmitted = true;
             bridge.observeCarrierStatus(actor, latestStatus);
           },
+          requestReauthentication(requestId: string, connectorId: string): boolean {
+            if (rejected || reauthenticationFenced || reauthenticationInFlight
+              || !controllerAdmitted || actor === null) return false;
+            const requestActor = actor;
+            reauthenticationInFlight = true;
+            try {
+              return requestActor.requestReauthentication(
+                requestId,
+                credentialReference,
+                (): boolean => {
+                  if (closing || rejected || reauthenticationFenced
+                    || !controllerAdmitted || actor !== requestActor
+                    || attemptRuntimeBindings.get(input.controllerGeneration)
+                      !== runtimeBinding) return false;
+                  const cut = controller.inspectCut();
+                  return cut.status === "registered"
+                    && cut.controllerGeneration === input.controllerGeneration
+                    && cut.connectorId === connectorId;
+                },
+              );
+            } catch {
+              return false;
+            } finally {
+              reauthenticationInFlight = false;
+            }
+          },
+          fenceReauthentication(): void {
+            reauthenticationFenced = true;
+          },
           observe(status: Readonly<RelayV2HostCarrierStatus>): void {
             if (rejected || actor === null) return;
             if (!adapterAccepted) {
@@ -1475,6 +1548,7 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
           reject(): void {
             if (rejected) return;
             rejected = true;
+            reauthenticationFenced = true;
             pendingStatuses.length = 0;
             if (actor !== null) bridge.detachActor(actor, true);
             if (attemptRuntimeBindings.get(input.controllerGeneration) === runtimeBinding) {
@@ -1520,7 +1594,6 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
     hostInstanceId: runtimeOptions.hostInstanceId,
     credentialReference,
   });
-  let closing = false;
   let closeBarrier: Promise<void> | null = null;
   return Object.freeze({
     inspect: () => projectManagedConnectorCut(controller.inspectCut()),
@@ -1541,6 +1614,28 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         return result;
       });
     },
+    requestReauthentication(rawInput): boolean {
+      let input: RelayV2HostManagedConnectorReauthenticationInput;
+      try {
+        input = captureManagedReauthenticationInput(rawInput);
+      } catch {
+        return false;
+      }
+      try {
+        if (closing) return false;
+        const cut = controller.inspectCut();
+        if (cut.status !== "registered"
+          || cut.controllerGeneration !== input.controllerGeneration
+          || cut.connectorId !== input.connectorId) return false;
+        const runtimeBinding = attemptRuntimeBindings.get(input.controllerGeneration);
+        return runtimeBinding?.requestReauthentication(
+          input.requestId,
+          input.connectorId,
+        ) ?? false;
+      } catch {
+        return false;
+      }
+    },
     stopAndDrain(rawInput): Promise<RelayV2HostConnectorControllerStopResult> {
       let input: RelayV2HostManagedConnectorStopInput;
       try {
@@ -1549,8 +1644,11 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         return Promise.reject(error);
       }
       const cut = controller.inspectCut();
+      if (sameManagedStopCut(cut, input)) {
+        attemptRuntimeBindings.get(input.controllerGeneration)?.fenceReauthentication();
+        bridge.withdrawCarrierReadiness();
+      }
       const result = controller.stopAndDrain(Object.freeze({ ...identity, ...input }));
-      if (sameManagedStopCut(cut, input)) bridge.withdrawCarrierReadiness();
       return result;
     },
     readiness: bridge.readiness,
@@ -1564,6 +1662,12 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
       const published = createDeferredBarrier();
       closeBarrier = published.promise;
       closing = true;
+      const closingCut = controller.inspectCut();
+      if (closingCut.status !== "stopped") {
+        attemptRuntimeBindings.get(
+          closingCut.controllerGeneration,
+        )?.fenceReauthentication();
+      }
       bridge.beginManagedClose();
       void (async () => {
         let firstFailure: unknown = null;

@@ -1468,7 +1468,11 @@ export class RelayV2HostCarrierActor {
     }
   }
 
-  requestReauthentication(requestId: string, credentialReference: string): boolean {
+  requestReauthentication(
+    requestId: string,
+    credentialReference: string,
+    postPreparationAdmission?: () => boolean,
+  ): boolean {
     if (this.disposed) return false;
     const activePreparation = this.reauthenticationPreparation;
     if (activePreparation) {
@@ -1499,6 +1503,17 @@ export class RelayV2HostCarrierActor {
       // calls. Re-establish exact ownership before touching volatile pending
       // state or either carrier queue.
       if (!this.ownsReauthenticationPreparation(preparation)) return false;
+      if (postPreparationAdmission !== undefined) {
+        let admitted = false;
+        try {
+          admitted = postPreparationAdmission() === true;
+        } catch {
+          return false;
+        }
+        // The admission callback is also an untrusted synchronous call and
+        // may reenter the actor. Re-establish both owners at the same boundary.
+        if (!admitted || !this.ownsReauthenticationPreparation(preparation)) return false;
+      }
       if (winner.grantId !== connector.credential.grantId) {
         throw new Error("Relay v2 host reauthentication cannot change the host grant");
       }
