@@ -2,10 +2,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
-import {
-  createDashboardBackend,
-  createUnavailableMobileRelayV2Adapter,
-} from "./dashboardBackend";
+import { createDashboardBackend } from "./dashboardBackend";
+import { createRelayV2ManagementV1Adapter } from "./relayV2ManagementV1Adapter";
 import { createTauriTransport } from "./tauriTransportFactory";
 
 const currentWindow = getCurrentWindow();
@@ -35,8 +33,7 @@ export const tauriTransport = createTauriTransport({
 });
 
 export const tauriDashboardBackend = createDashboardBackend(tauriTransport, {
-  // The frozen v2 contract keeps issuer, bootstrap attempts, credentials, and
-  // enrollment attempts in Node. Until that control API exists, Tauri must not
-  // invent a native issuer or proxy bootstrap/access/refresh secrets over IPC.
-  relayV2: createUnavailableMobileRelayV2Adapter(),
+  relayV2: createRelayV2ManagementV1Adapter(
+    (command, args) => tauriTransport.invoke(command, args),
+  ),
 });

@@ -19,6 +19,7 @@ pub(crate) use files::*;
 pub(crate) use git::*;
 pub(crate) use layout::*;
 pub(crate) use mobile_relay::*;
+pub(crate) use mobile_relay_v2::*;
 pub(crate) use pty::*;
 pub(crate) use sessions::*;
 pub(crate) use terminal_control::*;

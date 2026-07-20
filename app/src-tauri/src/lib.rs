@@ -30,6 +30,9 @@ pub fn run() {
             app.manage(Arc::new(TerminalControlState::new()));
             app.manage(Arc::new(FeishuBridgeRuntimeState::default()));
             app.manage(Arc::new(MobileRelayState::default()));
+            app.manage(Arc::new(MobileRelayV2ManagementCommandState::start(
+                &app.handle(),
+            )));
             app.manage(Arc::new(GitFetchState::default()));
             app.manage(Arc::new(HostState::default()));
             setup_clipboard_bindings();
@@ -126,6 +129,7 @@ pub fn run() {
             mobile_relay_save_config,
             mobile_relay_stop,
             mobile_relay_status,
+            mobile_relay_v2_management_call,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -141,6 +145,9 @@ pub fn run() {
                 );
                 let relay_state = app.state::<Arc<MobileRelayState>>();
                 stop_mobile_relay_processes(relay_state.inner().as_ref());
+                let relay_v2_management_state =
+                    app.state::<Arc<MobileRelayV2ManagementCommandState>>();
+                relay_v2_management_state.dispose();
                 control_state.inner().stop_remote_proxies();
                 // The terminal-control authority and Feishu bridge are shared by
                 // Dashboard, Relay and CLI adapters. Dashboard must not fence
