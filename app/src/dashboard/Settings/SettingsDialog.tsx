@@ -142,7 +142,8 @@ const DEFAULT_CONTENT: Record<SettingsSectionId, ReactNode> = {
   integrations: <SettingsNotice>No external integrations are configured.</SettingsNotice>,
   agents: (
     <SettingsNotice>
-      Agent defaults are currently selected when a terminal or worktree is created.
+      Agent defaults seed automations and the detected-agent preference for new worktrees. New
+      terminals start in a login shell.
     </SettingsNotice>
   ),
   history: (

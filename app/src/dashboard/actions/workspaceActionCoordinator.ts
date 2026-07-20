@@ -20,7 +20,6 @@ import {
 export type WorkspaceTerminalDraft = Readonly<{
   label: string;
   cwd: string;
-  aiCmd: string;
   hostId?: string | null;
 }>;
 
@@ -300,7 +299,6 @@ export function createWorkspaceActionCoordinator(
         tmuxName: created.tmuxName,
         hostId: created.hostId ?? draft.hostId ?? null,
         rawName: created.rawName,
-        aiCmd: draft.aiCmd,
         managed: created.managed,
       });
       void nextContext.backend.sessions.exists(sessionKey)
@@ -524,7 +522,7 @@ export function createWorkspaceActionCoordinator(
         dispatched = true;
         created = await nextContext.backend.terminals.create({
           cwd: draft.cwd,
-          aiCmd: draft.aiCmd,
+          aiCmd: "",
           hostId: draft.hostId ?? null,
         });
         nextContext = actionContext(action);

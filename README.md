@@ -148,7 +148,7 @@ Typical Dashboard flow:
 
 1. Click `New worktree`.
 2. Choose a local project or SSH host.
-3. Enter an AI command such as `claude` or `codex`.
+3. Choose one of the supported agents detected as available on that machine.
 4. Attach to the tmux terminal, inspect Git state, edit files, and keep scratch terminals nearby.
 
 ## Dashboard
@@ -157,12 +157,12 @@ The macOS app is built with Tauri 2, React, xterm.js, and a Rust PTY backend.
 
 | Area | Purpose |
 | --- | --- |
-| Worktrees | Create, restore, attach, and clean up TW-managed git worktrees. |
-| Terminals | Keep standalone tmux terminals next to agent sessions. |
+| Worktrees | Create, restore, attach, clean up, and drag to reorder TW-managed git worktrees. |
+| Terminals | Keep and drag to reorder standalone tmux login-shell terminals next to agent sessions. |
 | Git panel | Track active branch, changed files, diffs, and recent commits for the selected session cwd. |
 | File tree and editor | Browse files, edit source, preview Markdown and images, and search by filename or content. |
 | Automations | Define reusable instructions, run them now, pause them, or schedule them. |
-| Layout | Persist window state, sidebar state, column order, editor state, and selected panes. |
+| Layout | Persist window state, sidebar state and ordering, column order, editor state, and selected panes. |
 
 Runtime state is stored in user-local JSON files:
 
@@ -170,7 +170,7 @@ Runtime state is stored in user-local JSON files:
 | --- | --- | --- |
 | `~/.tmux-worktree.json` | CLI and Dashboard | Projects, SSH hosts, and worktree root. |
 | `~/.tmux-worktree/state.json` | CLI and Dashboard | TW-managed sessions and worktrees. |
-| `~/.tw-dashboard-layout.json` | Dashboard | Window, columns, file tree, editor, diff, and selection state. |
+| `~/.tw-dashboard-layout.json` | Dashboard | Window, columns, sidebar ordering, file tree, editor, diff, and selection state. |
 | `~/.tw-dashboard-terminals.json` | Dashboard | Saved standalone terminals. |
 | `~/.tw-dashboard-automations.json` | Dashboard | Automation definitions. |
 | `~/.tw-dashboard-automation-runs.json` | Dashboard | Recent automation run history. |
@@ -205,8 +205,9 @@ tw rpc restore-worktree --path ~/.tmux-worktree/worktrees/myapp/myapp-fix-abc12 
 tw rpc kill-session --name tw-term-abc12
 ```
 
-The Dashboard's `New terminal` AI command is optional. Leaving it empty creates the same
-TW-managed single-pane terminal directly in a login shell.
+The Dashboard's `New terminal` flow always creates the TW-managed single-pane terminal
+directly in a login shell. The lower-level CLI/RPC command still accepts an explicit
+`--ai-command` for automated callers that need one.
 
 `tw ls` is non-interactive and exits after printing the current session list; `tw status` remains a compatibility alias. Session switching remains available through `tw attach <session>` and native tmux; the CLI no longer opens an alternate-screen status UI or creates status/extra-shell panes.
 

@@ -51,7 +51,9 @@ tw codex /Users/me/workspace/demo fix-auth
 
 Both forms always create a managed git worktree and write `~/.tmux-worktree/state.json`; a path that is not a git repository is rejected instead of becoming an untracked plain tmux session. New worktree sessions use the same single tmux pane as Dashboard-created sessions. The managed-state `profile` still records whether the request came from the CLI or Dashboard for compatibility, but it does not change the pane layout. Existing live sessions created by older releases keep their original panes and remain attachable.
 
-Create one from the Dashboard with `New worktree`: choose `Local`, choose a configured project or browse a path, then enter an AI command such as `claude` or `codex`.
+Create one from the Dashboard with `New worktree`: choose `Local`, choose a configured project or browse a path, then choose one of the supported agents that the Dashboard detected as available on this Mac. The field is a fixed picker; Dashboard worktree creation does not accept an arbitrary command there.
+
+Drag a Worktrees group header to reorder Host/Project groups. Drag an individual worktree within its own group to reorder that group; a row cannot be moved into a different Host/Project identity. Focused drag handles also accept Up/Down, and the order survives relaunch.
 
 When a selected local project preset points to a path that no longer exists, the Dashboard removes only that exact name/path entry from `~/.tmux-worktree.json`; unrelated fields and a concurrently replaced entry are preserved.
 
@@ -140,14 +142,14 @@ ssh remote-dev -- 'npm i -g --prefix ~/.local @openai/codex@latest'
 ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" codex --version'
 ```
 
-For Dashboard-created sessions, entering `claude`, `codex`, or another command in the AI command field is enough after the remote binary is installed.
+For Dashboard-created worktrees, the agent picker probes the selected Host and lists only supported commands that are actually available there. Install the remote binary first, then select it from that picker.
 
 ## Create Remote Worktrees From Dashboard
 
 1. Click `New worktree`.
 2. Choose the remote host.
 3. Choose a configured remote project, use `browse`, or type a remote repository path.
-4. Enter the AI command, for example `claude` or `codex`.
+4. Choose an agent detected as available on that Host.
 5. Create the worktree.
 
 For a selected SSH host, the project picker reads `projects`/`repositories`/`repos` from that host's own `~/.tmux-worktree.json`, expanding `~` against the remote physical home. The picker reports loading and an explicit empty-config state instead of hiding the project row.
@@ -160,7 +162,7 @@ Remote managed terminals use a read-only SSH tmux attachment and send keyboard i
 
 ## Create Remote Terminals From Dashboard
 
-Use `+ terminal`, choose the remote host, and choose or type the remote path. The AI command is optional; leaving it empty opens the TW-managed terminal in a login shell. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label/order metadata remains in `~/.tw-dashboard-terminals.json`.
+Use `+ terminal`, choose the remote host, and choose or type the remote path. Dashboard does not ask for an AI command here: it opens every new terminal in a login shell. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label and runtime identity metadata remains in `~/.tw-dashboard-terminals.json`; the visible terminal order, including discovered terminals, is stored with the Dashboard layout in `~/.tw-dashboard-layout.json`. Drag any Terminal row, or focus its handle and press Up/Down, to change an order that survives relaunch.
 
 ## Configure The Feishu Bot
 

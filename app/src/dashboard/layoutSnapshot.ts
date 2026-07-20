@@ -20,6 +20,8 @@ export type DashboardLayoutSnapshotInput = {
   scratchWidth: number;
   selection: Selection;
   sessionOrder: string[];
+  worktreeGroupOrder: string[];
+  terminalOrder: string[];
   sidebarOpen: boolean;
   sidebarView: SidebarView;
   sidebarWidth: number;
@@ -43,6 +45,8 @@ export function buildDashboardLayoutSnapshot({
   scratchWidth,
   selection,
   sessionOrder,
+  worktreeGroupOrder,
+  terminalOrder,
   sidebarOpen,
   sidebarView,
   sidebarWidth,
@@ -56,6 +60,8 @@ export function buildDashboardLayoutSnapshot({
     inspectorOpen,
     sidebarView,
     sessionOrder: [...sessionOrder],
+    worktreeGroupOrder: [...worktreeGroupOrder],
+    terminalOrder: [...terminalOrder],
     collapsedProjects: [...collapsedProjects],
     pinnedItems: pinnedItems.map((item) => ({ ...item })),
     automationSectionCollapsed,

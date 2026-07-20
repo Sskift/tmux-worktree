@@ -123,6 +123,20 @@ function cloneLayoutSnapshot(
   if (hasOwn(source, "sessionOrder")) {
     defineOwn(snapshot, "sessionOrder", source.sessionOrder ? [...source.sessionOrder] : undefined);
   }
+  if (hasOwn(source, "worktreeGroupOrder")) {
+    defineOwn(
+      snapshot,
+      "worktreeGroupOrder",
+      source.worktreeGroupOrder ? [...source.worktreeGroupOrder] : undefined,
+    );
+  }
+  if (hasOwn(source, "terminalOrder")) {
+    defineOwn(
+      snapshot,
+      "terminalOrder",
+      source.terminalOrder ? [...source.terminalOrder] : undefined,
+    );
+  }
   if (hasOwn(source, "collapsedProjects")) {
     defineOwn(
       snapshot,

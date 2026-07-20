@@ -6,6 +6,7 @@ import {
   isInternalTerminalName,
   isLocalDiscoveredInternalTerminal,
   normalizePlainTerminal,
+  orderTerminalsBySessionKey,
   sessionDisplayName,
   terminalRawName,
   terminalSessionKey,
@@ -42,6 +43,20 @@ test("terminal identities preserve raw names and host-qualified catalog keys", (
   assert.equal(
     terminalRawName({ ...terminal, tmuxName: "other:tw-term-one" }),
     "other:tw-term-one",
+  );
+});
+
+test("terminal sidebar order uses stable host and tmux identity", () => {
+  const local = { ...terminal, id: "metadata-id", hostId: null, tmuxName: "tw-term-local" };
+  const remoteDiscovered = { ...terminal, id: "discovered-id", discovered: true };
+  const unknown = { ...terminal, id: "unknown", hostId: null, tmuxName: "tw-term-new" };
+
+  assert.deepEqual(
+    orderTerminalsBySessionKey(
+      [local, remoteDiscovered, unknown],
+      ["builder:tw-term-one", "tw-term-local"],
+    ).map((item) => item.id),
+    ["discovered-id", "metadata-id", "unknown"],
   );
 });
 

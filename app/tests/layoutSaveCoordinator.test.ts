@@ -70,6 +70,8 @@ function snapshot(label: string): DashboardLayoutPreferences {
     sectionSplit: 221,
     automationHeight: 131,
     sessionOrder: [`session-${label}`],
+    worktreeGroupOrder: [`group-${label}`],
+    terminalOrder: [`terminal-${label}`],
     collapsedProjects: [`project-${label}`],
     pinnedItems: [{ kind: "session", name: `pinned-${label}` }],
     automationSectionCollapsed: false,
@@ -173,6 +175,8 @@ test("debounce keeps only the latest deeply cloned known snapshot", async () => 
 
   latest.columnOrder.reverse();
   latest.sessionOrder?.push("mutated");
+  latest.worktreeGroupOrder?.push("mutated");
+  latest.terminalOrder?.push("mutated");
   latest.collapsedProjects?.push("mutated");
   if (latest.pinnedItems?.[0]?.kind === "session") latest.pinnedItems[0].name = "mutated";
   if (latest.selection?.kind === "session") latest.selection.name = "mutated";

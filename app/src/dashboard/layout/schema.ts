@@ -313,6 +313,8 @@ export function isDashboardLayoutV2(value: unknown): value is DashboardLayoutV2 
     optionalField(value, "sectionSplit", isPositiveFiniteNumber) &&
     optionalField(value, "automationHeight", isPositiveFiniteNumber) &&
     optionalField(value, "sessionOrder", isStringArray) &&
+    optionalField(value, "worktreeGroupOrder", isStringArray) &&
+    optionalField(value, "terminalOrder", isStringArray) &&
     optionalField(value, "collapsedProjects", isNonEmptyStringArray) &&
     optionalField(value, "pinnedItems", isPinnedItems) &&
     optionalField(value, "automationSectionCollapsed", (field) => typeof field === "boolean") &&
@@ -364,6 +366,20 @@ function normalizedPreferences(value: unknown): DashboardLayoutPreferences {
       normalized,
       "sessionOrder",
       source.sessionOrder.filter((item): item is string => typeof item === "string"),
+    );
+  }
+  if (Array.isArray(source.worktreeGroupOrder)) {
+    defineOwnDataProperty(
+      normalized,
+      "worktreeGroupOrder",
+      source.worktreeGroupOrder.filter((item): item is string => typeof item === "string"),
+    );
+  }
+  if (Array.isArray(source.terminalOrder)) {
+    defineOwnDataProperty(
+      normalized,
+      "terminalOrder",
+      source.terminalOrder.filter((item): item is string => typeof item === "string"),
     );
   }
   if (Array.isArray(source.collapsedProjects)) {
@@ -458,6 +474,8 @@ const DASHBOARD_LAYOUT_KNOWN_KEYS = new Set<string>([
   "sectionSplit",
   "automationHeight",
   "sessionOrder",
+  "worktreeGroupOrder",
+  "terminalOrder",
   "collapsedProjects",
   "pinnedItems",
   "automationSectionCollapsed",

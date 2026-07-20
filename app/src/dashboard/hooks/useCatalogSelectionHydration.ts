@@ -14,12 +14,14 @@ import {
 import {
   isLocalDiscoveredInternalTerminal,
   normalizePlainTerminal,
+  orderTerminalsBySessionKey,
   terminalSessionKey,
 } from "../model/terminalIdentity";
 
 type UseCatalogSelectionHydrationOptions = {
   terminals: PlainTerminal[];
   discoveredTerminals: PlainTerminal[];
+  terminalOrder?: readonly string[];
   sessions: Session[];
   hosts: HostConfig[];
   selection: Selection;
@@ -38,6 +40,7 @@ type UseCatalogSelectionHydrationOptions = {
 export function useCatalogSelectionHydration({
   terminals,
   discoveredTerminals,
+  terminalOrder = [],
   sessions,
   hosts,
   selection,
@@ -52,14 +55,14 @@ export function useCatalogSelectionHydration({
 }: UseCatalogSelectionHydrationOptions) {
   const allTerminals = useMemo(() => {
     const persistedKeys = new Set(terminals.map(terminalSessionKey));
-    return [
+    return orderTerminalsBySessionKey([
       ...terminals,
       ...discoveredTerminals
         .filter((terminal) => !isLocalDiscoveredInternalTerminal(terminal))
         .filter((terminal) => !persistedKeys.has(terminalSessionKey(terminal)))
         .map(normalizePlainTerminal),
-    ];
-  }, [terminals, discoveredTerminals]);
+    ], terminalOrder);
+  }, [terminals, discoveredTerminals, terminalOrder]);
 
   const catalogSelectionResolution = useMemo(
     () =>

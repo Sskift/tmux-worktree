@@ -6,6 +6,7 @@ import {
   type SessionActivityInfo,
 } from "../model/sessionActivity";
 import type { OwnerEpochLease } from "../ownerEpochLease";
+import { orderSessionsByName } from "../model/workspaceSelectors";
 
 type WorkspaceCatalogBackend = Pick<DashboardBackend, "catalog" | "sessions" | "terminals">;
 
@@ -45,14 +46,6 @@ export type WorkspaceCatalogRefreshOptions = {
   publishError(error: string): void;
 };
 
-function sortSessions(sessions: Session[], order: readonly string[]): Session[] {
-  const orderMap = new Map(order.map((name, index) => [name, index]));
-  sessions.sort((left, right) =>
-    (orderMap.get(left.name) ?? Infinity) - (orderMap.get(right.name) ?? Infinity),
-  );
-  return sessions;
-}
-
 function discoveredTerminals(terminals: PlainTerminal[]): PlainTerminal[] {
   return terminals.map((terminal) => ({ ...terminal, discovered: true }));
 }
@@ -76,7 +69,7 @@ export async function workspaceCatalogRefresh(
           options.getCurrentDiscoveredTerminals(),
           localSnapshot,
         );
-        const localSessions = sortSessions(
+        const localSessions = orderSessionsByName(
           mergedLocalCatalog.sessions,
           options.getSessionOrder(),
         );
@@ -113,7 +106,7 @@ export async function workspaceCatalogRefresh(
       options.getCurrentDiscoveredTerminals(),
       snapshot,
     );
-    const sessions = sortSessions(mergedCatalog.sessions, options.getSessionOrder());
+    const sessions = orderSessionsByName(mergedCatalog.sessions, options.getSessionOrder());
     const nowSeconds = options.nowSeconds();
     const previousActivity = options.getPreviousActivity();
     const nextActivity = new Map<string, PreviousSessionActivity>();

@@ -40,6 +40,35 @@ function sessionProjectName(session: Session): string {
   return separatorIndex > 0 ? displayName.slice(0, separatorIndex) : displayName || "Unassigned";
 }
 
+export function sidebarSessionGroupKey(session: Session): string {
+  const project = sessionProjectName(session);
+  return session.hostId ? `ssh:${session.hostId}:${project}` : `local:${project}`;
+}
+
+export function orderSessionsByName(
+  sessions: readonly Session[],
+  order: readonly string[],
+): Session[] {
+  const orderMap = new Map<string, number>();
+  for (const name of order) {
+    if (!orderMap.has(name)) orderMap.set(name, orderMap.size);
+  }
+  return [...sessions].sort((left, right) =>
+    (orderMap.get(left.name) ?? Number.POSITIVE_INFINITY) -
+    (orderMap.get(right.name) ?? Number.POSITIVE_INFINITY),
+  );
+}
+
+export function canReorderSessionsWithinGroup(
+  sessions: readonly Session[],
+  fromIndex: number,
+  toIndex: number,
+): boolean {
+  const source = sessions[fromIndex];
+  const target = sessions[toIndex];
+  return !!source && !!target && sidebarSessionGroupKey(source) === sidebarSessionGroupKey(target);
+}
+
 /**
  * Keep the legacy group keys so persisted collapse state survives the shell
  * redesign while the visible label becomes an explicit Host / Project pair.
@@ -55,7 +84,7 @@ export function groupSessionsByHostProject(
   for (const session of sessions) {
     const project = sessionProjectName(session);
     const hostId = session.hostId || null;
-    const key = hostId ? `ssh:${hostId}:${project}` : `local:${project}`;
+    const key = sidebarSessionGroupKey(session);
     let group = groupsByKey.get(key);
 
     if (!group) {
@@ -74,6 +103,20 @@ export function groupSessionsByHostProject(
   }
 
   return groups;
+}
+
+export function orderSidebarSessionGroups(
+  groups: readonly SidebarSessionGroup[],
+  order: readonly string[],
+): SidebarSessionGroup[] {
+  const orderMap = new Map<string, number>();
+  for (const key of order) {
+    if (!orderMap.has(key)) orderMap.set(key, orderMap.size);
+  }
+  return [...groups].sort((left, right) =>
+    (orderMap.get(left.key) ?? Number.POSITIVE_INFINITY) -
+    (orderMap.get(right.key) ?? Number.POSITIVE_INFINITY),
+  );
 }
 
 export function summarizeSidebarConnections(

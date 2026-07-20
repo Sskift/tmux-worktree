@@ -150,7 +150,7 @@ export function AgentsSettings({
           <span className="agents-card__icon" aria-hidden="true"><Terminal size={16} /></span>
           <div>
             <h3 id="agents-default-heading">Default agent command</h3>
-            <p>Used when a new worktree, terminal, or automation does not specify one.</p>
+            <p>Automations use this command by default. New worktrees prefer the matching agent when it is available on the selected host.</p>
           </div>
         </div>
 
@@ -182,7 +182,8 @@ export function AgentsSettings({
             </button>
           </div>
           <p id="settings-default-agent-command-hint" className="agents-field-hint">
-            This value is saved as configuration. Detection never runs this full command.
+            Worktree creation accepts only a supported agent detected on the selected machine;
+            detection never runs this full command.
           </p>
           {saveNotice ? (
             <p

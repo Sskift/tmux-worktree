@@ -28,14 +28,14 @@ use super::{
     ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
     trigger_automation_with_creator, try_cleanup_remote_worktree, try_cleanup_worktree,
     tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
-    validate_ssh_host_fields, worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs,
-    AgentProbeResult, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
-    AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
-    DashboardConfigLockOwner, DashboardLayoutClassification, DeleteWorktreeArgs,
-    EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery, GitGraphRefKind,
-    HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree, Project,
-    RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS,
-    AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+    user_bin_search_paths, validate_ssh_host_fields, worktree_has_uncommitted_changes,
+    worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
+    AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
+    CreateTerminalArgs, DashboardConfigLockOwner, DashboardLayoutClassification,
+    DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
+    GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
+    Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
+    AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -84,10 +84,12 @@ fn restore_env(name: &str, value: Option<String>) {
 }
 
 #[test]
-fn agent_probe_uses_only_the_fixed_allowlist_and_checks_executable_bits() {
+fn agent_probe_uses_managed_session_paths_and_only_the_fixed_executable_allowlist() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let codex_path = temp.path().join("codex");
-    let custom_path = temp.path().join("custom-agent --unsafe");
+    let user_bin = temp.path().join(".local/bin");
+    fs::create_dir_all(&user_bin).expect("user bin");
+    let codex_path = user_bin.join("codex");
+    let custom_path = user_bin.join("custom-agent --unsafe");
     fs::write(&codex_path, "#!/bin/sh\nexit 0\n").expect("write codex");
     fs::write(&custom_path, "#!/bin/sh\nexit 0\n").expect("write custom agent");
 
@@ -102,7 +104,12 @@ fn agent_probe_uses_only_the_fixed_allowlist_and_checks_executable_bits() {
     custom_permissions.set_mode(0o755);
     fs::set_permissions(&custom_path, custom_permissions).expect("chmod custom agent");
 
-    let results = probe_local_agents_in_paths(&[temp.path().to_path_buf()]);
+    let search_paths = user_bin_search_paths(
+        Some(temp.path()),
+        Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+    );
+    assert_eq!(search_paths[0], user_bin);
+    let results = probe_local_agents_in_paths(&search_paths);
     assert_eq!(
         AGENT_PROBE_SPECS
             .iter()
@@ -4595,6 +4602,8 @@ fn canonical_dashboard_layout(label: &str) -> serde_json::Value {
     serde_json::json!({
         "schemaVersion": 2,
         "columnOrder": ["file", "main", "scratch", "editor"],
+        "worktreeGroupOrder": ["local:dashboard", "ssh:builder:dashboard"],
+        "terminalOrder": ["builder:tw-term-one", "tw-term-two"],
         "sidebarWidth": if label == "first" { 280 } else { 320 },
         "selection": { "kind": "session", "name": label },
         "opaqueExtension": { "label": label }
@@ -4937,6 +4946,8 @@ fn invalid_layout_save_request_fails_before_lock_backup_or_write() {
         serde_json::json!({ "schemaVersion": 3, "columnOrder": ["file", "main", "scratch", "editor"] }),
         serde_json::json!({ "schemaVersion": 2, "version": 2, "columnOrder": ["file", "main", "scratch", "editor"] }),
         serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "file", "scratch", "editor"] }),
+        serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "main", "scratch", "editor"], "worktreeGroupOrder": ["valid", 42] }),
+        serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "main", "scratch", "editor"], "terminalOrder": ["valid", 42] }),
     ] {
         let error = save_layout_to_path(&path, invalid, &revision)
             .expect_err("invalid request must fail closed");

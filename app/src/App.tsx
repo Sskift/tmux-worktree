@@ -122,6 +122,7 @@ import {
 } from "./automationTypes";
 import {
   sessionDisplayName,
+  terminalSessionKey,
 } from "./dashboard/model/terminalIdentity";
 import { deriveWorkspacePresentation } from "./dashboard/model/workspacePresentation";
 import { projectKey } from "./dashboard/model/workspaceSelectors";
@@ -141,6 +142,10 @@ function App() {
   const {
     sessionOrder,
     setSessionOrder,
+    worktreeGroupOrder,
+    setWorktreeGroupOrder,
+    terminalOrder,
+    setTerminalOrder,
     collapsedProjects,
     setCollapsedProjects,
     pinnedItems,
@@ -462,6 +467,7 @@ function App() {
   } = useCatalogSelectionHydration({
     terminals,
     discoveredTerminals,
+    terminalOrder,
     sessions,
     hosts,
     selection,
@@ -898,6 +904,9 @@ function App() {
     setPinnedItems((current) => current.filter(
       (item) => item.kind !== "terminal" || item.id !== id,
     ));
+    setTerminalOrder((current) => current.filter(
+      (key) => key !== terminalSessionKey(terminal),
+    ));
     setSelection((current) => {
       if (current?.kind !== "terminal" || current.id !== id) return current;
       const remainingTerminal = allTerminals.find((candidate) => candidate.id !== id);
@@ -934,6 +943,15 @@ function App() {
       renamePersistedTerminal(current, allTerminals, id, label)
     ));
   }, [allTerminals]);
+  const reorderSessions = useCallback((reordered: typeof sessions) => {
+    setSessionOrder(reordered.map((session) => session.name));
+  }, [setSessionOrder]);
+  const reorderWorktreeGroups = useCallback((groupKeys: string[]) => {
+    setWorktreeGroupOrder(groupKeys);
+  }, [setWorktreeGroupOrder]);
+  const reorderTerminals = useCallback((reordered: typeof allTerminals) => {
+    setTerminalOrder(reordered.map(terminalSessionKey));
+  }, [setTerminalOrder]);
 
   useEffect(() => {
     const handleNewWorktreeShortcut = (event: KeyboardEvent) => {
@@ -1531,6 +1549,8 @@ function App() {
           localRuntimeState={error ? "error" : catalogRefreshGeneration > 0 ? "ready" : "checking"}
           selection={selection}
           sessionActivity={sessionActivity}
+          sessionOrder={sessionOrder}
+          worktreeGroupOrder={worktreeGroupOrder}
           collapsedProjects={collapsedProjects}
           pinnedItems={pinnedItems}
           automationSectionCollapsed={automationSectionCollapsed}
@@ -1567,8 +1587,11 @@ function App() {
             );
           }}
           onSelectSession={selectSession}
+          onReorderSessions={reorderSessions}
+          onReorderWorktreeGroups={reorderWorktreeGroups}
           onCloseSession={closeSession}
           onSelectTerminal={selectTerminal}
+          onReorderTerminals={reorderTerminals}
           onRenameTerminal={renameTerminal}
           onCloseTerminal={closeTerminal}
           onSelectAutomation={selectAutomation}

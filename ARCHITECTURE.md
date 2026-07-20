@@ -176,7 +176,7 @@ React -> Tauri/Rust -> SSH Host
 - 已连接 Host 只来自本机 `~/.tmux-worktree.json` 的显式 `hosts`；`~/.ssh/config` 只提供添加候选。
 - 远端 catalog 合并 `tw rpc list` 的 managed 条目和严格匹配的 legacy tmux/worktree 发现，按原始 tmux name 去重；RPC 条目优先。
 - 远端 create-worktree、create-terminal 和 restore 必须经过兼容的远端 `tw rpc`；缺失或 capability 不兼容时要求安装/升级，不回退到 Rust 手写 SSH git/tmux mutation。managed kill 先走 RPC，只有下文“Managed lifecycle 与兼容层”第 4 项枚举的 legacy 信号才允许 direct tmux compatibility path。
-- New worktree 对话框按所选 Host 扫描 orphan。远端扫描和删除只接受该 Host 配置的 `worktreeBase` 下 `project/worktree` 两级真实 Git worktree；删除由 Dashboard 的 SSH/Git adapter 执行，保留分支，并在用户明确强制删除时于提供 `/proc` 的 Linux Host 上终止 cwd 仍位于目标目录内的残留进程。远端 restore 仍委托目标主机的 `tw rpc restore-worktree`。
+- New worktree 对话框按所选 Host 扫描 orphan，并通过 DashboardBackend 探测该目标上的受支持 Agent；创建与 restore 只能从探测结果中选择 `available` 的固定命令，不接受任意文本，探测失败或无可用 Agent 时不允许提交。远端扫描和删除只接受该 Host 配置的 `worktreeBase` 下 `project/worktree` 两级真实 Git worktree；删除由 Dashboard 的 SSH/Git adapter 执行，保留分支，并在用户明确强制删除时于提供 `/proc` 的 Linux Host 上终止 cwd 仍位于目标目录内的残留进程。远端 restore 仍委托目标主机的 `tw rpc restore-worktree`。
 - Dashboard 可以把 `.app` 中的 CLI 复制到 Host 并安装 wrapper；远端仍需要 Node.js、git 和 tmux。
 - PTY、文件和 git 读取按 Host 路由通过 SSH 执行，不经过 Relay broker。
 
@@ -234,8 +234,8 @@ Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 
 | git repositories/worktrees | 各目标主机的 git | `tw` managed create；Dashboard orphan cleanup | 工作区内容和 dirty 状态由 git 决定 |
 | `~/.tmux-worktree/state.json` | 目标主机上的 `tw` | `tw` session/RPC lifecycle | managed worktree/terminal registry；mutation 使用跨进程锁和原子替换，损坏或未知 schema 时 fail closed |
 | `~/.tmux-worktree.json` | 用户配置 | CLI 和 Dashboard | projects、hosts、worktree base、mobile relay，以及非敏感的 `feishuBridge.larkProfile`；跨进程写入必须持锁并保留未知字段，Lark credential 不写入这里 |
-| `~/.tw-dashboard-terminals.json` | Dashboard metadata | Dashboard Rust 与 relay-host | label、order、cwd、host/raw name、managed marker；不是 tmux 或 managed state 的替代品 |
-| `~/.tw-dashboard-layout.json` | Dashboard | Dashboard Rust | canonical schema、revision/CAS、窗口与工作区展示状态 |
+| `~/.tw-dashboard-terminals.json` | Dashboard metadata | Dashboard Rust 与 relay-host | label、cwd、host/raw name、managed marker；不是 tmux 或 managed state 的替代品 |
+| `~/.tw-dashboard-layout.json` | Dashboard | Dashboard Rust | canonical schema、revision/CAS、窗口与工作区展示状态，包括 worktree/terminal 侧栏顺序 |
 | `~/.tw-dashboard-automations.json` | Dashboard/CLI 共用定义 | Dashboard Rust 与 `tw automation` | 本机 automation 定义；调度器随 Dashboard 进程运行 |
 | `~/.tw-dashboard-automation-runs.json` | Dashboard | Dashboard Rust | 本地、有界的运行历史 |
 | `~/.tw-dashboard-pending-worktree-cleanup.json` | Dashboard | Dashboard Rust | session 关闭后尚未完成的本机 worktree 清理队列 |
@@ -245,7 +245,7 @@ Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 
 | `~/.tmux-worktree/terminal-control-output-v1/` | local terminal-control | terminal-control daemon | Feishu marker correlation 使用的有界、generation-fenced 两段式 capture；不是可见 PTY/scrollback，不授予 input ownership；旧 generation 在 fence 后回收 |
 | `~/.tmux-worktree/feishu-*.json` | Feishu Bridge | Feishu bridge daemon | 私有 binding、event dedup、turn 和 outbound reply disposition；不是 lease authority |
 
-`profile=cli|dashboard` 只是 managed record 的来源标记，不选择不同的 tmux 布局。新 managed worktree 和 terminal 都是 single-pane contract：可选的 AI command 在唯一 pane 中运行，退出后回到 login shell；terminal 省略命令时直接进入 login shell。
+`profile=cli|dashboard` 只是 managed record 的来源标记，不选择不同的 tmux 布局。新 managed worktree 和 terminal 都是 single-pane contract：可选的 AI command 在唯一 pane 中运行，退出后回到 login shell。Dashboard 的 worktree 创建只传入所选目标上已探测可用的固定 Agent 命令，Dashboard 的 terminal 创建始终省略命令并直接进入 login shell；CLI/RPC 仍保留显式可选命令能力。
 
 ### Android
 
