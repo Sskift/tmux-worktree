@@ -136,12 +136,14 @@ class FakeClientSocket {
     this.closes = [];
     this.pauseCalls = 0;
     this.terminates = 0;
+    this.onInstalled = undefined;
   }
 
   on(event, listener) {
     const listeners = this.listeners.get(event) ?? [];
     listeners.push(listener);
     this.listeners.set(event, listeners);
+    this.onInstalled?.(event, listeners.length);
     return this;
   }
 
@@ -164,7 +166,7 @@ class FakeClientSocket {
   terminate() { this.terminates += 1; }
 }
 
-test("shared composition routes a client frame through its one registry into the Host Pump", async () => {
+test("sealed shared admission rejects untouched inputs while existing Pump effects remain live", async () => {
   const scheduler = new ManualScheduler();
   let callerBrokerActionCalls = 0;
   let callerForceActionCalls = 0;
@@ -242,6 +244,80 @@ test("shared composition routes a client frame through its one registry into the
   assert.equal(callerBrokerActionCalls, 0);
   assert.equal(callerForceActionCalls, 0);
 
+  const pending = shared.clientWssRuntime.prepareClientWss({
+    connectionId: "shared-producer-pending-client",
+    trustedAuthContext: authContext("client"),
+    hostProducerTarget: pump.producerComposition.target,
+  });
+  assert.equal(pending.outcome, "accept");
+  const sealClientAdmission = shared.clientWssRuntime.sealClientAdmission;
+  assert.strictEqual(
+    shared.clientWssRuntime.sealClientAdmission,
+    sealClientAdmission,
+  );
+  assert.equal(sealClientAdmission(), undefined);
+  assert.equal(sealClientAdmission(), undefined);
+
+  let hostilePrepareReads = 0;
+  const hostilePrepareInput = new Proxy({}, {
+    ownKeys() {
+      hostilePrepareReads += 1;
+      throw new Error("sealed prepare input must stay untouched");
+    },
+    getOwnPropertyDescriptor() {
+      hostilePrepareReads += 1;
+      throw new Error("sealed prepare descriptors must stay untouched");
+    },
+    get() {
+      hostilePrepareReads += 1;
+      throw new Error("sealed prepare properties must stay untouched");
+    },
+  });
+  const sealedPrepare = shared.clientWssRuntime.prepareClientWss(hostilePrepareInput);
+  assert.equal(sealedPrepare.outcome, "reject");
+  assert.equal(sealedPrepare.status, 503);
+  assert.equal(sealedPrepare.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(hostilePrepareReads, 0);
+
+  let hostileSocketReads = 0;
+  const hostileSocket = new Proxy({}, {
+    ownKeys() {
+      hostileSocketReads += 1;
+      throw new Error("sealed socket must stay untouched");
+    },
+    getOwnPropertyDescriptor() {
+      hostileSocketReads += 1;
+      throw new Error("sealed socket descriptors must stay untouched");
+    },
+    getPrototypeOf() {
+      hostileSocketReads += 1;
+      throw new Error("sealed socket prototype must stay untouched");
+    },
+    get() {
+      hostileSocketReads += 1;
+      throw new Error("sealed socket properties must stay untouched");
+    },
+  });
+  assert.throws(() => shared.clientWssRuntime.attachPreparedClientWss({
+    admissionReceipt: pending.admissionReceipt,
+    alreadyUpgradedSocket: hostileSocket,
+  }), /runtime is closing/);
+  assert.equal(hostileSocketReads, 0);
+
+  pump.acceptBrokerResult({
+    accepted: true,
+    actions: [{
+      kind: "pause_client",
+      connectionId: client.connectionId,
+      connectionIncarnation: client.incarnation,
+    }],
+  });
+  await scheduler.flushReady();
+  assert.equal(socket.pauseCalls, 1);
+  assert.equal(callerBrokerActionCalls, 0);
+  assert.equal(callerForceActionCalls, 0);
+  assert.equal(sealClientAdmission(), undefined);
+
   socket.emit("close", 1000);
   await client.drained;
   const pumpClosed = pump.shutdown();
@@ -250,7 +326,7 @@ test("shared composition routes a client frame through its one registry into the
   await shared.clientWssRuntime.closeAndDrain();
 });
 
-test("opaque authority stays closed and a timed-out client cleanup is forced exactly once", async () => {
+test("opaque owner keeps forced cleanup and reentrant seal rolls back a partial attach", async () => {
   const scheduler = new ManualScheduler();
   const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
     brokerOptions: { now: () => NOW_MS },
@@ -259,6 +335,7 @@ test("opaque authority stays closed and a timed-out client cleanup is forced exa
   });
   assert.deepEqual(Reflect.ownKeys(shared), ["clientWssRuntime", "hostPumpAuthority"]);
   assert.deepEqual(Reflect.ownKeys(shared.clientWssRuntime), [
+    "sealClientAdmission",
     "prepareClientWss",
     "attachPreparedClientWss",
     "applyBrokerAction",
@@ -366,4 +443,70 @@ test("opaque authority stays closed and a timed-out client cleanup is forced exa
   socket.emit("close", 1000);
   await client.drained;
   await shared.clientWssRuntime.closeAndDrain();
+
+  const reentrantScheduler = new ManualScheduler();
+  const reentrantShared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+    brokerOptions: { now: () => NOW_MS },
+    clientSocketScheduler: reentrantScheduler,
+    authorizationExpiryScheduleAt: () => () => {},
+  });
+  const reentrantHost = new FakeHostCarrier();
+  const reentrantPump = pumpModule.createRelayV2BrokerSharedProducerHostCarrierPump(
+    reentrantShared.hostPumpAuthority,
+    {
+      host: reentrantHost,
+      transportId: "shared-producer-reentrant-seal-transport",
+      hostAuthContext: authContext("host"),
+      credentialReference: "host-credential-reference",
+      now: () => NOW_MS,
+      schedule: reentrantScheduler.schedule,
+    },
+  );
+  reentrantPump.start();
+  await reentrantScheduler.flushReady();
+  assert.equal(reentrantHost.phase, "registered");
+
+  const reentrantPrepared = reentrantShared.clientWssRuntime.prepareClientWss({
+    connectionId: "shared-producer-reentrant-seal-client",
+    trustedAuthContext: authContext("client"),
+    hostProducerTarget: reentrantPump.producerComposition.target,
+  });
+  assert.equal(reentrantPrepared.outcome, "accept");
+  const reentrantSocket = new FakeClientSocket();
+  let reentrantSealCalls = 0;
+  reentrantSocket.onInstalled = (event, count) => {
+    if (event !== "error" || count !== 2 || reentrantSealCalls !== 0) return;
+    reentrantSealCalls += 1;
+    reentrantShared.clientWssRuntime.sealClientAdmission();
+  };
+  assert.throws(() => reentrantShared.clientWssRuntime.attachPreparedClientWss({
+    admissionReceipt: reentrantPrepared.admissionReceipt,
+    alreadyUpgradedSocket: reentrantSocket,
+  }), /transport construction failed|runtime is closing/);
+  assert.equal(reentrantSealCalls, 1);
+  assert.equal(reentrantSocket.terminates, 1);
+  assert.equal(reentrantShared.clientWssRuntime.sealClientAdmission(), undefined);
+
+  const reentrantClose = reentrantShared.clientWssRuntime.closeAndDrain();
+  assert.strictEqual(reentrantShared.clientWssRuntime.closeAndDrain(), reentrantClose);
+  let reentrantCloseSettled = false;
+  void reentrantClose.then(() => { reentrantCloseSettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    reentrantCloseSettled,
+    false,
+    "partial force termination is not native terminal evidence",
+  );
+  reentrantSocket.emit("error", new Error("partial socket terminal"));
+  await reentrantScheduler.flushReady();
+  const reentrantPumpClosed = reentrantPump.shutdown();
+  await reentrantScheduler.flushReady();
+  await reentrantPumpClosed;
+  await reentrantClose;
+  assert.equal(reentrantCloseSettled, true);
+  assert.equal(
+    [...reentrantSocket.listeners.values()].every((listeners) => listeners.length === 0),
+    true,
+  );
+  assert.equal(reentrantShared.clientWssRuntime.sealClientAdmission(), undefined);
 });

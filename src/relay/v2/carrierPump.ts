@@ -145,6 +145,7 @@ export type RelayV2BrokerSharedProducerHostPumpOptions = Omit<
 
 export type RelayV2BrokerSharedProducerClientWssRuntime = Readonly<Pick<
   RelayV2BrokerClientWssRuntimeComposition,
+  | "sealClientAdmission"
   | "prepareClientWss"
   | "attachPreparedClientWss"
   | "applyBrokerAction"
@@ -2657,6 +2658,7 @@ export function createRelayV2BrokerSharedProducerRuntimeComposition(
     },
   });
   const clientWssRuntime = Object.freeze({
+    sealClientAdmission: runtime.sealClientAdmission,
     prepareClientWss: runtime.prepareClientWss,
     attachPreparedClientWss: runtime.attachPreparedClientWss,
     applyBrokerAction: runtime.applyBrokerAction,

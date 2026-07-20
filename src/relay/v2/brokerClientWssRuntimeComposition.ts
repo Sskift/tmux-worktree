@@ -126,6 +126,8 @@ export interface RelayV2BrokerClientWssConnectionHandle {
 export interface RelayV2BrokerClientWssRuntimeComposition {
   /** Exact bound handoff for the future Host carrier Pump owner only. */
   readonly hostPumpBrokerAuthority: RelayV2CarrierPumpBrokerPort;
+  /** Synchronously and permanently fences only new client admission. */
+  sealClientAdmission(): void;
   prepareClientWss(
     input: RelayV2BrokerClientWssPrepareInput,
   ): RelayV2BrokerClientWssPrepareResult;
@@ -556,7 +558,8 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   private readonly partialDrains = new Set<Promise<void>>();
   private partialDrainFailure: unknown;
   private partialDrainFailed = false;
-  private accepting = true;
+  private clientAdmissionOpen = true;
+  private clientEffectsOpen = true;
   private serializerActive = false;
   private readonly serializerQueue: Array<{
     run: () => unknown;
@@ -626,10 +629,14 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     });
   }
 
+  sealClientAdmission(): void {
+    this.clientAdmissionOpen = false;
+  }
+
   prepareClientWss(
     input: RelayV2BrokerClientWssPrepareInput,
   ): RelayV2BrokerClientWssPrepareResult {
-    if (!this.accepting) return closingAdmissionRejection();
+    if (!this.clientAdmissionOpen) return closingAdmissionRejection();
     const captured = capturePrepareInput(input);
     if (
       this.connections.has(captured.connectionId)
@@ -639,7 +646,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     }
     const admission = this.broker.inspectClientAdmission(captured.trustedAuthContext);
     if (admission.outcome === "reject") return frozenAdmissionRejection(admission);
-    if (!this.accepting) return closingAdmissionRejection();
+    if (!this.clientAdmissionOpen) return closingAdmissionRejection();
 
     const admissionReceipt = Object.freeze(
       Object.create(null),
@@ -657,8 +664,13 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   attachPreparedClientWss(
     input: RelayV2BrokerClientWssAttachPreparedInput,
   ): RelayV2BrokerClientWssConnectionHandle {
-    if (!this.accepting) throw new Error("Relay v2 Broker client WSS runtime is closing");
+    if (!this.clientAdmissionOpen) {
+      throw new Error("Relay v2 Broker client WSS runtime is closing");
+    }
     const prepared = captureAttachPreparedInput(input);
+    if (!this.clientAdmissionOpen) {
+      throw new Error("Relay v2 Broker client WSS runtime is closing");
+    }
     const receipt = prepared.admissionReceipt;
     const receiptRecord = receipt !== null && typeof receipt === "object"
       ? ADMISSION_RECEIPTS.get(receipt)
@@ -689,7 +701,13 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   private attachCapturedClientWss(
     captured: CapturedClientWssAttach,
   ): RelayV2BrokerClientWssConnectionHandle {
+    if (!this.clientAdmissionOpen) {
+      throw new Error("Relay v2 Broker client WSS runtime is closing");
+    }
     const nativeTerminalSocket = captureNativeTerminalSocket(captured.alreadyUpgradedSocket);
+    if (!this.clientAdmissionOpen) {
+      throw new Error("Relay v2 Broker client WSS runtime is closing");
+    }
     if (
       this.connections.has(captured.connectionId)
       || this.attachingConnectionIds.has(captured.connectionId)
@@ -771,7 +789,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
       );
       this.connections.set(record.connectionId, record);
 
-      if (transportFailure || !this.accepting) {
+      if (transportFailure || !this.clientAdmissionOpen) {
         this.abortPartialConnection(record);
         throw new Error("Relay v2 Broker client WSS transport construction failed");
       }
@@ -785,7 +803,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
         this.abortPartialConnection(record);
         throw new Error("Relay v2 Broker client WSS expiry construction failed");
       }
-      if (!this.accepting) {
+      if (!this.clientAdmissionOpen) {
         this.abortPartialConnection(record);
         throw new Error("Relay v2 Broker client WSS runtime is closing");
       }
@@ -845,13 +863,14 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   }
 
   applyBrokerAction(action: RelayV2BrokerAction): RelayV2BrokerClientSocketEffectReceipt {
-    if (!this.accepting) return "rejected";
+    if (!this.clientEffectsOpen) return "rejected";
     return this.transport.applyBrokerAction(action);
   }
 
   closeAndDrain(): Promise<void> {
     if (this.closeDrain) return this.closeDrain;
-    this.accepting = false;
+    this.sealClientAdmission();
+    this.clientEffectsOpen = false;
     const failClosed = observeBarrier(() => this.serialize(() => {
       this.broker.liveAuthorizationFencePort.failClosed();
     }));
@@ -1015,8 +1034,10 @@ export function createRelayV2BrokerClientWssRuntimeComposition(
   options: RelayV2BrokerClientWssRuntimeCompositionOptions,
 ): RelayV2BrokerClientWssRuntimeComposition {
   const owner = new RelayV2BrokerClientWssRuntimeCompositionImpl(options);
+  const sealClientAdmission = () => owner.sealClientAdmission();
   return Object.freeze({
     hostPumpBrokerAuthority: owner.hostPumpBrokerAuthority,
+    sealClientAdmission,
     prepareClientWss: (input: RelayV2BrokerClientWssPrepareInput) => (
       owner.prepareClientWss(input)
     ),
