@@ -1,5 +1,13 @@
 [
   {
+    "name": "probe-capabilities",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-ping-1",
+      "type": "ping"
+    }
+  },
+  {
     "name": "resolve-managed-target",
     "message": {
       "protocolVersion": 1,
@@ -214,6 +222,28 @@
       "outputGeneration": "output-example-1",
       "cursor": 42,
       "maxBytes": 65536
+    }
+  },
+  {
+    "name": "capture-feishu-rendered-snapshot",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-rendered-output-1",
+      "type": "output.rendered-snapshot",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "feishu",
+          "instanceId": "feishu-binding:binding-1:daemon-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "outputGeneration": "output-example-1",
+      "pane": "0",
+      "maxBytes": 131072
     }
   }
 ]

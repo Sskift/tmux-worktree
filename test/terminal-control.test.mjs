@@ -16,6 +16,10 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
+const {
+  CanonicalTerminalControlSocketClient,
+  parseCanonicalRenderedSnapshotResult,
+} = await import("../dist/canonicalTerminalControlClient.js");
 const contractRoot = new URL("../contracts/terminal-control/v1/", import.meta.url);
 const isolatedTmuxWrapperRoot = mkdtempSync(join(tmpdir(), "tw-terminal-control-tmux-wrapper-"));
 const isolatedTmuxWrapper = join(isolatedTmuxWrapperRoot, "isolated-tmux");
@@ -216,6 +220,9 @@ class FakeBackend {
     this.outputGeneration = undefined;
     this.outputs = new Map();
     this.resetCalls = 0;
+    this.renderedOutput = "rendered terminal output\n";
+    this.renderedSnapshotCalls = [];
+    this.failRenderedSnapshot = undefined;
   }
 
   async resolveManagedSession(sessionName) {
@@ -299,6 +306,23 @@ class FakeBackend {
     };
   }
 
+  async captureRenderedSnapshot(session, instance, generation, pane, maxBytes) {
+    this.renderedSnapshotCalls.push({
+      session: structuredClone(session),
+      instance,
+      generation,
+      pane,
+      maxBytes,
+    });
+    if (this.failRenderedSnapshot) throw this.failRenderedSnapshot;
+    const source = Buffer.from(this.renderedOutput, "utf8");
+    const data = source.subarray(Math.max(0, source.byteLength - maxBytes));
+    return {
+      dataBase64: data.toString("base64"),
+      truncated: data.byteLength < source.byteLength,
+    };
+  }
+
   appendOutput(controlTargetId, text) {
     const key = `${controlTargetId}:${this.outputGeneration}`;
     const current = this.outputs.get(key) ?? Buffer.alloc(0);
@@ -372,6 +396,56 @@ test("terminal-control v1 contract fixtures are closed and storage fixtures are 
     () => terminalControl.parseTerminalControlRequest({ ...requests[0].message, extra: true }),
     /invalid or unknown request type/,
   );
+  const renderedSnapshot = requests.find(({ message }) => message.type === "output.rendered-snapshot");
+  assert.ok(renderedSnapshot);
+  assert.throws(
+    () => terminalControl.parseTerminalControlRequest({ ...renderedSnapshot.message, extra: true }),
+    /invalid or unknown request type/,
+  );
+  assert.throws(
+    () => terminalControl.parseTerminalControlRequest({
+      ...renderedSnapshot.message,
+      maxBytes: terminalControl.TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES + 1,
+    }),
+    /maxBytes is invalid/,
+  );
+
+  const responses = JSON.parse(readFileSync(new URL("responses.json", contractRoot), "utf8"));
+  for (const fixture of responses) {
+    assert.deepEqual(
+      terminalControl.parseTerminalControlResponse(fixture.message, fixture.message.requestId),
+      fixture.message,
+      fixture.name,
+    );
+  }
+  assert.throws(
+    () => terminalControl.parseTerminalControlResponse({ ...responses[0].message, extra: true }),
+    /response envelope is invalid/,
+  );
+  assert.throws(
+    () => terminalControl.parseTerminalControlResponse(responses[0].message, "another-request"),
+    /requestId does not match/,
+  );
+  const renderedResponse = responses.find(({ message }) =>
+    message.requestId === renderedSnapshot.message.requestId && message.ok);
+  assert.ok(renderedResponse);
+  const renderedInput = {
+    lease: renderedSnapshot.message.lease,
+    outputGeneration: renderedSnapshot.message.outputGeneration,
+    pane: renderedSnapshot.message.pane,
+    maxBytes: renderedSnapshot.message.maxBytes,
+  };
+  assert.deepEqual(
+    parseCanonicalRenderedSnapshotResult(renderedResponse.message.result, renderedInput),
+    renderedResponse.message.result,
+  );
+  assert.throws(
+    () => parseCanonicalRenderedSnapshotResult(
+      { ...renderedResponse.message.result, extra: true },
+      renderedInput,
+    ),
+    /invalid rendered snapshot/,
+  );
 
   const storage = JSON.parse(readFileSync(new URL("storage-cases.json", contractRoot), "utf8"));
   for (const fixture of storage.valid) {
@@ -422,8 +496,58 @@ test("permission-protected socket serves correlated local requests and shortens 
         { type: "ping" },
         { socketPath, autoStart: false },
       ),
-      { protocolVersion: 1, authority: "local-terminal-control" },
+      {
+        protocolVersion: 1,
+        authority: "local-terminal-control",
+        capabilities: ["output.rendered-snapshot"],
+      },
     );
+    const canonical = new CanonicalTerminalControlSocketClient({ socketPath, timeoutMs: 2_000 });
+    assert.deepEqual(await canonical.capabilities(), { renderedSnapshot: true });
+    const currentHandle = authority.handle.bind(authority);
+    authority.handle = async (request) => request.type === "ping"
+      ? { protocolVersion: 1, authority: "local-terminal-control" }
+      : currentHandle(request);
+    assert.deepEqual(
+      await canonical.capabilities(),
+      { renderedSnapshot: false },
+      "a legacy ping without capabilities must not imply rendered-snapshot support",
+    );
+    authority.handle = async (request) => request.type === "ping"
+      ? {
+          protocolVersion: 1,
+          authority: "local-terminal-control",
+          capabilities: ["output.rendered-snapshot", ""],
+        }
+      : currentHandle(request);
+    await assert.rejects(
+      canonical.capabilities(),
+      (error) => error?.code === "CONTROLLER_UNAVAILABLE" && /capabilities/.test(error.message),
+    );
+    authority.handle = currentHandle;
+    const target = await canonical.resolveTarget("canonical-rendered");
+    const feishu = await canonical.acquireLease(target.controlTargetId, {
+      kind: "feishu",
+      instanceId: "feishu:canonical-rendered",
+    });
+    const rendered = await canonical.renderedSnapshot({
+      lease: feishu.lease,
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+      maxBytes: 128,
+    });
+    assert.equal(rendered.controlTargetId, target.controlTargetId);
+    assert.equal(rendered.controlEpoch, feishu.lease.controlEpoch);
+    assert.equal(rendered.leaseId, feishu.lease.leaseId);
+    assert.equal(rendered.fence, feishu.lease.fence);
+    assert.equal(rendered.ownerKind, "feishu");
+    assert.equal(rendered.outputGeneration, feishu.ownership.outputGeneration);
+    assert.equal(rendered.pane, "0");
+    assert.equal(
+      Buffer.from(rendered.dataBase64, "base64").toString("utf8"),
+      "rendered terminal output\n",
+    );
+    assert.equal(rendered.truncated, false);
     const longHome = join(temp.root, "h".repeat(140));
     const shortened = terminalControl.terminalControlSocketPath(longHome);
     assert.ok(Buffer.byteLength(shortened, "utf8") <= 100, shortened);
@@ -1333,6 +1457,96 @@ test("agent input atomically returns a bounded generation-fenced output cursor",
   }
 });
 
+test("rendered snapshots require the exact Feishu lease and remain readable while draining", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
+  try {
+    const target = await resolved(authority);
+    const feishu = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("feishu", "binding-rendered:daemon-1"),
+    );
+    backend.renderedOutput = "private prefix\nrendered public output\n";
+    const request = (requestId, overrides = {}) => authority.handle({
+      protocolVersion: 1,
+      requestId,
+      type: "output.rendered-snapshot",
+      lease: feishu.lease,
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+      maxBytes: 23,
+      ...overrides,
+    });
+
+    const held = await request("rendered-held");
+    assert.deepEqual(held, {
+      controlTargetId: target.controlTargetId,
+      controlEpoch: feishu.lease.controlEpoch,
+      leaseId: feishu.lease.leaseId,
+      fence: feishu.lease.fence,
+      ownerKind: "feishu",
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+      dataBase64: Buffer.from("rendered public output\n", "utf8").toString("base64"),
+      truncated: true,
+    });
+
+    const handoff = await authority.handle({
+      protocolVersion: 1,
+      requestId: "rendered-handoff",
+      type: "handoff.begin",
+      controlTargetId: target.controlTargetId,
+      nextOwner: owner("dashboard", "rendered-handoff"),
+    });
+    assert.equal(handoff.ownership.state, "DRAINING");
+    const draining = await request("rendered-draining");
+    assert.equal(Buffer.from(draining.dataBase64, "base64").toString("utf8"), "rendered public output\n");
+
+    const callsBeforeRejections = backend.renderedSnapshotCalls.length;
+    await assert.rejects(
+      request("rendered-stale-generation", { outputGeneration: "stale-generation" }),
+      (error) => error.code === "STALE_OUTPUT_CURSOR",
+    );
+    await assert.rejects(
+      request("rendered-stale-fence", {
+        lease: { ...feishu.lease, fence: (BigInt(feishu.lease.fence) + 1n).toString() },
+      }),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    await assert.rejects(
+      request("rendered-non-feishu", {
+        lease: {
+          ...feishu.lease,
+          owner: owner("dashboard", "forged-rendered-reader"),
+        },
+      }),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    assert.equal(backend.renderedSnapshotCalls.length, callsBeforeRejections);
+
+    backend.failRenderedSnapshot = new terminalControl.TerminalControlProtocolError(
+      "RESOURCE_EXHAUSTED",
+      "injected bounded snapshot overflow",
+    );
+    await assert.rejects(
+      request("rendered-bounded-overflow"),
+      (error) => error.code === "RESOURCE_EXHAUSTED",
+    );
+    const afterOverflow = await authority.handle({
+      protocolVersion: 1,
+      requestId: "rendered-status-after-overflow",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    });
+    assert.equal(afterOverflow.state, "DRAINING");
+    assert.equal(afterOverflow.fence, feishu.lease.fence);
+  } finally {
+    temp.cleanup();
+  }
+});
+
 test("clean ownership release rotates output generation and fences every old marker cursor", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
@@ -2043,6 +2257,111 @@ test("production tmux backend captures bounded correlated output on an isolated 
       if (!chunk.dataBase64) await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.match(observed, /\[\[notify-group\]\]real-output\[\[\/notify-group\]\]/);
+    const renderedOpenMarker = "[[notify-group:rendered]]";
+    const renderedCloseMarker = "[[/notify-group:rendered]]";
+    const renderedPayload = Buffer.from([
+      "\x1b[2J\x1b[10;1H",
+      renderedOpenMarker,
+      "public rendered answer",
+      "\x1b[s",
+      "\x1b[H\x1b[2Kinput box",
+      "\x1b[2;1H\x1b[2Kfooter",
+      "\x1b[u",
+      renderedCloseMarker,
+      "\n",
+    ].join(""), "utf8").toString("base64");
+    const renderedTurn = await authority.handle({
+      protocolVersion: 1,
+      requestId: "real-tmux-rendered-message",
+      type: "input.agent-message",
+      lease: feishu.lease,
+      operationId: "real-tmux-rendered-message",
+      pane: "0",
+      message: `printf '%s' '${renderedPayload}' | base64 -d`,
+      submit: true,
+    });
+    let renderedRawCursor = renderedTurn.outputCursor;
+    let renderedRaw = "";
+    const renderedRawDeadline = Date.now() + 3_000;
+    while (!renderedRaw.includes(renderedCloseMarker) && Date.now() < renderedRawDeadline) {
+      const chunk = await authority.handle({
+        protocolVersion: 1,
+        requestId: `real-rendered-tail-${renderedRawCursor}`,
+        type: "output.tail",
+        controlTargetId: target.controlTargetId,
+        controlEpoch: renderedTurn.controlEpoch,
+        outputGeneration: renderedTurn.outputGeneration,
+        cursor: renderedRawCursor,
+        maxBytes: 64 * 1024,
+      });
+      renderedRawCursor = chunk.nextCursor;
+      renderedRaw += Buffer.from(chunk.dataBase64, "base64").toString("utf8");
+      if (!chunk.dataBase64) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const repaintSequence = [
+      renderedOpenMarker,
+      "\x1b[s",
+      "\x1b[H",
+      "\x1b[2K",
+      "input box",
+      "\x1b[2;1H",
+      "\x1b[2K",
+      "footer",
+      "\x1b[u",
+      renderedCloseMarker,
+    ];
+    const renderedRawPositions = [];
+    let repaintOffset = 0;
+    for (const item of repaintSequence) {
+      const position = renderedRaw.indexOf(item, repaintOffset);
+      renderedRawPositions.push(position);
+      if (position >= 0) repaintOffset = position + item.length;
+    }
+    assert.ok(
+      renderedRawPositions.every((position, index) => (
+        position >= 0 && (index === 0 || position > renderedRawPositions[index - 1])
+      )),
+      `raw pipe output must retain repaint bytes in chronological order: ${renderedRawPositions.join(",")}`,
+    );
+    let rendered;
+    let renderedText = "";
+    const renderedDeadline = Date.now() + 3_000;
+    while (!renderedText.includes(renderedCloseMarker) && Date.now() < renderedDeadline) {
+      rendered = await authority.handle({
+        protocolVersion: 1,
+        requestId: `real-rendered-${Date.now()}`,
+        type: "output.rendered-snapshot",
+        lease: feishu.lease,
+        outputGeneration: renderedTurn.outputGeneration,
+        pane: "0",
+        maxBytes: 64 * 1024,
+      });
+      renderedText = Buffer.from(rendered.dataBase64, "base64").toString("utf8");
+      if (!renderedText.includes(renderedCloseMarker)) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    assert.equal(rendered.controlTargetId, target.controlTargetId);
+    assert.equal(rendered.leaseId, feishu.lease.leaseId);
+    assert.equal(rendered.fence, feishu.lease.fence);
+    assert.equal(rendered.ownerKind, "feishu");
+    assert.equal(rendered.outputGeneration, renderedTurn.outputGeneration);
+    assert.equal(rendered.pane, "0");
+    assert.equal(rendered.truncated, false);
+    assert.doesNotMatch(renderedText, /\x1b/);
+    const renderedOpenPosition = renderedText.indexOf(renderedOpenMarker);
+    const renderedClosePosition = renderedText.indexOf(renderedCloseMarker, renderedOpenPosition);
+    assert.ok(renderedOpenPosition >= 0);
+    assert.ok(renderedClosePosition > renderedOpenPosition);
+    const renderedInputPosition = renderedText.indexOf("input box");
+    const renderedFooterPosition = renderedText.indexOf("footer");
+    assert.ok(renderedInputPosition >= 0);
+    assert.ok(renderedFooterPosition > renderedInputPosition);
+    assert.ok(renderedOpenPosition > renderedFooterPosition);
+    assert.equal(
+      renderedText.slice(renderedOpenPosition + renderedOpenMarker.length, renderedClosePosition),
+      "public rendered answer",
+    );
     const history = await authority.handle({
       protocolVersion: 1,
       requestId: "real-tmux-history",
@@ -2114,6 +2433,16 @@ test("production tmux backend captures bounded correlated output on an isolated 
     await assert.rejects(
       backend.writeRaw("controlled", "0", Buffer.from("must-not-write")),
       (error) => error.code === "RECOVERY_REQUIRED" && /2 live panes/.test(error.message),
+    );
+    await assert.rejects(
+      backend.captureRenderedSnapshot(
+        currentBackend.managedSession,
+        currentBackend.tmuxInstanceId,
+        released.outputGeneration,
+        "0",
+        terminalControl.TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
+      ),
+      (error) => error.code === "RECOVERY_REQUIRED" && /single-pane shape changed/.test(error.message),
     );
   } finally {
     if (linkedClient) {

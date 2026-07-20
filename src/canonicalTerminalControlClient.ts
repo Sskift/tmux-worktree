@@ -3,8 +3,10 @@ import {
   type TerminalControlRequestInput,
 } from "./terminalControl/client.js";
 import {
+  TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
   TERMINAL_CONTROL_MAX_FRAME_BYTES,
   TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
+  TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   TERMINAL_CONTROL_PROTOCOL_VERSION,
   type TerminalControlDrainProof,
@@ -16,8 +18,10 @@ import {
 import { terminalControlSocketPath } from "./terminalControl/store.js";
 
 export const CANONICAL_TERMINAL_CONTROL_PROTOCOL_VERSION = TERMINAL_CONTROL_PROTOCOL_VERSION;
+export const CANONICAL_TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT = TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT;
 export const CANONICAL_TERMINAL_CONTROL_MAX_FRAME_BYTES = TERMINAL_CONTROL_MAX_FRAME_BYTES;
 export const CANONICAL_TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES = TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES;
+export const CANONICAL_TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES = TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES;
 export const CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES = TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES;
 
 export type CanonicalTerminalOwnerKind = TerminalControlOwnerKind;
@@ -72,7 +76,31 @@ export interface CanonicalOutputTailResult {
   nextCursor: number;
 }
 
+export interface CanonicalRenderedSnapshotResult {
+  controlTargetId: string;
+  controlEpoch: string;
+  leaseId: string;
+  fence: string;
+  ownerKind: "feishu";
+  outputGeneration: string;
+  pane: string;
+  dataBase64: string;
+  truncated: boolean;
+}
+
+export interface CanonicalRenderedSnapshotInput {
+  lease: CanonicalTerminalLease;
+  outputGeneration: string;
+  pane: string;
+  maxBytes?: number;
+}
+
+export interface CanonicalTerminalControlCapabilities {
+  renderedSnapshot: boolean;
+}
+
 export interface CanonicalTerminalControlClient {
+  capabilities(): Promise<CanonicalTerminalControlCapabilities>;
   resolveTarget(sessionName: string): Promise<CanonicalTargetResolution>;
   ownershipStatus(controlTargetId: string): Promise<CanonicalTerminalOwnership>;
   acquireLease(
@@ -116,6 +144,7 @@ export interface CanonicalTerminalControlClient {
     cursor: number;
     maxBytes?: number;
   }): Promise<CanonicalOutputTailResult>;
+  renderedSnapshot(input: CanonicalRenderedSnapshotInput): Promise<CanonicalRenderedSnapshotResult>;
 }
 
 export class CanonicalTerminalControlError extends Error {
@@ -132,6 +161,12 @@ export class CanonicalTerminalControlError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const expected = new Set(keys);
+  return Object.keys(value).length === expected.size
+    && Object.keys(value).every((key) => expected.has(key));
 }
 
 function requiredString(value: unknown, field: string, maxBytes = 1024): string {
@@ -217,6 +252,97 @@ function requiredOwnerKind(value: unknown, field: string): CanonicalTerminalOwne
     );
   }
   return parsed;
+}
+
+function validateRenderedSnapshotInput(input: CanonicalRenderedSnapshotInput): void {
+  if (input.lease.owner.kind !== "feishu"
+    || input.pane !== "0"
+    || typeof input.outputGeneration !== "string"
+    || !input.outputGeneration
+    || input.outputGeneration.includes("\0")
+    || Buffer.byteLength(input.outputGeneration, "utf8") > 128
+    || (input.maxBytes !== undefined
+      && (!Number.isSafeInteger(input.maxBytes)
+        || input.maxBytes < 1
+        || input.maxBytes > CANONICAL_TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES))) {
+    throw new CanonicalTerminalControlError(
+      "INVALID_REQUEST",
+      "canonical terminal-control rendered snapshot bounds are invalid",
+    );
+  }
+}
+
+export function parseCanonicalRenderedSnapshotResult(
+  value: unknown,
+  input: CanonicalRenderedSnapshotInput,
+): CanonicalRenderedSnapshotResult {
+  validateRenderedSnapshotInput(input);
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "controlTargetId",
+      "controlEpoch",
+      "leaseId",
+      "fence",
+      "ownerKind",
+      "outputGeneration",
+      "pane",
+      "dataBase64",
+      "truncated",
+    ])
+    || typeof value.truncated !== "boolean") {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned invalid rendered snapshot",
+    );
+  }
+  const dataBase64 = typeof value.dataBase64 === "string" ? value.dataBase64 : "";
+  const data = Buffer.from(dataBase64, "base64");
+  const maxBytes = input.maxBytes ?? CANONICAL_TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES;
+  let validUtf8 = true;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(data);
+  } catch {
+    validUtf8 = false;
+  }
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(dataBase64)
+    || data.toString("base64") !== dataBase64
+    || data.byteLength > maxBytes
+    || !validUtf8) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned invalid rendered snapshot dataBase64",
+    );
+  }
+  const parsedOwnerKind = requiredOwnerKind(value.ownerKind, "snapshot.ownerKind");
+  if (parsedOwnerKind !== "feishu") {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned mismatched rendered snapshot correlation",
+    );
+  }
+  const result: CanonicalRenderedSnapshotResult = {
+    controlTargetId: requiredString(value.controlTargetId, "snapshot.controlTargetId"),
+    controlEpoch: requiredString(value.controlEpoch, "snapshot.controlEpoch"),
+    leaseId: requiredString(value.leaseId, "snapshot.leaseId"),
+    fence: decimal(value.fence, "snapshot.fence"),
+    ownerKind: parsedOwnerKind,
+    outputGeneration: requiredString(value.outputGeneration, "snapshot.outputGeneration"),
+    pane: requiredString(value.pane, "snapshot.pane", 8),
+    dataBase64,
+    truncated: value.truncated,
+  };
+  if (result.controlTargetId !== input.lease.controlTargetId
+    || result.controlEpoch !== input.lease.controlEpoch
+    || result.leaseId !== input.lease.leaseId
+    || result.fence !== input.lease.fence
+    || result.outputGeneration !== input.outputGeneration
+    || result.pane !== input.pane) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned mismatched rendered snapshot correlation",
+    );
+  }
+  return result;
 }
 
 function canonicalTimestamp(value: unknown, field: string): string {
@@ -305,6 +431,40 @@ export class CanonicalTerminalControlSocketClient implements CanonicalTerminalCo
   constructor(options: { socketPath?: string; timeoutMs?: number } = {}) {
     this.socketPath = options.socketPath ?? canonicalTerminalControlSocketPath();
     this.timeoutMs = options.timeoutMs ?? 10_000;
+  }
+
+  async capabilities(): Promise<CanonicalTerminalControlCapabilities> {
+    const value = await this.request("ping", {});
+    if (!isRecord(value)
+      || value.protocolVersion !== CANONICAL_TERMINAL_CONTROL_PROTOCOL_VERSION
+      || value.authority !== "local-terminal-control") {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        "canonical terminal-control returned invalid capability information",
+      );
+    }
+    if (value.capabilities === undefined) {
+      return { renderedSnapshot: false };
+    }
+    if (!Array.isArray(value.capabilities) || value.capabilities.length > 64) {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        "canonical terminal-control returned invalid capabilities",
+      );
+    }
+    const capabilities = value.capabilities.map((capability) =>
+      requiredString(capability, "capabilities[]", 128));
+    if (new Set(capabilities).size !== capabilities.length) {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        "canonical terminal-control returned duplicate capabilities",
+      );
+    }
+    return {
+      renderedSnapshot: capabilities.includes(
+        CANONICAL_TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
+      ),
+    };
   }
 
   async resolveTarget(sessionName: string): Promise<CanonicalTargetResolution> {
@@ -487,6 +647,14 @@ export class CanonicalTerminalControlSocketClient implements CanonicalTerminalCo
       );
     }
     return result;
+  }
+
+  async renderedSnapshot(input: CanonicalRenderedSnapshotInput): Promise<CanonicalRenderedSnapshotResult> {
+    validateRenderedSnapshotInput(input);
+    return parseCanonicalRenderedSnapshotResult(
+      await this.request("output.rendered-snapshot", input),
+      input,
+    );
   }
 
   private request(type: string, fields: Record<string, unknown>): Promise<unknown> {

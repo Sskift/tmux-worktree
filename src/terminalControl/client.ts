@@ -5,6 +5,7 @@ import type { TerminalControlRequest, TerminalControlResponse } from "./protocol
 import {
   TERMINAL_CONTROL_MAX_FRAME_BYTES,
   TERMINAL_CONTROL_PROTOCOL_VERSION,
+  parseTerminalControlResponse,
   TerminalControlProtocolError,
 } from "./protocol";
 import { terminalControlSocketPath } from "./store";
@@ -70,16 +71,10 @@ function sendRequest(
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
       try {
-        const response = JSON.parse(buffer.slice(0, newline)) as TerminalControlResponse;
-        if (
-          !response
-          || typeof response !== "object"
-          || response.protocolVersion !== TERMINAL_CONTROL_PROTOCOL_VERSION
-          || response.requestId !== request.requestId
-          || typeof response.ok !== "boolean"
-        ) {
-          throw new Error("terminal-control response envelope is invalid");
-        }
+        const response = parseTerminalControlResponse(
+          JSON.parse(buffer.slice(0, newline)),
+          request.requestId,
+        );
         finish(undefined, response);
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)));

@@ -21,6 +21,17 @@ function neutralizeCardMentions(value: string): string {
   return value.replace(/<\/?at\b/gi, (tag) => `<\u200b${tag.slice(1)}`);
 }
 
+function conciseCardContext(value: string): string {
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const characters = [...normalized];
+  if (characters.length === 0) return "session";
+  if (characters.length <= 48) return normalized;
+  return `${characters.slice(0, 47).join("")}…`;
+}
+
 /**
  * Build the final, non-streaming Card JSON 2.0 payload used by the Bridge.
  * Agent text is kept inside one markdown element and cannot create a real
@@ -28,9 +39,11 @@ function neutralizeCardMentions(value: string): string {
  */
 export function buildFeishuReplyCard(
   text: string,
+  sessionName: string,
   tone: FeishuReplyCardTone = "answer",
 ): FeishuReplyCard {
   const status = tone === "status";
+  const title = `tw agent on ${conciseCardContext(sessionName)}`;
   return {
     schema: "2.0",
     config: {
@@ -44,7 +57,7 @@ export function buildFeishuReplyCard(
       template: status ? "orange" : "blue",
       title: {
         tag: "plain_text",
-        content: status ? "TW Agent 状态" : "TW Agent",
+        content: title,
         text_align: "left",
       },
     },

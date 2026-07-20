@@ -1,5 +1,20 @@
 [
   {
+    "name": "ping-advertises-rendered-snapshot",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-ping-1",
+      "ok": true,
+      "result": {
+        "protocolVersion": 1,
+        "authority": "local-terminal-control",
+        "capabilities": [
+          "output.rendered-snapshot"
+        ]
+      }
+    }
+  },
+  {
     "name": "target-resolved-free",
     "message": {
       "protocolVersion": 1,
@@ -70,6 +85,25 @@
         "cursor": 42,
         "dataBase64": "ZG9uZVxu",
         "nextCursor": 47
+      }
+    }
+  },
+  {
+    "name": "bounded-rendered-snapshot",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-rendered-output-1",
+      "ok": true,
+      "result": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "ownerKind": "feishu",
+        "outputGeneration": "output-example-1",
+        "pane": "0",
+        "dataBase64": "cmVuZGVyZWQK",
+        "truncated": false
       }
     }
   }

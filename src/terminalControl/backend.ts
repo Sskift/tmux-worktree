@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { managedStatePath, loadManagedStateForMutation, type ManagedSession } from "../state";
 import { tmuxBin } from "../tmux";
 import {
+  TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   TerminalControlProtocolError,
 } from "./protocol";
@@ -32,6 +33,8 @@ const MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
 const OUTPUT_SEGMENT_BYTES = TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES;
 const MAX_OUTPUT_SEGMENTS = 2;
 const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
+const MAX_RENDERED_SNAPSHOT_SOURCE_BYTES = 2 * 1024 * 1024;
+const RENDERED_SNAPSHOT_HISTORY_LINES = 1024;
 
 // xterm emits client-terminal escape sequences for special keys. Pasting
 // those bytes directly into a pane bypasses tmux's key translation, so TUIs
@@ -111,6 +114,11 @@ export interface TerminalControlOutputChunk extends TerminalControlOutputPositio
   nextCursor: number;
 }
 
+export interface TerminalControlRenderedSnapshot {
+  dataBase64: string;
+  truncated: boolean;
+}
+
 export interface ResolvedManagedTerminalBackend {
   managedSession: ManagedSession;
   tmuxInstanceId: string;
@@ -158,6 +166,13 @@ export interface TerminalControlBackend {
     cursor: number,
     maxBytes: number,
   ): Promise<TerminalControlOutputChunk>;
+  captureRenderedSnapshot(
+    session: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    maxBytes: number,
+  ): Promise<TerminalControlRenderedSnapshot>;
 }
 
 type TmuxResult = {
@@ -167,6 +182,13 @@ type TmuxResult = {
   signal?: NodeJS.Signals | null;
 };
 
+class TmuxStdoutLimitError extends Error {
+  constructor() {
+    super("tmux stdout exceeded the terminal-control limit");
+    this.name = "TmuxStdoutLimitError";
+  }
+}
+
 function validateSessionName(name: string): void {
   if (!name || name.length > 128 || /[\0-\x1f\x7f]/.test(name)) {
     throw new TerminalControlProtocolError("INVALID_REQUEST", "managed session name is invalid");
@@ -175,7 +197,11 @@ function validateSessionName(name: string): void {
 
 function runTmux(
   args: string[],
-  options: { input?: Buffer | string; allowFailure?: boolean } = {},
+  options: {
+    input?: Buffer | string;
+    allowFailure?: boolean;
+    maxStdoutBytes?: number;
+  } = {},
 ): Promise<TmuxResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tmuxBin(), args, {
@@ -201,9 +227,9 @@ function runTmux(
 
     child.stdout!.on("data", (raw: Buffer) => {
       stdoutBytes += raw.byteLength;
-      if (stdoutBytes > MAX_COMMAND_OUTPUT_BYTES) {
+      if (stdoutBytes > (options.maxStdoutBytes ?? MAX_COMMAND_OUTPUT_BYTES)) {
         try { child.kill("SIGKILL"); } catch {}
-        finish(new Error("tmux stdout exceeded the terminal-control limit"));
+        finish(new TmuxStdoutLimitError());
         return;
       }
       stdout.push(Buffer.from(raw));
@@ -490,6 +516,98 @@ async function requirePane(
     );
   }
   return { sessionId, paneTarget: panes[0][1] };
+}
+
+async function requireRenderedSnapshotPane(
+  expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+  tmuxInstanceId: string,
+  outputGeneration: string,
+  pane: string,
+): Promise<string> {
+  if (pane !== "0") {
+    throw new TerminalControlProtocolError(
+      "INVALID_REQUEST",
+      `managed single-pane target has no logical pane: ${pane}`,
+    );
+  }
+  const current = exactManagedSession(expected.name);
+  if (current.kind !== expected.kind || current.createdAt !== expected.createdAt) {
+    throw new TerminalControlProtocolError(
+      "TARGET_GONE",
+      "managed session lifecycle no longer matches the control target",
+    );
+  }
+  if (
+    !/^[A-Za-z0-9-]{1,128}$/.test(tmuxInstanceId)
+    || !/^[A-Za-z0-9-]{1,128}$/.test(outputGeneration)
+  ) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal backend fencing identity is malformed",
+    );
+  }
+
+  const sessionId = await requireTmuxSession(expected.name, "TARGET_GONE");
+  const canonicalPaneTarget = `=${expected.name}:`;
+  let probe: TmuxResult;
+  try {
+    probe = await runTmux([
+      "display-message",
+      "-p",
+      "-t",
+      canonicalPaneTarget,
+      [
+        "#{pane_id}",
+        "#{session_id}",
+        `#{@${TMUX_INSTANCE_OPTION.slice(1)}}`,
+        `#{@${OUTPUT_GENERATION_OPTION.slice(1)}}`,
+        "#{pane_pipe}",
+        "#{session_windows}",
+        "#{window_panes}",
+      ].join("\u001f"),
+    ]);
+  } catch (error) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      `could not resolve the fenced terminal pane for rendered output: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const fields = probe.stdout.trim().split("\u001f");
+  if (
+    fields.length !== 7
+    || !/^%\d+$/.test(fields[0])
+    || fields[1] !== sessionId
+    || fields[2] !== tmuxInstanceId
+    || fields[3] !== outputGeneration
+    || fields[4] !== "1"
+    || fields[5] !== "1"
+    || fields[6] !== "1"
+  ) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal backend identity, output capture, or single-pane shape changed before rendered output capture",
+    );
+  }
+  return fields[0];
+}
+
+function boundedUtf8Tail(value: string, maxBytes: number): {
+  text: string;
+  truncated: boolean;
+} {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return { text: value, truncated: false };
+  }
+  const characters = [...value];
+  let start = characters.length;
+  let bytes = 0;
+  while (start > 0) {
+    const size = Buffer.byteLength(characters[start - 1], "utf8");
+    if (bytes + size > maxBytes) break;
+    start -= 1;
+    bytes += size;
+  }
+  return { text: characters.slice(start).join(""), truncated: true };
 }
 
 function shellQuote(value: string): string {
@@ -1350,5 +1468,70 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       cursor,
       maxBytes,
     );
+  }
+
+  async captureRenderedSnapshot(
+    expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    maxBytes: number,
+  ): Promise<TerminalControlRenderedSnapshot> {
+    if (!Number.isSafeInteger(maxBytes)
+      || maxBytes < 1
+      || maxBytes > TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES) {
+      throw new TerminalControlProtocolError(
+        "INVALID_REQUEST",
+        "rendered terminal snapshot size is invalid",
+      );
+    }
+    const beforePaneId = await requireRenderedSnapshotPane(
+      expected,
+      tmuxInstanceId,
+      outputGeneration,
+      pane,
+    );
+    let captured: TmuxResult | undefined;
+    let captureError: unknown;
+    try {
+      captured = await runTmux([
+        "capture-pane",
+        "-p",
+        "-J",
+        "-S",
+        `-${RENDERED_SNAPSHOT_HISTORY_LINES}`,
+        "-E",
+        "-",
+        "-t",
+        beforePaneId,
+      ], { maxStdoutBytes: MAX_RENDERED_SNAPSHOT_SOURCE_BYTES });
+    } catch (error) {
+      captureError = error;
+    }
+
+    const afterPaneId = await requireRenderedSnapshotPane(
+      expected,
+      tmuxInstanceId,
+      outputGeneration,
+      pane,
+    );
+    if (afterPaneId !== beforePaneId) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal pane identity changed during rendered output capture",
+      );
+    }
+    if (captureError instanceof TmuxStdoutLimitError) {
+      throw new TerminalControlProtocolError(
+        "RESOURCE_EXHAUSTED",
+        "rendered terminal snapshot exceeded its bounded source limit",
+      );
+    }
+    if (captureError) throw captureError;
+    const bounded = boundedUtf8Tail(captured!.stdout, maxBytes);
+    return {
+      dataBase64: Buffer.from(bounded.text, "utf8").toString("base64"),
+      truncated: bounded.truncated,
+    };
   }
 }

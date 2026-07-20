@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+  CanonicalTerminalControlError,
   type CanonicalDrainRecord,
   type CanonicalHandoffResult,
   type CanonicalLeaseResult,
@@ -161,6 +162,40 @@ function hasCode(error: unknown, code: string): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === code;
 }
 
+class RenderedSnapshotCorrelationError extends Error {
+  constructor() {
+    super("terminal rendered snapshot correlation changed while polling a Feishu turn");
+    this.name = "RenderedSnapshotCorrelationError";
+  }
+}
+
+const FATAL_RENDERED_SNAPSHOT_CODES = new Set([
+  "INVALID_REQUEST",
+  "UNSUPPORTED_VERSION",
+  "TARGET_NOT_FOUND",
+  "TARGET_GONE",
+  "PERMISSION_DENIED",
+  "HANDOFF_PENDING",
+  "RECOVERY_REQUIRED",
+  "STALE_OUTPUT_CURSOR",
+  "OPERATION_IN_DOUBT",
+]);
+
+function retryableRenderedSnapshotObservation(error: unknown): boolean {
+  if (error instanceof RenderedSnapshotCorrelationError) return false;
+  if (!(error instanceof Error)) return false;
+  const candidate = error as { code?: unknown; retryable?: unknown };
+  if (typeof candidate.code === "string" && FATAL_RENDERED_SNAPSHOT_CODES.has(candidate.code)) {
+    return false;
+  }
+  if (candidate.code === "RESOURCE_EXHAUSTED" || candidate.code === "INTERNAL") return true;
+  if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable === true;
+  // Socket timeouts/resets may not be normalized by the canonical client. The
+  // snapshot is read-only, so an ordinary transport Error can wait for the
+  // next fenced authority check instead of invalidating the binding now.
+  return !(error instanceof CanonicalTerminalControlError);
+}
+
 export class FeishuBridge {
   readonly instanceId: string;
   private readonly control: CanonicalTerminalControlClient;
@@ -234,6 +269,7 @@ export class FeishuBridge {
       if (this.state.bindings.some((binding) => binding.chatId === input.chatId)) {
         throw new Error("this Feishu chat already has a binding");
       }
+      await this.requireRenderedSnapshotCapability();
       const target = await this.control.resolveTarget(input.sessionName);
       if (this.state.bindings.some((binding) =>
         binding.controlTargetId === target.controlTargetId && binding.status !== "stale")) {
@@ -415,6 +451,7 @@ export class FeishuBridge {
     return this.serial(async () => {
       const binding = this.requireBinding(bindingId);
       if (this.activeTurn(binding.id)) throw new Error("binding still has an unresolved turn");
+      await this.requireRenderedSnapshotCapability();
       const target = await this.control.resolveTarget(binding.sessionName);
       if (target.controlTargetId !== binding.controlTargetId) {
         binding.status = "stale";
@@ -454,6 +491,7 @@ export class FeishuBridge {
         this.persist();
         return structuredClone(binding);
       } else if (target.state === "FREE") {
+        await this.requireRenderedSnapshotCapability();
         lease = this.requireGrantedLease(
           await this.control.acquireLease(binding.controlTargetId, owner),
           binding.controlTargetId,
@@ -608,6 +646,7 @@ export class FeishuBridge {
         || target.ownerKind !== dashboardLease.owner.kind) {
         throw new Error("the controlled local owner no longer owns the exact binding target");
       }
+      await this.requireRenderedSnapshotCapability();
       try {
         const feishuOwner = this.feishuOwner(binding.id);
         const draining = await this.control.beginHandoff(
@@ -701,6 +740,7 @@ export class FeishuBridge {
         return;
       }
 
+      await this.requireRenderedSnapshotCapability();
       const target = await this.control.ownershipStatus(binding.controlTargetId);
       if (this.isFeishuDrainingView(binding, lease, target)) {
         this.rememberEvent(event.event_id);
@@ -1004,13 +1044,54 @@ export class FeishuBridge {
       this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
-    const marked = extractFeishuMarkedReply(turn.output, turn.markerNonce);
-    if (marked.reply && !turn.markerSeenAt) {
+    const rawMarked = extractFeishuMarkedReply(turn.output, turn.markerNonce);
+    if (rawMarked.complete && !turn.markerSeenAt) {
       turn.markerSeenAt = nowIso(this.now);
       this.persist();
     }
-    if (!marked.reply || !marked.complete) return;
-    await this.completeReply(turn, binding, marked.reply, "completed");
+    // markerSeenAt is a persisted closed-marker latch. It keeps snapshot
+    // retries alive across later polls if TUI repaint bytes push the raw
+    // opening marker out of the bounded parser tail.
+    if (!rawMarked.complete && !turn.markerSeenAt) return;
+
+    let renderedMarked: ReturnType<typeof extractFeishuMarkedReply>;
+    try {
+      const snapshot = await this.control.renderedSnapshot({
+        lease,
+        outputGeneration: turn.outputGeneration,
+        pane: "0",
+        maxBytes: MAX_TURN_OUTPUT_BYTES,
+      });
+      if (snapshot.controlTargetId !== turn.controlTargetId
+        || snapshot.controlEpoch !== turn.controlEpoch
+        || snapshot.leaseId !== turn.leaseId
+        || snapshot.fence !== turn.fence
+        || snapshot.ownerKind !== "feishu"
+        || snapshot.outputGeneration !== turn.outputGeneration
+        || snapshot.pane !== "0") {
+        throw new RenderedSnapshotCorrelationError();
+      }
+      renderedMarked = extractFeishuMarkedReply(
+        Buffer.from(snapshot.dataBase64, "base64").toString("utf8"),
+        turn.markerNonce,
+      );
+    } catch (error) {
+      if (retryableRenderedSnapshotObservation(error)) return;
+      turn.status = "recovery-required";
+      turn.completedAt = nowIso(this.now);
+      turn.error = error instanceof Error ? error.message : String(error);
+      this.markBindingStale(binding, turn.error);
+      this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "failure");
+      return;
+    }
+    // Raw pipe-pane bytes prove only that the nonce reached the terminal. A
+    // fullscreen TUI may repaint its composer and footer between those raw
+    // markers, so only tmux's fenced rendered view is allowed to become public
+    // card content. A transiently incomplete snapshot is retried on the next
+    // poll and never falls back to the raw byte stream.
+    if (!renderedMarked.reply || !renderedMarked.complete) return;
+    await this.completeReply(turn, binding, renderedMarked.reply, "completed");
   }
 
   private async completeReply(
@@ -1056,7 +1137,11 @@ export class FeishuBridge {
     try {
       const result = await this.lark.replyCard(
         turn.messageId,
-        buildFeishuReplyCard(text, finalStatus === "timed-out" ? "status" : "answer"),
+        buildFeishuReplyCard(
+          text,
+          binding.sessionName,
+          finalStatus === "timed-out" ? "status" : "answer",
+        ),
         attempt.idempotencyKey,
         binding.options.replyMode,
       );
@@ -1596,7 +1681,7 @@ export class FeishuBridge {
     try {
       await this.lark.replyCard(
         messageId,
-        buildFeishuReplyCard(text, "status"),
+        buildFeishuReplyCard(text, binding.sessionName, "status"),
         `tw-${digest(idempotencySeed).slice(0, 40)}`,
         binding.options.replyMode,
       );
@@ -1671,6 +1756,16 @@ export class FeishuBridge {
         process.stderr.write(`[feishu-bridge] reaction effect failed: ${error instanceof Error ? error.message : String(error)}\n`);
       },
     );
+  }
+
+  private async requireRenderedSnapshotCapability(): Promise<void> {
+    const capabilities = await this.control.capabilities();
+    if (capabilities.renderedSnapshot) return;
+    const error = new Error(
+      "terminal controller must be upgraded before Feishu can own or write to this terminal: missing output.rendered-snapshot capability",
+    ) as Error & { code?: string };
+    error.code = "FEISHU_BRIDGE_UPGRADE_REQUIRED";
+    throw error;
   }
 
   private persist(): void {

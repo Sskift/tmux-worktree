@@ -1,8 +1,10 @@
 export const TERMINAL_CONTROL_PROTOCOL_VERSION = 1 as const;
+export const TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT = "output.rendered-snapshot" as const;
 
 export const TERMINAL_CONTROL_MAX_FRAME_BYTES = 384 * 1024;
 export const TERMINAL_CONTROL_MAX_INPUT_BYTES = 256 * 1024;
 export const TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES = 256 * 1024;
+export const TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES = 128 * 1024;
 export const TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES = 4 * 1024 * 1024;
 export const TERMINAL_CONTROL_DEFAULT_LEASE_TTL_MS = 60_000;
 export const TERMINAL_CONTROL_MIN_LEASE_TTL_MS = 5_000;
@@ -150,6 +152,13 @@ export type TerminalControlRequest =
       controlEpoch: string;
       outputGeneration: string;
       cursor: number;
+      maxBytes?: number;
+    })
+  | (TerminalControlRequestBase & {
+      type: "output.rendered-snapshot";
+      lease: TerminalControlLease;
+      outputGeneration: string;
+      pane: string;
       maxBytes?: number;
     });
 
@@ -535,8 +544,96 @@ export function parseTerminalControlRequest(value: unknown): TerminalControlRequ
         cursor: record.cursor as number,
         ...(record.maxBytes === undefined ? {} : { maxBytes: record.maxBytes as number }),
       };
+    case "output.rendered-snapshot":
+      if (!exactKeys(
+        record,
+        ["protocolVersion", "requestId", "type", "lease", "outputGeneration", "pane"],
+        ["maxBytes"],
+      )) break;
+      if (
+        record.maxBytes !== undefined
+        && (
+          !Number.isSafeInteger(record.maxBytes)
+          || (record.maxBytes as number) < 1
+          || (record.maxBytes as number) > TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES
+        )
+      ) {
+        throw new TerminalControlProtocolError("INVALID_REQUEST", "maxBytes is invalid");
+      }
+      return {
+        ...base,
+        type,
+        lease: lease(record.lease),
+        outputGeneration: boundedString(record.outputGeneration, "outputGeneration", 128),
+        pane: pane(record.pane),
+        ...(record.maxBytes === undefined ? {} : { maxBytes: record.maxBytes as number }),
+      };
   }
   throw new TerminalControlProtocolError("INVALID_REQUEST", `invalid or unknown request type: ${type}`);
+}
+
+export function parseTerminalControlResponse(
+  value: unknown,
+  expectedRequestId?: string,
+): TerminalControlResponse {
+  if (!isRecord(value)) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "response must be an object");
+  }
+  if (value.protocolVersion !== TERMINAL_CONTROL_PROTOCOL_VERSION) {
+    throw new TerminalControlProtocolError("UNSUPPORTED_VERSION", "unsupported terminal-control protocolVersion");
+  }
+  const requestId = boundedString(value.requestId, "requestId", 128);
+  if (expectedRequestId !== undefined && requestId !== expectedRequestId) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "response requestId does not match the request");
+  }
+  if (value.ok === true) {
+    if (!exactKeys(value, ["protocolVersion", "requestId", "ok", "result"])) {
+      throw new TerminalControlProtocolError("INVALID_REQUEST", "successful response envelope is invalid");
+    }
+    return {
+      protocolVersion: TERMINAL_CONTROL_PROTOCOL_VERSION,
+      requestId,
+      ok: true,
+      result: value.result,
+    };
+  }
+  if (value.ok !== false
+    || !exactKeys(value, ["protocolVersion", "requestId", "ok", "error"])
+    || !isRecord(value.error)
+    || !exactKeys(value.error, ["code", "message", "retryable"])) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "error response envelope is invalid");
+  }
+  const codes: TerminalControlErrorCode[] = [
+    "INVALID_REQUEST",
+    "UNSUPPORTED_VERSION",
+    "TARGET_NOT_FOUND",
+    "TARGET_GONE",
+    "PERMISSION_DENIED",
+    "HANDOFF_PENDING",
+    "RECOVERY_REQUIRED",
+    "STALE_OUTPUT_CURSOR",
+    "OPERATION_IN_DOUBT",
+    "RESOURCE_EXHAUSTED",
+    "INTERNAL",
+  ];
+  if (!codes.includes(value.error.code as TerminalControlErrorCode)
+    || typeof value.error.message !== "string"
+    || value.error.message.length === 0
+    || value.error.message.includes("\0")
+    || Buffer.byteLength(value.error.message, "utf8") > 8 * 1024
+    || typeof value.error.retryable !== "boolean") {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "terminal-control response error is invalid");
+  }
+  return {
+    protocolVersion: TERMINAL_CONTROL_PROTOCOL_VERSION,
+    requestId,
+    ok: false,
+    error: {
+      code: value.error.code as TerminalControlErrorCode,
+      message: value.error.message,
+      retryable: value.error.retryable,
+    },
+  };
 }
 
 export function terminalControlErrorResponse(

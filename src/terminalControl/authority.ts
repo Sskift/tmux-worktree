@@ -8,8 +8,10 @@ import type {
   TerminalControlRequest,
 } from "./protocol";
 import {
+  TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
   TERMINAL_CONTROL_DEFAULT_LEASE_TTL_MS,
   TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
+  TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TerminalControlProtocolError,
 } from "./protocol";
 import { TmuxTerminalControlBackend, type TerminalControlBackend } from "./backend";
@@ -546,7 +548,11 @@ export class TerminalControlAuthority {
 
   async handle(request: TerminalControlRequest): Promise<unknown> {
     if (request.type === "ping") {
-      return { protocolVersion: 1, authority: "local-terminal-control" };
+      return {
+        protocolVersion: 1,
+        authority: "local-terminal-control",
+        capabilities: [TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT],
+      };
     }
     if (request.type === "target.resolve") return this.resolveTarget(request.sessionName);
     if (request.type === "ownership.status") return this.status(request.controlTargetId);
@@ -621,6 +627,14 @@ export class TerminalControlAuthority {
         request.controlEpoch,
         request.outputGeneration,
         request.cursor,
+        request.maxBytes,
+      );
+    }
+    if (request.type === "output.rendered-snapshot") {
+      return this.renderedSnapshot(
+        request.lease,
+        request.outputGeneration,
+        request.pane,
         request.maxBytes,
       );
     }
@@ -1329,6 +1343,55 @@ export class TerminalControlAuthority {
         cursor: chunk.cursor,
         dataBase64: chunk.dataBase64,
         nextCursor: chunk.nextCursor,
+      };
+    });
+  }
+
+  private async renderedSnapshot(
+    lease: TerminalControlLease,
+    outputGeneration: string,
+    pane: string,
+    maxBytes = TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
+  ): Promise<unknown> {
+    return this.locked(async (state) => {
+      const target = targetById(state, lease.controlTargetId);
+      if (lease.owner.kind !== "feishu") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "rendered terminal snapshots require the exact Feishu owner",
+        );
+      }
+      await this.assertTargetCurrent(state, target);
+      validateLease(state, target, lease, { allowDraining: true });
+      if (pane !== "0") {
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
+      if (outputGeneration !== target.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "rendered terminal snapshot was fenced by an output generation change",
+        );
+      }
+      const snapshot = await this.backend.captureRenderedSnapshot(
+        target.managedSession,
+        target.backend.tmuxInstanceId,
+        outputGeneration,
+        pane,
+        maxBytes,
+      );
+      return {
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        leaseId: lease.leaseId,
+        fence: target.ownership.fence,
+        ownerKind: "feishu",
+        outputGeneration,
+        pane,
+        dataBase64: snapshot.dataBase64,
+        truncated: snapshot.truncated,
       };
     });
   }
