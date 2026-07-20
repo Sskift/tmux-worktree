@@ -34,6 +34,7 @@ import {
   type RelayV2BrokerProducerRegistry,
   type RelayV2BrokerProducerTarget,
 } from "./brokerProducerRegistry.js";
+import type { RelayV2CarrierPumpBrokerPort } from "./carrierPump.js";
 import {
   RelayV2BrokerTransportCloseCoordinator,
   type RelayV2BrokerTransportCloseDeadlineScheduler,
@@ -122,20 +123,9 @@ export interface RelayV2BrokerClientWssConnectionHandle {
   readonly drained: Promise<void>;
 }
 
-export type RelayV2BrokerHostPumpAuthority = Readonly<Pick<
-  RelayV2BrokerCore,
-  | "attachHostCarrier"
-  | "receiveHostFrame"
-  | "drainHostCarrier"
-  | "acknowledgeHostControlDelivery"
-  | "acknowledgeHostDelivery"
-  | "sweepBackpressure"
-  | "disconnectHost"
->>;
-
 export interface RelayV2BrokerClientWssRuntimeComposition {
   /** Exact bound handoff for the future Host carrier Pump owner only. */
-  readonly hostPumpBrokerAuthority: RelayV2BrokerHostPumpAuthority;
+  readonly hostPumpBrokerAuthority: RelayV2CarrierPumpBrokerPort;
   prepareClientWss(
     input: RelayV2BrokerClientWssPrepareInput,
   ): RelayV2BrokerClientWssPrepareResult;
@@ -554,7 +544,7 @@ class ManagedRegistrationTerminalOwner {
 
 class RelayV2BrokerClientWssRuntimeCompositionImpl
 implements RelayV2BrokerClientWssRuntimeComposition {
-  readonly hostPumpBrokerAuthority: RelayV2BrokerHostPumpAuthority;
+  readonly hostPumpBrokerAuthority: RelayV2CarrierPumpBrokerPort;
 
   private readonly broker: RelayV2BrokerCore;
   private readonly transport: RelayV2BrokerManagedClientSocketTransport;

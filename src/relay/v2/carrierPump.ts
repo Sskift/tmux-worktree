@@ -51,8 +51,19 @@ export interface RelayV2CarrierPumpQueueLimits {
   maxPendingActionBytes?: number;
 }
 
+export type RelayV2CarrierPumpBrokerPort = Readonly<Pick<
+  RelayV2BrokerCore,
+  | "attachHostCarrier"
+  | "receiveHostFrame"
+  | "drainHostCarrier"
+  | "acknowledgeHostControlDelivery"
+  | "acknowledgeHostDelivery"
+  | "sweepBackpressure"
+  | "disconnectHost"
+>>;
+
 export interface RelayV2CarrierPumpOptions {
-  broker: RelayV2BrokerCore;
+  broker: RelayV2CarrierPumpBrokerPort;
   host: RelayV2HostCarrierActor;
   transportId: string;
   hostAuthContext: RelayV2BrokerConnectionAuthorization;
