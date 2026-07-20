@@ -5,8 +5,8 @@
 ## 当前实现边界
 
 - 这里交付原生 Kotlin + Compose Android 客户端。`V2Activity` / `V2ViewModel` 表示第二代 Android 产品与客户端架构，不表示 Relay v2。
-- 当前生产连接仍由 `RelayV1ConnectionActor` 和 `core/relay/v1` codec 驱动。Relay v1 contract 是 active-but-legacy-frozen；不得在 Android 单端添加 wire 字段或从终端文本伪造 Agent 回复、transcript、Waiting/Failed/Completed 状态。
-- `core/relay/v2/codec` 是与 Node 独立实现、共同消费 `contracts/relay/v2` 的 conformance 基础，尚未接入 connection actor、profile、credential 或 UI。codec 测试通过不得被描述为 Relay v2 runtime、配对或 capability 已交付。
+- 没有已存在且 cold-start credential/admission 验证成功的显式 v2 profile 时，生产连接仍由 `RelayV1ConnectionActor` 和 `core/relay/v1` codec 驱动。Relay v1 contract 是 active-but-legacy-frozen；不得在 Android 单端添加 wire 字段或从终端文本伪造 Agent 回复、transcript、Waiting/Failed/Completed 状态。
+- 只有上述显式 v2 profile 才进入受限的 `RelayV2BaseRuntimeComposition`：它已装配独立 v2 actor、bounded WSS、Room 基础 state-sync、Outbox query/recovered 与 bounded fresh durable dispatch、受限 Session reply producer，以及 default-off 的 selected-Session structured transcript/lifecycle evidence 投影 seam。`core/relay/v2/codec` 仍是与 Node 独立实现、共同消费 `contracts/relay/v2` 的 strict conformance 边界；production actor 的 `optionalCapabilities` 仍固定为空，所以 selected-Session seam 当前只返回 `Unavailable` 空页，真实 Agent reply/state/capability、通知和完整 extension runtime 仍未交付。Dashboard、`relay-server` 和 `relay-host` 的 production runtime 仍只实现 Relay v1；上述 Android seam 不得被宣称为完整 Relay v2、ready 或 capability 已交付，也不得在失败时 fallback 到 v1。
 - Compose 只通过 `V2ViewModel` 进入 repository/actor；Room、DataStore、Keystore 和 WebSocket 不得成为 Screen 的直接依赖。
 - `MainActivity`、`LegacyIdentityImporter`、`TerminalWebView`、xterm assets 和 v1 actor 都仍是生产或升级兼容路径，不得因名称像 legacy 就删除。
 
