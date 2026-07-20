@@ -9,7 +9,21 @@ import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TimelineEvent
 
+enum class RelayStartupAdmissionState {
+    CHECKING,
+    RELAY_V1,
+    RELAY_V2_RUNTIME_UNAVAILABLE,
+    RELAY_V2_REENROLLMENT_REQUIRED,
+    RELAY_V2_RECOVERY_REQUIRED,
+    RELAY_V2_CREDENTIAL_MISSING,
+    RELAY_V2_CREDENTIAL_BINDING_MISMATCH,
+    RELAY_V2_CREDENTIAL_BLOB_BEHIND,
+    RELAY_V2_CREDENTIAL_REPAIR_CONFLICT,
+    RELAY_V2_ADMISSION_FAILED,
+}
+
 data class V2UiState(
+    val relayStartupAdmission: RelayStartupAdmissionState = RelayStartupAdmissionState.CHECKING,
     val initialized: Boolean = false,
     val demoMode: Boolean = false,
     val networkAvailable: Boolean = true,

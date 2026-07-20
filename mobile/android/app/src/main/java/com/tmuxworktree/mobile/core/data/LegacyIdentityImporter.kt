@@ -38,6 +38,12 @@ class LegacyIdentityImporter(
         return true
     }
 
+    suspend fun discardForV2Profile() {
+        val legacy = context.getSharedPreferences(LEGACY_PREFERENCES, Context.MODE_PRIVATE)
+        removeLingeringPlaintext(legacy)
+        preferencesStore.setLegacyIdentityMigrated()
+    }
+
     private fun removeLingeringPlaintext(legacy: SharedPreferences) {
         if (!legacy.contains("relaySecret")) return
         val plaintextRemoved = removeLegacySecret(legacy)

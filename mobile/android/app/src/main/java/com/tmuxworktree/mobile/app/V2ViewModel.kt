@@ -3,6 +3,9 @@ package com.tmuxworktree.mobile.app
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
 import com.tmuxworktree.mobile.core.data.OutboxInFlightMessage
@@ -207,6 +210,16 @@ class V2ViewModel(
     fun connectPairing() {
         if (demoMode) {
             _uiState.update { it.copy(pairingRequired = false, paired = true) }
+            return
+        }
+        if (_uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V1) {
+            _uiState.update {
+                it.copy(
+                    isConnecting = false,
+                    pairingError = it.pairingError
+                        ?: "Relay startup admission has not enabled Relay v1.",
+                )
+            }
             return
         }
         val current = _uiState.value
@@ -787,15 +800,76 @@ class V2ViewModel(
         }
     }
 
+    private fun applyStartupAdmission(admission: RelayStartupAdmission) {
+        _uiState.update { current ->
+            if (admission.allowsRelayV1) {
+                current.copy(relayStartupAdmission = admission.state)
+            } else {
+                current.copy(
+                    relayStartupAdmission = admission.state,
+                    initialized = true,
+                    paired = false,
+                    pairingRequired = true,
+                    isConnecting = false,
+                    pairingError = admission.message,
+                )
+            }
+        }
+    }
+
     private fun startRealApp() {
         viewModelScope.launch {
-            runCatching { container.legacyIdentityImporter.importIfNeeded() }
-                .onFailure { emit(V2UiEffect.Notice("Existing connection could not be migrated")) }
-            runCatching { reconcileInterruptedOutbox() }
-                .onFailure {
-                    emit(V2UiEffect.Notice("Local cache could not be fully recovered"))
+            val startupAdmission = try {
+                container.createRelayV2StartupAdmissionRuntime(
+                    disconnectBarrier = object : RelayProfileDisconnectBarrier {
+                        override suspend fun disconnectAndDrain(
+                            profile: RelayActiveProfileIdentity,
+                            barrierId: String,
+                        ): RelayProfileDisconnectReceipt {
+                            relay.disconnectAndAwait(barrierId)
+                            return RelayProfileDisconnectReceipt(profile, barrierId)
+                        }
+                    },
+                    clearEphemeralAfterDisconnect = {
+                        _uiState.value = V2UiState()
+                    },
+                ).admitStartup()
+            } catch (error: Throwable) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                RelayStartupAdmission(
+                    state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
+                    message = "Relay v2 startup admission failed closed; Relay v1 fallback is disabled.",
+                )
+            }
+            val effectiveAdmission = if (startupAdmission.allowsRelayV1) {
+                try {
+                    container.legacyIdentityImporter.importIfNeeded()
+                } catch (error: Throwable) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    emit(V2UiEffect.Notice("Existing connection could not be migrated"))
                 }
-            launchCollectors()
+                startupAdmission
+            } else {
+                try {
+                    container.legacyIdentityImporter.discardForV2Profile()
+                    startupAdmission
+                } catch (error: Throwable) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    RelayStartupAdmission(
+                        state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
+                        message = "Legacy credential cleanup failed closed; Relay v1 fallback is disabled.",
+                    )
+                }
+            }
+            applyStartupAdmission(effectiveAdmission)
+
+            if (effectiveAdmission.allowsRelayV1) {
+                runCatching { reconcileInterruptedOutbox() }
+                    .onFailure {
+                        emit(V2UiEffect.Notice("Local cache could not be fully recovered"))
+                    }
+                launchCollectors()
+            }
         }
     }
 
@@ -934,6 +1008,9 @@ class V2ViewModel(
     }
 
     private fun connectActiveProfile(force: Boolean = false) {
+        if (_uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V1) {
+            return
+        }
         val state = _uiState.value
         if (!state.networkAvailable) return
         val relayUrl = state.preferences.relayUrl.ifBlank { state.pairingRelayUrl }
