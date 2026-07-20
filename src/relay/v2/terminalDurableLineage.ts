@@ -11,6 +11,7 @@ import {
   RELAY_V2_TERMINAL_CONTROL_RETENTION_MS,
   RELAY_V2_TERMINAL_MAX_CONTROL_RECORDS,
   RELAY_V2_TERMINAL_MAX_STREAMS,
+  captureRelayV2TerminalManagerRecoveryBinding,
   type RelayV2TerminalDurableCloseClaimResult,
   type RelayV2TerminalDurableCloseIntent,
   type RelayV2TerminalDurableCloseTombstone,
@@ -25,12 +26,155 @@ import {
   type RelayV2TerminalDurableStreamClosedResult,
   type RelayV2TerminalDurableStreamReleaseResult,
   type RelayV2TerminalOpenFailureStreamEffect,
+  type RelayV2TerminalManagerRecoveryBinding,
   type RelayV2TerminalCanonicalResolver,
   type RelayV2TerminalCanonicalResolution,
   type RelayV2TerminalCanonicalTargetBindingV1,
   type RelayV2TerminalRoute,
   type RelayV2TerminalWireTarget,
 } from "./terminalManager.js";
+
+const RELAY_V2_HOST_H3_RECOVERY_CANDIDATE_ISSUER = Symbol.for(
+  "tmux-worktree.relay-v2.host-h3-recovery-candidate-issuer",
+);
+
+declare const RELAY_V2_HOST_H3_RECOVERY_CANDIDATE: unique symbol;
+
+/** One-shot process capability issued only after durable H3 owner recovery. */
+export type RelayV2HostH3RecoveryCandidate = Readonly<object> & {
+  readonly [RELAY_V2_HOST_H3_RECOVERY_CANDIDATE]: true;
+};
+
+export interface RelayV2HostH3RecoveryCandidateSink {
+  close(error?: unknown): void;
+}
+
+export interface RelayV2HostH3RecoveryCandidateAuthority {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly ownerFence: string;
+  consume(
+    sink: RelayV2HostH3RecoveryCandidateSink,
+  ): RelayV2TerminalManagerRecoveryBinding | null;
+  release(sink: RelayV2HostH3RecoveryCandidateSink): boolean;
+}
+
+interface RelayV2HostH3RecoveryCandidateIssuer {
+  capture(candidate: unknown): RelayV2HostH3RecoveryCandidateAuthority | null;
+}
+
+interface ActiveH3Candidate {
+  retire(): void;
+}
+
+const activeH3Candidates = new Map<string, ActiveH3Candidate>();
+
+/**
+ * Captures the candidate's lexical issuer. Symbol discovery is not authority:
+ * the issuer closure still compares the exact original candidate identity.
+ */
+export function captureRelayV2HostH3RecoveryCandidate(
+  value: unknown,
+): RelayV2HostH3RecoveryCandidateAuthority | null {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return null;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(
+      value,
+      RELAY_V2_HOST_H3_RECOVERY_CANDIDATE_ISSUER,
+    );
+  } catch {
+    return null;
+  }
+  if (!descriptor
+    || !Object.hasOwn(descriptor, "value")
+    || descriptor.configurable !== false
+    || descriptor.enumerable !== false
+    || descriptor.writable !== false
+    || !descriptor.value
+    || typeof descriptor.value !== "object") return null;
+  const issuer = descriptor.value as RelayV2HostH3RecoveryCandidateIssuer;
+  const capture = Object.getOwnPropertyDescriptor(issuer, "capture");
+  if (!capture
+    || !Object.hasOwn(capture, "value")
+    || typeof capture.value !== "function") return null;
+  try {
+    return Reflect.apply(capture.value, issuer, [value]);
+  } catch {
+    return null;
+  }
+}
+
+function issueRelayV2HostH3RecoveryCandidate(
+  binding: RelayV2TerminalManagerRecoveryBinding,
+  ownerFence: string,
+): RelayV2HostH3RecoveryCandidate {
+  let status: "issued" | "consumed" | "retired" = "issued";
+  let sink: RelayV2HostH3RecoveryCandidateSink | null = null;
+  let fatalSink: ((error: unknown) => void) | null = null;
+  let candidate: RelayV2HostH3RecoveryCandidate;
+
+  const state: ActiveH3Candidate = Object.freeze({
+    retire(): void {
+      if (status === "retired") return;
+      status = "retired";
+      if (activeH3Candidates.get(binding.hostEpoch) === state) {
+        activeH3Candidates.delete(binding.hostEpoch);
+      }
+      if (fatalSink !== null) binding.clearFatalSink(fatalSink);
+      fatalSink = null;
+      const observed = sink;
+      sink = null;
+      if (observed !== null) {
+        try { observed.close(); } catch {}
+      }
+    },
+  });
+
+  const authority: RelayV2HostH3RecoveryCandidateAuthority = Object.freeze({
+    hostId: binding.hostId,
+    hostEpoch: binding.hostEpoch,
+    hostInstanceId: binding.hostInstanceId,
+    ownerFence,
+    consume(candidateSink): RelayV2TerminalManagerRecoveryBinding | null {
+      if (!candidateSink
+        || typeof candidateSink !== "object"
+        || typeof candidateSink.close !== "function"
+        || status !== "issued"
+        || activeH3Candidates.get(binding.hostEpoch) !== state) return null;
+      const managerFatalSink = (error: unknown) => candidateSink.close(error);
+      if (!binding.installFatalSink(managerFatalSink)) return null;
+      status = "consumed";
+      sink = candidateSink;
+      fatalSink = managerFatalSink;
+      return binding;
+    },
+    release(candidateSink): boolean {
+      if (status !== "consumed" || sink !== candidateSink) return false;
+      sink = null;
+      state.retire();
+      return true;
+    },
+  });
+  const issuer: RelayV2HostH3RecoveryCandidateIssuer = Object.freeze({
+    capture(value): RelayV2HostH3RecoveryCandidateAuthority | null {
+      return value === candidate ? authority : null;
+    },
+  });
+  const issued = Object.create(null) as RelayV2HostH3RecoveryCandidate;
+  Object.defineProperty(issued, RELAY_V2_HOST_H3_RECOVERY_CANDIDATE_ISSUER, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: issuer,
+  });
+  candidate = Object.freeze(issued);
+
+  activeH3Candidates.get(binding.hostEpoch)?.retire();
+  activeH3Candidates.set(binding.hostEpoch, state);
+  return candidate;
+}
 
 const TERMINAL_LINEAGE_KEY = "h3:terminal-durable-lineage:v1";
 // Revision 3 adds the mandatory prepared exact H2/control binding. Revisions 1
@@ -1396,6 +1540,7 @@ export class RelayV2TerminalDurableLineageAuthority
     | Pick<RelayV2TerminalCanonicalResolver, "fenceSessionForAdmission">
     | undefined;
   private activated = false;
+  private recoveryStarted = false;
 
   constructor(options: RelayV2TerminalDurableLineageAuthorityOptions) {
     if (!isRecord(options)
@@ -1428,6 +1573,56 @@ export class RelayV2TerminalDurableLineageAuthority
       }
     }
     this.limits = Object.freeze(limits);
+  }
+
+  /**
+   * Performs the complete H3 recovery cut in one H0 transaction and only then
+   * signs a candidate bound to this exact lineage and manager instance.
+   */
+  async recoverForHostH3(manager: unknown): Promise<RelayV2HostH3RecoveryCandidate> {
+    const binding = captureRelayV2TerminalManagerRecoveryBinding(manager, this);
+    if (binding === null
+      || binding.hostInstanceId !== this.hostInstanceId
+      || this.recoveryStarted
+      || this.activated) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+        "Relay v2 terminal recovery manager or lineage is stale",
+      );
+    }
+    this.recoveryStarted = true;
+    let proposed: { hostEpoch: string; ownerFence: string } | null = null;
+    const recovered = await this.store.serialize((section) => {
+      const authorityExpiresAtMs = this.authorityRetentionExpiresAtMs();
+      const mutate = (transaction: RelayV2HostStateTransaction) => {
+        if (binding.hostEpoch !== transaction.hostEpoch) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal recovery host epoch mismatched HostState",
+          );
+        }
+        const state = this.stateForTransaction(transaction);
+        this.cleanup(state);
+        const ownerFence = this.replaceOwner(state, authorityExpiresAtMs, true);
+        proposed = Object.freeze({ hostEpoch: transaction.hostEpoch, ownerFence });
+        return { result: proposed, state };
+      };
+      return this.commitAndReconcile(section, mutate, (snapshot) => {
+        const state = this.stateFromSnapshot(snapshot);
+        if (proposed === null
+          || snapshot.hostEpoch !== proposed.hostEpoch
+          || state.activeHostInstanceId !== this.hostInstanceId
+          || state.ownerFence !== proposed.ownerFence) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal recovery commit could not be reconciled",
+          );
+        }
+        return proposed;
+      });
+    });
+    this.activated = true;
+    return issueRelayV2HostH3RecoveryCandidate(binding, recovered.ownerFence);
   }
 
   async claimOpen(
@@ -2418,6 +2613,17 @@ export class RelayV2TerminalDurableLineageAuthority
     if (state.activeHostInstanceId === this.hostInstanceId) {
       return;
     }
+    this.replaceOwner(state, authorityExpiresAtMs, false);
+  }
+
+  private replaceOwner(
+    state: PersistedTerminalLineageState,
+    authorityExpiresAtMs: number,
+    force: boolean,
+  ): string {
+    if (!force && state.activeHostInstanceId === this.hostInstanceId) {
+      return state.ownerFence;
+    }
     if (this.activated) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
@@ -2471,6 +2677,7 @@ export class RelayV2TerminalDurableLineageAuthority
         "Relay v2 terminal process retirement exceeded its evidence quota",
       );
     }
+    return fence;
   }
 
   private stateForTransaction(

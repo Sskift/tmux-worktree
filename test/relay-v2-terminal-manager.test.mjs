@@ -625,10 +625,14 @@ function harness(options = {}) {
   let now = 1_000_000;
   const authority = options.authority ?? new FakeTerminalControl(() => now, trace);
   const resolver = options.resolver ?? new FakeResolver(trace);
+  if (options.hostEpoch !== undefined) {
+    resolver.resolved.admission.resourceToken.hostEpoch = options.hostEpoch;
+    resolver.resolved.admission.resourceTarget.hostEpoch = options.hostEpoch;
+  }
   const lineage = options.lineage ?? new FakeDurableLineage(trace);
   const manager = new terminal.RelayV2TerminalManager({
     hostId: HOST_ID,
-    hostEpoch: HOST_EPOCH,
+    hostEpoch: options.hostEpoch ?? HOST_EPOCH,
     hostInstanceId: options.hostInstanceId ?? HOST_INSTANCE_ID,
     resolver,
     lineage,
@@ -1969,16 +1973,22 @@ test("HostState durable lineage is exercised by open, natural close, explicit fi
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-lineage-"));
   try {
     const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
     const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
       store,
       admissionFence: new FakeResolver(),
       now: () => 1_000_000,
     });
-    const first = harness({ lineage, hostInstanceId: store.hostInstanceId });
+    const first = harness({
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+    });
     const explicitRequest = goldenOpen({
       requestId: "host-state-explicit-open",
       streamId: "host-state-explicit-stream",
       openId: "host-state-explicit-open-id",
+      expectedHostEpoch: identity.hostEpoch,
     });
     await first.manager.open(explicitRequest);
     const explicitOpened = opened(first.sent, explicitRequest.requestId);
@@ -1986,12 +1996,14 @@ test("HostState durable lineage is exercised by open, natural close, explicit fi
     await first.manager.close(closeRequest(explicitOpened, ROUTE_ONE, {
       requestId: "host-state-explicit-close",
       closeId: "host-state-explicit-close-id",
+      expectedHostEpoch: identity.hostEpoch,
     }));
 
     const naturalRequest = goldenOpen({
       requestId: "host-state-natural-open",
       streamId: "host-state-natural-stream",
       openId: "host-state-natural-open-id",
+      expectedHostEpoch: identity.hostEpoch,
     });
     await first.manager.open(naturalRequest);
     const naturalOpened = opened(first.sent, naturalRequest.requestId);
@@ -2019,8 +2031,12 @@ test("HostState durable lineage is exercised by open, natural close, explicit fi
     });
     const restarted = harness({
       lineage: restartedLineage,
+      hostEpoch: identity.hostEpoch,
       hostInstanceId: restartedStore.hostInstanceId,
     });
+    const recoveryCandidate = await restartedLineage.recoverForHostH3(restarted.manager);
+    assert.equal(Object.isFrozen(recoveryCandidate), true);
+    assert.deepEqual(Object.keys(recoveryCandidate), []);
     await restarted.manager.open({
       ...explicitRequest,
       requestId: "host-state-open-after-restart",
@@ -2040,6 +2056,7 @@ test("HostState durable lineage is exercised by open, natural close, explicit fi
     }, {
       requestId: "host-state-close-after-restart",
       closeId: "host-state-explicit-close-id",
+      expectedHostEpoch: identity.hostEpoch,
     }));
     const closeReplay = restarted.sent.find(({ frame }) => (
       frame.requestId === "host-state-close-after-restart"
@@ -2061,6 +2078,7 @@ test("manager accepts the authority extending a close winner to its later retent
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-close-retention-"));
   try {
     const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
     let authorityNow = 999_999;
     const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
       store,
@@ -2096,6 +2114,7 @@ test("HostState pending exact retry durably replays stream_lost without resolver
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-pending-"));
   try {
     const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
     const authority = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
       store,
       admissionFence: new FakeResolver(),
@@ -2115,12 +2134,14 @@ test("HostState pending exact retry durably replays stream_lost without resolver
     };
     const first = harness({
       lineage: crashingLineage,
+      hostEpoch: identity.hostEpoch,
       hostInstanceId: store.hostInstanceId,
     });
     const request = goldenOpen({
       requestId: "host-state-pending-open",
       streamId: "host-state-pending-stream",
       openId: "host-state-pending-open-id",
+      expectedHostEpoch: identity.hostEpoch,
     });
     await assert.rejects(
       first.manager.open(request),
@@ -2144,8 +2165,11 @@ test("HostState pending exact retry durably replays stream_lost without resolver
     });
     const restarted = harness({
       lineage: restartedLineage,
+      hostEpoch: identity.hostEpoch,
       hostInstanceId: restartedStore.hostInstanceId,
     });
+    const recoveryCandidate = await restartedLineage.recoverForHostH3(restarted.manager);
+    assert.equal(Object.isFrozen(recoveryCandidate), true);
     await restarted.manager.open({ ...request, requestId: "host-state-pending-retry" });
     const reset = restarted.sent.find(({ frame }) => (
       frame.requestId === "host-state-pending-retry"

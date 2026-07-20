@@ -710,6 +710,86 @@ export interface RelayV2TerminalManagerOptions {
   limits?: Partial<RelayV2TerminalLimits>;
 }
 
+const RELAY_V2_TERMINAL_MANAGER_RECOVERY_CAPTURE_OWNER = Symbol.for(
+  "tmux-worktree.relay-v2.terminal-manager-recovery-capture-owner",
+);
+
+export interface RelayV2TerminalManagerRecoveryBinding {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly manager: RelayV2TerminalManager;
+  installFatalSink(sink: (error: unknown) => void): boolean;
+  clearFatalSink(sink: (error: unknown) => void): boolean;
+}
+
+const terminalManagerRecoveryBindings = new WeakMap<object, Readonly<{
+  lineage: RelayV2TerminalDurableLineage;
+  binding: RelayV2TerminalManagerRecoveryBinding;
+}>>();
+
+const ownedTerminalManagerRecoveryCapture = (
+  value: unknown,
+  expectedLineage: RelayV2TerminalDurableLineage,
+): RelayV2TerminalManagerRecoveryBinding | null => {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return null;
+  const registered = terminalManagerRecoveryBindings.get(value);
+  return registered?.lineage === expectedLineage ? registered.binding : null;
+};
+
+function registerTerminalManagerRecoveryBinding(
+  manager: RelayV2TerminalManager,
+  lineage: RelayV2TerminalDurableLineage,
+  binding: RelayV2TerminalManagerRecoveryBinding,
+): void {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    RELAY_V2_TERMINAL_MANAGER_RECOVERY_CAPTURE_OWNER,
+  );
+  if (descriptor === undefined) {
+    Object.defineProperty(globalThis, RELAY_V2_TERMINAL_MANAGER_RECOVERY_CAPTURE_OWNER, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: ownedTerminalManagerRecoveryCapture,
+    });
+  } else if (!Object.hasOwn(descriptor, "value")
+    || descriptor.value !== ownedTerminalManagerRecoveryCapture) {
+    throw new Error("Relay v2 terminal manager recovery capture owner is unavailable");
+  }
+  terminalManagerRecoveryBindings.set(manager, Object.freeze({ lineage, binding }));
+}
+
+/**
+ * Captures through the first real manager module's non-replaceable lexical
+ * WeakMap owner. Globally naming the capture slot grants no issue authority.
+ */
+export function captureRelayV2TerminalManagerRecoveryBinding(
+  value: unknown,
+  expectedLineage: RelayV2TerminalDurableLineage,
+): RelayV2TerminalManagerRecoveryBinding | null {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(
+      globalThis,
+      RELAY_V2_TERMINAL_MANAGER_RECOVERY_CAPTURE_OWNER,
+    );
+  } catch {
+    return null;
+  }
+  if (!descriptor
+    || !Object.hasOwn(descriptor, "value")
+    || descriptor.configurable !== false
+    || descriptor.enumerable !== false
+    || descriptor.writable !== false
+    || typeof descriptor.value !== "function") return null;
+  try {
+    return Reflect.apply(descriptor.value, undefined, [value, expectedLineage]);
+  } catch {
+    return null;
+  }
+}
+
 export interface RelayV2TerminalManagerStats {
   liveOrDetachedStreams: number;
   retainedStreams: number;
@@ -1724,6 +1804,8 @@ export class RelayV2TerminalManager {
   private ringBytes = 0;
   private hostPressure = false;
   private stopping = false;
+  private shutdownBarrier: Promise<void> | null = null;
+  private fatalSink: ((error: unknown) => void) | null = null;
 
   private readonly hostId: string;
   private readonly hostEpoch: string;
@@ -1749,6 +1831,27 @@ export class RelayV2TerminalManager {
     this.issueToken = options.issueToken
       ?? (() => randomBytes(32).toString("base64url"));
     this.limits = Object.freeze(resolveLimits(options.limits));
+
+    const manager = this;
+    const lineage = options.lineage;
+    const recoveryBinding: RelayV2TerminalManagerRecoveryBinding = Object.freeze({
+      hostId: this.hostId,
+      hostEpoch: this.hostEpoch,
+      hostInstanceId: this.hostInstanceId,
+      manager,
+      installFatalSink(sink: (error: unknown) => void): boolean {
+        if (typeof sink !== "function") return false;
+        if (manager.fatalSink !== null && manager.fatalSink !== sink) return false;
+        manager.fatalSink = sink;
+        return true;
+      },
+      clearFatalSink(sink: (error: unknown) => void): boolean {
+        if (manager.fatalSink !== sink) return false;
+        manager.fatalSink = null;
+        return true;
+      },
+    });
+    registerTerminalManagerRecoveryBinding(manager, lineage, recoveryBinding);
   }
 
   open(request: RelayV2TerminalOpenRequest): Promise<void> {
@@ -1805,7 +1908,8 @@ export class RelayV2TerminalManager {
   }
 
   shutdown(): Promise<void> {
-    return this.enqueue(async () => {
+    if (this.shutdownBarrier !== null) return this.shutdownBarrier;
+    this.shutdownBarrier = this.enqueue(async () => {
       this.stopping = true;
       for (const stream of this.streams.values()) {
         stream.binding = undefined;
@@ -1818,6 +1922,7 @@ export class RelayV2TerminalManager {
         await this.closeQuarantinedBackend(quarantined);
       }
     });
+    return this.shutdownBarrier;
   }
 
   stats(): RelayV2TerminalManagerStats {
@@ -1845,8 +1950,28 @@ export class RelayV2TerminalManager {
 
   private enqueue<T>(operation: () => Promise<T> | T): Promise<T> {
     const run = this.serialized.then(operation, operation);
-    this.serialized = run.then(() => undefined, () => undefined);
-    return run;
+    const observed = run.catch((error: unknown) => {
+      if (this.isFatalAuthorityFailure(error)) this.notifyFatal(error);
+      throw error;
+    });
+    this.serialized = observed.then(() => undefined, () => undefined);
+    return observed;
+  }
+
+  private isFatalAuthorityFailure(error: unknown): boolean {
+    return !isRelayV2TerminalManagerError(error)
+      || error.code === "CAPABILITY_UNAVAILABLE"
+      || error.code === "INTERNAL";
+  }
+
+  private notifyFatal(error: unknown): void {
+    const sink = this.fatalSink;
+    if (sink === null) return;
+    try {
+      sink(error);
+    } catch {
+      // The manager remains failed closed even if the lifecycle observer fails.
+    }
   }
 
   private streamKey(auth: RelayV2TerminalAuthContext, streamId: string): string {

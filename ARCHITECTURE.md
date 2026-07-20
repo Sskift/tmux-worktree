@@ -349,3 +349,17 @@ Android 使用自己的 Gradle wrapper、依赖图、测试和 Lint。根 npm bu
 | `.codex/skills/` | Agent 操作规程 | 固化跨机器等易误操作流程，不属于产品 runtime |
 
 历史重构计划、一次性 QA 记录、临时截图路径和已经完成的迁移清单不应伪装成当前架构基线；需要追溯时使用 Git 历史。新增文档前先判断它属于用户手册、当前架构、专题运维、未来 contract 还是 Agent 规程，避免复制同一事实到多个位置。
+
+## Relay v2 host H3 composition foundation
+
+The default-off Relay v2 host composition now closes the isolated H3 authority
+chain: a single H0/HostState transaction strictly parses and prunes durable
+terminal lineage, retires the previous process owner, settles pending claims as
+`stream_lost`, and commits a new owner fence before signing one opaque,
+one-consumer recovery candidate. The H3 activation accepts only that exact
+lineage/manager/host binding and gives the runtime a gated facade; there is no
+public readiness `apply` path. Close, disposal, replacement, or fatal manager
+failure synchronously withdraws H3 (thereby applying the existing 4406 route
+fence) before awaiting accepted work and the idempotent manager shutdown
+barrier. This foundation remains outside `relay-host` production composition
+and does not advertise Relay v2 capabilities.

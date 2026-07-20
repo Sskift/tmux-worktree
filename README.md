@@ -442,6 +442,15 @@ Generated asset inputs:
 - [Relay Agent extension v1](docs/relay-agent-transcript-lifecycle-extension-v1.md): frozen optional-extension fixtures plus unwired Node host authority/public codec/durable store/replay runtime and Android lifecycle/notification foundations. Android now also has a default-off runtime composition seam that reuses one durable repository instance for the existing frame consumer, notification dispatch coordinator, and revision-pinned read projection. It only handles effects explicitly passed by an upper layer, returns `NotOwned` with the complete original effect for non-Agent effects and Agent unavailability to the upper-layer dispatcher, and does not collect from or construct a Relay v2 actor. Only an unavailable effect carrying an exact failed request/admission identity belongs to the RequestSync redrive owner. The Node store requires an explicitly injected shared monotonic/CAS continuity port, publishes exact durable-byte checkpoints through its existing locked local CAS, and rejects paired local rollback against the external anchor. Its future `agent-transcript-lifecycle.v1` anchor namespace/ACL/reset/tombstone history and failure scope are independent from broker credential continuity; continuity failures reuse its existing unavailable/commit-uncertain/corrupt store errors and never globally fence base v2. Unavailable preserves provable timeline/cache lineage for authority repair/reopen; only corrupt continuity permits extension reset/new epoch. The Android seam is not instantiated by the production root, default optional capability advertisement remains empty, and no real platform notification executor, UI/notification startup, production monotonic-authority adapter, relay-host wiring, G4 acceptance, or capability advertisement exists yet.
 - [Relay v2 implementation plan](docs/relay-v2-implementation-plan.md): parallel broker, relay-host, Dashboard, Android, Agent-extension work packages and their interoperability gates.
 
+## Relay v2 implementation status
+
+Relay v2 remains unavailable in production. Its isolated Node host composition
+foundation now admits terminal H3 only after one HostState transaction recovers
+the durable lineage owner and issues an exact, one-shot process candidate for
+the same terminal manager. H3 withdrawal gates terminal work immediately and
+fences active routes before the manager drains and shuts down. This is not wired
+to `relay-host` or capability advertisement and adds no protocol fallback.
+
 ## License
 
 MIT

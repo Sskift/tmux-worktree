@@ -11,6 +11,8 @@ const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const snapshotSpool = await import("../dist/relay/v2/stateSnapshotSpool.js");
+const terminalDurable = await import("../dist/relay/v2/terminalDurableLineage.js");
+const terminalManagerModule = await import("../dist/relay/v2/terminalManager.js");
 
 const HOST_ID = "mac-admin";
 const corpus = loadRelayV2FixtureCorpus();
@@ -122,15 +124,7 @@ function baseAuthorities(snapshotAuthority, hostEpoch, hostInstanceId, overrides
       async issueDedupeWindow() { throw new Error("unexpected H1 window"); },
     },
     h2SnapshotAuthority: snapshotAuthority,
-    h3: {
-      async open() { throw new Error("unexpected H3 open"); },
-      async requestReplay() { throw new Error("unexpected H3 replay"); },
-      async acknowledgeOutput() { throw new Error("unexpected H3 ack"); },
-      async input() { throw new Error("unexpected H3 input"); },
-      async resize() { throw new Error("unexpected H3 resize"); },
-      async close() { throw new Error("unexpected H3 close"); },
-      async unbind() {},
-    },
+    h3RecoveryCandidate: overrides.h3RecoveryCandidate,
     nextDedupeWindowBounds: overrides.nextDedupeWindowBounds ?? function () {
       throw new Error("unexpected dedupe policy");
     },
@@ -156,13 +150,15 @@ function createComposition(snapshotAuthority, hostEpoch, hostInstanceId, overrid
 }
 
 function applyFiveReadySources(composition, generation = "1") {
-  for (const source of ["codec", "carrier", "h1", "h3"]) {
+  for (const source of ["codec", "carrier", "h1"]) {
     assert.equal(composition.readiness[source].apply({
       source,
       generation,
       ready: true,
     }), true);
   }
+  assert.equal(composition.readiness.h3.apply, undefined);
+  assert.equal(composition.readiness.h3.activate(), true);
 }
 
 async function settle(turns = 4) {
@@ -177,6 +173,7 @@ async function realCompositionHarness({
   spoolHooks,
   wrapSpool,
   compositionOverrides,
+  h3ManagerOverrides,
   activateH0 = true,
 } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-composition-"));
@@ -207,11 +204,24 @@ async function realCompositionHarness({
     testHooks: { ...spoolHooks, ...wrapped?.testHooks },
   });
   assert.notEqual(spool.hostH2Authority, null);
+  const terminalLineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({ store });
+  const h3Manager = new terminalManagerModule.RelayV2TerminalManager({
+    hostId: HOST_ID,
+    hostEpoch: seeded.snapshot.hostEpoch,
+    hostInstanceId: store.hostInstanceId,
+    resolver: { async resolve() { throw new Error("unexpected terminal resolve"); } },
+    lineage: terminalLineage,
+    backend: { async open() { throw new Error("unexpected terminal backend open"); } },
+    terminalControl: {},
+    async send() { throw new Error("unexpected terminal frame"); },
+  });
+  Object.assign(h3Manager, h3ManagerOverrides);
+  const h3RecoveryCandidate = await terminalLineage.recoverForHostH3(h3Manager);
   const composition = createComposition(
     spool.hostH2Authority,
     seeded.snapshot.hostEpoch,
     store.hostInstanceId,
-    { ...compositionOverrides, h0: store.h0ReadinessPort },
+    { ...compositionOverrides, h0: store.h0ReadinessPort, h3RecoveryCandidate },
   );
   if (activateH0) assert.equal(await composition.readiness.h0.activate(), true);
   wrapped?.attach?.(composition);
@@ -1036,6 +1046,47 @@ test("replacement generation ignores old late close and dispose releases each le
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     assert.deepEqual([...h.wrapped.releaseCounts.values()].sort(), [1, 1]);
   } finally {
+    await h.cleanup();
+  }
+});
+
+test("composition dispose publishes one reentrant barrier and waits for H3 shutdown", async () => {
+  let releaseShutdown;
+  const shutdownBarrier = new Promise((resolve) => { releaseShutdown = resolve; });
+  let shutdownCalls = 0;
+  const h = await realCompositionHarness({
+    wrapSpool: controlledSpoolAdapter,
+    h3ManagerOverrides: {
+      shutdown() {
+        shutdownCalls += 1;
+        return shutdownBarrier;
+      },
+    },
+  });
+  try {
+    applyFiveReadySources(h.composition);
+    const active = await issueReadiness(h, "composition-dispose-reentrant");
+    assert.equal(await h.composition.readiness.h2.activate(active.issue), true);
+    let reentrantDispose = null;
+    h.wrapped.controls.onRelease = () => {
+      reentrantDispose = h.composition.dispose();
+    };
+
+    const firstDispose = h.composition.dispose();
+    const secondDispose = h.composition.dispose();
+    assert.equal(reentrantDispose, firstDispose);
+    assert.equal(secondDispose, firstDispose);
+    let settled = false;
+    void firstDispose.then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(shutdownCalls, 1);
+    assert.equal(settled, false);
+
+    releaseShutdown();
+    await firstDispose;
+    assert.equal(settled, true);
+  } finally {
+    releaseShutdown?.();
     await h.cleanup();
   }
 });

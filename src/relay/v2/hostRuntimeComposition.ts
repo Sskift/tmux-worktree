@@ -41,10 +41,13 @@ import type {
   RelayV2HostH2ReadinessLifecycle,
   RelayV2HostH2ReadinessSnapshotSpool,
 } from "./hostH2ReadinessActivation.js";
+import { createRelayV2HostH3ReadinessActivation } from "./hostH3ReadinessActivation.js";
+import type { RelayV2HostH3ReadinessLifecycle } from "./hostH3ReadinessActivation.js";
 import type {
   RelayV2StateSnapshotHostH2Authority,
 } from "./stateSnapshotSpool.js";
 import type { RelayV2HostH0ReadinessPort } from "./hostState.js";
+import type { RelayV2HostH3RecoveryCandidate } from "./terminalDurableLineage.js";
 import type {
   RelayV2TerminalOpenResponseLineage,
   RelayV2TerminalRuntimeBinding,
@@ -52,7 +55,7 @@ import type {
 
 type ManualReadinessSource = Exclude<
   RelayV2HostCapabilityReadinessSource,
-  "h0" | "h2"
+  "h0" | "h2" | "h3"
 >;
 
 const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
@@ -71,7 +74,7 @@ export interface RelayV2HostRuntimeCompositionReadinessLifecycle {
   readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostCapabilityReadinessSourceSink<"h1">;
   readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
-  readonly h3: RelayV2HostCapabilityReadinessSourceSink<"h3">;
+  readonly h3: RelayV2HostH3ReadinessLifecycle;
   current(): RelayV2HostReadinessSnapshot;
   advertisedCapabilities(): readonly RelayV2RequiredCapability[];
 }
@@ -91,10 +94,11 @@ export type RelayV2HostRuntimeCompositionSnapshotSpool =
 
 export type RelayV2HostRuntimeCompositionAuthorities = Omit<
   RelayV2HostRuntimeActualAuthorityInput,
-  "h0" | "h2" | "snapshotSpool"
+  "h0" | "h2" | "snapshotSpool" | "h3"
 > & Readonly<{
   h0: RelayV2HostH0ReadinessPort;
   h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
+  h3RecoveryCandidate: RelayV2HostH3RecoveryCandidate;
 }>;
 
 export interface RelayV2HostRuntimeCompositionOptions {
@@ -111,7 +115,7 @@ export interface RelayV2HostRuntimeCompositionOptions {
 export interface RelayV2HostRuntimeComposition {
   readonly routeSink: RelayV2HostRuntimeCompositionRouteSink;
   readonly readiness: RelayV2HostRuntimeCompositionReadinessLifecycle;
-  dispose(): void;
+  dispose(): Promise<void>;
 }
 
 export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
@@ -152,7 +156,7 @@ export interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
   readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostCapabilityReadinessSourceSink<"h1">;
   readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
-  readonly h3: RelayV2HostCapabilityReadinessSourceSink<"h3">;
+  readonly h3: RelayV2HostH3ReadinessLifecycle;
   current(): RelayV2HostReadinessSnapshot;
 }
 
@@ -164,7 +168,7 @@ export interface RelayV2HostCarrierRuntimeComposition {
     frame: RelayV2JsonObject,
     responseLineage?: RelayV2TerminalOpenResponseLineage,
   ): Promise<void>;
-  dispose(): void;
+  dispose(): Promise<void>;
 }
 
 function guardedSource<Source extends ManualReadinessSource>(
@@ -181,18 +185,44 @@ function guardedSource<Source extends ManualReadinessSource>(
   });
 }
 
+interface RelayV2DeferredBarrier {
+  readonly promise: Promise<void>;
+  resolve(): void;
+  reject(error: unknown): void;
+}
+
+function createDeferredBarrier(): RelayV2DeferredBarrier {
+  let resolveBarrier: () => void = () => undefined;
+  let rejectBarrier: (reason?: unknown) => void = () => undefined;
+  const promise = new Promise<void>((resolve, reject) => {
+    resolveBarrier = resolve;
+    rejectBarrier = reject;
+  });
+  return Object.freeze({
+    promise,
+    resolve: resolveBarrier,
+    reject: rejectBarrier,
+  });
+}
+
 function captureRuntimeAuthorities(
   value: RelayV2HostRuntimeCompositionAuthorities,
 ): Readonly<{
   h0: RelayV2HostH0ReadinessPort;
   h1: RelayV2HostRuntimeActualAuthorityInput["h1"];
   h2SnapshotAuthority: RelayV2StateSnapshotHostH2Authority;
-  h3: RelayV2HostRuntimeActualAuthorityInput["h3"];
+  h3RecoveryCandidate: RelayV2HostH3RecoveryCandidate;
   nextDedupeWindowBounds: RelayV2HostRuntimeActualAuthorityInput["nextDedupeWindowBounds"];
   nextDedupeWindowBoundsReceiver: object;
 }> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const fields = ["h0", "h1", "h2SnapshotAuthority", "h3", "nextDedupeWindowBounds"] as const;
+  const fields = [
+    "h0",
+    "h1",
+    "h2SnapshotAuthority",
+    "h3RecoveryCandidate",
+    "nextDedupeWindowBounds",
+  ] as const;
   const descriptors: Partial<Record<typeof fields[number], PropertyDescriptor>> = {};
   try {
     for (const field of fields) {
@@ -210,7 +240,8 @@ function captureRuntimeAuthorities(
     h1: descriptors.h1!.value as RelayV2HostRuntimeActualAuthorityInput["h1"],
     h2SnapshotAuthority: descriptors.h2SnapshotAuthority!.value as
       RelayV2StateSnapshotHostH2Authority,
-    h3: descriptors.h3!.value as RelayV2HostRuntimeActualAuthorityInput["h3"],
+    h3RecoveryCandidate: descriptors.h3RecoveryCandidate!.value as
+      RelayV2HostH3RecoveryCandidate,
     nextDedupeWindowBounds,
     nextDedupeWindowBoundsReceiver: value,
   });
@@ -375,6 +406,13 @@ export function createRelayV2HostRuntimeComposition(
     h0Port: capturedAuthorities.h0,
     readinessSink: rawSources.h0,
   });
+  const h3Activation = createRelayV2HostH3ReadinessActivation({
+    hostId,
+    hostEpoch,
+    hostInstanceId,
+    candidate: capturedAuthorities.h3RecoveryCandidate,
+    readinessSink: rawSources.h3,
+  });
   const nextDedupeWindowBounds = capturedAuthorities.nextDedupeWindowBounds;
   const nextDedupeWindowBoundsReceiver = capturedAuthorities.nextDedupeWindowBoundsReceiver;
   const runtimeAuthorities: RelayV2HostRuntimeActualAuthorityInput = Object.freeze({
@@ -382,7 +420,7 @@ export function createRelayV2HostRuntimeComposition(
     h1: capturedAuthorities.h1,
     h2: h2Activation.runtimeH2,
     snapshotSpool: h2Activation.snapshotSpool,
-    h3: capturedAuthorities.h3,
+    h3: h3Activation.runtimeH3,
     nextDedupeWindowBounds: () => Reflect.apply(
       nextDedupeWindowBounds,
       nextDedupeWindowBoundsReceiver,
@@ -409,7 +447,7 @@ export function createRelayV2HostRuntimeComposition(
     h0: h0Activation.lifecycle,
     h1: guardedSource(rawSources.h1, isDisposed),
     h2: h2Activation.lifecycle,
-    h3: guardedSource(rawSources.h3, isDisposed),
+    h3: h3Activation.lifecycle,
     current: () => readinessOwner.current(),
     advertisedCapabilities: () => runtime.advertisedCapabilities(),
   });
@@ -439,18 +477,36 @@ export function createRelayV2HostRuntimeComposition(
     },
   });
 
+  let disposeBarrier: Promise<void> | null = null;
   return Object.freeze({
     routeSink,
     readiness,
-    dispose(): void {
-      if (disposed) return;
+    dispose(): Promise<void> {
+      if (disposeBarrier !== null) return disposeBarrier;
+      const published = createDeferredBarrier();
+      disposeBarrier = published.promise;
       disposed = true;
-      h0Activation.dispose();
-      h2Activation.dispose();
+      const synchronousFailures: unknown[] = [];
+      const rememberFailure = (error: unknown): void => {
+        if (synchronousFailures.length === 0) synchronousFailures.push(error);
+      };
+      let h3Barrier: Promise<void> = Promise.resolve();
+      try { h3Barrier = h3Activation.dispose(); } catch (error) { rememberFailure(error); }
+      try { h0Activation.dispose(); } catch (error) { rememberFailure(error); }
+      try { h2Activation.dispose(); } catch (error) { rememberFailure(error); }
       for (const [source, sink] of Object.entries(rawSources)) {
-        if (source !== "h0" && source !== "h2") sink.close();
+        if (source === "h0" || source === "h2" || source === "h3") continue;
+        try { sink.close(); } catch (error) { rememberFailure(error); }
       }
-      runtime.dispose();
+      try { runtime.dispose(); } catch (error) { rememberFailure(error); }
+      void (async () => {
+        const asynchronousFailures: unknown[] = [];
+        try { await h3Barrier; } catch (error) { asynchronousFailures.push(error); }
+        const failures = [...synchronousFailures, ...asynchronousFailures];
+        if (failures.length === 0) published.resolve();
+        else published.reject(failures[0]);
+      })();
+      return published.promise;
     },
   });
 }
@@ -599,7 +655,7 @@ export function createRelayV2HostCarrierRuntimeComposition(
     carrierReadinessActive = false;
     bridgeActive = false;
     bindings.clear();
-    try { runtime.dispose(); } catch {}
+    void runtime.dispose().catch(() => undefined);
     throw error;
   }
 
@@ -623,6 +679,7 @@ export function createRelayV2HostCarrierRuntimeComposition(
     current: () => runtime.readiness.current(),
   });
 
+  let disposeBarrier: Promise<void> | null = null;
   return Object.freeze({
     carrier,
     readiness,
@@ -631,21 +688,30 @@ export function createRelayV2HostCarrierRuntimeComposition(
       frame: RelayV2JsonObject,
       responseLineage?: RelayV2TerminalOpenResponseLineage,
     ) => runtime.routeSink.sendTerminalFrame(route, frame, responseLineage),
-    dispose(): void {
-      if (lifecycleDisposed) return;
+    dispose(): Promise<void> {
+      if (disposeBarrier !== null) return disposeBarrier;
+      const published = createDeferredBarrier();
+      disposeBarrier = published.promise;
       lifecycleDisposed = true;
       acceptingBindings = false;
-      try {
-        runtime.dispose();
-      } finally {
-        try {
-          actor!.dispose();
-        } finally {
-          carrierReadinessActive = false;
-          bridgeActive = false;
-          bindings.clear();
-        }
-      }
+      const synchronousFailures: unknown[] = [];
+      const rememberFailure = (error: unknown): void => {
+        if (synchronousFailures.length === 0) synchronousFailures.push(error);
+      };
+      let runtimeBarrier: Promise<void> = Promise.resolve();
+      try { runtimeBarrier = runtime.dispose(); } catch (error) { rememberFailure(error); }
+      try { actor!.dispose(); } catch (error) { rememberFailure(error); }
+      carrierReadinessActive = false;
+      bridgeActive = false;
+      bindings.clear();
+      void (async () => {
+        const asynchronousFailures: unknown[] = [];
+        try { await runtimeBarrier; } catch (error) { asynchronousFailures.push(error); }
+        const failures = [...synchronousFailures, ...asynchronousFailures];
+        if (failures.length === 0) published.resolve();
+        else published.reject(failures[0]);
+      })();
+      return published.promise;
     },
   });
 }

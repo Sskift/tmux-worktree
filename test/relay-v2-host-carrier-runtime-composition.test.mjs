@@ -11,6 +11,8 @@ const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const snapshotSpool = await import("../dist/relay/v2/stateSnapshotSpool.js");
+const terminalDurable = await import("../dist/relay/v2/terminalDurableLineage.js");
+const terminal = await import("../dist/relay/v2/terminalManager.js");
 
 const HOST_ID = "mac-admin";
 const corpus = loadRelayV2FixtureCorpus();
@@ -94,7 +96,11 @@ function completeScope() {
   };
 }
 
-async function createHarness({ throwStatusObserver = false } = {}) {
+async function createHarness({
+  throwStatusObserver = false,
+  reenterDisposeOnOffline = false,
+  terminalManagerOverrides,
+} = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-carrier-runtime-"));
   const store = await hostState.RelayV2HostStateStore.open({
     paths: hostState.relayV2HostStatePaths(home),
@@ -123,6 +129,22 @@ async function createHarness({ throwStatusObserver = false } = {}) {
   let expectedWelcome = null;
   let expectedQuery = null;
   let composition = null;
+  let reentrantDispose = null;
+  const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({ store });
+  const terminalManager = new terminal.RelayV2TerminalManager({
+    hostId: HOST_ID,
+    hostEpoch: identity.hostEpoch,
+    hostInstanceId: identity.hostInstanceId,
+    resolver: { async resolve() { throw new Error("unexpected terminal resolve"); } },
+    lineage,
+    backend: { async open() { throw new Error("unexpected terminal backend open"); } },
+    terminalControl: {},
+    async send(route, frame, responseLineage) {
+      await composition.routeSink.sendTerminalFrame(route, frame, responseLineage);
+    },
+  });
+  Object.assign(terminalManager, terminalManagerOverrides);
+  const h3RecoveryCandidate = await lineage.recoverForHostH3(terminalManager);
   const statusObservations = [];
   const identityReads = { hostId: 0, hostEpoch: 0, hostInstanceId: 0 };
   composition = compositionModule.createRelayV2HostCarrierRuntimeComposition({
@@ -163,15 +185,7 @@ async function createHarness({ throwStatusObserver = false } = {}) {
           },
         },
         h2SnapshotAuthority: spool.hostH2Authority,
-        h3: {
-          async open() { throw new Error("unexpected terminal open"); },
-          async requestReplay() { throw new Error("unexpected terminal replay"); },
-          async acknowledgeOutput() { throw new Error("unexpected terminal ACK"); },
-          async input() { throw new Error("unexpected terminal input"); },
-          async resize() { throw new Error("unexpected terminal resize"); },
-          async close() { throw new Error("unexpected terminal close"); },
-          async unbind() {},
-        },
+        h3RecoveryCandidate,
         nextDedupeWindowBounds() {
           return {
             acceptUntilMs: 1_783_786_400_000,
@@ -220,19 +234,24 @@ async function createHarness({ throwStatusObserver = false } = {}) {
           status: structuredClone(status),
           cut: composition.readiness.current(),
         });
+        if (reenterDisposeOnOffline && status.phase === "offline") {
+          reentrantDispose = composition.dispose();
+        }
         if (throwStatusObserver) throw new Error("status observer failure");
       },
     },
   });
 
   assert.equal(await composition.readiness.h0.activate(), true);
-  for (const source of ["codec", "h1", "h3"]) {
+  for (const source of ["codec", "h1"]) {
     assert.equal(composition.readiness[source].apply({
       source,
       generation: "1",
       ready: true,
     }), true);
   }
+  assert.equal(composition.readiness.h3.apply, undefined);
+  assert.equal(composition.readiness.h3.activate(), true);
   const principalId = "carrier-runtime-readiness-principal";
   const chunk = await spool.get({
     principalId,
@@ -255,8 +274,9 @@ async function createHarness({ throwStatusObserver = false } = {}) {
     statusObservations,
     expectedWelcome: () => expectedWelcome,
     expectedQuery: () => expectedQuery,
+    reentrantDispose: () => reentrantDispose,
     async cleanup() {
-      composition.dispose();
+      await composition.dispose();
       store.close();
       await spool.close().catch(() => undefined);
       rmSync(home, { recursive: true, force: true });
@@ -439,7 +459,7 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
 
     route.connection.acknowledge(route.transport.confirmNext());
     await settle();
-    h.composition.readiness.h0.close();
+    const h3Close = h.composition.readiness.h3.close();
     await settle();
     const close = route.transport.sent.map(decodeCarrier).findLast((frame) => (
       frame.type === "route.close"
@@ -456,13 +476,25 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
       retryable: false,
     });
     assert.equal(h.composition.carrier.status().phase, "registered");
+    await h3Close;
   } finally {
     await h.cleanup();
   }
 });
 
 test("combined dispose keeps the bridge alive through receipt cleanup and then closes once", async () => {
-  const h = await createHarness();
+  let releaseShutdown;
+  const shutdownBarrier = new Promise((resolve) => { releaseShutdown = resolve; });
+  let shutdownCalls = 0;
+  const h = await createHarness({
+    reenterDisposeOnOffline: true,
+    terminalManagerOverrides: {
+      shutdown() {
+        shutdownCalls += 1;
+        return shutdownBarrier;
+      },
+    },
+  });
   try {
     const route = await openRoute(h);
     const hello = fixture("client-hello-fresh");
@@ -474,13 +506,28 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
     assert.equal(route.transport.pending.length, 1);
 
     const observationsBeforeDispose = h.statusObservations.length;
-    h.composition.dispose();
-    h.composition.dispose();
+    const firstDispose = h.composition.dispose();
+    const secondDispose = h.composition.dispose();
+    assert.equal(h.reentrantDispose(), firstDispose);
+    assert.equal(firstDispose, secondDispose);
     assert.equal(h.statusObservations.length, observationsBeforeDispose + 1);
     assert.equal(h.statusObservations.at(-1).status.phase, "offline");
     assert.equal(readinessReady(h.statusObservations.at(-1).cut), false);
     assert.equal(readinessReady(h.composition.readiness.current()), false);
+    const routeClose = route.transport.sent.map(decodeCarrier).findLast((frame) => (
+      frame.type === "route.close"
+    ));
+    assert.equal(routeClose.payload.closeCode, 4406);
+    assert.equal(routeClose.payload.error.code, "CAPABILITY_UNAVAILABLE");
     assert.deepEqual(route.transport.closes, [{ code: 1000, reason: "host_shutdown" }]);
+    let disposed = false;
+    void firstDispose.then(() => { disposed = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(shutdownCalls, 1);
+    assert.equal(disposed, false);
+    releaseShutdown();
+    await firstDispose;
+    assert.equal(disposed, true);
     assert.throws(
       () => h.composition.carrier.connect(new FakeTransport(), "host-credential"),
       /disposed and cannot reconnect/,
@@ -493,6 +540,34 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
     const late = route.transport.confirmNext();
     assert.doesNotThrow(() => route.connection.acknowledge(late));
     assert.deepEqual(route.transport.closes, [{ code: 1000, reason: "host_shutdown" }]);
+  } finally {
+    releaseShutdown?.();
+    await h.cleanup();
+  }
+});
+
+test("fatal H3 authority failure withdraws readiness and fences the route with 4406 first", async () => {
+  const h = await createHarness();
+  try {
+    const route = await openRoute(h);
+    const hello = fixture("client-hello-fresh");
+    hello.hostId = HOST_ID;
+    hello.payload.clientInstanceId = route.route.payload.authContext.clientInstanceId;
+    sendClientFrame(route, hello);
+    await settle();
+    route.connection.acknowledge(route.transport.confirmNext());
+
+    const terminalOpen = fixture("terminal-open-new");
+    terminalOpen.expectedHostEpoch = h.identity.hostEpoch;
+    sendClientFrame(route, terminalOpen);
+    await settle();
+
+    const close = route.transport.sent.map(decodeCarrier).findLast((frame) => (
+      frame.type === "route.close"
+    ));
+    assert.equal(close.payload.closeCode, 4406);
+    assert.equal(close.payload.error.code, "CAPABILITY_UNAVAILABLE");
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
   } finally {
     await h.cleanup();
   }
