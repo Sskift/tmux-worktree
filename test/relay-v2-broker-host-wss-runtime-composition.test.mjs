@@ -242,6 +242,7 @@ test("Host WSS receipt is owner-bound/one-shot and registration commits only aft
   const second = createShared();
   assert.deepEqual(Reflect.ownKeys(first.hostWssRuntime), [
     "prepareHostWss",
+    "claimPreparedHostWss",
     "attachPreparedHostWss",
     "closeAndDrain",
   ]);
@@ -261,15 +262,26 @@ test("Host WSS receipt is owner-bound/one-shot and registration commits only aft
     getOwnPropertyDescriptor() { foreignSocketReads += 1; throw new Error("foreign receipt touched socket"); },
     getPrototypeOf() { foreignSocketReads += 1; throw new Error("foreign receipt touched socket"); },
   });
-  assert.throws(() => second.hostWssRuntime.attachPreparedHostWss({
+  assert.throws(() => second.hostWssRuntime.claimPreparedHostWss({
+    receipt: pending.receipt,
+  }), /admission receipt/);
+  assert.equal(foreignSocketReads, 0);
+
+  const claim = first.hostWssRuntime.claimPreparedHostWss({
+    receipt: pending.receipt,
+  });
+  assert.deepEqual(Reflect.ownKeys(claim), ["attach"]);
+  assert.throws(() => Reflect.apply(claim.attach, {}, [{
+    alreadyUpgradedSocket: foreignSocket,
+  }]), /admission claim/);
+  assert.throws(() => first.hostWssRuntime.attachPreparedHostWss({
     receipt: pending.receipt,
     alreadyUpgradedSocket: foreignSocket,
   }), /admission receipt/);
   assert.equal(foreignSocketReads, 0);
 
   const socket = new FakeUpgradedSocket();
-  const handle = first.hostWssRuntime.attachPreparedHostWss({
-    receipt: pending.receipt,
+  const handle = claim.attach({
     alreadyUpgradedSocket: socket,
   });
   assert.match(handle.transportId, /^[0-9a-f-]{36}$/);
@@ -288,10 +300,9 @@ test("Host WSS receipt is owner-bound/one-shot and registration commits only aft
   assert.equal(handle.closeLease, undefined);
   assert.equal(handle.core, undefined);
   assert.equal(handle.producerRegistry, undefined);
-  assert.throws(() => first.hostWssRuntime.attachPreparedHostWss({
-    receipt: pending.receipt,
+  assert.throws(() => claim.attach({
     alreadyUpgradedSocket: foreignSocket,
-  }), /admission receipt/);
+  }), /admission claim/);
   assert.equal(foreignSocketReads, 0);
 
   socket.emit("message", carrierFrame(hostHello()), false);

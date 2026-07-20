@@ -38,7 +38,9 @@ const CONTROL_RESERVE_BYTES = 64 * 1_024;
 const CONTROL_RESERVE_FRAMES = 16;
 
 const PREPARE_KEYS = Object.freeze(["trustedAuthContext"] as const);
+const CLAIM_KEYS = Object.freeze(["receipt"] as const);
 const ATTACH_KEYS = Object.freeze(["receipt", "alreadyUpgradedSocket"] as const);
+const CLAIMED_ATTACH_KEYS = Object.freeze(["alreadyUpgradedSocket"] as const);
 const AUTHORIZATION_KEYS = Object.freeze([
   "scheme",
   "role",
@@ -129,10 +131,19 @@ export interface RelayV2BrokerHostWssConnectionHandle {
   readonly drained: Promise<void>;
 }
 
+export interface RelayV2BrokerHostWssAdmissionClaim {
+  attach(input: Readonly<{
+    alreadyUpgradedSocket: RelayV2BrokerHostWssSocket;
+  }>): RelayV2BrokerHostWssConnectionHandle;
+}
+
 export interface RelayV2BrokerHostWssRuntimeFacade {
   prepareHostWss(input: Readonly<{
     trustedAuthContext: RelayV2BrokerConnectionAuthorization;
   }>): RelayV2BrokerHostWssPrepareResult;
+  claimPreparedHostWss(input: Readonly<{
+    receipt: RelayV2BrokerHostWssAdmissionReceipt;
+  }>): RelayV2BrokerHostWssAdmissionClaim;
   attachPreparedHostWss(input: Readonly<{
     receipt: RelayV2BrokerHostWssAdmissionReceipt;
     alreadyUpgradedSocket: RelayV2BrokerHostWssSocket;
@@ -143,7 +154,7 @@ export interface RelayV2BrokerHostWssRuntimeFacade {
 type ReceiptRecord = {
   readonly owner: RelayV2BrokerHostWssRuntimeCompositionImpl;
   readonly authContext: RelayV2BrokerConnectionAuthorization;
-  phase: "issued" | "consumed";
+  phase: "issued" | "claimed" | "consumed";
 };
 
 const RECEIPTS = new WeakMap<object, ReceiptRecord>();
@@ -873,13 +884,12 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     return Object.freeze({ outcome: "accept", receipt });
   }
 
-  attachPreparedHostWss(input: Readonly<{
+  claimPreparedHostWss(input: Readonly<{
     receipt: RelayV2BrokerHostWssAdmissionReceipt;
-    alreadyUpgradedSocket: RelayV2BrokerHostWssSocket;
-  }>): RelayV2BrokerHostWssConnectionHandle {
+  }>): RelayV2BrokerHostWssAdmissionClaim {
     if (!this.admissionOpen) throw new Error("Relay v2 Broker Host WSS runtime is closing");
-    const values = ownDataValues(input, ATTACH_KEYS);
-    if (!values || !this.admissionOpen) throw new Error("invalid Host WSS attach input");
+    const values = ownDataValues(input, CLAIM_KEYS);
+    if (!values || !this.admissionOpen) throw new Error("invalid Host WSS claim input");
     const receipt = values.receipt;
     const record = receipt !== null && typeof receipt === "object"
       ? RECEIPTS.get(receipt as object)
@@ -887,15 +897,60 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     if (!record || record.owner !== this || record.phase !== "issued") {
       throw new Error("invalid Relay v2 Broker Host WSS admission receipt");
     }
-    record.phase = "consumed";
+    record.phase = "claimed";
+
+    let claim!: RelayV2BrokerHostWssAdmissionClaim;
+    let claimedAttachOpen = true;
+    const attach = function attach(
+      this: unknown,
+      attachInput: Readonly<{ alreadyUpgradedSocket: RelayV2BrokerHostWssSocket }>,
+    ): RelayV2BrokerHostWssConnectionHandle {
+      if (this !== claim || !claimedAttachOpen || record.phase !== "claimed") {
+        throw new Error("invalid Relay v2 Broker Host WSS admission claim");
+      }
+      const attachValues = ownDataValues(attachInput, CLAIMED_ATTACH_KEYS);
+      if (!attachValues || !thisRuntime.admissionOpen) {
+        throw new Error("invalid Relay v2 Broker Host WSS claimed attach input");
+      }
+      claimedAttachOpen = false;
+      record.phase = "consumed";
+      return thisRuntime.attachClaimedHostWss(
+        record,
+        attachValues.alreadyUpgradedSocket as RelayV2BrokerHostWssSocket,
+      );
+    };
+    const thisRuntime = this;
+    claim = Object.freeze(
+      Object.assign(Object.create(null), { attach }),
+    ) as RelayV2BrokerHostWssAdmissionClaim;
+    return claim;
+  }
+
+  attachPreparedHostWss(input: Readonly<{
+    receipt: RelayV2BrokerHostWssAdmissionReceipt;
+    alreadyUpgradedSocket: RelayV2BrokerHostWssSocket;
+  }>): RelayV2BrokerHostWssConnectionHandle {
+    if (!this.admissionOpen) throw new Error("Relay v2 Broker Host WSS runtime is closing");
+    const values = ownDataValues(input, ATTACH_KEYS);
+    if (!values || !this.admissionOpen) throw new Error("invalid Host WSS attach input");
+    const claim = this.claimPreparedHostWss({
+      receipt: values.receipt as RelayV2BrokerHostWssAdmissionReceipt,
+    });
+    return Reflect.apply(claim.attach, claim, [Object.freeze({
+      alreadyUpgradedSocket: values.alreadyUpgradedSocket as RelayV2BrokerHostWssSocket,
+    })]) as RelayV2BrokerHostWssConnectionHandle;
+  }
+
+  private attachClaimedHostWss(
+    record: ReceiptRecord,
+    alreadyUpgradedSocket: RelayV2BrokerHostWssSocket,
+  ): RelayV2BrokerHostWssConnectionHandle {
     const reservation = attachReservation();
     this.reservations.add(reservation);
     let adapter: RelayV2BrokerHostWssAdapter | null = null;
     let connection: HostWssConnection | null = null;
     try {
-      adapter = this.captureAuthority.capture(
-        values.alreadyUpgradedSocket as RelayV2BrokerHostWssSocket,
-      );
+      adapter = this.captureAuthority.capture(alreadyUpgradedSocket);
       if (adapter.validate() !== "applied") throw hostWssClosedError();
       if (!this.admissionOpen) throw new Error("Host WSS attach crossed close during capture");
       const bridge = new StagedHostWssLifecycleBridge(adapter);
@@ -1045,6 +1100,7 @@ export function bindRelayV2BrokerHostWssRuntimeFacade(
   );
   return Object.freeze({
     prepareHostWss: runtime.prepareHostWss.bind(runtime),
+    claimPreparedHostWss: runtime.claimPreparedHostWss.bind(runtime),
     attachPreparedHostWss: runtime.attachPreparedHostWss.bind(runtime),
     closeAndDrain: runtime.closeAndDrain.bind(runtime),
   });
