@@ -1843,6 +1843,7 @@ test("production tmux backend captures bounded correlated output on an isolated 
   process.env.TW_TMUX = wrapper;
   process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR = join(twHome, "terminal-control-output-v1");
   let readonlyClient;
+  let linkedClient;
   try {
     const bootstrap = spawnSync(wrapper, ["new-session", "-d", "-s", "bootstrap"], {
       encoding: "utf8",
@@ -1901,6 +1902,69 @@ test("production tmux backend captures bounded correlated output on an isolated 
       if (!readonlyAttached) await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal(readonlyAttached, true, "test must cover a read-only observer client");
+    const linked = spawnSync(
+      wrapper,
+      ["new-session", "-d", "-t", "=controlled", "-s", "tw-mobile-linked"],
+      { encoding: "utf8" },
+    );
+    assert.equal(linked.status, 0, linked.stderr);
+    const canonicalIdentity = spawnSync(
+      wrapper,
+      ["display-message", "-p", "-t", "=controlled:", "#{pane_id}"],
+      { encoding: "utf8" },
+    );
+    assert.equal(canonicalIdentity.status, 0, canonicalIdentity.stderr);
+    const linkedIdentity = spawnSync(
+      wrapper,
+      [
+        "display-message",
+        "-p",
+        "-t",
+        "=tw-mobile-linked:",
+        "#{pane_id}\u001f#{@tw_terminal_control_instance_v1}\u001f#{@tw_terminal_control_output_generation_v1}",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(linkedIdentity.status, 0, linkedIdentity.stderr);
+    const [linkedPaneId, linkedInstanceId, linkedGeneration] = linkedIdentity.stdout.trim().split("\u001f");
+    assert.equal(linkedPaneId, canonicalIdentity.stdout.trim());
+    assert.equal(linkedInstanceId, "", "grouped mobile session must not inherit canonical session fencing");
+    assert.equal(linkedGeneration, "", "grouped mobile session must not inherit canonical output fencing");
+    linkedClient = spawn(
+      wrapper,
+      [
+        "-C",
+        "attach-session",
+        "-E",
+        "-f",
+        "read-only,ignore-size,no-output",
+        "-t",
+        "=tw-mobile-linked",
+      ],
+      { stdio: ["pipe", "ignore", "ignore"] },
+    );
+    const linkedClientDeadline = Date.now() + 2_000;
+    let linkedAttached = false;
+    while (!linkedAttached && Date.now() < linkedClientDeadline) {
+      const clients = spawnSync(wrapper, ["list-clients", "-F", "#{session_name}:#{client_readonly}"], {
+        encoding: "utf8",
+      });
+      linkedAttached = clients.status === 0
+        && clients.stdout.split("\n").includes("tw-mobile-linked:1");
+      if (!linkedAttached) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(linkedAttached, true, "test must cover a grouped mobile observer client");
+    const paneTargetContext = spawnSync(
+      wrapper,
+      ["display-message", "-p", "-t", linkedPaneId, "#{session_name}"],
+      { encoding: "utf8" },
+    );
+    assert.equal(paneTargetContext.status, 0, paneTargetContext.stderr);
+    assert.equal(
+      paneTargetContext.stdout.trim(),
+      "tw-mobile-linked",
+      "the shared pane target must reproduce the mobile linked-session context",
+    );
     const raw = await authority.handle({
       protocolVersion: 1,
       requestId: "real-tmux-fenced-raw",
@@ -1912,6 +1976,17 @@ test("production tmux backend captures bounded correlated output on an isolated 
     });
     assert.equal(raw.accepted, true);
     assert.equal(raw.deduplicated, false);
+    const emptyRaw = await authority.handle({
+      protocolVersion: 1,
+      requestId: "real-tmux-empty-raw",
+      type: "input.raw",
+      lease: feishu.lease,
+      operationId: "real-tmux-empty-raw",
+      pane: "0",
+      dataBase64: "",
+    });
+    assert.equal(emptyRaw.accepted, true);
+    assert.equal(emptyRaw.deduplicated, false);
     const rawKey = (operationId, data) => authority.handle({
       protocolVersion: 1,
       requestId: operationId,
@@ -2041,6 +2116,10 @@ test("production tmux backend captures bounded correlated output on an isolated 
       (error) => error.code === "RECOVERY_REQUIRED" && /2 live panes/.test(error.message),
     );
   } finally {
+    if (linkedClient) {
+      linkedClient.stdin?.end();
+      linkedClient.kill("SIGTERM");
+    }
     if (readonlyClient) {
       readonlyClient.stdin?.end();
       readonlyClient.kill("SIGTERM");

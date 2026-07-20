@@ -1027,13 +1027,14 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
     const committedMarker = `__TW_CONTROL_RAW_COMMITTED_${randomUUID()}__`;
     const rejectedMarker = `__TW_CONTROL_RAW_REJECTED_${randomUUID()}__`;
+    const canonicalPaneTarget = `=${expected.name}:`;
     let paneId: string;
     try {
       const probe = await runTmux([
         "display-message",
         "-p",
         "-t",
-        expected.name,
+        canonicalPaneTarget,
         [
           "#{pane_id}",
           `#{@${TMUX_INSTANCE_OPTION.slice(1)}}`,
@@ -1066,7 +1067,9 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         `could not resolve the fenced terminal pane before input: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    if (data.byteLength === 0) return;
     const condition = [
+      `#{==:#{pane_id},${paneId}}`,
       `#{==:#{@${TMUX_INSTANCE_OPTION.slice(1)}},${tmuxInstanceId}}`,
       `#{==:#{@${OUTPUT_GENERATION_OPTION.slice(1)}},${outputGeneration}}`,
       "#{==:#{pane_pipe},1}",
@@ -1088,7 +1091,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
           "if-shell",
           "-F",
           "-t",
-          paneId,
+          shellQuote(canonicalPaneTarget),
           shellQuote(condition),
           shellQuote(committed),
           shellQuote(rejected),
@@ -1100,7 +1103,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
           "if-shell",
           "-F",
           "-t",
-          paneId,
+          canonicalPaneTarget,
           condition,
           committed,
           rejected,

@@ -33,6 +33,7 @@ class TerminalWebViewController internal constructor() {
     private val pendingTerminalOutput = StringBuilder()
     private var terminalWriteInFlight = false
     private var terminalOutputGeneration = 0L
+    private val controlledOutput = ControlledTerminalOutputFilter()
     @Volatile
     var isReady: Boolean = false
         private set
@@ -67,13 +68,16 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            controlledOutput.reset()
         }
     }
 
     fun write(data: String) {
         if (data.isEmpty()) return
         val scheduled: Pair<WebView, Long>? = synchronized(lock) {
-            appendTerminalOutput(data)
+            val output = controlledOutput.push(data)
+            if (output.isEmpty()) return@synchronized null
+            appendTerminalOutput(output)
             val readyView = webView?.takeIf { isReady }
             if (readyView == null || terminalWriteInFlight) {
                 null
@@ -92,6 +96,7 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            controlledOutput.reset()
         }
         evaluate("window.twReset&&window.twReset(${JSONObject.quote(message)});")
     }
@@ -118,6 +123,7 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            controlledOutput.reset()
             webView?.takeIf { isReady }
         }
         readyView?.post {
@@ -339,6 +345,7 @@ private class TerminalBridge(
 
     @JavascriptInterface
     fun input(data: String) {
+        if (isControlledTerminalTransportReport(data)) return
         mainHandler.post { onInput(data) }
     }
 

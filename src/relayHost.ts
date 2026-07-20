@@ -363,12 +363,24 @@ type RelayControlLeaseRecord = {
   renewing?: Promise<void>;
 };
 
+type PendingRelayRawInput = {
+  targetKey: string;
+  tailToken: symbol;
+  chunks: Buffer[];
+  byteLength: number;
+  frameCount: number;
+  started: boolean;
+  task: Promise<void>;
+};
+
 type RelayTerminalControl = {
   connectorId: string;
   accepting: boolean;
   closedClients: Set<string>;
   leases: Map<string, RelayControlLeaseRecord>;
   lanes: Map<string, Promise<void>>;
+  laneTailTokens: Map<string, symbol>;
+  pendingRawInputs: Map<string, PendingRelayRawInput>;
   nextOperation: number;
 };
 
@@ -476,6 +488,8 @@ const MAX_RELAY_FRAME_BYTES = 1 * 1024 * 1024;
 const MAX_RELAY_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
 const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
 const MAX_PENDING_INPUT_BYTES_PER_STREAM = 256 * 1024;
+const MAX_RELAY_RAW_INPUT_BATCH_BYTES = 4 * 1024;
+const MAX_RELAY_RAW_INPUT_BATCH_FRAMES = 64;
 const MAX_REMOTE_STDIN_BUFFERED_BYTES = 256 * 1024;
 const MAX_LOCAL_SOCKET_BUFFERED_BYTES = 1 * 1024 * 1024;
 const MAX_ACTIVE_STREAMS_PER_CLIENT = 128;
@@ -2151,25 +2165,78 @@ function failCurrentStream(
   });
 }
 
-async function writeControlledRawInput(
+function relayRawInputRouteKey(route: StreamRoute): string {
+  return `${route.clientId}\x1f${route.streamId}\x1f${route.generation}`;
+}
+
+function isBatchableRelayRawInput(data: string): boolean {
+  return data.length > 0
+    && !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(data);
+}
+
+function writeControlledRawInput(
   control: RelayTerminalControl,
   route: StreamRoute,
   data: string,
 ): Promise<void> {
-  await controlledRelayInput(
-    control,
-    route.clientId,
-    route.scope,
-    route.rawName,
-    (lease, operationId) => ({
-      type: "input.raw",
-      lease,
-      operationId,
-      pane: "0",
-      dataBase64: Buffer.from(data, "utf8").toString("base64"),
-    }),
-    `stream:${route.streamId}:input`,
-  );
+  const targetKey = relayControlLeaseKey(route.clientId, route.scope, route.rawName);
+  const routeKey = relayRawInputRouteKey(route);
+  const bytes = Buffer.from(data, "utf8");
+  const batchable = isBatchableRelayRawInput(data)
+    && bytes.byteLength <= MAX_RELAY_RAW_INPUT_BATCH_BYTES;
+  const pending = batchable ? control.pendingRawInputs.get(routeKey) : undefined;
+  if (
+    pending
+    && !pending.started
+    && pending.targetKey === targetKey
+    && control.laneTailTokens.get(targetKey) === pending.tailToken
+    && pending.frameCount < MAX_RELAY_RAW_INPUT_BATCH_FRAMES
+    && pending.byteLength + bytes.byteLength <= MAX_RELAY_RAW_INPUT_BATCH_BYTES
+  ) {
+    pending.chunks.push(bytes);
+    pending.byteLength += bytes.byteLength;
+    pending.frameCount += 1;
+    // The first frame owns the batch error report. Followers still wait for
+    // the same terminal-control boundary, but must not fan one ownership or
+    // recovery failure out into dozens of identical Relay error frames.
+    return pending.task.catch(() => undefined);
+  }
+
+  const tailToken = Symbol("relay-raw-input");
+  const batch = {
+    targetKey,
+    tailToken,
+    chunks: [bytes],
+    byteLength: bytes.byteLength,
+    frameCount: 1,
+    started: false,
+    task: Promise.resolve(),
+  } satisfies PendingRelayRawInput;
+  batch.task = runRelayControlLane(control, targetKey, async () => {
+    batch.started = true;
+    if (control.pendingRawInputs.get(routeKey) === batch) {
+      control.pendingRawInputs.delete(routeKey);
+    }
+    const payload = batch.chunks.length === 1
+      ? batch.chunks[0]!
+      : Buffer.concat(batch.chunks, batch.byteLength);
+    await executeControlledRelayInput(
+      control,
+      route.clientId,
+      route.scope,
+      route.rawName,
+      (lease, operationId) => ({
+        type: "input.raw",
+        lease,
+        operationId,
+        pane: "0",
+        dataBase64: payload.toString("base64"),
+      }),
+      `stream:${route.streamId}:input`,
+    );
+  }, tailToken);
+  if (batchable) control.pendingRawInputs.set(routeKey, batch);
+  return batch.task;
 }
 
 function sendRelayControlError(stream: LocalStream, error: unknown): void {
@@ -2240,13 +2307,19 @@ function runRelayControlLane<T>(
   control: RelayTerminalControl,
   key: string,
   operation: () => Promise<T>,
+  tailToken = Symbol("relay-control-lane"),
 ): Promise<T> {
   const previous = control.lanes.get(key) ?? Promise.resolve();
   const running = previous.catch(() => undefined).then(operation);
   const settled = running.then(() => undefined, () => undefined);
   control.lanes.set(key, settled);
+  control.laneTailTokens.set(key, tailToken);
   void settled.then(() => {
-    if (control.lanes.get(key) === settled) control.lanes.delete(key);
+    if (control.lanes.get(key) !== settled) return;
+    control.lanes.delete(key);
+    if (control.laneTailTokens.get(key) === tailToken) {
+      control.laneTailTokens.delete(key);
+    }
   });
   return running;
 }
@@ -2370,6 +2443,39 @@ function relayV1ErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function executeControlledRelayInput<T>(
+  control: RelayTerminalControl,
+  clientId: string,
+  scope: AdminScope,
+  rawName: string,
+  input: (
+    lease: TerminalControlLease,
+    operationId: string,
+  ) => TerminalControlRequestInput | Promise<TerminalControlRequestInput>,
+  lane: string,
+): Promise<T> {
+  if (!control.accepting || control.closedClients.has(clientId)) {
+    throw new Error("relay client closed before terminal input was accepted");
+  }
+  const operationId = nextRelayControlOperation(control, clientId, lane);
+  const lease = await relayControlLease(control, clientId, scope, rawName);
+  const request = await input(lease, operationId);
+  if (!control.accepting || control.closedClients.has(clientId)) {
+    throw new Error("relay client closed before terminal input was accepted");
+  }
+  try {
+    return await requestScopedTerminalControl<T>(scope, request);
+  } catch (error) {
+    if (shouldForgetControlLease(error)) {
+      forgetRelayControlLease(control, clientId, scope, rawName);
+    }
+    // Never replay a terminal mutation here. A stale lease is forgotten so
+    // the next explicit input reacquires it, while every ambiguous response
+    // remains visible to the caller.
+    throw error;
+  }
+}
+
 function controlledRelayInput<T>(
   control: RelayTerminalControl,
   clientId: string,
@@ -2382,28 +2488,11 @@ function controlledRelayInput<T>(
   lane: string,
 ): Promise<T> {
   const key = relayControlLeaseKey(clientId, scope, rawName);
-  return runRelayControlLane(control, key, async () => {
-    if (!control.accepting || control.closedClients.has(clientId)) {
-      throw new Error("relay client closed before terminal input was accepted");
-    }
-    const operationId = nextRelayControlOperation(control, clientId, lane);
-    const lease = await relayControlLease(control, clientId, scope, rawName);
-    const request = await input(lease, operationId);
-    if (!control.accepting || control.closedClients.has(clientId)) {
-      throw new Error("relay client closed before terminal input was accepted");
-    }
-    try {
-      return await requestScopedTerminalControl<T>(scope, request);
-    } catch (error) {
-      if (shouldForgetControlLease(error)) {
-        forgetRelayControlLease(control, clientId, scope, rawName);
-      }
-      // Never replay a terminal mutation here. A stale lease is forgotten so
-      // the next explicit input reacquires it, while every ambiguous response
-      // remains visible to the caller.
-      throw error;
-    }
-  });
+  return runRelayControlLane(
+    control,
+    key,
+    () => executeControlledRelayInput(control, clientId, scope, rawName, input, lane),
+  );
 }
 
 async function sendControlledAgentMessage(
@@ -3098,6 +3187,8 @@ async function runConnection(
     closedClients: new Set(),
     leases: new Map(),
     lanes: new Map(),
+    laneTailTokens: new Map(),
+    pendingRawInputs: new Map(),
     nextOperation: 0,
   };
   const terminalControlRenewal = setInterval(

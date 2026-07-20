@@ -75,7 +75,7 @@ const args = process.argv.slice(2);
 const targetIndex = args.indexOf("-t");
 const target = targetIndex >= 0 ? String(args[targetIndex + 1] || "") : "";
 const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
-const rawSession = target.replace(/^=/, "").split(":.")[0];
+const rawSession = target.replace(/^=/, "").split(":")[0];
 let session = rawSession;
 if (/^%\\d+$/.test(rawSession)) {
   const mapped = join(gateDir, "pane-" + rawSession.slice(1) + ".session");
@@ -160,7 +160,7 @@ if (args[0] === "-C" && args[1] === "attach-session") {
   process.stdin.on("data", (chunk) => { controlInput += chunk.toString("utf8"); });
   process.stdin.on("end", () => {
     const command = controlInput.split("\\n").find((line) => line.startsWith("if-shell ")) || "";
-    const parsed = /^if-shell -F -t (%\\d+) '([^']*)' '([^']*)' '([^']*)'$/.exec(command);
+    const parsed = /^if-shell -F -t (%\\d+|'=[^']+:') '([^']*)' '([^']*)' '([^']*)'$/.exec(command);
     const condition = parsed?.[2] || "";
     const committedCommand = parsed?.[3] || "";
     const rejectedCommand = parsed?.[4] || "";
@@ -217,6 +217,7 @@ if (args[0] === "-C" && args[1] === "attach-session") {
   return;
 }
 if (args[0] === "if-shell") {
+  const runFencedInput = () => {
   const condition = String(args.at(-3) || "");
   const committedCommand = String(args.at(-2) || "");
   const rejectedCommand = String(args.at(-1) || "");
@@ -295,6 +296,18 @@ if (args[0] === "if-shell") {
     process.exit(0);
   });
   process.stdin.resume();
+  };
+  const inputGate = join(gateDir, key + ".raw-input.block");
+  if (!existsSync(inputGate)) {
+    runFencedInput();
+  } else {
+    writeFileSync(join(gateDir, key + ".raw-input.entered"), "");
+    const timer = setInterval(() => {
+      if (!existsSync(join(gateDir, key + ".raw-input.release"))) return;
+      clearInterval(timer);
+      runFencedInput();
+    }, 5);
+  }
   return;
 }
 if (args[0] === "load-buffer" && existsSync(join(gateDir, "fail-load-buffer"))) {
@@ -799,6 +812,21 @@ async function waitForBlockedResolution(harness, session) {
 
 function releasePaneResolution(harness, session) {
   writeFileSync(join(harness.gateDir, `${safeGateName(session)}.release`), "");
+}
+
+function blockRawInput(harness, session) {
+  writeFileSync(join(harness.gateDir, `${safeGateName(session)}.raw-input.block`), "");
+}
+
+async function waitForBlockedRawInput(harness, session) {
+  await waitFor(
+    () => existsSync(join(harness.gateDir, `${safeGateName(session)}.raw-input.entered`)),
+    `raw input for ${session} did not enter its gate`,
+  );
+}
+
+function releaseRawInput(harness, session) {
+  writeFileSync(join(harness.gateDir, `${safeGateName(session)}.raw-input.release`), "");
 }
 
 function blockTwCommand(harness, key = "default") {
@@ -1689,6 +1717,82 @@ test("local input bypasses the observer socket and remains on the controlled bac
     .map(({ message }) => message)
     .filter(({ type, streamId }) => streamId === STREAM_ID && (type === "error" || type === "terminal_exit"));
   assert.deepEqual(lifecycleFailures, []);
+});
+
+test("Relay batches queued printable terminal input without crossing control-frame barriers", async (t) => {
+  const harness = await startHarness(t);
+  const session = "batched-raw-input";
+  openTerminal(harness, session);
+  await waitFor(
+    () => harness.localConnections.some((candidate) => candidate.session === session),
+    "batched input backend did not open",
+  );
+
+  blockRawInput(harness, session);
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "seed" });
+  await waitForBlockedRawInput(harness, session);
+  for (const data of [
+    "a",
+    "b",
+    "\r",
+    "中",
+    "文",
+    "\x1bOD",
+    "tail",
+    "paste\rline",
+    "final",
+    "-",
+    "batch",
+  ]) {
+    sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data });
+  }
+  releaseRawInput(harness, session);
+
+  const inputs = await waitFor(() => {
+    const error = harness.brokerMessages.find(({ message }) => (
+      message.type === "error" && message.streamId === STREAM_ID
+    ))?.message;
+    if (error) throw new Error(`batched input failed: ${error.message}`);
+    const path = join(harness.gateDir, "tmux-inputs.ndjson");
+    if (!existsSync(path)) return undefined;
+    const parsed = readFileSync(path, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    if (parsed.length >= 6 && !parsed.some(({ input }) => input === "final-batch")) {
+      throw new Error(`unexpected raw input batches: ${JSON.stringify(parsed.map(({ input }) => input))}`);
+    }
+    return parsed.some(({ input }) => input === "final-batch") ? parsed : undefined;
+  }, "queued printable input did not flush as a batch");
+  assert.deepEqual(
+    inputs.map(({ input }) => input),
+    ["seed", "ab", "中文", "tail", "paste\rline", "final-batch"],
+  );
+
+  const mutations = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((call) => call.session === session && ["load-buffer", "send-keys"].includes(call.args[0]));
+  assert.deepEqual(
+    mutations.map(({ args }) => args[0]),
+    [
+      "load-buffer",
+      "load-buffer",
+      "send-keys",
+      "load-buffer",
+      "send-keys",
+      "load-buffer",
+      "load-buffer",
+      "load-buffer",
+    ],
+  );
+  assert.deepEqual(
+    mutations.filter(({ args }) => args[0] === "send-keys").map(({ args }) => args.at(-1)),
+    ["Enter", "Left"],
+  );
 });
 
 test("application cursor input is translated by tmux inside the fenced controller write", async (t) => {
