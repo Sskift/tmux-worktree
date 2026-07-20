@@ -43,7 +43,7 @@ function publicBytes(streamId = randomUUID()) {
   });
 }
 
-function hostHello() {
+function hostHello(overrides = {}) {
   return {
     carrierVersion: 1,
     type: "host.hello",
@@ -55,6 +55,7 @@ function hostHello() {
       clientDialects: ["tw-relay.v2"],
       capabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
       limits: { maxFrameBytes: 1_048_576, terminalMaxFrameBytes: 65_536 },
+      ...overrides,
     },
   };
 }
@@ -209,7 +210,7 @@ async function createHarness(options = {}) {
   );
   const registered = await hostBroker.receiveHostFrame(
     transportId,
-    carrierBytes(hostHello()),
+    carrierBytes(hostHello(options.hostHelloOverrides)),
   );
   const registration = registered.actions.find((action) => (
     action.kind === "send_host" && action.frame.type === "host.registered"
@@ -234,18 +235,28 @@ async function createHarness(options = {}) {
   };
 }
 
-async function attachOpenedClient(harness, options = {}) {
+function prepareClient(harness, options = {}) {
   const connectionId = options.connectionId ?? `client-${randomUUID()}`;
-  const socket = options.socket ?? new StrictFakeSocket(harness.log);
-  const handle = harness.composition.attachClientWss({
+  const prepared = harness.composition.prepareClientWss({
     connectionId,
-    authContext: authContext("client", {
+    trustedAuthContext: authContext("client", {
       grantId: options.grantId ?? `${connectionId}-grant`,
       jti: `${connectionId}-jti`,
       kid: options.kid ?? "kid-current",
       expiresAtMs: options.expiresAtMs ?? NOW_MS + 60_000,
     }),
     hostProducerTarget: harness.producer.target,
+  });
+  assert.equal(prepared.outcome, "accept");
+  return { connectionId, admissionReceipt: prepared.admissionReceipt };
+}
+
+async function attachOpenedClient(harness, options = {}) {
+  const prepared = prepareClient(harness, options);
+  const connectionId = prepared.connectionId;
+  const socket = options.socket ?? new StrictFakeSocket(harness.log);
+  const handle = harness.composition.attachPreparedClientWss({
+    admissionReceipt: prepared.admissionReceipt,
     alreadyUpgradedSocket: socket,
   });
   assert.equal(handle.openResult.accepted, true);
@@ -277,7 +288,13 @@ async function attachOpenedClient(harness, options = {}) {
   );
   for (const action of opened.actions) harness.composition.applyBrokerAction(action);
   await settle();
-  return { connectionId, socket, handle, routeOpen };
+  return {
+    connectionId,
+    admissionReceipt: prepared.admissionReceipt,
+    socket,
+    handle,
+    routeOpen,
+  };
 }
 
 async function completeRouteUnbind(harness, capturedDelivery) {
@@ -336,6 +353,49 @@ test("client WSS runtime keeps one incarnation through Core and drains only afte
   assert.ok(expiryIndex < lastListenerIndex, "composition terminal guard drains last");
   assert.equal(harness.closeDeadlines.tasks.length, 0);
   await harness.composition.closeAndDrain();
+});
+
+test("pre-101 admission rejection returns the Core HTTP result without socket or close-lease effects", async () => {
+  const harness = await createHarness({
+    hostHelloOverrides: { capabilities: ["error.structured.v1"] },
+  });
+  const prepared = harness.composition.prepareClientWss({
+    connectionId: "client-preflight-rejected",
+    trustedAuthContext: authContext("client", {
+      grantId: "client-preflight-rejected-grant",
+      jti: "client-preflight-rejected-jti",
+    }),
+    hostProducerTarget: harness.producer.target,
+  });
+
+  assert.equal(prepared.outcome, "reject");
+  assert.equal(prepared.status, 426);
+  assert.equal(prepared.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(Object.hasOwn(prepared, "admissionReceipt"), false);
+  assert.equal(harness.hostBroker.drainHostCarrier(harness.transportId).length, 0);
+  assert.equal(harness.absolute.tasks.length, 0);
+  assert.equal(harness.closeDeadlines.tasks.length, 0);
+  await harness.composition.closeAndDrain();
+});
+
+test("prepared admission is one-shot and a composition close invalidates unconsumed receipts", async () => {
+  const harness = await createHarness();
+  const client = await attachOpenedClient(harness, { connectionId: "client-one-shot" });
+  const untouchedSocket = new Proxy({}, {});
+
+  assert.throws(() => harness.composition.attachPreparedClientWss({
+    admissionReceipt: client.admissionReceipt,
+    alreadyUpgradedSocket: untouchedSocket,
+  }), /admission receipt/);
+  const pending = prepareClient(harness, { connectionId: "client-close-invalidated" });
+  const closeDrain = harness.composition.closeAndDrain();
+  assert.throws(() => harness.composition.attachPreparedClientWss({
+    admissionReceipt: pending.admissionReceipt,
+    alreadyUpgradedSocket: untouchedSocket,
+  }), /closing/);
+
+  client.socket.emit("close", 1000);
+  await closeDrain;
 });
 
 test("absolute expiry fences frames before 4401, forces at 5s, and stale callbacks miss replacement", async () => {
@@ -404,20 +464,20 @@ test("partial attach and concurrent close share a real-terminal drain barrier", 
       closeFromAttach = harness.composition.closeAndDrain();
     }
   };
-  assert.throws(() => harness.composition.attachClientWss({
-    connectionId: "partial-client",
-    authContext: authContext("client"),
-    hostProducerTarget: harness.producer.target,
+  const partial = prepareClient(harness, { connectionId: "partial-client" });
+  assert.throws(() => harness.composition.attachPreparedClientWss({
+    admissionReceipt: partial.admissionReceipt,
     alreadyUpgradedSocket: socket,
   }), /closing|construction failed/);
   assert.ok(closeFromAttach);
   assert.strictEqual(harness.composition.closeAndDrain(), closeFromAttach);
-  assert.throws(() => harness.composition.attachClientWss({
+  const late = harness.composition.prepareClientWss({
     connectionId: "late-client",
-    authContext: authContext("client", { jti: "late-client-jti" }),
+    trustedAuthContext: authContext("client", { jti: "late-client-jti" }),
     hostProducerTarget: harness.producer.target,
-    alreadyUpgradedSocket: new StrictFakeSocket(),
-  }), /closing/);
+  });
+  assert.equal(late.outcome, "reject");
+  assert.equal(late.status, 503);
   let closed = false;
   void closeFromAttach.then(() => { closed = true; });
   await settle();

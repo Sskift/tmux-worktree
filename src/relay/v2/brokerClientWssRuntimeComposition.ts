@@ -24,8 +24,10 @@ import {
   RelayV2BrokerCore,
   type RelayV2BrokerAction,
   type RelayV2BrokerConnectionAuthorization,
+  type RelayV2ClientAdmission,
   type RelayV2BrokerResult,
   type RelayV2RouteOpenResult,
+  type RelayV2StructuredError,
 } from "./brokerCore.js";
 import {
   type RelayV2BrokerHostProducerBinding,
@@ -42,10 +44,14 @@ type RelayV2BrokerCoreOptions = NonNullable<
   ConstructorParameters<typeof RelayV2BrokerCore>[0]
 >;
 
-const ATTACH_KEYS = Object.freeze([
+const PREPARE_KEYS = Object.freeze([
   "connectionId",
-  "authContext",
+  "trustedAuthContext",
   "hostProducerTarget",
+] as const);
+
+const ATTACH_PREPARED_KEYS = Object.freeze([
+  "admissionReceipt",
   "alreadyUpgradedSocket",
 ] as const);
 
@@ -77,10 +83,33 @@ export interface RelayV2BrokerClientWssRuntimeCompositionOptions {
   transportCloseDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
 }
 
-export interface RelayV2BrokerClientWssAttachInput {
+export interface RelayV2BrokerClientWssPrepareInput {
   connectionId: string;
-  authContext: RelayV2BrokerConnectionAuthorization;
+  trustedAuthContext: RelayV2BrokerConnectionAuthorization;
   hostProducerTarget: RelayV2BrokerProducerTarget;
+}
+
+declare const RELAY_V2_BROKER_CLIENT_WSS_ADMISSION_RECEIPT: unique symbol;
+
+/** Process-local, owner-bound, one-shot proof of the pre-101 Core cut. */
+export interface RelayV2BrokerClientWssAdmissionReceipt {
+  readonly [RELAY_V2_BROKER_CLIENT_WSS_ADMISSION_RECEIPT]: never;
+}
+
+export type RelayV2BrokerClientWssPrepareResult = Readonly<
+  | {
+      outcome: "accept";
+      admissionReceipt: RelayV2BrokerClientWssAdmissionReceipt;
+    }
+  | {
+      outcome: "reject";
+      status: 401 | 403 | 426 | 503;
+      error: Readonly<RelayV2StructuredError>;
+    }
+>;
+
+export interface RelayV2BrokerClientWssAttachPreparedInput {
+  admissionReceipt: RelayV2BrokerClientWssAdmissionReceipt;
   alreadyUpgradedSocket: RelayV2BrokerClientWssSocket;
 }
 
@@ -107,12 +136,32 @@ export type RelayV2BrokerHostPumpAuthority = Readonly<Pick<
 export interface RelayV2BrokerClientWssRuntimeComposition {
   /** Exact bound handoff for the future Host carrier Pump owner only. */
   readonly hostPumpBrokerAuthority: RelayV2BrokerHostPumpAuthority;
-  attachClientWss(
-    input: RelayV2BrokerClientWssAttachInput,
+  prepareClientWss(
+    input: RelayV2BrokerClientWssPrepareInput,
+  ): RelayV2BrokerClientWssPrepareResult;
+  attachPreparedClientWss(
+    input: RelayV2BrokerClientWssAttachPreparedInput,
   ): RelayV2BrokerClientWssConnectionHandle;
   applyBrokerAction(action: RelayV2BrokerAction): RelayV2BrokerClientSocketEffectReceipt;
   closeAndDrain(): Promise<void>;
 }
+
+type CapturedClientWssAttach = Readonly<{
+  connectionId: string;
+  authContext: RelayV2BrokerConnectionAuthorization;
+  hostProducerTarget: RelayV2BrokerProducerTarget;
+  alreadyUpgradedSocket: RelayV2BrokerClientWssSocket;
+}>;
+
+type AdmissionReceiptRecord = {
+  readonly owner: RelayV2BrokerClientWssRuntimeCompositionImpl;
+  readonly connectionId: string;
+  readonly authContext: RelayV2BrokerConnectionAuthorization;
+  readonly hostProducerTarget: RelayV2BrokerProducerTarget;
+  phase: "issued" | "consumed";
+};
+
+const ADMISSION_RECEIPTS = new WeakMap<object, AdmissionReceiptRecord>();
 
 type ConnectionRecord = {
   readonly connectionId: string;
@@ -184,38 +233,164 @@ function captureNativeTerminalSocket(socket: unknown): NativeTerminalSocket {
   });
 }
 
-function captureAttachInput(input: RelayV2BrokerClientWssAttachInput): Readonly<
-  RelayV2BrokerClientWssAttachInput
-> {
+function isIdentifier(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= 128
+    && value.trim() === value
+    && !/[\0\r\n]/.test(value);
+}
+
+function invalidAuthorizationSnapshot(): RelayV2BrokerConnectionAuthorization {
+  return Object.freeze(Object.create(null)) as RelayV2BrokerConnectionAuthorization;
+}
+
+function captureAuthorizationSnapshot(
+  value: unknown,
+): RelayV2BrokerConnectionAuthorization {
+  if (value === null || typeof value !== "object" || isRejectedProxy(value)) {
+    return invalidAuthorizationSnapshot();
+  }
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.some((key) => typeof key !== "string")) {
+      return invalidAuthorizationSnapshot();
+    }
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of keys as string[]) {
+      const descriptor = descriptors[key];
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+        return invalidAuthorizationSnapshot();
+      }
+      snapshot[key] = descriptor.value;
+    }
+    return Object.freeze(snapshot) as RelayV2BrokerConnectionAuthorization;
+  } catch {
+    return invalidAuthorizationSnapshot();
+  }
+}
+
+function captureHostProducerTarget(value: unknown): RelayV2BrokerProducerTarget | null {
+  if (value === null || typeof value !== "object" || isRejectedProxy(value)) return null;
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.length !== 2
+      || !keys.every((key) => key === "transportId" || key === "generation")
+    ) return null;
+    const transportId = descriptors.transportId;
+    const generation = descriptors.generation;
+    if (
+      !transportId
+      || !Object.hasOwn(transportId, "value")
+      || !isIdentifier(transportId.value)
+      || !generation
+      || !Object.hasOwn(generation, "value")
+      || typeof generation.value !== "string"
+      || !/^[1-9][0-9]*$/.test(generation.value)
+    ) return null;
+    return Object.freeze({
+      transportId: transportId.value,
+      generation: generation.value,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function capturePrepareInput(
+  input: RelayV2BrokerClientWssPrepareInput,
+): Readonly<RelayV2BrokerClientWssPrepareInput> {
   if (input === null || typeof input !== "object" || isRejectedProxy(input)) {
-    throw new Error("invalid Relay v2 Broker client WSS attach input");
+    throw new Error("invalid Relay v2 Broker client WSS prepare input");
   }
   try {
     const descriptors = Object.getOwnPropertyDescriptors(input);
     const keys = Reflect.ownKeys(descriptors);
     if (
-      keys.length !== ATTACH_KEYS.length
-      || !keys.every((key) => typeof key === "string" && ATTACH_KEYS.includes(
-        key as (typeof ATTACH_KEYS)[number],
+      keys.length !== PREPARE_KEYS.length
+      || !keys.every((key) => typeof key === "string" && PREPARE_KEYS.includes(
+        key as (typeof PREPARE_KEYS)[number],
       ))
-    ) throw new Error("invalid attach shape");
+    ) throw new Error("invalid prepare shape");
     const values = Object.create(null) as Record<string, unknown>;
-    for (const key of ATTACH_KEYS) {
+    for (const key of PREPARE_KEYS) {
       const descriptor = descriptors[key];
       if (!descriptor || !Object.hasOwn(descriptor, "value")) {
-        throw new Error("invalid attach descriptor");
+        throw new Error("invalid prepare descriptor");
       }
       values[key] = descriptor.value;
     }
+    if (!isIdentifier(values.connectionId)) throw new Error("invalid connection ID");
+    const hostProducerTarget = captureHostProducerTarget(values.hostProducerTarget);
+    if (!hostProducerTarget) throw new Error("invalid Host producer target");
     return Object.freeze({
-      connectionId: values.connectionId as string,
-      authContext: values.authContext as RelayV2BrokerConnectionAuthorization,
-      hostProducerTarget: values.hostProducerTarget as RelayV2BrokerProducerTarget,
-      alreadyUpgradedSocket: values.alreadyUpgradedSocket as RelayV2BrokerClientWssSocket,
+      connectionId: values.connectionId,
+      trustedAuthContext: captureAuthorizationSnapshot(values.trustedAuthContext),
+      hostProducerTarget,
     });
   } catch {
-    throw new Error("invalid Relay v2 Broker client WSS attach input");
+    throw new Error("invalid Relay v2 Broker client WSS prepare input");
   }
+}
+
+function captureAttachPreparedInput(
+  input: RelayV2BrokerClientWssAttachPreparedInput,
+): Readonly<RelayV2BrokerClientWssAttachPreparedInput> {
+  if (input === null || typeof input !== "object" || isRejectedProxy(input)) {
+    throw new Error("invalid Relay v2 Broker prepared client WSS attach input");
+  }
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.length !== ATTACH_PREPARED_KEYS.length
+      || !keys.every((key) => typeof key === "string" && ATTACH_PREPARED_KEYS.includes(
+        key as (typeof ATTACH_PREPARED_KEYS)[number],
+      ))
+    ) throw new Error("invalid prepared attach shape");
+    const admissionReceipt = descriptors.admissionReceipt;
+    const alreadyUpgradedSocket = descriptors.alreadyUpgradedSocket;
+    if (
+      !admissionReceipt
+      || !Object.hasOwn(admissionReceipt, "value")
+      || !alreadyUpgradedSocket
+      || !Object.hasOwn(alreadyUpgradedSocket, "value")
+    ) throw new Error("invalid prepared attach descriptor");
+    return Object.freeze({
+      admissionReceipt: admissionReceipt.value as RelayV2BrokerClientWssAdmissionReceipt,
+      alreadyUpgradedSocket: alreadyUpgradedSocket.value as RelayV2BrokerClientWssSocket,
+    });
+  } catch {
+    throw new Error("invalid Relay v2 Broker prepared client WSS attach input");
+  }
+}
+
+function frozenAdmissionRejection(
+  admission: Extract<RelayV2ClientAdmission, { outcome: "reject" }>,
+): RelayV2BrokerClientWssPrepareResult {
+  return Object.freeze({
+    outcome: "reject" as const,
+    status: admission.status,
+    error: Object.freeze({ ...admission.error }),
+  });
+}
+
+function closingAdmissionRejection(): RelayV2BrokerClientWssPrepareResult {
+  return Object.freeze({
+    outcome: "reject" as const,
+    status: 503 as const,
+    error: Object.freeze({
+      code: "CAPABILITY_UNAVAILABLE" as const,
+      message: "Broker client WSS runtime is closing",
+      retryable: false,
+      retryAfterMs: null,
+      commandDisposition: "not_applicable" as const,
+      details: null,
+    }),
+  });
 }
 
 function rejectedResult(): RelayV2BrokerResult {
@@ -456,11 +631,69 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     });
   }
 
-  attachClientWss(
-    input: RelayV2BrokerClientWssAttachInput,
+  prepareClientWss(
+    input: RelayV2BrokerClientWssPrepareInput,
+  ): RelayV2BrokerClientWssPrepareResult {
+    if (!this.accepting) return closingAdmissionRejection();
+    const captured = capturePrepareInput(input);
+    if (
+      this.connections.has(captured.connectionId)
+      || this.attachingConnectionIds.has(captured.connectionId)
+    ) {
+      throw new Error("duplicate Relay v2 Broker client WSS connection ID");
+    }
+    const admission = this.broker.inspectClientAdmission(captured.trustedAuthContext);
+    if (admission.outcome === "reject") return frozenAdmissionRejection(admission);
+    if (!this.accepting) return closingAdmissionRejection();
+
+    const admissionReceipt = Object.freeze(
+      Object.create(null),
+    ) as RelayV2BrokerClientWssAdmissionReceipt;
+    ADMISSION_RECEIPTS.set(admissionReceipt, {
+      owner: this,
+      connectionId: captured.connectionId,
+      authContext: captured.trustedAuthContext,
+      hostProducerTarget: captured.hostProducerTarget,
+      phase: "issued",
+    });
+    return Object.freeze({ outcome: "accept", admissionReceipt });
+  }
+
+  attachPreparedClientWss(
+    input: RelayV2BrokerClientWssAttachPreparedInput,
   ): RelayV2BrokerClientWssConnectionHandle {
     if (!this.accepting) throw new Error("Relay v2 Broker client WSS runtime is closing");
-    const captured = captureAttachInput(input);
+    const prepared = captureAttachPreparedInput(input);
+    const receipt = prepared.admissionReceipt;
+    const receiptRecord = receipt !== null && typeof receipt === "object"
+      ? ADMISSION_RECEIPTS.get(receipt)
+      : undefined;
+    if (
+      !receiptRecord
+      || receiptRecord.owner !== this
+      || receiptRecord.phase !== "issued"
+    ) {
+      throw new Error("invalid Relay v2 Broker client WSS admission receipt");
+    }
+    receiptRecord.phase = "consumed";
+    if (
+      this.connections.has(receiptRecord.connectionId)
+      || this.attachingConnectionIds.has(receiptRecord.connectionId)
+    ) {
+      throw new Error("stale Relay v2 Broker client WSS admission receipt");
+    }
+    const captured: CapturedClientWssAttach = Object.freeze({
+      connectionId: receiptRecord.connectionId,
+      authContext: receiptRecord.authContext,
+      hostProducerTarget: receiptRecord.hostProducerTarget,
+      alreadyUpgradedSocket: prepared.alreadyUpgradedSocket,
+    });
+    return this.attachCapturedClientWss(captured);
+  }
+
+  private attachCapturedClientWss(
+    captured: CapturedClientWssAttach,
+  ): RelayV2BrokerClientWssConnectionHandle {
     const nativeTerminalSocket = captureNativeTerminalSocket(captured.alreadyUpgradedSocket);
     if (
       this.connections.has(captured.connectionId)
@@ -789,8 +1022,11 @@ export function createRelayV2BrokerClientWssRuntimeComposition(
   const owner = new RelayV2BrokerClientWssRuntimeCompositionImpl(options);
   return Object.freeze({
     hostPumpBrokerAuthority: owner.hostPumpBrokerAuthority,
-    attachClientWss: (input: RelayV2BrokerClientWssAttachInput) => (
-      owner.attachClientWss(input)
+    prepareClientWss: (input: RelayV2BrokerClientWssPrepareInput) => (
+      owner.prepareClientWss(input)
+    ),
+    attachPreparedClientWss: (input: RelayV2BrokerClientWssAttachPreparedInput) => (
+      owner.attachPreparedClientWss(input)
     ),
     applyBrokerAction: (action: RelayV2BrokerAction) => owner.applyBrokerAction(action),
     closeAndDrain: () => owner.closeAndDrain(),
