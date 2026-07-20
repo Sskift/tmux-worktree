@@ -16,6 +16,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeHandlePort
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeUnavailableReason
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationState
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
@@ -184,6 +185,76 @@ class RelayV2BaseRuntimeCompositionTest {
             assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
         } finally {
             harness.close()
+        }
+    }
+
+    @Test
+    fun `selected Session read is unavailable before any Room read without capability`() =
+        runBlocking {
+            val agent = SeededAgentDurableRepository()
+            val harness = Harness(
+                autoConnect = true,
+                agentDurableRepository = agent.repository,
+            )
+            try {
+                harness.connectOnline()
+                val product = withTimeout(TIMEOUT_MS) {
+                    harness.composition.sessions.first { it.isNotEmpty() }.single()
+                }
+
+                assertEquals(
+                    AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
+                    harness.composition.readSelectedSession(product.replyCut),
+                )
+                assertEquals(0, harness.authority.materializedSessionCutReads.get())
+                assertEquals(0, agent.loadCalls.get())
+                assertEquals(0, agent.mutationCommits.get())
+                assertEquals(1, harness.transport().sendCount())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `foreign and disconnected selected Session cuts close unavailable`() = runBlocking {
+        val ownerAgent = SeededAgentDurableRepository()
+        val foreignAgent = SeededAgentDurableRepository()
+        val owner = Harness(
+            autoConnect = true,
+            agentDurableRepository = ownerAgent.repository,
+        )
+        val foreign = Harness(
+            autoConnect = true,
+            agentDurableRepository = foreignAgent.repository,
+        )
+        try {
+            owner.connectOnline()
+            foreign.connectOnline()
+            val ownerCut = withTimeout(TIMEOUT_MS) {
+                owner.composition.sessions.first { it.isNotEmpty() }.single().replyCut
+            }
+            val foreignCut = withTimeout(TIMEOUT_MS) {
+                foreign.composition.sessions.first { it.isNotEmpty() }.single().replyCut
+            }
+
+            assertEquals(
+                AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
+                owner.composition.readSelectedSession(foreignCut),
+            )
+            owner.composition.disconnectAndDrain(
+                owner.profile.identity,
+                "selected-session-disconnect",
+            )
+            assertEquals(
+                AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
+                owner.composition.readSelectedSession(ownerCut),
+            )
+            assertTrue(owner.composition.sessions.value.isEmpty())
+            assertEquals(0, owner.authority.materializedSessionCutReads.get())
+            assertEquals(0, ownerAgent.loadCalls.get())
+        } finally {
+            owner.close()
+            foreign.close()
         }
     }
 
@@ -1549,6 +1620,7 @@ class RelayV2BaseRuntimeCompositionTest {
         val queryCommits = AtomicInteger()
         val statusCommits = AtomicInteger()
         val enqueueCommits = AtomicInteger()
+        val materializedSessionCutReads = AtomicInteger()
         val freshBatchSizes = CopyOnWriteArrayList<Int>()
         val stateEventApplyEntered = CompletableDeferred<Unit>()
         val releaseStateEventApply = CompletableDeferred<Unit>()
@@ -1604,8 +1676,11 @@ class RelayV2BaseRuntimeCompositionTest {
             namespace: RelayV2StateNamespace,
             scopeId: String,
             sessionId: String,
-        ): RelayV2MaterializedSessionReadCut? = materializedSession(namespace).takeIf {
-            it.session.scopeId == scopeId && it.session.sessionId == sessionId
+        ): RelayV2MaterializedSessionReadCut? {
+            materializedSessionCutReads.incrementAndGet()
+            return materializedSession(namespace).takeIf {
+                it.session.scopeId == scopeId && it.session.sessionId == sessionId
+            }
         }
 
         override suspend fun enqueueOutbox(

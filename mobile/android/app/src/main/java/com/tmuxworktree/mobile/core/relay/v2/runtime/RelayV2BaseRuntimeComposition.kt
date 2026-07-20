@@ -4,6 +4,11 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeHandlePort
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationController
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionReadController
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSessionSelectionController
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSessionSelectionIntent
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
@@ -188,6 +193,21 @@ internal class RelayV2BaseRuntimeComposition(
                 )
             }
     }
+    private val selectedSessionPresentation = agentDurableRepository?.let { durableRepository ->
+        val selection = AgentTranscriptLifecycleSessionSelectionController(
+            readAuthority = actor,
+            stateRepositoryRead = materializedSessions::readMaterializedSessionCut,
+        )
+        val read = AgentTranscriptLifecycleSelectedSessionReadController(
+            sessionSelection = selection,
+            durableRepository = durableRepository,
+            enabled = true,
+        )
+        AgentTranscriptLifecycleSelectedSessionPresentationController(
+            readController = read,
+            pageLimit = SELECTED_SESSION_PRESENTATION_PAGE_LIMIT,
+        )
+    }
     private val queryAdmissionAdapter = queryAdmissionComposition.adapter(actor, outboxAuthority)
     private val outboxDispatchComposition =
         RelayV2OutboxDispatchAuthority.recoveryComposition(
@@ -308,6 +328,55 @@ internal class RelayV2BaseRuntimeComposition(
             return RelayV2SessionReplyResult.Committed(committed.receipt)
         }
         return RelayV2SessionReplyResult.Rejected((committed as ReplyCommit.Rejected).failure)
+    }
+
+    /**
+     * Reads one bounded structured Agent page for an exact product Session cut.
+     *
+     * The existing selected-Session controllers own capability admission, the actor read lease,
+     * materialized Session revalidation, durable namespace derivation and Room projection. This
+     * composition adds only its product-cut fence and never turns production capability input on.
+     */
+    suspend fun readSelectedSession(
+        sessionCut: RelayV2SessionReplyCut,
+    ): AgentTranscriptLifecycleSelectedSessionPresentationState {
+        val issuedSession = currentIssuedSession(sessionCut)
+            ?: return AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable
+        val presentation = selectedSessionPresentation
+            ?: return AgentTranscriptLifecycleSelectedSessionPresentationState.Disabled
+        val result = presentation.read(
+            AgentTranscriptLifecycleSessionSelectionIntent(
+                namespace = issuedSession.materialized.namespace,
+                scopeId = issuedSession.materialized.session.scopeId,
+                sessionId = issuedSession.materialized.session.sessionId,
+            ),
+        )
+        if (currentIssuedSession(sessionCut) !== issuedSession) {
+            return AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable
+        }
+        return when (result) {
+            is AgentTranscriptLifecycleSelectedSessionPresentationState.Content -> {
+                if (result.materializedSession == issuedSession.materialized) {
+                    result
+                } else {
+                    AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable
+                }
+            }
+            else -> result
+        }
+    }
+
+    private fun currentIssuedSession(
+        sessionCut: RelayV2SessionReplyCut,
+    ): CompositionSessionReplyCut? {
+        if (closed.get() || terminalFailure.get() != null) return null
+        val issuedSession = sessionCut as? CompositionSessionReplyCut ?: return null
+        if (issuedSession.origin !== this) return null
+        return issuedSession.takeIf { expected ->
+            _sessions.value.any { product ->
+                product.replyCut === expected && product.materialized == expected.materialized
+            }
+        }
     }
 
     private fun startInitialConnectionAttempt() {
@@ -1261,6 +1330,7 @@ internal class RelayV2BaseRuntimeComposition(
         val COMMAND_RECOVERY_TYPES = setOf("command.status", "command.result")
         const val CLOSE_BARRIER_ID = "relay-v2-base-runtime-close"
         const val MAX_RECOVERED_DISPATCH_CAPABILITIES = 4_096
+        const val SELECTED_SESSION_PRESENTATION_PAGE_LIMIT = 64
         const val RETRY_BASE_DELAY_MS = 1_000L
         const val RETRY_MAX_DELAY_MS = 30_000L
         const val MAX_RETRY_EXPONENT = 5

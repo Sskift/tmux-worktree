@@ -3,6 +3,10 @@ package com.tmuxworktree.mobile.app
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTimelineEntryRole
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptEntryContent
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePresentationItem
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
@@ -38,6 +42,7 @@ import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionConfig
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -45,8 +50,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -78,8 +83,8 @@ class V2ViewModel(
         get() = relayOwner.value
     @Volatile
     private var relayV2Composition: RelayV2BaseRuntimeComposition? = null
-    @Volatile
-    private var relayV2SessionReplyCuts: Map<String, RelayV2SessionReplyCut> = emptyMap()
+    private val relayV2SessionReplyCuts =
+        MutableStateFlow<Map<String, RelayV2SessionReplyCut>>(emptyMap())
     private val relayV2UiFenceLock = Any()
     private val outboxMutex = Mutex()
     private val inFlightMessages = OutboxInFlightRegistry()
@@ -113,10 +118,38 @@ class V2ViewModel(
         if (!demoMode) startRealApp()
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     fun timeline(sessionId: String): Flow<List<TimelineEvent>> = if (demoMode) {
         uiState.map { state -> state.demoTimelines[sessionId].orEmpty() }
     } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-        flowOf(emptyList())
+        relayV2SessionReplyCuts.mapLatest { observedCuts ->
+            val selected = synchronized(relayV2UiFenceLock) {
+                val composition = relayV2Composition
+                val cut = observedCuts[sessionId]
+                if (_uiState.value.relayStartupAdmission !=
+                    RelayStartupAdmissionState.RELAY_V2 ||
+                    composition == null || cut == null ||
+                    relayV2SessionReplyCuts.value[sessionId] !== cut
+                ) {
+                    null
+                } else {
+                    composition to cut
+                }
+            } ?: return@mapLatest emptyList()
+            val (composition, cut) = selected
+            projectRelayV2SelectedSessionTimeline(
+                sessionStableId = sessionId,
+                readPresentation = { composition.readSelectedSession(cut) },
+                stillCurrent = {
+                    synchronized(relayV2UiFenceLock) {
+                        relayV2Composition === composition &&
+                            _uiState.value.relayStartupAdmission ==
+                            RelayStartupAdmissionState.RELAY_V2 &&
+                            relayV2SessionReplyCuts.value[sessionId] === cut
+                    }
+                },
+            )
+        }
     } else {
         repository.timeline(sessionId)
     }
@@ -521,7 +554,7 @@ class V2ViewModel(
         if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
             val admittedReply = synchronized(relayV2UiFenceLock) {
                 val composition = relayV2Composition
-                val sessionCut = relayV2SessionReplyCuts[session.stableId]
+                val sessionCut = relayV2SessionReplyCuts.value[session.stableId]
                 if (composition == null || sessionCut == null) null else composition to sessionCut
             }
             if (admittedReply == null) {
@@ -779,7 +812,7 @@ class V2ViewModel(
     override fun onCleared() {
         relayV2Composition?.close()
         synchronized(relayV2UiFenceLock) {
-            relayV2SessionReplyCuts = emptyMap()
+            relayV2SessionReplyCuts.value = emptyMap()
             relayV2Composition = null
         }
         if (relayOwner.isInitialized()) relay.close()
@@ -898,7 +931,7 @@ class V2ViewModel(
     private fun applyStartupAdmission(admission: RelayStartupAdmission) {
         synchronized(relayV2UiFenceLock) {
             if (admission.state != RelayStartupAdmissionState.RELAY_V2) {
-                relayV2SessionReplyCuts = emptyMap()
+                relayV2SessionReplyCuts.value = emptyMap()
             }
             val current = _uiState.value
             _uiState.value = when {
@@ -940,7 +973,7 @@ class V2ViewModel(
                             }
                             RelayProfileDialect.V2 -> {
                                 synchronized(relayV2UiFenceLock) {
-                                    relayV2SessionReplyCuts = emptyMap()
+                                    relayV2SessionReplyCuts.value = emptyMap()
                                 }
                                 relayV2Composition?.disconnectAndDrain(
                                     profile,
@@ -951,7 +984,7 @@ class V2ViewModel(
                     },
                     clearEphemeralAfterDisconnect = {
                         synchronized(relayV2UiFenceLock) {
-                            relayV2SessionReplyCuts = emptyMap()
+                            relayV2SessionReplyCuts.value = emptyMap()
                             _uiState.value = V2UiState()
                         }
                     },
@@ -1018,7 +1051,7 @@ class V2ViewModel(
         val composition = container.createRelayV2BaseRuntimeComposition(viewModelScope, profile)
         synchronized(relayV2UiFenceLock) {
             relayV2Composition = composition
-            relayV2SessionReplyCuts = emptyMap()
+            relayV2SessionReplyCuts.value = emptyMap()
             val state = _uiState.value
             _uiState.value = state.copy(
                 preferences = state.preferences.copy(preferredHostId = profile.hostId),
@@ -1073,7 +1106,7 @@ class V2ViewModel(
                     if (relayV2Composition !== composition ||
                         _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
                     ) return@synchronized
-                    relayV2SessionReplyCuts = cuts
+                    relayV2SessionReplyCuts.value = cuts
                     _uiState.value = _uiState.value.copy(scopes = scopes, sessions = sessions)
                 }
             }
@@ -1088,7 +1121,7 @@ class V2ViewModel(
         val mutation = fence.applyIfCurrent(
             state = current,
             currentComposition = relayV2Composition,
-            currentCuts = relayV2SessionReplyCuts,
+            currentCuts = relayV2SessionReplyCuts.value,
             update = update,
         )
         if (mutation.applied) _uiState.value = mutation.state
@@ -1718,6 +1751,60 @@ private fun RelayV2ProductSession.toUiSession(): RelaySession {
             session.sessionId,
         ),
     )
+}
+
+private fun AgentTranscriptLifecycleSelectedSessionPresentationState.toTimeline(
+    sessionStableId: String,
+): List<TimelineEvent> = when (this) {
+    AgentTranscriptLifecycleSelectedSessionPresentationState.Disabled,
+    AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
+    AgentTranscriptLifecycleSelectedSessionPresentationState.Stale,
+    -> emptyList()
+    is AgentTranscriptLifecycleSelectedSessionPresentationState.Content ->
+        presentation.items.mapNotNull { item ->
+            val transcript = item as? AgentTranscriptLifecyclePresentationItem.Transcript
+                ?: return@mapNotNull null
+            TimelineEvent(
+                eventId = relayV2TranscriptUiStableId(
+                    sessionStableId,
+                    transcript.runId,
+                    transcript.turnId,
+                    transcript.entryId,
+                ),
+                sessionId = sessionStableId,
+                actor = when (transcript.role) {
+                    AgentTimelineEntryRole.USER -> TimelineActor.USER
+                    AgentTimelineEntryRole.AGENT -> TimelineActor.AGENT
+                },
+                body = when (val content = transcript.content) {
+                    is AgentTranscriptEntryContent.Visible -> content.text
+                    is AgentTranscriptEntryContent.Redacted -> "Message redacted"
+                },
+                createdAtMillis = transcript.createdAtMs,
+            )
+        }
+}
+
+internal suspend fun projectRelayV2SelectedSessionTimeline(
+    sessionStableId: String,
+    readPresentation: suspend () ->
+        AgentTranscriptLifecycleSelectedSessionPresentationState,
+    stillCurrent: () -> Boolean,
+): List<TimelineEvent> {
+    val presentation = readPresentation()
+    if (!stillCurrent()) return emptyList()
+    return presentation.toTimeline(sessionStableId)
+}
+
+/** Injective UI identity that retains the transcript's exact Session/run/turn scope. */
+private fun relayV2TranscriptUiStableId(vararg opaqueParts: String): String = buildString {
+    append("relay-v2-agent-transcript")
+    opaqueParts.forEach { part ->
+        append(':')
+        append(part.length)
+        append(':')
+        append(part)
+    }
 }
 
 private fun RelayV2SessionReplyFailure.userMessage(): String = when (this) {
