@@ -31,7 +31,8 @@ import kotlinx.coroutines.CancellationException
 /** Room adapter for the Agent transcript/lifecycle durable consumer. */
 internal class AgentTranscriptLifecycleDurableRepository(
     database: RelayV2StateDatabase,
-) : AgentTranscriptLifecycleRuntimeDurableRepository {
+) : AgentTranscriptLifecycleRuntimeDurableRepository,
+    AgentTranscriptLifecycleRecoveryCatalogPort {
     private val core = AgentTranscriptLifecycleDurableRepositoryCore(
         RoomAgentTranscriptLifecycleDurableStore(database),
     )
@@ -39,6 +40,13 @@ internal class AgentTranscriptLifecycleDurableRepository(
     override suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = core.load(consumer)
+
+    override suspend fun readRecoveryNamespacePage(
+        authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+        cursor: AgentTranscriptLifecycleRecoveryCatalogCursor?,
+        limit: Int,
+    ): AgentTranscriptLifecycleRecoveryNamespacePage =
+        core.readRecoveryNamespacePage(authority, cursor, limit)
 
     override suspend fun readRevisionPinnedPage(
         namespace: AgentTranscriptLifecycleDurableNamespace,
@@ -210,6 +218,54 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
         consumer.scopeId,
         consumer.sessionId,
     ).map(RelayV2AgentTranscriptLifecycleStateEntity::toPersisted)
+
+    override fun recoveryNamespaceCandidates(
+        authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+        afterScopeId: String?,
+        afterSessionId: String?,
+        limit: Int,
+    ): List<AgentTranscriptLifecycleDurableNamespace> {
+        require((afterScopeId == null) == (afterSessionId == null))
+        require(limit in 1..AGENT_TRANSCRIPT_LIFECYCLE_RECOVERY_CATALOG_PAGE_LIMIT + 1)
+        val candidates = if (afterScopeId == null) {
+            dao.agentTranscriptRecoveryNamespaceFirstPage(
+                authority.profileId,
+                authority.profileActivationGeneration,
+                authority.principalId,
+                authority.clientInstanceId,
+                authority.hostId,
+                authority.hostEpoch,
+                limit,
+            )
+        } else {
+            dao.agentTranscriptRecoveryNamespacePageAfter(
+                authority.profileId,
+                authority.profileActivationGeneration,
+                authority.principalId,
+                authority.clientInstanceId,
+                authority.hostId,
+                authority.hostEpoch,
+                afterScopeId,
+                requireNotNull(afterSessionId),
+                limit,
+            )
+        }
+        return candidates.map { candidate ->
+            AgentTranscriptLifecycleDurableNamespace(
+                AgentTranscriptLifecycleDurableConsumerIdentity(
+                    candidate.profileId,
+                    candidate.profileActivationGeneration,
+                    candidate.principalId,
+                    candidate.clientInstanceId,
+                    candidate.hostId,
+                    candidate.hostEpoch,
+                    candidate.scopeId,
+                    candidate.sessionId,
+                ),
+                candidate.timelineEpochKey.takeIf(String::isNotEmpty),
+            )
+        }
+    }
 
     override fun insertState(state: AgentTranscriptLifecyclePersistedState) {
         dao.insertAgentTranscriptLifecycleState(state.toEntity())

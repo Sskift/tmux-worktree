@@ -681,6 +681,140 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals(listOf(unknownState), agentClaims(namespace).map { it.lifecycleState })
     }
 
+    @Test
+    fun agentRecoveryCatalogKeysetPagesExactActivationAndHostLineage() = runBlocking {
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+        val authority = AgentTranscriptLifecycleRecoveryCatalogAuthority(
+            profileId = "catalog-profile",
+            profileActivationGeneration = 7,
+            principalId = "catalog-principal",
+            clientInstanceId = "catalog-client",
+            hostId = "catalog-host",
+            hostEpoch = "catalog-epoch",
+        )
+
+        suspend fun insertNamespace(
+            owner: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+            scopeId: String,
+            sessionId: String,
+            timelineEpoch: String,
+        ): AgentTranscriptLifecycleDurableNamespace {
+            val consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
+                owner.profileId,
+                owner.profileActivationGeneration,
+                owner.principalId,
+                owner.clientInstanceId,
+                owner.hostId,
+                owner.hostEpoch,
+                scopeId,
+                sessionId,
+            )
+            val namespace = AgentTranscriptLifecycleDurableNamespace(consumer, timelineEpoch)
+            val state = operationalAgentState(consumer).let { initial ->
+                initial.copy(extensionLane = initial.extensionLane.copy(
+                    timelineEpoch = timelineEpoch,
+                ))
+            }
+            repository.initializeUnderApplyLease(namespace, state)
+            return namespace
+        }
+
+        val expected = listOf(
+            insertNamespace(authority, "scope-A", "session-z", "timeline-upper-scope"),
+            insertNamespace(authority, "scope-a", "session-B", "timeline-upper-session"),
+            insertNamespace(authority, "scope-a", "session-b", "timeline-lower-session"),
+        )
+        repository.prepareRequestUnderApplyLease(
+            AgentTranscriptLifecycleDurablePrepareRequestCommand.Status(
+                operationFence(expected.first()),
+                proposedRequestNetworkToken = "catalog-prepared-status",
+            ),
+        )
+        val withoutPreparedRequest = expected.last()
+        assertEquals(
+            emptyList<AgentTranscriptLifecycleDurablePreparedRequest>(),
+            repository.loadPreparedRequestsUnderApplyLease(
+                operationFence(withoutPreparedRequest),
+            ),
+        )
+
+        val foreignAuthorities = listOf(
+            authority.copy(profileId = "foreign-profile"),
+            authority.copy(profileActivationGeneration = 8),
+            authority.copy(principalId = "foreign-principal"),
+            authority.copy(clientInstanceId = "foreign-client"),
+            authority.copy(hostId = "foreign-host"),
+            authority.copy(hostEpoch = "foreign-epoch"),
+        )
+        foreignAuthorities.forEachIndexed { index, foreign ->
+            insertNamespace(
+                foreign,
+                scopeId = "foreign-scope-$index",
+                sessionId = "foreign-session-$index",
+                timelineEpoch = "foreign-timeline-$index",
+            )
+        }
+
+        val seen = mutableListOf<AgentTranscriptLifecycleDurableNamespace>()
+        var cursor: AgentTranscriptLifecycleRecoveryCatalogCursor? = null
+        var firstCursor: AgentTranscriptLifecycleRecoveryCatalogCursor? = null
+        do {
+            val page = repository.readRecoveryNamespacePage(authority, cursor, limit = 1)
+            assertEquals(1, page.candidates.size)
+            seen += page.candidates.single()
+            if (firstCursor == null) firstCursor = page.nextCursor
+            cursor = page.nextCursor
+        } while (cursor != null)
+
+        assertEquals(expected, seen)
+        assertEquals(seen.size, seen.distinct().size)
+        assertEquals(
+            listOf(
+                "timeline-upper-scope",
+                "timeline-upper-session",
+                "timeline-lower-session",
+            ),
+            seen.map(AgentTranscriptLifecycleDurableNamespace::timelineEpoch),
+        )
+
+        val issuedCursor = requireNotNull(firstCursor)
+        val foreignCursorFailure = runCatching {
+            repository.readRecoveryNamespacePage(
+                foreignAuthorities.first(),
+                issuedCursor,
+                limit = 1,
+            )
+        }.exceptionOrNull()
+        assertTrue(foreignCursorFailure is AgentTranscriptLifecycleRecoveryCatalogCursorException)
+
+        val staleCursorFailure = runCatching {
+            repository.readRecoveryNamespacePage(
+                authority.copy(profileActivationGeneration = 8),
+                issuedCursor,
+                limit = 1,
+            )
+        }.exceptionOrNull()
+        assertTrue(staleCursorFailure is AgentTranscriptLifecycleRecoveryCatalogCursorException)
+
+        val foreignOwnerFailure = runCatching {
+            AgentTranscriptLifecycleDurableRepository(database).readRecoveryNamespacePage(
+                authority,
+                issuedCursor,
+                limit = 1,
+            )
+        }.exceptionOrNull()
+        assertTrue(foreignOwnerFailure is AgentTranscriptLifecycleRecoveryCatalogCursorException)
+
+        val overLimitFailure = runCatching {
+            repository.readRecoveryNamespacePage(
+                authority,
+                cursor = null,
+                limit = AGENT_TRANSCRIPT_LIFECYCLE_RECOVERY_CATALOG_PAGE_LIMIT + 1,
+            )
+        }.exceptionOrNull()
+        assertTrue(overLimitFailure is IllegalArgumentException)
+    }
+
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
         val scopeRecord = partialSnapshotScopeRecord(suffix)
         val scopeCanonical = scopeRecord.canonicalJson()

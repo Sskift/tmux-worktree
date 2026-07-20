@@ -358,6 +358,14 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): List<AgentTranscriptLifecyclePersistedState>
 
+    fun recoveryNamespaceCandidates(
+        authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+        afterScopeId: String?,
+        afterSessionId: String?,
+        limit: Int,
+    ): List<AgentTranscriptLifecycleDurableNamespace> =
+        throw UnsupportedOperationException("Recovery catalog is not implemented by this store")
+
     /** Exact same-timeline parent CAS; callers require an affected-row count of one. */
     fun compareAndSetState(
         expected: AgentTranscriptLifecyclePersistedState,
@@ -607,11 +615,64 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private val publicCodec: AgentTranscriptLifecycleV1Codec = AgentTranscriptLifecycleV1Codec(),
 ) : AgentTranscriptLifecycleDurableOperationPort,
     AgentTranscriptLifecycleNotificationClaimPort,
-    AgentTranscriptLifecycleRevisionPinnedReadPort {
+    AgentTranscriptLifecycleRevisionPinnedReadPort,
+    AgentTranscriptLifecycleRecoveryCatalogPort {
+    private val recoveryCatalogCursorIssuer = Any()
+
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = store.transaction {
         loadAuditedSingle(consumer)
+    }
+
+    override suspend fun readRecoveryNamespacePage(
+        authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+        cursor: AgentTranscriptLifecycleRecoveryCatalogCursor?,
+        limit: Int,
+    ): AgentTranscriptLifecycleRecoveryNamespacePage = store.transaction {
+        require(limit in 1..AGENT_TRANSCRIPT_LIFECYCLE_RECOVERY_CATALOG_PAGE_LIMIT) {
+            "Agent recovery catalog page limit is out of bounds"
+        }
+        val continuation = cursor?.continuationFor(authority, recoveryCatalogCursorIssuer)
+        val candidates = recoveryNamespaceCandidates(
+            authority = authority,
+            afterScopeId = continuation?.first,
+            afterSessionId = continuation?.second,
+            limit = limit + 1,
+        )
+        if (candidates.size > limit + 1) storageMalformed()
+
+        var previousScopeId = continuation?.first
+        var previousSessionId = continuation?.second
+        candidates.forEach { candidate ->
+            if (!authority.owns(candidate.consumer)) storageMalformed()
+            val priorScopeId = previousScopeId
+            val priorSessionId = previousSessionId
+            if (priorScopeId != null && priorSessionId != null &&
+                compareRecoveryCatalogKeys(
+                    candidate.consumer.scopeId,
+                    candidate.consumer.sessionId,
+                    priorScopeId,
+                    priorSessionId,
+                ) <= 0
+            ) storageMalformed()
+            previousScopeId = candidate.consumer.scopeId
+            previousSessionId = candidate.consumer.sessionId
+        }
+
+        val pageCandidates = candidates.take(limit)
+        AgentTranscriptLifecycleRecoveryNamespacePage(
+            candidates = pageCandidates,
+            nextCursor = if (candidates.size > limit) {
+                AgentTranscriptLifecycleRecoveryCatalogCursor.issue(
+                    authority,
+                    pageCandidates.last(),
+                    recoveryCatalogCursorIssuer,
+                )
+            } else {
+                null
+            },
+        )
     }
 
     /**
@@ -4563,6 +4624,30 @@ private val SNAPSHOT_RECORD_KINDS = setOf(
 )
 private val STORAGE_UINT64_MAX = BigInteger("18446744073709551615")
 private val STORAGE_CANONICAL_COUNTER = Regex("^(?:0|[1-9][0-9]*)$")
+
+private fun compareRecoveryCatalogKeys(
+    leftScopeId: String,
+    leftSessionId: String,
+    rightScopeId: String,
+    rightSessionId: String,
+): Int {
+    val scopeComparison = compareBinaryUtf8(leftScopeId, rightScopeId)
+    return if (scopeComparison != 0) scopeComparison else
+        compareBinaryUtf8(leftSessionId, rightSessionId)
+}
+
+/** Matches SQLite COLLATE BINARY ordering for validated UTF-8 opaque IDs. */
+private fun compareBinaryUtf8(left: String, right: String): Int {
+    val leftBytes = left.toByteArray(StandardCharsets.UTF_8)
+    val rightBytes = right.toByteArray(StandardCharsets.UTF_8)
+    val sharedLength = minOf(leftBytes.size, rightBytes.size)
+    for (index in 0 until sharedLength) {
+        val difference = (leftBytes[index].toInt() and 0xff) -
+            (rightBytes[index].toInt() and 0xff)
+        if (difference != 0) return difference
+    }
+    return leftBytes.size - rightBytes.size
+}
 
 /** Storage-boundary copy of the frozen opaque-ID constraints; it does not widen reducer APIs. */
 private fun requireStorageOpaqueIdentity(value: String?, label: String) {

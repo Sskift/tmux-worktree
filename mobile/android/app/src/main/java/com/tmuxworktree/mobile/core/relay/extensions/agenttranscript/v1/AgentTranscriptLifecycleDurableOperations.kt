@@ -18,6 +18,88 @@ internal enum class AgentTranscriptLifecycleRequestKind {
     SNAPSHOT,
 }
 
+/** Exact activation and host-lineage authority for bounded recovery candidate discovery. */
+internal data class AgentTranscriptLifecycleRecoveryCatalogAuthority(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+) {
+    init {
+        require(profileActivationGeneration > 0) {
+            "Profile activation generation must be positive"
+        }
+        requireOperationOpaqueId(profileId)
+        requireOperationOpaqueId(principalId)
+        requireOperationOpaqueId(clientInstanceId)
+        requireOperationOpaqueId(hostId)
+        requireOperationOpaqueId(hostEpoch)
+    }
+
+    fun owns(consumer: AgentTranscriptLifecycleDurableConsumerIdentity): Boolean =
+        profileId == consumer.profileId &&
+            profileActivationGeneration == consumer.profileActivationGeneration &&
+            principalId == consumer.principalId &&
+            clientInstanceId == consumer.clientInstanceId &&
+            hostId == consumer.hostId &&
+            hostEpoch == consumer.hostEpoch
+}
+
+/**
+ * Opaque in-process keyset continuation. It is bound to one catalog owner, exact authority, and
+ * the final scope/session key returned by the previous page.
+ */
+internal class AgentTranscriptLifecycleRecoveryCatalogCursor private constructor(
+    private val authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+    private val previousScopeId: String,
+    private val previousSessionId: String,
+    private val issuer: Any,
+) {
+    internal fun continuationFor(
+        expectedAuthority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+        expectedIssuer: Any,
+    ): Pair<String, String> {
+        if (authority != expectedAuthority || issuer !== expectedIssuer) {
+            throw AgentTranscriptLifecycleRecoveryCatalogCursorException()
+        }
+        return previousScopeId to previousSessionId
+    }
+
+    internal companion object {
+        fun issue(
+            authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+            previousNamespace: AgentTranscriptLifecycleDurableNamespace,
+            issuer: Any,
+        ): AgentTranscriptLifecycleRecoveryCatalogCursor {
+            require(authority.owns(previousNamespace.consumer))
+            return AgentTranscriptLifecycleRecoveryCatalogCursor(
+                authority,
+                previousNamespace.consumer.scopeId,
+                previousNamespace.consumer.sessionId,
+                issuer,
+            )
+        }
+    }
+}
+
+internal class AgentTranscriptLifecycleRecoveryCatalogCursorException :
+    IllegalStateException("Agent recovery catalog cursor is foreign or stale")
+
+/** Candidate namespaces only; prepared-request truth remains an exact A3f re-read. */
+internal data class AgentTranscriptLifecycleRecoveryNamespacePage(
+    val candidates: List<AgentTranscriptLifecycleDurableNamespace>,
+    val nextCursor: AgentTranscriptLifecycleRecoveryCatalogCursor?,
+) {
+    init {
+        require(candidates.size <= AGENT_TRANSCRIPT_LIFECYCLE_RECOVERY_CATALOG_PAGE_LIMIT)
+        require(candidates.distinct().size == candidates.size)
+    }
+}
+
+internal const val AGENT_TRANSCRIPT_LIFECYCLE_RECOVERY_CATALOG_PAGE_LIMIT = 32
+
 /**
  * Exact durable authority supplied by the serialized v2 apply owner.
  *
@@ -318,6 +400,15 @@ internal interface AgentTranscriptLifecycleNotificationClaimPort {
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         intent: AgentSystemNotificationIntent,
     ): AgentTranscriptLifecycleNotificationClaimResult
+}
+
+/** Bounded, read-only namespace discovery seam for activation-scoped Agent recovery. */
+internal interface AgentTranscriptLifecycleRecoveryCatalogPort {
+    suspend fun readRecoveryNamespacePage(
+        authority: AgentTranscriptLifecycleRecoveryCatalogAuthority,
+        cursor: AgentTranscriptLifecycleRecoveryCatalogCursor? = null,
+        limit: Int,
+    ): AgentTranscriptLifecycleRecoveryNamespacePage
 }
 
 /**

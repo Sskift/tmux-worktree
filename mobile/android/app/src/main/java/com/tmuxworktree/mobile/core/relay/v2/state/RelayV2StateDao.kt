@@ -36,6 +36,19 @@ internal data class RelayV2AgentTranscriptPendingEventBatchMetadata(
     val actualPayloadUtf8Bytes: Long,
 )
 
+/** Payload-free keyset projection from the existing lifecycle state authority rows. */
+internal data class RelayV2AgentTranscriptRecoveryNamespaceCandidate(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpochKey: String,
+)
+
 /** One-row, no-payload preflight for the exact nine-column transcript namespace. */
 internal data class RelayV2AgentTranscriptNamespaceStats(
     val entryCount: Long,
@@ -1264,6 +1277,50 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
     ): List<RelayV2AgentTranscriptLifecycleStateEntity>
+
+    @Query(
+        "SELECT profileId, profileActivationGeneration, principalId, clientInstanceId, " +
+            "hostId, hostEpoch, scopeId, sessionId, timelineEpochKey " +
+            "FROM relay_v2_agent_transcript_lifecycle_states " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "ORDER BY scopeId COLLATE BINARY, sessionId COLLATE BINARY LIMIT :limit",
+    )
+    fun agentTranscriptRecoveryNamespaceFirstPage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptRecoveryNamespaceCandidate>
+
+    @Query(
+        "SELECT profileId, profileActivationGeneration, principalId, clientInstanceId, " +
+            "hostId, hostEpoch, scopeId, sessionId, timelineEpochKey " +
+            "FROM relay_v2_agent_transcript_lifecycle_states " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "AND (scopeId COLLATE BINARY, sessionId COLLATE BINARY) > " +
+            "(:afterScopeId COLLATE BINARY, :afterSessionId COLLATE BINARY) " +
+            "ORDER BY scopeId COLLATE BINARY, sessionId COLLATE BINARY LIMIT :limit",
+    )
+    fun agentTranscriptRecoveryNamespacePageAfter(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        afterScopeId: String,
+        afterSessionId: String,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptRecoveryNamespaceCandidate>
 
     @Query(
         "SELECT COUNT(*) FROM relay_v2_agent_transcript_lifecycle_states " +
