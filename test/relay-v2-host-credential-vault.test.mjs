@@ -4,6 +4,7 @@ import test from "node:test";
 
 const credentialAuthority = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const credentialVault = await import("../dist/relay/v2/hostCredentialVault.js");
+const bootstrapHandoff = await import("../dist/relay/v2/hostBootstrapSecretHandoff.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
 
 const NOW_SECONDS = 1_783_700_000;
@@ -82,44 +83,21 @@ class FakeAtomicByteCell {
   }
 }
 
-class FakeReadOnceBootstrapHandoff {
-  candidates = new WeakMap();
-  attempts = 0;
-  consumes = 0;
-
-  issue(secret) {
-    const candidate = Object.freeze(Object.create(null));
-    this.candidates.set(candidate, { secret, consumed: false, inFlight: false });
-    return candidate;
-  }
-
-  runWithCandidate(candidate, operation) {
-    const record = this.candidates.get(candidate);
-    if (!record || record.consumed || record.inFlight) throw new Error("handoff unavailable");
-    this.attempts += 1;
-    record.inFlight = true;
-    try {
-      const result = operation(record.secret);
-      record.consumed = true;
-      this.consumes += 1;
-      return result;
-    } finally {
-      record.inFlight = false;
-    }
-  }
+function createBootstrapHandoff() {
+  return bootstrapHandoff.createRelayV2HostBootstrapSecretHandoffAuthority();
 }
 
-function openVault(cell, handoff = new FakeReadOnceBootstrapHandoff()) {
+function openVault(cell, handoffAuthority = createBootstrapHandoff()) {
   return {
     cell,
-    handoff,
+    handoffAuthority,
     vault: new credentialVault.RelayV2HostCredentialVault({
       hostId: HOST_ID,
       credentialReference: CREDENTIAL_REFERENCE,
       bootstrapSecretReference: BOOTSTRAP_SECRET_REFERENCE,
       refreshSecretReference: REFRESH_SECRET_REFERENCE,
       cell,
-      bootstrapSecretHandoff: handoff,
+      bootstrapSecretHandoff: handoffAuthority.handoff,
     }),
   };
 }
@@ -216,6 +194,57 @@ function assertAuthorityError(code) {
     && !error.message.includes("twhostboot2.");
 }
 
+function assertHandoffError(code) {
+  return (error) => error?.code === code
+    && doesNotExposeBootstrapSecret(error)
+    && doesNotExposeBootstrapSecret(error.message)
+    && doesNotExposeBootstrapSecret(error.cause);
+}
+
+function doesNotExposeBootstrapSecret(value) {
+  try {
+    return !String(value).includes(BOOTSTRAP_SECRET);
+  } catch (error) {
+    return error === value || (
+      doesNotExposeBootstrapSecret(error?.message)
+      && doesNotExposeBootstrapSecret(error?.cause)
+    );
+  }
+}
+
+function assertStringDoesNotExposeBootstrapSecret(value) {
+  let rendered;
+  try {
+    rendered = String(value);
+  } catch (error) {
+    assert.equal(doesNotExposeBootstrapSecret(error), true);
+    assert.equal(doesNotExposeBootstrapSecret(error?.message), true);
+    assert.equal(doesNotExposeBootstrapSecret(error?.cause), true);
+    return;
+  }
+  assert.equal(rendered.includes(BOOTSTRAP_SECRET), false);
+}
+
+function assertInspectableSurfaceDoesNotExposeBootstrapSecret(value) {
+  for (const inspect of [
+    () => Object.keys(value),
+    () => Reflect.ownKeys(value).map((key) => String(key)),
+    () => JSON.stringify(value),
+  ]) {
+    let observed;
+    try {
+      observed = inspect();
+    } catch (error) {
+      assert.equal(doesNotExposeBootstrapSecret(error), true);
+      assert.equal(doesNotExposeBootstrapSecret(error?.message), true);
+      assert.equal(doesNotExposeBootstrapSecret(error?.cause), true);
+      continue;
+    }
+    assert.equal(doesNotExposeBootstrapSecret(observed), true);
+  }
+  assertStringDoesNotExposeBootstrapSecret(value);
+}
+
 function rewriteEnvelope(bytes, mutate) {
   const source = Buffer.from(bytes);
   const payload = JSON.parse(source.subarray(ENVELOPE_HEADER_BYTES).toString("utf8"));
@@ -232,23 +261,24 @@ function rewriteEnvelope(bytes, mutate) {
   return Uint8Array.from(replacement);
 }
 
-test("provision, pending response-loss retry, bootstrap commit, and refresh rotation reopen from one atomic envelope", () => {
+test("provision, pending response-loss retry, bootstrap commit, and refresh rotation reopen from one atomic envelope", async () => {
   const cell = new FakeAtomicByteCell();
-  const handoff = new FakeReadOnceBootstrapHandoff();
-  const opened = openVault(cell, handoff);
+  const handoffAuthority = createBootstrapHandoff();
+  const opened = openVault(cell, handoffAuthority);
   assert.equal(cell.operations, 0, "construction is inert against the byte cell");
-  assert.equal(handoff.consumes, 0, "construction does not consume a handoff");
-  assert.deepEqual(Object.keys(opened.vault), []);
+  assertInspectableSurfaceDoesNotExposeBootstrapSecret(opened.vault);
+  assertInspectableSurfaceDoesNotExposeBootstrapSecret(handoffAuthority);
 
-  const candidate = handoff.issue(BOOTSTRAP_SECRET);
-  assert.deepEqual(Object.keys(candidate), []);
+  const candidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+  assertInspectableSurfaceDoesNotExposeBootstrapSecret(candidate);
+  assert.equal(cell.operations, 0, "privileged intake is inert against the byte cell");
   opened.vault.provisionBootstrap(candidate);
   const authority = openAuthority(opened.vault);
   const prepared = authority.prepareBootstrap(bootstrapPreparation());
   assert.equal(prepared.fence.oldCredentialVersion, "0");
   assert.equal(digest(prepared.credential.bootstrapToken), digest(BOOTSTRAP_SECRET));
 
-  const reopenedVault = openVault(cell, handoff).vault;
+  const reopenedVault = openVault(cell, handoffAuthority).vault;
   const reopenedAuthority = openAuthority(reopenedVault);
   const responseLossRetry = reopenedAuthority.prepareBootstrap(bootstrapPreparation({
     attemptId: "must-reuse-durable-bootstrap-attempt",
@@ -276,7 +306,7 @@ test("provision, pending response-loss retry, bootstrap commit, and refresh rota
     digest(REFRESH_SECRET_1),
   );
 
-  const afterBootstrapReopen = openVault(cell, handoff).vault;
+  const afterBootstrapReopen = openVault(cell, handoffAuthority).vault;
   const afterBootstrapAuthority = openAuthority(afterBootstrapReopen);
   const carrier = afterBootstrapAuthority.read(CREDENTIAL_REFERENCE);
   assert.equal(carrier.version, "1");
@@ -296,7 +326,7 @@ test("provision, pending response-loss retry, bootstrap commit, and refresh rota
   ), { status: "applied", credentialVersion: "2" });
   assert.equal(cell.compares - comparesBeforeRefreshCommit, 1);
 
-  const rotatedVault = openVault(cell, handoff).vault;
+  const rotatedVault = openVault(cell, handoffAuthority).vault;
   const rotatedAuthority = openAuthority(rotatedVault);
   assert.equal(rotatedAuthority.read(CREDENTIAL_REFERENCE).version, "2");
   assert.equal(
@@ -309,6 +339,7 @@ test("provision, pending response-loss retry, bootstrap commit, and refresh rota
   assert.equal(nextRefresh.fence.oldCredentialVersion, "2");
   assert.equal(nextRefresh.fence.oldSecretReference, REFRESH_SECRET_REFERENCE);
   assert.equal(digest(nextRefresh.credential.refreshToken), digest(REFRESH_SECRET_2));
+  await handoffAuthority.closeAndDrain();
 });
 
 test("foreign, replayed, invalid, uncertain, and closed inputs fail closed without byte or secret disclosure", async (t) => {
@@ -328,11 +359,301 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
     assert.equal(cell.snapshotBytes(), null);
   });
 
-  await t.test("bootstrap failures preserve candidates until an exact CAS commits", () => {
+  await t.test("opaque candidates are exact, synchronous, read-once, and retryable only after callback throw", async () => {
+    const handoffAuthority = createBootstrapHandoff();
+    for (const handle of [
+      handoffAuthority,
+      handoffAuthority.privilegedIntake,
+      handoffAuthority.handoff,
+    ]) {
+      assertInspectableSurfaceDoesNotExposeBootstrapSecret(handle);
+    }
+    const bootstrapSecretPrefix = "twhostboot2.";
+    const maxBootstrapSecret = `${bootstrapSecretPrefix}${"x".repeat(
+      8_192 - Buffer.byteLength(bootstrapSecretPrefix, "utf8"),
+    )}`;
+    assert.equal(Buffer.byteLength(maxBootstrapSecret, "utf8"), 8_192);
+    const maxCandidate = handoffAuthority.privilegedIntake.accept(maxBootstrapSecret);
+    for (const value of [
+      "twref2.not-a-bootstrap-secret",
+      "twhostboot2.with whitespace",
+      "twhostboot2.non-ascii-é",
+      "twhostboot2.control-\n",
+      `${maxBootstrapSecret}x`,
+    ]) {
+      assert.throws(
+        () => handoffAuthority.privilegedIntake.accept(value),
+        assertHandoffError("RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_INTAKE_INVALID"),
+      );
+    }
+
+    const candidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+    assertInspectableSurfaceDoesNotExposeBootstrapSecret(candidate);
+
+    const copy = Object.freeze({ ...candidate });
+    const proxy = new Proxy(candidate, {});
+    for (const foreign of [Object.freeze(Object.create(null)), copy, proxy]) {
+      let callbackCalled = false;
+      assert.throws(
+        () => handoffAuthority.handoff.runWithCandidate(foreign, () => {
+          callbackCalled = true;
+        }),
+        assertHandoffError(
+          "RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CANDIDATE_UNAVAILABLE",
+        ),
+      );
+      assert.equal(callbackCalled, false);
+    }
+
+    let callbackCalls = 0;
+    let nestedCallbackCalled = false;
+    const resultIdentity = Object.freeze(Object.create(null));
+    assert.equal(handoffAuthority.handoff.runWithCandidate(candidate, (secret) => {
+      callbackCalls += 1;
+      assert.equal(digest(secret), digest(BOOTSTRAP_SECRET));
+      assert.throws(
+        () => handoffAuthority.handoff.runWithCandidate(candidate, () => {
+          nestedCallbackCalled = true;
+        }),
+        assertHandoffError(
+          "RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CANDIDATE_UNAVAILABLE",
+        ),
+      );
+      return resultIdentity;
+    }), resultIdentity);
+    assert.equal(callbackCalls, 1);
+    assert.equal(nestedCallbackCalled, false);
+    let replayCallbackCalled = false;
+    assert.throws(
+      () => handoffAuthority.handoff.runWithCandidate(candidate, () => {
+        replayCallbackCalled = true;
+      }),
+      assertHandoffError("RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CANDIDATE_UNAVAILABLE"),
+    );
+    assert.equal(replayCallbackCalled, false);
+
+    const retryCandidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+    const originalCallbackError = new Error("vault callback sentinel");
+    assert.throws(
+      () => handoffAuthority.handoff.runWithCandidate(retryCandidate, () => {
+        throw originalCallbackError;
+      }),
+      (error) => error === originalCallbackError,
+    );
+    assert.equal(handoffAuthority.handoff.runWithCandidate(
+      retryCandidate,
+      (secret) => digest(secret),
+    ), digest(BOOTSTRAP_SECRET));
+    assertInspectableSurfaceDoesNotExposeBootstrapSecret(maxCandidate);
+    await handoffAuthority.closeAndDrain();
+  });
+
+  await t.test("Promise and hostile thenable callback results fail closed without assimilation", async () => {
+    const handoffAuthority = createBootstrapHandoff();
+    const promiseCandidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+    const secretBearingRejection = Promise.reject(new Error(
+      `native Promise rejection exposed ${BOOTSTRAP_SECRET}`,
+      { cause: BOOTSTRAP_SECRET },
+    ));
+    assert.throws(
+      () => handoffAuthority.handoff.runWithCandidate(
+        promiseCandidate,
+        () => secretBearingRejection,
+      ),
+      assertHandoffError(
+        "RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_ASYNC_CALLBACK_UNSUPPORTED",
+      ),
+    );
+    const acceptingCell = new FakeAtomicByteCell();
+    openVault(acceptingCell, handoffAuthority).vault.provisionBootstrap(promiseCandidate);
+    assert.notEqual(acceptingCell.snapshotBytes(), null);
+
+    const brandedCandidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+    const promiseWithNonCallableOwnThen = Promise.resolve("native-promise");
+    Object.defineProperty(promiseWithNonCallableOwnThen, "then", {
+      value: null,
+    });
+    assert.throws(
+      () => handoffAuthority.handoff.runWithCandidate(
+        brandedCandidate,
+        () => promiseWithNonCallableOwnThen,
+      ),
+      assertHandoffError(
+        "RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_ASYNC_CALLBACK_UNSUPPORTED",
+      ),
+    );
+    assert.equal(handoffAuthority.handoff.runWithCandidate(
+      brandedCandidate,
+      (secret) => digest(secret),
+    ), digest(BOOTSTRAP_SECRET));
+
+    const thenableCandidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+    let thenGetterReads = 0;
+    let thenCalls = 0;
+    const hostileThenable = Object.create(null);
+    Object.defineProperty(hostileThenable, "then", {
+      get() {
+        thenGetterReads += 1;
+        return () => {
+          thenCalls += 1;
+        };
+      },
+    });
+    assert.throws(
+      () => handoffAuthority.handoff.runWithCandidate(
+        thenableCandidate,
+        () => hostileThenable,
+      ),
+      assertHandoffError(
+        "RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_ASYNC_CALLBACK_UNSUPPORTED",
+      ),
+    );
+    assert.equal(thenGetterReads, 1);
+    assert.equal(thenCalls, 0);
+    assert.equal(handoffAuthority.handoff.runWithCandidate(
+      thenableCandidate,
+      (secret) => digest(secret),
+    ), digest(BOOTSTRAP_SECRET));
+
+    const throwingGetterCandidate = handoffAuthority.privilegedIntake.accept(
+      BOOTSTRAP_SECRET,
+    );
+    let throwingGetterReads = 0;
+    const throwingThenable = Object.create(null);
+    Object.defineProperty(throwingThenable, "then", {
+      get() {
+        throwingGetterReads += 1;
+        throw new Error(`hostile then getter exposed ${BOOTSTRAP_SECRET}`, {
+          cause: BOOTSTRAP_SECRET,
+        });
+      },
+    });
+    assert.throws(
+      () => handoffAuthority.handoff.runWithCandidate(
+        throwingGetterCandidate,
+        () => throwingThenable,
+      ),
+      assertHandoffError(
+        "RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_ASYNC_CALLBACK_UNSUPPORTED",
+      ),
+    );
+    assert.equal(throwingGetterReads, 1);
+    assert.equal(handoffAuthority.handoff.runWithCandidate(
+      throwingGetterCandidate,
+      (secret) => digest(secret),
+    ), digest(BOOTSTRAP_SECRET));
+    await handoffAuthority.closeAndDrain();
+  });
+
+  await t.test("handoff close synchronously fences intake and consume, drains its callback, and cannot revive", async () => {
+    const handoffAuthority = createBootstrapHandoff();
+    const abandonedCandidate = handoffAuthority.privilegedIntake.accept(
+      `${BOOTSTRAP_SECRET}-abandoned`,
+    );
+    const admittedCandidate = handoffAuthority.privilegedIntake.accept(
+      `${BOOTSTRAP_SECRET}-admitted`,
+    );
+    let closePromise;
+    let callbackReturned = false;
+    let closeObservedAfterReturn = false;
+    let fencedCallbackCalled = false;
+    const result = handoffAuthority.handoff.runWithCandidate(
+      admittedCandidate,
+      (secret) => {
+        assert.equal(digest(secret), digest(`${BOOTSTRAP_SECRET}-admitted`));
+        closePromise = handoffAuthority.closeAndDrain();
+        assert.equal(handoffAuthority.closeAndDrain(), closePromise);
+        void closePromise.then(() => {
+          closeObservedAfterReturn = callbackReturned;
+        });
+        assert.throws(
+          () => handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET),
+          assertHandoffError("RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CLOSED"),
+        );
+        for (const fencedCandidate of [abandonedCandidate, admittedCandidate]) {
+          assert.throws(
+            () => handoffAuthority.handoff.runWithCandidate(fencedCandidate, () => {
+              fencedCallbackCalled = true;
+            }),
+            assertHandoffError("RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CLOSED"),
+          );
+        }
+        return "admitted-result";
+      },
+    );
+    callbackReturned = true;
+    assert.equal(result, "admitted-result");
+    assert.equal(fencedCallbackCalled, false);
+    assert.ok(closePromise);
+    await closePromise;
+    assert.equal(closeObservedAfterReturn, true);
+    assert.equal(handoffAuthority.closeAndDrain(), closePromise);
+
+    await Promise.resolve();
+    for (const staleCandidate of [abandonedCandidate, admittedCandidate]) {
+      assert.throws(
+        () => handoffAuthority.handoff.runWithCandidate(staleCandidate, () => {
+          fencedCallbackCalled = true;
+        }),
+        assertHandoffError("RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CLOSED"),
+      );
+    }
+    assert.equal(fencedCallbackCalled, false);
+
+    const throwingHandoffAuthority = createBootstrapHandoff();
+    const throwingCandidate = throwingHandoffAuthority.privilegedIntake.accept(
+      BOOTSTRAP_SECRET,
+    );
+    const originalCallbackError = new Error("reentrant close callback sentinel");
+    let throwingClosePromise;
+    let callbackThrowEscaped = false;
+    let closeObservedAfterFinally = false;
+    assert.throws(
+      () => throwingHandoffAuthority.handoff.runWithCandidate(
+        throwingCandidate,
+        () => {
+          throwingClosePromise = throwingHandoffAuthority.closeAndDrain();
+          assert.equal(
+            throwingHandoffAuthority.closeAndDrain(),
+            throwingClosePromise,
+          );
+          void throwingClosePromise.then(() => {
+            closeObservedAfterFinally = callbackThrowEscaped;
+          });
+          throw originalCallbackError;
+        },
+      ),
+      (error) => error === originalCallbackError
+        && doesNotExposeBootstrapSecret(error)
+        && doesNotExposeBootstrapSecret(error.message)
+        && doesNotExposeBootstrapSecret(error.cause),
+    );
+    callbackThrowEscaped = true;
+    assert.ok(throwingClosePromise);
+    await throwingClosePromise;
+    assert.equal(closeObservedAfterFinally, true);
+    assert.equal(
+      throwingHandoffAuthority.closeAndDrain(),
+      throwingClosePromise,
+    );
+    let throwingReplayCalled = false;
+    assert.throws(
+      () => throwingHandoffAuthority.handoff.runWithCandidate(
+        throwingCandidate,
+        () => {
+          throwingReplayCalled = true;
+        },
+      ),
+      assertHandoffError("RELAY_V2_HOST_BOOTSTRAP_SECRET_HANDOFF_CLOSED"),
+    );
+    assert.equal(throwingReplayCalled, false);
+  });
+
+  await t.test("bootstrap failures preserve candidates until an exact CAS commits", async () => {
     const sourceCell = new FakeAtomicByteCell();
-    const sourceHandoff = new FakeReadOnceBootstrapHandoff();
+    const sourceHandoff = createBootstrapHandoff();
     openVault(sourceCell, sourceHandoff).vault.provisionBootstrap(
-      sourceHandoff.issue(BOOTSTRAP_SECRET),
+      sourceHandoff.privilegedIntake.accept(BOOTSTRAP_SECRET),
     );
     const occupiedBytes = sourceCell.snapshotBytes();
     const corruptBytes = Uint8Array.from(occupiedBytes);
@@ -342,16 +663,19 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
         label: "occupied",
         cell: new FakeAtomicByteCell(occupiedBytes),
         errorCode: "RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED",
+        preflight: true,
       },
       {
         label: "corrupt",
         cell: new FakeAtomicByteCell(corruptBytes),
         errorCode: "RELAY_V2_HOST_CREDENTIAL_VAULT_STATE_INVALID",
+        preflight: true,
       },
       {
         label: "backend-read-failure",
         cell: new FakeAtomicByteCell(occupiedBytes),
         errorCode: "RELAY_V2_HOST_CREDENTIAL_VAULT_BACKEND_UNAVAILABLE",
+        preflight: true,
         configure: (cell) => {
           cell.readCut = () => {
             throw new Error(`backend exposed ${REFRESH_SECRET_1}`);
@@ -362,7 +686,6 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
         label: "cas-throw",
         cell: new FakeAtomicByteCell(),
         errorCode: "RELAY_V2_HOST_CREDENTIAL_VAULT_BACKEND_UNAVAILABLE",
-        expectedAttempts: 1,
         expectedCompares: 1,
         configure: (cell) => {
           cell.throwOnNextCompare = true;
@@ -372,7 +695,6 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
         label: "uncertain-before",
         cell: new FakeAtomicByteCell(),
         errorCode: "RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN",
-        expectedAttempts: 1,
         expectedCompares: 1,
         configure: (cell) => {
           cell.uncertainNext = "before";
@@ -381,17 +703,20 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
     ];
     let replay;
     for (const entry of cases) {
-      const handoff = new FakeReadOnceBootstrapHandoff();
-      const candidate = handoff.issue(BOOTSTRAP_SECRET);
+      const handoffAuthority = createBootstrapHandoff();
+      const candidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+      const candidateForFailure = entry.preflight
+        ? Object.freeze(Object.create(null))
+        : candidate;
       const before = entry.cell.snapshotBytes();
       entry.configure?.(entry.cell);
       assert.throws(
-        () => openVault(entry.cell, handoff).vault.provisionBootstrap(candidate),
+        () => openVault(entry.cell, handoffAuthority).vault.provisionBootstrap(
+          candidateForFailure,
+        ),
         assertVaultError(entry.errorCode),
         entry.label,
       );
-      assert.equal(handoff.consumes, 0, entry.label);
-      assert.equal(handoff.attempts, entry.expectedAttempts ?? 0, entry.label);
       assert.equal(entry.cell.compares, entry.expectedCompares ?? 0, entry.label);
       assert.equal(
         optionalDigest(entry.cell.snapshotBytes()),
@@ -400,15 +725,18 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
       );
 
       const acceptingCell = new FakeAtomicByteCell();
-      openVault(acceptingCell, handoff).vault.provisionBootstrap(candidate);
-      assert.equal(handoff.consumes, 1, entry.label);
+      openVault(acceptingCell, handoffAuthority).vault.provisionBootstrap(candidate);
       assert.notEqual(acceptingCell.snapshotBytes(), null, entry.label);
-      replay ??= { handoff, candidate };
+      if (replay === undefined) replay = { handoffAuthority, candidate };
+      else await handoffAuthority.closeAndDrain();
     }
+    await sourceHandoff.closeAndDrain();
 
     const uncertainAfterCell = new FakeAtomicByteCell();
-    const uncertainAfterHandoff = new FakeReadOnceBootstrapHandoff();
-    const uncertainAfterCandidate = uncertainAfterHandoff.issue(BOOTSTRAP_SECRET);
+    const uncertainAfterHandoff = createBootstrapHandoff();
+    const uncertainAfterCandidate = uncertainAfterHandoff.privilegedIntake.accept(
+      BOOTSTRAP_SECRET,
+    );
     const uncertainAfterVault = openVault(
       uncertainAfterCell,
       uncertainAfterHandoff,
@@ -418,15 +746,12 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
       () => uncertainAfterVault.provisionBootstrap(uncertainAfterCandidate),
       assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN"),
     );
-    assert.equal(uncertainAfterHandoff.attempts, 1);
-    assert.equal(uncertainAfterHandoff.consumes, 0);
     const uncertainAfterBytes = uncertainAfterCell.snapshotBytes();
     assert.notEqual(uncertainAfterBytes, null);
     assert.throws(
       () => uncertainAfterVault.provisionBootstrap(uncertainAfterCandidate),
       assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED"),
     );
-    assert.equal(uncertainAfterHandoff.attempts, 1);
     assert.equal(
       optionalDigest(uncertainAfterCell.snapshotBytes()),
       optionalDigest(uncertainAfterBytes),
@@ -434,19 +759,23 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
 
     const replayCell = new FakeAtomicByteCell();
     assert.throws(
-      () => openVault(replayCell, replay.handoff).vault.provisionBootstrap(replay.candidate),
+      () => openVault(replayCell, replay.handoffAuthority).vault.provisionBootstrap(
+        replay.candidate,
+      ),
       assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_HANDOFF_INVALID"),
     );
     assert.equal(replayCell.compares, 0);
     assert.equal(replayCell.snapshotBytes(), null);
+    await replay.handoffAuthority.closeAndDrain();
+    await uncertainAfterHandoff.closeAndDrain();
   });
 
-  await t.test("structurally and semantically invalid envelopes preserve original bytes", () => {
+  await t.test("structurally and semantically invalid envelopes preserve original bytes", async () => {
     const sourceCell = new FakeAtomicByteCell();
-    const sourceHandoff = new FakeReadOnceBootstrapHandoff();
+    const sourceHandoff = createBootstrapHandoff();
     const sourceVault = openVault(sourceCell, sourceHandoff).vault;
     sourceVault.provisionBootstrap(
-      sourceHandoff.issue(BOOTSTRAP_SECRET),
+      sourceHandoff.privilegedIntake.accept(BOOTSTRAP_SECRET),
     );
     openAuthority(sourceVault).prepareBootstrap(bootstrapPreparation());
     const valid = sourceCell.snapshotBytes();
@@ -483,13 +812,16 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
       assert.equal(cell.compares, 0, label);
       assert.equal(digest(cell.snapshotBytes()), digest(before), label);
     }
+    await sourceHandoff.closeAndDrain();
   });
 
-  await t.test("uncertain CAS is never reported as success and reopens from the committed cut", () => {
+  await t.test("uncertain CAS is never reported as success and reopens from the committed cut", async () => {
     const cell = new FakeAtomicByteCell();
-    const handoff = new FakeReadOnceBootstrapHandoff();
-    const { vault } = openVault(cell, handoff);
-    vault.provisionBootstrap(handoff.issue(BOOTSTRAP_SECRET));
+    const handoffAuthority = createBootstrapHandoff();
+    const { vault } = openVault(cell, handoffAuthority);
+    vault.provisionBootstrap(
+      handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET),
+    );
     const authority = openAuthority(vault);
     cell.uncertainNext = "after";
     assert.throws(
@@ -497,20 +829,23 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
       assertAuthorityError("RELAY_V2_HOST_CREDENTIAL_COMMIT_UNCERTAIN"),
     );
     const committedBytes = cell.snapshotBytes();
-    const reopened = openAuthority(openVault(cell, handoff).vault);
+    const reopened = openAuthority(openVault(cell, handoffAuthority).vault);
     const recovered = reopened.prepareBootstrap(bootstrapPreparation({
       attemptId: "must-not-replace-uncertain-winner",
     }));
     assert.equal(recovered.fence.attemptId, "host-bootstrap-attempt-1");
     assert.equal(digest(recovered.credential.bootstrapToken), digest(BOOTSTRAP_SECRET));
     assert.equal(digest(cell.snapshotBytes()), digest(committedBytes));
+    await handoffAuthority.closeAndDrain();
   });
 
   await t.test("close fences new work and drains the already admitted transaction", async () => {
     const cell = new FakeAtomicByteCell();
-    const handoff = new FakeReadOnceBootstrapHandoff();
-    const { vault } = openVault(cell, handoff);
-    vault.provisionBootstrap(handoff.issue(BOOTSTRAP_SECRET));
+    const handoffAuthority = createBootstrapHandoff();
+    const { vault } = openVault(cell, handoffAuthority);
+    vault.provisionBootstrap(
+      handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET),
+    );
     const before = cell.snapshotBytes();
     let closePromise;
     let closeSettled = false;
@@ -538,5 +873,6 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
     );
     assert.equal(cell.operations, operations);
     assert.equal(digest(cell.snapshotBytes()), digest(before));
+    await handoffAuthority.closeAndDrain();
   });
 });
