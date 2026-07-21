@@ -34,6 +34,8 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueFailure
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
 import java.io.Closeable
 import java.util.UUID
@@ -85,10 +87,51 @@ internal fun interface RelayV2ActivationOutboxReadPort {
 /** Opaque product cut; only its issuing base composition can consume it. */
 internal interface RelayV2SessionReplyCut
 
+/** Opaque Scope authority; only its issuing base composition can consume it. */
+internal interface RelayV2ScopeCreateCut
+
 internal data class RelayV2ProductSession(
     val materialized: RelayV2MaterializedSessionReadCut,
     val replyCut: RelayV2SessionReplyCut,
+    val scopeCreateCut: RelayV2ScopeCreateCut,
 )
+
+internal data class RelayV2CreateWorktreeInputs(
+    val project: String?,
+    val path: String?,
+    val name: String?,
+    val branch: String?,
+    val aiCommand: String,
+)
+
+internal enum class RelayV2ScopeCreateFailure {
+    NOT_ONLINE,
+    PROFILE_BARRIER,
+    SCOPE_STALE,
+    INVALID_INPUT,
+    DUPLICATE_COMMAND,
+    CAPACITY_EXCEEDED,
+    FOREIGN_LINEAGE,
+    CORRUPT_STATE,
+    STORE_FAILURE,
+}
+
+internal sealed interface RelayV2ScopeCreateResult {
+    data class Queued(
+        val receipt: RelayV2OutboxEnqueueReceipt,
+    ) : RelayV2ScopeCreateResult
+
+    data class Rejected(
+        val failure: RelayV2ScopeCreateFailure,
+    ) : RelayV2ScopeCreateResult
+}
+
+internal fun interface RelayV2ScopeCreateCommandPort {
+    suspend fun submitCreateWorktree(
+        scopeCut: RelayV2ScopeCreateCut,
+        inputs: RelayV2CreateWorktreeInputs,
+    ): RelayV2ScopeCreateResult
+}
 
 internal enum class RelayV2SessionReplyFailure {
     NOT_ONLINE,
@@ -190,6 +233,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val afterActorConnectAdmissionHandoff: () -> Unit = {},
 ) : RelayV2SessionReplyCommandPort,
     RelayV2SessionKillCommandPort,
+    RelayV2ScopeCreateCommandPort,
     Closeable {
     private val closed = AtomicBoolean(false)
     private val terminalFailure = AtomicReference<RelayV2BaseRuntimeFailure?>(null)
@@ -453,6 +497,47 @@ internal class RelayV2BaseRuntimeComposition(
         return RelayV2SessionKillResult.Rejected((committed as ReplyCommit.Rejected).failure)
     }
 
+    override suspend fun submitCreateWorktree(
+        scopeCut: RelayV2ScopeCreateCut,
+        inputs: RelayV2CreateWorktreeInputs,
+    ): RelayV2ScopeCreateResult {
+        if (closed.get() || terminalFailure.get() != null) {
+            return RelayV2ScopeCreateResult.Rejected(
+                RelayV2ScopeCreateFailure.PROFILE_BARRIER,
+            )
+        }
+        val issuedScope = scopeCut as? CompositionScopeCreateCut
+            ?: return RelayV2ScopeCreateResult.Rejected(
+                RelayV2ScopeCreateFailure.SCOPE_STALE,
+            )
+        if (issuedScope.origin !== this) {
+            return RelayV2ScopeCreateResult.Rejected(
+                RelayV2ScopeCreateFailure.SCOPE_STALE,
+            )
+        }
+        val leased = actor.withCurrentOnlineCommandLease(issuedScope.onlineCut) { current ->
+            productMutationLock.withLock {
+                enqueueCreateWorktreeUnderLease(issuedScope, current, inputs)
+            }
+        }
+        val committed = when (leased) {
+            RelayV2CurrentOnlineCommandLeaseResult.Stale ->
+                return RelayV2ScopeCreateResult.Rejected(
+                    RelayV2ScopeCreateFailure.NOT_ONLINE,
+                )
+            is RelayV2CurrentOnlineCommandLeaseResult.Current -> leased.value
+        }
+        if (committed is ScopeCreateCommit.Committed) {
+            // The Room commit is the only success boundary. If the actor becomes stale after it,
+            // dispatch withdraws and the queued create lane remains for successor recovery.
+            dispatchFresh(committed.authority)
+            return RelayV2ScopeCreateResult.Queued(committed.receipt)
+        }
+        return RelayV2ScopeCreateResult.Rejected(
+            (committed as ScopeCreateCommit.Rejected).failure,
+        )
+    }
+
     /**
      * Reads one bounded structured Agent page for an exact product Session cut.
      *
@@ -584,6 +669,23 @@ internal class RelayV2BaseRuntimeComposition(
         return issuedSession.takeIf { expected ->
             _sessions.value.any { product ->
                 product.replyCut === expected && product.materialized == expected.materialized
+            }
+        }
+    }
+
+    private fun currentIssuedScope(
+        scopeCut: RelayV2ScopeCreateCut,
+    ): CompositionScopeCreateCut? {
+        if (closed.get() || terminalFailure.get() != null) return null
+        val issuedScope = scopeCut as? CompositionScopeCreateCut ?: return null
+        if (issuedScope.origin !== this) return null
+        return issuedScope.takeIf { expected ->
+            _sessions.value.any { product ->
+                product.scopeCreateCut === expected &&
+                    ScopeCreateAuthority.from(
+                        product.materialized,
+                        expected.authority.activationNamespace,
+                    ) == expected.authority
             }
         }
     }
@@ -1116,6 +1218,113 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
+    private suspend fun enqueueCreateWorktreeUnderLease(
+        scopeCut: CompositionScopeCreateCut,
+        current: RelayV2CurrentOnlineCommandContext,
+        inputs: RelayV2CreateWorktreeInputs,
+    ): ScopeCreateCommit {
+        if (closed.get() || terminalFailure.get() != null) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.PROFILE_BARRIER)
+        }
+        if (currentIssuedScope(scopeCut) !== scopeCut) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
+        }
+        val authority = current.authority
+        val namespace = authority.stateNamespace()
+        val issued = scopeCut.authority
+        if (authority.outboxNamespace() != issued.activationNamespace ||
+            namespace != issued.namespace ||
+            namespace.hostEpoch != authority.hostEpoch
+        ) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
+        }
+        val projection = try {
+            materializedSessions.readMaterializedSessionCuts(namespace)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: IllegalStateException) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.CORRUPT_STATE)
+        } catch (_: Exception) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.STORE_FAILURE)
+        }
+        if (projection.any { materialized ->
+                materialized.namespace != namespace ||
+                    materialized.cursor.hostEpoch != authority.hostEpoch ||
+                    materialized.scope.scopeId != materialized.session.scopeId
+            }
+        ) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.CORRUPT_STATE)
+        }
+        val scopeSessions = projection.filter { materialized ->
+            materialized.scope.scopeId == issued.scope.scopeId
+        }
+        if (scopeSessions.isEmpty()) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
+        }
+        val materializedScopeAuthorities = scopeSessions
+            .map { materialized -> materialized.scopesRevision to materialized.scope }
+            .distinct()
+        if (materializedScopeAuthorities.size != 1) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.CORRUPT_STATE)
+        }
+        if (materializedScopeAuthorities.single() != (issued.scopesRevision to issued.scope)) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
+        }
+        val arguments = try {
+            RelayV2OutboxArguments.createWorktree(
+                project = inputs.project,
+                path = inputs.path,
+                name = inputs.name,
+                branch = inputs.branch,
+                aiCommand = inputs.aiCommand,
+            )
+        } catch (_: Exception) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.INVALID_INPUT)
+        }
+        val enqueue = try {
+            outboxEnqueueAuthority.enqueueOutbox(
+                namespace = authority.outboxNamespace(),
+                draft = RelayV2OutboxDraft(
+                    profileId = authority.profileId,
+                    principalId = authority.principalId,
+                    hostId = authority.hostId,
+                    expectedHostEpoch = authority.hostEpoch,
+                    dedupeWindowId = current.dedupeWindow.windowId,
+                    commandId = newCommandId(),
+                    scopeId = issued.scope.scopeId,
+                    sessionId = null,
+                    arguments = arguments,
+                ),
+                createdAtMillis = clock(),
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.STORE_FAILURE)
+        }
+        return when (enqueue) {
+            is RelayV2OutboxEnqueueResult.Committed -> {
+                markOutboxTimelineCommit()
+                ScopeCreateCommit.Committed(authority, enqueue.receipt)
+            }
+            is RelayV2OutboxEnqueueResult.Rejected -> ScopeCreateCommit.Rejected(
+                when (enqueue.failure) {
+                    RelayV2OutboxEnqueueFailure.DUPLICATE_COMMAND ->
+                        RelayV2ScopeCreateFailure.DUPLICATE_COMMAND
+                    RelayV2OutboxEnqueueFailure.CAPACITY_EXCEEDED ->
+                        RelayV2ScopeCreateFailure.CAPACITY_EXCEEDED
+                    RelayV2OutboxEnqueueFailure.FOREIGN_LINEAGE ->
+                        RelayV2ScopeCreateFailure.FOREIGN_LINEAGE
+                    RelayV2OutboxEnqueueFailure.CORRUPT_STATE,
+                    RelayV2OutboxEnqueueFailure.UNKNOWN_STATE,
+                    -> RelayV2ScopeCreateFailure.CORRUPT_STATE
+                    RelayV2OutboxEnqueueFailure.STORE_FAILURE ->
+                        RelayV2ScopeCreateFailure.STORE_FAILURE
+                },
+            )
+        }
+    }
+
     private suspend fun refreshSessionProjection() {
         if (closed.get() || terminalFailure.get() != null) {
             clearSessionProjection()
@@ -1131,11 +1340,23 @@ internal class RelayV2BaseRuntimeComposition(
         val published = try {
             actor.withCurrentOnlineCommandLease(issued) { current ->
                 productMutationLock.withLock {
+                    val scopeCuts = LinkedHashMap<ScopeCreateAuthority, CompositionScopeCreateCut>()
                     val projection = materializedSessions.readMaterializedSessionCuts(
                         current.authority.stateNamespace(),
                     ).map { materialized ->
                         check(materialized.namespace == current.authority.stateNamespace()) {
                             "Relay v2 Session projection crossed current actor authority"
+                        }
+                        val scopeAuthority = ScopeCreateAuthority.from(
+                            materialized,
+                            current.authority.outboxNamespace(),
+                        )
+                        val scopeCreateCut = scopeCuts.getOrPut(scopeAuthority) {
+                            CompositionScopeCreateCut(
+                                origin = this,
+                                onlineCut = issued,
+                                authority = scopeAuthority,
+                            )
                         }
                         RelayV2ProductSession(
                             materialized = materialized,
@@ -1144,6 +1365,7 @@ internal class RelayV2BaseRuntimeComposition(
                                 onlineCut = issued,
                                 materialized = materialized,
                             ),
+                            scopeCreateCut = scopeCreateCut,
                         )
                     }
                     beforeSessionProjectionPublish()
@@ -1693,6 +1915,31 @@ internal class RelayV2BaseRuntimeComposition(
         val materialized: RelayV2MaterializedSessionReadCut,
     ) : RelayV2SessionReplyCut
 
+    private data class ScopeCreateAuthority(
+        val activationNamespace: RelayV2OutboxAuthorityNamespace,
+        val namespace: RelayV2StateNamespace,
+        val scopesRevision: String,
+        val scope: RelayV2ScopeResource,
+    ) {
+        companion object {
+            fun from(
+                materialized: RelayV2MaterializedSessionReadCut,
+                activationNamespace: RelayV2OutboxAuthorityNamespace,
+            ) = ScopeCreateAuthority(
+                activationNamespace = activationNamespace,
+                namespace = materialized.namespace,
+                scopesRevision = materialized.scopesRevision,
+                scope = materialized.scope,
+            )
+        }
+    }
+
+    private class CompositionScopeCreateCut(
+        val origin: RelayV2BaseRuntimeComposition,
+        val onlineCut: RelayV2CurrentOnlineCommandCut,
+        val authority: ScopeCreateAuthority,
+    ) : RelayV2ScopeCreateCut
+
     private sealed interface ReplyCommit {
         data class Committed(
             val authority: RelayV2RepositoryEffectAuthority,
@@ -1700,6 +1947,15 @@ internal class RelayV2BaseRuntimeComposition(
         ) : ReplyCommit
 
         data class Rejected(val failure: RelayV2SessionReplyFailure) : ReplyCommit
+    }
+
+    private sealed interface ScopeCreateCommit {
+        data class Committed(
+            val authority: RelayV2RepositoryEffectAuthority,
+            val receipt: RelayV2OutboxEnqueueReceipt,
+        ) : ScopeCreateCommit
+
+        data class Rejected(val failure: RelayV2ScopeCreateFailure) : ScopeCreateCommit
     }
 }
 

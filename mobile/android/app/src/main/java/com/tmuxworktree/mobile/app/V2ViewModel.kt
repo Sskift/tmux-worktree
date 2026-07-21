@@ -15,7 +15,11 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarri
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateCut
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateFailure
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionKillResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyFailure
@@ -108,6 +112,8 @@ class V2ViewModel(
     private var relayV2Composition: RelayV2BaseRuntimeComposition? = null
     private val relayV2SessionReplyCuts =
         MutableStateFlow<Map<String, RelayV2SessionReplyCut>>(emptyMap())
+    private val relayV2ScopeCreateCuts =
+        MutableStateFlow<Map<Pair<String, String>, RelayV2ScopeCreateCut>>(emptyMap())
     private val relayV2UiFenceLock = Any()
     private val outboxMutex = Mutex()
     private val inFlightMessages = OutboxInFlightRegistry()
@@ -706,6 +712,82 @@ class V2ViewModel(
             return
         }
 
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            if (request.scopeId.isBlank()) {
+                _uiState.update {
+                    it.copy(actionError = "Choose a visible Relay v2 Scope")
+                }
+                return
+            }
+            val admittedCreate = synchronized(relayV2UiFenceLock) {
+                val composition = relayV2Composition
+                val scopeCut = relayV2ScopeCreateCuts.value[hostId to request.scopeId]
+                if (_uiState.value.relayStartupAdmission !=
+                    RelayStartupAdmissionState.RELAY_V2 ||
+                    composition == null || scopeCut == null
+                ) {
+                    null
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        creatingWorktree = true,
+                        actionError = null,
+                    )
+                    composition to scopeCut
+                }
+            }
+            if (admittedCreate == null) {
+                _uiState.update {
+                    it.copy(actionError = "The Relay v2 Scope is no longer current")
+                }
+                return
+            }
+            val (composition, scopeCut) = admittedCreate
+            viewModelScope.launch {
+                val result = composition.submitCreateWorktree(
+                    scopeCut = scopeCut,
+                    inputs = RelayV2CreateWorktreeInputs(
+                        project = request.project.takeIf(String::isNotBlank),
+                        path = request.path.takeIf(String::isNotBlank),
+                        name = request.name.takeIf(String::isNotBlank),
+                        branch = request.branch.takeIf(String::isNotBlank),
+                        aiCommand = request.aiCommand,
+                    ),
+                )
+                val current = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission !=
+                        RelayStartupAdmissionState.RELAY_V2
+                    ) {
+                        false
+                    } else {
+                        _uiState.value = when (result) {
+                            is RelayV2ScopeCreateResult.Queued -> _uiState.value.copy(
+                                creatingWorktree = false,
+                                actionError = null,
+                            )
+                            is RelayV2ScopeCreateResult.Rejected -> _uiState.value.copy(
+                                creatingWorktree = false,
+                                actionError = result.failure.createWorktreeUserMessage(),
+                            )
+                        }
+                        true
+                    }
+                }
+                if (current) {
+                    emit(
+                        V2UiEffect.Notice(
+                            when (result) {
+                                is RelayV2ScopeCreateResult.Queued -> "Worktree creation queued"
+                                is RelayV2ScopeCreateResult.Rejected ->
+                                    "Worktree creation was not queued"
+                            },
+                        ),
+                    )
+                }
+            }
+            return
+        }
+
         val relay = relayV1IfAdmitted() ?: run {
             _uiState.update { it.copy(actionError = "Relay v2 commands are not connected yet") }
             return
@@ -912,6 +994,7 @@ class V2ViewModel(
         relayV2Composition?.close()
         synchronized(relayV2UiFenceLock) {
             relayV2SessionReplyCuts.value = emptyMap()
+            relayV2ScopeCreateCuts.value = emptyMap()
             relayV2Composition = null
         }
         if (relayOwner.isInitialized()) relay.close()
@@ -1031,6 +1114,7 @@ class V2ViewModel(
         synchronized(relayV2UiFenceLock) {
             if (admission.state != RelayStartupAdmissionState.RELAY_V2) {
                 relayV2SessionReplyCuts.value = emptyMap()
+                relayV2ScopeCreateCuts.value = emptyMap()
             }
             val current = _uiState.value
             _uiState.value = when {
@@ -1073,6 +1157,7 @@ class V2ViewModel(
                             RelayProfileDialect.V2 -> {
                                 synchronized(relayV2UiFenceLock) {
                                     relayV2SessionReplyCuts.value = emptyMap()
+                                    relayV2ScopeCreateCuts.value = emptyMap()
                                 }
                                 relayV2Composition?.disconnectAndDrain(
                                     profile,
@@ -1084,6 +1169,7 @@ class V2ViewModel(
                     clearEphemeralAfterDisconnect = {
                         synchronized(relayV2UiFenceLock) {
                             relayV2SessionReplyCuts.value = emptyMap()
+                            relayV2ScopeCreateCuts.value = emptyMap()
                             _uiState.value = V2UiState()
                         }
                     },
@@ -1151,6 +1237,7 @@ class V2ViewModel(
         synchronized(relayV2UiFenceLock) {
             relayV2Composition = composition
             relayV2SessionReplyCuts.value = emptyMap()
+            relayV2ScopeCreateCuts.value = emptyMap()
             val state = _uiState.value
             _uiState.value = state.copy(
                 preferences = state.preferences.copy(preferredHostId = profile.hostId),
@@ -1186,6 +1273,18 @@ class V2ViewModel(
                 val projected = projection.map { product -> product.toUiSession() to product.replyCut }
                 val sessions = projected.map { it.first }
                 val cuts = projected.associate { (session, cut) -> session.stableId to cut }
+                val scopeCreateCuts = projection
+                    .groupBy { product ->
+                        product.materialized.namespace.hostId to
+                            product.materialized.scope.scopeId
+                    }
+                    .mapValues { (_, rows) ->
+                        rows.first().scopeCreateCut.also { sharedCut ->
+                            check(rows.all { it.scopeCreateCut === sharedCut }) {
+                                "Relay v2 Scope projection split its exact create authority"
+                            }
+                        }
+                    }
                 val scopes = projection
                     .groupBy { it.materialized.scope.scopeId }
                     .values
@@ -1206,6 +1305,7 @@ class V2ViewModel(
                         _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
                     ) return@synchronized
                     relayV2SessionReplyCuts.value = cuts
+                    relayV2ScopeCreateCuts.value = scopeCreateCuts
                     _uiState.value = _uiState.value.copy(scopes = scopes, sessions = sessions)
                 }
             }
@@ -2062,4 +2162,17 @@ private fun RelayV2SessionReplyFailure.killUserMessage(): String = when (this) {
     RelayV2SessionReplyFailure.CORRUPT_STATE,
     RelayV2SessionReplyFailure.STORE_FAILURE,
     -> "The Session end command could not be safely queued"
+}
+
+private fun RelayV2ScopeCreateFailure.createWorktreeUserMessage(): String = when (this) {
+    RelayV2ScopeCreateFailure.NOT_ONLINE -> "Relay v2 is not online"
+    RelayV2ScopeCreateFailure.PROFILE_BARRIER -> "The Relay v2 profile is changing"
+    RelayV2ScopeCreateFailure.SCOPE_STALE -> "The Relay v2 Scope is no longer current"
+    RelayV2ScopeCreateFailure.INVALID_INPUT -> "The Worktree settings are invalid"
+    RelayV2ScopeCreateFailure.CAPACITY_EXCEEDED -> "The Relay v2 Outbox is full"
+    RelayV2ScopeCreateFailure.DUPLICATE_COMMAND,
+    RelayV2ScopeCreateFailure.FOREIGN_LINEAGE,
+    RelayV2ScopeCreateFailure.CORRUPT_STATE,
+    RelayV2ScopeCreateFailure.STORE_FAILURE,
+    -> "The Worktree command could not be safely queued"
 }

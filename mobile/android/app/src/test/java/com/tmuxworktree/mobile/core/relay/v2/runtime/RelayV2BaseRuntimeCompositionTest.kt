@@ -56,6 +56,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAttemptKind
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRecovery
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
@@ -993,6 +994,89 @@ class RelayV2BaseRuntimeCompositionTest {
             harness.close()
         }
     }
+
+    @Test
+    fun `online current Scope create worktree commits exact create lane before one fresh dispatch`() =
+        runBlocking {
+            val harness = Harness(autoConnect = true, newCommandId = { "create-command" })
+            try {
+                harness.connectOnline()
+                val product = withTimeout(TIMEOUT_MS) {
+                    harness.composition.sessions.first { it.size == 1 }.single()
+                }
+                harness.authority.blockReplyEnqueue = true
+                val create = async {
+                    harness.composition.submitCreateWorktree(
+                        scopeCut = product.scopeCreateCut,
+                        inputs = RelayV2CreateWorktreeInputs(
+                            project = "project-a",
+                            path = "/work/project-a",
+                            name = "new-worktree",
+                            branch = "feature/a3p",
+                            aiCommand = "codex",
+                        ),
+                    )
+                }
+                withTimeout(TIMEOUT_MS) { harness.authority.enqueueEntered.await() }
+
+                assertEquals(0, harness.authority.enqueueCommits.get())
+                assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+
+                harness.authority.releaseEnqueue.complete(Unit)
+                assertTrue(
+                    withTimeout(TIMEOUT_MS) { create.await() } is
+                        RelayV2ScopeCreateResult.Queued,
+                )
+                val entry = harness.authority.outboxState().entries.single()
+                assertEquals(PROFILE_ID, entry.profileId)
+                assertEquals(PRINCIPAL_ID, entry.principalId)
+                assertEquals(HOST_ID, entry.hostId)
+                assertEquals(HOST_EPOCH, entry.expectedHostEpoch)
+                assertEquals("dedupe-window-uuid", entry.dedupeWindowId)
+                assertEquals("create-command", entry.commandId)
+                assertEquals("scope-a", entry.scopeId)
+                assertEquals(null, entry.sessionId)
+                assertEquals(RelayV2OutboxOperation.CREATE_WORKTREE, entry.operation)
+                assertEquals(RelayV2OutboxOperation.CREATE_WORKTREE, entry.laneKey.createOperation)
+                assertEquals(null, entry.laneKey.sessionId)
+                assertEquals(
+                    RelayV2OutboxArguments.CreateWorktree(
+                        project = "project-a",
+                        path = "/work/project-a",
+                        name = "new-worktree",
+                        branch = "feature/a3p",
+                        aiCommand = "codex",
+                    ),
+                    entry.canonicalRequestArguments.value,
+                )
+                assertEquals(RelayV2OutboxStateTag.SENDING, entry.state)
+                val execute = harness.transport().awaitSentType("command.execute")
+                assertEquals("create-command", execute.stringValue("commandId"))
+                assertEquals(HOST_ID, execute.stringValue("hostId"))
+                assertEquals(HOST_EPOCH, execute.stringValue("expectedHostEpoch"))
+                assertEquals("scope-a", execute.stringValue("scopeId"))
+                assertFalse(execute.containsKey("sessionId"))
+                val payload = execute.payloadReadOnly()
+                assertEquals("dedupe-window-uuid", payload.stringValue("dedupeWindowId"))
+                assertEquals("create_worktree", payload.stringValue("operation"))
+                assertEquals(
+                    mapOf(
+                        "project" to "project-a",
+                        "path" to "/work/project-a",
+                        "name" to "new-worktree",
+                        "branch" to "feature/a3p",
+                        "aiCommand" to "codex",
+                    ),
+                    payload["arguments"],
+                )
+                assertEquals(1, harness.authority.enqueueCommits.get())
+                assertEquals(1, harness.transport().framesOfType("command.execute").size)
+                assertEquals(listOf(product), harness.composition.sessions.value)
+            } finally {
+                harness.authority.releaseEnqueue.complete(Unit)
+                harness.close()
+            }
+        }
 
     @Test
     fun `online Session kill commits fixed command once before fresh dispatch`() = runBlocking {
