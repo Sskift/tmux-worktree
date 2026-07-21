@@ -5,6 +5,9 @@ import test from "node:test";
 const adapterModule = await import(
   "../dist/relay/v2/externalContinuityAuthorityHttpsAdapter.js"
 );
+const configModule = await import(
+  "../dist/relay/v2/externalContinuityAuthorityConfig.js"
+);
 const continuity = await import("../dist/relay/v2/continuityAnchor.js");
 
 const ENDPOINT = "https://continuity.example.test/external/continuity/v1";
@@ -13,6 +16,19 @@ const NAMESPACE = "broker-credential.v1";
 const ANCHOR_ID = "anchor-broker-a";
 const SECRET = "Bearer workload-secret-never-reflect";
 const VERSION = continuity.RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION;
+const E0_BASE_CONFIG = {
+  configVersion: 1,
+  endpoint: ENDPOINT,
+  securityDomainId: SECURITY_DOMAIN,
+  authenticationMode: "mutual_tls",
+  credentialReference: "mtls-credential-a",
+  tlsTrustReference: "private-trust-a",
+  operationTimeoutMs: 250,
+  maxPendingOperations: 4,
+  namespaceBindings: [{
+    namespace: NAMESPACE, ownerBinding: "broker-owner-a", anchorId: ANCHOR_ID,
+  }],
+};
 
 function forgedPublicAdapterError(code = "ANCHOR_COMMIT_UNCERTAIN") {
   const error = new adapterModule.RelayV2ExternalContinuityHttpsAdapterError(code);
@@ -608,4 +624,263 @@ test("an own getter cannot mask pre-start abort or resolve auth and HTTPS", asyn
   assert.equal(authCalls, 0);
   assert.equal(starts, 0);
   assert.equal(ownAbortedGetterReads, 0);
+});
+
+test("closed E0 config rejects hostile shape, invalid references, duplicate bindings, and limits before resolution", () => {
+  let resolverCalls = 0;
+  let transportCalls = 0;
+  const resolved = Object.freeze({
+    authenticationHeaders: () => ({ Authorization: SECRET }),
+    transport: Object.freeze({
+      start() { transportCalls += 1; throw new Error("must not start"); },
+      discard() { transportCalls += 1; },
+    }),
+  });
+  const provider = Object.freeze({
+    resolveAttempt() { resolverCalls += 1; return resolved; },
+  });
+  const base = E0_BASE_CONFIG;
+  const accessor = { ...base };
+  Object.defineProperty(accessor, "credentialReference", {
+    enumerable: true,
+    get() { throw new Error(`accessor ${SECRET}`); },
+  });
+  const symbolKey = { ...base };
+  symbolKey[Symbol("future")] = true;
+  const invalid = [
+    { ...base, future: true },
+    accessor,
+    symbolKey,
+    new Proxy(base, {}),
+    { ...base, credentialReference: "../credential" },
+    { ...base, operationTimeoutMs: 0 },
+    { ...base, maxPendingOperations: 1_025 },
+    { ...base,
+      namespaceBindings: [base.namespaceBindings[0], {
+        namespace: NAMESPACE, ownerBinding: "other-owner", anchorId: "other-anchor",
+      }],
+    },
+    { ...base,
+      namespaceBindings: [base.namespaceBindings[0], {
+        namespace: "agent-transcript-lifecycle.v1",
+        ownerBinding: "host-a:epoch-a", anchorId: ANCHOR_ID,
+      }],
+    },
+  ];
+
+  for (const config of invalid) {
+    assert.throws(() => configModule.bindRelayV2ExternalContinuityAuthorityConfig(
+      config, provider,
+    ), { name: "TypeError" });
+  }
+  assert.equal(resolverCalls, 0);
+  assert.equal(transportCalls, 0);
+});
+
+test("valid E0 bindings are immutable Anchor options and preserve exact local and wire identity", async () => {
+  const resolverRequests = [];
+  const transportRequests = [];
+  let discards = 0;
+  let provider;
+  provider = Object.freeze({
+    resolveAttempt(request) {
+      assert.equal(this, provider);
+      assert.equal(Object.getPrototypeOf(request), null);
+      assert.equal(Object.isFrozen(request), true);
+      resolverRequests.push(request);
+      let resolved;
+      let transport;
+      transport = Object.freeze({
+        start(transportRequest) {
+          assert.equal(this, transport);
+          transportRequests.push(transportRequest);
+          const wire = JSON.parse(Buffer.from(transportRequest.body).toString("utf8"));
+          return immediateExchange(response({ body: jsonEnvelope(wire, {
+            ok: true, result: { admitted: wire.anchorId },
+          }) }).value).exchange;
+        },
+        discard() { assert.equal(this, transport); discards += 1; },
+      });
+      resolved = Object.freeze({
+        authenticationHeaders() { assert.equal(this, resolved); return { Authorization: SECRET }; },
+        transport,
+      });
+      return resolved;
+    },
+  });
+  const config = {
+    ...E0_BASE_CONFIG,
+    authenticationMode: "workload_identity",
+    credentialReference: "credential-ref-a",
+    tlsTrustReference: "trust-ref-a",
+    maxPendingOperations: 2,
+    namespaceBindings: [
+      { namespace: NAMESPACE, ownerBinding: "broker-owner-a", anchorId: ANCHOR_ID },
+      { namespace: "agent-transcript-lifecycle.v1", ownerBinding: "host-a:epoch-a",
+        anchorId: "anchor-agent-a" },
+    ],
+  };
+  const binding = configModule.bindRelayV2ExternalContinuityAuthorityConfig(config, provider);
+  assert.equal(resolverRequests.length, 0, "binding is inert");
+  assert.equal(transportRequests.length, 0, "binding creates no HTTPS attempt");
+  assert.equal(Object.getPrototypeOf(binding), null);
+  assert.equal(Object.isFrozen(binding), true);
+  assert.equal(Object.isFrozen(binding.namespaceBindings), true);
+  assert.deepEqual(Reflect.ownKeys(binding), ["namespaceBindings"]);
+
+  for (const [index, item] of binding.namespaceBindings.entries()) {
+    const options = item.continuityAnchorOptions;
+    const authority = options.authority;
+    assert.deepEqual([item.namespace, item.ownerBinding, item.anchorId], [
+      config.namespaceBindings[index].namespace,
+      config.namespaceBindings[index].ownerBinding,
+      config.namespaceBindings[index].anchorId,
+    ]);
+    for (const [value, keys] of [
+      [item, ["namespace", "ownerBinding", "anchorId", "continuityAnchorOptions"]],
+      [options, ["anchorId", "authority", "operationTimeoutMs", "maxPendingOperations"]],
+      [authority, ["read", "compareAndSwap"]],
+    ]) {
+      assert.equal(Object.getPrototypeOf(value), null);
+      assert.equal(Object.isFrozen(value), true);
+      assert.deepEqual(Reflect.ownKeys(value), keys);
+    }
+    assert.equal(item.continuityAnchorOptions.anchorId, item.anchorId);
+    assert.equal(options.operationTimeoutMs, 250);
+    assert.equal(options.maxPendingOperations, 2);
+    assert.doesNotThrow(() => new continuity.RelayV2ContinuityAnchor(options));
+    await authority.read({
+      protocolVersion: VERSION,
+      anchorId: item.anchorId,
+      signal: new AbortController().signal,
+    });
+  }
+
+  assert.equal(resolverRequests.length, 2, "each binding performs one read attempt");
+  assert.equal(transportRequests.length, 2, "each read uses one exchange");
+  assert.equal(discards, 0, "a started attempt cannot also be discarded");
+  for (const request of resolverRequests) {
+    assert.deepEqual({ ...request }, {
+      endpoint: ENDPOINT,
+      authenticationMode: "workload_identity",
+      credentialReference: "credential-ref-a",
+      tlsTrustReference: "trust-ref-a",
+    });
+  }
+  for (const request of transportRequests) {
+    assert.equal(request.endpoint, ENDPOINT);
+    assert.equal(request.headers.Authorization, SECRET);
+    const wire = JSON.parse(Buffer.from(request.body).toString("utf8"));
+    assert.equal(wire.securityDomainId, SECURITY_DOMAIN);
+    assert.ok(binding.namespaceBindings.some(
+      (item) => item.namespace === wire.namespace && item.anchorId === wire.anchorId,
+    ));
+    const encoded = JSON.stringify(wire);
+    assert.doesNotMatch(encoded, /broker-owner-a|host-a:epoch-a|workload-secret/);
+    assert.equal(Object.hasOwn(wire, "ownerBinding"), false);
+  }
+
+  const firstAuthority = binding.namespaceBindings[0].continuityAnchorOptions.authority;
+  const providerCallsBeforeBorrow = resolverRequests.length;
+  await assert.rejects(Reflect.apply(firstAuthority.read, Object.create(null), [readRequest()]),
+    (error) => error.code === "ANCHOR_UNAVAILABLE");
+  assert.equal(resolverRequests.length, providerCallsBeforeBorrow, "foreign receiver is inert");
+});
+
+test("E0 attempts reject hostile callables, discard pre-start faults, and preserve fault mapping", async () => {
+  const config = E0_BASE_CONFIG;
+  const bindAuthority = (provider) => configModule
+    .bindRelayV2ExternalContinuityAuthorityConfig(config, provider)
+    .namespaceBindings[0].continuityAnchorOptions.authority;
+
+  let proxiedResolveCalls = 0;
+  const proxiedResolve = new Proxy(() => { proxiedResolveCalls += 1; }, {});
+  assert.throws(() => bindAuthority(Object.freeze({ resolveAttempt: proxiedResolve })),
+    { name: "TypeError" });
+  assert.equal(proxiedResolveCalls, 0);
+
+  for (const [mode, operation, expectedCode] of [
+    ["invalid_headers", "read", "ANCHOR_UNAVAILABLE"],
+    ["auth_abort", "read", "ANCHOR_UNAVAILABLE"],
+    ["auth_proxy", "read", "ANCHOR_UNAVAILABLE"],
+    ["start_proxy", "read", "ANCHOR_UNAVAILABLE"],
+    ["discard_proxy", "read", "ANCHOR_UNAVAILABLE"],
+    ["transport_non_frozen", "read", "ANCHOR_UNAVAILABLE"],
+    ["transport_extra_field", "read", "ANCHOR_UNAVAILABLE"],
+    ["provider_failure", "read", "ANCHOR_UNAVAILABLE"],
+    ["transport_failure", "cas", "ANCHOR_COMMIT_UNCERTAIN"],
+  ]) {
+    const state = { resolves: 0, auths: 0, starts: 0, aborts: 0, discards: 0 };
+    const controller = new AbortController();
+    let resolved;
+    let transport;
+    function authenticationHeaders() {
+      assert.equal(this, resolved);
+      state.auths += 1;
+      if (mode === "auth_abort") controller.abort();
+      return mode === "invalid_headers"
+        ? { Authorization: `${SECRET}\r\nforged` }
+        : { Authorization: SECRET };
+    }
+    function start() {
+      assert.equal(this, transport);
+      state.starts += 1;
+      if (mode !== "transport_failure") throw new Error(`must not start ${SECRET}`);
+      return {
+        response: Promise.reject(new Error(`transport failed ${SECRET}`)),
+        abort() { state.aborts += 1; },
+      };
+    }
+    function discard() {
+      assert.equal(this, transport); state.discards += 1;
+    }
+    const transportShape = {
+      start: mode === "start_proxy" ? new Proxy(start, {}) : start,
+      discard: mode === "discard_proxy" ? new Proxy(discard, {}) : discard,
+    };
+    if (mode === "transport_extra_field") transportShape.future = true;
+    transport = mode === "transport_non_frozen"
+      ? transportShape : Object.freeze(transportShape);
+    resolved = Object.freeze({
+      authenticationHeaders: mode === "auth_proxy"
+        ? new Proxy(authenticationHeaders, {}) : authenticationHeaders,
+      transport,
+    });
+    const provider = Object.freeze({
+      resolveAttempt() {
+        state.resolves += 1;
+        if (mode === "provider_failure") throw new Error(`provider failed ${SECRET}`);
+        return resolved;
+      },
+    });
+    const authority = bindAuthority(provider);
+    assert.equal(state.resolves, 0, `${mode} remains lazy`);
+    const attempt = operation === "read"
+      ? authority.read(readRequest(controller.signal))
+      : authority.compareAndSwap(casRequest(controller.signal));
+    await assert.rejects(
+      attempt,
+      (error) => {
+        assert.equal(error.code, expectedCode, mode);
+        assert.doesNotMatch(`${error.message}\n${JSON.stringify(error)}`, /workload-secret/);
+        return true;
+      },
+    );
+    assert.equal(state.resolves, 1, mode);
+    assert.equal(
+      state.auths,
+      ["invalid_headers", "auth_abort", "transport_failure"].includes(mode) ? 1 : 0,
+      mode,
+    );
+    assert.equal(state.starts, mode === "transport_failure" ? 1 : 0, mode);
+    assert.equal(state.aborts, mode === "transport_failure" ? 1 : 0, mode);
+    assert.equal(
+      state.discards,
+      [
+        "invalid_headers", "auth_abort", "auth_proxy", "start_proxy",
+        "transport_non_frozen", "transport_extra_field",
+      ].includes(mode) ? 1 : 0,
+      `${mode} converges once through a valid discard`,
+    );
+  }
 });

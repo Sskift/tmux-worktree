@@ -41,6 +41,7 @@ export default defineConfig({
     "src/relay/v2/auth.ts",
     "src/relay/v2/continuityAnchor.ts",
     "src/relay/v2/externalContinuityAuthorityHttpsAdapter.ts",
+    "src/relay/v2/externalContinuityAuthorityConfig.ts",
     "src/relay/v2/brokerCredentialStateStore.ts",
     "src/relay/v2/brokerCredentialStateStoreNativeTarget.ts",
     "src/relay/v2/brokerCredentialStateStoreLoader.ts",

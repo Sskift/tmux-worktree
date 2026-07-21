@@ -18,6 +18,7 @@ import {
   type RelayV2SingleExchangeNodeHttpsRequest,
   type RelayV2SingleExchangeHttpsTransport,
   type RelayV2SingleExchangeHttpsTransportExchange,
+  type RelayV2SingleExchangeHttpsOutcome,
   type RelayV2SingleExchangeHttpsTransportRequest,
   type RelayV2SingleExchangeHttpsTransportResponse,
 } from "./singleExchangeHttpsTransport.js";
@@ -104,6 +105,8 @@ export interface RelayV2ExternalContinuityHttpsAdapterOptions {
    * never accepts credential material in its endpoint or persisted options.
    */
   authenticationHeaders(): Readonly<Record<string, string>>;
+  /** Releases an auth-resolved attempt that did not reach transport.start(). */
+  discardUnstartedAttempt?(): void;
   /** Isolated test seam; production composition is intentionally absent. */
   transport?: RelayV2ExternalContinuityHttpsTransport;
 }
@@ -402,6 +405,7 @@ implements RelayV2MonotonicCasAuthority {
   private readonly namespace: RelayV2ExternalContinuityNamespace;
   private readonly anchorId: string;
   private readonly authenticationHeaders: () => Readonly<Record<string, string>>;
+  private readonly discardUnstartedAttempt: () => void;
   private readonly transport: RelayV2ExternalContinuityHttpsTransport;
 
   constructor(options: RelayV2ExternalContinuityHttpsAdapterOptions) {
@@ -409,6 +413,8 @@ implements RelayV2MonotonicCasAuthority {
       !isRecord(options)
       || !hasExactKeys(options, [
         "endpoint", "securityDomainId", "namespace", "anchorId", "authenticationHeaders",
+        ...(Object.hasOwn(options, "discardUnstartedAttempt")
+          ? ["discardUnstartedAttempt"] : []),
         ...(Object.hasOwn(options, "transport") ? ["transport"] : []),
       ])
       || !isIdentifier(options.securityDomainId)
@@ -416,6 +422,8 @@ implements RelayV2MonotonicCasAuthority {
       || !(["broker-credential.v1", "agent-transcript-lifecycle.v1"] as const)
         .includes(options.namespace as RelayV2ExternalContinuityNamespace)
       || typeof options.authenticationHeaders !== "function"
+      || (options.discardUnstartedAttempt !== undefined
+        && typeof options.discardUnstartedAttempt !== "function")
       || (options.transport !== undefined
         && (!isRecord(options.transport) || typeof options.transport.start !== "function"))
     ) {
@@ -426,6 +434,7 @@ implements RelayV2MonotonicCasAuthority {
     this.namespace = options.namespace;
     this.anchorId = options.anchorId;
     this.authenticationHeaders = options.authenticationHeaders;
+    this.discardUnstartedAttempt = options.discardUnstartedAttempt ?? (() => {});
     this.transport = options.transport ?? createRelayV2ExternalContinuityNodeHttpsTransport();
   }
 
@@ -466,6 +475,7 @@ implements RelayV2MonotonicCasAuthority {
     const requestOperationId = operationId();
     let body: Uint8Array;
     let headers: Readonly<Record<string, string>>;
+    let authenticationAttempted = false;
     try {
       body = encodeRequestBody({
         contractVersion: CONTRACT_VERSION,
@@ -476,31 +486,53 @@ implements RelayV2MonotonicCasAuthority {
         operation,
         payload,
       });
+      authenticationAttempted = true;
       headers = requestHeaders(body.byteLength, this.authenticationHeaders);
     } catch {
+      if (authenticationAttempted) this.discardUnstartedAttemptSafely();
       throw mappedFailure(operation);
     }
     if (readRelayV2SingleExchangeAbortState(signal) !== false) {
+      this.discardUnstartedAttemptSafely();
       throw mappedFailure(operation);
     }
 
-    const outcome = await performRelayV2SingleExchangeHttps({
-      transport: this.transport,
-      request: {
-        endpoint: this.endpoint,
-        method: "POST",
-        headers,
-        body,
+    let started = false;
+    const trackedTransport: RelayV2ExternalContinuityHttpsTransport = {
+      start: (request) => {
+        started = true;
+        return this.transport.start(request);
       },
-      signal,
-      consume: async (received) => {
-        const contentLength = acceptedResponseHeaders(received);
-        if (contentLength === undefined) throw mappedFailure(operation);
-        const bytes = await readBoundedBody(received, contentLength);
-        return decodeResponseEnvelope(bytes, operation, requestOperationId);
-      },
-    });
+    };
+    let outcomePromise: Promise<RelayV2SingleExchangeHttpsOutcome<unknown>>;
+    try {
+      outcomePromise = performRelayV2SingleExchangeHttps({
+        transport: trackedTransport,
+        request: {
+          endpoint: this.endpoint,
+          method: "POST",
+          headers,
+          body,
+        },
+        signal,
+        consume: async (received) => {
+          const contentLength = acceptedResponseHeaders(received);
+          if (contentLength === undefined) throw mappedFailure(operation);
+          const bytes = await readBoundedBody(received, contentLength);
+          return decodeResponseEnvelope(bytes, operation, requestOperationId);
+        },
+      });
+    } catch {
+      this.discardUnstartedAttemptSafely();
+      throw mappedFailure(operation);
+    }
+    if (!started) this.discardUnstartedAttemptSafely();
+    const outcome = await outcomePromise;
     if (outcome.kind === "completed") return outcome.value;
     throw mappedFailure(operation);
+  }
+
+  private discardUnstartedAttemptSafely(): void {
+    try { this.discardUnstartedAttempt(); } catch {}
   }
 }
