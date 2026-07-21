@@ -71,6 +71,7 @@ export default defineConfig({
     "src/relay/v2/brokerHostWssUpgradeAuthority.ts",
     "src/relay/v2/brokerHostWssNodeNoServerAdapter.ts",
     "src/relay/v2/brokerHostWssListenerFreeComposition.ts",
+    "src/relay/v2/brokerHostWssNodeUpgradeRequestAdapter.ts",
     "src/relay/v2/brokerTransportCloseCoordinator.ts",
     "src/relay/v2/brokerAuthorizationExpiryDeadlineOwner.ts",
     "src/relay/v2/carrierPump.ts",
