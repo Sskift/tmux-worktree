@@ -5,11 +5,13 @@
 //! the Host-specific process registry, traditional record-lock descriptor,
 //! fixed claim journal, and exactly-once final close chain. All filesystem
 //! admission operations are supplied through [`DescriptorRelativePlatform`].
-//! The additive [`CredentialMutationPlatform`] subtrait enables the common-only
-//! read/CAS mutation owner without changing existing target adapters. No path,
-//! HOME, environment, broker N0 type, real syscall mutation adapter, N-API,
-//! Vault, Authority, recovery, loader, readiness, or production composition
-//! exists here.
+//! This crate implements the common read/CAS mutation owner through the
+//! additive [`CredentialMutationPlatform`] subtrait; the companion Darwin and
+//! Linux crates implement stateless descriptor-relative syscall adapters for
+//! that seam. There is still no trusted production factory, durability
+//! qualification, N-API, Vault or Authority injection, recovery, loader,
+//! readiness, capability advertisement, or production composition. No path,
+//! HOME, environment, or broker N0 type is accepted here.
 
 mod claim_journal;
 mod credential_mutation;

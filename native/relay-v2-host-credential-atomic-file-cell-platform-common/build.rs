@@ -35,6 +35,16 @@ fn relative_component<'a>(value: &'a Value, label: &str) -> &'a str {
     component
 }
 
+fn exact_string_array(value: &Value, label: &str, expected: &[&str]) {
+    let actual = value
+        .as_array()
+        .unwrap_or_else(|| panic!("host credential cell manifest {label} is not an array"));
+    assert_eq!(actual.len(), expected.len(), "{label} length changed");
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(string(actual, label), *expected, "{label}[{index}] changed");
+    }
+}
+
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let contract_dir =
@@ -56,9 +66,34 @@ fn main() {
     );
     assert_eq!(
         unsigned(member(&manifest, "contractVersion"), "contractVersion"),
-        4
+        5
     );
     assert_eq!(member(&manifest, "status"), "frozen");
+    assert_eq!(member(&manifest, "productionWired"), false);
+    assert_eq!(member(&manifest, "productionCapabilityEffect"), "none");
+    let native_module_authority = member(&manifest, "nativeModuleAuthority");
+    assert_eq!(
+        member(native_module_authority, "pathOrDescriptorArgumentInAbi"),
+        false
+    );
+    assert_eq!(
+        member(
+            native_module_authority,
+            "homePathEnvironmentOrGlobalLookupAllowed"
+        ),
+        false
+    );
+    assert_eq!(
+        member(
+            native_module_authority,
+            "factoryLoaderOrPathImplementedIn4b1"
+        ),
+        false
+    );
+    assert_eq!(
+        member(native_module_authority, "platformAdmissionProductionWired"),
+        false
+    );
     assert_eq!(
         unsigned(
             member(&manifest, "fixtureFormatVersion"),
@@ -114,8 +149,16 @@ fn main() {
             .as_array()
             .expect("qualifiedRecords array")
             .is_empty(),
-        "contract revision 4 must remain deny-by-default"
+        "contract revision 5 must remain deny-by-default"
     );
+    let target_facts = member(platform, "targetFacts");
+    for target in ["darwin", "linux"] {
+        let facts = member(target_facts, target);
+        assert_eq!(member(facts, "traitImplemented"), true);
+        assert_eq!(member(facts, "fullAdmissionValidated"), false);
+        assert_eq!(member(facts, "durabilityQualified"), false);
+        assert_eq!(member(facts, "productionWired"), false);
+    }
 
     let mutation_manifest = member(&manifest, "credentialMutation");
     assert_eq!(
@@ -136,10 +179,13 @@ fn main() {
         member(mutation_manifest, "fixture"),
         "credential-mutation-cases-v1.json"
     );
-    assert_eq!(member(mutation_manifest, "status"), "platform-common-only");
+    assert_eq!(
+        member(mutation_manifest, "status"),
+        "platform-adapters-implemented-not-qualified-or-production-wired"
+    );
     assert_eq!(
         member(mutation_manifest, "implementation"),
-        "platform-common-only"
+        "platform-common-darwin-linux"
     );
     assert_eq!(
         unsigned(
@@ -165,18 +211,45 @@ fn main() {
     );
     assert_eq!(
         member(mutation_manifest, "implementedInDarwinAdapter"),
-        false
+        true
     );
-    assert_eq!(
-        member(mutation_manifest, "implementedInLinuxAdapter"),
-        false
-    );
+    assert_eq!(member(mutation_manifest, "implementedInLinuxAdapter"), true);
     assert_eq!(member(mutation_manifest, "fullAdmissionValidated"), false);
     assert_eq!(member(mutation_manifest, "durabilityQualified"), false);
     assert_eq!(member(mutation_manifest, "productionWired"), false);
     assert_eq!(
         member(mutation_manifest, "productionCapabilityEffect"),
         "none"
+    );
+    let mutation_recovery = member(mutation_manifest, "recovery");
+    assert_eq!(member(mutation_recovery, "crashRecoveryImplemented"), false);
+    assert_eq!(
+        member(mutation_recovery, "enumerationCleanupAllowed"),
+        false
+    );
+    assert_eq!(
+        member(mutation_recovery, "claimJournalMutationStateAllowed"),
+        false
+    );
+    assert_eq!(
+        member(mutation_recovery, "claimJournalTempNameOrRevisionAllowed"),
+        false
+    );
+    exact_string_array(
+        member(&manifest, "notImplemented"),
+        "notImplemented",
+        &[
+            "trusted-production-factory",
+            "darwin-x86_64-validation-evidence",
+            "orphan-cleanup-or-recovery",
+            "production-durability-qualification",
+            "continuity",
+            "napi-binding",
+            "loader-or-packaging",
+            "vault-injection",
+            "relay-host-production-composition",
+            "capability-advertisement",
+        ],
     );
     let mutation_maximum_bytes = unsigned(
         member(mutation_manifest, "maximumCredentialBytes"),
@@ -289,7 +362,7 @@ fn main() {
     );
     assert_eq!(
         member(&mutation_fixture, "implementationStatus"),
-        "platform-common-only"
+        "platform-adapters-implemented-not-qualified-or-production-wired"
     );
     let mutation_constants = member(&mutation_fixture, "constants");
     assert_eq!(
@@ -372,7 +445,7 @@ fn main() {
             .as_array()
             .expect("credential mutation qualifiedRecords array")
             .is_empty(),
-        "contract revision 4 credential mutation must remain deny-by-default"
+        "contract revision 5 credential mutation must remain deny-by-default"
     );
     assert_eq!(
         member(mutation_qualification, "productionProofConstructible"),
@@ -390,7 +463,7 @@ fn main() {
     );
 
     let mut generated = String::new();
-    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 4;").unwrap();
+    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 5;").unwrap();
     writeln!(
         generated,
         "pub(super) const RESOURCE_CONTRACT_VERSION: u32 = 1;"

@@ -21,14 +21,15 @@ primitive remain descriptor-relative; the adapter only validates dynamic temp
 names against the contract-derived prefix and lowercase-hex length supplied by
 platform-common.
 
-This local adapter seam does not change the frozen shared contract's
-`implementedInDarwinAdapter=false`, empty qualification records, or
-`fullAdmissionValidated=false`. It does not construct
-`DurabilityQualification`, open the complete admission owner, implement orphan
-recovery, or connect N-API, a loader, Vault, Authority, `relay-host`, production
-composition, readiness, or capability advertisement. It remains default-off,
-has no dependency on the broker credential native crates, and provides no
-fallback.
+The frozen shared contract records this mutation seam as implemented with
+`implementedInDarwinAdapter=true`. Qualification records remain empty, while
+`fullAdmissionValidated=false`, `durabilityQualified=false`, and
+`productionWired=false`. This crate does not construct a trusted production
+factory or `DurabilityQualification`, open the complete admission owner,
+implement orphan recovery, or connect N-API, a loader, Vault, Authority,
+`relay-host`, production composition, readiness, or capability advertisement.
+It remains default-off, has no dependency on the broker credential native
+crates, and provides no fallback.
 
 The current native validation scope is Darwin arm64 only. It does not establish
 Darwin x86_64 support or filesystem/power-loss durability qualification.

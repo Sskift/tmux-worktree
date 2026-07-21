@@ -1,6 +1,6 @@
 {
   "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
-  "contractVersion": 4,
+  "contractVersion": 5,
   "fixtureFormatVersion": 1,
   "status": "frozen",
   "scope": "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -322,8 +322,8 @@
     "contractVersion": 1,
     "fixtureFormatVersion": 1,
     "fixture": "credential-mutation-cases-v1.json",
-    "status": "platform-common-only",
-    "implementation": "platform-common-only",
+    "status": "platform-adapters-implemented-not-qualified-or-production-wired",
+    "implementation": "platform-common-darwin-linux",
     "owner": "exact-live-AdmissionOwner",
     "platformResourceContractVersion": 1,
     "claimJournalFormatVersion": 1,
@@ -503,8 +503,8 @@
       "claimJournalTempNameOrRevisionAllowed": false
     },
     "implementedInPlatformCommon": true,
-    "implementedInDarwinAdapter": false,
-    "implementedInLinuxAdapter": false,
+    "implementedInDarwinAdapter": true,
+    "implementedInLinuxAdapter": true,
     "fullAdmissionValidated": false,
     "durabilityQualified": false,
     "productionWired": false,
@@ -513,7 +513,6 @@
   "notImplemented": [
     "trusted-production-factory",
     "darwin-x86_64-validation-evidence",
-    "credential-cell-read-cas-temp-or-rename",
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",
     "continuity",

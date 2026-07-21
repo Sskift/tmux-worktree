@@ -127,7 +127,7 @@ function assertCaseTable(entries, fields, expected, label) {
 
 test("Host credential native ABI manifest and every machine case stay closed", async () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-host-credential-atomic-file-cell");
-  assert.equal(manifest.contractVersion, 4);
+  assert.equal(manifest.contractVersion, 5);
   assert.equal(
     manifest.scope,
     "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -215,7 +215,6 @@ test("Host credential native ABI manifest and every machine case stay closed", a
   assert.deepEqual(manifest.notImplemented, [
     "trusted-production-factory",
     "darwin-x86_64-validation-evidence",
-    "credential-cell-read-cas-temp-or-rename",
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",
     "continuity",
@@ -270,8 +269,8 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     contractVersion: 1,
     fixtureFormatVersion: 1,
     fixture: "credential-mutation-cases-v1.json",
-    status: "platform-common-only",
-    implementation: "platform-common-only",
+    status: "platform-adapters-implemented-not-qualified-or-production-wired",
+    implementation: "platform-common-darwin-linux",
     owner: "exact-live-AdmissionOwner",
     platformResourceContractVersion: 1,
     claimJournalFormatVersion: 1,
@@ -506,8 +505,8 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     productionCapabilityEffect: mutation.productionCapabilityEffect,
   }, {
     implementedInPlatformCommon: true,
-    implementedInDarwinAdapter: false,
-    implementedInLinuxAdapter: false,
+    implementedInDarwinAdapter: true,
+    implementedInLinuxAdapter: true,
     fullAdmissionValidated: false,
     durabilityQualified: false,
     productionWired: false,
@@ -543,7 +542,8 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     credentialMutationContractVersion: 1,
     platformResourceContractVersion: 1,
     claimJournalFormatVersion: 1,
-    implementationStatus: "platform-common-only",
+    implementationStatus:
+      "platform-adapters-implemented-not-qualified-or-production-wired",
   });
   assert.deepEqual(credentialMutationFixture.constants, {
     credentialMaximumBytes: 65_536,
