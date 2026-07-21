@@ -357,6 +357,96 @@ test("one Core activates one credential authority before publishing the shared r
     "authority:closed",
   ]);
 
+  let readyLossFence;
+  let readyLossAuthorityCloseCalls = 0;
+  const readyLossActivation = await pumpModule
+    .activateRelayV2BrokerSharedProducerRuntimeComposition({
+      hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+      hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
+      brokerOptions: { now: () => NOW_MS },
+      clientSocketScheduler: new ManualScheduler(),
+      authorizationExpiryScheduleAt: () => () => {},
+      async openCredentialAuthority({ liveAuthorizationFence }) {
+        readyLossFence = liveAuthorizationFence;
+        return {
+          authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+          async handle() {
+            throw new Error("ready-loss authority must remain unreachable");
+          },
+          async close() {
+            readyLossAuthorityCloseCalls += 1;
+          },
+        };
+      },
+    });
+  const readyLossShared = readyLossActivation.sharedRuntime;
+  const stagedReceipt = readyLossShared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext("host", "ready-loss-staged-host"),
+  });
+  assert.equal(stagedReceipt.outcome, "accept");
+  const delayedClaim = readyLossShared.hostWssRuntime.claimPreparedHostWss({
+    receipt: stagedReceipt.receipt,
+  });
+  const unclaimedReceipt = readyLossShared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext("host", "ready-loss-unclaimed-host"),
+  });
+  assert.equal(unclaimedReceipt.outcome, "accept");
+
+  readyLossFence.failClosed();
+  let hostileReadyLossPrepareReads = 0;
+  const hostileReadyLossPrepare = new Proxy({}, {
+    ownKeys() {
+      hostileReadyLossPrepareReads += 1;
+      throw new Error("ready-loss Host prepare must stay untouched");
+    },
+    getOwnPropertyDescriptor() {
+      hostileReadyLossPrepareReads += 1;
+      throw new Error("ready-loss Host prepare descriptor must stay untouched");
+    },
+    get() {
+      hostileReadyLossPrepareReads += 1;
+      throw new Error("ready-loss Host prepare property must stay untouched");
+    },
+  });
+  const readyLossPrepare = readyLossShared.hostWssRuntime.prepareHostWss(
+    hostileReadyLossPrepare,
+  );
+  assert.deepEqual(readyLossPrepare, { outcome: "reject", status: 503 });
+  assert.equal(hostileReadyLossPrepareReads, 0);
+  assert.throws(
+    () => readyLossShared.hostWssRuntime.claimPreparedHostWss({
+      receipt: unclaimedReceipt.receipt,
+    }),
+    /admission is closed/,
+  );
+
+  let hostileDelayedSocketReads = 0;
+  const hostileDelayedSocket = new Proxy({}, {
+    ownKeys() {
+      hostileDelayedSocketReads += 1;
+      throw new Error("ready-loss delayed socket must stay untouched");
+    },
+    getOwnPropertyDescriptor() {
+      hostileDelayedSocketReads += 1;
+      throw new Error("ready-loss delayed socket descriptor must stay untouched");
+    },
+    getPrototypeOf() {
+      hostileDelayedSocketReads += 1;
+      throw new Error("ready-loss delayed socket prototype must stay untouched");
+    },
+    get() {
+      hostileDelayedSocketReads += 1;
+      throw new Error("ready-loss delayed socket property must stay untouched");
+    },
+  });
+  assert.throws(
+    () => delayedClaim.attach({ alreadyUpgradedSocket: hostileDelayedSocket }),
+    /admission claim/,
+  );
+  assert.equal(hostileDelayedSocketReads, 0);
+  await readyLossShared.closeAndDrain();
+  assert.equal(readyLossAuthorityCloseCalls, 1);
+
   let failClosedAuthorityCloseCalls = 0;
   let failClosedFence;
   const failClosedActivation = pumpModule.activateRelayV2BrokerSharedProducerRuntimeComposition({

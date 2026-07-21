@@ -5,6 +5,7 @@ import {
   type RelayV2BrokerHostUpgradeDispatchResult,
   type RelayV2BrokerHostUpgradeMetadata,
   type RelayV2BrokerHostUpgradeVerifyPort,
+  type RelayV2BrokerHostWssPreflightPort,
 } from "./brokerHostUpgradeDispatch.js";
 import {
   createRelayV2BrokerHostWssNodeNoServerAdapter,
@@ -20,14 +21,23 @@ import {
 import type {
   RelayV2BrokerHostWssConnectionHandle,
 } from "./brokerHostWssRuntimeComposition.js";
+import type {
+  RelayV2BrokerActivatedCredentialAuthority,
+} from "./brokerClientWssRuntimeComposition.js";
 import {
+  activateRelayV2BrokerSharedProducerRuntimeComposition,
   createRelayV2BrokerSharedProducerRuntimeComposition,
   type RelayV2BrokerSharedProducerRuntimeComposition,
+  type RelayV2BrokerSharedProducerRuntimeActivationOptions,
   type RelayV2BrokerSharedProducerRuntimeCompositionOptions,
 } from "./carrierPump.js";
 
-const FACTORY_KEYS = Object.freeze([
+const RAW_FACTORY_KEYS = Object.freeze([
   "verifyV2AccessToken",
+  "sharedRuntimeOptions",
+] as const);
+const CREDENTIAL_ACTIVATED_FACTORY_KEYS = Object.freeze([
+  "openCredentialAuthority",
   "sharedRuntimeOptions",
 ] as const);
 const UPGRADE_KEYS = Object.freeze([
@@ -57,6 +67,28 @@ export type RelayV2BrokerHostWssListenerFreeSharedRuntimeOptions = Readonly<Pick
 export interface RelayV2BrokerHostWssListenerFreeCompositionOptions {
   readonly verifyV2AccessToken: RelayV2BrokerHostUpgradeVerifyPort;
   readonly sharedRuntimeOptions: RelayV2BrokerHostWssListenerFreeSharedRuntimeOptions;
+}
+
+export type RelayV2BrokerHostWssListenerFreeCredentialAuthority =
+  RelayV2BrokerActivatedCredentialAuthority & Readonly<{
+    authorizeAccessToken: RelayV2BrokerHostUpgradeVerifyPort;
+  }>;
+
+export type RelayV2BrokerHostWssListenerFreeCredentialSharedRuntimeOptions =
+  Readonly<Pick<
+    RelayV2BrokerSharedProducerRuntimeActivationOptions<
+      RelayV2BrokerHostWssListenerFreeCredentialAuthority
+    >,
+    (typeof SHARED_RUNTIME_OPTION_KEYS)[number]
+  >>;
+
+export interface RelayV2BrokerHostWssListenerFreeCredentialActivationOptions {
+  readonly openCredentialAuthority:
+    RelayV2BrokerSharedProducerRuntimeActivationOptions<
+      RelayV2BrokerHostWssListenerFreeCredentialAuthority
+    >["openCredentialAuthority"];
+  readonly sharedRuntimeOptions:
+    RelayV2BrokerHostWssListenerFreeCredentialSharedRuntimeOptions;
 }
 
 export interface RelayV2BrokerHostWssListenerFreeUpgradeInput {
@@ -147,6 +179,34 @@ function captureSharedRuntimeOptions(
   }
 }
 
+type CapturedDataMethod = Readonly<{
+  receiver: object;
+  method: Function;
+}>;
+
+function captureDataMethod(value: unknown, name: string): CapturedDataMethod | null {
+  if (value === null || typeof value !== "object" || rejectedProxy(value)) return null;
+  let owner: object | null = value;
+  try {
+    while (owner !== null) {
+      if (rejectedProxy(owner)) return null;
+      const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+      if (descriptor) {
+        if (
+          !Object.hasOwn(descriptor, "value")
+          || typeof descriptor.value !== "function"
+          || rejectedProxy(descriptor.value)
+        ) return null;
+        return Object.freeze({ receiver: value, method: descriptor.value });
+      }
+      owner = Object.getPrototypeOf(owner);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 async function settleCloseStep(
   step: () => Promise<void>,
   failures: unknown[],
@@ -158,24 +218,24 @@ async function settleCloseStep(
   }
 }
 
-/**
- * Default-off deep module for the complete listener-free Host Upgrade loop.
- * Receipt, socket brand, native port, dispatch, and shared runtime stay lexical.
- */
-export async function createRelayV2BrokerHostWssListenerFreeComposition(
-  options: RelayV2BrokerHostWssListenerFreeCompositionOptions,
-): Promise<RelayV2BrokerHostWssListenerFreeComposition> {
-  const capturedFactory = captureExactDataRecord(options, FACTORY_KEYS);
-  const verifyV2AccessToken = capturedFactory?.verifyV2AccessToken;
-  const sharedRuntimeOptions = captureSharedRuntimeOptions(
-    capturedFactory?.sharedRuntimeOptions,
-  );
-  if (
-    typeof verifyV2AccessToken !== "function"
-    || rejectedProxy(verifyV2AccessToken)
-    || !sharedRuntimeOptions
-  ) throw failure();
+type RelayV2BrokerHostWssListenerFreeOpenedRuntime = Readonly<{
+  sharedRuntime: RelayV2BrokerSharedProducerRuntimeComposition;
+  verifyV2AccessToken: RelayV2BrokerHostUpgradeVerifyPort;
+  prepareHostWss: RelayV2BrokerHostWssPreflightPort;
+}>;
 
+type RelayV2BrokerHostWssListenerFreeRuntimeOpener = (
+  authority: RelayV2BrokerHostWssUpgradeAuthority,
+) => Promise<RelayV2BrokerHostWssListenerFreeOpenedRuntime>;
+
+/**
+ * File-private common owner for both raw and credential-activated entries.
+ * Receipt, socket brand, native port, dispatch, and shared runtime never cross
+ * the two-method public facade.
+ */
+async function openRelayV2BrokerHostWssListenerFreeComposition(
+  openRuntime: RelayV2BrokerHostWssListenerFreeRuntimeOpener,
+): Promise<RelayV2BrokerHostWssListenerFreeComposition> {
   let adapter: RelayV2BrokerHostWssNodeNoServerAdapter | null = null;
   let authority: RelayV2BrokerHostWssUpgradeAuthority | null = null;
   let sharedRuntime: RelayV2BrokerSharedProducerRuntimeComposition | null = null;
@@ -190,14 +250,11 @@ export async function createRelayV2BrokerHostWssListenerFreeComposition(
         return sharedRuntime.hostWssRuntime.claimPreparedHostWss(input);
       },
     });
-    sharedRuntime = createRelayV2BrokerSharedProducerRuntimeComposition({
-      ...sharedRuntimeOptions,
-      hostWssTrustedSocketPrototype: authority.trustedSocketPrototype,
-      hostWssTrustedSocketBrand: authority.trustedSocketBrand,
-    });
+    const openedRuntime = await openRuntime(authority);
+    sharedRuntime = openedRuntime.sharedRuntime;
     const dispatch = new RelayV2BrokerHostUpgradeDispatchOwner({
-      verifyV2AccessToken,
-      prepareHostWss: sharedRuntime.hostWssRuntime.prepareHostWss,
+      verifyV2AccessToken: openedRuntime.verifyV2AccessToken,
+      prepareHostWss: openedRuntime.prepareHostWss,
     });
 
     let lifecycle: "open" | "closing" | "closed" = "open";
@@ -295,13 +352,111 @@ export async function createRelayV2BrokerHostWssListenerFreeComposition(
     return composition;
   } catch {
     const failures: unknown[] = [];
-    if (authority) {
-      await settleCloseStep(() => authority!.handoff.closeAndDrain(), failures);
-    }
     if (sharedRuntime) {
       await settleCloseStep(() => sharedRuntime!.closeAndDrain(), failures);
+    }
+    if (authority) {
+      await settleCloseStep(() => authority!.handoff.closeAndDrain(), failures);
     }
     if (adapter) await settleCloseStep(() => adapter!.closeAndDrain(), failures);
     throw failure();
   }
+}
+
+/**
+ * Default-off raw-verifier entry retained for isolated dispatch foundations.
+ */
+export async function createRelayV2BrokerHostWssListenerFreeComposition(
+  options: RelayV2BrokerHostWssListenerFreeCompositionOptions,
+): Promise<RelayV2BrokerHostWssListenerFreeComposition> {
+  const capturedFactory = captureExactDataRecord(options, RAW_FACTORY_KEYS);
+  const verifyV2AccessToken = capturedFactory?.verifyV2AccessToken;
+  const sharedRuntimeOptions = captureSharedRuntimeOptions(
+    capturedFactory?.sharedRuntimeOptions,
+  );
+  if (
+    typeof verifyV2AccessToken !== "function"
+    || rejectedProxy(verifyV2AccessToken)
+    || !sharedRuntimeOptions
+  ) throw failure();
+
+  return openRelayV2BrokerHostWssListenerFreeComposition(async (authority) => {
+    const sharedRuntime = createRelayV2BrokerSharedProducerRuntimeComposition({
+      ...sharedRuntimeOptions,
+      hostWssTrustedSocketPrototype: authority.trustedSocketPrototype,
+      hostWssTrustedSocketBrand: authority.trustedSocketBrand,
+    });
+    return Object.freeze({
+      sharedRuntime,
+      verifyV2AccessToken: verifyV2AccessToken as RelayV2BrokerHostUpgradeVerifyPort,
+      prepareHostWss: sharedRuntime.hostWssRuntime.prepareHostWss,
+    });
+  });
+}
+
+/**
+ * Default-off credential-activated entry. The opener receives only the exact
+ * Core live fence; its returned authority supplies both Core auth-control and
+ * the Host Upgrade verifier, and remains owned by the shared runtime close.
+ */
+export async function activateRelayV2BrokerHostWssListenerFreeComposition(
+  options: RelayV2BrokerHostWssListenerFreeCredentialActivationOptions,
+): Promise<RelayV2BrokerHostWssListenerFreeComposition> {
+  const capturedFactory = captureExactDataRecord(
+    options,
+    CREDENTIAL_ACTIVATED_FACTORY_KEYS,
+  );
+  const openCredentialAuthority = capturedFactory?.openCredentialAuthority;
+  const sharedRuntimeOptions = captureSharedRuntimeOptions(
+    capturedFactory?.sharedRuntimeOptions,
+  );
+  if (
+    typeof openCredentialAuthority !== "function"
+    || rejectedProxy(openCredentialAuthority)
+    || !sharedRuntimeOptions
+  ) throw failure();
+
+  return openRelayV2BrokerHostWssListenerFreeComposition(async (authority) => {
+    let authorizer: CapturedDataMethod | null = null;
+    const activation = await activateRelayV2BrokerSharedProducerRuntimeComposition<
+      RelayV2BrokerHostWssListenerFreeCredentialAuthority
+    >({
+      ...(sharedRuntimeOptions as
+        RelayV2BrokerHostWssListenerFreeCredentialSharedRuntimeOptions),
+      hostWssTrustedSocketPrototype: authority.trustedSocketPrototype,
+      hostWssTrustedSocketBrand: authority.trustedSocketBrand,
+      async openCredentialAuthority(input) {
+        const opened = await Reflect.apply(openCredentialAuthority, undefined, [
+          input,
+        ]) as RelayV2BrokerHostWssListenerFreeCredentialAuthority;
+        authorizer = captureDataMethod(opened, "authorizeAccessToken");
+        return opened;
+      },
+    });
+
+    if (!authorizer) {
+      try {
+        await activation.sharedRuntime.closeAndDrain();
+      } catch {
+        // The outer owner still drains B7h and the noServer adapter.
+      }
+      throw failure();
+    }
+    const capturedAuthorizer = authorizer;
+    const verifyV2AccessToken: RelayV2BrokerHostUpgradeVerifyPort = (
+      token,
+      expectedRole,
+    ) => {
+      if (expectedRole !== "host") throw failure();
+      return Reflect.apply(capturedAuthorizer.method, capturedAuthorizer.receiver, [
+        token,
+        "host",
+      ]) as ReturnType<RelayV2BrokerHostUpgradeVerifyPort>;
+    };
+    return Object.freeze({
+      sharedRuntime: activation.sharedRuntime,
+      verifyV2AccessToken,
+      prepareHostWss: activation.sharedRuntime.hostWssRuntime.prepareHostWss,
+    });
+  });
 }

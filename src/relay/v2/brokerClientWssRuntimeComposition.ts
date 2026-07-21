@@ -1050,6 +1050,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
         ?? defaultAuthorizationExpiryScheduleAt,
     });
     this.hostWssOwnerBinding = Object.freeze({
+      credentialAdmissionOpen: (): boolean => this.credentialAdmissionOpen(),
       createSession: (input: Readonly<{
         producerPort: RelayV2BrokerProducerPort;
         close(code: number, reason: string): unknown;
@@ -1119,12 +1120,16 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     return this.broker.liveAuthorizationFencePort;
   }
 
+  private credentialAdmissionOpen(): boolean {
+    return this.broker.inspectLiveAuthCompositionLatch() === "open"
+      && this.broker.outputReadyCompositionState === "open";
+  }
+
   credentialActivationPublishable(): boolean {
     return this.clientAdmissionOpen
       && this.clientEffectsOpen
       && this.closeDrain === null
-      && this.broker.inspectLiveAuthCompositionLatch() === "open"
-      && this.broker.outputReadyCompositionState === "open";
+      && this.credentialAdmissionOpen();
   }
 
   sealClientAdmission(): void {

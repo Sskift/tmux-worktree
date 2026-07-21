@@ -106,6 +106,7 @@ interface RelayV2BrokerHostWssOwnerSession {
 
 /** Type-only binding; the live instance never crosses the safe facade claim. */
 export interface RelayV2BrokerHostWssRuntimeOwnerBinding {
+  credentialAdmissionOpen(): boolean;
   createSession(input: Readonly<{
     producerPort: RelayV2BrokerProducerPort;
     close(code: number, reason: string): unknown;
@@ -870,13 +871,23 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     );
   }
 
+  private credentialAdmissionOpen(): boolean {
+    try {
+      return this.ownerBinding.credentialAdmissionOpen() === true;
+    } catch {
+      return false;
+    }
+  }
+
   prepareHostWss(input: Readonly<{
     trustedAuthContext: RelayV2BrokerConnectionAuthorization;
   }>): RelayV2BrokerHostWssPrepareResult {
-    if (!this.admissionOpen) return Object.freeze({ outcome: "reject", status: 503 });
+    if (!this.admissionOpen || !this.credentialAdmissionOpen()) {
+      return Object.freeze({ outcome: "reject", status: 503 });
+    }
     const values = ownDataValues(input, PREPARE_KEYS);
     const authContext = values ? captureAuthorization(values.trustedAuthContext) : null;
-    if (!authContext || !this.admissionOpen) {
+    if (!authContext || !this.admissionOpen || !this.credentialAdmissionOpen()) {
       return Object.freeze({ outcome: "reject", status: 503 });
     }
     const receipt = Object.freeze(Object.create(null)) as RelayV2BrokerHostWssAdmissionReceipt;
@@ -887,14 +898,23 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
   claimPreparedHostWss(input: Readonly<{
     receipt: RelayV2BrokerHostWssAdmissionReceipt;
   }>): RelayV2BrokerHostWssAdmissionClaim {
-    if (!this.admissionOpen) throw new Error("Relay v2 Broker Host WSS runtime is closing");
+    if (!this.admissionOpen || !this.credentialAdmissionOpen()) {
+      throw new Error("Relay v2 Broker Host WSS runtime admission is closed");
+    }
     const values = ownDataValues(input, CLAIM_KEYS);
-    if (!values || !this.admissionOpen) throw new Error("invalid Host WSS claim input");
+    if (!values || !this.admissionOpen || !this.credentialAdmissionOpen()) {
+      throw new Error("invalid Host WSS claim input");
+    }
     const receipt = values.receipt;
     const record = receipt !== null && typeof receipt === "object"
       ? RECEIPTS.get(receipt as object)
       : undefined;
-    if (!record || record.owner !== this || record.phase !== "issued") {
+    if (
+      !record
+      || record.owner !== this
+      || record.phase !== "issued"
+      || !this.credentialAdmissionOpen()
+    ) {
       throw new Error("invalid Relay v2 Broker Host WSS admission receipt");
     }
     record.phase = "claimed";
@@ -905,11 +925,20 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
       this: unknown,
       attachInput: Readonly<{ alreadyUpgradedSocket: RelayV2BrokerHostWssSocket }>,
     ): RelayV2BrokerHostWssConnectionHandle {
-      if (this !== claim || !claimedAttachOpen || record.phase !== "claimed") {
+      if (
+        this !== claim
+        || !claimedAttachOpen
+        || record.phase !== "claimed"
+        || !thisRuntime.credentialAdmissionOpen()
+      ) {
         throw new Error("invalid Relay v2 Broker Host WSS admission claim");
       }
       const attachValues = ownDataValues(attachInput, CLAIMED_ATTACH_KEYS);
-      if (!attachValues || !thisRuntime.admissionOpen) {
+      if (
+        !attachValues
+        || !thisRuntime.admissionOpen
+        || !thisRuntime.credentialAdmissionOpen()
+      ) {
         throw new Error("invalid Relay v2 Broker Host WSS claimed attach input");
       }
       claimedAttachOpen = false;
@@ -945,6 +974,9 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     record: ReceiptRecord,
     alreadyUpgradedSocket: RelayV2BrokerHostWssSocket,
   ): RelayV2BrokerHostWssConnectionHandle {
+    if (!this.admissionOpen || !this.credentialAdmissionOpen()) {
+      throw new Error("Relay v2 Broker Host WSS runtime admission is closed");
+    }
     const reservation = attachReservation();
     this.reservations.add(reservation);
     let adapter: RelayV2BrokerHostWssAdapter | null = null;
@@ -952,7 +984,9 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     try {
       adapter = this.captureAuthority.capture(alreadyUpgradedSocket);
       if (adapter.validate() !== "applied") throw hostWssClosedError();
-      if (!this.admissionOpen) throw new Error("Host WSS attach crossed close during capture");
+      if (!this.admissionOpen || !this.credentialAdmissionOpen()) {
+        throw new Error("Host WSS attach crossed closed admission during capture");
+      }
       const bridge = new StagedHostWssLifecycleBridge(adapter);
       const producerPort = Object.freeze(Object.create(null, {
         apply: {
@@ -975,12 +1009,24 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
       }));
       connection = new HostWssConnection(this, adapter, session, record.authContext);
       bridge.bind(connection);
-      if (!this.admissionOpen || !bridge.mayAttach()) {
-        throw new Error("Host WSS attach crossed close during owner open");
+      if (
+        !this.admissionOpen
+        || !this.credentialAdmissionOpen()
+        || !bridge.mayAttach()
+      ) {
+        throw new Error("Host WSS attach crossed closed admission during owner open");
       }
-      connection.attach(() => this.admissionOpen && bridge.mayAttach());
-      if (!this.admissionOpen || !bridge.mayAttach()) {
-        throw new Error("Host WSS attach crossed close during construction");
+      connection.attach(() => (
+        this.admissionOpen
+        && this.credentialAdmissionOpen()
+        && bridge.mayAttach()
+      ));
+      if (
+        !this.admissionOpen
+        || !this.credentialAdmissionOpen()
+        || !bridge.mayAttach()
+      ) {
+        throw new Error("Host WSS attach crossed closed admission during construction");
       }
       this.connections.add(connection);
       this.reservations.delete(reservation);
