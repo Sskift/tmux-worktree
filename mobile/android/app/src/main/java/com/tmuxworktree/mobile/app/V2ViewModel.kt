@@ -16,6 +16,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectRecei
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionKillResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyResult
@@ -772,9 +773,59 @@ class V2ViewModel(
     fun killSession(session: RelaySession) {
         if (demoMode) {
             _uiState.update { it.copy(sessions = it.sessions.filterNot { row -> row.stableId == session.stableId }) }
-        } else {
-            relayV1IfAdmitted()?.killSession(session.hostId, session.name)
+            return
         }
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val admittedKill = synchronized(relayV2UiFenceLock) {
+                val composition = relayV2Composition
+                val sessionCut = relayV2SessionReplyCuts.value[session.stableId]
+                if (_uiState.value.relayStartupAdmission !=
+                    RelayStartupAdmissionState.RELAY_V2 ||
+                    composition == null || sessionCut == null
+                ) {
+                    null
+                } else {
+                    composition to sessionCut
+                }
+            }
+            if (admittedKill == null) {
+                synchronized(relayV2UiFenceLock) {
+                    if (_uiState.value.relayStartupAdmission ==
+                        RelayStartupAdmissionState.RELAY_V2
+                    ) {
+                        _uiState.value = _uiState.value.copy(
+                            actionError = "Relay v2 Session is no longer current",
+                        )
+                    }
+                }
+                return
+            }
+            val (composition, sessionCut) = admittedKill
+            val callbackFence = RelayV2ReplyUiCallbackFence(
+                composition = composition,
+                sessionStableId = session.stableId,
+                sessionCut = sessionCut,
+            )
+            viewModelScope.launch {
+                when (val result = composition.submitKillSession(sessionCut)) {
+                    is RelayV2SessionKillResult.Queued -> {
+                        // Queued is not terminated. The Session remains until sessions.changed
+                        // authoritatively deletes the materialized row.
+                        updateCurrentRelayV2Reply(callbackFence) {
+                            it.copy(actionError = null)
+                        }
+                    }
+                    is RelayV2SessionKillResult.Rejected -> {
+                        val current = updateCurrentRelayV2Reply(callbackFence) {
+                            it.copy(actionError = result.failure.killUserMessage())
+                        }
+                        if (current) emit(V2UiEffect.Notice("Session end was not queued"))
+                    }
+                }
+            }
+            return
+        }
+        relayV1IfAdmitted()?.killSession(session.hostId, session.name)
     }
 
     fun openTerminal(session: RelaySession) {
@@ -1998,4 +2049,17 @@ private fun RelayV2SessionReplyFailure.userMessage(): String = when (this) {
     RelayV2SessionReplyFailure.CORRUPT_STATE,
     RelayV2SessionReplyFailure.STORE_FAILURE,
     -> "The message could not be committed to the Relay v2 Outbox"
+}
+
+private fun RelayV2SessionReplyFailure.killUserMessage(): String = when (this) {
+    RelayV2SessionReplyFailure.NOT_ONLINE -> "Relay v2 is not online"
+    RelayV2SessionReplyFailure.PROFILE_BARRIER -> "The Relay v2 profile is changing"
+    RelayV2SessionReplyFailure.SESSION_STALE -> "The Relay v2 Session is no longer current"
+    RelayV2SessionReplyFailure.CAPACITY_EXCEEDED -> "The Relay v2 Outbox is full"
+    RelayV2SessionReplyFailure.INVALID_MESSAGE,
+    RelayV2SessionReplyFailure.DUPLICATE_COMMAND,
+    RelayV2SessionReplyFailure.FOREIGN_LINEAGE,
+    RelayV2SessionReplyFailure.CORRUPT_STATE,
+    RelayV2SessionReplyFailure.STORE_FAILURE,
+    -> "The Session end command could not be safely queued"
 }

@@ -119,6 +119,22 @@ internal fun interface RelayV2SessionReplyCommandPort {
     ): RelayV2SessionReplyResult
 }
 
+internal sealed interface RelayV2SessionKillResult {
+    data class Queued(
+        val receipt: RelayV2OutboxEnqueueReceipt,
+    ) : RelayV2SessionKillResult
+
+    data class Rejected(
+        val failure: RelayV2SessionReplyFailure,
+    ) : RelayV2SessionKillResult
+}
+
+internal fun interface RelayV2SessionKillCommandPort {
+    suspend fun submitKillSession(
+        sessionCut: RelayV2SessionReplyCut,
+    ): RelayV2SessionKillResult
+}
+
 internal data class SelectedSessionReplyRow(
     val commandId: String,
     val message: String,
@@ -173,6 +189,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val afterRetryableFailureAdmissionDetached: () -> Unit = {},
     private val afterActorConnectAdmissionHandoff: () -> Unit = {},
 ) : RelayV2SessionReplyCommandPort,
+    RelayV2SessionKillCommandPort,
     Closeable {
     private val closed = AtomicBoolean(false)
     private val terminalFailure = AtomicReference<RelayV2BaseRuntimeFailure?>(null)
@@ -375,7 +392,7 @@ internal class RelayV2BaseRuntimeComposition(
         }
         val leased = actor.withCurrentOnlineCommandLease(issuedSession.onlineCut) { current ->
             productMutationLock.withLock {
-                enqueueReplyUnderLease(issuedSession, current, arguments)
+                enqueueSessionCommandUnderLease(issuedSession, current, arguments)
             }
         }
         val committed = when (leased) {
@@ -392,6 +409,48 @@ internal class RelayV2BaseRuntimeComposition(
             return RelayV2SessionReplyResult.Committed(committed.receipt)
         }
         return RelayV2SessionReplyResult.Rejected((committed as ReplyCommit.Rejected).failure)
+    }
+
+    override suspend fun submitKillSession(
+        sessionCut: RelayV2SessionReplyCut,
+    ): RelayV2SessionKillResult {
+        if (closed.get() || terminalFailure.get() != null) {
+            return RelayV2SessionKillResult.Rejected(
+                RelayV2SessionReplyFailure.PROFILE_BARRIER,
+            )
+        }
+        val issuedSession = sessionCut as? CompositionSessionReplyCut
+            ?: return RelayV2SessionKillResult.Rejected(
+                RelayV2SessionReplyFailure.SESSION_STALE,
+            )
+        if (issuedSession.origin !== this) {
+            return RelayV2SessionKillResult.Rejected(
+                RelayV2SessionReplyFailure.SESSION_STALE,
+            )
+        }
+        val leased = actor.withCurrentOnlineCommandLease(issuedSession.onlineCut) { current ->
+            productMutationLock.withLock {
+                enqueueSessionCommandUnderLease(
+                    issuedSession,
+                    current,
+                    RelayV2OutboxArguments.killSession(),
+                )
+            }
+        }
+        val committed = when (leased) {
+            RelayV2CurrentOnlineCommandLeaseResult.Stale ->
+                return RelayV2SessionKillResult.Rejected(
+                    RelayV2SessionReplyFailure.NOT_ONLINE,
+                )
+            is RelayV2CurrentOnlineCommandLeaseResult.Current -> leased.value
+        }
+        if (committed is ReplyCommit.Committed) {
+            // A queued kill never mutates the Session projection. Only a later authoritative
+            // sessions.changed delete may remove it; a stale dispatch stays durable for recovery.
+            dispatchFresh(committed.authority)
+            return RelayV2SessionKillResult.Queued(committed.receipt)
+        }
+        return RelayV2SessionKillResult.Rejected((committed as ReplyCommit.Rejected).failure)
     }
 
     /**
@@ -980,10 +1039,10 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
-    private suspend fun enqueueReplyUnderLease(
+    private suspend fun enqueueSessionCommandUnderLease(
         sessionCut: CompositionSessionReplyCut,
         current: RelayV2CurrentOnlineCommandContext,
-        arguments: RelayV2OutboxArguments.SendAgentMessage,
+        arguments: RelayV2OutboxArguments,
     ): ReplyCommit {
         if (closed.get() || terminalFailure.get() != null) {
             return ReplyCommit.Rejected(RelayV2SessionReplyFailure.PROFILE_BARRIER)

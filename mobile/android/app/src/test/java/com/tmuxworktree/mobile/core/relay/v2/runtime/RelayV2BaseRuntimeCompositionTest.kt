@@ -995,6 +995,47 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `online Session kill commits fixed command once before fresh dispatch`() = runBlocking {
+        val harness = Harness(autoConnect = true, newCommandId = { "kill-command" })
+        try {
+            harness.connectOnline()
+            val product = withTimeout(TIMEOUT_MS) {
+                harness.composition.sessions.first { it.size == 1 }.single()
+            }
+            harness.authority.blockReplyEnqueue = true
+            val kill = async {
+                harness.composition.submitKillSession(product.replyCut)
+            }
+            withTimeout(TIMEOUT_MS) { harness.authority.enqueueEntered.await() }
+
+            assertEquals(0, harness.authority.enqueueCommits.get())
+            assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+
+            harness.authority.releaseEnqueue.complete(Unit)
+            assertTrue(
+                withTimeout(TIMEOUT_MS) { kill.await() } is RelayV2SessionKillResult.Queued,
+            )
+            val entry = harness.authority.outboxState().entries.single()
+            assertEquals("kill-command", entry.commandId)
+            assertEquals("scope-a", entry.scopeId)
+            assertEquals("session-a", entry.sessionId)
+            assertEquals(HOST_ID, entry.hostId)
+            assertEquals(HOST_EPOCH, entry.expectedHostEpoch)
+            assertEquals("dedupe-window-uuid", entry.dedupeWindowId)
+            assertEquals(RelayV2OutboxArguments.KillSession, entry.canonicalRequestArguments.value)
+            assertEquals(RelayV2OutboxStateTag.SENDING, entry.state)
+            val execute = harness.transport().awaitSentType("command.execute")
+            assertEquals("kill-command", execute.stringValue("commandId"))
+            assertEquals(1, harness.authority.enqueueCommits.get())
+            assertEquals(1, harness.transport().framesOfType("command.execute").size)
+            assertEquals(listOf(product), harness.composition.sessions.value)
+        } finally {
+            harness.authority.releaseEnqueue.complete(Unit)
+            harness.close()
+        }
+    }
+
+    @Test
     fun `disconnect withdraws reply admission and waits an entered enqueue transaction`() =
         runBlocking {
             val harness = Harness(autoConnect = true, newCommandId = { "reply-race" })
