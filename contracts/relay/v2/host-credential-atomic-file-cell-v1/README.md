@@ -1,6 +1,6 @@
 # Relay v2 Host Credential Atomic File Cell v1
 
-状态：**Frozen contract revision 2；native ABI、fixture、platform resource contract 与 claim journal format 各为 v1。default-off、injected-only。Darwin arm64 与 Linux `x86_64-unknown-linux-gnu` descriptor-relative syscall adapter 已实现并有真实验证；native addon 与 production wiring 未实现。**
+状态：**Frozen contract revision 3；native ABI、native fixture、platform resource contract、claim journal format 与相邻 credential mutation contract 各为 v1。default-off、injected-only。Darwin arm64 与 Linux `x86_64-unknown-linux-gnu` descriptor-relative syscall adapter 仍只实现 admission 所需操作并有真实验证；credential mutation、native addon 与 production wiring 未实现。**
 
 本目录冻结 Relay v2 Host credential vault 的专属 atomic byte-cell native seam。它不修改 Relay public wire，不产生 readiness/capability，也不复用 broker credential state store 的 logical store kind、binary container、private location、artifact、loader、lifecycle owner 或 continuity namespace。
 
@@ -16,7 +16,7 @@
 
 Platform-common 现已唯一拥有 claimId 签发：接管预绑定 directory descriptor 并通过 parent-PID fence 后、任何 process registry、lock、claim、fsync 或 namespace mutation 前，它只调用一次 OS CSPRNG，生成 exact 32-byte non-zero opaque claimId。entropy source error 或全零结果固定映射为 `CELL_IO`；common 只把已接管的 directory descriptor raw-close 一次，不 reserve registry、不打开 lock/claim、不 fsync、不 fallback、预测或重试，也不接受 caller 提供的 claimId。claimId 只进入 `TWV2HAC1` journal，并在 normal close 时按 exact journal match 验证；它不进入公开 API、Debug、result、log 或 error。
 
-本 revision 仍不实现 trusted factory、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell read/CAS/temp/rename、orphan recovery、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
+Revision 3 新增相邻的 credential mutation v1 机器契约，只冻结未来 descriptor-relative read/CAS/temp/rename 与 uncertainty 边界；它不向 platform-common trait、Darwin/Linux adapter、native ABI 或 claim journal 添加实现。当前仍不实现 trusted factory、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell read/CAS/temp/rename、orphan recovery、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
 
 ## Platform-common admission owner
 
@@ -38,9 +38,25 @@ Production durability qualification v1 是 deny-by-default：`qualifiedRecords=[
 
 Registry 只有 `Opening / Open / Closing / CloseUncertain`。Owner 捕获 opener PID，并在每个 descriptor-relative operation 前检查 PID。Fork 后 inherited owner 的所有 operation 只返回 `CELL_CLOSED`；child 不得 unlink、unlock、fsync 或 close 任何 inherited descriptor。
 
+## Credential mutation v1（contract only）
+
+Credential mutation v1 只允许 exact live `AdmissionOwner` 执行。read、CAS revision consume、两次 current check、temp create/proof、rename、published proof、directory fsync、final descriptor close 与 pre-commit cleanup 的每个 phase 都必须重新验证 parent PID、exact process-registry entry/fence，以及 directory、lock、claim 的 descriptor/path identity、safety、lock 与 exact claimId journal。任一 gate 失败都在进入下一 phase 前 fail closed；fork child 仍不得 cleanup inherited descriptor。
+
+Credential read 固定为 `fstatat(directory, credential, AT_SYMLINK_NOFOLLOW)` → `openat(..., O_RDONLY|O_NOFOLLOW|O_CLOEXEC)` → A/B/C stable proof。只有 initial `fstatat` 的 `ENOENT` 表示 absent；已经观察到 present 后的 `ENOENT` 是 identity race。Present 必须是 current euid+egid 所有、regular、exact `0600`、`nlink=1`、size `0..65536` 且 descriptor 已有 `FD_CLOEXEC`；A/B/C 的 dev、ino、type、uid、gid、mode、nlink 与 size 全部保持一致，bytes 必须按 observed size exact 读取。Descriptor final raw close 成功后才可签发 revision。
+
+Revision 是 one-shot opaque native token，exact 绑定 `AdmissionOwner`、owner fence、absent/present tag、exact bytes SHA-256，以及 present 的 dev+ino（absent 为 null identity）。CAS 先消费 exact revision，再做第一次 current check；foreign、stale、copy、replay 或 forged revision 在 current read 和任何 filesystem mutation 前返回 `INVALID_REVISION`。第一次 mismatch 不创建 temp并返回带 fresh revision 的 conflict。Temp 完成后、rename 前必须在 full owner revalidation 下做第二次 current check；mismatch 只在 exact owned temp cleanup 完整成功后返回 fresh conflict。
+
+Temp 只能在 adopted directory 中使用固定前缀 `.relay-v2-host-credential.cell.tmp-` 加 fresh 32-byte CSPRNG 的 64 lowercase hex。每次只以 `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`、`0600` 创建；只有 `EEXIST` 可以用新的随机值重试，最多 8 次。碰撞对象永不打开、修复或删除。Owner 记录 temp dev+ino，只允许 unlink exact tracked object；写入 exact replacement、temp `fsync`、A/B/C identity/metadata/bytes proof全部完成后才能进入 pre-commit revalidation。
+
+CAS commit point 唯一是同一 directory descriptor 内 temp→credential 的 `renameat`。成功 rename 后必须证明旧 temp name absent、credential name 的 A/B/C identity exact 等于 tracked temp、published bytes/digest exact 等于 replacement，再 directory `fsync`，最后 raw-close published descriptor一次；只有全链成功才返回 `swapped`。Rename 已成功后的 proof、directory fsync 或 close 任一失败都返回无 current/revision 的 `uncertain` 并永久 fence。Rename 报错时，只有同时证明 expected old current 未变且 temp name仍是 exact owned object，才可按 pre-commit cleanup收敛为 definite `CELL_IO`；不能证明时同样 `uncertain`并永久 fence。
+
+确定尚未 commit 的 cleanup 固定为 full owner revalidation → exact dev+ino proof → `unlinkat` owned temp → prove `ENOENT` → directory `fsync` → raw close一次。Identity 不确定返回 `CELL_IDENTITY_UNCERTAIN`且不 unlink；unlink/durability/close 不确定返回 `CELL_RECOVERY_REQUIRED`。两者都永久 fence。Contract 不提供 crash recovery 或 enumeration cleanup；遗留 claim、以及任何已知遗留 temp 都继续返回 `CELL_RECOVERY_REQUIRED`并原样保留。
+
+上述完整机器语义与 failure cuts 见 [`credential-mutation-cases-v1.json`](credential-mutation-cases-v1.json)。它仍保持 `qualifiedRecords=[]`、`productionProofConstructible=false`、`fullAdmissionValidated=false`、`durabilityQualified=false`、`productionWired=false` 与 `productionCapabilityEffect=none`。
+
 ## Claim journal v1
 
-Claim 是 exact 192-byte little-endian binary record，magic 为 `TWV2HAC1`。它只表达 `ADMISSION_HELD_NO_CREDENTIAL_MUTATION`，并包含 journal version/length、32-byte claimId、directory/lock/claim 的 dev+ino、opener PID、euid、egid、必须为零的 reserved bytes和对前 160 bytes 的 SHA-256 integrity digest。它不得包含 credential bytes、secret、HOME、path、business credential reference、hostId 或 continuity state。Exact layout 与 golden bytes 见 [`claim-journal-v1.json`](claim-journal-v1.json)。
+Claim 是 exact 192-byte little-endian binary record，magic 为 `TWV2HAC1`。它只作为 admission ownership proof，继续使用状态符号 `ADMISSION_HELD_NO_CREDENTIAL_MUTATION`，不升级为 mutation journal。它包含 journal version/length、32-byte claimId、directory/lock/claim 的 dev+ino、opener PID、euid、egid、必须为零的 reserved bytes和对前 160 bytes 的 SHA-256 integrity digest；不得新增 revision、temp name、mutation phase、credential bytes、secret、HOME、path、business credential reference、hostId 或 continuity state。Exact layout 与 golden bytes 见 [`claim-journal-v1.json`](claim-journal-v1.json)。
 
 ## Close
 
@@ -91,4 +107,4 @@ Raw native error 只有 exact `{code}`，其 closed code 集合见 [`manifest.js
 
 Raw handle 由 Node wrapper 唯一拥有。Opened handle 在公开 wrapper 前发生的任一可闭合失败都先调用一次 raw `close`；公开后的 `closeAndDrain()` 是稳定、幂等 barrier，同一 raw handle 的 `close` 最多调用一次。Barrier 开始后不再接受 read/CAS；resolve 只表示 exact closed result 已收到，reject 也不授权 retry raw close。
 
-机器可读 union 和每个 conformance case 以 [`manifest.json`](manifest.json) 与 [`native-interface-cases.json`](native-interface-cases.json) 为准。Fixture 只含非敏感占位 bytes，不含 credential、secret、真实路径或 production readiness 声明。
+机器可读 union 和每个 conformance case 以 [`manifest.json`](manifest.json)、[`native-interface-cases.json`](native-interface-cases.json) 与 [`credential-mutation-cases-v1.json`](credential-mutation-cases-v1.json) 为准。Fixture 只含非敏感占位 bytes，不含 credential、secret、真实路径或 production readiness 声明。

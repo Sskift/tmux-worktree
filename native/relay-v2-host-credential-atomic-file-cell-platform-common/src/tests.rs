@@ -442,8 +442,12 @@ fn production_qualification_is_empty_and_resources_are_host_specific() {
         Err(CellErrorCode::CellDurabilityUnsupported)
     ));
     let spec = platform_resource_spec();
-    assert_eq!(spec.contract_revision(), 2);
+    assert_eq!(spec.contract_revision(), 3);
     assert_eq!(spec.resource_contract_version(), 1);
+    assert_eq!(generated::CREDENTIAL_MUTATION_CONTRACT_VERSION, 1);
+    assert!(!generated::CREDENTIAL_MUTATION_IMPLEMENTED);
+    assert_eq!(CLAIM_JOURNAL_FORMAT_VERSION, 1);
+    assert_eq!(CLAIM_JOURNAL_STATE_ADMISSION_HELD_NO_CREDENTIAL_MUTATION, 1);
     assert_eq!(spec.claim_journal_length(), CLAIM_JOURNAL_LENGTH);
     for component in [spec.credential_name(), spec.lock_name(), spec.claim_name()] {
         assert!(!component.to_ascii_lowercase().contains("broker"));

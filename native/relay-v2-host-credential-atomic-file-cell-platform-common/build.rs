@@ -41,8 +41,10 @@ fn main() {
         format!("{crate_dir}/../../contracts/relay/v2/host-credential-atomic-file-cell-v1");
     let manifest_path = format!("{contract_dir}/manifest.json");
     let journal_path = format!("{contract_dir}/claim-journal-v1.json");
+    let mutation_path = format!("{contract_dir}/credential-mutation-cases-v1.json");
     println!("cargo:rerun-if-changed={manifest_path}");
     println!("cargo:rerun-if-changed={journal_path}");
+    println!("cargo:rerun-if-changed={mutation_path}");
 
     let manifest: Value = serde_json::from_slice(
         &fs::read(&manifest_path).expect("read host credential cell manifest"),
@@ -54,9 +56,16 @@ fn main() {
     );
     assert_eq!(
         unsigned(member(&manifest, "contractVersion"), "contractVersion"),
-        2
+        3
     );
     assert_eq!(member(&manifest, "status"), "frozen");
+    assert_eq!(
+        unsigned(
+            member(&manifest, "fixtureFormatVersion"),
+            "fixtureFormatVersion"
+        ),
+        1
+    );
     assert_eq!(
         unsigned(
             member(member(&manifest, "nativeInterface"), "abiVersion"),
@@ -105,7 +114,69 @@ fn main() {
             .as_array()
             .expect("qualifiedRecords array")
             .is_empty(),
-        "contract revision 2 must remain deny-by-default"
+        "contract revision 3 must remain deny-by-default"
+    );
+
+    let mutation_manifest = member(&manifest, "credentialMutation");
+    assert_eq!(
+        unsigned(
+            member(mutation_manifest, "contractVersion"),
+            "credentialMutation.contractVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(mutation_manifest, "fixtureFormatVersion"),
+            "credentialMutation.fixtureFormatVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        member(mutation_manifest, "fixture"),
+        "credential-mutation-cases-v1.json"
+    );
+    assert_eq!(member(mutation_manifest, "status"), "frozen-contract-only");
+    assert_eq!(
+        member(mutation_manifest, "implementation"),
+        "not-implemented"
+    );
+    assert_eq!(
+        unsigned(
+            member(mutation_manifest, "platformResourceContractVersion"),
+            "credentialMutation.platformResourceContractVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(mutation_manifest, "claimJournalFormatVersion"),
+            "credentialMutation.claimJournalFormatVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        member(mutation_manifest, "claimJournalRole"),
+        "admission-proof-only-not-mutation-journal"
+    );
+    assert_eq!(
+        member(mutation_manifest, "implementedInPlatformCommon"),
+        false
+    );
+    assert_eq!(
+        member(mutation_manifest, "implementedInDarwinAdapter"),
+        false
+    );
+    assert_eq!(
+        member(mutation_manifest, "implementedInLinuxAdapter"),
+        false
+    );
+    assert_eq!(member(mutation_manifest, "fullAdmissionValidated"), false);
+    assert_eq!(member(mutation_manifest, "durabilityQualified"), false);
+    assert_eq!(member(mutation_manifest, "productionWired"), false);
+    assert_eq!(
+        member(mutation_manifest, "productionCapabilityEffect"),
+        "none"
     );
 
     let claim_manifest = member(platform, "claimJournal");
@@ -158,11 +229,80 @@ fn main() {
         160
     );
 
+    let mutation_fixture: Value = serde_json::from_slice(
+        &fs::read(&mutation_path).expect("read credential mutation fixture"),
+    )
+    .expect("parse credential mutation fixture");
+    assert_eq!(
+        unsigned(
+            member(&mutation_fixture, "fixtureFormatVersion"),
+            "credential mutation fixture version"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(&mutation_fixture, "credentialMutationContractVersion"),
+            "credential mutation contract version"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(&mutation_fixture, "platformResourceContractVersion"),
+            "credential mutation platform resource version"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(&mutation_fixture, "claimJournalFormatVersion"),
+            "credential mutation claim journal version"
+        ),
+        1
+    );
+    assert_eq!(
+        member(&mutation_fixture, "implementationStatus"),
+        "contract-only-not-implemented"
+    );
+    let mutation_qualification = member(&mutation_fixture, "qualification");
+    assert!(
+        member(mutation_qualification, "qualifiedRecords")
+            .as_array()
+            .expect("credential mutation qualifiedRecords array")
+            .is_empty(),
+        "contract revision 3 credential mutation must remain deny-by-default"
+    );
+    assert_eq!(
+        member(mutation_qualification, "productionProofConstructible"),
+        false
+    );
+    assert_eq!(
+        member(mutation_qualification, "fullAdmissionValidated"),
+        false
+    );
+    assert_eq!(member(mutation_qualification, "durabilityQualified"), false);
+    assert_eq!(member(mutation_qualification, "productionWired"), false);
+    assert_eq!(
+        member(mutation_qualification, "productionCapabilityEffect"),
+        "none"
+    );
+
     let mut generated = String::new();
-    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 2;").unwrap();
+    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 3;").unwrap();
     writeln!(
         generated,
         "pub(super) const RESOURCE_CONTRACT_VERSION: u32 = 1;"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "#[cfg(test)]\npub(super) const CREDENTIAL_MUTATION_CONTRACT_VERSION: u32 = 1;"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "#[cfg(test)]\npub(super) const CREDENTIAL_MUTATION_IMPLEMENTED: bool = false;"
     )
     .unwrap();
     writeln!(

@@ -1,9 +1,9 @@
 {
   "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
-  "contractVersion": 2,
+  "contractVersion": 3,
   "fixtureFormatVersion": 1,
   "status": "frozen",
-  "scope": "host-credential-native-abi-and-isolated-platform-admission-contract-foundation",
+  "scope": "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
   "productionWired": false,
   "productionCapabilityEffect": "none",
   "businessOwner": "RelayV2HostCredentialVault",
@@ -318,6 +318,198 @@
       }
     }
   },
+  "credentialMutation": {
+    "contractVersion": 1,
+    "fixtureFormatVersion": 1,
+    "fixture": "credential-mutation-cases-v1.json",
+    "status": "frozen-contract-only",
+    "implementation": "not-implemented",
+    "owner": "exact-live-AdmissionOwner",
+    "platformResourceContractVersion": 1,
+    "claimJournalFormatVersion": 1,
+    "claimJournalRole": "admission-proof-only-not-mutation-journal",
+    "maximumCredentialBytes": 65536,
+    "operationGate": {
+      "requiredAtEveryPhase": [
+        "exact-live-AdmissionOwner",
+        "parent-pid",
+        "exact-process-registry-entry-and-fence",
+        "directory-descriptor-and-identity-safety",
+        "lock-descriptor-path-identity-lock-and-safety",
+        "claim-descriptor-path-journal-claimId-and-safety"
+      ],
+      "phases": [
+        "read-before-credential-observation",
+        "read-after-open-before-A-proof",
+        "read-after-bytes-before-B-proof",
+        "read-before-C-proof",
+        "read-before-close-and-revision-issue",
+        "cas-before-revision-consumption",
+        "cas-before-first-current-check",
+        "cas-before-temp-create",
+        "cas-before-temp-write",
+        "cas-before-temp-fsync",
+        "cas-before-temp-proof",
+        "cas-before-second-current-check",
+        "cas-before-renameat",
+        "cas-after-rename-before-published-proof",
+        "cas-before-directory-fsync",
+        "cas-before-final-descriptor-close",
+        "precommit-cleanup"
+      ],
+      "failure": "closed-before-next-phase",
+      "forkChildCleanupAllowed": false
+    },
+    "credentialRead": {
+      "order": [
+        "fstatat-credential-AT_SYMLINK_NOFOLLOW",
+        "openat-credential-O_RDONLY-O_NOFOLLOW-O_CLOEXEC",
+        "A=fstat(credential-descriptor)",
+        "read-exact-observed-size",
+        "B=fstatat(directory,credential,AT_SYMLINK_NOFOLLOW)",
+        "C=fstat(credential-descriptor)",
+        "raw-close-credential-descriptor-once"
+      ],
+      "absentOnlyWhen": "initial-fstatat-returns-ENOENT",
+      "postPresentEnoent": "CELL_IDENTITY_UNCERTAIN",
+      "presentProof": {
+        "type": "regular",
+        "owner": "current-effective-uid-and-effective-gid",
+        "modeOctal": "0600",
+        "nlink": 1,
+        "minimumSizeBytes": 0,
+        "maximumSizeBytes": 65536,
+        "descriptorFlag": "FD_CLOEXEC",
+        "stableFields": ["device", "inode", "type", "uid", "gid", "mode", "nlink", "size"]
+      },
+      "readBytes": "exact-size-no-short-read-or-trailing-byte",
+      "repairAllowed": false
+    },
+    "revision": {
+      "opaque": true,
+      "oneShot": true,
+      "source": ["read-current", "compare-and-swap-conflict-current"],
+      "boundTo": [
+        "exact-AdmissionOwner",
+        "exact-owner-fence",
+        "absent-or-present-state-tag",
+        "SHA-256-of-exact-present-bytes-or-empty-bytes-when-absent",
+        "present-device-and-inode-or-null-when-absent"
+      ],
+      "consume": "before-first-current-check-and-before-temp-or-rename-mutation",
+      "invalid": "INVALID_REVISION-before-current-check-or-filesystem-mutation",
+      "staleComparison": "state-tag-digest-and-object-identity-all-exact"
+    },
+    "compareAndSwap": {
+      "replacementMaximumBytes": 65536,
+      "currentChecks": [
+        "first-after-exact-revision-consumption-before-temp-create",
+        "second-after-temp-fsync-proof-and-full-owner-revalidation-immediately-before-renameat"
+      ],
+      "firstMismatch": "conflict-with-fresh-current-and-no-temp",
+      "secondMismatch": "cleanup-exact-owned-temp-then-conflict-with-fresh-current",
+      "sameBytesOptimizationAllowed": false
+    },
+    "temporary": {
+      "directory": "same-adopted-directory",
+      "name": {
+        "prefix": ".relay-v2-host-credential.cell.tmp-",
+        "entropyBytes": 32,
+        "suffixEncoding": "lowercase-hex",
+        "suffixCharacters": 64,
+        "freshCSPRNGPerAttempt": true
+      },
+      "create": {
+        "flags": ["O_RDWR", "O_CREAT", "O_EXCL", "O_NOFOLLOW", "O_CLOEXEC"],
+        "modeOctal": "0600",
+        "collisionErrno": "EEXIST",
+        "maximumAttempts": 8,
+        "collisionExhaustion": "CELL_IO",
+        "otherFailure": "closed-without-alternate-name-source"
+      },
+      "trackedIdentity": ["device", "inode"],
+      "requiredProof": {
+        "type": "regular",
+        "owner": "current-effective-uid-and-effective-gid",
+        "modeOctal": "0600",
+        "nlink": 1,
+        "size": "exact-replacement-byte-length",
+        "descriptorFlag": "FD_CLOEXEC",
+        "bytes": "exact-replacement-bytes-and-SHA-256",
+        "stableSequence": [
+          "A=fstat(temp-descriptor)",
+          "B=fstatat(directory,temp-name,AT_SYMLINK_NOFOLLOW)",
+          "C=fstat(temp-descriptor)"
+        ]
+      },
+      "prepareOrder": [
+        "exclusive-create",
+        "prove-empty-owned-temp",
+        "write-exact-replacement-from-offset-zero",
+        "fsync-temp",
+        "prove-stable-temp-identity-metadata-and-bytes"
+      ],
+      "cleanup": "unlinkat-only-after-exact-tracked-device-and-inode-proof",
+      "foreignCollisionOrReplacementCleanupAllowed": false
+    },
+    "publication": {
+      "preCommitOrder": [
+        "revalidate-AdmissionOwner-parent-registry-directory-lock-and-claim",
+        "second-current-check",
+        "prove-exact-owned-temp"
+      ],
+      "commitPoint": "same-directory-renameat-temp-to-credential",
+      "postCommitOrder": [
+        "prove-temp-name-absent",
+        "prove-published-name-A-B-C-equals-tracked-temp-device-and-inode",
+        "prove-published-bytes-equal-exact-replacement-and-digest",
+        "fsync-directory",
+        "raw-close-published-descriptor-once"
+      ],
+      "publishedStableSequence": [
+        "A=fstat(published-temp-descriptor)",
+        "B=fstatat(directory,credential,AT_SYMLINK_NOFOLLOW)",
+        "C=fstat(published-temp-descriptor)"
+      ],
+      "success": "swapped-only-after-all-post-commit-proof-fsync-and-close",
+      "renameErrorDefiniteNoCommit": "expected-current-still-exact-and-temp-name-still-exact-owned",
+      "renameErrorWithoutDefiniteNoCommit": "uncertain-and-permanent-fence"
+    },
+    "preCommitCleanup": {
+      "order": [
+        "revalidate-full-owner-gate",
+        "prove-temp-name-equals-tracked-device-and-inode",
+        "unlinkat-exact-owned-temp",
+        "prove-temp-name-ENOENT",
+        "fsync-directory",
+        "raw-close-temp-descriptor-once"
+      ],
+      "identityUncertain": "CELL_IDENTITY_UNCERTAIN-and-permanent-fence-without-unlink",
+      "cleanupOrDurabilityUncertain": "CELL_RECOVERY_REQUIRED-and-permanent-fence",
+      "untrackedOrForeignTempUnlinkAllowed": false
+    },
+    "uncertainty": {
+      "renameSucceededThenProofFsyncOrCloseFailure": "uncertain-and-permanent-fence",
+      "renameErroredAndOldValueCannotBeProvedUnchanged": "uncertain-and-permanent-fence",
+      "currentOrRevisionReturned": false,
+      "automaticReadRetryOrFallbackAllowed": false
+    },
+    "recovery": {
+      "crashRecoveryImplemented": false,
+      "enumerationCleanupAllowed": false,
+      "existingClaim": "CELL_RECOVERY_REQUIRED-and-preserve",
+      "knownLeftoverTemp": "CELL_RECOVERY_REQUIRED-and-preserve",
+      "claimJournalMutationStateAllowed": false,
+      "claimJournalTempNameOrRevisionAllowed": false
+    },
+    "implementedInPlatformCommon": false,
+    "implementedInDarwinAdapter": false,
+    "implementedInLinuxAdapter": false,
+    "fullAdmissionValidated": false,
+    "durabilityQualified": false,
+    "productionWired": false,
+    "productionCapabilityEffect": "none"
+  },
   "notImplemented": [
     "trusted-production-factory",
     "darwin-x86_64-validation-evidence",
@@ -335,6 +527,7 @@
     { "role": "specification", "path": "README.md" },
     { "role": "native-interface", "path": "native-interface-cases.json" },
     { "role": "platform-resource-cases", "path": "platform-resource-cases.json" },
-    { "role": "claim-journal-golden", "path": "claim-journal-v1.json" }
+    { "role": "claim-journal-golden", "path": "claim-journal-v1.json" },
+    { "role": "credential-mutation-contract", "path": "credential-mutation-cases-v1.json" }
   ]
 }
