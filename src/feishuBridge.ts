@@ -28,7 +28,7 @@ import {
   type FeishuBindingLifecycleCardKind,
 } from "./feishuReplyCard.js";
 
-const TURN_TIMEOUT_MS = 10 * 60_000;
+const TURN_IDLE_TIMEOUT_MS = 10 * 60_000;
 const MAX_PROMPT_BYTES = 16 * 1024;
 const MAX_TURN_OUTPUT_BYTES = 128 * 1024;
 const MAX_REPLY_BYTES = 16 * 1024;
@@ -774,7 +774,7 @@ export class FeishuBridge {
         operationId,
         outboundAttemptId: `reply-${digest(turnId).slice(0, 32)}`,
         createdAt: nowIso(this.now),
-        deadlineAt: new Date(this.now() + TURN_TIMEOUT_MS).toISOString(),
+        deadlineAt: new Date(this.now() + TURN_IDLE_TIMEOUT_MS).toISOString(),
       };
       this.state.turns.push(turn);
       this.rememberEvent(event.event_id, false);
@@ -962,15 +962,6 @@ export class FeishuBridge {
       this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
-    if (this.now() >= Date.parse(turn.deadlineAt)) {
-      await this.completeReply(turn, binding, "等待终端回复超时；本轮状态不确定，需要在本地恢复后才能继续。", "timed-out");
-      if (turn.status === "timed-out") {
-        this.leases.delete(binding.id);
-        this.markBindingStale(binding, "terminal turn timed out without a certain drain disposition");
-        this.persist();
-      }
-      return;
-    }
     try {
       if (turn.outputGeneration === undefined || turn.cursor === undefined) {
         throw new Error("Feishu turn has no committed terminal output correlation");
@@ -1004,7 +995,9 @@ export class FeishuBridge {
         turn.output = "";
         delete turn.outputRemainderBase64;
         delete turn.markerSeenAt;
-        delete turn.lastOutputAt;
+        const observedAt = this.now();
+        turn.lastOutputAt = new Date(observedAt).toISOString();
+        turn.deadlineAt = new Date(observedAt + TURN_IDLE_TIMEOUT_MS).toISOString();
         this.persist();
         return;
       }
@@ -1019,11 +1012,13 @@ export class FeishuBridge {
       const raw = Buffer.from(chunk.dataBase64, "base64");
       if (raw.byteLength > 0) {
         const decoded = decodeUtf8Incrementally(turn.outputRemainderBase64, raw);
+        const observedAt = this.now();
         turn.cursor = chunk.nextCursor;
         turn.output = boundedUtf8Tail(`${turn.output}${decoded.text}`, MAX_TURN_OUTPUT_BYTES);
         if (decoded.remainderBase64) turn.outputRemainderBase64 = decoded.remainderBase64;
         else delete turn.outputRemainderBase64;
-        turn.lastOutputAt = nowIso(this.now);
+        turn.lastOutputAt = new Date(observedAt).toISOString();
+        turn.deadlineAt = new Date(observedAt + TURN_IDLE_TIMEOUT_MS).toISOString();
         this.persist();
       }
     } catch (error) {
@@ -1033,6 +1028,24 @@ export class FeishuBridge {
       this.markBindingStale(binding, turn.error);
       this.persist();
       this.queueProcessingReactionSettlement(turn.messageId, "failure");
+      return;
+    }
+    // deadlineAt is an inactivity deadline, not a wall-clock budget for the
+    // whole Agent run. Always perform one final fenced output observation
+    // first: output that arrives at the old boundary proves the same turn is
+    // still making progress and slides the deadline without replaying input.
+    if (this.now() >= Date.parse(turn.deadlineAt)) {
+      await this.completeReply(
+        turn,
+        binding,
+        "终端已连续 10 分钟没有新输出，且尚未形成完整回复；本轮状态不确定，需要在本地恢复后才能继续。",
+        "timed-out",
+      );
+      if (turn.status === "timed-out") {
+        this.leases.delete(binding.id);
+        this.markBindingStale(binding, "terminal turn was idle for 10 minutes without a certain drain disposition");
+        this.persist();
+      }
       return;
     }
     if (!turn.markerNonce) {

@@ -2037,7 +2037,41 @@ test("turn nonce rejects prompt echo and marker injection, and UTF-8 survives ch
   }
 });
 
-test("turn timeout stops lease renewal and requires controlled recovery", async () => {
+test("active terminal output slides the turn inactivity deadline until a marked reply completes", async () => {
+  let clock = Date.now();
+  const h = harness({ now: () => clock });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    const originalDeadline = currentTurn(h).deadlineAt;
+
+    clock += 10 * 60_000 - 100;
+    h.control.output = "agent is still producing terminal output";
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "awaiting");
+    assert.equal(currentTurn(h).lastOutputAt, new Date(clock).toISOString());
+    assert.equal(currentTurn(h).deadlineAt, new Date(clock + 10 * 60_000).toISOString());
+
+    clock += 101;
+    assert.ok(clock > Date.parse(originalDeadline));
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "awaiting", "the original wall-clock deadline must not end an active run");
+    assert.equal(h.lark.replies.length, 0);
+
+    h.control.output += marked(h, "long-running answer");
+    h.control.renderedOutput = marked(h, "long-running answer");
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "completed");
+    assert.deepEqual(h.lark.replies.map(({ text }) => text), ["long-running answer"]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("turn inactivity timeout stops lease renewal and requires controlled recovery", async () => {
   let clock = Date.now();
   const h = harness({ now: () => clock });
   try {
@@ -2050,7 +2084,8 @@ test("turn timeout stops lease renewal and requires controlled recovery", async 
     const state = h.store.read();
     assert.equal(state.turns.at(-1).status, "timed-out");
     assert.equal(state.bindings[0].status, "stale");
-    assert.match(state.bindings[0].staleReason, /timed out/);
+    assert.match(state.bindings[0].staleReason, /idle for 10 minutes/);
+    assert.match(h.lark.replies[0].text, /连续 10 分钟没有新输出/);
     const renewals = h.control.requests.filter(({ type }) => type === "lease.renew").length;
     await h.bridge.renewLeases();
     assert.equal(h.control.requests.filter(({ type }) => type === "lease.renew").length, renewals);

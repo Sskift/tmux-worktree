@@ -1513,8 +1513,6 @@ function App() {
           windowTitlebar
           sidebarDrawer={viewportTier === "compact"}
           scratchOpen={!scratchCollapsed}
-          filesActive={sidebarOpen && sidebarView === "files"}
-          filesAvailable={workspacePresentation.header.filesAvailable}
           gitActive={inspectorOpen}
           gitAvailable={workspacePresentation.header.gitAvailable}
           onOpenSidebar={() => {
@@ -1523,7 +1521,6 @@ function App() {
             setInspectorOpen(false);
             setSidebarOpen(true);
           }}
-          onOpenFiles={openFiles}
           onOpenGit={openGit}
           onToggleScratch={() => {
             if (scratchCollapsed) openScratch();
