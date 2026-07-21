@@ -1,0 +1,9 @@
+[package]
+name = "relay-v2-host-credential-atomic-file-cell-platform-linux"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libc = "0.2"
+relay-v2-host-credential-atomic-file-cell-platform-common = { path = "../relay-v2-host-credential-atomic-file-cell-platform-common" }

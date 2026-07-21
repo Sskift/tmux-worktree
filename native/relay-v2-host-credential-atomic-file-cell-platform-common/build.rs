@@ -77,11 +77,6 @@ fn main() {
         member(platform, "fileOperations"),
         "injected-descriptor-relative-trait-only"
     );
-    assert_eq!(
-        member(platform, "realDarwinOrLinuxSyscallsImplemented"),
-        false
-    );
-
     let names = member(platform, "relativeNames");
     assert_eq!(member(names, "singleComponentsOnly"), true);
     assert_eq!(member(names, "callerOverrideAllowed"), false);
