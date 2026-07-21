@@ -56,7 +56,7 @@ fn main() {
     );
     assert_eq!(
         unsigned(member(&manifest, "contractVersion"), "contractVersion"),
-        3
+        4
     );
     assert_eq!(member(&manifest, "status"), "frozen");
     assert_eq!(
@@ -114,7 +114,7 @@ fn main() {
             .as_array()
             .expect("qualifiedRecords array")
             .is_empty(),
-        "contract revision 3 must remain deny-by-default"
+        "contract revision 4 must remain deny-by-default"
     );
 
     let mutation_manifest = member(&manifest, "credentialMutation");
@@ -136,10 +136,10 @@ fn main() {
         member(mutation_manifest, "fixture"),
         "credential-mutation-cases-v1.json"
     );
-    assert_eq!(member(mutation_manifest, "status"), "frozen-contract-only");
+    assert_eq!(member(mutation_manifest, "status"), "platform-common-only");
     assert_eq!(
         member(mutation_manifest, "implementation"),
-        "not-implemented"
+        "platform-common-only"
     );
     assert_eq!(
         unsigned(
@@ -161,7 +161,7 @@ fn main() {
     );
     assert_eq!(
         member(mutation_manifest, "implementedInPlatformCommon"),
-        false
+        true
     );
     assert_eq!(
         member(mutation_manifest, "implementedInDarwinAdapter"),
@@ -177,6 +177,32 @@ fn main() {
     assert_eq!(
         member(mutation_manifest, "productionCapabilityEffect"),
         "none"
+    );
+    let mutation_maximum_bytes = unsigned(
+        member(mutation_manifest, "maximumCredentialBytes"),
+        "credentialMutation.maximumCredentialBytes",
+    );
+    let mutation_temporary = member(mutation_manifest, "temporary");
+    let mutation_temporary_name = member(mutation_temporary, "name");
+    let mutation_temporary_prefix = relative_component(
+        member(mutation_temporary_name, "prefix"),
+        "credentialMutation.temporary.name.prefix",
+    );
+    let mutation_temporary_entropy_bytes = unsigned(
+        member(mutation_temporary_name, "entropyBytes"),
+        "credentialMutation.temporary.name.entropyBytes",
+    );
+    let mutation_temporary_suffix_encoding = string(
+        member(mutation_temporary_name, "suffixEncoding"),
+        "credentialMutation.temporary.name.suffixEncoding",
+    );
+    let mutation_temporary_suffix_characters = unsigned(
+        member(mutation_temporary_name, "suffixCharacters"),
+        "credentialMutation.temporary.name.suffixCharacters",
+    );
+    let mutation_temporary_attempts = unsigned(
+        member(member(mutation_temporary, "create"), "maximumAttempts"),
+        "credentialMutation.temporary.create.maximumAttempts",
     );
 
     let claim_manifest = member(platform, "claimJournal");
@@ -263,15 +289,90 @@ fn main() {
     );
     assert_eq!(
         member(&mutation_fixture, "implementationStatus"),
-        "contract-only-not-implemented"
+        "platform-common-only"
     );
+    let mutation_constants = member(&mutation_fixture, "constants");
+    assert_eq!(
+        unsigned(
+            member(mutation_constants, "credentialMaximumBytes"),
+            "credential mutation credentialMaximumBytes",
+        ),
+        mutation_maximum_bytes
+    );
+    assert_eq!(
+        relative_component(
+            member(mutation_constants, "temporaryPrefix"),
+            "credential mutation temporaryPrefix",
+        ),
+        mutation_temporary_prefix
+    );
+    assert_eq!(
+        unsigned(
+            member(mutation_constants, "temporaryEntropyBytes"),
+            "credential mutation temporaryEntropyBytes",
+        ),
+        mutation_temporary_entropy_bytes
+    );
+    assert_eq!(
+        string(
+            member(mutation_constants, "temporarySuffixEncoding"),
+            "credential mutation temporarySuffixEncoding",
+        ),
+        mutation_temporary_suffix_encoding
+    );
+    assert_eq!(
+        unsigned(
+            member(mutation_constants, "temporarySuffixCharacters"),
+            "credential mutation temporarySuffixCharacters",
+        ),
+        mutation_temporary_suffix_characters
+    );
+    assert_eq!(
+        unsigned(
+            member(mutation_constants, "temporaryCreateAttempts"),
+            "credential mutation temporaryCreateAttempts",
+        ),
+        mutation_temporary_attempts
+    );
+    assert!(
+        mutation_maximum_bytes > 0,
+        "credential mutation maximum bytes must be nonzero"
+    );
+    assert!(
+        mutation_temporary_entropy_bytes > 0,
+        "credential mutation temporary entropy must be nonzero"
+    );
+    assert!(
+        mutation_temporary_attempts > 0,
+        "credential mutation temporary attempts must be nonzero"
+    );
+    assert_eq!(
+        mutation_temporary_suffix_encoding, "lowercase-hex",
+        "credential mutation temporary suffix encoding must remain lowercase hex"
+    );
+    assert_eq!(
+        mutation_temporary_suffix_characters,
+        mutation_temporary_entropy_bytes
+            .checked_mul(2)
+            .expect("credential mutation lowercase hex length overflow"),
+        "credential mutation lowercase hex must encode two characters per entropy byte"
+    );
+    let mutation_maximum_bytes = usize::try_from(mutation_maximum_bytes)
+        .expect("credential mutation maximum bytes fit usize");
+    let mutation_temporary_entropy_bytes = usize::try_from(mutation_temporary_entropy_bytes)
+        .expect("credential mutation temporary entropy bytes fit usize");
+    let mutation_temporary_suffix_characters =
+        usize::try_from(mutation_temporary_suffix_characters)
+            .expect("credential mutation temporary suffix characters fit usize");
+    let mutation_temporary_attempts = usize::try_from(mutation_temporary_attempts)
+        .expect("credential mutation temporary attempts fit usize");
     let mutation_qualification = member(&mutation_fixture, "qualification");
     assert!(
         member(mutation_qualification, "qualifiedRecords")
             .as_array()
             .expect("credential mutation qualifiedRecords array")
             .is_empty(),
-        "contract revision 3 credential mutation must remain deny-by-default"
+        "contract revision 4 credential mutation must remain deny-by-default"
     );
     assert_eq!(
         member(mutation_qualification, "productionProofConstructible"),
@@ -289,7 +390,7 @@ fn main() {
     );
 
     let mut generated = String::new();
-    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 3;").unwrap();
+    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 4;").unwrap();
     writeln!(
         generated,
         "pub(super) const RESOURCE_CONTRACT_VERSION: u32 = 1;"
@@ -302,7 +403,7 @@ fn main() {
     .unwrap();
     writeln!(
         generated,
-        "#[cfg(test)]\npub(super) const CREDENTIAL_MUTATION_IMPLEMENTED: bool = false;"
+        "#[cfg(test)]\npub(super) const CREDENTIAL_MUTATION_IMPLEMENTED: bool = true;"
     )
     .unwrap();
     writeln!(
@@ -315,6 +416,36 @@ fn main() {
     writeln!(
         generated,
         "pub(super) const CLAIM_JOURNAL_LENGTH: usize = {journal_length};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub const CREDENTIAL_MAXIMUM_BYTES: usize = {mutation_maximum_bytes};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub const TEMPORARY_PREFIX: &str = {mutation_temporary_prefix:?};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub const TEMPORARY_ENTROPY_BYTES: usize = {mutation_temporary_entropy_bytes};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const TEMPORARY_SUFFIX_CHARACTERS: usize = {mutation_temporary_suffix_characters};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const TEMPORARY_LOWERCASE_HEX_ALPHABET: &[u8; 16] = b\"0123456789abcdef\";"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub const TEMPORARY_CREATE_ATTEMPTS: usize = {mutation_temporary_attempts};"
     )
     .unwrap();
 

@@ -4,12 +4,15 @@
 //! This default-off crate adopts one pre-bound directory descriptor and owns
 //! the Host-specific process registry, traditional record-lock descriptor,
 //! fixed claim journal, and exactly-once final close chain. All filesystem
-//! operations are supplied through [`DescriptorRelativePlatform`]. No path,
-//! HOME, environment, broker N0 type, real syscall, N-API, Vault, Authority,
-//! credential mutation, recovery, loader, readiness, or production
-//! composition exists here.
+//! admission operations are supplied through [`DescriptorRelativePlatform`].
+//! The additive [`CredentialMutationPlatform`] subtrait enables the common-only
+//! read/CAS mutation owner without changing existing target adapters. No path,
+//! HOME, environment, broker N0 type, real syscall mutation adapter, N-API,
+//! Vault, Authority, recovery, loader, readiness, or production composition
+//! exists here.
 
 mod claim_journal;
+mod credential_mutation;
 mod process_lifecycle;
 
 #[cfg(test)]
@@ -18,6 +21,12 @@ mod tests;
 pub use claim_journal::{
     CLAIM_ID_LENGTH, CLAIM_JOURNAL_FORMAT_VERSION, CLAIM_JOURNAL_LENGTH,
     CLAIM_JOURNAL_STATE_ADMISSION_HELD_NO_CREDENTIAL_MUTATION,
+};
+use credential_mutation::TrackedTemporary;
+pub use credential_mutation::{
+    CredentialCompareAndSwapOutcome, CredentialCurrent, CredentialMutationPlatform,
+    CredentialRevision, CREDENTIAL_MAXIMUM_BYTES, TEMPORARY_CREATE_ATTEMPTS,
+    TEMPORARY_ENTROPY_BYTES, TEMPORARY_PREFIX,
 };
 pub use process_lifecycle::{initialize_process_lifecycle, ProcessLifecycleToken};
 
@@ -397,6 +406,10 @@ impl<'a, P: DescriptorRelativePlatform> OpenAttempt<'a, P> {
             lock_identity,
             claim_identity,
             journal,
+            mutation_fenced: false,
+            next_revision_generation: 1,
+            current_revision_generation: None,
+            known_temporary: None,
             close_result: None,
         }
     }
@@ -872,8 +885,8 @@ fn adopt_prebound_directory_with_claim_id<'a, P: DescriptorRelativePlatform>(
     ))
 }
 
-/// Sole Host admission owner. It intentionally exposes no descriptor, journal,
-/// registry, unlock, cleanup, credential, mutation, or path operation.
+/// Sole Host admission and credential-mutation owner. It never exposes a
+/// descriptor, journal, registry, unlock, cleanup, or path operation.
 pub struct AdmissionOwner<P: DescriptorRelativePlatform> {
     platform: Option<P>,
     directory: DescriptorSlot<P::Descriptor>,
@@ -885,6 +898,10 @@ pub struct AdmissionOwner<P: DescriptorRelativePlatform> {
     lock_identity: ObjectIdentity,
     claim_identity: ObjectIdentity,
     journal: ClaimJournal,
+    mutation_fenced: bool,
+    next_revision_generation: u64,
+    current_revision_generation: Option<u64>,
+    known_temporary: Option<TrackedTemporary<P::Descriptor>>,
     close_result: Option<Result<(), CellErrorCode>>,
 }
 
@@ -952,6 +969,15 @@ impl<P: DescriptorRelativePlatform> AdmissionOwner<P> {
 
     fn close_resources(&mut self) -> bool {
         let mut all_closed = true;
+        if let Some(temporary) = self.known_temporary.as_mut() {
+            if let Some(descriptor) = temporary.take_descriptor() {
+                if self.lifecycle.check_parent_process().is_err()
+                    || self.platform().raw_close(descriptor).is_err()
+                {
+                    all_closed = false;
+                }
+            }
+        }
         let descriptors = [self.claim.take(), self.lock.take(), self.directory.take()];
         for descriptor in descriptors.into_iter().flatten() {
             if self.lifecycle.check_parent_process().is_err()
@@ -974,9 +1000,10 @@ impl<P: DescriptorRelativePlatform> AdmissionOwner<P> {
         result
     }
 
-    /// Stable, idempotent close result. The three raw descriptors are each
-    /// transferred to `raw_close` at most once and are never explicitly
-    /// unlocked. A failed result is cached and never retried.
+    /// Stable, idempotent close result. The owned core descriptors and any
+    /// optional tracked temporary descriptor are each transferred to
+    /// `raw_close` at most once and are never explicitly unlocked. A failed
+    /// result is cached and never retried.
     pub fn close(&mut self) -> Result<(), CellErrorCode> {
         if let Some(result) = self.close_result {
             return result;
@@ -986,6 +1013,11 @@ impl<P: DescriptorRelativePlatform> AdmissionOwner<P> {
             self.close_result = Some(result);
             self.lifecycle.mark_close_uncertain();
             return result;
+        }
+        self.current_revision_generation = None;
+        if self.mutation_fenced || self.known_temporary.is_some() {
+            self.mutation_fenced = true;
+            return self.tombstone_then_close_resources(CellErrorCode::CellRecoveryRequired);
         }
         if let Err(error) = self.lifecycle.begin_close() {
             return self.tombstone_then_close_resources(error);

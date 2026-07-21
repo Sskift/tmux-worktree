@@ -18,6 +18,16 @@ enum FakeDescriptor {
     Directory(u32),
     Lock,
     Claim,
+    Credential,
+    Temporary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FakeRename {
+    Succeed,
+    ErrorNoCommit,
+    ErrorAfterCommit,
+    SucceedWithPublishedIdentityMismatch,
 }
 
 #[derive(Debug)]
@@ -34,6 +44,28 @@ struct FakeState {
     lock_busy: bool,
     claim_create_race: Option<ObjectMetadata>,
     poison_registry_on_event: Option<(String, Arc<AtomicBool>)>,
+    credential_exists: bool,
+    credential: ObjectMetadata,
+    credential_bytes: Vec<u8>,
+    open_credential: Option<(ObjectMetadata, Vec<u8>)>,
+    credential_lookup_count: usize,
+    credential_lookup_error: bool,
+    credential_open_not_found: bool,
+    change_credential_on_lookup: Option<usize>,
+    credential_path_identity_mismatch_on_lookup: Option<usize>,
+    temporary_name: Option<String>,
+    temporary_exists: bool,
+    temporary: ObjectMetadata,
+    temporary_bytes: Vec<u8>,
+    temporary_lookup_count: usize,
+    temporary_path_identity_mismatch_on_lookup: Option<usize>,
+    temporary_collisions_remaining: usize,
+    poison_registry_after_temporary_collision: Option<Arc<AtomicBool>>,
+    temporary_create_count: usize,
+    temporary_unlink_failure: bool,
+    rename: FakeRename,
+    claim_read_count: usize,
+    poison_registry_after_claim_read: Option<(usize, Arc<AtomicBool>)>,
 }
 
 impl FakeState {
@@ -58,6 +90,28 @@ impl FakeState {
             lock_busy: false,
             claim_create_race: None,
             poison_registry_on_event: None,
+            credential_exists: false,
+            credential: metadata(ObjectKind::RegularFile, 41, 42, 0o600, 1, 0),
+            credential_bytes: Vec::new(),
+            open_credential: None,
+            credential_lookup_count: 0,
+            credential_lookup_error: false,
+            credential_open_not_found: false,
+            change_credential_on_lookup: None,
+            credential_path_identity_mismatch_on_lookup: None,
+            temporary_name: None,
+            temporary_exists: false,
+            temporary: metadata(ObjectKind::RegularFile, 51, 52, 0o600, 1, 0),
+            temporary_bytes: Vec::new(),
+            temporary_lookup_count: 0,
+            temporary_path_identity_mismatch_on_lookup: None,
+            temporary_collisions_remaining: 0,
+            poison_registry_after_temporary_collision: None,
+            temporary_create_count: 0,
+            temporary_unlink_failure: false,
+            rename: FakeRename::Succeed,
+            claim_read_count: 0,
+            poison_registry_after_claim_read: None,
         }
     }
 }
@@ -135,6 +189,12 @@ impl DescriptorRelativePlatform for FakePlatform {
                 claim.size_bytes = state.claim_bytes.len() as u64;
                 claim
             }
+            FakeDescriptor::Credential => state
+                .open_credential
+                .as_ref()
+                .map(|(metadata, _)| *metadata)
+                .unwrap_or(state.credential),
+            FakeDescriptor::Temporary => state.temporary,
         })
     }
 
@@ -234,11 +294,21 @@ impl DescriptorRelativePlatform for FakePlatform {
         output: &mut [u8],
     ) -> Result<(), PlatformFailure> {
         self.event("read:claim:offset-0:exact")?;
-        let state = self.state.lock().expect("fake state");
+        let mut state = self.state.lock().expect("fake state");
         if state.claim_bytes.len() != output.len() {
             return Err(PlatformFailure::Io);
         }
         output.copy_from_slice(&state.claim_bytes);
+        state.claim_read_count += 1;
+        let poison = state
+            .poison_registry_after_claim_read
+            .as_ref()
+            .filter(|(target, _)| *target == state.claim_read_count)
+            .map(|(_, flag)| Arc::clone(flag));
+        drop(state);
+        if let Some(poison) = poison {
+            poison.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -265,7 +335,185 @@ impl DescriptorRelativePlatform for FakePlatform {
         let mut state = self.state.lock().expect("fake state");
         state.events.push(event.clone());
         *state.close_counts.entry(descriptor).or_default() += 1;
+        if descriptor == FakeDescriptor::Credential {
+            state.open_credential = None;
+        }
         if state.fail_event.as_deref() == Some(event.as_str()) {
+            Err(PlatformFailure::Io)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CredentialMutationPlatform for FakePlatform {
+    fn fstatat_credential_nofollow(
+        &mut self,
+        _directory: &Self::Descriptor,
+    ) -> Result<Lookup, PlatformFailure> {
+        self.event("fstatat:credential:nofollow")?;
+        let mut state = self.state.lock().expect("fake state");
+        state.credential_lookup_count += 1;
+        let count = state.credential_lookup_count;
+        if state.credential_lookup_error && count == 1 {
+            return Err(PlatformFailure::Io);
+        }
+        if state.change_credential_on_lookup == Some(count) {
+            state.credential_exists = true;
+            state.credential = metadata(ObjectKind::RegularFile, 61, 62, 0o600, 1, 3);
+            state.credential_bytes = vec![9, 8, 7];
+        }
+        if !state.credential_exists {
+            return Ok(Lookup::Absent);
+        }
+        let mut observed = state.credential;
+        if state.credential_path_identity_mismatch_on_lookup == Some(count) {
+            observed.identity.inode += 1;
+        }
+        Ok(Lookup::Present(observed))
+    }
+
+    fn open_credential_readonly(
+        &mut self,
+        _directory: &Self::Descriptor,
+    ) -> Result<Self::Descriptor, PlatformFailure> {
+        self.event("open:credential:readonly-nofollow-cloexec")?;
+        let mut state = self.state.lock().expect("fake state");
+        if state.credential_open_not_found || !state.credential_exists {
+            return Err(PlatformFailure::NotFound);
+        }
+        state.open_credential = Some((state.credential, state.credential_bytes.clone()));
+        Ok(FakeDescriptor::Credential)
+    }
+
+    fn read_file_exact(
+        &mut self,
+        descriptor: &Self::Descriptor,
+        output: &mut [u8],
+    ) -> Result<(), PlatformFailure> {
+        self.event(format!("read-file:{}:exact", descriptor_name(*descriptor)))?;
+        let state = self.state.lock().expect("fake state");
+        let bytes = match descriptor {
+            FakeDescriptor::Credential => state
+                .open_credential
+                .as_ref()
+                .map(|(_, bytes)| bytes.as_slice())
+                .ok_or(PlatformFailure::IdentityUncertain)?,
+            FakeDescriptor::Temporary => state.temporary_bytes.as_slice(),
+            _ => return Err(PlatformFailure::IdentityUncertain),
+        };
+        if bytes.len() != output.len() {
+            return Err(PlatformFailure::Io);
+        }
+        output.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn fstatat_temporary_nofollow(
+        &mut self,
+        _directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<Lookup, PlatformFailure> {
+        self.event(format!("fstatat:temporary:{temporary_name}:nofollow"))?;
+        let mut state = self.state.lock().expect("fake state");
+        state.temporary_lookup_count += 1;
+        if !state.temporary_exists || state.temporary_name.as_deref() != Some(temporary_name) {
+            return Ok(Lookup::Absent);
+        }
+        let mut observed = state.temporary;
+        if state.temporary_path_identity_mismatch_on_lookup == Some(state.temporary_lookup_count) {
+            observed.identity.inode += 1;
+        }
+        Ok(Lookup::Present(observed))
+    }
+
+    fn create_temporary_exclusive(
+        &mut self,
+        _directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<Self::Descriptor, PlatformFailure> {
+        self.event(format!("open:temporary:{temporary_name}:exclusive-0600"))?;
+        let mut state = self.state.lock().expect("fake state");
+        state.temporary_create_count += 1;
+        if state.temporary_collisions_remaining > 0 {
+            state.temporary_collisions_remaining -= 1;
+            if let Some(poison) = state.poison_registry_after_temporary_collision.take() {
+                poison.store(true, Ordering::Release);
+            }
+            return Err(PlatformFailure::AlreadyExists);
+        }
+        if state.temporary_exists {
+            return Err(PlatformFailure::AlreadyExists);
+        }
+        state.temporary_name = Some(temporary_name.to_string());
+        state.temporary_exists = true;
+        state.temporary = metadata(
+            ObjectKind::RegularFile,
+            51,
+            100 + state.temporary_create_count as u64,
+            0o600,
+            1,
+            0,
+        );
+        state.temporary_bytes.clear();
+        Ok(FakeDescriptor::Temporary)
+    }
+
+    fn write_temporary_from_start(
+        &mut self,
+        _temporary: &Self::Descriptor,
+        bytes: &[u8],
+    ) -> Result<(), PlatformFailure> {
+        self.event("write:temporary:offset-0:exact")?;
+        let mut state = self.state.lock().expect("fake state");
+        state.temporary_bytes = bytes.to_vec();
+        state.temporary.size_bytes = bytes.len() as u64;
+        Ok(())
+    }
+
+    fn fsync_temporary(&mut self, _temporary: &Self::Descriptor) -> Result<(), PlatformFailure> {
+        self.event("fsync:temporary")
+    }
+
+    fn unlink_temporary(
+        &mut self,
+        _directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<(), PlatformFailure> {
+        self.event(format!("unlinkat:temporary:{temporary_name}"))?;
+        let mut state = self.state.lock().expect("fake state");
+        if state.temporary_unlink_failure {
+            return Err(PlatformFailure::Io);
+        }
+        if !state.temporary_exists || state.temporary_name.as_deref() != Some(temporary_name) {
+            return Err(PlatformFailure::NotFound);
+        }
+        state.temporary_exists = false;
+        Ok(())
+    }
+
+    fn rename_temporary_to_credential(
+        &mut self,
+        _directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<(), PlatformFailure> {
+        self.event(format!("renameat:{temporary_name}:credential"))?;
+        let mut state = self.state.lock().expect("fake state");
+        if !state.temporary_exists || state.temporary_name.as_deref() != Some(temporary_name) {
+            return Err(PlatformFailure::NotFound);
+        }
+        let disposition = state.rename;
+        if disposition == FakeRename::ErrorNoCommit {
+            return Err(PlatformFailure::Io);
+        }
+        state.credential_exists = true;
+        state.credential = state.temporary;
+        state.credential_bytes = state.temporary_bytes.clone();
+        state.temporary_exists = false;
+        if disposition == FakeRename::SucceedWithPublishedIdentityMismatch {
+            state.credential.identity.inode += 1;
+        }
+        if disposition == FakeRename::ErrorAfterCommit {
             Err(PlatformFailure::Io)
         } else {
             Ok(())
@@ -278,6 +526,8 @@ fn descriptor_name(descriptor: FakeDescriptor) -> &'static str {
         FakeDescriptor::Directory(_) => "directory",
         FakeDescriptor::Lock => "lock",
         FakeDescriptor::Claim => "claim",
+        FakeDescriptor::Credential => "credential",
+        FakeDescriptor::Temporary => "temporary",
     }
 }
 
@@ -353,9 +603,60 @@ fn contract_json(name: &str) -> Value {
         "manifest.json" => include_str!(
             "../../../contracts/relay/v2/host-credential-atomic-file-cell-v1/manifest.json"
         ),
+        "credential-mutation-cases-v1.json" => include_str!(
+            "../../../contracts/relay/v2/host-credential-atomic-file-cell-v1/credential-mutation-cases-v1.json"
+        ),
         _ => panic!("unknown contract fixture {name}"),
     };
     serde_json::from_str(source).expect("parse contract JSON")
+}
+
+fn revision_from(current: CredentialCurrent) -> CredentialRevision {
+    match current {
+        CredentialCurrent::Absent { revision } | CredentialCurrent::Present { revision, .. } => {
+            revision
+        }
+    }
+}
+
+fn current_state(current: &CredentialCurrent) -> &'static str {
+    match current {
+        CredentialCurrent::Absent { .. } => "absent",
+        CredentialCurrent::Present { .. } => "present",
+    }
+}
+
+fn contract_error(code: &str) -> CellErrorCode {
+    match code {
+        "CELL_CLOSED" => CellErrorCode::CellClosed,
+        "CELL_CORRUPT" => CellErrorCode::CellCorrupt,
+        "CELL_IDENTITY_UNCERTAIN" => CellErrorCode::CellIdentityUncertain,
+        "CELL_IO" => CellErrorCode::CellIo,
+        "CELL_PERMISSION_INVALID" => CellErrorCode::CellPermissionInvalid,
+        "CELL_RECOVERY_REQUIRED" => CellErrorCode::CellRecoveryRequired,
+        "INVALID_REVISION" => CellErrorCode::InvalidRevision,
+        other => panic!("unsupported fixture error {other}"),
+    }
+}
+
+fn set_present_credential(state: &mut FakeState, bytes: &[u8]) {
+    state.credential_exists = true;
+    state.credential_bytes = bytes.to_vec();
+    state.credential = metadata(
+        ObjectKind::RegularFile,
+        41,
+        42,
+        0o600,
+        1,
+        bytes.len() as u64,
+    );
+}
+
+fn reset_mutation_observation(state: &mut FakeState) {
+    state.credential_lookup_count = 0;
+    state.temporary_lookup_count = 0;
+    state.claim_read_count = 0;
+    state.events.clear();
 }
 
 fn assert_fixture_close_bounds(
@@ -442,10 +743,10 @@ fn production_qualification_is_empty_and_resources_are_host_specific() {
         Err(CellErrorCode::CellDurabilityUnsupported)
     ));
     let spec = platform_resource_spec();
-    assert_eq!(spec.contract_revision(), 3);
+    assert_eq!(spec.contract_revision(), 4);
     assert_eq!(spec.resource_contract_version(), 1);
     assert_eq!(generated::CREDENTIAL_MUTATION_CONTRACT_VERSION, 1);
-    assert!(!generated::CREDENTIAL_MUTATION_IMPLEMENTED);
+    assert!(generated::CREDENTIAL_MUTATION_IMPLEMENTED);
     assert_eq!(CLAIM_JOURNAL_FORMAT_VERSION, 1);
     assert_eq!(CLAIM_JOURNAL_STATE_ADMISSION_HELD_NO_CREDENTIAL_MUTATION, 1);
     assert_eq!(spec.claim_journal_length(), CLAIM_JOURNAL_LENGTH);
@@ -941,5 +1242,512 @@ fn all_platform_error_codes_stay_inside_the_frozen_raw_union() {
         CellErrorCode::CellRecoveryRequired,
     ] {
         assert!(raw_codes.contains(&code.as_contract_code()));
+    }
+}
+
+#[test]
+fn credential_mutation_read_cases_and_exact_open_phase_gates_follow_fixture() {
+    let fixture = contract_json("credential-mutation-cases-v1.json");
+    let cases = fixture["readCases"].as_array().expect("read cases");
+    assert_eq!(cases.len(), 8);
+
+    for case in cases {
+        let name = case["name"].as_str().expect("read case name");
+        let (_current_pid, token) = context();
+        let mut fake = FakeState::new();
+        match name {
+            "initial-enoent-is-absent" => {}
+            "safe-present-is-read-and-bound" => set_present_credential(&mut fake, &[1, 2, 3]),
+            "non-enoent-lookup-error-is-not-absent" => {
+                fake.credential_lookup_error = true;
+            }
+            "post-present-enoent-is-an-identity-race" => {
+                set_present_credential(&mut fake, &[1]);
+                fake.credential_open_not_found = true;
+            }
+            "present-type-link-or-stable-identity-failure-fences" => {
+                set_present_credential(&mut fake, &[1]);
+                fake.credential.link_count = 2;
+            }
+            "present-owner-or-mode-invalid-fences" => {
+                set_present_credential(&mut fake, &[1]);
+                fake.credential.mode = 0o640;
+            }
+            "present-size-over-limit-fences" => {
+                set_present_credential(&mut fake, &vec![0x5a; CREDENTIAL_MAXIMUM_BYTES + 1]);
+            }
+            "read-descriptor-close-failure-does-not-issue-revision" => {
+                set_present_credential(&mut fake, &[1]);
+                fake.fail_event = Some("raw-close:credential".to_string());
+            }
+            _ => panic!("unknown read fixture case {name}"),
+        }
+        let state = Arc::new(Mutex::new(fake));
+        let mut owner = open(&token, Arc::clone(&state), 1).expect("admission owner");
+        let result = owner.read();
+        if let Some(expected) = case["expectedState"].as_str() {
+            let current = result.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(current_state(&current), expected, "{name}");
+            assert!(case["revisionIssued"].as_bool().expect("revision issued"));
+        } else {
+            let expected = contract_error(case["errorCode"].as_str().expect("read error"));
+            assert!(matches!(result, Err(error) if error == expected), "{name}");
+        }
+        let fenced = case["fenced"].as_bool().expect("fenced");
+        if fenced {
+            assert_eq!(
+                owner.read().map(|_| ()),
+                Err(CellErrorCode::CellClosed),
+                "{name}"
+            );
+            assert_eq!(
+                owner.close(),
+                Err(CellErrorCode::CellRecoveryRequired),
+                "{name}"
+            );
+            assert!(state.lock().expect("fake state").claim_exists, "{name}");
+        } else {
+            assert_eq!(owner.close(), Ok(()), "{name}");
+        }
+        let state = state.lock().expect("fake state");
+        assert!(
+            state
+                .close_counts
+                .get(&FakeDescriptor::Credential)
+                .copied()
+                .unwrap_or(0)
+                <= 1,
+            "{name}: {state:?}"
+        );
+    }
+
+    let phases = fixture["phaseRevalidation"]["phases"]
+        .as_array()
+        .expect("phase list");
+    assert_eq!(
+        phases[..5]
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>(),
+        Some(vec![
+            "read-before-credential-observation",
+            "read-after-open-before-A-proof",
+            "read-after-bytes-before-B-proof",
+            "read-before-C-proof",
+            "read-before-close-and-revision-issue",
+        ])
+    );
+    for (index, phase) in phases[..5].iter().enumerate() {
+        let (_current_pid, token) = context();
+        let mut fake = FakeState::new();
+        set_present_credential(&mut fake, &[1, 2, 3]);
+        let state = Arc::new(Mutex::new(fake));
+        let mut owner = open(&token, Arc::clone(&state), 1).expect("phase owner");
+        let poison = registry_poison_flag_for_test(&token);
+        state
+            .lock()
+            .expect("fake state")
+            .poison_registry_after_claim_read = Some((index + 1, poison));
+        assert_eq!(
+            owner.read().map(|_| ()),
+            Err(CellErrorCode::CellClosed),
+            "{}",
+            phase.as_str().expect("phase")
+        );
+        assert_eq!(
+            state.lock().expect("fake state").claim_read_count,
+            index + 1,
+            "{}",
+            phase.as_str().expect("phase")
+        );
+        assert_eq!(owner.close(), Err(CellErrorCode::CellRecoveryRequired));
+        let state = state.lock().expect("fake state");
+        assert!(state.claim_exists);
+        for descriptor in [
+            FakeDescriptor::Credential,
+            FakeDescriptor::Claim,
+            FakeDescriptor::Lock,
+            FakeDescriptor::Directory(1),
+        ] {
+            assert!(state.close_counts.get(&descriptor).copied().unwrap_or(0) <= 1);
+        }
+    }
+}
+
+#[test]
+fn credential_mutation_cas_cases_revisions_gates_and_publication_follow_fixture() {
+    let fixture = contract_json("credential-mutation-cases-v1.json");
+    let cases = fixture["compareAndSwapCases"]
+        .as_array()
+        .expect("compare-and-swap cases");
+    assert_eq!(cases.len(), 12);
+    let replacement = [7_u8, 8, 9];
+
+    for case in cases {
+        let name = case["name"].as_str().expect("CAS case name");
+        let (_current_pid, token) = context();
+        let state = Arc::new(Mutex::new(FakeState::new()));
+        let mut owner = open(&token, Arc::clone(&state), 1).expect("admission owner");
+        let revision = revision_from(owner.read().expect("initial revision"));
+        let revision = if name == "invalid-revision-stops-before-current-check" {
+            let _new_current = owner.read().expect("replacement revision");
+            revision
+        } else {
+            revision
+        };
+        {
+            let mut fake = state.lock().expect("fake state");
+            reset_mutation_observation(&mut fake);
+            match name {
+                "invalid-revision-stops-before-current-check" => {}
+                "first-current-mismatch-conflicts-before-temp" => {
+                    set_present_credential(&mut fake, &[4]);
+                }
+                "eight-temp-name-collisions-exhaust" => {
+                    fake.temporary_collisions_remaining = TEMPORARY_CREATE_ATTEMPTS;
+                }
+                "second-current-mismatch-cleans-owned-temp-then-conflicts" => {
+                    fake.change_credential_on_lookup = Some(2);
+                }
+                "precommit-cleanup-identity-mismatch-fences" => {
+                    fake.change_credential_on_lookup = Some(2);
+                    fake.temporary_path_identity_mismatch_on_lookup = Some(3);
+                }
+                "precommit-cleanup-durability-uncertain-fences" => {
+                    fake.change_credential_on_lookup = Some(2);
+                    fake.fail_event = Some("fsync:directory".to_string());
+                }
+                "rename-error-with-old-and-temp-proof-is-definite" => {
+                    fake.rename = FakeRename::ErrorNoCommit;
+                }
+                "rename-error-without-old-value-proof-is-uncertain" => {
+                    fake.rename = FakeRename::ErrorAfterCommit;
+                }
+                "post-rename-published-proof-failure-is-uncertain" => {
+                    fake.rename = FakeRename::SucceedWithPublishedIdentityMismatch;
+                }
+                "post-rename-directory-fsync-failure-is-uncertain" => {
+                    fake.fail_event = Some("fsync:directory".to_string());
+                }
+                "post-rename-close-failure-is-uncertain" => {
+                    fake.fail_event = Some("raw-close:temporary".to_string());
+                }
+                "complete-publication-swaps" => {}
+                _ => panic!("unknown CAS fixture case {name}"),
+            }
+        }
+
+        let result = owner.compare_and_swap(revision, &replacement);
+        match case["expectedOutcome"].as_str().expect("expected outcome") {
+            "error" => {
+                let expected = contract_error(case["errorCode"].as_str().expect("CAS error"));
+                assert!(matches!(result, Err(error) if error == expected), "{name}");
+            }
+            "conflict" => {
+                let conflict = match result.unwrap_or_else(|error| panic!("{name}: {error:?}")) {
+                    CredentialCompareAndSwapOutcome::Conflict(current) => current,
+                    other => panic!("{name}: {other:?}"),
+                };
+                assert!(case["freshRevisionIssued"]
+                    .as_bool()
+                    .expect("fresh revision"));
+                if name == "first-current-mismatch-conflicts-before-temp" {
+                    let fresh = revision_from(conflict);
+                    assert!(matches!(
+                        owner.compare_and_swap(fresh, &replacement),
+                        Ok(CredentialCompareAndSwapOutcome::Swapped)
+                    ));
+                }
+            }
+            "uncertain" => assert!(
+                matches!(result, Ok(CredentialCompareAndSwapOutcome::Uncertain)),
+                "{name}"
+            ),
+            "swapped" => assert!(
+                matches!(result, Ok(CredentialCompareAndSwapOutcome::Swapped)),
+                "{name}"
+            ),
+            other => panic!("unknown expected CAS outcome {other}"),
+        }
+
+        let fenced = case["fenced"].as_bool().expect("CAS fenced");
+        if fenced {
+            assert_eq!(
+                owner.read().map(|_| ()),
+                Err(CellErrorCode::CellClosed),
+                "{name}"
+            );
+            assert_eq!(
+                owner.close(),
+                Err(CellErrorCode::CellRecoveryRequired),
+                "{name}"
+            );
+        } else {
+            assert_eq!(owner.close(), Ok(()), "{name}");
+        }
+        let fake = state.lock().expect("fake state");
+        if name == "invalid-revision-stops-before-current-check" {
+            assert_eq!(fake.credential_lookup_count, 0);
+            assert_eq!(fake.temporary_create_count, 0);
+        }
+        if name == "eight-temp-name-collisions-exhaust" {
+            assert_eq!(fake.temporary_create_count, TEMPORARY_CREATE_ATTEMPTS);
+            let names = fake
+                .events
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .strip_prefix("open:temporary:")
+                        .and_then(|value| value.strip_suffix(":exclusive-0600"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), TEMPORARY_CREATE_ATTEMPTS);
+            assert_eq!(
+                names
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                names.len()
+            );
+            assert!(names.iter().all(|name| {
+                name.starts_with(TEMPORARY_PREFIX)
+                    && name.len() == TEMPORARY_PREFIX.len() + TEMPORARY_ENTROPY_BYTES * 2
+                    && name[TEMPORARY_PREFIX.len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }));
+            assert!(!fake
+                .events
+                .iter()
+                .any(|event| event.starts_with("unlinkat:temporary:")));
+        }
+        if name == "complete-publication-swaps" {
+            assert_eq!(
+                fake.credential_lookup_count, 3,
+                "two current checks plus published proof"
+            );
+            assert_eq!(fake.credential_bytes, replacement);
+        }
+        if fenced {
+            assert!(fake.claim_exists, "{name}");
+        }
+    }
+
+    let (_current_pid, token) = context();
+    let owner_a_state = Arc::new(Mutex::new(FakeState::new()));
+    let mut owner_b_fake = FakeState::new();
+    owner_b_fake.directory.identity.inode += 100;
+    let owner_b_state = Arc::new(Mutex::new(owner_b_fake));
+    let mut owner_a = open(&token, Arc::clone(&owner_a_state), 1).expect("live owner A");
+    let mut owner_b = open(&token, owner_b_state, 2).expect("live owner B");
+    let owner_a_revision = revision_from(owner_a.read().expect("owner A revision"));
+    let owner_b_revision = revision_from(owner_b.read().expect("owner B revision"));
+    reset_mutation_observation(&mut owner_a_state.lock().expect("owner A state"));
+    assert_eq!(
+        owner_a
+            .compare_and_swap(owner_b_revision, &replacement)
+            .map(|_| ()),
+        Err(CellErrorCode::InvalidRevision)
+    );
+    {
+        let owner_a_state = owner_a_state.lock().expect("owner A state");
+        assert_eq!(owner_a_state.credential_lookup_count, 0);
+        assert_eq!(owner_a_state.temporary_create_count, 0);
+    }
+    assert!(matches!(
+        owner_a.compare_and_swap(owner_a_revision, &replacement),
+        Ok(CredentialCompareAndSwapOutcome::Swapped)
+    ));
+    owner_a.close().expect("owner A close");
+    owner_b.close().expect("owner B close");
+
+    let (_current_pid, token) = context();
+    let state = Arc::new(Mutex::new(FakeState::new()));
+    let mut owner = open(&token, Arc::clone(&state), 1).expect("collision gate owner");
+    let revision = revision_from(owner.read().expect("collision gate revision"));
+    let poison = registry_poison_flag_for_test(&token);
+    {
+        let mut fake = state.lock().expect("fake state");
+        reset_mutation_observation(&mut fake);
+        fake.temporary_collisions_remaining = 1;
+        fake.poison_registry_after_temporary_collision = Some(poison);
+    }
+    assert_eq!(
+        owner.compare_and_swap(revision, &replacement).map(|_| ()),
+        Err(CellErrorCode::CellClosed),
+        "collision successor attempt must stop at its full owner gate"
+    );
+    assert_eq!(owner.read().map(|_| ()), Err(CellErrorCode::CellClosed));
+    assert_eq!(owner.close(), Err(CellErrorCode::CellRecoveryRequired));
+    {
+        let fake = state.lock().expect("fake state");
+        assert_eq!(fake.temporary_create_count, 1);
+        assert!(!fake.temporary_exists);
+        assert!(!fake
+            .events
+            .iter()
+            .any(|event| event.starts_with("unlinkat:temporary:")));
+        assert!(fake.claim_exists);
+    }
+
+    let (_current_pid, token) = context();
+    let mut same_fake = FakeState::new();
+    set_present_credential(&mut same_fake, &replacement);
+    let same_state = Arc::new(Mutex::new(same_fake));
+    let mut same_owner = open(&token, Arc::clone(&same_state), 1).expect("same-bytes owner");
+    let same_revision = revision_from(same_owner.read().expect("same-bytes revision"));
+    reset_mutation_observation(&mut same_state.lock().expect("fake state"));
+    assert!(matches!(
+        same_owner.compare_and_swap(same_revision, &replacement),
+        Ok(CredentialCompareAndSwapOutcome::Swapped)
+    ));
+    assert!(same_state
+        .lock()
+        .expect("fake state")
+        .events
+        .iter()
+        .any(|event| event.starts_with("renameat:")));
+    same_owner.close().expect("same-bytes close");
+
+    let phases = fixture["phaseRevalidation"]["phases"]
+        .as_array()
+        .expect("phase list");
+    let cas_phases = &phases[5..16];
+    assert_eq!(cas_phases.len(), 11);
+    for (index, phase) in cas_phases.iter().enumerate() {
+        let (_current_pid, token) = context();
+        let state = Arc::new(Mutex::new(FakeState::new()));
+        let mut owner = open(&token, Arc::clone(&state), 1).expect("CAS phase owner");
+        let revision = revision_from(owner.read().expect("CAS phase revision"));
+        let poison = registry_poison_flag_for_test(&token);
+        {
+            let mut fake = state.lock().expect("fake state");
+            reset_mutation_observation(&mut fake);
+            fake.poison_registry_after_claim_read = Some((index + 1, poison));
+        }
+        let result = owner.compare_and_swap(revision, &replacement);
+        assert!(
+            !matches!(result, Ok(CredentialCompareAndSwapOutcome::Swapped)),
+            "{}",
+            phase.as_str().expect("phase")
+        );
+        assert_eq!(owner.read().map(|_| ()), Err(CellErrorCode::CellClosed));
+        assert_eq!(owner.close(), Err(CellErrorCode::CellRecoveryRequired));
+        let fake = state.lock().expect("fake state");
+        assert_eq!(
+            fake.claim_read_count,
+            index + 1,
+            "{}",
+            phase.as_str().expect("phase")
+        );
+        assert!(fake.claim_exists);
+    }
+
+    let cleanup_phase = phases[16].as_str().expect("cleanup phase");
+    assert_eq!(cleanup_phase, "precommit-cleanup");
+    let (_current_pid, token) = context();
+    let state = Arc::new(Mutex::new(FakeState::new()));
+    let mut owner = open(&token, Arc::clone(&state), 1).expect("cleanup phase owner");
+    let revision = revision_from(owner.read().expect("cleanup phase revision"));
+    let poison = registry_poison_flag_for_test(&token);
+    {
+        let mut fake = state.lock().expect("fake state");
+        reset_mutation_observation(&mut fake);
+        fake.change_credential_on_lookup = Some(2);
+        fake.poison_registry_after_claim_read = Some((8, poison));
+    }
+    assert_eq!(
+        owner.compare_and_swap(revision, &replacement).map(|_| ()),
+        Err(CellErrorCode::CellRecoveryRequired),
+        "{cleanup_phase}"
+    );
+    assert_eq!(owner.close(), Err(CellErrorCode::CellRecoveryRequired));
+    let fake = state.lock().expect("fake state");
+    assert!(fake.temporary_exists);
+    assert!(!fake
+        .events
+        .iter()
+        .any(|event| event.starts_with("unlinkat:temporary:")));
+}
+
+#[test]
+fn credential_mutation_recovery_cases_fence_and_preserve_owned_artifacts() {
+    let fixture = contract_json("credential-mutation-cases-v1.json");
+    let recovery = fixture["recoveryCases"].as_array().expect("recovery cases");
+    assert_eq!(recovery.len(), 2);
+    assert_eq!(
+        recovery[0]["name"].as_str(),
+        Some("existing-admission-claim-remains-recovery-required")
+    );
+    assert_eq!(
+        recovery[1]["name"].as_str(),
+        Some("known-leftover-temp-remains-recovery-required")
+    );
+
+    let (_current_pid, token) = context();
+    let mut existing = FakeState::new();
+    existing.claim_exists = true;
+    existing.claim_bytes = vec![0x5a; CLAIM_JOURNAL_LENGTH];
+    let existing_state = Arc::new(Mutex::new(existing));
+    assert_eq!(
+        open(&token, Arc::clone(&existing_state), 1).map(|_| ()),
+        Err(contract_error(
+            recovery[0]["expectedErrorCode"]
+                .as_str()
+                .expect("existing claim error")
+        ))
+    );
+    let existing = existing_state.lock().expect("fake state");
+    assert!(existing.claim_exists);
+    assert!(!existing
+        .events
+        .iter()
+        .any(|event| event == "unlinkat:claim"));
+    assert_eq!(existing.close_counts.get(&FakeDescriptor::Lock), Some(&1));
+    assert_eq!(
+        existing.close_counts.get(&FakeDescriptor::Directory(1)),
+        Some(&1)
+    );
+    drop(existing);
+
+    let (_current_pid, token) = context();
+    let state = Arc::new(Mutex::new(FakeState::new()));
+    let mut owner = open(&token, Arc::clone(&state), 1).expect("recovery owner");
+    let revision = revision_from(owner.read().expect("recovery revision"));
+    {
+        let mut fake = state.lock().expect("fake state");
+        reset_mutation_observation(&mut fake);
+        fake.change_credential_on_lookup = Some(2);
+        fake.temporary_unlink_failure = true;
+    }
+    assert_eq!(
+        owner.compare_and_swap(revision, &[4, 5, 6]).map(|_| ()),
+        Err(contract_error(
+            recovery[1]["expectedErrorCode"]
+                .as_str()
+                .expect("known temp error")
+        ))
+    );
+    assert_eq!(owner.read().map(|_| ()), Err(CellErrorCode::CellClosed));
+
+    let first_close = owner.close();
+    assert_eq!(first_close, Err(CellErrorCode::CellRecoveryRequired));
+    assert_eq!(owner.close(), first_close);
+    let fake = state.lock().expect("fake state");
+    assert!(fake.claim_exists);
+    assert!(fake.temporary_exists);
+    assert!(!fake.events.iter().any(|event| event == "unlinkat:claim"));
+    for descriptor in [
+        FakeDescriptor::Temporary,
+        FakeDescriptor::Claim,
+        FakeDescriptor::Lock,
+        FakeDescriptor::Directory(1),
+    ] {
+        assert_eq!(
+            fake.close_counts.get(&descriptor).copied().unwrap_or(0),
+            1,
+            "{descriptor:?}: {fake:?}"
+        );
     }
 }

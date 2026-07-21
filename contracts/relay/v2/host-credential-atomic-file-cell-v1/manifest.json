@@ -1,6 +1,6 @@
 {
   "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
-  "contractVersion": 3,
+  "contractVersion": 4,
   "fixtureFormatVersion": 1,
   "status": "frozen",
   "scope": "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -322,8 +322,8 @@
     "contractVersion": 1,
     "fixtureFormatVersion": 1,
     "fixture": "credential-mutation-cases-v1.json",
-    "status": "frozen-contract-only",
-    "implementation": "not-implemented",
+    "status": "platform-common-only",
+    "implementation": "platform-common-only",
     "owner": "exact-live-AdmissionOwner",
     "platformResourceContractVersion": 1,
     "claimJournalFormatVersion": 1,
@@ -502,7 +502,7 @@
       "claimJournalMutationStateAllowed": false,
       "claimJournalTempNameOrRevisionAllowed": false
     },
-    "implementedInPlatformCommon": false,
+    "implementedInPlatformCommon": true,
     "implementedInDarwinAdapter": false,
     "implementedInLinuxAdapter": false,
     "fullAdmissionValidated": false,

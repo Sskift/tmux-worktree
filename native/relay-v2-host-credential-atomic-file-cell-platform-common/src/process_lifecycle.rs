@@ -80,6 +80,16 @@ impl EntryFence {
         }
     }
 
+    fn check_mutation_open(&self) -> Result<(), CellErrorCode> {
+        self.check_parent_process()?;
+        if self.registry_poisoned.load(Ordering::Acquire)
+            || self.phase.load(Ordering::Acquire) != OPEN
+        {
+            return Err(CellErrorCode::CellClosed);
+        }
+        Ok(())
+    }
+
     fn set_phase(&self, phase: u8) {
         self.phase.store(phase, Ordering::Release);
     }
@@ -231,6 +241,12 @@ pub(crate) struct LifecycleHandle {
     fence: Arc<EntryFence>,
 }
 
+pub(crate) struct MutationOwnerBinding {
+    token: u64,
+    opener_pid: u32,
+    fence: Arc<EntryFence>,
+}
+
 impl LifecycleHandle {
     pub(crate) fn check_parent_process(&self) -> Result<(), CellErrorCode> {
         self.fence.check_parent_process()
@@ -238,6 +254,35 @@ impl LifecycleHandle {
 
     pub(crate) fn check_operation(&self) -> Result<(), CellErrorCode> {
         self.fence.check_operation()
+    }
+
+    pub(crate) fn check_mutation_open(&self) -> Result<(), CellErrorCode> {
+        self.fence.check_mutation_open()?;
+        self.registry.with_entries(|entries| {
+            let entry = entries.get(&self.key).ok_or(CellErrorCode::CellClosed)?;
+            if !Self::matching(entry, self.token, self.opener_pid())
+                || entry.phase != RegistryPhase::Open
+                || !Arc::ptr_eq(&entry.fence, &self.fence)
+            {
+                return Err(CellErrorCode::CellClosed);
+            }
+            entry.fence.check_mutation_open()
+        })
+    }
+
+    pub(crate) fn mutation_owner_binding(&self) -> Result<MutationOwnerBinding, CellErrorCode> {
+        self.check_mutation_open()?;
+        Ok(MutationOwnerBinding {
+            token: self.token,
+            opener_pid: self.opener_pid(),
+            fence: Arc::clone(&self.fence),
+        })
+    }
+
+    pub(crate) fn matches_mutation_owner_binding(&self, binding: &MutationOwnerBinding) -> bool {
+        self.token == binding.token
+            && self.opener_pid() == binding.opener_pid
+            && Arc::ptr_eq(&self.fence, &binding.fence)
     }
 
     pub(crate) fn opener_pid(&self) -> u32 {

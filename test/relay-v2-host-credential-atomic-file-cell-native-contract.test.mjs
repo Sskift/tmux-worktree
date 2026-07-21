@@ -127,7 +127,7 @@ function assertCaseTable(entries, fields, expected, label) {
 
 test("Host credential native ABI manifest and every machine case stay closed", async () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-host-credential-atomic-file-cell");
-  assert.equal(manifest.contractVersion, 3);
+  assert.equal(manifest.contractVersion, 4);
   assert.equal(
     manifest.scope,
     "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -270,8 +270,8 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     contractVersion: 1,
     fixtureFormatVersion: 1,
     fixture: "credential-mutation-cases-v1.json",
-    status: "frozen-contract-only",
-    implementation: "not-implemented",
+    status: "platform-common-only",
+    implementation: "platform-common-only",
     owner: "exact-live-AdmissionOwner",
     platformResourceContractVersion: 1,
     claimJournalFormatVersion: 1,
@@ -505,7 +505,7 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     productionWired: mutation.productionWired,
     productionCapabilityEffect: mutation.productionCapabilityEffect,
   }, {
-    implementedInPlatformCommon: false,
+    implementedInPlatformCommon: true,
     implementedInDarwinAdapter: false,
     implementedInLinuxAdapter: false,
     fullAdmissionValidated: false,
@@ -543,7 +543,7 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     credentialMutationContractVersion: 1,
     platformResourceContractVersion: 1,
     claimJournalFormatVersion: 1,
-    implementationStatus: "contract-only-not-implemented",
+    implementationStatus: "platform-common-only",
   });
   assert.deepEqual(credentialMutationFixture.constants, {
     credentialMaximumBytes: 65_536,

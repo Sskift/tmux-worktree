@@ -1,6 +1,6 @@
 # Relay v2 Host Credential Atomic File Cell v1
 
-状态：**Frozen contract revision 3；native ABI、native fixture、platform resource contract、claim journal format 与相邻 credential mutation contract 各为 v1。default-off、injected-only。Darwin arm64 与 Linux `x86_64-unknown-linux-gnu` descriptor-relative syscall adapter 仍只实现 admission 所需操作并有真实验证；credential mutation、native addon 与 production wiring 未实现。**
+状态：**Frozen contract revision 4；native ABI、native fixture、platform resource contract、claim journal format 与 credential mutation contract 各为 v1。default-off、injected-only。Platform-common 已在唯一 `AdmissionOwner` 内实现 mutation v1；Darwin arm64 与 Linux `x86_64-unknown-linux-gnu` descriptor-relative syscall adapter 仍只实现 admission 所需操作，mutation adapter、native addon 与 production wiring 未实现。**
 
 本目录冻结 Relay v2 Host credential vault 的专属 atomic byte-cell native seam。它不修改 Relay public wire，不产生 readiness/capability，也不复用 broker credential state store 的 logical store kind、binary container、private location、artifact、loader、lifecycle owner 或 continuity namespace。
 
@@ -16,7 +16,7 @@
 
 Platform-common 现已唯一拥有 claimId 签发：接管预绑定 directory descriptor 并通过 parent-PID fence 后、任何 process registry、lock、claim、fsync 或 namespace mutation 前，它只调用一次 OS CSPRNG，生成 exact 32-byte non-zero opaque claimId。entropy source error 或全零结果固定映射为 `CELL_IO`；common 只把已接管的 directory descriptor raw-close 一次，不 reserve registry、不打开 lock/claim、不 fsync、不 fallback、预测或重试，也不接受 caller 提供的 claimId。claimId 只进入 `TWV2HAC1` journal，并在 normal close 时按 exact journal match 验证；它不进入公开 API、Debug、result、log 或 error。
 
-Revision 3 新增相邻的 credential mutation v1 机器契约，只冻结未来 descriptor-relative read/CAS/temp/rename 与 uncertainty 边界；它不向 platform-common trait、Darwin/Linux adapter、native ABI 或 claim journal 添加实现。当前仍不实现 trusted factory、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell read/CAS/temp/rename、orphan recovery、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
+Revision 4 保持 credential mutation/native ABI/fixture/platform resource/claim journal 各自为 v1，并只把 mutation 实现状态推进为 `platform-common-only`。Platform-common 通过 additive `CredentialMutationPlatform` 子 trait，在同一个 `AdmissionOwner` 内拥有 read、opaque revision、双 current-check CAS、tracked temp、rename publication、cleanup 与 terminal fence；既有 `DescriptorRelativePlatform` 和 Darwin/Linux adapter 不变。当前仍不实现 trusted factory、HOME/path/env 输入、global lookup、真实 Darwin/Linux credential read/CAS/temp/rename adapter、N-API、loader/packaging、orphan recovery、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
 
 ## Platform-common admission owner
 
@@ -38,9 +38,9 @@ Production durability qualification v1 是 deny-by-default：`qualifiedRecords=[
 
 Registry 只有 `Opening / Open / Closing / CloseUncertain`。Owner 捕获 opener PID，并在每个 descriptor-relative operation 前检查 PID。Fork 后 inherited owner 的所有 operation 只返回 `CELL_CLOSED`；child 不得 unlink、unlock、fsync 或 close 任何 inherited descriptor。
 
-## Credential mutation v1（contract only）
+## Credential mutation v1（platform-common only）
 
-Credential mutation v1 只允许 exact live `AdmissionOwner` 执行。read、CAS revision consume、两次 current check、temp create/proof、rename、published proof、directory fsync、final descriptor close 与 pre-commit cleanup 的每个 phase 都必须重新验证 parent PID、exact process-registry entry/fence，以及 directory、lock、claim 的 descriptor/path identity、safety、lock 与 exact claimId journal。任一 gate 失败都在进入下一 phase 前 fail closed；fork child 仍不得 cleanup inherited descriptor。
+Credential mutation v1 只允许 exact live `AdmissionOwner` 执行。Platform-common 的实现让该 owner 唯一持有 revision generation、terminal mutation fence 与 known temp；没有第二个 mutation owner。read、CAS revision consume、两次 current check、temp create/proof、rename、published proof、directory fsync、final descriptor close 与 pre-commit cleanup 的每个 phase 都重新验证 parent PID、exact `Open` process-registry entry/fence，以及 directory、lock、claim 的 descriptor/path identity、safety、lock 与 exact claimId journal。任一 gate 失败都在进入下一 phase 前 fail closed；fork child 仍不得 cleanup inherited descriptor。
 
 Credential read 固定为 `fstatat(directory, credential, AT_SYMLINK_NOFOLLOW)` → `openat(..., O_RDONLY|O_NOFOLLOW|O_CLOEXEC)` → A/B/C stable proof。只有 initial `fstatat` 的 `ENOENT` 表示 absent；已经观察到 present 后的 `ENOENT` 是 identity race。Present 必须是 current euid+egid 所有、regular、exact `0600`、`nlink=1`、size `0..65536` 且 descriptor 已有 `FD_CLOEXEC`；A/B/C 的 dev、ino、type、uid、gid、mode、nlink 与 size 全部保持一致，bytes 必须按 observed size exact 读取。Descriptor final raw close 成功后才可签发 revision。
 
@@ -52,7 +52,7 @@ CAS commit point 唯一是同一 directory descriptor 内 temp→credential 的 
 
 确定尚未 commit 的 cleanup 固定为 full owner revalidation → exact dev+ino proof → `unlinkat` owned temp → prove `ENOENT` → directory `fsync` → raw close一次。Identity 不确定返回 `CELL_IDENTITY_UNCERTAIN`且不 unlink；unlink/durability/close 不确定返回 `CELL_RECOVERY_REQUIRED`。两者都永久 fence。Contract 不提供 crash recovery 或 enumeration cleanup；遗留 claim、以及任何已知遗留 temp 都继续返回 `CELL_RECOVERY_REQUIRED`并原样保留。
 
-上述完整机器语义与 failure cuts 见 [`credential-mutation-cases-v1.json`](credential-mutation-cases-v1.json)。它仍保持 `qualifiedRecords=[]`、`productionProofConstructible=false`、`fullAdmissionValidated=false`、`durabilityQualified=false`、`productionWired=false` 与 `productionCapabilityEffect=none`。
+上述完整机器语义与 failure cuts 见 [`credential-mutation-cases-v1.json`](credential-mutation-cases-v1.json)。实现声明仅为 `platform-common-only` / `implementedInPlatformCommon=true`；`qualifiedRecords=[]`、`productionProofConstructible=false`、Darwin/Linux mutation adapter、`fullAdmissionValidated=false`、`durabilityQualified=false`、`productionWired=false` 与 `productionCapabilityEffect=none` 均保持不变。全局 `credential-cell-read-cas-temp-or-rename` 仍列在 `notImplemented`，表示没有真实 adapter 或 production 可达路径。
 
 ## Claim journal v1
 
