@@ -4,6 +4,9 @@ import test from "node:test";
 const openerModule = await import(
   "../dist/relay/v2/brokerCredentialExternalContinuityOpener.js"
 );
+const hostActivationModule = await import(
+  "../dist/relay/v2/brokerHostWssNodeExternalContinuityActivation.js"
+);
 const broker = await import("../dist/relay/v2/brokerCore.js");
 const credential = await import("../dist/relay/v2/brokerCredentialAuthority.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
@@ -18,6 +21,8 @@ const CREDENTIAL_REFERENCE = "credential-reference-a";
 const TRUST_REFERENCE = "trust-reference-a";
 const AUTHORIZATION = "Bearer test-only-workload-token";
 const TEST_SECRET = Buffer.alloc(32, 17).toString("base64url");
+const HOST_ACTIVATION_FAILURE =
+  "Relay v2 Broker Host WSS Node external continuity activation failed";
 
 function copy(value) {
   return structuredClone(value);
@@ -232,6 +237,38 @@ function createOpener({
   });
 }
 
+function hostSharedRuntimeOptions() {
+  return {
+    brokerOptions: {
+      now: () => Date.now(),
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
+    authorizationExpiryScheduleAt: () => () => {},
+  };
+}
+
+function hostActivationOptions({
+  loader,
+  provider,
+  externalConfig = config(),
+  genesis = validGenesis(),
+  sharedRuntimeOptions = hostSharedRuntimeOptions(),
+}) {
+  return {
+    trustedHome: TRUSTED_HOME,
+    nativeLoader: loader,
+    externalContinuityConfig: externalConfig,
+    externalContinuityAttemptProvider: provider,
+    genesis,
+    sharedRuntimeOptions,
+  };
+}
+
+function createHostActivation(options) {
+  return hostActivationModule
+    .createRelayV2BrokerHostWssNodeExternalContinuityActivation(options);
+}
+
 function input(liveAuthorizationFence) {
   return Object.freeze({ liveAuthorizationFence });
 }
@@ -244,6 +281,14 @@ function openerFailure(error) {
 function authorityFailure(code) {
   return (error) => credential.isRelayV2BrokerCredentialAuthorityError(error)
     && error.code === code;
+}
+
+function hostActivationFailure(error) {
+  assert.equal(error instanceof Error, true);
+  assert.equal(error.message, HOST_ACTIVATION_FAILURE);
+  assert.equal(error.cause, undefined);
+  assert.equal(error.message.includes(AUTHORIZATION), false);
+  return true;
 }
 
 test("happy activation stays inert until one exact open and transfers the Broker store once", async () => {
@@ -475,4 +520,170 @@ test("post-transfer authority faults retain owner mappings and close without ope
     assert.equal(opened.state.openCalls, 1, `${selected.name}: opener is terminal`);
     assert.equal(store.closeCalls, 1, `${selected.name}: opener never double-closes`);
   }
+});
+
+test("external-continuity Host ingress activation is inert, one-shot, and preserves existing ownership", async (t) => {
+  await t.test("construction closes the facade and rejects non-exact authority input without touching dependencies", async () => {
+    const events = [];
+    const store = new NarrowNativeStore();
+    const opened = nativeLoader(
+      () => Object.freeze({ status: "opened", selfCheck: "passed", store }),
+      events,
+    );
+    const external = backend("success", events);
+    const options = hostActivationOptions({
+      loader: opened.loader,
+      provider: external.provider,
+    });
+    const activation = createHostActivation(options);
+
+    assert.deepEqual(events, []);
+    assert.equal(opened.state.capabilityCalls, 0);
+    assert.equal(opened.state.openCalls, 0);
+    assert.equal(external.state.resolveCalls, 0);
+    assert.equal(external.state.startCalls, 0);
+    assert.equal(store.runExclusiveCalls, 0);
+    assert.equal(store.closeCalls, 0);
+    assert.equal(Object.getPrototypeOf(activation), null);
+    assert.equal(Object.isFrozen(activation), true);
+    assert.deepEqual(Reflect.ownKeys(activation), ["activate"]);
+    for (const hidden of [
+      "close",
+      "closeAndDrain",
+      "openCredentialAuthority",
+      "sharedRuntimeOptions",
+      "nativeLoader",
+      "externalContinuityAttemptProvider",
+    ]) assert.equal(activation[hidden], undefined);
+
+    assert.throws(
+      () => createHostActivation({ ...options, extra: AUTHORIZATION }),
+      hostActivationFailure,
+    );
+    const missing = { ...options };
+    delete missing.genesis;
+    assert.throws(() => createHostActivation(missing), hostActivationFailure);
+
+    let accessorCalls = 0;
+    const accessor = { ...options };
+    Object.defineProperty(accessor, "nativeLoader", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error(`accessor exposed ${AUTHORIZATION}`);
+      },
+    });
+    assert.throws(() => createHostActivation(accessor), hostActivationFailure);
+    assert.equal(accessorCalls, 0);
+
+    let proxyTouches = 0;
+    const proxied = new Proxy(options, {
+      get() { proxyTouches += 1; throw new Error(`proxy exposed ${AUTHORIZATION}`); },
+      ownKeys() { proxyTouches += 1; throw new Error(`proxy exposed ${AUTHORIZATION}`); },
+      getOwnPropertyDescriptor() {
+        proxyTouches += 1;
+        throw new Error(`proxy exposed ${AUTHORIZATION}`);
+      },
+    });
+    assert.throws(() => createHostActivation(proxied), hostActivationFailure);
+    assert.equal(proxyTouches, 0);
+
+    await assert.rejects(
+      Reflect.apply(activation.activate, Object.create(null), []),
+      hostActivationFailure,
+    );
+    await assert.rejects(
+      Reflect.apply(activation.activate, activation, [AUTHORIZATION]),
+      hostActivationFailure,
+    );
+    assert.deepEqual(events, []);
+    assert.equal(opened.state.openCalls, 0);
+    assert.equal(external.state.resolveCalls, 0);
+    assert.equal(store.closeCalls, 0);
+  });
+
+  await t.test("one explicit activation traverses E0 and B7m, returns B7k, and transfers its single close", async () => {
+    const events = [];
+    const store = new NarrowNativeStore();
+    const opened = nativeLoader(
+      () => Object.freeze({ status: "opened", selfCheck: "passed", store }),
+      events,
+    );
+    const replacement = nativeLoader(() => {
+      throw new Error(`late top-level loader exposed ${AUTHORIZATION}`);
+    });
+    const external = backend("success", events);
+    const options = hostActivationOptions({
+      loader: opened.loader,
+      provider: external.provider,
+    });
+    const activation = createHostActivation(options);
+
+    options.nativeLoader = replacement.loader;
+    options.externalContinuityAttemptProvider = Object.freeze({
+      resolveAttempt() {
+        throw new Error(`late top-level provider exposed ${AUTHORIZATION}`);
+      },
+    });
+    options.sharedRuntimeOptions = Object.freeze({ unexpected: true });
+
+    const first = activation.activate();
+    const concurrent = activation.activate();
+    await assert.rejects(concurrent, hostActivationFailure);
+    const ingress = await first;
+
+    assert.equal(Object.getPrototypeOf(ingress), null);
+    assert.equal(Object.isFrozen(ingress), true);
+    assert.deepEqual(Reflect.ownKeys(ingress), [
+      "handleUpgradeRequest",
+      "closeAndDrain",
+    ]);
+    assert.equal(opened.state.capabilityCalls, 0);
+    assert.equal(opened.state.openCalls, 1);
+    assert.equal(replacement.state.openCalls, 0);
+    assert.deepEqual(opened.state.trustedHomes, [TRUSTED_HOME]);
+    assert.ok(events.indexOf("native.open") < events.indexOf("provider.resolve"));
+    assert.equal(external.state.resolveCalls, 2);
+    assert.equal(store.closeCalls, 0);
+
+    await assert.rejects(activation.activate(), hostActivationFailure);
+    assert.equal(opened.state.openCalls, 1);
+    assert.equal(external.state.resolveCalls, 2);
+
+    const close = ingress.closeAndDrain();
+    assert.strictEqual(ingress.closeAndDrain(), close);
+    await close;
+    assert.equal(store.closeCalls, 1);
+  });
+
+  await t.test("a pre-publication external failure leaves rollback with existing owners and stays generic", async () => {
+    const events = [];
+    const store = new NarrowNativeStore();
+    const opened = nativeLoader(
+      () => Object.freeze({ status: "opened", selfCheck: "passed", store }),
+      events,
+    );
+    const external = backend("read", events);
+    const activation = createHostActivation(hostActivationOptions({
+      loader: opened.loader,
+      provider: external.provider,
+    }));
+    let published;
+
+    await assert.rejects(
+      activation.activate().then((ingress) => { published = ingress; }),
+      hostActivationFailure,
+    );
+    assert.equal(published, undefined);
+    assert.equal(opened.state.openCalls, 1);
+    assert.equal(external.state.resolveCalls, 1);
+    assert.equal(external.state.startCalls, 1);
+    assert.equal(store.closeCalls, 1);
+
+    await assert.rejects(activation.activate(), hostActivationFailure);
+    assert.equal(opened.state.openCalls, 1);
+    assert.equal(external.state.resolveCalls, 1);
+    assert.equal(external.state.startCalls, 1);
+    assert.equal(store.closeCalls, 1);
+  });
 });
