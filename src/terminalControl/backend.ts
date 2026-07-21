@@ -104,6 +104,26 @@ function tmuxSendKeyCommand(paneTarget: string, key: TmuxRawKey): string {
   return tmuxSendKeyArgs(paneTarget, key).join(" ");
 }
 
+function sgrMouseWheelPayload(
+  direction: "up" | "down",
+  lines: number,
+  paneWidth: number,
+  paneHeight: number,
+): Buffer | undefined {
+  if (
+    !Number.isSafeInteger(paneWidth)
+    || paneWidth < 1
+    || !Number.isSafeInteger(paneHeight)
+    || paneHeight < 1
+  ) {
+    return undefined;
+  }
+  const button = direction === "up" ? 64 : 65;
+  const x = Math.ceil(paneWidth / 2);
+  const y = Math.ceil(paneHeight / 2);
+  return Buffer.from(`\x1b[<${button};${x};${y}M`.repeat(lines), "ascii");
+}
+
 export interface TerminalControlOutputPosition {
   generation: string;
   cursor: number;
@@ -267,6 +287,22 @@ function runTmux(
       child.stdin.end(options.input);
     }
   });
+}
+
+async function pasteRawToPane(paneTarget: string, data: Buffer): Promise<void> {
+  const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
+  try {
+    await runTmux(
+      [
+        "load-buffer", "-b", bufferName, "-",
+        ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
+      ],
+      { input: data },
+    );
+  } catch (error) {
+    await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function controlCommandMarker(
@@ -1071,19 +1107,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       );
       return;
     }
-    const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
-    try {
-      await runTmux(
-        [
-          "load-buffer", "-b", bufferName, "-",
-          ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
-        ],
-        { input: data },
-      );
-    } catch (error) {
-      await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
-      throw error;
-    }
+    await pasteRawToPane(paneTarget, data);
   }
 
   async rawInputPosition(
@@ -1297,9 +1321,30 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       throw new TerminalControlProtocolError("INVALID_REQUEST", "tmux scroll input is invalid");
     }
     const { paneTarget } = await requirePane(sessionName, pane);
-    const inMode = (await runTmux([
-      "display-message", "-p", "-t", paneTarget, "#{pane_in_mode}",
-    ])).stdout.trim() === "1";
+    const paneState = (await runTmux([
+      "display-message",
+      "-p",
+      "-t",
+      paneTarget,
+      "#{pane_in_mode}\u001f#{alternate_on}\u001f#{mouse_any_flag}\u001f#{mouse_sgr_flag}\u001f#{pane_width}\u001f#{pane_height}",
+    ])).stdout.trim().split("\u001f");
+    const inMode = paneState[0] === "1";
+    if (!inMode && paneState[1] === "1" && paneState[2] === "1" && paneState[3] === "1") {
+      const payload = sgrMouseWheelPayload(
+        direction,
+        lines,
+        Number(paneState[4]),
+        Number(paneState[5]),
+      );
+      if (payload) {
+        // Full-screen TUIs such as Claude own their transcript inside the
+        // alternate screen, so tmux has no scrollback to navigate. Synthesize
+        // only the SGR wheel protocol the pane explicitly requested; generic
+        // client mouse reports remain blocked at the controlled attachment.
+        await pasteRawToPane(paneTarget, payload);
+        return;
+      }
+    }
     if (direction === "down" && !inMode) return;
     if (direction === "up" && !inMode) {
       await runTmux(["copy-mode", "-e", "-t", paneTarget]);

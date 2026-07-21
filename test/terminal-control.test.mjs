@@ -2035,6 +2035,82 @@ test("production capture rolls over with an absolute cursor and garbage-collects
   }
 });
 
+test("production scroll delegates to an alternate-screen SGR mouse application", async (t) => {
+  const harness = isolatedManagedTmux(t, "alternate-scroll");
+  if (!harness) return;
+  const inputPath = join(harness.temp.root, "mouse-input.bin");
+  const appPath = join(harness.temp.root, "mouse-app.cjs");
+  try {
+    writeFileSync(appPath, [
+      'const { appendFileSync } = require("node:fs")',
+      "process.stdin.setRawMode(true)",
+      "process.stdin.resume()",
+      'process.stdout.write("\\x1b[?1049h\\x1b[?1003h\\x1b[?1006h")',
+      "process.stdin.on(\"data\", (chunk) => appendFileSync(process.argv[2], chunk))",
+      "setInterval(() => {}, 1000)",
+    ].join(";\n"), { mode: 0o600 });
+    const paneTarget = `=${harness.sessionName}:`;
+    const command = [process.execPath, appPath, inputPath].map(shellSingleQuote).join(" ");
+    const typed = spawnSync(
+      harness.wrapper,
+      ["send-keys", "-t", paneTarget, "-l", command],
+      { encoding: "utf8" },
+    );
+    assert.equal(typed.status, 0, typed.stderr);
+    const submitted = spawnSync(
+      harness.wrapper,
+      ["send-keys", "-t", paneTarget, "Enter"],
+      { encoding: "utf8" },
+    );
+    assert.equal(submitted.status, 0, submitted.stderr);
+
+    let state;
+    const readyDeadline = Date.now() + 2_000;
+    while (Date.now() < readyDeadline) {
+      state = spawnSync(
+        harness.wrapper,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          paneTarget,
+          "#{alternate_on}\u001f#{mouse_any_flag}\u001f#{mouse_sgr_flag}\u001f#{pane_width}\u001f#{pane_height}",
+        ],
+        { encoding: "utf8" },
+      );
+      if (state.status === 0 && state.stdout.startsWith("1\u001f1\u001f1\u001f")) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(state?.status, 0, state?.stderr);
+    const [alternateOn, mouseAny, mouseSgr, widthRaw, heightRaw] = state.stdout.trim().split("\u001f");
+    assert.deepEqual([alternateOn, mouseAny, mouseSgr], ["1", "1", "1"]);
+    const x = Math.ceil(Number(widthRaw) / 2);
+    const y = Math.ceil(Number(heightRaw) / 2);
+
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    await backend.scroll(harness.sessionName, "0", "up", 3);
+    await backend.scroll(harness.sessionName, "0", "down", 2);
+    const expected = Buffer.from(
+      `\x1b[<64;${x};${y}M`.repeat(3) + `\x1b[<65;${x};${y}M`.repeat(2),
+      "ascii",
+    );
+    const inputDeadline = Date.now() + 2_000;
+    while ((!existsSync(inputPath) || statSync(inputPath).size < expected.byteLength) && Date.now() < inputDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(readFileSync(inputPath), expected);
+    const mode = spawnSync(
+      harness.wrapper,
+      ["display-message", "-p", "-t", paneTarget, "#{pane_in_mode}"],
+      { encoding: "utf8" },
+    );
+    assert.equal(mode.status, 0, mode.stderr);
+    assert.equal(mode.stdout.trim(), "0", "application scroll must not enter tmux copy-mode");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("production tmux backend captures bounded correlated output on an isolated server", async (t) => {
   const probe = spawnSync("tmux", ["-V"], { encoding: "utf8" });
   if (probe.status !== 0) {

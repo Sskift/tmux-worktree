@@ -15,7 +15,7 @@
 3. Relay v2 的 `RelayStreamAttachmentLease` 仍由 relay-host 的 process-scoped terminal manager 持有；它只管理 Android stream 的 generation、ring、route rebind 和短断线恢复，不授予跨产品输入权。
 4. `FeishuAwaitingTurn` 仍由 Feishu Bridge 持有；它只关联一条群消息、output cursor、回复 attempt 和滑动的无输出 deadline，不是 terminal lease。每次同一 authority correlation 下观察到新 output 都会把 deadline 后移十分钟；Dashboard 的 `agent_running` 展示提示不构成发送或完成依据。
 5. Dashboard、受控本地 CLI、Feishu、Relay v1 和 Relay v2 的所有产品级真实写路径都必须进入同一个 target-scoped single writer，由它在写 backend 的同一 critical section 内校验 lease 和 fence。
-   Dashboard 的 tmux 历史滚动也属于真实输入，必须使用 authority 内的 `input.scroll` 语义操作；受控附件不得把 SGR mouse 字节作为 `input.raw` 直接注入 pane，因为这会绕过 tmux client 的鼠标解析。
+   Dashboard 的滚动也属于真实输入，必须使用 authority 内的 `input.scroll` 语义操作。普通 pane 由 backend 操作 tmux copy-mode；只有 alternate-screen pane 已明确启用 SGR mouse 时，backend 才可在该 fenced mutation 内合成有界 wheel 输入交给 TUI 自身处理。受控附件仍不得把 xterm 产生的 SGR mouse transport report 当作 `input.raw` 直接注入 pane。
 6. Input ownership 只分两类：Feishu 是独占类；Dashboard、APK/Relay、受控 CLI 和 `tw serve` 都属于共享 interactive 类。interactive producer 共享同一 lease/fence，彼此不触发 takeover 或只读。
 7. 直接执行 `tmux attach`、`tmux send-keys` 或其他绕过 TW 产品入口的本地管理员操作是明确的 privileged bypass，不在产品级排他保证内，也不能被 UI 描述为已受保护。
 

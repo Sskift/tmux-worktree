@@ -180,7 +180,7 @@ React -> Tauri/Rust -> SSH Host
 - Dashboard 可以把 `.app` 中的 CLI 复制到 Host 并安装 wrapper；远端仍需要 Node.js、git 和 tmux。
 - PTY、文件和 git 读取按 Host 路由通过 SSH 执行，不经过 Relay broker。
 
-远端 managed terminal 的 SSH tmux attachment 保持 read-only，Dashboard 输入统一经过目标主机的 terminal-control authority。xterm 产生的 mouse/focus transport report 不得作为 `input.raw` 粘入 pane；受控 attachment 的滚轮使用显式、受 fence 保护的 `input.scroll`，不伪装成 raw mouse report。authority 进入 `RECOVERY_REQUIRED` 时，Dashboard 只有在用户明确确认后才发送 host-aware `handoff.force`，接受上一次操作可能已生效并推进 fence，不重放不确定输入。
+远端 managed terminal 的 SSH tmux attachment 保持 read-only，Dashboard 输入统一经过目标主机的 terminal-control authority。xterm 产生的 mouse/focus transport report 不得作为 `input.raw` 粘入 pane；受控 attachment 的滚轮使用显式、受 fence 保护的 `input.scroll`，不伪装成 raw mouse report。backend 对普通 pane 进入 tmux copy-mode；只有 pane 已进入 alternate screen 且应用明确声明 `mouse_any + mouse_sgr` 时，才在同一次 `input.scroll` mutation 内合成有界 SGR wheel 输入，让 Claude Code 一类不产生 tmux scrollback 的全屏 TUI 使用自身滚动逻辑。该分支不放宽 `input.raw` 或 attachment transport report。authority 进入 `RECOVERY_REQUIRED` 时，Dashboard 只有在用户明确确认后才发送 host-aware `handoff.force`，接受上一次操作可能已生效并推进 fence，不重放不确定输入。
 
 远端 UI identity 使用 `<hostId>:<rawTmuxName>`；实际远端命令始终使用 `rawTmuxName`，不能把展示用 composite key 直接传给 tmux。
 
