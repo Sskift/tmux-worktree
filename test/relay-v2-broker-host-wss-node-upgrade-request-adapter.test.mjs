@@ -3,13 +3,20 @@ import { IncomingMessage } from "node:http";
 import { Duplex } from "node:stream";
 import test from "node:test";
 
+const broker = await import("../dist/relay/v2/brokerCore.js");
 const adapterModule = await import(
   "../dist/relay/v2/brokerHostWssNodeUpgradeRequestAdapter.js"
 );
+const ingressModule = await import(
+  "../dist/relay/v2/brokerHostWssNodeListenerFreeIngress.js"
+);
 
+const NOW_MS = 1_783_700_000_000;
 const HOST_PROTOCOL = "tw-relay.host.v2";
 const TOKEN = "twcap2.node-upgrade-request-sensitive";
 const FAILURE = "Relay v2 Broker Host Node Upgrade request adapter failed";
+const INGRESS_FAILURE =
+  "Relay v2 Broker Host WSS Node listener-free ingress activation failed";
 const STATUS_LINES = Object.freeze({
   400: "HTTP/1.1 400 Bad Request",
   401: "HTTP/1.1 401 Unauthorized",
@@ -117,6 +124,32 @@ function requestFor(socket, {
   return request;
 }
 
+function fullUpgradeRequestFor(socket) {
+  const key = Buffer.alloc(16, 9).toString("base64");
+  const request = requestFor(socket, {
+    rawHeaders: [
+      "Host", "relay.example.com",
+      "Connection", "Upgrade",
+      "Upgrade", "websocket",
+      "Authorization", `Bearer ${TOKEN}`,
+      "Sec-WebSocket-Key", key,
+      "Sec-WebSocket-Version", "13",
+      "Sec-WebSocket-Protocol", HOST_PROTOCOL,
+    ],
+    normalizedHeaders: Object.freeze({
+      host: "relay.example.com",
+      connection: "Upgrade",
+      upgrade: "websocket",
+      authorization: `Bearer ${TOKEN}`,
+      "sec-websocket-key": key,
+      "sec-websocket-version": "13",
+      "sec-websocket-protocol": HOST_PROTOCOL,
+    }),
+  });
+  request.method = "GET";
+  return request;
+}
+
 function inputFor(socket, request = requestFor(socket), head = Buffer.from([1, 2, 3])) {
   return { request, socket, head };
 }
@@ -148,6 +181,40 @@ function createAdapter(composition) {
   );
 }
 
+function trustedHostAuthorization(hostId = "node-listener-free-host") {
+  return Object.freeze({
+    scheme: "twcap2",
+    role: "host",
+    hostId,
+    principalId: `${hostId}-principal`,
+    grantId: `${hostId}-grant`,
+    clientInstanceId: null,
+    jti: `${hostId}-jti`,
+    kid: "kid-current",
+    expiresAtMs: NOW_MS + 3_600_000,
+    authorizationRevision: "1",
+    authorizationFence: "authorization-fence-1",
+  });
+}
+
+function sharedRuntimeOptions() {
+  return {
+    brokerOptions: {
+      now: () => NOW_MS,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
+    authorizationExpiryScheduleAt: () => () => {},
+  };
+}
+
+function activateIngress(openCredentialAuthority, extra = {}) {
+  return ingressModule.activateRelayV2BrokerHostWssNodeListenerFreeIngress({
+    openCredentialAuthority,
+    sharedRuntimeOptions: sharedRuntimeOptions(),
+    ...extra,
+  });
+}
+
 function expectedResponse(status) {
   return `${STATUS_LINES[status]}\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n`;
 }
@@ -159,7 +226,14 @@ function isGenericFailure(error) {
   return true;
 }
 
-test("captures exact raw IncomingMessage metadata and delegates the same request, socket, and head once", async () => {
+function isIngressGenericFailure(error) {
+  assert.equal(error.message, INGRESS_FAILURE);
+  assert.equal(error.cause, undefined);
+  assert.equal(String(error).includes(TOKEN), false);
+  return true;
+}
+
+test("captures exact raw IncomingMessage metadata and the credential ingress reaches 101 without leaking owners", async () => {
   const delegatedInputs = [];
   let closeCalls = 0;
   const hiddenConnection = Object.freeze({ secret: TOKEN });
@@ -243,6 +317,73 @@ test("captures exact raw IncomingMessage metadata and delegates the same request
   await adapter.closeAndDrain();
   assert.equal(closeCalls, 1);
   socket.destroy();
+
+  let openerCalls = 0;
+  let authorizerCalls = 0;
+  let authorityCloseCalls = 0;
+  let exactAuthority;
+  const authority = {
+    authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+    async handle() {
+      throw new Error("auth-control is not used by this Host Upgrade case");
+    },
+    authorizeAccessToken(token, expectedRole) {
+      assert.strictEqual(this, exactAuthority);
+      authorizerCalls += 1;
+      assert.equal(token, TOKEN);
+      assert.equal(expectedRole, "host");
+      return trustedHostAuthorization();
+    },
+    async close() {
+      assert.strictEqual(this, exactAuthority);
+      authorityCloseCalls += 1;
+    },
+  };
+  exactAuthority = authority;
+  const ingress = await activateIngress(async (input) => {
+    openerCalls += 1;
+    assert.equal(Object.isFrozen(input), true);
+    assert.deepEqual(Reflect.ownKeys(input), ["liveAuthorizationFence"]);
+    return exactAuthority;
+  });
+
+  assert.equal(Object.getPrototypeOf(ingress), null);
+  assert.equal(Object.isFrozen(ingress), true);
+  assert.deepEqual(Reflect.ownKeys(ingress), [
+    "handleUpgradeRequest",
+    "closeAndDrain",
+  ]);
+  for (const hidden of [
+    "composition",
+    "hostUpgrade",
+    "connection",
+    "credentialAuthority",
+    "authorizeAccessToken",
+    "runtime",
+    "core",
+    "trustedSocketBrand",
+    "trustedSocketPrototype",
+  ]) assert.equal(ingress[hidden], undefined);
+
+  const ingressSocket = new MemoryDuplex();
+  const ingressRequest = fullUpgradeRequestFor(ingressSocket);
+  assert.equal(
+    await ingress.handleUpgradeRequest(inputFor(ingressSocket, ingressRequest)),
+    "upgraded",
+  );
+  assert.match(ingressSocket.responseText(), /^HTTP\/1\.1 101 Switching Protocols\r\n/);
+  assert.match(
+    ingressSocket.responseText(),
+    /\r\nSec-WebSocket-Protocol: tw-relay\.host\.v2\r\n/,
+  );
+  assert.equal(openerCalls, 1);
+  assert.equal(authorizerCalls, 1);
+
+  const ingressClose = ingress.closeAndDrain();
+  assert.strictEqual(ingress.closeAndDrain(), ingressClose);
+  await ingressClose;
+  assert.equal(authorityCloseCalls, 1);
+  assert.equal(ingressSocket.destroyCalls, 1);
 });
 
 test("writes fixed minimal pre-101 rejects and keeps malformed raw targets or headers out of B7j", async () => {
@@ -364,6 +505,46 @@ test("writes fixed minimal pre-101 rejects and keeps malformed raw targets or he
   assert.equal(failingSocket.responseText(), "");
 
   await adapter.closeAndDrain();
+
+  let extraOptionOpenerCalls = 0;
+  await assert.rejects(
+    activateIngress(async () => {
+      extraOptionOpenerCalls += 1;
+      throw new Error(`extra option reached opener with ${TOKEN}`);
+    }, {
+      verifyV2AccessToken() {
+        throw new Error("foreign verifier must not be accepted");
+      },
+    }),
+    isIngressGenericFailure,
+  );
+  assert.equal(extraOptionOpenerCalls, 0);
+
+  let authorizerAccessorExecutions = 0;
+  let unpublishedAuthorityCloseCalls = 0;
+  const unpublishedAuthority = {
+    authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+    async handle() {
+      throw new Error("unpublished authority must not handle auth-control");
+    },
+    async close() {
+      assert.strictEqual(this, unpublishedAuthority);
+      unpublishedAuthorityCloseCalls += 1;
+    },
+  };
+  Object.defineProperty(unpublishedAuthority, "authorizeAccessToken", {
+    configurable: true,
+    get() {
+      authorizerAccessorExecutions += 1;
+      throw new Error(`authorizer accessor exposed ${TOKEN}`);
+    },
+  });
+  await assert.rejects(
+    activateIngress(async () => unpublishedAuthority),
+    isIngressGenericFailure,
+  );
+  assert.equal(authorizerAccessorExecutions, 0);
+  assert.equal(unpublishedAuthorityCloseCalls, 1);
 });
 
 test("upgraded sockets stay untouched while exact receivers and close races fence and drain both sides", async () => {
@@ -408,36 +589,54 @@ test("upgraded sockets stay untouched while exact receivers and close races fenc
   assert.equal(upgradedCloseCalls, 1);
   upgradedSocket.destroy();
 
-  let reentrantAdapter;
+  const authorizerEntered = deferred();
+  const authorizerDecision = deferred();
+  let reentrantIngress;
   let reentrantClose;
-  let reentrantCloseCalls = 0;
-  const reentrantComposition = fakeComposition({
-    upgrade() {
-      reentrantClose = reentrantAdapter.closeAndDrain();
-      return Promise.resolve(Object.freeze({ outcome: "reject", status: 503 }));
+  let reentrantAuthorityCloseCalls = 0;
+  let exactReentrantAuthority;
+  const reentrantAuthority = {
+    authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+    async handle() {
+      throw new Error("auth-control is not used by this close race");
     },
-    close() {
-      reentrantCloseCalls += 1;
-      return Promise.resolve();
+    authorizeAccessToken(token, expectedRole) {
+      assert.strictEqual(this, exactReentrantAuthority);
+      assert.equal(token, TOKEN);
+      assert.equal(expectedRole, "host");
+      reentrantClose ??= reentrantIngress.closeAndDrain();
+      authorizerEntered.resolve();
+      return authorizerDecision.promise;
     },
-  });
-  reentrantAdapter = createAdapter(reentrantComposition);
+    async close() {
+      assert.strictEqual(this, exactReentrantAuthority);
+      reentrantAuthorityCloseCalls += 1;
+    },
+  };
+  exactReentrantAuthority = reentrantAuthority;
+  reentrantIngress = await activateIngress(async () => exactReentrantAuthority);
   const reentrantSocket = new GatedEndDuplex();
-  const reentrantHandler = reentrantAdapter.handleUpgradeRequest(
-    inputFor(reentrantSocket),
+  const reentrantRequest = fullUpgradeRequestFor(reentrantSocket);
+  const reentrantHandler = reentrantIngress.handleUpgradeRequest(
+    inputFor(reentrantSocket, reentrantRequest),
   );
+  await authorizerEntered.promise;
   assert.ok(reentrantClose);
-  assert.equal(reentrantCloseCalls, 1);
+  assert.strictEqual(reentrantIngress.closeAndDrain(), reentrantClose);
   let reentrantCloseSettled = false;
   void reentrantClose.then(() => { reentrantCloseSettled = true; });
+  authorizerDecision.resolve(trustedHostAuthorization("reentrant-close-host"));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(reentrantSocket.responseText(), expectedResponse(503));
+  assert.equal(reentrantSocket.responseText().includes("101 Switching Protocols"), false);
   assert.equal(reentrantSocket.endCalls, 1);
+  assert.equal(reentrantSocket.destroyCalls, 0);
   assert.equal(reentrantCloseSettled, false);
   reentrantSocket.flushEnd();
   assert.equal(await reentrantHandler, "rejected");
   await reentrantClose;
   assert.equal(reentrantCloseSettled, true);
+  assert.equal(reentrantAuthorityCloseCalls, 1);
   assert.equal(reentrantSocket.destroyCalls, 0);
   reentrantSocket.destroy();
 
