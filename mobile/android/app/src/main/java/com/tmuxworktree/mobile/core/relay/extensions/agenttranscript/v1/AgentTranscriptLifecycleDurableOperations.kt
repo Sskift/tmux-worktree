@@ -425,6 +425,10 @@ internal interface AgentTranscriptLifecycleRuntimeDurableRepository :
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord?
+
+    suspend fun loadOrInitializeStatusNamespaceUnderApplyLease(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): AgentTranscriptLifecycleDurableRecord
 }
 
 private fun requireReplayArtifactNamespace(

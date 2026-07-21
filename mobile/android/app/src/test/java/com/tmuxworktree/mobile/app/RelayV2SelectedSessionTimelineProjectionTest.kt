@@ -29,6 +29,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyRow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -37,6 +38,34 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RelayV2SelectedSessionTimelineProjectionTest {
+    @Test
+    fun `each exact cut requests status once before collecting all outbox revisions`() =
+        runBlocking {
+            val observed = mutableListOf<String>()
+
+            listOf("cut-1", "cut-2").forEach { cut ->
+                collectRelayV2SelectedSessionCut(
+                    requestAgentStatus = { observed += "status:$cut" },
+                    outboxRevisions = flowOf(0L, 1L, 2L),
+                    collectRevision = { revision -> observed += "revision:$cut:$revision" },
+                )
+            }
+
+            assertEquals(
+                listOf(
+                    "status:cut-1",
+                    "revision:cut-1:0",
+                    "revision:cut-1:1",
+                    "revision:cut-1:2",
+                    "status:cut-2",
+                    "revision:cut-2:0",
+                    "revision:cut-2:1",
+                    "revision:cut-2:2",
+                ),
+                observed,
+            )
+        }
+
     @Test
     fun `content keeps transcript projection and maps structured lifecycle evidence`() = runBlocking {
         val content = projectionContent(

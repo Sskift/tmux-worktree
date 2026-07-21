@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLoadOrInitializeAdapter
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
@@ -7,6 +8,8 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationController
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationState
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionReadController
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionStatusAdmissionController
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSessionSelectionController
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSessionSelectionIntent
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
@@ -140,8 +143,8 @@ internal sealed interface SelectedSessionReplyReadState {
  * ready cut, it flushes recovered Execute capabilities in commit order and then asks the durable
  * Outbox producer for bounded fresh QUEUED batches. Retryable connection failures are redriven by
  * one bounded backoff owner after the actor's prior transport/apply fence. The Agent durable
- * consumer remains dormant behind empty optional capabilities; refresh and advertisement remain
- * unowned.
+ * consumer remains dormant behind empty optional capabilities; live Agent revision refresh and
+ * advertisement remain unowned.
  */
 internal class RelayV2BaseRuntimeComposition(
     parentScope: CoroutineScope,
@@ -155,6 +158,7 @@ internal class RelayV2BaseRuntimeComposition(
     agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
     agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
         AgentTranscriptLifecycleRuntimeHandlePort)? = null,
+    agentOptionalCapabilities: Set<String> = emptySet(),
     transportFactory: RelayV2TransportFactory = BoundedRelayV2TransportFactory(),
     private val newCommandId: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = System::currentTimeMillis,
@@ -204,35 +208,50 @@ internal class RelayV2BaseRuntimeComposition(
         credentialStore = credentialStore,
         connectPlanSource = recoveryAdapter,
         commandQueryAdmissionComposition = queryAdmissionComposition,
-        optionalCapabilities = emptySet(),
+        optionalCapabilities = agentOptionalCapabilities,
     )
+    private val agentRuntimeComposition = agentDurableRepository?.let {
+        AgentTranscriptLifecycleRuntimeComposition.dormant(
+            applyLease = actor,
+            durableRepository = it,
+            durableHandoff = actor,
+            requestSender = actor,
+        )
+    }
     private val agentRuntime = run {
         require(agentRuntimeFactory == null || agentDurableRepository == null) {
             "Agent runtime factory and durable repository are mutually exclusive"
         }
         agentRuntimeFactory?.invoke(actor)
-            ?: agentDurableRepository?.let {
-                AgentTranscriptLifecycleRuntimeComposition.dormant(
-                    applyLease = actor,
-                    durableRepository = it,
-                    durableHandoff = actor,
-                    requestSender = actor,
-                )
-            }
+            ?: agentRuntimeComposition
     }
-    private val selectedSessionPresentation = agentDurableRepository?.let { durableRepository ->
-        val selection = AgentTranscriptLifecycleSessionSelectionController(
+    private val selectedSessionSelection = agentDurableRepository?.let {
+        AgentTranscriptLifecycleSessionSelectionController(
             readAuthority = actor,
             stateRepositoryRead = materializedSessions::readMaterializedSessionCut,
         )
+    }
+    private val selectedSessionPresentation = agentDurableRepository?.let { durableRepository ->
         val read = AgentTranscriptLifecycleSelectedSessionReadController(
-            sessionSelection = selection,
+            sessionSelection = requireNotNull(selectedSessionSelection),
             durableRepository = durableRepository,
             enabled = true,
         )
         AgentTranscriptLifecycleSelectedSessionPresentationController(
             readController = read,
             pageLimit = SELECTED_SESSION_PRESENTATION_PAGE_LIMIT,
+        )
+    }
+    private val selectedSessionStatusAdmission = agentDurableRepository?.let { durableRepository ->
+        AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
+            sessionSelection = requireNotNull(selectedSessionSelection),
+            durableRepository = durableRepository,
+            durableLoadOrInitialize = AgentTranscriptLifecycleDurableLoadOrInitializeAdapter(
+                applyLease = actor,
+                repository = durableRepository,
+            ),
+            requestSync = requireNotNull(agentRuntimeComposition),
+            enabled = true,
         )
     }
     private val queryAdmissionAdapter = queryAdmissionComposition.adapter(actor, outboxAuthority)
@@ -400,6 +419,33 @@ internal class RelayV2BaseRuntimeComposition(
             }
             else -> result
         }
+    }
+
+    /** Requests one structured Agent status refresh for an exact current product Session cut. */
+    suspend fun requestSelectedSessionAgentStatus(
+        sessionCut: RelayV2SessionReplyCut,
+    ): AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult {
+        val issuedSession = currentIssuedSession(sessionCut)
+            ?: return AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
+        val admission = selectedSessionStatusAdmission
+            ?: return AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
+        val result = try {
+            admission.requestStatus(
+                AgentTranscriptLifecycleSessionSelectionIntent(
+                    namespace = issuedSession.materialized.namespace,
+                    scopeId = issuedSession.materialized.session.scopeId,
+                    sessionId = issuedSession.materialized.session.sessionId,
+                ),
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
+        }
+        if (currentIssuedSession(sessionCut) !== issuedSession) {
+            return AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
+        }
+        return result
     }
 
     /**

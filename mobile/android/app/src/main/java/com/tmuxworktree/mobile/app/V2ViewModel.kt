@@ -76,6 +76,16 @@ internal fun shouldPersistRelaySelectedHost(
     selectedHostId != preferredHostId &&
     preferredHostId !in availableHostIds
 
+/** Owns one exact selected-Session cut from status admission through its revision collector. */
+internal suspend fun collectRelayV2SelectedSessionCut(
+    requestAgentStatus: suspend () -> Unit,
+    outboxRevisions: Flow<Long>,
+    collectRevision: suspend (Long) -> Unit,
+) {
+    requestAgentStatus()
+    outboxRevisions.collectLatest(collectRevision)
+}
+
 class V2ViewModel(
     private val container: AppContainer,
     private val demoMode: Boolean = false,
@@ -151,9 +161,14 @@ class V2ViewModel(
                 }
             } ?: return@transformLatest
             val (composition, cut) = selected
-            composition.outboxTimelineRevision.collectLatest { expectedRevision ->
+            collectRelayV2SelectedSessionCut(
+                requestAgentStatus = {
+                    composition.requestSelectedSessionAgentStatus(cut)
+                },
+                outboxRevisions = composition.outboxTimelineRevision,
+            ) { expectedRevision ->
                 val replies = composition.readSelectedSessionReplies(cut, expectedRevision)
-                if (replies == SelectedSessionReplyReadState.Stale) return@collectLatest
+                if (replies == SelectedSessionReplyReadState.Stale) return@collectRelayV2SelectedSessionCut
                 val stillCurrent = {
                     synchronized(relayV2UiFenceLock) {
                         relayV2Composition === composition &&

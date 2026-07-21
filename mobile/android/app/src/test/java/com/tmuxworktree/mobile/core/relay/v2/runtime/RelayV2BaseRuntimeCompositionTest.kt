@@ -13,6 +13,8 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableNamespace
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableOperationResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableOperationFence
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurablePrepareRequestCommand
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurablePrepareRequestResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurablePreparedRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRecord
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableHandoffPort
@@ -32,8 +34,10 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeHandlePort
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeUnavailableReason
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStatusGetFrame
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
@@ -235,6 +239,132 @@ class RelayV2BaseRuntimeCompositionTest {
                 assertEquals(1, harness.transport().sendCount())
             } finally {
                 harness.close()
+            }
+        }
+
+    @Test
+    fun `selected Session status admission dispatches when negotiated and fences unavailable cuts`() =
+        runBlocking {
+            data class Case(
+                val name: String,
+                val negotiated: Boolean = false,
+                val foreignCut: Boolean = false,
+                val disconnectBeforeRequest: Boolean = false,
+                val expectedRequest: Boolean = false,
+            )
+
+            listOf(
+                Case("extension not negotiated"),
+                Case(
+                    "three-party negotiated current cut",
+                    negotiated = true,
+                    expectedRequest = true,
+                ),
+                Case("foreign cut", negotiated = true, foreignCut = true),
+                Case(
+                    "disconnected cut",
+                    negotiated = true,
+                    disconnectBeforeRequest = true,
+                ),
+            ).forEach { case ->
+                val agent = SeededAgentDurableRepository()
+                val owner = Harness(
+                    autoConnect = true,
+                    agentDurableRepository = agent.repository,
+                    agentOptionalCapabilities = if (case.negotiated) {
+                        setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
+                    } else {
+                        emptySet()
+                    },
+                )
+                val foreign = if (case.foreignCut) {
+                    Harness(
+                        autoConnect = true,
+                        agentDurableRepository = SeededAgentDurableRepository().repository,
+                        agentOptionalCapabilities = setOf(
+                            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+                        ),
+                    )
+                } else {
+                    null
+                }
+                try {
+                    owner.connectOnline(agentCapabilityNegotiated = case.negotiated)
+                    foreign?.connectOnline(agentCapabilityNegotiated = true)
+                    val ownerProduct = withTimeout(TIMEOUT_MS) {
+                        owner.composition.sessions.first { it.isNotEmpty() }.single()
+                    }
+                    val requestedCut = if (foreign == null) {
+                        ownerProduct.replyCut
+                    } else {
+                        withTimeout(TIMEOUT_MS) {
+                            foreign.composition.sessions.first { it.isNotEmpty() }
+                                .single()
+                                .replyCut
+                        }
+                    }
+                    if (case.disconnectBeforeRequest) {
+                        owner.composition.disconnectAndDrain(
+                            owner.profile.identity,
+                            "selected-session-status-disconnect",
+                        )
+                    }
+                    val sendsBeforeRequest = owner.transport().sendCount()
+
+                    val result = owner.composition.requestSelectedSessionAgentStatus(requestedCut)
+                    if (case.expectedRequest) {
+                        assertTrue(
+                            "${case.name}: result=$result, " +
+                                "materialized=${owner.authority.materializedSessionCutReads.get()}, " +
+                                "loads=${agent.loadCalls.get()}, " +
+                                "initializes=${agent.statusInitializationCalls.get()}, " +
+                                "prepares=${agent.statusPrepareCalls.get()}",
+                            result is
+                                AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Requested,
+                        )
+                        val status = owner.transport().awaitAgentStatusGet()
+                        val initialized = requireNotNull(agent.statusInitializationNamespace.get())
+                        assertEquals(
+                            case.name,
+                            ownerProduct.materialized.session.scopeId,
+                            initialized.consumer.scopeId,
+                        )
+                        assertEquals(
+                            case.name,
+                            ownerProduct.materialized.session.sessionId,
+                            initialized.consumer.sessionId,
+                        )
+                        assertEquals(case.name, initialized.consumer.scopeId, status.scopeId)
+                        assertEquals(case.name, initialized.consumer.sessionId, status.sessionId)
+                        assertEquals(case.name, null, initialized.timelineEpoch)
+                        assertEquals(case.name, 1, owner.authority.materializedSessionCutReads.get())
+                        assertEquals(case.name, 1, agent.loadCalls.get())
+                        assertEquals(case.name, 1, agent.statusInitializationCalls.get())
+                        assertEquals(case.name, 1, agent.statusPrepareCalls.get())
+                        assertEquals(case.name, 1, agent.mutationCommits.get())
+                        assertEquals(
+                            case.name,
+                            1,
+                            owner.transport().agentStatusGets().size,
+                        )
+                        assertEquals(case.name, sendsBeforeRequest + 1, owner.transport().sendCount())
+                    } else {
+                        assertEquals(
+                            case.name,
+                            AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable,
+                            result,
+                        )
+                        assertEquals(case.name, 0, owner.authority.materializedSessionCutReads.get())
+                        assertEquals(case.name, 0, agent.loadCalls.get())
+                        assertEquals(case.name, 0, agent.statusInitializationCalls.get())
+                        assertEquals(case.name, 0, agent.statusPrepareCalls.get())
+                        assertEquals(case.name, 0, agent.mutationCommits.get())
+                        assertEquals(case.name, sendsBeforeRequest, owner.transport().sendCount())
+                    }
+                } finally {
+                    owner.close()
+                    foreign?.close()
+                }
             }
         }
 
@@ -1635,6 +1765,7 @@ class RelayV2BaseRuntimeCompositionTest {
         agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
         agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
             AgentTranscriptLifecycleRuntimeHandlePort)? = null,
+        agentOptionalCapabilities: Set<String> = emptySet(),
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -1685,6 +1816,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 outboxEnqueueAuthority = authority,
                 agentDurableRepository = agentDurableRepository,
                 agentRuntimeFactory = agentRuntimeFactory,
+                agentOptionalCapabilities = agentOptionalCapabilities,
                 transportFactory = factory,
                 newCommandId = newCommandId,
                 clock = { NOW_MS },
@@ -1698,16 +1830,28 @@ class RelayV2BaseRuntimeCompositionTest {
             )
         }
 
-        suspend fun connectOnline(index: Int = 0): MutableMap<String, Any?> {
+        suspend fun connectOnline(
+            index: Int = 0,
+            agentCapabilityNegotiated: Boolean = false,
+        ): MutableMap<String, Any?> {
             val transport = awaitTransport(index)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
-            transport.sendFixture("relay-welcome")
+            val relayWelcome = fixture("relay-welcome")
+            if (agentCapabilityNegotiated) relayWelcome.addAgentCapability()
+            transport.sendFrame(relayWelcome)
             val hello = transport.awaitSentFrame()
             val welcome = fixture("host-welcome-caught-up")
             welcome["requestId"] = hello.stringValue("requestId")
+            if (agentCapabilityNegotiated) welcome.addAgentCapability()
             transport.sendFrame(welcome)
             awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
             return hello
+        }
+
+        private fun MutableMap<String, Any?>.addAgentCapability() {
+            payload()["capabilities"] =
+                (payload().stringList("capabilities") + AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
+                    .distinct()
         }
 
         fun agentEffect(
@@ -1858,6 +2002,10 @@ class RelayV2BaseRuntimeCompositionTest {
         )
         val loadCalls = AtomicInteger()
         val mutationCommits = AtomicInteger()
+        val statusInitializationCalls = AtomicInteger()
+        val statusPrepareCalls = AtomicInteger()
+        val statusInitializationNamespace =
+            AtomicReference<AgentTranscriptLifecycleDurableNamespace?>(null)
         private val current = AtomicReference(
             AgentTranscriptLifecycleDurableRecord(
                 namespace = namespace,
@@ -1892,6 +2040,45 @@ class RelayV2BaseRuntimeCompositionTest {
                         current.get().takeIf {
                             it.namespace.consumer == arguments!![0]
                         }
+                    }
+                    "loadOrInitializeStatusNamespaceUnderApplyLease" -> {
+                        val expected = arguments!![0]
+                            as AgentTranscriptLifecycleDurableNamespace
+                        statusInitializationCalls.incrementAndGet()
+                        statusInitializationNamespace.set(expected)
+                        val existing = current.get()
+                        if (existing.namespace.consumer == expected.consumer) {
+                            existing.also { check(it.namespace == expected) }
+                        } else {
+                            check(expected.timelineEpoch == null)
+                            AgentTranscriptLifecycleDurableRecord(
+                                namespace = expected,
+                                state = AgentTranscriptLifecycleClientState(
+                                    expected.consumer.sessionIdentity,
+                                ),
+                                storageAccounting = AgentTranscriptDurableStorageAccounting.EMPTY,
+                            ).also(current::set)
+                        }
+                    }
+                    "prepareRequestUnderApplyLease" -> {
+                        statusPrepareCalls.incrementAndGet()
+                        val command = arguments!![0]
+                            as AgentTranscriptLifecycleDurablePrepareRequestCommand.Status
+                        val record = current.get()
+                        check(command.fence.expectedNamespace == record.namespace)
+                        mutationCommits.incrementAndGet()
+                        AgentTranscriptLifecycleDurablePrepareRequestResult(
+                            reduction = AgentTranscriptLifecycleClientReduction(
+                                state = record.state,
+                                disposition = AgentClientDisposition.APPLIED,
+                            ),
+                            preparedRequest = AgentTranscriptLifecycleDurablePreparedRequest.Status(
+                                AgentLocalRequestFence(
+                                    localGeneration = record.state.extensionLane.localGeneration,
+                                    requestToken = command.proposedRequestNetworkToken,
+                                ),
+                            ),
+                        )
                     }
                     "consumeLiveEventUnderApplyLease" -> {
                         val command = arguments!![0]
@@ -2639,6 +2826,20 @@ class RelayV2BaseRuntimeCompositionTest {
                 ).frame,
             ))
             frame.takeIf { it["type"] == type }
+        }
+
+        suspend fun awaitAgentStatusGet(): AgentTimelineStatusGetFrame =
+            withTimeout(TIMEOUT_MS) {
+                while (true) {
+                    agentStatusGets().firstOrNull()?.let { return@withTimeout it }
+                    delay(1)
+                }
+                error("unreachable")
+            }
+
+        fun agentStatusGets(): List<AgentTimelineStatusGetFrame> = sent.mapNotNull { bytes ->
+            runCatching { AgentTranscriptLifecycleV1Codec().decodePublicFrame(bytes) }
+                .getOrNull() as? AgentTimelineStatusGetFrame
         }
 
         fun sendCommandStatuses(

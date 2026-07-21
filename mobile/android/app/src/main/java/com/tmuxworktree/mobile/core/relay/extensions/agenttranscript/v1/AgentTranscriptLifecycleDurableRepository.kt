@@ -61,7 +61,7 @@ internal class AgentTranscriptLifecycleDurableRepository(
     ): AgentTranscriptLifecycleInitializeResult =
         core.initializeUnderApplyLease(namespace, state)
 
-    suspend fun loadOrInitializeStatusNamespaceUnderApplyLease(
+    override suspend fun loadOrInitializeStatusNamespaceUnderApplyLease(
         namespace: AgentTranscriptLifecycleDurableNamespace,
     ): AgentTranscriptLifecycleDurableRecord =
         core.loadOrInitializeStatusNamespaceUnderApplyLease(namespace)
@@ -134,7 +134,7 @@ internal class AgentTranscriptLifecycleDurableLoadOrInitializeAdapter(
 ) : AgentTranscriptLifecycleDurableLoadOrInitializePort {
     constructor(
         applyLease: RelayV2RepositoryEffectApplyLeasePort,
-        repository: AgentTranscriptLifecycleDurableRepository,
+        repository: AgentTranscriptLifecycleRuntimeDurableRepository,
     ) : this(applyLease, repository::loadOrInitializeStatusNamespaceUnderApplyLease)
 
     override suspend fun loadOrInitialize(

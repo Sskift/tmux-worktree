@@ -73,7 +73,8 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
     private val enabled: Boolean = false,
     requestSender: AgentTranscriptLifecycleExtensionRequestSender? = null,
     nextRequestToken: () -> String = { java.util.UUID.randomUUID().toString() },
-) : AgentTranscriptLifecycleRuntimeHandlePort {
+) : AgentTranscriptLifecycleRuntimeHandlePort,
+    AgentTranscriptLifecycleStatusRequestPort {
     private val runtimeConsumer = AgentTranscriptLifecycleRuntimeConsumer(
         applyLease = applyLease,
         durableRepository = durableRepository,
@@ -242,6 +243,17 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             }
             cursor = next
         }
+    }
+
+    override suspend fun requestStatus(
+        context: AgentTranscriptLifecycleOutboundStatusRequestContext,
+    ): AgentTranscriptLifecycleRequestSyncResult {
+        if (!enabled) {
+            return AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated
+        }
+        val coordinator = requestSync
+            ?: return AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated
+        return coordinator.requestStatus(context)
     }
 
     suspend fun read(

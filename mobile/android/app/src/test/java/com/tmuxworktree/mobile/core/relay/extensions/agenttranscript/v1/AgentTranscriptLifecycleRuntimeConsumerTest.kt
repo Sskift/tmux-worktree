@@ -1012,6 +1012,11 @@ private class RecordingDurableOperationPort(
         )
     }
 
+    override suspend fun loadOrInitializeStatusNamespaceUnderApplyLease(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): AgentTranscriptLifecycleDurableRecord =
+        error("Selected-Session status initialization is outside runtime consumer tests")
+
     override suspend fun claimNotificationUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         intent: AgentSystemNotificationIntent,
