@@ -1,5 +1,5 @@
 use super::*;
-use crate::claim_journal::ClaimJournal;
+use crate::claim_journal::{issue_claim_id_with_for_test, ClaimJournal};
 use crate::process_lifecycle::{
     poison_registry_after_begin_close_for_test, poison_registry_for_test,
     process_lifecycle_for_test, registry_poison_flag_for_test, remove_registry_entry_for_test,
@@ -289,11 +289,13 @@ fn resource_name(resource: RelativeResource) -> &'static str {
 }
 
 fn claim_id() -> ClaimId {
-    let mut bytes = [0_u8; CLAIM_ID_LENGTH];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = index as u8;
-    }
-    ClaimId::from_bytes(bytes).expect("claim id")
+    issue_claim_id_with_for_test(|bytes| {
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        Ok(())
+    })
+    .expect("claim id")
 }
 
 fn context() -> (Arc<AtomicU32>, ProcessLifecycleToken) {
@@ -311,7 +313,6 @@ fn open(
         token,
         FakePlatform::new(state),
         FakeDescriptor::Directory(directory_id),
-        claim_id(),
         &durability_qualification_for_test(),
     )
 }
@@ -333,6 +334,12 @@ fn decode_hex(input: &str) -> Vec<u8> {
             u8::from_str_radix(text, 16).expect("hex byte")
         })
         .collect()
+}
+
+fn observed_claim_id(state: &FakeState) -> [u8; CLAIM_ID_LENGTH] {
+    state.claim_bytes[24..56]
+        .try_into()
+        .expect("fixed claim id field")
 }
 
 fn contract_json(name: &str) -> Value {
@@ -415,21 +422,17 @@ fn claim_codec_consumes_the_v1_golden_and_rejects_corruption() {
         encoded.as_slice(),
         decode_hex(golden["bytesHex"].as_str().expect("golden bytes"))
     );
-    assert_eq!(ClaimJournal::decode(&encoded), Ok(journal));
+    assert!(ClaimJournal::decode(&encoded) == Ok(journal));
 
     for offset in [0, 8, 12, 16, 20, 116, 160, 191] {
         let mut corrupt = encoded;
         corrupt[offset] ^= 0x01;
-        assert_eq!(
-            ClaimJournal::decode(&corrupt),
-            Err(CellErrorCode::CellCorrupt),
+        assert!(
+            ClaimJournal::decode(&corrupt) == Err(CellErrorCode::CellCorrupt),
             "offset {offset}"
         );
     }
-    assert_eq!(
-        ClaimJournal::decode(&encoded[..encoded.len() - 1]),
-        Err(CellErrorCode::CellCorrupt)
-    );
+    assert!(ClaimJournal::decode(&encoded[..encoded.len() - 1]) == Err(CellErrorCode::CellCorrupt));
 }
 
 #[test]
@@ -458,6 +461,7 @@ fn admission_and_normal_close_follow_the_locked_durable_owner_chain() {
         let state = state.lock().expect("fake state");
         assert!(state.claim_exists);
         assert_eq!(state.claim_bytes.len(), CLAIM_JOURNAL_LENGTH);
+        assert!(observed_claim_id(&state).iter().any(|byte| *byte != 0));
         let events = &state.events;
         assert!(index(events, "fstat:directory") < index(events, "fstatat:lock:nofollow"));
         assert!(
@@ -506,6 +510,53 @@ fn admission_and_normal_close_follow_the_locked_durable_owner_chain() {
             .count(),
         1
     );
+}
+
+#[test]
+fn operating_system_entropy_issues_nonzero_distinct_claim_ids() {
+    let (_current_pid, token) = context();
+    let mut issued = Vec::new();
+
+    for directory_id in [1, 2] {
+        let state = Arc::new(Mutex::new(FakeState::new()));
+        let mut owner = open(&token, Arc::clone(&state), directory_id).expect("open owner");
+        let claim_id = observed_claim_id(&state.lock().expect("fake state"));
+        assert!(claim_id.iter().any(|byte| *byte != 0));
+        issued.push(claim_id);
+        owner.close().expect("close owner");
+    }
+
+    assert_ne!(issued[0], issued[1]);
+}
+
+#[test]
+fn entropy_error_and_all_zero_fail_before_mutation_and_close_directory_once() {
+    fn assert_failure(fill: impl FnOnce(&mut [u8; CLAIM_ID_LENGTH]) -> Result<(), ()>) {
+        let (_current_pid, token) = context();
+        let state = Arc::new(Mutex::new(FakeState::new()));
+        let result = adopt_prebound_directory_with_entropy_for_test(
+            &token,
+            FakePlatform::new(Arc::clone(&state)),
+            FakeDescriptor::Directory(1),
+            &durability_qualification_for_test(),
+            fill,
+        )
+        .map(|_| ());
+        assert_eq!(result, Err(CellErrorCode::CellIo));
+
+        let state = state.lock().expect("fake state");
+        assert_eq!(state.events, ["raw-close:directory"]);
+        assert_eq!(
+            state.close_counts.get(&FakeDescriptor::Directory(1)),
+            Some(&1)
+        );
+        assert_eq!(state.close_counts.get(&FakeDescriptor::Lock), None);
+        assert_eq!(state.close_counts.get(&FakeDescriptor::Claim), None);
+        assert!(!state.claim_exists);
+    }
+
+    assert_failure(|_| Err(()));
+    assert_failure(|_| Ok(()));
 }
 
 #[test]

@@ -8,15 +8,15 @@ pub const CLAIM_JOURNAL_LENGTH: usize = 192;
 const INTEGRITY_OFFSET: usize = 160;
 const MAGIC: &[u8; 8] = b"TWV2HAC1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClaimId([u8; CLAIM_ID_LENGTH]);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClaimId([u8; CLAIM_ID_LENGTH]);
 
 impl ClaimId {
-    pub fn from_bytes(bytes: [u8; CLAIM_ID_LENGTH]) -> Result<Self, CellErrorCode> {
+    fn from_bytes(bytes: [u8; CLAIM_ID_LENGTH]) -> Option<Self> {
         if bytes.iter().all(|byte| *byte == 0) {
-            return Err(CellErrorCode::InvalidArgument);
+            return None;
         }
-        Ok(Self(bytes))
+        Some(Self(bytes))
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8; CLAIM_ID_LENGTH] {
@@ -24,7 +24,22 @@ impl ClaimId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) fn issue_claim_id() -> Result<ClaimId, CellErrorCode> {
+    let mut bytes = [0_u8; CLAIM_ID_LENGTH];
+    getrandom::fill(&mut bytes).map_err(|_| CellErrorCode::CellIo)?;
+    ClaimId::from_bytes(bytes).ok_or(CellErrorCode::CellIo)
+}
+
+#[cfg(test)]
+pub(super) fn issue_claim_id_with_for_test(
+    fill: impl FnOnce(&mut [u8; CLAIM_ID_LENGTH]) -> Result<(), ()>,
+) -> Result<ClaimId, CellErrorCode> {
+    let mut bytes = [0_u8; CLAIM_ID_LENGTH];
+    fill(&mut bytes).map_err(|()| CellErrorCode::CellIo)?;
+    ClaimId::from_bytes(bytes).ok_or(CellErrorCode::CellIo)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClaimJournal {
     pub(crate) claim_id: ClaimId,
     pub(crate) directory: ObjectIdentity,
@@ -76,7 +91,7 @@ impl ClaimJournal {
         let mut claim_id = [0_u8; CLAIM_ID_LENGTH];
         claim_id.copy_from_slice(&bytes[24..56]);
         Ok(Self {
-            claim_id: ClaimId::from_bytes(claim_id).map_err(|_| CellErrorCode::CellCorrupt)?,
+            claim_id: ClaimId::from_bytes(claim_id).ok_or(CellErrorCode::CellCorrupt)?,
             directory: get_identity(bytes, 56),
             lock: get_identity(bytes, 72),
             claim: get_identity(bytes, 88),

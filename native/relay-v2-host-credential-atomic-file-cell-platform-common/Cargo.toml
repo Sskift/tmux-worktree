@@ -6,6 +6,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+getrandom = "0.3"
 sha2 = "0.10"
 
 [build-dependencies]

@@ -197,7 +197,6 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     "trusted-production-factory",
     "darwin-x86_64-validation-evidence",
     "credential-cell-read-cas-temp-or-rename",
-    "csprng-claim-id-source",
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",
     "continuity",

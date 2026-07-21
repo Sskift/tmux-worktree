@@ -16,12 +16,14 @@ mod process_lifecycle;
 mod tests;
 
 pub use claim_journal::{
-    ClaimId, CLAIM_ID_LENGTH, CLAIM_JOURNAL_FORMAT_VERSION, CLAIM_JOURNAL_LENGTH,
+    CLAIM_ID_LENGTH, CLAIM_JOURNAL_FORMAT_VERSION, CLAIM_JOURNAL_LENGTH,
     CLAIM_JOURNAL_STATE_ADMISSION_HELD_NO_CREDENTIAL_MUTATION,
 };
 pub use process_lifecycle::{initialize_process_lifecycle, ProcessLifecycleToken};
 
-use claim_journal::ClaimJournal;
+#[cfg(test)]
+use claim_journal::issue_claim_id_with_for_test;
+use claim_journal::{issue_claim_id, ClaimId, ClaimJournal};
 use process_lifecycle::{reserve_directory, DirectoryIdentity, LifecycleHandle};
 use std::fmt;
 use std::mem::ManuallyDrop;
@@ -553,12 +555,39 @@ pub fn adopt_prebound_directory<P: DescriptorRelativePlatform>(
     lifecycle_token: &ProcessLifecycleToken,
     platform: P,
     directory: P::Descriptor,
-    claim_id: ClaimId,
     _qualification: &DurabilityQualification,
 ) -> Result<AdmissionOwner<P>, CellErrorCode> {
     lifecycle_token.check_parent_process()?;
     let mut attempt = OpenAttempt::new(lifecycle_token, platform, directory);
+    let claim_id = match issue_claim_id() {
+        Ok(claim_id) => claim_id,
+        Err(error) => return Err(attempt.fail(error, false)),
+    };
+    adopt_prebound_directory_with_claim_id(lifecycle_token, attempt, claim_id)
+}
 
+#[cfg(test)]
+fn adopt_prebound_directory_with_entropy_for_test<P: DescriptorRelativePlatform>(
+    lifecycle_token: &ProcessLifecycleToken,
+    platform: P,
+    directory: P::Descriptor,
+    _qualification: &DurabilityQualification,
+    fill: impl FnOnce(&mut [u8; CLAIM_ID_LENGTH]) -> Result<(), ()>,
+) -> Result<AdmissionOwner<P>, CellErrorCode> {
+    lifecycle_token.check_parent_process()?;
+    let mut attempt = OpenAttempt::new(lifecycle_token, platform, directory);
+    let claim_id = match issue_claim_id_with_for_test(fill) {
+        Ok(claim_id) => claim_id,
+        Err(error) => return Err(attempt.fail(error, false)),
+    };
+    adopt_prebound_directory_with_claim_id(lifecycle_token, attempt, claim_id)
+}
+
+fn adopt_prebound_directory_with_claim_id<'a, P: DescriptorRelativePlatform>(
+    lifecycle_token: &'a ProcessLifecycleToken,
+    mut attempt: OpenAttempt<'a, P>,
+    claim_id: ClaimId,
+) -> Result<AdmissionOwner<P>, CellErrorCode> {
     let initial = {
         let platform = attempt.platform.as_mut().expect("platform");
         initial_directory_proof(lifecycle_token, platform, attempt.directory.get())

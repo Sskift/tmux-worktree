@@ -14,7 +14,9 @@
 
 相邻的 `native/relay-v2-host-credential-atomic-file-cell-platform-darwin` 与 `native/relay-v2-host-credential-atomic-file-cell-platform-linux` 已分别实现该 trait 的 macOS 与 Linux descriptor-relative syscall seam。当前真实验证覆盖 `aarch64-apple-darwin` 与 `x86_64-unknown-linux-gnu`：descriptor-relative filesystem 操作、独立 subprocess 间 `F_SETLK` busy 与 raw-close release，以及 exec 边界的 `FD_CLOEXEC`。这不是完整 admission 验证；Darwin x86_64 与 Linux arm64 尚无证据。
 
-本 revision 仍不实现 trusted factory、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell read/CAS/temp/rename、orphan recovery、CSPRNG、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
+Platform-common 现已唯一拥有 claimId 签发：接管预绑定 directory descriptor 并通过 parent-PID fence 后、任何 process registry、lock、claim、fsync 或 namespace mutation 前，它只调用一次 OS CSPRNG，生成 exact 32-byte non-zero opaque claimId。entropy source error 或全零结果固定映射为 `CELL_IO`；common 只把已接管的 directory descriptor raw-close 一次，不 reserve registry、不打开 lock/claim、不 fsync、不 fallback、预测或重试，也不接受 caller 提供的 claimId。claimId 只进入 `TWV2HAC1` journal，并在 normal close 时按 exact journal match 验证；它不进入公开 API、Debug、result、log 或 error。
+
+本 revision 仍不实现 trusted factory、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell read/CAS/temp/rename、orphan recovery、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
 
 ## Platform-common admission owner
 
@@ -24,13 +26,15 @@ Production durability qualification v1 是 deny-by-default：`qualifiedRecords=[
 
 测试可达的 exact admission 顺序冻结为：
 
-1. adopt 调用方预绑定的 sole directory descriptor；`fstat` 必须证明 directory、effective uid/effective gid owner、exact `0700` 和 `FD_CLOEXEC`。
-2. 以 `(directory dev, directory ino, RelayV2HostCredentialAtomicFileCellAdmissionV1)` 在 Host 专属 process registry 中 reserve；随后立即重做 directory identity/safety 证明。第二个同进程 owner 必须在产生第二个 lock descriptor 前返回 `CELL_BUSY`。
-3. `fstatat(directory, lock, AT_SYMLINK_NOFOLLOW)`。Existing 只能以 `openat(..., O_RDWR|O_NOFOLLOW|O_CLOEXEC)` 打开；absent 只能以 `O_RDWR|O_NOFOLLOW|O_CLOEXEC|O_CREAT|O_EXCL` 和 `0600` 创建。禁止 `O_TRUNC`、reopen、dup 或辅助 lock descriptor。
-4. lock 文件完成 `A=fstat(fd) / B=fstatat(directory, lock, NOFOLLOW) / C=fstat(fd)` stable proof；A/B/C 必须是同一 dev+ino、regular、euid/egid owner、exact `0600`、`nlink=1`、size `0`，且 descriptor 必须 `FD_CLOEXEC`。
-5. 只在该 lock fd 上执行 nonblocking traditional process-owned whole-file `fcntl(F_SETLK, {F_WRLCK, SEEK_SET, start=0, len=0})`。只有 `EACCES`/`EAGAIN` 映射 `CELL_BUSY`；禁止 `F_SETLKW`、`flock`、Linux `F_OFD_*` 和显式 unlock。锁只由 final raw close 释放。
-6. `fstatat(directory, claim, AT_SYMLINK_NOFOLLOW)`。安全、fixed-length 的 existing claim 表示 `CELL_RECOVERY_REQUIRED`；foreign owner/mode、symlink/special/link、wrong length/corrupt observation 都原样保留，绝不修复或删除。Absent claim 只能在同一次 `openat` 以 exact `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` 和 `0600` 创建，禁止 `O_TRUNC`；不得以事后 `F_SETFD` 替代 atomic `O_CLOEXEC`，但仍必须独立验证 sole descriptor 已有 `FD_CLOEXEC`，以便 normal close 从同一 descriptor 读回 exact journal。若 preflight 为 absent、但 exclusive create 返回 `EEXIST`，必须再次以 `fstatat(..., AT_SYMLINK_NOFOLLOW)` 观察并执行同一完整 type/link/owner/mode/fixed-length 分类；只有合格的 192-byte existing claim 返回 `CELL_RECOVERY_REQUIRED`，type/link/identity race 返回 `CELL_IDENTITY_UNCERTAIN`，wrong length 返回 `CELL_CORRUPT`，owner/mode invalid 返回 `CELL_PERMISSION_INVALID`，且所有分支 unlink 次数都为零。
-7. 向 sole claim fd 从 offset 0 写入 exact fixed journal，执行 claim `fsync`，再完成 claim A/B/C stable proof，最后 directory `fsync`。只有这些全部成功才把 registry 转为 `Open`。Durable cut 后的任何 failure 必须保留 claim。
+1. adopt 调用方预绑定的 sole directory descriptor，并通过 parent-PID fence。
+2. common 调用 OS CSPRNG 一次，签发 exact 32-byte non-zero opaque claimId；error 或全零按上述 pre-mutation `CELL_IO` 路径关闭。
+3. `fstat` 必须证明 directory、effective uid/effective gid owner、exact `0700` 和 `FD_CLOEXEC`。
+4. 以 `(directory dev, directory ino, RelayV2HostCredentialAtomicFileCellAdmissionV1)` 在 Host 专属 process registry 中 reserve；随后立即重做 directory identity/safety 证明。第二个同进程 owner 必须在产生第二个 lock descriptor 前返回 `CELL_BUSY`。
+5. `fstatat(directory, lock, AT_SYMLINK_NOFOLLOW)`。Existing 只能以 `openat(..., O_RDWR|O_NOFOLLOW|O_CLOEXEC)` 打开；absent 只能以 `O_RDWR|O_NOFOLLOW|O_CLOEXEC|O_CREAT|O_EXCL` 和 `0600` 创建。禁止 `O_TRUNC`、reopen、dup 或辅助 lock descriptor。
+6. lock 文件完成 `A=fstat(fd) / B=fstatat(directory, lock, NOFOLLOW) / C=fstat(fd)` stable proof；A/B/C 必须是同一 dev+ino、regular、euid/egid owner、exact `0600`、`nlink=1`、size `0`，且 descriptor 必须 `FD_CLOEXEC`。
+7. 只在该 lock fd 上执行 nonblocking traditional process-owned whole-file `fcntl(F_SETLK, {F_WRLCK, SEEK_SET, start=0, len=0})`。只有 `EACCES`/`EAGAIN` 映射 `CELL_BUSY`；禁止 `F_SETLKW`、`flock`、Linux `F_OFD_*` 和显式 unlock。锁只由 final raw close 释放。
+8. `fstatat(directory, claim, AT_SYMLINK_NOFOLLOW)`。安全、fixed-length 的 existing claim 表示 `CELL_RECOVERY_REQUIRED`；foreign owner/mode、symlink/special/link、wrong length/corrupt observation 都原样保留，绝不修复或删除。Absent claim 只能在同一次 `openat` 以 exact `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` 和 `0600` 创建，禁止 `O_TRUNC`；不得以事后 `F_SETFD` 替代 atomic `O_CLOEXEC`，但仍必须独立验证 sole descriptor 已有 `FD_CLOEXEC`，以便 normal close 从同一 descriptor 读回 exact journal。若 preflight 为 absent、但 exclusive create 返回 `EEXIST`，必须再次以 `fstatat(..., AT_SYMLINK_NOFOLLOW)` 观察并执行同一完整 type/link/owner/mode/fixed-length 分类；只有合格的 192-byte existing claim 返回 `CELL_RECOVERY_REQUIRED`，type/link/identity race 返回 `CELL_IDENTITY_UNCERTAIN`，wrong length 返回 `CELL_CORRUPT`，owner/mode invalid 返回 `CELL_PERMISSION_INVALID`，且所有分支 unlink 次数都为零。
+9. 向 sole claim fd 从 offset 0 写入 exact fixed journal，执行 claim `fsync`，再完成 claim A/B/C stable proof，最后 directory `fsync`。只有这些全部成功才把 registry 转为 `Open`。Durable cut 后的任何 failure 必须保留 claim。
 
 Registry 只有 `Opening / Open / Closing / CloseUncertain`。Owner 捕获 opener PID，并在每个 descriptor-relative operation 前检查 PID。Fork 后 inherited owner 的所有 operation 只返回 `CELL_CLOSED`；child 不得 unlink、unlock、fsync 或 close 任何 inherited descriptor。
 
