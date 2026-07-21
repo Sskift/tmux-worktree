@@ -1,6 +1,6 @@
 # Relay v2 Host Credential Atomic File Cell v1
 
-状态：**Frozen contract revision 2；native ABI、fixture 与 claim journal format 各为 v1。default-off、injected-only，未接 native addon、真实 Darwin/Linux syscall 或 production wiring。**
+状态：**Frozen contract revision 2；native ABI、fixture、platform resource contract 与 claim journal format 各为 v1。default-off、injected-only。Darwin arm64 descriptor-relative syscall adapter 已实现并有真实验证；Linux adapter、native addon 与 production wiring 未实现。**
 
 本目录冻结 Relay v2 Host credential vault 的专属 atomic byte-cell native seam。它不修改 Relay public wire，不产生 readiness/capability，也不复用 broker credential state store 的 logical store kind、binary container、private location、artifact、loader、lifecycle owner 或 continuity namespace。
 
@@ -12,11 +12,15 @@
 
 4b2a 新增的 `native/relay-v2-host-credential-atomic-file-cell-platform-common` 是 Host 专属、未接线的 admission owner。它只消费预绑定 directory descriptor、调用 descriptor-relative platform trait，并独占 process registry、lock descriptor、claim journal 和 final close。它不依赖、导入或复用 broker N0 的 namespace、path component、container/binary format、registry、lifecycle owner、artifact、loader 或 continuity namespace。
 
-本 revision 仍不实现 trusted factory、Darwin/Linux syscall adapter、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell CAS/temp/rename、orphan recovery、CSPRNG、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
+相邻的 `native/relay-v2-host-credential-atomic-file-cell-platform-darwin` 已实现该 trait 的 macOS descriptor-relative syscall seam。当前真实验证只覆盖 `aarch64-apple-darwin`：descriptor-relative filesystem 操作、独立 subprocess 间 `F_SETLK` busy 与 raw-close release，以及 exec 边界的 `FD_CLOEXEC`。这不是完整 admission 验证；Darwin x86_64 尚无证据，Linux 尚无 Host adapter 或真实 runner 证据。
+
+本 revision 仍不实现 trusted factory、Linux syscall adapter、HOME/path/env 输入、global lookup、N-API、loader/packaging、credential byte-cell read/CAS/temp/rename、orphan recovery、CSPRNG、continuity、Vault/Authority injection、`relay-host` composition、readiness 或 capability advertisement。现有 H4a path-based cell 不是本 ABI 或 admission owner 的 production fallback。
 
 ## Platform-common admission owner
 
-Production durability qualification v1 是 deny-by-default：`qualifiedRecords=[]`，且没有 public constructor、template、wildcard 或 runtime-probe 通道。实现只在 `cfg(test)` 内能构造 test qualification；未来真实 platform adapter 必须在 process registry 和任何 namespace mutation 前返回 `CELL_DURABILITY_UNSUPPORTED`，直到新 contract revision 显式加入 qualified record。Syscall 成功或 runtime probe 不能自行产生 qualification。
+Production durability qualification v1 是 deny-by-default：`qualifiedRecords=[]`，且没有 public constructor、template、wildcard 或 runtime-probe 通道。实现只在 `cfg(test)` 内能构造 test qualification；因此即使 Darwin trait 与上述真实 syscall 证据已经存在，完整 admission adopt 在 production 仍不可达，必须在 process registry 和任何 namespace mutation 前返回 `CELL_DURABILITY_UNSUPPORTED`，直到新 contract revision 显式加入 qualified record。Syscall 成功或 runtime probe 不能自行产生 qualification。
+
+Darwin arm64 的验证只证明该 target adapter 的列举 syscall 行为，不等于 durability qualification、credential read/CAS、完整 admission、orphan recovery、filesystem power-loss、production wiring、readiness 或 capability。
 
 测试可达的 exact admission 顺序冻结为：
 

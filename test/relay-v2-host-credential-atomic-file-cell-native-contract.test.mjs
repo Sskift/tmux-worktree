@@ -159,7 +159,50 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     manifest.platformResources.fileOperations,
     "injected-descriptor-relative-trait-only",
   );
-  assert.equal(manifest.platformResources.realDarwinOrLinuxSyscallsImplemented, false);
+  assert.equal(
+    Object.hasOwn(manifest.platformResources, "realDarwinOrLinuxSyscallsImplemented"),
+    false,
+  );
+  assert.deepEqual(manifest.platformResources.targetFacts, {
+    darwin: {
+      implementationPath:
+        "native/relay-v2-host-credential-atomic-file-cell-platform-darwin",
+      traitImplemented: true,
+      validatedTargets: ["aarch64-apple-darwin"],
+      realEvidence: [
+        "descriptor-relative-filesystem",
+        "subprocess-F_SETLK-busy-and-close-release",
+        "exec-FD_CLOEXEC",
+      ],
+      fullAdmissionValidated: false,
+      durabilityQualified: false,
+      productionWired: false,
+    },
+    linux: {
+      implementationPath: null,
+      traitImplemented: false,
+      validatedTargets: [],
+      realEvidence: [],
+      fullAdmissionValidated: false,
+      durabilityQualified: false,
+      productionWired: false,
+    },
+  });
+  assert.deepEqual(manifest.notImplemented, [
+    "trusted-production-factory",
+    "linux-platform-adapter",
+    "darwin-x86_64-validation-evidence",
+    "credential-cell-read-cas-temp-or-rename",
+    "csprng-claim-id-source",
+    "orphan-cleanup-or-recovery",
+    "production-durability-qualification",
+    "continuity",
+    "napi-binding",
+    "loader-or-packaging",
+    "vault-injection",
+    "relay-host-production-composition",
+    "capability-advertisement",
+  ]);
   assert.equal(platformFixture.fixtureFormatVersion, 1);
   assert.equal(
     platformFixture.platformResourceContractVersion,
