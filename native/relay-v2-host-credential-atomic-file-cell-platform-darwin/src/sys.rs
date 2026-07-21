@@ -150,6 +150,26 @@ pub(crate) fn unlinkat_file(directory_fd: libc::c_int, name: &CStr) -> Result<()
     }
 }
 
+pub(crate) fn renameat_same_directory(
+    directory_fd: libc::c_int,
+    source: &CStr,
+    destination: &CStr,
+) -> Result<(), libc::c_int> {
+    if unsafe {
+        libc::renameat(
+            directory_fd,
+            source.as_ptr(),
+            directory_fd,
+            destination.as_ptr(),
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(errno())
+    }
+}
+
 /// Performs one close syscall and deliberately does not retry `EINTR`.
 pub(crate) fn close_once(raw_fd: libc::c_int) -> Result<(), libc::c_int> {
     if unsafe { libc::close(raw_fd) } == 0 {

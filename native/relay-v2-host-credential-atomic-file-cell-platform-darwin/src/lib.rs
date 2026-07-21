@@ -2,8 +2,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 //! Darwin syscall adapter for the Host credential atomic-file-cell admission
-//! owner. This crate owns no registry, journal, durability qualification, path
-//! lookup, credential mutation, or production composition.
+//! and mutation owner. This crate owns no registry, journal, mutation state,
+//! durability qualification, path lookup, or production composition.
 
 mod sys;
 
@@ -11,8 +11,9 @@ mod sys;
 mod tests;
 
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
-    platform_resource_spec, DescriptorRelativePlatform, EffectiveIdentity, Lookup, ObjectIdentity,
-    ObjectKind, ObjectMetadata, PlatformFailure, RelativeResource,
+    platform_resource_spec, CredentialMutationPlatform, DescriptorRelativePlatform,
+    EffectiveIdentity, Lookup, ObjectIdentity, ObjectKind, ObjectMetadata, PlatformFailure,
+    RelativeResource, TEMPORARY_ENTROPY_BYTES, TEMPORARY_PREFIX,
 };
 use std::ffi::CString;
 use std::fmt;
@@ -87,6 +88,32 @@ fn resource_name(resource: RelativeResource) -> Result<CString, PlatformFailure>
     CString::new(name.as_bytes()).map_err(|_| PlatformFailure::IdentityUncertain)
 }
 
+fn credential_name() -> Result<CString, PlatformFailure> {
+    CString::new(platform_resource_spec().credential_name().as_bytes())
+        .map_err(|_| PlatformFailure::IdentityUncertain)
+}
+
+fn temporary_name(name: &str) -> Result<CString, PlatformFailure> {
+    let suffix_length = TEMPORARY_ENTROPY_BYTES
+        .checked_mul(2)
+        .ok_or(PlatformFailure::IdentityUncertain)?;
+    let expected_length = TEMPORARY_PREFIX
+        .len()
+        .checked_add(suffix_length)
+        .ok_or(PlatformFailure::IdentityUncertain)?;
+    let bytes = name.as_bytes();
+    if bytes.len() != expected_length || !bytes.starts_with(TEMPORARY_PREFIX.as_bytes()) {
+        return Err(PlatformFailure::IdentityUncertain);
+    }
+    if !bytes[TEMPORARY_PREFIX.len()..]
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(PlatformFailure::IdentityUncertain);
+    }
+    CString::new(bytes).map_err(|_| PlatformFailure::IdentityUncertain)
+}
+
 fn map_errno(errno: libc::c_int) -> PlatformFailure {
     match errno {
         libc::EACCES | libc::EPERM => PlatformFailure::PermissionDenied,
@@ -129,6 +156,69 @@ fn metadata_from_stat(stat: &libc::stat) -> Result<ObjectMetadata, PlatformFailu
 
 fn positional_attempt_limit(length: usize) -> usize {
     length.saturating_mul(2).saturating_add(8)
+}
+
+fn positional_offset(offset: usize) -> Result<libc::off_t, PlatformFailure> {
+    libc::off_t::try_from(offset).map_err(|_| PlatformFailure::Io)
+}
+
+fn positional_write_all(raw_fd: RawFd, bytes: &[u8]) -> Result<(), PlatformFailure> {
+    let mut written = 0_usize;
+    for _ in 0..positional_attempt_limit(bytes.len()) {
+        if written == bytes.len() {
+            return Ok(());
+        }
+        let offset = positional_offset(written)?;
+        match sys::pwrite(raw_fd, &bytes[written..], offset) {
+            Ok(0) => return Err(PlatformFailure::Io),
+            Ok(count) if count <= bytes.len() - written => written += count,
+            Ok(_) => return Err(PlatformFailure::Io),
+            Err(libc::EINTR) => {}
+            Err(errno) => return Err(map_errno(errno)),
+        }
+    }
+    Err(PlatformFailure::Io)
+}
+
+fn positional_read_exact(
+    raw_fd: RawFd,
+    output: &mut [u8],
+    prove_eof: bool,
+) -> Result<(), PlatformFailure> {
+    let mut read = 0_usize;
+    let eof_attempt = if prove_eof { 1 } else { 0 };
+    let attempt_limit = positional_attempt_limit(output.len().saturating_add(eof_attempt));
+    let mut attempts = 0_usize;
+    while read < output.len() && attempts < attempt_limit {
+        attempts += 1;
+        let offset = positional_offset(read)?;
+        match sys::pread(raw_fd, &mut output[read..], offset) {
+            Ok(0) => return Err(PlatformFailure::Io),
+            Ok(count) if count <= output.len() - read => read += count,
+            Ok(_) => return Err(PlatformFailure::Io),
+            Err(libc::EINTR) => {}
+            Err(errno) => return Err(map_errno(errno)),
+        }
+    }
+    if read != output.len() {
+        return Err(PlatformFailure::Io);
+    }
+    if !prove_eof {
+        return Ok(());
+    }
+
+    let mut trailing = [0_u8; 1];
+    while attempts < attempt_limit {
+        attempts += 1;
+        let offset = positional_offset(output.len())?;
+        match sys::pread(raw_fd, &mut trailing, offset) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(PlatformFailure::Io),
+            Err(libc::EINTR) => {}
+            Err(errno) => return Err(map_errno(errno)),
+        }
+    }
+    Err(PlatformFailure::Io)
 }
 
 impl DescriptorRelativePlatform for DarwinDescriptorRelativePlatform {
@@ -230,20 +320,7 @@ impl DescriptorRelativePlatform for DarwinDescriptorRelativePlatform {
         if bytes.len() != platform_resource_spec().claim_journal_length() {
             return Err(PlatformFailure::Io);
         }
-        let mut written = 0_usize;
-        for _ in 0..positional_attempt_limit(bytes.len()) {
-            if written == bytes.len() {
-                return Ok(());
-            }
-            match sys::pwrite(claim.raw_fd, &bytes[written..], written as libc::off_t) {
-                Ok(0) => return Err(PlatformFailure::Io),
-                Ok(count) if count <= bytes.len() - written => written += count,
-                Ok(_) => return Err(PlatformFailure::Io),
-                Err(libc::EINTR) => {}
-                Err(errno) => return Err(map_errno(errno)),
-            }
-        }
-        Err(PlatformFailure::Io)
+        positional_write_all(claim.raw_fd, bytes)
     }
 
     fn read_claim_exact(
@@ -254,20 +331,7 @@ impl DescriptorRelativePlatform for DarwinDescriptorRelativePlatform {
         if output.len() != platform_resource_spec().claim_journal_length() {
             return Err(PlatformFailure::Io);
         }
-        let mut read = 0_usize;
-        for _ in 0..positional_attempt_limit(output.len()) {
-            if read == output.len() {
-                return Ok(());
-            }
-            match sys::pread(claim.raw_fd, &mut output[read..], read as libc::off_t) {
-                Ok(0) => return Err(PlatformFailure::Io),
-                Ok(count) if count <= output.len() - read => read += count,
-                Ok(_) => return Err(PlatformFailure::Io),
-                Err(libc::EINTR) => {}
-                Err(errno) => return Err(map_errno(errno)),
-            }
-        }
-        Err(PlatformFailure::Io)
+        positional_read_exact(claim.raw_fd, output, false)
     }
 
     fn fsync_claim(&mut self, claim: &Self::Descriptor) -> Result<(), PlatformFailure> {
@@ -289,5 +353,105 @@ impl DescriptorRelativePlatform for DarwinDescriptorRelativePlatform {
 
     fn raw_close(&mut self, descriptor: Self::Descriptor) -> Result<(), PlatformFailure> {
         sys::close_once(descriptor.raw_fd).map_err(map_errno)
+    }
+}
+
+impl CredentialMutationPlatform for DarwinDescriptorRelativePlatform {
+    fn fstatat_credential_nofollow(
+        &mut self,
+        directory: &Self::Descriptor,
+    ) -> Result<Lookup, PlatformFailure> {
+        let name = credential_name()?;
+        match sys::fstatat_nofollow(directory.raw_fd, &name) {
+            Ok(stat) => metadata_from_stat(&stat).map(Lookup::Present),
+            Err(libc::ENOENT) => Ok(Lookup::Absent),
+            Err(errno) => Err(map_errno(errno)),
+        }
+    }
+
+    fn open_credential_readonly(
+        &mut self,
+        directory: &Self::Descriptor,
+    ) -> Result<Self::Descriptor, PlatformFailure> {
+        let name = credential_name()?;
+        let raw_fd = sys::openat_existing(
+            directory.raw_fd,
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+        .map_err(map_errno)?;
+        Ok(DarwinDescriptor { raw_fd })
+    }
+
+    fn read_file_exact(
+        &mut self,
+        descriptor: &Self::Descriptor,
+        output: &mut [u8],
+    ) -> Result<(), PlatformFailure> {
+        positional_read_exact(descriptor.raw_fd, output, true)
+    }
+
+    fn fstatat_temporary_nofollow(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name_value: &str,
+    ) -> Result<Lookup, PlatformFailure> {
+        let name = temporary_name(temporary_name_value)?;
+        match sys::fstatat_nofollow(directory.raw_fd, &name) {
+            Ok(stat) => metadata_from_stat(&stat).map(Lookup::Present),
+            Err(libc::ENOENT) => Ok(Lookup::Absent),
+            Err(errno) => Err(map_errno(errno)),
+        }
+    }
+
+    fn create_temporary_exclusive(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name_value: &str,
+    ) -> Result<Self::Descriptor, PlatformFailure> {
+        let name = temporary_name(temporary_name_value)?;
+        let raw_fd = sys::openat_create(
+            directory.raw_fd,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map_err(map_errno)?;
+        Ok(DarwinDescriptor { raw_fd })
+    }
+
+    fn write_temporary_from_start(
+        &mut self,
+        temporary: &Self::Descriptor,
+        bytes: &[u8],
+    ) -> Result<(), PlatformFailure> {
+        positional_write_all(temporary.raw_fd, bytes)
+    }
+
+    fn fsync_temporary(&mut self, temporary: &Self::Descriptor) -> Result<(), PlatformFailure> {
+        sys::fsync(temporary.raw_fd).map_err(map_errno)
+    }
+
+    fn unlink_temporary(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name_value: &str,
+    ) -> Result<(), PlatformFailure> {
+        let name = temporary_name(temporary_name_value)?;
+        match sys::unlinkat_file(directory.raw_fd, &name) {
+            Ok(()) => Ok(()),
+            Err(libc::EPERM | libc::EISDIR) => Err(PlatformFailure::IdentityUncertain),
+            Err(errno) => Err(map_errno(errno)),
+        }
+    }
+
+    fn rename_temporary_to_credential(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name_value: &str,
+    ) -> Result<(), PlatformFailure> {
+        let temporary = temporary_name(temporary_name_value)?;
+        let credential = credential_name()?;
+        sys::renameat_same_directory(directory.raw_fd, &temporary, &credential).map_err(map_errno)
     }
 }
