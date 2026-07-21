@@ -46,6 +46,7 @@ export default defineConfig({
     "src/relay/v2/brokerCredentialStateStoreNativeTarget.ts",
     "src/relay/v2/brokerCredentialStateStoreLoader.ts",
     "src/relay/v2/brokerCredentialAuthority.ts",
+    "src/relay/v2/brokerCredentialExternalContinuityOpener.ts",
     "src/relay/v2/brokerCredentialHttpBoundary.ts",
     "src/relay/v2/brokerCredentialHttpIngress.ts",
     "src/relay/v2/brokerHostBootstrapHttpIngress.ts",
@@ -115,6 +116,9 @@ export default defineConfig({
     "./hostCredentialAuthority.js",
     "./hostCredentialVault.js",
     "./hostCredentialExchangeCoordinator.js",
+    // The external-continuity opener transfers ownership to the canonical
+    // credential authority entry instead of bundling a second owner class.
+    "./brokerCredentialAuthority.js",
     // The protocol-v2 session must consume the accepted composition and stdio
     // owners through their real dist entries rather than rebundled copies.
     "./relayV2DashboardManagementComposition.js",
