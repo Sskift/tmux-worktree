@@ -111,12 +111,15 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
          * Production durable-consumer seam while capability advertisement remains disabled.
          *
          * The base runtime remains the only effect pump and supplies its actor-owned apply and
-         * handoff authorities. System notification delivery deliberately stays disconnected.
+         * handoff authorities. The default platform remains closed; an injected platform is
+         * reached only after an exact negotiated effect durably commits and claims its ticket.
          */
         fun dormant(
             applyLease: RelayV2RepositoryEffectApplyLeasePort,
             durableRepository: AgentTranscriptLifecycleRuntimeDurableRepository,
             durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
+            notificationPlatform: AgentTranscriptLifecycleNotificationPlatformPort =
+                AgentTranscriptLifecycleDisabledNotificationPlatform,
             requestSender: AgentTranscriptLifecycleExtensionRequestSender? = null,
             onDurablePresentationCommit: () -> Unit = {},
         ): AgentTranscriptLifecycleRuntimeComposition =
@@ -124,12 +127,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
                 applyLease = applyLease,
                 durableRepository = durableRepository,
                 durableHandoff = durableHandoff,
-                notificationPlatform = AgentTranscriptLifecycleNotificationPlatformPort {
-                    AgentTranscriptLifecycleNotificationPlatformResult.Suppressed(
-                        AgentTranscriptLifecycleNotificationSuppressionReason
-                            .NOTIFICATIONS_DISABLED,
-                    )
-                },
+                notificationPlatform = notificationPlatform,
                 enabled = true,
                 requestSender = requestSender,
                 onDurablePresentationCommit = onDurablePresentationCommit,

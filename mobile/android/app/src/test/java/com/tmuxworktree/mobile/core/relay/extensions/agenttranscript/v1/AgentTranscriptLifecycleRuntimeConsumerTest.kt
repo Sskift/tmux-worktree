@@ -447,6 +447,8 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         val failClosedRequestSender = AgentTranscriptLifecycleExtensionRequestSender {
             error("Request sender must not be reached before an enabled negotiated frame")
         }
+        val platformTickets =
+            mutableListOf<AgentTranscriptLifecycleNotificationExecutionTicket>()
         val disabled = AgentTranscriptLifecycleRuntimeComposition(
             harness.lease,
             harness.operations,
@@ -454,13 +456,14 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             failClosedPlatform,
             requestSender = failClosedRequestSender,
         )
-        val guarded = AgentTranscriptLifecycleRuntimeComposition(
-            harness.lease,
-            harness.operations,
-            harness.handoff,
-            failClosedPlatform,
-            enabled = true,
-            requestSender = failClosedRequestSender,
+        val guarded = AgentTranscriptLifecycleRuntimeComposition.dormant(
+            applyLease = harness.lease,
+            durableRepository = harness.operations,
+            durableHandoff = harness.handoff,
+            notificationPlatform = AgentTranscriptLifecycleNotificationPlatformPort { ticket ->
+                platformTickets += ticket
+                AgentTranscriptLifecycleNotificationPlatformResult.Posted
+            },
         )
         suspend fun assertNotOwned(effect: RelayV2RuntimeEffect) = assertSame(
             effect,
@@ -510,19 +513,10 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         assertTrue(harness.handoff.replacements.isEmpty())
         assertEquals(0, harness.operations.applyCount)
         assertTrue(harness.handoff.accepted.isEmpty())
+        assertTrue(platformTickets.isEmpty())
 
         harness.operations.compositionNamespace = harness.namespace
-        val enabled = AgentTranscriptLifecycleRuntimeComposition(
-            harness.lease,
-            harness.operations,
-            harness.handoff,
-            AgentTranscriptLifecycleNotificationPlatformPort {
-                AgentTranscriptLifecycleNotificationPlatformResult.Posted
-            },
-            enabled = true,
-        )
-
-        val handled = enabled.handle(effect)
+        val handled = guarded.handle(effect)
             as AgentTranscriptLifecycleRuntimeCompositionResult.Consumed
         val consumption = handled.consumption
             as AgentTranscriptLifecycleRuntimeConsumeResult.Applied
@@ -540,9 +534,20 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             ),
             handled.notificationDispatches,
         )
+        assertEquals(
+            AgentTranscriptLifecycleNotificationExecutionTicket(
+                claimId = "0123456789abcdef".repeat(4),
+                namespace = harness.namespace,
+                intent = requireNotNull(
+                    compositionNotificationDecision(harness.namespace)
+                        .systemNotificationIntent,
+                ),
+            ),
+            platformTickets.single(),
+        )
         assertTrue(handled.requestSyncDispatches.isEmpty())
 
-        val read = enabled.read(compositionReadRequest(harness.namespace))
+        val read = guarded.read(compositionReadRequest(harness.namespace))
             as AgentTranscriptLifecycleReadState.Page
         assertEquals(harness.namespace, read.namespace)
     }

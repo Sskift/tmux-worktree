@@ -9,6 +9,7 @@ import com.tmuxworktree.mobile.core.data.TwDatabase
 import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.network.NetworkMonitor
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRepository
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AndroidAgentTranscriptLifecycleNotificationPlatform
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
@@ -39,6 +40,9 @@ class AppContainer(context: Context) {
     }
     private val agentTranscriptLifecycleRepository by lazy {
         AgentTranscriptLifecycleDurableRepository(relayV2StateDatabase)
+    }
+    private val agentTranscriptLifecycleNotificationPlatform by lazy {
+        AndroidAgentTranscriptLifecycleNotificationPlatform(appContext)
     }
     val legacyIdentityImporter: LegacyIdentityImporter by lazy {
         LegacyIdentityImporter(
@@ -78,6 +82,7 @@ class AppContainer(context: Context) {
         outboxAuthority = relayV2StateRepository,
         outboxEnqueueAuthority = relayV2StateRepository,
         agentDurableRepository = agentTranscriptLifecycleRepository,
+        agentNotificationPlatform = agentTranscriptLifecycleNotificationPlatform,
         transportFactory = BoundedRelayV2TransportFactory(),
     )
 }

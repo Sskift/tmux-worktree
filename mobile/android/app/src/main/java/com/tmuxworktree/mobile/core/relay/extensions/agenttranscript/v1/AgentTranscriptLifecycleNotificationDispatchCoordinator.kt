@@ -30,7 +30,7 @@ internal sealed interface AgentTranscriptLifecycleNotificationDispatchResult {
 }
 
 /**
- * Unwired bridge from a reducer notification intent to its durable claim and platform dispatch.
+ * Bridge from a reducer notification intent to its durable claim and platform dispatch.
  *
  * This coordinator owns neither actor nor WebSocket state. It borrows the caller-supplied actor
  * lease across both the complete claim transaction and its post-commit platform dispatch. The

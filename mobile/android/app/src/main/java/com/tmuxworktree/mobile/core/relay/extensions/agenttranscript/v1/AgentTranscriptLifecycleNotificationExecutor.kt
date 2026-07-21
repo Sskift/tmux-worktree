@@ -34,6 +34,16 @@ internal sealed interface AgentTranscriptLifecycleNotificationPlatformResult {
     ) : AgentTranscriptLifecycleNotificationPlatformResult
 }
 
+internal object AgentTranscriptLifecycleDisabledNotificationPlatform :
+    AgentTranscriptLifecycleNotificationPlatformPort {
+    override fun post(
+        ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ): AgentTranscriptLifecycleNotificationPlatformResult =
+        AgentTranscriptLifecycleNotificationPlatformResult.Suppressed(
+            AgentTranscriptLifecycleNotificationSuppressionReason.NOTIFICATIONS_DISABLED,
+        )
+}
+
 internal enum class AgentTranscriptLifecycleNotificationExecutionFailureReason {
     PLATFORM_CALL_FAILED,
 }

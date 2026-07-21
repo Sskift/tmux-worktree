@@ -1,6 +1,8 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLoadOrInitializeAdapter
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDisabledNotificationPlatform
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationPlatformPort
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeDurableRepository
@@ -156,6 +158,8 @@ internal class RelayV2BaseRuntimeComposition(
     outboxAuthority: RelayV2OutboxRuntimeAuthority,
     private val outboxEnqueueAuthority: RelayV2OutboxEnqueueAuthority,
     agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
+    agentNotificationPlatform: AgentTranscriptLifecycleNotificationPlatformPort =
+        AgentTranscriptLifecycleDisabledNotificationPlatform,
     agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
         AgentTranscriptLifecycleRuntimeHandlePort)? = null,
     agentOptionalCapabilities: Set<String> = emptySet(),
@@ -216,6 +220,7 @@ internal class RelayV2BaseRuntimeComposition(
             applyLease = actor,
             durableRepository = it,
             durableHandoff = actor,
+            notificationPlatform = agentNotificationPlatform,
             requestSender = actor,
             onDurablePresentationCommit = ::markAgentTimelineCommit,
         )
