@@ -179,10 +179,15 @@ test("Host credential native ABI manifest and every machine case stay closed", a
       productionWired: false,
     },
     linux: {
-      implementationPath: null,
-      traitImplemented: false,
-      validatedTargets: [],
-      realEvidence: [],
+      implementationPath:
+        "native/relay-v2-host-credential-atomic-file-cell-platform-linux",
+      traitImplemented: true,
+      validatedTargets: ["x86_64-unknown-linux-gnu"],
+      realEvidence: [
+        "descriptor-relative-filesystem",
+        "subprocess-F_SETLK-busy-and-close-release",
+        "exec-FD_CLOEXEC",
+      ],
       fullAdmissionValidated: false,
       durabilityQualified: false,
       productionWired: false,
@@ -190,7 +195,6 @@ test("Host credential native ABI manifest and every machine case stay closed", a
   });
   assert.deepEqual(manifest.notImplemented, [
     "trusted-production-factory",
-    "linux-platform-adapter",
     "darwin-x86_64-validation-evidence",
     "credential-cell-read-cas-temp-or-rename",
     "csprng-claim-id-source",
