@@ -165,6 +165,7 @@ class RelayV2BaseRuntimeCompositionTest {
         )
         try {
             harness.connectOnline()
+            assertEquals(0L, harness.composition.agentTimelineRevision.value)
             val effect = harness.agentEffect()
 
             val result = harness.composition.consume(effect)
@@ -174,6 +175,7 @@ class RelayV2BaseRuntimeCompositionTest {
             assertEquals(agent.namespace, agent.record().namespace)
             assertEquals("12", agent.record().state.extensionLane.lastAgentSeq)
             assertEquals(1, agent.mutationCommits.get())
+            assertEquals(1L, harness.composition.agentTimelineRevision.value)
             assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
         } finally {
             harness.close()
@@ -208,6 +210,7 @@ class RelayV2BaseRuntimeCompositionTest {
             assertEquals(0, agent.loadCalls.get())
             assertEquals(0, agent.mutationCommits.get())
             assertEquals("11", agent.record().state.extensionLane.lastAgentSeq)
+            assertEquals(0L, harness.composition.agentTimelineRevision.value)
             assertEquals(1, harness.transport().sendCount())
             assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
         } finally {
@@ -536,6 +539,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 )
                 assertEquals(case.name, 0, agent.mutationCommits.get())
                 assertEquals(case.name, "11", agent.record().state.extensionLane.lastAgentSeq)
+                assertEquals(case.name, 0L, harness.composition.agentTimelineRevision.value)
                 assertEquals(
                     case.name,
                     if (case.disconnectBeforeLease) {

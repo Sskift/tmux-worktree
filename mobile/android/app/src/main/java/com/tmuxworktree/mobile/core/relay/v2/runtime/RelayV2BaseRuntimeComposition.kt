@@ -143,8 +143,8 @@ internal sealed interface SelectedSessionReplyReadState {
  * ready cut, it flushes recovered Execute capabilities in commit order and then asks the durable
  * Outbox producer for bounded fresh QUEUED batches. Retryable connection failures are redriven by
  * one bounded backoff owner after the actor's prior transport/apply fence. The Agent durable
- * consumer remains dormant behind empty optional capabilities; live Agent revision refresh and
- * advertisement remain unowned.
+ * consumer remains dormant behind empty optional capabilities; its durable presentation revision
+ * is wired for live invalidation while capability advertisement remains unowned.
  */
 internal class RelayV2BaseRuntimeComposition(
     parentScope: CoroutineScope,
@@ -183,6 +183,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val connectionLock = Any()
     private val productMutationLock = Mutex()
     private val outboxTimelineRevisionLock = Any()
+    private val agentTimelineRevisionLock = Any()
     private var reconnectEnabled = profile.autoConnect
     private var retryFence: Any = Any()
     private var connectionAttemptJob: Job? = null
@@ -216,6 +217,7 @@ internal class RelayV2BaseRuntimeComposition(
             durableRepository = it,
             durableHandoff = actor,
             requestSender = actor,
+            onDurablePresentationCommit = ::markAgentTimelineCommit,
         )
     }
     private val agentRuntime = run {
@@ -269,6 +271,8 @@ internal class RelayV2BaseRuntimeComposition(
     val sessions: StateFlow<List<RelayV2ProductSession>> = _sessions.asStateFlow()
     private val _outboxTimelineRevision = MutableStateFlow(0L)
     val outboxTimelineRevision: StateFlow<Long> = _outboxTimelineRevision.asStateFlow()
+    private val _agentTimelineRevision = MutableStateFlow(0L)
+    val agentTimelineRevision: StateFlow<Long> = _agentTimelineRevision.asStateFlow()
 
     init {
         val completionHandle = parentScope.coroutineContext[Job]?.invokeOnCompletion { close() }
@@ -1113,6 +1117,13 @@ internal class RelayV2BaseRuntimeComposition(
     private fun markOutboxTimelineCommit() {
         synchronized(outboxTimelineRevisionLock) {
             _outboxTimelineRevision.value = _outboxTimelineRevision.value + 1L
+        }
+    }
+
+    /** Replay-latest invalidation for an eligible Agent durable presentation commit. */
+    private fun markAgentTimelineCommit() {
+        synchronized(agentTimelineRevisionLock) {
+            _agentTimelineRevision.value = _agentTimelineRevision.value + 1L
         }
     }
 

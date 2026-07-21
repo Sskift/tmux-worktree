@@ -57,6 +57,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -80,10 +81,13 @@ internal fun shouldPersistRelaySelectedHost(
 internal suspend fun collectRelayV2SelectedSessionCut(
     requestAgentStatus: suspend () -> Unit,
     outboxRevisions: Flow<Long>,
-    collectRevision: suspend (Long) -> Unit,
+    agentRevisions: Flow<Long>,
+    collectRevision: suspend (Long, Long) -> Unit,
 ) {
     requestAgentStatus()
-    outboxRevisions.collectLatest(collectRevision)
+    outboxRevisions.combine(agentRevisions, ::Pair).collectLatest { (outbox, agent) ->
+        collectRevision(outbox, agent)
+    }
 }
 
 class V2ViewModel(
@@ -166,8 +170,9 @@ class V2ViewModel(
                     composition.requestSelectedSessionAgentStatus(cut)
                 },
                 outboxRevisions = composition.outboxTimelineRevision,
-            ) { expectedRevision ->
-                val replies = composition.readSelectedSessionReplies(cut, expectedRevision)
+                agentRevisions = composition.agentTimelineRevision,
+            ) { expectedOutboxRevision, expectedAgentRevision ->
+                val replies = composition.readSelectedSessionReplies(cut, expectedOutboxRevision)
                 if (replies == SelectedSessionReplyReadState.Stale) return@collectRelayV2SelectedSessionCut
                 val stillCurrent = {
                     synchronized(relayV2UiFenceLock) {
@@ -175,7 +180,8 @@ class V2ViewModel(
                             _uiState.value.relayStartupAdmission ==
                             RelayStartupAdmissionState.RELAY_V2 &&
                             relayV2SessionReplyCuts.value[sessionId] === cut &&
-                            composition.outboxTimelineRevision.value == expectedRevision
+                            composition.outboxTimelineRevision.value == expectedOutboxRevision &&
+                            composition.agentTimelineRevision.value == expectedAgentRevision
                     }
                 }
                 val timelineState = projectRelayV2SelectedSessionTimeline(

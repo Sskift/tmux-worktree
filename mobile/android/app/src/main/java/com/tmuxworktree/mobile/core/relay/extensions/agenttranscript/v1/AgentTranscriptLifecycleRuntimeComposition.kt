@@ -73,6 +73,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
     private val enabled: Boolean = false,
     requestSender: AgentTranscriptLifecycleExtensionRequestSender? = null,
     nextRequestToken: () -> String = { java.util.UUID.randomUUID().toString() },
+    private val onDurablePresentationCommit: () -> Unit = {},
 ) : AgentTranscriptLifecycleRuntimeHandlePort,
     AgentTranscriptLifecycleStatusRequestPort {
     private val runtimeConsumer = AgentTranscriptLifecycleRuntimeConsumer(
@@ -117,6 +118,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             durableRepository: AgentTranscriptLifecycleRuntimeDurableRepository,
             durableHandoff: AgentTranscriptLifecycleDurableHandoffPort,
             requestSender: AgentTranscriptLifecycleExtensionRequestSender? = null,
+            onDurablePresentationCommit: () -> Unit = {},
         ): AgentTranscriptLifecycleRuntimeComposition =
             AgentTranscriptLifecycleRuntimeComposition(
                 applyLease = applyLease,
@@ -130,6 +132,7 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
                 },
                 enabled = true,
                 requestSender = requestSender,
+                onDurablePresentationCommit = onDurablePresentationCommit,
             )
     }
 
@@ -302,6 +305,9 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             requestAdmission = effect.requestAdmission,
         )
         val consumption = runtimeConsumer.consume(effect.artifact, fence)
+        if (consumption.publishesDurablePresentationCommit()) {
+            onDurablePresentationCommit()
+        }
         val postCommitEffects = consumption.postCommitEffects()
         val notificationResults = mutableListOf<AgentTranscriptLifecycleNotificationDispatchResult>()
         val requestSyncResults = mutableListOf<AgentTranscriptLifecycleRequestSyncResult>()
@@ -373,6 +379,19 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
         )
         return AgentTranscriptLifecycleRuntimeCompositionResult.RequestRedrive(result)
     }
+}
+
+private fun AgentTranscriptLifecycleRuntimeConsumeResult.publishesDurablePresentationCommit():
+    Boolean {
+    val disposition = when (this) {
+        is AgentTranscriptLifecycleRuntimeConsumeResult.Applied -> reduction.disposition
+        is AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionFault -> reduction.disposition
+        AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionNotNegotiated,
+        is AgentTranscriptLifecycleRuntimeConsumeResult.Unavailable,
+        -> return false
+    }
+    return disposition != AgentClientDisposition.DUPLICATE &&
+        disposition != AgentClientDisposition.EXTENSION_NOT_ACTIVE
 }
 
 private fun AgentTranscriptLifecycleRuntimeConsumeResult.postCommitEffects():

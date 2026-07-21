@@ -29,8 +29,11 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyRow
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
@@ -39,28 +42,41 @@ import org.junit.Test
 
 class RelayV2SelectedSessionTimelineProjectionTest {
     @Test
-    fun `each exact cut requests status once before collecting all outbox revisions`() =
+    fun `each exact cut requests status once before collecting combined revisions`() =
         runBlocking {
             val observed = mutableListOf<String>()
 
             listOf("cut-1", "cut-2").forEach { cut ->
-                collectRelayV2SelectedSessionCut(
-                    requestAgentStatus = { observed += "status:$cut" },
-                    outboxRevisions = flowOf(0L, 1L, 2L),
-                    collectRevision = { revision -> observed += "revision:$cut:$revision" },
-                )
+                val outboxRevisions = MutableStateFlow(0L)
+                val agentRevisions = MutableStateFlow(0L)
+                val expectedInitialCount = observed.size + 2
+                val collection = launch {
+                    collectRelayV2SelectedSessionCut(
+                        requestAgentStatus = { observed += "status:$cut" },
+                        outboxRevisions = outboxRevisions,
+                        agentRevisions = agentRevisions,
+                        collectRevision = { outbox, agent ->
+                            observed += "revision:$cut:$outbox:$agent"
+                        },
+                    )
+                }
+                withTimeout(1_000) { while (observed.size < expectedInitialCount) yield() }
+                outboxRevisions.value = 1L
+                withTimeout(1_000) { while (observed.size < expectedInitialCount + 1) yield() }
+                agentRevisions.value = 1L
+                withTimeout(1_000) { while (observed.size < expectedInitialCount + 2) yield() }
+                collection.cancel()
             }
 
             assertEquals(
                 listOf(
                     "status:cut-1",
-                    "revision:cut-1:0",
-                    "revision:cut-1:1",
-                    "revision:cut-1:2",
+                    "revision:cut-1:0:0", "revision:cut-1:1:0",
+                    "revision:cut-1:1:1",
                     "status:cut-2",
-                    "revision:cut-2:0",
-                    "revision:cut-2:1",
-                    "revision:cut-2:2",
+                    "revision:cut-2:0:0",
+                    "revision:cut-2:1:0",
+                    "revision:cut-2:1:1",
                 ),
                 observed,
             )
