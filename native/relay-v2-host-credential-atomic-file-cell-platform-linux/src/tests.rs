@@ -1,6 +1,7 @@
 use super::*;
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
-    DescriptorRelativePlatform, Lookup, ObjectKind, PlatformFailure, RelativeResource,
+    CredentialMutationPlatform, DescriptorRelativePlatform, Lookup, ObjectKind, PlatformFailure,
+    RelativeResource, TEMPORARY_ENTROPY_BYTES, TEMPORARY_PREFIX,
 };
 use std::ffi::CString;
 use std::fs;
@@ -78,6 +79,18 @@ fn descriptor_identity(
 ) -> (u64, u64) {
     let metadata = platform.fstat(descriptor).expect("descriptor metadata");
     (metadata.identity.device, metadata.identity.inode)
+}
+
+fn contract_temporary_name(hex_pair: &str) -> String {
+    assert_eq!(hex_pair.len(), 2);
+    format!(
+        "{TEMPORARY_PREFIX}{}",
+        hex_pair.repeat(TEMPORARY_ENTROPY_BYTES)
+    )
+}
+
+fn assert_closed(raw_fd: RawFd) {
+    assert!(matches!(sys::fstat(raw_fd), Err(libc::EBADF)));
 }
 
 fn spawn_probe(input: &str) {
@@ -566,4 +579,261 @@ fn dropping_the_raw_fd_newtype_has_no_implicit_close_side_effect() {
         "raw descriptor was closed by Drop"
     );
     sys::close_once(raw_fd).expect("explicit single close after inert Drop");
+}
+
+#[test]
+fn credential_mutation_syscalls_publish_one_exact_positional_file() {
+    let temporary = TestDirectory::new("credential-mutation-success");
+    let (mut platform, directory) = platform_for(&temporary.path);
+    assert_eq!(
+        platform
+            .fstatat_credential_nofollow(&directory)
+            .expect("credential absent lookup"),
+        Lookup::Absent
+    );
+
+    let name = contract_temporary_name("0a");
+    let published = platform
+        .create_temporary_exclusive(&directory, &name)
+        .expect("exclusive contract temporary create");
+    let created = platform.fstat(&published).expect("temporary metadata");
+    assert_eq!(created.kind, ObjectKind::RegularFile);
+    assert_eq!(created.mode, 0o600);
+    assert_eq!(created.link_count, 1);
+    assert!(platform
+        .descriptor_has_cloexec(&published)
+        .expect("temporary FD_CLOEXEC"));
+
+    let bytes = b"contract-derived-linux-credential-bytes";
+    assert_eq!(
+        unsafe { libc::lseek(published.raw_fd, 17, libc::SEEK_SET) },
+        17
+    );
+    platform
+        .write_temporary_from_start(&published, bytes)
+        .expect("full positional temporary write");
+    assert_eq!(
+        unsafe { libc::lseek(published.raw_fd, 0, libc::SEEK_CUR) },
+        17
+    );
+    platform
+        .fsync_temporary(&published)
+        .expect("temporary file fsync");
+
+    let mut short = vec![0_u8; bytes.len() - 1];
+    assert_eq!(
+        platform.read_file_exact(&published, &mut short),
+        Err(PlatformFailure::Io),
+        "a shorter buffer must fail the EOF proof"
+    );
+    let mut exact = vec![0_u8; bytes.len()];
+    platform
+        .read_file_exact(&published, &mut exact)
+        .expect("exact positional read and EOF proof");
+    assert_eq!(exact, bytes);
+    assert_eq!(
+        unsafe { libc::lseek(published.raw_fd, 0, libc::SEEK_CUR) },
+        17
+    );
+    let mut long = vec![0_u8; bytes.len() + 1];
+    assert_eq!(
+        platform.read_file_exact(&published, &mut long),
+        Err(PlatformFailure::Io),
+        "a longer buffer must fail on short EOF"
+    );
+
+    let tracked_identity = created.identity;
+    platform
+        .rename_temporary_to_credential(&directory, &name)
+        .expect("same-directory rename commit syscall");
+    assert_eq!(
+        platform
+            .fstatat_temporary_nofollow(&directory, &name)
+            .expect("temporary lookup after rename"),
+        Lookup::Absent
+    );
+    let published_at_name = match platform
+        .fstatat_credential_nofollow(&directory)
+        .expect("published credential lookup")
+    {
+        Lookup::Present(metadata) => metadata,
+        Lookup::Absent => panic!("published credential is absent"),
+    };
+    assert_eq!(published_at_name.identity, tracked_identity);
+    assert_eq!(
+        platform
+            .fstat(&published)
+            .expect("held published descriptor")
+            .identity,
+        tracked_identity
+    );
+
+    let readback = platform
+        .open_credential_readonly(&directory)
+        .expect("safe present credential open");
+    let readback_metadata = platform.fstat(&readback).expect("readback metadata");
+    assert_eq!(readback_metadata.identity, tracked_identity);
+    assert_eq!(readback_metadata.mode, 0o600);
+    assert_eq!(readback_metadata.link_count, 1);
+    assert!(platform
+        .descriptor_has_cloexec(&readback)
+        .expect("credential read FD_CLOEXEC"));
+    let mut observed = vec![0_u8; bytes.len()];
+    platform
+        .read_file_exact(&readback, &mut observed)
+        .expect("credential exact readback");
+    assert_eq!(observed, bytes);
+    platform
+        .fsync_directory(&directory)
+        .expect("publication directory fsync");
+
+    let readback_fd = readback.raw_fd;
+    platform
+        .raw_close(readback)
+        .expect("close read descriptor once");
+    assert_closed(readback_fd);
+    let published_fd = published.raw_fd;
+    platform
+        .raw_close(published)
+        .expect("close published descriptor once");
+    assert_closed(published_fd);
+    let directory_fd = directory.raw_fd;
+    platform.raw_close(directory).expect("close directory once");
+    assert_closed(directory_fd);
+}
+
+#[test]
+fn credential_mutation_syscalls_close_symlink_collision_and_namespace_races() {
+    let temporary = TestDirectory::new("credential-mutation-races");
+    let (mut platform, directory) = platform_for(&temporary.path);
+    let credential_path = temporary
+        .path
+        .join(platform_resource_spec().credential_name());
+    let symlink_target = temporary.path.join("credential-symlink-target");
+    fs::write(&symlink_target, b"do-not-follow").expect("write credential symlink target");
+    std::os::unix::fs::symlink(&symlink_target, &credential_path)
+        .expect("create credential symlink");
+    assert!(matches!(
+        platform
+            .fstatat_credential_nofollow(&directory)
+            .expect("credential nofollow lookup"),
+        Lookup::Present(metadata) if metadata.kind == ObjectKind::Symlink
+    ));
+    assert_eq!(
+        platform.open_credential_readonly(&directory).map(|_| ()),
+        Err(PlatformFailure::IdentityUncertain)
+    );
+    fs::remove_file(&credential_path).expect("remove credential symlink");
+
+    for invalid in [
+        format!(
+            "{TEMPORARY_PREFIX}{}",
+            "0".repeat(TEMPORARY_ENTROPY_BYTES * 2 - 1)
+        ),
+        format!("{TEMPORARY_PREFIX}{}", "A0".repeat(TEMPORARY_ENTROPY_BYTES)),
+        format!(
+            "{TEMPORARY_PREFIX}{}/0",
+            "00".repeat(TEMPORARY_ENTROPY_BYTES)
+        ),
+    ] {
+        assert_eq!(
+            platform
+                .create_temporary_exclusive(&directory, &invalid)
+                .map(|_| ()),
+            Err(PlatformFailure::IdentityUncertain)
+        );
+    }
+
+    let collision_name = contract_temporary_name("1b");
+    let collision_path = temporary.path.join(&collision_name);
+    let collision_bytes = b"existing-collision-must-survive";
+    fs::write(&collision_path, collision_bytes).expect("create collision object");
+    fs::set_permissions(&collision_path, fs::Permissions::from_mode(0o600))
+        .expect("set collision mode");
+    assert_eq!(
+        platform
+            .create_temporary_exclusive(&directory, &collision_name)
+            .map(|_| ()),
+        Err(PlatformFailure::AlreadyExists)
+    );
+    assert_eq!(
+        fs::read(&collision_path).expect("collision preserved"),
+        collision_bytes
+    );
+    fs::remove_file(&collision_path).expect("remove test collision");
+
+    let hardlink_name = contract_temporary_name("2c");
+    let hardlink_path = temporary.path.join(&hardlink_name);
+    let hardlink = platform
+        .create_temporary_exclusive(&directory, &hardlink_name)
+        .expect("create hardlink-race temporary");
+    let hardlink_shadow = temporary.path.join("temporary-hardlink-shadow");
+    fs::hard_link(&hardlink_path, &hardlink_shadow).expect("link temporary identity");
+    assert!(matches!(
+        platform
+            .fstatat_temporary_nofollow(&directory, &hardlink_name)
+            .expect("observe temporary hardlink"),
+        Lookup::Present(metadata) if metadata.link_count == 2
+    ));
+    fs::remove_file(&hardlink_shadow).expect("remove hardlink shadow");
+    platform
+        .unlink_temporary(&directory, &hardlink_name)
+        .expect("unlink restored single-link temporary");
+    platform
+        .raw_close(hardlink)
+        .expect("close hardlink temporary");
+
+    let replacement_name = contract_temporary_name("3d");
+    let replacement_path = temporary.path.join(&replacement_name);
+    let replaced = platform
+        .create_temporary_exclusive(&directory, &replacement_name)
+        .expect("create replacement-race temporary");
+    let held_identity = platform
+        .fstat(&replaced)
+        .expect("held replacement-race identity")
+        .identity;
+    fs::remove_file(&replacement_path).expect("unlink held temporary name");
+    fs::write(&replacement_path, b"foreign-replacement").expect("replace temporary name");
+    fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600))
+        .expect("set replacement mode");
+    assert!(matches!(
+        platform
+            .fstatat_temporary_nofollow(&directory, &replacement_name)
+            .expect("observe temporary replacement"),
+        Lookup::Present(metadata) if metadata.identity != held_identity
+    ));
+    platform
+        .raw_close(replaced)
+        .expect("close unlinked held temporary");
+    fs::remove_file(&replacement_path).expect("remove foreign replacement");
+
+    let type_race_name = contract_temporary_name("4e");
+    let type_race_path = temporary.path.join(&type_race_name);
+    let type_race = platform
+        .create_temporary_exclusive(&directory, &type_race_name)
+        .expect("create unlink type-race temporary");
+    fs::remove_file(&type_race_path).expect("unlink type-race temporary name");
+    fs::create_dir(&type_race_path).expect("replace temporary name with directory");
+    assert_eq!(
+        platform.unlink_temporary(&directory, &type_race_name),
+        Err(PlatformFailure::IdentityUncertain)
+    );
+    assert!(type_race_path.is_dir(), "type-race directory is preserved");
+    fs::remove_dir(&type_race_path).expect("remove type-race directory");
+    platform
+        .raw_close(type_race)
+        .expect("close type-race descriptor");
+
+    let missing_name = contract_temporary_name("5f");
+    assert_eq!(
+        platform.rename_temporary_to_credential(&directory, &missing_name),
+        Err(PlatformFailure::NotFound)
+    );
+    assert_eq!(
+        platform
+            .fstatat_credential_nofollow(&directory)
+            .expect("credential remains absent after missing rename"),
+        Lookup::Absent
+    );
+    platform.raw_close(directory).expect("close directory");
 }

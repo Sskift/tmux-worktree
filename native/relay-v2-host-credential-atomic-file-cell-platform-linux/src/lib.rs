@@ -2,8 +2,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 //! Linux syscall adapter for the Host credential atomic-file-cell admission
-//! owner. This crate owns no registry, journal, durability qualification, path
-//! lookup, credential mutation, or production composition.
+//! and mutation owner. This crate owns no registry, journal, revision, random
+//! naming, retry, commit decision, durability qualification, path lookup, or
+//! production composition.
 
 mod sys;
 
@@ -11,8 +12,9 @@ mod sys;
 mod tests;
 
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
-    platform_resource_spec, DescriptorRelativePlatform, EffectiveIdentity, Lookup, ObjectIdentity,
-    ObjectKind, ObjectMetadata, PlatformFailure, RelativeResource,
+    platform_resource_spec, CredentialMutationPlatform, DescriptorRelativePlatform,
+    EffectiveIdentity, Lookup, ObjectIdentity, ObjectKind, ObjectMetadata, PlatformFailure,
+    RelativeResource, TEMPORARY_ENTROPY_BYTES, TEMPORARY_PREFIX,
 };
 use std::ffi::CString;
 use std::fmt;
@@ -87,6 +89,32 @@ fn resource_name(resource: RelativeResource) -> Result<CString, PlatformFailure>
     CString::new(name.as_bytes()).map_err(|_| PlatformFailure::IdentityUncertain)
 }
 
+fn credential_name() -> Result<CString, PlatformFailure> {
+    CString::new(platform_resource_spec().credential_name().as_bytes())
+        .map_err(|_| PlatformFailure::IdentityUncertain)
+}
+
+fn validated_temporary_name(name: &str) -> Result<CString, PlatformFailure> {
+    let suffix_length = TEMPORARY_ENTROPY_BYTES
+        .checked_mul(2)
+        .ok_or(PlatformFailure::IdentityUncertain)?;
+    let expected_length = TEMPORARY_PREFIX
+        .len()
+        .checked_add(suffix_length)
+        .ok_or(PlatformFailure::IdentityUncertain)?;
+    let bytes = name.as_bytes();
+    if bytes.len() != expected_length
+        || bytes.contains(&b'/')
+        || !bytes.starts_with(TEMPORARY_PREFIX.as_bytes())
+        || !bytes[TEMPORARY_PREFIX.len()..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(PlatformFailure::IdentityUncertain);
+    }
+    CString::new(bytes).map_err(|_| PlatformFailure::IdentityUncertain)
+}
+
 fn map_errno(errno: libc::c_int) -> PlatformFailure {
     match errno {
         libc::ENOENT => PlatformFailure::NotFound,
@@ -137,6 +165,28 @@ fn metadata_from_stat(stat: &libc::stat) -> Result<ObjectMetadata, PlatformFailu
 
 fn positional_attempt_limit(length: usize) -> usize {
     length.saturating_mul(2).saturating_add(8)
+}
+
+fn positional_offset(offset: usize) -> Result<libc::off_t, PlatformFailure> {
+    libc::off_t::try_from(offset).map_err(|_| PlatformFailure::Io)
+}
+
+fn pwrite_all_from_start(raw_fd: RawFd, bytes: &[u8]) -> Result<(), PlatformFailure> {
+    let mut written = 0_usize;
+    for _ in 0..positional_attempt_limit(bytes.len()) {
+        if written == bytes.len() {
+            return Ok(());
+        }
+        let offset = positional_offset(written)?;
+        match sys::pwrite(raw_fd, &bytes[written..], offset) {
+            Ok(0) => return Err(PlatformFailure::Io),
+            Ok(count) if count <= bytes.len() - written => written += count,
+            Ok(_) => return Err(PlatformFailure::Io),
+            Err(libc::EINTR) => {}
+            Err(errno) => return Err(map_errno(errno)),
+        }
+    }
+    Err(PlatformFailure::Io)
 }
 
 impl DescriptorRelativePlatform for LinuxDescriptorRelativePlatform {
@@ -238,20 +288,7 @@ impl DescriptorRelativePlatform for LinuxDescriptorRelativePlatform {
         if bytes.len() != platform_resource_spec().claim_journal_length() {
             return Err(PlatformFailure::Io);
         }
-        let mut written = 0_usize;
-        for _ in 0..positional_attempt_limit(bytes.len()) {
-            if written == bytes.len() {
-                return Ok(());
-            }
-            match sys::pwrite(claim.raw_fd, &bytes[written..], written as libc::off_t) {
-                Ok(0) => return Err(PlatformFailure::Io),
-                Ok(count) if count <= bytes.len() - written => written += count,
-                Ok(_) => return Err(PlatformFailure::Io),
-                Err(libc::EINTR) => {}
-                Err(errno) => return Err(map_errno(errno)),
-            }
-        }
-        Err(PlatformFailure::Io)
+        pwrite_all_from_start(claim.raw_fd, bytes)
     }
 
     fn read_claim_exact(
@@ -293,5 +330,129 @@ impl DescriptorRelativePlatform for LinuxDescriptorRelativePlatform {
 
     fn raw_close(&mut self, descriptor: Self::Descriptor) -> Result<(), PlatformFailure> {
         sys::close_once(descriptor.raw_fd).map_err(map_errno)
+    }
+}
+
+impl CredentialMutationPlatform for LinuxDescriptorRelativePlatform {
+    fn fstatat_credential_nofollow(
+        &mut self,
+        directory: &Self::Descriptor,
+    ) -> Result<Lookup, PlatformFailure> {
+        let name = credential_name()?;
+        match sys::fstatat_nofollow(directory.raw_fd, &name) {
+            Ok(stat) => metadata_from_stat(&stat).map(Lookup::Present),
+            Err(libc::ENOENT) => Ok(Lookup::Absent),
+            Err(errno) => Err(map_errno(errno)),
+        }
+    }
+
+    fn open_credential_readonly(
+        &mut self,
+        directory: &Self::Descriptor,
+    ) -> Result<Self::Descriptor, PlatformFailure> {
+        let name = credential_name()?;
+        let raw_fd = sys::openat_existing(
+            directory.raw_fd,
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+        .map_err(map_errno)?;
+        Ok(LinuxDescriptor { raw_fd })
+    }
+
+    fn read_file_exact(
+        &mut self,
+        descriptor: &Self::Descriptor,
+        output: &mut [u8],
+    ) -> Result<(), PlatformFailure> {
+        let mut read = 0_usize;
+        for _ in 0..positional_attempt_limit(output.len()) {
+            if read == output.len() {
+                break;
+            }
+            let offset = positional_offset(read)?;
+            match sys::pread(descriptor.raw_fd, &mut output[read..], offset) {
+                Ok(0) => return Err(PlatformFailure::Io),
+                Ok(count) if count <= output.len() - read => read += count,
+                Ok(_) => return Err(PlatformFailure::Io),
+                Err(libc::EINTR) => {}
+                Err(errno) => return Err(map_errno(errno)),
+            }
+        }
+        if read != output.len() {
+            return Err(PlatformFailure::Io);
+        }
+
+        let mut trailing = [0_u8; 1];
+        let eof_offset = positional_offset(output.len())?;
+        for _ in 0..positional_attempt_limit(trailing.len()) {
+            match sys::pread(descriptor.raw_fd, &mut trailing, eof_offset) {
+                Ok(0) => return Ok(()),
+                Ok(_) => return Err(PlatformFailure::Io),
+                Err(libc::EINTR) => {}
+                Err(errno) => return Err(map_errno(errno)),
+            }
+        }
+        Err(PlatformFailure::Io)
+    }
+
+    fn fstatat_temporary_nofollow(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<Lookup, PlatformFailure> {
+        let name = validated_temporary_name(temporary_name)?;
+        match sys::fstatat_nofollow(directory.raw_fd, &name) {
+            Ok(stat) => metadata_from_stat(&stat).map(Lookup::Present),
+            Err(libc::ENOENT) => Ok(Lookup::Absent),
+            Err(errno) => Err(map_errno(errno)),
+        }
+    }
+
+    fn create_temporary_exclusive(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<Self::Descriptor, PlatformFailure> {
+        let name = validated_temporary_name(temporary_name)?;
+        let raw_fd = sys::openat_create(
+            directory.raw_fd,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map_err(map_errno)?;
+        Ok(LinuxDescriptor { raw_fd })
+    }
+
+    fn write_temporary_from_start(
+        &mut self,
+        temporary: &Self::Descriptor,
+        bytes: &[u8],
+    ) -> Result<(), PlatformFailure> {
+        pwrite_all_from_start(temporary.raw_fd, bytes)
+    }
+
+    fn fsync_temporary(&mut self, temporary: &Self::Descriptor) -> Result<(), PlatformFailure> {
+        sys::fsync(temporary.raw_fd).map_err(map_errno)
+    }
+
+    fn unlink_temporary(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<(), PlatformFailure> {
+        let name = validated_temporary_name(temporary_name)?;
+        sys::unlinkat_file(directory.raw_fd, &name).map_err(map_unlink_errno)
+    }
+
+    fn rename_temporary_to_credential(
+        &mut self,
+        directory: &Self::Descriptor,
+        temporary_name: &str,
+    ) -> Result<(), PlatformFailure> {
+        let temporary = validated_temporary_name(temporary_name)?;
+        let credential = credential_name()?;
+        sys::renameat_same_directory(directory.raw_fd, &temporary, &credential).map_err(map_errno)
     }
 }
