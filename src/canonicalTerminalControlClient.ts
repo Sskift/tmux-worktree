@@ -3,7 +3,10 @@ import {
   type TerminalControlRequestInput,
 } from "./terminalControl/client.js";
 import {
+  TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT,
+  TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS,
   TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
+  TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
   TERMINAL_CONTROL_MAX_FRAME_BYTES,
   TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
   TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
@@ -14,14 +17,18 @@ import {
   type TerminalControlOwner,
   type TerminalControlOwnerKind,
   type TerminalControlOwnershipView,
+  type TerminalControlAgentSource,
 } from "./terminalControl/protocol.js";
 import { terminalControlSocketPath } from "./terminalControl/store.js";
 
 export const CANONICAL_TERMINAL_CONTROL_PROTOCOL_VERSION = TERMINAL_CONTROL_PROTOCOL_VERSION;
+export const CANONICAL_TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS = TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS;
+export const CANONICAL_TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT = TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT;
 export const CANONICAL_TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT = TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT;
 export const CANONICAL_TERMINAL_CONTROL_MAX_FRAME_BYTES = TERMINAL_CONTROL_MAX_FRAME_BYTES;
 export const CANONICAL_TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES = TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES;
 export const CANONICAL_TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES = TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES;
+export const CANONICAL_TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES = TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES;
 export const CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES = TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES;
 
 export type CanonicalTerminalOwnerKind = TerminalControlOwnerKind;
@@ -95,8 +102,47 @@ export interface CanonicalRenderedSnapshotInput {
   maxBytes?: number;
 }
 
+export interface CanonicalAgentStatusResult {
+  controlTargetId: string;
+  controlEpoch: string;
+  leaseId: string;
+  fence: string;
+  ownerKind: "feishu";
+  outputGeneration: string;
+  pane: string;
+  agentRunning: boolean;
+  source?: TerminalControlAgentSource;
+}
+
+export interface CanonicalAgentResultInput extends CanonicalAgentStatusInput {
+  source: TerminalControlAgentSource;
+  maxBytes?: number;
+}
+
+export interface CanonicalAgentResultResult {
+  controlTargetId: string;
+  controlEpoch: string;
+  leaseId: string;
+  fence: string;
+  ownerKind: "feishu";
+  outputGeneration: string;
+  pane: string;
+  source: TerminalControlAgentSource;
+  completedAt: string;
+  text: string;
+  truncated: boolean;
+}
+
+export interface CanonicalAgentStatusInput {
+  lease: CanonicalTerminalLease;
+  outputGeneration: string;
+  pane: string;
+}
+
 export interface CanonicalTerminalControlCapabilities {
   renderedSnapshot: boolean;
+  agentStatus: boolean;
+  agentResult: boolean;
 }
 
 export interface CanonicalTerminalControlClient {
@@ -145,6 +191,8 @@ export interface CanonicalTerminalControlClient {
     maxBytes?: number;
   }): Promise<CanonicalOutputTailResult>;
   renderedSnapshot(input: CanonicalRenderedSnapshotInput): Promise<CanonicalRenderedSnapshotResult>;
+  agentStatus(input: CanonicalAgentStatusInput): Promise<CanonicalAgentStatusResult>;
+  agentResult(input: CanonicalAgentResultInput): Promise<CanonicalAgentResultResult>;
 }
 
 export class CanonicalTerminalControlError extends Error {
@@ -167,6 +215,16 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   const expected = new Set(keys);
   return Object.keys(value).length === expected.size
     && Object.keys(value).every((key) => expected.has(key));
+}
+
+function exactKeysWithOptional(
+  value: Record<string, unknown>,
+  required: string[],
+  optional: string[],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key))
+    && Object.keys(value).every((key) => allowed.has(key));
 }
 
 function requiredString(value: unknown, field: string, maxBytes = 1024): string {
@@ -270,6 +328,193 @@ function validateRenderedSnapshotInput(input: CanonicalRenderedSnapshotInput): v
       "canonical terminal-control rendered snapshot bounds are invalid",
     );
   }
+}
+
+function validateAgentStatusInput(input: CanonicalAgentStatusInput): void {
+  if (input.lease.owner.kind !== "feishu"
+    || input.pane !== "0"
+    || typeof input.outputGeneration !== "string"
+    || !input.outputGeneration
+    || input.outputGeneration.includes("\0")
+    || Buffer.byteLength(input.outputGeneration, "utf8") > 128) {
+    throw new CanonicalTerminalControlError(
+      "INVALID_REQUEST",
+      "canonical terminal-control agent status correlation is invalid",
+    );
+  }
+}
+
+function parseAgentSource(value: unknown, field: string): TerminalControlAgentSource {
+  if (!isRecord(value) || !exactKeys(
+    value,
+    ["provider", "boundary", "sourceId", "sessionId", "turnId", "startedAt"],
+  ) || (value.provider !== "claude" && value.provider !== "codex")
+    || (value.boundary !== "after" && value.boundary !== "inclusive" && value.boundary !== "exact")) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      `canonical terminal-control returned invalid ${field}`,
+    );
+  }
+  const sourceId = requiredString(value.sourceId, `${field}.sourceId`, 64);
+  if (!/^[0-9a-f]{64}$/u.test(sourceId)) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      `canonical terminal-control returned invalid ${field}.sourceId`,
+    );
+  }
+  return {
+    provider: value.provider,
+    boundary: value.boundary,
+    sourceId,
+    sessionId: requiredString(value.sessionId, `${field}.sessionId`, 128),
+    turnId: requiredString(value.turnId, `${field}.turnId`, 128),
+    startedAt: canonicalTimestamp(value.startedAt, `${field}.startedAt`),
+  };
+}
+
+function sameAgentSource(
+  left: TerminalControlAgentSource,
+  right: TerminalControlAgentSource,
+): boolean {
+  return left.provider === right.provider
+    && left.boundary === right.boundary
+    && left.sourceId === right.sourceId
+    && left.sessionId === right.sessionId
+    && left.turnId === right.turnId
+    && left.startedAt === right.startedAt;
+}
+
+function validateAgentResultInput(input: CanonicalAgentResultInput): void {
+  validateAgentStatusInput(input);
+  parseAgentSource(input.source, "agentResult.source");
+  if (input.maxBytes !== undefined
+    && (!Number.isSafeInteger(input.maxBytes)
+      || input.maxBytes < 1
+      || input.maxBytes > CANONICAL_TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES)) {
+    throw new CanonicalTerminalControlError(
+      "INVALID_REQUEST",
+      "canonical terminal-control Agent result bounds are invalid",
+    );
+  }
+}
+
+export function parseCanonicalAgentStatusResult(
+  value: unknown,
+  input: CanonicalAgentStatusInput,
+): CanonicalAgentStatusResult {
+  validateAgentStatusInput(input);
+  if (!isRecord(value)
+    || !exactKeysWithOptional(value, [
+      "controlTargetId",
+      "controlEpoch",
+      "leaseId",
+      "fence",
+      "ownerKind",
+      "outputGeneration",
+      "pane",
+      "agentRunning",
+    ], ["source"])
+    || typeof value.agentRunning !== "boolean") {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned invalid agent status",
+    );
+  }
+  const parsedOwnerKind = requiredOwnerKind(value.ownerKind, "agentStatus.ownerKind");
+  if (parsedOwnerKind !== "feishu") {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned mismatched agent status correlation",
+    );
+  }
+  const result: CanonicalAgentStatusResult = {
+    controlTargetId: requiredString(value.controlTargetId, "agentStatus.controlTargetId"),
+    controlEpoch: requiredString(value.controlEpoch, "agentStatus.controlEpoch"),
+    leaseId: requiredString(value.leaseId, "agentStatus.leaseId"),
+    fence: decimal(value.fence, "agentStatus.fence"),
+    ownerKind: parsedOwnerKind,
+    outputGeneration: requiredString(value.outputGeneration, "agentStatus.outputGeneration"),
+    pane: requiredString(value.pane, "agentStatus.pane", 8),
+    agentRunning: value.agentRunning,
+    ...(value.source === undefined ? {} : {
+      source: parseAgentSource(value.source, "agentStatus.source"),
+    }),
+  };
+  if (result.agentRunning !== (result.source !== undefined)) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned an Agent status without exact result correlation",
+    );
+  }
+  if (result.controlTargetId !== input.lease.controlTargetId
+    || result.controlEpoch !== input.lease.controlEpoch
+    || result.leaseId !== input.lease.leaseId
+    || result.fence !== input.lease.fence
+    || result.outputGeneration !== input.outputGeneration
+    || result.pane !== input.pane) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned mismatched agent status correlation",
+    );
+  }
+  return result;
+}
+
+export function parseCanonicalAgentResultResult(
+  value: unknown,
+  input: CanonicalAgentResultInput,
+): CanonicalAgentResultResult {
+  validateAgentResultInput(input);
+  if (!isRecord(value) || !exactKeys(value, [
+    "controlTargetId", "controlEpoch", "leaseId", "fence", "ownerKind",
+    "outputGeneration", "pane", "source", "completedAt", "text", "truncated",
+  ]) || typeof value.text !== "string" || value.text.length === 0
+    || typeof value.truncated !== "boolean") {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned invalid Agent final response",
+    );
+  }
+  const maxBytes = input.maxBytes ?? CANONICAL_TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES;
+  if (Buffer.byteLength(value.text, "utf8") > maxBytes || value.text.includes("\0")) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned oversized Agent final response text",
+    );
+  }
+  const parsedOwnerKind = requiredOwnerKind(value.ownerKind, "agentResult.ownerKind");
+  const parsedSource = parseAgentSource(value.source, "agentResult.source");
+  const result: CanonicalAgentResultResult = {
+    controlTargetId: requiredString(value.controlTargetId, "agentResult.controlTargetId"),
+    controlEpoch: requiredString(value.controlEpoch, "agentResult.controlEpoch"),
+    leaseId: requiredString(value.leaseId, "agentResult.leaseId"),
+    fence: decimal(value.fence, "agentResult.fence"),
+    ownerKind: parsedOwnerKind === "feishu" ? parsedOwnerKind : (() => {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        "canonical terminal-control returned mismatched Agent final response owner",
+      );
+    })(),
+    outputGeneration: requiredString(value.outputGeneration, "agentResult.outputGeneration"),
+    pane: requiredString(value.pane, "agentResult.pane", 8),
+    source: parsedSource,
+    completedAt: canonicalTimestamp(value.completedAt, "agentResult.completedAt"),
+    text: value.text,
+    truncated: value.truncated,
+  };
+  if (result.controlTargetId !== input.lease.controlTargetId
+    || result.controlEpoch !== input.lease.controlEpoch
+    || result.leaseId !== input.lease.leaseId
+    || result.fence !== input.lease.fence
+    || result.outputGeneration !== input.outputGeneration
+    || result.pane !== input.pane
+    || !sameAgentSource(result.source, input.source)) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned mismatched Agent final response correlation",
+    );
+  }
+  return result;
 }
 
 export function parseCanonicalRenderedSnapshotResult(
@@ -444,7 +689,7 @@ export class CanonicalTerminalControlSocketClient implements CanonicalTerminalCo
       );
     }
     if (value.capabilities === undefined) {
-      return { renderedSnapshot: false };
+      return { renderedSnapshot: false, agentStatus: false, agentResult: false };
     }
     if (!Array.isArray(value.capabilities) || value.capabilities.length > 64) {
       throw new CanonicalTerminalControlError(
@@ -463,6 +708,12 @@ export class CanonicalTerminalControlSocketClient implements CanonicalTerminalCo
     return {
       renderedSnapshot: capabilities.includes(
         CANONICAL_TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
+      ),
+      agentStatus: capabilities.includes(
+        CANONICAL_TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS,
+      ),
+      agentResult: capabilities.includes(
+        CANONICAL_TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT,
       ),
     };
   }
@@ -657,7 +908,23 @@ export class CanonicalTerminalControlSocketClient implements CanonicalTerminalCo
     );
   }
 
-  private request(type: string, fields: Record<string, unknown>): Promise<unknown> {
+  async agentStatus(input: CanonicalAgentStatusInput): Promise<CanonicalAgentStatusResult> {
+    validateAgentStatusInput(input);
+    return parseCanonicalAgentStatusResult(
+      await this.request("activity.agent-status", input),
+      input,
+    );
+  }
+
+  async agentResult(input: CanonicalAgentResultInput): Promise<CanonicalAgentResultResult> {
+    validateAgentResultInput(input);
+    return parseCanonicalAgentResultResult(
+      await this.request("activity.agent-result", input),
+      input,
+    );
+  }
+
+  private request(type: string, fields: object): Promise<unknown> {
     const input = {
       type,
       ...fields,

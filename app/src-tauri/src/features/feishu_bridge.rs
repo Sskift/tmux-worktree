@@ -29,6 +29,7 @@ const BASE_REQUIRED_BRIDGE_CAPABILITIES: [&str; 3] = [
     "binding.target-reconciliation.v1",
 ];
 const REPLY_MODE_BRIDGE_CAPABILITY: &str = "binding.reply-mode.v1";
+const ACTIVITY_COMPLETION_BRIDGE_CAPABILITY: &str = "binding.structured-agent-result.v1";
 const UNKNOWN_BRIDGE_INFO_ERROR: &str = "BRIDGE_ERROR: unknown Feishu bridge operation";
 
 #[derive(Default)]
@@ -712,10 +713,27 @@ fn require_reply_mode_capability(probe: &BridgeProbe) -> Result<(), String> {
     }
 }
 
+fn require_activity_completion_capability(probe: &BridgeProbe) -> Result<(), String> {
+    if bridge_has_activity_completion_capability(probe) {
+        return Ok(());
+    }
+    Err(format!(
+        "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capability: {ACTIVITY_COMPLETION_BRIDGE_CAPABILITY}"
+    ))
+}
+
+fn bridge_has_activity_completion_capability(probe: &BridgeProbe) -> bool {
+    probe
+        .capabilities
+        .iter()
+        .any(|capability| capability == ACTIVITY_COMPLETION_BRIDGE_CAPABILITY)
+}
+
 fn should_upgrade_empty_bridge(probe: &BridgeProbe) -> Result<bool, String> {
     Ok(bridge_snapshot_is_empty(&probe.snapshot)?
         && (probe.disposition == BridgeProbeDisposition::LegacyEmpty
-            || !bridge_has_reply_mode_capability(probe)))
+            || !bridge_has_reply_mode_capability(probe)
+            || !bridge_has_activity_completion_capability(probe)))
 }
 
 fn start_server(
@@ -1327,6 +1345,7 @@ pub(crate) fn feishu_binding_create(
                 .to_string(),
         );
     }
+    require_activity_completion_capability(&probe)?;
     let reply_mode_param = reply_mode_create_param(&probe, reply_mode)?;
     let mut params = json!({
         "chatId": args.chat_id,
@@ -1411,7 +1430,8 @@ pub(crate) fn feishu_binding_resume(
     state: State<'_, Arc<FeishuBridgeRuntimeState>>,
     binding_id: String,
 ) -> Result<Value, String> {
-    ensure_server(&app, state.inner().as_ref())?;
+    let probe = ensure_server(&app, state.inner().as_ref())?;
+    require_activity_completion_capability(&probe)?;
     request("binding.resume", json!({ "bindingId": binding_id }))
 }
 
@@ -1421,7 +1441,8 @@ pub(crate) fn feishu_binding_repair(
     state: State<'_, Arc<FeishuBridgeRuntimeState>>,
     binding_id: String,
 ) -> Result<Value, String> {
-    ensure_server(&app, state.inner().as_ref())?;
+    let probe = ensure_server(&app, state.inner().as_ref())?;
+    require_activity_completion_capability(&probe)?;
     request("binding.repair", json!({ "bindingId": binding_id }))
 }
 
@@ -1500,7 +1521,8 @@ pub(crate) fn feishu_binding_return(
     binding_id: String,
     pty_id: String,
 ) -> Result<Value, String> {
-    ensure_server(&app, bridge_state.inner().as_ref())?;
+    let probe = ensure_server(&app, bridge_state.inner().as_ref())?;
+    require_activity_completion_capability(&probe)?;
     with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
         let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
         ensure_binding_matches_pty(control, &target)?;
@@ -1523,9 +1545,10 @@ mod tests {
         add_lark_profile_with_program, classify_bridge_probe, configured_profile_from_file,
         default_reply_mode, effective_profile, empty_lark_profile_config,
         generated_lark_profile_name, lark_cli_error_message, legacy_binding_remove_action,
-        reply_mode_create_param, require_reply_mode_capability, save_configured_profile,
-        should_upgrade_empty_bridge, validate_bridge_shutdown, BridgeProbeDisposition,
-        FeishuBindingInput, FeishuLarkProfile, FeishuReplyMode, LegacyBindingRemoveAction,
+        reply_mode_create_param, require_activity_completion_capability,
+        require_reply_mode_capability, save_configured_profile, should_upgrade_empty_bridge,
+        validate_bridge_shutdown, BridgeProbeDisposition, FeishuBindingInput, FeishuLarkProfile,
+        FeishuReplyMode, LegacyBindingRemoveAction, ACTIVITY_COMPLETION_BRIDGE_CAPABILITY,
         BASE_REQUIRED_BRIDGE_CAPABILITIES, REPLY_MODE_BRIDGE_CAPABILITY, UNKNOWN_BRIDGE_INFO_ERROR,
     };
     use serde_json::json;
@@ -1763,6 +1786,9 @@ mod tests {
         assert!(require_reply_mode_capability(&occupied_base)
             .expect_err("updates require the feature capability")
             .contains(REPLY_MODE_BRIDGE_CAPABILITY));
+        assert!(require_activity_completion_capability(&occupied_base)
+            .expect_err("ownership activation requires completion tracking")
+            .contains(ACTIVITY_COMPLETION_BRIDGE_CAPABILITY));
 
         let current_info = json!({
             "daemonVersion": "1.0.8",
@@ -1772,6 +1798,7 @@ mod tests {
                 BASE_REQUIRED_BRIDGE_CAPABILITIES[1],
                 BASE_REQUIRED_BRIDGE_CAPABILITIES[2],
                 REPLY_MODE_BRIDGE_CAPABILITY,
+                ACTIVITY_COMPLETION_BRIDGE_CAPABILITY,
             ],
         });
         let current = classify_bridge_probe(&empty, Ok(current_info), "team-bot")
@@ -1787,6 +1814,7 @@ mod tests {
             Some("direct"),
         );
         require_reply_mode_capability(&current).expect("current update capability");
+        require_activity_completion_capability(&current).expect("current completion capability");
     }
 
     #[test]

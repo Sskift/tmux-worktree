@@ -18,6 +18,8 @@ import test, { after } from "node:test";
 const terminalControl = await import("../dist/terminalControl/index.js");
 const {
   CanonicalTerminalControlSocketClient,
+  parseCanonicalAgentResultResult,
+  parseCanonicalAgentStatusResult,
   parseCanonicalRenderedSnapshotResult,
 } = await import("../dist/canonicalTerminalControlClient.js");
 const contractRoot = new URL("../contracts/terminal-control/v1/", import.meta.url);
@@ -223,6 +225,17 @@ class FakeBackend {
     this.renderedOutput = "rendered terminal output\n";
     this.renderedSnapshotCalls = [];
     this.failRenderedSnapshot = undefined;
+    this.agentRunning = true;
+    this.agentSource = {
+      provider: "codex",
+      boundary: "exact",
+      sourceId: "b".repeat(64),
+      sessionId: "codex-session-one",
+      turnId: "codex-turn-one",
+      startedAt: "2026-07-13T00:30:00.000Z",
+    };
+    this.agentStatusCalls = [];
+    this.agentResultCalls = [];
   }
 
   async resolveManagedSession(sessionName) {
@@ -323,6 +336,32 @@ class FakeBackend {
     };
   }
 
+  async agentStatus(session, instance, generation, pane) {
+    this.agentStatusCalls.push({
+      session: structuredClone(session),
+      instance,
+      generation,
+      pane,
+    });
+    return {
+      agentRunning: this.agentRunning,
+      ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
+    };
+  }
+
+  async agentResult(session, instance, generation, pane, source, maxBytes) {
+    this.agentResultCalls.push({
+      session: structuredClone(session), instance, generation, pane,
+      source: structuredClone(source), maxBytes,
+    });
+    return {
+      source: structuredClone(source),
+      completedAt: "2026-07-13T01:00:00.000Z",
+      text: "Exact structured final response",
+      truncated: false,
+    };
+  }
+
   appendOutput(controlTargetId, text) {
     const key = `${controlTargetId}:${this.outputGeneration}`;
     const current = this.outputs.get(key) ?? Buffer.alloc(0);
@@ -378,6 +417,14 @@ function scrollRequest(lease, operationId, direction, lines) {
   };
 }
 
+test("agent activity classifier matches the Dashboard Braille-spinner contract", () => {
+  assert.equal(terminalControl.agentRunningFromPaneTitle("⠴ running task"), true);
+  assert.equal(terminalControl.agentRunningFromPaneTitle("  ⠇ another task"), true);
+  assert.equal(terminalControl.agentRunningFromPaneTitle("✳ Claude Code"), false);
+  assert.equal(terminalControl.agentRunningFromPaneTitle("⠴not-a-status-prefix"), false);
+  assert.equal(terminalControl.agentRunningFromPaneTitle(""), false);
+});
+
 test("terminal-control v1 contract fixtures are closed and storage fixtures are strict", () => {
   const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot), "utf8"));
   assert.equal(manifest.contract, "tmux-worktree-local-terminal-control");
@@ -409,6 +456,14 @@ test("terminal-control v1 contract fixtures are closed and storage fixtures are 
     }),
     /maxBytes is invalid/,
   );
+  const agentStatus = requests.find(({ message }) => message.type === "activity.agent-status");
+  assert.ok(agentStatus);
+  assert.throws(
+    () => terminalControl.parseTerminalControlRequest({ ...agentStatus.message, extra: true }),
+    /invalid or unknown request type/,
+  );
+  const agentResultRequest = requests.find(({ message }) => message.type === "activity.agent-result");
+  assert.ok(agentResultRequest);
 
   const responses = JSON.parse(readFileSync(new URL("responses.json", contractRoot), "utf8"));
   for (const fixture of responses) {
@@ -446,6 +501,56 @@ test("terminal-control v1 contract fixtures are closed and storage fixtures are 
     ),
     /invalid rendered snapshot/,
   );
+  const agentStatusResponse = responses.find(({ message }) =>
+    message.requestId === agentStatus.message.requestId && message.ok);
+  assert.ok(agentStatusResponse);
+  const agentStatusInput = {
+    lease: agentStatus.message.lease,
+    outputGeneration: agentStatus.message.outputGeneration,
+    pane: agentStatus.message.pane,
+  };
+  assert.deepEqual(
+    parseCanonicalAgentStatusResult(agentStatusResponse.message.result, agentStatusInput),
+    agentStatusResponse.message.result,
+  );
+  assert.throws(
+    () => parseCanonicalAgentStatusResult(
+      { ...agentStatusResponse.message.result, extra: true },
+      agentStatusInput,
+    ),
+    /invalid agent status/,
+  );
+  assert.throws(
+    () => parseCanonicalAgentStatusResult(
+      { ...agentStatusResponse.message.result, fence: "8" },
+      agentStatusInput,
+    ),
+    /mismatched agent status correlation/,
+  );
+  const agentResultResponse = responses.find(({ message }) =>
+    message.requestId === agentResultRequest.message.requestId && message.ok);
+  assert.ok(agentResultResponse);
+  const agentResultInput = {
+    lease: agentResultRequest.message.lease,
+    outputGeneration: agentResultRequest.message.outputGeneration,
+    pane: agentResultRequest.message.pane,
+    source: agentResultRequest.message.source,
+    maxBytes: agentResultRequest.message.maxBytes,
+  };
+  assert.deepEqual(
+    parseCanonicalAgentResultResult(agentResultResponse.message.result, agentResultInput),
+    agentResultResponse.message.result,
+  );
+  assert.throws(
+    () => parseCanonicalAgentResultResult(
+      { ...agentResultResponse.message.result, source: {
+        ...agentResultResponse.message.result.source,
+        turnId: "another-turn",
+      } },
+      agentResultInput,
+    ),
+    /mismatched Agent final response correlation/,
+  );
 
   const storage = JSON.parse(readFileSync(new URL("storage-cases.json", contractRoot), "utf8"));
   for (const fixture of storage.valid) {
@@ -480,9 +585,10 @@ test("permission-protected socket serves correlated local requests and shortens 
   const temp = tempState();
   const socketPath = join(temp.root, "control.sock");
   const abort = new AbortController();
+  const backend = new FakeBackend();
   const authority = new terminalControl.TerminalControlAuthority({
     statePath: temp.path,
-    backend: new FakeBackend(),
+    backend,
   });
   const serving = terminalControl.runTerminalControlServer({ socketPath, authority, signal: abort.signal });
   try {
@@ -499,19 +605,23 @@ test("permission-protected socket serves correlated local requests and shortens 
       {
         protocolVersion: 1,
         authority: "local-terminal-control",
-        capabilities: ["output.rendered-snapshot"],
+        capabilities: ["output.rendered-snapshot", "activity.agent-status", "activity.agent-result"],
       },
     );
     const canonical = new CanonicalTerminalControlSocketClient({ socketPath, timeoutMs: 2_000 });
-    assert.deepEqual(await canonical.capabilities(), { renderedSnapshot: true });
+    assert.deepEqual(await canonical.capabilities(), {
+      renderedSnapshot: true,
+      agentStatus: true,
+      agentResult: true,
+    });
     const currentHandle = authority.handle.bind(authority);
     authority.handle = async (request) => request.type === "ping"
       ? { protocolVersion: 1, authority: "local-terminal-control" }
       : currentHandle(request);
     assert.deepEqual(
       await canonical.capabilities(),
-      { renderedSnapshot: false },
-      "a legacy ping without capabilities must not imply rendered-snapshot support",
+      { renderedSnapshot: false, agentStatus: false, agentResult: false },
+      "a legacy ping without capabilities must not imply observation support",
     );
     authority.handle = async (request) => request.type === "ping"
       ? {
@@ -548,6 +658,31 @@ test("permission-protected socket serves correlated local requests and shortens 
       "rendered terminal output\n",
     );
     assert.equal(rendered.truncated, false);
+    const activity = await canonical.agentStatus({
+      lease: feishu.lease,
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+    });
+    assert.deepEqual(activity, {
+      controlTargetId: target.controlTargetId,
+      controlEpoch: feishu.lease.controlEpoch,
+      leaseId: feishu.lease.leaseId,
+      fence: feishu.lease.fence,
+      ownerKind: "feishu",
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+      agentRunning: true,
+      source: structuredClone(backend.agentSource),
+    });
+    const agentResult = await canonical.agentResult({
+      lease: feishu.lease,
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+      source: backend.agentSource,
+      maxBytes: 256,
+    });
+    assert.equal(agentResult.text, "Exact structured final response");
+    assert.deepEqual(agentResult.source, backend.agentSource);
     const longHome = join(temp.root, "h".repeat(140));
     const shortened = terminalControl.terminalControlSocketPath(longHome);
     assert.ok(Buffer.byteLength(shortened, "utf8") <= 100, shortened);
@@ -556,6 +691,139 @@ test("permission-protected socket serves correlated local requests and shortens 
     abort.abort();
     await serving;
     temp.cleanup();
+  }
+});
+
+test("agent status requires the exact Feishu lease and output generation", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+  });
+  try {
+    const target = await resolved(authority);
+    const dashboard = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("dashboard", "activity-pty"),
+    );
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "dashboard-agent-status",
+        type: "activity.agent-status",
+        lease: dashboard.lease,
+        outputGeneration: dashboard.ownership.outputGeneration,
+        pane: "0",
+      }),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "release-dashboard-activity",
+      type: "lease.release",
+      lease: dashboard.lease,
+    });
+    const feishu = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("feishu", "activity-binding:daemon"),
+    );
+    const request = {
+      protocolVersion: 1,
+      requestId: "feishu-agent-status",
+      type: "activity.agent-status",
+      lease: feishu.lease,
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+    };
+    assert.deepEqual(await authority.handle(request), {
+      controlTargetId: target.controlTargetId,
+      controlEpoch: feishu.lease.controlEpoch,
+      leaseId: feishu.lease.leaseId,
+      fence: feishu.lease.fence,
+      ownerKind: "feishu",
+      outputGeneration: feishu.ownership.outputGeneration,
+      pane: "0",
+      agentRunning: true,
+      source: structuredClone(backend.agentSource),
+    });
+    assert.equal(backend.agentStatusCalls.length, 1);
+    await assert.rejects(
+      authority.handle({ ...request, requestId: "stale-agent-generation", outputGeneration: "stale" }),
+      (error) => error.code === "STALE_OUTPUT_CURSOR",
+    );
+    await assert.rejects(
+      authority.handle({
+        ...request,
+        requestId: "stale-agent-fence",
+        lease: { ...feishu.lease, fence: (BigInt(feishu.lease.fence) + 1n).toString() },
+      }),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test("structured Claude and Codex transcripts yield only the exact final assistant response", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-agent-transcript-"));
+  const claudeCwd = join(root, "claude-worktree");
+  const claudeSessionId = "11111111-1111-4111-8111-111111111111";
+  const claudeDirectory = join(root, ".claude", "projects", claudeCwd.replace(/[^A-Za-z0-9]/g, "-"));
+  const claudePath = join(claudeDirectory, `${claudeSessionId}.jsonl`);
+  const claudeRows = [
+    { type: "user", uuid: "claude-user-1", timestamp: "2026-07-21T01:00:00.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "user", content: "investigate" } },
+    { type: "assistant", uuid: "claude-intermediate", timestamp: "2026-07-21T01:01:00.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "assistant", content: [{ type: "text", text: "intermediate status" }] } },
+    { type: "system", subtype: "turn_duration", uuid: "claude-duration-1", parentUuid: "claude-intermediate", timestamp: "2026-07-21T01:01:01.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false },
+    { type: "user", uuid: "claude-notification", timestamp: "2026-07-21T01:02:00.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "user", content: "<task-notification>worker finished</task-notification>" } },
+  ];
+  try {
+    mkdirSync(claudeDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(claudePath, `${claudeRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const claudeSource = terminalControl.discoverActiveAgentSource({
+      provider: "claude", cwd: claudeCwd, home: root,
+    });
+    assert.equal(claudeSource.boundary, "after");
+    claudeRows.push(
+      { type: "assistant", uuid: "claude-final", timestamp: "2026-07-21T01:03:00.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "assistant", content: [{ type: "text", text: "Claude final answer" }, { type: "tool_use", name: "ignored-tool" }] } },
+      { type: "user", uuid: "claude-tool-result", timestamp: "2026-07-21T01:03:01.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "user", content: [{ type: "tool_result", content: "composer footer must stay private" }] } },
+      { type: "system", subtype: "turn_duration", uuid: "claude-duration-2", parentUuid: "claude-final", timestamp: "2026-07-21T01:03:02.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false },
+    );
+    writeFileSync(claudePath, `${claudeRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const claudeResult = terminalControl.readCompletedAgentResult({
+      source: claudeSource, cwd: claudeCwd, home: root, maxBytes: 1024,
+    });
+    assert.equal(claudeResult.text, "Claude final answer");
+    assert.doesNotMatch(claudeResult.text, /composer footer|ignored-tool/);
+
+    const codexCwd = join(root, "codex-worktree");
+    const codexSessionId = "019f1111-1111-7111-8111-111111111111";
+    const codexTurnId = "019f2222-2222-7222-8222-222222222222";
+    const codexDirectory = join(root, ".codex", "sessions", "2026", "07", "21");
+    const codexPath = join(codexDirectory, `rollout-2026-07-21T01-00-00-${codexSessionId}.jsonl`);
+    const codexRows = [
+      { type: "session_meta", timestamp: "2026-07-21T02:00:00.000Z", payload: { id: codexSessionId, cwd: codexCwd } },
+      { type: "event_msg", timestamp: "2026-07-21T02:00:01.000Z", payload: { type: "task_started", turn_id: codexTurnId } },
+      { type: "session_meta", timestamp: "2026-07-21T02:00:02.000Z", payload: { id: codexSessionId, cwd: codexCwd } },
+    ];
+    mkdirSync(codexDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const codexSource = terminalControl.discoverActiveAgentSource({
+      provider: "codex", cwd: codexCwd, home: root,
+    });
+    assert.equal(codexSource.boundary, "exact");
+    codexRows.push(
+      { type: "response_item", timestamp: "2026-07-21T02:01:00.000Z", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Codex final answer" }] } },
+      { type: "event_msg", timestamp: "2026-07-21T02:01:01.000Z", payload: { type: "task_complete", turn_id: codexTurnId, last_agent_message: "Codex final answer" } },
+    );
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    assert.equal(terminalControl.readCompletedAgentResult({
+      source: codexSource, cwd: codexCwd, home: root, maxBytes: 1024,
+    }).text, "Codex final answer");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

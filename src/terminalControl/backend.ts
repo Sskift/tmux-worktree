@@ -20,10 +20,18 @@ import { join } from "node:path";
 import { managedStatePath, loadManagedStateForMutation, type ManagedSession } from "../state";
 import { tmuxBin } from "../tmux";
 import {
+  TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
   TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   TerminalControlProtocolError,
+  type TerminalControlAgentResult,
+  type TerminalControlAgentSource,
 } from "./protocol";
+import {
+  agentProviderFromStartCommand,
+  discoverActiveAgentSource,
+  readCompletedAgentResult,
+} from "./agentTranscript";
 
 const TMUX_INSTANCE_OPTION = "@tw_terminal_control_instance_v1";
 const OUTPUT_GENERATION_OPTION = "@tw_terminal_control_output_generation_v1";
@@ -139,6 +147,11 @@ export interface TerminalControlRenderedSnapshot {
   truncated: boolean;
 }
 
+export interface TerminalControlAgentStatus {
+  agentRunning: boolean;
+  source?: TerminalControlAgentSource;
+}
+
 export interface ResolvedManagedTerminalBackend {
   managedSession: ManagedSession;
   tmuxInstanceId: string;
@@ -193,6 +206,20 @@ export interface TerminalControlBackend {
     pane: string,
     maxBytes: number,
   ): Promise<TerminalControlRenderedSnapshot>;
+  agentStatus(
+    session: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+  ): Promise<TerminalControlAgentStatus>;
+  agentResult(
+    session: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    source: TerminalControlAgentSource,
+    maxBytes: number,
+  ): Promise<TerminalControlAgentResult>;
 }
 
 type TmuxResult = {
@@ -554,12 +581,24 @@ async function requirePane(
   return { sessionId, paneTarget: panes[0][1] };
 }
 
-async function requireRenderedSnapshotPane(
+export function agentRunningFromPaneTitle(title: string): boolean {
+  const characters = [...title.trimStart()];
+  if (characters.length < 2) return false;
+  const first = characters[0].codePointAt(0)!;
+  return first >= 0x2800 && first <= 0x28ff && /\s/u.test(characters[1]);
+}
+
+async function requireFencedTerminalPane(
   expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
   tmuxInstanceId: string,
   outputGeneration: string,
   pane: string,
-): Promise<string> {
+): Promise<{
+  paneId: string;
+  agentRunning: boolean;
+  paneStartCommand: string;
+  paneCurrentPath: string;
+}> {
   if (pane !== "0") {
     throw new TerminalControlProtocolError(
       "INVALID_REQUEST",
@@ -600,17 +639,20 @@ async function requireRenderedSnapshotPane(
         "#{pane_pipe}",
         "#{session_windows}",
         "#{window_panes}",
+        "#{pane_title}",
+        "#{pane_start_command}",
+        "#{pane_current_path}",
       ].join("\u001f"),
     ]);
   } catch (error) {
     throw new TerminalControlProtocolError(
       "RECOVERY_REQUIRED",
-      `could not resolve the fenced terminal pane for rendered output: ${error instanceof Error ? error.message : String(error)}`,
+      `could not resolve the fenced terminal pane: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  const fields = probe.stdout.trim().split("\u001f");
+  const fields = probe.stdout.replace(/\r?\n$/, "").split("\u001f");
   if (
-    fields.length !== 7
+    fields.length !== 10
     || !/^%\d+$/.test(fields[0])
     || fields[1] !== sessionId
     || fields[2] !== tmuxInstanceId
@@ -624,7 +666,12 @@ async function requireRenderedSnapshotPane(
       "terminal backend identity, output capture, or single-pane shape changed before rendered output capture",
     );
   }
-  return fields[0];
+  return {
+    paneId: fields[0],
+    agentRunning: agentRunningFromPaneTitle(fields[7]),
+    paneStartCommand: fields[8],
+    paneCurrentPath: fields[9],
+  };
 }
 
 function boundedUtf8Tail(value: string, maxBytes: number): {
@@ -1530,7 +1577,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         "rendered terminal snapshot size is invalid",
       );
     }
-    const beforePaneId = await requireRenderedSnapshotPane(
+    const beforePane = await requireFencedTerminalPane(
       expected,
       tmuxInstanceId,
       outputGeneration,
@@ -1548,19 +1595,19 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         "-E",
         "-",
         "-t",
-        beforePaneId,
+        beforePane.paneId,
       ], { maxStdoutBytes: MAX_RENDERED_SNAPSHOT_SOURCE_BYTES });
     } catch (error) {
       captureError = error;
     }
 
-    const afterPaneId = await requireRenderedSnapshotPane(
+    const afterPane = await requireFencedTerminalPane(
       expected,
       tmuxInstanceId,
       outputGeneration,
       pane,
     );
-    if (afterPaneId !== beforePaneId) {
+    if (afterPane.paneId !== beforePane.paneId) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
         "terminal pane identity changed during rendered output capture",
@@ -1578,5 +1625,95 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       dataBase64: Buffer.from(bounded.text, "utf8").toString("base64"),
       truncated: bounded.truncated,
     };
+  }
+
+  async agentStatus(
+    expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+  ): Promise<TerminalControlAgentStatus> {
+    const observed = await requireFencedTerminalPane(
+      expected,
+      tmuxInstanceId,
+      outputGeneration,
+      pane,
+    );
+    if (!observed.agentRunning) return { agentRunning: false };
+    const provider = agentProviderFromStartCommand(observed.paneStartCommand);
+    if (!provider) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "the running managed Agent is not a supported Claude or Codex session",
+      );
+    }
+    if (!observed.paneCurrentPath.startsWith("/")) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "the running Agent working directory is not absolute",
+      );
+    }
+    return {
+      agentRunning: true,
+      source: discoverActiveAgentSource({
+        provider,
+        cwd: observed.paneCurrentPath,
+      }),
+    };
+  }
+
+  async agentResult(
+    expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    source: TerminalControlAgentSource,
+    maxBytes: number,
+  ): Promise<TerminalControlAgentResult> {
+    if (!Number.isSafeInteger(maxBytes)
+      || maxBytes < 1
+      || maxBytes > TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES) {
+      throw new TerminalControlProtocolError("INVALID_REQUEST", "Agent result size is invalid");
+    }
+    const before = await requireFencedTerminalPane(
+      expected,
+      tmuxInstanceId,
+      outputGeneration,
+      pane,
+    );
+    if (before.agentRunning) {
+      throw new TerminalControlProtocolError(
+        "RESOURCE_EXHAUSTED",
+        "the Agent is still running and has no final response yet",
+        true,
+      );
+    }
+    const provider = agentProviderFromStartCommand(before.paneStartCommand);
+    if (provider !== source.provider || !before.paneCurrentPath.startsWith("/")) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "the Agent result source no longer matches the managed terminal",
+      );
+    }
+    const result = readCompletedAgentResult({
+      source,
+      cwd: before.paneCurrentPath,
+      maxBytes,
+    });
+    const after = await requireFencedTerminalPane(
+      expected,
+      tmuxInstanceId,
+      outputGeneration,
+      pane,
+    );
+    if (after.paneId !== before.paneId || after.agentRunning
+      || after.paneStartCommand !== before.paneStartCommand
+      || after.paneCurrentPath !== before.paneCurrentPath) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "the managed Agent changed during final response extraction",
+      );
+    }
+    return result;
   }
 }

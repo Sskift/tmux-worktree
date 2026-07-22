@@ -31,6 +31,8 @@ export const FEISHU_BRIDGE_CAPABILITIES = [
   "binding.create.session-summary.v1",
   "binding.target-reconciliation.v1",
   "binding.reply-mode.v1",
+  "binding.activity-completion.v1",
+  "binding.structured-agent-result.v1",
 ] as const;
 
 type FeishuBridgeOperation =
@@ -358,6 +360,8 @@ export class FeishuBridgeServer {
   private pollTimer?: ReturnType<typeof setInterval>;
   private renewTimer?: ReturnType<typeof setInterval>;
   private restartTimer?: ReturnType<typeof setTimeout>;
+  private pollInFlight = false;
+  private renewInFlight = false;
   private stopping = false;
   readonly stopped: Promise<void>;
   private resolveStopped!: () => void;
@@ -429,19 +433,29 @@ export class FeishuBridgeServer {
       chmodSync(this.paths.socket, 0o600);
       await this.bridge.reconcileBindingTargets();
       this.pollTimer = setInterval(() => {
-        void this.bridge.pollTurns().then(
-          () => this.bridge.reconcileHandoffs(),
-        ).catch((error) => {
-          process.stderr.write(`[feishu-bridge] output poll failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
+        if (this.pollInFlight) return;
+        this.pollInFlight = true;
+        void this.bridge.pollTurns()
+          .then(() => this.bridge.reconcileHandoffs())
+          .catch((error) => {
+            process.stderr.write(`[feishu-bridge] output poll failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          })
+          .finally(() => {
+            this.pollInFlight = false;
+          });
       }, 500);
       this.pollTimer.unref();
       this.renewTimer = setInterval(() => {
-        void this.bridge.renewLeases().then(
-          () => this.bridge.reconcileBindingTargets(),
-        ).catch((error) => {
-          process.stderr.write(`[feishu-bridge] lease renewal failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
+        if (this.renewInFlight) return;
+        this.renewInFlight = true;
+        void this.bridge.renewLeases()
+          .then(() => this.bridge.reconcileBindingTargets())
+          .catch((error) => {
+            process.stderr.write(`[feishu-bridge] lease renewal failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          })
+          .finally(() => {
+            this.renewInFlight = false;
+          });
       }, 20_000);
       this.renewTimer.unref();
       this.startConsumer();

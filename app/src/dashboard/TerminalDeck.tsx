@@ -174,6 +174,12 @@ export function TerminalDeck({
     const activeTurn = binding
       ? feishuSnapshot?.activeTurns.some((turn) => turn.bindingId === binding.id)
       : false;
+    const activeActivityWatch = binding
+      ? ["probing", "armed", "stop-candidate", "sending"].includes(
+        binding.activityWatch?.status ?? "",
+      )
+      : false;
+    const activeAgentWork = activeTurn || activeActivityWatch;
     if (!binding) {
       return (
         <div className="terminal-feishu-bar" data-state="unbound">
@@ -202,14 +208,18 @@ export function TerminalDeck({
       <div className="terminal-feishu-bar" data-state={binding.status} role="status">
         <span>
           {binding.status === "active"
-            ? `Input locked by Feishu group “${binding.chatName}”${activeTurn ? " (turn in progress)" : ""}`
+            ? `Input locked by Feishu group “${binding.chatName}”${activeTurn
+              ? " (turn in progress)"
+              : activeActivityWatch
+                ? " (local Agent task in progress; final response will be posted)"
+                : ""}`
             : binding.status === "paused"
               ? `Feishu group “${binding.chatName}” is paused; local input is active`
               : binding.status === "pausing"
                 ? `Safely handing off from Feishu group “${binding.chatName}”…`
                 : `Feishu link needs recovery: ${binding.staleReason ?? binding.chatName}`}
         </span>
-        {binding.status === "active" && !activeTurn && (
+        {binding.status === "active" && !activeAgentWork && (
           <button
             type="button"
             disabled={feishuBusy || !ptyId}
@@ -226,6 +236,16 @@ export function TerminalDeck({
             onClick={() => ptyId && void runFeishuAction(() => dashboardBackend.feishu.takeover(binding.id, ptyId, true))}
           >
             Cancel turn and take over
+          </button>
+        )}
+        {binding.status === "active" && !activeTurn && activeActivityWatch && (
+          <button
+            type="button"
+            className="danger"
+            disabled={feishuBusy || !ptyId || binding.activityWatch?.status === "sending"}
+            onClick={() => ptyId && void runFeishuAction(() => dashboardBackend.feishu.takeover(binding.id, ptyId, true))}
+          >
+            Cancel result delivery and take over
           </button>
         )}
         {binding.status === "paused" && (

@@ -2,9 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   CanonicalTerminalControlError,
+  type CanonicalAgentStatusResult,
   type CanonicalDrainRecord,
   type CanonicalHandoffResult,
   type CanonicalLeaseResult,
+  type CanonicalAgentResultResult,
   type CanonicalTerminalControlClient,
   type CanonicalTerminalLease,
   type CanonicalTerminalOwner,
@@ -12,6 +14,7 @@ import {
 } from "./canonicalTerminalControlClient.js";
 import {
   FeishuBridgeStore,
+  type FeishuActivityWatch,
   type FeishuBinding,
   type FeishuHandoffRecord,
   type FeishuOutboundReply,
@@ -24,6 +27,7 @@ import {
 } from "./larkCliBridge.js";
 import {
   buildFeishuBindingLifecycleCard,
+  buildFeishuLocalTaskResultCard,
   buildFeishuReplyCard,
   type FeishuBindingLifecycleCardKind,
 } from "./feishuReplyCard.js";
@@ -34,6 +38,8 @@ const MAX_TURN_OUTPUT_BYTES = 128 * 1024;
 const MAX_REPLY_BYTES = 16 * 1024;
 const OUTPUT_TAIL_BYTES = 64 * 1024;
 const PROCESSING_REACTION_CACHE_SIZE = 1024;
+const ACTIVITY_STOP_DEBOUNCE_MS = 1_000;
+const ACTIVITY_POLL_INTERVAL_MS = 1_000;
 
 interface BridgeState {
   bindings: FeishuBinding[];
@@ -206,10 +212,13 @@ export class FeishuBridge {
   private botMentionIds?: Set<string>;
   private readonly leases = new Map<string, CanonicalTerminalLease>();
   private readonly pendingProcessingReactions = new Map<string, PendingProcessingReaction>();
+  private readonly activityPollAfter = new Map<string, number>();
+  private lastActivityPolledBindingId?: string;
   private state: BridgeState;
   private mutation = Promise.resolve();
   private reactionMutation = Promise.resolve();
   private lifecycleMutation = Promise.resolve();
+  private activityCompletionMutation = Promise.resolve();
 
   constructor(options: {
     control: CanonicalTerminalControlClient;
@@ -238,6 +247,12 @@ export class FeishuBridge {
       if (binding.status === "active" || binding.status === "pausing") {
         binding.status = "stale";
         binding.staleReason = "bridge restarted; ownership was not recreated automatically";
+        changed = true;
+      }
+      if (binding.activityWatch?.status === "sending") {
+        binding.activityWatch.status = "uncertain";
+        binding.activityWatch.completedAt = nowIso(this.now);
+        binding.activityWatch.error = "bridge restarted while the completion card disposition was unknown";
         changed = true;
       }
     }
@@ -269,7 +284,7 @@ export class FeishuBridge {
       if (this.state.bindings.some((binding) => binding.chatId === input.chatId)) {
         throw new Error("this Feishu chat already has a binding");
       }
-      await this.requireRenderedSnapshotCapability();
+      await this.requireBindingCapabilities();
       const target = await this.control.resolveTarget(input.sessionName);
       if (this.state.bindings.some((binding) =>
         binding.controlTargetId === target.controlTargetId && binding.status !== "stale")) {
@@ -298,6 +313,7 @@ export class FeishuBridge {
         allowedSenderIds,
         createdAt,
         createdBy: input.createdBy,
+        ...(input.sessionSummary?.trim() ? { sessionSummary: input.sessionSummary.trim() } : {}),
         lastActivityAt: createdAt,
       };
       const feishuOwner = this.feishuOwner(id);
@@ -384,6 +400,8 @@ export class FeishuBridge {
           throw error;
         }
       }
+      await this.activateActivityWatchOrStale(binding, lease, "binding activation");
+      this.persist();
       this.queueBindingLifecycle(binding, "linked", {
         sessionKind: target.managedSession.kind,
         sessionSummary: input.sessionSummary?.trim(),
@@ -417,12 +435,19 @@ export class FeishuBridge {
     return this.serial(async () => {
       const binding = this.requireBinding(bindingId);
       const turn = this.activeTurn(binding.id);
-      if (turn && !force) throw new Error("binding has an active Feishu turn; force is required to cancel it");
+      const watch = this.activeActivityWatch(binding);
+      if (watch?.status === "sending") {
+        throw new Error("the local Agent completion card is being delivered; wait for its disposition before pausing");
+      }
+      if ((turn || watch) && !force) {
+        throw new Error("binding has active Agent work; force is required to cancel it");
+      }
       if (turn) {
         turn.status = "cancelled";
         turn.completedAt = nowIso(this.now);
         turn.error = "cancelled by explicit force pause";
       }
+      if (watch) this.cancelActivityWatch(binding, "cancelled by explicit force pause");
       binding.status = "pausing";
       this.persist();
       const lease = this.leases.get(binding.id);
@@ -451,7 +476,7 @@ export class FeishuBridge {
     return this.serial(async () => {
       const binding = this.requireBinding(bindingId);
       if (this.activeTurn(binding.id)) throw new Error("binding still has an unresolved turn");
-      await this.requireRenderedSnapshotCapability();
+      await this.requireBindingCapabilities();
       const target = await this.control.resolveTarget(binding.sessionName);
       if (target.controlTargetId !== binding.controlTargetId) {
         binding.status = "stale";
@@ -469,6 +494,7 @@ export class FeishuBridge {
       binding.status = "active";
       delete binding.staleReason;
       binding.lastActivityAt = nowIso(this.now);
+      await this.activateActivityWatchOrStale(binding, lease, "binding resume");
       this.persist();
       return structuredClone(binding);
     });
@@ -491,7 +517,7 @@ export class FeishuBridge {
         this.persist();
         return structuredClone(binding);
       } else if (target.state === "FREE") {
-        await this.requireRenderedSnapshotCapability();
+        await this.requireBindingCapabilities();
         lease = this.requireGrantedLease(
           await this.control.acquireLease(binding.controlTargetId, owner),
           binding.controlTargetId,
@@ -509,6 +535,7 @@ export class FeishuBridge {
       binding.status = "active";
       delete binding.staleReason;
       binding.lastActivityAt = nowIso(this.now);
+      await this.activateActivityWatchOrStale(binding, lease, "binding repair");
       this.persist();
       return structuredClone(binding);
     });
@@ -518,12 +545,19 @@ export class FeishuBridge {
     return this.serial(async () => {
       const binding = this.requireBinding(bindingId);
       const turn = this.activeTurn(binding.id);
-      if (turn && !force) throw new Error("binding has an active turn; force is required to unbind");
+      const watch = this.activeActivityWatch(binding);
+      if (watch?.status === "sending") {
+        throw new Error("the local Agent completion card is being delivered; wait for its disposition before unlinking");
+      }
+      if ((turn || watch) && !force) {
+        throw new Error("binding has active Agent work; force is required to unbind");
+      }
       if (turn) {
         turn.status = "cancelled";
         turn.completedAt = nowIso(this.now);
         turn.error = "cancelled by explicit unbind";
       }
+      if (watch) this.cancelActivityWatch(binding, "cancelled by explicit unbind");
       const lease = this.leases.get(binding.id);
       if (lease) {
         try {
@@ -558,14 +592,22 @@ export class FeishuBridge {
         throw new Error("Feishu binding does not hold a transferable lease");
       }
       const turn = this.activeTurn(binding.id);
+      const watch = this.activeActivityWatch(binding);
+      if (watch?.status === "sending") {
+        throw new Error("the local Agent completion card is being delivered; wait for its disposition before takeover");
+      }
       if (turn && !force) {
         throw new Error("a Feishu turn is active; wait for its certain reply or choose force takeover");
+      }
+      if (watch && !force) {
+        throw new Error("a bound local Agent task is active; wait for completion or choose force takeover");
       }
       if (turn) {
         turn.status = "cancelled";
         turn.completedAt = nowIso(this.now);
         turn.error = "cancelled before explicit force takeover";
       }
+      if (watch) this.cancelActivityWatch(binding, "cancelled before explicit force takeover");
       binding.status = "pausing";
       binding.lastActivityAt = nowIso(this.now);
       this.persist();
@@ -585,6 +627,8 @@ export class FeishuBridge {
           disposition: force ? "cancelled" : "drained",
           recordId: force && turn
             ? `feishu-turn:${turn.id}:cancelled`
+            : force && watch
+              ? `activity-watch:${watch.id}:cancelled`
             : `binding:${binding.id}:feishu-drained`,
           recordedAt: turn?.completedAt ?? nowIso(this.now),
         };
@@ -646,7 +690,7 @@ export class FeishuBridge {
         || target.ownerKind !== dashboardLease.owner.kind) {
         throw new Error("the controlled local owner no longer owns the exact binding target");
       }
-      await this.requireRenderedSnapshotCapability();
+      await this.requireBindingCapabilities();
       try {
         const feishuOwner = this.feishuOwner(binding.id);
         const draining = await this.control.beginHandoff(
@@ -690,6 +734,7 @@ export class FeishuBridge {
         binding.status = "active";
         delete binding.staleReason;
         binding.lastActivityAt = nowIso(this.now);
+        await this.activateActivityWatchOrStale(binding, feishuLease, "binding return");
         this.persist();
         return structuredClone(binding);
       } catch (error) {
@@ -727,6 +772,16 @@ export class FeishuBridge {
       if (!lease) {
         this.markBindingStale(binding, "active binding has no live bridge ownership lease");
         this.rememberEvent(event.event_id);
+        return;
+      }
+      if (this.activeActivityWatch(binding)) {
+        this.rememberEvent(event.event_id);
+        await this.safeInform(
+          binding,
+          event.message_id,
+          "绑定时终端已有本地 Agent 任务正在运行，完成后会通知本群。请等待完成通知后再试。",
+          `activity-busy-${event.event_id}`,
+        );
         return;
       }
       if (this.activeTurn(binding.id)) {
@@ -851,11 +906,18 @@ export class FeishuBridge {
           this.leases.delete(bindingId);
           this.markBindingStale(binding, error instanceof Error ? error.message : String(error));
           const turn = this.activeTurn(bindingId);
+          const watch = this.activeActivityWatch(binding);
           if (turn) {
             turn.status = "recovery-required";
             turn.completedAt = nowIso(this.now);
             turn.error = "terminal ownership lease renewal failed";
             failedTurnMessageIds.push(turn.messageId);
+          }
+          if (watch) {
+            watch.status = "recovery-required";
+            watch.completedAt = nowIso(this.now);
+            watch.error = "terminal ownership lease renewal failed";
+            this.activityPollAfter.delete(watch.id);
           }
           changed = true;
         }
@@ -893,11 +955,25 @@ export class FeishuBridge {
     });
   }
 
-  pollTurns(): Promise<void> {
-    return this.serial(async () => {
+  async pollTurns(): Promise<void> {
+    await this.serial(async () => {
       const turns = this.state.turns.filter((turn) => turn.status === "awaiting");
       for (const turn of turns) await this.pollTurn(turn);
+      const bindings = this.state.bindings.filter((binding) =>
+        binding.status === "active" && this.activeActivityWatch(binding));
+      if (bindings.length > 0) {
+        const previousIndex = this.lastActivityPolledBindingId
+          ? bindings.findIndex((binding) => binding.id === this.lastActivityPolledBindingId)
+          : -1;
+        const binding = bindings[(previousIndex + 1) % bindings.length];
+        this.lastActivityPolledBindingId = binding.id;
+        await this.pollActivityWatch(binding);
+      }
     });
+    // Completion delivery has its own lane so a slow Feishu API cannot hold
+    // terminal ownership mutations or lease renewal. Callers may still await
+    // the observable completion result without occupying that lane.
+    await this.activityCompletionMutation;
   }
 
   reconcileHandoffs(): Promise<void> {
@@ -911,6 +987,10 @@ export class FeishuBridge {
   }
 
   async close(): Promise<void> {
+    // Let a completion Card that already crossed the outbound boundary settle
+    // before releasing authority. A crash still recovers persisted `sending`
+    // as uncertain, but a clean shutdown does not manufacture that ambiguity.
+    await this.activityCompletionMutation;
     await this.serial(async () => {
       const failedTurnMessageIds: string[] = [];
       for (const [bindingId, lease] of [...this.leases]) {
@@ -948,7 +1028,11 @@ export class FeishuBridge {
     // independent best-effort UX lanes before a clean shutdown reports done so
     // known reactions and lifecycle notices are not abandoned merely because
     // the daemon stopped.
-    await Promise.all([this.reactionMutation, this.lifecycleMutation]);
+    await Promise.all([
+      this.reactionMutation,
+      this.lifecycleMutation,
+      this.activityCompletionMutation,
+    ]);
   }
 
   private async pollTurn(turn: FeishuTurn): Promise<void> {
@@ -1107,6 +1191,261 @@ export class FeishuBridge {
     await this.completeReply(turn, binding, renderedMarked.reply, "completed");
   }
 
+  private async pollActivityWatch(binding: FeishuBinding): Promise<void> {
+    const watch = this.activeActivityWatch(binding);
+    const lease = this.leases.get(binding.id);
+    if (!watch || !lease || binding.status !== "active") return;
+    if (watch.status === "sending") return;
+    if (this.now() < (this.activityPollAfter.get(watch.id) ?? 0)) return;
+    this.activityPollAfter.set(watch.id, this.now() + ACTIVITY_POLL_INTERVAL_MS);
+    let agentRunning: boolean;
+    let observedSource: CanonicalAgentStatusResult["source"];
+    try {
+      const observation = await this.control.agentStatus({
+        lease,
+        outputGeneration: watch.outputGeneration,
+        pane: "0",
+      });
+      this.assertActivityWatchCorrelation(binding, watch, lease, observation);
+      agentRunning = observation.agentRunning;
+      observedSource = observation.source;
+    } catch (error) {
+      if (!this.fatalActivityObservation(error)) return;
+      watch.status = "recovery-required";
+      watch.completedAt = nowIso(this.now);
+      watch.error = error instanceof Error ? error.message : String(error);
+      this.markBindingStale(binding, `Agent activity continuity was lost: ${watch.error}`);
+      this.activityPollAfter.delete(watch.id);
+      this.persist();
+      return;
+    }
+
+    const observedAt = nowIso(this.now);
+    if (agentRunning) {
+      if (!observedSource) {
+        watch.status = "recovery-required";
+        watch.completedAt = observedAt;
+        watch.error = "the running Agent has no exact structured result correlation";
+        this.markBindingStale(binding, `Agent activity continuity was lost: ${watch.error}`);
+        this.activityPollAfter.delete(watch.id);
+        this.persist();
+        return;
+      }
+      const sourceChanged = watch.source?.sourceId !== observedSource.sourceId;
+      if (watch.status !== "armed" || watch.stopCandidateAt || sourceChanged) {
+        watch.status = "armed";
+        watch.observedRunningAt = observedAt;
+        watch.source = observedSource;
+        delete watch.stopCandidateAt;
+        this.persist();
+      }
+      return;
+    }
+    if (!watch.observedRunningAt) {
+      watch.status = "cancelled";
+      watch.completedAt = observedAt;
+      watch.error = "the Agent was not observed running after Feishu ownership became active";
+      this.activityPollAfter.delete(watch.id);
+      this.persist();
+      return;
+    }
+    if (watch.status !== "stop-candidate" || !watch.stopCandidateAt) {
+      watch.status = "stop-candidate";
+      watch.stopCandidateAt = observedAt;
+      this.persist();
+      return;
+    }
+    if (this.now() - Date.parse(watch.stopCandidateAt) < ACTIVITY_STOP_DEBOUNCE_MS) return;
+    await this.prepareActivityCompletion(binding, watch, lease);
+  }
+
+  private async prepareActivityCompletion(
+    binding: FeishuBinding,
+    watch: FeishuActivityWatch,
+    lease: CanonicalTerminalLease,
+  ): Promise<void> {
+    let result: CanonicalAgentResultResult;
+    try {
+      const before = await this.control.ownershipStatus(binding.controlTargetId);
+      if (this.isFeishuDrainingView(binding, lease, before)) return;
+      this.assertLeaseView(binding, lease, before);
+      if (before.outputGeneration !== watch.outputGeneration) {
+        throw new CanonicalTerminalControlError(
+          "STALE_OUTPUT_CURSOR",
+          "Agent activity completion was fenced by an output generation change",
+        );
+      }
+      if (!watch.source) {
+        throw new CanonicalTerminalControlError(
+          "CONTROLLER_UNAVAILABLE",
+          "Agent activity watch has no exact structured result source",
+        );
+      }
+      result = await this.control.agentResult({
+        lease,
+        outputGeneration: watch.outputGeneration,
+        pane: "0",
+        source: watch.source,
+        maxBytes: MAX_REPLY_BYTES,
+      });
+      this.assertActivityResultCorrelation(binding, watch, lease, result);
+    } catch (error) {
+      if (!this.fatalActivityObservation(error)) return;
+      watch.status = "recovery-required";
+      watch.completedAt = nowIso(this.now);
+      watch.error = error instanceof Error ? error.message : String(error);
+      this.markBindingStale(binding, `Agent activity continuity was lost before completion: ${watch.error}`);
+      this.persist();
+      return;
+    }
+    const completedAt = result.completedAt;
+    const idempotencyKey = `tw-${digest(`activity-result:${watch.id}:${result.source.sourceId}`).slice(0, 40)}`;
+    watch.status = "sending";
+    watch.completedAt = completedAt;
+    delete watch.error;
+    this.persist();
+    this.queueActivityCompletion(binding, watch, lease, result, idempotencyKey);
+  }
+
+  private queueActivityCompletion(
+    binding: FeishuBinding,
+    watch: FeishuActivityWatch,
+    lease: CanonicalTerminalLease,
+    activityResult: CanonicalAgentResultResult,
+    idempotencyKey: string,
+  ): void {
+    const bindingSnapshot = structuredClone(binding);
+    const watchSnapshot = structuredClone(watch);
+    const leaseSnapshot = structuredClone(lease);
+    // Binding lifecycle cards are ordered before completion cards, but their
+    // network I/O stays outside the terminal mutation lane.
+    const lifecycleBarrier = this.lifecycleMutation;
+    const effect = async () => {
+      await lifecycleBarrier;
+      await this.deliverActivityCompletion(
+        bindingSnapshot,
+        watchSnapshot,
+        leaseSnapshot,
+        activityResult,
+        idempotencyKey,
+      );
+    };
+    const queued = this.activityCompletionMutation.then(effect, effect);
+    this.activityCompletionMutation = queued.then(
+      () => undefined,
+      (error) => {
+        process.stderr.write(`[feishu-bridge] activity completion effect failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    );
+  }
+
+  private async deliverActivityCompletion(
+    binding: FeishuBinding,
+    watch: FeishuActivityWatch,
+    lease: CanonicalTerminalLease,
+    activityResult: CanonicalAgentResultResult,
+    idempotencyKey: string,
+  ): Promise<void> {
+    try {
+      const before = await this.control.ownershipStatus(binding.controlTargetId);
+      if (this.isFeishuDrainingView(binding, lease, before)) {
+        await this.deferActivityCompletion(binding.id, watch.id);
+        return;
+      }
+      this.assertLeaseView(binding, lease, before);
+      if (before.outputGeneration !== watch.outputGeneration) {
+        throw new CanonicalTerminalControlError(
+          "STALE_OUTPUT_CURSOR",
+          "Agent activity completion was fenced by an output generation change",
+        );
+      }
+    } catch (error) {
+      if (this.fatalActivityObservation(error)) {
+        await this.failActivityCompletionBeforeSend(binding.id, watch.id, error);
+      } else {
+        await this.deferActivityCompletion(binding.id, watch.id);
+      }
+      return;
+    }
+
+    try {
+      const sendResult = await this.lark.sendCard(
+        binding.chatId,
+        buildFeishuLocalTaskResultCard({
+          sessionName: binding.sessionName,
+          sessionSummary: binding.sessionSummary,
+          text: activityResult.text,
+          truncated: activityResult.truncated,
+        }),
+        idempotencyKey,
+      );
+      const latest = await this.control.ownershipStatus(binding.controlTargetId);
+      this.assertLeaseView(binding, lease, latest);
+      if (latest.outputGeneration !== watch.outputGeneration) {
+        throw new CanonicalTerminalControlError(
+          "STALE_OUTPUT_CURSOR",
+          "Agent activity completion was fenced by an output generation change",
+        );
+      }
+      await this.serial(async () => {
+        const currentBinding = this.state.bindings.find((candidate) => candidate.id === binding.id);
+        const currentWatch = currentBinding?.activityWatch;
+        if (!currentBinding || currentWatch?.id !== watch.id
+          || currentWatch.status === "cancelled" || currentWatch.status === "uncertain") return;
+        currentWatch.status = "sent";
+        currentWatch.completedAt = activityResult.completedAt;
+        delete currentWatch.error;
+        this.activityPollAfter.delete(currentWatch.id);
+        if (sendResult.messageId) currentWatch.messageId = sendResult.messageId;
+        currentBinding.lastActivityAt = activityResult.completedAt;
+        this.persist();
+      });
+    } catch (error) {
+      await this.serial(async () => {
+        const currentBinding = this.state.bindings.find((candidate) => candidate.id === binding.id);
+        const currentWatch = currentBinding?.activityWatch;
+        if (!currentBinding || currentWatch?.id !== watch.id || currentWatch.status === "sent") return;
+        currentWatch.status = "uncertain";
+        currentWatch.completedAt = activityResult.completedAt;
+        this.activityPollAfter.delete(currentWatch.id);
+        currentWatch.error = error instanceof Error ? error.message : String(error);
+        this.markBindingStale(currentBinding, "local Agent completion card disposition is uncertain");
+        this.persist();
+      });
+    }
+  }
+
+  private deferActivityCompletion(bindingId: string, watchId: string): Promise<void> {
+    return this.serial(async () => {
+      const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
+      const watch = binding?.activityWatch;
+      if (!binding || watch?.id !== watchId || watch.status !== "sending") return;
+      watch.status = "stop-candidate";
+      delete watch.completedAt;
+      delete watch.error;
+      this.activityPollAfter.set(watch.id, this.now() + ACTIVITY_POLL_INTERVAL_MS);
+      this.persist();
+    });
+  }
+
+  private failActivityCompletionBeforeSend(
+    bindingId: string,
+    watchId: string,
+    error: unknown,
+  ): Promise<void> {
+    return this.serial(async () => {
+      const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
+      const watch = binding?.activityWatch;
+      if (!binding || watch?.id !== watchId || watch.status !== "sending") return;
+      watch.status = "recovery-required";
+      watch.completedAt = nowIso(this.now);
+      watch.error = error instanceof Error ? error.message : String(error);
+      this.activityPollAfter.delete(watch.id);
+      this.markBindingStale(binding, `Agent activity continuity was lost before completion: ${watch.error}`);
+      this.persist();
+    });
+  }
+
   private async completeReply(
     turn: FeishuTurn,
     binding: FeishuBinding,
@@ -1208,17 +1547,28 @@ export class FeishuBridge {
     if (!this.isFeishuDrainingView(binding, lease, target)) {
       this.leases.delete(binding.id);
       const turn = this.activeTurn(binding.id);
+      const watch = this.activeActivityWatch(binding);
       if (turn) {
         turn.status = "recovery-required";
         turn.completedAt = nowIso(this.now);
         turn.error = `terminal ownership entered ${target.state} during Feishu handoff reconciliation`;
+      }
+      if (watch) {
+        watch.status = "recovery-required";
+        watch.completedAt = nowIso(this.now);
+        watch.error = `terminal ownership entered ${target.state} during Feishu handoff reconciliation`;
+        this.activityPollAfter.delete(watch.id);
       }
       this.markBindingStale(binding, `terminal ownership entered ${target.state} during Feishu handoff reconciliation`);
       this.persist();
       if (turn) this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
-    if (this.activeTurn(binding.id)) return;
+    // A lease-less local handoff may be initiated outside the Bridge. Keep the
+    // canonical target DRAINING until both Feishu turns and inherited local
+    // task completion delivery have reached a certain disposition. Explicit
+    // force takeover cancels the watch before beginning its handoff.
+    if (this.activeTurn(binding.id) || this.activeActivityWatch(binding)) return;
 
     const handoffId = target.handoffId!;
     const nextOwnerKind = target.nextOwnerKind as "dashboard" | "local-cli";
@@ -1323,7 +1673,10 @@ export class FeishuBridge {
       || target.state !== "HELD"
       || target.ownerKind !== lease.owner.kind
       || target.fence !== lease.fence) {
-      throw new Error("Feishu binding no longer owns the exact terminal target");
+      throw new CanonicalTerminalControlError(
+        "PERMISSION_DENIED",
+        "Feishu binding no longer owns the exact terminal target",
+      );
     }
   }
 
@@ -1435,6 +1788,171 @@ export class FeishuBridge {
   private activeTurn(bindingId: string): FeishuTurn | undefined {
     return this.state.turns.find((turn) => turn.bindingId === bindingId
       && (turn.status === "prepared" || turn.status === "awaiting" || turn.status === "replying"));
+  }
+
+  private activeActivityWatch(binding: FeishuBinding): FeishuActivityWatch | undefined {
+    const watch = binding.activityWatch;
+    return watch && (watch.status === "probing"
+      || watch.status === "armed"
+      || watch.status === "stop-candidate"
+      || watch.status === "sending")
+      ? watch
+      : undefined;
+  }
+
+  private cancelActivityWatch(binding: FeishuBinding, reason: string): void {
+    const watch = this.activeActivityWatch(binding);
+    if (!watch) return;
+    watch.status = "cancelled";
+    watch.completedAt = nowIso(this.now);
+    watch.error = boundedUtf8(reason, 4096);
+    this.activityPollAfter.delete(watch.id);
+  }
+
+  private async activateActivityWatchOrStale(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+    operation: string,
+  ): Promise<void> {
+    try {
+      await this.startOrResumeActivityWatch(binding, lease);
+    } catch (error) {
+      const watch = this.activeActivityWatch(binding);
+      if (watch) {
+        watch.status = "recovery-required";
+        watch.completedAt = nowIso(this.now);
+        watch.error = error instanceof Error ? error.message : String(error);
+        this.activityPollAfter.delete(watch.id);
+      }
+      this.markBindingStale(
+        binding,
+        `${operation} could not establish Agent activity continuity: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.persist();
+      throw error;
+    }
+  }
+
+  private async startOrResumeActivityWatch(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+  ): Promise<void> {
+    const target = await this.control.ownershipStatus(binding.controlTargetId);
+    this.assertLeaseView(binding, lease, target);
+    const previous = this.activeActivityWatch(binding);
+    const watch: FeishuActivityWatch = previous ?? {
+      id: `activity-${randomUUID()}`,
+      status: "probing",
+      controlEpoch: lease.controlEpoch,
+      leaseId: lease.leaseId,
+      fence: lease.fence,
+      outputGeneration: target.outputGeneration,
+      createdAt: nowIso(this.now),
+    };
+    watch.controlEpoch = lease.controlEpoch;
+    watch.leaseId = lease.leaseId;
+    watch.fence = lease.fence;
+    watch.outputGeneration = target.outputGeneration;
+    watch.status = watch.observedRunningAt ? "armed" : "probing";
+    delete watch.stopCandidateAt;
+    delete watch.completedAt;
+    delete watch.messageId;
+    delete watch.error;
+    this.activityPollAfter.delete(watch.id);
+    binding.activityWatch = watch;
+    try {
+      const observation = await this.control.agentStatus({
+        lease,
+        outputGeneration: watch.outputGeneration,
+        pane: "0",
+      });
+      this.assertActivityWatchCorrelation(binding, watch, lease, observation);
+      const observedAt = nowIso(this.now);
+      if (observation.agentRunning) {
+        if (!observation.source) {
+          throw new CanonicalTerminalControlError(
+            "CONTROLLER_UNAVAILABLE",
+            "the running Agent has no exact structured result correlation",
+          );
+        }
+        watch.status = "armed";
+        watch.observedRunningAt = observedAt;
+        watch.source = observation.source;
+      } else if (watch.observedRunningAt) {
+        watch.status = "stop-candidate";
+        watch.stopCandidateAt = observedAt;
+      } else {
+        watch.status = "cancelled";
+        watch.completedAt = observedAt;
+        watch.error = "the Agent was not running when Feishu ownership became active";
+      }
+    } catch (error) {
+      if (this.fatalActivityObservation(error)) throw error;
+      // A transient read-only observation leaves the durable probe armed. The
+      // normal poll loop retries without replaying terminal input.
+    }
+  }
+
+  private assertActivityWatchCorrelation(
+    binding: FeishuBinding,
+    watch: FeishuActivityWatch,
+    lease: CanonicalTerminalLease,
+    observation: Awaited<ReturnType<CanonicalTerminalControlClient["agentStatus"]>>,
+  ): void {
+    if (observation.controlTargetId !== binding.controlTargetId
+      || observation.controlEpoch !== watch.controlEpoch
+      || observation.controlEpoch !== lease.controlEpoch
+      || observation.leaseId !== watch.leaseId
+      || observation.leaseId !== lease.leaseId
+      || observation.fence !== watch.fence
+      || observation.fence !== lease.fence
+      || observation.ownerKind !== "feishu"
+      || observation.outputGeneration !== watch.outputGeneration
+      || observation.pane !== "0") {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        "canonical terminal-control returned mismatched Agent activity correlation",
+      );
+    }
+  }
+
+  private assertActivityResultCorrelation(
+    binding: FeishuBinding,
+    watch: FeishuActivityWatch,
+    lease: CanonicalTerminalLease,
+    result: CanonicalAgentResultResult,
+  ): void {
+    if (result.controlTargetId !== binding.controlTargetId
+      || result.controlEpoch !== watch.controlEpoch
+      || result.controlEpoch !== lease.controlEpoch
+      || result.leaseId !== watch.leaseId
+      || result.leaseId !== lease.leaseId
+      || result.fence !== watch.fence
+      || result.fence !== lease.fence
+      || result.ownerKind !== "feishu"
+      || result.outputGeneration !== watch.outputGeneration
+      || result.pane !== "0"
+      || !watch.source
+      || result.source.sourceId !== watch.source.sourceId
+      || result.source.provider !== watch.source.provider
+      || result.source.boundary !== watch.source.boundary
+      || result.source.sessionId !== watch.source.sessionId
+      || result.source.turnId !== watch.source.turnId
+      || result.source.startedAt !== watch.source.startedAt) {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        "canonical terminal-control returned mismatched Agent final response correlation",
+      );
+    }
+  }
+
+  private fatalActivityObservation(error: unknown): boolean {
+    if (!(error instanceof Error)) return true;
+    const candidate = error as { code?: unknown; retryable?: unknown };
+    if (candidate.code === "RESOURCE_EXHAUSTED" || candidate.code === "INTERNAL") return false;
+    if (candidate.code === "CONTROLLER_UNAVAILABLE") return candidate.retryable !== true;
+    if (typeof candidate.code === "string") return true;
+    return false;
   }
 
   private rememberEvent(eventId: string, persist = true): void {
@@ -1630,6 +2148,9 @@ export class FeishuBridge {
         ? "the bound TW session was deleted"
         : "the exact bound TW lifecycle no longer exists";
     }
+    if (this.activeActivityWatch(binding)) {
+      this.cancelActivityWatch(binding, "the bound terminal lifecycle ended");
+    }
     this.leases.delete(binding.id);
     this.state.bindings = this.state.bindings.filter((candidate) => candidate.id !== binding.id);
     this.persist();
@@ -1776,6 +2297,21 @@ export class FeishuBridge {
     if (capabilities.renderedSnapshot) return;
     const error = new Error(
       "terminal controller must be upgraded before Feishu can own or write to this terminal: missing output.rendered-snapshot capability",
+    ) as Error & { code?: string };
+    error.code = "FEISHU_BRIDGE_UPGRADE_REQUIRED";
+    throw error;
+  }
+
+  private async requireBindingCapabilities(): Promise<void> {
+    const capabilities = await this.control.capabilities();
+    const missing = [
+      ...(capabilities.renderedSnapshot ? [] : ["output.rendered-snapshot"]),
+      ...(capabilities.agentStatus ? [] : ["activity.agent-status"]),
+      ...(capabilities.agentResult ? [] : ["activity.agent-result"]),
+    ];
+    if (missing.length === 0) return;
+    const error = new Error(
+      `terminal controller must be upgraded before Feishu can own this terminal: missing ${missing.join(", ")} capability`,
     ) as Error & { code?: string };
     error.code = "FEISHU_BRIDGE_UPGRADE_REQUIRED";
     throw error;

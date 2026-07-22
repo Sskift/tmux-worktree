@@ -15,6 +15,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { TerminalControlAgentSource } from "./terminalControl/protocol";
 export const FEISHU_BRIDGE_STORAGE_VERSION = 1;
 export const FEISHU_EVENT_DEDUP_LIMIT = 4096;
 export const FEISHU_TURN_HISTORY_LIMIT = 256;
@@ -22,6 +23,32 @@ export const FEISHU_REPLY_HISTORY_LIMIT = 256;
 
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 export type FeishuReplyMode = "topic" | "direct";
+
+export type FeishuActivityWatchStatus =
+  | "probing"
+  | "armed"
+  | "stop-candidate"
+  | "sending"
+  | "sent"
+  | "uncertain"
+  | "cancelled"
+  | "recovery-required";
+
+export interface FeishuActivityWatch {
+  id: string;
+  status: FeishuActivityWatchStatus;
+  controlEpoch: string;
+  leaseId: string;
+  fence: string;
+  outputGeneration: string;
+  source?: TerminalControlAgentSource;
+  createdAt: string;
+  observedRunningAt?: string;
+  stopCandidateAt?: string;
+  completedAt?: string;
+  messageId?: string;
+  error?: string;
+}
 
 export interface FeishuHandoffRecord {
   handoffId: string;
@@ -57,6 +84,8 @@ export interface FeishuBinding {
   allowedSenderIds: string[];
   createdAt: string;
   createdBy: string;
+  sessionSummary?: string;
+  activityWatch?: FeishuActivityWatch;
   lastActivityAt?: string;
   staleReason?: string;
   handoff?: FeishuHandoffRecord;
@@ -198,7 +227,9 @@ function isBinding(value: unknown): value is StoredFeishuBinding {
   if (!isRecord(value) || !exactKeys(value, [
     "version", "id", "chatId", "chatName", "controlTargetId",
     "sessionName", "status", "options", "allowedSenderIds", "createdAt", "createdBy",
-  ], ["backendBirthId", "lastActivityAt", "staleReason", "handoff"])) return false;
+  ], [
+    "backendBirthId", "sessionSummary", "activityWatch", "lastActivityAt", "staleReason", "handoff",
+  ])) return false;
   if (value.version !== 1 || !isSafeText(value.id) || !isSafeText(value.chatId)
     || !isSafeText(value.chatName) || !isSafeText(value.controlTargetId)
     || (value.backendBirthId !== undefined && !isSafeText(value.backendBirthId))
@@ -216,6 +247,8 @@ function isBinding(value: unknown): value is StoredFeishuBinding {
       && value.options.replyMode !== "direct")) return false;
   return Array.isArray(value.allowedSenderIds)
     && value.allowedSenderIds.every((item) => isSafeText(item))
+    && (value.sessionSummary === undefined || isSafeText(value.sessionSummary))
+    && (value.activityWatch === undefined || isActivityWatch(value.activityWatch))
     && (value.lastActivityAt === undefined || isIso(value.lastActivityAt))
     && (value.staleReason === undefined || isSafeText(value.staleReason))
     && (value.handoff === undefined || isHandoffRecord(value.handoff));
@@ -242,6 +275,62 @@ function isHandoffRecord(value: unknown): value is FeishuHandoffRecord {
     || !isIso(value.drain.recordedAt)) return false;
   return (value.completedAt === undefined || isIso(value.completedAt))
     && (value.error === undefined || isSafeText(value.error, 4096));
+}
+
+function isActivityWatch(value: unknown): value is FeishuActivityWatch {
+  if (!isRecord(value) || !exactKeys(value, [
+    "id", "status", "controlEpoch", "leaseId", "fence", "outputGeneration", "createdAt",
+  ], [
+    "source", "observedRunningAt", "stopCandidateAt", "completedAt", "messageId", "error",
+  ])) return false;
+  const statuses: FeishuActivityWatchStatus[] = [
+    "probing", "armed", "stop-candidate", "sending", "sent", "uncertain", "cancelled",
+    "recovery-required",
+  ];
+  const fieldsValid = [value.id, value.controlEpoch, value.leaseId, value.outputGeneration]
+    .every((item) => isSafeText(item))
+    && statuses.includes(value.status as FeishuActivityWatchStatus)
+    && isDecimal(value.fence)
+    && isIso(value.createdAt)
+    && (value.source === undefined || isAgentSource(value.source))
+    && [value.observedRunningAt, value.stopCandidateAt, value.completedAt]
+      .every((item) => item === undefined || isIso(item))
+    && (value.messageId === undefined || isSafeText(value.messageId))
+    && (value.error === undefined || isSafeText(value.error, 4096));
+  if (!fieldsValid) return false;
+
+  const status = value.status as FeishuActivityWatchStatus;
+  const runningWasObserved = value.observedRunningAt !== undefined;
+  const stopWasObserved = value.stopCandidateAt !== undefined;
+  const hasCompletedAt = value.completedAt !== undefined;
+  const hasError = value.error !== undefined;
+  if ((status === "armed" || status === "stop-candidate" || status === "sending" || status === "sent")
+    && !runningWasObserved) return false;
+  if ((status === "armed" || status === "stop-candidate" || status === "sending" || status === "sent")
+    && value.source === undefined) return false;
+  if ((status === "stop-candidate" || status === "sending" || status === "sent")
+    && !stopWasObserved) return false;
+  if ((status === "sending" || status === "sent" || status === "uncertain"
+      || status === "cancelled" || status === "recovery-required")
+    !== hasCompletedAt) return false;
+  if ((status === "uncertain" || status === "cancelled" || status === "recovery-required")
+    !== hasError) return false;
+  if (status !== "sent" && value.messageId !== undefined) return false;
+  return true;
+}
+
+function isAgentSource(value: unknown): value is TerminalControlAgentSource {
+  if (!isRecord(value) || !exactKeys(
+    value,
+    ["provider", "boundary", "sourceId", "sessionId", "turnId", "startedAt"],
+  )) return false;
+  return (value.provider === "claude" || value.provider === "codex")
+    && (value.boundary === "after" || value.boundary === "inclusive" || value.boundary === "exact")
+    && typeof value.sourceId === "string"
+    && /^[0-9a-f]{64}$/u.test(value.sourceId)
+    && isSafeText(value.sessionId)
+    && isSafeText(value.turnId)
+    && isIso(value.startedAt);
 }
 
 function isCanonicalBase64(value: unknown, maxBytes: number): value is string {

@@ -29,6 +29,7 @@ const {
 } = await import("../dist/larkCliBridge.js");
 const {
   buildFeishuBindingLifecycleCard,
+  buildFeishuLocalTaskResultCard,
   buildFeishuReplyCard,
 } = await import("../dist/feishuReplyCard.js");
 const terminalControl = await import("../dist/terminalControl/index.js");
@@ -43,6 +44,15 @@ class JointTerminalBackend {
     this.nextOutputGeneration = 1;
     this.outputs = new Map();
     this.renderedOutputs = new Map();
+    this.agentRunning = false;
+    this.agentSource = {
+      provider: "claude",
+      boundary: "exact",
+      sourceId: "a".repeat(64),
+      sessionId: "claude-session-one",
+      turnId: "claude-turn-one",
+      startedAt: "2026-07-13T00:00:00.000Z",
+    };
   }
 
   async resolveManagedSession(sessionName) {
@@ -133,6 +143,32 @@ class JointTerminalBackend {
     };
   }
 
+  async agentStatus(managedSession, tmuxInstanceId, outputGeneration, pane) {
+    assert.equal(managedSession.createdAt, this.createdAt);
+    assert.equal(tmuxInstanceId, this.instance);
+    assert.equal(outputGeneration, this.outputGeneration);
+    assert.equal(pane, "0");
+    return {
+      agentRunning: this.agentRunning,
+      ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
+    };
+  }
+
+  async agentResult(managedSession, tmuxInstanceId, outputGeneration, pane, source, maxBytes) {
+    assert.equal(managedSession.createdAt, this.createdAt);
+    assert.equal(tmuxInstanceId, this.instance);
+    assert.equal(outputGeneration, this.outputGeneration);
+    assert.equal(pane, "0");
+    assert.deepEqual(source, this.agentSource);
+    assert.equal(maxBytes, 16 * 1024);
+    return {
+      source: structuredClone(source),
+      completedAt: "2026-07-13T01:00:00.000Z",
+      text: "Structured final answer",
+      truncated: false,
+    };
+  }
+
   appendOutput(controlTargetId, text) {
     const key = `${controlTargetId}:${this.outputGeneration}`;
     const current = this.outputs.get(key) ?? Buffer.alloc(0);
@@ -149,6 +185,21 @@ class FakeControlClient {
     this.output = "";
     this.renderedOutput = undefined;
     this.renderedSnapshotCapability = true;
+    this.agentStatusCapability = true;
+    this.agentResultCapability = true;
+    this.agentRunning = false;
+    this.agentSource = {
+      provider: "claude",
+      boundary: "exact",
+      sourceId: "a".repeat(64),
+      sessionId: "claude-session-one",
+      turnId: "claude-turn-one",
+      startedAt: "2026-07-21T11:00:00.000Z",
+    };
+    this.agentResultText = "The exact structured final answer.";
+    this.agentResultTruncated = false;
+    this.agentResultErrors = [];
+    this.agentStatusErrors = [];
     this.failRelease = false;
     this.failRenew = false;
     this.tailFence = undefined;
@@ -188,7 +239,11 @@ class FakeControlClient {
 
   async capabilities() {
     this.record("ping", {});
-    return { renderedSnapshot: this.renderedSnapshotCapability };
+    return {
+      renderedSnapshot: this.renderedSnapshotCapability,
+      agentStatus: this.agentStatusCapability,
+      agentResult: this.agentResultCapability,
+    };
   }
 
   nextFence() {
@@ -283,6 +338,52 @@ class FakeControlClient {
       throw error;
     }
     return this.ownership();
+  }
+
+  async agentStatus(input) {
+    this.record("activity.agent-status", { input: structuredClone(input) });
+    this.assertLease(input.lease, true);
+    const activityError = this.agentStatusErrors.shift();
+    if (activityError) throw activityError;
+    if (input.outputGeneration !== this.target.outputGeneration || input.pane !== "0") {
+      const error = new Error("stale Agent activity observation");
+      error.code = "STALE_OUTPUT_CURSOR";
+      throw error;
+    }
+    return {
+      controlTargetId: this.target.controlTargetId,
+      controlEpoch: this.target.controlEpoch,
+      leaseId: this.target.leaseId,
+      fence: this.target.fence,
+      ownerKind: "feishu",
+      outputGeneration: this.target.outputGeneration,
+      pane: "0",
+      agentRunning: this.agentRunning,
+      ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
+    };
+  }
+
+  async agentResult(input) {
+    this.record("activity.agent-result", { input: structuredClone(input) });
+    this.assertLease(input.lease, true);
+    const resultError = this.agentResultErrors.shift();
+    if (resultError) throw resultError;
+    assert.equal(input.outputGeneration, this.target.outputGeneration);
+    assert.equal(input.pane, "0");
+    assert.deepEqual(input.source, this.agentSource);
+    return {
+      controlTargetId: this.target.controlTargetId,
+      controlEpoch: this.target.controlEpoch,
+      leaseId: this.target.leaseId,
+      fence: this.target.fence,
+      ownerKind: "feishu",
+      outputGeneration: this.target.outputGeneration,
+      pane: "0",
+      source: structuredClone(this.agentSource),
+      completedAt: "2026-07-21T12:30:00.000Z",
+      text: this.agentResultText,
+      truncated: this.agentResultTruncated,
+    };
   }
 
   async acquireLease(controlTargetId, owner, ttlMs) {
@@ -1076,7 +1177,24 @@ test("binding lifecycle cards keep dynamic session details in plain-text compone
   assert.ok(dynamicTextNodes.every((text) => text.tag === "plain_text"));
 });
 
-test("Feishu ownership activation fails before acquire or handoff when rendered snapshots are unsupported", async () => {
+test("local task result card contains only the structured final answer", () => {
+  const card = buildFeishuLocalTaskResultCard({
+    sessionName: "x-redis-cache",
+    sessionSummary: "Redis cache investigation",
+    text: "Final answer from the structured transcript <at id='all'>",
+    truncated: false,
+  });
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.header.template, "green");
+  assert.equal(card.header.title.content, "tw agent on Redis cache investigation");
+  assert.equal(card.config.summary.content, "TW Agent 回复");
+  assert.equal(card.body.elements[0].tag, "markdown");
+  assert.match(card.body.elements[0].content, /Final answer from the structured transcript/);
+  assert.doesNotMatch(card.body.elements[0].content, /<at\b/i);
+  assert.doesNotMatch(cardText(card), /已结束|完成时间|input footer/i);
+});
+
+test("Feishu ownership activation requires rendered snapshots and structured Agent results", async () => {
   const create = harness();
   try {
     create.control.renderedSnapshotCapability = false;
@@ -1092,6 +1210,22 @@ test("Feishu ownership activation fails before acquire or handoff when rendered 
   } finally {
     await create.bridge.close();
     rmSync(create.root, { recursive: true, force: true });
+  }
+
+  const missingResult = harness();
+  try {
+    missingResult.control.agentResultCapability = false;
+    await assert.rejects(
+      missingResult.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      }),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED"
+        && /activity\.agent-result/.test(error.message),
+    );
+    assert.equal(missingResult.control.target.state, "FREE");
+  } finally {
+    await missingResult.bridge.close();
+    rmSync(missingResult.root, { recursive: true, force: true });
   }
 
   const resume = harness();
@@ -1230,6 +1364,210 @@ test("binding creation and manual unlink announce the committed lifecycle to the
     assert.equal(h.lark.groupCards[1].card.header.template, "grey");
     assert.match(cardText(h.lark.groupCards[1].card), /用户主动解除绑定/);
     assert.deepEqual(observedBindingCounts, [1, 0]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a task already running at bind time posts its structured final answer after it stops", async () => {
+  let now = Date.parse("2026-07-21T12:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "existing local task",
+      createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    assert.equal(binding.activityWatch.status, "armed");
+    assert.equal(h.store.read().turns.length, 0, "an inherited task is not a synthetic Feishu turn");
+    assert.equal(h.control.inputs.length, 0, "arming the watch never writes to the Agent");
+
+    await h.bridge.handleEvent(event({ event_id: "evt-while-local", message_id: "om-while-local" }));
+    assert.equal(h.control.inputs.length, 0, "group input must not interrupt the inherited task");
+    assert.match(h.lark.replies.at(-1).text, /本地 Agent 任务正在运行/);
+
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 0, "running observations do not announce completion");
+    h.control.agentRunning = false;
+    now += 1_000;
+    await h.bridge.pollTurns();
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "stop-candidate");
+    assert.equal(h.lark.groupCards.length, 0, "one stopped sample is debounced");
+
+    now += 1_001;
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards[0].chatId, "oc-one");
+    assert.match(cardText(h.lark.groupCards[0].card), /The exact structured final answer\./);
+    assert.doesNotMatch(cardText(h.lark.groupCards[0].card), /已结束|完整结果请在 TW 中查看/);
+    assert.equal(h.lark.groupCards[0].card.header.title.content, "tw agent on existing local task");
+    assert.match(h.lark.groupCards[0].idempotencyKey, /^tw-[0-9a-f]{40}$/);
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sent");
+    assert.equal(h.control.inputs.length, 0);
+
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 1, "settled watches never resend");
+    await h.bridge.handleEvent(event({ event_id: "evt-after-local", message_id: "om-after-local" }));
+    assert.equal(h.control.inputs.length, 1, "new group turns resume after completion is announced");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an uncertain local-task completion card is never sent twice", async () => {
+  let now = Date.parse("2026-07-21T13:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    now += 1_001;
+    h.lark.failGroupCard = true;
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "uncertain");
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 1, "unknown acknowledgement must not be retried blindly");
+  } finally {
+    h.lark.failGroupCard = false;
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed local-task completion card never blocks terminal lease renewal", async () => {
+  let now = Date.parse("2026-07-21T00:00:00.000Z");
+  const h = harness({ now: () => now });
+  let releaseCard = () => {};
+  const cardBarrier = new Promise((resolve) => { releaseCard = resolve; });
+  let markCardStarted = () => {};
+  const cardStarted = new Promise((resolve) => { markCardStarted = resolve; });
+  let pollPromise;
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    now += 1_001;
+    h.lark.beforeGroupCard = async () => {
+      markCardStarted();
+      await cardBarrier;
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await cardStarted;
+    await h.bridge.renewLeases();
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "lease.renew").length,
+      1,
+      "outbound Feishu I/O must not occupy the terminal mutation lane",
+    );
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sending");
+
+    releaseCard();
+    await pollPromise;
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sent");
+  } finally {
+    releaseCard();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an external non-force handoff waits for inherited Agent completion", async () => {
+  const h = harness();
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    const localOwner = { kind: "dashboard", instanceId: "dashboard:external:pty-one" };
+    const pending = await h.control.beginHandoff(binding.controlTargetId, localOwner);
+
+    await h.bridge.reconcileHandoffs();
+    assert.equal(h.control.target.state, "DRAINING");
+    assert.equal(h.control.target.owner.kind, "feishu");
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "armed");
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "handoff.commit").length,
+      0,
+      "an inherited running task is not a drained Feishu binding",
+    );
+
+    await h.control.withdrawHandoff(binding.controlTargetId, pending.ownership.handoffId, localOwner);
+    await h.bridge.reconcileHandoffs();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("fatal first activity probe leaves committed Feishu ownership stale and visible", async () => {
+  const h = harness();
+  try {
+    const error = new Error("activity probe lost authority");
+    error.code = "PERMISSION_DENIED";
+    h.control.agentStatusErrors.push(error);
+    await assert.rejects(
+      h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      }),
+      /activity probe lost authority/,
+    );
+    const [binding] = h.bridge.snapshot().bindings;
+    assert.equal(binding.status, "stale");
+    assert.equal(binding.activityWatch.status, "recovery-required");
+    assert.match(binding.staleReason, /could not establish Agent activity continuity/);
+    assert.equal(h.control.target.owner.kind, "feishu");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("completion authority mismatch fails closed before a group Card is sent", async () => {
+  let now = Date.parse("2026-07-21T01:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    now += 1_001;
+    const originalAgentStatus = h.control.agentStatus.bind(h.control);
+    h.control.agentStatus = async (input) => {
+      const observation = await originalAgentStatus(input);
+      h.control.target.outputGeneration = "out-fenced-before-completion";
+      return observation;
+    };
+
+    await h.bridge.pollTurns();
+    const [binding] = h.bridge.snapshot().bindings;
+    assert.equal(binding.status, "stale");
+    assert.equal(binding.activityWatch.status, "recovery-required");
+    assert.equal(h.lark.groupCards.length, 0);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -1617,6 +1955,32 @@ test("Dashboard binding creation atomically hands its lease to Feishu and requir
   }
 });
 
+test("Dashboard handoff arms completion watch for an already running local Agent", async () => {
+  const h = harness();
+  try {
+    h.control.target.state = "HELD";
+    h.control.target.owner = { kind: "dashboard", instanceId: "dashboard-one:pty-one" };
+    h.control.target.leaseId = "lease-dashboard";
+    h.control.target.expiresAt = new Date(Date.now() + 60_000).toISOString();
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+      dashboardLease: h.control.lease(),
+    });
+
+    assert.equal(binding.status, "active");
+    assert.equal(binding.activityWatch.status, "armed");
+    assert.equal(h.control.target.owner.kind, "feishu");
+    assert.equal(h.control.inputs.length, 0);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("an uncertain lease release leaves the binding stale instead of pretending to be paused", async () => {
   const h = harness();
   try {
@@ -1654,6 +2018,27 @@ test("lease renewal carries the full canonical token and failure fences an activ
     assert.equal(state.bindings[0].status, "stale");
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.equal(h.lark.replies.length, 0);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("lease renewal failure settles an inherited task watch as recovery-required", async () => {
+  const h = harness();
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    h.control.failRenew = true;
+
+    await h.bridge.renewLeases();
+
+    const [binding] = h.bridge.snapshot().bindings;
+    assert.equal(binding.status, "stale");
+    assert.equal(binding.activityWatch.status, "recovery-required");
+    assert.match(binding.activityWatch.error, /lease renewal failed/);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -2422,10 +2807,12 @@ test("explicit takeover cancellation drains before normal handoff and return rev
     assert.equal(h.store.read().turns.at(-1).status, "cancelled");
     assert.equal(h.store.read().bindings[0].status, "paused");
 
+    h.control.agentRunning = true;
     await h.bridge.returnBinding(binding.id, dashboardLease);
     assert.equal(h.control.target.owner.kind, "feishu");
     assert.equal(h.control.target.fence, "3");
     assert.equal(h.store.read().bindings[0].status, "active");
+    assert.equal(h.store.read().bindings[0].activityWatch.status, "armed");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -2500,9 +2887,11 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
       capabilities: [
         "binding.lifecycle-notices.v1",
         "binding.create.session-summary.v1",
-        "binding.target-reconciliation.v1",
-        "binding.reply-mode.v1",
-      ],
+          "binding.target-reconciliation.v1",
+          "binding.reply-mode.v1",
+          "binding.activity-completion.v1",
+          "binding.structured-agent-result.v1",
+        ],
     });
     await assert.rejects(
       client.request("bridge.info", { extra: true }),

@@ -245,5 +245,56 @@
       "pane": "0",
       "maxBytes": 131072
     }
+  },
+  {
+    "name": "observe-fenced-feishu-agent-status",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-agent-status-1",
+      "type": "activity.agent-status",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "feishu",
+          "instanceId": "feishu-binding:binding-1:daemon-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "outputGeneration": "output-example-1",
+      "pane": "0"
+    }
+  },
+  {
+    "name": "extract-fenced-feishu-agent-result",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-agent-result-1",
+      "type": "activity.agent-result",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "feishu",
+          "instanceId": "feishu-binding:binding-1:daemon-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "outputGeneration": "output-example-1",
+      "pane": "0",
+      "source": {
+        "provider": "claude",
+        "boundary": "exact",
+        "sourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sessionId": "claude-session-example-1",
+        "turnId": "claude-turn-example-1",
+        "startedAt": "2026-07-13T00:00:10.000Z"
+      },
+      "maxBytes": 16384
+    }
   }
 ]

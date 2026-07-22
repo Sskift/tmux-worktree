@@ -9,7 +9,9 @@
         "protocolVersion": 1,
         "authority": "local-terminal-control",
         "capabilities": [
-          "output.rendered-snapshot"
+          "output.rendered-snapshot",
+          "activity.agent-status",
+          "activity.agent-result"
         ]
       }
     }
@@ -103,6 +105,60 @@
         "outputGeneration": "output-example-1",
         "pane": "0",
         "dataBase64": "cmVuZGVyZWQK",
+        "truncated": false
+      }
+    }
+  },
+  {
+    "name": "fenced-feishu-agent-status",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-agent-status-1",
+      "ok": true,
+      "result": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "ownerKind": "feishu",
+        "outputGeneration": "output-example-1",
+        "pane": "0",
+        "agentRunning": true,
+        "source": {
+          "provider": "claude",
+          "boundary": "exact",
+          "sourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sessionId": "claude-session-example-1",
+          "turnId": "claude-turn-example-1",
+          "startedAt": "2026-07-13T00:00:10.000Z"
+        }
+      }
+    }
+  },
+  {
+    "name": "fenced-feishu-agent-result",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-agent-result-1",
+      "ok": true,
+      "result": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "ownerKind": "feishu",
+        "outputGeneration": "output-example-1",
+        "pane": "0",
+        "source": {
+          "provider": "claude",
+          "boundary": "exact",
+          "sourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sessionId": "claude-session-example-1",
+          "turnId": "claude-turn-example-1",
+          "startedAt": "2026-07-13T00:00:10.000Z"
+        },
+        "completedAt": "2026-07-13T00:00:45.000Z",
+        "text": "Exact structured final response",
         "truncated": false
       }
     }

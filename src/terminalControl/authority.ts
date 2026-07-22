@@ -8,8 +8,11 @@ import type {
   TerminalControlRequest,
 } from "./protocol";
 import {
+  TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT,
+  TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS,
   TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
   TERMINAL_CONTROL_DEFAULT_LEASE_TTL_MS,
+  TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
   TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
   TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TerminalControlProtocolError,
@@ -551,7 +554,11 @@ export class TerminalControlAuthority {
       return {
         protocolVersion: 1,
         authority: "local-terminal-control",
-        capabilities: [TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT],
+        capabilities: [
+          TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
+          TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS,
+          TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT,
+        ],
       };
     }
     if (request.type === "target.resolve") return this.resolveTarget(request.sessionName);
@@ -635,6 +642,22 @@ export class TerminalControlAuthority {
         request.lease,
         request.outputGeneration,
         request.pane,
+        request.maxBytes,
+      );
+    }
+    if (request.type === "activity.agent-status") {
+      return this.agentStatus(
+        request.lease,
+        request.outputGeneration,
+        request.pane,
+      );
+    }
+    if (request.type === "activity.agent-result") {
+      return this.agentResult(
+        request.lease,
+        request.outputGeneration,
+        request.pane,
+        request.source,
         request.maxBytes,
       );
     }
@@ -1392,6 +1415,106 @@ export class TerminalControlAuthority {
         pane,
         dataBase64: snapshot.dataBase64,
         truncated: snapshot.truncated,
+      };
+    });
+  }
+
+  private async agentStatus(
+    lease: TerminalControlLease,
+    outputGeneration: string,
+    pane: string,
+  ): Promise<unknown> {
+    return this.locked(async (state) => {
+      const target = targetById(state, lease.controlTargetId);
+      if (lease.owner.kind !== "feishu") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "agent status observations require the exact Feishu owner",
+        );
+      }
+      await this.assertTargetCurrent(state, target);
+      validateLease(state, target, lease, { allowDraining: true });
+      if (pane !== "0") {
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
+      if (outputGeneration !== target.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "agent status observation was fenced by an output generation change",
+        );
+      }
+      const activity = await this.backend.agentStatus(
+        target.managedSession,
+        target.backend.tmuxInstanceId,
+        outputGeneration,
+        pane,
+      );
+      return {
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        leaseId: lease.leaseId,
+        fence: target.ownership.fence,
+        ownerKind: "feishu",
+        outputGeneration,
+        pane,
+        agentRunning: activity.agentRunning,
+        ...(activity.source === undefined ? {} : { source: activity.source }),
+      };
+    });
+  }
+
+  private async agentResult(
+    lease: TerminalControlLease,
+    outputGeneration: string,
+    pane: string,
+    source: import("./protocol").TerminalControlAgentSource,
+    maxBytes = TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
+  ): Promise<unknown> {
+    return this.locked(async (state) => {
+      const target = targetById(state, lease.controlTargetId);
+      if (lease.owner.kind !== "feishu") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "Agent final response extraction requires the exact Feishu owner",
+        );
+      }
+      await this.assertTargetCurrent(state, target);
+      validateLease(state, target, lease, { allowDraining: true });
+      if (pane !== "0") {
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
+      if (outputGeneration !== target.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "Agent final response extraction was fenced by an output generation change",
+        );
+      }
+      const result = await this.backend.agentResult(
+        target.managedSession,
+        target.backend.tmuxInstanceId,
+        outputGeneration,
+        pane,
+        source,
+        maxBytes,
+      );
+      return {
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        leaseId: lease.leaseId,
+        fence: target.ownership.fence,
+        ownerKind: "feishu",
+        outputGeneration,
+        pane,
+        source: result.source,
+        completedAt: result.completedAt,
+        text: result.text,
+        truncated: result.truncated,
       };
     });
   }

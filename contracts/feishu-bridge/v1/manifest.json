@@ -36,10 +36,12 @@
       "binding.lifecycle-notices.v1",
       "binding.create.session-summary.v1",
       "binding.target-reconciliation.v1",
-      "binding.reply-mode.v1"
+      "binding.reply-mode.v1",
+      "binding.activity-completion.v1",
+      "binding.structured-agent-result.v1"
     ],
-    "rollingUpgrade": "a Dashboard may reuse a daemon only when the selected larkProfile and required capabilities match; an empty daemon missing required capabilities may be shut down and replaced; an occupied daemon missing only binding.reply-mode.v1 remains available for status, canonical removal, and topic-mode creation that omits replyMode, while direct creation and binding.update fail with FEISHU_BRIDGE_UPGRADE_REQUIRED; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
-    "legacyCreate": "topic-mode creation may use an occupied daemon missing only binding.reply-mode.v1 by omitting replyMode; direct creation fails with FEISHU_BRIDGE_UPGRADE_REQUIRED; never send fields unsupported by an old closed binding.create parser"
+    "rollingUpgrade": "a Dashboard may reuse a daemon for new or resumed Feishu ownership only when the selected larkProfile and required capabilities match; an empty daemon missing required capabilities may be shut down and replaced; an occupied older daemon remains available for status, canonical removal, and controlled takeover, but create/resume/repair/return fail with FEISHU_BRIDGE_UPGRADE_REQUIRED when binding.structured-agent-result.v1 is missing; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
+    "legacyCreate": "new binding creation requires binding.structured-agent-result.v1; never send fields unsupported by an old closed binding.create parser"
   },
   "eventSource": {
     "command": "lark-cli event consume im.message.receive_v1 --as bot --quiet",
@@ -71,7 +73,7 @@
     "startMarkerTemplate": "[[notify-group:<persisted-turn-nonce>]]",
     "endMarkerTemplate": "[[/notify-group:<persisted-turn-nonce>]]",
     "rawMarkerRole": "raw generation-fenced output is used only to detect a closed current-turn nonce and is never sent as card content",
-    "controllerCapability": "binding create/resume/repair/return must prove terminal-control advertises output.rendered-snapshot before acquiring or accepting Feishu ownership; every authorized inbound turn repeats the proof before event dedup or terminal input so a rolled-back controller cannot receive a prompt that the Bridge cannot safely render",
+    "controllerCapability": "binding create/resume/repair/return must prove terminal-control advertises output.rendered-snapshot, activity.agent-status, and activity.agent-result before acquiring or accepting Feishu ownership; every authorized inbound turn repeats the rendered-snapshot proof before event dedup or terminal input so a rolled-back controller cannot receive a prompt that the Bridge cannot safely render",
     "renderedExtraction": "after raw close detection, extract public text only from a bounded terminal-control rendered snapshot fenced by the exact Feishu lease, pane, control epoch, fence, and output generation; an incomplete snapshot never falls back to raw terminal text",
     "renderedObservationFailure": "bounded resource exhaustion, controller-internal capture failure, and ordinary transport failure remain read-only observations and retry until the turn inactivity deadline; permission, target, generation, protocol, or correlation failures immediately make the turn recovery-required and never send a card",
     "promptEchoSafe": true,
@@ -91,6 +93,16 @@
     "uncertainTargetState": "recovery, transport failure, or a new controlTargetId caused only by unknown controller continuity remains fail-closed and is not announced as deletion or replacement",
     "delivery": "best-effort ordered effect lane with deterministic idempotency; notification latency or failure never blocks lease renewal or rolls back terminal ownership or binding state"
   },
+  "localTaskCompletion": {
+    "capability": "binding.structured-agent-result.v1",
+    "scope": "when Feishu first acquires or regains an exact binding lease, a lease-, generation-, and pane-fenced activity.agent-status observation arms a persisted watch only after Claude or Codex is observed running with an exact structured transcript source",
+    "busyPolicy": "while an inherited local task watch is active, new group messages are acknowledged as busy and are never injected into the running Agent",
+    "settlement": "two stopped observations separated by at least one second complete the watch; a later running observation clears a stop candidate",
+    "delivery": "after earlier binding lifecycle effects settle, an independent outbound lane uses lark-cli im +messages-send to post one top-level Card JSON 2.0 final-answer card with a deterministic idempotency key; Feishu network latency never occupies the terminal mutation lane, and topic/direct reply placement does not apply because there is no source Feishu message",
+    "content": "activity.agent-result extracts only the exact final assistant text from the correlated Claude or Codex structured transcript. Terminal rendering, tool calls/results, composer content, status/footer text, and inferred answers are never eligible card content; a bounded long answer is explicitly marked truncated",
+    "unknownAcknowledgement": "persist uncertain, mark the binding stale, and never retry blindly",
+    "restart": "a sending watch becomes uncertain; an armed watch remains dormant while the binding is paused/stale and is re-correlated when controlled ownership returns to Feishu"
+  },
   "reactions": {
     "processing": "Typing",
     "success": "remove Typing; the reply card is the success signal",
@@ -104,7 +116,7 @@
     "directoryMode": "0700",
     "atomicReplace": true,
     "failClosed": true,
-    "bindingReplyModeMigration": "a version 1 binding missing options.replyMode is read as topic and the next write persists it explicitly; unknown fields and unknown reply modes remain malformed state; after replyMode is written, an older strict daemon fails closed on downgrade instead of silently changing the configured mode",
+    "bindingReplyModeMigration": "a version 1 binding missing options.replyMode is read as topic and the next write persists it explicitly; sessionSummary and activityWatch are optional additive binding fields; unknown fields, unknown reply modes, and unknown activity watch states remain malformed state; after newer fields are written, an older strict daemon fails closed on downgrade instead of silently changing behavior",
     "handoffDrainPersistedBeforeCommit": true,
     "utf8TailRemainderPersisted": true,
     "files": [
@@ -125,7 +137,7 @@
     "turnIdleTimeoutMs": 600000,
     "turnTimeoutCompatibility": "turnTimeoutMs is retained as the v1 manifest compatibility key; it now denotes the same consecutive no-output interval as turnIdleTimeoutMs, not a total Agent runtime budget",
     "turnDeadlinePolicy": "deadlineAt begins ten minutes after accepted input and slides ten minutes after every newly observed byte under the same control target, epoch, generation, and fence; polling performs one final fenced output observation before declaring inactivity",
-    "completionPolicy": "agent-running UI hints never authorize delivery; only the exact closed turn marker extracted from a correlated rendered snapshot can complete and send an Agent reply",
+    "completionPolicy": "group-originated turns still require the exact closed public marker extracted from a correlated rendered snapshot. An inherited running-to-stopped watch may send only the exact activity.agent-result final assistant text from its persisted structured transcript source; terminal capture is never a fallback.",
     "maxPromptBytes": 16384,
     "maxReplyBytes": 16384,
     "maxTurnOutputBytes": 131072

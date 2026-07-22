@@ -268,6 +268,39 @@ export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 
 export type FeishuReplyMode = "topic" | "direct";
 
+export type FeishuActivityWatchStatus =
+  | "probing"
+  | "armed"
+  | "stop-candidate"
+  | "sending"
+  | "sent"
+  | "uncertain"
+  | "cancelled"
+  | "recovery-required";
+
+export type FeishuActivityWatch = {
+  id: string;
+  status: FeishuActivityWatchStatus;
+  controlEpoch: string;
+  leaseId: string;
+  fence: string;
+  outputGeneration: string;
+  source?: {
+    provider: "claude" | "codex";
+    boundary: "after" | "inclusive" | "exact";
+    sourceId: string;
+    sessionId: string;
+    turnId: string;
+    startedAt: string;
+  };
+  createdAt: string;
+  observedRunningAt?: string;
+  stopCandidateAt?: string;
+  completedAt?: string;
+  messageId?: string;
+  error?: string;
+};
+
 export type FeishuBinding = {
   version: 1;
   id: string;
@@ -286,6 +319,8 @@ export type FeishuBinding = {
   allowedSenderIds: string[];
   createdAt: string;
   createdBy: string;
+  sessionSummary?: string;
+  activityWatch?: FeishuActivityWatch;
   lastActivityAt?: string;
   staleReason?: string;
 };

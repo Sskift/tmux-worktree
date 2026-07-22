@@ -17,6 +17,13 @@ export interface FeishuBindingLifecycleCardInput {
   sessionSummary?: string;
 }
 
+export interface FeishuLocalTaskResultCardInput {
+  sessionName: string;
+  sessionSummary?: string;
+  text: string;
+  truncated: boolean;
+}
+
 function neutralizeCardMentions(value: string): string {
   return value.replace(/<\/?at\b/gi, (tag) => `<\u200b${tag.slice(1)}`);
 }
@@ -74,6 +81,67 @@ export function buildFeishuReplyCard(
         text_align: "left",
         text_size: "normal",
       }],
+    },
+  };
+}
+
+/**
+ * Build the top-level result card for a task that was already running when
+ * the group binding was created. The text comes from the Agent's structured
+ * transcript, never from terminal rendering, composer state, or tool logs.
+ */
+export function buildFeishuLocalTaskResultCard(
+  input: FeishuLocalTaskResultCardInput,
+): FeishuReplyCard {
+  const titleContext = input.sessionSummary?.trim() || input.sessionName;
+  const elements: Record<string, unknown>[] = [{
+    tag: "markdown",
+    content: neutralizeCardMentions(input.text),
+    text_align: "left",
+    text_size: "normal",
+  }];
+  if (input.truncated) {
+    elements.push({ tag: "hr" }, {
+      tag: "div",
+      text: {
+        tag: "plain_text",
+        content: "最终回答过长，卡片仅展示前半部分；完整内容请在 TW 中查看。",
+        text_align: "left",
+        text_color: "grey",
+        text_size: "notation",
+      },
+    });
+  }
+  return {
+    schema: "2.0",
+    config: {
+      update_multi: true,
+      compact_width: false,
+      enable_forward: true,
+      streaming_mode: false,
+      summary: { content: "TW Agent 回复" },
+    },
+    header: {
+      template: "green",
+      icon: {
+        tag: "standard_icon",
+        token: "done_outlined",
+        color: "green",
+      },
+      title: {
+        tag: "plain_text",
+        content: `tw agent on ${conciseCardContext(titleContext)}`,
+        text_align: "left",
+      },
+    },
+    body: {
+      direction: "vertical",
+      horizontal_spacing: "8px",
+      vertical_spacing: "8px",
+      horizontal_align: "left",
+      vertical_align: "top",
+      padding: "16px 20px 16px 20px",
+      elements,
     },
   };
 }
