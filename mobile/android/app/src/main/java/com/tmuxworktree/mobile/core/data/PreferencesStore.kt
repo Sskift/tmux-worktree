@@ -954,6 +954,31 @@ class PreferencesStore internal constructor(
         return updated
     }
 
+    /**
+     * Exact-profile connect consent CAS: flips `autoConnect` to true only when the stored profile
+     * still equals [expectedProfile] in every field (including `autoConnect == false`), and
+     * returns the consented profile. Any drift — endpoint, host, lineage, or an already-consented
+     * profile — leaves the durable value untouched.
+     */
+    internal suspend fun consentRelayV2AutoConnect(
+        expectedProfile: RelayV2Profile,
+    ): RelayV2Profile? {
+        var consented: RelayV2Profile? = null
+        store.edit { preferences ->
+            if (selfRevokeJournal(preferences) != null) return@edit
+            if (activationJournal(preferences)?.phase?.let {
+                    it != RelayV2ProfileActivationPhase.PREPARED
+                } == true
+            ) return@edit
+            val current = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            if (current != null && current == expectedProfile && !current.autoConnect) {
+                preferences[Keys.relayV2AutoConnect] = true
+                consented = current.copy(autoConnect = true)
+            }
+        }
+        return consented
+    }
+
     suspend fun getOrCreateRelayV2ClientInstanceId(): String {
         var resolved = ""
         store.edit { preferences ->
@@ -1172,4 +1197,8 @@ internal class PreferencesRelayV2ProfileStore(
         expectedVersion = expectedVersion,
         newVersion = newVersion,
     )
+
+    override suspend fun consentRelayV2AutoConnect(
+        expectedProfile: RelayV2Profile,
+    ): RelayV2Profile? = preferencesStore.consentRelayV2AutoConnect(expectedProfile)
 }

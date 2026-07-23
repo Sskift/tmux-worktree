@@ -717,6 +717,81 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `connect consent CAS writes only for the exact durable profile and survives reopen`() =
+        runBlocking {
+            val directory = Files.createTempDirectory("relay-v2-connect-consent")
+            val file = directory.resolve("preferences.preferences_pb").toFile()
+            val target = relayV2Profile()
+            try {
+                withPreferencesStore(file) { preferences ->
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    preferences.saveProfile(
+                        relayUrl = "wss://legacy.example.com/client",
+                        hostId = "legacy-host",
+                        autoConnect = true,
+                    )
+                    val previous = requireNotNull(store.activeProfileIdentity())
+                    val prepared = requireNotNull(
+                        store.prepareRelayV2Activation(
+                            expectedActiveProfile = previous,
+                            operationId = "activation-connect-consent",
+                            profile = target,
+                            targetBindingDigest = "binding-connect-consent",
+                            targetCredentialAttemptId = "attempt-connect-consent",
+                            targetCredentialSecretReference = "secret-connect-consent",
+                            barrierId = "barrier-connect-consent",
+                            previousCredentialReference = null,
+                        ),
+                    )
+                    val ready = requireNotNull(
+                        store.markRelayV2CredentialReady(
+                            prepared.operationId,
+                            RelayV2CompletedCredentialProof(
+                                credentialReference = target.credentialReference,
+                                credentialVersion = target.credentialVersion + 1,
+                                bindingDigest = prepared.targetBindingDigest,
+                                completedAttemptId = prepared.targetCredentialAttemptId,
+                                completedSecretReference = prepared.targetCredentialSecretReference,
+                            ),
+                        ),
+                    )
+                    val activated = requireNotNull(
+                        store.activateRelayV2Profile(
+                            ready,
+                            target.copy(credentialVersion = ready.targetCredentialVersion),
+                        ),
+                    )
+                    assertFalse(activated.autoConnect)
+
+                    // Same identity fields but drifted endpoint/host data must not write.
+                    assertEquals(
+                        null,
+                        store.consentRelayV2AutoConnect(activated.copy(hostId = "drifted-host")),
+                    )
+                    assertEquals(
+                        null,
+                        store.consentRelayV2AutoConnect(
+                            activated.copy(relayUrl = "wss://drifted.example.com/client"),
+                        ),
+                    )
+                    assertFalse(requireNotNull(store.activeRelayV2Profile()).autoConnect)
+
+                    val consented = requireNotNull(store.consentRelayV2AutoConnect(activated))
+                    assertEquals(activated.copy(autoConnect = true), consented)
+
+                    // A stale pre-consent snapshot can no longer match or rewrite.
+                    assertEquals(null, store.consentRelayV2AutoConnect(activated))
+                }
+                withPreferencesStore(file) { preferences ->
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    assertTrue(requireNotNull(store.activeRelayV2Profile()).autoConnect)
+                }
+            } finally {
+                directory.toFile().deleteRecursively()
+            }
+        }
+
+    @Test
     fun `startup admission closes pending and incompatible recovery without exchange`() =
         runBlocking {
             val pending = Harness()
@@ -3058,6 +3133,21 @@ class RelayV2ProfileRepositoryTest {
             storedActiveIdentity = updated.identity
             persistedValues = persistedValues + ("credentialVersion" to newVersion)
             return true
+        }
+
+        override suspend fun consentRelayV2AutoConnect(
+            expectedProfile: RelayV2Profile,
+        ): RelayV2Profile? {
+            if (selfRevokeJournal != null) return null
+            if (journal?.phase?.let { it != RelayV2ProfileActivationPhase.PREPARED } == true) {
+                return null
+            }
+            val current = storedActiveV2 ?: return null
+            if (current != expectedProfile || current.autoConnect) return null
+            val updated = current.copy(autoConnect = true)
+            storedActiveV2 = updated
+            persistedValues = persistedValues + ("autoConnect" to true)
+            return updated
         }
     }
 

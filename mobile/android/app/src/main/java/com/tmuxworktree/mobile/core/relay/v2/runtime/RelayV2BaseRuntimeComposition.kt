@@ -280,6 +280,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val retryDelay: suspend (Long) -> Unit = { delay(it) },
     private val actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
     private val beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
+    private val beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
     private val beforeSessionProjectionPublish: suspend () -> Unit = {},
     private val beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
     private val afterRetryableFailureAdmissionDetached: () -> Unit = {},
@@ -303,6 +304,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val outboxTimelineRevisionLock = Any()
     private val agentTimelineRevisionLock = Any()
     private var reconnectEnabled = profile.autoConnect
+    private var terminalRecoveryReady = false
     private var retryFence: Any = Any()
     private var connectionAttemptJob: Job? = null
     private var retryAttempt = 0
@@ -446,6 +448,7 @@ internal class RelayV2BaseRuntimeComposition(
             }
         }
         pumpScope.launch {
+            beforeTerminalRecoveryAdmission()
             val recovered = try {
                 terminalRuntime.recoverBeforeAdmission()
             } catch (cancelled: CancellationException) {
@@ -455,8 +458,14 @@ internal class RelayV2BaseRuntimeComposition(
             }
             if (!recovered) {
                 failRuntimeIncomplete("TERMINAL_POST_COMMIT_RECOVERY_FAILED")
-            } else if (profile.autoConnect) {
-                startInitialConnectionAttempt()
+            } else {
+                // Recovery completion and explicit connect share the same single-attempt claim
+                // under connectionLock; auto-start is just the claim observing armed consent.
+                val attempt = synchronized(connectionLock) {
+                    terminalRecoveryReady = true
+                    claimConnectionAttemptLocked()
+                }
+                attempt?.start()
             }
         }
     }
@@ -929,20 +938,55 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
-    private fun startInitialConnectionAttempt() {
+    /**
+     * Single connection-attempt claim shared by post-recovery auto-start and explicit connect.
+     * Caller must hold [connectionLock]. Returns the lazy attempt job, or null when recovery is
+     * not ready, connects are fenced, or an attempt/admission is already owned.
+     */
+    private fun claimConnectionAttemptLocked(): Job? {
+        val fence = retryFence
+        if (!terminalRecoveryReady || !canConnectLocked(fence)) return null
+        if (connectionAttemptJob != null ||
+            pendingOutboxAdmission != null ||
+            boundOutboxAdmission != null
+        ) {
+            return null
+        }
+        val job = pumpScope.launch(start = CoroutineStart.LAZY) {
+            connectOnce(fence, currentCoroutineContext()[Job]!!)
+        }
+        trackConnectionAttemptLocked(job)
+        return job
+    }
+
+    /**
+     * Explicit user connect/retry for this exact profile after the durable CAS owner persisted
+     * `autoConnect=true`. The full-profile compare, consent re-arm, and single-attempt claim are
+     * one [connectionLock] critical section, so a concurrent credential rollover cannot make a
+     * retry resurrect a stale profile. While durable terminal recovery is still pending this only
+     * persists/arm consent without opening a socket; recovery completion starts the attempt
+     * exactly once through the same claim. Returns false — without mutating, re-arming, or
+     * starting anything — when the profile is not this composition's exact profile or the runtime
+     * is already closed/terminally failed.
+     */
+    internal fun connectExplicitly(consentedProfile: RelayV2Profile): Boolean {
+        var accepted = false
         val attempt = synchronized(connectionLock) {
-            val fence = retryFence
-            if (!canConnectLocked(fence)) return@synchronized null
-            check(connectionAttemptJob == null) {
-                "Relay v2 connection attempt already exists"
+            if (!consentedProfile.autoConnect ||
+                closed.get() || terminalFailure.get() != null ||
+                consentedProfile != profile.copy(autoConnect = true)
+            ) {
+                return@synchronized null
             }
-            val job = pumpScope.launch(start = CoroutineStart.LAZY) {
-                connectOnce(fence, currentCoroutineContext()[Job]!!)
-            }
-            trackConnectionAttemptLocked(job)
-            job
+            profile = consentedProfile
+            reconnectEnabled = true
+            retryAttempt = 0
+            retryStateFence = null
+            accepted = true
+            claimConnectionAttemptLocked()
         }
         attempt?.start()
+        return accepted
     }
 
     private suspend fun connectOnce(expectedFence: Any, expectedJob: Job) {

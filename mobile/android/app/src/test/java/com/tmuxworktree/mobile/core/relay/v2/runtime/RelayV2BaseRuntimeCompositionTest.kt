@@ -1004,6 +1004,89 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `explicit connect shares one recovery-gated claim with auto-start`() = runBlocking {
+        data class Case(
+            val name: String,
+            val autoConnect: Boolean,
+            val explicitProfiles: List<(RelayV2Profile) -> RelayV2Profile>,
+            val expectedAccepted: List<Boolean>,
+        )
+        val cases = listOf(
+            Case(
+                name = "recovery pending arms consent then starts exactly once",
+                autoConnect = false,
+                explicitProfiles = listOf({ it.copy(autoConnect = true) }),
+                expectedAccepted = listOf(true),
+            ),
+            Case(
+                name = "version drift is rejected without arming",
+                autoConnect = false,
+                explicitProfiles = listOf(
+                    { it.copy(credentialVersion = it.credentialVersion + 1, autoConnect = true) },
+                    { it.copy(autoConnect = true) },
+                ),
+                expectedAccepted = listOf(false, true),
+            ),
+            Case(
+                name = "duplicate explicit calls claim once",
+                autoConnect = false,
+                explicitProfiles = listOf(
+                    { it.copy(autoConnect = true) },
+                    { it.copy(autoConnect = true) },
+                ),
+                expectedAccepted = listOf(true, true),
+            ),
+            Case(
+                name = "auto-connect and early explicit retry do not double open",
+                autoConnect = true,
+                explicitProfiles = listOf({ it.copy(autoConnect = true) }),
+                expectedAccepted = listOf(true),
+            ),
+        )
+        cases.forEach { case ->
+            val recoveryGate = CompletableDeferred<Unit>()
+            val harness = Harness(
+                autoConnect = case.autoConnect,
+                beforeTerminalRecoveryAdmission = { recoveryGate.await() },
+            )
+            try {
+                case.explicitProfiles.forEachIndexed { index, explicit ->
+                    assertEquals(
+                        "${case.name}: call $index",
+                        case.expectedAccepted[index],
+                        harness.composition.connectExplicitly(explicit(harness.profile)),
+                    )
+                }
+                // Recovery still pending: consent may be armed, but no socket is opened.
+                assertEquals(
+                    "${case.name}: no socket before recovery",
+                    null,
+                    withTimeoutOrNull(200) {
+                        while (harness.factory.transports.isEmpty()) delay(1)
+                        harness.factory.transports.single()
+                    },
+                )
+
+                recoveryGate.complete(Unit)
+
+                harness.connectOnline()
+                assertEquals(
+                    case.name,
+                    RelayV2BaseRuntimePhase.ONLINE,
+                    harness.composition.state.value.phase,
+                )
+                assertEquals(
+                    "${case.name}: exactly one socket",
+                    null,
+                    withTimeoutOrNull(200) { harness.awaitTransport(1) },
+                )
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
     fun `host presence suspends cached state snapshots gaps once and rehandshakes`() = runBlocking {
         val harness = Harness(autoConnect = true)
         try {
@@ -2461,6 +2544,7 @@ class RelayV2BaseRuntimeCompositionTest {
         retryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
         actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { millis -> delay(millis) },
         beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
+        beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
         beforeSessionProjectionPublish: suspend () -> Unit = {},
         beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
         afterRetryableFailureAdmissionDetached: () -> Unit = {},
@@ -2540,6 +2624,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 retryDelay = retryDelayBlock,
                 actorRecoveryWatchdogDelay = actorRecoveryWatchdogDelay,
                 beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
+                beforeTerminalRecoveryAdmission = beforeTerminalRecoveryAdmission,
                 beforeSessionProjectionPublish = beforeSessionProjectionPublish,
                 beforeOnlineResyncReceiptSubmit = beforeOnlineResyncReceiptSubmit,
                 afterRetryableFailureAdmissionDetached =

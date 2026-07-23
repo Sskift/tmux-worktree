@@ -678,6 +678,10 @@ class V2ViewModel(
 
     fun retryConnection() {
         if (demoMode) return
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            connectRelayV2ActiveProfile()
+            return
+        }
         connectedConfigKey = null
         connectActiveProfile(force = true)
     }
@@ -1409,16 +1413,21 @@ class V2ViewModel(
             expectedUrl = null,
             updateProfileExpectation = false,
         ) {
-            val admission = requireRelayV2ProfileRuntime().admitStartup()
+            val runtime = requireRelayV2ProfileRuntime()
+            val admission = runtime.admitStartup()
             check(admission.state == RelayStartupAdmissionState.RELAY_V2)
             val admittedProfile = requireNotNull(admission.relayV2Profile)
             check(admittedProfile == expectedProfile) {
                 "Confirmed Relay v2 profile changed before activation"
             }
+            // The explicit second Connect is the exact-profile connect consent; the runtime is
+            // started from the profile returned by the durable CAS owner.
+            val consentedProfile = runtime.consentAutoConnect(admittedProfile)
+                ?: error("Relay v2 connect consent was rejected by the profile owner")
             container.legacyIdentityImporter.discardForV2Profile()
             applyStartupAdmission(admission)
             try {
-                startRelayV2BaseRuntime(admittedProfile)
+                startRelayV2BaseRuntime(consentedProfile)
             } catch (failure: Throwable) {
                 applyStartupAdmission(
                     RelayStartupAdmission(
@@ -1428,6 +1437,41 @@ class V2ViewModel(
                     ),
                 )
                 throw failure
+            }
+        }
+    }
+
+    /**
+     * Explicit Connect/Retry for the admitted Relay v2 profile after a cold restart with
+     * `autoConnect=false`: persists exact-profile consent through the CAS owner, then enters the
+     * existing v2 composition owner (or starts it from the consented profile). Never touches the
+     * Relay v1 path.
+     */
+    private fun connectRelayV2ActiveProfile() {
+        viewModelScope.launch {
+            trackProfileMutation(
+                expectedUrl = null,
+                updateProfileExpectation = false,
+            ) {
+                val runtime = requireRelayV2ProfileRuntime()
+                val admission = runtime.admitStartup()
+                if (admission.state != RelayStartupAdmissionState.RELAY_V2) {
+                    return@trackProfileMutation
+                }
+                val admittedProfile = requireNotNull(admission.relayV2Profile)
+                // Consent already persisted only needs the composition owner; otherwise the
+                // explicit Connect/Retry persists exact-profile consent through the CAS owner.
+                val consentedProfile = if (admittedProfile.autoConnect) {
+                    admittedProfile
+                } else {
+                    runtime.consentAutoConnect(admittedProfile) ?: return@trackProfileMutation
+                }
+                val composition = synchronized(relayV2UiFenceLock) { relayV2Composition }
+                if (composition == null) {
+                    startRelayV2BaseRuntime(consentedProfile)
+                } else {
+                    composition.connectExplicitly(consentedProfile)
+                }
             }
         }
     }

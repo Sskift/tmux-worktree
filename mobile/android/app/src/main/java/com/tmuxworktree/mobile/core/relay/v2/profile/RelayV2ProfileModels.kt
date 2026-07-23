@@ -364,6 +364,11 @@ internal interface RelayV2ProfileStore {
         expectedVersion: Long,
         newVersion: Long,
     ): Boolean
+
+    /** Exact-profile CAS that persists user connect consent and returns the consented profile. */
+    suspend fun consentRelayV2AutoConnect(
+        expectedProfile: RelayV2Profile,
+    ): RelayV2Profile?
 }
 
 /** Exact-CAS durable owner for the default-off self-revoke quarantine foundation. */

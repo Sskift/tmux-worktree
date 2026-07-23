@@ -175,6 +175,13 @@ internal class RelayV2ProfileRuntimeAdapter(
         repository.refreshActiveCredential()
     }
 
+    /** Exact-profile connect consent; never starts a socket by itself. */
+    suspend fun consentAutoConnect(
+        expectedProfile: RelayV2Profile,
+    ): RelayV2Profile? = profileMutationCoordinator.mutate {
+        repository.consentAutoConnect(expectedProfile)
+    }
+
     suspend fun selfRevokeActiveProfile(): RelayV2SelfRevokeResult =
         profileMutationCoordinator.mutate {
             repository.selfRevokeActiveProfile()

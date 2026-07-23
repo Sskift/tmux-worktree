@@ -1307,6 +1307,19 @@ internal class RelayV2ProfileRepository(
         return credentialReconciler.reconcileActive()
     }
 
+    /**
+     * Explicit user connect consent for the exact active profile. Persists `autoConnect=true`
+     * through the store CAS owner; performs no exchange or transport work. The CAS compares the
+     * whole profile before writing, so any drift refuses the write instead of persisting consent
+     * for a different profile.
+     */
+    suspend fun consentAutoConnect(
+        expectedProfile: RelayV2Profile,
+    ): RelayV2Profile? = credentialMutationMutex.withLock {
+        requireNoSelfRevokeJournal()
+        profileStore.consentRelayV2AutoConnect(expectedProfile)
+    }
+
     suspend fun prepareRefresh(
         profile: RelayV2Profile,
     ): RelayV2PreparedRefresh = credentialMutationMutex.withLock {
