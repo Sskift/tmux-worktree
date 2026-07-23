@@ -52,6 +52,76 @@ function hostHello() {
   };
 }
 
+function clientHello(requestId = randomUUID()) {
+  return {
+    protocolVersion: 2,
+    kind: "request",
+    type: "client.hello",
+    requestId,
+    hostId: HOST_ID,
+    payload: {
+      clientInstanceId: "android-install",
+      capabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+      requiredCapabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+      resume: null,
+    },
+  };
+}
+
+function hostWelcome(requestId, hostEpoch, hostInstanceId) {
+  return {
+    protocolVersion: 2,
+    kind: "response",
+    type: "host.welcome",
+    requestId,
+    hostId: HOST_ID,
+    hostEpoch,
+    hostInstanceId,
+    payload: {
+      selectedVersion: 2,
+      capabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+      eventSeq: "0",
+      resumeDisposition: "snapshot_required",
+      resumeReason: "fresh",
+      commandDedupeWindow: {
+        windowId: randomUUID(),
+        windowSeq: "1",
+        acceptUntilMs: NOW_MS + 60_000,
+        queryUntilMs: NOW_MS + 600_000,
+      },
+      limits: {
+        commandResultRetentionMs: 86_400_000,
+        commandDedupeRetentionMs: 604_800_000,
+        maxCommandQueryIds: 32,
+        stateSnapshotChunkBytes: 524_288,
+        stateSnapshotChunkRecords: 256,
+        stateSnapshotMaxBytes: 268_435_456,
+        stateSnapshotMaxRecords: 100_000,
+        stateSnapshotIdleLeaseMs: 300_000,
+        stateSnapshotMaxLifetimeMs: 3_600_000,
+        stateSnapshotMaxPinnedPerPrincipal: 2,
+        stateSnapshotMaxPinnedPerHost: 16,
+        stateSnapshotPinnedBytesPerHost: 536_870_912,
+        stateSnapshotPinnedMetadataBytesPerHost: 16_777_216,
+        stateSnapshotChunkMaxJsonKeys: 8_192,
+        stateSnapshotChunkMaxJsonNodes: 16_384,
+        terminalReplayBytesPerStream: 4_194_304,
+        terminalReplayBytesPerHost: 67_108_864,
+        terminalDetachedLeaseMs: 120_000,
+        terminalControlDedupeRetentionMs: 600_000,
+        terminalMaxUnackedBytes: 524_288,
+        terminalMaxFrameBytes: 65_536,
+        terminalInputDedupeEntriesPerStream: 512,
+        terminalResizeDedupeEntriesPerStream: 256,
+        terminalMaxStreamsPerHost: 256,
+        terminalControlRecordsPerHost: 4_096,
+        brokerRouteBufferedBytesPerDirection: 1_048_576,
+        brokerRouteLowWaterBytesPerDirection: 524_288,
+      },
+    },
+  };
+}
+
 function clientTerminalAck(streamId = randomUUID()) {
   return {
     protocolVersion: 2,
@@ -879,6 +949,60 @@ test("only current uncompressed text reaches Broker; invalid and stale input fai
     { opcode: "text", compressed: false },
   ).accepted, false);
   assert.equal(forwarded.length, 1);
+});
+
+test("handshake deadlines arm on welcome, switch on accepted hello, cancel on host.welcome", async () => {
+  const scenarios = [
+    { id: "hello-timeout", hello: false, welcome: false, firesAtMs: 5_000 },
+    { id: "welcome-timeout", hello: true, welcome: false, firesAtMs: 10_000 },
+    { id: "completed", hello: true, welcome: true, firesAtMs: null },
+  ];
+  for (const scenario of scenarios) {
+    const h = await createClientHarness({ connectionId: `client-handshake-${scenario.id}` });
+    let helloRequestId = null;
+    if (scenario.hello) {
+      helloRequestId = randomUUID();
+      assert.equal(h.registration.receive(
+        publicBytes(clientHello(helloRequestId)),
+        { opcode: "text", compressed: false },
+      ).accepted, true, scenario.id);
+      assert.equal(
+        h.scheduler.runNext(5_000),
+        false,
+        `${scenario.id}: accepted client.hello cancels the 5s deadline`,
+      );
+    }
+    if (scenario.welcome) {
+      const welcome = enqueueHostData(h, hostWelcome(
+        helloRequestId,
+        h.host.hello.payload.hostEpoch,
+        h.host.hello.payload.hostInstanceId,
+      ));
+      await welcome.result;
+      await settleReadyTurns();
+      assert.equal(h.socket.state.sends.length, 1, scenario.id);
+      h.socket.state.sends[0].complete("delivered");
+      await settleReadyTurns();
+      assert.equal(h.scheduler.runNext(5_000), false, scenario.id);
+      assert.equal(h.scheduler.runNext(10_000), false, scenario.id);
+      assert.equal(h.socket.state.closes.length, 0, scenario.id);
+      assert.equal(h.registration.receive(
+        publicBytes(clientHello()),
+        { opcode: "text", compressed: false },
+      ).accepted, true, scenario.id);
+      assert.equal(
+        h.scheduler.runNext(10_000),
+        false,
+        `${scenario.id}: a late accepted client.hello never restarts the deadline`,
+      );
+      assert.equal(h.socket.state.closes.length, 0, scenario.id);
+      continue;
+    }
+    assert.equal(h.scheduler.runNext(scenario.firesAtMs), true, scenario.id);
+    assert.deepEqual(h.socket.state.closes, [
+      { code: 4408, reason: "handshake_timeout" },
+    ], scenario.id);
+  }
 });
 
 test("managed client transport consumes the coordinator incarnation lease exactly once", async () => {

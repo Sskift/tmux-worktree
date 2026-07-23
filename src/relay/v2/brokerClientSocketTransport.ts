@@ -23,10 +23,19 @@ import {
   consumeRelayV2BrokerClientTransportCloseLease,
   type RelayV2BrokerTransportCloseLease,
 } from "./brokerTransportCloseCoordinator.js";
-import { encodeRelayV2WebSocketFrame } from "./codec.js";
+import {
+  decodeRelayV2WebSocketFrame,
+  encodeRelayV2WebSocketFrame,
+} from "./codec.js";
 
 const DEFAULT_DELIVERY_TIMEOUT_MS = 5_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
+const HANDSHAKE_CLIENT_HELLO_TIMEOUT_MS = 5_000;
+const HANDSHAKE_HOST_WELCOME_TIMEOUT_MS = 10_000;
+const HANDSHAKE_TIMEOUT_CLOSE_CODE = 4_408;
+const HANDSHAKE_TIMEOUT_CLOSE_REASON = "handshake_timeout";
+const HANDSHAKE_TIMER_FAILURE_CLOSE_CODE = 1_013;
+const HANDSHAKE_TIMER_FAILURE_CLOSE_REASON = "client_handshake_timer_failure";
 
 export type RelayV2BrokerClientSocketEffectReceipt = "applied" | "rejected";
 export type RelayV2BrokerClientSocketWriteCompletion = "delivered" | "rejected";
@@ -141,6 +150,7 @@ type CapturedSocket = {
 type OutboundAttempt = {
   readonly deliveryId: string;
   readonly token: string;
+  readonly frameType: string | null;
   cancelDeadline: (() => void) | null;
   deadlineArmed: boolean;
   deadlineFiredEarly: boolean;
@@ -161,6 +171,11 @@ type ClientEntry = {
   readonly socket: CapturedSocket;
   readonly managed: boolean;
   phase: "open" | "closing" | "closed";
+  handshakePhase:
+    | "awaiting_relay_welcome"
+    | "awaiting_client_hello"
+    | "awaiting_host_welcome"
+    | "complete";
   routeOpened: boolean;
   paused: boolean;
   pauseTransition: Readonly<{ token: string; desired: boolean }> | null;
@@ -171,6 +186,7 @@ type ClientEntry = {
   lastAutoReadyEpoch: string | null;
   readyTurnQueued: boolean;
   closeDeadline: CloseDeadline | null;
+  handshakeDeadline: CloseDeadline | null;
   terminalWriteToken: string | null;
   closeRequested: boolean;
   forceDestroyRequested: boolean;
@@ -232,6 +248,31 @@ function positiveBounded(
 
 function rejectedBrokerResult(): RelayV2BrokerResult {
   return { accepted: false, actions: [] };
+}
+
+/**
+ * Reads only the discriminating frame type through the safe public decoder;
+ * any decode failure or non-string type simply yields no handshake signal and
+ * never alters codec or forward failure semantics.
+ */
+function decodePublicFrameType(bytes: Uint8Array): string | null {
+  try {
+    const decoded: unknown = decodeRelayV2WebSocketFrame("public", bytes, {
+      opcode: "text",
+      compressed: false,
+    });
+    if (decoded === null || typeof decoded !== "object" || isRejectedProxy(decoded)) {
+      return null;
+    }
+    const frame = Reflect.get(decoded, "frame");
+    if (frame === null || typeof frame !== "object" || isRejectedProxy(frame)) {
+      return null;
+    }
+    const type = Reflect.get(frame, "type");
+    return typeof type === "string" ? type : null;
+  } catch {
+    return null;
+  }
 }
 
 function captureSocket(port: unknown): CapturedSocket | undefined {
@@ -408,6 +449,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
       socket,
       managed: lease !== undefined,
       phase: "open",
+      handshakePhase: "awaiting_relay_welcome",
       routeOpened: false,
       paused: false,
       pauseTransition: null,
@@ -418,6 +460,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
       lastAutoReadyEpoch: null,
       readyTurnQueued: false,
       closeDeadline: null,
+      handshakeDeadline: null,
       terminalWriteToken: null,
       closeRequested: false,
       forceDestroyRequested: false,
@@ -678,6 +721,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
     const attempt: OutboundAttempt = {
       deliveryId,
       token,
+      frameType: decodePublicFrameType(bytes),
       cancelDeadline: null,
       deadlineArmed: false,
       deadlineFiredEarly: false,
@@ -786,6 +830,23 @@ implements RelayV2BrokerManagedClientSocketTransport {
       this.beginBoundedClose(entry, 1013, "client_delivery_ack_rejected");
       return;
     }
+    // Only a delivered and Core-acknowledged relay.welcome/host.welcome moves
+    // the frozen client handshake deadline state; duplicate or late signals
+    // never restart a one-shot deadline.
+    if (
+      attempt.frameType === "relay.welcome"
+      && entry.handshakePhase === "awaiting_relay_welcome"
+    ) {
+      entry.handshakePhase = "awaiting_client_hello";
+      this.armHandshakeDeadline(entry, HANDSHAKE_CLIENT_HELLO_TIMEOUT_MS);
+    } else if (
+      attempt.frameType === "host.welcome"
+      && entry.handshakePhase === "awaiting_host_welcome"
+    ) {
+      entry.handshakePhase = "complete";
+      this.clearHandshakeDeadline(entry, true);
+    }
+    if (!this.isCurrentOpen(entry)) return;
     // An asynchronous socket completion is one real progress edge. A
     // completion invoked inside send() only acknowledges this frame; it cannot
     // recursively manufacture progress and must wait for writable().
@@ -827,6 +888,87 @@ implements RelayV2BrokerManagedClientSocketTransport {
     }
   }
 
+  private armHandshakeDeadline(entry: ClientEntry, delayMs: number): boolean {
+    this.clearHandshakeDeadline(entry, false);
+    if (!this.isCurrentOpen(entry)) return false;
+    const deadline: CloseDeadline = {
+      token: randomUUID(),
+      cancel: null,
+      armed: false,
+      firedEarly: false,
+    };
+    entry.handshakeDeadline = deadline;
+    try {
+      const cancel = this.scheduler.schedule(delayMs, () => {
+        if (!deadline.armed) {
+          deadline.firedEarly = true;
+          return;
+        }
+        this.handshakeDeadlineElapsed(entry, deadline.token);
+      });
+      if (typeof cancel !== "function") {
+        throw new Error("invalid Relay v2 handshake deadline cancellation receipt");
+      }
+      deadline.cancel = cancel;
+      deadline.armed = true;
+    } catch {
+      if (entry.handshakeDeadline === deadline) entry.handshakeDeadline = null;
+      // Local scheduler infrastructure failure is not a handshake timeout.
+      this.beginBoundedClose(
+        entry,
+        HANDSHAKE_TIMER_FAILURE_CLOSE_CODE,
+        HANDSHAKE_TIMER_FAILURE_CLOSE_REASON,
+      );
+      return false;
+    }
+    if (deadline.firedEarly) {
+      this.handshakeDeadlineElapsed(entry, deadline.token);
+      return false;
+    }
+    return true;
+  }
+
+  private handshakeDeadlineElapsed(entry: ClientEntry, token: string): void {
+    const deadline = entry.handshakeDeadline;
+    if (
+      !deadline
+      || deadline.token !== token
+      || !deadline.armed
+      || !this.isCurrentOpen(entry)
+    ) return;
+    this.clearHandshakeDeadline(entry, false);
+    this.beginBoundedClose(
+      entry,
+      HANDSHAKE_TIMEOUT_CLOSE_CODE,
+      HANDSHAKE_TIMEOUT_CLOSE_REASON,
+    );
+  }
+
+  /**
+   * Token-scoped cancellation. Cleanup paths swallow a hostile cancellation
+   * receipt; handshake transition paths fail closed instead of letting a
+   * failed cancel leave a live stale deadline behind.
+   */
+  private clearHandshakeDeadline(entry: ClientEntry, failClosed: boolean): boolean {
+    const deadline = entry.handshakeDeadline;
+    entry.handshakeDeadline = null;
+    const cancel = deadline?.cancel;
+    if (!cancel) return true;
+    try {
+      Reflect.apply(cancel, undefined, []);
+      return true;
+    } catch {
+      if (failClosed && this.isCurrentOpen(entry)) {
+        this.beginBoundedClose(
+          entry,
+          HANDSHAKE_TIMER_FAILURE_CLOSE_CODE,
+          HANDSHAKE_TIMER_FAILURE_CLOSE_REASON,
+        );
+      }
+      return false;
+    }
+  }
+
   private receive(
     entry: ClientEntry,
     source: unknown,
@@ -861,8 +1003,9 @@ implements RelayV2BrokerManagedClientSocketTransport {
       this.beginBoundedClose(entry, 4400, "invalid_client_frame");
       return result;
     }
+    let forwarded: RelayV2BrokerResult;
     try {
-      return this.runEntryBrokerCall(entry, () => (
+      forwarded = this.runEntryBrokerCall(entry, () => (
         this.broker.forwardClientFrame(entry.connectionId, bytes)
       ));
     } catch {
@@ -870,6 +1013,19 @@ implements RelayV2BrokerManagedClientSocketTransport {
       this.beginBoundedClose(entry, 1013, "client_frame_dispatch_failure");
       return result;
     }
+    // Only the first accepted inbound client.hello switches the deadline from
+    // the hello budget to the welcome budget; later hellos are inert here.
+    if (
+      forwarded.accepted
+      && entry.handshakePhase === "awaiting_client_hello"
+      && decodePublicFrameType(bytes) === "client.hello"
+    ) {
+      entry.handshakePhase = "awaiting_host_welcome";
+      if (this.clearHandshakeDeadline(entry, true) && this.isCurrentOpen(entry)) {
+        this.armHandshakeDeadline(entry, HANDSHAKE_HOST_WELCOME_TIMEOUT_MS);
+      }
+    }
+    return forwarded;
   }
 
   private runEntryBrokerCall<Result extends RelayV2BrokerResult>(
@@ -1038,6 +1194,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
     entry.phase = "closing";
     entry.pendingReadyFence = null;
     entry.pauseTransition = null;
+    this.clearHandshakeDeadline(entry, false);
     if (entry.outbound) this.cancelDeliveryDeadline(entry.outbound);
     entry.outbound = null;
     this.unbindOnce(entry, reason === "route_unavailable" ? "broker_shutdown" : "protocol_error");
@@ -1285,6 +1442,7 @@ implements RelayV2BrokerManagedClientSocketTransport {
     if (entry.phase === "closed") return;
     entry.phase = "closed";
     this.cancelCloseDeadline(entry);
+    this.clearHandshakeDeadline(entry, false);
     if (entry.outbound) this.cancelDeliveryDeadline(entry.outbound);
     entry.outbound = null;
     entry.pendingReadyFence = null;
