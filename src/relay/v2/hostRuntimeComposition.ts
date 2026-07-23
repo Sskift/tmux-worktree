@@ -508,8 +508,6 @@ function captureRuntimeAuthorities(
   h1RecoveryCandidate: RelayV2HostCommandPlaneReadinessCandidate;
   h2RecoveryCandidate: RelayV2HostH2RecoveryCandidate;
   h3RecoveryCandidate: RelayV2HostH3RecoveryCandidate;
-  nextDedupeWindowBounds: RelayV2HostRuntimeActualAuthorityInput["nextDedupeWindowBounds"];
-  nextDedupeWindowBoundsReceiver: object;
 }> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const fields = [
@@ -517,7 +515,6 @@ function captureRuntimeAuthorities(
     "h1RecoveryCandidate",
     "h2RecoveryCandidate",
     "h3RecoveryCandidate",
-    "nextDedupeWindowBounds",
   ] as const;
   const descriptors: Partial<Record<typeof fields[number], PropertyDescriptor>> = {};
   try {
@@ -529,8 +526,6 @@ function captureRuntimeAuthorities(
   } catch {
     return null;
   }
-  const nextDedupeWindowBounds = descriptors.nextDedupeWindowBounds!.value;
-  if (typeof nextDedupeWindowBounds !== "function") return null;
   return Object.freeze({
     h0: descriptors.h0!.value as RelayV2HostH0ReadinessPort,
     h1RecoveryCandidate: descriptors.h1RecoveryCandidate!.value as
@@ -539,8 +534,6 @@ function captureRuntimeAuthorities(
       RelayV2HostH2RecoveryCandidate,
     h3RecoveryCandidate: descriptors.h3RecoveryCandidate!.value as
       RelayV2HostH3RecoveryCandidate,
-    nextDedupeWindowBounds,
-    nextDedupeWindowBoundsReceiver: value,
   });
 }
 
@@ -793,19 +786,12 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
     await abandonConstruction();
     throw error;
   }
-  const nextDedupeWindowBounds = capturedAuthorities.nextDedupeWindowBounds;
-  const nextDedupeWindowBoundsReceiver = capturedAuthorities.nextDedupeWindowBoundsReceiver;
   const runtimeAuthorities: RelayV2HostRuntimeActualAuthorityInput = Object.freeze({
     h0: h0Activation.runtimeH0,
     h1: h1Activation,
     h2: h2Activation.runtimeH2,
     snapshotSpool: h2Activation.snapshotSpool,
     h3: h3Activation.runtimeH3,
-    nextDedupeWindowBounds: () => Reflect.apply(
-      nextDedupeWindowBounds,
-      nextDedupeWindowBoundsReceiver,
-      [],
-    ),
   });
   let runtime: RelayV2HostRuntime;
   try {

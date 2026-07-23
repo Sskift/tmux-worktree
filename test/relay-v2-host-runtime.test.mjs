@@ -2706,10 +2706,6 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
       h2,
       snapshotSpool: spool,
       h3,
-      nextDedupeWindowBounds: () => ({
-        acceptUntilMs: now + 60_000,
-        queryUntilMs: now + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-      }),
     });
     const sent = [];
     const closes = [];

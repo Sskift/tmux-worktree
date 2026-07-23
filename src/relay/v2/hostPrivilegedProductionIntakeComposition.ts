@@ -151,7 +151,6 @@ const CANONICAL_REQUIRED_KEYS = Object.freeze([
   "process",
   "terminalBackend",
   "localProcessTarget",
-  "nextDedupeWindowBounds",
 ] as const);
 const CANONICAL_OPTIONAL_KEYS = Object.freeze([
   "terminalControl",
@@ -343,9 +342,7 @@ function captureCanonicalOptions(value: unknown): CapturedCanonicalOptions | nul
     CANONICAL_REQUIRED_KEYS,
     CANONICAL_OPTIONAL_KEYS,
   );
-  if (fields === null
-    || typeof fields.nextDedupeWindowBounds !== "function"
-    || rejectedProxy(fields.nextDedupeWindowBounds)) return null;
+  if (fields === null) return null;
   const closeSpool = captureDataMethod(fields.recoveredH2Spool, "close");
   const closeHostState = captureDataMethod(fields.hostState, "close");
   if (closeSpool === null || closeHostState === null) return null;

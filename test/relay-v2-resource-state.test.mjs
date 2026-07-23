@@ -1498,10 +1498,7 @@ async function openCommandPlane(h, executor, options = {}) {
 }
 
 async function issueWindow(h, plane) {
-  return plane.issueDedupeWindow({
-    acceptUntilMs: h.now() + 60_000,
-    queryUntilMs: h.now() + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-  });
+  return plane.issueDedupeWindow();
 }
 
 test("H2 resolution cuts are re-fenced inside H1 final admission", async (t) => {

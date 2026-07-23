@@ -300,8 +300,6 @@ export interface RelayV2HostRuntimeActualAuthorityInput {
     RelayV2TerminalManager,
     "open" | "requestReplay" | "acknowledgeOutput" | "input" | "resize" | "close" | "unbind"
   >;
-  /** Synchronous local policy; no H0/H1 call is permitted from this callback. */
-  nextDedupeWindowBounds(): { acceptUntilMs: number; queryUntilMs: number };
 }
 
 export interface RelayV2HostRuntimeAuthorityPorts {
@@ -336,7 +334,7 @@ export function createRelayV2HostRuntimeAuthorityPorts(
       query: (auth: RelayV2CommandAuthContext, frame: RelayV2JsonObject) => (
         input.h1.query(auth, frame)
       ),
-      issueDedupeWindow: () => input.h1.issueDedupeWindow(input.nextDedupeWindowBounds()),
+      issueDedupeWindow: () => input.h1.issueDedupeWindow(),
     }),
     resources: Object.freeze({
       linearizeWelcome: (

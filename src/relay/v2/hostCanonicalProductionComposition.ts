@@ -80,10 +80,6 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
   readonly process: RelayV2StructuredProcessPort;
   readonly terminalBackend: RelayV2TerminalByteBackend;
   readonly localProcessTarget: Readonly<{ kind: "local"; targetId: string }>;
-  readonly nextDedupeWindowBounds: () => {
-    acceptUntilMs: number;
-    queryUntilMs: number;
-  };
   readonly terminalControl?: Readonly<{
     daemonSocketPath?: string;
     remoteCompoundChannels: RelayV2RemoteExactCompoundChannelFactoryV1;
@@ -313,7 +309,6 @@ function validateOptions(
     && isRecord(options.localProcessTarget)
     && options.localProcessTarget.kind === "local"
     && typeof options.localProcessTarget.targetId === "string"
-    && typeof options.nextDedupeWindowBounds === "function"
     && (options.agentTranscriptLifecycle === undefined
       || (isRecord(options.agentTranscriptLifecycle)
         && isRecord(options.agentTranscriptLifecycle.store)
@@ -509,7 +504,6 @@ export async function openRelayV2HostCanonicalProductionComposition(
           h1RecoveryCandidate: h1Candidate,
           h2RecoveryCandidate: h2.h2RecoveryCandidate,
           h3RecoveryCandidate: h3Candidate,
-          nextDedupeWindowBounds: options.nextDedupeWindowBounds,
         }),
         welcome: options.welcome,
         ...(optionalExtension === null ? {} : { optionalExtension }),

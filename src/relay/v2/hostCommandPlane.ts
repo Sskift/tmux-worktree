@@ -26,6 +26,14 @@ export const RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_RESULT_RETENTION_MS = 86_400_000;
 export const RELAY_V2_COMMAND_DEDUPE_RETENTION_MS = 604_800_000;
+/**
+ * Fixed H1 lifetime acceptance policy: a dedupe window admits new commands
+ * for 15 minutes from issuance and remains queryable until 7 days after its
+ * accept deadline (`acceptUntilMs + RELAY_V2_COMMAND_DEDUPE_RETENTION_MS`).
+ * The command plane is the sole owner of these bounds; callers cannot inject
+ * a different accept or query lifetime.
+ */
+export const RELAY_V2_COMMAND_ACCEPT_WINDOW_MS = 900_000;
 
 const COMMAND_RECORD_SCHEMA_VERSION = 1 as const;
 const COMMAND_WINDOW_REVISION_KEY = "command-windows";
@@ -397,10 +405,7 @@ export interface RelayV2HostH1ReadinessActivation {
     auth: RelayV2CommandAuthContext,
     frame: RelayV2JsonObject,
   ): Promise<RelayV2JsonObject>;
-  issueDedupeWindow(input: {
-    acceptUntilMs: number;
-    queryUntilMs: number;
-  }): Promise<RelayV2CommandDedupeWindow>;
+  issueDedupeWindow(): Promise<RelayV2CommandDedupeWindow>;
   /** Stops admission and withdraws synchronously, then drains admitted calls. */
   close(): Promise<void>;
 }
@@ -2095,15 +2100,11 @@ export class RelayV2HostCommandPlane {
     return plane;
   }
 
-  async issueDedupeWindow(input: {
-    acceptUntilMs: number;
-    queryUntilMs: number;
-  }): Promise<RelayV2CommandDedupeWindow> {
+  async issueDedupeWindow(): Promise<RelayV2CommandDedupeWindow> {
     const now = this.now();
-    if (!isSafeTime(input.acceptUntilMs)
-      || !isSafeTime(input.queryUntilMs)
-      || input.acceptUntilMs < now
-      || input.queryUntilMs < input.acceptUntilMs + RELAY_V2_COMMAND_DEDUPE_RETENTION_MS) {
+    const acceptUntilMs = now + RELAY_V2_COMMAND_ACCEPT_WINDOW_MS;
+    const queryUntilMs = acceptUntilMs + RELAY_V2_COMMAND_DEDUPE_RETENTION_MS;
+    if (!isSafeTime(acceptUntilMs) || !isSafeTime(queryUntilMs)) {
       throw new TypeError("Relay v2 command dedupe window retention is invalid");
     }
     const commit = await this.store.transaction((transaction) => {
@@ -2115,8 +2116,8 @@ export class RelayV2HostCommandPlane {
         hostEpoch: transaction.hostEpoch,
         windowId,
         windowSeq,
-        acceptUntilMs: input.acceptUntilMs,
-        queryUntilMs: input.queryUntilMs,
+        acceptUntilMs,
+        queryUntilMs,
       };
       transaction.putMaterializedRecord(windowStorageKey(windowId), cloneJson(window) as unknown as RelayV2HostJson);
       return window;
@@ -3346,10 +3347,10 @@ function createRecoveredH1Facade(
       binding.plane,
       [auth, frame],
     )),
-    issueDedupeWindow: (input) => invoke(() => Reflect.apply(
+    issueDedupeWindow: () => invoke(() => Reflect.apply(
       recoveredH1OriginalMethods.issueDedupeWindow,
       binding.plane,
-      [input],
+      [],
     )),
     close: beginClose,
   };

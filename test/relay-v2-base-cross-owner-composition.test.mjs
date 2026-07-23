@@ -691,13 +691,6 @@ test("isolated base-v2 composition crosses activated Broker and canonical manage
             h1RecoveryCandidate,
             h2RecoveryCandidate,
             h3RecoveryCandidate,
-            nextDedupeWindowBounds() {
-              const acceptUntilMs = NOW_MS + 86_400_000;
-              return {
-                acceptUntilMs,
-                queryUntilMs: acceptUntilMs + 7 * 86_400_000,
-              };
-            },
           },
           welcome: {
             build(input) {

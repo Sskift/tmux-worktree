@@ -192,9 +192,6 @@ async function makeHarness(label, { fresh = false } = {}) {
     process: { async execute() { throw new Error("unexpected process execution"); } },
     terminalBackend: { async open() { throw new Error("unexpected terminal open"); } },
     localProcessTarget: { kind: "local", targetId: "local" },
-    nextDedupeWindowBounds() {
-      return { acceptUntilMs: 1_800_000_000_000, queryUntilMs: 1_800_086_400_000 };
-    },
     terminalControl: {
       daemonSocketPath: socketPath,
       remoteCompoundChannels: {

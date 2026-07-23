@@ -257,9 +257,6 @@ async function makeHarness(label, home) {
       },
     },
     localProcessTarget: { kind: "local", targetId: "local" },
-    nextDedupeWindowBounds() {
-      return { acceptUntilMs: 1_800_000_000_000, queryUntilMs: 1_800_086_400_000 };
-    },
     terminalControl: {
       daemonSocketPath: socketPath,
       remoteCompoundChannels: {
@@ -337,7 +334,6 @@ function bareCanonicalOptions() {
     process: {},
     terminalBackend: {},
     localProcessTarget: {},
-    nextDedupeWindowBounds() { return {}; },
   };
 }
 

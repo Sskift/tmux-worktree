@@ -324,10 +324,7 @@ async function setup(h, executor, recover = true, resource = fakeResourceMutatio
     recover,
   });
   const snapshot = await store.read();
-  const window = await plane.issueDedupeWindow({
-    acceptUntilMs: h.now() + 60_000,
-    queryUntilMs: h.now() + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-  });
+  const window = await plane.issueDedupeWindow();
   return { store, plane, snapshot, window, resource };
 }
 
@@ -708,6 +705,30 @@ test("host epoch mismatch is rejected before resolution and leaves the command l
     const after = await configured.store.read();
     assert.equal(after.commitSeq, before.commitSeq);
     assert.deepEqual({ ...after.commands }, {});
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("dedupe window issuance fails closed when the fixed bounds exceed safe time", async () => {
+  const h = harness();
+  try {
+    const configured = await setup(h, fakeExecutor().executor);
+    const before = await configured.store.read();
+    const windowsBefore = Object.keys(before.materialized)
+      .filter((key) => key.startsWith("cmdwin:"));
+    h.setNow(Number.MAX_SAFE_INTEGER - 1);
+    await assert.rejects(
+      configured.plane.issueDedupeWindow(),
+      (error) => error instanceof TypeError
+        && error.message === "Relay v2 command dedupe window retention is invalid",
+    );
+    const after = await configured.store.read();
+    assert.equal(after.commitSeq, before.commitSeq);
+    assert.deepEqual(
+      Object.keys(after.materialized).filter((key) => key.startsWith("cmdwin:")),
+      windowsBefore,
+    );
   } finally {
     h.cleanup();
   }
@@ -1490,10 +1511,7 @@ test("query distinguishes retry, reissue, expired result, and unknown evidence",
     assert.equal(expiredExecuteResponse.error.code, "COMMAND_WINDOW_EXPIRED");
     assert.equal(fake.calls.resolve.length, 0);
 
-    const replacementWindow = await configured.plane.issueDedupeWindow({
-      acceptUntilMs: h.now() + 60_000,
-      queryUntilMs: h.now() + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const replacementWindow = await configured.plane.issueDedupeWindow();
     const replacement = commandFrame(
       "command-execute-kill-session",
       configured.snapshot.hostEpoch,

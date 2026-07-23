@@ -236,10 +236,7 @@ async function seedCompletedCommand(ctx, executor, suffix = "seed") {
     recover: false,
   });
   const snapshot = await ctx.store.read();
-  const window = await plane.issueDedupeWindow({
-    acceptUntilMs: BASE_TIME + 60_000,
-    queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-  });
+  const window = await plane.issueDedupeWindow();
   const frame = commandFrame(snapshot.hostEpoch, window.windowId, suffix);
   const response = await plane.execute(auth(), frame);
   assert.equal(response.payload.state, "succeeded");
@@ -290,10 +287,7 @@ test("recovered H1 authority audits one final cut and exposes only three capture
       });
     }
 
-    const issued = await activation.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 120_000,
-      queryUntilMs: BASE_TIME + 120_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const issued = await activation.issueDedupeWindow();
     assert.equal(typeof issued.windowId, "string");
 
     const query = await activation.query(auth(), queryFrame(
@@ -375,10 +369,7 @@ test("recovery-time prototype mutation cannot replace the captured H1 authority"
     const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
-    const window = await activation.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 60_000,
-      queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const window = await activation.issueDedupeWindow();
     const result = await activation.execute(
       auth(),
       commandFrame(snapshot.hostEpoch, window.windowId, "prototype-fence"),
@@ -521,10 +512,7 @@ test("recovered opening settles a residual RUNNING record before issuing its aud
       recover: false,
     });
     const snapshot = await ctx.store.read();
-    const window = await rawPlane.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 60_000,
-      queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const window = await rawPlane.issueDedupeWindow();
     const frame = commandFrame(snapshot.hostEpoch, window.windowId, "residual-running");
     const oldCall = rawPlane.execute(auth(), frame);
     await waitFor(async () => Object.values((await ctx.store.read()).commands).some(
@@ -671,10 +659,7 @@ test("ordinary TypeError and safely finalized command failures do not withdraw H
     const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
-    const window = await activation.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 60_000,
-      queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const window = await activation.issueDedupeWindow();
 
     const resolutionFailure = await activation.execute(
       auth(),
@@ -729,10 +714,7 @@ test("exact command-plane StateError withdraws H1 before its rejection is observ
     const activation = activate(ctx, candidate, sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
-    const window = await activation.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 60_000,
-      queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const window = await activation.issueDedupeWindow();
     fatal = true;
     const visible = activation.execute(
       auth(),
@@ -863,10 +845,7 @@ test("publication StateError survives ordinary fencing failure and withdraws bef
     const activation = activate(ctx, candidate, sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
-    const window = await activation.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 60_000,
-      queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const window = await activation.issueDedupeWindow();
     const frame = fixture("command-execute-create-terminal");
     frame.expectedHostEpoch = snapshot.hostEpoch;
     frame.payload.dedupeWindowId = window.windowId;
@@ -899,10 +878,7 @@ test("close withdraws synchronously, returns one barrier, and drains an already 
     const activation = activate(ctx, candidate, readiness.sink);
     assert.notEqual(activation, null);
     const snapshot = await ctx.store.read();
-    const window = await activation.issueDedupeWindow({
-      acceptUntilMs: BASE_TIME + 60_000,
-      queryUntilMs: BASE_TIME + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
-    });
+    const window = await activation.issueDedupeWindow();
 
     const admitted = activation.execute(
       auth(),

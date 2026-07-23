@@ -142,9 +142,6 @@ function baseAuthorities(h2RecoveryCandidate, hostEpoch, hostInstanceId, overrid
     h1RecoveryCandidate: overrides.h1RecoveryCandidate,
     h2RecoveryCandidate,
     h3RecoveryCandidate: overrides.h3RecoveryCandidate,
-    nextDedupeWindowBounds: overrides.nextDedupeWindowBounds ?? function () {
-      throw new Error("unexpected dedupe policy");
-    },
   };
 }
 
@@ -744,23 +741,14 @@ test("recovered H2 internal receipt rejects a fence wait crossing cut expiry", a
   }
 });
 
-test("composition preserves the exact top-level dedupe policy receiver", async () => {
-  let expectedReceiver = null;
-  let observedReceiver = null;
-  let policyCalls = 0;
+test("composition derives the dedupe window only from the H1 owner fixed lifetime", async () => {
+  // The composition plane clock is fixed at 1_783_700_000_000; the H1 owner
+  // alone issues acceptUntilMs = now + 15min and queryUntilMs covering 7d.
+  const acceptUntilMs = 1_783_700_900_000;
+  const queryUntilMs = acceptUntilMs + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS;
   const outboundFrames = [];
-  const acceptUntilMs = 1_783_786_400_000;
-  const queryUntilMs = 1_784_391_200_000;
   const h = await realCompositionHarness({
     compositionOverrides: {
-      captureAuthorities(authorities) {
-        expectedReceiver = authorities;
-      },
-      nextDedupeWindowBounds() {
-        observedReceiver = this;
-        policyCalls += 1;
-        return { acceptUntilMs, queryUntilMs };
-      },
       welcome: {
         build(input) {
           assert.equal(typeof input.commandDedupeWindow.windowId, "string");
@@ -801,8 +789,6 @@ test("composition preserves the exact top-level dedupe policy receiver", async (
       codec.encodeRelayV2WebSocketFrame("public", hello),
     );
     await settle();
-    assert.equal(policyCalls, 1);
-    assert.equal(observedReceiver, expectedReceiver);
     const query = fixture("command-query");
     query.expectedHostEpoch = h.seeded.snapshot.hostEpoch;
     h.composition.routeSink.onClientFrame(
@@ -829,12 +815,6 @@ test("fatal recovered H1 withdrawal fences an active route with 4406", async () 
             "fatal composed H1 state",
           );
         },
-      },
-      nextDedupeWindowBounds() {
-        return {
-          acceptUntilMs: 1_783_786_400_000,
-          queryUntilMs: 1_784_391_200_000,
-        };
       },
       welcome: {
         build(input) {
@@ -993,12 +973,6 @@ test("composition dispose publishes one reentrant barrier and waits for H1 and H
             signalH1Entered();
           });
         },
-      },
-      nextDedupeWindowBounds() {
-        return {
-          acceptUntilMs: 1_783_786_400_000,
-          queryUntilMs: 1_784_391_200_000,
-        };
       },
       welcome: {
         build(input) {

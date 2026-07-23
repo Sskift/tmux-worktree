@@ -211,12 +211,6 @@ async function createHarness({
         h1RecoveryCandidate,
         h2RecoveryCandidate,
         h3RecoveryCandidate,
-        nextDedupeWindowBounds() {
-          return {
-            acceptUntilMs: 1_783_786_400_000,
-            queryUntilMs: 1_784_391_200_000,
-          };
-        },
       },
       welcome: {
         build(input) {
