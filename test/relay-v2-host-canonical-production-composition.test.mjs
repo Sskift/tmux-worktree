@@ -71,9 +71,15 @@ class ControlledManagementInput {
 class OneScanDiscovery {
   used = false;
 
+  constructor({ repeatable = false } = {}) {
+    this.repeatable = repeatable;
+  }
+
   async scan() {
-    assert.equal(this.used, false);
-    this.used = true;
+    if (!this.repeatable) {
+      assert.equal(this.used, false);
+      this.used = true;
+    }
     const processTarget = { kind: "local", targetId: "local" };
     return {
       coverage: "complete",
@@ -133,34 +139,36 @@ function makeCredentialAuthority() {
   });
 }
 
-async function makeHarness(label) {
+async function makeHarness(label, { fresh = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), `tw-relay-v2-host-root-${label}-`));
   const store = await hostState.RelayV2HostStateStore.open({
     paths: hostState.relayV2HostStatePaths(root),
   });
   const foundation = new resourceState.RelayV2MaterializedStateFoundation({
     hostId: HOST_ID,
-    discovery: new OneScanDiscovery(),
+    discovery: new OneScanDiscovery({ repeatable: fresh }),
     store,
     readinessSink: { apply: () => true },
   });
-  const seeded = await foundation.reconcile();
   const spoolRoot = join(root, "snapshot-spool");
-  const publisher = await foundation.openStateSnapshotSpool({
-    hostId: HOST_ID,
-    root: spoolRoot,
-    ownerInstanceId: store.hostInstanceId,
-  });
-  await publisher.get({
-    principalId: "canonical-production-principal",
-    clientInstanceId: "canonical-production-client",
-    expectedHostEpoch: seeded.snapshot.hostEpoch,
-    snapshotRequestId: "canonical-production-snapshot",
-    snapshotId: null,
-    cursor: null,
-    nextChunkIndex: 0,
-  });
-  await publisher.close();
+  if (!fresh) {
+    const seeded = await foundation.reconcile();
+    const publisher = await foundation.openStateSnapshotSpool({
+      hostId: HOST_ID,
+      root: spoolRoot,
+      ownerInstanceId: store.hostInstanceId,
+    });
+    await publisher.get({
+      principalId: "canonical-production-principal",
+      clientInstanceId: "canonical-production-client",
+      expectedHostEpoch: seeded.snapshot.hostEpoch,
+      snapshotRequestId: "canonical-production-snapshot",
+      snapshotId: null,
+      cursor: null,
+      nextChunkIndex: 0,
+    });
+    await publisher.close();
+  }
   const spool = await foundation.openStateSnapshotSpool({
     hostId: HOST_ID,
     root: spoolRoot,
@@ -444,6 +452,78 @@ test("canonical production root owns one exact Dashboard management session and 
     assert.ok(events.indexOf("management-input-closed") < events.indexOf("spool-closed"));
   } finally {
     daemonAbort.abort();
+    await daemon.catch(() => undefined);
+    h.cleanup();
+  }
+});
+
+test("canonical production root opens from a fresh-install H2 bootstrap", async () => {
+  const h = await makeHarness("fresh-install", { fresh: true });
+  const abort = new AbortController();
+  const daemonAuthority = new terminalControl.TerminalControlAuthority({
+    statePath: h.statePath,
+    backend: h.terminalBackend,
+  });
+  const daemon = terminalControl.runTerminalControlServer({
+    socketPath: h.socketPath,
+    authority: daemonAuthority,
+    signal: abort.signal,
+    relayV2RemoteExactCompoundV1: true,
+  });
+  try {
+    await waitForPath(h.socketPath);
+    await waitForPath(exactCompound.relayV2RemoteExactCompoundSocketPathV1(h.socketPath));
+    const composition = await relayHost.openRelayV2HostCanonicalProductionComposition(
+      h.profile,
+      h.options,
+    );
+    assert.notEqual(composition, null,
+      "fresh install has no recovered cut, so the one-shot bootstrap must issue H2 authority");
+    assert.deepEqual(composition.inspect(), {
+      status: "stopped",
+      controllerGeneration: "0",
+    });
+
+    // One-shot: the issued candidate is consumed by this composition, and the
+    // recovered port still finds no recovered cut rather than minting one.
+    assert.equal(await h.spool.issueFreshInstallHostH2Candidate(), null,
+      "the fresh-install bootstrap must not issue a second candidate");
+    assert.equal(await h.spool.issueRecoveredHostH2Candidate(), null,
+      "the recovered port must stay empty on a fresh install");
+
+    // The first real client snapshot still goes through the existing
+    // reservation/buildAndPublish path of the same spool.
+    const epoch = (await h.store.read()).hostEpoch;
+    const first = await h.spool.get({
+      principalId: "canonical-production-principal",
+      clientInstanceId: "canonical-production-client",
+      expectedHostEpoch: epoch,
+      snapshotRequestId: "fresh-install-first-snapshot",
+      snapshotId: null,
+      cursor: null,
+      nextChunkIndex: 0,
+    });
+    assert.equal(first.coverageComplete, true);
+    assert.equal(first.isLast, true);
+    assert.equal(typeof first.snapshotId, "string");
+    assert.deepEqual(
+      first.records.map((record) => record.recordType),
+      ["scope", "sessions_scope"],
+      "the first client cut must be built by buildAndPublish, not the bootstrap",
+    );
+    const released = await h.spool.release({
+      principalId: "canonical-production-principal",
+      clientInstanceId: "canonical-production-client",
+      expectedHostEpoch: epoch,
+      snapshotRequestId: "fresh-install-first-snapshot",
+      snapshotId: first.snapshotId,
+      reason: "completed",
+    });
+    assert.equal(released.released, true);
+
+    await composition.closeAndDrain();
+  } finally {
+    abort.abort();
     await daemon.catch(() => undefined);
     h.cleanup();
   }

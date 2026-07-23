@@ -300,7 +300,9 @@ function validateOptions(
     && typeof profile.credentialReference === "string"
     && isRecord(options)
     && validPort(options.hostState, ["read", "serialize", "close"])
-    && validPort(options.recoveredH2Spool, ["issueRecoveredHostH2Candidate", "close"])
+    && validPort(options.recoveredH2Spool, [
+      "issueRecoveredHostH2Candidate", "issueFreshInstallHostH2Candidate", "close",
+    ])
     && isRelayV2HostCredentialAuthority(options.credentialAuthority)
     && validPort(options.welcome, ["build"])
     && validPort(options.createTargetAuthority, [
@@ -359,7 +361,14 @@ export async function openRelayV2HostCanonicalProductionComposition(
   let claimedOwners = false;
   try {
     const snapshot = await options.hostState.read();
-    const h2Candidate = await options.recoveredH2Spool.issueRecoveredHostH2Candidate();
+    // The fresh-install bootstrap is consulted first because it is structurally
+    // inert around any recovered authority: it returns null before touching
+    // reconcile or the cut source whenever the spool holds any recovered or
+    // published cut, reservation, tombstone, or in-flight build, and the
+    // recovered port can only issue from exactly such state. Recovered
+    // issuance therefore proceeds unchanged whenever it can succeed at all.
+    const h2Candidate = await options.recoveredH2Spool.issueFreshInstallHostH2Candidate()
+      ?? await options.recoveredH2Spool.issueRecoveredHostH2Candidate();
     if (h2Candidate === null) {
       claimedOwners = true;
       throw new RelayV2TerminalManagerError(

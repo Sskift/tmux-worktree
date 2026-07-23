@@ -3139,10 +3139,20 @@ export class RelayV2MaterializedStateFoundation {
     const canonicalSpool = await import(canonicalSpoolUrl) as typeof import(
       "./stateSnapshotSpool.js"
     );
-    return canonicalSpool.RelayV2StateSnapshotSpool.open({
+    const spool = await canonicalSpool.RelayV2StateSnapshotSpool.open({
       ...options,
       materializedStateOwner: this.#snapshotSpoolOwner,
     });
+    try {
+      canonicalSpool.registerRelayV2FreshInstallH2BootstrapReconcile(
+        spool,
+        () => this.reconcile(),
+      );
+    } catch (error) {
+      try { await spool.close(); } catch {}
+      throw error;
+    }
+    return spool;
   }
 
   private reserveCommandResource(
