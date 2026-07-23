@@ -1,14 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { request as nodeHttpRequest } from "node:http";
+import {
+  createServer as createHttpServer,
+  request as nodeHttpRequest,
+} from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { createConnection, createServer } from "node:net";
 import test from "node:test";
 import { WebSocket } from "ws";
 
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
-const { startRelayBroker } = await import("../dist/relayServer.js");
+const {
+  startRelayBroker,
+  startRelayV2BrokerPublicHttpsServer,
+} = await import("../dist/relayServer.js");
 const brokerCore = await import("../dist/relay/v2/brokerCore.js");
 const relayV2Codec = await import("../dist/relay/v2/codec.js");
 const agentCodec = await import(
@@ -599,6 +606,97 @@ test("relay server keeps detailed host state behind authentication", async () =>
     child.kill("SIGTERM");
     await new Promise((resolve) => child.once("exit", resolve));
   }
+});
+
+test("public v2 HTTPS root claims one listener lifecycle and drains every terminal path", async () => {
+  const countedComposition = (fake) => {
+    let opens = 0;
+    const open = fake.composition.openCredentialAuthority;
+    return {
+      composition: {
+        ...fake.composition,
+        async openCredentialAuthority(input) {
+          opens += 1;
+          return open.call(fake.composition, input);
+        },
+      },
+      openCount: () => opens,
+    };
+  };
+
+  const wrongProtocol = countedComposition(fakeComposition());
+  await assert.rejects(
+    startRelayV2BrokerPublicHttpsServer(
+      createHttpServer(),
+      { host: "127.0.0.1", port: 0 },
+      wrongProtocol.composition,
+    ),
+    /node:https Server/,
+  );
+  assert.equal(wrongProtocol.openCount(), 0);
+
+  const alreadyOwnedServer = createHttpsServer((_request, response) => response.end());
+  const alreadyOwned = countedComposition(fakeComposition());
+  await assert.rejects(
+    startRelayV2BrokerPublicHttpsServer(
+      alreadyOwnedServer,
+      { host: "127.0.0.1", port: 0 },
+      alreadyOwned.composition,
+    ),
+    /already has a listener owner/,
+  );
+  assert.equal(alreadyOwned.openCount(), 0);
+
+  const explicitShutdownFake = fakeComposition();
+  const explicitShutdown = countedComposition(explicitShutdownFake);
+  const explicitShutdownServer = createHttpsServer();
+  const explicitShutdownHandle = await startRelayV2BrokerPublicHttpsServer(
+    explicitShutdownServer,
+    { host: "127.0.0.1", port: 0 },
+    explicitShutdown.composition,
+  );
+  const explicitShutdownAuthority = await explicitShutdownFake.opened.promise;
+  assert.equal(explicitShutdown.openCount(), 1);
+  assert.equal(explicitShutdownServer.listening, true);
+  assert.equal(explicitShutdownServer.listenerCount("request"), 1);
+  assert.equal(explicitShutdownServer.listenerCount("upgrade"), 1);
+  await explicitShutdownHandle.shutdown();
+  assert.equal(explicitShutdownAuthority.closed, true);
+  assert.equal(explicitShutdownServer.listenerCount("request"), 0);
+  assert.equal(explicitShutdownServer.listenerCount("upgrade"), 0);
+
+  const occupied = createServer();
+  await new Promise((resolve) => occupied.listen(0, "127.0.0.1", resolve));
+  const occupiedAddress = occupied.address();
+  assert.ok(occupiedAddress !== null && typeof occupiedAddress === "object");
+  const listenFailureFake = fakeComposition();
+  const listenFailure = countedComposition(listenFailureFake);
+  await assert.rejects(
+    startRelayV2BrokerPublicHttpsServer(
+      createHttpsServer(),
+      { host: "127.0.0.1", port: occupiedAddress.port },
+      listenFailure.composition,
+    ),
+    (error) => error?.code === "EADDRINUSE",
+  );
+  const listenFailureAuthority = await listenFailureFake.opened.promise;
+  assert.equal(listenFailure.openCount(), 1);
+  assert.equal(listenFailureAuthority.closed, true);
+  await new Promise((resolve) => occupied.close(resolve));
+
+  const externalCloseFake = fakeComposition();
+  const externalClose = countedComposition(externalCloseFake);
+  const externalCloseServer = createHttpsServer();
+  const externalCloseHandle = await startRelayV2BrokerPublicHttpsServer(
+    externalCloseServer,
+    { host: "127.0.0.1", port: 0 },
+    externalClose.composition,
+  );
+  const externalCloseAuthority = await externalCloseFake.opened.promise;
+  await new Promise((resolve) => externalCloseServer.close(resolve));
+  await externalCloseHandle.shutdown();
+  assert.equal(externalClose.openCount(), 1);
+  assert.equal(externalCloseAuthority.closed, true);
 });
 
 test("default relay listener keeps twcap2 credentials out of the v1 verifier", async () => {
