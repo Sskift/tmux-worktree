@@ -1,15 +1,8 @@
 import { stdin, stdout } from "node:process";
 import {
-  RELAY_V2_DASHBOARD_MANAGEMENT_MAX_FRAME_PAYLOAD_BYTES,
-  RelayV2DashboardManagementProtocolError,
-  createRelayV2DashboardManagementDefaultOffHandler,
-  decodeRelayV2DashboardManagementRequest,
-  encodeRelayV2DashboardManagementReadyFrame,
-  encodeRelayV2DashboardManagementResponseFrame,
-} from "./relayV2DashboardManagementProtocol.js";
-import {
   RELAY_V2_DASHBOARD_MANAGEMENT_PROTOCOL_V2_MAX_FRAME_PAYLOAD_BYTES,
   RelayV2DashboardManagementProtocolV2Error,
+  createRelayV2DashboardManagementProtocolV2FailureResponse,
   decodeRelayV2DashboardManagementProtocolV2Request,
   encodeRelayV2DashboardManagementProtocolV2ReadyFrame,
   encodeRelayV2DashboardManagementProtocolV2ResponseFrame,
@@ -113,8 +106,9 @@ async function runSingleProtocolSession<Request, Response>(options: {
 }
 
 /**
- * Test/composition factory for exactly protocol v2. It has no CLI, argv,
- * environment, config, stdio default, respawn, retry, or fallback callsite.
+ * Factory for exactly protocol v2. The caller supplies the sole handler and
+ * IO ownership; this layer adds no argv, environment, config, respawn, retry,
+ * or fallback path.
  */
 export function createRelayV2DashboardManagementProtocolV2StdioSession(options: {
   runtimeVersion: string;
@@ -156,22 +150,18 @@ export function createRelayV2DashboardManagementProtocolV2StdioSession(options: 
 export async function runRelayV2DashboardManagementStdio(
   runtimeVersion: string,
 ): Promise<number> {
-  const handler = createRelayV2DashboardManagementDefaultOffHandler();
-
   const ignoreStdoutError = (): void => {};
   stdout.on("error", ignoreStdoutError);
-  return runSingleProtocolSession({
+  return createRelayV2DashboardManagementProtocolV2StdioSession({
     runtimeVersion,
-    protocol: Object.freeze({
-      maxFramePayloadBytes: RELAY_V2_DASHBOARD_MANAGEMENT_MAX_FRAME_PAYLOAD_BYTES,
-      decodeRequest: decodeRelayV2DashboardManagementRequest,
-      encodeReadyFrame: encodeRelayV2DashboardManagementReadyFrame,
-      encodeResponseFrame: (response) => (
-        encodeRelayV2DashboardManagementResponseFrame(response)
+    handler: Object.freeze({
+      handle: (request: RelayV2DashboardManagementProtocolV2Request) => (
+        createRelayV2DashboardManagementProtocolV2FailureResponse(
+          request.requestId,
+          "UNAVAILABLE",
+        )
       ),
-      isProtocolError: (error) => error instanceof RelayV2DashboardManagementProtocolError,
     }),
-    handler,
     io: Object.freeze({ input: stdin, writeFrame }),
-  });
+  }).run();
 }

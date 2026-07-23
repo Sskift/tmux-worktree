@@ -8,11 +8,15 @@ import {
 } from "../dist/relay/v2/relayV2DashboardManagementStdio.js";
 
 const contractRoot = new URL(
-  "../contracts/dashboard-relay-v2-management/v1/",
+  "../contracts/dashboard-relay-v2-management/v2/",
   import.meta.url,
 );
 const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot), "utf8"));
 const cases = JSON.parse(readFileSync(new URL("cases.json", contractRoot), "utf8"));
+const legacyCases = JSON.parse(readFileSync(new URL(
+  "../contracts/dashboard-relay-v2-management/v1/cases.json",
+  import.meta.url,
+), "utf8"));
 const packageVersion = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ).version;
@@ -21,20 +25,24 @@ const hiddenEntry = "__relay-v2-dashboard-management-stdio";
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 function readyValue() {
-  const fixture = cases.startupHandshakeCases.find(
-    (item) => item.name === "same-version-absolute-bundled-resource-ready",
-  );
-  assert.ok(fixture, "startup ready fixture is required");
   return {
-    ...JSON.parse(fixture.input.firstStdoutFrame),
+    ...JSON.parse(cases.startupReadyFrame),
     runtimeVersion: packageVersion,
   };
 }
 
-function responseValue(operation, requestId) {
-  const fixture = cases.goldenExchanges.find((item) => item.operation === operation);
-  assert.ok(fixture, `missing golden exchange for ${operation}`);
-  return { ...structuredClone(fixture.normalizedResponse), requestId };
+function unavailableResponse(requestId) {
+  return {
+    protocolVersion: manifest.protocolVersion,
+    requestId,
+    ok: false,
+    result: null,
+    error: {
+      code: "UNAVAILABLE",
+      message: "Relay v2 management is unavailable",
+      retryable: false,
+    },
+  };
 }
 
 function runChild(input, { args = [], env = {} } = {}) {
@@ -131,7 +139,7 @@ test("hidden child emits one closed ready frame from the package constant and st
   const ready = decodeFrames(child.stdout)[0];
   assert.deepEqual(
     Object.keys(ready).sort(),
-    [...manifest.startupHandshake.schema.exactKeys].sort(),
+    [...manifest.startupHandshake.exactKeys].sort(),
   );
   assert.equal(ready.contract, manifest.contract);
   assert.equal(ready.protocolVersion, manifest.protocolVersion);
@@ -143,52 +151,50 @@ test("hidden child emits one closed ready frame from the package constant and st
   assert.equal(help.stdout.includes(hiddenEntry), false);
 });
 
-test("golden operations compare normalized semantics without freezing JSON key order", async (t) => {
+test("hidden child selects protocol v2 and fails every operation closed without fallback", async (t) => {
   for (const exchange of cases.goldenExchanges) {
     await t.test(exchange.name, () => {
       const child = runChild(Buffer.from(exchange.requestFrame, "utf8"));
-      assertQuietExit(child, 0, [readyValue(), exchange.normalizedResponse]);
+      assertQuietExit(child, 0, [
+        readyValue(),
+        unavailableResponse(exchange.normalizedRequest.requestId),
+      ]);
     });
   }
   assert.deepEqual(
-    cases.goldenExchanges.filter((item) => item.operation !== "status").map(
-      (item) => item.operation,
-    ),
-    manifest.requestSchema.mutationOperations,
+    cases.goldenExchanges.map((item) => item.operation),
+    manifest.requestSchema.operations,
   );
 });
 
-test("one child accepts reordered keys and serially emits one correlated response per request", () => {
-  const reordered = cases.validSequenceCases.find(
-    (item) => item.name === "json-object-key-order-does-not-change-meaning",
+test("one child accepts reordered protocol-v2 keys and emits correlated responses", () => {
+  const status = cases.goldenExchanges.find(
+    (item) => item.operation === "status",
   );
-  const sequence = cases.validSequenceCases.find(
-    (item) => item.name === "handshake-then-two-requests-are-serialized-on-one-child",
+  const bootstrap = cases.goldenExchanges.find(
+    (item) => item.operation === "bootstrap_host",
   );
-  assert.ok(reordered && sequence);
-  const requests = sequence.steps.filter((step) => step.event === "send-request");
-  const input = [
-    reordered.requestFrame,
-    ...requests.map((step) => `${JSON.stringify({
-      protocolVersion: manifest.protocolVersion,
-      requestId: step.requestId,
-      operation: step.operation,
-    })}\n`),
-  ].join("");
-  const expected = [
+  assert.ok(status && bootstrap);
+  const reorderedStatus = `${JSON.stringify({
+    operation: status.normalizedRequest.operation,
+    input: status.normalizedRequest.input,
+    requestId: status.normalizedRequest.requestId,
+    protocolVersion: status.normalizedRequest.protocolVersion,
+  })}\n`;
+  const input = `${reorderedStatus}${bootstrap.requestFrame}`;
+  assertQuietExit(runChild(Buffer.from(input, "utf8")), 0, [
     readyValue(),
-    responseValue("status", reordered.expected.normalizedRequest.requestId),
-    ...requests.map((step) => responseValue(step.operation, step.requestId)),
-  ];
-  assertQuietExit(runChild(Buffer.from(input, "utf8")), 0, expected);
+    unavailableResponse(status.normalizedRequest.requestId),
+    unavailableResponse(bootstrap.normalizedRequest.requestId),
+  ]);
 });
 
-test("fixture bad request frames alone exit 64 silently and never 78", async (t) => {
-  for (const invalid of cases.invalidRequestFrameCases) {
+test("legacy and invalid request frames exit 64 silently without v1 fallback", async (t) => {
+  for (const invalid of legacyCases.invalidRequestFrameCases) {
     await t.test(invalid.name, () => {
       const child = runChild(materializeFixtureInput(invalid.input));
-      assertQuietExit(child, cases.constants.badRequestExitCode, [readyValue()]);
-      assert.notEqual(child.status, cases.constants.supersededExitCode);
+      assertQuietExit(child, legacyCases.constants.badRequestExitCode, [readyValue()]);
+      assert.notEqual(child.status, legacyCases.constants.supersededExitCode);
     });
   }
 });
@@ -202,15 +208,15 @@ test("closed request schema rejects each missing field and a nested duplicate", 
       delete request[key];
       assertQuietExit(
         runChild(Buffer.from(`${JSON.stringify(request)}\n`, "utf8")),
-        cases.constants.badRequestExitCode,
+        legacyCases.constants.badRequestExitCode,
         [readyValue()],
       );
     });
   }
-  const nestedDuplicate = `{"protocolVersion":1,"requestId":"${valid.normalizedRequest.requestId}","operation":{"x":1,"x":2}}\n`;
+  const nestedDuplicate = `{"protocolVersion":2,"requestId":"${valid.normalizedRequest.requestId}","operation":"status","input":null,"input":null}\n`;
   assertQuietExit(
     runChild(Buffer.from(nestedDuplicate, "utf8")),
-    cases.constants.badRequestExitCode,
+    legacyCases.constants.badRequestExitCode,
     [readyValue()],
   );
 });
@@ -223,11 +229,14 @@ test("real child framing covers fragmented writes, exact limits, LF variants, an
   await t.test("fragmented valid frame and normal EOF", async () => {
     const split = Math.floor(frame.byteLength / 2);
     const child = await runChildChunks([frame.subarray(0, split), frame.subarray(split)]);
-    assertQuietExit(child, 0, [readyValue(), status.normalizedResponse]);
+    assertQuietExit(child, 0, [
+      readyValue(),
+      unavailableResponse(status.normalizedRequest.requestId),
+    ]);
   });
 
   await t.test("fragmented multibyte UTF-8 is decoded only after the complete frame", async () => {
-    const utf8 = Buffer.from(`{"protocolVersion":1,"requestId":"${status.normalizedRequest.requestId}","operation":"status","extra":"请"}\n`);
+    const utf8 = Buffer.from(`{"protocolVersion":2,"requestId":"${status.normalizedRequest.requestId}","operation":"status","input":null,"extra":"请"}\n`);
     const marker = utf8.indexOf(Buffer.from("请"));
     const child = await runChildChunks([
       utf8.subarray(0, marker + 1),
@@ -239,7 +248,10 @@ test("real child framing covers fragmented writes, exact limits, LF variants, an
 
   await t.test("16384-byte payload is accepted", async () => {
     const child = await runChildChunks([Buffer.from(paddedStatusFrame(16_384))]);
-    assertQuietExit(child, 0, [readyValue(), status.normalizedResponse]);
+    assertQuietExit(child, 0, [
+      readyValue(),
+      unavailableResponse(status.normalizedRequest.requestId),
+    ]);
   });
 
   await t.test("16385-byte payload is rejected", async () => {
@@ -248,7 +260,11 @@ test("real child framing covers fragmented writes, exact limits, LF variants, an
   });
 
   for (const [name, input, expected] of [
-    ["double LF", Buffer.concat([frame, Buffer.from("\n")]), [readyValue(), status.normalizedResponse]],
+    [
+      "double LF",
+      Buffer.concat([frame, Buffer.from("\n")]),
+      [readyValue(), unavailableResponse(status.normalizedRequest.requestId)],
+    ],
     ["CRLF", Buffer.from(status.requestFrame.replace(/\n$/, "\r\n")), [readyValue()]],
     ["incomplete EOF", frame.subarray(0, frame.byteLength - 1), [readyValue()]],
   ]) {
@@ -259,35 +275,47 @@ test("real child framing covers fragmented writes, exact limits, LF variants, an
   }
 
   await t.test("valid response is retained before a later bad frame", async () => {
-    const bad = Buffer.from(`{"protocolVersion":1,"requestId":"${status.normalizedRequest.requestId}","operation":"bad"}\n`);
+    const bad = Buffer.from(`{"protocolVersion":2,"requestId":"${status.normalizedRequest.requestId}","operation":"bad","input":null}\n`);
     const child = await runChildChunks([frame, bad]);
-    assertQuietExit(child, 64, [readyValue(), status.normalizedResponse]);
+    assertQuietExit(child, 64, [
+      readyValue(),
+      unavailableResponse(status.normalizedRequest.requestId),
+    ]);
   });
 });
 
-test("requestId fixture cases enforce wire canonicality without pretending to observe manager origin", async (t) => {
-  const wireAcceptedClassifications = new Set(["valid-non-sensitive-requestId", "invalid-origin"]);
-  for (const identityCase of cases.requestIdentityCases) {
-    await t.test(identityCase.name, () => {
-      const request = {
-        protocolVersion: manifest.protocolVersion,
-        requestId: identityCase.input.candidate,
-        operation: "status",
-      };
+test("requestId canonicality is enforced without pretending to observe manager origin", async (t) => {
+  const status = cases.goldenExchanges.find((item) => item.operation === "status");
+  assert.ok(status);
+
+  for (const exchange of cases.goldenExchanges) {
+    await t.test(`accepts ${exchange.normalizedRequest.requestId}`, () => {
+      const child = runChild(Buffer.from(exchange.requestFrame, "utf8"));
+      assertQuietExit(child, 0, [
+        readyValue(),
+        unavailableResponse(exchange.normalizedRequest.requestId),
+      ]);
+    });
+  }
+
+  for (const requestId of [
+    "dmgmt1.AquZUdkZ9FXG7OEIfRHmjw",
+    "dmgmt2.not-canonical",
+    "dmgmt2.AquZUdkZ9FXG7OEIfRHmjx",
+    "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw==",
+  ]) {
+    await t.test(`rejects ${requestId}`, () => {
+      const request = { ...status.normalizedRequest, requestId };
       const child = runChild(Buffer.from(`${JSON.stringify(request)}\n`, "utf8"));
-      if (wireAcceptedClassifications.has(identityCase.expected.classification)) {
-        assertQuietExit(child, 0, [readyValue(), responseValue("status", request.requestId)]);
-      } else {
-        assertQuietExit(child, 64, [readyValue()]);
-      }
+      assertQuietExit(child, legacyCases.constants.badRequestExitCode, [readyValue()]);
     });
   }
 });
 
 test("extra argv is a silent ordinary pre-handshake failure, not bad-frame 64 or superseded 78", () => {
   const child = runChild(Buffer.alloc(0), { args: ["forbidden-secret-marker"] });
-  assert.notEqual(child.status, cases.constants.badRequestExitCode);
-  assert.notEqual(child.status, cases.constants.supersededExitCode);
+  assert.notEqual(child.status, legacyCases.constants.badRequestExitCode);
+  assert.notEqual(child.status, legacyCases.constants.supersededExitCode);
   assert.deepEqual(child.stdout, Buffer.alloc(0));
   assert.deepEqual(child.stderr, Buffer.alloc(0));
 });
@@ -299,7 +327,10 @@ test("environment material is never reflected into frames, logs, or fixed errors
   const child = runChild(Buffer.from(status.requestFrame, "utf8"), {
     env: { TW_TOKEN: marker, TW_RELAY_SECRET: marker, RELAY_V2_CREDENTIAL: marker },
   });
-  assertQuietExit(child, 0, [readyValue(), status.normalizedResponse]);
+  assertQuietExit(child, 0, [
+    readyValue(),
+    unavailableResponse(status.normalizedRequest.requestId),
+  ]);
   assert.equal(child.stdout.includes(Buffer.from(marker)), false);
   assert.equal(child.stderr.includes(Buffer.from(marker)), false);
 });
@@ -326,8 +357,8 @@ test("valid request hitting a broken stdout channel exits ordinary non-64/non-78
   await stdoutClosed;
   child.stdin.end(Buffer.from(status.requestFrame, "utf8"));
   const [exit, stderrBytes] = await Promise.all([exited, stderr]);
-  assert.notEqual(exit.status, cases.constants.badRequestExitCode);
-  assert.notEqual(exit.status, cases.constants.supersededExitCode);
+  assert.notEqual(exit.status, legacyCases.constants.badRequestExitCode);
+  assert.notEqual(exit.status, legacyCases.constants.supersededExitCode);
   assert.deepEqual(stderrBytes, Buffer.alloc(0));
   assert.deepEqual(decodeFrames(readyBytes), [readyValue()]);
 });
