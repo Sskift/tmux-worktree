@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { IncomingMessage } from "node:http";
+import { Duplex } from "node:stream";
 import test from "node:test";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const compositionModule = await import(
   "../dist/relay/v2/brokerClientWssRuntimeComposition.js"
+);
+const nodeIngressModule = await import(
+  "../dist/relay/v2/brokerClientWssNodeListenerFreeIngress.js"
 );
 const producerModule = await import("../dist/relay/v2/brokerProducerRegistry.js");
 
@@ -66,10 +71,10 @@ async function settle(turns = 8) {
 
 class StrictFakeSocket {
   constructor(log = []) {
-    this.readyState = 1;
-    this.protocol = "tw-relay.v2";
-    this.extensions = "";
-    this.bufferedAmount = 0;
+    this._readyState = 1;
+    this._protocol = "tw-relay.v2";
+    this._extensions = "";
+    this._bufferedAmount = 0;
     this.listeners = new Map();
     this.closes = [];
     this.terminates = 0;
@@ -77,6 +82,11 @@ class StrictFakeSocket {
     this.onInstalled = undefined;
     this.removeListenerImpl = undefined;
   }
+
+  get readyState() { return this._readyState; }
+  get protocol() { return this._protocol; }
+  get extensions() { return this._extensions; }
+  get bufferedAmount() { return this._bufferedAmount; }
 
   on(event, listener) {
     const listeners = this.listeners.get(event) ?? [];
@@ -113,6 +123,28 @@ class StrictFakeSocket {
 
   terminate() {
     this.terminates += 1;
+  }
+}
+
+class MemoryDuplex extends Duplex {
+  constructor() {
+    super();
+    this.writes = [];
+  }
+
+  _read() {}
+
+  _write(chunk, _encoding, callback) {
+    this.writes.push(Buffer.from(chunk));
+    callback();
+  }
+
+  _destroy(error, callback) {
+    callback(error);
+  }
+
+  responseText() {
+    return Buffer.concat(this.writes).toString("latin1");
   }
 }
 
@@ -190,8 +222,13 @@ async function createHarness(options = {}) {
   });
   const producer = registry.registerHostProducer(transportId, producerPort);
   const binding = producer.bindConnectionIncarnation(hostIncarnation);
+  let clientWssRuntime;
   const composition = compositionModule.createRelayV2BrokerClientWssRuntimeComposition({
-    brokerOptions: { now: () => now.value },
+    brokerOptions: {
+      now: () => now.value,
+      baseCapabilityReadiness: options.baseCapabilityReadiness
+        ?? [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
     producerRegistry: registry,
     resolveHostProducerBinding: () => binding,
     clientSocketScheduler: createClientScheduler(),
@@ -201,7 +238,17 @@ async function createHarness(options = {}) {
       absolute.scheduleAt(expiresAtMs, callback)
     ),
     transportCloseDeadlineScheduler: closeDeadlines,
+  }, (runtime) => {
+    clientWssRuntime = runtime;
   });
+  assert.ok(clientWssRuntime);
+  const trustedClientSockets = new WeakSet();
+  if (options.installClientIngress !== false) {
+    clientWssRuntime.installTrustedSocketCapture(
+      StrictFakeSocket.prototype,
+      (socket) => trustedClientSockets.has(socket),
+    );
+  }
   const hostBroker = composition.hostPumpBrokerAuthority;
   hostBroker.attachHostCarrier(
     transportId,
@@ -225,6 +272,7 @@ async function createHarness(options = {}) {
   );
   return {
     composition,
+    clientWssRuntime,
     hostBroker,
     producer,
     transportId,
@@ -232,12 +280,18 @@ async function createHarness(options = {}) {
     log,
     absolute,
     closeDeadlines,
+    admitClientSocket(socket) {
+      trustedClientSockets.add(socket);
+    },
+    releaseClientSocket(socket) {
+      trustedClientSockets.delete(socket);
+    },
   };
 }
 
 function prepareClient(harness, options = {}) {
   const connectionId = options.connectionId ?? `client-${randomUUID()}`;
-  const prepared = harness.composition.prepareClientWss({
+  const prepared = harness.clientWssRuntime.prepareClientWssForCurrentHost({
     connectionId,
     trustedAuthContext: authContext("client", {
       grantId: options.grantId ?? `${connectionId}-grant`,
@@ -245,7 +299,6 @@ function prepareClient(harness, options = {}) {
       kid: options.kid ?? "kid-current",
       expiresAtMs: options.expiresAtMs ?? NOW_MS + 60_000,
     }),
-    hostProducerTarget: harness.producer.target,
   });
   assert.equal(prepared.outcome, "accept");
   return { connectionId, admissionReceipt: prepared.admissionReceipt };
@@ -255,10 +308,16 @@ async function attachOpenedClient(harness, options = {}) {
   const prepared = prepareClient(harness, options);
   const connectionId = prepared.connectionId;
   const socket = options.socket ?? new StrictFakeSocket(harness.log);
-  const handle = harness.composition.attachPreparedClientWss({
-    admissionReceipt: prepared.admissionReceipt,
-    alreadyUpgradedSocket: socket,
-  });
+  harness.admitClientSocket(socket);
+  let handle;
+  try {
+    handle = harness.clientWssRuntime.attachPreparedClientWss({
+      admissionReceipt: prepared.admissionReceipt,
+      alreadyUpgradedSocket: socket,
+    });
+  } finally {
+    harness.releaseClientSocket(socket);
+  }
   assert.equal(handle.openResult.accepted, true);
   const deliveries = harness.hostBroker.drainHostCarrier(harness.transportId);
   const routeOpen = deliveries.find((delivery) => delivery.frame.type === "route.open");
@@ -328,6 +387,63 @@ async function completeRouteUnbind(harness, capturedDelivery) {
   assert.equal(result.accepted, true);
 }
 
+test("listener-free Node ingress composes the canonical client runtime without a server owner", async () => {
+  const harness = await createHarness({ installClientIngress: false });
+  let verifierCalls = 0;
+  const ingress = nodeIngressModule.createRelayV2BrokerClientWssNodeListenerFreeIngress({
+    verifyV2AccessToken(token, expectedRole) {
+      verifierCalls += 1;
+      assert.equal(token, "twcap2.node-runtime-integration");
+      assert.equal(expectedRole, "client");
+      return authContext("client");
+    },
+    runtime: harness.clientWssRuntime,
+  });
+  const socket = new MemoryDuplex();
+  const key = Buffer.alloc(16, 12).toString("base64");
+  const request = new IncomingMessage(socket);
+  request.method = "GET";
+  request.url = "/client";
+  request.rawHeaders = [
+    "Host", "relay.example.com",
+    "Connection", "Upgrade",
+    "Upgrade", "websocket",
+    "Authorization", "Bearer twcap2.node-runtime-integration",
+    "Sec-WebSocket-Key", key,
+    "Sec-WebSocket-Version", "13",
+    "Sec-WebSocket-Protocol", "tw-relay.v2",
+    "Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits",
+  ];
+  request.headers = {
+    host: "relay.example.com",
+    connection: "Upgrade",
+    upgrade: "websocket",
+    authorization: "Bearer twcap2.node-runtime-integration",
+    "sec-websocket-key": key,
+    "sec-websocket-version": "13",
+    "sec-websocket-protocol": "tw-relay.v2",
+    "sec-websocket-extensions": "permessage-deflate; client_max_window_bits",
+  };
+
+  const ingressResult = await ingress.handleUpgradeRequest({
+    request,
+    socket,
+    head: Buffer.alloc(0),
+  });
+  assert.equal(ingressResult, "upgraded", socket.responseText());
+  assert.equal(verifierCalls, 1);
+  assert.match(socket.responseText(), /^HTTP\/1\.1 101 Switching Protocols\r\n/);
+  assert.doesNotMatch(socket.responseText(), /\r\nSec-WebSocket-Extensions:/i);
+  assert.equal(
+    harness.hostBroker.drainHostCarrier(harness.transportId)
+      .some((delivery) => delivery.frame.type === "route.open"),
+    true,
+  );
+
+  socket.destroy();
+  await ingress.closeAndDrain();
+});
+
 test("client WSS runtime keeps one incarnation through Core and drains only after native close", async () => {
   const harness = await createHarness();
   assert.equal(
@@ -383,19 +499,54 @@ test("prepared admission is one-shot and a composition close invalidates unconsu
   const client = await attachOpenedClient(harness, { connectionId: "client-one-shot" });
   const untouchedSocket = new Proxy({}, {});
 
-  assert.throws(() => harness.composition.attachPreparedClientWss({
+  assert.throws(() => harness.clientWssRuntime.attachPreparedClientWss({
     admissionReceipt: client.admissionReceipt,
     alreadyUpgradedSocket: untouchedSocket,
   }), /admission receipt/);
   const pending = prepareClient(harness, { connectionId: "client-close-invalidated" });
   const closeDrain = harness.composition.closeAndDrain();
-  assert.throws(() => harness.composition.attachPreparedClientWss({
+  assert.throws(() => harness.clientWssRuntime.attachPreparedClientWss({
     admissionReceipt: pending.admissionReceipt,
     alreadyUpgradedSocket: untouchedSocket,
   }), /closing/);
 
   client.socket.emit("close", 1000);
   await closeDrain;
+});
+
+test("client ingress claim rejects missing brand and a branded structural socket", async () => {
+  const harness = await createHarness();
+  const missingBrand = prepareClient(harness, { connectionId: "client-missing-brand" });
+  const samePrototypeSocket = new StrictFakeSocket();
+  assert.throws(() => harness.clientWssRuntime.attachPreparedClientWss({
+    admissionReceipt: missingBrand.admissionReceipt,
+    alreadyUpgradedSocket: samePrototypeSocket,
+  }), /adapter|construction failed/i);
+  harness.admitClientSocket(samePrototypeSocket);
+  try {
+    assert.throws(() => harness.clientWssRuntime.attachPreparedClientWss({
+      admissionReceipt: missingBrand.admissionReceipt,
+      alreadyUpgradedSocket: samePrototypeSocket,
+    }), /admission receipt/);
+  } finally {
+    harness.releaseClientSocket(samePrototypeSocket);
+  }
+
+  class StructuralSocket extends StrictFakeSocket {}
+  const foreignPrototype = prepareClient(harness, {
+    connectionId: "client-foreign-prototype",
+  });
+  const structuralSocket = new StructuralSocket();
+  harness.admitClientSocket(structuralSocket);
+  try {
+    assert.throws(() => harness.clientWssRuntime.attachPreparedClientWss({
+      admissionReceipt: foreignPrototype.admissionReceipt,
+      alreadyUpgradedSocket: structuralSocket,
+    }), /adapter|construction failed/i);
+  } finally {
+    harness.releaseClientSocket(structuralSocket);
+  }
+  await harness.composition.closeAndDrain();
 });
 
 test("absolute expiry fences frames before 4401, forces at 5s, and stale callbacks miss replacement", async () => {
@@ -465,10 +616,15 @@ test("partial attach and concurrent close share a real-terminal drain barrier", 
     }
   };
   const partial = prepareClient(harness, { connectionId: "partial-client" });
-  assert.throws(() => harness.composition.attachPreparedClientWss({
-    admissionReceipt: partial.admissionReceipt,
-    alreadyUpgradedSocket: socket,
-  }), /closing|construction failed/);
+  harness.admitClientSocket(socket);
+  try {
+    assert.throws(() => harness.clientWssRuntime.attachPreparedClientWss({
+      admissionReceipt: partial.admissionReceipt,
+      alreadyUpgradedSocket: socket,
+    }), /closing|construction failed/);
+  } finally {
+    harness.releaseClientSocket(socket);
+  }
   assert.ok(closeFromAttach);
   assert.strictEqual(harness.composition.closeAndDrain(), closeFromAttach);
   const late = harness.composition.prepareClientWss({
@@ -508,4 +664,24 @@ test("partial attach and concurrent close share a real-terminal drain barrier", 
   second.socket.emit("close", 1000);
   await assert.rejects(allDrained, /WebSocket adapter rejected|cleanup/);
   assert.equal(allSettled, true);
+});
+
+test("private client socket capture and Host WSS runtime hold independent one-shot claims", async () => {
+  const harness = await createHarness();
+  const hostRuntime = compositionModule.installRelayV2BrokerHostWssRuntime(
+    harness.composition,
+    StrictFakeSocket.prototype,
+    () => false,
+  );
+  assert.equal(typeof hostRuntime.prepareHostWss, "function");
+  assert.throws(() => harness.clientWssRuntime.installTrustedSocketCapture(
+    StrictFakeSocket.prototype,
+    () => false,
+  ), /already installed/);
+  assert.throws(() => compositionModule.installRelayV2BrokerHostWssRuntime(
+    harness.composition,
+    StrictFakeSocket.prototype,
+    () => false,
+  ), /already installed/);
+  await harness.composition.closeAndDrain();
 });

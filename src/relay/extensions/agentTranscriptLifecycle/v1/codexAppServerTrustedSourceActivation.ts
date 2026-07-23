@@ -48,6 +48,7 @@ export interface CodexAppServerTrustedSourceActivationOptions {
   controller: CodexAppServerProcessControllerPort;
   runtime: RelayAgentTranscriptLifecycleRuntime;
   canonicalResourceResolver: RelayV2CanonicalResourceResolverPort;
+  onUnavailable?: (error: unknown) => void;
 }
 
 type ActivationState =
@@ -68,13 +69,15 @@ interface CapturedOptions {
   controller: unknown;
   runtime: unknown;
   canonicalResourceResolver: unknown;
+  onUnavailable: ((error: unknown) => void) | null;
 }
 
-const OPTION_KEYS = Object.freeze([
+const REQUIRED_OPTION_KEYS = Object.freeze([
   "controller",
   "runtime",
   "canonicalResourceResolver",
 ]);
+const OPTION_KEYS = Object.freeze([...REQUIRED_OPTION_KEYS, "onUnavailable"]);
 
 function activationError(
   code: CodexAppServerTrustedSourceActivationErrorCode,
@@ -105,22 +108,29 @@ function captureOptions(value: unknown): Readonly<CapturedOptions> {
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Reflect.ownKeys(descriptors);
-  if (keys.length !== OPTION_KEYS.length
-    || keys.some((key) => typeof key !== "string" || !OPTION_KEYS.includes(key))) {
+  if ((keys.length !== REQUIRED_OPTION_KEYS.length && keys.length !== OPTION_KEYS.length)
+    || keys.some((key) => typeof key !== "string" || !OPTION_KEYS.includes(key))
+    || REQUIRED_OPTION_KEYS.some((key) => !Object.hasOwn(descriptors, key))) {
     throw new TypeError("Codex app-server trusted-source activation dependencies are invalid");
   }
   const captured: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-  for (const key of OPTION_KEYS) {
+  for (const key of keys as string[]) {
     const descriptor = descriptors[key];
     if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
       throw new TypeError("Codex app-server trusted-source activation dependencies are invalid");
     }
     captured[key] = descriptor.value;
   }
+  if (captured.onUnavailable !== undefined
+    && (typeof captured.onUnavailable !== "function"
+      || nodeTypes.isProxy(captured.onUnavailable))) {
+    throw new TypeError("Codex app-server trusted-source activation dependencies are invalid");
+  }
   return Object.freeze({
     controller: captured.controller,
     runtime: captured.runtime,
     canonicalResourceResolver: captured.canonicalResourceResolver,
+    onUnavailable: (captured.onUnavailable ?? null) as ((error: unknown) => void) | null,
   });
 }
 
@@ -166,6 +176,7 @@ export class CodexAppServerTrustedSourceActivation {
       controller: options.controller as CodexAppServerProcessControllerPort,
       controlledSourceIssuer: issuer,
       controlledSourceReceiver: receiver,
+      ...(options.onUnavailable === null ? {} : { onUnavailable: options.onUnavailable }),
     });
     this.#composition = composition;
     this.#authority = authority;

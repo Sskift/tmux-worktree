@@ -8,6 +8,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
@@ -29,7 +30,8 @@ internal class RelayV2StateRepository(
 ) : RelayV2StateSyncAuthority,
     RelayV2OutboxRuntimeAuthority,
     RelayV2OutboxEnqueueAuthority,
-    RelayV2MaterializedSessionReadAuthority {
+    RelayV2MaterializedSessionReadAuthority,
+    RelayV2TerminalRecoveryAuthority {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
     private val durableCore = RelayV2DurableStateRepositoryCore(
         RoomRelayV2DurableStateStore(database),
@@ -135,14 +137,30 @@ internal class RelayV2StateRepository(
         attemptRequestIds,
     )
 
-    suspend fun loadTerminal(
+    override suspend fun loadTerminalUnderApplyLease(
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2TerminalStoredCheckpoint = durableCore.loadTerminal(key)
 
-    suspend fun reduceTerminalUnderApplyLease(
+    override suspend fun reduceTerminalUnderApplyLease(
         key: RelayV2TerminalCheckpointKey,
         action: RelayV2TerminalAction,
     ): RelayV2TerminalReduction = durableCore.reduceTerminalUnderApplyLease(key, action)
+
+    override suspend fun claimResumableTerminalUnderApplyLease(
+        selector: RelayV2TerminalResumeSessionSelector,
+        authority: RelayV2RepositoryEffectAuthority,
+        requestId: String,
+        openAttempt: RelayV2TerminalOpenAttempt,
+        cols: Int,
+        rows: Int,
+    ): RelayV2TerminalResumeClaim? = durableCore.claimResumableTerminalUnderApplyLease(
+        selector,
+        authority,
+        requestId,
+        openAttempt,
+        cols,
+        rows,
+    )
 
     suspend fun restoreTerminalUnderApplyLease(
         key: RelayV2TerminalCheckpointKey,
@@ -171,6 +189,11 @@ internal class RelayV2StateRepository(
         currentDeliveryToken,
         currentParserContinuityId,
     )
+
+    override suspend fun recoverPostCommitUnknown(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalReduction? = durableCore.recoverPostCommitUnknown(authority, key)
 
     suspend fun clearProfileAfterDisconnect(receipt: RelayProfileDisconnectReceipt) {
         core.clearProfileAfterDisconnect(receipt)
@@ -248,18 +271,36 @@ private class RoomDurableTransaction(
         key.sessionId,
         key.streamId,
         key.pane,
-    )?.let { entity ->
-        RelayV2PersistedTerminalCheckpoint(
-            key = entity.toCheckpointKey(),
-            kind = entity.checkpointKind,
-            payload = RelayV2EncodedPayload(
-                codecVersion = entity.codecVersion,
-                payloadUtf8Bytes = entity.payloadUtf8Bytes,
-                canonicalJson = entity.payloadCanonicalJson,
-                sha256 = entity.payloadSha256,
-            ),
-        )
-    }
+    )?.toPersistedCheckpoint()
+
+    override fun terminalCheckpointsForSession(
+        selector: RelayV2TerminalResumeSessionSelector,
+        hostEpoch: String,
+    ): List<RelayV2PersistedTerminalCheckpoint> = dao.terminalCheckpointsForSession(
+        selector.profileId,
+        selector.profileActivationGeneration,
+        selector.principalId,
+        selector.clientInstanceId,
+        selector.hostId,
+        hostEpoch,
+        selector.scopeId,
+        selector.sessionId,
+        selector.pane,
+    ).map { it.toPersistedCheckpoint() }
+
+    override fun deleteTerminalCheckpoint(key: RelayV2TerminalCheckpointKey): Boolean =
+        dao.deleteTerminalCheckpoint(
+            key.profileId,
+            key.profileActivationGeneration,
+            key.principalId,
+            key.clientInstanceId,
+            key.hostId,
+            key.hostEpoch,
+            key.scopeId,
+            key.sessionId,
+            key.streamId,
+            key.pane,
+        ) == 1
 
     override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) {
         val key = checkpoint.key
@@ -283,6 +324,18 @@ private class RoomDurableTransaction(
             ),
         )
     }
+
+    private fun RelayV2TerminalCheckpointEntity.toPersistedCheckpoint() =
+        RelayV2PersistedTerminalCheckpoint(
+            key = toCheckpointKey(),
+            kind = checkpointKind,
+            payload = RelayV2EncodedPayload(
+                codecVersion = codecVersion,
+                payloadUtf8Bytes = payloadUtf8Bytes,
+                canonicalJson = payloadCanonicalJson,
+                sha256 = payloadSha256,
+            ),
+        )
 }
 
 private fun RelayV2OutboxMetaEntity.toPersisted(): RelayV2PersistedOutboxMeta =

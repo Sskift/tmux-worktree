@@ -548,10 +548,10 @@ class RelayV2BrokerHostWssAdapterImpl implements RelayV2BrokerHostWssAdapter {
         this.forceDestroy();
       }
     };
-    const callback = (error?: Error): void => {
+    const callback = (error?: Error | null): void => {
       if (callbackSeen) return;
       callbackSeen = true;
-      const receipt = error === undefined ? "delivered" : "rejected";
+      const receipt = error == null ? "delivered" : "rejected";
       if (!returned) {
         callbackObserved = true;
         callbackReceipt = receipt;

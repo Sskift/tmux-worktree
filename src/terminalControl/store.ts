@@ -27,6 +27,7 @@ export const TERMINAL_CONTROL_STATE_VERSION = 1 as const;
 const LOCK_OWNER_FILE = "owner.json";
 const LOCK_STALE_MS = 60_000;
 const LOCK_WAIT_MS = 5_000;
+const ACTIVE_STORE_LOCKS = new WeakSet<object>();
 
 export type TerminalTargetLifecycle = "ACTIVE" | "RECOVERY_REQUIRED" | "TARGET_GONE";
 
@@ -465,7 +466,9 @@ export async function acquireTerminalControlStoreLock(
         rmSync(lockPath, { recursive: true, force: true });
         throw error;
       }
-      return { path: lockPath, owner };
+      const lock = Object.freeze({ path: lockPath, owner });
+      ACTIVE_STORE_LOCKS.add(lock);
+      return lock;
     } catch (error) {
       if (!existsSync(lockPath)) throw error;
       if (lockIsStale(lockPath)) {
@@ -485,9 +488,23 @@ export async function acquireTerminalControlStoreLock(
 }
 
 export function releaseTerminalControlStoreLock(lock: TerminalControlStoreLock): void {
+  if (!lock || !ACTIVE_STORE_LOCKS.has(lock as object)) return;
+  ACTIVE_STORE_LOCKS.delete(lock as object);
   const current = readLockOwner(lock.path);
   if (current?.owner !== lock.owner) return;
   rmSync(lock.path, { recursive: true, force: true });
+}
+
+/** Process-local proof that the exact acquired lock object still owns its path. */
+export function isTerminalControlStoreLockAuthorityCurrent(
+  lock: TerminalControlStoreLock,
+  expectedPath: string,
+): boolean {
+  if (!lock
+    || !ACTIVE_STORE_LOCKS.has(lock as object)
+    || lock.path !== expectedPath) return false;
+  const current = readLockOwner(lock.path);
+  return current?.owner === lock.owner && current.pid === process.pid;
 }
 
 export function leaseFromTarget(

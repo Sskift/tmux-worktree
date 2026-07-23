@@ -3,6 +3,7 @@ import test from "node:test";
 
 const codec = await import("../dist/relay/v2/codec.js");
 const carrier = await import("../dist/relay/v2/hostCarrier.js");
+const broker = await import("../dist/relay/v2/brokerCore.js");
 
 function wire(frame) {
   return codec.encodeRelayV2WebSocketFrame("carrier", frame);
@@ -130,7 +131,8 @@ function createHarness(options = {}) {
     hostEpoch: "authority-uuid",
     hostInstanceId: "host-process-uuid",
     credentialReferences: credentials,
-    advertisedCapabilities: [],
+    advertisedCapabilities: options.advertisedCapabilities ?? [],
+    preCarrierOfferClaim: options.preCarrierOfferClaim,
     clientDialects,
     dialectAdapters: options.dialectAdapters,
     publicPayloadDecoder: options.publicPayloadDecoder,
@@ -164,6 +166,7 @@ function createHarness(options = {}) {
     unbound,
     closing,
     clientDialects,
+    expectedCapabilities: options.expectedCapabilities ?? [],
   };
 }
 
@@ -172,7 +175,7 @@ function connect(harness, transport = new FakeTransport(), credential = "credent
   const hello = decoded(transport.sent).at(-1);
   assert.equal(hello.type, "host.hello");
   assert.deepEqual(hello.payload.clientDialects, harness.clientDialects);
-  assert.deepEqual(hello.payload.capabilities, []);
+  assert.deepEqual(hello.payload.capabilities, harness.expectedCapabilities);
   return { connection, transport, hello };
 }
 
@@ -308,6 +311,35 @@ test("host route and identity configuration cannot exceed production ceilings", 
   assert.throws(() => createHarness({
     queueLimits: { maxRouteIdentitiesPerConnector: 4_097 },
   }), /route identity limit exceeds the production ceiling/);
+});
+
+test("host hello consumes one exact pre-carrier offer and never accepts a static subset", () => {
+  assert.throws(() => createHarness({
+    advertisedCapabilities: [broker.RELAY_V2_REQUIRED_CAPABILITIES[0]],
+  }), /static capability advertisement is forbidden/);
+
+  const owner = new carrier.RelayV2HostCapabilityReadiness();
+  for (const source of carrier.RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES) {
+    if (source === "carrier") continue;
+    assert.equal(owner.source(source).apply({ source, generation: "1", ready: true }), true);
+  }
+  const fence = Object.freeze({ bind: () => true, fence() {} });
+  const claim = owner.issuePreCarrierOffer(Object.freeze({
+    controllerGeneration: "3",
+    carrierAttemptGeneration: "5",
+    fence,
+  }));
+  assert.notEqual(claim, null);
+  const h = createHarness({
+    preCarrierOfferClaim: claim,
+    expectedCapabilities: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+  });
+  const first = connect(h);
+  assert.deepEqual(first.hello.payload.capabilities, [...broker.RELAY_V2_REQUIRED_CAPABILITIES]);
+
+  h.expectedCapabilities = [];
+  const second = connect(h, new FakeTransport());
+  assert.deepEqual(second.hello.payload.capabilities, []);
 });
 
 test("post-publish connect failure rolls back connecting state and scheduled pressure", () => {

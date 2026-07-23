@@ -13,14 +13,18 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxTransactionPlan
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpoint
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpointReducer
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenMode
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenResume
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOutcome
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserRestoreProof
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPhase
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalRestoreInvalidity
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
@@ -76,6 +80,13 @@ internal interface RelayV2DurableStateTransaction {
     fun terminalCheckpoint(
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2PersistedTerminalCheckpoint?
+
+    fun terminalCheckpointsForSession(
+        selector: RelayV2TerminalResumeSessionSelector,
+        hostEpoch: String,
+    ): List<RelayV2PersistedTerminalCheckpoint> = emptyList()
+
+    fun deleteTerminalCheckpoint(key: RelayV2TerminalCheckpointKey): Boolean = false
 
     fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint)
 }
@@ -181,11 +192,50 @@ internal interface RelayV2OutboxRuntimeAuthority :
  * calls are adapter work and must never run from inside a store transaction.
  */
 internal interface RelayV2TerminalRuntimeAuthority {
+    suspend fun loadTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalStoredCheckpoint = throw RelayV2TerminalRestoreRequiredException()
+
     suspend fun reduceTerminalUnderApplyLease(
         key: RelayV2TerminalCheckpointKey,
         action: RelayV2TerminalAction,
     ): RelayV2TerminalReduction
 }
+
+/** Startup-only recovery port paired with the durable post-commit journal owner. */
+internal interface RelayV2TerminalRecoveryAuthority : RelayV2TerminalRuntimeAuthority {
+    suspend fun claimResumableTerminalUnderApplyLease(
+        selector: RelayV2TerminalResumeSessionSelector,
+        authority: RelayV2RepositoryEffectAuthority,
+        requestId: String,
+        openAttempt: RelayV2TerminalOpenAttempt,
+        cols: Int,
+        rows: Int,
+    ): RelayV2TerminalResumeClaim?
+
+    suspend fun recoverPostCommitUnknown(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalReduction?
+}
+
+/** UI-free exact Session selector used only to locate a durable terminal checkpoint. */
+internal data class RelayV2TerminalResumeSessionSelector(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val scopeId: String,
+    val sessionId: String,
+    val pane: Int,
+)
+
+/** One transaction's one-shot claim of a stored terminal identity for a RESUME attempt. */
+internal data class RelayV2TerminalResumeClaim(
+    val key: RelayV2TerminalCheckpointKey,
+    val reduction: RelayV2TerminalReduction,
+)
 
 /**
  * Single transaction owner for the accepted pure Outbox and terminal authorities.
@@ -201,7 +251,7 @@ internal class RelayV2DurableStateRepositoryCore(
     private val outboxAuthority: RelayV2OutboxAuthorityCore = RelayV2OutboxAuthorityCore(),
 ) : RelayV2OutboxRuntimeAuthority,
     RelayV2OutboxEnqueueAuthority,
-    RelayV2TerminalRuntimeAuthority {
+    RelayV2TerminalRecoveryAuthority {
     private val restoredTerminalKeys = ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
     private val resetAuthorizedTerminalKeys =
         ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
@@ -426,6 +476,10 @@ internal class RelayV2DurableStateRepositoryCore(
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2TerminalStoredCheckpoint = store.transaction { decodeTerminal(key) }
 
+    override suspend fun loadTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalStoredCheckpoint = loadTerminal(key)
+
     override suspend fun reduceTerminalUnderApplyLease(
         key: RelayV2TerminalCheckpointKey,
         action: RelayV2TerminalAction,
@@ -460,6 +514,104 @@ internal class RelayV2DurableStateRepositoryCore(
         }
         result.rememberReducedKey(key)
         return result
+    }
+
+    override suspend fun claimResumableTerminalUnderApplyLease(
+        selector: RelayV2TerminalResumeSessionSelector,
+        authority: RelayV2RepositoryEffectAuthority,
+        requestId: String,
+        openAttempt: RelayV2TerminalOpenAttempt,
+        cols: Int,
+        rows: Int,
+    ): RelayV2TerminalResumeClaim? {
+        requireResumeSelectorAuthority(selector, authority)
+        val claim = store.transaction {
+            val rowsForSession = terminalCheckpointsForSession(selector, authority.hostEpoch)
+            check(rowsForSession.size <= MAX_TERMINAL_CHECKPOINTS_PER_SESSION) {
+                "Terminal checkpoint retention is over limit"
+            }
+            val decoded = rowsForSession.map { row ->
+                row.key to decodeTerminalRow(row.key, row)
+            }
+            val invalid = decoded.firstOrNull { it.second is RelayV2TerminalStoredCheckpoint.Invalid }
+            if (invalid != null) {
+                throw (invalid.second as RelayV2TerminalStoredCheckpoint.Invalid)
+                    .asStorageException()
+            }
+            check(decoded.none { it.second is RelayV2TerminalStoredCheckpoint.PreOpen }) {
+                "A terminal open attempt is already pending for this Session"
+            }
+            decoded.filter { (_, stored) ->
+                (stored as? RelayV2TerminalStoredCheckpoint.Present)
+                    ?.checkpoint?.phase == RelayV2TerminalPhase.FINALIZED
+            }.forEach { (key, stored) ->
+                val checkpoint = (stored as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+                check(finalizedCheckpointIsPrunable(checkpoint)) {
+                    "Finalized terminal checkpoint still owns callback authority"
+                }
+                check(deleteTerminalCheckpoint(key)) {
+                    "Finalized terminal checkpoint could not be pruned"
+                }
+            }
+            val candidates = decoded.mapNotNull { (key, stored) ->
+                val present = stored as? RelayV2TerminalStoredCheckpoint.Present
+                    ?: return@mapNotNull null
+                if (present.checkpoint.phase == RelayV2TerminalPhase.FINALIZED) null
+                else key to present
+            }
+            check(candidates.size <= 1) {
+                "Multiple resumable terminal checkpoints exist for one Session"
+            }
+            val (key, stored) = candidates.singleOrNull() ?: return@transaction null
+            val checkpoint = stored.checkpoint
+            check(key == RelayV2TerminalCheckpointKey.from(checkpoint.identity.target()))
+            check(checkpoint.deliveryToken.authorityGeneration < Long.MAX_VALUE) {
+                "Terminal delivery authority generation is exhausted"
+            }
+            val deliveryToken = RelayV2TerminalDeliveryToken(
+                actorGeneration = authority.generation,
+                authorityGeneration = checkpoint.deliveryToken.authorityGeneration + 1,
+                localDispatchToken = 1,
+            )
+            val restored = RelayV2TerminalCheckpointReducer.restore(
+                stored = stored,
+                expectedIdentity = checkpoint.identity,
+                expectedOpenAttempt = checkpoint.openAttempt,
+                currentDeliveryToken = deliveryToken,
+                currentParserContinuityId = checkpoint.parserContinuityId,
+                parserOperationProof = null,
+            )
+            val reduction = if (restored.outcome is RelayV2TerminalOutcome.Restored) {
+                val current = requireNotNull(restored.checkpoint)
+                RelayV2TerminalCheckpointReducer.reduce(
+                    current,
+                    RelayV2TerminalAction.BeginOpenAttempt(
+                        deliveryToken = deliveryToken,
+                        requestId = requestId,
+                        openAttempt = openAttempt,
+                        mode = RelayV2TerminalOpenMode.RESUME,
+                        cols = cols,
+                        rows = rows,
+                        target = current.identity.target(),
+                        parserContinuityId = current.parserContinuityId,
+                        resume = RelayV2TerminalOpenResume(
+                            generation = current.identity.generation,
+                            nextOffset = current.parserAppliedNextOffset,
+                            resumeTokenCredentialReference =
+                                current.identity.resumeTokenCredentialReference,
+                            resumeTokenCredentialFingerprint =
+                                current.identity.resumeTokenCredentialFingerprint,
+                        ),
+                    ),
+                )
+            } else {
+                restored
+            }
+            persistTerminalReduction(key, reduction)
+            RelayV2TerminalResumeClaim(key, reduction)
+        }
+        claim?.reduction?.rememberRestoreOutcome(claim.key)
+        return claim
     }
 
     suspend fun restoreTerminalUnderApplyLease(
@@ -511,6 +663,41 @@ internal class RelayV2DurableStateRepositoryCore(
             reduction
         }
         result.rememberRestoreOutcome(key)
+        return result
+    }
+
+    override suspend fun recoverPostCommitUnknown(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalReduction? {
+        require(authority.profileId == key.profileId)
+        require(authority.profileActivationGeneration == key.profileActivationGeneration)
+        require(authority.principalId == key.principalId)
+        require(authority.clientInstanceId == key.clientInstanceId)
+        require(authority.hostId == key.hostId)
+        require(authority.hostEpoch == key.hostEpoch)
+        val result = store.transaction {
+            val stored = decodeTerminal(key) as? RelayV2TerminalStoredCheckpoint.Present
+                ?: return@transaction null
+            val checkpoint = stored.checkpoint
+            if (checkpoint.identity.target() != key.toTarget() ||
+                checkpoint.deliveryToken.actorGeneration != authority.generation
+            ) return@transaction null
+            val reduction = RelayV2TerminalCheckpointReducer.restore(
+                stored = stored,
+                expectedIdentity = checkpoint.identity,
+                expectedOpenAttempt = checkpoint.openAttempt,
+                currentDeliveryToken = checkpoint.deliveryToken,
+                currentParserContinuityId = null,
+                parserOperationProof = null,
+            )
+            if (reduction.outcome !is RelayV2TerminalOutcome.ResetRequired) {
+                return@transaction null
+            }
+            persistTerminalReduction(key, reduction)
+            reduction
+        }
+        result?.rememberRestoreOutcome(key)
         return result
     }
 
@@ -689,12 +876,42 @@ internal class RelayV2DurableStateRepositoryCore(
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2TerminalStoredCheckpoint {
         val row = terminalCheckpoint(key) ?: return RelayV2TerminalStoredCheckpoint.Missing
+        return decodeTerminalRow(key, row)
+    }
+
+    private fun decodeTerminalRow(
+        key: RelayV2TerminalCheckpointKey,
+        row: RelayV2PersistedTerminalCheckpoint,
+    ): RelayV2TerminalStoredCheckpoint {
         if (row.key != key) {
             return RelayV2TerminalStoredCheckpoint.Invalid(
                 RelayV2TerminalRestoreInvalidity.CORRUPT_QUEUE,
             )
         }
         return RelayV2TerminalCheckpointCodec.decode(key, row.kind, row.payload)
+    }
+
+    private fun requireResumeSelectorAuthority(
+        selector: RelayV2TerminalResumeSessionSelector,
+        authority: RelayV2RepositoryEffectAuthority,
+    ) {
+        require(selector.profileId == authority.profileId)
+        require(selector.profileActivationGeneration == authority.profileActivationGeneration)
+        require(selector.principalId == authority.principalId)
+        require(selector.clientInstanceId == authority.clientInstanceId)
+        require(selector.hostId == authority.hostId)
+        require(selector.pane >= 0)
+    }
+
+    private fun finalizedCheckpointIsPrunable(checkpoint: RelayV2TerminalCheckpoint): Boolean =
+        checkpoint.pendingParserDispatchClaim == null &&
+            checkpoint.pendingParserEffectHandoff == null &&
+            checkpoint.pendingParserEffectActivation == null &&
+            checkpoint.parserInFlightCallbackToken == null &&
+            checkpoint.parserResetCallbackToken == null
+
+    private companion object {
+        const val MAX_TERMINAL_CHECKPOINTS_PER_SESSION = 256
     }
 
     private fun RelayV2DurableStateTransaction.persistTerminalReduction(

@@ -7,6 +7,8 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineReplayPagePublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSnapshotPagePublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectApplyResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
@@ -119,6 +121,31 @@ internal data class AgentTranscriptLifecycleDurableControlCommand(
     val fence: AgentTranscriptLifecycleDurableOperationFence,
     val input: AgentTranscriptLifecycleControlInput,
 )
+
+/** Exact consumer-scoped durable notification configuration mutation. */
+internal data class AgentTranscriptLifecycleNotificationConfigMutationCommand(
+    val consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    val config: AgentNotificationConfig,
+)
+
+internal sealed interface AgentTranscriptLifecycleNotificationConfigMutationResult {
+    data object Applied : AgentTranscriptLifecycleNotificationConfigMutationResult
+    data object Unavailable : AgentTranscriptLifecycleNotificationConfigMutationResult
+}
+
+/** Actor-owned optional-capability lease; callers cannot supply or reconstruct its generation. */
+internal interface AgentTranscriptLifecycleNotificationConfigMutationLeasePort {
+    suspend fun <T> withCurrentAgentNotificationConfigMutationLease(
+        consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+        block: suspend () -> T,
+    ): RelayV2EffectApplyResult<T>
+}
+
+internal fun interface AgentTranscriptLifecycleNotificationConfigMutationPort {
+    suspend fun mutate(
+        command: AgentTranscriptLifecycleNotificationConfigMutationCommand,
+    ): AgentTranscriptLifecycleNotificationConfigMutationResult
+}
 
 /** One strict codec-issued LIVE frame. */
 internal data class AgentTranscriptLifecycleDurableLiveEventCommand(
@@ -350,6 +377,11 @@ internal data class AgentTranscriptLifecycleDurableRequestIdentity(
 
 /** One deep production seam: every method maps to one outer Room transaction. */
 internal interface AgentTranscriptLifecycleDurableOperationPort {
+    suspend fun applyNotificationConfigUnderApplyLease(
+        command: AgentTranscriptLifecycleNotificationConfigMutationCommand,
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        throw UnsupportedOperationException("Notification config mutation is not installed")
+
     suspend fun prepareRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
         limits: AgentClientReducerLimits = AgentClientReducerLimits(),
@@ -402,6 +434,20 @@ internal interface AgentTranscriptLifecycleNotificationClaimPort {
     ): AgentTranscriptLifecycleNotificationClaimResult
 }
 
+/** Same durable claim owner: publication is recorded only after the platform returns Posted. */
+internal interface AgentTranscriptLifecyclePostedNotificationDurablePort {
+    suspend fun markNotificationPostedUnderApplyLease(
+        ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ): AgentTranscriptLifecycleMarkNotificationPostedResult
+
+    suspend fun readPostedNotificationPage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): AgentTranscriptLifecyclePostedNotificationPage
+}
+
 /** Bounded, read-only namespace discovery seam for activation-scoped Agent recovery. */
 internal interface AgentTranscriptLifecycleRecoveryCatalogPort {
     suspend fun readRecoveryNamespacePage(
@@ -430,6 +476,17 @@ internal interface AgentTranscriptLifecycleRuntimeDurableRepository :
         namespace: AgentTranscriptLifecycleDurableNamespace,
     ): AgentTranscriptLifecycleDurableRecord
 }
+
+internal fun RelayV2RepositoryEffectAuthority.ownsExactly(
+    consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+): Boolean = generation.profileId == consumer.profileId &&
+    generation.profileGeneration == consumer.profileActivationGeneration &&
+    profileId == consumer.profileId &&
+    profileActivationGeneration == consumer.profileActivationGeneration &&
+    principalId == consumer.principalId &&
+    clientInstanceId == consumer.clientInstanceId &&
+    hostId == consumer.hostId &&
+    hostEpoch == consumer.hostEpoch
 
 private fun requireReplayArtifactNamespace(
     fence: AgentTranscriptLifecycleDurableOperationFence,

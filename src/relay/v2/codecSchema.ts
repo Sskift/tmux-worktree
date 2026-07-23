@@ -965,11 +965,16 @@ function validateStateChange(type: "scopes.changed" | "sessions.changed", value:
   }
 }
 
-function validateTerminalResume(value: RelayV2JsonValue): void {
+function validateTerminalResume(
+  value: RelayV2JsonValue,
+  mode: "resume" | "reset",
+): void {
   const resume = object(value);
-  exact(resume, ["generation", "nextOffset", "resumeToken"]);
+  exact(resume, mode === "resume"
+    ? ["generation", "nextOffset", "resumeToken"]
+    : ["generation", "resumeToken"]);
   id(field(resume, "generation"));
-  counter(field(resume, "nextOffset"));
+  if (mode === "resume") counter(field(resume, "nextOffset"));
   stringValue(field(resume, "resumeToken"), { maxBytes: 4_096 });
 }
 
@@ -1516,7 +1521,7 @@ export function validateRelayV2PublicFrame(
       const hasResume = Object.hasOwn(payload, "resume");
       if (mode === "new" && hasResume) reject("schema-mismatch");
       if (mode === "resume" && !hasResume) reject("missing-field");
-      if (hasResume) validateTerminalResume(payload.resume!);
+      if (hasResume && mode !== "new") validateTerminalResume(payload.resume!, mode);
       break;
     }
     case "terminal.opened": {

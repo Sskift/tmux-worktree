@@ -241,7 +241,8 @@ export interface RelayV2TerminalRequestContext {
 
 export interface RelayV2TerminalResume {
   generation: string;
-  nextOffset: string;
+  /** Present only for mode=resume; mode=reset forbids this field. */
+  nextOffset?: string;
   resumeToken: string;
 }
 
@@ -2001,7 +2002,7 @@ export class RelayV2TerminalManager {
       request.rows,
       request.mode,
       request.resume?.generation ?? null,
-      request.resume?.nextOffset ?? null,
+      request.mode === "resume" ? request.resume?.nextOffset ?? null : null,
       request.resume ? tokenHash(request.resume.resumeToken) : null,
     ]);
   }
@@ -2120,7 +2121,7 @@ export class RelayV2TerminalManager {
       resumeTokenHash: requestResumeTokenHash,
       mode: request.mode,
       previousGeneration: request.resume?.generation ?? null,
-      requestedOffset: request.resume?.nextOffset ?? null,
+      requestedOffset: request.mode === "resume" ? request.resume?.nextOffset ?? null : null,
       expiresAtMs: this.now() + this.limits.controlRetentionMs,
     });
     if (!claim || typeof claim !== "object" || typeof claim.status !== "string") {
@@ -2180,7 +2181,7 @@ export class RelayV2TerminalManager {
           kind: "reset",
           generation: request.resume?.generation ?? null,
           reason: "stream_lost",
-          requestedOffset: request.resume
+          requestedOffset: request.mode === "resume" && request.resume
             ? parseCounter(request.resume.nextOffset, "nextOffset")
             : null,
           bufferStartOffset: null,
@@ -2363,7 +2364,23 @@ export class RelayV2TerminalManager {
     if (request.mode === "resume" && request.resume === undefined) {
       throw new RelayV2TerminalManagerError("INVALID_ARGUMENT", "mode=resume requires resume fields");
     }
-    if (request.resume) parseCounter(request.resume.nextOffset, "nextOffset");
+    if (request.mode === "resume") {
+      if (request.resume?.nextOffset === undefined) {
+        throw new RelayV2TerminalManagerError(
+          "INVALID_ARGUMENT",
+          "mode=resume requires nextOffset",
+        );
+      }
+      parseCounter(request.resume.nextOffset, "nextOffset");
+    }
+    if (request.mode === "reset"
+      && request.resume !== undefined
+      && Object.hasOwn(request.resume, "nextOffset")) {
+      throw new RelayV2TerminalManagerError(
+        "INVALID_ARGUMENT",
+        "mode=reset forbids nextOffset",
+      );
+    }
   }
 
   private durableOpenOutcome(
@@ -2642,7 +2659,9 @@ export class RelayV2TerminalManager {
       kind: "reset",
       generation: outcome.generation,
       reason: "stream_lost",
-      requestedOffset: parseCounter(outcome.replayFromOffset, "durable replayFromOffset"),
+      requestedOffset: outcome.disposition === "resumed"
+        ? parseCounter(outcome.replayFromOffset, "durable replayFromOffset")
+        : null,
       bufferStartOffset: null,
       tailOffset: null,
     };
@@ -2871,7 +2890,9 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation: record.outcome.generation,
         reason: "stream_lost",
-        requestedOffset: record.outcome.replayFromOffset,
+        requestedOffset: record.outcome.disposition === "resumed"
+          ? record.outcome.replayFromOffset
+          : null,
         bufferStartOffset: null,
         tailOffset: null,
       });
@@ -2884,7 +2905,9 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation: stream.generation,
         reason: "stream_lost",
-        requestedOffset: record.outcome.replayFromOffset,
+        requestedOffset: record.outcome.disposition === "resumed"
+          ? record.outcome.replayFromOffset
+          : null,
         bufferStartOffset: null,
         tailOffset: null,
       });
@@ -2983,9 +3006,7 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation,
         reason: "stream_lost",
-        requestedOffset: request.resume
-          ? parseCounter(request.resume.nextOffset, "nextOffset")
-          : null,
+        requestedOffset: null,
         bufferStartOffset: null,
         tailOffset: null,
       };
@@ -3250,12 +3271,11 @@ export class RelayV2TerminalManager {
       && requestResumeTokenHash !== null
       && safeHashEqual(source.resumeTokenHash, requestResumeTokenHash);
     if (restartLikeExactPrevious) {
-      const requestedOffset = parseCounter(resume.nextOffset, "nextOffset");
       const outcome: Extract<OpenRecordOutcome, { kind: "reset" }> = {
         kind: "reset",
         generation: source.generation,
         reason: "stream_lost",
-        requestedOffset,
+        requestedOffset: null,
         bufferStartOffset: null,
         tailOffset: null,
       };
@@ -3272,7 +3292,7 @@ export class RelayV2TerminalManager {
         completed.kind !== "reset"
         || completed.generation !== outcome.generation
         || completed.reason !== outcome.reason
-        || completed.requestedOffset !== outcome.requestedOffset
+        || completed.requestedOffset !== null
         || completed.bufferStartOffset !== null
         || completed.tailOffset !== null
       ) {
@@ -3289,9 +3309,7 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation: request.resume?.generation ?? null,
         reason: "stream_lost",
-        requestedOffset: request.resume
-          ? parseCounter(request.resume.nextOffset, "nextOffset")
-          : null,
+        requestedOffset: null,
         bufferStartOffset: null,
         tailOffset: null,
       };
@@ -3569,7 +3587,7 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation: request.resume?.generation ?? null,
         reason: "stream_lost",
-        requestedOffset: request.resume
+        requestedOffset: request.mode === "resume" && request.resume
           ? parseCounter(request.resume.nextOffset, "nextOffset")
           : null,
         bufferStartOffset: null,

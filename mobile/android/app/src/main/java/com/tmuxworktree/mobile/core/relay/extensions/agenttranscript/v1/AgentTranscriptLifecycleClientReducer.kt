@@ -449,7 +449,17 @@ internal data class AgentNotificationConfig(
     val permission: AgentNotificationPermission = AgentNotificationPermission.DENIED,
     val profileActive: Boolean = false,
     val policy: AgentNotificationPolicy = AgentNotificationPolicy.ALLOW,
-)
+    val waitingForUser: Boolean = false,
+    val failed: Boolean = false,
+    val completed: Boolean = false,
+) {
+    fun allows(state: AgentLifecycleState): Boolean = when (state) {
+        AgentLifecycleState.WAITING_FOR_USER -> waitingForUser
+        AgentLifecycleState.FAILED -> failed
+        AgentLifecycleState.COMPLETED -> completed
+        AgentLifecycleState.RUNNING -> false
+    }
+}
 
 internal data class AgentNotificationDedupeKey(
     val profileId: String,
@@ -538,7 +548,8 @@ internal data class AgentSystemNotificationIntent(
             currentRecord != null && eventIdentity.matches(currentRecord) &&
             clientState.notificationConfig.profileActive &&
             clientState.notificationConfig.permission == AgentNotificationPermission.GRANTED &&
-            clientState.notificationConfig.policy == AgentNotificationPolicy.ALLOW
+            clientState.notificationConfig.policy == AgentNotificationPolicy.ALLOW &&
+            clientState.notificationConfig.allows(dedupeKey.state)
     }
 }
 
@@ -2043,7 +2054,7 @@ internal object AgentTranscriptLifecycleClientReducer {
             !config.profileActive -> AgentNotificationDisposition.SUPPRESSED_INACTIVE_PROFILE
             config.permission == AgentNotificationPermission.DENIED ->
                 AgentNotificationDisposition.SUPPRESSED_PERMISSION
-            config.policy == AgentNotificationPolicy.SUPPRESS ->
+            config.policy == AgentNotificationPolicy.SUPPRESS || !config.allows(lifecycle.state) ->
                 AgentNotificationDisposition.SUPPRESSED_POLICY
             else -> AgentNotificationDisposition.SHOWN
         }

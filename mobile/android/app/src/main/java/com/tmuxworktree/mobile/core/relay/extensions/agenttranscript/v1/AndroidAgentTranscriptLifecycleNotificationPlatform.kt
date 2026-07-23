@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import com.tmuxworktree.mobile.R
 import com.tmuxworktree.mobile.V2Activity
+import java.util.concurrent.CancellationException
 
 /** Android system-notification adapter for post-commit Agent lifecycle claim tickets. */
 internal class AndroidAgentTranscriptLifecycleNotificationPlatform(
@@ -30,6 +31,19 @@ internal class AndroidAgentTranscriptLifecycleNotificationPlatform(
         failed(
             AgentTranscriptLifecycleNotificationPlatformFailureReason.PLATFORM_STATE_CHECK_FAILED,
         )
+    }
+
+    override fun cancel(
+        identity: AgentTranscriptLifecyclePostedNotificationIdentity,
+    ): AgentTranscriptLifecycleNotificationCancellationPlatformResult = try {
+        system.cancel(identity.claimId, NOTIFICATION_ID)
+        AgentTranscriptLifecycleNotificationCancellationPlatformResult.Cancelled
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: SecurityException) {
+        AgentTranscriptLifecycleNotificationCancellationPlatformResult.Failed
+    } catch (_: RuntimeException) {
+        AgentTranscriptLifecycleNotificationCancellationPlatformResult.Failed
     }
 
     private fun postChecked(
@@ -181,6 +195,20 @@ internal interface AndroidAgentTranscriptLifecycleNotificationSystem {
     fun createNotificationChannel(channel: NotificationChannel)
 
     fun notify(tag: String, notificationId: Int, notification: Notification)
+
+    fun cancel(tag: String, notificationId: Int) {
+        throw UnsupportedOperationException("Notification cancellation is not installed")
+    }
+}
+
+/** Canonical platform interpretation of the POST_NOTIFICATIONS runtime permission. */
+internal object AndroidAgentTranscriptLifecycleNotificationPermission {
+    fun isGranted(context: Context): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+
+    fun requiresRuntimeRequest(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
 }
 
 private class AndroidAgentTranscriptLifecycleNotificationSystemAdapter(
@@ -189,9 +217,7 @@ private class AndroidAgentTranscriptLifecycleNotificationSystemAdapter(
     private val manager = context.getSystemService(NotificationManager::class.java)
 
     override fun hasPostNotificationsPermission(): Boolean =
-        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
+        AndroidAgentTranscriptLifecycleNotificationPermission.isGranted(context)
 
     override fun areNotificationsEnabled(): Boolean = manager.areNotificationsEnabled()
 
@@ -204,5 +230,9 @@ private class AndroidAgentTranscriptLifecycleNotificationSystemAdapter(
 
     override fun notify(tag: String, notificationId: Int, notification: Notification) {
         manager.notify(tag, notificationId, notification)
+    }
+
+    override fun cancel(tag: String, notificationId: Int) {
+        manager.cancel(tag, notificationId)
     }
 }

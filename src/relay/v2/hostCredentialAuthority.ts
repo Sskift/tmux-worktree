@@ -455,7 +455,7 @@ function isTimestamp(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-function isCredentialReference(value: unknown): value is string {
+export function isRelayV2HostCredentialReference(value: unknown): value is string {
   if (typeof value !== "string"
     || !value.startsWith(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE)
     || Buffer.byteLength(value, "utf8") > 128) return false;
@@ -464,7 +464,7 @@ function isCredentialReference(value: unknown): value is string {
     && !/^(?:twcap2|twref2|twenroll2|twhostboot2)\./.test(identifier);
 }
 
-function isSecretReference(value: unknown): value is string {
+export function isRelayV2HostCredentialSecretReference(value: unknown): value is string {
   return isRelayV2AuthIdentifier(value)
     && !/^(?:twcap2|twref2|twenroll2|twhostboot2)\./.test(value);
 }
@@ -537,7 +537,7 @@ function parseCredentialAttempt(value: unknown): RelayV2HostPendingCredentialAtt
     || (value.kind !== "bootstrap" && value.kind !== "refresh")
     || !isRelayV2AuthIdentifier(value.attemptId)
     || !isCanonicalCounter(value.oldCredentialVersion)
-    || !isSecretReference(value.oldSecretReference)) {
+    || !isRelayV2HostCredentialSecretReference(value.oldSecretReference)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
   }
   return {
@@ -556,7 +556,7 @@ function parsePendingReauthentication(
     || !hasExactKeys(value, [
       "credentialReference", "credentialVersion", "requestId", "grantId", "accessJti",
     ])
-    || !isCredentialReference(value.credentialReference)
+    || !isRelayV2HostCredentialReference(value.credentialReference)
     || !isCanonicalCounter(value.credentialVersion)
     || value.credentialVersion === "0"
     || !isRelayV2AuthIdentifier(value.requestId)
@@ -662,7 +662,7 @@ export function decodeRelayV2HostCredentialState(
   credentialReference: string,
 ): RelayV2HostCredentialState {
   try {
-    if (!isCredentialReference(credentialReference)) {
+    if (!isRelayV2HostCredentialReference(credentialReference)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
     }
     return parseState(value, credentialReference);
@@ -672,7 +672,7 @@ export function decodeRelayV2HostCredentialState(
 }
 
 function validateReference(value: unknown): string {
-  if (!isCredentialReference(value)) {
+  if (!isRelayV2HostCredentialReference(value)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
   }
   return value;
@@ -682,9 +682,9 @@ function validateAttemptInput(
   value: RelayV2HostBootstrapPreparation | RelayV2HostRefreshPreparation,
 ): void {
   if (!isRecord(value)
-    || !isCredentialReference(value.credentialReference)
+    || !isRelayV2HostCredentialReference(value.credentialReference)
     || !isRelayV2AuthIdentifier(value.attemptId)
-    || !isSecretReference(value.oldSecretReference)) {
+    || !isRelayV2HostCredentialSecretReference(value.oldSecretReference)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
   }
 }
@@ -825,7 +825,7 @@ function validateConnectionAttemptBinding(
     || !isRelayV2AuthIdentifier(value.hostId)
     || !isRelayV2AuthIdentifier(value.hostEpoch)
     || !isRelayV2AuthIdentifier(value.hostInstanceId)
-    || !isCredentialReference(value.credentialReference)) {
+    || !isRelayV2HostCredentialReference(value.credentialReference)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
   }
   return Object.freeze({
@@ -848,7 +848,7 @@ function validateConnectionCarrierBinding(
     || !isRelayV2AuthIdentifier(value.hostId)
     || !isRelayV2AuthIdentifier(value.hostEpoch)
     || !isRelayV2AuthIdentifier(value.hostInstanceId)
-    || !isCredentialReference(value.credentialReference)) {
+    || !isRelayV2HostCredentialReference(value.credentialReference)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
   }
   return Object.freeze({
@@ -1273,7 +1273,7 @@ implements RelayV2HostCarrierCredentialReferences {
   }
 
   read(reference: string): RelayV2HostCredentialRecord {
-    if (!isCredentialReference(reference)) {
+    if (!isRelayV2HostCredentialReference(reference)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_NOT_FOUND");
     }
     const state = this.readState(reference);
@@ -1300,7 +1300,7 @@ implements RelayV2HostCarrierCredentialReferences {
   }
 
   inspect(reference: string): RelayV2HostCredentialInspection | null {
-    if (!isCredentialReference(reference)) return null;
+    if (!isRelayV2HostCredentialReference(reference)) return null;
     const state = this.readState(reference);
     if (!state) return null;
     return inspectCredentialState(state);
@@ -1311,7 +1311,7 @@ implements RelayV2HostCarrierCredentialReferences {
   ): RelayV2HostCredentialCapturedExchangeCut {
     if (!isRecord(input)
       || !hasExactKeys(input, ["credentialReference", "hostId"])
-      || !isCredentialReference(input.credentialReference)
+      || !isRelayV2HostCredentialReference(input.credentialReference)
       || !isRelayV2AuthIdentifier(input.hostId)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
@@ -1651,7 +1651,7 @@ implements RelayV2HostCarrierCredentialReferences {
     input: RelayV2HostReauthenticationPreparation,
   ): RelayV2HostPreparedReauthentication {
     if (!isRecord(input)
-      || !isCredentialReference(input.credentialReference)
+      || !isRelayV2HostCredentialReference(input.credentialReference)
       || !isRelayV2AuthIdentifier(input.requestId)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
@@ -1712,7 +1712,7 @@ implements RelayV2HostCarrierCredentialReferences {
 
   acknowledgeReauthentication(fence: RelayV2HostCredentialAckFence): boolean {
     if (!isRecord(fence)
-      || !isCredentialReference(fence.reference)
+      || !isRelayV2HostCredentialReference(fence.reference)
       || !isCanonicalCounter(fence.version)
       || !isRelayV2AuthIdentifier(fence.requestId)
       || !isRelayV2AuthIdentifier(fence.grantId)

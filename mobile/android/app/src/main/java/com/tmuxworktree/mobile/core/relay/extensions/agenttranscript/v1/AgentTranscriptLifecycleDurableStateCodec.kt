@@ -11,7 +11,7 @@ import java.nio.charset.StandardCharsets
 
 /** Closed, digest-protected codec for the complete durable Android consumer reducer state. */
 internal object AgentTranscriptLifecycleDurableStateCodec {
-    const val CODEC_VERSION = 2
+    const val CODEC_VERSION = 3
     const val MAX_PAYLOAD_UTF8_BYTES = 16_777_216
 
     fun encode(
@@ -43,7 +43,12 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         payload: RelayV2EncodedPayload,
     ): AgentTranscriptLifecycleDecodedDurablePayload = try {
-        if (payload.codecVersion !in setOf(LEGACY_CODEC_VERSION, CODEC_VERSION)) incompatible()
+        if (payload.codecVersion !in setOf(
+                LEGACY_CODEC_VERSION,
+                PREVIOUS_CODEC_VERSION,
+                CODEC_VERSION,
+            )
+        ) incompatible()
         val root = RelayV2StorageJson.decode(
             payload,
             expectedCodecVersion = payload.codecVersion,
@@ -74,7 +79,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         ) malformed()
         AgentTranscriptLifecycleDecodedDurablePayload(
             state = state,
-            storageAccounting = if (payload.codecVersion == CODEC_VERSION) {
+            storageAccounting = if (payload.codecVersion != LEGACY_CODEC_VERSION) {
                 decodeDurableStorageAccounting(
                     RelayV2StorageJson.objectValue(root, "storageAccounting"),
                 )
@@ -100,6 +105,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         if (identity != namespace.consumer.sessionIdentity) malformed()
         val notificationConfig = decodeNotificationConfig(
             RelayV2StorageJson.objectValue(value, "notificationConfig"),
+            codecVersion,
         )
         val extension = decodeExtension(
             namespace,
@@ -295,7 +301,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             notificationBaseline == null ||
             legacyHasIncompleteLifecycleMaterialization ||
             legacyNeedsFreshTranscriptMaterialization
-        val syncState = if (codecVersion == CODEC_VERSION) {
+        val syncState = if (codecVersion != LEGACY_CODEC_VERSION) {
             decodeSyncState(RelayV2StorageJson.objectValue(value, "syncState"))
         } else if (support == AgentExtensionSupport.AVAILABLE) {
             AgentTimelineSyncState.StatusRefresh(
@@ -326,7 +332,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             activeSourceEpoch = RelayV2StorageJson.nullableString(value, "activeSourceEpoch"),
             timelineEpoch = timelineEpoch,
             lastAgentSeq = storedLastAgentSeq,
-            effectiveHostLimits = if (codecVersion == CODEC_VERSION) {
+            effectiveHostLimits = if (codecVersion != LEGACY_CODEC_VERSION) {
                 RelayV2StorageJson.nullableObject(value, "effectiveHostLimits")
                     ?.let(::decodeEffectiveHostLimits)
             } else {
@@ -336,7 +342,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             notificationBaselineAgentSeq = notificationBaseline,
             lifecycleByIdentity = lifecycleByIdentity,
             currentLifecycleIdentityByEventId = lifecycleEventIndex,
-            runsWithTurnRecords = if (codecVersion == CODEC_VERSION) {
+            runsWithTurnRecords = if (codecVersion != LEGACY_CODEC_VERSION) {
                 encodedRunsWithTurns.toCollection(linkedSetOf())
             } else {
                 emptySet()
@@ -361,7 +367,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
                 codecVersion == LEGACY_CODEC_VERSION &&
                 syncState is AgentTimelineSyncState.StatusRefresh
             ) null else pendingStatus,
-            pendingSnapshotRequest = if (codecVersion == CODEC_VERSION) {
+            pendingSnapshotRequest = if (codecVersion != LEGACY_CODEC_VERSION) {
                 encodedPendingSnapshot?.let(::decodeSnapshotPreFirstFence)
             } else {
                 null
@@ -484,12 +490,44 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         return encoded.toLongOrNull() ?: malformed()
     }
 
-    private fun decodeNotificationConfig(value: Map<String, Any?>): AgentNotificationConfig {
-        RelayV2StorageJson.requireKeys(value, "permission", "profileActive", "policy")
+    private fun decodeNotificationConfig(
+        value: Map<String, Any?>,
+        codecVersion: Int,
+    ): AgentNotificationConfig {
+        if (codecVersion == CODEC_VERSION) {
+            RelayV2StorageJson.requireKeys(
+                value,
+                "permission",
+                "profileActive",
+                "policy",
+                "waitingForUser",
+                "failed",
+                "completed",
+            )
+        } else {
+            RelayV2StorageJson.requireKeys(value, "permission", "profileActive", "policy")
+        }
         return AgentNotificationConfig(
             permission = RelayV2StorageJson.enum(value, "permission"),
             profileActive = RelayV2StorageJson.boolean(value, "profileActive"),
             policy = RelayV2StorageJson.enum(value, "policy"),
+            waitingForUser = if (codecVersion == CODEC_VERSION) {
+                RelayV2StorageJson.boolean(value, "waitingForUser")
+            } else {
+                // v1/v2 stored only the global gate. Preserve the existing waiting/failed
+                // defaults, while keeping completed closed and retaining all three stored gates.
+                true
+            },
+            failed = if (codecVersion == CODEC_VERSION) {
+                RelayV2StorageJson.boolean(value, "failed")
+            } else {
+                true
+            },
+            completed = if (codecVersion == CODEC_VERSION) {
+                RelayV2StorageJson.boolean(value, "completed")
+            } else {
+                false
+            },
         )
     }
 
@@ -1057,6 +1095,9 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         "permission" to permission.name,
         "profileActive" to profileActive,
         "policy" to policy.name,
+        "waitingForUser" to waitingForUser,
+        "failed" to failed,
+        "completed" to completed,
     )
 
     private fun AgentTranscriptLifecycleExtensionState.toStorageMap(): Map<String, Any?> =
@@ -1260,6 +1301,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
 
     private const val PAYLOAD_KIND = "agent_transcript_lifecycle_client_state"
     private const val LEGACY_CODEC_VERSION = 1
+    private const val PREVIOUS_CODEC_VERSION = 2
     private const val MAX_APPLIED_EVENT_EVIDENCE = 4_096
     private const val MAX_EVENT_IDENTITY_WITNESSES = 4_096
     private const val MAX_LIFECYCLE_RECORDS = 2_048

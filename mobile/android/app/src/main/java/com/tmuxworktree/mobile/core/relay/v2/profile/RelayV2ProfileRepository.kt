@@ -3,8 +3,12 @@ package com.tmuxworktree.mobile.core.relay.v2.profile
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 internal sealed interface RelayV2ProfileSwitchState {
     data object Idle : RelayV2ProfileSwitchState
@@ -145,6 +149,45 @@ internal class RelayV2ProfileSwitchStateMachine(
         }
         state = RelayV2ProfileSwitchState.Active(committed.identity)
         committed
+    }
+
+    suspend fun disconnectSelfRevoke(
+        profile: RelayV2Profile,
+        barrierId: String,
+    ): RelayProfileDisconnectReceipt = mutex.withLock {
+        require(barrierId.isNotBlank()) { "Self-revoke barrier ID is required" }
+        check(profileStore.activeRelayV2Profile() == profile) {
+            "Self-revoke profile changed before disconnect"
+        }
+        state = RelayV2ProfileSwitchState.Draining(profile.identity, barrierId)
+        try {
+            disconnectBarrier.disconnectAndDrain(profile.identity, barrierId).also { receipt ->
+                check(receipt.profile == profile.identity && receipt.barrierId == barrierId) {
+                    "Self-revoke disconnect did not drain the exact profile"
+                }
+            }
+        } catch (error: Throwable) {
+            state = RelayV2ProfileSwitchState.Idle
+            throw error
+        }
+    }
+
+    suspend fun isolateConfirmedSelfRevoke(
+        profile: RelayV2Profile,
+        receipt: RelayProfileDisconnectReceipt,
+    ): Unit = mutex.withLock {
+        check(receipt.profile == profile.identity) {
+            "Self-revoke isolation receipt belongs to another profile"
+        }
+        check(profileStore.activeRelayV2Profile() == profile) {
+            "Self-revoke profile changed before isolation"
+        }
+        state = RelayV2ProfileSwitchState.Isolating(receipt)
+        try {
+            isolationBoundary.clearAfterDisconnect(receipt, profile.credentialReference)
+        } finally {
+            state = RelayV2ProfileSwitchState.Idle
+        }
     }
 
     private suspend fun commitPreparedActivation(
@@ -350,17 +393,116 @@ internal sealed interface RelayV2StartupAdmissionResult {
         val profile: RelayV2Profile,
         val reason: RelayV2StartupCredentialUnavailableReason,
     ) : RelayV2StartupAdmissionResult
+
+    data class SelfRevokeQuarantined(
+        val profile: RelayV2Profile,
+        val phase: RelayV2SelfRevokePhase,
+    ) : RelayV2StartupAdmissionResult
 }
 
 internal data class RelayV2PreparedRefresh(
     val profileIdentity: RelayActiveProfileIdentity,
     val credentialReference: RelayV2CredentialReference,
+    val binding: RelayV2RefreshBinding,
     val expectation: RelayV2CredentialCasExpectation,
     val request: RelayV2RefreshRequest,
 ) {
+    init {
+        require(expectation.pendingAttemptId == request.refreshAttemptId) {
+            "Refresh request does not match its durable pending attempt"
+        }
+        require(
+            binding.issuerUrl == request.issuerUrl &&
+                binding.grantId == request.grantId &&
+                binding.clientInstanceId == request.clientInstanceId
+        ) { "Refresh request does not match its credential binding" }
+    }
+
     override fun toString(): String =
         "RelayV2PreparedRefresh(profileIdentity=$profileIdentity, " +
-            "credentialReference=$credentialReference, expectation=$expectation, request=$request)"
+            "credentialReference=$credentialReference, binding=$binding, " +
+            "expectation=$expectation, request=$request)"
+}
+
+internal data class RelayV2RefreshBinding(
+    val issuerUrl: String,
+    val relayUrl: String,
+    val hostId: String,
+    val principalId: String,
+    val grantId: String,
+    val clientInstanceId: String,
+)
+
+/**
+ * Process-scoped live owner for one durable refresh exchange.
+ *
+ * The durable Keystore blob remains authoritative. This coordinator only joins repositories that
+ * independently read the same pending attempt and exact non-sensitive credential binding.
+ */
+internal class RelayV2RefreshCoordinator {
+    private val mutex = Mutex()
+    private var inFlight: InFlight? = null
+
+    suspend fun coordinate(
+        prepared: RelayV2PreparedRefresh,
+        exchange: suspend () -> RelayV2RefreshApplyResult,
+    ): RelayV2RefreshApplyResult {
+        val key = RefreshKey(prepared)
+        val claim = mutex.withLock {
+            val current = inFlight
+            if (current != null) {
+                require(current.key == key) {
+                    "A different Relay v2 credential refresh is already in progress"
+                }
+                Claim(current, ownsExchange = false)
+            } else {
+                val created = InFlight(key)
+                inFlight = created
+                Claim(created, ownsExchange = true)
+            }
+        }
+        if (!claim.ownsExchange) return claim.inFlight.result.await()
+
+        return try {
+            val result = exchange()
+            claim.inFlight.result.complete(result)
+            result
+        } catch (error: Throwable) {
+            claim.inFlight.result.completeExceptionally(error)
+            throw error
+        } finally {
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    if (inFlight === claim.inFlight) inFlight = null
+                }
+            }
+        }
+    }
+
+    private data class RefreshKey(
+        val refreshAttemptId: String,
+        val profileIdentity: RelayActiveProfileIdentity,
+        val credentialReference: RelayV2CredentialReference,
+        val binding: RelayV2RefreshBinding,
+        val expectation: RelayV2CredentialCasExpectation,
+    ) {
+        constructor(prepared: RelayV2PreparedRefresh) : this(
+            refreshAttemptId = prepared.request.refreshAttemptId,
+            profileIdentity = prepared.profileIdentity,
+            credentialReference = prepared.credentialReference,
+            binding = prepared.binding,
+            expectation = prepared.expectation,
+        )
+    }
+
+    private class InFlight(val key: RefreshKey) {
+        val result = CompletableDeferred<RelayV2RefreshApplyResult>()
+    }
+
+    private data class Claim(
+        val inFlight: InFlight,
+        val ownsExchange: Boolean,
+    )
 }
 
 internal enum class RelayV2CredentialReconciliationFailure {
@@ -529,14 +671,18 @@ internal sealed interface RelayV2RefreshApplyResult {
 /**
  * Canonical owner for the first Relay v2 profile/credential slice.
  *
- * The injected [exchange] is not selected by production composition. Parsing a QR never reaches
- * this repository; callers must explicitly create [RelayV2ConfirmedEnrollment].
+ * Parsing a QR never reaches this repository; callers must explicitly create
+ * [RelayV2ConfirmedEnrollment]. Production composition injects the strict HTTPS exchange, but
+ * only an explicit confirmation or refresh call can reach it.
  */
 internal class RelayV2ProfileRepository(
     private val credentialStore: RelayV2CredentialStore,
     private val profileStore: RelayV2ProfileStore,
+    private val selfRevokeJournalStore: RelayV2SelfRevokeJournalStore,
     private val profileSwitch: RelayV2ProfileSwitchStateMachine,
     private val exchange: RelayV2CredentialExchange,
+    private val selfRevokeExchange: RelayV2SelfRevokeExchange,
+    private val refreshCoordinator: RelayV2RefreshCoordinator,
     private val clientInstanceId: String,
     private val newId: () -> String = { UUID.randomUUID().toString() },
     private val credentialReconciler: RelayV2ProfileCredentialReconciler =
@@ -561,6 +707,7 @@ internal class RelayV2ProfileRepository(
     suspend fun confirmEnrollment(
         confirmed: RelayV2ConfirmedEnrollment,
     ): RelayV2EnrollmentResult {
+        requireNoSelfRevokeJournal()
         val confirmedReference = credentialReference(confirmed.draft)
         val intent = beginEnrollmentIntent(confirmedReference)
             ?: return supersededEnrollment()
@@ -734,6 +881,7 @@ internal class RelayV2ProfileRepository(
     suspend fun cancelPendingEnrollment(
         confirmed: RelayV2ConfirmedEnrollment,
     ): Boolean {
+        requireNoSelfRevokeJournal()
         val reference = credentialReference(confirmed.draft)
         val journal = profileStore.pendingRelayV2Activation()
         if (journal?.targetCredentialReference == reference &&
@@ -776,14 +924,223 @@ internal class RelayV2ProfileRepository(
         }
     }
 
+    suspend fun selfRevokeActiveProfile(): RelayV2SelfRevokeResult {
+        val profile = profileStore.activeRelayV2Profile()
+            ?: error("No active Relay v2 profile is available for self-revoke")
+        val journal = selfRevokeJournalStore.readSelfRevokeJournal() ?: run {
+            requireSelfRevokeCredential(profile, expectedJournal = null)
+            selfRevokeJournalStore.prepareSelfRevokeJournal(
+                expectedActiveProfile = profile,
+                operationId = "self-revoke-${newId()}",
+            ) ?: selfRevokeJournalStore.readSelfRevokeJournal()
+                ?.takeIf { it.matches(profile) }
+                ?: error("Relay v2 self-revoke journal could not be prepared")
+        }
+        check(journal.matches(profile)) { "Self-revoke journal profile changed" }
+        when (journal.phase) {
+            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+            RelayV2SelfRevokePhase.REJECTED,
+            -> return RelayV2SelfRevokeResult.Quarantined(journal.phase)
+            RelayV2SelfRevokePhase.CONFIRMED ->
+                return cleanupConfirmedSelfRevokeOrQuarantine(journal, profile, receipt = null)
+            RelayV2SelfRevokePhase.PREPARED -> Unit
+        }
+
+        val receipt = try {
+            profileSwitch.disconnectSelfRevoke(
+                profile = profile,
+                barrierId = "self-revoke-drain-${newId()}",
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.PREPARED)
+        }
+        val request = try {
+            val blob = requireSelfRevokeCredential(profile, journal)
+            RelayV2SelfRevokeRequest(
+                issuerUrl = profile.issuerUrl,
+                accessToken = requireNotNull(blob.accessToken),
+            )
+        } catch (_: Throwable) {
+            return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.PREPARED)
+        }
+        val mayHaveCommitted = journal.copy(
+            phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+        )
+        val exchangeResult = try {
+            selfRevokeExchange.revoke(request) {
+                val advanced = selfRevokeJournalStore.advanceSelfRevokeJournal(
+                    expected = journal,
+                    phase = RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                )
+                check(advanced == mayHaveCommitted) {
+                    "Self-revoke handoff lost its exact durable journal"
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { currentSelfRevokeJournal(journal) }
+            throw cancelled
+        } catch (_: Throwable) {
+            val current = withContext(NonCancellable) { currentSelfRevokeJournal(journal) }
+            return RelayV2SelfRevokeResult.Quarantined(current.phase)
+        }
+        val durableHandoff = withContext(NonCancellable) {
+            currentSelfRevokeJournal(journal)
+        }
+        if (durableHandoff != mayHaveCommitted) {
+            return RelayV2SelfRevokeResult.Quarantined(durableHandoff.phase)
+        }
+
+        return when (exchangeResult) {
+            is RelayV2SelfRevokeExchangeResult.Confirmed -> {
+                if (exchangeResult.grantId != journal.grantId) {
+                    RelayV2SelfRevokeResult.Quarantined(
+                        RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                    )
+                } else {
+                    val confirmed = persistSelfRevokeTerminal(
+                        expected = mayHaveCommitted,
+                        phase = RelayV2SelfRevokePhase.CONFIRMED,
+                        revokedAtMs = exchangeResult.revokedAtMs,
+                        failureCode = null,
+                    ) ?: return RelayV2SelfRevokeResult.Quarantined(
+                        RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                    )
+                    cleanupConfirmedSelfRevokeOrQuarantine(confirmed, profile, receipt)
+                }
+            }
+            is RelayV2SelfRevokeExchangeResult.Rejected -> {
+                check(exchangeResult.failureCode == RelayV2SelfRevokeFailureCode.FORBIDDEN)
+                val rejected = persistSelfRevokeTerminal(
+                    expected = mayHaveCommitted,
+                    phase = RelayV2SelfRevokePhase.REJECTED,
+                    revokedAtMs = null,
+                    failureCode = RelayV2SelfRevokeFailureCode.FORBIDDEN,
+                )
+                RelayV2SelfRevokeResult.Quarantined(
+                    rejected?.phase ?: RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                )
+            }
+            RelayV2SelfRevokeExchangeResult.MayHaveCommitted ->
+                RelayV2SelfRevokeResult.Quarantined(
+                    RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                )
+        }
+    }
+
+    private suspend fun requireSelfRevokeCredential(
+        profile: RelayV2Profile,
+        expectedJournal: RelayV2SelfRevokeJournal?,
+    ): RelayV2CredentialBlob {
+        val blob = credentialStore.read(profile.credentialReference)
+            ?: error("Relay v2 credential is unavailable for self-revoke")
+        check(blob.hasCredentialMaterial && profile.matchesCredentialBinding(blob)) {
+            "Relay v2 self-revoke credential binding is unavailable"
+        }
+        check(blob.credentialVersion == profile.credentialVersion &&
+            expectedJournal?.credentialVersion?.let { it == blob.credentialVersion } != false &&
+            expectedJournal?.grantId?.let { it == blob.grantId } != false
+        ) { "Relay v2 self-revoke credential version changed" }
+        return blob
+    }
+
+    private suspend fun persistSelfRevokeTerminal(
+        expected: RelayV2SelfRevokeJournal,
+        phase: RelayV2SelfRevokePhase,
+        revokedAtMs: Long?,
+        failureCode: RelayV2SelfRevokeFailureCode?,
+    ): RelayV2SelfRevokeJournal? = withContext(NonCancellable) {
+        val replacement = expected.copy(
+            phase = phase,
+            revokedAtMs = revokedAtMs,
+            failureCode = failureCode,
+        )
+        try {
+            selfRevokeJournalStore.advanceSelfRevokeJournal(
+                expected = expected,
+                phase = phase,
+                revokedAtMs = revokedAtMs,
+                failureCode = failureCode,
+            )?.takeIf { it == replacement }
+                ?: selfRevokeJournalStore.readSelfRevokeJournal()?.takeIf { it == replacement }
+        } catch (error: Throwable) {
+            when (val current = selfRevokeJournalStore.readSelfRevokeJournal()) {
+                replacement -> replacement
+                expected -> null
+                else -> throw error
+            }
+        }
+    }
+
+    private suspend fun cleanupConfirmedSelfRevokeOrQuarantine(
+        journal: RelayV2SelfRevokeJournal,
+        profile: RelayV2Profile,
+        receipt: RelayProfileDisconnectReceipt?,
+    ): RelayV2SelfRevokeResult = try {
+        cleanupConfirmedSelfRevoke(journal, profile, receipt)
+        RelayV2SelfRevokeResult.ProfileRemoved
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.CONFIRMED)
+    }
+
+    private suspend fun cleanupConfirmedSelfRevoke(
+        journal: RelayV2SelfRevokeJournal,
+        profile: RelayV2Profile,
+        receipt: RelayProfileDisconnectReceipt?,
+    ) {
+        check(journal.phase == RelayV2SelfRevokePhase.CONFIRMED)
+        check(selfRevokeJournalStore.readSelfRevokeJournal() == journal &&
+            profileStore.activeRelayV2Profile() == profile
+        ) { "Confirmed self-revoke cleanup lost its exact profile" }
+        val exactReceipt = receipt ?: profileSwitch.disconnectSelfRevoke(
+            profile = profile,
+            barrierId = "self-revoke-cleanup-${newId()}",
+        )
+        profileSwitch.isolateConfirmedSelfRevoke(profile, exactReceipt)
+        val committed = try {
+            selfRevokeJournalStore.commitConfirmedSelfRevokeRemoval(journal)
+        } catch (error: Throwable) {
+            val remaining = selfRevokeJournalStore.readSelfRevokeJournal()
+            val active = profileStore.activeRelayV2Profile()
+            if (remaining == null && active == null) true else throw error
+        }
+        check(committed) { "Confirmed self-revoke profile removal lost exact authority" }
+    }
+
+    private suspend fun currentSelfRevokeJournal(
+        expectedOperation: RelayV2SelfRevokeJournal,
+    ): RelayV2SelfRevokeJournal {
+        val current = requireNotNull(selfRevokeJournalStore.readSelfRevokeJournal()) {
+            "Relay v2 self-revoke journal disappeared"
+        }
+        check(current.sameOperationAs(expectedOperation)) {
+            "Relay v2 self-revoke journal changed operation"
+        }
+        return current
+    }
+
+    private fun RelayV2SelfRevokeJournal.sameOperationAs(
+        other: RelayV2SelfRevokeJournal,
+    ): Boolean = operationId == other.operationId &&
+        profileId == other.profileId &&
+        activationGeneration == other.activationGeneration &&
+        credentialReference == other.credentialReference &&
+        credentialVersion == other.credentialVersion &&
+        grantId == other.grantId
+
     /**
      * Resumes the durable activation saga without QR, enrollment code, or broker replay.
      *
      * Any future production v2 composition must complete this before restoring a profile actor.
      * Production v2 composition remains disabled and does not currently construct this owner.
      */
-    suspend fun recoverPendingActivation(): RelayV2ActivationRecoveryResult =
-        recoverDurableActivation(allowedIntent = null)
+    suspend fun recoverPendingActivation(): RelayV2ActivationRecoveryResult {
+        requireNoSelfRevokeJournal()
+        return recoverDurableActivation(allowedIntent = null)
+    }
 
     /**
      * Closed startup admission for a future explicitly enabled Relay v2 composition.
@@ -795,6 +1152,30 @@ internal class RelayV2ProfileRepository(
      */
     suspend fun admitStartup(): RelayV2StartupAdmissionResult =
         activationOperationMutex.withLock {
+            selfRevokeJournalStore.readSelfRevokeJournal()?.let { journal ->
+                val profile = profileStore.activeRelayV2Profile()
+                    ?: error("Self-revoke quarantine lost its active profile")
+                check(journal.matches(profile)) {
+                    "Self-revoke quarantine does not match its active profile"
+                }
+                if (journal.phase == RelayV2SelfRevokePhase.CONFIRMED) {
+                    return@withLock when (
+                        cleanupConfirmedSelfRevokeOrQuarantine(journal, profile, receipt = null)
+                    ) {
+                        RelayV2SelfRevokeResult.ProfileRemoved ->
+                            RelayV2StartupAdmissionResult.NoActiveProfile
+                        is RelayV2SelfRevokeResult.Quarantined ->
+                            RelayV2StartupAdmissionResult.SelfRevokeQuarantined(
+                                profile,
+                                RelayV2SelfRevokePhase.CONFIRMED,
+                            )
+                    }
+                }
+                return@withLock RelayV2StartupAdmissionResult.SelfRevokeQuarantined(
+                    profile,
+                    journal.phase,
+                )
+            }
             when (val recovery = recoverDurableActivationWithLease(allowedIntent = null)) {
                 is RelayV2ActivationRecoveryResult.Activated ->
                     reconcileStartupWinner(recovery.profile)
@@ -921,12 +1302,15 @@ internal class RelayV2ProfileRepository(
     }
 
     /** Startup/recovery hook for an already-published active credential. */
-    suspend fun reconcileActiveCredential(): RelayV2CredentialReconciliationResult =
-        credentialReconciler.reconcileActive()
+    suspend fun reconcileActiveCredential(): RelayV2CredentialReconciliationResult {
+        requireNoSelfRevokeJournal()
+        return credentialReconciler.reconcileActive()
+    }
 
     suspend fun prepareRefresh(
         profile: RelayV2Profile,
     ): RelayV2PreparedRefresh = credentialMutationMutex.withLock {
+        requireNoSelfRevokeJournal()
         while (true) {
             val current = credentialStore.read(profile.credentialReference)
                 ?: error("Relay v2 credential is unavailable")
@@ -961,15 +1345,20 @@ internal class RelayV2ProfileRepository(
         error("Credential preparation loop terminated unexpectedly")
     }
 
-    suspend fun refresh(profile: RelayV2Profile): RelayV2RefreshApplyResult {
+    suspend fun refreshActiveCredential(): RelayV2RefreshApplyResult {
+        val profile = profileStore.activeRelayV2Profile()
+            ?: error("No active Relay v2 profile is available for refresh")
         val prepared = prepareRefresh(profile)
-        return applyRefreshResponse(prepared, exchange.refresh(prepared.request))
+        return refreshCoordinator.coordinate(prepared) {
+            applyRefreshResponse(prepared, exchange.refresh(prepared.request))
+        }
     }
 
     suspend fun applyRefreshResponse(
         prepared: RelayV2PreparedRefresh,
         response: RelayV2RefreshResponse,
     ): RelayV2RefreshApplyResult = credentialMutationMutex.withLock {
+        requireNoSelfRevokeJournal()
         activeProfileChange(prepared, credentialVersion = null)?.let { return@withLock it }
         val current = credentialStore.read(prepared.credentialReference)
             ?: return@withLock activeProfileChange(prepared, credentialVersion = null)
@@ -1054,6 +1443,12 @@ internal class RelayV2ProfileRepository(
             credentialVersion = credentialVersion,
             activeProfile = profileStore.activeProfileIdentity(),
         )
+    }
+
+    private suspend fun requireNoSelfRevokeJournal() {
+        check(selfRevokeJournalStore.readSelfRevokeJournal() == null) {
+            "Relay v2 profile is quarantined by self-revoke"
+        }
     }
 
     private fun prepareEnrollment(
@@ -1449,6 +1844,14 @@ internal class RelayV2ProfileRepository(
     ): RelayV2PreparedRefresh = RelayV2PreparedRefresh(
         profileIdentity = profile.identity,
         credentialReference = profile.credentialReference,
+        binding = RelayV2RefreshBinding(
+            issuerUrl = blob.issuerUrl,
+            relayUrl = blob.relayUrl,
+            hostId = blob.hostId,
+            principalId = blob.principalId!!,
+            grantId = blob.grantId!!,
+            clientInstanceId = blob.clientInstanceId,
+        ),
         expectation = blob.expectation(),
         request = RelayV2RefreshRequest(
             issuerUrl = blob.issuerUrl,

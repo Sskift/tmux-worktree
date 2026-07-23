@@ -1,6 +1,10 @@
 import { types as nodeTypes } from "node:util";
 import type { RelayV2JsonObject } from "./codecSchema.js";
-import { RelayV2HostCarrierActor } from "./hostCarrier.js";
+import {
+  RelayV2HostCarrierActor,
+  RelayV2HostCapabilityReadiness,
+  releaseRelayV2HostPreCarrierOfferClaim,
+} from "./hostCarrier.js";
 import type {
   RelayV2HostCarrierConnection,
   RelayV2HostCarrierOptions,
@@ -29,15 +33,16 @@ import type {
   RelayV2HostConnectorControllerPort,
   RelayV2HostConnectorControllerStartResult,
   RelayV2HostConnectorControllerStopResult,
+  RelayV2HostConnectorAttemptFactoryPort,
   RelayV2HostConnectorAttemptPort,
+  RelayV2HostConnectorAttemptStartInput,
 } from "./hostConnectorController.js";
-import {
-  RelayV2HostCapabilityReadiness,
-} from "./hostCapabilityReadiness.js";
 import type {
   RelayV2HostCapabilityReadinessSource,
   RelayV2HostCapabilityReadinessSourceSink,
   RelayV2HostCapabilityReadinessSourceSnapshot,
+  RelayV2HostPreCarrierOfferClaim,
+  RelayV2HostPreCarrierOfferIssueInput,
 } from "./hostCapabilityReadiness.js";
 import { createRelayV2HostCodecReadinessActivation } from "./hostCodecReadinessActivation.js";
 import type {
@@ -54,6 +59,7 @@ import type {
   RelayV2HostRuntimeOptions,
   RelayV2HostRuntimeOutboundPort,
   RelayV2HostRuntimeWelcomeSerializer,
+  RelayV2HostOptionalExtensionAttachment,
   RelayV2RequiredCapability,
 } from "./hostRuntime.js";
 import { createRelayV2HostH0ReadinessActivation } from "./hostH0ReadinessActivation.js";
@@ -118,6 +124,10 @@ type ManualReadinessSource = Exclude<
 const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
 const HOST_CARRIER_CREATE_DASHBOARD_MANAGEMENT_CONTROL =
   RelayV2HostCarrierActor.prototype.createDashboardManagementCarrierControlAdapter;
+const runtimePreCarrierOfferIssuers = new WeakMap<object, Readonly<{
+  issue(input: Readonly<RelayV2HostPreCarrierOfferIssueInput>):
+  RelayV2HostPreCarrierOfferClaim | null;
+}>>();
 
 declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
 declare const relayV2HostDashboardManagementPortBrand: unique symbol;
@@ -231,7 +241,7 @@ export interface RelayV2HostRuntimeCompositionReadinessLifecycle {
   readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
   readonly h3: RelayV2HostH3ReadinessLifecycle;
   current(): RelayV2HostReadinessSnapshot;
-  advertisedCapabilities(): readonly RelayV2RequiredCapability[];
+  advertisedCapabilities(): readonly string[];
 }
 
 /** The only host-side routing seam exposed by this default-off composition. */
@@ -263,6 +273,7 @@ export interface RelayV2HostRuntimeCompositionOptions {
   hostInstanceId: string;
   authorities: RelayV2HostRuntimeCompositionAuthorities;
   welcome: RelayV2HostRuntimeWelcomeSerializer;
+  optionalExtension?: RelayV2HostOptionalExtensionAttachment;
   outbound: RelayV2HostRuntimeOutboundPort;
   /** Tests may only make the existing runtime limits stricter. */
   testLimits?: RelayV2HostRuntimeOptions["testLimits"];
@@ -282,6 +293,7 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   | "routeSink"
   | "credentialConnectionAdmission"
   | "advertisedCapabilities"
+  | "preCarrierOfferClaim"
   | "clientDialects"
   | "dialectAdapters"
 > & Readonly<{
@@ -291,6 +303,7 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   routeSink?: never;
   credentialConnectionAdmission?: never;
   advertisedCapabilities?: never;
+  preCarrierOfferClaim?: never;
   clientDialects?: never;
   dialectAdapters?: never;
 }>;
@@ -336,7 +349,7 @@ export type RelayV2HostManagedConnectorCarrierOptions = Omit<
 
 export type RelayV2HostManagedConnectorTransportLifecycleFactoryInput = Omit<
   RelayV2HostConnectorCarrierAttemptFactoryInput,
-  "onCarrierStatus"
+  "onCarrierStatus" | "carrierAttemptGeneration" | "preCarrierOfferClaim"
 >;
 
 export interface RelayV2HostManagedConnectorTransportLifecycle {
@@ -702,6 +715,9 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
   let h3Activation: ReturnType<typeof createRelayV2HostH3ReadinessActivation> | null = null;
   const abandonConstruction = async (): Promise<void> => {
     const barriers: Promise<unknown>[] = [];
+    if (options.optionalExtension !== undefined) {
+      try { barriers.push(options.optionalExtension.closeAndDrain()); } catch {}
+    }
     if (codecActivation !== null) {
       try { codecActivation.close(); } catch {}
     } else {
@@ -802,6 +818,7 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       capabilityIntersection: readinessOwner,
       welcome: options.welcome,
       outbound: options.outbound,
+      optionalExtension: options.optionalExtension,
       testLimits: options.testLimits,
     });
   } catch (error) {
@@ -848,7 +865,7 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
   });
 
   let disposeBarrier: Promise<void> | null = null;
-  return Object.freeze({
+  const composition: RelayV2HostRuntimeComposition = Object.freeze({
     routeSink,
     readiness,
     dispose(): Promise<void> {
@@ -856,12 +873,18 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       const published = createDeferredBarrier();
       disposeBarrier = published.promise;
       disposed = true;
+      runtime.fenceOptionalExtensionIngress();
+      runtimePreCarrierOfferIssuers.delete(composition);
       const synchronousFailures: unknown[] = [];
       const rememberFailure = (error: unknown): void => {
         if (synchronousFailures.length === 0) synchronousFailures.push(error);
       };
       let h1Barrier: Promise<void> = Promise.resolve();
       let h3Barrier: Promise<void> = Promise.resolve();
+      let extensionBarrier: Promise<void> = Promise.resolve();
+      try {
+        extensionBarrier = options.optionalExtension?.closeAndDrain() ?? Promise.resolve();
+      } catch (error) { rememberFailure(error); }
       try { h1Barrier = h1Activation.close(); } catch (error) { rememberFailure(error); }
       try { h3Barrier = h3Activation.dispose(); } catch (error) { rememberFailure(error); }
       try { h0Activation.dispose(); } catch (error) { rememberFailure(error); }
@@ -878,7 +901,7 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       try { runtime.dispose(); } catch (error) { rememberFailure(error); }
       void (async () => {
         const asynchronousFailures: unknown[] = [];
-        const barriers = await Promise.allSettled([h1Barrier, h3Barrier]);
+        const barriers = await Promise.allSettled([extensionBarrier, h1Barrier, h3Barrier]);
         for (const barrier of barriers) {
           if (barrier.status === "rejected") asynchronousFailures.push(barrier.reason);
         }
@@ -889,6 +912,15 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       return published.promise;
     },
   });
+  runtimePreCarrierOfferIssuers.set(composition, Object.freeze({
+    issue: (input: Readonly<RelayV2HostPreCarrierOfferIssueInput>) => (
+      readinessOwner.issuePreCarrierOffer(Object.freeze({
+        ...input,
+        optionalCapabilities: runtime.advertisedOptionalCapabilities(),
+      }))
+    ),
+  }));
+  return composition;
 }
 
 /**
@@ -917,7 +949,11 @@ interface RelayV2HostCarrierRuntimeBridge {
   observeCarrierStatus(
     actor: RelayV2HostCarrierActor,
     status: Readonly<RelayV2HostCarrierStatus>,
+    registeredOfferReady?: boolean,
   ): void;
+  issuePreCarrierOffer(
+    input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
+  ): RelayV2HostPreCarrierOfferClaim | null;
   withdrawCarrierReadiness(): void;
   fenceNewBindings(): void;
   beginManagedClose(): void;
@@ -938,6 +974,7 @@ function captureRelayV2HostCarrierRuntimeOptions(
     hostInstanceId: options.hostInstanceId,
     authorities: options.authorities,
     welcome: options.welcome,
+    optionalExtension: options.optionalExtension,
     testLimits: options.testLimits,
   });
 }
@@ -1002,9 +1039,15 @@ async function openRelayV2HostCarrierRuntimeBridge(
     hostInstanceId: runtimeOptions.hostInstanceId,
     authorities: runtimeOptions.authorities,
     welcome: runtimeOptions.welcome,
+    optionalExtension: runtimeOptions.optionalExtension,
     outbound,
     testLimits: runtimeOptions.testLimits,
   });
+  const preCarrierOfferIssuer = runtimePreCarrierOfferIssuers.get(runtime as object);
+  if (preCarrierOfferIssuer === undefined) {
+    await runtime.dispose().catch(() => undefined);
+    throw new RelayV2HostConnectorControllerError("OPERATION_FAILED");
+  }
 
   const routeSink: RelayV2HostCarrierRouteSink = Object.freeze({
     onRouteBound(binding): void | RelayV2HostRouteBindingRejection {
@@ -1078,9 +1121,16 @@ async function openRelayV2HostCarrierRuntimeBridge(
     observeCarrierStatus(
       actor: RelayV2HostCarrierActor,
       status: Readonly<RelayV2HostCarrierStatus>,
+      registeredOfferReady = true,
     ): void {
       if (currentActor !== actor) return;
-      applyCarrierReadiness(status.phase === "registered");
+      applyCarrierReadiness(status.phase === "registered" && registeredOfferReady);
+    },
+    issuePreCarrierOffer(
+      input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
+    ): RelayV2HostPreCarrierOfferClaim | null {
+      if (!bridgeActive || !acceptingBindings) return null;
+      return preCarrierOfferIssuer.issue(input);
     },
     withdrawCarrierReadiness(): void {
       applyCarrierReadiness(false);
@@ -1149,6 +1199,7 @@ export async function openRelayV2HostCarrierRuntimeComposition(
       hostInstanceId: runtimeOptions.hostInstanceId,
       routeSink: bridge.routeSink,
       advertisedCapabilities: [],
+      preCarrierOfferClaim: undefined,
       clientDialects: ["tw-relay.v2"],
       dialectAdapters: Object.freeze({}),
       onStatus(status): void {
@@ -1415,7 +1466,7 @@ function captureManagedWssRuntimeOptions(
   const required = [
     "hostId", "hostEpoch", "hostInstanceId", "authorities", "welcome",
   ] as const;
-  const allowed = new Set<string>([...required, "testLimits"]);
+  const allowed = new Set<string>([...required, "optionalExtension", "testLimits"]);
   const keys = Reflect.ownKeys(descriptors);
   if (keys.some((key) => typeof key !== "string"
     || !allowed.has(key)
@@ -1691,7 +1742,8 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
   const bridge = await openRelayV2HostCarrierRuntimeBridge(runtimeOptions);
   const attemptRuntimeBindings = new Map<string, Readonly<{
     actor: RelayV2HostCarrierActor | null;
-    attach(actor: RelayV2HostCarrierActor): void;
+    attach(actor: RelayV2HostCarrierActor, carrierAttemptGeneration: string): void;
+    bindCarrierAttemptGeneration(carrierAttemptGeneration: string): void;
     acceptAdapter(): void;
     admitController(connectorId: string): void;
     managementCarrierControl(
@@ -1707,7 +1759,9 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
   let closing = false;
   try {
     const carrierAttemptFactory: RelayV2HostConnectorCarrierAttemptFactoryPort = Object.freeze({
-      async createAttempt(input): Promise<Readonly<{
+      async createAttempt(
+        input: Readonly<RelayV2HostConnectorCarrierAttemptFactoryInput>,
+      ): Promise<Readonly<{
         actor: RelayV2HostCarrierActor;
         transport: RelayV2HostCarrierTransport;
         drainHandle: RelayV2HostConnectorCarrierAttemptDrainHandle;
@@ -1717,8 +1771,10 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
           throw managedCompositionFailure();
         }
         let actor: RelayV2HostCarrierActor | null = null;
+        const preCarrierOfferClaim = input.preCarrierOfferClaim ?? null;
         let connectionAdmission: RelayV2HostCredentialConnectionAdmission | null = null;
         try {
+          runtimeBinding.bindCarrierAttemptGeneration(input.carrierAttemptGeneration);
           connectionAdmission = prepareRelayV2HostWssTransportLifecycleAttempt(
             transportLifecycleFactory.receiver,
             Object.freeze({
@@ -1740,11 +1796,12 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             routeSink: bridge.routeSink,
             credentialConnectionAdmission: connectionAdmission ?? undefined,
             advertisedCapabilities: [],
+            preCarrierOfferClaim: preCarrierOfferClaim ?? undefined,
             clientDialects: ["tw-relay.v2"],
             dialectAdapters: Object.freeze({}),
             onStatus: input.onCarrierStatus,
           });
-          runtimeBinding.attach(actor);
+          runtimeBinding.attach(actor, input.carrierAttemptGeneration);
           const lifecycleInput = Object.freeze({
             requestId: input.requestId,
             controllerGeneration: input.controllerGeneration,
@@ -1802,7 +1859,8 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             transportLifecycleFactory.receiver,
             connectionAdmission,
           );
-          try { actor?.dispose(); } catch {}
+          if (actor === null) releaseRelayV2HostPreCarrierOfferClaim(preCarrierOfferClaim);
+          else try { actor.dispose(); } catch {}
           runtimeBinding.reject();
           throw managedCompositionFailure();
         }
@@ -1810,10 +1868,18 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
     });
     const attemptAdapter = new RelayV2HostConnectorCarrierAttemptAdapter({
       factory: carrierAttemptFactory,
+      preCarrierOfferIssuer: Object.freeze({
+        issuePreCarrierOffer: (
+          input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
+        ) => bridge.issuePreCarrierOffer(input),
+      }),
     });
     const attempts: RelayV2HostConnectorAttemptFactoryPort = Object.freeze({
-      startAttempt(input): Promise<RelayV2HostConnectorAttemptPort> {
+      startAttempt(
+        input: Readonly<RelayV2HostConnectorAttemptStartInput>,
+      ): Promise<RelayV2HostConnectorAttemptPort> {
         let actor: RelayV2HostCarrierActor | null = null;
+        let carrierAttemptGeneration: string | null = null;
         let adapterAccepted = false;
         let controllerAdmitted = false;
         let reauthenticationInFlight = false;
@@ -1821,16 +1887,36 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         let rejected = false;
         let latestStatus: Readonly<RelayV2HostCarrierStatus> | null = null;
         const pendingStatuses: Readonly<RelayV2HostCarrierStatus>[] = [];
+        const consumedFullOffer = (): boolean => actor !== null
+          && carrierAttemptGeneration !== null
+          && RelayV2HostCarrierActor.consumedCanonicalPreCarrierOffer(actor, {
+            controllerGeneration: input.controllerGeneration,
+            carrierAttemptGeneration,
+          });
         const forwardStatus = (status: Readonly<RelayV2HostCarrierStatus>): void => {
           if (rejected || actor === null) return;
           latestStatus = status;
-          if (controllerAdmitted) bridge.observeCarrierStatus(actor, status);
-          input.onCarrierStatus(status);
+          // Preserve the controller's irreversible superseded terminal cut
+          // before carrier-readiness withdrawal fences the consumed offer.
+          if (status.phase === "superseded") input.onCarrierStatus(status);
+          if (controllerAdmitted) {
+            bridge.observeCarrierStatus(actor, status, consumedFullOffer());
+          }
+          if (status.phase !== "superseded") input.onCarrierStatus(status);
         };
         const runtimeBinding = Object.freeze({
           get actor(): RelayV2HostCarrierActor | null { return actor; },
-          attach(value: RelayV2HostCarrierActor): void {
-            if (actor !== null || rejected) throw managedCompositionFailure();
+          bindCarrierAttemptGeneration(value: string): void {
+            if (carrierAttemptGeneration !== null || rejected) {
+              throw managedCompositionFailure();
+            }
+            carrierAttemptGeneration = value;
+          },
+          attach(value: RelayV2HostCarrierActor, valueGeneration: string): void {
+            if (actor !== null || rejected
+              || carrierAttemptGeneration !== valueGeneration) {
+              throw managedCompositionFailure();
+            }
             actor = value;
             bridge.attachActor(value);
           },
@@ -1844,12 +1930,13 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             if (latestStatus?.phase !== "registered"
               || latestStatus.connectorId !== connectorId) return;
             controllerAdmitted = true;
-            bridge.observeCarrierStatus(actor, latestStatus);
+            bridge.observeCarrierStatus(actor, latestStatus, consumedFullOffer());
           },
           managementCarrierControl(
             connectorId: string,
           ): RelayV2DashboardManagementCarrierControlPort | null {
             if (rejected || !controllerAdmitted || actor === null
+              || !consumedFullOffer()
               || latestStatus?.phase !== "registered"
               || latestStatus.connectorId !== connectorId
               || attemptRuntimeBindings.get(input.controllerGeneration)
@@ -1918,7 +2005,7 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         attemptRuntimeBindings.set(input.controllerGeneration, runtimeBinding);
         const attempt = attemptAdapter.startAttempt(Object.freeze({
           ...input,
-          onCarrierStatus(status): void {
+          onCarrierStatus(status: Readonly<RelayV2HostCarrierStatus>): void {
             runtimeBinding.observe(status);
           },
         }));
@@ -2243,19 +2330,22 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
           closingCut.controllerGeneration,
         )?.fenceReauthentication();
       }
+      let connectorStop: Promise<RelayV2HostConnectorControllerStopResult> | null = null;
+      if (closingCut.status !== "stopped") {
+        connectorStop = controller.stopAndDrain(Object.freeze({
+          ...identity,
+          requestId: `managed-close-${closingCut.controllerGeneration}`,
+          controllerGeneration: closingCut.controllerGeneration,
+          connectorId: closingCut.connectorId,
+          signal: new AbortController().signal,
+        }));
+      }
       bridge.beginManagedClose();
       void (async () => {
         let firstFailure: unknown = null;
-        const cut = controller.inspectCut();
-        if (cut.status !== "stopped") {
+        if (connectorStop !== null) {
           try {
-            await controller.stopAndDrain(Object.freeze({
-              ...identity,
-              requestId: `managed-close-${cut.controllerGeneration}`,
-              controllerGeneration: cut.controllerGeneration,
-              connectorId: cut.connectorId,
-              signal: new AbortController().signal,
-            }));
+            await connectorStop;
           } catch (error) {
             if (!(error instanceof RelayV2HostConnectorControllerError)
               || error.code !== "SUPERSEDED") firstFailure = error;

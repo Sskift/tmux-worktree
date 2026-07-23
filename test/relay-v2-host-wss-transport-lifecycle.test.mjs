@@ -340,7 +340,11 @@ function fakeWebSockets(expectedAuthorizationDigest, behavior = {}) {
     }
 
     send(bytes, options, callback) {
-      this.writes.push({ bytes: Uint8Array.from(bytes), options, callback });
+      this.writes.push({
+        bytes: typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Uint8Array.from(bytes),
+        options,
+        callback,
+      });
       if (behavior.syncSendCallbackError) {
         callback(new Error("injected non-sensitive synchronous write failure"));
       } else if (behavior.syncSendCallback) {
@@ -426,6 +430,7 @@ function observedConnection(connection, observations) {
     generation: connection.generation,
     receive(bytes) {
       observations.receives += 1;
+      if (observations.suppressForwarding) return;
       return connection.receive(bytes);
     },
     acknowledge(deliveryToken) {
@@ -433,14 +438,19 @@ function observedConnection(connection, observations) {
         deliveryToken,
         bufferedAmount: observations.bufferedAmount(),
       });
+      if (observations.suppressForwarding) return;
       return connection.acknowledge(deliveryToken);
     },
-    rejectUnaccepted: (deliveryToken) => connection.rejectUnaccepted(deliveryToken),
+    rejectUnaccepted(deliveryToken) {
+      if (observations.suppressForwarding) return;
+      return connection.rejectUnaccepted(deliveryToken);
+    },
     writable() {
       observations.writables.push({
         acknowledgementCount: observations.acks.length,
         bufferedAmount: observations.bufferedAmount(),
       });
+      if (observations.suppressForwarding) return;
       return connection.writable();
     },
     closed(code) {
@@ -448,6 +458,7 @@ function observedConnection(connection, observations) {
       if (observations.closeThrows) {
         throw new Error("injected non-sensitive close observation failure");
       }
+      if (observations.suppressForwarding) return;
       return connection.closed(code);
     },
   });
@@ -530,14 +541,14 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
 
   socket.emitOpen();
   assert.equal(socket.writes.length, 1);
-  assert.deepEqual(socket.writes[0].options, { binary: true, compress: false });
+  assert.deepEqual(socket.writes[0].options, { binary: false, compress: false });
   const hello = decodeCarrier(socket.writes[0].bytes);
   assert.equal(hello.type, "host.hello");
   assert.equal(lifecycle.transport.bufferedAmount(), helloBuffered);
   assert.notEqual(lifecycle.transport.bufferedAmount(), socket.bufferedAmount);
 
-  socket.emitMessage(Buffer.from(registeredFrame(hello)), true);
-  socket.emitMessage(Buffer.from(routeOpenFrame()), true);
+  socket.emitMessage(Buffer.from(registeredFrame(hello)), false);
+  socket.emitMessage(Buffer.from(routeOpenFrame()), false);
   assert.equal(statuses.at(-1).phase, "registered");
   assert.equal(socket.writes.length, 1, "one lifecycle write is in flight at a time");
   assert.ok(lifecycle.transport.bufferedAmount() > helloBuffered);
@@ -1042,7 +1053,7 @@ test("stale, revoked, replayed, copied, and foreign admissions fail before WSS o
   });
 });
 
-test("binary, subprotocol, extension, and frame limits fail closed without fallback", async (t) => {
+test("text carrier, subprotocol, extension, and frame limits fail closed without fallback", async (t) => {
   for (const scenario of [
     { name: "selected subprotocol", protocol: "tw-relay.host.v1", extensions: "" },
     { name: "negotiated extension", protocol: "tw-relay.host.v2", extensions: "permessage-deflate" },
@@ -1070,13 +1081,13 @@ test("binary, subprotocol, extension, and frame limits fail closed without fallb
   }
 
   for (const scenario of [
-    { name: "text frame", data: Buffer.from("{}"), isBinary: false },
+    { name: "binary frame", data: Buffer.from("{}"), isBinary: true },
     {
-      name: "oversized binary frame",
+      name: "oversized text frame",
       data: Buffer.alloc(codec.RELAY_V2_CARRIER_FRAME_BYTES + 1),
-      isBinary: true,
+      isBinary: false,
     },
-    { name: "malformed binary event", data: [Buffer.from("{}")], isBinary: true },
+    { name: "malformed text event", data: [Buffer.from("{}")], isBinary: false },
   ]) {
     await t.test(scenario.name, async () => {
       const h = credentialHarness();
@@ -1146,7 +1157,7 @@ test("a synchronous successful write callback settles only after send returns", 
   await closeLifecycle(lifecycle, socket);
 });
 
-test("write refusal, throw, and callback error settle without ACK or another socket", async (t) => {
+test("write failures and invalid UTF-8 settle without ACK of the failed delivery", async (t) => {
   for (const scenario of [
     {
       name: "refusal-after-callback",
@@ -1159,6 +1170,12 @@ test("write refusal, throw, and callback error settle without ACK or another soc
       reason: "write_failed",
     },
     { name: "callback-error", behavior: {}, reason: "write_failed" },
+    {
+      name: "invalid-utf8",
+      behavior: {},
+      reason: "write_failed",
+      invalidFrame: Uint8Array.of(0xc3, 0x28),
+    },
   ]) {
     await t.test(scenario.name, async () => {
       const h = credentialHarness();
@@ -1176,20 +1193,35 @@ test("write refusal, throw, and callback error settle without ACK or another soc
         closes: [],
         receives: 0,
         writables: [],
+        suppressForwarding: scenario.invalidFrame !== undefined,
         bufferedAmount: () => lifecycle.transport.bufferedAmount(),
       };
       const connection = actor(h.authority, admission)
         .connect(lifecycle.transport, REFERENCE);
       lifecycle.bindConnection(observedConnection(connection, observations));
       const socket = sockets.sockets[0];
+      if (scenario.invalidFrame) {
+        assert.equal(
+          lifecycle.transport.trySend(scenario.invalidFrame, "invalid-utf8-delivery"),
+          true,
+        );
+      }
       socket.emitOpen();
       assert.equal(socket.writes.length, 1);
-      if (scenario.name === "callback-error") {
+      if (scenario.invalidFrame) {
+        socket.writes[0].callback();
+        await Promise.resolve();
+        assert.equal(socket.writes.length, 1, "invalid UTF-8 never reaches socket.send");
+      } else if (scenario.name === "callback-error") {
         socket.writes[0].callback(new Error("injected non-sensitive write failure"));
         await Promise.resolve();
       }
       assert.deepEqual(socket.closeCalls, [{ code: 1011, reason: scenario.reason }]);
-      assert.deepEqual(observations.acks, []);
+      assert.equal(
+        observations.acks.some((entry) => entry.deliveryToken === "invalid-utf8-delivery"),
+        false,
+      );
+      assert.equal(observations.acks.length, scenario.invalidFrame ? 1 : 0);
       assert.equal(lifecycle.transport.bufferedAmount(), 0);
       assert.equal(sockets.sockets.length, 1);
       const proof = Object.freeze(Object.create(null));
@@ -1198,7 +1230,11 @@ test("write refusal, throw, and callback error settle without ACK or another soc
       assert.equal(await drained, proof);
       socket.writes[0].callback();
       await Promise.resolve();
-      assert.deepEqual(observations.acks, []);
+      assert.equal(observations.acks.length, scenario.invalidFrame ? 1 : 0);
+      assert.equal(
+        observations.acks.some((entry) => entry.deliveryToken === "invalid-utf8-delivery"),
+        false,
+      );
     });
   }
 });
@@ -1259,6 +1295,8 @@ test("an actor.connect failure explicitly drains the exact unbound lifecycle", a
   await assert.rejects(adapter.startAttempt(Object.freeze({
     ...input,
     onCarrierStatus() {},
+    onCarrierAttemptPrepared() {},
+    onCarrierAttemptFenced() {},
   })));
   assert.equal(drained, true);
   assert.notEqual(lifecycle, null);
@@ -1348,7 +1386,7 @@ test("close is idempotent and drain fences callbacks through forced termination"
   assert.equal(await drain, proof);
   assert.equal(socket.terminateCalls, 1);
 
-  socket.emitMessage(Buffer.from("{}"), true);
+  socket.emitMessage(Buffer.from("{}"), false);
   socket.emitOpen();
   socket.emitClose(1000);
   socket.writes[0].callback();

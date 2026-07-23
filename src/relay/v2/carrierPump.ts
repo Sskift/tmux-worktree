@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { types as nodeUtilTypes } from "node:util";
 import { RELAY_V2_CARRIER_ROUTE_HARD_LIMIT } from "./carrierLimits.js";
 import {
   type RelayV2BrokerAction,
@@ -28,6 +29,7 @@ import {
   type RelayV2BrokerClientWssRuntimeComposition,
   type RelayV2BrokerClientWssRuntimeActivationOptions,
   type RelayV2BrokerClientWssRuntimeCompositionOptions,
+  type RelayV2BrokerClientWssPrivateIngressRuntime,
 } from "./brokerClientWssRuntimeComposition.js";
 import {
   type RelayV2BrokerHostWssRuntimeFacade,
@@ -123,12 +125,35 @@ export type RelayV2BrokerSharedProducerClientWssRuntime = Readonly<Pick<
   "prepareClientWss" | "attachPreparedClientWss"
 >>;
 
+type RelayV2BrokerSharedProducerPrivateIngressPorts = Readonly<{
+  clientWssRuntime: RelayV2BrokerClientWssPrivateIngressRuntime;
+  hostWssRuntime: Readonly<Pick<
+    RelayV2BrokerHostWssRuntimeFacade,
+    "prepareHostWss" | "claimPreparedHostWss" | "attachPreparedHostWss"
+  >>;
+}>;
+
+type RelayV2BrokerSharedProducerPrivateIngressChild = Readonly<{
+  closeAndDrain(): Promise<void>;
+}>;
+
+type RelayV2BrokerSharedProducerPrivateIngressChildren = Readonly<{
+  hostIngress: RelayV2BrokerSharedProducerPrivateIngressChild;
+  clientIngress: RelayV2BrokerSharedProducerPrivateIngressChild;
+}>;
+
+type RelayV2BrokerSharedProducerPrivateIngressInstaller = (
+  ports: RelayV2BrokerSharedProducerPrivateIngressPorts,
+) => RelayV2BrokerSharedProducerPrivateIngressChildren;
+
 export type RelayV2BrokerSharedProducerRuntimeCompositionOptions = Omit<
   RelayV2BrokerClientWssRuntimeCompositionOptions,
   "producerRegistry" | "resolveHostProducerBinding"
 > & Readonly<{
   hostWssTrustedSocketPrototype: object;
   hostWssTrustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand;
+  /** Installs both children atomically; the installer rolls back before throwing. */
+  installPrivateIngressChildren?: RelayV2BrokerSharedProducerPrivateIngressInstaller;
 }>;
 
 export type RelayV2BrokerSharedProducerRuntimeActivationOptions<
@@ -140,6 +165,7 @@ export type RelayV2BrokerSharedProducerRuntimeActivationOptions<
 > & Readonly<{
   hostWssTrustedSocketPrototype: object;
   hostWssTrustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand;
+  installPrivateIngressChildren?: RelayV2BrokerSharedProducerPrivateIngressInstaller;
 }>;
 
 export type RelayV2BrokerManagedHostCarrierPump = Readonly<Pick<
@@ -2682,13 +2708,86 @@ function createRelayV2BrokerSharedProducerPumpConstructionReservation(
   return Object.freeze({ barrier, resolve, reject });
 }
 
+type PrivateIngressClose = Readonly<{ receiver: object; method: Function }>;
+
+function rejectedPrivateIngressProxy(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return false;
+  }
+  try {
+    return nodeUtilTypes.isProxy(value);
+  } catch {
+    return true;
+  }
+}
+
+function capturePrivateIngressClose(value: unknown): PrivateIngressClose {
+  if (value === null || typeof value !== "object" || rejectedPrivateIngressProxy(value)) {
+    throw new Error("invalid Relay v2 shared-producer private ingress child");
+  }
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const descriptor = descriptors.closeAndDrain;
+    if (
+      Reflect.ownKeys(descriptors).length !== 1
+      || !descriptor
+      || !Object.hasOwn(descriptor, "value")
+      || typeof descriptor.value !== "function"
+      || rejectedPrivateIngressProxy(descriptor.value)
+    ) throw new Error("invalid child shape");
+    return Object.freeze({ receiver: value, method: descriptor.value });
+  } catch {
+    throw new Error("invalid Relay v2 shared-producer private ingress child");
+  }
+}
+
+function installPrivateIngressChildren(
+  installer: RelayV2BrokerSharedProducerPrivateIngressInstaller | undefined,
+  ports: RelayV2BrokerSharedProducerPrivateIngressPorts,
+): readonly PrivateIngressClose[] {
+  if (installer === undefined) return Object.freeze([]);
+  if (typeof installer !== "function" || rejectedPrivateIngressProxy(installer)) {
+    throw new Error("invalid Relay v2 shared-producer private ingress installer");
+  }
+  const installed = Reflect.apply(installer, undefined, [ports]);
+  if (
+    installed === null
+    || typeof installed !== "object"
+    || rejectedPrivateIngressProxy(installed)
+  ) {
+    throw new Error("invalid Relay v2 shared-producer private ingress children");
+  }
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(installed);
+    const hostIngress = descriptors.hostIngress;
+    const clientIngress = descriptors.clientIngress;
+    if (
+      Reflect.ownKeys(descriptors).length !== 2
+      || !hostIngress
+      || !Object.hasOwn(hostIngress, "value")
+      || !clientIngress
+      || !Object.hasOwn(clientIngress, "value")
+    ) throw new Error("invalid children shape");
+    if (hostIngress.value === clientIngress.value) throw new Error("duplicate child");
+    return Object.freeze([
+      capturePrivateIngressClose(hostIngress.value),
+      capturePrivateIngressClose(clientIngress.value),
+    ]);
+  } catch {
+    throw new Error("invalid Relay v2 shared-producer private ingress children");
+  }
+}
+
 class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
   readonly clientWssRuntime: RelayV2BrokerSharedProducerClientWssRuntime;
   readonly hostWssRuntime: RelayV2BrokerHostWssRuntimeFacade;
 
   private readonly producerRegistry: RelayV2BrokerProducerRegistry;
   private readonly runtime: RelayV2BrokerClientWssRuntimeComposition;
+  private readonly privateClientIngressRuntime:
+    RelayV2BrokerClientWssPrivateIngressRuntime;
   private readonly hostPumpOwner: RelayV2BrokerSharedProducerHostPumpOwner;
+  private readonly privateIngressCloses: readonly PrivateIngressClose[];
   private readonly hostPumps = new Set<RelayV2BrokerHostCarrierPump>();
   private readonly observedPumpCloseReceipts = new WeakSet<
     RelayV2CarrierPumpCloseReceipt
@@ -2712,16 +2811,24 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
         runtime: RelayV2BrokerClientWssRuntimeComposition;
         hostWssTrustedSocketPrototype: object;
         hostWssTrustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand;
+        privateClientIngressRuntime: RelayV2BrokerClientWssPrivateIngressRuntime;
+        installPrivateIngressChildren?: RelayV2BrokerSharedProducerPrivateIngressInstaller;
       }
   >) {
+    let privateIngressInstaller: RelayV2BrokerSharedProducerPrivateIngressInstaller
+      | undefined;
     if (input.kind === "create") {
       const {
         hostWssTrustedSocketPrototype,
         hostWssTrustedSocketBrand,
+        installPrivateIngressChildren: installPrivateIngress,
         ...runtimeOptions
       } = input.options;
+      privateIngressInstaller = installPrivateIngress;
       const producerRegistry = new RelayV2BrokerProducerRegistry();
       this.producerRegistry = producerRegistry;
+      let privateClientIngressRuntime: RelayV2BrokerClientWssPrivateIngressRuntime
+        | undefined;
       this.runtime = createRelayV2BrokerClientWssRuntimeComposition({
         ...runtimeOptions,
         producerRegistry,
@@ -2732,15 +2839,23 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
           );
           return owner.status === "current" ? owner.binding : undefined;
         },
+      }, (runtime) => {
+        privateClientIngressRuntime = runtime;
       });
+      if (!privateClientIngressRuntime) {
+        throw new Error("Relay v2 shared-producer private client ingress port is unavailable");
+      }
+      this.privateClientIngressRuntime = privateClientIngressRuntime;
       this.hostWssRuntime = installRelayV2BrokerHostWssRuntime(
         this.runtime,
         hostWssTrustedSocketPrototype,
         hostWssTrustedSocketBrand,
       );
     } else {
+      privateIngressInstaller = input.installPrivateIngressChildren;
       this.producerRegistry = input.producerRegistry;
       this.runtime = input.runtime;
+      this.privateClientIngressRuntime = input.privateClientIngressRuntime;
       this.hostWssRuntime = installRelayV2BrokerHostWssRuntime(
         this.runtime,
         input.hostWssTrustedSocketPrototype,
@@ -2756,6 +2871,34 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
       prepareClientWss: this.runtime.prepareClientWss,
       attachPreparedClientWss: this.runtime.attachPreparedClientWss,
     });
+    try {
+      this.privateIngressCloses = installPrivateIngressChildren(
+        privateIngressInstaller,
+        Object.freeze({
+          clientWssRuntime: this.privateClientIngressRuntime,
+          hostWssRuntime: Object.freeze({
+            prepareHostWss: this.hostWssRuntime.prepareHostWss,
+            claimPreparedHostWss: this.hostWssRuntime.claimPreparedHostWss,
+            attachPreparedHostWss: this.hostWssRuntime.attachPreparedHostWss,
+          }),
+        }),
+      );
+    } catch (error) {
+      this.hostPumpAdmissionOpen = false;
+      const rollbackBarriers: Promise<unknown>[] = [];
+      try {
+        rollbackBarriers.push(this.hostWssRuntime.closeAndDrain());
+      } catch (rollbackError) {
+        rollbackBarriers.push(Promise.reject(rollbackError));
+      }
+      try {
+        rollbackBarriers.push(this.runtime.closeAndDrain());
+      } catch (rollbackError) {
+        rollbackBarriers.push(Promise.reject(rollbackError));
+      }
+      void Promise.allSettled(rollbackBarriers);
+      throw error;
+    }
   }
 
   createHostCarrierPump(
@@ -2825,6 +2968,17 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     } catch (error) {
       sealFailures.push(error);
     }
+    const privateIngressBarriers = this.privateIngressCloses.map((close) => {
+      try {
+        const barrier = Reflect.apply(close.method, close.receiver, []);
+        if (!nodeUtilTypes.isPromise(barrier)) {
+          throw new Error("invalid Relay v2 shared-producer private ingress close barrier");
+        }
+        return barrier as Promise<void>;
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    });
 
     // Every Pump present at the close cut begins shutdown in this turn. No
     // receipt is awaited until all siblings have received their terminal cut.
@@ -2835,7 +2989,12 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     for (const reservation of this.constructionReservations) {
       pumpBarriers.push(reservation.barrier);
     }
-    void this.finishCloseAndDrain(pumpBarriers, hostWssBarrier, sealFailures).then(
+    void this.finishCloseAndDrain(
+      pumpBarriers,
+      hostWssBarrier,
+      privateIngressBarriers,
+      sealFailures,
+    ).then(
       resolveClose,
       rejectClose,
     );
@@ -2893,6 +3052,7 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
   private async finishCloseAndDrain(
     pumpBarriers: readonly Promise<RelayV2CarrierPumpCloseReceipt | null>[],
     hostWssBarrier: Promise<void>,
+    privateIngressBarriers: readonly Promise<void>[],
     sealFailures: readonly unknown[],
   ): Promise<void> {
     const failures: unknown[] = [...sealFailures];
@@ -2900,6 +3060,7 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     const siblingSettlements = await Promise.allSettled([
       ...pumpBarriers,
       hostWssBarrier,
+      ...privateIngressBarriers,
     ]);
     for (let index = 0; index < pumpBarriers.length; index += 1) {
       const settlement = siblingSettlements[index] as PromiseSettledResult<
@@ -2916,6 +3077,14 @@ class RelayV2BrokerSharedProducerRuntimeCompositionOwner {
     if (hostWssSettlement?.status === "rejected") {
       hostWssFailure = hostWssSettlement.reason;
       failures.push(hostWssFailure);
+    }
+    for (
+      let index = pumpBarriers.length + 1;
+      index < siblingSettlements.length;
+      index += 1
+    ) {
+      const settlement = siblingSettlements[index];
+      if (settlement?.status === "rejected") failures.push(settlement.reason);
     }
     if (this.terminalPumpFailureCount > 0) {
       failures.push(new Error(
@@ -2990,9 +3159,12 @@ export async function activateRelayV2BrokerSharedProducerRuntimeComposition<
   const {
     hostWssTrustedSocketPrototype,
     hostWssTrustedSocketBrand,
+    installPrivateIngressChildren: privateIngressInstaller,
     ...runtimeOptions
   } = options;
   const producerRegistry = new RelayV2BrokerProducerRegistry();
+  let privateClientIngressRuntime: RelayV2BrokerClientWssPrivateIngressRuntime
+    | undefined;
   const activation = await activateRelayV2BrokerClientWssRuntimeComposition({
     ...runtimeOptions,
     producerRegistry,
@@ -3003,15 +3175,22 @@ export async function activateRelayV2BrokerSharedProducerRuntimeComposition<
       );
       return owner.status === "current" ? owner.binding : undefined;
     },
+  }, (runtime) => {
+    privateClientIngressRuntime = runtime;
   });
 
   try {
+    if (!privateClientIngressRuntime) {
+      throw new Error("Relay v2 shared-producer private client ingress port is unavailable");
+    }
     const owner = new RelayV2BrokerSharedProducerRuntimeCompositionOwner({
       kind: "activated",
       producerRegistry,
       runtime: activation.runtime,
+      privateClientIngressRuntime,
       hostWssTrustedSocketPrototype,
       hostWssTrustedSocketBrand,
+      installPrivateIngressChildren: privateIngressInstaller,
     });
     return Object.freeze({
       sharedRuntime: createRelayV2BrokerSharedProducerRuntimeFacade(owner),

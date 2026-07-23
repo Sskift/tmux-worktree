@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
+use super::enrollment_artifact::{EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim};
 use super::management_child::{
     ManagementCallError, ManagementChildManager, ManagementError, ManagementInput,
     ManagementOperation, ManagementOutcome, ManagementStartError,
@@ -50,24 +51,57 @@ enum ManagementCommandOwner {
 
 pub(crate) struct MobileRelayV2ManagementCommandState {
     owner: ManagementCommandOwner,
+    artifacts: EnrollmentArtifactRegistry,
     disposed: AtomicBool,
 }
 
 impl MobileRelayV2ManagementCommandState {
     pub(crate) fn start(app: &tauri::AppHandle) -> Self {
-        Self::from_start(ManagementChildManager::start(app))
+        let closer_app = app.clone();
+        let artifacts = EnrollmentArtifactRegistry::new(move |label| {
+            if let Some(window) = closer_app.get_webview_window(label) {
+                let _ = window.destroy();
+            }
+        });
+        Self::from_artifact_start(artifacts, || ManagementChildManager::start(app))
     }
 
+    fn from_artifact_start<F>(
+        artifacts: Result<EnrollmentArtifactRegistry, ()>,
+        start_manager: F,
+    ) -> Self
+    where
+        F: FnOnce() -> Result<ManagementChildManager, ManagementStartError>,
+    {
+        match artifacts {
+            Ok(artifacts) => Self::from_start_with_artifacts(start_manager(), artifacts),
+            Err(()) => Self::from_start_with_artifacts(
+                Err(ManagementStartError::Unavailable),
+                EnrollmentArtifactRegistry::disabled(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
     fn from_start(start: Result<ManagementChildManager, ManagementStartError>) -> Self {
+        Self::from_start_with_artifacts(start, EnrollmentArtifactRegistry::disabled())
+    }
+
+    fn from_start_with_artifacts(
+        start: Result<ManagementChildManager, ManagementStartError>,
+        artifacts: EnrollmentArtifactRegistry,
+    ) -> Self {
         Self {
             owner: match start {
                 Ok(manager) => ManagementCommandOwner::Ready(manager),
                 Err(error) => ManagementCommandOwner::StartFailed(error),
             },
+            artifacts,
             disposed: AtomicBool::new(false),
         }
     }
 
+    #[cfg(test)]
     fn call(
         &self,
         operation: MobileRelayV2ManagementOperation,
@@ -83,10 +117,39 @@ impl MobileRelayV2ManagementCommandState {
         if self.disposed.load(Ordering::Acquire) {
             return Err(channel_closed_error());
         }
+        if operation == MobileRelayV2ManagementOperation::RefreshHost {
+            self.artifacts.clear();
+        }
         match &self.owner {
-            ManagementCommandOwner::Ready(manager) => manager
-                .request_with_input(operation.into(), input)
-                .map_err(map_call_error),
+            ManagementCommandOwner::Ready(manager) => {
+                let mut outcome = match manager.request_with_input(operation.into(), input) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.artifacts.clear();
+                        return Err(map_call_error(error));
+                    }
+                };
+                if outcome.protocol_version == super::management_protocol_v2::PROTOCOL_VERSION {
+                    let projected = outcome
+                        .result
+                        .take()
+                        .map(|result| {
+                            super::management_protocol_v2::project_for_renderer(
+                                result,
+                                &self.artifacts,
+                            )
+                        })
+                        .transpose();
+                    match projected {
+                        Ok(result) => outcome.result = result,
+                        Err(()) => {
+                            self.dispose();
+                            return Err(channel_closed_error());
+                        }
+                    }
+                }
+                Ok(outcome)
+            }
             ManagementCommandOwner::StartFailed(error) => Err(map_start_error(*error)),
         }
     }
@@ -95,6 +158,7 @@ impl MobileRelayV2ManagementCommandState {
         if self.disposed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.artifacts.close();
         if let ManagementCommandOwner::Ready(manager) = &self.owner {
             manager.dispose();
         }
@@ -118,6 +182,132 @@ pub(crate) async fn mobile_relay_v2_management_call(
     tauri::async_runtime::spawn_blocking(move || state.call_with_input(operation, input))
         .await
         .map_err(|_| channel_closed_error())?
+}
+
+#[tauri::command]
+pub(crate) async fn mobile_relay_v2_enrollment_artifact_show(
+    handle: String,
+    app: tauri::AppHandle,
+    state: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
+) -> Result<(), ManagementError> {
+    if !valid_artifact_handle(&handle) {
+        return Err(invalid_argument_error());
+    }
+    show_enrollment_artifact(&app, state.inner().as_ref(), &handle).map_err(|_| not_ready_error())
+}
+
+fn show_enrollment_artifact(
+    app: &tauri::AppHandle,
+    state: &MobileRelayV2ManagementCommandState,
+    handle: &str,
+) -> Result<(), ()> {
+    if state.disposed.load(Ordering::Acquire) {
+        return Err(());
+    }
+    for _ in 0..2 {
+        match state.artifacts.claim_window(handle)? {
+            EnrollmentArtifactWindowClaim::Existing { label } => {
+                if let Some(window) = app.get_webview_window(&label) {
+                    if window.show().is_ok() && window.set_focus().is_ok() {
+                        return Ok(());
+                    }
+                    state.artifacts.clear();
+                    return Err(());
+                }
+                state.artifacts.release_window(handle, &label);
+            }
+            EnrollmentArtifactWindowClaim::Fresh { label, png } => {
+                if create_native_artifact_window(
+                    app,
+                    &label,
+                    png,
+                    state.artifacts.clone(),
+                    handle.to_string(),
+                )
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                state.artifacts.clear();
+                return Err(());
+            }
+        }
+    }
+    Err(())
+}
+
+#[cfg(target_os = "macos")]
+fn create_native_artifact_window(
+    app: &tauri::AppHandle,
+    label: &str,
+    png: Arc<[u8]>,
+    artifacts: EnrollmentArtifactRegistry,
+    handle: String,
+) -> Result<(), ()> {
+    let url = tauri::Url::parse("about:blank").map_err(|_| ())?;
+    let window = tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::External(url))
+        .title("Relay v2 one-time enrollment")
+        .inner_size(360.0, 360.0)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .center()
+        .build()
+        .map_err(|_| ())?;
+
+    let native_window = window.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let install_result = window
+        .run_on_main_thread(move || {
+            let _ = sender.send(install_native_png(&native_window, &png));
+        })
+        .map_err(|_| ())
+        .and_then(|()| receiver.recv().map_err(|_| ()))
+        .and_then(|result| result);
+    if install_result.is_err() {
+        let _ = window.destroy();
+        return Err(());
+    }
+
+    let event_label = label.to_string();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            artifacts.clear_if_window(&handle, &event_label);
+        }
+    });
+    if window.show().is_err() || window.set_focus().is_err() {
+        let _ = window.destroy();
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_native_png(window: &tauri::WebviewWindow, png: &[u8]) -> Result<(), ()> {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSImage, NSImageScaling, NSImageView, NSWindow};
+    use objc2_foundation::NSData;
+
+    let mtm = MainThreadMarker::new().ok_or(())?;
+    let pointer = window.ns_window().map_err(|_| ())?;
+    let ns_window = unsafe { &*pointer.cast::<NSWindow>() };
+    let data = unsafe { NSData::dataWithBytes_length(png.as_ptr().cast(), png.len()) };
+    let image = NSImage::initWithData(NSImage::alloc(), &data).ok_or(())?;
+    let image_view = NSImageView::imageViewWithImage(&image, mtm);
+    image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+    ns_window.setContentView(Some(&image_view));
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_native_artifact_window(
+    _app: &tauri::AppHandle,
+    _label: &str,
+    _png: Arc<[u8]>,
+    _artifacts: EnrollmentArtifactRegistry,
+    _handle: String,
+) -> Result<(), ()> {
+    Err(())
 }
 
 fn decode_command_input(
@@ -179,6 +369,16 @@ fn valid_opaque(value: &str, max_bytes: usize) -> bool {
             .any(|prefix| value.to_ascii_lowercase().contains(prefix))
 }
 
+fn valid_artifact_handle(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("dqart1.") else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 fn fixed_error(code: &str, message: &str) -> ManagementError {
     ManagementError {
         code: code.to_string(),
@@ -201,6 +401,10 @@ fn superseded_error() -> ManagementError {
 
 fn invalid_argument_error() -> ManagementError {
     fixed_error(INVALID_ARGUMENT_CODE, INVALID_ARGUMENT_MESSAGE)
+}
+
+fn not_ready_error() -> ManagementError {
+    fixed_error("NOT_READY", "Relay v2 management is not ready")
 }
 
 fn map_start_error(error: ManagementStartError) -> ManagementError {
@@ -293,6 +497,19 @@ mod tests {
                 .call(MobileRelayV2ManagementOperation::Status)
                 .unwrap_err(),
             channel_closed_error()
+        );
+    }
+
+    #[test]
+    fn artifact_owner_start_failure_is_permanently_unavailable_without_starting_the_child() {
+        let unavailable = MobileRelayV2ManagementCommandState::from_artifact_start(Err(()), || {
+            panic!("artifact failure must fence child startup")
+        });
+        assert_eq!(
+            unavailable
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap_err(),
+            unavailable_error()
         );
     }
 

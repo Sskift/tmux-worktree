@@ -16,6 +16,13 @@ const resourceState = await import("../dist/relay/v2/resourceState.js");
 const snapshotSpool = await import("../dist/relay/v2/stateSnapshotSpool.js");
 const terminalManager = await import("../dist/relay/v2/terminalManager.js");
 const runtimeModule = await import("../dist/relay/v2/hostRuntime.js");
+const agentAttachmentModule = await import(
+  "../dist/relay/v2/hostAgentTranscriptLifecycleAttachment.js"
+);
+const agentStoreModule = await import(
+  "../dist/relay/extensions/agentTranscriptLifecycle/v1/store.js"
+);
+const continuityModule = await import("../dist/relay/v2/continuityAnchor.js");
 
 const corpus = loadRelayV2FixtureCorpus();
 const HOST_ID = "mac-admin";
@@ -250,7 +257,9 @@ function createHarness(options = {}) {
   };
   const outbound = {
     trySend(routeBinding, bytes, receipt) {
-      const frame = codec.decodeRelayV2WebSocketFrame("public", bytes).frame;
+      const frame = options.decodeOutbound
+        ? options.decodeOutbound(bytes)
+        : codec.decodeRelayV2WebSocketFrame("public", bytes).frame;
       state.sent.push({ binding: routeBinding, frame });
       if (options.trySend) return options.trySend(routeBinding, bytes, frame, receipt);
       receipt.settle(true);
@@ -299,6 +308,7 @@ function createHarness(options = {}) {
     terminals,
     welcome: { build: options.buildWelcome ?? hostWelcome },
     outbound,
+    optionalExtension: options.optionalExtension,
     testLimits: options.testLimits,
   });
   return { runtime, state, readiness, commands, resources, snapshots, terminals, outbound };
@@ -1655,15 +1665,13 @@ test("actual H3 durable mode=reset retry correlates the replacement generation",
     const initial = h.state.sent.find(({ frame }) => frame.requestId === initialOpen.requestId)?.frame;
     assert.equal(initial.type, "terminal.opened");
 
-    const resetOpen = fixture("terminal-open-resume");
+    const resetOpen = fixture("terminal-open-reset-with-resume");
     resetOpen.requestId = "durable-reset-first-request";
     resetOpen.hostId = HOST_ID;
     resetOpen.expectedHostEpoch = HOST_EPOCH;
     resetOpen.streamId = initial.streamId;
     resetOpen.payload.openId = "durable-reset-open-id";
-    resetOpen.payload.mode = "reset";
     resetOpen.payload.resume.generation = initial.payload.generation;
-    resetOpen.payload.resume.nextOffset = "0";
     resetOpen.payload.resume.resumeToken = initial.payload.resumeToken;
     send(h.runtime, firstBinding, resetOpen);
     await settle(16);
@@ -1698,7 +1706,7 @@ test("actual H3 durable mode=reset retry correlates the replacement generation",
     assert.equal(reset.type, "terminal.reset_required");
     assert.equal(reset.payload.origin, "open");
     assert.equal(reset.payload.generation, "actual-authority-generation-2");
-    assert.equal(reset.payload.requestedOffset, "0");
+    assert.equal(reset.payload.requestedOffset, null);
     assert.equal(backend.opens.length, 2, "durable reset retry must not replace the backend twice");
   } finally {
     h.runtime.dispose();
@@ -1844,7 +1852,11 @@ test("request ownership and response metadata fence cross-owner or retargeted fr
         },
       });
       const routeBinding = await ready(h);
-      const open = fixture(mode === "new" ? "terminal-open-new" : "terminal-open-resume");
+      const open = fixture(mode === "new"
+        ? "terminal-open-new"
+        : mode === "resume"
+          ? "terminal-open-resume"
+          : "terminal-open-reset-with-resume");
       open.requestId = `open-truth-table-${mode}`;
       open.expectedHostEpoch = HOST_EPOCH;
       open.payload.mode = mode;
@@ -2822,6 +2834,492 @@ test("a misrouted v1 dialect returns the typed rejection consumed as route.rejec
   assert.equal(h.state.calls.hello.length, 0);
   assert.equal(h.state.calls.commandExecute.length, 0);
   assert.equal(h.state.calls.terminal.length, 0);
+});
+
+test("optional Host attachment keeps negotiated routes correlated across ready loss", async (t) => {
+  const capability = "agent.transcript-lifecycle.v1";
+  const scopeId = "scope-extension-ready-loss";
+  const sessionId = "session-extension-ready-loss";
+  const counters = {
+    authorize: 0,
+    handle: 0,
+    unavailable: 0,
+    isolate: 0,
+    unsubscribe: 0,
+  };
+  let extensionSink;
+  const decodeJson = (bytes) => JSON.parse(Buffer.from(bytes).toString("utf8"));
+  const response = (request) => ({
+    protocolVersion: 2,
+    kind: "response",
+    type: "agent.timeline.status",
+    requestId: request.requestId,
+    hostId: request.hostId,
+    hostEpoch: HOST_EPOCH,
+    scopeId: request.scopeId,
+    sessionId: request.sessionId,
+    payload: {
+      capability,
+      support: "unavailable",
+      reason: "store_unavailable",
+      liveSource: "absent",
+      activeSourceEpoch: null,
+      timelineEpoch: null,
+      currentAgentSeq: null,
+      earliestReplaySeq: null,
+      limits: null,
+    },
+  });
+  const attachment = {
+    capability,
+    subscribe(sink) {
+      extensionSink = sink;
+      sink.apply(true);
+      return { unsubscribe() { counters.unsubscribe += 1; } };
+    },
+    inspectRequest(bytes) {
+      const request = decodeJson(bytes);
+      return {
+        requestId: request.requestId,
+        hostId: request.hostId,
+        expectedHostEpoch: request.expectedHostEpoch,
+        scopeId: request.scopeId,
+        sessionId: request.sessionId,
+      };
+    },
+    async authorize() {
+      counters.authorize += 1;
+      return true;
+    },
+    async handleRequest() {
+      counters.handle += 1;
+      throw new Error("extension owner failed after admission");
+    },
+    handleUnavailableRequest(bytes) {
+      counters.unavailable += 1;
+      const frame = response(decodeJson(bytes));
+      return { frame, bytes: Buffer.from(JSON.stringify(frame), "utf8") };
+    },
+    isolateFailure() {
+      counters.isolate += 1;
+      throw new Error("untrusted isolate callback failed");
+    },
+    async closeAndDrain() {},
+  };
+  const h = createHarness({ optionalExtension: attachment, decodeOutbound: decodeJson });
+  const routeBinding = binding();
+  h.runtime.onRouteBound(routeBinding);
+  const hello = fixture("client-hello-fresh");
+  hello.hostId = HOST_ID;
+  hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
+  hello.payload.capabilities.push(capability);
+  send(h.runtime, routeBinding, hello);
+  await settle();
+  assert.equal(h.state.sent.at(-1).frame.type, "host.welcome");
+  assert.deepEqual(h.state.sent.at(-1).frame.payload.capabilities, [
+    ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
+    capability,
+  ]);
+
+  const extensionRequest = (requestId) => ({
+    protocolVersion: 2,
+    kind: "request",
+    type: "agent.timeline.status.get",
+    requestId,
+    hostId: HOST_ID,
+    expectedHostEpoch: HOST_EPOCH,
+    scopeId,
+    sessionId,
+    payload: { capability },
+  });
+  const sendExtension = (request) => h.runtime.onClientFrame(
+    routeBinding,
+    Buffer.from(JSON.stringify(request), "utf8"),
+  );
+
+  assert.equal(extensionSink.apply(false), true);
+  sendExtension(extensionRequest("extension-ready-loss"));
+  await settle();
+  assert.equal(counters.authorize, 0, "ready loss must bypass target/durable owners");
+  assert.equal(counters.handle, 0);
+  assert.equal(counters.unavailable, 1);
+  assert.equal(h.state.sent.at(-1).frame.requestId, "extension-ready-loss");
+  assert.equal(h.state.sent.at(-1).frame.payload.support, "unavailable");
+  assert.deepEqual(h.state.closes, []);
+
+  assert.equal(extensionSink.apply(true), true);
+  const live = {
+    protocolVersion: 2,
+    kind: "event",
+    type: "agent.timeline.event",
+    hostId: HOST_ID,
+    hostEpoch: HOST_EPOCH,
+    scopeId,
+    sessionId,
+    payload: { capability },
+  };
+  const queued = extensionSink.publish({
+    frame: live,
+    bytes: Buffer.from(JSON.stringify(live), "utf8"),
+  });
+  assert.equal(extensionSink.apply(false), true);
+  await queued;
+  assert.equal(h.state.sent.some(({ frame }) => frame.type === "agent.timeline.event"), false);
+
+  assert.equal(extensionSink.apply(true), true);
+  sendExtension(extensionRequest("extension-owner-failure"));
+  await settle();
+  assert.equal(counters.authorize, 1);
+  assert.equal(counters.handle, 1);
+  assert.equal(counters.isolate, 1);
+  assert.equal(counters.unavailable, 2, "throwing isolate callback cannot strand pending");
+  assert.equal(h.state.sent.at(-1).frame.requestId, "extension-owner-failure");
+  assert.equal(h.state.sent.at(-1).frame.payload.support, "unavailable");
+  assert.deepEqual(h.state.closes, []);
+
+  assert.equal(counters.unsubscribe, 1, "Host fences ingress before untrusted isolation");
+  assert.equal(extensionSink.apply(true), true, "the stale sink remains a closed no-op");
+  assert.equal(h.runtime.advertisedCapabilities().includes(capability), false);
+  sendExtension(extensionRequest("extension-after-isolate"));
+  await settle();
+  assert.equal(counters.authorize, 1, "a fenced attachment cannot re-enter authorization");
+  assert.equal(counters.handle, 1, "a fenced attachment cannot re-enter its request owner");
+  assert.equal(counters.unavailable, 3);
+  assert.equal(h.state.sent.at(-1).frame.requestId, "extension-after-isolate");
+  assert.equal(h.state.sent.at(-1).frame.payload.support, "unavailable");
+  assert.deepEqual(h.state.closes, []);
+
+  extensionSink.close();
+  assert.equal(counters.unsubscribe, 1);
+  assert.equal(extensionSink.apply(true), true, "permanent close cannot re-enable ingress");
+  await extensionSink.publish({
+    frame: live,
+    bytes: Buffer.from(JSON.stringify(live), "utf8"),
+  });
+  sendExtension(extensionRequest("extension-after-close"));
+  await settle();
+  assert.equal(counters.authorize, 1);
+  assert.equal(counters.handle, 1);
+  assert.equal(counters.unavailable, 4);
+  assert.equal(h.state.sent.at(-1).frame.requestId, "extension-after-close");
+  assert.deepEqual(h.state.closes, []);
+  h.runtime.dispose();
+
+  await t.test("synchronous subscribe close isolates optional ingress without failing base", () => {
+    let unsubscribeCalls = 0;
+    const closedAttachment = {
+      ...attachment,
+      subscribe(sink) {
+        sink.close();
+        return { unsubscribe() { unsubscribeCalls += 1; } };
+      },
+      isolateFailure() {},
+    };
+    const closed = createHarness({ optionalExtension: closedAttachment });
+    assert.deepEqual(closed.runtime.advertisedCapabilities(), [
+      ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
+    ]);
+    assert.equal(unsubscribeCalls, 1);
+    closed.runtime.dispose();
+    assert.equal(unsubscribeCalls, 1);
+  });
+
+  await t.test("canonical attachment commits, replays, and isolates continuity ready loss", async () => {
+    const actualScopeId = "scope-agent-attachment";
+    const actualSessionId = "session-agent-attachment";
+    const backendInstanceKey = "backend-agent-attachment";
+    const managedIncarnation = `twinc2.${"a".repeat(43)}`;
+    const home = mkdtempSync(join(tmpdir(), "tw-agent-host-attachment-"));
+    const clone = (value) => structuredClone(value);
+    class MemoryContinuityAuthority {
+      constructor(anchorId) {
+        this.anchorId = anchorId;
+        this.sequence = 0;
+        this.failReads = false;
+        this.current = {
+          protocolVersion: continuityModule.RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
+          status: "uninitialized",
+          anchorId,
+          casToken: "cas-0",
+        };
+      }
+
+      async read(request) {
+        assert.equal(request.anchorId, this.anchorId);
+        if (this.failReads) throw new Error("injected external continuity loss");
+        return clone(this.current);
+      }
+
+      async compareAndSwap(request) {
+        assert.equal(request.anchorId, this.anchorId);
+        if (request.expected.casToken !== this.current.casToken) {
+          return {
+            protocolVersion: continuityModule.RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
+            outcome: "conflict",
+            current: clone(this.current),
+          };
+        }
+        this.sequence += 1;
+        this.current = {
+          protocolVersion: continuityModule.RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
+          status: "committed",
+          anchorId: this.anchorId,
+          casToken: `cas-${this.sequence}`,
+          checkpoint: clone(request.next),
+        };
+        return {
+          protocolVersion: continuityModule.RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
+          outcome: "swapped",
+          current: clone(this.current),
+        };
+      }
+    }
+    class PushSource {
+      queue = [];
+      pending = null;
+      ended = false;
+      nextCalls = 0;
+      cancelCalls = 0;
+
+      [Symbol.asyncIterator]() {
+        return Object.freeze({ next: () => this.next() });
+      }
+
+      next() {
+        this.nextCalls += 1;
+        if (this.queue.length > 0) return Promise.resolve(this.queue.shift());
+        if (this.ended) return Promise.resolve({ done: true, value: undefined });
+        let resolve;
+        const promise = new Promise((settlePromise) => { resolve = settlePromise; });
+        this.pending = { promise, resolve };
+        return promise;
+      }
+
+      push(bytes) {
+        const item = { done: false, value: bytes };
+        if (this.pending === null) this.queue.push(item);
+        else {
+          const pending = this.pending;
+          this.pending = null;
+          pending.resolve(item);
+        }
+      }
+
+      async cancel() {
+        this.cancelCalls += 1;
+        if (this.ended) return;
+        this.ended = true;
+        if (this.pending !== null) {
+          const pending = this.pending;
+          this.pending = null;
+          pending.resolve({ done: true, value: undefined });
+        }
+      }
+    }
+    const waitFor = async (predicate, message) => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (predicate()) return;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.fail(message);
+    };
+    const sourceLine = (turnId) => Buffer.from(`${JSON.stringify({
+      method: "turn/started",
+      params: {
+        threadId: "attachment-thread",
+        turn: {
+          id: turnId,
+          items: [],
+          itemsView: "full",
+          status: "inProgress",
+          error: null,
+          startedAt: Math.floor(Date.now() / 1_000),
+          completedAt: null,
+          durationMs: null,
+        },
+      },
+    })}\n`, "utf8");
+    const source = new PushSource();
+    const target = {
+      authorization: "evidence_only",
+      hostEpoch: HOST_EPOCH,
+      discoveryGeneration: "attachment-discovery-generation",
+      scopeId: actualScopeId,
+      processTarget: { kind: "local", targetId: "attachment-process" },
+      capabilities: [],
+      sessionId: actualSessionId,
+      backendInstanceKey,
+      managedTarget: {
+        name: "attachment-managed-session",
+        kind: "worktree",
+        incarnation: managedIncarnation,
+      },
+    };
+    let captureCalls = 0;
+    const resolver = {
+      async captureToken(hostEpoch) {
+        captureCalls += 1;
+        return {
+          schemaVersion: 1,
+          hostEpoch,
+          resourceMappingDigest: "attachment-resource-mapping",
+          discoveryGeneration: target.discoveryGeneration,
+        };
+      },
+      async resolveSession(_token, requestedScopeId, requestedSessionId) {
+        assert.equal(requestedScopeId, actualScopeId);
+        assert.equal(requestedSessionId, actualSessionId);
+        return clone(target);
+      },
+    };
+    const controller = {
+      async claimControlledProcess() {
+        return Object.freeze({
+          binding: Object.freeze({
+            hostId: HOST_ID,
+            hostEpoch: HOST_EPOCH,
+            scopeId: actualScopeId,
+            sessionId: actualSessionId,
+            backendInstanceKey,
+            managedIncarnation,
+          }),
+          notificationSource: source,
+        });
+      },
+    };
+    const anchorId = agentStoreModule.relayAgentAuthorityContinuityAnchorId({
+      hostId: HOST_ID,
+      hostEpoch: HOST_EPOCH,
+    });
+    const authority = new MemoryContinuityAuthority(anchorId);
+    let actualAttachment;
+    let actualRuntime;
+    try {
+      const store = await agentStoreModule.RelayAgentAuthorityStore.open({
+        hostId: HOST_ID,
+        hostEpoch: HOST_EPOCH,
+        home,
+        eventReplayRetentionMs: 604_800_000,
+        continuityAnchor: {
+          anchorId,
+          authority,
+          operationTimeoutMs: 500,
+          maxPendingOperations: 16,
+        },
+      });
+      actualAttachment = await agentAttachmentModule
+        .openRelayV2HostAgentTranscriptLifecycleAttachment({
+          store,
+          controller,
+          canonicalResourceResolver: resolver,
+        });
+      let heldLiveReceipt = null;
+      const actual = createHarness({
+        optionalExtension: actualAttachment,
+        decodeOutbound: decodeJson,
+        trySend(_route, _bytes, frame, receipt) {
+          if (frame.type === "agent.timeline.event" && heldLiveReceipt === null) {
+            heldLiveReceipt = receipt;
+            return true;
+          }
+          receipt.settle(true);
+          return true;
+        },
+      });
+      actualRuntime = actual.runtime;
+      const actualBinding = binding({ routeId: "actual-extension-route" });
+      actual.runtime.onRouteBound(actualBinding);
+      const actualHello = fixture("client-hello-fresh");
+      actualHello.hostId = HOST_ID;
+      actualHello.payload.clientInstanceId = actualBinding.authContext.clientInstanceId;
+      actualHello.payload.capabilities.push(capability);
+      send(actual.runtime, actualBinding, actualHello);
+      await settle();
+      assert.equal(actual.state.sent.at(-1).frame.type, "host.welcome");
+      assert.equal(actual.state.sent.at(-1).frame.payload.capabilities.includes(capability), true);
+
+      const nextCallsBefore = source.nextCalls;
+      source.push(sourceLine("attachment-turn-one"));
+      await waitFor(() => heldLiveReceipt !== null, "live extension frame was not admitted");
+      await waitFor(
+        () => source.nextCalls > nextCallsBefore,
+        "durable source ACK waited for the unresolved route receipt",
+      );
+      heldLiveReceipt.settle(true);
+      await settle(12);
+
+      const extensionRequestBytes = (type, requestId, payload) => Buffer.from(JSON.stringify({
+        protocolVersion: 2,
+        kind: "request",
+        type,
+        requestId,
+        hostId: HOST_ID,
+        expectedHostEpoch: HOST_EPOCH,
+        scopeId: actualScopeId,
+        sessionId: actualSessionId,
+        payload,
+      }), "utf8");
+      actual.runtime.onClientFrame(actualBinding, extensionRequestBytes(
+        "agent.timeline.status.get",
+        "actual-extension-status",
+        {},
+      ));
+      await settle(12);
+      const status = actual.state.sent.find(
+        ({ frame }) => frame.requestId === "actual-extension-status",
+      )?.frame;
+      assert.equal(status.type, "agent.timeline.status");
+      assert.equal(status.payload.support, "available");
+
+      actual.runtime.onClientFrame(actualBinding, extensionRequestBytes(
+        "agent.timeline.replay.get",
+        "actual-extension-replay",
+        {
+          timelineEpoch: status.payload.timelineEpoch,
+          afterAgentSeq: status.payload.earliestReplaySeq,
+          cursor: null,
+          limit: 256,
+        },
+      ));
+      await settle(12);
+      const replay = actual.state.sent.find(
+        ({ frame }) => frame.requestId === "actual-extension-replay",
+      )?.frame;
+      assert.equal(replay.type, "agent.timeline.replay.page");
+      assert.equal(replay.payload.events.length > 0, true);
+
+      authority.failReads = true;
+      source.push(sourceLine("attachment-turn-ready-loss"));
+      await waitFor(() => source.cancelCalls === 1, "continuity loss did not withdraw source");
+      await settle(12);
+      assert.equal(actual.runtime.advertisedCapabilities().includes(capability), false);
+      const capturesBeforeUnavailable = captureCalls;
+      actual.runtime.onClientFrame(actualBinding, extensionRequestBytes(
+        "agent.timeline.status.get",
+        "actual-extension-unavailable",
+        {},
+      ));
+      await settle(12);
+      const unavailable = actual.state.sent.find(
+        ({ frame }) => frame.requestId === "actual-extension-unavailable",
+      )?.frame;
+      assert.equal(unavailable.type, "agent.timeline.status");
+      assert.equal(unavailable.payload.support, "unavailable");
+      assert.equal(captureCalls, capturesBeforeUnavailable, "ready loss re-entered H2/owner");
+
+      const scopes = fixture("scopes-snapshot-get");
+      scopes.hostId = HOST_ID;
+      scopes.expectedHostEpoch = HOST_EPOCH;
+      send(actual.runtime, actualBinding, scopes);
+      await settle();
+      assert.equal(actual.state.sent.some(({ frame }) => frame.requestId === scopes.requestId), true);
+      assert.deepEqual(actual.state.closes, []);
+    } finally {
+      actualRuntime?.dispose();
+      await actualAttachment?.closeAndDrain().catch(() => undefined);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
 
 test("unknown types, opposite-direction frames, and closed-schema extensions fail closed", async (t) => {

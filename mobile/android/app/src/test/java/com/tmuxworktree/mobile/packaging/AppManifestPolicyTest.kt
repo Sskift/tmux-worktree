@@ -19,6 +19,7 @@ class AppManifestPolicyTest {
         val legacyActivity = activities.single { it.androidAttribute("name") == ".MainActivity" }
 
         assertEquals("true", v2Activity.androidAttribute("exported"))
+        assertEquals("singleTask", v2Activity.androidAttribute("launchMode"))
         assertTrue(v2Activity.intentActions().contains(ACTION_MAIN))
         assertTrue(v2Activity.intentCategories().contains(CATEGORY_LAUNCHER))
 

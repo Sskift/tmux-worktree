@@ -881,8 +881,8 @@ impl ManagementOperation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagementProtocol {
-    V1,
     #[cfg_attr(not(test), allow(dead_code))]
+    V1,
     V2,
 }
 
@@ -902,7 +902,7 @@ impl ManagementProtocol {
     }
 }
 
-const PRODUCTION_EXPECTED_PROTOCOL: ManagementProtocol = ManagementProtocol::V1;
+const PRODUCTION_EXPECTED_PROTOCOL: ManagementProtocol = ManagementProtocol::V2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagementInput {
@@ -2468,6 +2468,33 @@ mod tests {
     fn dashboard_management_v2_invalid_or_forged_stdout_poisons_without_switching_protocol() {
         let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
         let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
+
+        for (name, ready) in [
+            ("v1-ready", ready_frame(version)),
+            ("wrong-runtime", ready_frame_v2("9.9.9")),
+        ] {
+            let child = FakeChild::sequenced(vec![(0, ChildRead::Bytes(ready))]);
+            let request_ids = Arc::new(CountingIds(Mutex::new(0)));
+            let result = ManagementChildManager::start_with_factory(
+                artifact(),
+                FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
+                request_ids.clone(),
+                PRODUCTION_EXPECTED_PROTOCOL,
+                version,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            );
+            assert_eq!(
+                result.err(),
+                Some(ManagementStartError::ChannelClosed),
+                "{name}"
+            );
+            assert_eq!(*request_ids.0.lock().unwrap(), 0, "{name}");
+            let state = child.state.lock().unwrap();
+            assert!(state.writes.is_empty(), "{name}");
+            assert_eq!(state.events, ["kill-if-live", "wait-and-reap"], "{name}");
+        }
+
         for case in fixture["invalidResponseFrameCases"].as_array().unwrap() {
             let request_id = case["expectedRequestId"].as_str().unwrap();
             let mut response = case["frame"].as_str().unwrap().as_bytes().to_vec();
@@ -2480,7 +2507,7 @@ mod tests {
                 child.clone(),
                 vec![id_bytes(request_id)],
                 version,
-                ManagementProtocol::V2,
+                PRODUCTION_EXPECTED_PROTOCOL,
             );
             let outcome = manager
                 .request(operation(case["operation"].as_str().unwrap()))

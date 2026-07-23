@@ -5,6 +5,7 @@ import type {
   RelayV2HostReadinessSink,
   RelayV2HostReadinessSnapshot,
   RelayV2HostReadinessSubscription,
+  RelayV2RequiredCapability,
 } from "./hostRuntime.js";
 
 export const RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES = Object.freeze([
@@ -21,9 +22,50 @@ export const RELAY_V2_HOST_CAPABILITY_READINESS_LIMITS = Object.freeze({
 } as const);
 
 const MAX_SOURCE_GENERATION = 18_446_744_073_709_551_615n;
+const MAX_ACTIVE_PRE_CARRIER_OFFERS = 64;
+const PRE_CARRIER_SOURCES = Object.freeze(
+  RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES.filter((source) => source !== "carrier"),
+) as readonly Exclude<RelayV2HostCapabilityReadinessSource, "carrier">[];
+const FULL_PRE_CARRIER_CAPABILITIES = Object.freeze([
+  ...RELAY_V2_REQUIRED_CAPABILITIES,
+]);
+
+declare const relayV2HostPreCarrierOfferClaimBrand: unique symbol;
 
 export type RelayV2HostCapabilityReadinessSource =
   typeof RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES[number];
+
+export interface RelayV2HostPreCarrierOfferClaim {
+  readonly [relayV2HostPreCarrierOfferClaimBrand]: true;
+}
+
+export interface RelayV2HostPreCarrierOfferAttemptBinding {
+  readonly controllerGeneration: string;
+  readonly carrierAttemptGeneration: string;
+}
+
+export interface RelayV2HostPreCarrierOfferBinding
+extends RelayV2HostPreCarrierOfferAttemptBinding {
+  readonly offerGeneration: string;
+}
+
+export interface RelayV2HostPreCarrierOfferFence {
+  bind(binding: Readonly<RelayV2HostPreCarrierOfferBinding>): boolean;
+  fence(binding: Readonly<RelayV2HostPreCarrierOfferBinding>): void;
+}
+
+export interface RelayV2HostPreCarrierOfferIssueInput
+extends RelayV2HostPreCarrierOfferAttemptBinding {
+  readonly fence: RelayV2HostPreCarrierOfferFence;
+  /** Exact optional producer cut captured by the composition at issuance. */
+  readonly optionalCapabilities?: readonly string[];
+}
+
+export interface RelayV2HostPreCarrierOfferIssuerPort {
+  issuePreCarrierOffer(
+    input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
+  ): RelayV2HostPreCarrierOfferClaim | null;
+}
 
 /**
  * One source-local readiness fact. A generation is a canonical uint64 counter
@@ -62,6 +104,72 @@ interface SourceState {
 interface Subscriber {
   apply(snapshot: RelayV2HostReadinessSnapshot): unknown;
   close(): void;
+}
+
+interface PreCarrierOfferRecord {
+  readonly binding: Readonly<RelayV2HostPreCarrierOfferBinding>;
+  readonly fence: Readonly<{
+    receiver: object;
+    bind: RelayV2HostPreCarrierOfferFence["bind"];
+    fence: RelayV2HostPreCarrierOfferFence["fence"];
+  }>;
+  readonly cutSerial: bigint;
+  readonly capabilities: readonly string[];
+  state: "offered" | "consumed" | "invalidated" | "released";
+  consume(): readonly string[] | null;
+  release(): void;
+}
+
+const preCarrierOfferClaims = new WeakMap<object, PreCarrierOfferRecord>();
+
+function exactPositiveGeneration(value: unknown): bigint | null {
+  const parsed = parseGeneration(value);
+  return parsed !== null && parsed > 0n ? parsed : null;
+}
+
+function samePreCarrierAttemptBinding(
+  record: PreCarrierOfferRecord,
+  candidate: RelayV2HostPreCarrierOfferAttemptBinding,
+): boolean {
+  return record.binding.controllerGeneration === candidate.controllerGeneration
+    && record.binding.carrierAttemptGeneration === candidate.carrierAttemptGeneration;
+}
+
+export function matchesRelayV2HostPreCarrierOfferClaim(
+  claim: unknown,
+  binding: Readonly<RelayV2HostPreCarrierOfferAttemptBinding>,
+): claim is RelayV2HostPreCarrierOfferClaim {
+  if (typeof claim !== "object" || claim === null
+    || exactPositiveGeneration(binding?.controllerGeneration) === null
+    || exactPositiveGeneration(binding?.carrierAttemptGeneration) === null) return false;
+  const record = preCarrierOfferClaims.get(claim);
+  return record !== undefined && samePreCarrierAttemptBinding(record, binding);
+}
+
+export function consumeRelayV2HostPreCarrierOfferClaim(
+  claim: unknown,
+): readonly string[] | null {
+  if (typeof claim !== "object" || claim === null) return null;
+  return preCarrierOfferClaims.get(claim)?.consume() ?? null;
+}
+
+export function releaseRelayV2HostPreCarrierOfferClaim(claim: unknown): void {
+  if (typeof claim !== "object" || claim === null) return;
+  preCarrierOfferClaims.get(claim)?.release();
+}
+
+function capturePreCarrierOfferFence(
+  value: unknown,
+): PreCarrierOfferRecord["fence"] | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  try {
+    const bind = Reflect.get(value, "bind");
+    const fence = Reflect.get(value, "fence");
+    if (typeof bind !== "function" || typeof fence !== "function") return null;
+    return Object.freeze({ receiver: value, bind, fence });
+  } catch {
+    return null;
+  }
 }
 
 function exactCapabilitySet(ready: boolean): RelayV2HostCapabilityIntersection {
@@ -180,6 +288,10 @@ implements RelayV2HostCapabilityIntersectionPort {
   private sourceMutationActive = false;
   private pendingWithdrawal = false;
   private faultSerial = 0;
+  private preCarrierCutSerial = 0n;
+  private preCarrierOfferGeneration = 0n;
+  private preCarrierOfferIssuanceClosed = false;
+  private readonly activePreCarrierOffers = new Set<PreCarrierOfferRecord>();
 
   constructor(options: RelayV2HostCapabilityReadinessOptions = {}) {
     this.maxSubscribers = maxSubscribers(options);
@@ -208,6 +320,69 @@ implements RelayV2HostCapabilityIntersectionPort {
   /** Synchronous immutable view; an empty intersection is represented by six false keys. */
   current(): RelayV2HostReadinessSnapshot {
     return this.published;
+  }
+
+  /**
+   * Issues one opaque offer against the current five-source pre-carrier cut.
+   * The supplied fence is bound before the claim becomes observable.
+   */
+  issuePreCarrierOffer(
+    input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
+  ): RelayV2HostPreCarrierOfferClaim | null {
+    const controllerGeneration = exactPositiveGeneration(input?.controllerGeneration);
+    const carrierAttemptGeneration = exactPositiveGeneration(input?.carrierAttemptGeneration);
+    const fence = capturePreCarrierOfferFence(input?.fence);
+    const optionalCapabilities = this.captureOptionalCapabilities(input?.optionalCapabilities);
+    if (controllerGeneration === null
+      || carrierAttemptGeneration === null
+      || fence === null
+      || optionalCapabilities === null
+      || this.preCarrierOfferIssuanceClosed
+      || !this.allPreCarrierSourcesReady()) return null;
+    if (this.activePreCarrierOffers.size >= MAX_ACTIVE_PRE_CARRIER_OFFERS
+      || this.preCarrierOfferGeneration === MAX_SOURCE_GENERATION) {
+      this.preCarrierOfferIssuanceClosed = true;
+      this.invalidatePreCarrierOffers();
+      return null;
+    }
+
+    this.preCarrierOfferGeneration += 1n;
+    const binding = Object.freeze({
+      controllerGeneration: controllerGeneration.toString(10),
+      carrierAttemptGeneration: carrierAttemptGeneration.toString(10),
+      offerGeneration: this.preCarrierOfferGeneration.toString(10),
+    });
+    const cutSerial = this.preCarrierCutSerial;
+    let bound = false;
+    try {
+      bound = Reflect.apply(fence.bind, fence.receiver, [binding]) === true;
+    } catch {}
+    if (!bound
+      || cutSerial !== this.preCarrierCutSerial
+      || !this.allPreCarrierSourcesReady()) {
+      if (bound) {
+        try { Reflect.apply(fence.fence, fence.receiver, [binding]); } catch {}
+      }
+      return null;
+    }
+
+    const claim = Object.freeze(Object.create(null)) as RelayV2HostPreCarrierOfferClaim;
+    let record!: PreCarrierOfferRecord;
+    record = {
+      binding,
+      fence,
+      cutSerial,
+      capabilities: Object.freeze([
+        ...FULL_PRE_CARRIER_CAPABILITIES,
+        ...optionalCapabilities,
+      ]),
+      state: "offered",
+      consume: () => this.consumePreCarrierOffer(record),
+      release: () => this.releasePreCarrierOffer(record),
+    };
+    preCarrierOfferClaims.set(claim as object, record);
+    this.activePreCarrierOffers.add(record);
+    return claim;
   }
 
   subscribe(sink: RelayV2HostReadinessSink): RelayV2HostReadinessSubscription {
@@ -302,6 +477,8 @@ implements RelayV2HostCapabilityIntersectionPort {
     const faultBeforeDecode = this.faultSerial;
     let accepted = false;
     let publishRequired = false;
+    let invalidateOffers = false;
+    let advancePreCarrierCut = false;
     try {
       const snapshot = decodeSourceSnapshot(source, input);
       const generationCandidate = snapshot.valid
@@ -310,20 +487,28 @@ implements RelayV2HostCapabilityIntersectionPort {
       if (this.faultSerial !== faultBeforeDecode) {
         this.invalidateSource(source, generationCandidate);
         publishRequired = !this.pendingWithdrawal;
+        invalidateOffers = true;
+        advancePreCarrierCut = source !== "carrier";
       } else if (!snapshot.valid) {
         this.invalidateSource(source, snapshot.generationCandidate);
         publishRequired = true;
+        invalidateOffers = true;
+        advancePreCarrierCut = source !== "carrier";
       } else {
         const state = this.sources.get(source)!;
         if (state.generation !== null && snapshot.generation < state.generation) {
           this.invalidateSource(source, snapshot.generation);
           publishRequired = true;
+          invalidateOffers = true;
+          advancePreCarrierCut = source !== "carrier";
         } else if (state.generation !== null && snapshot.generation === state.generation) {
           if (!state.requiresNewGeneration && state.ready === snapshot.ready) {
             accepted = true;
           } else {
             this.invalidateSource(source, snapshot.generation);
             publishRequired = true;
+            invalidateOffers = true;
+            advancePreCarrierCut = source !== "carrier";
           }
         } else {
           state.generation = snapshot.generation;
@@ -331,11 +516,16 @@ implements RelayV2HostCapabilityIntersectionPort {
           state.requiresNewGeneration = false;
           accepted = true;
           publishRequired = true;
+          invalidateOffers = source !== "carrier" || !snapshot.ready;
+          advancePreCarrierCut = source !== "carrier";
         }
       }
     } finally {
       this.sourceMutationActive = false;
     }
+
+    if (advancePreCarrierCut) this.advancePreCarrierCut();
+    if (invalidateOffers) this.invalidatePreCarrierOffers();
 
     const faultBeforePublish = this.faultSerial;
     if (publishRequired) this.publishState();
@@ -349,6 +539,8 @@ implements RelayV2HostCapabilityIntersectionPort {
       return;
     }
     this.invalidateSource(source, null);
+    if (source !== "carrier") this.advancePreCarrierCut();
+    this.invalidatePreCarrierOffers();
     this.publishState();
   }
 
@@ -368,6 +560,8 @@ implements RelayV2HostCapabilityIntersectionPort {
   /** Caller callbacks may withdraw, but never recursively fan out. */
   private withdrawDuringCallback(source: RelayV2HostCapabilityReadinessSource): void {
     this.invalidateSource(source, null);
+    if (source !== "carrier") this.advancePreCarrierCut();
+    this.invalidatePreCarrierOffers();
     if (this.intersectionReady(this.published)) {
       this.advancePublished(false);
       this.pendingWithdrawal = true;
@@ -432,6 +626,71 @@ implements RelayV2HostCapabilityIntersectionPort {
       const state = this.sources.get(source)!;
       return state.generation !== null && state.ready && !state.requiresNewGeneration;
     });
+  }
+
+  private allPreCarrierSourcesReady(): boolean {
+    return PRE_CARRIER_SOURCES.every((source) => {
+      const state = this.sources.get(source)!;
+      return state.generation !== null && state.ready && !state.requiresNewGeneration;
+    });
+  }
+
+  private advancePreCarrierCut(): void {
+    if (this.preCarrierCutSerial === MAX_SOURCE_GENERATION) {
+      this.preCarrierOfferIssuanceClosed = true;
+      return;
+    }
+    this.preCarrierCutSerial += 1n;
+  }
+
+  private consumePreCarrierOffer(
+    record: PreCarrierOfferRecord,
+  ): readonly string[] | null {
+    if (record.state !== "offered"
+      || !this.activePreCarrierOffers.has(record)
+      || record.cutSerial !== this.preCarrierCutSerial
+      || !this.allPreCarrierSourcesReady()) {
+      if (record.state === "offered" || record.state === "consumed") {
+        this.invalidatePreCarrierOffer(record);
+      }
+      return null;
+    }
+    record.state = "consumed";
+    return record.capabilities;
+  }
+
+  private captureOptionalCapabilities(value: unknown): readonly string[] | null {
+    if (value === undefined) return Object.freeze([]);
+    if (!Array.isArray(value) || value.length > 58) return null;
+    const capabilities: string[] = [];
+    for (const capability of value) {
+      if (typeof capability !== "string"
+        || capability.length === 0
+        || Buffer.byteLength(capability, "utf8") > 128
+        || (RELAY_V2_REQUIRED_CAPABILITIES as readonly string[]).includes(capability)
+        || capabilities.includes(capability)) return null;
+      capabilities.push(capability);
+    }
+    return Object.freeze(capabilities);
+  }
+
+  private releasePreCarrierOffer(record: PreCarrierOfferRecord): void {
+    if (record.state === "released" || record.state === "invalidated") return;
+    record.state = "released";
+    this.activePreCarrierOffers.delete(record);
+  }
+
+  private invalidatePreCarrierOffer(record: PreCarrierOfferRecord): void {
+    if (record.state === "invalidated" || record.state === "released") return;
+    record.state = "invalidated";
+    this.activePreCarrierOffers.delete(record);
+    try { Reflect.apply(record.fence.fence, record.fence.receiver, [record.binding]); } catch {}
+  }
+
+  private invalidatePreCarrierOffers(): void {
+    for (const record of [...this.activePreCarrierOffers]) {
+      this.invalidatePreCarrierOffer(record);
+    }
   }
 
   private intersectionReady(snapshot: RelayV2HostReadinessSnapshot): boolean {

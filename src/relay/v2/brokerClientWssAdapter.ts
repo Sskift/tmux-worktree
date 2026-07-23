@@ -76,6 +76,10 @@ export interface RelayV2BrokerClientWssSocket {
   terminate(): unknown;
 }
 
+export type RelayV2BrokerClientWssTrustedSocketBrand = (
+  socket: RelayV2BrokerClientWssSocket,
+) => boolean;
+
 export interface RelayV2BrokerClientWssAdapterInput {
   readonly connectionId: string;
   /** Trusted post-Upgrade client authorization; no credential string is accepted here. */
@@ -102,6 +106,10 @@ export interface RelayV2BrokerClientWssAdapter {
   readonly drained: Promise<void>;
 }
 
+export interface RelayV2BrokerClientWssCaptureAuthority {
+  create(input: RelayV2BrokerClientWssAdapterInput): RelayV2BrokerClientWssAdapter;
+}
+
 export class RelayV2BrokerClientWssAdapterError extends Error {
   constructor() {
     super("Relay v2 broker client WebSocket adapter rejected its boundary");
@@ -118,6 +126,26 @@ type CapturedSocket = Readonly<{
   resume: Function;
   close: Function;
   terminate: Function;
+  readReadyState(): unknown;
+  readProtocol(): unknown;
+  readExtensions(): unknown;
+  readBufferedAmount(): unknown;
+}>;
+
+type CapturedSocketPrototype = Readonly<{
+  prototype: object;
+  brand: Function;
+  on: Function;
+  removeListener: Function;
+  send: Function;
+  pause: Function;
+  resume: Function;
+  close: Function;
+  terminate: Function;
+  readyState: PropertyDescriptor;
+  protocol: PropertyDescriptor;
+  extensions: PropertyDescriptor;
+  bufferedAmount: PropertyDescriptor;
 }>;
 
 type CapturedRegistration = Readonly<{
@@ -252,7 +280,7 @@ function captureMethod(value: object, name: string): Function {
   throw failure();
 }
 
-function captureSocket(value: unknown): CapturedSocket {
+function captureLegacySocket(value: unknown): CapturedSocket {
   if (value === null || typeof value !== "object" || isRejectedProxy(value)) throw failure();
   return Object.freeze({
     receiver: value,
@@ -263,6 +291,10 @@ function captureSocket(value: unknown): CapturedSocket {
     resume: captureMethod(value, "resume"),
     close: captureMethod(value, "close"),
     terminate: captureMethod(value, "terminate"),
+    readReadyState: () => readSocketFact(value, "readyState"),
+    readProtocol: () => readSocketFact(value, "protocol"),
+    readExtensions: () => readSocketFact(value, "extensions"),
+    readBufferedAmount: () => readSocketFact(value, "bufferedAmount"),
   });
 }
 
@@ -312,18 +344,130 @@ function readSocketFact(socket: object, name: string): unknown {
   throw failure();
 }
 
-function assertOpenClientSocket(socket: object, afterRead: () => void = () => {}): void {
-  const readyState = readSocketFact(socket, "readyState");
+const SOCKET_METHOD_NAMES = Object.freeze([
+  "on",
+  "removeListener",
+  "send",
+  "pause",
+  "resume",
+  "close",
+  "terminate",
+] as const);
+
+function captureTrustedDescriptor(
+  trustedPrototype: object,
+  name: string,
+): PropertyDescriptor {
+  let owner: object | null = trustedPrototype;
+  while (owner !== null) {
+    if (isRejectedProxy(owner)) throw failure();
+    const descriptor = Reflect.getOwnPropertyDescriptor(owner, name);
+    if (descriptor !== undefined) return Object.freeze({ ...descriptor });
+    owner = Reflect.getPrototypeOf(owner);
+  }
+  throw failure();
+}
+
+function captureTrustedMethod(trustedPrototype: object, name: string): Function {
+  const descriptor = captureTrustedDescriptor(trustedPrototype, name);
+  if (
+    !Object.hasOwn(descriptor, "value")
+    || typeof descriptor.value !== "function"
+    || isRejectedProxy(descriptor.value)
+  ) throw failure();
+  return descriptor.value;
+}
+
+function captureTrustedFact(
+  trustedPrototype: object,
+  name: string,
+): PropertyDescriptor {
+  const descriptor = captureTrustedDescriptor(trustedPrototype, name);
+  if (Object.hasOwn(descriptor, "value")) return descriptor;
+  if (
+    typeof descriptor.get !== "function"
+    || descriptor.set !== undefined
+    || isRejectedProxy(descriptor.get)
+  ) throw failure();
+  return descriptor;
+}
+
+function captureTrustedPrototype(
+  trustedPrototype: unknown,
+  trustedSocketBrand: unknown,
+): CapturedSocketPrototype {
+  if (
+    trustedPrototype === null
+    || typeof trustedPrototype !== "object"
+    || isRejectedProxy(trustedPrototype)
+    || typeof trustedSocketBrand !== "function"
+    || isRejectedProxy(trustedSocketBrand)
+  ) throw failure();
+  const methods = Object.create(null) as Record<string, Function>;
+  for (const name of SOCKET_METHOD_NAMES) {
+    methods[name] = captureTrustedMethod(trustedPrototype, name);
+  }
+  return Object.freeze({
+    prototype: trustedPrototype,
+    brand: trustedSocketBrand,
+    on: methods.on,
+    removeListener: methods.removeListener,
+    send: methods.send,
+    pause: methods.pause,
+    resume: methods.resume,
+    close: methods.close,
+    terminate: methods.terminate,
+    readyState: captureTrustedFact(trustedPrototype, "readyState"),
+    protocol: captureTrustedFact(trustedPrototype, "protocol"),
+    extensions: captureTrustedFact(trustedPrototype, "extensions"),
+    bufferedAmount: captureTrustedFact(trustedPrototype, "bufferedAmount"),
+  });
+}
+
+function readTrustedFact(socket: object, descriptor: PropertyDescriptor): unknown {
+  if (Object.hasOwn(descriptor, "value")) return descriptor.value;
+  return Reflect.apply(descriptor.get as Function, socket, []);
+}
+
+function captureTrustedSocket(
+  value: unknown,
+  trusted: CapturedSocketPrototype,
+): CapturedSocket {
+  if (value === null || typeof value !== "object" || isRejectedProxy(value)) throw failure();
+  try {
+    if (Reflect.getPrototypeOf(value) !== trusted.prototype) throw failure();
+    if (Reflect.apply(trusted.brand, undefined, [value]) !== true) throw failure();
+  } catch {
+    throw failure();
+  }
+  return Object.freeze({
+    receiver: value,
+    on: trusted.on,
+    removeListener: trusted.removeListener,
+    send: trusted.send,
+    pause: trusted.pause,
+    resume: trusted.resume,
+    close: trusted.close,
+    terminate: trusted.terminate,
+    readReadyState: () => readTrustedFact(value, trusted.readyState),
+    readProtocol: () => readTrustedFact(value, trusted.protocol),
+    readExtensions: () => readTrustedFact(value, trusted.extensions),
+    readBufferedAmount: () => readTrustedFact(value, trusted.bufferedAmount),
+  });
+}
+
+function assertOpenClientSocket(socket: CapturedSocket, afterRead: () => void = () => {}): void {
+  const readyState = socket.readReadyState();
   afterRead();
-  const protocol = readSocketFact(socket, "protocol");
+  const protocol = socket.readProtocol();
   afterRead();
-  const extensions = readSocketFact(socket, "extensions");
+  const extensions = socket.readExtensions();
   afterRead();
   if (readyState !== OPEN || protocol !== CLIENT_PROTOCOL || extensions !== "") throw failure();
 }
 
-function readBufferedAmount(socket: object): number {
-  const amount = readSocketFact(socket, "bufferedAmount");
+function readBufferedAmount(socket: CapturedSocket): number {
+  const amount = socket.readBufferedAmount();
   if (!Number.isSafeInteger(amount) || (amount as number) < 0) throw failure();
   return amount as number;
 }
@@ -419,8 +563,9 @@ function callVoidSocketMethod(
  * Adapts one already-upgraded client `ws` socket into the existing transport.
  * It performs no HTTP admission, authentication, routing, retry, or expiry work.
  */
-export function createRelayV2BrokerClientWssAdapter(
+function createRelayV2BrokerClientWssAdapterWithCapture(
   input: RelayV2BrokerClientWssAdapterInput,
+  trustedSocket: CapturedSocketPrototype | null,
 ): RelayV2BrokerClientWssAdapter {
   const fields = exactDataRecord(input, INPUT_KEYS);
   if (!isIdentifier(fields.connectionId)) throw failure();
@@ -428,7 +573,9 @@ export function createRelayV2BrokerClientWssAdapter(
   // reenter this setup. The adapter never retains their caller-owned objects.
   const authContext = captureAuthorization(fields.authContext);
   const hostProducerTarget = captureTarget(fields.hostProducerTarget);
-  const socket = captureSocket(fields.socket);
+  const socket = trustedSocket
+    ? captureTrustedSocket(fields.socket, trustedSocket)
+    : captureLegacySocket(fields.socket);
   const transport = fields.transport;
   if (transport === null || typeof transport !== "object" || isRejectedProxy(transport)) {
     throw failure();
@@ -620,12 +767,12 @@ export function createRelayV2BrokerClientWssAdapter(
       for (const write of pendingWrites) {
         if (!write.nativeCompleted) frames += 1;
       }
-      return Object.freeze({ bytes: readBufferedAmount(socket.receiver), frames });
+      return Object.freeze({ bytes: readBufferedAmount(socket), frames });
     },
     send(bytes, complete) {
       let state: unknown;
       try {
-        state = readSocketFact(socket.receiver, "readyState");
+        state = socket.readReadyState();
       } catch {
         return "rejected";
       }
@@ -669,7 +816,9 @@ export function createRelayV2BrokerClientWssAdapter(
       const callback = (error?: unknown): void => {
         if (callbackSeen || !pendingWrites.has(write)) return;
         callbackSeen = true;
-        callbackReceipt = error === undefined ? "delivered" : "rejected";
+        callbackReceipt = error === undefined || error === null
+          ? "delivered"
+          : "rejected";
         if (returned && accepted) queueCompletion();
       };
       let result: unknown;
@@ -687,7 +836,7 @@ export function createRelayV2BrokerClientWssAdapter(
       returned = true;
       let committedState: unknown;
       try {
-        committedState = readSocketFact(socket.receiver, "readyState");
+        committedState = socket.readReadyState();
       } catch {
         pendingWrites.delete(write);
         return "rejected";
@@ -708,7 +857,7 @@ export function createRelayV2BrokerClientWssAdapter(
     pause() {
       let state: unknown;
       try {
-        state = readSocketFact(socket.receiver, "readyState");
+        state = socket.readReadyState();
       } catch {
         return "rejected";
       }
@@ -719,7 +868,7 @@ export function createRelayV2BrokerClientWssAdapter(
     resume() {
       let state: unknown;
       try {
-        state = readSocketFact(socket.receiver, "readyState");
+        state = socket.readReadyState();
       } catch {
         return "rejected";
       }
@@ -730,7 +879,7 @@ export function createRelayV2BrokerClientWssAdapter(
     close(code, reason) {
       let state: unknown;
       try {
-        state = readSocketFact(socket.receiver, "readyState");
+        state = socket.readReadyState();
       } catch {
         return "rejected";
       }
@@ -745,7 +894,7 @@ export function createRelayV2BrokerClientWssAdapter(
   });
 
   try {
-    assertOpenClientSocket(socket.receiver);
+    assertOpenClientSocket(socket);
     setupPhase = "installing";
     for (const [event, listener] of [
       ["error", errorListener],
@@ -759,7 +908,7 @@ export function createRelayV2BrokerClientWssAdapter(
       if (result !== socket.receiver) throw failure();
       setupMayContinue();
     }
-    assertOpenClientSocket(socket.receiver, setupMayContinue);
+    assertOpenClientSocket(socket, setupMayContinue);
     setupMayContinue();
     setupPhase = "registering";
     const rawRegistration = Reflect.apply(registerClientSocket, transport, [{
@@ -793,5 +942,23 @@ export function createRelayV2BrokerClientWssAdapter(
     openResult: registration.openResult,
     terminal,
     drained,
+  });
+}
+
+export function createRelayV2BrokerClientWssAdapter(
+  input: RelayV2BrokerClientWssAdapterInput,
+): RelayV2BrokerClientWssAdapter {
+  return createRelayV2BrokerClientWssAdapterWithCapture(input, null);
+}
+
+export function createRelayV2BrokerClientWssCaptureAuthority(
+  trustedSocketPrototype: object,
+  trustedSocketBrand: RelayV2BrokerClientWssTrustedSocketBrand,
+): RelayV2BrokerClientWssCaptureAuthority {
+  const trusted = captureTrustedPrototype(trustedSocketPrototype, trustedSocketBrand);
+  return Object.freeze({
+    create: (input: RelayV2BrokerClientWssAdapterInput) => (
+      createRelayV2BrokerClientWssAdapterWithCapture(input, trusted)
+    ),
   });
 }

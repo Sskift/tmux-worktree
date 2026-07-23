@@ -489,6 +489,20 @@ export interface RelayV2MaterializedStateSnapshotOwner
   extends RelayV2MaterializedStateCutSource, RelayV2MaterializedStateRuntimeH2Port {}
 
 const materializedStateSnapshotOwners = new WeakSet<object>();
+const materializedStateProcessAuthorityPorts = new WeakMap<
+  object,
+  Readonly<RelayV2MaterializedStateProcessAuthorityPorts>
+>();
+
+export interface RelayV2MaterializedStateProcessAuthorityPorts {
+  readonly hostId: string;
+  readonly hostStateOwner: object;
+  readonly resourceResolver: RelayV2CanonicalResourceResolverPort;
+  readonly resourceMutationOwner: RelayV2CommandResourceMutationOwner;
+  captureProcessTargets(
+    expectedHostEpoch: string,
+  ): Promise<readonly RelayV2ResourceResolverProcessTarget[]>;
+}
 
 /** Exact-identity check used by the canonical snapshot-spool entry. */
 export function isRelayV2MaterializedStateSnapshotOwner(
@@ -496,6 +510,14 @@ export function isRelayV2MaterializedStateSnapshotOwner(
 ): value is RelayV2MaterializedStateSnapshotOwner {
   return ((typeof value === "object" && value !== null) || typeof value === "function")
     && materializedStateSnapshotOwners.has(value as object);
+}
+
+/** Private-owner capture used only while opening its exact bound H2 spool. */
+export function captureRelayV2MaterializedStateProcessAuthorityPorts(
+  value: unknown,
+): RelayV2MaterializedStateProcessAuthorityPorts | null {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") return null;
+  return materializedStateProcessAuthorityPorts.get(value as object) ?? null;
 }
 
 export type RelayV2MaterializedErrorCode =
@@ -3091,6 +3113,15 @@ export class RelayV2MaterializedStateFoundation {
         fence,
       ),
     });
+    materializedStateProcessAuthorityPorts.set(snapshotSpoolOwner as object, Object.freeze({
+      hostId: this.hostId,
+      hostStateOwner: this.store as object,
+      resourceResolver: this.canonicalTargetResolver,
+      resourceMutationOwner: this.commandResourceMutationOwner,
+      captureProcessTargets: (expectedHostEpoch: string) => (
+        this.captureCanonicalProcessTargets(expectedHostEpoch)
+      ),
+    }));
   }
 
   /**
@@ -3576,6 +3607,29 @@ export class RelayV2MaterializedStateFoundation {
       const state = parseMaterializedState(snapshot);
       const publication = this.requireCanonicalResolver(snapshot, state);
       return clone(publication.token);
+    });
+  }
+
+  private async captureCanonicalProcessTargets(
+    expectedHostEpoch: string,
+  ): Promise<readonly RelayV2ResourceResolverProcessTarget[]> {
+    validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
+      const state = parseMaterializedState(snapshot);
+      const publication = this.requireCanonicalResolver(snapshot, state);
+      const targets = new Map<string, RelayV2ResourceResolverProcessTarget>();
+      for (const scope of publication.scopes.values()) {
+        const target = clone(scope.processTarget);
+        targets.set(`${target.kind}\0${target.targetId}`, target);
+      }
+      return Object.freeze([...targets.values()]
+        .sort((left, right) => (
+          left.kind.localeCompare(right.kind) || left.targetId.localeCompare(right.targetId)
+        ))
+        .map((target) => Object.freeze(target)));
     });
   }
 

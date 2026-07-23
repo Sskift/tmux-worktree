@@ -5,11 +5,14 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedHandoffReceipt
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableHandoffPort
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExactRedriveReplacement
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExtensionRequestSender
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationConfigMutationLeasePort
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestAdmission
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestKind
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.ownsExactly
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCode
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineEventFrame
@@ -67,6 +70,14 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 
+internal sealed interface RelayV2AgentCapabilityAvailability {
+    data object Unavailable : RelayV2AgentCapabilityAvailability
+
+    data class Available(
+        val generation: RelayV2EffectGeneration,
+    ) : RelayV2AgentCapabilityAvailability
+}
+
 /**
  * Serialized Relay v2 client runtime seam.
  *
@@ -119,8 +130,10 @@ internal class RelayV2ConnectionActor(
     RelayV2CurrentOnlineCommandAuthorityPort,
     RelayV2CurrentRepositoryReadAuthorityPort,
     RelayV2OutboxExactGenerationSendPort,
+    RelayV2TerminalExactGenerationSendPort,
     AgentTranscriptLifecycleExtensionRequestSender,
     AgentTranscriptLifecycleDurableHandoffPort,
+    AgentTranscriptLifecycleNotificationConfigMutationLeasePort,
     Closeable {
     private val commandQueryReceiverIdentity = Any()
     private val commandQueryAdmissionReceiver =
@@ -175,6 +188,8 @@ internal class RelayV2ConnectionActor(
     private var committedCallbackOwner: CommittedCallbackOwner? = null
     /** Guarded by lifecycleLock; this is the sole Execute mutation-readiness fact. */
     private var outboxExecuteReadyCut: OutboxExecuteReadyCut? = null
+    /** Guarded by lifecycleLock; only a strictly different generation may restore availability. */
+    private var agentCapabilityWithdrawnGeneration: RelayV2EffectGeneration? = null
     private var pendingTerminalIntent: PendingTerminalIntent? = null
     private val pendingBarriers = linkedMapOf<
         CompletableDeferred<RelayProfileDisconnectReceipt>,
@@ -184,6 +199,12 @@ internal class RelayV2ConnectionActor(
 
     private val _state = MutableStateFlow(RelayV2ConnectionState(changedAtMs = clock()))
     val state: StateFlow<RelayV2ConnectionState> = _state.asStateFlow()
+    private val _agentCapabilityAvailability =
+        MutableStateFlow<RelayV2AgentCapabilityAvailability>(
+            RelayV2AgentCapabilityAvailability.Unavailable,
+        )
+    val agentCapabilityAvailability: StateFlow<RelayV2AgentCapabilityAvailability> =
+        _agentCapabilityAvailability.asStateFlow()
     val effects: Flow<RelayV2RuntimeEffect> = multiplexedEffectFlow()
 
     /**
@@ -210,6 +231,24 @@ internal class RelayV2ConnectionActor(
         repositoryAuthority = authority,
         block = block,
     )
+
+    override suspend fun <T> withCurrentAgentNotificationConfigMutationLease(
+        consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+        block: suspend () -> T,
+    ): RelayV2EffectApplyResult<T> {
+        val lease = synchronized(lifecycleLock) {
+            val fence = currentRepositoryReadFenceLocked(
+                RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+            ) ?: return@synchronized null
+            if (!fence.authority.ownsExactly(consumer)) return@synchronized null
+            effectApplyGate.begin(fence.authority.generation, fence.authority)
+        } ?: return RelayV2EffectApplyResult.Stale
+        return try {
+            RelayV2EffectApplyResult.Applied(block())
+        } finally {
+            lease.close()
+        }
+    }
 
     private suspend fun <T> withEffectApplyLease(
         generation: RelayV2EffectGeneration,
@@ -359,6 +398,58 @@ internal class RelayV2ConnectionActor(
         }
     }
 
+    /**
+     * Atomically validates the terminal effect authority against this actor's current ONLINE
+     * transport owner, then makes exactly one synchronous transport attempt. Terminal dispatch
+     * intentionally has no dependency on command/Outbox execute readiness.
+     */
+    override fun sendTerminalIfCurrent(
+        authority: RelayV2RepositoryEffectAuthority,
+        canonicalWireBytes: ByteArray,
+    ): RelayV2TerminalExactGenerationSendResult {
+        if (canonicalWireBytes.isEmpty() ||
+            canonicalWireBytes.size > RelayV2Codec.PUBLIC_FRAME_BYTES
+        ) {
+            return RelayV2TerminalExactGenerationSendResult.Stale
+        }
+        val detachedWireBytes = canonicalWireBytes.copyOf()
+        return synchronized(lifecycleLock) {
+            if (lifecycleState != LifecycleState.OPEN ||
+                _state.value.phase != RelayV2ConnectionPhase.ONLINE
+            ) {
+                return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+            }
+            val profile = activeProfile
+                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+            val context = onlineContext
+                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+            val source = activeTransport
+                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+            val committed = committedCallbackOwner
+                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+            if (detachedWireBytes.size.toLong() > context.negotiatedLimits.maxPublicFrameBytes ||
+                detachedWireBytes.size.toLong() >
+                context.negotiatedLimits.terminalMaxFrameBytes ||
+                committed.source !== source ||
+                committed.effectGeneration != authority.generation ||
+                publishedEffectGeneration.get() != authority.generation ||
+                !isCurrentCallbackLocked(committed.key, source) ||
+                profile.identity != context.profile ||
+                profile.principalId != context.principalId ||
+                profile.clientInstanceId != context.clientInstanceId ||
+                profile.hostId != context.hostId ||
+                context.repositoryEffectAuthority(authority.generation) != authority
+            ) {
+                return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+            }
+            if (source.send(detachedWireBytes)) {
+                RelayV2TerminalExactGenerationSendResult.Sent
+            } else {
+                RelayV2TerminalExactGenerationSendResult.NotSent
+            }
+        }
+    }
+
     override fun currentRepositoryReadCut(
         capability: RelayV2RepositoryReadCapability,
     ): RelayV2CurrentRepositoryReadCutResult = synchronized(lifecycleLock) {
@@ -413,6 +504,8 @@ internal class RelayV2ConnectionActor(
         val context = onlineContext ?: return null
         val profile = activeProfile ?: return null
         val fence = agentExtensionSendFence.get() ?: return null
+        val availability = _agentCapabilityAvailability.value
+            as? RelayV2AgentCapabilityAvailability.Available
         if (publishedEffectGeneration.get() != generation ||
             generation.connectionGeneration != connectionGeneration ||
             context.profile != profile.identity ||
@@ -421,6 +514,7 @@ internal class RelayV2ConnectionActor(
             context.hostId != profile.hostId ||
             context.repositoryEffectAuthority(generation) != fence.authority ||
             context.negotiatedCapabilities != fence.negotiatedCapabilities ||
+            availability?.generation != generation ||
             capability.wireIdentity !in context.negotiatedCapabilities
         ) {
             return null
@@ -461,8 +555,13 @@ internal class RelayV2ConnectionActor(
     private var relayWelcomeWatchdog: Job? = null
     private var hostWelcomeWatchdog: Job? = null
     private var recoveryStepWatchdog: Job? = null
+    private var hostsSnapshotWatchdog: Job? = null
     private var recoveryAttempt: RecoveryAttempt? = null
     private var onlineQueryWindow: OnlineQueryWindow? = null
+    private var hostAvailability: HostAvailability? = null
+    private var pendingHostsSnapshot: PendingHostsSnapshot? = null
+    private var hostReconnectGeneration: RelayV2EffectGeneration? = null
+    private var authRolloverGeneration: RelayV2EffectGeneration? = null
     @Volatile
     private var onlineContext: RelayV2HandshakeContext? = null
     private val recentIssuedIds = LinkedHashSet<String>()
@@ -508,6 +607,7 @@ internal class RelayV2ConnectionActor(
             } finally {
                 cancelHandshakeWatchdogs()
                 clearRecoveryAttempt()
+                clearPendingHostsSnapshot()
                 clearPendingAgentExtensionRequests()
                 invalidateConnectionOwnershipAndDrain()
                 val source = activeTransport
@@ -934,6 +1034,7 @@ internal class RelayV2ConnectionActor(
             }
             is Action.OnlineResyncRequired -> handleOnlineResyncRequired(action.receipt)
             is Action.RecoveryStepTimedOut -> handleRecoveryTimeout(action)
+            is Action.HostsSnapshotTimedOut -> handleHostsSnapshotTimeout(action)
             Action.Shutdown -> shutdownNow()
         }
     }
@@ -999,6 +1100,9 @@ internal class RelayV2ConnectionActor(
                 pendingTerminalIntent = null
                 clearRecoveryAttempt()
                 clearPendingAgentExtensionRequests()
+                clearPendingHostsSnapshot()
+                hostReconnectGeneration = null
+                authRolloverGeneration = null
                 recentIssuedIds.clear()
                 completedRecoveryResponses.clear()
                 onlineQueryWindow = null
@@ -1861,6 +1965,8 @@ internal class RelayV2ConnectionActor(
             return
         }
         if (routeOverlappingAgentExtensionError(decoded, action.bytes, action.metadata)) return
+        if (handleAuthExpiringFrame(action, decoded)) return
+        if (handleHostDirectoryFrame(decoded, action.bytes.size)) return
         when (_state.value.phase) {
             RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME -> handleRelayWelcome(decoded, action.bytes.size)
             RelayV2ConnectionPhase.AWAITING_HOST_WELCOME -> handleHostWelcome(decoded, action.bytes.size)
@@ -1871,8 +1977,313 @@ internal class RelayV2ConnectionActor(
                 handleRecoveryFrame(decoded, action.bytes.size)
             }
             RelayV2ConnectionPhase.ONLINE -> deliverOnlineFrame(decoded, action.bytes.size)
+            RelayV2ConnectionPhase.SUSPENDED ->
+                failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             else -> failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
         }
+    }
+
+    private fun handleAuthExpiringFrame(
+        action: Action.TransportFrame,
+        decoded: RelayV2DecodedMessage,
+    ): Boolean {
+        if (decoded.type() != "auth.expiring") return false
+        val profile = activeProfile ?: return true
+        if (_state.value.phase !in AUTH_EXPIRING_INBOUND_PHASES) {
+            failConnection(
+                RelayV2FailureKind.SCHEMA,
+                "INVALID_ENVELOPE",
+                retryable = false,
+                closeCode = 4400,
+                rawBytes = action.bytes.size,
+            )
+            return true
+        }
+        val payload = decoded.frame.objectValue("payload")
+        val grantId = payload.stringValue("grantId")
+        if (grantId != profile.grantId) {
+            failConnection(
+                RelayV2FailureKind.AUTH,
+                "AUTH_INVALID",
+                retryable = false,
+                closeCode = 4403,
+                rawBytes = action.bytes.size,
+            )
+            return true
+        }
+        val generation = currentEffectGeneration(profile)
+        var duplicate = false
+        val connectionAttempt = synchronized(lifecycleLock) {
+            val committed = committedCallbackOwner
+            if (lifecycleState != LifecycleState.OPEN ||
+                committed?.key != action.owner ||
+                committed.source !== action.source ||
+                activeTransport !== action.source ||
+                committed.effectGeneration != generation ||
+                publishedEffectGeneration.get() != generation ||
+                generation.connectionGeneration != connectionGeneration
+            ) {
+                return@synchronized null
+            }
+            if (authRolloverGeneration == generation) {
+                duplicate = true
+                return@synchronized null
+            }
+            authRolloverGeneration = generation
+            committed.connectionAttempt
+        }
+        if (duplicate || connectionAttempt == null) return true
+        emitEffect(
+            RelayV2RuntimeEffect.AuthRolloverRequested(
+                profile = profile.identity,
+                generation = generation,
+                connectionAttempt = connectionAttempt,
+                grantId = grantId,
+                expiresAtMs = payload.longValue("expiresAtMs"),
+                refreshRecommendedAtMs = payload.longValue("refreshRecommendedAtMs"),
+            ),
+            action.bytes.size,
+        )
+        return true
+    }
+
+    private fun handleHostDirectoryFrame(
+        decoded: RelayV2DecodedMessage,
+        rawBytes: Int,
+    ): Boolean {
+        if (decoded.type() !in HOST_DIRECTORY_INBOUND_TYPES) return false
+        if (_state.value.phase !in HOST_DIRECTORY_INBOUND_PHASES) {
+            rejectHostDirectoryFrame(rawBytes)
+            return true
+        }
+        when (decoded.type()) {
+            "host.presence" -> handleHostPresence(decoded, rawBytes)
+            "hosts.snapshot" -> handleHostsSnapshot(decoded, rawBytes)
+        }
+        return true
+    }
+
+    private fun handleHostPresence(decoded: RelayV2DecodedMessage, rawBytes: Int) {
+        val profile = activeProfile ?: return
+        val frame = decoded.frame
+        val payload = frame.objectValue("payload")
+        val state = payload.stringValue("state")
+        val reason = payload.stringValue("reason")
+        if (frame["hostId"] != profile.hostId ||
+            (state == "offline") != (reason == "disconnected")
+        ) {
+            rejectHostDirectoryFrame(rawBytes)
+            return
+        }
+        val presence = HostPresence(
+            brokerEpoch = payload.stringValue("brokerEpoch"),
+            revisionText = payload.stringValue("revision"),
+            state = state,
+            fingerprint = recoveryResponseFingerprint(frame),
+        )
+        pendingHostsSnapshot?.let { pending ->
+            if (pending.generation != currentEffectGeneration(profile)) return
+            pending.latestPresence = presence
+            if (presence.state == "offline") suspendForHostPresence(pending.generation)
+            return
+        }
+        applyHostPresence(profile, presence, rawBytes)
+    }
+
+    private fun applyHostPresence(
+        profile: RelayV2Profile,
+        presence: HostPresence,
+        rawBytes: Int,
+    ) {
+        val current = hostAvailability
+        if (current == null || current.brokerEpoch != presence.brokerEpoch) {
+            suspendForHostPresence(currentEffectGeneration(profile))
+            requestHostsSnapshot(profile, presence, rawBytes)
+            return
+        }
+        val comparison = presence.revision.compareTo(current.revision)
+        when {
+            comparison == 0 -> {
+                if (presence.state != current.state ||
+                    (current.presenceFingerprint != null &&
+                        current.presenceFingerprint != presence.fingerprint)
+                ) {
+                    rejectHostDirectoryFrame(rawBytes)
+                    return
+                }
+                hostAvailability = current.copy(presenceFingerprint = presence.fingerprint)
+            }
+            presence.revision == current.revision + BigInteger.ONE -> {
+                val next = presence.toAvailability()
+                hostAvailability = next
+                applyHostAvailability(profile, next)
+            }
+            else -> {
+                suspendForHostPresence(currentEffectGeneration(profile))
+                requestHostsSnapshot(profile, presence, rawBytes)
+            }
+        }
+    }
+
+    private fun requestHostsSnapshot(
+        profile: RelayV2Profile,
+        trigger: HostPresence,
+        rawBytes: Int,
+    ) {
+        if (pendingHostsSnapshot != null) return
+        val requestId = issueId() ?: return
+        val generation = currentEffectGeneration(profile)
+        val pending = PendingHostsSnapshot(
+            requestId = requestId,
+            generation = generation,
+            triggerBrokerEpoch = trigger.brokerEpoch,
+            triggerRevision = trigger.revision,
+        )
+        pendingHostsSnapshot = pending
+        val frame = linkedMapOf<String, Any?>(
+            "protocolVersion" to 2L,
+            "kind" to "request",
+            "type" to "hosts.snapshot.get",
+            "requestId" to requestId,
+            "payload" to linkedMapOf<String, Any?>(),
+        )
+        val encoded = codec.encodeWebSocketFrame(RelayV2WebSocketChannel.PUBLIC, frame)
+        val sent = synchronized(lifecycleLock) {
+            val committed = committedCallbackOwner
+            val source = activeTransport
+            when {
+                lifecycleState != LifecycleState.OPEN ||
+                    committed?.effectGeneration != generation ||
+                    source == null ||
+                    !isCurrentCallbackLocked(committed.key, source) -> RecoverySendResult.STALE
+                source.send(encoded) -> RecoverySendResult.SENT
+                else -> RecoverySendResult.FAILED
+            }
+        }
+        when (sent) {
+            RecoverySendResult.SENT -> scheduleHostsSnapshotWatchdog(pending)
+            RecoverySendResult.STALE -> if (pendingHostsSnapshot === pending) {
+                clearPendingHostsSnapshot()
+            }
+            RecoverySendResult.FAILED -> {
+                if (pendingHostsSnapshot === pending) clearPendingHostsSnapshot()
+                failConnection(
+                    RelayV2FailureKind.TRANSPORT,
+                    "HOST_OFFLINE",
+                    retryable = true,
+                    closeCode = null,
+                    rawBytes = rawBytes,
+                )
+            }
+        }
+    }
+
+    private fun handleHostsSnapshot(decoded: RelayV2DecodedMessage, rawBytes: Int) {
+        val profile = activeProfile ?: return
+        val pending = pendingHostsSnapshot
+        val payload = decoded.frame.objectValue("payload")
+        val brokerEpoch = payload.stringValue("brokerEpoch")
+        val revisionText = payload.stringValue("revision")
+        val revision = BigInteger(revisionText)
+        val items = payload.listValue("items")
+        val item = items.singleOrNull() as? Map<*, *>
+        if (pending == null ||
+            pending.generation != currentEffectGeneration(profile) ||
+            decoded.frame["requestId"] != pending.requestId ||
+            brokerEpoch != pending.triggerBrokerEpoch ||
+            revision < pending.triggerRevision ||
+            item?.get("hostId") != profile.hostId
+        ) {
+            rejectHostDirectoryFrame(rawBytes)
+            return
+        }
+        val snapshot = HostAvailability(
+            brokerEpoch = brokerEpoch,
+            revisionText = revisionText,
+            state = item["state"] as String,
+            presenceFingerprint = null,
+        )
+        val queued = pending.latestPresence
+        clearPendingHostsSnapshot()
+        hostAvailability = snapshot
+        if (queued != null &&
+            (queued.brokerEpoch != snapshot.brokerEpoch || queued.revision > snapshot.revision)
+        ) {
+            applyHostPresence(profile, queued, rawBytes)
+            return
+        }
+        if (queued != null && queued.revision == snapshot.revision &&
+            queued.brokerEpoch == snapshot.brokerEpoch && queued.state != snapshot.state
+        ) {
+            rejectHostDirectoryFrame(rawBytes)
+            return
+        }
+        applyHostAvailability(profile, snapshot)
+    }
+
+    private fun rejectHostDirectoryFrame(rawBytes: Int) {
+        failConnection(
+            RelayV2FailureKind.SCHEMA,
+            "INVALID_ENVELOPE",
+            retryable = false,
+            closeCode = 4400,
+            rawBytes = rawBytes,
+        )
+    }
+
+    private fun applyHostAvailability(profile: RelayV2Profile, availability: HostAvailability) {
+        val generation = currentEffectGeneration(profile)
+        if (availability.state == "offline") {
+            suspendForHostPresence(generation)
+            return
+        }
+        if (!suspendForHostPresence(generation) || hostReconnectGeneration == generation) return
+        val connectionAttempt = synchronized(lifecycleLock) {
+            committedCallbackOwner?.takeIf { committed ->
+                committed.effectGeneration == generation &&
+                    publishedEffectGeneration.get() == generation
+            }?.connectionAttempt
+        } ?: return
+        hostReconnectGeneration = generation
+        emitEffect(
+            RelayV2RuntimeEffect.ReconnectAfterHostPresence(
+                profile = profile.identity,
+                generation = generation,
+                connectionAttempt = connectionAttempt,
+                brokerEpoch = availability.brokerEpoch,
+                hostsRevision = availability.revisionText,
+            ),
+        )
+    }
+
+    private fun suspendForHostPresence(generation: RelayV2EffectGeneration): Boolean {
+        val profile = activeProfile ?: return false
+        val changed = synchronized(lifecycleLock) {
+            val committed = committedCallbackOwner
+            val source = activeTransport
+            if (lifecycleState != LifecycleState.OPEN ||
+                committed?.effectGeneration != generation ||
+                publishedEffectGeneration.get() != generation ||
+                source == null ||
+                !isCurrentCallbackLocked(committed.key, source) ||
+                currentEffectGeneration(profile) != generation
+            ) {
+                return@synchronized null
+            }
+            if (_state.value.phase == RelayV2ConnectionPhase.SUSPENDED) {
+                false
+            } else {
+                suspendPublishedRepositoryAuthorityLocked()
+                publishState(RelayV2ConnectionPhase.SUSPENDED, profile)
+                true
+            }
+        } ?: return false
+        if (changed) {
+            clearRecoveryAttempt()
+            clearPendingAgentExtensionRequests()
+            onlineQueryWindow = null
+        }
+        return true
     }
 
     private fun handlePotentialAgentExtensionFrame(
@@ -1916,7 +2327,10 @@ internal class RelayV2ConnectionActor(
         if (errorCode !in BASE_AGENT_EXTENSION_OVERLAPPING_ERROR_CODES) return false
         val owner = agentExtensionRequestOwnerForOverlappingError(requestId) ?: return false
         fun isolateOwnedError(): Boolean {
-            isolateAgentExtension(RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE)
+            isolateAgentExtension(
+                RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                owner.identity.authority.generation,
+            )
             return true
         }
         val sendFence = agentExtensionSendFence.get() ?: return isolateOwnedError()
@@ -1948,63 +2362,108 @@ internal class RelayV2ConnectionActor(
     private fun deliverAgentExtensionArtifact(
         artifact: AgentTranscriptLifecycleV1PublicFrameArtifact,
     ) {
-        val phase = _state.value.phase
-        val context = onlineContext
-        if (phase !in AGENT_EXTENSION_INBOUND_PHASES ||
-            context == null ||
-            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in context.negotiatedCapabilities
-        ) {
+        val negotiatedContext = synchronized(lifecycleLock) {
+            val context = onlineContext
+            context?.takeIf {
+                _state.value.phase in AGENT_EXTENSION_INBOUND_PHASES &&
+                    AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in it.negotiatedCapabilities
+            }
+        }
+        if (negotiatedContext == null) {
             failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             return
         }
-        val resolved = resolveAgentExtensionIngress(artifact, context) ?: return
-        val profile = activeProfile ?: return
-        emitAgentExtensionDelivery(
-            effect = RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
-                context = context,
-                artifact = artifact,
-                ingress = resolved.ingress,
-                requestAdmission = resolved.admission,
-                generation = currentEffectGeneration(profile),
-            ),
-            admission = resolved.admission,
+        val ingressOwner = synchronized(lifecycleLock) {
+            val profile = activeProfile ?: return@synchronized null
+            val generation = currentEffectGeneration(profile)
+            if (!isCurrentAgentExtensionIngressLocked(negotiatedContext, generation)) {
+                return@synchronized null
+            }
+            negotiatedContext to generation
+        } ?: return
+        val (context, generation) = ingressOwner
+        val resolved = resolveAgentExtensionIngress(artifact, context, generation) ?: return
+        val effect = RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
+            context = context,
+            artifact = artifact,
+            ingress = resolved.ingress,
+            requestAdmission = resolved.admission,
+            generation = generation,
         )
+        synchronized(lifecycleLock) {
+            if (!isCurrentAgentExtensionIngressLocked(context, generation)) return
+            emitAgentExtensionDelivery(effect, resolved.admission)
+        }
+    }
+
+    private fun isCurrentAgentExtensionIngressLocked(
+        context: RelayV2HandshakeContext,
+        generation: RelayV2EffectGeneration,
+    ): Boolean {
+        val available = _agentCapabilityAvailability.value
+            as? RelayV2AgentCapabilityAvailability.Available
+            ?: return false
+        val profile = activeProfile ?: return false
+        val committed = committedCallbackOwner ?: return false
+        val source = activeTransport ?: return false
+        val fence = agentExtensionSendFence.get() ?: return false
+        return lifecycleState == LifecycleState.OPEN &&
+            _state.value.phase in AGENT_EXTENSION_INBOUND_PHASES &&
+            onlineContext === context &&
+            available.generation == generation &&
+            agentCapabilityWithdrawnGeneration != generation &&
+            committed.effectGeneration == generation &&
+            publishedEffectGeneration.get() == generation &&
+            currentEffectGeneration(profile) == generation &&
+            isCurrentCallbackLocked(committed.key, source) &&
+            fence.authority.generation == generation &&
+            context.repositoryEffectAuthority(generation) == fence.authority &&
+            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in context.negotiatedCapabilities
     }
 
     private fun resolveAgentExtensionIngress(
         artifact: AgentTranscriptLifecycleV1PublicFrameArtifact,
         context: RelayV2HandshakeContext,
+        generation: RelayV2EffectGeneration,
     ): ResolvedAgentExtensionIngress? = when (val frame = artifact.frame) {
         is AgentTimelineEventFrame,
         is AgentTimelineResetFrame,
         -> if ((frame as AgentTranscriptLifecycleV1InboundFrame).matchesHost(context)) {
             ResolvedAgentExtensionIngress(AgentTranscriptLifecycleTrustedIngress.Live, null)
         } else {
-            isolateAgentExtension(RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH)
+            isolateAgentExtension(
+                RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH,
+                generation,
+            )
         }
         is AgentTimelineStatusFrame -> correlateAgentExtensionResponse(
             frame,
             frame.requestId,
             AgentTranscriptLifecycleRequestKind.STATUS,
+            generation,
         )
         is AgentTimelineReplayPageFrame -> correlateAgentExtensionResponse(
             frame,
             frame.requestId,
             AgentTranscriptLifecycleRequestKind.REPLAY,
+            generation,
         )
         is AgentTimelineSnapshotPageFrame -> correlateAgentExtensionResponse(
             frame,
             frame.requestId,
             AgentTranscriptLifecycleRequestKind.SNAPSHOT,
+            generation,
         )
         is AgentTimelineErrorFrame -> {
             val pending = pendingAgentExtensionRequestForResponse(frame.requestId)
                 ?: return isolateAgentExtension(
                     RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                    generation,
                 )
             if (!frame.matchesErrorRequest(pending.request)) {
                 isolateAgentExtension(
                     RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH,
+                    generation,
                 )
             } else {
                 ResolvedAgentExtensionIngress(
@@ -2029,14 +2488,17 @@ internal class RelayV2ConnectionActor(
         frame: AgentTranscriptLifecycleV1InboundFrame,
         requestId: String,
         expectedKind: AgentTranscriptLifecycleRequestKind,
+        generation: RelayV2EffectGeneration,
     ): ResolvedAgentExtensionIngress? {
         val pending = pendingAgentExtensionRequestForResponse(requestId)
             ?: return isolateAgentExtension(
                 RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                generation,
             )
         if (pending.request.kind != expectedKind || !frame.matchesRequest(pending.request)) {
             return isolateAgentExtension(
                 RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH,
+                generation,
             )
         }
         val ingress = when (val request = pending.request) {
@@ -2052,14 +2514,38 @@ internal class RelayV2ConnectionActor(
 
     private fun isolateAgentExtension(
         reason: RelayV2AgentExtensionUnavailableReason,
+        expectedGeneration: RelayV2EffectGeneration,
     ): ResolvedAgentExtensionIngress? {
-        val context = onlineContext ?: return null
-        val profile = activeProfile ?: return null
+        val context = synchronized(lifecycleLock) {
+            val available = _agentCapabilityAvailability.value
+                as? RelayV2AgentCapabilityAvailability.Available
+                ?: return@synchronized null
+            val profile = activeProfile ?: return@synchronized null
+            val committed = committedCallbackOwner ?: return@synchronized null
+            val source = activeTransport ?: return@synchronized null
+            val current = onlineContext ?: return@synchronized null
+            val fence = agentExtensionSendFence.get() ?: return@synchronized null
+            if (lifecycleState != LifecycleState.OPEN ||
+                available.generation != expectedGeneration ||
+                committed.effectGeneration != expectedGeneration ||
+                publishedEffectGeneration.get() != expectedGeneration ||
+                currentEffectGeneration(profile) != expectedGeneration ||
+                !isCurrentCallbackLocked(committed.key, source) ||
+                fence.authority.generation != expectedGeneration ||
+                current.repositoryEffectAuthority(expectedGeneration) != fence.authority ||
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in current.negotiatedCapabilities
+            ) {
+                return@synchronized null
+            }
+            agentCapabilityWithdrawnGeneration = expectedGeneration
+            _agentCapabilityAvailability.value = RelayV2AgentCapabilityAvailability.Unavailable
+            current
+        } ?: return null
         emitAgentExtensionControlEffect(
             RelayV2RuntimeEffect.AgentExtensionUnavailable(
                 context = context,
                 reason = reason,
-                generation = currentEffectGeneration(profile),
+                generation = expectedGeneration,
             ),
         )
         return null
@@ -2069,11 +2555,14 @@ internal class RelayV2ConnectionActor(
         val source = synchronized(lifecycleLock) {
             val pending = pendingAgentExtensionRequests[action.request.requestId]
             val fence = agentExtensionSendFence.get()
+            val availability = _agentCapabilityAvailability.value
+                as? RelayV2AgentCapabilityAvailability.Available
             val context = onlineContext
             if (pending?.admission != action.admission ||
                 pending.state != AgentExtensionPendingState.QUEUED ||
                 fence == null ||
                 fence.authority != action.request.authority ||
+                availability?.generation != action.request.authority.generation ||
                 context == null ||
                 context.repositoryEffectAuthority(fence.authority.generation) != fence.authority ||
                 AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in fence.negotiatedCapabilities ||
@@ -2184,7 +2673,7 @@ internal class RelayV2ConnectionActor(
         if (!queued) {
             // The exact failure remains actor-owned and will be retried on its bounded lane.
             // Only the optional extension is isolated; base routes remain online.
-            isolateAgentExtension(reason)
+            isolateAgentExtension(reason, admission.authority.generation)
         }
     }
 
@@ -3695,6 +4184,8 @@ internal class RelayV2ConnectionActor(
         }
         clearRecoveryAttempt()
         clearPendingAgentExtensionRequests()
+        clearPendingHostsSnapshot()
+        hostReconnectGeneration = null
         source?.let {
             beginRetirement(listOf(it), closeCode = 4400, reason = "event cursor ahead")
         }
@@ -3831,10 +4322,18 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun enqueueRecoveryTimeout(action: Action.RecoveryStepTimedOut) {
+        enqueueOwnedTimeout(action, action.owner, action.source)
+    }
+
+    private fun enqueueOwnedTimeout(
+        action: Action,
+        owner: CallbackOwnerKey,
+        source: RelayV2Transport,
+    ) {
         val first = synchronized(lifecycleLock) {
             when {
                 lifecycleState != LifecycleState.OPEN ||
-                    !acceptsCallbackLocked(action.owner, action.source) -> CallbackEnqueue.STOPPED
+                    !acceptsCallbackLocked(owner, source) -> CallbackEnqueue.STOPPED
                 actions.trySendNormalOrReserved(action) -> CallbackEnqueue.ENQUEUED
                 else -> CallbackEnqueue.RETRY
             }
@@ -3845,7 +4344,7 @@ internal class RelayV2ConnectionActor(
                 val retry = synchronized(lifecycleLock) {
                     when {
                         lifecycleState != LifecycleState.OPEN ||
-                            !acceptsCallbackLocked(action.owner, action.source) ->
+                            !acceptsCallbackLocked(owner, source) ->
                             CallbackEnqueue.STOPPED
                         actions.trySendReserved(action) -> CallbackEnqueue.ENQUEUED
                         else -> CallbackEnqueue.RETRY
@@ -3860,6 +4359,48 @@ internal class RelayV2ConnectionActor(
                 }
             }
         }
+    }
+
+    private fun scheduleHostsSnapshotWatchdog(pending: PendingHostsSnapshot) {
+        hostsSnapshotWatchdog?.cancel()
+        val committed = synchronized(lifecycleLock) {
+            committedCallbackOwner?.takeIf { owner ->
+                pendingHostsSnapshot === pending &&
+                    owner.effectGeneration == pending.generation &&
+                    isCurrentCallbackLocked(owner.key, owner.source)
+            }
+        } ?: return
+        hostsSnapshotWatchdog = scope.launch {
+            recoveryWatchdogDelay(recoveryStepTimeoutMs)
+            enqueueOwnedTimeout(
+                Action.HostsSnapshotTimedOut(
+                    ownerTokenId = committed.connectTokenId,
+                    effectGeneration = committed.effectGeneration,
+                    source = committed.source,
+                    requestId = pending.requestId,
+                ),
+                committed.key,
+                committed.source,
+            )
+        }
+    }
+
+    private fun handleHostsSnapshotTimeout(action: Action.HostsSnapshotTimedOut) {
+        val current = synchronized(lifecycleLock) {
+            isCurrentCallbackLocked(action.owner, action.source) &&
+                pendingHostsSnapshot?.let { pending ->
+                    pending.generation == action.effectGeneration &&
+                        pending.requestId == action.requestId
+                } == true
+        }
+        if (!current) return
+        clearPendingHostsSnapshot()
+        failConnection(
+            RelayV2FailureKind.TRANSPORT,
+            "HOST_OFFLINE",
+            retryable = true,
+            closeCode = 1013,
+        )
     }
 
     private fun handleRecoveryTimeout(action: Action.RecoveryStepTimedOut) {
@@ -3885,6 +4426,12 @@ internal class RelayV2ConnectionActor(
         recoveryStepWatchdog?.cancel()
         recoveryStepWatchdog = null
         recoveryAttempt = null
+    }
+
+    private fun clearPendingHostsSnapshot() {
+        hostsSnapshotWatchdog?.cancel()
+        hostsSnapshotWatchdog = null
+        pendingHostsSnapshot = null
     }
 
     private fun hasExactFrozenLimits(
@@ -4035,6 +4582,8 @@ internal class RelayV2ConnectionActor(
         activeTransport = null
         pendingTerminalIntent = null
         clearRecoveryAttempt()
+        clearPendingHostsSnapshot()
+        hostReconnectGeneration = null
         clearPendingAgentExtensionRequests()
         val retirementCommand = terminalSource?.let {
             claimTerminalRetirementLocked(terminalCause, it)
@@ -4300,6 +4849,9 @@ internal class RelayV2ConnectionActor(
         brokerEpoch = null
         brokerCapabilities = emptySet()
         brokerLimits = null
+        hostAvailability = null
+        clearPendingHostsSnapshot()
+        hostReconnectGeneration = null
         updateState(RelayV2ConnectionPhase.DISCONNECTED, null)
         drainQueuedEffects()
         if (!isLifecycleOpen()) return
@@ -4509,7 +5061,10 @@ internal class RelayV2ConnectionActor(
                 agentExtensionEffectChannel.trySend(QueuedEffect(effect, rawBytes)).isSuccess
             ) return true
             if (reserved) releaseBytes(queuedAgentExtensionEffectBytes, rawBytes)
-            isolateAgentExtension(RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED)
+            isolateAgentExtension(
+                RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED,
+                effect.generation,
+            )
             return false
         }
 
@@ -4854,9 +5409,19 @@ internal class RelayV2ConnectionActor(
 
     private fun clearPublishedEffectAuthorityLocked() {
         withdrawOutboxExecuteReadyLocked()
+        _agentCapabilityAvailability.value = RelayV2AgentCapabilityAvailability.Unavailable
         onlineContext = null
         agentExtensionSendFence.set(null)
         publishedEffectGeneration.set(null)
+    }
+
+    /** Fences repository admission while preserving this broker callback lineage for presence. */
+    private fun suspendPublishedRepositoryAuthorityLocked(): CompletableDeferred<Unit> {
+        withdrawOutboxExecuteReadyLocked()
+        _agentCapabilityAvailability.value = RelayV2AgentCapabilityAvailability.Unavailable
+        onlineContext = null
+        agentExtensionSendFence.set(null)
+        return effectApplyGate.invalidateAndDrain()
     }
 
     private fun withdrawPublishedRepositoryAuthorityAndDrainLocked(): CompletableDeferred<Unit> {
@@ -4900,6 +5465,14 @@ internal class RelayV2ConnectionActor(
         onlineContext = context
         publishedEffectGeneration.set(generation)
         agentExtensionSendFence.set(fence)
+        _agentCapabilityAvailability.value =
+            if (agentCapabilityWithdrawnGeneration != generation &&
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in context.negotiatedCapabilities
+            ) {
+                RelayV2AgentCapabilityAvailability.Available(generation)
+            } else {
+                RelayV2AgentCapabilityAvailability.Unavailable
+            }
         true
     }
 
@@ -4911,6 +5484,8 @@ internal class RelayV2ConnectionActor(
         connectionGeneration += 1
         clearRecoveryAttempt()
         clearPendingAgentExtensionRequests()
+        clearPendingHostsSnapshot()
+        hostReconnectGeneration = null
         source?.let {
             beginRetirement(listOf(it), closeCode = null, forceCancel = true)
         }
@@ -4922,6 +5497,7 @@ internal class RelayV2ConnectionActor(
         }
         activeProfile = null
         onlineQueryWindow = null
+        hostAvailability = null
         updateState(RelayV2ConnectionPhase.CLOSED, null)
         drainQueuedEffects()
         completeShutdownDrain()
@@ -5082,6 +5658,15 @@ internal class RelayV2ConnectionActor(
             val owner = CallbackOwnerKey(ownerTokenId, effectGeneration)
         }
 
+        data class HostsSnapshotTimedOut(
+            val ownerTokenId: Long,
+            val effectGeneration: RelayV2EffectGeneration,
+            val source: RelayV2Transport,
+            val requestId: String,
+        ) : Action {
+            val owner = CallbackOwnerKey(ownerTokenId, effectGeneration)
+        }
+
         data object Shutdown : Action
     }
 
@@ -5105,6 +5690,39 @@ internal class RelayV2ConnectionActor(
         val authority: RelayV2RepositoryEffectAuthority,
         val owner: CallbackOwnerKey,
         val source: RelayV2Transport,
+    )
+
+    private data class HostPresence(
+        val brokerEpoch: String,
+        val revisionText: String,
+        val state: String,
+        val fingerprint: String,
+    ) {
+        val revision: BigInteger = BigInteger(revisionText)
+
+        fun toAvailability(): HostAvailability = HostAvailability(
+            brokerEpoch = brokerEpoch,
+            revisionText = revisionText,
+            state = state,
+            presenceFingerprint = fingerprint,
+        )
+    }
+
+    private data class HostAvailability(
+        val brokerEpoch: String,
+        val revisionText: String,
+        val state: String,
+        val presenceFingerprint: String?,
+    ) {
+        val revision: BigInteger = BigInteger(revisionText)
+    }
+
+    private data class PendingHostsSnapshot(
+        val requestId: String,
+        val generation: RelayV2EffectGeneration,
+        val triggerBrokerEpoch: String,
+        val triggerRevision: BigInteger,
+        var latestPresence: HostPresence? = null,
     )
 
     private class ActorCurrentOnlineCommandCut(
@@ -5667,6 +6285,20 @@ internal class RelayV2ConnectionActor(
             RelayV2ConnectionPhase.QUERYING,
             RelayV2ConnectionPhase.RESYNCING,
             RelayV2ConnectionPhase.ONLINE,
+        )
+
+        private val HOST_DIRECTORY_INBOUND_PHASES = setOf(
+            RelayV2ConnectionPhase.QUERYING,
+            RelayV2ConnectionPhase.RESYNCING,
+            RelayV2ConnectionPhase.ONLINE,
+            RelayV2ConnectionPhase.SUSPENDED,
+        )
+
+        private val AUTH_EXPIRING_INBOUND_PHASES = HOST_DIRECTORY_INBOUND_PHASES
+
+        private val HOST_DIRECTORY_INBOUND_TYPES = setOf(
+            "host.presence",
+            "hosts.snapshot",
         )
 
         private val BASE_AGENT_EXTENSION_OVERLAPPING_ERROR_CODES = setOf(

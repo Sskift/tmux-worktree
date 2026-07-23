@@ -3,6 +3,7 @@ import {
   MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
   type MobileRelayV2CreateEnrollmentInput,
   type MobileRelayV2DashboardState,
+  type MobileRelayV2EnrollmentReview,
   type MobileRelayV2RevokeClientGrantInput,
 } from "./domainTypes";
 import {
@@ -18,6 +19,17 @@ export interface FakeMobileRelayV2AdapterOptions {
   issuerUrl?: string;
   relayUrl?: string;
   hostId?: string;
+}
+
+export function createFakeMobileRelayV2RenderArtifact(
+  expiresAtMs: number,
+  sequence = 0,
+): MobileRelayV2EnrollmentReview["renderArtifact"] {
+  return {
+    kind: "native_qr_handle",
+    handle: `dqart1.${String(sequence).padStart(32, "0")}`,
+    expiresAtMs,
+  };
 }
 
 function cloneState(state: MobileRelayV2DashboardState): MobileRelayV2DashboardState {
@@ -216,6 +228,18 @@ export function createFakeMobileRelayV2Adapter(
       };
       return publish();
     },
+    showEnrollmentArtifact: async ({ handle }) => {
+      expireEnrollment();
+      if (
+        state.enrollment.status !== "active"
+        || state.enrollment.review.renderArtifact.handle !== handle
+      ) {
+        fail(
+          "relay_v2_enrollment_artifact_unavailable",
+          "The Relay v2 enrollment artifact is unavailable.",
+        );
+      }
+    },
     createEnrollment: async (input: MobileRelayV2CreateEnrollmentInput) => {
       requireAuthority();
       expireEnrollment();
@@ -239,6 +263,7 @@ export function createFakeMobileRelayV2Adapter(
         ...state,
         enrollment: { status: "creating", intent: input.intent },
       };
+      const expiresAtMs = now() + 5 * 60_000;
       state = {
         ...state,
         enrollment: {
@@ -246,8 +271,7 @@ export function createFakeMobileRelayV2Adapter(
           review: {
             enrollment: {
               enrollmentId: `fake-preview-enrollment-${enrollmentSequence}`,
-              enrollmentCode: `twenroll2.fake-preview-${enrollmentSequence}`,
-              expiresAtMs: now() + 5 * 60_000,
+              expiresAtMs,
             },
             display: {
               issuerUrl,
@@ -255,6 +279,10 @@ export function createFakeMobileRelayV2Adapter(
               hostId,
               deviceLabel: input.deviceLabel?.trim() || null,
             },
+            renderArtifact: createFakeMobileRelayV2RenderArtifact(
+              expiresAtMs,
+              enrollmentSequence,
+            ),
           },
         },
       };

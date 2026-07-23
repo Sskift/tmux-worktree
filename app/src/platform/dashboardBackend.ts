@@ -49,6 +49,7 @@ import type {
   MobileRelayV2CreateEnrollmentInput,
   MobileRelayV2DashboardState,
   MobileRelayV2RevokeClientGrantInput,
+  MobileRelayV2ShowEnrollmentArtifactInput,
   OrphanedWorktree,
   PlainTerminal,
   ProjectPreset,
@@ -91,6 +92,7 @@ export interface MobileRelayV2ProductAdapter {
   refreshHost(): Promise<MobileRelayV2DashboardState>;
   startConnector(): Promise<MobileRelayV2DashboardState>;
   stopConnector(): Promise<MobileRelayV2DashboardState>;
+  showEnrollmentArtifact(input: MobileRelayV2ShowEnrollmentArtifactInput): Promise<void>;
   createEnrollment(
     input: MobileRelayV2CreateEnrollmentInput,
   ): Promise<MobileRelayV2DashboardState>;
@@ -268,6 +270,13 @@ export function createUnavailableMobileRelayV2Adapter(
     refreshHost: unavailable,
     startConnector: unavailable,
     stopConnector: unavailable,
+    showEnrollmentArtifact: async () => {
+      throw new MobileRelayV2BackendOperationError({
+        code: "relay_v2_adapter_unavailable",
+        message: reason,
+        retryable: false,
+      });
+    },
     createEnrollment: unavailable,
     revokeClientGrant: unavailable,
   };

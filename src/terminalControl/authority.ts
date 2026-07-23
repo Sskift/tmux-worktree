@@ -9,6 +9,7 @@ import type {
 } from "./protocol";
 import {
   TERMINAL_CONTROL_DEFAULT_LEASE_TTL_MS,
+  TERMINAL_CONTROL_MAX_LEASE_TTL_MS,
   TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
   TerminalControlProtocolError,
 } from "./protocol";
@@ -30,11 +31,84 @@ import {
 
 const MAX_COMPLETED_OPERATIONS = 128;
 
-type AuthorityOptions = {
+export interface TerminalControlRelayV2ExactTargetInput {
+  schemaVersion: 1;
+  hostId: string;
+  scopeId: string;
+  sessionId: string;
+  pane: number;
+  processTarget: {
+    kind: "local" | "ssh";
+    targetId: string;
+  };
+  backendInstanceKey: string;
+  managedTarget: {
+    name: string;
+    kind: "worktree" | "terminal";
+    incarnation: string;
+  };
+  owner: TerminalControlOwner & { kind: "relay-v2" };
+}
+
+export interface TerminalControlRelayV2ExactTargetIdentity {
+  schemaVersion: 1;
+  controlTargetId: string;
+  controlEpoch: string;
+  targetIncarnationProof: string;
+}
+
+declare const terminalControlRelayV2ExactTargetClaimBrand: unique symbol;
+
+/** Opaque, process-local authority. It has no wire or persisted representation. */
+export interface TerminalControlRelayV2ExactTargetClaim {
+  readonly [terminalControlRelayV2ExactTargetClaimBrand]: true;
+}
+
+export interface TerminalControlRelayV2ExactTargetPreparation {
+  preparationId: string;
+  claim: TerminalControlRelayV2ExactTargetClaim;
+  identity: TerminalControlRelayV2ExactTargetIdentity;
+  expiresAt: string;
+}
+
+export interface TerminalControlRelayV2ExactTargetAuthorityPort {
+  prepareRelayV2ExactTarget(
+    input: TerminalControlRelayV2ExactTargetInput,
+  ): Promise<TerminalControlRelayV2ExactTargetPreparation>;
+  fenceRelayV2ExactTarget(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+    input: TerminalControlRelayV2ExactTargetInput,
+  ): void;
+  consumeRelayV2ExactTarget(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+    input: TerminalControlRelayV2ExactTargetInput,
+    owner?: TerminalControlOwner & { kind: "relay-v2" },
+  ): TerminalControlLease;
+  rollbackRelayV2ExactTarget(claim: TerminalControlRelayV2ExactTargetClaim): Promise<boolean>;
+}
+
+export interface TerminalControlAuthorityOptions {
   statePath?: string;
   backend?: TerminalControlBackend;
   now?: () => Date;
-};
+  /** Exact process identity is opt-in and does not alter terminal-control v1. */
+  relayV2ProcessTarget?: Readonly<{ kind: "local" | "ssh"; targetId: string }>;
+  /** Tests may shrink this owner-bound reservation TTL. */
+  relayV2ExactTargetTtlMs?: number;
+}
+
+type RelayV2ExactClaimState = "prepared" | "admitted" | "consumed" | "revoked";
+
+interface RelayV2ExactClaimRecord {
+  readonly input: TerminalControlRelayV2ExactTargetInput;
+  readonly inputJson: string;
+  readonly preparationId: string;
+  readonly identity: TerminalControlRelayV2ExactTargetIdentity;
+  readonly lease: TerminalControlLease;
+  readonly externalEpoch: number;
+  state: RelayV2ExactClaimState;
+  timer: NodeJS.Timeout | null;
+}
 
 function isoNow(now: () => Date): string {
   return now().toISOString();
@@ -288,16 +362,133 @@ function operationResult(
   };
 }
 
-export class TerminalControlAuthority {
+function relayV2ExactBoundedId(value: unknown, maxBytes = 128): string {
+  if (typeof value !== "string"
+    || value.length === 0
+    || value.trim() !== value
+    || /[\0\r\n]/.test(value)
+    || Buffer.byteLength(value, "utf8") > maxBytes) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "Relay v2 exact target identity is invalid");
+  }
+  return value;
+}
+
+function relayV2ExactCanonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(relayV2ExactCanonicalJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => (
+    `${JSON.stringify(key)}:${relayV2ExactCanonicalJson(record[key])}`
+  )).join(",")}}`;
+}
+
+function relayV2ExactInput(value: TerminalControlRelayV2ExactTargetInput): TerminalControlRelayV2ExactTargetInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || value.schemaVersion !== 1
+    || !Number.isSafeInteger(value.pane)
+    || value.pane < 0
+    || value.pane > 65_535
+    || !value.processTarget
+    || (value.processTarget.kind !== "local" && value.processTarget.kind !== "ssh")
+    || !value.managedTarget
+    || (value.managedTarget.kind !== "worktree" && value.managedTarget.kind !== "terminal")
+    || !/^twinc2\.[A-Za-z0-9_-]{43}$/.test(value.managedTarget.incarnation)
+    || !value.owner
+    || value.owner.kind !== "relay-v2") {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "Relay v2 exact target input is malformed");
+  }
+  return {
+    schemaVersion: 1,
+    hostId: relayV2ExactBoundedId(value.hostId),
+    scopeId: relayV2ExactBoundedId(value.scopeId),
+    sessionId: relayV2ExactBoundedId(value.sessionId),
+    pane: value.pane,
+    processTarget: {
+      kind: value.processTarget.kind,
+      targetId: relayV2ExactBoundedId(value.processTarget.targetId),
+    },
+    backendInstanceKey: relayV2ExactBoundedId(value.backendInstanceKey),
+    managedTarget: {
+      name: relayV2ExactBoundedId(value.managedTarget.name),
+      kind: value.managedTarget.kind,
+      incarnation: value.managedTarget.incarnation,
+    },
+    owner: {
+      kind: "relay-v2",
+      instanceId: relayV2ExactBoundedId(value.owner.instanceId, 256),
+    },
+  };
+}
+
+function ownerRelayV2ExactConsumer(
+  value: TerminalControlOwner & { kind: "relay-v2" },
+): TerminalControlOwner & { kind: "relay-v2" } {
+  if (!value || typeof value !== "object" || value.kind !== "relay-v2") {
+    throw new TerminalControlProtocolError(
+      "INVALID_REQUEST",
+      "Relay v2 exact target consumer owner is invalid",
+    );
+  }
+  return {
+    kind: "relay-v2",
+    instanceId: relayV2ExactBoundedId(value.instanceId, 256),
+  };
+}
+
+function relayV2TargetIncarnationProof(input: {
+  request: TerminalControlRelayV2ExactTargetInput;
+  state: TerminalControlState;
+  target: TerminalControlTargetRecord;
+  paneIdentity: string;
+}): string {
+  const digest = createHash("sha256").update(relayV2ExactCanonicalJson({
+    domain: "tmux-worktree.terminal-control.relay-v2-exact-target.v1",
+    request: input.request,
+    controlEpoch: input.state.controlEpoch,
+    controlTargetId: input.target.controlTargetId,
+    targetRevision: input.target.revision,
+    targetCreatedAt: input.target.managedSession.createdAt,
+    tmuxInstanceId: input.target.backend.tmuxInstanceId,
+    outputGeneration: input.target.outputGeneration,
+    paneIdentity: input.paneIdentity,
+  }), "utf8").digest("base64url");
+  return `twct2.${digest}`;
+}
+
+export class TerminalControlAuthority implements TerminalControlRelayV2ExactTargetAuthorityPort {
   private readonly statePath: string;
   private readonly backend: TerminalControlBackend;
   private readonly now: () => Date;
   private readonly interactiveOwners = new Map<string, Map<string, TerminalControlOwner>>();
+  private readonly relayV2ProcessTarget: Readonly<{ kind: "local" | "ssh"; targetId: string }> | null;
+  private readonly relayV2ExactTargetTtlMs: number;
+  private readonly relayV2ExactClaims = new WeakMap<object, RelayV2ExactClaimRecord>();
+  private readonly relayV2ExactLiveClaims = new Set<TerminalControlRelayV2ExactTargetClaim>();
+  private relayV2ExternalEpoch = 0;
+  private relayV2ExternalOperations = 0;
+  private relayV2ExactClosed = false;
 
-  constructor(options: AuthorityOptions = {}) {
+  constructor(options: TerminalControlAuthorityOptions = {}) {
     this.statePath = options.statePath ?? terminalControlStatePath();
     this.backend = options.backend ?? new TmuxTerminalControlBackend();
     this.now = options.now ?? (() => new Date());
+    if (options.relayV2ProcessTarget !== undefined
+      && (options.relayV2ProcessTarget === null
+        || (options.relayV2ProcessTarget.kind !== "local"
+          && options.relayV2ProcessTarget.kind !== "ssh"))) {
+      throw new TypeError("Relay v2 terminal-control process target is invalid");
+    }
+    this.relayV2ProcessTarget = options.relayV2ProcessTarget === undefined
+      ? null
+      : Object.freeze({
+          kind: options.relayV2ProcessTarget.kind,
+          targetId: relayV2ExactBoundedId(options.relayV2ProcessTarget.targetId),
+        });
+    const ttl = options.relayV2ExactTargetTtlMs ?? 30_000;
+    if (!Number.isSafeInteger(ttl) || ttl < 1 || ttl > TERMINAL_CONTROL_MAX_LEASE_TTL_MS) {
+      throw new TypeError("Relay v2 exact target reservation TTL is invalid");
+    }
+    this.relayV2ExactTargetTtlMs = ttl;
   }
 
   private interactiveOwnerKey(owner: TerminalControlOwner): string {
@@ -329,8 +520,328 @@ export class TerminalControlAuthority {
     this.interactiveOwners.delete(controlTargetId);
   }
 
-  async initializeContinuity(): Promise<string> {
+  private relayV2ExactClaimRecord(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+  ): RelayV2ExactClaimRecord {
+    const record = this.relayV2ExactClaims.get(claim as object);
+    if (!record) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact target claim is not owned by this authority",
+      );
+    }
+    return record;
+  }
+
+  private relayV2ExactClaimCurrent(record: RelayV2ExactClaimRecord): boolean {
+    return !this.relayV2ExactClosed
+      && this.relayV2ExternalOperations === 0
+      && this.relayV2ExternalEpoch === record.externalEpoch
+      && Date.parse(record.lease.expiresAt) > this.now().getTime();
+  }
+
+  private async relayV2RollbackRecord(record: RelayV2ExactClaimRecord): Promise<boolean> {
+    if (record.timer) clearTimeout(record.timer);
+    record.timer = null;
+    record.state = "revoked";
     return this.locked(async (state) => {
+      const target = state.targets.find(
+        (candidate) => candidate.controlTargetId === record.lease.controlTargetId,
+      );
+      if (!target
+        || state.controlEpoch !== record.lease.controlEpoch
+        || target.ownership.state === "FREE"
+        || target.ownership.state === "DRAINING"
+        || target.ownership.leaseId !== record.lease.leaseId
+        || target.ownership.fence !== record.lease.fence
+        || !sameOwner(target.ownership.owner, record.lease.owner)) {
+        return false;
+      }
+      this.resetInteractiveOwners(target.controlTargetId);
+      target.ownership = {
+        state: "FREE",
+        fence: nextDecimal(target.ownership.fence),
+      };
+      revision(target);
+      target.updatedAt = isoNow(this.now);
+      saveTerminalControlState(state, this.statePath);
+      return true;
+    });
+  }
+
+  private async relayV2WithdrawAllExactClaims(): Promise<void> {
+    const records: RelayV2ExactClaimRecord[] = [];
+    for (const claim of this.relayV2ExactLiveClaims) {
+      const record = this.relayV2ExactClaims.get(claim as object);
+      this.relayV2ExactLiveClaims.delete(claim);
+      this.relayV2ExactClaims.delete(claim as object);
+      if (record && record.state !== "consumed" && record.state !== "revoked") {
+        record.state = "revoked";
+        records.push(record);
+      }
+    }
+    const settled = await Promise.allSettled(records.map((record) => (
+      this.relayV2RollbackRecord(record)
+    )));
+    const failed = settled.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  }
+
+  private async relayV2ExternalOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.relayV2ExternalOperations += 1;
+    this.relayV2ExternalEpoch += 1;
+    try {
+      await this.relayV2WithdrawAllExactClaims();
+      return await operation();
+    } finally {
+      this.relayV2ExternalOperations -= 1;
+      this.relayV2ExternalEpoch += 1;
+    }
+  }
+
+  /**
+   * Atomically reserves an already-existing exact terminal target. This never
+   * invokes v1 target.resolve, creates a target, prepares output, or attaches
+   * observation. The returned object is useful only to this live authority.
+   */
+  async prepareRelayV2ExactTarget(
+    rawInput: TerminalControlRelayV2ExactTargetInput,
+  ): Promise<TerminalControlRelayV2ExactTargetPreparation> {
+    return this.prepareRelayV2ExactTargetForProcess(rawInput, this.relayV2ProcessTarget);
+  }
+
+  /**
+   * Issues a process-local view for one remote compound connection. The view
+   * owns no state: every operation remains on this authority and its exact
+   * claim registry. It exists only because a long-lived daemon cannot bake a
+   * caller-specific configured SSH target into its constructor.
+   */
+  captureRelayV2ExactProcessTarget(
+    rawTarget: Readonly<{ kind: "local" | "ssh"; targetId: string }>,
+  ): TerminalControlRelayV2ExactTargetAuthorityPort {
+    if (!rawTarget
+      || (rawTarget.kind !== "local" && rawTarget.kind !== "ssh")) {
+      throw new TerminalControlProtocolError(
+        "INVALID_REQUEST",
+        "Relay v2 exact process target is invalid",
+      );
+    }
+    const target = Object.freeze({
+      kind: rawTarget.kind,
+      targetId: relayV2ExactBoundedId(rawTarget.targetId),
+    });
+    const view = Object.create(null) as TerminalControlRelayV2ExactTargetAuthorityPort;
+    Object.defineProperties(view, {
+      prepareRelayV2ExactTarget: {
+        value: (input: TerminalControlRelayV2ExactTargetInput) => (
+          this.prepareRelayV2ExactTargetForProcess(input, target)
+        ),
+        enumerable: true,
+      },
+      fenceRelayV2ExactTarget: {
+        value: this.fenceRelayV2ExactTarget.bind(this),
+        enumerable: true,
+      },
+      consumeRelayV2ExactTarget: {
+        value: this.consumeRelayV2ExactTarget.bind(this),
+        enumerable: true,
+      },
+      rollbackRelayV2ExactTarget: {
+        value: this.rollbackRelayV2ExactTarget.bind(this),
+        enumerable: true,
+      },
+    });
+    return Object.freeze(view);
+  }
+
+  private async prepareRelayV2ExactTargetForProcess(
+    rawInput: TerminalControlRelayV2ExactTargetInput,
+    expectedProcessTarget: Readonly<{ kind: "local" | "ssh"; targetId: string }> | null,
+  ): Promise<TerminalControlRelayV2ExactTargetPreparation> {
+    const input = relayV2ExactInput(rawInput);
+    if (this.relayV2ExactClosed
+      || expectedProcessTarget === null
+      || this.backend.inspectExactTarget === undefined) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target authority is unavailable",
+      );
+    }
+    if (input.processTarget.kind !== expectedProcessTarget.kind
+      || input.processTarget.targetId !== expectedProcessTarget.targetId) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target crossed process authority",
+      );
+    }
+    if (this.relayV2ExternalOperations !== 0) {
+      throw new TerminalControlProtocolError("RESOURCE_EXHAUSTED", "terminal-control is busy", true);
+    }
+    const externalEpoch = this.relayV2ExternalEpoch;
+    const prepared = await this.locked(async (state) => {
+      if (this.relayV2ExactClosed
+        || this.relayV2ExternalOperations !== 0
+        || this.relayV2ExternalEpoch !== externalEpoch) {
+        throw new TerminalControlProtocolError("RESOURCE_EXHAUSTED", "terminal-control is busy", true);
+      }
+      const inspected = await this.backend.inspectExactTarget!({
+        managedName: input.managedTarget.name,
+        managedKind: input.managedTarget.kind,
+        managedIncarnation: input.managedTarget.incarnation,
+        pane: input.pane,
+      });
+      if (inspected.managedSession.name !== input.managedTarget.name
+        || inspected.managedSession.kind !== input.managedTarget.kind
+        || inspected.managedIncarnation !== input.managedTarget.incarnation) {
+        throw new TerminalControlProtocolError(
+          "TARGET_GONE",
+          "managed target changed during Relay v2 exact preparation",
+        );
+      }
+      const matches = state.targets.filter((candidate) => (
+        candidate.lifecycle !== "TARGET_GONE"
+        && candidate.managedSession.name === input.managedTarget.name
+        && candidate.managedSession.kind === input.managedTarget.kind
+        && candidate.managedSession.createdAt === inspected.managedSession.createdAt
+        && candidate.backend.tmuxInstanceId === inspected.tmuxInstanceId
+      ));
+      if (matches.length !== 1) {
+        throw new TerminalControlProtocolError(
+          matches.length === 0 ? "TARGET_NOT_FOUND" : "RECOVERY_REQUIRED",
+          "exact terminal-control target is missing or ambiguous",
+        );
+      }
+      const target = matches[0];
+      ensureOperable(target);
+      if (target.ownership.state !== "FREE") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "exact terminal-control target already has an input owner",
+        );
+      }
+      target.ownership = {
+        state: "HELD",
+        fence: nextDecimal(target.ownership.fence),
+        owner: { ...input.owner },
+        leaseId: randomUUID(),
+        leaseExpiresAt: expiresAt(this.now, this.relayV2ExactTargetTtlMs),
+      };
+      this.resetInteractiveOwners(target.controlTargetId);
+      this.registerInteractiveOwner(target.controlTargetId, input.owner);
+      revision(target);
+      target.updatedAt = isoNow(this.now);
+      saveTerminalControlState(state, this.statePath);
+      const identity: TerminalControlRelayV2ExactTargetIdentity = {
+        schemaVersion: 1,
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        targetIncarnationProof: relayV2TargetIncarnationProof({
+          request: input,
+          state,
+          target,
+          paneIdentity: inspected.paneIdentity,
+        }),
+      };
+      return {
+        identity,
+        lease: leaseForOwner(state, target, input.owner),
+      };
+    });
+    const claim = Object.freeze(Object.create(null)) as TerminalControlRelayV2ExactTargetClaim;
+    const record: RelayV2ExactClaimRecord = {
+      input,
+      inputJson: relayV2ExactCanonicalJson(input),
+      preparationId: randomUUID(),
+      identity: Object.freeze({ ...prepared.identity }),
+      lease: Object.freeze({ ...prepared.lease, owner: Object.freeze({ ...prepared.lease.owner }) }),
+      externalEpoch,
+      state: "prepared",
+      timer: null,
+    };
+    this.relayV2ExactClaims.set(claim as object, record);
+    this.relayV2ExactLiveClaims.add(claim);
+    record.timer = setTimeout(() => {
+      void this.rollbackRelayV2ExactTarget(claim).catch(() => undefined);
+    }, this.relayV2ExactTargetTtlMs);
+    record.timer.unref?.();
+    if (!this.relayV2ExactClaimCurrent(record)) {
+      await this.rollbackRelayV2ExactTarget(claim);
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target preparation was fenced",
+      );
+    }
+    return Object.freeze({
+      preparationId: record.preparationId,
+      claim,
+      identity: Object.freeze({ ...record.identity }),
+      expiresAt: record.lease.expiresAt,
+    });
+  }
+
+  fenceRelayV2ExactTarget(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+    rawInput: TerminalControlRelayV2ExactTargetInput,
+  ): void {
+    const input = relayV2ExactInput(rawInput);
+    const record = this.relayV2ExactClaimRecord(claim);
+    if (record.state !== "prepared"
+      || record.inputJson !== relayV2ExactCanonicalJson(input)
+      || !this.relayV2ExactClaimCurrent(record)) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target claim is stale or mismatched",
+      );
+    }
+    record.state = "admitted";
+  }
+
+  consumeRelayV2ExactTarget(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+    rawInput: TerminalControlRelayV2ExactTargetInput,
+    rawConsumerOwner: TerminalControlOwner & { kind: "relay-v2" } = rawInput.owner,
+  ): TerminalControlLease {
+    const input = relayV2ExactInput(rawInput);
+    const consumerOwner = ownerRelayV2ExactConsumer(rawConsumerOwner);
+    const record = this.relayV2ExactClaimRecord(claim);
+    if (record.state !== "admitted"
+      || record.inputJson !== relayV2ExactCanonicalJson(input)
+      || !this.relayV2ExactClaimCurrent(record)) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target claim cannot be consumed",
+      );
+    }
+    record.state = "consumed";
+    if (record.timer) clearTimeout(record.timer);
+    record.timer = null;
+    this.resetInteractiveOwners(record.lease.controlTargetId);
+    this.registerInteractiveOwner(record.lease.controlTargetId, consumerOwner);
+    this.relayV2ExactLiveClaims.delete(claim);
+    this.relayV2ExactClaims.delete(claim as object);
+    return { ...record.lease, owner: { ...consumerOwner } };
+  }
+
+  async rollbackRelayV2ExactTarget(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+  ): Promise<boolean> {
+    const record = this.relayV2ExactClaims.get(claim as object);
+    if (!record || record.state === "consumed" || record.state === "revoked") return false;
+    record.state = "revoked";
+    this.relayV2ExactLiveClaims.delete(claim);
+    this.relayV2ExactClaims.delete(claim as object);
+    return this.relayV2RollbackRecord(record);
+  }
+
+  async closeRelayV2ExactTargetAuthority(): Promise<void> {
+    if (this.relayV2ExactClosed) return;
+    this.relayV2ExactClosed = true;
+    this.relayV2ExternalEpoch += 1;
+    await this.relayV2WithdrawAllExactClaims();
+  }
+
+  async initializeContinuity(): Promise<string> {
+    return this.relayV2ExternalOperation(() => this.locked(async (state) => {
       const previousControlEpoch = state.controlEpoch;
       state.controlEpoch = randomUUID();
       for (const target of state.targets) {
@@ -355,7 +866,7 @@ export class TerminalControlAuthority {
       }
       saveTerminalControlState(state, this.statePath);
       return state.controlEpoch;
-    });
+    }));
   }
 
   private async locked<T>(operation: (state: TerminalControlState) => Promise<T>): Promise<T> {
@@ -528,6 +1039,10 @@ export class TerminalControlAuthority {
   }
 
   async handle(request: TerminalControlRequest): Promise<unknown> {
+    return this.relayV2ExternalOperation(() => this.handleV1(request));
+  }
+
+  private async handleV1(request: TerminalControlRequest): Promise<unknown> {
     if (request.type === "ping") {
       return { protocolVersion: 1, authority: "local-terminal-control" };
     }

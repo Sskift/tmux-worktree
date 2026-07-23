@@ -101,10 +101,28 @@ export interface RelayV2HostConnectorAttemptStartInput
 extends RelayV2HostConnectorControllerStartInput {
   readonly controllerGeneration: string;
   readonly onCarrierStatus: (status: Readonly<RelayV2HostCarrierStatus>) => void;
+  readonly onCarrierAttemptPrepared: (
+    binding: Readonly<RelayV2HostConnectorAttemptPreparedBinding>,
+  ) => void;
+  readonly onCarrierAttemptFenced: (
+    binding: Readonly<RelayV2HostConnectorAttemptCapabilityFence>,
+  ) => void;
+}
+
+export interface RelayV2HostConnectorAttemptPreparedBinding {
+  readonly controllerGeneration: string;
+  readonly carrierAttemptGeneration: string;
+}
+
+export interface RelayV2HostConnectorAttemptCapabilityFence
+extends RelayV2HostConnectorAttemptPreparedBinding {
+  readonly reason: "capability_withdrawn";
+  readonly offerGeneration: string;
 }
 
 export interface RelayV2HostConnectorAttemptDrainInput {
   readonly controllerGeneration: string;
+  readonly carrierAttemptGeneration: string;
   readonly carrierGeneration: number | null;
   readonly connectorId: string | null;
 }
@@ -115,6 +133,8 @@ extends RelayV2HostConnectorAttemptDrainInput {
 }
 
 export interface RelayV2HostConnectorAttemptPort {
+  /** Synchronously closes exact attempt admission before any asynchronous drain. */
+  fence(input: Readonly<RelayV2HostConnectorAttemptDrainInput>): boolean;
   disposeAndDrain(
     input: Readonly<RelayV2HostConnectorAttemptDrainInput>,
   ): MaybePromise<RelayV2HostConnectorAttemptDrainEvidence>;
@@ -139,6 +159,7 @@ interface Deferred<T> {
 
 interface CapturedAttemptPort {
   readonly receiver: object;
+  readonly fence: RelayV2HostConnectorAttemptPort["fence"];
   readonly disposeAndDrain: RelayV2HostConnectorAttemptPort["disposeAndDrain"];
 }
 
@@ -151,6 +172,7 @@ interface AttemptRecord extends RelayV2HostConnectorControllerIdentity {
   readonly abortListener: () => void;
   phase: "starting" | "registered" | "failed" | "superseded";
   connectorId: string | null;
+  carrierAttemptGeneration: string | null;
   carrierGeneration: number | null;
   retryable: boolean | null;
   registrationObserved: boolean;
@@ -160,6 +182,8 @@ interface AttemptRecord extends RelayV2HostConnectorControllerIdentity {
   explicitStop: boolean;
   drainPromise: Promise<void> | null;
   drainFailed: boolean;
+  handle: CapturedAttemptPort | null;
+  synchronousFenceApplied: boolean;
 }
 
 interface DrainedBinding extends RelayV2HostConnectorControllerBinding {}
@@ -271,6 +295,12 @@ function counter(value: unknown): string {
   return value;
 }
 
+function positiveCounter(value: unknown): string {
+  const parsed = counter(value);
+  if (parsed === "0") throw failure("OPERATION_FAILED");
+  return parsed;
+}
+
 function carrierGeneration(value: unknown): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) {
     throw failure("OPERATION_FAILED");
@@ -337,12 +367,15 @@ function parseCarrierStatus(value: unknown): ParsedCarrierStatus {
 }
 
 function captureAttemptPort(value: unknown): CapturedAttemptPort {
-  const fields = exactDataObject(value, ["disposeAndDrain"]);
-  if (typeof fields.disposeAndDrain !== "function" || !isObject(value)) {
+  const fields = exactDataObject(value, ["fence", "disposeAndDrain"]);
+  if (typeof fields.fence !== "function"
+    || typeof fields.disposeAndDrain !== "function"
+    || !isObject(value)) {
     throw failure("OPERATION_FAILED");
   }
   return Object.freeze({
     receiver: value,
+    fence: fields.fence as RelayV2HostConnectorAttemptPort["fence"],
     disposeAndDrain: fields.disposeAndDrain as RelayV2HostConnectorAttemptPort["disposeAndDrain"],
   });
 }
@@ -494,6 +527,7 @@ implements RelayV2HostConnectorControllerPort {
       phase: "starting",
       connectorId: null,
       carrierGeneration: null,
+      carrierAttemptGeneration: null,
       retryable: null,
       registrationObserved: false,
       acceptingStatus: true,
@@ -502,6 +536,8 @@ implements RelayV2HostConnectorControllerPort {
       explicitStop: false,
       drainPromise: null,
       drainFailed: false,
+      handle: null,
+      synchronousFenceApplied: false,
     };
     this.#current = record;
     parsed.signal.addEventListener("abort", abortListener, { once: true });
@@ -578,9 +614,21 @@ implements RelayV2HostConnectorControllerPort {
         onCarrierStatus: (status: Readonly<RelayV2HostCarrierStatus>) => {
           this.#receiveCarrierStatus(record, status);
         },
+        onCarrierAttemptPrepared: (
+          binding: Readonly<RelayV2HostConnectorAttemptPreparedBinding>,
+        ) => {
+          this.#receiveCarrierAttemptPrepared(record, binding);
+        },
+        onCarrierAttemptFenced: (
+          binding: Readonly<RelayV2HostConnectorAttemptCapabilityFence>,
+        ) => {
+          this.#receiveCarrierAttemptFenced(record, binding);
+        },
       })]);
       const captured = captureAttemptPort(raw);
+      if (record.carrierAttemptGeneration === null) throw failure("OPERATION_FAILED");
       record.factorySettled = true;
+      record.handle = captured;
       record.handleDeferred.resolve(captured);
       if (this.#current !== record || !record.acceptingStatus || record.explicitStop) {
         void this.#ensureDrain(record).catch(() => undefined);
@@ -593,7 +641,7 @@ implements RelayV2HostConnectorControllerPort {
     } catch (error) {
       record.factorySettled = true;
       record.handleDeferred.resolve(null);
-      if (this.#current !== record || record.phase === "superseded") return;
+      if (this.#current !== record || !record.acceptingStatus) return;
       const code = controllerErrorCode(error) ?? "OPERATION_FAILED";
       this.#failAttempt(
         record,
@@ -650,6 +698,43 @@ implements RelayV2HostConnectorControllerPort {
     }
   }
 
+  #receiveCarrierAttemptPrepared(record: AttemptRecord, value: unknown): void {
+    if (this.#current !== record || !record.acceptingStatus) return;
+    try {
+      const fields = exactDataObject(value, [
+        "controllerGeneration", "carrierAttemptGeneration",
+      ]);
+      const controllerGeneration = positiveCounter(fields.controllerGeneration);
+      const carrierAttemptGeneration = positiveCounter(fields.carrierAttemptGeneration);
+      if (controllerGeneration !== record.controllerGeneration
+        || record.carrierAttemptGeneration !== null) {
+        throw failure("OPERATION_FAILED");
+      }
+      record.carrierAttemptGeneration = carrierAttemptGeneration;
+    } catch {
+      this.#failAttempt(record, "OPERATION_FAILED", false, true);
+    }
+  }
+
+  #receiveCarrierAttemptFenced(record: AttemptRecord, value: unknown): void {
+    if (this.#current !== record || !record.acceptingStatus) return;
+    try {
+      const fields = exactDataObject(value, [
+        "reason", "controllerGeneration", "carrierAttemptGeneration", "offerGeneration",
+      ]);
+      positiveCounter(fields.offerGeneration);
+      if (fields.reason !== "capability_withdrawn"
+        || positiveCounter(fields.controllerGeneration) !== record.controllerGeneration
+        || positiveCounter(fields.carrierAttemptGeneration) !== record.carrierAttemptGeneration) {
+        throw failure("OPERATION_FAILED");
+      }
+    } catch {
+      this.#failAttempt(record, "OPERATION_FAILED", false, true);
+      return;
+    }
+    this.#failAttempt(record, "UNAVAILABLE", true, true);
+  }
+
   #abort(record: AttemptRecord): void {
     if (this.#current !== record || record.startSettled || record.phase !== "starting") return;
     record.acceptingStatus = false;
@@ -700,20 +785,34 @@ implements RelayV2HostConnectorControllerPort {
   #ensureDrain(record: AttemptRecord): Promise<void> {
     if (record.drainPromise !== null) return record.drainPromise;
     record.acceptingStatus = false;
+    let synchronousFenceFailed = false;
+    if (record.handle !== null) {
+      try {
+        this.#fenceAttemptSynchronously(record, record.handle);
+      } catch {
+        synchronousFenceFailed = true;
+      }
+    }
     record.drainPromise = (async () => {
+      if (synchronousFenceFailed) throw failure("OPERATION_FAILED");
       const captured = await record.handleDeferred.promise;
       if (captured === null) return;
+      this.#fenceAttemptSynchronously(record, captured);
+      if (record.carrierAttemptGeneration === null) throw failure("OPERATION_FAILED");
       const input = Object.freeze({
         controllerGeneration: record.controllerGeneration,
+        carrierAttemptGeneration: record.carrierAttemptGeneration,
         carrierGeneration: record.carrierGeneration,
         connectorId: record.connectorId,
       });
       const raw = await Reflect.apply(captured.disposeAndDrain, captured.receiver, [input]);
       const fields = exactDataObject(raw, [
-        "status", "controllerGeneration", "carrierGeneration", "connectorId",
+        "status", "controllerGeneration", "carrierAttemptGeneration",
+        "carrierGeneration", "connectorId",
       ]);
       if (fields.status !== "closed_and_drained"
         || counter(fields.controllerGeneration) !== record.controllerGeneration
+        || counter(fields.carrierAttemptGeneration) !== record.carrierAttemptGeneration
         || (fields.carrierGeneration === null
           ? null
           : carrierGeneration(fields.carrierGeneration)) !== record.carrierGeneration
@@ -726,6 +825,20 @@ implements RelayV2HostConnectorControllerPort {
       this.#drainPoisoned = true;
     });
     return record.drainPromise;
+  }
+
+  #fenceAttemptSynchronously(record: AttemptRecord, captured: CapturedAttemptPort): void {
+    if (record.synchronousFenceApplied) return;
+    if (record.carrierAttemptGeneration === null) throw failure("OPERATION_FAILED");
+    const input = Object.freeze({
+      controllerGeneration: record.controllerGeneration,
+      carrierAttemptGeneration: record.carrierAttemptGeneration,
+      carrierGeneration: record.carrierGeneration,
+      connectorId: record.connectorId,
+    });
+    const fenced = Reflect.apply(captured.fence, captured.receiver, [input]);
+    if (fenced !== true) throw failure("OPERATION_FAILED");
+    record.synchronousFenceApplied = true;
   }
 
   #parseStartInput(value: unknown): RelayV2HostConnectorControllerStartInput {

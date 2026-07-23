@@ -363,7 +363,6 @@ export type MobileRelayV2Connector =
 export type MobileRelayV2EnrollmentReview = {
   enrollment: {
     enrollmentId: string;
-    enrollmentCode: string;
     expiresAtMs: number;
   };
   display: {
@@ -372,6 +371,15 @@ export type MobileRelayV2EnrollmentReview = {
     hostId: string;
     deviceLabel: string | null;
   };
+  renderArtifact: {
+    kind: "native_qr_handle";
+    handle: string;
+    expiresAtMs: number;
+  };
+};
+
+export type MobileRelayV2ShowEnrollmentArtifactInput = {
+  handle: string;
 };
 
 export type MobileRelayV2Enrollment =

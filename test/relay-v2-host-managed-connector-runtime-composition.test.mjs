@@ -7,6 +7,7 @@ import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
+const broker = await import("../dist/relay/v2/brokerCore.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
 const credentialAuthorityModule = await import("../dist/relay/v2/hostCredentialAuthority.js");
@@ -445,10 +446,11 @@ async function createHarness(options = {}) {
   assert.notEqual(h1RecoveryCandidate, null);
 
   const records = [];
-  const transportLifecycleFactory = options.managedWss
+  const usesManagedWss = options.managedWss;
+  const transportLifecycleFactory = usesManagedWss
     ? null
     : createTransportLifecycleFactory(options, records);
-  const managedWssCredential = options.managedWss
+  const managedWssCredential = usesManagedWss
     ? createManagedWssCredentialAuthority()
     : null;
   const managedWssEffects = {
@@ -497,7 +499,7 @@ async function createHarness(options = {}) {
     idFactory: () => `managed-host-hello-${++helloSequence}`,
     clock: () => 1_783_700_100_000,
   };
-  composition = options.managedWss
+  if (composition === null) composition = options.managedWss
     ? await compositionModule.openRelayV2HostManagedWssConnectorRuntimeComposition({
       runtime: runtimeOptions,
       connector: {
@@ -822,7 +824,10 @@ test("managed WSS composition keeps construction inert and binds one credential 
       ]]);
       assert.equal(record.requestEnds, 1);
       assert.equal(record.requestDestroys, 0);
-      assert.deepEqual(record.hello.payload.capabilities, []);
+      assert.deepEqual(
+        record.hello.payload.capabilities,
+        [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+      );
       assert.deepEqual(record.hello.payload.clientDialects, ["tw-relay.v2"]);
       assert.deepEqual(h.composition.inspect(), {
         status: "registered_incomplete",
@@ -916,7 +921,10 @@ test("exact current Dashboard management port is claimed once through the protoc
         negotiatedCapabilityIntersection: [],
       });
     }
-    assert.deepEqual(record.hello.payload.capabilities, []);
+    assert.deepEqual(
+      record.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
     assert.equal(
       record.sent.some(({ bytes }) => decodeCarrier(bytes).type === "host.reauthenticate"),
       false,
@@ -1219,7 +1227,7 @@ test("managed WSS composition rejects malformed or foreign ownership input befor
   });
 });
 
-test("managed composition bridges the exact actor route and projects empty capability registration", async () => {
+test("managed composition advertises the atomic full offer and becomes ready only after registration", async () => {
   const h = await createHarness();
   try {
     const { result, record } = await startRegistered(h);
@@ -1229,7 +1237,10 @@ test("managed composition bridges the exact actor route and projects empty capab
     assert.equal(record.input.credentialReference, CREDENTIAL_REFERENCE);
     assert.equal(record.input.onCarrierStatus, undefined);
     assert.equal(record.input.actor, undefined);
-    assert.deepEqual(record.hello.payload.capabilities, []);
+    assert.deepEqual(
+      record.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
     assert.deepEqual(record.hello.payload.clientDialects, ["tw-relay.v2"]);
     assert.equal(result.connectorId, `managed-connector-${record.sequence}`);
     assert.deepEqual(h.composition.inspect(), {
@@ -1261,6 +1272,39 @@ test("managed composition bridges the exact actor route and projects empty capab
     assert.equal(frames.length, 2);
     assert.equal(frames[1].type, "command.statuses");
     assert.equal(frames[1].requestId, query.requestId);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("managed withdrawal fences a consumed offer and recovery requires new generations", async () => {
+  const h = await createHarness();
+  try {
+    const first = await startRegistered(h, "managed.offer.first");
+    assert.deepEqual(
+      first.record.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
+    assert.equal(readinessReady(h.composition.readiness.current()), true);
+
+    h.composition.readiness.h0.close();
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
+    assert.deepEqual(first.record.transport.closes, [{ code: 1000, reason: "host_shutdown" }]);
+    assert.equal(h.composition.inspect().status, "failed");
+    await settle();
+    assert.equal(first.record.drainCalls, 1);
+
+    assert.equal(await h.composition.readiness.h0.activate(), true);
+    const second = await startRegistered(h, "managed.offer.second");
+    assert.notEqual(
+      second.result.controllerGeneration,
+      first.result.controllerGeneration,
+    );
+    assert.deepEqual(
+      second.record.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
+    assert.equal(readinessReady(h.composition.readiness.current()), true);
   } finally {
     await h.cleanup();
   }

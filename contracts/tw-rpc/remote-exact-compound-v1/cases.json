@@ -1,0 +1,160 @@
+{
+  "helloLocal": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "hello",
+      "processTarget": {
+        "kind": "local",
+        "targetId": "local"
+      }
+    },
+    "response": {
+      "protocolVersion": 1,
+      "ok": true,
+      "result": {
+        "processTarget": {
+          "kind": "local",
+          "targetId": "local"
+        }
+      }
+    },
+    "note": "Preflight validates the existing daemon and exact local process-target view without creating a claim or lease."
+  },
+  "prepareLocal": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "prepare",
+      "processTarget": {
+        "kind": "local",
+        "targetId": "local"
+      },
+      "owner": {
+        "kind": "relay-v2",
+        "instanceId": "relay-v2-host-instance"
+      },
+      "input": {
+        "schemaVersion": 1,
+        "hostId": "host-1",
+        "scopeId": "scope-local",
+        "sessionId": "session-local",
+        "pane": 0,
+        "processTarget": {
+          "kind": "local",
+          "targetId": "local"
+        },
+        "backendInstanceKey": "twbk2.STiw976W4mORfg2v6guZnWAi6Y8UIpvgvC5sv_CKzNE",
+        "managedTarget": {
+          "name": "managed-local-session",
+          "kind": "worktree",
+          "incarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      }
+    },
+    "note": "Local preparation uses the same daemon-owned exact claim lifecycle; it is never a fallback from SSH."
+  },
+  "prepare": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "prepare",
+      "processTarget": {
+        "kind": "ssh",
+        "targetId": "twcfg2.example-opaque-target"
+      },
+      "owner": {
+        "kind": "relay-v2",
+        "instanceId": "relay-v2-host-instance"
+      },
+      "input": {
+        "schemaVersion": 1,
+        "hostId": "host-1",
+        "scopeId": "scope-1",
+        "sessionId": "session-1",
+        "pane": 0,
+        "processTarget": {
+          "kind": "ssh",
+          "targetId": "twcfg2.example-opaque-target"
+        },
+        "backendInstanceKey": "twbk2.XBRN_0PoVEo1TIloDPFiEw03mHFyOMUmzODNnH-r2xk",
+        "managedTarget": {
+          "name": "managed-session",
+          "kind": "worktree",
+          "incarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      }
+    },
+    "response": {
+      "protocolVersion": 1,
+      "ok": true,
+      "result": {
+        "exactControlIdentity": {
+          "schemaVersion": 1,
+          "controlTargetId": "opaque-control-target",
+          "controlEpoch": "opaque-control-epoch",
+          "targetIncarnationProof": "twct2.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        }
+      }
+    },
+    "note": "No process-local claim, preparation id, credential, or reusable acquire capability is serialized."
+  },
+  "admit": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "admit",
+      "owner": {
+        "kind": "relay-v2",
+        "instanceId": "relay-v2-command-or-stream-owner"
+      }
+    },
+    "note": "This frame is valid only on the same live child that accepted prepare."
+  },
+  "effect": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "effect",
+      "request": {
+        "type": "input.agent-message",
+        "lease": {
+          "controlTargetId": "opaque-control-target",
+          "controlEpoch": "opaque-control-epoch",
+          "leaseId": "opaque-lease",
+          "fence": "1",
+          "owner": {
+            "kind": "relay-v2",
+            "instanceId": "relay-v2-command-or-stream-owner"
+          },
+          "expiresAt": "2026-07-22T00:01:00.000Z"
+        },
+        "operationId": "twmsg2.fixture-operation",
+        "pane": "0",
+        "message": "continue",
+        "submit": true
+      }
+    }
+  },
+  "release": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "effect",
+      "request": {
+        "type": "lease.release",
+        "lease": {
+          "controlTargetId": "opaque-control-target",
+          "controlEpoch": "opaque-control-epoch",
+          "leaseId": "opaque-lease",
+          "fence": "1",
+          "owner": {
+            "kind": "relay-v2",
+            "instanceId": "relay-v2-command-or-stream-owner"
+          },
+          "expiresAt": "2026-07-22T00:01:00.000Z"
+        }
+      }
+    }
+  },
+  "rollback": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "rollback"
+    }
+  }
+}

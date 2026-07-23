@@ -21,6 +21,7 @@ import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -51,6 +52,136 @@ import com.tmuxworktree.mobile.designsystem.TwOnAccent
 import com.tmuxworktree.mobile.designsystem.TwSurface
 import com.tmuxworktree.mobile.designsystem.TwTextPrimary
 import com.tmuxworktree.mobile.designsystem.TwTextSecondary
+
+@Composable
+internal fun RelayV2EnrollmentReviewScreen(
+    issuerUrl: String,
+    relayUrl: String,
+    hostId: String,
+    enrollmentId: String,
+    submitting: Boolean,
+    completed: Boolean,
+    activating: Boolean,
+    activationFailureMessage: String?,
+    failureMessage: String?,
+    onConfirm: () -> Unit,
+    onActivate: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 32.dp)
+            .testTag("relay_v2_enrollment_review"),
+    ) {
+        Text(
+            text = when {
+                activationFailureMessage != null -> "Enrollment saved; connection not started"
+                completed -> "Enrollment saved"
+                submitting -> "Confirming enrollment…"
+                failureMessage != null -> "Enrollment not completed"
+                else -> "Review Relay v2 enrollment"
+            },
+            color = TwTextPrimary,
+            style = MaterialTheme.typography.headlineMedium,
+            modifier = Modifier.semantics { heading() },
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = when {
+                completed -> activationFailureMessage
+                    ?: "The credential is saved with Android Keystore. Connect when ready."
+                failureMessage != null -> failureMessage
+                else -> "Confirm these endpoints and computer identity before redeeming the one-time enrollment."
+            },
+            color = if (failureMessage != null || activationFailureMessage != null) {
+                TwError
+            } else {
+                TwTextSecondary
+            },
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Spacer(Modifier.height(28.dp))
+        EnrollmentReviewFact("Issuer", issuerUrl)
+        EnrollmentReviewFact("Relay", relayUrl)
+        EnrollmentReviewFact("Computer", hostId)
+        EnrollmentReviewFact("Enrollment", enrollmentId)
+
+        if (submitting || activating) {
+            Spacer(Modifier.height(20.dp))
+            CircularProgressIndicator(
+                color = TwAccent,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            )
+        } else if (completed) {
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = onActivate,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = TwAccent,
+                    contentColor = TwOnAccent,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .testTag("relay_v2_enrollment_activate"),
+            ) {
+                Text("Connect with Relay v2")
+            }
+        } else if (failureMessage == null) {
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = onConfirm,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = TwAccent,
+                    contentColor = TwOnAccent,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .testTag("relay_v2_enrollment_confirm"),
+            ) {
+                Text("Confirm enrollment")
+            }
+        }
+
+        if (
+            !submitting &&
+            !activating &&
+            (!completed || activationFailureMessage != null)
+        ) {
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = onCancel,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .testTag("relay_v2_enrollment_cancel"),
+            ) {
+                Text(
+                    if (failureMessage == null && activationFailureMessage == null) {
+                        "Cancel"
+                    } else {
+                        "Dismiss"
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EnrollmentReviewFact(label: String, value: String) {
+    Text(label, color = TwTextSecondary, style = MaterialTheme.typography.labelLarge)
+    Spacer(Modifier.height(4.dp))
+    Text(value, color = TwTextPrimary, style = MaterialTheme.typography.bodyLarge)
+    Spacer(Modifier.height(16.dp))
+}
 
 @Composable
 fun PairingScreen(

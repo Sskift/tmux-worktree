@@ -107,6 +107,9 @@ interface RelayV2BrokerHostWssOwnerSession {
 /** Type-only binding; the live instance never crosses the safe facade claim. */
 export interface RelayV2BrokerHostWssRuntimeOwnerBinding {
   credentialAdmissionOpen(): boolean;
+  inspectHostAdmission(
+    authContext: RelayV2BrokerConnectionAuthorization,
+  ): Readonly<{ outcome: "accept" } | { outcome: "reject"; status: 401 | 403 | 503 }>;
   createSession(input: Readonly<{
     producerPort: RelayV2BrokerProducerPort;
     close(code: number, reason: string): unknown;
@@ -121,7 +124,7 @@ export interface RelayV2BrokerHostWssAdmissionReceipt {
 
 export type RelayV2BrokerHostWssPrepareResult = Readonly<
   | { outcome: "accept"; receipt: RelayV2BrokerHostWssAdmissionReceipt }
-  | { outcome: "reject"; status: 503 }
+  | { outcome: "reject"; status: 401 | 403 | 503 }
 >;
 
 export interface RelayV2BrokerHostWssConnectionHandle {
@@ -879,6 +882,19 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     }
   }
 
+  private inspectHostAdmission(
+    authContext: RelayV2BrokerConnectionAuthorization,
+  ): Readonly<{ outcome: "accept" } | { outcome: "reject"; status: 401 | 403 | 503 }> {
+    try {
+      const result = this.ownerBinding.inspectHostAdmission(authContext);
+      if (result.outcome === "accept") return Object.freeze({ outcome: "accept" });
+      if ([401, 403, 503].includes(result.status)) {
+        return Object.freeze({ outcome: "reject", status: result.status });
+      }
+    } catch {}
+    return Object.freeze({ outcome: "reject", status: 503 });
+  }
+
   prepareHostWss(input: Readonly<{
     trustedAuthContext: RelayV2BrokerConnectionAuthorization;
   }>): RelayV2BrokerHostWssPrepareResult {
@@ -888,6 +904,11 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     const values = ownDataValues(input, PREPARE_KEYS);
     const authContext = values ? captureAuthorization(values.trustedAuthContext) : null;
     if (!authContext || !this.admissionOpen || !this.credentialAdmissionOpen()) {
+      return Object.freeze({ outcome: "reject", status: 503 });
+    }
+    const admission = this.inspectHostAdmission(authContext);
+    if (admission.outcome === "reject") return admission;
+    if (!this.admissionOpen || !this.credentialAdmissionOpen()) {
       return Object.freeze({ outcome: "reject", status: 503 });
     }
     const receipt = Object.freeze(Object.create(null)) as RelayV2BrokerHostWssAdmissionReceipt;

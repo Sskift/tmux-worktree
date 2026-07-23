@@ -209,6 +209,12 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     );
   }, [backend, run, state.knownClientGrant]);
 
+  const showEnrollmentArtifact = useCallback((handle: string) => {
+    void backend.relay.v2.showEnrollmentArtifact({ handle }).catch(() => {
+      observerRef.current?.refresh();
+    });
+  }, [backend]);
+
   return {
     state,
     loaded,
@@ -218,6 +224,7 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     startConnector,
     stopConnector,
     createEnrollment,
+    showEnrollmentArtifact,
     revokeKnownGrant,
   };
 }

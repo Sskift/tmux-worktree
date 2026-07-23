@@ -1,6 +1,8 @@
 import { types as nodeTypes } from "node:util";
 import {
   RelayV2HostCarrierActor,
+  matchesRelayV2HostPreCarrierOfferClaim,
+  releaseRelayV2HostPreCarrierOfferClaim,
   type RelayV2HostCarrierConnection,
   type RelayV2HostCarrierStatus,
   type RelayV2HostCarrierTransport,
@@ -10,8 +12,16 @@ import type {
   RelayV2HostConnectorAttemptDrainInput,
   RelayV2HostConnectorAttemptFactoryPort,
   RelayV2HostConnectorAttemptPort,
+  RelayV2HostConnectorAttemptCapabilityFence,
+  RelayV2HostConnectorAttemptPreparedBinding,
   RelayV2HostConnectorAttemptStartInput,
 } from "./hostConnectorController.js";
+import type {
+  RelayV2HostPreCarrierOfferBinding,
+  RelayV2HostPreCarrierOfferClaim,
+  RelayV2HostPreCarrierOfferFence,
+  RelayV2HostPreCarrierOfferIssuerPort,
+} from "./hostCapabilityReadiness.js";
 import {
   RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE,
 } from "./hostCredentialAuthority.js";
@@ -26,7 +36,11 @@ type MaybePromise<T> = T | Promise<T>;
 type DataRecord = Record<string, unknown>;
 
 export interface RelayV2HostConnectorCarrierAttemptFactoryInput
-extends RelayV2HostConnectorAttemptStartInput {}
+extends Omit<RelayV2HostConnectorAttemptStartInput,
+"onCarrierAttemptPrepared" | "onCarrierAttemptFenced"> {
+  readonly carrierAttemptGeneration: string;
+  readonly preCarrierOfferClaim?: RelayV2HostPreCarrierOfferClaim;
+}
 
 export interface RelayV2HostConnectorCarrierAttemptFactoryResult {
   readonly actor: RelayV2HostCarrierActor;
@@ -50,11 +64,17 @@ export interface RelayV2HostConnectorCarrierAttemptDrainHandleOptions {
 
 export interface RelayV2HostConnectorCarrierAttemptAdapterOptions {
   readonly factory: RelayV2HostConnectorCarrierAttemptFactoryPort;
+  readonly preCarrierOfferIssuer?: RelayV2HostPreCarrierOfferIssuerPort;
 }
 
 interface CapturedFactory {
   readonly receiver: object;
   readonly createAttempt: RelayV2HostConnectorCarrierAttemptFactoryPort["createAttempt"];
+}
+
+interface CapturedPreCarrierOfferIssuer {
+  readonly receiver: object;
+  readonly issuePreCarrierOffer: RelayV2HostPreCarrierOfferIssuerPort["issuePreCarrierOffer"];
 }
 
 interface CapturedTransport {
@@ -179,6 +199,17 @@ function captureFactory(value: unknown): CapturedFactory {
   });
 }
 
+function capturePreCarrierOfferIssuer(value: unknown): CapturedPreCarrierOfferIssuer {
+  if (!isObject(value)) throw failure();
+  return Object.freeze({
+    receiver: value,
+    issuePreCarrierOffer: captureMethod(
+      value,
+      "issuePreCarrierOffer",
+    ) as RelayV2HostPreCarrierOfferIssuerPort["issuePreCarrierOffer"],
+  });
+}
+
 function captureTransport(value: unknown): CapturedTransport {
   if (!isObject(value)) throw failure();
   return Object.freeze({
@@ -297,15 +328,17 @@ function createCallbackFence(
 
 function drainInput(value: unknown): RelayV2HostConnectorAttemptDrainInput {
   const fields = exactDataObject(value, [
-    "controllerGeneration", "carrierGeneration", "connectorId",
+    "controllerGeneration", "carrierAttemptGeneration", "carrierGeneration", "connectorId",
   ]);
   const controllerGeneration = counter(fields.controllerGeneration);
+  const carrierAttemptGeneration = counter(fields.carrierAttemptGeneration);
   const generation = fields.carrierGeneration;
   if (generation !== null
     && (!Number.isSafeInteger(generation) || (generation as number) <= 0)) throw failure();
   const connectorId = fields.connectorId === null ? null : identifier(fields.connectorId);
   return Object.freeze({
     controllerGeneration,
+    carrierAttemptGeneration,
     carrierGeneration: generation as number | null,
     connectorId,
   });
@@ -408,16 +441,19 @@ export class RelayV2HostConnectorCarrierAttemptAdapterError extends Error {
 
 class CanonicalAttempt implements RelayV2HostConnectorAttemptPort {
   readonly #controllerGeneration: string;
+  readonly #carrierAttemptGeneration: string;
   readonly #carrierGeneration: number;
   readonly #actor: RelayV2HostCarrierActor;
   readonly #transport: RelayV2HostCarrierTransport;
   readonly #gate: TransportGate;
   readonly #drainHandle: RelayV2HostConnectorCarrierAttemptDrainHandle;
   readonly #fence: CallbackFence;
+  #fenced = false;
   #disposePromise: Promise<RelayV2HostConnectorAttemptDrainEvidence> | null = null;
 
   constructor(input: Readonly<{
     controllerGeneration: string;
+    carrierAttemptGeneration: string;
     carrierGeneration: number;
     actor: RelayV2HostCarrierActor;
     transport: RelayV2HostCarrierTransport;
@@ -426,6 +462,7 @@ class CanonicalAttempt implements RelayV2HostConnectorAttemptPort {
     fence: CallbackFence;
   }>) {
     this.#controllerGeneration = input.controllerGeneration;
+    this.#carrierAttemptGeneration = input.carrierAttemptGeneration;
     this.#carrierGeneration = input.carrierGeneration;
     this.#actor = input.actor;
     this.#transport = input.transport;
@@ -434,30 +471,52 @@ class CanonicalAttempt implements RelayV2HostConnectorAttemptPort {
     this.#fence = input.fence;
   }
 
+  readonly fence = (
+    rawInput: Readonly<RelayV2HostConnectorAttemptDrainInput>,
+  ): boolean => {
+    let parsed: RelayV2HostConnectorAttemptDrainInput;
+    try {
+      parsed = drainInput(rawInput);
+    } catch {
+      this.#fenceAttempt();
+      return false;
+    }
+    const exact = parsed.controllerGeneration === this.#controllerGeneration
+      && parsed.carrierAttemptGeneration === this.#carrierAttemptGeneration
+      && (parsed.carrierGeneration === null
+        || parsed.carrierGeneration === this.#carrierGeneration);
+    this.#fenceAttempt();
+    return exact;
+  };
+
+  #fenceAttempt(): void {
+    if (this.#fenced) return;
+    this.#fenced = true;
+    this.#fence.fence();
+    this.#gate.close(1000, "host_shutdown");
+    try {
+      Reflect.apply(RelayV2HostCarrierActor.prototype.dispose, this.#actor, []);
+    } catch {}
+  }
+
   readonly disposeAndDrain = (
     rawInput: Readonly<RelayV2HostConnectorAttemptDrainInput>,
   ): Promise<RelayV2HostConnectorAttemptDrainEvidence> => {
     if (this.#disposePromise !== null) return this.#disposePromise;
 
-    // Fence before parsing caller data or invoking either lifecycle owner.
-    this.#fence.fence();
+    // Fence admission, transport, status, and routes before asynchronous drain.
     let parsed: RelayV2HostConnectorAttemptDrainInput | null = null;
     let invalid = false;
     try {
       parsed = drainInput(rawInput);
       if (parsed.controllerGeneration !== this.#controllerGeneration
+        || parsed.carrierAttemptGeneration !== this.#carrierAttemptGeneration
         || (parsed.carrierGeneration !== null
           && parsed.carrierGeneration !== this.#carrierGeneration)) invalid = true;
     } catch {
       invalid = true;
     }
-
-    try {
-      Reflect.apply(RelayV2HostCarrierActor.prototype.dispose, this.#actor, []);
-    } catch {
-      invalid = true;
-    }
-    this.#gate.close(1000, "host_shutdown");
+    this.#fenceAttempt();
     const drain = RelayV2HostConnectorCarrierAttemptDrainHandle.drain(
       drainHandleAdapterKey,
       this.#drainHandle,
@@ -469,6 +528,7 @@ class CanonicalAttempt implements RelayV2HostConnectorAttemptPort {
       return Object.freeze({
         status: "closed_and_drained" as const,
         controllerGeneration: parsed.controllerGeneration,
+        carrierAttemptGeneration: parsed.carrierAttemptGeneration,
         carrierGeneration: parsed.carrierGeneration,
         connectorId: parsed.connectorId,
       });
@@ -488,11 +548,18 @@ class CanonicalAttempt implements RelayV2HostConnectorAttemptPort {
 export class RelayV2HostConnectorCarrierAttemptAdapter
 implements RelayV2HostConnectorAttemptFactoryPort {
   readonly #factory: CapturedFactory;
+  readonly #preCarrierOfferIssuer: CapturedPreCarrierOfferIssuer | null;
   #lastControllerGeneration = 0n;
+  #lastCarrierAttemptGeneration = 0n;
 
   constructor(options: RelayV2HostConnectorCarrierAttemptAdapterOptions) {
-    const fields = exactDataObject(options, ["factory"]);
+    const fields = exactDataObject(options, Object.hasOwn(options, "preCarrierOfferIssuer")
+      ? ["factory", "preCarrierOfferIssuer"]
+      : ["factory"]);
     this.#factory = captureFactory(fields.factory);
+    this.#preCarrierOfferIssuer = Object.hasOwn(fields, "preCarrierOfferIssuer")
+      ? capturePreCarrierOfferIssuer(fields.preCarrierOfferIssuer)
+      : null;
   }
 
   readonly startAttempt = async (
@@ -509,6 +576,8 @@ implements RelayV2HostConnectorAttemptFactoryPort {
         "credentialReference",
         "signal",
         "onCarrierStatus",
+        "onCarrierAttemptPrepared",
+        "onCarrierAttemptFenced",
       ]);
     } catch {
       throw failure();
@@ -519,17 +588,134 @@ implements RelayV2HostConnectorAttemptFactoryPort {
     const hostEpoch = identifier(fields.hostEpoch);
     const hostInstanceId = identifier(fields.hostInstanceId);
     const exactCredentialReference = credentialReference(fields.credentialReference);
-    if (!(fields.signal instanceof AbortSignal) || typeof fields.onCarrierStatus !== "function") {
+    if (!(fields.signal instanceof AbortSignal)
+      || typeof fields.onCarrierStatus !== "function"
+      || typeof fields.onCarrierAttemptPrepared !== "function"
+      || typeof fields.onCarrierAttemptFenced !== "function") {
       throw failure();
     }
     const numericGeneration = BigInt(controllerGeneration);
     if (numericGeneration <= this.#lastControllerGeneration) throw failure();
     this.#lastControllerGeneration = numericGeneration;
+    if (this.#lastCarrierAttemptGeneration === MAX_COUNTER) throw failure();
+    this.#lastCarrierAttemptGeneration += 1n;
+    const carrierAttemptGeneration = this.#lastCarrierAttemptGeneration.toString(10);
 
     const forward = fields.onCarrierStatus as (
       status: Readonly<RelayV2HostCarrierStatus>,
     ) => void;
     const fence = createCallbackFence(forward);
+    const preparedBinding: RelayV2HostConnectorAttemptPreparedBinding = Object.freeze({
+      controllerGeneration,
+      carrierAttemptGeneration,
+    });
+    const notifyPrepared = fields.onCarrierAttemptPrepared as (
+      binding: Readonly<RelayV2HostConnectorAttemptPreparedBinding>,
+    ) => void;
+    const notifyCapabilityFence = fields.onCarrierAttemptFenced as (
+      binding: Readonly<RelayV2HostConnectorAttemptCapabilityFence>,
+    ) => void;
+
+    let boundOffer: Readonly<RelayV2HostPreCarrierOfferBinding> | null = null;
+    let capabilityFenceNotified = false;
+    let lifecycleFenced = false;
+    let actor: RelayV2HostCarrierActor | null = null;
+    let transport: RelayV2HostCarrierTransport | null = null;
+    let capturedTransport: CapturedTransport | null = null;
+    let gate: TransportGate | null = null;
+    let drainHandle: RelayV2HostConnectorCarrierAttemptDrainHandle | null = null;
+    let earlyDrain: Promise<void> | null = null;
+
+    const beginDrain = (): Promise<void> | null => {
+      if (earlyDrain !== null) return earlyDrain;
+      if (drainHandle === null || transport === null) return null;
+      earlyDrain = RelayV2HostConnectorCarrierAttemptDrainHandle.drain(
+        drainHandleAdapterKey,
+        drainHandle,
+        transport,
+      );
+      ignorePromiseRejection(earlyDrain);
+      return earlyDrain;
+    };
+    const fenceAttachedAttempt = (): void => {
+      if (!lifecycleFenced) lifecycleFenced = true;
+      fence.fence();
+      gate?.close(1000, "host_shutdown");
+      if (actor !== null) {
+        try { Reflect.apply(RelayV2HostCarrierActor.prototype.dispose, actor, []); } catch {}
+      }
+    };
+    const parseOfferBinding = (value: unknown): RelayV2HostPreCarrierOfferBinding | null => {
+      try {
+        const binding = exactDataObject(value, [
+          "controllerGeneration", "carrierAttemptGeneration", "offerGeneration",
+        ]);
+        const parsed = Object.freeze({
+          controllerGeneration: counter(binding.controllerGeneration),
+          carrierAttemptGeneration: counter(binding.carrierAttemptGeneration),
+          offerGeneration: counter(binding.offerGeneration),
+        });
+        return parsed.controllerGeneration === controllerGeneration
+          && parsed.carrierAttemptGeneration === carrierAttemptGeneration
+          ? parsed
+          : null;
+      } catch {
+        return null;
+      }
+    };
+    const preCarrierOfferFence: RelayV2HostPreCarrierOfferFence = Object.freeze({
+      bind(value: Readonly<RelayV2HostPreCarrierOfferBinding>): boolean {
+        const binding = parseOfferBinding(value);
+        if (binding === null || lifecycleFenced || boundOffer !== null) return false;
+        boundOffer = binding;
+        return true;
+      },
+      fence(value: Readonly<RelayV2HostPreCarrierOfferBinding>): void {
+        const binding = parseOfferBinding(value);
+        if (binding === null || boundOffer === null
+          || binding.offerGeneration !== boundOffer.offerGeneration) {
+          fenceAttachedAttempt();
+          void beginDrain();
+          return;
+        }
+        fenceAttachedAttempt();
+        if (!capabilityFenceNotified) {
+          capabilityFenceNotified = true;
+          try {
+            notifyCapabilityFence(Object.freeze({
+              reason: "capability_withdrawn",
+              ...binding,
+            }));
+          } catch {}
+        }
+        void beginDrain();
+      },
+    });
+
+    try {
+      notifyPrepared(preparedBinding);
+    } catch {
+      fenceAttachedAttempt();
+      throw failure();
+    }
+    let preCarrierOfferClaim: RelayV2HostPreCarrierOfferClaim | null = null;
+    if (this.#preCarrierOfferIssuer !== null) {
+      try {
+        const candidate = Reflect.apply(
+          this.#preCarrierOfferIssuer.issuePreCarrierOffer,
+          this.#preCarrierOfferIssuer.receiver,
+          [Object.freeze({ ...preparedBinding, fence: preCarrierOfferFence })],
+        );
+        if (candidate !== null
+          && !matchesRelayV2HostPreCarrierOfferClaim(candidate, preparedBinding)) {
+          throw failure();
+        }
+        preCarrierOfferClaim = candidate;
+      } catch {
+        fenceAttachedAttempt();
+        throw failure();
+      }
+    }
     const factoryInput = Object.freeze({
       requestId,
       controllerGeneration,
@@ -539,13 +725,9 @@ implements RelayV2HostConnectorAttemptFactoryPort {
       credentialReference: exactCredentialReference,
       signal: fields.signal as AbortSignal,
       onCarrierStatus: fence.callback,
+      carrierAttemptGeneration,
+      preCarrierOfferClaim: preCarrierOfferClaim ?? undefined,
     });
-
-    let actor: RelayV2HostCarrierActor | null = null;
-    let transport: RelayV2HostCarrierTransport | null = null;
-    let capturedTransport: CapturedTransport | null = null;
-    let gate: TransportGate | null = null;
-    let drainHandle: RelayV2HostConnectorCarrierAttemptDrainHandle | null = null;
 
     try {
       const pendingResult = Reflect.apply(
@@ -567,6 +749,9 @@ implements RelayV2HostConnectorAttemptFactoryPort {
         hostId,
         hostEpoch,
         hostInstanceId,
+        controllerGeneration,
+        carrierAttemptGeneration,
+        preCarrierOfferClaim,
         onCarrierStatus: fence.callback,
       })) throw failure();
       if (Reflect.apply(RelayV2HostCarrierActor.prototype.status, actor, []) !== null) {
@@ -580,6 +765,11 @@ implements RelayV2HostConnectorAttemptFactoryPort {
         throw failure();
       }
       fence.attach(actor);
+      if (lifecycleFenced) {
+        fenceAttachedAttempt();
+        await beginDrain();
+        throw failure();
+      }
 
       const connection = Reflect.apply(RelayV2HostCarrierActor.prototype.connect, actor, [
         gate.facade,
@@ -595,9 +785,15 @@ implements RelayV2HostConnectorAttemptFactoryPort {
         connection,
       );
       if (fence.failed()) throw failure();
+      if (lifecycleFenced) {
+        fenceAttachedAttempt();
+        await beginDrain();
+        throw failure();
+      }
 
       return Object.freeze(new CanonicalAttempt({
         controllerGeneration,
+        carrierAttemptGeneration,
         carrierGeneration: connection.generation,
         actor,
         transport,
@@ -612,6 +808,9 @@ implements RelayV2HostConnectorAttemptFactoryPort {
           hostId,
           hostEpoch,
           hostInstanceId,
+          controllerGeneration,
+          carrierAttemptGeneration,
+          preCarrierOfferClaim,
           onCarrierStatus: fence.callback,
         })) {
         try { Reflect.apply(RelayV2HostCarrierActor.prototype.dispose, actor, []); } catch {}
@@ -619,13 +818,10 @@ implements RelayV2HostConnectorAttemptFactoryPort {
       gate?.close(1000, "host_shutdown");
       if (drainHandle !== null && transport !== null) {
         try {
-          await RelayV2HostConnectorCarrierAttemptDrainHandle.drain(
-            drainHandleAdapterKey,
-            drainHandle,
-            transport,
-          );
+          await (beginDrain() ?? Promise.resolve());
         } catch {}
       }
+      releaseRelayV2HostPreCarrierOfferClaim(preCarrierOfferClaim);
       throw failure();
     }
   };

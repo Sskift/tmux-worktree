@@ -105,6 +105,127 @@ class OkHttpRelayV2CredentialExchangeTest {
     }
 
     @Test
+    fun `self revoke uses one strict handoff-aware HTTPS attempt`() = runBlocking {
+        data class Scenario(
+            val name: String,
+            val response: MockResponse,
+            val expected: RelayV2SelfRevokeExchangeResult,
+        )
+
+        RelayV2TlsMockServer().use { tls ->
+            val inheritedInterceptorCalls = AtomicInteger()
+            val inheritedAuthenticatorCalls = AtomicInteger()
+            val injected = tls.client.newBuilder()
+                .addInterceptor { chain ->
+                    inheritedInterceptorCalls.incrementAndGet()
+                    chain.proceed(chain.request())
+                }
+                .authenticator(Authenticator { _, _ ->
+                    inheritedAuthenticatorCalls.incrementAndGet()
+                    null
+                })
+                .build()
+            val exchange = OkHttpRelayV2CredentialExchange(injected)
+            val request = RelayV2SelfRevokeRequest(tls.issuerUrl, ACCESS_TOKEN_1)
+
+            val callbackFailure = runCatching {
+                exchange.revoke(request) {
+                    error("handoff failed for $ACCESS_TOKEN_1")
+                }
+            }.exceptionOrNull() ?: error("Handoff failure unexpectedly enqueued")
+            assertTrue(callbackFailure is RelayV2CredentialExchangeException)
+            assertEquals(
+                RelayV2CredentialExchangeFailureKind.CONFIGURATION,
+                (callbackFailure as RelayV2CredentialExchangeException).kind,
+            )
+            assertSecretsRedacted(callbackFailure)
+            assertEquals(0, tls.server.requestCount)
+
+            val scenarios = listOf(
+                Scenario(
+                    "confirmed",
+                    jsonResponse(
+                        """{"grantId":"$GRANT_ID","revokedAtMs":1783700200000,"alreadyRevoked":false}""",
+                    ),
+                    RelayV2SelfRevokeExchangeResult.Confirmed(
+                        grantId = GRANT_ID,
+                        revokedAtMs = 1_783_700_200_000,
+                        alreadyRevoked = false,
+                    ),
+                ),
+                Scenario(
+                    "unauthorized",
+                    jsonResponse(errorBody("AUTH_INVALID", "Credential is invalid"), 401),
+                    RelayV2SelfRevokeExchangeResult.MayHaveCommitted,
+                ),
+                Scenario(
+                    "accepted-but-not-committed",
+                    jsonResponse(
+                        """{"grantId":"$GRANT_ID","revokedAtMs":1783700200000,"alreadyRevoked":false}""",
+                        202,
+                    ),
+                    RelayV2SelfRevokeExchangeResult.MayHaveCommitted,
+                ),
+                Scenario(
+                    "malformed-success",
+                    jsonResponse("""{"unexpected":"$ACCESS_TOKEN_1"}"""),
+                    RelayV2SelfRevokeExchangeResult.MayHaveCommitted,
+                ),
+                Scenario(
+                    "oversized-success",
+                    jsonResponse("x".repeat(RelayV2Codec.HTTPS_BODY_BYTES + 1)),
+                    RelayV2SelfRevokeExchangeResult.MayHaveCommitted,
+                ),
+                Scenario(
+                    "forbidden",
+                    jsonResponse(errorBody("PERMISSION_DENIED", "Forbidden"), 403),
+                    RelayV2SelfRevokeExchangeResult.Rejected(
+                        RelayV2SelfRevokeFailureCode.FORBIDDEN,
+                    ),
+                ),
+            )
+            scenarios.forEach { scenario ->
+                tls.server.enqueue(scenario.response)
+                val handoffs = AtomicInteger()
+                val result = exchange.revoke(request) { handoffs.incrementAndGet() }
+                assertEquals("${scenario.name} handoff", 1, handoffs.get())
+                assertEquals(scenario.name, scenario.expected, result)
+                assertFalse(result.toString().contains(ACCESS_TOKEN_1))
+
+                val recorded = tls.recordedRequest()
+                assertEquals("POST", recorded.method)
+                assertEquals("/v2/grants/self/revoke", recorded.requestUrl?.encodedPath)
+                assertNull(recorded.requestUrl?.encodedQuery)
+                assertEquals("Bearer $ACCESS_TOKEN_1", recorded.getHeader("Authorization"))
+                assertEquals("no-store", recorded.getHeader("Cache-Control"))
+                assertEquals("identity", recorded.getHeader("Accept-Encoding"))
+                assertTrue(recorded.getHeader("Content-Type")?.startsWith("application/json") == true)
+                assertTrue(recorded.requestLine.endsWith(" HTTP/1.1"))
+                assertEquals("""{"reason":"user_revoked"}""", recorded.body.readUtf8())
+            }
+            assertEquals(0, inheritedInterceptorCalls.get())
+            assertEquals(0, inheritedAuthenticatorCalls.get())
+            assertFalse(request.toString().contains(ACCESS_TOKEN_1))
+        }
+
+        val networkTls = RelayV2TlsMockServer()
+        val networkIssuerUrl = networkTls.issuerUrl
+        val networkExchange = OkHttpRelayV2CredentialExchange(networkTls.client)
+        networkTls.server.shutdown()
+        try {
+            val handoffs = AtomicInteger()
+            val result = networkExchange.revoke(
+                RelayV2SelfRevokeRequest(networkIssuerUrl, ACCESS_TOKEN_1),
+            ) { handoffs.incrementAndGet() }
+            assertEquals(1, handoffs.get())
+            assertEquals(RelayV2SelfRevokeExchangeResult.MayHaveCommitted, result)
+        } finally {
+            networkTls.client.dispatcher.executorService.shutdownNow()
+            networkTls.client.connectionPool.evictAll()
+        }
+    }
+
+    @Test
     fun `HTTP auth and server failures expose only closed diagnostics`() = runBlocking {
         RelayV2TlsMockServer().use { tls ->
             val leakedMessage = "$ENROLLMENT_CODE $ACCESS_TOKEN_1 $REFRESH_TOKEN_1"

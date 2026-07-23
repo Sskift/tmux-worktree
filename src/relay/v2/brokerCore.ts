@@ -2,6 +2,11 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { RelayV2AuthContext } from "./auth.js";
 import { RELAY_V2_CARRIER_ROUTE_HARD_LIMIT } from "./carrierLimits.js";
 import {
+  decodeRelayAgentTranscriptLifecycleFrame,
+  encodeRelayAgentTranscriptLifecycleFrame,
+  RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+} from "../extensions/agentTranscriptLifecycle/v1/codec.js";
+import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
   RELAY_V2_CARRIER_FRAME_BYTES,
@@ -17,6 +22,10 @@ export const RELAY_V2_REQUIRED_CAPABILITIES = Object.freeze([
   "snapshot.revision.v1",
   "event.sequence.v1",
   "terminal.stream.resume.v1",
+] as const);
+
+export const RELAY_V2_OPTIONAL_CAPABILITIES = Object.freeze([
+  RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
 ] as const);
 
 export const RELAY_V2_BROKER_LIMITS = Object.freeze({
@@ -93,6 +102,21 @@ const HOST_TO_CLIENT_PUBLIC_TYPES = new Set([
   "terminal.closed",
 ]);
 
+const CLIENT_TO_HOST_AGENT_EXTENSION_TYPES = new Set([
+  "agent.timeline.status.get",
+  "agent.timeline.snapshot.get",
+  "agent.timeline.replay.get",
+]);
+
+const HOST_TO_CLIENT_AGENT_EXTENSION_TYPES = new Set([
+  "agent.timeline.status",
+  "agent.timeline.snapshot.page",
+  "agent.timeline.replay.page",
+  "agent.timeline.event",
+  "agent.timeline.reset",
+  "error",
+]);
+
 type RelayV2PresenceReason = "connected" | "reconnected" | "superseded" | "disconnected";
 
 export type RelayBrokerRole = "client" | "host";
@@ -142,13 +166,14 @@ export type RelayBrokerUpgradeResult =
     }
   | {
       outcome: "reject";
-      status: 400 | 401 | 403 | 404 | 426;
+      status: 400 | 401 | 403 | 404 | 426 | 503;
       errorCode:
         | "AUTH_REQUIRED"
         | "AUTH_INVALID"
         | "GRANT_NOT_FOUND"
         | "ROLE_MISMATCH"
         | "PERMISSION_DENIED"
+        | "CAPABILITY_UNAVAILABLE"
         | "PROTOCOL_UNSUPPORTED";
       fallback: false;
     };
@@ -305,6 +330,15 @@ export interface RelayV2BrokerResult {
   error?: RelayV2StructuredError;
 }
 
+/**
+ * Narrow consumer port for an existing optional-extension readiness owner.
+ * Withdrawal is process-lifetime and extension-scoped; it never mutates the
+ * frozen base-six readiness receipt or the credential admission fence.
+ */
+export interface RelayV2BrokerOptionalCapabilityReadinessPort {
+  withdraw(capability: typeof RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY): RelayV2BrokerResult;
+}
+
 export interface RelayV2RouteOpenResult extends RelayV2BrokerResult {
   routeId?: string;
   routeFence?: string;
@@ -455,6 +489,21 @@ export type RelayV2ClientAdmission =
       error: RelayV2StructuredError;
     };
 
+export type RelayV2HostAdmission =
+  | Readonly<{ outcome: "accept" }>
+  | Readonly<{
+      outcome: "reject";
+      status: 401 | 403 | 503;
+      error: RelayV2StructuredError;
+    }>;
+
+export type RelayV2ClientProducerAdmission =
+  | (Extract<RelayV2ClientAdmission, { outcome: "accept" }> & {
+      carrierTransportId: string;
+      carrierConnectionIncarnation: string;
+    })
+  | Extract<RelayV2ClientAdmission, { outcome: "reject" }>;
+
 type HostHello = {
   requestId: string;
   hostId: string;
@@ -509,6 +558,8 @@ type CarrierState = {
 type QueuedClientFrame = {
   bytes: Uint8Array;
   route: RouteState;
+  /** False only for the reserved handshake welcome outside Host carrier capacity. */
+  carrierAccounted: boolean;
 };
 
 type InFlightClientFrame = QueuedClientFrame & {
@@ -553,6 +604,8 @@ type RouteState = {
   hostToClientPressureSinceMs: number | null;
   clientReadPaused: boolean;
   hostReadPaused: boolean;
+  agentExtensionDisposition: "unselected" | "selected" | "withdrawn";
+  clientOfferedAgentExtension: boolean;
 };
 
 type PendingLiveAuthorizationInvalidation = {
@@ -616,7 +669,7 @@ function bearerCredential(header: string): string | undefined {
 }
 
 function upgradeReject(
-  status: 400 | 401 | 403 | 404 | 426,
+  status: 400 | 401 | 403 | 404 | 426 | 503,
   errorCode: Extract<RelayBrokerUpgradeResult, { outcome: "reject" }>["errorCode"],
 ): RelayBrokerUpgradeResult {
   return { outcome: "reject", status, errorCode, fallback: false };
@@ -689,6 +742,9 @@ export async function dispatchRelayBrokerUpgrade(
       };
     } catch (error) {
       const code = (error as { code?: unknown })?.code;
+      if (code === "CAPABILITY_UNAVAILABLE") {
+        return upgradeReject(503, code);
+      }
       if (
         code === "GRANT_NOT_FOUND"
         || code === "ROLE_MISMATCH"
@@ -900,6 +956,29 @@ function completeBaseReadiness(hello: HostHello): string[] {
   return [...RELAY_V2_REQUIRED_CAPABILITIES];
 }
 
+type BrokerDecodedPublicFrame = Readonly<{
+  lane: "base" | "agent_extension";
+  frame: RelayV2JsonObject;
+}>;
+
+function decodeBrokerPublicFrame(bytes: Uint8Array): BrokerDecodedPublicFrame {
+  try {
+    return Object.freeze({
+      lane: "base" as const,
+      frame: decodeRelayV2WebSocketFrame("public", bytes).frame,
+    });
+  } catch (baseError) {
+    try {
+      return Object.freeze({
+        lane: "agent_extension" as const,
+        frame: decodeRelayAgentTranscriptLifecycleFrame(bytes).frame,
+      });
+    } catch {
+      throw baseError;
+    }
+  }
+}
+
 export class RelayV2BrokerCore {
   readonly brokerEpoch: string;
 
@@ -922,6 +1001,9 @@ export class RelayV2BrokerCore {
   private readonly authControlAuthority: RelayV2BrokerAuthControlAuthority | undefined;
   private readonly outputReadyPort: RelayV2BrokerOutputReadyPort | undefined;
   private readonly baseCapabilityReadiness: string[];
+  private agentTranscriptLifecycleReady: boolean;
+  private readonly optionalCapabilityReadinessPortValue:
+    RelayV2BrokerOptionalCapabilityReadinessPort;
   private readonly onLiveAuthorizationClose:
     ((signal: RelayV2LiveAuthorizationCloseSignal) => void) | undefined;
   private readonly liveAuthorizationFencePortValue: RelayV2LiveAuthorizationFencePort;
@@ -937,6 +1019,11 @@ export class RelayV2BrokerCore {
      * advertisement disabled even when host.hello claims the base set.
      */
     baseCapabilityReadiness?: readonly string[];
+    /**
+     * Independent optional-extension receipt. Unknown values are ignored and
+     * this input can never complete or alter the atomic base-six gate.
+     */
+    optionalCapabilityReadiness?: readonly string[];
   } = {}) {
     this.brokerEpoch = options.brokerEpoch ?? randomUUID();
     if (!isIdentifier(this.brokerEpoch)) throw new Error("invalid Relay v2 broker epoch");
@@ -952,16 +1039,27 @@ export class RelayV2BrokerCore {
         this.latchCredentialAuthorityUnavailable();
       },
     });
+    this.optionalCapabilityReadinessPortValue = Object.freeze({
+      withdraw: (capability) => this.withdrawOptionalCapability(capability),
+    });
     this.baseCapabilityReadiness = RELAY_V2_REQUIRED_CAPABILITIES.every((capability) => (
       options.baseCapabilityReadiness?.includes(capability)
     ))
       ? [...RELAY_V2_REQUIRED_CAPABILITIES]
       : [];
+    this.agentTranscriptLifecycleReady = options.optionalCapabilityReadiness?.includes(
+      RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+    ) === true;
   }
 
   /** Unwired credential-authority commit seam; it does not imply readiness. */
   get liveAuthorizationFencePort(): RelayV2LiveAuthorizationFencePort {
     return this.liveAuthorizationFencePortValue;
+  }
+
+  /** Existing optional authority publishes loss through this exact Core cut. */
+  get optionalCapabilityReadinessPort(): RelayV2BrokerOptionalCapabilityReadinessPort {
+    return this.optionalCapabilityReadinessPortValue;
   }
 
   get outputReadyCompositionState(): "open" | "latched_fail_closed" {
@@ -1112,12 +1210,78 @@ export class RelayV2BrokerCore {
         error: structuredError("PERMISSION_DENIED", "Client authorization is not valid"),
       };
     }
+    const admission = this.inspectClosedClientAdmission(authorization);
+    if (admission.outcome === "reject") return admission;
+    return {
+      outcome: "accept",
+      connectorId: admission.connectorId,
+      hostEpoch: admission.hostEpoch,
+      hostInstanceId: admission.hostInstanceId,
+    };
+  }
+
+  /**
+   * Exact pre-101 Host authorization cut. The credential verifier owns token
+   * authenticity; Core additionally owns pending/committed live fences,
+   * trusted-time expiry and the process-lifetime readiness latch.
+   */
+  inspectHostAdmission(
+    authContext: RelayV2BrokerConnectionAuthorization,
+  ): RelayV2HostAdmission {
+    const authorization = cloneClosedConnectionAuthorization(authContext);
+    if (!authorization || authorization.role !== "host") {
+      return {
+        outcome: "reject",
+        status: 403,
+        error: structuredError("PERMISSION_DENIED", "Host authorization is not valid"),
+      };
+    }
+    if (this.liveAuthCompositionLatched || this.outputReadyCompositionLatched) {
+      return {
+        outcome: "reject",
+        status: 503,
+        error: structuredError(
+          "CAPABILITY_UNAVAILABLE",
+          "Broker composition is latched fail-closed",
+        ),
+      };
+    }
+    const liveAuthFence = this.liveAuthorizationInvalidationFor(authorization);
+    const authorizationExpired = this.isAuthorizationExpired(authorization);
+    if (
+      authorizationExpired
+      || !this.observeAuthorizationHighWater(authorization)
+      || liveAuthFence
+    ) {
+      return {
+        outcome: "reject",
+        status: authorizationExpired || liveAuthFence?.reason === "access_expired"
+          ? 401
+          : 403,
+        error: structuredError("AUTH_INVALID", "Host authorization is fenced"),
+      };
+    }
+    return Object.freeze({ outcome: "accept" });
+  }
+
+  /** Exact current carrier cut for the shared runtime's private ingress owner. */
+  inspectClientProducerAdmission(
+    authContext: RelayV2BrokerConnectionAuthorization,
+  ): RelayV2ClientProducerAdmission {
+    const authorization = cloneClosedConnectionAuthorization(authContext);
+    if (!authorization || authorization.role !== "client") {
+      return {
+        outcome: "reject",
+        status: 503,
+        error: structuredError("PERMISSION_DENIED", "Client authorization is not valid"),
+      };
+    }
     return this.inspectClosedClientAdmission(authorization);
   }
 
   private inspectClosedClientAdmission(
     authorization: RelayV2BrokerConnectionAuthorization,
-  ): RelayV2ClientAdmission {
+  ): RelayV2ClientProducerAdmission {
     if (this.liveAuthCompositionLatched || this.outputReadyCompositionLatched) {
       return {
         outcome: "reject",
@@ -1187,6 +1351,8 @@ export class RelayV2BrokerCore {
       connectorId: carrier.connectorId,
       hostEpoch: carrier.hello.hostEpoch,
       hostInstanceId: carrier.hello.hostInstanceId,
+      carrierTransportId: carrier.transportId,
+      carrierConnectionIncarnation: carrier.connectionIncarnation,
     };
   }
 
@@ -1267,9 +1433,9 @@ export class RelayV2BrokerCore {
   /**
    * Call inspectClientAdmission before sending HTTP 101 so known offline and
    * dialect failures stay HTTP 503/426. This second admission closes the race
-   * between 101 and route.open. It opens only the carrier route: route_opened
-   * is an adapter signal, not a public relay.welcome, so capability
-   * advertisement remains gated on later H/G2 integration.
+   * between 101 and route.open. The public relay.welcome remains gated on the
+   * Host's correlated route.opened acknowledgement and the complete atomic
+   * base-capability readiness receipt.
    */
   openClientRoute(
     connectionId: string,
@@ -1400,6 +1566,8 @@ export class RelayV2BrokerCore {
       hostToClientPressureSinceMs: null,
       clientReadPaused: false,
       hostReadPaused: false,
+      agentExtensionDisposition: "unselected",
+      clientOfferedAgentExtension: false,
     };
     const frame = {
       carrierVersion: 1,
@@ -1695,9 +1863,9 @@ export class RelayV2BrokerCore {
     if (!this.isCarrierAuthorizationActive(carrier)) {
       return this.failure("AUTH_INVALID", "Host authorization is being fenced");
     }
-    let publicFrame: RelayV2JsonObject;
+    let decodedPublicFrame: BrokerDecodedPublicFrame;
     try {
-      publicFrame = decodeRelayV2WebSocketFrame("public", bytes).frame;
+      decodedPublicFrame = decodeBrokerPublicFrame(bytes);
     } catch {
       const actions = this.beginRouteUnbind(route, "protocol_error");
       actions.push({
@@ -1709,9 +1877,12 @@ export class RelayV2BrokerCore {
       });
       return this.failure("INVALID_ENVELOPE", "Client frame is not a valid public envelope", actions);
     }
+    const publicFrame = decodedPublicFrame.frame;
     if (
       bytes.byteLength > route.maxFrameBytes
-      || !this.isClientPublicFrameAuthorized(route, publicFrame)
+      || (decodedPublicFrame.lane === "base"
+        ? !this.isClientPublicFrameAuthorized(route, publicFrame)
+        : !this.isClientAgentExtensionFrameAuthorized(route, publicFrame))
     ) {
       const actions = this.beginRouteUnbind(route, "protocol_error");
       actions.push({
@@ -1754,7 +1925,7 @@ export class RelayV2BrokerCore {
       route.hostToClientBufferedBytes += responseBytes.byteLength;
       carrier.hostToClientBufferedBytes += responseBytes.byteLength;
       const clientQueueWasEmpty = client.queue.length === 0;
-      client.queue.push({ bytes: responseBytes, route });
+      client.queue.push({ bytes: responseBytes, route, carrierAccounted: true });
       if (clientQueueWasEmpty) this.signalClientOutputReady(client, true);
       return { accepted: true, actions: [] };
     }
@@ -1779,6 +1950,33 @@ export class RelayV2BrokerCore {
         "not_accepted",
       );
       return { accepted: false, error, actions: [] };
+    }
+    if (
+      decodedPublicFrame.lane === "agent_extension"
+      && !this.agentExtensionNegotiatedForRoute(route)
+    ) {
+      if (route.agentExtensionDisposition === "withdrawn") {
+        return this.enqueueAgentExtensionUnavailable(
+          carrier,
+          route,
+          client,
+          publicFrame,
+          true,
+        );
+      }
+      const actions = this.beginRouteUnbind(route, "protocol_error");
+      actions.push({
+        kind: "close_client",
+        connectionId,
+        connectionIncarnation: route.connectionIncarnation,
+        closeCode: 4400,
+        reason: "unnegotiated_agent_extension",
+      });
+      return this.failure(
+        "INVALID_ENVELOPE",
+        "Relay Agent extension was not negotiated",
+        actions,
+      );
     }
     const seq = route.nextClientToHostSeq;
     const frame = {
@@ -1808,6 +2006,15 @@ export class RelayV2BrokerCore {
     }
     route.nextClientToHostSeq += 1n;
     if (requestId !== null) route.inFlightRequestIds.add(requestId);
+    if (publicFrame.type === "client.hello") {
+      const payload = publicFrame.payload as RelayV2JsonObject;
+      route.clientOfferedAgentExtension = (payload.capabilities as string[]).includes(
+        RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      );
+      if (route.agentExtensionDisposition !== "withdrawn") {
+        route.agentExtensionDisposition = "unselected";
+      }
+    }
     const actions = this.clientToHostAtHighWater(carrier, route)
       ? this.markClientPressure(route)
       : [];
@@ -2070,7 +2277,11 @@ export class RelayV2BrokerCore {
       return this.failure("INVALID_ENVELOPE", "Client delivery acknowledgement is stale");
     }
     client.inFlight.delete(deliveryId);
-    this.releaseHostToClientBytes(delivery.route, delivery.bytes.byteLength);
+    this.releaseHostToClientBytes(
+      delivery.route,
+      delivery.bytes.byteLength,
+      delivery.carrierAccounted,
+    );
     const carrier = this.carriers.get(delivery.route.carrierTransportId);
     return {
       accepted: true,
@@ -2263,9 +2474,60 @@ export class RelayV2BrokerCore {
     if (openedMaxFrameBytes <= 0 || openedMaxFrameBytes > route.maxFrameBytes) {
       return this.protocolViolation(carrier, "invalid_route_frame_limit");
     }
+    if (
+      !client
+      || client.routeId !== route.routeId
+      || client.connectionIncarnation !== route.connectionIncarnation
+      || client.queue.length !== 0
+      || client.inFlight.size !== 0
+      || route.hostToClientFrames !== 0
+      || route.hostToClientBufferedBytes !== 0
+    ) {
+      return this.protocolViolation(carrier, "route_welcome_state_conflict");
+    }
+    const baseCapabilities = this.advertisedBaseCapabilities(carrier.hello!);
+    if (baseCapabilities.length !== RELAY_V2_REQUIRED_CAPABILITIES.length) {
+      return this.protocolViolation(carrier, "route_capability_readiness_withdrawn");
+    }
+    const capabilities = this.advertisedCapabilities(carrier.hello!);
+    const welcomeBytes = encodeRelayV2WebSocketFrame("public", {
+      protocolVersion: 2,
+      kind: "event",
+      type: "relay.welcome",
+      payload: {
+        selectedVersion: 2,
+        connectionId: route.connectionId,
+        brokerEpoch: this.brokerEpoch,
+        principalId: route.authContext.principalId,
+        capabilities,
+        limits: {
+          maxFrameBytes: RELAY_V2_BROKER_LIMITS.maxFrameBytes,
+          maxCarrierFrameBytes: RELAY_V2_BROKER_LIMITS.maxCarrierFrameBytes,
+          brokerRouteBufferedBytesPerDirection:
+            RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection,
+          brokerRouteLowWaterBytesPerDirection:
+            RELAY_V2_BROKER_LIMITS.routeLowWaterBytesPerDirection,
+          brokerCarrierBufferedBytes: RELAY_V2_BROKER_LIMITS.carrierBufferedBytes,
+          brokerCarrierLowWaterBytes: RELAY_V2_BROKER_LIMITS.carrierLowWaterBytes,
+          maxQueuedRouteFrames: RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames,
+          maxInFlightRequestsPerRoute:
+            RELAY_V2_BROKER_LIMITS.maxInFlightRequestsPerRoute,
+        },
+      },
+    });
+    if (
+      welcomeBytes.byteLength > RELAY_V2_BROKER_LIMITS.maxFrameBytes
+      || welcomeBytes.byteLength > RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection
+    ) {
+      return this.protocolViolation(carrier, "route_welcome_capacity_unavailable");
+    }
     route.maxFrameBytes = openedMaxFrameBytes;
     route.status = "opened";
     route.firstApplicationFrame = "welcome";
+    route.hostToClientFrames = 1;
+    route.hostToClientBufferedBytes = welcomeBytes.byteLength;
+    client.queue.push({ bytes: welcomeBytes, route, carrierAccounted: false });
+    this.signalClientOutputReady(client, true);
     return {
       accepted: true,
       actions: [{
@@ -2277,7 +2539,7 @@ export class RelayV2BrokerCore {
         hostId: route.authContext.hostId,
         hostEpoch: carrier.hello!.hostEpoch,
         hostInstanceId: carrier.hello!.hostInstanceId,
-        capabilities: this.advertisedBaseCapabilities(carrier.hello!),
+        capabilities,
       }],
     };
   }
@@ -2348,15 +2610,18 @@ export class RelayV2BrokerCore {
     }
     const payload = frame.payload as RelayV2JsonObject;
     const bytes = Buffer.from(payload.data as string, "base64");
-    let publicFrame: RelayV2JsonObject;
+    let decodedPublicFrame: BrokerDecodedPublicFrame;
     try {
-      publicFrame = decodeRelayV2WebSocketFrame("public", bytes).frame;
+      decodedPublicFrame = decodeBrokerPublicFrame(bytes);
     } catch {
       return this.protocolViolation(carrier, "invalid_public_envelope");
     }
+    const publicFrame = decodedPublicFrame.frame;
     if (
       bytes.byteLength > route.maxFrameBytes
-      || !this.isHostPublicFrameAuthorized(carrier, route, publicFrame)
+      || (decodedPublicFrame.lane === "base"
+        ? !this.isHostPublicFrameAuthorized(carrier, route, publicFrame)
+        : !this.isHostAgentExtensionFrameAuthorized(carrier, route, publicFrame))
     ) {
       return this.protocolViolation(carrier, "forged_public_identity");
     }
@@ -2368,11 +2633,56 @@ export class RelayV2BrokerCore {
     if (responseRequestId !== null && !route.inFlightRequestIds.has(responseRequestId)) {
       return this.protocolViolation(carrier, "uncorrelated_public_response");
     }
+    let outboundBytes = bytes;
+    if (publicFrame.type === "host.welcome") {
+      const welcomePayload = publicFrame.payload as RelayV2JsonObject;
+      const hostSelectedAgentExtension = (welcomePayload.capabilities as string[]).includes(
+        RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      );
+      const brokerAndRouteSelectAgentExtension = route.clientOfferedAgentExtension
+        && this.agentExtensionAvailableForRoute(route);
+      if (hostSelectedAgentExtension && brokerAndRouteSelectAgentExtension) {
+        route.agentExtensionDisposition = "selected";
+      } else {
+        route.agentExtensionDisposition = "unselected";
+      }
+      if (hostSelectedAgentExtension && !brokerAndRouteSelectAgentExtension) {
+        outboundBytes = encodeRelayV2WebSocketFrame("public", {
+          ...publicFrame,
+          payload: {
+            ...welcomePayload,
+            capabilities: (welcomePayload.capabilities as string[]).filter((capability) => (
+              capability !== RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+            )),
+          },
+        });
+      }
+    }
+    if (
+      decodedPublicFrame.lane === "agent_extension"
+      && !this.agentExtensionNegotiatedForRoute(route)
+    ) {
+      if (route.agentExtensionDisposition !== "withdrawn") {
+        return this.protocolViolation(carrier, "unnegotiated_agent_extension");
+      }
+      route.expectedHostToClientSeq += 1n;
+      if (responseRequestId !== null) {
+        route.inFlightRequestIds.delete(responseRequestId);
+        return this.enqueueAgentExtensionUnavailable(
+          carrier,
+          route,
+          client,
+          publicFrame,
+          true,
+        );
+      }
+      return { accepted: true, actions: [] };
+    }
     if (
       route.hostToClientFrames + 1 > RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames
-      || route.hostToClientBufferedBytes + bytes.byteLength
+      || route.hostToClientBufferedBytes + outboundBytes.byteLength
         > RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection
-      || this.carrierBufferedBytes(carrier) + bytes.byteLength
+      || this.carrierBufferedBytes(carrier) + outboundBytes.byteLength
         > RELAY_V2_BROKER_LIMITS.carrierBufferedBytes - CARRIER_CONTROL_RESERVE_BYTES
     ) {
       const error = structuredError("SLOW_CONSUMER", "Client route cannot drain", true, 1_000);
@@ -2381,10 +2691,10 @@ export class RelayV2BrokerCore {
     }
     route.expectedHostToClientSeq += 1n;
     route.hostToClientFrames += 1;
-    route.hostToClientBufferedBytes += bytes.byteLength;
-    carrier.hostToClientBufferedBytes += bytes.byteLength;
+    route.hostToClientBufferedBytes += outboundBytes.byteLength;
+    carrier.hostToClientBufferedBytes += outboundBytes.byteLength;
     const clientQueueWasEmpty = client.queue.length === 0;
-    client.queue.push({ bytes, route });
+    client.queue.push({ bytes: outboundBytes, route, carrierAccounted: true });
     if (clientQueueWasEmpty) this.signalClientOutputReady(client, true);
     if (responseRequestId !== null) route.inFlightRequestIds.delete(responseRequestId);
     const actions = this.hostToClientAtHighWater(carrier, route)
@@ -2590,6 +2900,64 @@ export class RelayV2BrokerCore {
       || completeBaseReadiness(hello).length !== RELAY_V2_REQUIRED_CAPABILITIES.length
     ) return [];
     return [...RELAY_V2_REQUIRED_CAPABILITIES];
+  }
+
+  private advertisedCapabilities(hello: HostHello): string[] {
+    const base = this.advertisedBaseCapabilities(hello);
+    if (base.length !== RELAY_V2_REQUIRED_CAPABILITIES.length) return [];
+    if (
+      this.agentTranscriptLifecycleReady
+      && hello.capabilities.includes(RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
+    ) base.push(RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY);
+    return base;
+  }
+
+  private agentExtensionAvailableForRoute(route: RouteState): boolean {
+    const carrier = this.carriers.get(route.carrierTransportId);
+    return this.agentTranscriptLifecycleReady
+      && carrier?.hello?.capabilities.includes(
+        RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      ) === true;
+  }
+
+  private agentExtensionNegotiatedForRoute(route: RouteState): boolean {
+    return route.agentExtensionDisposition === "selected"
+      && route.clientOfferedAgentExtension
+      && this.agentExtensionAvailableForRoute(route);
+  }
+
+  private withdrawOptionalCapability(
+    capability: typeof RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+  ): RelayV2BrokerResult {
+    if (capability !== RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY) {
+      return this.failure("INVALID_ENVELOPE", "Optional capability withdrawal is invalid");
+    }
+    if (!this.agentTranscriptLifecycleReady) return { accepted: true, actions: [] };
+    this.agentTranscriptLifecycleReady = false;
+
+    for (const [hostId, record] of this.directory) {
+      if (!record.capabilities.includes(RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)) continue;
+      let observedAtMs = record.observedAtMs;
+      try {
+        observedAtMs = this.now();
+      } catch {
+        // Optional loss remains isolated even if its observational clock fails.
+      }
+      this.directory.set(hostId, {
+        ...record,
+        revision: record.revision + 1n,
+        capabilities: record.capabilities.filter((entry) => (
+          entry !== RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+        )),
+        observedAtMs,
+      });
+    }
+    for (const route of this.routes.values()) {
+      if (route.agentExtensionDisposition === "selected") {
+        route.agentExtensionDisposition = "withdrawn";
+      }
+    }
+    return { accepted: true, actions: [] };
   }
 
   private beginLiveAuthorizationInvalidation(
@@ -3161,6 +3529,21 @@ export class RelayV2BrokerCore {
     return true;
   }
 
+  private isClientAgentExtensionFrameAuthorized(
+    route: RouteState,
+    frame: RelayV2JsonObject,
+  ): boolean {
+    if (
+      frame.kind !== "request"
+      || !CLIENT_TO_HOST_AGENT_EXTENSION_TYPES.has(frame.type as string)
+      || frame.hostId !== route.authContext.hostId
+    ) return false;
+    const carrier = this.carriers.get(route.carrierTransportId);
+    return carrier?.hello !== null && carrier?.hello !== undefined
+      ? frame.expectedHostEpoch === carrier.hello.hostEpoch
+      : false;
+  }
+
   private isHostPublicFrameAuthorized(
     carrier: CarrierState,
     route: RouteState,
@@ -3174,6 +3557,76 @@ export class RelayV2BrokerCore {
       && frame.hostInstanceId !== carrier.hello.hostInstanceId
     ) return false;
     return true;
+  }
+
+  private isHostAgentExtensionFrameAuthorized(
+    carrier: CarrierState,
+    route: RouteState,
+    frame: RelayV2JsonObject,
+  ): boolean {
+    if (
+      !carrier.hello
+      || (frame.kind !== "response" && frame.kind !== "event")
+      || !HOST_TO_CLIENT_AGENT_EXTENSION_TYPES.has(frame.type as string)
+    ) return false;
+    return frame.hostId === route.authContext.hostId
+      && frame.hostEpoch === carrier.hello.hostEpoch;
+  }
+
+  private enqueueAgentExtensionUnavailable(
+    carrier: CarrierState,
+    route: RouteState,
+    client: ClientState,
+    source: RelayV2JsonObject,
+    retryable: boolean,
+  ): RelayV2BrokerResult {
+    const unavailableBytes = encodeRelayAgentTranscriptLifecycleFrame({
+      protocolVersion: 2,
+      kind: "response",
+      type: "error",
+      requestId: source.requestId,
+      hostId: route.authContext.hostId,
+      hostEpoch: carrier.hello!.hostEpoch,
+      scopeId: source.scopeId,
+      sessionId: source.sessionId,
+      payload: null,
+      error: {
+        code: "AGENT_TIMELINE_UNAVAILABLE",
+        message: "The Relay Agent timeline request cannot be satisfied",
+        retryable,
+        commandDisposition: "not_applicable",
+      },
+    });
+    if (
+      route.hostToClientFrames + 1 > RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames
+      || route.hostToClientBufferedBytes + unavailableBytes.byteLength
+        > RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection
+      || this.carrierBufferedBytes(carrier) + unavailableBytes.byteLength
+        > RELAY_V2_BROKER_LIMITS.carrierBufferedBytes - CARRIER_CONTROL_RESERVE_BYTES
+    ) {
+      const error = structuredError(
+        "SLOW_CONSUMER",
+        "Client extension route cannot drain",
+        true,
+        1_000,
+      );
+      const actions = this.beginRouteUnbind(route, "slow_consumer");
+      actions.push({
+        kind: "close_client",
+        connectionId: route.connectionId,
+        connectionIncarnation: route.connectionIncarnation,
+        closeCode: 1013,
+        reason: "slow_consumer",
+      });
+      return { accepted: false, error, actions };
+    }
+    route.hostToClientFrames += 1;
+    route.hostToClientBufferedBytes += unavailableBytes.byteLength;
+    carrier.hostToClientBufferedBytes += unavailableBytes.byteLength;
+    const clientQueueWasEmpty = client.queue.length === 0;
+    client.queue.push({ bytes: unavailableBytes, route, carrierAccounted: true });
+    if (clientQueueWasEmpty) this.signalClientOutputReady(client, true);
+    return { accepted: true, actions: [] };
   }
 
   private currentRouteForFrame(
@@ -3532,10 +3985,16 @@ export class RelayV2BrokerCore {
     }
     const client = this.clients.get(route.connectionId);
     if (client) {
-      for (const entry of client.queue) this.releaseHostToClientBytes(route, entry.bytes.byteLength);
+      for (const entry of client.queue) {
+        this.releaseHostToClientBytes(route, entry.bytes.byteLength, entry.carrierAccounted);
+      }
       client.queue = [];
       for (const delivery of client.inFlight.values()) {
-        this.releaseHostToClientBytes(route, delivery.bytes.byteLength);
+        this.releaseHostToClientBytes(
+          route,
+          delivery.bytes.byteLength,
+          delivery.carrierAccounted,
+        );
       }
       client.inFlight.clear();
       client.outputReadyEpoch += 1n;
@@ -3548,14 +4007,21 @@ export class RelayV2BrokerCore {
   private discardQueuedClientData(route: RouteState): void {
     const client = this.clients.get(route.connectionId);
     if (!client) return;
-    for (const entry of client.queue) this.releaseHostToClientBytes(route, entry.bytes.byteLength);
+    for (const entry of client.queue) {
+      this.releaseHostToClientBytes(route, entry.bytes.byteLength, entry.carrierAccounted);
+    }
     client.queue = [];
     client.outputReadyEpoch += 1n;
   }
 
-  private releaseHostToClientBytes(route: RouteState, bytes: number): void {
+  private releaseHostToClientBytes(
+    route: RouteState,
+    bytes: number,
+    carrierAccounted: boolean,
+  ): void {
     route.hostToClientBufferedBytes = Math.max(0, route.hostToClientBufferedBytes - bytes);
     route.hostToClientFrames = Math.max(0, route.hostToClientFrames - 1);
+    if (!carrierAccounted) return;
     const carrier = this.carriers.get(route.carrierTransportId);
     if (carrier) {
       carrier.hostToClientBufferedBytes = Math.max(0, carrier.hostToClientBufferedBytes - bytes);
@@ -3652,7 +4118,7 @@ export class RelayV2BrokerCore {
       connectorId: state === "online" ? carrier.connectorId : null,
       clientDialects: hello ? [...hello.clientDialects] : [...previous?.clientDialects ?? []],
       capabilities: hello
-        ? this.advertisedBaseCapabilities(hello)
+        ? this.advertisedCapabilities(hello)
         : [...previous?.capabilities ?? []],
       observedAtMs: this.now(),
       presenceReason,

@@ -1,0 +1,74 @@
+{
+  "contract": "tmux-worktree-relay-v2-host-production-profile",
+  "contractVersion": 1,
+  "status": "frozen",
+  "storagePath": "~/.tmux-worktree/relay-v2-host/profile-v1.json",
+  "encoding": "utf-8-json-with-two-space-indent-and-trailing-newline",
+  "maximumBytes": 16384,
+  "schema": {
+    "exactKeys": [
+      "contract",
+      "schemaVersion",
+      "hostId",
+      "relayUrl",
+      "credentialIssuerUrl",
+      "credentialReference",
+      "bootstrapSecretReference",
+      "refreshSecretReference"
+    ],
+    "contract": "tmux-worktree-relay-v2-host-production-profile",
+    "schemaVersion": 1,
+    "identifierMaximumUtf8Bytes": 128,
+    "urlMaximumUtf8Bytes": 2048,
+    "relayUrl": "canonical root wss URL; no userinfo, non-root path, query, or fragment",
+    "credentialIssuerUrl": "canonical root https URL; no userinfo, non-root path, query, or fragment",
+    "credentialReference": "RelayV2HostCredentialReference validator and namespace",
+    "secretReferences": "RelayV2HostCredentialSecretReference validator; bootstrap and refresh must differ"
+  },
+  "forbiddenProfileMaterial": [
+    "credential or secret values",
+    "access or refresh tokens",
+    "enrollment material",
+    "Relay v1 shared secret",
+    "native filesystem paths",
+    "TLS key, certificate, or trust material",
+    "E0 configuration",
+    "unknown keys"
+  ],
+  "filesystem": {
+    "owner": "Node RelayV2HostProductionProfileStore",
+    "parentDirectoryMode": "0700",
+    "profileMode": "0600",
+    "lockMode": "0600",
+    "temporaryMode": "0600",
+    "lock": "exclusive create; existing safe lock is busy and is never removed automatically",
+    "publication": [
+      "full temporary write",
+      "temporary fsync",
+      "same-directory atomic hard-link create of profile with no replacement",
+      "destination EEXIST: strict existing-profile inspection; exact is idempotent, different/corrupt/unsafe fails closed without target replacement",
+      "verify temporary, profile, and descriptor are one inode with link count two",
+      "identity-safe unlink of temporary and verify profile link count one",
+      "parent directory fsync"
+    ],
+    "createOnce": {
+      "missing": "create",
+      "exact": "return idempotently",
+      "different": "fail closed without overwrite",
+      "corruptUnknownOrUnsafe": "fail closed without repair, migration, fallback, or overwrite"
+    },
+    "readExisting": "accept only optional trustedHome; require no active/unsafe lock; missing, corrupt, unknown, or unsafe fails closed without filesystem mutation",
+    "metadata": "reject symlink, non-regular file, foreign owner, wrong mode, or link count other than one",
+    "supportedPlatforms": [
+      "darwin",
+      "linux"
+    ],
+    "otherPlatforms": "typed unsupported failure"
+  },
+  "errorPolicy": {
+    "typed": true,
+    "messagesMayContainProfileContentOrReferences": false,
+    "commitUncertaintyPreservesLockForExplicitRecovery": true
+  },
+  "fixture": "cases.json"
+}

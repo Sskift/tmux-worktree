@@ -34,7 +34,6 @@ import {
 const relayV2Review: RelayV2EnrollmentReview = {
   enrollment: {
     enrollmentId: "enrollment-preview",
-    enrollmentCode: "twenroll2.one-time-preview-code",
     expiresAtMs: 4_000_000_000_000,
   },
   display: {
@@ -42,6 +41,11 @@ const relayV2Review: RelayV2EnrollmentReview = {
     relayUrl: "wss://relay.test/client",
     hostId: "mac-admin",
     deviceLabel: "Pixel preview",
+  },
+  renderArtifact: {
+    kind: "native_qr_handle",
+    handle: `dqart1.${"P".repeat(32)}`,
+    expiresAtMs: 4_000_000_000_000,
   },
 };
 
@@ -340,7 +344,7 @@ test("Relay v2 enrollment stays unavailable without host.registered or one requi
 
   assert.equal(unregistered.ready, false);
   assert.equal(unregistered.enrollmentActionDisabled, true);
-  assert.equal(unregistered.qrPayload, null);
+  assert.equal(unregistered.qrArtifact, null);
   assert.match(unregistered.readinessLabel, /not registered/i);
   assert.match(unregistered.readinessDetail, /host\.registered/);
 
@@ -356,7 +360,7 @@ test("Relay v2 enrollment stays unavailable without host.registered or one requi
   assert.equal(incomplete.ready, false);
   assert.deepEqual(incomplete.missingCapabilities, ["terminal.stream.resume.v1"]);
   assert.equal(incomplete.enrollmentActionDisabled, true);
-  assert.equal(incomplete.qrPayload, null);
+  assert.equal(incomplete.qrArtifact, null);
   assert.match(incomplete.readinessDetail, /terminal\.stream\.resume\.v1/);
 
   const adapter = createFakeMobileRelayV2Adapter({ initialState: missingTerminalResume });
@@ -374,7 +378,7 @@ test("Relay v2 enrollment stays unavailable without host.registered or one requi
   }));
   assert.match(markup, /Relay v2 capabilities incomplete/);
   assert.match(markup, /<button[^>]*disabled=""/);
-  assert.doesNotMatch(markup, /Relay v2 one-time enrollment preview QR code/);
+  assert.doesNotMatch(markup, /Native QR unavailable in browser preview/);
 });
 
 test("Relay v2 readiness exposes only a one-time enrollment review and never claims the phone is online", () => {
@@ -389,22 +393,11 @@ test("Relay v2 readiness exposes only a one-time enrollment review and never cla
   assert.equal(ready.v2CredentialLabel, "Relay v2 host credential ready");
   assert.match(ready.readinessDetail, /Phone connectivity is not verified/);
   assert.doesNotMatch(ready.readinessDetail, /phone is online/i);
-  assert.ok(ready.qrPayload);
-
-  const qr = new URL(ready.qrPayload);
-  assert.equal(qr.protocol, "tmuxworktree:");
-  assert.equal(qr.hostname, "enroll");
-  assert.deepEqual([...qr.searchParams.keys()], [
-    "v",
-    "issuerUrl",
-    "relayUrl",
-    "hostId",
-    "enrollmentId",
-    "enrollmentCode",
-  ]);
-  assert.equal(qr.searchParams.get("enrollmentCode"), relayV2Review.enrollment.enrollmentCode);
-  assert.equal(qr.searchParams.has("accessToken"), false);
-  assert.equal(qr.searchParams.has("refreshToken"), false);
+  assert.equal(ready.qrArtifact?.kind, "native_qr_handle");
+  assert.equal(ready.qrArtifact?.handle, relayV2Review.renderArtifact.handle);
+  assert.equal(JSON.stringify(ready).includes("enrollmentCode"), false);
+  assert.equal(JSON.stringify(ready).includes("tmuxworktree://enroll"), false);
+  assert.equal(JSON.stringify(ready).includes("data:image/"), false);
 
   const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
     state: readyState,
@@ -412,7 +405,7 @@ test("Relay v2 readiness exposes only a one-time enrollment review and never cla
   }));
   assert.match(markup, /Relay v2 connector ready for enrollment/);
   assert.match(markup, /Fake-backed preview only/);
-  assert.match(markup, /Relay v2 one-time enrollment preview QR code/);
+  assert.match(markup, /Native QR unavailable in browser preview/);
 });
 
 test("Relay v2 active enrollment survives connector stop and restores the same QR after restart", async () => {
@@ -426,7 +419,7 @@ test("Relay v2 active enrollment survives connector stop and restores the same Q
   assert.equal(active.enrollment.status, "active");
   if (active.enrollment.status !== "active") return;
   const originalEnrollment = active.enrollment;
-  const originalQr = deriveRelayV2EnrollmentView(active, 1_000).qrPayload;
+  const originalQr = deriveRelayV2EnrollmentView(active, 1_000).qrArtifact;
   assert.ok(originalQr);
 
   await adapter.stopConnector();
@@ -437,12 +430,12 @@ test("Relay v2 active enrollment survives connector stop and restores the same Q
   assert.deepEqual(stopped.enrollment, originalEnrollment);
   assert.equal(stoppedView.adapterAvailable, true);
   assert.equal(stoppedView.ready, false);
-  assert.equal(stoppedView.qrPayload, null);
+  assert.equal(stoppedView.qrArtifact, null);
   assert.equal(stoppedView.enrollmentAction, null);
 
   const restarted = await adapter.startConnector();
   assert.deepEqual(restarted.enrollment, originalEnrollment);
-  assert.equal(deriveRelayV2EnrollmentView(restarted, 1_000).qrPayload, originalQr);
+  assert.deepEqual(deriveRelayV2EnrollmentView(restarted, 1_000).qrArtifact, originalQr);
 });
 
 test("Relay v2 invalid active enrollment requires authoritative recovery without creating a second code", () => {
@@ -464,9 +457,9 @@ test("Relay v2 invalid active enrollment requires authoritative recovery without
       ...relayV2Review,
       enrollment: { ...relayV2Review.enrollment, enrollmentId: "" },
     })],
-    ["enrollment code", activeState({
+    ["artifact handle", activeState({
       ...relayV2Review,
-      enrollment: { ...relayV2Review.enrollment, enrollmentCode: "not-an-enrollment-code" },
+      renderArtifact: { ...relayV2Review.renderArtifact, handle: "not-an-artifact-handle" },
     })],
     ["review host binding", activeState({
       ...relayV2Review,
@@ -491,7 +484,7 @@ test("Relay v2 invalid active enrollment requires authoritative recovery without
     const view = deriveRelayV2EnrollmentView(state, 1_000);
     assert.equal(view.ready, false, label);
     assert.equal(view.review, null, label);
-    assert.equal(view.qrPayload, null, label);
+    assert.equal(view.qrArtifact, null, label);
     assert.equal(view.enrollmentAction, null, label);
     assert.equal(view.enrollmentActionDisabled, true, label);
     assert.doesNotMatch(view.enrollmentActionLabel, /active|retry|rebuild/i, label);
@@ -559,7 +552,7 @@ test("Relay v2 expiry drops the code, rebuilds once, and known-grant revoke is i
     enrollmentId: firstEnrollmentId,
     expiredAtMs: nowMs,
   });
-  assert.doesNotMatch(JSON.stringify(expired), /twenroll2\./);
+  assert.doesNotMatch(JSON.stringify(expired), /dqart1\./);
 
   const rebuilt = await adapter.createEnrollment({ intent: "rebuild" });
   assert.equal(rebuilt.enrollment.status, "active");
@@ -594,7 +587,7 @@ test("Relay v2 non-retryable failures preserve v1 and offer reconfiguration, not
   assert.equal(failed.hostCredential.credentialReference, "fake-preview://host-grant-reference");
   assert.equal(view.enrollmentAction, null);
   assert.match(view.enrollmentActionLabel, /reconfigure Relay v2/i);
-  assert.equal(view.qrPayload, null);
+  assert.equal(view.qrArtifact, null);
   assert.match(view.error ?? "", /Relay v1 remains unchanged; no fallback was attempted/);
 
   const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
@@ -623,7 +616,7 @@ test("Relay v2 contradictory registered observations fail closed", async () => {
 
   assert.equal(view.ready, false);
   assert.equal(view.enrollmentActionDisabled, true);
-  assert.equal(view.qrPayload, null);
+  assert.equal(view.qrArtifact, null);
   assert.match(view.readinessDetail, /restore authoritative Relay v2 state/i);
 
   const adapter = createFakeMobileRelayV2Adapter({ initialState: contradictory });
@@ -648,7 +641,7 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
   const active = reduceRelayV2(ready, [
     { type: "enrollmentCreated", review: relayV2Review },
   ]);
-  const originalQr = deriveRelayV2EnrollmentView(active, 1_000).qrPayload;
+  const originalQr = deriveRelayV2EnrollmentView(active, 1_000).qrArtifact;
   assert.ok(originalQr);
   const superseded = relayV2EnrollmentReducer(active, {
     type: "connectorSuperseded",
@@ -661,7 +654,7 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
   assert.strictEqual(superseded.v1Profile, active.v1Profile);
   assert.equal(supersededView.connectorAction, "restart");
   assert.equal(supersededView.ready, false);
-  assert.equal(supersededView.qrPayload, null);
+  assert.equal(supersededView.qrArtifact, null);
 
   let startCalls = 0;
   let stopCalls = 0;
@@ -733,7 +726,7 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
   ] as const) {
     const candidate = deriveRelayV2EnrollmentView(state, 1_000);
     assert.equal(candidate.connectorAction, expectedAction, label);
-    assert.equal(candidate.qrPayload, expectedQr, label);
+    assert.deepEqual(candidate.qrArtifact, expectedQr, label);
     assert.equal(state.v1Profile.sharedSecretConfigured, true, label);
   }
 
@@ -750,8 +743,11 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
   }
 });
 
-test("Relay v2 renderer state and QR omit bootstrap, access, refresh, and v1 secret values", () => {
-  const activeState = reduceRelayV2(readyRelayV2State(true), [
+test("Relay v2 renderer state exposes only a native opaque artifact handle", () => {
+  const activeState = reduceRelayV2({
+    ...readyRelayV2State(true),
+    authority: { kind: "node", reason: null },
+  }, [
     { type: "enrollmentCreated", review: relayV2Review },
   ]);
   const serializedState = JSON.stringify(activeState);
@@ -763,17 +759,24 @@ test("Relay v2 renderer state and QR omit bootstrap, access, refresh, and v1 sec
     "legacy-secret-value",
   ]) assert.doesNotMatch(serializedState, new RegExp(forbidden, "i"));
 
-  const payload = deriveRelayV2EnrollmentView(activeState, 1_000).qrPayload;
-  assert.ok(payload);
-  const qr = new URL(payload);
-  assert.deepEqual([...qr.searchParams.keys()], [
-    "v",
-    "issuerUrl",
-    "relayUrl",
-    "hostId",
-    "enrollmentId",
+  const artifact = deriveRelayV2EnrollmentView(activeState, 1_000).qrArtifact;
+  assert.deepEqual(artifact, relayV2Review.renderArtifact);
+  for (const forbidden of [
     "enrollmentCode",
-  ]);
-  assert.equal(qr.searchParams.has("accessToken"), false);
-  assert.equal(qr.searchParams.has("refreshToken"), false);
+    "twenroll2.",
+    "tmuxworktree://enroll",
+    "data:image/",
+  ]) assert.equal(serializedState.includes(forbidden), false, forbidden);
+
+  let shownHandle: string | null = null;
+  const panel = RelayV2EnrollmentPreviewPanel({
+    state: activeState,
+    v1SharedSecretConfigured: true,
+    onShowEnrollmentArtifact: (handle) => {
+      shownHandle = handle;
+    },
+  });
+  assert.ok(panel);
+  findButtonByAccessibleName(panel, "Show QR code").props.onClick?.();
+  assert.equal(shownHandle, relayV2Review.renderArtifact.handle);
 });

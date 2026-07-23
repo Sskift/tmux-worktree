@@ -7,6 +7,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialSecretValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import java.math.BigInteger
@@ -106,6 +107,7 @@ internal enum class RelayV2ConnectionPhase {
     QUERYING,
     RESYNCING,
     ONLINE,
+    SUSPENDED,
     CONTINUITY_REJECTED,
     FAILED,
     DISCONNECTED,
@@ -1003,6 +1005,42 @@ internal sealed interface RelayV2RuntimeEffect {
         val hostEventSeq: String,
         val outcome: RelayV2HelloOutcome = RelayV2HelloOutcome.EVENT_CURSOR_AHEAD,
     ) : GenerationScoped
+
+    /** Exact actor-owned signal that an authoritative online host requires a fresh handshake. */
+    data class ReconnectAfterHostPresence(
+        val profile: RelayActiveProfileIdentity,
+        override val generation: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
+        val brokerEpoch: String,
+        val hostsRevision: String,
+    ) : GenerationScoped {
+        init {
+            require(profile.dialect == RelayProfileDialect.V2)
+            require(profile.profileId == generation.profileId)
+            require(profile.activationGeneration == generation.profileGeneration)
+            require(connectionAttempt.profile == profile)
+            requireRelayV2RuntimeId(brokerEpoch, "Broker epoch")
+            requireRelayV2RuntimeCounter(hostsRevision, "Hosts revision")
+        }
+    }
+
+    /** Broker-owned credential expiry fact, exact-bound to one actor connection attempt. */
+    data class AuthRolloverRequested(
+        val profile: RelayActiveProfileIdentity,
+        override val generation: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
+        val grantId: String,
+        val expiresAtMs: Long,
+        val refreshRecommendedAtMs: Long,
+    ) : GenerationScoped {
+        init {
+            require(profile.dialect == RelayProfileDialect.V2)
+            require(profile.profileId == generation.profileId)
+            require(profile.activationGeneration == generation.profileGeneration)
+            require(connectionAttempt.profile == profile)
+            requireRelayV2RuntimeId(grantId, "Grant ID")
+        }
+    }
 
     /** Bounded handoff seam for repository-owned post-handshake protocol state. */
     data class DeliverPostHandshakeFrame(

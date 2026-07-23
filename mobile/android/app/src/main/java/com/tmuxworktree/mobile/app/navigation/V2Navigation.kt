@@ -79,7 +79,9 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.tmuxworktree.mobile.BuildConfig
+import com.tmuxworktree.mobile.app.AgentCapabilityAvailability
 import com.tmuxworktree.mobile.app.NewWorktreeRequest
+import com.tmuxworktree.mobile.app.RelayV2EnrollmentReviewState
 import com.tmuxworktree.mobile.app.RelayStartupAdmissionState
 import com.tmuxworktree.mobile.app.V2UiEffect
 import com.tmuxworktree.mobile.app.V2UiState
@@ -110,6 +112,7 @@ import com.tmuxworktree.mobile.feature.createworktree.NewWorktreeStep
 import com.tmuxworktree.mobile.feature.createworktree.NewWorktreeValidationErrors
 import com.tmuxworktree.mobile.feature.inbox.InboxScreen
 import com.tmuxworktree.mobile.feature.pairing.PairingScreen
+import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
 import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
@@ -152,6 +155,7 @@ internal fun V2Navigation(
     onScanQr: () -> Unit,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val enrollmentReview by viewModel.relayV2EnrollmentReviewState.collectAsStateWithLifecycle()
     val navController = rememberNavController()
     val terminalController = rememberTerminalWebViewController()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -184,6 +188,10 @@ internal fun V2Navigation(
             .testTag("v2_app"),
     ) {
         when {
+            enrollmentReview != RelayV2EnrollmentReviewState.Idle -> RelayV2EnrollmentReviewGate(
+                state = enrollmentReview,
+                viewModel = viewModel,
+            )
             !state.initialized -> LoadingApp()
             state.pairingRequired || !state.paired -> PairingGate(
                 state = state,
@@ -203,6 +211,38 @@ internal fun V2Navigation(
             modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
         )
     }
+}
+
+@Composable
+private fun RelayV2EnrollmentReviewGate(
+    state: RelayV2EnrollmentReviewState,
+    viewModel: V2ViewModel,
+) {
+    val facts = when (state) {
+        is RelayV2EnrollmentReviewState.Review -> state.facts
+        is RelayV2EnrollmentReviewState.Submitting -> state.facts
+        is RelayV2EnrollmentReviewState.Completed -> state.facts
+        is RelayV2EnrollmentReviewState.Activating -> state.facts
+        is RelayV2EnrollmentReviewState.ActivationFailure -> state.facts
+        is RelayV2EnrollmentReviewState.Failure -> state.facts
+        RelayV2EnrollmentReviewState.Idle -> return
+    }
+    RelayV2EnrollmentReviewScreen(
+        issuerUrl = facts.issuerUrl,
+        relayUrl = facts.relayUrl,
+        hostId = facts.hostId,
+        enrollmentId = facts.enrollmentId,
+        submitting = state is RelayV2EnrollmentReviewState.Submitting,
+        completed = state is RelayV2EnrollmentReviewState.Completed ||
+            state is RelayV2EnrollmentReviewState.ActivationFailure,
+        activating = state is RelayV2EnrollmentReviewState.Activating,
+        activationFailureMessage =
+            (state as? RelayV2EnrollmentReviewState.ActivationFailure)?.message,
+        failureMessage = (state as? RelayV2EnrollmentReviewState.Failure)?.message,
+        onConfirm = viewModel::confirmRelayV2EnrollmentReview,
+        onActivate = viewModel::activateConfirmedRelayV2Profile,
+        onCancel = viewModel::cancelRelayV2EnrollmentReview,
+    )
 }
 
 @Composable
@@ -273,6 +313,8 @@ private fun MainNavigation(
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val agentCapabilityAvailable =
+        state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE
     val navigateRoot: (RootDestination) -> Unit = { destination ->
         val route = destination.route()
         navController.navigate(route) {
@@ -316,7 +358,7 @@ private fun MainNavigation(
                     onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
                     onReplyClick = { navController.navigate(V2Routes.session(it.stableId, focusReply = true)) },
                     onBottomDestinationSelected = navigateRoot,
-                    agentStateAvailable = state.demoMode,
+                    agentStateAvailable = agentCapabilityAvailable,
                 )
             }
             composable(V2Routes.WORKSPACES) {
@@ -353,7 +395,7 @@ private fun MainNavigation(
                         copyText(context, "tmux-worktree diagnostics", viewModel.diagnostics())
                     },
                     onBottomDestinationSelected = navigateRoot,
-                    notificationsAvailable = state.demoMode,
+                    notificationsAvailable = agentCapabilityAvailable,
                 )
             }
             composable(V2Routes.HEALTH) {
@@ -549,7 +591,8 @@ private fun SessionRoute(
         onOverflowClick = { showActions = true },
         onSend = { viewModel.sendMessage(session, it) },
         autoFocusReply = autoFocusReply,
-        agentStateAvailable = state.demoMode,
+        agentStateAvailable =
+            state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE,
         onCancelMessage = viewModel::cancelMessage,
     )
 
@@ -846,7 +889,6 @@ private fun TerminalRoute(
     val ownershipReadOnly = state.terminal.inputReadOnly
     val readOnly = userReadOnly || ownershipReadOnly
 
-    LaunchedEffect(session.stableId) { viewModel.openTerminal(session) }
     LaunchedEffect(readOnly) { controller.setReadOnly(readOnly) }
     LaunchedEffect(fontSize) { controller.setFontSize(fontSize) }
     DisposableEffect(session.stableId) {
@@ -862,7 +904,7 @@ private fun TerminalRoute(
         disconnectReason = state.terminal.resetReason.ifBlank { state.health.errorMessage }.ifBlank { null },
         onBack = onBack,
         onConnectionStatusClick = onHealth,
-        onReconnect = { viewModel.openTerminal(session) },
+        onReconnect = { viewModel.openTerminal(session, controller) },
         onToggleKeyboard = {
             keyboardVisible = !keyboardVisible
             if (keyboardVisible) controller.focus() else controller.blur()
@@ -877,6 +919,7 @@ private fun TerminalRoute(
                     controller.setReadOnly(readOnly)
                     controller.setFontSize(fontSize)
                     controller.fit()
+                    viewModel.openTerminal(session, controller)
                 },
                 onFailure = viewModel::reportTerminalError,
                 onInput = { if (!readOnly) viewModel.sendTerminalInput(it) },

@@ -2076,9 +2076,13 @@ private fun RelayV2CommandStatusEvidence.isValidExpiredFailure(): Boolean {
 
 private fun RelayV2CommandStatusEvidence.isRetryableNotAccepted(): Boolean =
     retryable &&
-        retryAfterMs != null &&
         !reissueRequired &&
-        errorCode == "COMMAND_NOT_ACCEPTED" &&
+        when (source) {
+            RelayV2CommandStatusSource.EXECUTE_RESPONSE -> errorCode != null
+            RelayV2CommandStatusSource.QUERY_RESPONSE ->
+                retryAfterMs != null && errorCode == "COMMAND_NOT_ACCEPTED"
+            RelayV2CommandStatusSource.RESULT_EVENT -> false
+        } &&
         commandDisposition == RelayV2CommandDisposition.NOT_ACCEPTED &&
         detailsReissueRequired == null &&
         expiredFinalState == null &&

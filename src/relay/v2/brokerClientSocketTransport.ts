@@ -940,7 +940,19 @@ implements RelayV2BrokerManagedClientSocketTransport {
       case "route_opened":
         if (entry.phase !== "open") return "rejected";
         entry.routeOpened = true;
-        // Deliberately no relay.welcome/capability fabrication here.
+        // Core queued the exact public relay.welcome before emitting this
+        // internal action. Opening this gate lets only that Core-owned ready
+        // fence drain on the already-scheduled turn; this adapter never
+        // fabricates handshake or capability facts.
+        if (
+          entry.pendingReadyFence
+          && relayV2BrokerOutputReadyMayDrain(entry.pendingReadyFence)
+          && !entry.outbound
+          && !entry.readyTurnQueued
+        ) {
+          entry.readyTurnQueued = true;
+          queueMicrotask(() => this.runClientReadyTurn(entry));
+        }
         return "applied";
       case "pause_client":
         return this.setPaused(entry, true);

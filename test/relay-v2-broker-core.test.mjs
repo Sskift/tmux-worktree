@@ -2,8 +2,24 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 
-const broker = await import("../dist/relay/v2/brokerCore.js");
+const brokerModule = await import("../dist/relay/v2/brokerCore.js");
+// Route behavior below exercises the explicit atomic G2 readiness receipt;
+// tests for the default-off boundary construct brokerModule.RelayV2BrokerCore directly.
+const broker = Object.freeze({
+  ...brokerModule,
+  RelayV2BrokerCore: class G2RelayV2BrokerCore extends brokerModule.RelayV2BrokerCore {
+    constructor(options = {}) {
+      super({
+        baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+        ...options,
+      });
+    }
+  },
+});
 const codec = await import("../dist/relay/v2/codec.js");
+const agentCodec = await import(
+  "../dist/relay/extensions/agentTranscriptLifecycle/v1/codec.js"
+);
 
 const HOST_ID = "mac-admin";
 const NOW_MS = 1_783_700_000_000;
@@ -103,6 +119,7 @@ async function openRoute(
   hostId = HOST_ID,
   authOverrides = {},
   connectionIncarnation = randomUUID(),
+  expectedCapabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
 ) {
   const opened = core.openClientRoute(connectionId, authContext("client", {
     hostId,
@@ -129,11 +146,50 @@ async function openRoute(
   }));
   assert.equal(acknowledged.accepted, true);
   assert.equal(acknowledged.actions[0].kind, "route_opened");
-  return { connectionId, connectionIncarnation, routeOpen, acknowledged };
+  const [welcomeDelivery] = core.drainClient(connectionId, { maxFrames: 1 });
+  assert.ok(welcomeDelivery);
+  const welcome = codec.decodeRelayV2WebSocketFrame("public", welcomeDelivery.bytes).frame;
+  assert.deepEqual(JSON.parse(Buffer.from(welcomeDelivery.bytes).toString("utf8")), {
+    protocolVersion: 2,
+    kind: "event",
+    type: "relay.welcome",
+    payload: {
+      selectedVersion: 2,
+      connectionId,
+      brokerEpoch: core.brokerEpoch,
+      principalId: authOverrides.principalId ?? "client-principal",
+      capabilities: expectedCapabilities,
+      limits: {
+        maxFrameBytes: broker.RELAY_V2_BROKER_LIMITS.maxFrameBytes,
+        maxCarrierFrameBytes: broker.RELAY_V2_BROKER_LIMITS.maxCarrierFrameBytes,
+        brokerRouteBufferedBytesPerDirection:
+          broker.RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection,
+        brokerRouteLowWaterBytesPerDirection:
+          broker.RELAY_V2_BROKER_LIMITS.routeLowWaterBytesPerDirection,
+        brokerCarrierBufferedBytes: broker.RELAY_V2_BROKER_LIMITS.carrierBufferedBytes,
+        brokerCarrierLowWaterBytes: broker.RELAY_V2_BROKER_LIMITS.carrierLowWaterBytes,
+        maxQueuedRouteFrames: broker.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames,
+        maxInFlightRequestsPerRoute:
+          broker.RELAY_V2_BROKER_LIMITS.maxInFlightRequestsPerRoute,
+      },
+    },
+  });
+  assert.equal(core.acknowledgeClientDelivery(connectionId, welcomeDelivery.deliveryId).accepted, true);
+  return {
+    connectionId,
+    connectionIncarnation,
+    routeOpen,
+    acknowledged,
+    welcome,
+  };
 }
 
 function publicBytes(frame) {
   return codec.encodeRelayV2WebSocketFrame("public", frame);
+}
+
+function agentBytes(frame) {
+  return agentCodec.encodeRelayAgentTranscriptLifecycleFrame(frame);
 }
 
 function clientHello(requestId = randomUUID(), overrides = {}) {
@@ -248,6 +304,10 @@ function hostTerminalAck(streamId = "stream-1") {
 }
 
 function hostRouteData(identity, seq = "1", frame = hostTerminalAck()) {
+  return hostRouteDataBytes(identity, seq, publicBytes(frame));
+}
+
+function hostRouteDataBytes(identity, seq, bytes) {
   return {
     carrierVersion: 1,
     type: "route.data",
@@ -259,7 +319,117 @@ function hostRouteData(identity, seq = "1", frame = hostTerminalAck()) {
     payload: {
       opcode: "text",
       encoding: "base64",
-      data: Buffer.from(publicBytes(frame)).toString("base64"),
+      data: Buffer.from(bytes).toString("base64"),
+    },
+  };
+}
+
+function agentStatusGet(hostEpoch, requestId = randomUUID()) {
+  return {
+    protocolVersion: 2,
+    kind: "request",
+    type: "agent.timeline.status.get",
+    requestId,
+    hostId: HOST_ID,
+    expectedHostEpoch: hostEpoch,
+    scopeId: "scope-local",
+    sessionId: "session-opaque",
+    payload: {},
+  };
+}
+
+function hostWelcome(requestId, host, capabilities) {
+  return {
+    protocolVersion: 2,
+    kind: "response",
+    type: "host.welcome",
+    requestId,
+    hostId: HOST_ID,
+    hostEpoch: host.hello.payload.hostEpoch,
+    hostInstanceId: host.hello.payload.hostInstanceId,
+    payload: {
+      selectedVersion: 2,
+      capabilities,
+      eventSeq: "1",
+      resumeDisposition: "snapshot_required",
+      resumeReason: "fresh",
+      commandDedupeWindow: {
+        windowId: "dedupe-window",
+        windowSeq: "1",
+        acceptUntilMs: NOW_MS + 60_000,
+        queryUntilMs: NOW_MS + 120_000,
+      },
+      limits: {
+        commandResultRetentionMs: 86_400_000,
+        commandDedupeRetentionMs: 604_800_000,
+        maxCommandQueryIds: 32,
+        stateSnapshotChunkBytes: 524_288,
+        stateSnapshotChunkRecords: 256,
+        stateSnapshotMaxBytes: 268_435_456,
+        stateSnapshotMaxRecords: 100_000,
+        stateSnapshotIdleLeaseMs: 300_000,
+        stateSnapshotMaxLifetimeMs: 3_600_000,
+        stateSnapshotMaxPinnedPerPrincipal: 2,
+        stateSnapshotMaxPinnedPerHost: 16,
+        stateSnapshotPinnedBytesPerHost: 536_870_912,
+        stateSnapshotPinnedMetadataBytesPerHost: 16_777_216,
+        stateSnapshotChunkMaxJsonKeys: 8_192,
+        stateSnapshotChunkMaxJsonNodes: 16_384,
+        terminalReplayBytesPerStream: 4_194_304,
+        terminalReplayBytesPerHost: 67_108_864,
+        terminalDetachedLeaseMs: 120_000,
+        terminalControlDedupeRetentionMs: 600_000,
+        terminalMaxUnackedBytes: 524_288,
+        terminalMaxFrameBytes: 65_536,
+        terminalInputDedupeEntriesPerStream: 512,
+        terminalResizeDedupeEntriesPerStream: 256,
+        terminalMaxStreamsPerHost: 256,
+        terminalControlRecordsPerHost: 4_096,
+        brokerRouteBufferedBytesPerDirection: 1_048_576,
+        brokerRouteLowWaterBytesPerDirection: 524_288,
+      },
+    },
+  };
+}
+
+function agentStatus(requestId, host) {
+  return {
+    protocolVersion: 2,
+    kind: "response",
+    type: "agent.timeline.status",
+    requestId,
+    hostId: HOST_ID,
+    hostEpoch: host.hello.payload.hostEpoch,
+    scopeId: "scope-local",
+    sessionId: "session-opaque",
+    payload: {
+      capability: agentCodec.RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      support: "unavailable",
+      reason: "agent_unsupported",
+      liveSource: "absent",
+      activeSourceEpoch: null,
+      timelineEpoch: null,
+      currentAgentSeq: null,
+      earliestReplaySeq: null,
+      limits: null,
+    },
+  };
+}
+
+function agentTimelineReset(host) {
+  return {
+    protocolVersion: 2,
+    kind: "event",
+    type: "agent.timeline.reset",
+    hostId: HOST_ID,
+    hostEpoch: host.hello.payload.hostEpoch,
+    scopeId: "scope-local",
+    sessionId: "session-opaque",
+    payload: {
+      capability: agentCodec.RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      previousTimelineEpoch: "timeline-before-withdrawal",
+      newTimelineEpoch: "timeline-after-withdrawal",
+      reason: "deleted",
     },
   };
 }
@@ -587,44 +757,77 @@ test("carrier route admission hard-bounds disconnect cleanup production", async 
   assert.equal(core.inspectHost(HOST_ID).state, "offline");
 });
 
-test("claim-scoped hosts.snapshot stays in broker and readiness never copies hello extensions", async () => {
-  const claimedCapabilities = [
-    ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
-    "agent.transcript-lifecycle.v1",
-  ];
-  const disabled = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+test("optional Agent capability is a three-party route intersection with isolated withdrawal", async () => {
+  const baseCapabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES];
+  const agentCapability = agentCodec.RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY;
+  const claimedCapabilities = [...baseCapabilities, agentCapability];
+  assert.deepEqual(brokerModule.RELAY_V2_OPTIONAL_CAPABILITIES, [agentCapability]);
+
+  const disabled = new brokerModule.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    optionalCapabilityReadiness: [agentCapability],
+  });
   await registerHost(disabled, "host-directory-disabled", hostHello({
     capabilities: claimedCapabilities,
   }));
   assert.deepEqual(disabled.inspectHost(HOST_ID).capabilities, []);
-  const disabledRoute = await openRoute(
-    disabled,
-    "host-directory-disabled",
+  const disabledRoute = disabled.openClientRoute(
     "client-directory-disabled",
+    authContext("client"),
   );
-  assert.deepEqual(disabledRoute.acknowledged.actions[0].capabilities, []);
+  assert.equal(disabledRoute.accepted, false);
+  assert.equal(disabledRoute.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(disabled.drainClient("client-directory-disabled").length, 0);
+
+  const hostWithoutExtension = new brokerModule.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    baseCapabilityReadiness: baseCapabilities,
+    optionalCapabilityReadiness: [agentCapability],
+  });
+  await registerHost(hostWithoutExtension, "host-without-agent", hostHello({
+    capabilities: baseCapabilities,
+  }));
+  assert.deepEqual(hostWithoutExtension.inspectHost(HOST_ID).capabilities, baseCapabilities);
+  const baseOnlyRoute = await openRoute(
+    hostWithoutExtension,
+    "host-without-agent",
+    "client-without-host-agent",
+  );
+  assert.deepEqual(
+    baseOnlyRoute.acknowledged.actions.find((action) => action.kind === "route_opened")
+      .capabilities,
+    baseCapabilities,
+  );
 
   const core = new broker.RelayV2BrokerCore({
     now: () => NOW_MS,
-    baseCapabilityReadiness: broker.RELAY_V2_REQUIRED_CAPABILITIES,
+    baseCapabilityReadiness: baseCapabilities,
+    optionalCapabilityReadiness: [agentCapability],
   });
-  await registerHost(core, "host-directory", hostHello({
+  const host = await registerHost(core, "host-directory", hostHello({
     capabilities: claimedCapabilities,
   }));
   const directory = core.readHostsSnapshot(authContext("client"), "hosts-direct");
   assert.deepEqual(
     directory.payload.items[0].capabilities,
-    [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    claimedCapabilities,
   );
 
-  const route = await openRoute(core, "host-directory", "client-directory");
+  const route = await openRoute(
+    core,
+    "host-directory",
+    "client-directory",
+    1_048_576,
+    HOST_ID,
+    {},
+    randomUUID(),
+    claimedCapabilities,
+  );
+  assert.equal(route.welcome.type, "relay.welcome");
   const openedAction = route.acknowledged.actions.find((action) => (
     action.kind === "route_opened"
   ));
-  assert.deepEqual(
-    openedAction.capabilities,
-    [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
-  );
+  assert.deepEqual(openedAction.capabilities, claimedCapabilities);
 
   const snapshotRequest = core.forwardClientFrame(
     route.connectionId,
@@ -643,6 +846,295 @@ test("claim-scoped hosts.snapshot stays in broker and readiness never copies hel
   assert.equal(response.requestId, "hosts-routed");
   assert.deepEqual(response.payload.items.map((item) => item.hostId), [HOST_ID]);
   core.acknowledgeClientDelivery(route.connectionId, delivery.deliveryId);
+
+  const noOfferHello = clientHello("hello-no-agent");
+  noOfferHello.payload.capabilities = baseCapabilities;
+  noOfferHello.payload.requiredCapabilities = baseCapabilities;
+  assert.equal(core.forwardClientFrame(
+    route.connectionId,
+    publicBytes(noOfferHello),
+  ).accepted, true);
+  const [noOfferHelloDelivery] = core.drainHostCarrier("host-directory", { maxFrames: 1 });
+  assert.equal(noOfferHelloDelivery.frame.type, "route.data");
+  core.acknowledgeHostDelivery("host-directory", noOfferHelloDelivery.deliveryId);
+  const noOfferWelcome = await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes(hostRouteDataBytes(
+      route.routeOpen,
+      "1",
+      publicBytes(hostWelcome("hello-no-agent", host, claimedCapabilities)),
+    )),
+  );
+  assert.equal(noOfferWelcome.accepted, true);
+  assert.equal(noOfferWelcome.actions.some((action) => action.kind === "close_client"), false);
+  const [noOfferWelcomeDelivery] = core.drainClient(route.connectionId, { maxFrames: 1 });
+  const filteredHostWelcome = codec.decodeRelayV2WebSocketFrame(
+    "public",
+    noOfferWelcomeDelivery.bytes,
+  ).frame;
+  assert.deepEqual(filteredHostWelcome.payload.capabilities, baseCapabilities);
+  core.acknowledgeClientDelivery(route.connectionId, noOfferWelcomeDelivery.deliveryId);
+
+  const noOfferAgentRequest = agentStatusGet(host.hello.payload.hostEpoch, "agent-no-offer");
+  const noOfferViolation = core.forwardClientFrame(
+    route.connectionId,
+    agentBytes(noOfferAgentRequest),
+  );
+  assert.equal(noOfferViolation.accepted, false);
+  assert.equal(noOfferViolation.error.code, "INVALID_ENVELOPE");
+  assert.equal(noOfferViolation.actions.some((action) => (
+    action.kind === "close_client" && action.closeCode === 4400
+  )), true);
+  assert.equal(core.drainClient(route.connectionId).length, 0);
+  const [noOfferUnbind] = core.drainHostCarrier("host-directory", { maxFrames: 1 });
+  assert.equal(noOfferUnbind.frame.type, "route.unbind");
+  assert.equal(noOfferUnbind.frame.routeId, route.routeOpen.routeId);
+  core.acknowledgeHostDelivery("host-directory", noOfferUnbind.deliveryId);
+  assert.equal((await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "route.unbound",
+      connectorId: noOfferUnbind.frame.connectorId,
+      routeId: noOfferUnbind.frame.routeId,
+      routeFence: noOfferUnbind.frame.routeFence,
+      payload: {
+        reason: noOfferUnbind.frame.payload.reason,
+        lastClientToHostSeq: noOfferUnbind.frame.payload.lastClientToHostSeq,
+        lastHostToClientSeq: "1",
+      },
+    }),
+  )).accepted, true);
+
+  const hostLossRoute = await openRoute(
+    core,
+    "host-directory",
+    "client-host-agent-loss",
+    1_048_576,
+    HOST_ID,
+    {},
+    randomUUID(),
+    claimedCapabilities,
+  );
+  const hostLossHello = clientHello("hello-host-agent-loss");
+  hostLossHello.payload.capabilities = claimedCapabilities;
+  hostLossHello.payload.requiredCapabilities = baseCapabilities;
+  assert.equal(core.forwardClientFrame(
+    hostLossRoute.connectionId,
+    publicBytes(hostLossHello),
+  ).accepted, true);
+  const [hostLossHelloDelivery] = core.drainHostCarrier(
+    "host-directory",
+    { maxFrames: 1 },
+  );
+  core.acknowledgeHostDelivery("host-directory", hostLossHelloDelivery.deliveryId);
+  const hostLossWelcomeResult = await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes(hostRouteDataBytes(
+      hostLossRoute.routeOpen,
+      "1",
+      publicBytes(hostWelcome("hello-host-agent-loss", host, baseCapabilities)),
+    )),
+  );
+  assert.equal(hostLossWelcomeResult.accepted, true);
+  assert.deepEqual(hostLossWelcomeResult.actions, []);
+  const [hostLossWelcomeDelivery] = core.drainClient(
+    hostLossRoute.connectionId,
+    { maxFrames: 1 },
+  );
+  assert.deepEqual(
+    codec.decodeRelayV2WebSocketFrame("public", hostLossWelcomeDelivery.bytes)
+      .frame.payload.capabilities,
+    baseCapabilities,
+  );
+  core.acknowledgeClientDelivery(
+    hostLossRoute.connectionId,
+    hostLossWelcomeDelivery.deliveryId,
+  );
+  assert.equal(core.forwardClientFrame(
+    hostLossRoute.connectionId,
+    publicBytes(clientTerminalAck("base-after-host-agent-loss")),
+  ).accepted, true);
+  const [baseAfterHostLoss] = core.drainHostCarrier("host-directory", { maxFrames: 1 });
+  assert.equal(baseAfterHostLoss.frame.type, "route.data");
+  core.acknowledgeHostDelivery("host-directory", baseAfterHostLoss.deliveryId);
+
+  const selectedRoute = await openRoute(
+    core,
+    "host-directory",
+    "client-agent-selected",
+    1_048_576,
+    HOST_ID,
+    {},
+    randomUUID(),
+    claimedCapabilities,
+  );
+  const selectedHello = clientHello("hello-agent-selected");
+  selectedHello.payload.capabilities = claimedCapabilities;
+  selectedHello.payload.requiredCapabilities = baseCapabilities;
+  assert.equal(core.forwardClientFrame(
+    selectedRoute.connectionId,
+    publicBytes(selectedHello),
+  ).accepted, true);
+  const [selectedHelloDelivery] = core.drainHostCarrier(
+    "host-directory",
+    { maxFrames: 1 },
+  );
+  core.acknowledgeHostDelivery("host-directory", selectedHelloDelivery.deliveryId);
+  assert.equal((await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes(hostRouteDataBytes(
+      selectedRoute.routeOpen,
+      "1",
+      publicBytes(hostWelcome("hello-agent-selected", host, claimedCapabilities)),
+    )),
+  )).accepted, true);
+  const [selectedWelcomeDelivery] = core.drainClient(
+    selectedRoute.connectionId,
+    { maxFrames: 1 },
+  );
+  assert.deepEqual(
+    codec.decodeRelayV2WebSocketFrame("public", selectedWelcomeDelivery.bytes)
+      .frame.payload.capabilities,
+    claimedCapabilities,
+  );
+  core.acknowledgeClientDelivery(
+    selectedRoute.connectionId,
+    selectedWelcomeDelivery.deliveryId,
+  );
+
+  const pendingAgentRequest = agentStatusGet(
+    host.hello.payload.hostEpoch,
+    "agent-pending-at-loss",
+  );
+  assert.equal(core.forwardClientFrame(
+    selectedRoute.connectionId,
+    agentBytes(pendingAgentRequest),
+  ).accepted, true);
+  const [pendingAgentDelivery] = core.drainHostCarrier(
+    "host-directory",
+    { maxFrames: 1 },
+  );
+  assert.deepEqual(
+    JSON.parse(agentCodec.decodeRelayAgentTranscriptLifecycleFrame(
+      Buffer.from(pendingAgentDelivery.frame.payload.data, "base64"),
+    ).canonicalWire),
+    pendingAgentRequest,
+  );
+  core.acknowledgeHostDelivery("host-directory", pendingAgentDelivery.deliveryId);
+
+  const revisionBeforeLoss = core.inspectHost(HOST_ID).revision;
+  const withdrawn = core.optionalCapabilityReadinessPort.withdraw(agentCapability);
+  assert.deepEqual(withdrawn, { accepted: true, actions: [] });
+  assert.deepEqual(core.inspectHost(HOST_ID).capabilities, baseCapabilities);
+  assert.equal(
+    core.inspectHost(HOST_ID).revision,
+    String(BigInt(revisionBeforeLoss) + 1n),
+  );
+  assert.deepEqual(
+    core.optionalCapabilityReadinessPort.withdraw(agentCapability),
+    { accepted: true, actions: [] },
+  );
+  assert.equal(core.inspectHost(HOST_ID).revision, String(BigInt(revisionBeforeLoss) + 1n));
+
+  const lateAgentResponse = await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes(hostRouteDataBytes(
+      selectedRoute.routeOpen,
+      "2",
+      agentBytes(agentStatus("agent-pending-at-loss", host)),
+    )),
+  );
+  assert.equal(lateAgentResponse.accepted, true);
+  assert.deepEqual(lateAgentResponse.actions, []);
+  const [lossUnavailable] = core.drainClient(
+    selectedRoute.connectionId,
+    { maxFrames: 1 },
+  );
+  const lossError = agentCodec.decodeRelayAgentTranscriptLifecycleFrame(
+    lossUnavailable.bytes,
+  ).frame;
+  assert.equal(lossError.requestId, "agent-pending-at-loss");
+  assert.equal(lossError.error.code, "AGENT_TIMELINE_UNAVAILABLE");
+  assert.equal(lossError.error.retryable, true);
+  core.acknowledgeClientDelivery(selectedRoute.connectionId, lossUnavailable.deliveryId);
+
+  const lateAgentEvent = await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes(hostRouteDataBytes(
+      selectedRoute.routeOpen,
+      "3",
+      agentBytes(agentTimelineReset(host)),
+    )),
+  );
+  assert.deepEqual(lateAgentEvent, { accepted: true, actions: [] });
+  assert.equal(core.drainClient(selectedRoute.connectionId).length, 0);
+
+  const baseAfterLateAgentEvent = await core.receiveHostFrame(
+    "host-directory",
+    carrierBytes(hostRouteData(
+      selectedRoute.routeOpen,
+      "4",
+      hostTerminalAck("base-after-late-agent-event"),
+    )),
+  );
+  assert.equal(baseAfterLateAgentEvent.accepted, true);
+  assert.equal(baseAfterLateAgentEvent.actions.some((action) => (
+    action.kind === "close_client" || action.kind === "close_host"
+  )), false);
+  const [baseAfterLateAgentEventDelivery] = core.drainClient(
+    selectedRoute.connectionId,
+    { maxFrames: 1 },
+  );
+  assert.equal(
+    codec.decodeRelayV2WebSocketFrame(
+      "public",
+      baseAfterLateAgentEventDelivery.bytes,
+    ).frame.streamId,
+    "base-after-late-agent-event",
+  );
+  core.acknowledgeClientDelivery(
+    selectedRoute.connectionId,
+    baseAfterLateAgentEventDelivery.deliveryId,
+  );
+
+  const afterLossRequest = agentStatusGet(
+    host.hello.payload.hostEpoch,
+    "agent-after-loss",
+  );
+  assert.equal(core.forwardClientFrame(
+    selectedRoute.connectionId,
+    agentBytes(afterLossRequest),
+  ).accepted, true);
+  assert.equal(core.drainHostCarrier("host-directory").length, 0);
+  const [afterLossUnavailable] = core.drainClient(
+    selectedRoute.connectionId,
+    { maxFrames: 1 },
+  );
+  assert.equal(
+    agentCodec.decodeRelayAgentTranscriptLifecycleFrame(afterLossUnavailable.bytes)
+      .frame.error.code,
+    "AGENT_TIMELINE_UNAVAILABLE",
+  );
+  core.acknowledgeClientDelivery(
+    selectedRoute.connectionId,
+    afterLossUnavailable.deliveryId,
+  );
+
+  assert.equal(core.forwardClientFrame(
+    selectedRoute.connectionId,
+    publicBytes(clientTerminalAck("base-after-broker-agent-loss")),
+  ).accepted, true);
+  const [baseAfterBrokerLoss] = core.drainHostCarrier(
+    "host-directory",
+    { maxFrames: 1 },
+  );
+  assert.equal(baseAfterBrokerLoss.frame.type, "route.data");
+  assert.equal(baseAfterBrokerLoss.frame.routeId, selectedRoute.routeOpen.routeId);
+  assert.equal(
+    core.openClientRoute("client-base-after-agent-loss", authContext("client")).accepted,
+    true,
+  );
 });
 
 test("persistent auth-control authority replays reauthentication ACK and preserves old context on failure", async () => {
@@ -1757,6 +2249,7 @@ test("route rejection preserves frozen error semantics and close class", async (
     assert.equal(rejected.accepted, false);
     assert.deepEqual(rejected.error, frozenError);
     assert.equal(rejected.actions[0].closeCode, closeCode);
+    assert.equal(core.drainClient(connectionId).length, 0, "rejected routes never queue welcome");
   }
 });
 
@@ -1798,6 +2291,7 @@ test("post-101 route races choose exactly one welcome or unavailable outcome", a
   assert.equal(lateOpened.accepted, false);
   assert.equal(lateOpened.actions.some((action) => action.kind === "route_opened"), false);
   assert.equal(lateOpened.actions.some((action) => action.kind === "route_unavailable"), false);
+  assert.equal(unavailableCore.drainClient(connectionId).length, 0);
 
   const welcomeCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
   await registerHost(welcomeCore, "host-race-welcome");
@@ -1810,9 +2304,88 @@ test("post-101 route races choose exactly one welcome or unavailable outcome", a
     welcome.acknowledged.actions.map((action) => action.kind),
     ["route_opened"],
   );
+  assert.equal(welcome.welcome.type, "relay.welcome");
   const afterWelcome = welcomeCore.disconnectHost("host-race-welcome");
   assert.equal(afterWelcome.actions.some((action) => action.kind === "route_unavailable"), false);
   assert.equal(afterWelcome.actions.some((action) => action.kind === "close_client"), true);
+
+  const duplicateCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const duplicateHost = await registerHost(duplicateCore, "host-race-duplicate");
+  const duplicateConnectionId = "client-race-duplicate";
+  assert.equal(duplicateCore.openClientRoute(
+    duplicateConnectionId,
+    authContext("client"),
+  ).accepted, true);
+  const [duplicateOpen] = duplicateCore.drainHostCarrier(
+    "host-race-duplicate",
+    { maxFrames: 1 },
+  );
+  duplicateCore.acknowledgeHostDelivery(
+    "host-race-duplicate",
+    duplicateOpen.deliveryId,
+  );
+  const duplicateOpenedFrame = {
+    carrierVersion: 1,
+    type: "route.opened",
+    requestId: duplicateOpen.frame.requestId,
+    connectorId: duplicateHost.connectorId,
+    routeId: duplicateOpen.frame.routeId,
+    routeFence: duplicateOpen.frame.routeFence,
+    payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+  };
+  const firstOpened = await duplicateCore.receiveHostFrame(
+    "host-race-duplicate",
+    carrierBytes(duplicateOpenedFrame),
+  );
+  assert.deepEqual(firstOpened.actions.map((action) => action.kind), ["route_opened"]);
+  const duplicateOpened = await duplicateCore.receiveHostFrame(
+    "host-race-duplicate",
+    carrierBytes(duplicateOpenedFrame),
+  );
+  assert.equal(duplicateOpened.accepted, false);
+  assert.equal(duplicateOpened.actions.some((action) => action.kind === "route_opened"), false);
+  assert.equal(
+    duplicateCore.drainClient(duplicateConnectionId).length,
+    0,
+    "duplicate route.opened fences the queued welcome before it can leak",
+  );
+
+  const staleCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const staleHost = await registerHost(staleCore, "host-race-stale");
+  const staleConnectionId = "client-race-stale";
+  assert.equal(staleCore.openClientRoute(staleConnectionId, authContext("client")).accepted, true);
+  const [staleOpen] = staleCore.drainHostCarrier("host-race-stale", { maxFrames: 1 });
+  staleCore.acknowledgeHostDelivery("host-race-stale", staleOpen.deliveryId);
+  const staleOpened = await staleCore.receiveHostFrame("host-race-stale", carrierBytes({
+    carrierVersion: 1,
+    type: "route.opened",
+    requestId: staleOpen.frame.requestId,
+    connectorId: staleHost.connectorId,
+    routeId: staleOpen.frame.routeId,
+    routeFence: randomUUID(),
+    payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+  }));
+  assert.equal(staleOpened.accepted, false);
+  assert.equal(staleCore.drainClient(staleConnectionId).length, 0);
+
+  const closeCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(closeCore, "host-race-client-close");
+  const closeConnectionId = "client-race-client-close";
+  assert.equal(closeCore.openClientRoute(closeConnectionId, authContext("client")).accepted, true);
+  const [closeOpen] = closeCore.drainHostCarrier("host-race-client-close", { maxFrames: 1 });
+  closeCore.acknowledgeHostDelivery("host-race-client-close", closeOpen.deliveryId);
+  const closeOpened = await closeCore.receiveHostFrame("host-race-client-close", carrierBytes({
+    carrierVersion: 1,
+    type: "route.opened",
+    requestId: closeOpen.frame.requestId,
+    connectorId: closeOpen.frame.connectorId,
+    routeId: closeOpen.frame.routeId,
+    routeFence: closeOpen.frame.routeFence,
+    payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+  }));
+  assert.equal(closeOpened.accepted, true);
+  assert.equal(closeCore.unbindClient(closeConnectionId, "client_closed").accepted, true);
+  assert.equal(closeCore.drainClient(closeConnectionId).length, 0);
 });
 
 test("route frame limit is the minimum of broker, host hello, and route.opened", async () => {

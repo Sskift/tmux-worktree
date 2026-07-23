@@ -1,0 +1,3765 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 6,
+    "identityHash": "41cab3652d7fb279a5ec225b00e860be",
+    "entities": [
+      {
+        "tableName": "relay_v2_authority",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `cursorEventSeq` TEXT, `requiredThroughEventSeq` TEXT NOT NULL, `scopesRevision` TEXT, `phase` TEXT NOT NULL, `cacheRecordCount` INTEGER NOT NULL, `cacheCanonicalBytes` INTEGER NOT NULL, `pendingReleaseSnapshotRequestId` TEXT, `pendingReleaseSnapshotId` TEXT, `pendingReleaseCursorEventSeq` TEXT, `pendingReleaseReason` TEXT, `pendingReleasePhase` TEXT, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cursorEventSeq",
+            "columnName": "cursorEventSeq",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "requiredThroughEventSeq",
+            "columnName": "requiredThroughEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopesRevision",
+            "columnName": "scopesRevision",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "phase",
+            "columnName": "phase",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cacheRecordCount",
+            "columnName": "cacheRecordCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cacheCanonicalBytes",
+            "columnName": "cacheCanonicalBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pendingReleaseSnapshotRequestId",
+            "columnName": "pendingReleaseSnapshotRequestId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "pendingReleaseSnapshotId",
+            "columnName": "pendingReleaseSnapshotId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "pendingReleaseCursorEventSeq",
+            "columnName": "pendingReleaseCursorEventSeq",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "pendingReleaseReason",
+            "columnName": "pendingReleaseReason",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "pendingReleasePhase",
+            "columnName": "pendingReleasePhase",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch"
+          ]
+        }
+      },
+      {
+        "tableName": "relay_v2_scopes",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `displayName` TEXT NOT NULL, `kind` TEXT NOT NULL, `reachability` TEXT NOT NULL, `sessionsRevision` TEXT NOT NULL, `scopeRecordCanonicalJson` TEXT NOT NULL, `sessionsScopeRecordCanonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reachability",
+            "columnName": "reachability",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionsRevision",
+            "columnName": "sessionsRevision",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeRecordCanonicalJson",
+            "columnName": "scopeRecordCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionsScopeRecordCanonicalJson",
+            "columnName": "sessionsScopeRecordCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_scopes_profileId_principalId_clientInstanceId_hostId_hostEpoch",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_scopes_profileId_principalId_clientInstanceId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_sessions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `kind` TEXT NOT NULL, `displayName` TEXT NOT NULL, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER NOT NULL, `windowCount` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `activityAtMs` INTEGER NOT NULL, `recordCanonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "project",
+            "columnName": "project",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "label",
+            "columnName": "label",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cwd",
+            "columnName": "cwd",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "attached",
+            "columnName": "attached",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "windowCount",
+            "columnName": "windowCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activityAtMs",
+            "columnName": "activityAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordCanonicalJson",
+            "columnName": "recordCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`)"
+          },
+          {
+            "name": "index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch_scopeId",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch_scopeId` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_snapshot_staging",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `snapshotRequestId` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `snapshotCreatedAtMs` INTEGER NOT NULL, `snapshotLeaseExpiresAtMs` INTEGER NOT NULL, `snapshotAbsoluteExpiresAtMs` INTEGER NOT NULL, `throughEventSeq` TEXT NOT NULL, `scopesRevision` TEXT NOT NULL, `totalRecords` INTEGER NOT NULL, `totalCanonicalBytes` INTEGER NOT NULL, `cutDigest` TEXT NOT NULL, `nextChunkIndex` INTEGER NOT NULL, `nextCursor` TEXT, `receivedRecords` INTEGER NOT NULL, `receivedRecordCanonicalBytes` INTEGER NOT NULL, `receivedRawUtf8Bytes` INTEGER NOT NULL, `lastScopeId` TEXT, `lastRecordKind` TEXT, `lastSessionId` TEXT, `complete` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotRequestId",
+            "columnName": "snapshotRequestId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotId",
+            "columnName": "snapshotId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotCreatedAtMs",
+            "columnName": "snapshotCreatedAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotLeaseExpiresAtMs",
+            "columnName": "snapshotLeaseExpiresAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotAbsoluteExpiresAtMs",
+            "columnName": "snapshotAbsoluteExpiresAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "throughEventSeq",
+            "columnName": "throughEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopesRevision",
+            "columnName": "scopesRevision",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalRecords",
+            "columnName": "totalRecords",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalCanonicalBytes",
+            "columnName": "totalCanonicalBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cutDigest",
+            "columnName": "cutDigest",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextChunkIndex",
+            "columnName": "nextChunkIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextCursor",
+            "columnName": "nextCursor",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "receivedRecords",
+            "columnName": "receivedRecords",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedRecordCanonicalBytes",
+            "columnName": "receivedRecordCanonicalBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedRawUtf8Bytes",
+            "columnName": "receivedRawUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastScopeId",
+            "columnName": "lastScopeId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastRecordKind",
+            "columnName": "lastRecordKind",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastSessionId",
+            "columnName": "lastSessionId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "complete",
+            "columnName": "complete",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "snapshotId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_snapshot_staging_profileId_principalId_clientInstanceId_hostId_hostEpoch",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_snapshot_staging_profileId_principalId_clientInstanceId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_snapshot_records",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `recordIndex` INTEGER NOT NULL, `chunkIndex` INTEGER NOT NULL, `recordType` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT, `revision` TEXT, `displayName` TEXT, `kind` TEXT, `reachability` TEXT, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER, `windowCount` INTEGER, `createdAtMs` INTEGER, `activityAtMs` INTEGER, `canonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `recordIndex`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotId",
+            "columnName": "snapshotId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordIndex",
+            "columnName": "recordIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chunkIndex",
+            "columnName": "chunkIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordType",
+            "columnName": "recordType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "revision",
+            "columnName": "revision",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "reachability",
+            "columnName": "reachability",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "project",
+            "columnName": "project",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "label",
+            "columnName": "label",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cwd",
+            "columnName": "cwd",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "attached",
+            "columnName": "attached",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "windowCount",
+            "columnName": "windowCount",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "activityAtMs",
+            "columnName": "activityAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "canonicalJson",
+            "columnName": "canonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "snapshotId",
+            "recordIndex"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_chunkIndex",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "snapshotId",
+              "chunkIndex"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_chunkIndex` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `chunkIndex`)"
+          },
+          {
+            "name": "index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_recordType",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "snapshotId",
+              "scopeId",
+              "recordType"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_recordType` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `scopeId`, `recordType`)"
+          },
+          {
+            "name": "index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_sessionId",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "snapshotId",
+              "scopeId",
+              "sessionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_sessionId` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `scopeId`, `sessionId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_state_event_buffer",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `eventSeq` TEXT NOT NULL, `eventSeqOrder` TEXT NOT NULL, `resultingRevision` TEXT NOT NULL, `changeType` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT, `displayName` TEXT, `kind` TEXT, `reachability` TEXT, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER, `windowCount` INTEGER, `createdAtMs` INTEGER, `activityAtMs` INTEGER, `rawUtf8Bytes` INTEGER NOT NULL, `canonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `eventSeq`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventSeq",
+            "columnName": "eventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventSeqOrder",
+            "columnName": "eventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultingRevision",
+            "columnName": "resultingRevision",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "changeType",
+            "columnName": "changeType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "displayName",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "reachability",
+            "columnName": "reachability",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "project",
+            "columnName": "project",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "label",
+            "columnName": "label",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cwd",
+            "columnName": "cwd",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "attached",
+            "columnName": "attached",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "windowCount",
+            "columnName": "windowCount",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "activityAtMs",
+            "columnName": "activityAtMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "rawUtf8Bytes",
+            "columnName": "rawUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "canonicalJson",
+            "columnName": "canonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "eventSeq"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_state_event_buffer_profileId_principalId_clientInstanceId_hostId_hostEpoch_eventSeqOrder",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "eventSeqOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_state_event_buffer_profileId_principalId_clientInstanceId_hostId_hostEpoch_eventSeqOrder` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `eventSeqOrder`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_outbox_meta",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `nextCreationOrder` INTEGER NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextCreationOrder",
+            "columnName": "nextCreationOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId"
+          ]
+        }
+      },
+      {
+        "tableName": "relay_v2_outbox_entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `expectedHostEpoch` TEXT NOT NULL, `commandId` TEXT NOT NULL, `createdOrder` INTEGER NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `expectedHostEpoch`, `commandId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedHostEpoch",
+            "columnName": "expectedHostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commandId",
+            "columnName": "commandId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdOrder",
+            "columnName": "createdOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "expectedHostEpoch",
+            "commandId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_outbox_entries_profileId_profileActivationGeneration_principalId_clientInstanceId_createdOrder",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "createdOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_outbox_entries_profileId_profileActivationGeneration_principalId_clientInstanceId_createdOrder` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `createdOrder`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_terminal_checkpoints",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `streamId` TEXT NOT NULL, `pane` INTEGER NOT NULL, `checkpointKind` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `streamId`, `pane`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "streamId",
+            "columnName": "streamId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pane",
+            "columnName": "pane",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "checkpointKind",
+            "columnName": "checkpointKind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "streamId",
+            "pane"
+          ]
+        }
+      },
+      {
+        "tableName": "relay_v2_terminal_post_commit_batches",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`journalOrder` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `reservationId` TEXT NOT NULL, `ownerIncarnation` TEXT NOT NULL, `authorityFingerprint` TEXT NOT NULL, `profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `connectionGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `streamId` TEXT NOT NULL, `pane` INTEGER NOT NULL, `batchFingerprint` TEXT NOT NULL, `callbackOperationId` TEXT NOT NULL, `effectCount` INTEGER NOT NULL, `nextEffectIndex` INTEGER NOT NULL, `runningEffectIndex` INTEGER, `state` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "journalOrder",
+            "columnName": "journalOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reservationId",
+            "columnName": "reservationId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ownerIncarnation",
+            "columnName": "ownerIncarnation",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "authorityFingerprint",
+            "columnName": "authorityFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "connectionGeneration",
+            "columnName": "connectionGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "streamId",
+            "columnName": "streamId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pane",
+            "columnName": "pane",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "batchFingerprint",
+            "columnName": "batchFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "callbackOperationId",
+            "columnName": "callbackOperationId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "effectCount",
+            "columnName": "effectCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextEffectIndex",
+            "columnName": "nextEffectIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "runningEffectIndex",
+            "columnName": "runningEffectIndex",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "journalOrder"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_terminal_post_commit_batches_reservationId",
+            "unique": true,
+            "columnNames": [
+              "reservationId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_terminal_post_commit_batches_reservationId` ON `${TABLE_NAME}` (`reservationId`)"
+          },
+          {
+            "name": "index_relay_v2_terminal_post_commit_batches_authorityFingerprint_journalOrder",
+            "unique": false,
+            "columnNames": [
+              "authorityFingerprint",
+              "journalOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_terminal_post_commit_batches_authorityFingerprint_journalOrder` ON `${TABLE_NAME}` (`authorityFingerprint`, `journalOrder`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_terminal_post_commit_fences",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`authorityFingerprint` TEXT NOT NULL, `profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `connectionGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `streamId` TEXT NOT NULL, `pane` INTEGER NOT NULL, PRIMARY KEY(`authorityFingerprint`))",
+        "fields": [
+          {
+            "fieldPath": "authorityFingerprint",
+            "columnName": "authorityFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "connectionGeneration",
+            "columnName": "connectionGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "streamId",
+            "columnName": "streamId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pane",
+            "columnName": "pane",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "authorityFingerprint"
+          ]
+        }
+      },
+      {
+        "tableName": "relay_v2_terminal_post_commit_meta",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`singletonId` INTEGER NOT NULL, `globallyClosed` INTEGER NOT NULL, PRIMARY KEY(`singletonId`))",
+        "fields": [
+          {
+            "fieldPath": "singletonId",
+            "columnName": "singletonId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "globallyClosed",
+            "columnName": "globallyClosed",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "singletonId"
+          ]
+        }
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_lifecycle_states",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpochKey` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpochKey",
+            "columnName": "timelineEpochKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpochKey"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_relay_v2_agent_transcript_lifecycle_states_profileId_profileActivationGeneration_principalId_clientInstanceId_hostId_hostEpoch_scopeId_sessionId",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_agent_transcript_lifecycle_states_profileId_profileActivationGeneration_principalId_clientInstanceId_hostId_hostEpoch_scopeId_sessionId` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_lifecycle_notification_claims",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `lifecycleEventId` TEXT NOT NULL, `lifecycleState` TEXT NOT NULL, `claimedLocalGeneration` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleEventId",
+            "columnName": "lifecycleEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleState",
+            "columnName": "lifecycleState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "claimedLocalGeneration",
+            "columnName": "claimedLocalGeneration",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "lifecycleEventId"
+          ]
+        }
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `entryId` TEXT NOT NULL, `runId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `role` TEXT NOT NULL, `commandId` TEXT, `createdAtMs` INTEGER NOT NULL, `createdAgentSeq` TEXT NOT NULL, `createdAgentSeqOrder` TEXT NOT NULL, `lastModifiedAgentSeq` TEXT NOT NULL, `lastModifiedAgentSeqOrder` TEXT NOT NULL, `entryState` TEXT NOT NULL, `text` TEXT, `redactionReason` TEXT, `tombstoneOrigin` TEXT, `tombstoneEvidenceThroughAgentSeq` TEXT, `tombstoneEvidenceThroughAgentSeqOrder` TEXT, `payloadCanonicalJson` TEXT NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `entryId`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "entryId",
+            "columnName": "entryId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "runId",
+            "columnName": "runId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "turnId",
+            "columnName": "turnId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "role",
+            "columnName": "role",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commandId",
+            "columnName": "commandId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "createdAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAgentSeq",
+            "columnName": "createdAgentSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAgentSeqOrder",
+            "columnName": "createdAgentSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastModifiedAgentSeq",
+            "columnName": "lastModifiedAgentSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastModifiedAgentSeqOrder",
+            "columnName": "lastModifiedAgentSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "entryState",
+            "columnName": "entryState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "text",
+            "columnName": "text",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "redactionReason",
+            "columnName": "redactionReason",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "tombstoneOrigin",
+            "columnName": "tombstoneOrigin",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "tombstoneEvidenceThroughAgentSeq",
+            "columnName": "tombstoneEvidenceThroughAgentSeq",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "tombstoneEvidenceThroughAgentSeqOrder",
+            "columnName": "tombstoneEvidenceThroughAgentSeqOrder",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "entryId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_transcript_entries_authority",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_transcript_entries_authority` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          },
+          {
+            "name": "index_agent_transcript_entries_namespace_created_seq",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "createdAgentSeq"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_transcript_entries_namespace_created_seq` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `createdAgentSeq`)"
+          },
+          {
+            "name": "index_agent_transcript_entries_namespace_created_order",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "createdAgentSeqOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_transcript_entries_namespace_created_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `createdAgentSeqOrder`)"
+          },
+          {
+            "name": "index_agent_transcript_entries_namespace_last_modified_order",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lastModifiedAgentSeqOrder",
+              "entryId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_transcript_entries_namespace_last_modified_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lastModifiedAgentSeqOrder`, `entryId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_snapshot_staging",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `snapshotRequestId` TEXT NOT NULL, `requestLocalGeneration` TEXT NOT NULL, `requestNetworkToken` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `nextPageIndex` INTEGER NOT NULL, `nextCursor` TEXT, `throughAgentSeq` TEXT NOT NULL, `throughAgentSeqOrder` TEXT NOT NULL, `earliestRetainedSeq` TEXT NOT NULL, `earliestRetainedSeqOrder` TEXT NOT NULL, `receivedRecordCount` INTEGER NOT NULL, `receivedCanonicalBytes` INTEGER NOT NULL, `receivedRawUtf8Bytes` INTEGER NOT NULL, `lastAgentSeq` TEXT, `lastAgentSeqOrder` TEXT, `lastRecordKind` TEXT, `lastStableIdentity` TEXT, `complete` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotRequestId",
+            "columnName": "snapshotRequestId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "requestLocalGeneration",
+            "columnName": "requestLocalGeneration",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "requestNetworkToken",
+            "columnName": "requestNetworkToken",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotId",
+            "columnName": "snapshotId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextPageIndex",
+            "columnName": "nextPageIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextCursor",
+            "columnName": "nextCursor",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "throughAgentSeq",
+            "columnName": "throughAgentSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "throughAgentSeqOrder",
+            "columnName": "throughAgentSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "earliestRetainedSeq",
+            "columnName": "earliestRetainedSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "earliestRetainedSeqOrder",
+            "columnName": "earliestRetainedSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedRecordCount",
+            "columnName": "receivedRecordCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedCanonicalBytes",
+            "columnName": "receivedCanonicalBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedRawUtf8Bytes",
+            "columnName": "receivedRawUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAgentSeq",
+            "columnName": "lastAgentSeq",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastAgentSeqOrder",
+            "columnName": "lastAgentSeqOrder",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastRecordKind",
+            "columnName": "lastRecordKind",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastStableIdentity",
+            "columnName": "lastStableIdentity",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "complete",
+            "columnName": "complete",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "snapshotId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_transcript_snapshot_staging_active_namespace",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_transcript_snapshot_staging_active_namespace` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_snapshot_records",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `pageIndex` INTEGER NOT NULL, `recordIndex` INTEGER NOT NULL, `recordKind` TEXT NOT NULL, `stableIdentity` TEXT NOT NULL, `agentEventSeq` TEXT NOT NULL, `agentEventSeqOrder` TEXT NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadRawUtf8Bytes` INTEGER NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`, `recordIndex`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`) REFERENCES `relay_v2_agent_transcript_snapshot_staging`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "snapshotId",
+            "columnName": "snapshotId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pageIndex",
+            "columnName": "pageIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordIndex",
+            "columnName": "recordIndex",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordKind",
+            "columnName": "recordKind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stableIdentity",
+            "columnName": "stableIdentity",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeq",
+            "columnName": "agentEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeqOrder",
+            "columnName": "agentEventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadRawUtf8Bytes",
+            "columnName": "payloadRawUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "snapshotId",
+            "recordIndex"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_transcript_snapshot_records_header",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "snapshotId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_transcript_snapshot_records_header` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`)"
+          },
+          {
+            "name": "index_agent_transcript_snapshot_records_stable",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "snapshotId",
+              "recordKind",
+              "stableIdentity"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_transcript_snapshot_records_stable` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`, `recordKind`, `stableIdentity`)"
+          },
+          {
+            "name": "index_agent_transcript_snapshot_records_order",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "snapshotId",
+              "agentEventSeqOrder",
+              "stableIdentity"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_transcript_snapshot_records_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `snapshotId`, `agentEventSeqOrder`, `stableIdentity`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_snapshot_staging",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "snapshotId"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "snapshotId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_pending_events",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `agentEventSeq` TEXT NOT NULL, `agentEventSeqOrder` TEXT NOT NULL, `eventId` TEXT NOT NULL, `closedEventDigest` TEXT NOT NULL, `trustedProvenance` TEXT NOT NULL, `eventCanonicalJson` TEXT NOT NULL, `eventRawUtf8Bytes` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeq`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeq",
+            "columnName": "agentEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeqOrder",
+            "columnName": "agentEventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "closedEventDigest",
+            "columnName": "closedEventDigest",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trustedProvenance",
+            "columnName": "trustedProvenance",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventCanonicalJson",
+            "columnName": "eventCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventRawUtf8Bytes",
+            "columnName": "eventRawUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "agentEventSeq"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_transcript_pending_events_authority",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_transcript_pending_events_authority` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          },
+          {
+            "name": "index_agent_transcript_pending_events_event_id",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_transcript_pending_events_event_id` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`)"
+          },
+          {
+            "name": "index_agent_transcript_pending_events_order",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeqOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_transcript_pending_events_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeqOrder`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_lifecycle_current",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `lifecycleScope` TEXT NOT NULL, `runId` TEXT NOT NULL, `turnIdKey` TEXT NOT NULL, `lifecycleEventId` TEXT NOT NULL, `agentEventSeq` TEXT NOT NULL, `agentEventSeqOrder` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleScope`, `runId`, `turnIdKey`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleScope`, `runId`, `turnIdKey`) REFERENCES `relay_v2_agent_lifecycle_event_witnesses`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleScope`, `runId`, `turnIdKey`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleScope",
+            "columnName": "lifecycleScope",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "runId",
+            "columnName": "runId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "turnIdKey",
+            "columnName": "turnIdKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleEventId",
+            "columnName": "lifecycleEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeq",
+            "columnName": "agentEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeqOrder",
+            "columnName": "agentEventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "lifecycleScope",
+            "runId",
+            "turnIdKey"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_lifecycle_current_authority",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_current_authority` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          },
+          {
+            "name": "index_agent_lifecycle_current_event",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleEventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_event` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`)"
+          },
+          {
+            "name": "index_agent_lifecycle_current_seq",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeq"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_seq` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeq`)"
+          },
+          {
+            "name": "index_agent_lifecycle_current_order",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeqOrder",
+              "lifecycleEventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeqOrder`, `lifecycleEventId`)"
+          },
+          {
+            "name": "index_agent_lifecycle_current_witness",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleEventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleScope",
+              "runId",
+              "turnIdKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_current_witness` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleScope`, `runId`, `turnIdKey`)"
+          },
+          {
+            "name": "index_agent_lifecycle_current_run_turn",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "runId",
+              "lifecycleScope",
+              "turnIdKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_run_turn` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `runId`, `lifecycleScope`, `turnIdKey`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          },
+          {
+            "table": "relay_v2_agent_lifecycle_event_witnesses",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleEventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleScope",
+              "runId",
+              "turnIdKey"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "eventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleScope",
+              "runId",
+              "turnIdKey"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_lifecycle_event_witnesses",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `eventId` TEXT NOT NULL, `agentEventSeq` TEXT NOT NULL, `agentEventSeqOrder` TEXT NOT NULL, `lifecycleScope` TEXT NOT NULL, `runId` TEXT NOT NULL, `turnIdKey` TEXT NOT NULL, `sourceEpoch` TEXT NOT NULL, `lifecycleState` TEXT NOT NULL, `failureCode` TEXT, `failureSummary` TEXT, `occurredAtMs` INTEGER NOT NULL, `closedEventDigest` TEXT, `witnessCanonicalJson` TEXT NOT NULL, `witnessCanonicalUtf8Bytes` INTEGER NOT NULL, `witnessSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeq",
+            "columnName": "agentEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeqOrder",
+            "columnName": "agentEventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleScope",
+            "columnName": "lifecycleScope",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "runId",
+            "columnName": "runId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "turnIdKey",
+            "columnName": "turnIdKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceEpoch",
+            "columnName": "sourceEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleState",
+            "columnName": "lifecycleState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "failureCode",
+            "columnName": "failureCode",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "failureSummary",
+            "columnName": "failureSummary",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "occurredAtMs",
+            "columnName": "occurredAtMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "closedEventDigest",
+            "columnName": "closedEventDigest",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "witnessCanonicalJson",
+            "columnName": "witnessCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "witnessCanonicalUtf8Bytes",
+            "columnName": "witnessCanonicalUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "witnessSha256",
+            "columnName": "witnessSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "eventId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_lifecycle_witnesses_authority",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_authority` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          },
+          {
+            "name": "index_agent_lifecycle_witnesses_seq",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeq"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_seq` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeq`)"
+          },
+          {
+            "name": "index_agent_lifecycle_witnesses_order",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeqOrder",
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeqOrder`, `eventId`)"
+          },
+          {
+            "name": "index_agent_lifecycle_witnesses_current_binding",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "eventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleScope",
+              "runId",
+              "turnIdKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_current_binding` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleScope`, `runId`, `turnIdKey`)"
+          },
+          {
+            "name": "index_agent_lifecycle_witnesses_notification_binding",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "eventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleState"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_notification_binding` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleState`)"
+          },
+          {
+            "name": "index_agent_lifecycle_witnesses_run_turn_history",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleScope",
+              "runId",
+              "turnIdKey",
+              "agentEventSeqOrder",
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_run_turn_history` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleScope`, `runId`, `turnIdKey`, `agentEventSeqOrder`, `eventId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_recent_event_evidence",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `agentEventSeq` TEXT NOT NULL, `agentEventSeqOrder` TEXT NOT NULL, `eventId` TEXT NOT NULL, `closedEventDigest` TEXT NOT NULL, `evidenceCanonicalJson` TEXT NOT NULL, `evidenceCanonicalUtf8Bytes` INTEGER NOT NULL, `evidenceSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeq`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeq",
+            "columnName": "agentEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeqOrder",
+            "columnName": "agentEventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "closedEventDigest",
+            "columnName": "closedEventDigest",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "evidenceCanonicalJson",
+            "columnName": "evidenceCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "evidenceCanonicalUtf8Bytes",
+            "columnName": "evidenceCanonicalUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "evidenceSha256",
+            "columnName": "evidenceSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "agentEventSeq"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_recent_evidence_authority",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_recent_evidence_authority` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          },
+          {
+            "name": "index_agent_recent_evidence_event",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_recent_evidence_event` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`)"
+          },
+          {
+            "name": "index_agent_recent_evidence_order",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeqOrder",
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_recent_evidence_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeqOrder`, `eventId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "relay_v2_agent_notification_ledger",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `lifecycleEventId` TEXT NOT NULL, `lifecycleState` TEXT NOT NULL, `agentEventSeq` TEXT NOT NULL, `agentEventSeqOrder` TEXT NOT NULL, `disposition` TEXT NOT NULL, `localGeneration` TEXT NOT NULL, `ledgerCanonicalJson` TEXT NOT NULL, `ledgerCanonicalUtf8Bytes` INTEGER NOT NULL, `ledgerSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `lifecycleState`), FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`) REFERENCES `relay_v2_agent_transcript_lifecycle_states`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpochKey`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleState`) REFERENCES `relay_v2_agent_lifecycle_event_witnesses`(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleState`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleEventId",
+            "columnName": "lifecycleEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleState",
+            "columnName": "lifecycleState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeq",
+            "columnName": "agentEventSeq",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "agentEventSeqOrder",
+            "columnName": "agentEventSeqOrder",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "disposition",
+            "columnName": "disposition",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "localGeneration",
+            "columnName": "localGeneration",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ledgerCanonicalJson",
+            "columnName": "ledgerCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ledgerCanonicalUtf8Bytes",
+            "columnName": "ledgerCanonicalUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ledgerSha256",
+            "columnName": "ledgerSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "lifecycleEventId",
+            "lifecycleState"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_agent_notification_ledger_authority",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_notification_ledger_authority` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`)"
+          },
+          {
+            "name": "index_agent_notification_ledger_event",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleEventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_notification_ledger_event` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`)"
+          },
+          {
+            "name": "index_agent_notification_ledger_seq",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeq"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_notification_ledger_seq` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeq`)"
+          },
+          {
+            "name": "index_agent_notification_ledger_witness",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleEventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleState"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_notification_ledger_witness` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`, `agentEventSeqOrder`, `lifecycleState`)"
+          },
+          {
+            "name": "index_agent_notification_ledger_pending_order",
+            "unique": true,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "disposition",
+              "agentEventSeqOrder",
+              "lifecycleEventId",
+              "lifecycleState"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_notification_ledger_pending_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `disposition`, `agentEventSeqOrder`, `lifecycleEventId`, `lifecycleState`)"
+          },
+          {
+            "name": "index_agent_notification_ledger_audit_order",
+            "unique": false,
+            "columnNames": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "agentEventSeqOrder",
+              "lifecycleEventId",
+              "lifecycleState"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_agent_notification_ledger_audit_order` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `agentEventSeqOrder`, `lifecycleEventId`, `lifecycleState`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "relay_v2_agent_transcript_lifecycle_states",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpochKey"
+            ]
+          },
+          {
+            "table": "relay_v2_agent_lifecycle_event_witnesses",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "lifecycleEventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleState"
+            ],
+            "referencedColumns": [
+              "profileId",
+              "profileActivationGeneration",
+              "principalId",
+              "clientInstanceId",
+              "hostId",
+              "hostEpoch",
+              "scopeId",
+              "sessionId",
+              "timelineEpoch",
+              "eventId",
+              "agentEventSeq",
+              "agentEventSeqOrder",
+              "lifecycleState"
+            ]
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '41cab3652d7fb279a5ec225b00e860be')"
+    ]
+  }
+}

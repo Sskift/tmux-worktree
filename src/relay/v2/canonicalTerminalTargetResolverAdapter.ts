@@ -1,5 +1,8 @@
 import type { RelayV2HostStateTransaction } from "./hostState.js";
+import type { TerminalControlLease, TerminalControlOwner } from "../../terminalControl/protocol.js";
 import type {
+  RelayV2CanonicalResourceResolutionFence,
+  RelayV2CanonicalResourceResolverToken,
   RelayV2CanonicalResolvedSessionTarget,
   RelayV2CanonicalResourceResolverPort,
 } from "./resourceState.js";
@@ -60,10 +63,25 @@ export interface RelayV2ExactTerminalControlTargetPortV1 {
   ): void;
 }
 
+/** Execution handoff for an exact claim already admitted by the H0 fence. */
+export interface RelayV2PreparedExactTerminalControlLeasePortV1
+extends RelayV2ExactTerminalControlTargetPortV1 {
+  consumePreparedLeaseForBinding(
+    binding: RelayV2TerminalCanonicalTargetBindingV1,
+    owner: TerminalControlOwner & { kind: "relay-v2" },
+  ): TerminalControlLease | Promise<TerminalControlLease>;
+}
+
 export interface RelayV2CanonicalTerminalTargetResolverAdapterOptions {
   resourceResolver: RelayV2CanonicalResourceResolverPort;
   /** Omission is the default NO-GO/read-only state. */
   exactControlTarget?: RelayV2ExactTerminalControlTargetPortV1;
+}
+
+interface RelayV2CanonicalTerminalResolutionRequestV1 {
+  hostEpoch: string;
+  target: RelayV2TerminalWireTarget;
+  pane: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -83,6 +101,241 @@ function opaque(value: unknown): value is string {
     && Buffer.byteLength(value, "utf8") <= 128
     && !/[\0\r\n]/.test(value)
     && value.trim() === value;
+}
+
+function parseRequest(value: unknown): RelayV2CanonicalTerminalResolutionRequestV1 {
+  if (!isRecord(value)
+    || !exactKeys(value, ["auth", "hostEpoch", "target", "pane"])
+    || !isRecord(value.auth)
+    || !exactKeys(value.auth, ["principalId", "clientInstanceId"])
+    || !isRecord(value.target)
+    || !exactKeys(value.target, ["hostId", "scopeId", "sessionId"])
+    || !opaque(value.auth.principalId)
+    || !opaque(value.auth.clientInstanceId)
+    || !opaque(value.hostEpoch)
+    || !opaque(value.target.hostId)
+    || !opaque(value.target.scopeId)
+    || !opaque(value.target.sessionId)
+    || !Number.isSafeInteger(value.pane)
+    || (value.pane as number) < 0
+    || (value.pane as number) > 65_535) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical terminal resolution request is malformed",
+    );
+  }
+  return {
+    hostEpoch: value.hostEpoch,
+    target: {
+      hostId: value.target.hostId,
+      scopeId: value.target.scopeId,
+      sessionId: value.target.sessionId,
+    },
+    pane: value.pane as number,
+  };
+}
+
+function parseFenceRequest(
+  transaction: RelayV2HostStateTransaction,
+  value: unknown,
+): RelayV2CanonicalTerminalResolutionRequestV1 {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "hostId", "scopeId", "sessionId", "pane", "canonicalTargetId", "controlTargetId",
+    ])
+    || !opaque(value.hostId)
+    || !opaque(value.scopeId)
+    || !opaque(value.sessionId)
+    || !Number.isSafeInteger(value.pane)
+    || (value.pane as number) < 0
+    || (value.pane as number) > 65_535
+    || !opaque(value.canonicalTargetId)
+    || !opaque(value.controlTargetId)
+    || !opaque(transaction.hostEpoch)) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical terminal resolution target is malformed before admission",
+    );
+  }
+  return {
+    hostEpoch: transaction.hostEpoch,
+    target: {
+      hostId: value.hostId,
+      scopeId: value.scopeId,
+      sessionId: value.sessionId,
+    },
+    pane: value.pane as number,
+  };
+}
+
+function parseResourceToken(
+  value: unknown,
+  expectedHostEpoch: string,
+): RelayV2CanonicalResourceResolverToken {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "hostEpoch", "resourceMappingDigest", "discoveryGeneration",
+    ])
+    || value.schemaVersion !== 1
+    || value.hostEpoch !== expectedHostEpoch
+    || !opaque(value.resourceMappingDigest)
+    || !opaque(value.discoveryGeneration)) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "H2 terminal resolution token is malformed",
+    );
+  }
+  return {
+    schemaVersion: 1,
+    hostEpoch: expectedHostEpoch,
+    resourceMappingDigest: value.resourceMappingDigest,
+    discoveryGeneration: value.discoveryGeneration,
+  };
+}
+
+function parseResourceTarget(
+  value: unknown,
+  request: RelayV2CanonicalTerminalResolutionRequestV1,
+  resourceToken: RelayV2CanonicalResourceResolverToken,
+): RelayV2CanonicalResolvedSessionTarget {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "authorization", "hostEpoch", "discoveryGeneration", "scopeId", "processTarget",
+      "capabilities", "sessionId", "backendInstanceKey", "managedTarget",
+    ])
+    || value.authorization !== "evidence_only"
+    || value.hostEpoch !== request.hostEpoch
+    || value.discoveryGeneration !== resourceToken.discoveryGeneration
+    || value.scopeId !== request.target.scopeId
+    || value.sessionId !== request.target.sessionId
+    || !isRecord(value.processTarget)
+    || !exactKeys(value.processTarget, ["kind", "targetId"])
+    || (value.processTarget.kind !== "local" && value.processTarget.kind !== "ssh")
+    || !opaque(value.processTarget.targetId)
+    || !Array.isArray(value.capabilities)
+    || value.capabilities.length > 64
+    || value.capabilities.some((capability) => !opaque(capability))
+    || new Set(value.capabilities).size !== value.capabilities.length
+    || !opaque(value.backendInstanceKey)
+    || !isRecord(value.managedTarget)
+    || !exactKeys(value.managedTarget, ["name", "kind", "incarnation"])
+    || !opaque(value.managedTarget.name)
+    || (value.managedTarget.kind !== "worktree" && value.managedTarget.kind !== "terminal")
+    || !opaque(value.managedTarget.incarnation)
+    || !/^twinc2\.[A-Za-z0-9_-]{43}$/.test(value.managedTarget.incarnation)) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "H2 terminal target evidence is malformed or crossed authority",
+    );
+  }
+  return {
+    authorization: "evidence_only",
+    hostEpoch: request.hostEpoch,
+    discoveryGeneration: resourceToken.discoveryGeneration,
+    scopeId: request.target.scopeId,
+    processTarget: {
+      kind: value.processTarget.kind,
+      targetId: value.processTarget.targetId,
+    },
+    capabilities: [...value.capabilities] as string[],
+    sessionId: request.target.sessionId,
+    backendInstanceKey: value.backendInstanceKey,
+    managedTarget: {
+      name: value.managedTarget.name,
+      kind: value.managedTarget.kind,
+      incarnation: value.managedTarget.incarnation,
+    },
+  };
+}
+
+function parseResourceFence(
+  value: unknown,
+  request: RelayV2CanonicalTerminalResolutionRequestV1,
+  expectedToken?: RelayV2CanonicalResourceResolverToken,
+): RelayV2CanonicalResourceResolutionFence {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "token", "expectedScopeId", "expectedSessionId", "result",
+    ])
+    || value.schemaVersion !== 1
+    || value.expectedScopeId !== request.target.scopeId
+    || value.expectedSessionId !== request.target.sessionId
+    || !isRecord(value.result)) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "H2 terminal admission cut is malformed",
+    );
+  }
+  const resourceToken = parseResourceToken(value.token, request.hostEpoch);
+  if (expectedToken !== undefined && (
+    resourceToken.resourceMappingDigest !== expectedToken.resourceMappingDigest
+    || resourceToken.discoveryGeneration !== expectedToken.discoveryGeneration
+  )) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "H2 terminal admission cut changed after capture",
+    );
+  }
+  if (value.result.kind === "complete_negative") {
+    if (!exactKeys(value.result, ["kind", "code"])
+      || (value.result.code !== "SCOPE_NOT_FOUND" && value.result.code !== "SESSION_NOT_FOUND")) {
+      throw new RelayV2TerminalManagerError(
+        "CAPABILITY_UNAVAILABLE",
+        "H2 terminal negative cut is malformed",
+      );
+    }
+    throw new RelayV2TerminalManagerError(
+      value.result.code,
+      "H2 terminal target is absent from the complete materialized cut",
+    );
+  }
+  if (value.result.kind !== "positive" || !exactKeys(value.result, ["kind", "target"])) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "H2 terminal positive cut is malformed",
+    );
+  }
+  return {
+    schemaVersion: 1,
+    token: resourceToken,
+    expectedScopeId: request.target.scopeId,
+    expectedSessionId: request.target.sessionId,
+    result: {
+      kind: "positive",
+      target: parseResourceTarget(value.result.target, request, resourceToken),
+    },
+  };
+}
+
+function cloneResourceFence(
+  fence: RelayV2CanonicalResourceResolutionFence,
+): RelayV2CanonicalResourceResolutionFence {
+  if (fence.result.kind !== "positive") {
+    return {
+      ...fence,
+      token: { ...fence.token },
+      result: { ...fence.result },
+    };
+  }
+  return {
+    ...fence,
+    token: { ...fence.token },
+    result: {
+      kind: "positive",
+      target: {
+        ...fence.result.target,
+        processTarget: { ...fence.result.target.processTarget },
+        capabilities: [...fence.result.target.capabilities],
+        ...(Object.hasOwn(fence.result.target, "sessionId")
+          ? {
+              managedTarget: {
+                ...(fence.result.target as RelayV2CanonicalResolvedSessionTarget).managedTarget,
+              },
+            }
+          : {}),
+      },
+    },
+  };
 }
 
 /** Reject every asynchronous fence shape while safely observing rejection. */
@@ -204,6 +457,47 @@ function bindingFrom(
   };
 }
 
+function parseBinding(
+  value: unknown,
+  expected: RelayV2ExactTerminalControlTargetInputV1,
+): RelayV2TerminalCanonicalTargetBindingV1 {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "hostId", "scopeId", "sessionId", "pane", "processTarget",
+      "backendInstanceKey", "managedTarget", "exactControlIdentity",
+    ])
+    || !isRecord(value.processTarget)
+    || !exactKeys(value.processTarget, ["kind", "targetId"])
+    || !isRecord(value.managedTarget)
+    || !exactKeys(value.managedTarget, ["name", "kind", "incarnation"])
+    || !isRecord(value.exactControlIdentity)
+    || !exactKeys(value.exactControlIdentity, [
+      "schemaVersion", "controlTargetId", "controlEpoch", "targetIncarnationProof",
+    ])) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical terminal target binding is malformed",
+    );
+  }
+  const candidate = value as unknown as RelayV2TerminalCanonicalTargetBindingV1;
+  if (!sameInput(candidate, expected)
+    || candidate.exactControlIdentity.schemaVersion !== 1
+    || !opaque(candidate.exactControlIdentity.controlTargetId)
+    || !opaque(candidate.exactControlIdentity.controlEpoch)
+    || !opaque(candidate.exactControlIdentity.targetIncarnationProof)) {
+    throw new RelayV2TerminalManagerError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical terminal target binding crossed authority",
+    );
+  }
+  return {
+    ...expected,
+    processTarget: { ...expected.processTarget },
+    managedTarget: { ...expected.managedTarget },
+    exactControlIdentity: { ...candidate.exactControlIdentity },
+  };
+}
+
 function resolvedTargetFrom(
   target: RelayV2TerminalWireTarget,
   binding: RelayV2TerminalCanonicalTargetBindingV1,
@@ -226,8 +520,8 @@ export class RelayV2CanonicalTerminalTargetResolverAdapter
     if (!isRecord(options)
       || !isRecord(options.resourceResolver)
       || typeof options.resourceResolver.captureToken !== "function"
-      || typeof options.resourceResolver.resolveSession !== "function"
-      || typeof options.resourceResolver.fenceSessionForAdmission !== "function") {
+      || typeof options.resourceResolver.resolveSessionForAdmission !== "function"
+      || typeof options.resourceResolver.fenceResourceCutForAdmission !== "function") {
       throw new TypeError("Relay v2 canonical terminal target resolver requires H2");
     }
     if (options.exactControlTarget !== undefined
@@ -252,20 +546,36 @@ export class RelayV2CanonicalTerminalTargetResolverAdapter
         "exact terminal-control target authority is not wired",
       );
     }
-    const resourceToken = await this.resourceResolver.captureToken(input.hostEpoch);
-    const resourceTarget = await this.resourceResolver.resolveSession(
-      resourceToken,
-      input.target.scopeId,
-      input.target.sessionId,
+    const request = parseRequest(input);
+    const resourceToken = parseResourceToken(
+      await this.resourceResolver.captureToken(request.hostEpoch),
+      request.hostEpoch,
     );
-    const exactTargetInput = exactInput(input.target.hostId, input.pane, resourceTarget);
+    const resourceFence = parseResourceFence(
+      await this.resourceResolver.resolveSessionForAdmission(
+        resourceToken,
+        request.target.scopeId,
+        request.target.sessionId,
+      ),
+      request,
+      resourceToken,
+    );
+    if (resourceFence.result.kind !== "positive"
+      || !Object.hasOwn(resourceFence.result.target, "sessionId")) {
+      throw new RelayV2TerminalManagerError(
+        "CAPABILITY_UNAVAILABLE",
+        "H2 terminal admission cut did not resolve an exact Session",
+      );
+    }
+    const resourceTarget = resourceFence.result.target as RelayV2CanonicalResolvedSessionTarget;
+    const exactTargetInput = exactInput(request.target.hostId, request.pane, resourceTarget);
     const exactControlEvidence = parseEvidence(
       await this.exactControlTarget.resolveExactTarget(exactTargetInput),
       exactTargetInput,
     );
     const binding = bindingFrom(exactTargetInput, exactControlEvidence);
     return {
-      target: resolvedTargetFrom(input.target, binding),
+      target: resolvedTargetFrom(request.target, binding),
       binding,
       admission: {
         resourceToken: { ...resourceToken },
@@ -290,40 +600,93 @@ export class RelayV2CanonicalTerminalTargetResolverAdapter
         "exact terminal-control target authority is not wired",
       );
     }
-    const exactTargetInput = exactInput(
-      resolution.binding.hostId,
-      resolution.binding.pane,
-      resolution.admission.resourceTarget,
+    if (!isRecord(resolution)
+      || !exactKeys(resolution, ["target", "binding", "admission"])
+      || !isRecord(resolution.target)
+      || !exactKeys(resolution.target, [
+        "hostId", "scopeId", "sessionId", "pane", "canonicalTargetId", "controlTargetId",
+      ])
+      || !isRecord(resolution.admission)
+      || !exactKeys(resolution.admission, [
+        "resourceToken", "resourceTarget", "exactControlToken",
+      ])) {
+      throw new RelayV2TerminalManagerError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical terminal resolution is malformed before admission",
+      );
+    }
+    const request = parseFenceRequest(transaction, resolution.target);
+    const resourceToken = parseResourceToken(
+      resolution.admission.resourceToken,
+      request.hostEpoch,
     );
-    const exactControlEvidence: RelayV2ExactTerminalControlTargetEvidenceV1 = {
+    const resourceFence = parseResourceFence({
+      schemaVersion: 1,
+      token: resourceToken,
+      expectedScopeId: request.target.scopeId,
+      expectedSessionId: request.target.sessionId,
+      result: {
+        kind: "positive",
+        target: resolution.admission.resourceTarget,
+      },
+    }, request, resourceToken);
+    if (!opaque(resolution.admission.exactControlToken)) {
+      throw new RelayV2TerminalManagerError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical terminal exact-control token is malformed",
+      );
+    }
+    if (resourceFence.result.kind !== "positive"
+      || !Object.hasOwn(resourceFence.result.target, "sessionId")) {
+      throw new RelayV2TerminalManagerError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical terminal resolution lost its exact H2 Session",
+      );
+    }
+    const resourceTarget = resourceFence.result.target as RelayV2CanonicalResolvedSessionTarget;
+    const exactTargetInput = exactInput(request.target.hostId, request.pane, resourceTarget);
+    const binding = parseBinding(resolution.binding, exactTargetInput);
+    const exactControlEvidence = parseEvidence({
       ...exactTargetInput,
       processTarget: { ...exactTargetInput.processTarget },
       managedTarget: { ...exactTargetInput.managedTarget },
       exactControlToken: resolution.admission.exactControlToken,
-      exactControlIdentity: { ...resolution.binding.exactControlIdentity },
-    };
-    if (!sameInput(exactTargetInput, resolution.binding)) {
+      exactControlIdentity: { ...binding.exactControlIdentity },
+    }, exactTargetInput);
+    const expectedBinding = bindingFrom(exactTargetInput, exactControlEvidence);
+    const expectedTarget = resolvedTargetFrom(request.target, expectedBinding);
+    if (binding.exactControlIdentity.schemaVersion
+        !== expectedBinding.exactControlIdentity.schemaVersion
+      || binding.exactControlIdentity.controlTargetId
+        !== expectedBinding.exactControlIdentity.controlTargetId
+      || binding.exactControlIdentity.controlEpoch
+        !== expectedBinding.exactControlIdentity.controlEpoch
+      || binding.exactControlIdentity.targetIncarnationProof
+        !== expectedBinding.exactControlIdentity.targetIncarnationProof
+      || resolution.target.hostId !== expectedTarget.hostId
+      || resolution.target.scopeId !== expectedTarget.scopeId
+      || resolution.target.sessionId !== expectedTarget.sessionId
+      || resolution.target.pane !== expectedTarget.pane
+      || resolution.target.canonicalTargetId !== expectedTarget.canonicalTargetId
+      || resolution.target.controlTargetId !== expectedTarget.controlTargetId) {
       throw new RelayV2TerminalManagerError(
         "CAPABILITY_UNAVAILABLE",
-        "exact terminal target binding changed before admission",
+        "canonical terminal request or exact target changed before admission",
       );
     }
-    const resourceFenceResult: unknown = this.resourceResolver.fenceSessionForAdmission(
-      transaction,
-      resolution.admission.resourceToken,
-      resolution.binding.scopeId,
-      resolution.binding.sessionId,
-      resolution.admission.resourceTarget,
-    );
-    requireSynchronousTerminalAdmissionFence(resourceFenceResult, "H2 terminal target fence");
     const exactControlFenceResult: unknown =
       this.exactControlTarget.fenceExactTargetForAdmission(
-      exactTargetInput,
-      exactControlEvidence,
-    );
+        exactTargetInput,
+        exactControlEvidence,
+      );
     requireSynchronousTerminalAdmissionFence(
       exactControlFenceResult,
       "exact terminal-control target fence",
     );
+    const resourceFenceResult: unknown = this.resourceResolver.fenceResourceCutForAdmission(
+      transaction,
+      cloneResourceFence(resourceFence),
+    );
+    requireSynchronousTerminalAdmissionFence(resourceFenceResult, "H2 terminal target fence");
   }
 }

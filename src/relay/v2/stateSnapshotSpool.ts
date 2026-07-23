@@ -30,8 +30,12 @@ import type {
   RelayV2MaterializedStateCutCandidateLease,
   RelayV2MaterializedStateCutRecord,
   RelayV2MaterializedStateCutSource,
+  RelayV2MaterializedStateProcessAuthorityPorts,
+  RelayV2CanonicalResourceResolverPort,
+  RelayV2ResourceResolverProcessTarget,
   RelayV2StateEventSink,
 } from "./resourceState.js";
+import type { RelayV2CommandResourceMutationOwner } from "./hostCommandPlane.js";
 import {
   canonicalizeRelayV2MaterializedJson as canonicalizeSnapshotJson,
   RelayV2MaterializedStateError,
@@ -298,6 +302,7 @@ interface RelayV2HostH2RecoveryCandidateRecord {
   readonly materializedCutIdentity: string;
   readonly readinessIssue: RelayV2StateSnapshotReadinessReceiptIssue;
   readonly compositionPair: object;
+  readonly processAuthority: RelayV2MaterializedStateProcessAuthorityPorts;
   claimReadiness(
     readinessSink: RelayV2RecoveredHostH2ReadinessSink,
   ): Promise<RelayV2RecoveredHostH2Activation | null>;
@@ -317,6 +322,41 @@ const recoveredHostH2Candidates = new WeakMap<
   object,
   Readonly<RelayV2HostH2RecoveryCandidateRecord>
 >();
+const recoveredHostH2SpoolProcessAuthorities = new WeakMap<
+  RelayV2StateSnapshotSpool,
+  RelayV2MaterializedStateProcessAuthorityPorts
+>();
+
+export interface RelayV2RecoveredHostH2ProcessAuthority {
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly hostInstanceId: string;
+  readonly h2RecoveryCandidate: RelayV2HostH2RecoveryCandidate;
+  readonly resourceResolver: RelayV2CanonicalResourceResolverPort;
+  readonly resourceMutationOwner: RelayV2CommandResourceMutationOwner;
+  captureProcessTargets(
+    expectedHostEpoch: string,
+  ): Promise<readonly RelayV2ResourceResolverProcessTarget[]>;
+}
+
+export function captureRelayV2RecoveredHostH2ProcessAuthority(
+  candidate: unknown,
+  expectedHostStateOwner: object,
+): RelayV2RecoveredHostH2ProcessAuthority | null {
+  if ((typeof candidate !== "object" || candidate === null)
+    || (typeof expectedHostStateOwner !== "object" || expectedHostStateOwner === null)) return null;
+  const record = recoveredHostH2Candidates.get(candidate as object);
+  if (!record || record.processAuthority.hostStateOwner !== expectedHostStateOwner) return null;
+  return Object.freeze({
+    hostId: record.hostId,
+    hostEpoch: record.hostEpoch,
+    hostInstanceId: record.hostInstanceId,
+    h2RecoveryCandidate: candidate as RelayV2HostH2RecoveryCandidate,
+    resourceResolver: record.processAuthority.resourceResolver,
+    resourceMutationOwner: record.processAuthority.resourceMutationOwner,
+    captureProcessTargets: record.processAuthority.captureProcessTargets,
+  });
+}
 let recoveredHostH2ActivationGeneration = 0n;
 const MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION = 18_446_744_073_709_551_615n;
 
@@ -1901,6 +1941,7 @@ export class RelayV2StateSnapshotSpool {
     options: RelayV2StateSnapshotSpoolOptions,
   ): Promise<RelayV2StateSnapshotSpool> {
     try {
+      let processAuthority: RelayV2MaterializedStateProcessAuthorityPorts | null = null;
       if (options.materializedStateOwner !== undefined) {
         const canonicalResourceUrl = new URL("./resourceState.js", import.meta.url).href;
         const canonicalResource = await import(canonicalResourceUrl) as typeof import(
@@ -1914,8 +1955,20 @@ export class RelayV2StateSnapshotSpool {
             "snapshot spool materialized owner is invalid",
           );
         }
+        processAuthority = canonicalResource.captureRelayV2MaterializedStateProcessAuthorityPorts(
+          options.materializedStateOwner,
+        );
+        if (processAuthority === null) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "INVALID_ARGUMENT",
+            "snapshot spool materialized process authority is unavailable",
+          );
+        }
       }
       const spool = new RelayV2StateSnapshotSpool(options);
+      if (processAuthority !== null) {
+        recoveredHostH2SpoolProcessAuthorities.set(spool, processAuthority);
+      }
       ensureSpoolDirectories(
         spool.paths,
         spool.trustedBoundary,
@@ -2084,6 +2137,8 @@ export class RelayV2StateSnapshotSpool {
 
   async issueRecoveredHostH2Candidate(): Promise<RelayV2HostH2RecoveryCandidate | null> {
     if (this.#runtimeH2 === null) return null;
+    const processAuthority = recoveredHostH2SpoolProcessAuthorities.get(this);
+    if (processAuthority === undefined || processAuthority.hostId !== this.hostId) return null;
     const compositionPair = await issueCanonicalHostRuntimeCompositionPair();
     let provisional: RelayV2MaterializedStateCutCandidateLease | null = null;
     let transferredCut: ActiveCut | null = null;
@@ -2158,6 +2213,7 @@ export class RelayV2StateSnapshotSpool {
             materializedCutIdentity: materialized.materializedCutIdentity,
             readinessIssue: issue,
             compositionPair,
+            processAuthority,
             claimReadiness: (readinessSink) => (
               this.#activateRecoveredHostH2Candidate(record, readinessSink)
             ),
@@ -2583,6 +2639,7 @@ export class RelayV2StateSnapshotSpool {
   close(): Promise<void> {
     if (this.closeBarrier !== null) return this.closeBarrier;
     this.closed = true;
+    recoveredHostH2SpoolProcessAuthorities.delete(this);
     this.invalidateAllReadinessAuthority();
     this.closeBarrier = this.serializeMetadata(() => {
       this.invalidateAllReadinessAuthority();

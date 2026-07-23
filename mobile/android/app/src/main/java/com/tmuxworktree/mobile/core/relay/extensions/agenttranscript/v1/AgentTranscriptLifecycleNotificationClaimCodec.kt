@@ -8,20 +8,54 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageJson
 
 /** Closed, content-free evidence for one committed notification claim. */
 internal object AgentTranscriptLifecycleNotificationClaimCodec {
-    const val CODEC_VERSION = 1
+    const val CODEC_VERSION = 2
     const val MAX_PAYLOAD_UTF8_BYTES = 16_384
+
+    internal enum class PlatformState {
+        CLAIMED,
+        POSTED,
+    }
+
+    internal data class DecodedClaim(
+        val intent: AgentSystemNotificationIntent,
+        val claimId: String,
+        val platformState: PlatformState,
+    )
+
+    fun isValidClaimId(value: String): Boolean = CLAIM_ID_HEX.matches(value)
 
     fun encode(
         key: AgentTranscriptLifecycleNotificationClaimKey,
         intent: AgentSystemNotificationIntent,
+    ): RelayV2EncodedPayload = encode(
+        key = key,
+        intent = intent,
+        claimId = legacyClaimPayload(key, intent).sha256,
+        platformState = PlatformState.CLAIMED,
+    )
+
+    fun encodePosted(
+        key: AgentTranscriptLifecycleNotificationClaimKey,
+        intent: AgentSystemNotificationIntent,
+        claimId: String,
+    ): RelayV2EncodedPayload = encode(key, intent, claimId, PlatformState.POSTED)
+
+    private fun encode(
+        key: AgentTranscriptLifecycleNotificationClaimKey,
+        intent: AgentSystemNotificationIntent,
+        claimId: String,
+        platformState: PlatformState,
     ): RelayV2EncodedPayload {
         require(intent.dedupeKey == key.dedupeKey)
+        require(isValidClaimId(claimId))
         return RelayV2StorageJson.encode(
             CODEC_VERSION,
             linkedMapOf(
                 "kind" to PAYLOAD_KIND,
                 "namespace" to key.consumer.toStorageMap(),
                 "intent" to intent.toStorageMap(),
+                "claimId" to claimId,
+                "platformState" to platformState.name,
             ),
         ).also { payload ->
             if (payload.payloadUtf8Bytes > MAX_PAYLOAD_UTF8_BYTES) {
@@ -34,14 +68,26 @@ internal object AgentTranscriptLifecycleNotificationClaimCodec {
         expectedKey: AgentTranscriptLifecycleNotificationClaimKey,
         expectedLocalGeneration: String,
         payload: RelayV2EncodedPayload,
-    ): AgentSystemNotificationIntent = try {
+    ): DecodedClaim = try {
+        if (payload.codecVersion !in setOf(LEGACY_CODEC_VERSION, CODEC_VERSION)) incompatible()
         val root = RelayV2StorageJson.decode(
             payload,
-            expectedCodecVersion = CODEC_VERSION,
+            expectedCodecVersion = payload.codecVersion,
             maxPayloadBytes = MAX_PAYLOAD_UTF8_BYTES,
             limits = JSON_LIMITS,
         )
-        RelayV2StorageJson.requireKeys(root, "kind", "namespace", "intent")
+        if (payload.codecVersion == LEGACY_CODEC_VERSION) {
+            RelayV2StorageJson.requireKeys(root, "kind", "namespace", "intent")
+        } else {
+            RelayV2StorageJson.requireKeys(
+                root,
+                "kind",
+                "namespace",
+                "intent",
+                "claimId",
+                "platformState",
+            )
+        }
         if (RelayV2StorageJson.string(root, "kind") != PAYLOAD_KIND) incompatible()
         val consumer = decodeConsumer(RelayV2StorageJson.objectValue(root, "namespace"))
         val intent = decodeIntent(RelayV2StorageJson.objectValue(root, "intent"))
@@ -55,7 +101,19 @@ internal object AgentTranscriptLifecycleNotificationClaimCodec {
             intent.dedupeKey != expectedKey.dedupeKey ||
             intent.localGeneration != expectedLocalGeneration
         ) malformed()
-        intent
+        val claimId = if (payload.codecVersion == LEGACY_CODEC_VERSION) {
+            payload.sha256
+        } else {
+            RelayV2StorageJson.string(root, "claimId").also { encoded ->
+                if (!isValidClaimId(encoded)) malformed()
+            }
+        }
+        val platformState = if (payload.codecVersion == LEGACY_CODEC_VERSION) {
+            PlatformState.CLAIMED
+        } else {
+            RelayV2StorageJson.enum(root, "platformState")
+        }
+        DecodedClaim(intent, claimId, platformState)
     } catch (error: RelayV2StorageException) {
         throw error
     } catch (_: IllegalArgumentException) {
@@ -63,6 +121,18 @@ internal object AgentTranscriptLifecycleNotificationClaimCodec {
     } catch (_: IllegalStateException) {
         malformed()
     }
+
+    private fun legacyClaimPayload(
+        key: AgentTranscriptLifecycleNotificationClaimKey,
+        intent: AgentSystemNotificationIntent,
+    ): RelayV2EncodedPayload = RelayV2StorageJson.encode(
+        LEGACY_CODEC_VERSION,
+        linkedMapOf(
+            "kind" to PAYLOAD_KIND,
+            "namespace" to key.consumer.toStorageMap(),
+            "intent" to intent.toStorageMap(),
+        ),
+    )
 
     private fun decodeConsumer(
         value: Map<String, Any?>,
@@ -163,6 +233,8 @@ internal object AgentTranscriptLifecycleNotificationClaimCodec {
         throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
 
     private const val PAYLOAD_KIND = "agent_transcript_lifecycle_notification_claim"
+    private const val LEGACY_CODEC_VERSION = 1
+    private val CLAIM_ID_HEX = Regex("^[0-9a-f]{64}$")
     private val CANONICAL_POSITIVE_DECIMAL = Regex("^[1-9][0-9]*$")
     private val JSON_LIMITS = RelayV2JsonLimits(
         maxDepth = 6,

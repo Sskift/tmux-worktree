@@ -27,10 +27,10 @@ function producerTarget() {
 
 class StrictFakeSocket {
   constructor() {
-    this.readyState = 1;
-    this.protocol = "tw-relay.v2";
-    this.extensions = "";
-    this.bufferedAmount = 0;
+    this._readyState = 1;
+    this._protocol = "tw-relay.v2";
+    this._extensions = "";
+    this._bufferedAmount = 0;
     this.listeners = new Map();
     this.sends = [];
     this.pauses = 0;
@@ -42,6 +42,11 @@ class StrictFakeSocket {
     this.closeImpl = undefined;
     this.terminateImpl = undefined;
   }
+
+  get readyState() { return this._readyState; }
+  get protocol() { return this._protocol; }
+  get extensions() { return this._extensions; }
+  get bufferedAmount() { return this._bufferedAmount; }
 
   on(event, listener) {
     const listeners = this.listeners.get(event) ?? [];
@@ -132,7 +137,11 @@ function createFakeTransport(overrides = {}) {
 function createAdapter(socket, fakeTransport, overrides = {}) {
   const authorization = overrides.authContext ?? authContext();
   const target = overrides.hostProducerTarget ?? producerTarget();
-  const adapter = adapterModule.createRelayV2BrokerClientWssAdapter({
+  const capture = adapterModule.createRelayV2BrokerClientWssCaptureAuthority(
+    StrictFakeSocket.prototype,
+    (candidate) => candidate === socket,
+  );
+  const adapter = capture.create({
     connectionId: overrides.connectionId ?? "client-connection-1",
     authContext: authorization,
     hostProducerTarget: target,
@@ -175,14 +184,14 @@ test("broker client WSS adapter translates text, write completion, flow control,
 
   const completions = [];
   const outbound = Uint8Array.from([123, 34, 120, 34, 58, 49, 125]);
-  socket.bufferedAmount = 17;
+  socket._bufferedAmount = 17;
   assert.equal(port.send(outbound, (receipt) => completions.push(receipt)), "applied");
   outbound.fill(0);
   assert.deepEqual([...socket.sends[0].bytes], [123, 34, 120, 34, 58, 49, 125]);
   assert.deepEqual(socket.sends[0].options, { binary: false, compress: false });
   assert.deepEqual(port.bufferedState(), { bytes: 17, frames: 1 });
 
-  socket.sends[0].callback();
+  socket.sends[0].callback(null);
   socket.sends[0].callback(new Error("late"));
   assert.deepEqual(completions, []);
   await Promise.resolve();
@@ -296,7 +305,7 @@ test("broker client WSS adapter preserves binary metadata and rejects unsafe sen
   assert.deepEqual(completions, ["delivered", "rejected"]);
 
   const invalidSocket = new StrictFakeSocket();
-  invalidSocket.protocol = "tw-relay.v1";
+  invalidSocket._protocol = "tw-relay.v1";
   assert.throws(
     () => createAdapter(invalidSocket, createFakeTransport()),
     adapterModule.RelayV2BrokerClientWssAdapterError,
@@ -314,14 +323,22 @@ test("broker client WSS adapter preserves binary metadata and rejects unsafe sen
   assert.equal(identityMismatch.terminates, 1);
 
   assert.throws(
-    () => adapterModule.createRelayV2BrokerClientWssAdapter(new Proxy({}, {})),
+    () => adapterModule.createRelayV2BrokerClientWssCaptureAuthority(
+      StrictFakeSocket.prototype,
+      () => false,
+    ).create(new Proxy({}, {})),
     adapterModule.RelayV2BrokerClientWssAdapterError,
   );
   assert.throws(
-    () => adapterModule.createRelayV2BrokerClientWssAdapter(Object.defineProperty({}, "socket", {
-      enumerable: true,
-      get: () => new StrictFakeSocket(),
-    })),
+    () => adapterModule.createRelayV2BrokerClientWssCaptureAuthority(
+      StrictFakeSocket.prototype,
+      () => false,
+    ).create(
+      Object.defineProperty({}, "socket", {
+        enumerable: true,
+        get: () => new StrictFakeSocket(),
+      }),
+    ),
     adapterModule.RelayV2BrokerClientWssAdapterError,
   );
 });
@@ -430,14 +447,14 @@ test("broker client WSS adapter commits sends only while OPEN and fences close o
 
     socket.sendImpl = ({ callback }) => {
       callback();
-      socket.readyState = 2;
+      socket._readyState = 2;
       return undefined;
     };
     assert.equal(port.send(Uint8Array.of(1), (receipt) => completions.push(receipt)), "rejected");
     await Promise.resolve();
     assert.deepEqual(completions, []);
 
-    socket.readyState = 1;
+    socket._readyState = 1;
     socket.sendImpl = ({ callback }) => {
       callback();
       assert.equal(port.forceDestroy(), "applied");

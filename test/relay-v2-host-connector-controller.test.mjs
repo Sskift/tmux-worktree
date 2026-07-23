@@ -51,6 +51,7 @@ function drainEvidence(input) {
   return {
     status: "closed_and_drained",
     controllerGeneration: input.controllerGeneration,
+    carrierAttemptGeneration: input.carrierAttemptGeneration,
     carrierGeneration: input.carrierGeneration,
     connectorId: input.connectorId,
   };
@@ -60,14 +61,23 @@ function harness(options = {}) {
   const records = [];
   const attempts = Object.freeze({
     startAttempt(input) {
+      const carrierAttemptGeneration = String(records.length + 1);
       const record = {
         input,
         emit: input.onCarrierStatus,
+        fenceAttempt: input.onCarrierAttemptFenced,
+        carrierAttemptGeneration,
+        fenceCalls: [],
         drainCalls: [],
         drainGate: null,
         port: null,
       };
       const port = Object.freeze({
+        fence(fenceInput) {
+          record.fenceCalls.push(fenceInput);
+          return fenceInput.controllerGeneration === input.controllerGeneration
+            && fenceInput.carrierAttemptGeneration === carrierAttemptGeneration;
+        },
         disposeAndDrain(drainInput) {
           record.drainCalls.push(drainInput);
           const finish = () => drainEvidence(drainInput);
@@ -78,6 +88,10 @@ function harness(options = {}) {
       });
       record.port = port;
       records.push(record);
+      input.onCarrierAttemptPrepared({
+        controllerGeneration: input.controllerGeneration,
+        carrierAttemptGeneration,
+      });
       return options.startAttempt ? options.startAttempt(record, port) : port;
     },
   });
@@ -205,9 +219,11 @@ test("stop fences new work, disposes exactly once, and returns only after drain"
   assert.equal(registered.record.drainCalls.length, 1);
   assert.deepEqual(registered.record.drainCalls[0], {
     controllerGeneration: "1",
+    carrierAttemptGeneration: "1",
     carrierGeneration: 1,
     connectorId: "broker-connector-one",
   });
+  assert.deepEqual(registered.record.fenceCalls, [registered.record.drainCalls[0]]);
   await assert.rejects(
     h.controller.start(startInput("controller.start-while-draining")),
     (error) => isControllerFailure(error, "BUSY"),
@@ -236,6 +252,39 @@ test("stop fences new work, disposes exactly once, and returns only after drain"
     status: "stopped",
     controllerGeneration: "1",
   });
+});
+
+test("an exact synchronous capability fence retires the attempt before drain", async () => {
+  const h = harness();
+  const registered = await registeredAttempt(h);
+  registered.record.drainGate = deferred();
+
+  registered.record.fenceAttempt({
+    reason: "capability_withdrawn",
+    controllerGeneration: registered.cut.controllerGeneration,
+    carrierAttemptGeneration: registered.record.carrierAttemptGeneration,
+    offerGeneration: "4",
+  });
+
+  assert.deepEqual(h.controller.inspectCut(), {
+    status: "failed",
+    retryable: true,
+    controllerGeneration: "1",
+    connectorId: "broker-connector-one",
+    ...IDENTITY,
+  });
+  await nextTurn();
+  assert.equal(registered.record.fenceCalls.length, 1);
+  assert.equal(registered.record.drainCalls.length, 1);
+  let retried = false;
+  const retry = h.controller.start(startInput("controller.after-capability-fence"));
+  void retry.then(() => { retried = true; });
+  await nextTurn();
+  assert.equal(retried, false);
+  registered.record.drainGate.resolve();
+  await nextTurn();
+  emitRegistered(h.records[1], "broker-connector-after-fence", 2);
+  assert.equal((await retry).controllerGeneration, "2");
 });
 
 test("old stop and callbacks cannot affect a replacement generation", async () => {

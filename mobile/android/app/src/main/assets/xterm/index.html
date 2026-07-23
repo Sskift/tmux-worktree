@@ -174,6 +174,21 @@
       if (ready) terminal.write(data);
       else pending.push(data);
     };
+    window.twWriteBytesWithAck = (callbackId, encoded) => {
+      if (!ready || !terminal || typeof callbackId !== 'string' ||
+          typeof encoded !== 'string') return false;
+      try {
+        const binary = atob(encoded);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        terminal.write(bytes, () => TwBridge.parserMutationApplied(callbackId, true));
+      } catch (_) {
+        TwBridge.parserMutationApplied(callbackId, false);
+      }
+      return true;
+    };
     window.twReset = data => {
       if (!ready) {
         pending.length = 0;
@@ -184,6 +199,18 @@
       if (data) terminal.write(data);
       terminal.focus();
       fitBurst();
+    };
+    window.twResetWithAck = callbackId => {
+      if (!ready || !terminal || typeof callbackId !== 'string') return false;
+      try {
+        terminal.reset();
+        terminal.focus();
+        fitBurst();
+        TwBridge.parserMutationApplied(callbackId, true);
+      } catch (_) {
+        TwBridge.parserMutationApplied(callbackId, false);
+      }
+      return true;
     };
     window.twSendKey = data => {
       if (!ready || readOnly) return;

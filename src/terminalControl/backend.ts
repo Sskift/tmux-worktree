@@ -13,7 +13,8 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { managedStatePath, loadManagedStateForMutation, type ManagedSession } from "../state";
-import { tmuxBin } from "../tmux";
+import { observeManagedSessionIncarnation } from "../session";
+import { listTmuxSessionLifecycleEntries, tmuxBin } from "../tmux";
 import { TerminalControlProtocolError } from "./protocol";
 
 const TMUX_INSTANCE_OPTION = "@tw_terminal_control_instance_v1";
@@ -87,8 +88,25 @@ export interface ResolvedManagedTerminalBackend {
   tmuxInstanceId: string;
 }
 
+export interface TerminalControlExactTargetInspection {
+  managedSession: ManagedSession;
+  managedIncarnation: string;
+  tmuxInstanceId: string;
+  paneIdentity: string;
+}
+
 export interface TerminalControlBackend {
   resolveManagedSession(sessionName: string): Promise<ResolvedManagedTerminalBackend>;
+  /**
+   * Optional Relay v2 closed inspection. Implementations must not establish a
+   * tmux identity, attach output, persist a target, or perform any mutation.
+   */
+  inspectExactTarget?(input: {
+    managedName: string;
+    managedKind: "worktree" | "terminal";
+    managedIncarnation: string;
+    pane: number;
+  }): Promise<TerminalControlExactTargetInspection>;
   assertCurrent(
     session: Pick<ManagedSession, "name" | "kind" | "createdAt">,
     tmuxInstanceId: string,
@@ -442,6 +460,67 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       }
     }
     return { managedSession, tmuxInstanceId };
+  }
+
+  async inspectExactTarget(input: {
+    managedName: string;
+    managedKind: "worktree" | "terminal";
+    managedIncarnation: string;
+    pane: number;
+  }): Promise<TerminalControlExactTargetInspection> {
+    const managedSession = exactManagedSession(input.managedName);
+    if (managedSession.kind !== input.managedKind) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "managed session kind no longer matches the exact target",
+      );
+    }
+    let live;
+    try {
+      const matches = listTmuxSessionLifecycleEntries().filter(
+        (candidate) => candidate.rawName === input.managedName,
+      );
+      if (matches.length !== 1) {
+        throw new TerminalControlProtocolError(
+          matches.length === 0 ? "TARGET_GONE" : "RECOVERY_REQUIRED",
+          "managed tmux incarnation is missing or ambiguous",
+        );
+      }
+      live = matches[0];
+    } catch (error) {
+      if (error instanceof TerminalControlProtocolError) throw error;
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `could not inspect the managed tmux incarnation: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const observed = observeManagedSessionIncarnation(managedSession, live);
+    if (!observed || observed.incarnation !== input.managedIncarnation) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "managed tmux incarnation no longer matches the exact target",
+      );
+    }
+    const pane = await requirePane(input.managedName, String(input.pane));
+    if (pane.sessionId !== live.sessionId) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "managed pane crossed the exact tmux incarnation",
+      );
+    }
+    const tmuxInstanceId = await currentTmuxInstanceId(pane.sessionId);
+    if (!tmuxInstanceId) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal-control identity has not been established for the exact target",
+      );
+    }
+    return {
+      managedSession,
+      managedIncarnation: observed.incarnation,
+      tmuxInstanceId,
+      paneIdentity: pane.paneTarget,
+    };
   }
 
   async assertCurrent(

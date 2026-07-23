@@ -5,7 +5,7 @@ import {
 } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { Socket } from "node:net";
-import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   RELAY_HOST_RETIRE_CAPABILITY,
   type RelayClientMessage,
@@ -19,27 +19,14 @@ import {
   isValidHostId,
   parseJsonMessage,
 } from "../v1/wire.js";
-import {
-  dispatchRelayBrokerUpgrade,
-  RelayV2BrokerCore,
-  type RelayBrokerRole,
-  type RelayV2BrokerAction,
-  type RelayV2BrokerAuthControlAuthority,
-  type RelayV2BrokerConnectionAuthorization,
-  type RelayV2LiveAuthorizationFencePort,
+import type {
+  RelayV2BrokerAuthControlAuthority,
+  RelayV2LiveAuthorizationFencePort,
 } from "../v2/brokerCore.js";
-import {
-  handleRelayV2BrokerCredentialNodeHttpRequest,
-  type RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort,
-} from "../v2/brokerCredentialNodeHttpAdapter.js";
-import {
-  RelayV2BrokerTransportCloseCoordinator,
-  type RelayV2BrokerTransportCloseDeadlineScheduler,
-  type RelayV2BrokerTransportSocketRegistration,
-} from "../v2/brokerTransportCloseCoordinator.js";
-import { encodeRelayV2WebSocketFrame } from "../v2/codec.js";
-import type { RelayV2JsonObject } from "../v2/codecSchema.js";
+import type { RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort } from "../v2/brokerCredentialNodeHttpAdapter.js";
+import type { RelayV2BrokerTransportCloseDeadlineScheduler } from "../v2/brokerTransportCloseCoordinator.js";
 import type { RelayServerOptions } from "./options.js";
+import type { RelayV2BrokerServerRuntimeV2 } from "../v2/brokerServerRuntime.js";
 
 export interface RelayV2BrokerServerCredentialAuthority
   extends RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort,
@@ -49,7 +36,17 @@ export interface RelayV2BrokerServerCredentialAuthority
 }
 
 /**
- * Explicit opt-in seam for the still-unwired Relay v2 broker foundations.
+ * Trusted, process-local receipt from the optional Agent extension readiness
+ * owner. The loss subscription is one-way: this server composition may only
+ * withdraw the extension from the already-constructed BrokerCore.
+ */
+export interface RelayV2BrokerServerAgentCapabilityReadinessReceipt {
+  readonly status: "ready";
+  subscribeLoss(onLoss: () => void): () => void;
+}
+
+/**
+ * Explicit opt-in seam for the isolated Relay v2 broker composition.
  * The CLI never supplies this object. A future production owner must create
  * the credential authority with the exact BrokerCore fence passed here; this
  * module never constructs a native store, continuity backend, secret, issuer,
@@ -63,8 +60,9 @@ export interface RelayV2BrokerServerComposition {
   resolveHttpSourceKey(socket: Socket): string;
   /** Optional deterministic scheduler for isolated lifecycle verification. */
   closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
-  /** Isolated deterministic cut at the transport actor's quiescent edge. */
-  onTransportPumpQuiescent?: () => void | Promise<void>;
+  /** Omission keeps agent.transcript-lifecycle.v1 disabled. */
+  agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
 export interface RelayBrokerServerHandle {
@@ -350,514 +348,16 @@ function waitForResponseSettlement(response: ServerResponse): Promise<void> {
   });
 }
 
-async function rejectHttpRequestAndDrain(
-  request: IncomingMessage,
-  response: ServerResponse,
-  status: number,
-  error: string,
-): Promise<void> {
-  const requestSettled = waitForRequestSettlement(request);
-  const responseSettled = waitForResponseSettlement(response);
-  response.shouldKeepAlive = false;
-  try { request.resume(); } catch {}
-  response.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-    Connection: "close",
-  });
-  response.end(JSON.stringify({ ok: false, error }));
-  await responseSettled;
-  if (!request.complete && !request.destroyed && !request.aborted) {
-    try { request.destroy(); } catch {}
-  }
-  await requestSettled;
-}
-
-function webSocketBytes(data: RawData): Uint8Array {
-  if (typeof data === "string") return Buffer.from(data, "utf8");
-  if (Buffer.isBuffer(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (Array.isArray(data)) return Buffer.concat(data);
-  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-}
-
-type RelayV2HostSocketEntry = {
-  socket: WebSocket;
-  registration: RelayV2BrokerTransportSocketRegistration;
-  abortController: AbortController;
-  acceptingFrames: boolean;
-};
-
-type RelayV2BrokerServerRuntime = {
-  readonly webSocketServer: WebSocketServer;
-  readonly core: RelayV2BrokerCore;
-  handleHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void>;
-  admitUpgrade(
-    request: IncomingMessage,
-    socket: Socket,
-    head: Buffer,
-    target: { pathname: string; search: string },
-    legacyQuerySecret: string | null,
-  ): boolean;
-  beginShutdown(): void;
-  shutdown(): Promise<void>;
-};
-
-function isCompleteRelayV2Authority(
-  authority: unknown,
-): authority is RelayV2BrokerServerCredentialAuthority {
-  if (authority === null || typeof authority !== "object") return false;
-  const candidate = authority as Record<string, unknown>;
-  return [
-    "handle",
-    "admitHttpSource",
-    "releaseHttpSourceAdmission",
-    "authorizeAccessToken",
-    "bootstrapHost",
-    "redeemEnrollment",
-    "refreshClientGrantFromHttp",
-    "refreshHostGrantFromHttp",
-    "selfRevokeGrantFromHttp",
-    "close",
-  ].every((name) => typeof candidate[name] === "function")
-    && candidate.authorityContinuityReadiness !== null
-    && typeof candidate.authorityContinuityReadiness === "object"
-    && (candidate.authorityContinuityReadiness as { status?: unknown }).status === "ready";
-}
-
-async function createRelayV2BrokerServerRuntime(
-  composition: RelayV2BrokerServerComposition,
-): Promise<RelayV2BrokerServerRuntime> {
-  if (
-    composition === null
-    || typeof composition !== "object"
-    || typeof composition.openCredentialAuthority !== "function"
-    || typeof composition.resolveHttpSourceKey !== "function"
-  ) {
-    throw new Error("Relay v2 broker composition is incomplete");
-  }
-
-  const closeCoordinator = new RelayV2BrokerTransportCloseCoordinator({
-    deadlineScheduler: composition.closeDeadlineScheduler,
-  });
-  const authorityTasks = new Set<Promise<unknown>>();
-  const trackAuthorityTask = <T>(task: Promise<T>): Promise<T> => {
-    authorityTasks.add(task);
-    void task.then(
-      () => authorityTasks.delete(task),
-      () => authorityTasks.delete(task),
-    );
-    return task;
-  };
-  let authority: RelayV2BrokerServerCredentialAuthority | null = null;
-  const authControlAuthority: RelayV2BrokerAuthControlAuthority = Object.freeze({
-    handle(request) {
-      if (authority === null) throw new Error("Relay v2 credential authority is unavailable");
-      return trackAuthorityTask(Promise.resolve(authority.handle(request)));
-    },
-  });
-  const core = new RelayV2BrokerCore({
-    authControlAuthority,
-    onLiveAuthorizationClose(signal) {
-      closeCoordinator.handleLiveAuthorizationClose(signal);
-    },
-    // Deliberately omit baseCapabilityReadiness. B6 never admits a v2 client.
-  });
-
-  let opened: unknown;
-  try {
-    opened = await composition.openCredentialAuthority({
-      liveAuthorizationFence: core.liveAuthorizationFencePort,
-    });
-  } catch {
-    throw new Error("Relay v2 credential authority failed to open");
-  }
-  if (!isCompleteRelayV2Authority(opened)) {
-    try {
-      if (
-        opened !== null
-        && typeof opened === "object"
-        && typeof (opened as { close?: unknown }).close === "function"
-      ) {
-        await Reflect.apply(
-          (opened as { close: () => unknown }).close,
-          opened,
-          [],
-        );
-      }
-    } catch {}
-    throw new Error("Relay v2 credential authority is not ready");
-  }
-  authority = opened;
-
-  const webSocketServer = new WebSocketServer({
-    noServer: true,
-    maxPayload: 1_048_576,
-    perMessageDeflate: false,
-    handleProtocols(protocols) {
-      return protocols.values().next().value ?? false;
-    },
-  });
-  const hosts = new Map<string, RelayV2HostSocketEntry>();
-  const upgradeAttempts = new Set<Promise<void>>();
-  let shuttingDown = false;
-  let acceptingTransportJobs = true;
-  let transportActorTail: Promise<void> = Promise.resolve();
-  let sealedTransportBarrier: Promise<void> | null = null;
-  let shutdownPromise: Promise<void> | null = null;
-
-  const enqueueTransportJob = <T>(
-    work: () => T | Promise<T>,
-    onFailure?: () => void,
-  ): Promise<T> | null => {
-    if (!acceptingTransportJobs) return null;
-    const execution = transportActorTail.then(work);
-    transportActorTail = execution.then(
-      () => undefined,
-      () => {
-        try { onFailure?.(); } catch {}
-      },
-    );
-    return execution;
-  };
-
-  const sealTransportActor = (): Promise<void> => {
-    if (sealedTransportBarrier) return sealedTransportBarrier;
-    acceptingTransportJobs = false;
-    sealedTransportBarrier = transportActorTail;
-    return sealedTransportBarrier;
-  };
-
-  const closeSocket = (socket: WebSocket, code: number, reason: string): void => {
-    if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING) return;
-    try { socket.close(code, reason); } catch {
-      try { socket.terminate(); } catch {}
-    }
-  };
-
-  const sendWire = (
-    socket: WebSocket,
-    wire: Uint8Array,
-  ): Promise<boolean> => new Promise((resolve) => {
-    if (socket.readyState !== WebSocket.OPEN) {
-      resolve(false);
-      return;
-    }
-    try {
-      socket.send(Buffer.from(wire).toString("utf8"), { compress: false }, (error) => {
-        resolve(error == null);
-      });
-    } catch {
-      resolve(false);
-    }
-  });
-
-  const sendFrame = (
-    socket: WebSocket,
-    dialect: "carrier" | "public",
-    frame: RelayV2JsonObject,
-  ): Promise<boolean> => {
-    try {
-      return sendWire(
-        socket,
-        encodeRelayV2WebSocketFrame(dialect, frame),
-      );
-    } catch {
-      return Promise.resolve(false);
-    }
-  };
-
-  const applyActions = async (actions: readonly RelayV2BrokerAction[]): Promise<void> => {
-    for (const action of actions) {
-      switch (action.kind) {
-        case "send_host": {
-          const entry = hosts.get(action.transportId);
-          if (!entry) break;
-          const sent = await sendFrame(entry.socket, "carrier", action.frame);
-          if (action.deliveryId) {
-            const result = sent
-              ? core.acknowledgeHostControlDelivery(action.transportId, action.deliveryId)
-              : core.rejectHostControlDelivery(action.transportId, action.deliveryId);
-            await applyActions(result.actions);
-          }
-          if (!sent) closeSocket(entry.socket, 1013, "carrier_write_failed");
-          break;
-        }
-        case "close_host": {
-          const entry = hosts.get(action.transportId);
-          if (entry) closeSocket(entry.socket, action.closeCode, action.reason);
-          break;
-        }
-        case "route_unavailable": {
-          // B6 rejects every v2 client before HTTP 101, so no public route
-          // transport exists to receive this defensive BrokerCore action.
-          break;
-        }
-        case "close_client": {
-          break;
-        }
-        case "pause_client":
-        case "resume_client":
-          break;
-        case "pause_host_route":
-        case "resume_host_route":
-          // These actions are route-scoped. Mapping either to pause()/resume()
-          // on the multiplexed carrier would cross route/auth-control owners.
-          // B6 has no per-route source-control seam and opens no client route.
-          break;
-        case "route_opened":
-          break;
-      }
-    }
-  };
-
-  const pumpHost = async (transportId: string): Promise<boolean> => {
-    const entry = hosts.get(transportId);
-    if (!entry) return false;
-    let progressed = false;
-    while (hosts.get(transportId) === entry) {
-      const deliveries = core.drainHostCarrier(transportId, {
-        maxFrames: 32,
-        maxBytes: 1_048_576,
-      });
-      if (deliveries.length === 0) break;
-      progressed = true;
-      for (const delivery of deliveries) {
-        const sent = await sendWire(entry.socket, delivery.wire);
-        if (!sent) {
-          closeSocket(entry.socket, 1013, "carrier_write_failed");
-          return progressed;
-        }
-        const acknowledged = core.acknowledgeHostDelivery(
-          transportId,
-          delivery.deliveryId,
-        );
-        await applyActions(acknowledged.actions);
-      }
-    }
-    return progressed;
-  };
-
-  const pumpAll = async (): Promise<void> => {
-    let progressed: boolean;
-    do {
-      progressed = false;
-      for (const transportId of hosts.keys()) {
-        progressed = await pumpHost(transportId) || progressed;
-      }
-    } while (progressed);
-    await composition.onTransportPumpQuiescent?.();
-  };
-
-  const acceptHost = (
-    socket: WebSocket,
-    authContext: RelayV2BrokerConnectionAuthorization,
-  ): void => {
-    const transportId = randomUUID();
-    const abortController = new AbortController();
-    const registration = closeCoordinator.registerSocket({
-      connectionKind: "host",
-      transportId,
-      close(code, reason) { closeSocket(socket, code, reason); },
-      forceDestroy() { socket.terminate(); },
-    });
-    const entry: RelayV2HostSocketEntry = {
-      socket,
-      registration,
-      abortController,
-      acceptingFrames: true,
-    };
-    hosts.set(transportId, entry);
-    socket.on("message", (data, isBinary) => {
-      if (!entry.acceptingFrames) return;
-      if (isBinary) {
-        entry.acceptingFrames = false;
-        const admitted = enqueueTransportJob(() => closeSocket(socket, 4400, "binary_frame_unsupported"));
-        if (admitted === null) closeSocket(socket, 4400, "binary_frame_unsupported");
-        return;
-      }
-      const bytes = webSocketBytes(data);
-      const admitted = enqueueTransportJob(async () => {
-        if (hosts.get(transportId) !== entry) return;
-        const result = await core.receiveHostFrame(
-          transportId,
-          bytes,
-          abortController.signal,
-        );
-        await applyActions(result.actions);
-        await pumpAll();
-      }, () => closeSocket(socket, 4400, "carrier_handler_failed"));
-      if (admitted === null) closeSocket(socket, 1013, "server_shutting_down");
-    });
-    socket.once("close", () => {
-      entry.acceptingFrames = false;
-      abortController.abort();
-      registration.unregister();
-      if (hosts.get(transportId) !== entry) return;
-      hosts.delete(transportId);
-      enqueueTransportJob(async () => {
-        const result = core.disconnectHost(transportId);
-        await applyActions(result.actions);
-        await pumpAll();
-      });
-    });
-    socket.once("error", () => {
-      try { socket.terminate(); } catch {}
-    });
-    const attached = enqueueTransportJob(() => {
-      if (hosts.get(transportId) !== entry) return;
-      core.attachHostCarrier(
-        transportId,
-        authContext,
-        registration.connectionIncarnation,
-      );
-    }, () => {
-      registration.unregister();
-      if (hosts.get(transportId) === entry) hosts.delete(transportId);
-      closeSocket(socket, 1013, "host_admission_unavailable");
-    });
-    if (attached === null) {
-      registration.unregister();
-      hosts.delete(transportId);
-      closeSocket(socket, 1013, "server_shutting_down");
-    }
-  };
-
-  const closeWebSocketServer = (): Promise<void> => new Promise((resolve) => {
-    try {
-      webSocketServer.close(() => resolve());
-    } catch {
-      resolve();
-    }
-  });
-
-  const runtime: RelayV2BrokerServerRuntime = {
-    webSocketServer,
-    core,
-    async handleHttpRequest(request, response) {
-      let sourceKey: unknown;
-      try {
-        sourceKey = composition.resolveHttpSourceKey(request.socket);
-      } catch {
-        sourceKey = null;
-      }
-      if (
-        typeof sourceKey !== "string"
-        || sourceKey.length === 0
-        || Buffer.byteLength(sourceKey, "utf8") > 1_024
-        || sourceKey.includes("\0")
-      ) {
-        await rejectHttpRequestAndDrain(
-          request,
-          response,
-          503,
-          "source unavailable",
-        );
-        return;
-      }
-      await handleRelayV2BrokerCredentialNodeHttpRequest(
-        authority!,
-        sourceKey,
-        request,
-        response,
-      );
-    },
-    admitUpgrade(request, socket, head, target, legacyQuerySecret) {
-      if (shuttingDown) return false;
-      let tracked: Promise<void>;
-      tracked = Promise.resolve().then(async () => {
-        if (shuttingDown) {
-          rejectUpgrade(socket, 503);
-          return;
-        }
-        const result = await dispatchRelayBrokerUpgrade({
-          pathname: target.pathname,
-          search: target.search,
-          authorizationHeaders: rawHeaderValues(request, "authorization"),
-          legacyQuerySecret,
-          offeredProtocols: offeredWebSocketProtocols(request),
-        }, {
-          verifyLegacySecret() {
-            throw new Error("Relay v2 dispatch must not invoke the v1 verifier");
-          },
-          verifyV2AccessToken(token: string, expectedRole: RelayBrokerRole) {
-            return trackAuthorityTask(Promise.resolve(authority!.authorizeAccessToken(token, expectedRole)));
-          },
-        });
-        if (result.outcome === "reject") {
-          rejectUpgrade(socket, result.status);
-          return;
-        }
-        if (result.stack !== "v2") {
-          rejectUpgrade(socket, 403);
-          return;
-        }
-        if (shuttingDown) {
-          rejectUpgrade(socket, 503);
-          return;
-        }
-        if (result.role === "client") {
-          // H/G2 readiness and per-route source control are not composed in
-          // B6. Stay below 101 so no client can enter a no-welcome route or
-          // pressure the multiplexed host carrier through whole-socket flow.
-          rejectUpgrade(socket, 426);
-          return;
-        }
-        if (shuttingDown) {
-          rejectUpgrade(socket, 503);
-          return;
-        }
-        webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-          acceptHost(webSocket, result.authContext);
-        });
-      }).catch(() => {
-        try { socket.destroy(); } catch {}
-      }).finally(() => {
-        upgradeAttempts.delete(tracked);
-      });
-      upgradeAttempts.add(tracked);
-      return true;
-    },
-    beginShutdown() {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      sealTransportActor();
-      core.liveAuthorizationFencePort.failClosed();
-    },
-    shutdown() {
-      if (shutdownPromise) return shutdownPromise;
-      runtime.beginShutdown();
-      shutdownPromise = (async () => {
-        await Promise.all([...upgradeAttempts]);
-        await sealTransportActor();
-        await Promise.allSettled([...authorityTasks]);
-        try {
-          await authority!.close();
-        } finally {
-          for (const entry of hosts.values()) {
-            try { entry.socket.terminate(); } catch {}
-          }
-          await closeWebSocketServer();
-        }
-      })();
-      return shutdownPromise;
-    },
-  };
-  return runtime;
-}
-
 export async function startRelayBroker(
   opts: RelayServerOptions,
-  relayV2Composition?: RelayV2BrokerServerComposition,
+  relayV2?: RelayV2BrokerServerRuntimeV2,
 ): Promise<RelayBrokerServerHandle> {
-  if (relayV2Composition !== undefined && !isIsolatedLoopbackListener(opts)) {
+  if (relayV2 !== undefined && !isIsolatedLoopbackListener(opts)) {
+    await relayV2.shutdown();
     throw new Error(
       "Relay v2 broker composition is restricted to an isolated random-port loopback listener",
     );
   }
-  const relayV2 = relayV2Composition === undefined
-    ? undefined
-    : await createRelayV2BrokerServerRuntime(relayV2Composition);
   const hosts = new Map<string, HostConnection>();
   const candidates = new Map<string, HostConnection>();
   const hostConnections = new Set<HostConnection>();

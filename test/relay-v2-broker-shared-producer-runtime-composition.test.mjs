@@ -218,6 +218,160 @@ function prepareLiveClient(shared, pump, hostId, connectionId) {
   return { client, socket };
 }
 
+test("the shared owner installs private ingress children with exact Host resolution and one close", async () => {
+  const scheduler = new ManualScheduler();
+  const baseOptions = {
+    hostWssTrustedSocketPrototype: FakeClientSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
+    brokerOptions: {
+      now: () => NOW_MS,
+      baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
+    clientSocketScheduler: scheduler,
+    authorizationExpiryScheduleAt: () => () => {},
+  };
+  let hostileInstallerCalls = 0;
+  assert.throws(() => pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+    ...baseOptions,
+    installPrivateIngressChildren: new Proxy(function hostileInstaller() {}, {
+      apply() { hostileInstallerCalls += 1; throw new Error("must not execute"); },
+    }),
+  }), /private ingress installer/);
+  assert.equal(hostileInstallerCalls, 0);
+
+  let getterCalls = 0;
+  const exactChild = () => Object.freeze({
+    closeAndDrain: () => Promise.resolve(),
+  });
+  for (const installPrivateIngressChildren of [
+    () => {
+      const children = { clientIngress: exactChild() };
+      Object.defineProperty(children, "hostIngress", {
+        enumerable: true,
+        get() { getterCalls += 1; throw new Error("must not execute"); },
+      });
+      return children;
+    },
+    () => ({ hostIngress: exactChild(), clientIngress: exactChild(), extra: true }),
+    () => ({
+      hostIngress: new Proxy(exactChild(), {}),
+      clientIngress: exactChild(),
+    }),
+    () => ({
+      hostIngress: Object.freeze({
+        closeAndDrain: () => Promise.resolve(),
+        extra: true,
+      }),
+      clientIngress: exactChild(),
+    }),
+  ]) {
+    assert.throws(() => pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+      ...baseOptions,
+      installPrivateIngressChildren,
+    }), /private ingress/);
+  }
+  assert.equal(getterCalls, 0);
+
+  const hostIngressClose = deferredValue();
+  const clientIngressClose = deferredValue();
+  let hostIngressCloseCalls = 0;
+  let clientIngressCloseCalls = 0;
+  let ingressPorts;
+
+  const shared = pumpModule.createRelayV2BrokerSharedProducerRuntimeComposition({
+    ...baseOptions,
+    installPrivateIngressChildren(ports) {
+      assert.equal(this, undefined);
+      assert.equal(Object.isFrozen(ports), true);
+      assert.deepEqual(Reflect.ownKeys(ports), ["clientWssRuntime", "hostWssRuntime"]);
+      assert.deepEqual(Reflect.ownKeys(ports.clientWssRuntime), [
+        "installTrustedSocketCapture",
+        "prepareClientWssForCurrentHost",
+        "attachPreparedClientWss",
+      ]);
+      assert.equal(ports.clientWssRuntime.prepareClientWss, undefined);
+      assert.equal(ports.clientWssRuntime.closeAndDrain, undefined);
+      assert.equal(ports.hostWssRuntime.closeAndDrain, undefined);
+      ingressPorts = ports;
+      return Object.freeze({
+        hostIngress: Object.freeze({
+          closeAndDrain() {
+            hostIngressCloseCalls += 1;
+            return hostIngressClose.promise;
+          },
+        }),
+        clientIngress: Object.freeze({
+          closeAndDrain() {
+            clientIngressCloseCalls += 1;
+            return clientIngressClose.promise;
+          },
+        }),
+      });
+    },
+  });
+
+  assert.ok(ingressPorts);
+  assert.deepEqual(Reflect.ownKeys(shared), [
+    "clientWssRuntime",
+    "hostWssRuntime",
+    "createHostCarrierPump",
+    "closeAndDrain",
+  ]);
+  assert.equal(shared.privateIngressChildren, undefined);
+  assert.equal(shared.clientWssRuntime.prepareClientWssForCurrentHost, undefined);
+
+  const first = createPump(
+    shared,
+    scheduler,
+    "private-ingress-first-host",
+    "private-ingress-first-transport",
+  );
+  const second = createPump(
+    shared,
+    scheduler,
+    "private-ingress-second-host",
+    "private-ingress-second-transport",
+  );
+  await startPumps(scheduler, first, second);
+
+  const prepared = ingressPorts.clientWssRuntime.prepareClientWssForCurrentHost({
+    connectionId: "private-ingress-client",
+    trustedAuthContext: authContext("client", second.host.hostId),
+  });
+  assert.equal(prepared.outcome, "accept");
+  const socket = new FakeClientSocket();
+  const client = ingressPorts.clientWssRuntime.attachPreparedClientWss({
+    admissionReceipt: prepared.admissionReceipt,
+    alreadyUpgradedSocket: socket,
+  });
+  assert.equal(client.openResult.accepted, true);
+  await scheduler.flushReady();
+  assert.equal(first.host.frames.some((frame) => frame.type === "route.open"), false);
+  assert.equal(second.host.frames.some((frame) => frame.type === "route.open"), true);
+
+  const close = shared.closeAndDrain();
+  assert.strictEqual(shared.closeAndDrain(), close);
+  assert.equal(hostIngressCloseCalls, 1);
+  assert.equal(clientIngressCloseCalls, 1);
+  await scheduler.flushReady();
+  socket.emit("close", 1000);
+  await scheduler.flushReady();
+  let closeSettled = false;
+  void close.then(
+    () => { closeSettled = true; },
+    () => { closeSettled = true; },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeSettled, false);
+
+  hostIngressClose.resolve();
+  clientIngressClose.resolve();
+  await close;
+  await client.drained;
+  assert.equal(hostIngressCloseCalls, 1);
+  assert.equal(clientIngressCloseCalls, 1);
+});
+
 test("one Core activates one credential authority before publishing the shared runtime", async () => {
   const scheduler = new ManualScheduler();
   const opened = deferredValue();

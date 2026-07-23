@@ -39,7 +39,13 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
                 result,
             )
             assertEquals(
-                listOf("lease-enter", "claim-committed", "platform", "lease-release"),
+                listOf(
+                    "lease-enter",
+                    "claim-committed",
+                    "platform",
+                    "posted-committed",
+                    "lease-release",
+                ),
                 order,
             )
             assertSame(fixture.authority, lease.observedAuthority)
@@ -47,6 +53,104 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
             assertSame(fixture.intent, claims.observedIntent)
             assertEquals(fixture.ticket.intent.dedupeKey, platform.tickets.single().intent.dedupeKey)
             assertEquals(fixture.ticket.namespace, platform.tickets.single().namespace)
+
+            listOf(
+                {
+                    AgentTranscriptLifecycleNotificationPlatformResult.Suppressed(
+                        AgentTranscriptLifecycleNotificationSuppressionReason.PERMISSION_DENIED,
+                    )
+                },
+                {
+                    AgentTranscriptLifecycleNotificationPlatformResult.Failed(
+                        AgentTranscriptLifecycleNotificationPlatformFailureReason.NOTIFY_FAILED,
+                    )
+                },
+                { throw IllegalStateException("injected platform failure") },
+            ).forEach { nonPosted ->
+                val nonPostedClaims = RecordingClaimPort(
+                    FakeApplyLease(mutableListOf()),
+                    mutableListOf(),
+                ) { namespace, intent ->
+                    AgentTranscriptLifecycleNotificationClaimResult.Claimed(
+                        fixture.ticket.copy(namespace = namespace, intent = intent),
+                    )
+                }
+                val nonPostedLease = nonPostedClaims.lease
+                val nonPostedPlatform = RecordingPlatform(nonPostedLease, mutableListOf()) {
+                    nonPosted()
+                }
+                coordinator(nonPostedLease, nonPostedClaims, nonPostedPlatform)
+                    .dispatch(fixture.request)
+                assertTrue(nonPostedClaims.postedIdentities.isEmpty())
+            }
+
+            val secondPosted = AgentTranscriptLifecyclePostedNotificationIdentity(
+                fixture.namespace.consumer.profileId,
+                fixture.namespace.consumer.profileActivationGeneration,
+                "1".repeat(64),
+            )
+            val foreignGeneration = AgentTranscriptLifecyclePostedNotificationIdentity(
+                fixture.namespace.consumer.profileId,
+                fixture.namespace.consumer.profileActivationGeneration + 1,
+                "2".repeat(64),
+            )
+            claims.recordPostedForTest(secondPosted)
+            claims.recordPostedForTest(foreignGeneration)
+            platform.cancelResult = { identity ->
+                if (identity == secondPosted) {
+                    AgentTranscriptLifecycleNotificationCancellationPlatformResult.Failed
+                } else {
+                    AgentTranscriptLifecycleNotificationCancellationPlatformResult.Cancelled
+                }
+            }
+            assertEquals(
+                AgentTranscriptLifecyclePostedNotificationCancellationResult.Completed(
+                    attempted = 2,
+                    failed = 1,
+                ),
+                AgentTranscriptLifecyclePostedNotificationCancellationCoordinator(
+                    claims,
+                    platform,
+                ).cancelAfterDisconnect(
+                    fixture.namespace.consumer.profileId,
+                    fixture.namespace.consumer.profileActivationGeneration,
+                ),
+            )
+            assertEquals(
+                setOf(claims.postedIdentities.first(), secondPosted),
+                platform.cancelledIdentities.toSet(),
+            )
+            assertFalse(foreignGeneration in platform.cancelledIdentities)
+
+            val compensationLease = FakeApplyLease(mutableListOf())
+            val compensationClaims = RecordingClaimPort(
+                compensationLease,
+                mutableListOf(),
+            ) { namespace, intent ->
+                AgentTranscriptLifecycleNotificationClaimResult.Claimed(
+                    fixture.ticket.copy(namespace = namespace, intent = intent),
+                )
+            }
+            val compensationPlatform = RecordingPlatform(
+                compensationLease,
+                mutableListOf(),
+            ) { AgentTranscriptLifecycleNotificationPlatformResult.Posted }
+            assertEquals(
+                AgentTranscriptLifecycleNotificationDispatchResult.Failed(
+                    AgentTranscriptLifecycleNotificationDispatchFailureReason
+                        .DURABLE_PUBLICATION_FAILED,
+                ),
+                AgentTranscriptLifecycleNotificationDispatchCoordinator(
+                    compensationLease,
+                    compensationClaims,
+                    compensationPlatform,
+                    postedNotifications = null,
+                ).dispatch(fixture.request),
+            )
+            assertEquals(
+                listOf(fixture.ticket.claimId),
+                compensationPlatform.cancelledIdentities.map { it.claimId },
+            )
         }
 
     @Test
@@ -189,7 +293,12 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
         lease: RelayV2RepositoryEffectApplyLeasePort,
         claims: AgentTranscriptLifecycleNotificationClaimPort,
         platform: AgentTranscriptLifecycleNotificationPlatformPort,
-    ) = AgentTranscriptLifecycleNotificationDispatchCoordinator(lease, claims, platform)
+    ) = AgentTranscriptLifecycleNotificationDispatchCoordinator(
+        lease,
+        claims,
+        platform,
+        claims as? AgentTranscriptLifecyclePostedNotificationDurablePort,
+    )
 
     private fun fixture(): Fixture {
         val consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
@@ -286,13 +395,15 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
     }
 
     private class RecordingClaimPort(
-        private val lease: FakeApplyLease,
+        val lease: FakeApplyLease,
         private val order: MutableList<String>,
         private val result: suspend (
             AgentTranscriptLifecycleDurableNamespace,
             AgentSystemNotificationIntent,
         ) -> AgentTranscriptLifecycleNotificationClaimResult,
-    ) : AgentTranscriptLifecycleNotificationClaimPort {
+    ) : AgentTranscriptLifecycleNotificationClaimPort,
+        AgentTranscriptLifecyclePostedNotificationDurablePort {
+        val postedIdentities = mutableListOf<AgentTranscriptLifecyclePostedNotificationIdentity>()
         var calls = 0
             private set
         var observedNamespace: AgentTranscriptLifecycleDurableNamespace? = null
@@ -312,6 +423,41 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
                 order += "claim-committed"
             }
         }
+
+        override suspend fun markNotificationPostedUnderApplyLease(
+            ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+        ): AgentTranscriptLifecycleMarkNotificationPostedResult {
+            check(lease.active)
+            val identity = AgentTranscriptLifecyclePostedNotificationIdentity(
+                ticket.namespace.consumer.profileId,
+                ticket.namespace.consumer.profileActivationGeneration,
+                ticket.claimId,
+            )
+            if (identity !in postedIdentities) postedIdentities += identity
+            order += "posted-committed"
+            return AgentTranscriptLifecycleMarkNotificationPostedResult.MARKED
+        }
+
+        override suspend fun readPostedNotificationPage(
+            profileId: String,
+            profileActivationGeneration: Long,
+            offset: Int,
+            limit: Int,
+        ): AgentTranscriptLifecyclePostedNotificationPage {
+            val matching = postedIdentities.filter {
+                it.profileId == profileId &&
+                    it.profileActivationGeneration == profileActivationGeneration
+            }
+            val page = matching.drop(offset).take(limit)
+            return AgentTranscriptLifecyclePostedNotificationPage(
+                page,
+                (offset + page.size).takeIf { it < matching.size },
+            )
+        }
+
+        fun recordPostedForTest(identity: AgentTranscriptLifecyclePostedNotificationIdentity) {
+            postedIdentities += identity
+        }
     }
 
     private class RecordingPlatform(
@@ -322,6 +468,13 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
         ) -> AgentTranscriptLifecycleNotificationPlatformResult,
     ) : AgentTranscriptLifecycleNotificationPlatformPort {
         val tickets = mutableListOf<AgentTranscriptLifecycleNotificationExecutionTicket>()
+        val cancelledIdentities = mutableListOf<
+            AgentTranscriptLifecyclePostedNotificationIdentity,
+            >()
+        var cancelResult: (AgentTranscriptLifecyclePostedNotificationIdentity) ->
+            AgentTranscriptLifecycleNotificationCancellationPlatformResult = {
+                AgentTranscriptLifecycleNotificationCancellationPlatformResult.Cancelled
+            }
         var calls = 0
             private set
 
@@ -333,6 +486,13 @@ class AgentTranscriptLifecycleNotificationDispatchCoordinatorTest {
             tickets += ticket
             order += "platform"
             return result(ticket)
+        }
+
+        override fun cancel(
+            identity: AgentTranscriptLifecyclePostedNotificationIdentity,
+        ): AgentTranscriptLifecycleNotificationCancellationPlatformResult {
+            cancelledIdentities += identity
+            return cancelResult(identity)
         }
     }
 }

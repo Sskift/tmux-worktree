@@ -3,8 +3,15 @@ package com.tmuxworktree.mobile.core.relay.v2.state
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.*
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2TerminalControlCodecBridge
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2TerminalExactGenerationSendPort
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2TerminalExactGenerationSendResult
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.terminal.*
 import java.security.MessageDigest
+import java.util.Base64
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -585,6 +592,270 @@ class RelayV2DurableStateRepositoryCoreTest {
         }
 
     @Test
+    fun `resumable Session claim atomically preserves identity and emits exact RESUME`() =
+        runBlocking {
+            val store = MemoryStore()
+            val repository = RelayV2DurableStateRepositoryCore(store)
+            val rawResumeToken = "host-resume-token"
+            val identity = terminalIdentity().copy(
+                resumeTokenCredentialFingerprint = Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(
+                        MessageDigest.getInstance("SHA-256")
+                            .digest(rawResumeToken.toByteArray()),
+                    ),
+            )
+            val key = RelayV2TerminalCheckpointKey.from(identity.target())
+            val originalDelivery = terminalDelivery()
+            val originalAttempt = RelayV2TerminalOpenAttempt(
+                "open-original",
+                "open-original-fingerprint",
+            )
+            repository.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.BeginOpenAttempt(
+                    originalDelivery,
+                    "open-original-request",
+                    originalAttempt,
+                    RelayV2TerminalOpenMode.NEW,
+                    120,
+                    36,
+                    identity.target(),
+                    PARSER_CONTINUITY,
+                    null,
+                ),
+            )
+            val activeCheckpoint = requireNotNull(repository.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.Opened(
+                    identity,
+                    "open-original-request",
+                    originalAttempt,
+                    originalDelivery,
+                    PARSER_CONTINUITY,
+                    RelayV2TerminalOpenDisposition.NEW,
+                    120,
+                    36,
+                    "0",
+                    "0",
+                ),
+            ).checkpoint)
+            val finalizedIdentity = identity.copy(
+                streamId = "stream-finalized",
+                resumeTokenCredentialReference = "resume-reference-finalized",
+            )
+            val finalizedKey = RelayV2TerminalCheckpointKey.from(finalizedIdentity.target())
+            val finalizedAttempt = RelayV2TerminalOpenAttempt(
+                "open-finalized",
+                "open-finalized-fingerprint",
+            )
+            repository.reduceTerminalUnderApplyLease(
+                finalizedKey,
+                RelayV2TerminalAction.BeginOpenAttempt(
+                    originalDelivery,
+                    "open-finalized-request",
+                    finalizedAttempt,
+                    RelayV2TerminalOpenMode.NEW,
+                    80,
+                    24,
+                    finalizedIdentity.target(),
+                    PARSER_CONTINUITY,
+                    null,
+                ),
+            )
+            var finalized = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    finalizedKey,
+                    RelayV2TerminalAction.Opened(
+                        finalizedIdentity,
+                        "open-finalized-request",
+                        finalizedAttempt,
+                        originalDelivery,
+                        PARSER_CONTINUITY,
+                        RelayV2TerminalOpenDisposition.NEW,
+                        80,
+                        24,
+                        "0",
+                        "0",
+                    ),
+                ).checkpoint,
+            )
+            finalized = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    finalizedKey,
+                    RelayV2TerminalAction.RequestClose(
+                        finalized.deliveryToken,
+                        RelayV2TerminalCloseAttempt(
+                            "close-finalized",
+                            "close-finalized-fingerprint",
+                        ),
+                        "close-finalized-request",
+                    ),
+                ).checkpoint,
+            )
+            finalized = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    finalizedKey,
+                    RelayV2TerminalAction.Closed(
+                        actionFence(finalized),
+                        "0",
+                        false,
+                        null,
+                        RelayV2TerminalCloseReason.CLIENT_CLOSED,
+                        null,
+                        "close-finalized",
+                        "close-finalized-request",
+                    ),
+                ).checkpoint,
+            )
+            assertEquals(RelayV2TerminalPhase.FINALIZED, finalized.phase)
+
+            val generation = RelayV2EffectGeneration("profile-v2", 7, 2)
+            val authority = RelayV2RepositoryEffectAuthority(
+                generation,
+                "profile-v2",
+                7,
+                "principal-v2",
+                "android-install-v2",
+                "host-a",
+                "epoch-a",
+            )
+            val resumedAttempt = RelayV2TerminalOpenAttempt(
+                "open-resume",
+                "open-resume-fingerprint",
+            )
+            val claim = requireNotNull(
+                RelayV2DurableStateRepositoryCore(store)
+                    .claimResumableTerminalUnderApplyLease(
+                        RelayV2TerminalResumeSessionSelector(
+                            "profile-v2",
+                            7,
+                            "principal-v2",
+                            "android-install-v2",
+                            "host-a",
+                            "scope-a",
+                            "session-a",
+                            0,
+                        ),
+                        authority,
+                        "open-resume-request",
+                        resumedAttempt,
+                        132,
+                        40,
+                    ),
+            )
+
+            assertEquals(key, claim.key)
+            assertEquals(null, store.terminalCheckpoint(finalizedKey))
+            val send = claim.reduction.effects
+                .filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+                .single()
+            assertEquals(RelayV2TerminalOpenMode.RESUME, send.mode)
+            assertEquals(identity.target(), send.openFence.target)
+            assertEquals(generation, send.openFence.deliveryToken.actorGeneration)
+            assertEquals(
+                originalDelivery.authorityGeneration + 1,
+                send.openFence.deliveryToken.authorityGeneration,
+            )
+            assertEquals(1, send.openFence.deliveryToken.localDispatchToken)
+            assertEquals(resumedAttempt, send.openFence.openAttempt)
+            assertEquals(identity.generation, send.resume?.generation)
+            assertEquals("0", send.resume?.nextOffset)
+            assertEquals(identity.resumeTokenCredentialReference,
+                send.resume?.resumeTokenCredentialReference)
+            assertEquals(identity.resumeTokenCredentialFingerprint,
+                send.resume?.resumeTokenCredentialFingerprint)
+
+            var wireBytes: ByteArray? = null
+            val wire = RelayV2TerminalControlCodecBridge(
+                RelayV2TerminalExactGenerationSendPort { _, bytes ->
+                    wireBytes = bytes
+                    RelayV2TerminalExactGenerationSendResult.Sent
+                },
+            )
+            val credentials = object : RelayV2TerminalResumeCredentialStore {
+                override fun installExact(
+                    owner: RelayV2TerminalResumeCredentialOwner,
+                    reference: String,
+                    resumeToken: String,
+                ) = error("unexpected install")
+                override fun read(
+                    owner: RelayV2TerminalResumeCredentialOwner,
+                    reference: String,
+                ): String? = if (
+                    owner == RelayV2TerminalResumeCredentialOwner("profile-v2", 7) &&
+                    reference == identity.resumeTokenCredentialReference
+                ) rawResumeToken else null
+                override fun clear(
+                    owner: RelayV2TerminalResumeCredentialOwner,
+                    reference: String,
+                ) = Unit
+                override fun clearProfile(
+                    profileId: String,
+                    throughActivationGeneration: Long,
+                ) = Unit
+            }
+            assertEquals(
+                RelayV2TerminalExactGenerationSendResult.Sent,
+                wire.sendCommittedEffect(authority, send, credentials),
+            )
+            val decoded = RelayV2Codec().decodeWebSocketFrame(
+                RelayV2WebSocketChannel.PUBLIC,
+                requireNotNull(wireBytes),
+            ).frame
+            val payload = decoded["payload"] as Map<*, *>
+            val resume = payload["resume"] as Map<*, *>
+            assertEquals("resume", payload["mode"])
+            assertEquals(rawResumeToken, resume["resumeToken"])
+
+            val duplicateStore = MemoryStore()
+            listOf(
+                activeCheckpoint,
+                activeCheckpoint.copy(
+                    identity = activeCheckpoint.identity.copy(streamId = "stream-duplicate"),
+                ),
+            ).forEach { checkpoint ->
+                val duplicateKey = RelayV2TerminalCheckpointKey.from(
+                    checkpoint.identity.target(),
+                )
+                val encoded = RelayV2TerminalCheckpointCodec.encode(
+                    duplicateKey,
+                    RelayV2TerminalStoredCheckpoint.Present(checkpoint),
+                )
+                duplicateStore.putTerminalCheckpoint(
+                    RelayV2PersistedTerminalCheckpoint(
+                        duplicateKey,
+                        encoded.kind.name,
+                        encoded.payload,
+                    ),
+                )
+            }
+            val duplicateFailure = runCatching {
+                RelayV2DurableStateRepositoryCore(duplicateStore)
+                    .claimResumableTerminalUnderApplyLease(
+                        RelayV2TerminalResumeSessionSelector(
+                            "profile-v2",
+                            7,
+                            "principal-v2",
+                            "android-install-v2",
+                            "host-a",
+                            "scope-a",
+                            "session-a",
+                            0,
+                        ),
+                        authority,
+                        "duplicate-resume-request",
+                        RelayV2TerminalOpenAttempt(
+                            "duplicate-resume",
+                            "duplicate-resume-fingerprint",
+                        ),
+                        132,
+                        40,
+                    )
+            }.exceptionOrNull()
+            assertTrue(duplicateFailure is IllegalStateException)
+        }
+
+    @Test
     fun `legacy schema and parser recovery markers normalize through durable round trips`() =
         runBlocking {
             val store = MemoryStore()
@@ -936,6 +1207,23 @@ class RelayV2DurableStateRepositoryCoreTest {
         override fun terminalCheckpoint(
             key: RelayV2TerminalCheckpointKey,
         ): RelayV2PersistedTerminalCheckpoint? = terminals[key]
+
+        override fun terminalCheckpointsForSession(
+            selector: RelayV2TerminalResumeSessionSelector,
+            hostEpoch: String,
+        ): List<RelayV2PersistedTerminalCheckpoint> = terminals.values.filter { row ->
+            val key = row.key
+            key.profileId == selector.profileId &&
+                key.profileActivationGeneration == selector.profileActivationGeneration &&
+                key.principalId == selector.principalId &&
+                key.clientInstanceId == selector.clientInstanceId &&
+                key.hostId == selector.hostId && key.hostEpoch == hostEpoch &&
+                key.scopeId == selector.scopeId && key.sessionId == selector.sessionId &&
+                key.pane == selector.pane
+        }.take(257)
+
+        override fun deleteTerminalCheckpoint(key: RelayV2TerminalCheckpointKey): Boolean =
+            terminals.remove(key) != null
 
         override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) {
             writeCount += 1

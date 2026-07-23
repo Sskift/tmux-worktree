@@ -14,6 +14,7 @@ internal data class AgentTranscriptLifecycleNotificationDispatchRequest(
 
 internal enum class AgentTranscriptLifecycleNotificationDispatchFailureReason {
     DURABLE_CLAIM_FAILED,
+    DURABLE_PUBLICATION_FAILED,
 }
 
 /** Closed, content-free result. No variant carries a claim ticket or exception detail. */
@@ -40,7 +41,8 @@ internal sealed interface AgentTranscriptLifecycleNotificationDispatchResult {
 internal class AgentTranscriptLifecycleNotificationDispatchCoordinator(
     private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
     private val durableClaims: AgentTranscriptLifecycleNotificationClaimPort,
-    platform: AgentTranscriptLifecycleNotificationPlatformPort,
+    private val platform: AgentTranscriptLifecycleNotificationPlatformPort,
+    private val postedNotifications: AgentTranscriptLifecyclePostedNotificationDurablePort? = null,
 ) {
     private val executor = AgentTranscriptLifecycleNotificationExecutor(platform)
 
@@ -68,9 +70,7 @@ internal class AgentTranscriptLifecycleNotificationDispatchCoordinator(
                             .DURABLE_CLAIM_FAILED,
                     )
                 } else {
-                    AgentTranscriptLifecycleNotificationDispatchResult.Completed(
-                        executor.execute(claimed),
-                    )
+                    completeDispatch(claimed)
                 }
             }
         } catch (cancelled: CancellationException) {
@@ -86,6 +86,49 @@ internal class AgentTranscriptLifecycleNotificationDispatchCoordinator(
                 AgentTranscriptLifecycleNotificationDispatchResult.StaleGeneration
             is RelayV2EffectApplyResult.Applied -> dispatched.value
         }
+    }
+
+    private suspend fun completeDispatch(
+        claimed: AgentTranscriptLifecycleNotificationClaimResult,
+    ): AgentTranscriptLifecycleNotificationDispatchResult {
+        val execution = executor.execute(claimed)
+        val ticket = (claimed as? AgentTranscriptLifecycleNotificationClaimResult.Claimed)?.ticket
+        if (ticket == null || execution != AgentTranscriptLifecycleNotificationExecutionResult
+                .Platform(AgentTranscriptLifecycleNotificationPlatformResult.Posted)
+        ) {
+            return AgentTranscriptLifecycleNotificationDispatchResult.Completed(execution)
+        }
+        val durable = postedNotifications ?: return publicationFailure(ticket)
+        val marked = try {
+            durable.markNotificationPostedUnderApplyLease(ticket)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: RuntimeException) {
+            AgentTranscriptLifecycleMarkNotificationPostedResult.UNAVAILABLE
+        }
+        if (marked == AgentTranscriptLifecycleMarkNotificationPostedResult.MARKED ||
+            marked == AgentTranscriptLifecycleMarkNotificationPostedResult.ALREADY_MARKED
+        ) {
+            return AgentTranscriptLifecycleNotificationDispatchResult.Completed(execution)
+        }
+        return publicationFailure(ticket)
+    }
+
+    private fun publicationFailure(
+        ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ): AgentTranscriptLifecycleNotificationDispatchResult {
+        // The platform side effect escaped but its durable publication barrier did not. Attempt
+        // only the same exact tag/id compensation; never retry or republish the notification.
+        try {
+            platform.cancel(ticket.postedIdentity())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: RuntimeException) {
+            // A cancellation failure remains isolated and content-free.
+        }
+        return AgentTranscriptLifecycleNotificationDispatchResult.Failed(
+            AgentTranscriptLifecycleNotificationDispatchFailureReason.DURABLE_PUBLICATION_FAILED,
+        )
     }
 
     private fun AgentTranscriptLifecycleNotificationDispatchRequest.hasExactIdentity(): Boolean {
@@ -108,3 +151,104 @@ internal class AgentTranscriptLifecycleNotificationDispatchCoordinator(
         AgentTranscriptLifecycleNotificationExecutionResult.NotExecutable(reason),
     )
 }
+
+internal sealed interface AgentTranscriptLifecyclePostedNotificationCancellationResult {
+    data class Completed(
+        val attempted: Int,
+        val failed: Int,
+    ) : AgentTranscriptLifecyclePostedNotificationCancellationResult
+
+    data object DurableUnavailable : AgentTranscriptLifecyclePostedNotificationCancellationResult
+}
+
+/** Profile-isolation adapter; caller supplies the already-drained exact profile activation. */
+internal class AgentTranscriptLifecyclePostedNotificationCancellationCoordinator(
+    private val durable: AgentTranscriptLifecyclePostedNotificationDurablePort,
+    private val platform: AgentTranscriptLifecycleNotificationPlatformPort,
+) {
+    suspend fun cancelAfterDisconnect(
+        profileId: String,
+        profileActivationGeneration: Long,
+    ): AgentTranscriptLifecyclePostedNotificationCancellationResult {
+        var offset = 0
+        var attempted = 0
+        var failed = 0
+        while (true) {
+            if (offset >= MAX_TOTAL_SCANNED_CLAIMS) {
+                return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                    .DurableUnavailable
+            }
+            val pageLimit = minOf(
+                CANCELLATION_PAGE_SIZE,
+                MAX_TOTAL_SCANNED_CLAIMS - offset,
+            )
+            val page = try {
+                durable.readPostedNotificationPage(
+                    profileId,
+                    profileActivationGeneration,
+                    offset,
+                    pageLimit,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: RuntimeException) {
+                return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                    .DurableUnavailable
+            }
+            if (page.identities.size > pageLimit) {
+                return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                    .DurableUnavailable
+            }
+            page.identities.forEach { identity ->
+                if (identity.profileId != profileId ||
+                    identity.profileActivationGeneration != profileActivationGeneration
+                ) {
+                    return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                        .DurableUnavailable
+                }
+                if (attempted >= MAX_TOTAL_CANCELLATION_ATTEMPTS) {
+                    return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                        .DurableUnavailable
+                }
+                attempted += 1
+                val result = try {
+                    platform.cancel(identity)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: RuntimeException) {
+                    AgentTranscriptLifecycleNotificationCancellationPlatformResult.Failed
+                }
+                if (result !=
+                    AgentTranscriptLifecycleNotificationCancellationPlatformResult.Cancelled
+                ) failed += 1
+            }
+            val next = page.nextOffset
+                ?: return AgentTranscriptLifecyclePostedNotificationCancellationResult.Completed(
+                    attempted,
+                    failed,
+                )
+            if (next <= offset) {
+                return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                    .DurableUnavailable
+            }
+            if (next > MAX_TOTAL_SCANNED_CLAIMS) {
+                return AgentTranscriptLifecyclePostedNotificationCancellationResult
+                    .DurableUnavailable
+            }
+            offset = next
+        }
+    }
+
+    private companion object {
+        const val CANCELLATION_PAGE_SIZE = 128
+        const val MAX_TOTAL_SCANNED_CLAIMS = 4_096
+        const val MAX_TOTAL_CANCELLATION_ATTEMPTS = 4_096
+    }
+}
+
+private fun AgentTranscriptLifecycleNotificationExecutionTicket.postedIdentity() =
+    AgentTranscriptLifecyclePostedNotificationIdentity(
+        profileId = namespace.consumer.profileId,
+        profileActivationGeneration = namespace.consumer.profileActivationGeneration,
+        claimId = claimId,
+    )

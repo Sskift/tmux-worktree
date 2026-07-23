@@ -199,6 +199,13 @@ async function main() {
       await rpcV2Cmd(process.argv.slice(3));
       return;
     }
+    case "rpc-v2-remote-exact-v1": {
+      const { runRelayV2RemoteExactCompoundStdioV1 } = await import(
+        "./relay/v2/remoteExactTerminalControlCompoundV1.js"
+      );
+      await runRelayV2RemoteExactCompoundStdioV1();
+      return;
+    }
     case "automation":
     case "auto": {
       const { automationCmd } = await import("./automation.js");

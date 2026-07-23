@@ -1,8 +1,10 @@
 package com.tmuxworktree.mobile.core.relay.v2.profile
 
 import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.mutablePreferencesOf
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.tmuxworktree.mobile.core.data.PreferencesRelayV2ProfileStore
@@ -383,6 +385,179 @@ class RelayV2ProfileRepositoryTest {
             )
             directory.toFile().deleteRecursively()
             Unit
+        }
+
+    @Test
+    fun `self revoke quarantine journal roundtrips exact CAS and fences profile mutation`() =
+        runBlocking {
+            data class TerminalCase(
+                val phase: RelayV2SelfRevokePhase,
+                val revokedAtMs: Long? = null,
+                val failureCode: RelayV2SelfRevokeFailureCode? = null,
+            )
+            val profile = relayV2Profile()
+            listOf(
+                TerminalCase(RelayV2SelfRevokePhase.CONFIRMED, revokedAtMs = 42),
+                TerminalCase(
+                    RelayV2SelfRevokePhase.REJECTED,
+                    failureCode = RelayV2SelfRevokeFailureCode.FORBIDDEN,
+                ),
+            ).forEach { terminal ->
+                val directory = Files.createTempDirectory("relay-v2-self-revoke")
+                val file = directory.resolve("preferences.preferences_pb").toFile()
+                lateinit var prepared: RelayV2SelfRevokeJournal
+                withRawPreferencesStore(file) { preferences, raw ->
+                    raw.edit { RelayProfilePreferencesCodec.activateRelayV2Profile(it, profile) }
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    assertEquals(
+                        null,
+                        store.prepareSelfRevokeJournal(
+                            profile.copy(credentialVersion = profile.credentialVersion + 1),
+                            "stale-operation",
+                        ),
+                    )
+                    prepared = requireNotNull(
+                        store.prepareSelfRevokeJournal(profile, "self-revoke-operation"),
+                    )
+                    assertEquals(profile, store.activeRelayV2Profile())
+                    assertEquals(profile.identity, store.activeProfileIdentity())
+                    assertEquals(null, prepared.revokedAtMs)
+                    assertEquals(null, prepared.failureCode)
+                    assertEquals(
+                        null,
+                        store.prepareSelfRevokeJournal(profile, "replacement-operation"),
+                    )
+                    assertV1ProfileMutationsRejected(preferences)
+                    assertEquals(
+                        null,
+                        store.prepareRelayV2Activation(
+                            expectedActiveProfile = profile.identity,
+                            operationId = "blocked-activation",
+                            profile = profile.copy(profileId = "replacement-profile"),
+                            targetBindingDigest = "replacement-binding",
+                            targetCredentialAttemptId = "replacement-attempt",
+                            targetCredentialSecretReference = "replacement-secret-reference",
+                            barrierId = "replacement-barrier",
+                            previousCredentialReference = profile.credentialReference,
+                        ),
+                    )
+                    assertFalse(
+                        store.updateRelayV2CredentialVersion(
+                            profile.profileId,
+                            profile.credentialReference,
+                            profile.activationGeneration,
+                            profile.credentialVersion,
+                            profile.credentialVersion + 1,
+                        ),
+                    )
+                }
+                lateinit var terminalJournal: RelayV2SelfRevokeJournal
+                withPreferencesStore(file) { preferences ->
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    assertEquals(prepared, store.readSelfRevokeJournal())
+                    assertTrue(
+                        runCatching {
+                            store.advanceSelfRevokeJournal(
+                                prepared,
+                                terminal.phase,
+                                terminal.revokedAtMs,
+                                terminal.failureCode,
+                            )
+                        }.isFailure,
+                    )
+                    val mayHaveCommitted = requireNotNull(
+                        store.advanceSelfRevokeJournal(
+                            prepared,
+                            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                        ),
+                    )
+                    assertEquals(
+                        null,
+                        store.advanceSelfRevokeJournal(
+                            prepared,
+                            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                        ),
+                    )
+                    terminalJournal = requireNotNull(
+                        store.advanceSelfRevokeJournal(
+                            mayHaveCommitted,
+                            terminal.phase,
+                            terminal.revokedAtMs,
+                            terminal.failureCode,
+                        ),
+                    )
+                }
+                withPreferencesStore(file) { preferences ->
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    assertEquals(terminalJournal, store.readSelfRevokeJournal())
+                    assertEquals(profile, store.activeRelayV2Profile())
+                    assertTrue(
+                        runCatching {
+                            store.advanceSelfRevokeJournal(
+                                terminalJournal,
+                                RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                            )
+                        }.isFailure,
+                    )
+                    if (terminal.phase == RelayV2SelfRevokePhase.CONFIRMED) {
+                        assertTrue(store.commitConfirmedSelfRevokeRemoval(terminalJournal))
+                        assertEquals(null, store.activeRelayV2Profile())
+                        assertEquals(null, store.readSelfRevokeJournal())
+                    } else {
+                        assertTrue(
+                            runCatching {
+                                store.commitConfirmedSelfRevokeRemoval(terminalJournal)
+                            }.isFailure,
+                        )
+                        assertEquals(profile, store.activeRelayV2Profile())
+                        assertEquals(terminalJournal, store.readSelfRevokeJournal())
+                    }
+                }
+                directory.toFile().deleteRecursively()
+            }
+
+            data class Corruption(
+                val name: String,
+                val expectedProfile: RelayV2Profile = profile,
+                val apply: (MutablePreferences) -> Unit,
+            )
+            val driftedProfile = profile.copy(grantId = "drifted-grant")
+            listOf(
+                Corruption("unknown-phase") {
+                    it[stringPreferencesKey("relay_v2_self_revoke_phase")] = "future"
+                },
+                Corruption("incomplete") {
+                    it.remove(stringPreferencesKey("relay_v2_self_revoke_operation_id"))
+                },
+                Corruption("binding-drift", driftedProfile) {
+                    it[stringPreferencesKey("relay_v2_profile_grant_id")] =
+                        driftedProfile.grantId
+                },
+            ).forEach { corruption ->
+                val directory = Files.createTempDirectory("relay-v2-self-revoke-${corruption.name}")
+                val file = directory.resolve("preferences.preferences_pb").toFile()
+                withRawPreferencesStore(file) { preferences, raw ->
+                    raw.edit { RelayProfilePreferencesCodec.activateRelayV2Profile(it, profile) }
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    requireNotNull(store.prepareSelfRevokeJournal(profile, "corrupt-operation"))
+                    raw.edit(corruption.apply)
+                    assertTrue(runCatching { store.readSelfRevokeJournal() }.isFailure)
+                    assertTrue(
+                        runCatching {
+                            preferences.saveProfile(
+                                "wss://forbidden.example.com/client",
+                                "forbidden-host",
+                                true,
+                            )
+                        }.isFailure,
+                    )
+                    assertEquals(
+                        corruption.expectedProfile,
+                        RelayProfilePreferencesCodec.toRelayV2Profile(raw.data.first()),
+                    )
+                }
+                directory.toFile().deleteRecursively()
+            }
         }
 
     @Test
@@ -1855,6 +2030,82 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `two repositories join one durable refresh and send one HTTPS exchange`() = runBlocking {
+        val harness = Harness()
+        val activated = harness.repository.confirmEnrollment(
+            enrollmentDraft().confirm(deviceLabel = "Pixel"),
+        ) as RelayV2EnrollmentResult.Activated
+        val gate = harness.exchange.deferRefresh()
+        val secondRepository = harness.additionalRepository()
+
+        val first = async { harness.repository.refreshActiveCredential() }
+        val request = gate.request.await()
+        val joined = async { secondRepository.refreshActiveCredential() }
+        yield()
+
+        assertFalse(joined.isCompleted)
+        assertEquals(1, harness.exchange.refreshCalls)
+        gate.response.complete(refreshResponse(request, version = 2))
+
+        val expected = RelayV2RefreshApplyResult.Applied(
+            credentialVersion = 2,
+            repairedProfileVersion = true,
+        )
+        assertEquals(expected, first.await())
+        assertEquals(expected, joined.await())
+        assertEquals(1, harness.exchange.refreshCalls)
+        assertEquals(2L, harness.profiles.activeV2?.credentialVersion)
+        val winner = harness.credentials.read(activated.profile.credentialReference)
+        assertEquals(2L, winner?.credentialVersion)
+        assertEquals(null, winner?.pendingAttempt)
+        assertEquals("twcap2.access-2", winner?.accessToken)
+        assertEquals("twref2.refresh-2", winner?.refreshToken)
+    }
+
+    @Test
+    fun `refresh coordinator rejects a different durable request while owner is live`() =
+        runBlocking {
+            val coordinator = RelayV2RefreshCoordinator()
+            val profile = relayV2Profile()
+            val firstPrepared = preparedRefreshForCoordinator(
+                profile = profile,
+                attemptId = "refresh-owner",
+                secretReference = "refresh-secret-owner",
+            )
+            val conflictingPrepared = preparedRefreshForCoordinator(
+                profile = profile,
+                attemptId = "refresh-conflict",
+                secretReference = "refresh-secret-conflict",
+            )
+            val ownerStarted = CompletableDeferred<Unit>()
+            val ownerRelease = CompletableDeferred<Unit>()
+            val owner = async {
+                coordinator.coordinate(firstPrepared) {
+                    ownerStarted.complete(Unit)
+                    ownerRelease.await()
+                    RelayV2RefreshApplyResult.StaleCredentialResponse(4)
+                }
+            }
+            ownerStarted.await()
+            var conflictingExchangeCalled = false
+
+            assertTrue(
+                runCatching {
+                    coordinator.coordinate(conflictingPrepared) {
+                        conflictingExchangeCalled = true
+                        RelayV2RefreshApplyResult.StaleCredentialResponse(4)
+                    }
+                }.isFailure,
+            )
+            assertFalse(conflictingExchangeCalled)
+            ownerRelease.complete(Unit)
+            assertEquals(
+                RelayV2RefreshApplyResult.StaleCredentialResponse(4),
+                owner.await(),
+            )
+        }
+
+    @Test
     fun `late refresh response cannot roll credential version or tokens back`() = runBlocking {
         val harness = Harness()
         val activated = harness.repository.confirmEnrollment(
@@ -2096,6 +2347,169 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(isolationCalls, harness.isolationCalls)
         }
 
+    @Test
+    fun `self revoke saga quarantines ambiguity and atomically removes confirmed profile`() =
+        runBlocking {
+            suspend fun activate(harness: Harness): RelayV2Profile =
+                (harness.repository.confirmEnrollment(
+                    enrollmentDraft().confirm(deviceLabel = "Pixel"),
+                ) as RelayV2EnrollmentResult.Activated).profile
+
+            data class RevokeCase(
+                val name: String,
+                val expectedPhase: RelayV2SelfRevokePhase?,
+                val configure: (Harness) -> Unit,
+                val expectedExchangeCalls: Int = 1,
+            )
+            listOf(
+                RevokeCase("confirmed", null, configure = {}),
+                RevokeCase(
+                    "forbidden",
+                    RelayV2SelfRevokePhase.REJECTED,
+                    configure = {
+                        it.exchange.selfRevokeResult =
+                            RelayV2SelfRevokeExchangeResult.Rejected(
+                                RelayV2SelfRevokeFailureCode.FORBIDDEN,
+                            )
+                    },
+                ),
+                RevokeCase(
+                    "ack-loss",
+                    RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                    configure = {
+                        it.exchange.selfRevokeResult =
+                            RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+                    },
+                ),
+                RevokeCase(
+                    "before-handoff",
+                    RelayV2SelfRevokePhase.PREPARED,
+                    configure = { it.exchange.failSelfRevokeBeforeHandoff = true },
+                ),
+                RevokeCase(
+                    "drain-failure",
+                    RelayV2SelfRevokePhase.PREPARED,
+                    configure = { it.barrier.failNextDisconnect() },
+                    expectedExchangeCalls = 0,
+                ),
+            ).forEach { case ->
+                val harness = Harness()
+                val active = activate(harness)
+                harness.events.clear()
+                case.configure(harness)
+
+                val result = harness.repository.selfRevokeActiveProfile()
+                assertEquals(case.expectedExchangeCalls, harness.exchange.selfRevokeCalls)
+                assertTrue(
+                    harness.events.indexOf("revoke:prepared") <
+                        harness.events.indexOf("disconnect:start"),
+                )
+                assertTrue(
+                    harness.events.indexOf("disconnect:start") <
+                        harness.events.indexOf("revoke:request").let {
+                            if (it < 0) Int.MAX_VALUE else it
+                        },
+                )
+
+                if (case.expectedPhase == null) {
+                    assertEquals(RelayV2SelfRevokeResult.ProfileRemoved, result)
+                    assertEquals(null, harness.profiles.activeV2)
+                    assertEquals(null, harness.profiles.readSelfRevokeJournal())
+                    assertEquals(null, harness.credentials.read(active.credentialReference))
+                    assertTrue(
+                        harness.events.indexOf("revoke:may_have_committed") <
+                            harness.events.indexOf("revoke:confirmed"),
+                    )
+                    assertTrue(
+                        harness.events.indexOf("revoke:may_have_committed") <
+                            harness.events.indexOf("revoke:handoff"),
+                    )
+                    assertTrue(
+                        harness.events.indexOf("revoke:handoff") <
+                            harness.events.indexOf("revoke:confirmed"),
+                    )
+                    assertTrue(
+                        harness.events.indexOf("clear") <
+                            harness.events.indexOf("revoke:removed"),
+                    )
+                } else {
+                    assertEquals(
+                        RelayV2SelfRevokeResult.Quarantined(case.expectedPhase),
+                        result,
+                    )
+                    assertEquals(active, harness.profiles.activeV2)
+                    assertEquals(
+                        case.expectedPhase,
+                        harness.profiles.readSelfRevokeJournal()?.phase,
+                    )
+                    val networkCalls = harness.exchange.selfRevokeCalls
+                    val redeemCalls = harness.exchange.redeemCalls
+                    val refreshCalls = harness.exchange.refreshCalls
+                    harness.restartRepository()
+                    assertEquals(
+                        RelayV2StartupAdmissionResult.SelfRevokeQuarantined(
+                            active,
+                            case.expectedPhase,
+                        ),
+                        harness.repository.admitStartup(),
+                    )
+                    assertTrue(
+                        runCatching {
+                            harness.repository.confirmEnrollment(
+                                enrollmentDraft(
+                                    enrollmentId = "blocked-${case.name}",
+                                    enrollmentCode = "twenroll2.blocked-${case.name}",
+                                ).confirm(deviceLabel = "Blocked"),
+                            )
+                        }.isFailure,
+                    )
+                    assertTrue(
+                        runCatching { harness.repository.refreshActiveCredential() }.isFailure,
+                    )
+                    assertTrue(
+                        runCatching { harness.repository.reconcileActiveCredential() }.isFailure,
+                    )
+                    assertEquals(networkCalls, harness.exchange.selfRevokeCalls)
+                    assertEquals(redeemCalls, harness.exchange.redeemCalls)
+                    assertEquals(refreshCalls, harness.exchange.refreshCalls)
+                }
+            }
+
+            val retry = Harness()
+            val retryProfile = activate(retry)
+            retry.events.clear()
+            retry.isolation.failNextAfterDestructiveMutation = true
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.CONFIRMED),
+                retry.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(
+                RelayV2SelfRevokePhase.CONFIRMED,
+                retry.profiles.readSelfRevokeJournal()?.phase,
+            )
+            assertEquals(retryProfile, retry.profiles.activeV2)
+            assertEquals(null, retry.credentials.read(retryProfile.credentialReference))
+            assertEquals(1, retry.exchange.selfRevokeCalls)
+
+            retry.restartRepository()
+            retry.isolation.failNextAfterDestructiveMutation = true
+            assertEquals(
+                RelayV2StartupAdmissionResult.SelfRevokeQuarantined(
+                    retryProfile,
+                    RelayV2SelfRevokePhase.CONFIRMED,
+                ),
+                retry.repository.admitStartup(),
+            )
+            assertEquals(1, retry.exchange.selfRevokeCalls)
+            assertEquals(
+                RelayV2SelfRevokeResult.ProfileRemoved,
+                retry.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(null, retry.profiles.activeV2)
+            assertEquals(null, retry.profiles.readSelfRevokeJournal())
+            assertEquals(1, retry.exchange.selfRevokeCalls)
+        }
+
     private class Harness(
         blockDisconnect: Boolean = false,
         disconnectReceipt: ((RelayActiveProfileIdentity, String) -> RelayProfileDisconnectReceipt)? = null,
@@ -2112,6 +2526,7 @@ class RelayV2ProfileRepositoryTest {
         private val ids = AtomicInteger()
         private val idFactory = { "test-${ids.incrementAndGet()}" }
         val exchange = FakeCredentialExchange(events)
+        private val refreshCoordinator = RelayV2RefreshCoordinator()
         var profileSwitch = newProfileSwitch()
             private set
         var repository = newRepository()
@@ -2121,6 +2536,8 @@ class RelayV2ProfileRepositoryTest {
             profileSwitch = newProfileSwitch()
             repository = newRepository()
         }
+
+        fun additionalRepository(): RelayV2ProfileRepository = newRepository()
 
         private fun newProfileSwitch() = RelayV2ProfileSwitchStateMachine(
             profileStore = profiles,
@@ -2132,8 +2549,11 @@ class RelayV2ProfileRepositoryTest {
         private fun newRepository() = RelayV2ProfileRepository(
             credentialStore = credentials,
             profileStore = profiles,
+            selfRevokeJournalStore = profiles,
             profileSwitch = profileSwitch,
             exchange = exchange,
+            selfRevokeExchange = exchange,
+            refreshCoordinator = refreshCoordinator,
             clientInstanceId = "android-install-1",
             newId = idFactory,
         )
@@ -2274,7 +2694,7 @@ class RelayV2ProfileRepositoryTest {
 
     private class MemoryProfileStore(
         private val events: MutableList<String>,
-    ) : RelayV2ProfileStore {
+    ) : RelayV2ProfileStore, RelayV2SelfRevokeJournalStore {
         private var storedActiveIdentity: RelayActiveProfileIdentity? = RelayActiveProfileIdentity(
             profileId = "legacy-v1",
             dialect = RelayProfileDialect.V1,
@@ -2282,6 +2702,8 @@ class RelayV2ProfileRepositoryTest {
         )
         private var storedActiveV2: RelayV2Profile? = null
         var journal: RelayV2ProfileActivationJournal? = null
+            private set
+        var selfRevokeJournal: RelayV2SelfRevokeJournal? = null
             private set
         val activeIdentity: RelayActiveProfileIdentity?
             get() = storedActiveIdentity.takeIf {
@@ -2343,6 +2765,76 @@ class RelayV2ProfileRepositoryTest {
 
         override suspend fun activeRelayV2Profile(): RelayV2Profile? = activeV2
 
+        override suspend fun readSelfRevokeJournal(): RelayV2SelfRevokeJournal? =
+            selfRevokeJournal?.also { current ->
+                check(storedActiveV2?.let(current::matches) == true) {
+                    "Self-revoke journal lost its exact active profile"
+                }
+            }
+
+        override suspend fun prepareSelfRevokeJournal(
+            expectedActiveProfile: RelayV2Profile,
+            operationId: String,
+        ): RelayV2SelfRevokeJournal? {
+            if (journal != null || selfRevokeJournal != null ||
+                storedActiveV2 != expectedActiveProfile
+            ) return null
+            return RelayV2SelfRevokeJournal(
+                operationId = operationId,
+                profileId = expectedActiveProfile.profileId,
+                activationGeneration = expectedActiveProfile.activationGeneration,
+                credentialReference = expectedActiveProfile.credentialReference,
+                credentialVersion = expectedActiveProfile.credentialVersion,
+                grantId = expectedActiveProfile.grantId,
+                phase = RelayV2SelfRevokePhase.PREPARED,
+            ).also {
+                selfRevokeJournal = it
+                events += "revoke:prepared"
+            }
+        }
+
+        override suspend fun advanceSelfRevokeJournal(
+            expected: RelayV2SelfRevokeJournal,
+            phase: RelayV2SelfRevokePhase,
+            revokedAtMs: Long?,
+            failureCode: RelayV2SelfRevokeFailureCode?,
+        ): RelayV2SelfRevokeJournal? {
+            if (selfRevokeJournal != expected) return null
+            check(storedActiveV2?.let(expected::matches) == true)
+            check(
+                (expected.phase == RelayV2SelfRevokePhase.PREPARED &&
+                    phase == RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED) ||
+                    (expected.phase == RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED &&
+                        phase in setOf(
+                            RelayV2SelfRevokePhase.CONFIRMED,
+                            RelayV2SelfRevokePhase.REJECTED,
+                        ))
+            ) { "Illegal self-revoke transition" }
+            return expected.copy(
+                phase = phase,
+                revokedAtMs = revokedAtMs,
+                failureCode = failureCode,
+            ).also {
+                selfRevokeJournal = it
+                events += "revoke:${phase.name.lowercase()}"
+            }
+        }
+
+        override suspend fun commitConfirmedSelfRevokeRemoval(
+            expected: RelayV2SelfRevokeJournal,
+        ): Boolean {
+            check(expected.phase == RelayV2SelfRevokePhase.CONFIRMED)
+            if (selfRevokeJournal != expected ||
+                storedActiveV2?.let(expected::matches) != true
+            ) return false
+            storedActiveIdentity = null
+            storedActiveV2 = null
+            persistedValues = emptyMap()
+            selfRevokeJournal = null
+            events += "revoke:removed"
+            return true
+        }
+
         override suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? {
             val snapshot = journal
             nextPendingActivationReadGate?.also {
@@ -2363,6 +2855,7 @@ class RelayV2ProfileRepositoryTest {
             barrierId: String?,
             previousCredentialReference: RelayV2CredentialReference?,
         ): RelayV2ProfileActivationJournal? {
+            if (selfRevokeJournal != null) return null
             if (failNextPrepareBeforeWrite) {
                 failNextPrepareBeforeWrite = false
                 error("Relay v2 activation prepare failed before write")
@@ -2399,6 +2892,7 @@ class RelayV2ProfileRepositoryTest {
             operationId: String,
             proof: RelayV2CompletedCredentialProof,
         ): RelayV2ProfileActivationJournal? {
+            if (selfRevokeJournal != null) return null
             if (failNextCredentialReadyBeforeWrite) {
                 failNextCredentialReadyBeforeWrite = false
                 error("Relay v2 credential-ready phase failed before write")
@@ -2444,6 +2938,7 @@ class RelayV2ProfileRepositoryTest {
             journal: RelayV2ProfileActivationJournal,
             profile: RelayV2Profile,
         ): RelayV2Profile? {
+            if (selfRevokeJournal != null) return null
             if (this.journal != journal ||
                 journal.phase != RelayV2ProfileActivationPhase.CREDENTIAL_READY ||
                 !journal.targets(profile) ||
@@ -2472,7 +2967,9 @@ class RelayV2ProfileRepositoryTest {
             expectedActiveProfile: RelayActiveProfileIdentity?,
             profile: RelayV2Profile,
         ): RelayV2Profile? {
-            if (journal != null || storedActiveIdentity != expectedActiveProfile) return null
+            if (journal != null || selfRevokeJournal != null ||
+                storedActiveIdentity != expectedActiveProfile
+            ) return null
             val resolved = resolveProfile(profile)
             publishProfile(resolved)
             return resolved
@@ -2537,6 +3034,7 @@ class RelayV2ProfileRepositoryTest {
             expectedVersion: Long,
             newVersion: Long,
         ): Boolean {
+            if (selfRevokeJournal != null) return false
             if (failNextCredentialVersionUpdate) {
                 failNextCredentialVersionUpdate = false
                 return false
@@ -2576,6 +3074,7 @@ class RelayV2ProfileRepositoryTest {
         var calls = 0
         var returnedReceipt: RelayProfileDisconnectReceipt? = null
         private var nextGate: SuspensionGate? = null
+        private var failNext = false
 
         init {
             if (!blocked) release.complete(Unit)
@@ -2584,6 +3083,10 @@ class RelayV2ProfileRepositoryTest {
         fun blockNextDisconnect(): SuspensionGate = SuspensionGate().also {
             check(nextGate == null)
             nextGate = it
+        }
+
+        fun failNextDisconnect() {
+            failNext = true
         }
 
         override suspend fun disconnectAndDrain(
@@ -2598,6 +3101,10 @@ class RelayV2ProfileRepositoryTest {
                 nextGate = null
                 gate.started.complete(Unit)
                 gate.release.await()
+            }
+            if (failNext) {
+                failNext = false
+                error("Relay v2 runtime drain failed")
             }
             events += "disconnect:end"
             return (receiptFactory?.invoke(profile, barrierId)
@@ -2650,10 +3157,20 @@ class RelayV2ProfileRepositoryTest {
 
     private class FakeCredentialExchange(
         private val events: MutableList<String>,
-    ) : RelayV2CredentialExchange {
+    ) : RelayV2CredentialExchange, RelayV2SelfRevokeExchange {
         var redeemCalls = 0
+        var refreshCalls = 0
+        var selfRevokeCalls = 0
+        var selfRevokeResult: RelayV2SelfRevokeExchangeResult =
+            RelayV2SelfRevokeExchangeResult.Confirmed(
+                grantId = "grant-1",
+                revokedAtMs = 4_000,
+                alreadyRevoked = false,
+            )
+        var failSelfRevokeBeforeHandoff = false
         private var nowMs = 0L
         private val deferredRedeems = linkedMapOf<String, DeferredRedeem>()
+        private var deferredRefresh: DeferredRefresh? = null
         private val enrollmentCodeOwners = linkedMapOf<String, String>()
         private val completedAttempts = linkedMapOf<String, CompletedRedeem>()
 
@@ -2664,6 +3181,11 @@ class RelayV2ProfileRepositoryTest {
 
         fun deferEnrollment(enrollmentId: String): DeferredRedeem = DeferredRedeem().also {
             check(deferredRedeems.put(enrollmentId, it) == null)
+        }
+
+        fun deferRefresh(): DeferredRefresh = DeferredRefresh().also {
+            check(deferredRefresh == null)
+            deferredRefresh = it
         }
 
         fun enrollmentCodeConsumptions(code: String): Int =
@@ -2715,8 +3237,28 @@ class RelayV2ProfileRepositoryTest {
             }
         }
 
-        override suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse =
-            error("No production or fake refresh call is needed by these state-machine cases")
+        override suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse {
+            refreshCalls += 1
+            return requireNotNull(deferredRefresh) {
+                "No fake refresh response was configured"
+            }.also { it.request.complete(request) }.response.await()
+        }
+
+        override suspend fun revoke(
+            request: RelayV2SelfRevokeRequest,
+            onPreparedForNetworkHandoff: suspend () -> Unit,
+        ): RelayV2SelfRevokeExchangeResult {
+            selfRevokeCalls += 1
+            events += "revoke:request"
+            check(!request.toString().contains(request.accessToken))
+            if (failSelfRevokeBeforeHandoff) {
+                failSelfRevokeBeforeHandoff = false
+                error("Self-revoke request failed before handoff")
+            }
+            onPreparedForNetworkHandoff()
+            events += "revoke:handoff"
+            return selfRevokeResult
+        }
 
         private data class CompletedRedeem(
             val response: RelayV2EnrollmentExchangeResponse,
@@ -2736,6 +3278,11 @@ class RelayV2ProfileRepositoryTest {
         fun record(value: RelayV2EnrollmentExchangeRequest) {
             if (!request.complete(value)) replayRequest.complete(value)
         }
+    }
+
+    private class DeferredRefresh {
+        val request = CompletableDeferred<RelayV2RefreshRequest>()
+        val response = CompletableDeferred<RelayV2RefreshResponse>()
     }
 
     private class SuspensionGate {
@@ -2873,6 +3420,22 @@ class RelayV2ProfileRepositoryTest {
         }
     }
 
+    private suspend fun <T> withRawPreferencesStore(
+        file: java.io.File,
+        block: suspend (PreferencesStore, DataStore<Preferences>) -> T,
+    ): T {
+        val job = SupervisorJob()
+        val dataStore = PreferenceDataStoreFactory.create(
+            scope = CoroutineScope(job + Dispatchers.IO),
+            produceFile = { file },
+        )
+        return try {
+            block(PreferencesStore(dataStore), dataStore)
+        } finally {
+            job.cancelAndJoin()
+        }
+    }
+
     private suspend fun assertV1ProfileMutationsRejected(preferences: PreferencesStore) {
         val mutations = listOf<suspend () -> Unit>(
             {
@@ -2938,8 +3501,13 @@ class RelayV2ProfileRepositoryTest {
     private fun refreshResponse(
         prepared: RelayV2PreparedRefresh,
         version: Int,
+    ): RelayV2RefreshResponse = refreshResponse(prepared.request, version)
+
+    private fun refreshResponse(
+        request: RelayV2RefreshRequest,
+        version: Int,
     ): RelayV2RefreshResponse = RelayV2RefreshResponse(
-        refreshAttemptId = prepared.request.refreshAttemptId,
+        refreshAttemptId = request.refreshAttemptId,
         principalId = "principal-1",
         grantId = "grant-1",
         hostId = "mac-admin",
@@ -2948,6 +3516,35 @@ class RelayV2ProfileRepositoryTest {
         accessExpiresAtMs = 2_000L + version,
         refreshToken = "twref2.refresh-$version",
         refreshExpiresAtMs = 3_000L + version,
+    )
+
+    private fun preparedRefreshForCoordinator(
+        profile: RelayV2Profile,
+        attemptId: String,
+        secretReference: String,
+    ): RelayV2PreparedRefresh = RelayV2PreparedRefresh(
+        profileIdentity = profile.identity,
+        credentialReference = profile.credentialReference,
+        binding = RelayV2RefreshBinding(
+            issuerUrl = profile.issuerUrl,
+            relayUrl = profile.relayUrl,
+            hostId = profile.hostId,
+            principalId = profile.principalId,
+            grantId = profile.grantId,
+            clientInstanceId = profile.clientInstanceId,
+        ),
+        expectation = RelayV2CredentialCasExpectation(
+            credentialVersion = profile.credentialVersion,
+            pendingAttemptId = attemptId,
+            pendingSecretReference = secretReference,
+        ),
+        request = RelayV2RefreshRequest(
+            issuerUrl = profile.issuerUrl,
+            refreshAttemptId = attemptId,
+            grantId = profile.grantId,
+            clientInstanceId = profile.clientInstanceId,
+            refreshToken = REFRESH_TOKEN_1,
+        ),
     )
 
     private fun readPendingKindTag(bytes: ByteArray): Int {

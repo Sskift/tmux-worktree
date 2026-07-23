@@ -6,9 +6,15 @@ import { createConnection, createServer } from "node:net";
 import test from "node:test";
 import { WebSocket } from "ws";
 
+import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+
 const { startRelayBroker } = await import("../dist/relayServer.js");
 const brokerCore = await import("../dist/relay/v2/brokerCore.js");
 const relayV2Codec = await import("../dist/relay/v2/codec.js");
+const agentCodec = await import(
+  "../dist/relay/extensions/agentTranscriptLifecycle/v1/codec.js"
+);
+const relayV2Corpus = loadRelayV2FixtureCorpus();
 
 const NOW_MS = 1_800_000_000_000;
 const ACCESS_TOKEN = "twcap2.payload.mac";
@@ -270,15 +276,9 @@ class FakeReadyAuthority {
 function fakeComposition(options = {}) {
   const opened = deferred();
   const schedulerDelays = [];
-  const pumpCut = {
-    armed: false,
-    entered: deferred(),
-    release: deferred(),
-  };
   return {
     opened,
     schedulerDelays,
-    pumpCut,
     composition: {
       async openCredentialAuthority({ liveAuthorizationFence }) {
         const authority = new FakeReadyAuthority(liveAuthorizationFence, options);
@@ -290,12 +290,6 @@ function fakeComposition(options = {}) {
         if (options.invalidSource) return "";
         return `trusted-listener:${socket.remoteAddress}`;
       },
-      async onTransportPumpQuiescent() {
-        if (!pumpCut.armed) return;
-        pumpCut.armed = false;
-        pumpCut.entered.resolve();
-        await pumpCut.release.promise;
-      },
       closeDeadlineScheduler: options.recordDeadlines ? {
         schedule(run, delayMs) {
           schedulerDelays.push(delayMs);
@@ -305,8 +299,44 @@ function fakeComposition(options = {}) {
         },
         cancel(timer) { clearTimeout(timer); },
       } : undefined,
+      ...(options.agentReadiness
+        ? {
+            agentTranscriptLifecycleReadiness: options.agentReadiness.receipt,
+          }
+        : {}),
     },
   };
+}
+
+function fakeAgentReadiness({ synchronousLoss = false } = {}) {
+  const subscribers = new Set();
+  let cancelCalls = 0;
+  let receipt;
+  receipt = Object.freeze({
+    status: "ready",
+    subscribeLoss(onLoss) {
+      assert.strictEqual(this, receipt);
+      assert.equal(typeof onLoss, "function");
+      subscribers.add(onLoss);
+      let active = true;
+      const cancel = () => {
+        if (!active) return;
+        active = false;
+        cancelCalls += 1;
+        subscribers.delete(onLoss);
+      };
+      if (synchronousLoss) onLoss();
+      return cancel;
+    },
+  });
+  return Object.freeze({
+    receipt,
+    lose() {
+      for (const subscriber of [...subscribers]) subscriber();
+    },
+    subscriptionCount() { return subscribers.size; },
+    cancelCalls() { return cancelCalls; },
+  });
 }
 
 async function postJson(port, path, body, authorization) {
@@ -457,17 +487,55 @@ function fakeHostHello(overrides = {}) {
   };
 }
 
-async function registerFakeHost(port, token = "twcap2.host-online") {
+function relayV2Fixture(name) {
+  return structuredClone(relayV2Corpus.goldenByName.get(name).frame);
+}
+
+function routeOpenedFrame(route) {
+  return {
+    carrierVersion: 1,
+    type: "route.opened",
+    requestId: route.requestId,
+    connectorId: route.connectorId,
+    routeId: route.routeId,
+    routeFence: route.routeFence,
+    payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+  };
+}
+
+function hostToClientFrame(route, seq, publicWire) {
+  return {
+    carrierVersion: 1,
+    type: "route.data",
+    connectorId: route.connectorId,
+    routeId: route.routeId,
+    routeFence: route.routeFence,
+    direction: "host_to_client",
+    seq,
+    payload: {
+      opcode: "text",
+      encoding: "base64",
+      data: Buffer.from(publicWire).toString("base64"),
+    },
+  };
+}
+
+async function registerFakeHost(
+  port,
+  token = "twcap2.host-online",
+  helloOverrides = {},
+) {
   const connection = connectV2(port, { role: "host", token });
   await connection.opened;
-  connection.socket.send(carrierFrame(fakeHostHello()), { binary: false });
+  const hello = fakeHostHello(helloOverrides);
+  connection.socket.send(carrierFrame(hello), { binary: false });
   const registered = decodeFrame(
     "carrier",
     await within(connection.nextMessage(), "host.registered"),
   );
   assert.equal(registered.type, "host.registered");
   await new Promise((resolve) => setImmediate(resolve));
-  return { ...connection, registered };
+  return { ...connection, hello, registered };
 }
 
 function reauthenticateFrame(connectorId, accessToken) {
@@ -653,18 +721,11 @@ test("v2 transport actor preserves host frame FIFO and rejects binary JSON befor
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(authority.authControlEvents, ["start:twcap2.first-control.mac"]);
 
-    fake.pumpCut.armed = true;
     authority.authControlRelease.resolve();
     const firstError = decodeFrame(
       "carrier",
       await within(host.nextMessage(), "first carrier.error"),
     );
-    await within(fake.pumpCut.entered.promise, "transport pump quiescent cut");
-    assert.deepEqual(authority.authControlEvents, [
-      "start:twcap2.first-control.mac",
-      "finish:twcap2.first-control.mac",
-    ]);
-    fake.pumpCut.release.resolve();
     const secondError = decodeFrame(
       "carrier",
       await within(host.nextMessage(), "second carrier.error"),
@@ -697,30 +758,255 @@ test("v2 transport actor preserves host frame FIFO and rejects binary JSON befor
   }
 });
 
-test("client route attempts stay below 101 and never flow-control the multiplexed host socket", async () => {
-  const disabled = fakeComposition();
-  const disabledServer = await startRelayBroker({
+test("opt-in listener wires optional Agent readiness into the canonical v2 owner", async () => {
+  const agentCapability = agentCodec.RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY;
+  const baseCapabilities = [...brokerCore.RELAY_V2_REQUIRED_CAPABILITIES];
+  const claimedCapabilities = [...baseCapabilities, agentCapability];
+  const fake = fakeComposition();
+  const server = await startRelayBroker({
     host: "127.0.0.1",
     port: 0,
     secret: "isolated-v1-secret",
-  }, disabled.composition);
-  const disabledAuthority = await disabled.opened.promise;
+  }, fake.composition);
+  const authority = await fake.opened.promise;
   try {
-    const host = await registerFakeHost(disabledServer.port);
-    for (const token of ["twcap2.client-a", "twcap2.client-b"]) {
-      assert.equal(
-        await rejectedUpgradeStatus(disabledServer.port, token, "tw-relay.v2"),
-        426,
-      );
-    }
-    assert.equal(host.messageCount(), 0);
+    const host = await registerFakeHost(server.port, undefined, {
+      capabilities: claimedCapabilities,
+    });
+    const client = connectV2(server.port, { role: "client", token: "twcap2.client-route" });
+    const route = decodeFrame(
+      "carrier",
+      await within(host.nextMessage(), "route.open"),
+    );
+    assert.equal(route.type, "route.open");
+    host.socket.send(carrierFrame(routeOpenedFrame(route)), { binary: false });
+
+    await client.opened;
+    const welcome = decodeFrame(
+      "public",
+      await within(client.nextMessage(), "relay.welcome"),
+    );
+    assert.equal(welcome.type, "relay.welcome");
+    assert.equal(welcome.payload.connectionId, route.payload.connectionId);
+    assert.equal(welcome.payload.principalId, "client-principal");
+    assert.deepEqual(
+      welcome.payload.capabilities,
+      baseCapabilities,
+      "Host hello alone cannot enable the default-off Agent capability",
+    );
+
+    const hello = relayV2Fixture("client-hello-fresh");
+    hello.requestId = randomUUID();
+    hello.hostId = "host-one";
+    hello.payload.clientInstanceId = "client-instance";
+    hello.payload.capabilities = baseCapabilities;
+    hello.payload.requiredCapabilities = baseCapabilities;
+    client.socket.send(Buffer.from(
+      relayV2Codec.encodeRelayV2WebSocketFrame("public", hello),
+    ).toString("utf8"), { binary: false });
+
+    const routedHello = decodeFrame(
+      "carrier",
+      await within(host.nextMessage(), "client.hello route.data"),
+    );
+    assert.equal(routedHello.type, "route.data");
+    assert.equal(routedHello.direction, "client_to_host");
+    const observedHello = relayV2Codec.decodeRelayV2WebSocketFrame(
+      "public",
+      Buffer.from(routedHello.payload.data, "base64"),
+    ).frame;
+    assert.equal(observedHello.type, "client.hello");
+    assert.equal(observedHello.requestId, hello.requestId);
+
+    const hostWelcome = relayV2Fixture("host-welcome-snapshot-required");
+    hostWelcome.requestId = hello.requestId;
+    hostWelcome.hostId = "host-one";
+    hostWelcome.hostEpoch = host.hello.payload.hostEpoch;
+    hostWelcome.hostInstanceId = host.hello.payload.hostInstanceId;
+    hostWelcome.payload.capabilities = baseCapabilities;
+    const hostWelcomeWire = relayV2Codec.encodeRelayV2WebSocketFrame(
+      "public",
+      hostWelcome,
+    );
+    host.socket.send(carrierFrame(hostToClientFrame(route, "1", hostWelcomeWire)), {
+      binary: false,
+    });
+    const observedWelcome = decodeFrame(
+      "public",
+      await within(client.nextMessage(), "host.welcome"),
+    );
+    assert.equal(observedWelcome.type, "host.welcome");
+    assert.equal(observedWelcome.requestId, hello.requestId);
+
     const hostClosed = closeCode(host.socket);
+    const clientClosed = closeCode(client.socket);
     host.socket.close();
-    await hostClosed;
+    client.socket.close();
+    await Promise.all([hostClosed, clientClosed]);
   } finally {
-    await disabledServer.shutdown();
+    await server.shutdown();
   }
-  assert.equal(disabledAuthority.closed, true);
+  assert.equal(authority.closed, true);
+
+  const malformed = fakeComposition();
+  let malformedGetterReads = 0;
+  Object.defineProperty(
+    malformed.composition,
+    "agentTranscriptLifecycleReadiness",
+    {
+      enumerable: true,
+      get() {
+        malformedGetterReads += 1;
+        return fakeAgentReadiness().receipt;
+      },
+    },
+  );
+  await assert.rejects(
+    startRelayBroker({
+      host: "127.0.0.1",
+      port: 0,
+      secret: "isolated-v1-secret",
+    }, malformed.composition),
+    /optional capability readiness is invalid/,
+  );
+  assert.equal(malformedGetterReads, 0);
+
+  const synchronousReadiness = fakeAgentReadiness({ synchronousLoss: true });
+  const synchronous = fakeComposition({ agentReadiness: synchronousReadiness });
+  const synchronousServer = await startRelayBroker({
+    host: "127.0.0.1",
+    port: 0,
+    secret: "isolated-v1-secret",
+  }, synchronous.composition);
+  const synchronousAuthority = await synchronous.opened.promise;
+  assert.equal(synchronousReadiness.subscriptionCount(), 0);
+  assert.equal(synchronousReadiness.cancelCalls(), 1);
+  assert.equal(synchronousAuthority.closed, false);
+  await synchronousServer.shutdown();
+  assert.equal(synchronousReadiness.cancelCalls(), 1);
+  assert.equal(synchronousAuthority.closed, true);
+
+  const readiness = fakeAgentReadiness();
+  const enabled = fakeComposition({ agentReadiness: readiness });
+  const enabledServer = await startRelayBroker({
+    host: "127.0.0.1",
+    port: 0,
+    secret: "isolated-v1-secret",
+  }, enabled.composition);
+  const enabledAuthority = await enabled.opened.promise;
+  try {
+    const host = await registerFakeHost(enabledServer.port, undefined, {
+      capabilities: claimedCapabilities,
+    });
+    assert.equal(readiness.subscriptionCount(), 1);
+
+    const client = connectV2(enabledServer.port, {
+      role: "client",
+      token: "twcap2.client-agent-route",
+    });
+    const route = decodeFrame(
+      "carrier",
+      await within(host.nextMessage(), "optional route.open"),
+    );
+    host.socket.send(carrierFrame(routeOpenedFrame(route)), { binary: false });
+
+    await client.opened;
+    const relayWelcome = decodeFrame(
+      "public",
+      await within(client.nextMessage(), "optional relay.welcome"),
+    );
+    assert.deepEqual(relayWelcome.payload.capabilities, claimedCapabilities);
+
+    const hello = relayV2Fixture("client-hello-fresh");
+    hello.requestId = randomUUID();
+    hello.hostId = "host-one";
+    hello.payload.clientInstanceId = "client-instance";
+    hello.payload.capabilities = claimedCapabilities;
+    hello.payload.requiredCapabilities = baseCapabilities;
+    client.socket.send(Buffer.from(
+      relayV2Codec.encodeRelayV2WebSocketFrame("public", hello),
+    ).toString("utf8"), { binary: false });
+
+    const routedHello = decodeFrame(
+      "carrier",
+      await within(host.nextMessage(), "optional client.hello route.data"),
+    );
+    const observedHello = relayV2Codec.decodeRelayV2WebSocketFrame(
+      "public",
+      Buffer.from(routedHello.payload.data, "base64"),
+    ).frame;
+    const hostWelcome = relayV2Fixture("host-welcome-snapshot-required");
+    hostWelcome.requestId = observedHello.requestId;
+    hostWelcome.hostId = "host-one";
+    hostWelcome.hostEpoch = host.hello.payload.hostEpoch;
+    hostWelcome.hostInstanceId = host.hello.payload.hostInstanceId;
+    hostWelcome.payload.capabilities = claimedCapabilities;
+    host.socket.send(carrierFrame(hostToClientFrame(
+      route,
+      "1",
+      relayV2Codec.encodeRelayV2WebSocketFrame("public", hostWelcome),
+    )), { binary: false });
+    const observedWelcome = decodeFrame(
+      "public",
+      await within(client.nextMessage(), "optional host.welcome"),
+    );
+    assert.deepEqual(observedWelcome.payload.capabilities, claimedCapabilities);
+
+    readiness.lose();
+    assert.equal(enabledAuthority.closed, false);
+    assert.equal(readiness.subscriptionCount(), 1);
+
+    const agentRequest = {
+      protocolVersion: 2,
+      kind: "request",
+      type: "agent.timeline.status.get",
+      requestId: "agent-after-production-loss",
+      hostId: "host-one",
+      expectedHostEpoch: host.hello.payload.hostEpoch,
+      scopeId: "scope-local",
+      sessionId: "session-opaque",
+      payload: {},
+    };
+    client.socket.send(Buffer.from(
+      agentCodec.encodeRelayAgentTranscriptLifecycleFrame(agentRequest),
+    ).toString("utf8"), { binary: false });
+    const unavailable = agentCodec.decodeRelayAgentTranscriptLifecycleFrame(
+      (await within(client.nextMessage(), "withdrawn Agent error")).data,
+    ).frame;
+    assert.equal(unavailable.requestId, agentRequest.requestId);
+    assert.equal(unavailable.error.code, "AGENT_TIMELINE_UNAVAILABLE");
+    assert.equal(unavailable.error.retryable, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(host.messageCount(), 0);
+
+    const baseAfterLoss = relayV2Codec.encodeRelayV2WebSocketFrame("public", {
+      protocolVersion: 2,
+      kind: "event",
+      type: "terminal.input_ack",
+      streamId: "base-after-production-agent-loss",
+      payload: { generation: "generation-1", ackedThroughInputSeq: "0" },
+    });
+    host.socket.send(carrierFrame(hostToClientFrame(route, "2", baseAfterLoss)), {
+      binary: false,
+    });
+    const observedBaseAfterLoss = decodeFrame(
+      "public",
+      await within(client.nextMessage(), "base frame after Agent loss"),
+    );
+    assert.equal(observedBaseAfterLoss.type, "terminal.input_ack");
+    assert.equal(observedBaseAfterLoss.streamId, "base-after-production-agent-loss");
+
+    const hostClosed = closeCode(host.socket);
+    const clientClosed = closeCode(client.socket);
+    host.socket.close();
+    client.socket.close();
+    await Promise.all([hostClosed, clientClosed]);
+  } finally {
+    await enabledServer.shutdown();
+  }
+  assert.equal(enabledAuthority.closed, true);
+  assert.equal(readiness.subscriptionCount(), 0);
+  assert.equal(readiness.cancelCalls(), 1);
 });
 
 test("v2 authority withdrawal fences admission and closes exact live sockets with bounded policy", async () => {
@@ -741,8 +1027,11 @@ test("v2 authority withdrawal fences admission and closes exact live sockets wit
       jti: "jti-expired",
     });
 
-    const late = await openWebSocket(server.port, "twcap2.expired");
-    assert.equal(await closeCode(late), 1013);
+    const late = upgradeAttempt(server.port, {
+      role: "host",
+      token: "twcap2.expired",
+    });
+    assert.deepEqual(await late.outcome, { outcome: "reject", status: 401 });
     expiry.committed({
       authorizationRevision: "2",
       authorizationFence: "authorization-fence-two",

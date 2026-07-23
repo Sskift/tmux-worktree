@@ -18,6 +18,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2OutboxMetaEntity::class,
         RelayV2OutboxEntryEntity::class,
         RelayV2TerminalCheckpointEntity::class,
+        RelayV2TerminalPostCommitBatchEntity::class,
+        RelayV2TerminalPostCommitFenceEntity::class,
+        RelayV2TerminalPostCommitMetaEntity::class,
         RelayV2AgentTranscriptLifecycleStateEntity::class,
         RelayV2AgentTranscriptLifecycleNotificationClaimEntity::class,
         RelayV2AgentTranscriptEntryEntity::class,
@@ -29,12 +32,13 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2AgentRecentEventEvidenceEntity::class,
         RelayV2AgentNotificationLedgerEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 internal abstract class RelayV2StateDatabase : RoomDatabase() {
     abstract fun stateDao(): RelayV2StateDao
     abstract fun agentLifecycleDao(): RelayV2AgentLifecycleDao
+    abstract fun terminalPostCommitJournalDao(): RelayV2TerminalPostCommitJournalDao
 
     companion object {
         const val DATABASE_NAME = "tw_mobile_relay_v2_state.db"
@@ -49,6 +53,7 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
             MIGRATION_2_3,
             MIGRATION_3_4,
             MIGRATION_4_5,
+            MIGRATION_5_6,
         ).build()
 
         /**
@@ -917,6 +922,87 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                         `profileId`, `profileActivationGeneration`, `principalId`,
                         `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
                         `timelineEpoch`, `agentEventSeqOrder`, `lifecycleEventId`, `lifecycleState`
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        /** Adds the isolated terminal post-commit journal; existing terminal rows are untouched. */
+        val MIGRATION_5_6: Migration = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_terminal_post_commit_batches` (
+                        `journalOrder` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `reservationId` TEXT NOT NULL,
+                        `ownerIncarnation` TEXT NOT NULL,
+                        `authorityFingerprint` TEXT NOT NULL,
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `connectionGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `streamId` TEXT NOT NULL,
+                        `pane` INTEGER NOT NULL,
+                        `batchFingerprint` TEXT NOT NULL,
+                        `callbackOperationId` TEXT NOT NULL,
+                        `effectCount` INTEGER NOT NULL,
+                        `nextEffectIndex` INTEGER NOT NULL,
+                        `runningEffectIndex` INTEGER,
+                        `state` TEXT NOT NULL,
+                        `codecVersion` INTEGER NOT NULL,
+                        `payloadUtf8Bytes` INTEGER NOT NULL,
+                        `payloadCanonicalJson` TEXT NOT NULL,
+                        `payloadSha256` TEXT NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_relay_v2_terminal_post_commit_batches_reservationId`
+                    ON `relay_v2_terminal_post_commit_batches` (`reservationId`)
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                        `index_relay_v2_terminal_post_commit_batches_authorityFingerprint_journalOrder`
+                    ON `relay_v2_terminal_post_commit_batches` (
+                        `authorityFingerprint`, `journalOrder`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_terminal_post_commit_fences` (
+                        `authorityFingerprint` TEXT NOT NULL,
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `connectionGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `streamId` TEXT NOT NULL,
+                        `pane` INTEGER NOT NULL,
+                        PRIMARY KEY(`authorityFingerprint`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_terminal_post_commit_meta` (
+                        `singletonId` INTEGER NOT NULL,
+                        `globallyClosed` INTEGER NOT NULL,
+                        PRIMARY KEY(`singletonId`)
                     )
                     """.trimIndent(),
                 )

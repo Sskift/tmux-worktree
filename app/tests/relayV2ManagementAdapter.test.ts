@@ -54,7 +54,6 @@ function activeEnrollment() {
     review: {
       enrollment: {
         enrollmentId: "enrollment-1",
-        enrollmentCode: "twenroll2.one-time-code",
         expiresAtMs: futureMs,
       },
       display: {
@@ -62,6 +61,11 @@ function activeEnrollment() {
         relayUrl: "wss://relay.example.com/client",
         hostId: "mac-admin",
         deviceLabel: "Pixel",
+      },
+      renderArtifact: {
+        kind: "native_qr_handle",
+        handle: `dqart1.${"A".repeat(32)}`,
+        expiresAtMs: futureMs,
       },
     },
   };
@@ -242,7 +246,7 @@ test("incomplete registration or any missing required capability cannot expose e
     const view = deriveRelayV2EnrollmentView(state, 1_000);
     assert.equal(state.connector.status, "registered_incomplete", missing);
     assert.equal(view.ready, false, missing);
-    assert.equal(view.qrPayload, null, missing);
+    assert.equal(view.qrArtifact, null, missing);
   }
 
   const adapter = createRelayV2ManagementAdapter(async () => successOutcome(
@@ -252,7 +256,9 @@ test("incomplete registration or any missing required capability cannot expose e
   const state = await adapter.createEnrollment({ intent: "create", deviceLabel: "Pixel" });
   const view = deriveRelayV2EnrollmentView(state, 1_000);
   assert.equal(view.ready, true);
-  assert.match(view.qrPayload ?? "", /enrollmentCode=twenroll2.one-time-code/);
+  assert.equal(view.qrArtifact?.handle, `dqart1.${"A".repeat(32)}`);
+  assert.equal(JSON.stringify(state).includes("enrollmentCode"), false);
+  assert.equal(JSON.stringify(state).includes("tmuxworktree://enroll"), false);
 });
 
 test("closed v2 outcomes reject malformed, unknown, credential, and contradictory state", async () => {
@@ -296,6 +302,22 @@ test("closed v2 outcomes reject malformed, unknown, credential, and contradictor
             display: {
               ...activeEnrollment().review.display,
               issuerUrl: "https://relay.example.com?accessToken=forbidden",
+            },
+          },
+        },
+      },
+    },
+    {
+      ...successOutcome("create_enrollment"),
+      result: {
+        ...projectionFor("create_enrollment"),
+        enrollment: {
+          ...activeEnrollment(),
+          review: {
+            ...activeEnrollment().review,
+            enrollment: {
+              ...activeEnrollment().review.enrollment,
+              enrollmentCode: "twenroll2.must-not-cross",
             },
           },
         },
@@ -462,9 +484,36 @@ test("renderer input and returned projection contain no credential or v1 secret 
     "twcap2.",
     "twref2.",
     "twhostboot2.",
+    "twenroll2.",
+    '"enrollmentCode":',
+    "tmuxworktree://enroll",
+    "data:image/",
   ]) {
     assert.equal(serializedCalls.includes(forbidden), false, forbidden);
     assert.equal(serializedState.includes(forbidden), false, forbidden);
   }
-  assert.equal(serializedState.includes("twenroll2.one-time-code"), true);
+  assert.match(serializedState, /dqart1\.[A-Za-z0-9_-]{32}/);
+});
+
+test("renderer can ask Tauri to show only an opaque current artifact handle", async () => {
+  const calls: Array<{ command: string; args?: unknown }> = [];
+  const adapter = createRelayV2ManagementAdapter(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "mobile_relay_v2_enrollment_artifact_show") return null;
+    return successOutcome("status");
+  });
+  const handle = `dqart1.${"B".repeat(32)}`;
+
+  await adapter.showEnrollmentArtifact({ handle });
+  assert.deepEqual(calls, [{
+    command: "mobile_relay_v2_enrollment_artifact_show",
+    args: { handle },
+  }]);
+  assert.equal(JSON.stringify(calls).includes("enrollmentCode"), false);
+  assert.equal(JSON.stringify(calls).includes("tmuxworktree://enroll"), false);
+  await assert.rejects(
+    adapter.showEnrollmentArtifact({ handle: "tmuxworktree://enroll?secret=forbidden" }),
+    (error: unknown) => error instanceof MobileRelayV2BackendOperationError
+      && error.code === "INVALID_ARGUMENT",
+  );
 });

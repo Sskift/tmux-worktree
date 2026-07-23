@@ -86,6 +86,8 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
         applyLease = applyLease,
         durableClaims = durableRepository,
         platform = notificationPlatform,
+        postedNotifications = durableRepository as?
+            AgentTranscriptLifecyclePostedNotificationDurablePort,
     )
     private val requestSync = requestSender?.let { sender ->
         AgentTranscriptLifecycleRequestSyncCoordinator(

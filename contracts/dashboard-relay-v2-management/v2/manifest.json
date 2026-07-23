@@ -4,7 +4,7 @@
   "protocolVersion": 2,
   "fixtureFormatVersion": 1,
   "status": "frozen-consumer-path-only",
-  "scope": "future-node-authority-to-dashboard-non-sensitive-management-projection",
+  "scope": "future-node-authority-to-tauri-secret-bearing-management-projection-with-native-renderer-boundary",
   "productionCapabilityEffect": "none-until-a-bundled-node-child-selects-v2-and-a-real-authority-is-wired",
   "compatibility": {
     "startupFrameSelectsExactlyOneProtocol": true,
@@ -15,9 +15,9 @@
   },
   "ownership": {
     "node": "sole-authority-for-host-credential-enrollment-grant-and-connector-facts",
-    "rust": "startup-negotiation-framing-request-id-single-in-flight-timeout-and-exact-child-lifecycle",
-    "tauri": "closed-operation-and-non-sensitive-input-forwarding-only",
-    "renderer": "closed-projection-mapping-only",
+    "rust": "startup-negotiation-framing-request-id-single-in-flight-timeout-exact-child-lifecycle-and-bounded-enrollment-artifact-registry",
+    "tauri": "closed-operation-and-non-sensitive-input-forwarding-plus-secret-to-native-image-boundary",
+    "renderer": "closed-non-sensitive-projection-and-opaque-native-artifact-handle-only",
     "rustOrRendererPersistenceAllowed": false
   },
   "transport": {
@@ -110,6 +110,20 @@
     "knownGrantIsSingleClosedProjectionNotDeviceList": true,
     "persistenceAllowed": false
   },
+  "rendererBoundary": {
+    "activeReviewExactKeys": ["enrollment", "display", "renderArtifact"],
+    "enrollmentExactKeys": ["enrollmentId", "expiresAtMs"],
+    "renderArtifactExactKeys": ["kind", "handle", "expiresAtMs"],
+    "renderArtifactKind": "native_qr_handle",
+    "handlePattern": "^dqart1\\.[A-Za-z0-9_-]{32}$",
+    "handleOwner": "tauri-bounded-in-memory-artifact-registry",
+    "nativeRendering": "macos-appkit-image-window-with-no-artifact-bytes-in-main-webview",
+    "sameLineageMayReuseHandle": true,
+    "lineage": ["enrollmentId", "hostId", "connectorId", "expiresAtMs"],
+    "revocation": ["host-refresh", "lineage-change", "non-active-projection", "native-window-close", "expiry", "dashboard-dispose"],
+    "maximumLifetimeMs": 300000,
+    "persistenceAllowed": false
+  },
   "secretPolicy": {
     "forbiddenFieldsAtAnyDepth": [
       "bootstrapToken",
@@ -121,12 +135,16 @@
       "privateKey",
       "bearerCredential"
     ],
-    "allowedSensitiveRendererField": "enrollment.review.enrollment.enrollmentCode-only",
+    "allowedSensitiveRendererField": null,
+    "enrollmentCodeBoundary": "node-child-stdout-to-tauri-strict-decoder-and-native-qr-renderer-only",
+    "rendererForbiddenFields": ["enrollmentCode", "qrPayload", "dataUrl", "imageBytes"],
     "enrollmentCodeMustStartWith": "twenroll2.",
     "credentialReferenceIsOpaqueNonSensitiveReference": true,
     "urlQueryAllowed": false,
     "rawFrameLoggingAllowed": false,
-    "rawFrameInErrorAllowed": false
+    "rawFrameInErrorAllowed": false,
+    "artifactHandleInLogsAllowed": false,
+    "artifactHandleInClipboardAllowed": false
   },
   "channelPoison": {
     "triggers": [

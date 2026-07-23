@@ -335,6 +335,9 @@ class AgentTranscriptLifecycleClientReducerTest {
             notificationConfig = AgentNotificationConfig(
                 permission = AgentNotificationPermission.GRANTED,
                 profileActive = true,
+                waitingForUser = true,
+                failed = true,
+                completed = true,
             ),
         )
         val snapshotRequested = snapshotRequestAccepted(initial, "snapshot-resync")
@@ -2135,6 +2138,9 @@ class AgentTranscriptLifecycleClientReducerTest {
             notificationConfig = AgentNotificationConfig(
                 permission = string("notificationPermission").toNotificationPermission(),
                 profileActive = boolean("profileActive"),
+                waitingForUser = true,
+                failed = true,
+                completed = true,
             ),
         )
     }
@@ -2154,6 +2160,9 @@ class AgentTranscriptLifecycleClientReducerTest {
                 permission = string("notificationPermission").toNotificationPermission(),
                 profileActive = boolean("profileActive"),
                 policy = state.notificationConfig.policy,
+                waitingForUser = state.notificationConfig.waitingForUser,
+                failed = state.notificationConfig.failed,
+                completed = state.notificationConfig.completed,
             ),
         )
         "status" -> when (string("support")) {
@@ -2300,6 +2309,9 @@ private fun availableState(
     notificationConfig = AgentNotificationConfig(
         permission = AgentNotificationPermission.GRANTED,
         profileActive = true,
+        waitingForUser = true,
+        failed = true,
+        completed = true,
     ),
 )
 

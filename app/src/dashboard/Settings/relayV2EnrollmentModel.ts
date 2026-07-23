@@ -10,7 +10,6 @@ import {
   mobileRelayV2ConnectorReady,
   normalizeMobileRelayV2DashboardState,
   normalizeMobileRelayV2Connector,
-  normalizeMobileRelayV2EnrollmentReview,
   relayV2MissingNegotiatedCapabilities,
   sanitizeMobileRelayV2DisplayMessage,
 } from "../../platform/relayV2Domain";
@@ -72,7 +71,7 @@ export interface RelayV2EnrollmentView {
   grantRevokeLabel: string;
   error: string | null;
   review: RelayV2EnrollmentReview | null;
-  qrPayload: string | null;
+  qrArtifact: RelayV2EnrollmentReview["renderArtifact"] | null;
 }
 
 const NOT_READY_ERROR =
@@ -392,22 +391,6 @@ export function relayV2EnrollmentReducer(
   }
 }
 
-export function buildRelayV2EnrollmentQrPayload(
-  review: RelayV2EnrollmentReview,
-): string | null {
-  const normalized = normalizeMobileRelayV2EnrollmentReview(review);
-  if (!normalized) return null;
-  const { enrollment, display } = normalized;
-  return [
-    "tmuxworktree://enroll?v=2",
-    `issuerUrl=${encodeURIComponent(display.issuerUrl)}`,
-    `relayUrl=${encodeURIComponent(display.relayUrl)}`,
-    `hostId=${encodeURIComponent(display.hostId)}`,
-    `enrollmentId=${encodeURIComponent(enrollment.enrollmentId)}`,
-    `enrollmentCode=${encodeURIComponent(enrollment.enrollmentCode)}`,
-  ].join("&");
-}
-
 export function deriveRelayV2EnrollmentView(
   state: RelayV2EnrollmentState,
   nowMs = Date.now(),
@@ -428,7 +411,7 @@ export function deriveRelayV2EnrollmentView(
   const reviewIsCurrent = activeReview !== null
     && activeReview.enrollment.expiresAtMs > nowMs;
   const review = ready && reviewMatchesRegistration && reviewIsCurrent ? activeReview : null;
-  const qrPayload = review ? buildRelayV2EnrollmentQrPayload(review) : null;
+  const qrArtifact = review?.renderArtifact ?? null;
 
   let readinessLabel: string;
   let readinessDetail: string;
@@ -464,7 +447,7 @@ export function deriveRelayV2EnrollmentView(
     ? "Enrollment adapter unavailable"
     : !ready
       ? "Enrollment unavailable"
-      : qrPayload
+      : qrArtifact
         ? "One-time enrollment active"
         : normalizedState.enrollment.status === "creating"
           ? normalizedState.enrollment.intent === "rebuild"
@@ -538,6 +521,6 @@ export function deriveRelayV2EnrollmentView(
       ? `${errors[0]} Relay v1 remains unchanged; no fallback was attempted.`
       : null,
     review,
-    qrPayload,
+    qrArtifact,
   };
 }

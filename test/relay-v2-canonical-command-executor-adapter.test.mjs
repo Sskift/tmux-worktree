@@ -168,15 +168,25 @@ function resolvedFor(request) {
     target: {
       authority: "terminal_control",
       operation: request.operation,
-      scopeId: request.scopeId,
-      pane: "0",
-      lease: {
-        controlTargetId: "target-exact-1",
-        controlEpoch: "control-epoch-1",
-        leaseId: "lease-exact-1",
-        fence: "7",
-        owner: { kind: "relay-v2", instanceId: "relay-v2-host-instance-1" },
-        expiresAt: "2026-07-16T12:00:00.000Z",
+      targetBinding: {
+        schemaVersion: 1,
+        hostId: request.hostId,
+        scopeId: request.scopeId,
+        sessionId: request.sessionId,
+        pane: 0,
+        processTarget: { kind: "local", targetId: "bundled-local-cli" },
+        backendInstanceKey: "backend-instance-exact-1",
+        managedTarget: {
+          name: "tw-term-a1b2c",
+          kind: "terminal",
+          incarnation: INCARNATION,
+        },
+        exactControlIdentity: {
+          schemaVersion: 1,
+          controlTargetId: "target-exact-1",
+          controlEpoch: "control-epoch-1",
+          targetIncarnationProof: "target-incarnation-proof-1",
+        },
       },
     },
   };
@@ -273,7 +283,7 @@ function fakePorts(overrides = {}) {
       },
     },
     terminalControl: {
-      async sendAgentMessage(input) {
+      async executeAgentMessage(input) {
         calls.terminal.push(structuredClone(input));
         if (overrides.terminal) return overrides.terminal(input);
         return {
@@ -282,8 +292,8 @@ function fakePorts(overrides = {}) {
             operationId: input.operationId,
             accepted: true,
             deduplicated: false,
-            controlEpoch: input.lease.controlEpoch,
-            fence: input.lease.fence,
+            controlEpoch: input.targetBinding.exactControlIdentity.controlEpoch,
+            fence: "7",
             outputGeneration: "output-generation-1",
             outputCursor: 12,
           },
@@ -294,7 +304,10 @@ function fakePorts(overrides = {}) {
 }
 
 function executorFor(ports) {
-  return new adapterModule.RelayV2CanonicalCommandExecutorAdapter(ports);
+  return new adapterModule.RelayV2CanonicalCommandExecutorAdapter({
+    ...ports,
+    terminalOwner: { kind: "relay-v2", instanceId: "relay-v2-host-instance-1" },
+  });
 }
 
 async function executionPlan(executor, request, reservationId = "reservation-stable-1") {
@@ -377,32 +390,35 @@ test("resolution fences delegate exact evidence and reject thenables", async () 
   );
 });
 
-test("terminal resolver fence rejects each independently legal lease identity swap", async (t) => {
+test("terminal resolver fence rejects each independently legal target identity swap", async (t) => {
   for (const [field, replacement] of [
     ["controlTargetId", "target-exact-other"],
-    ["leaseId", "lease-exact-other"],
+    ["controlEpoch", "control-epoch-other"],
   ]) {
     await t.test(field, async () => {
       const request = canonicalRequest("send_agent_message");
       const resolution = resolvedFor(request);
-      const expectedLease = structuredClone(resolution.target.lease);
+      const expectedIdentity = structuredClone(resolution.target.targetBinding.exactControlIdentity);
       resolution.admissionFence = {
         ...admissionFenceFor(request, "positive"),
-        expectedLease,
+        expectedIdentity,
       };
-      resolution.target.lease = {
-        ...structuredClone(expectedLease),
+      resolution.target.targetBinding.exactControlIdentity = {
+        ...structuredClone(expectedIdentity),
         [field]: replacement,
       };
-      const unchangedField = field === "leaseId" ? "controlTargetId" : "leaseId";
-      assert.equal(resolution.target.lease[unchangedField], expectedLease[unchangedField]);
+      const unchangedField = field === "controlEpoch" ? "controlTargetId" : "controlEpoch";
+      assert.equal(
+        resolution.target.targetBinding.exactControlIdentity[unchangedField],
+        expectedIdentity[unchangedField],
+      );
       const ports = fakePorts({
         resolve: () => resolution,
         fenceResolution: (_transaction, fencedRequest, fence) => {
-          const sameLease = JSON.stringify(fence.target.lease)
-            === JSON.stringify(fence.evidence.expectedLease);
-          if (fencedRequest.sessionId !== request.sessionId || !sameLease) {
-            throw new Error("terminal lease binding mismatch");
+          const sameIdentity = JSON.stringify(fence.target.targetBinding.exactControlIdentity)
+            === JSON.stringify(fence.evidence.expectedIdentity);
+          if (fencedRequest.sessionId !== request.sessionId || !sameIdentity) {
+            throw new Error("terminal target binding mismatch");
           }
         },
       });
@@ -419,7 +435,7 @@ test("terminal resolver fence rejects each independently legal lease identity sw
           request,
           admission.resolutionFence,
         ),
-        /terminal lease binding mismatch/,
+        /terminal target binding mismatch/,
       );
       assert.equal(ports.calls.terminal.length, 0);
     });
@@ -505,8 +521,8 @@ test("canonical executor translates all four operations to one exact authority c
   assert.match(operationId, /^twmsg2\.[A-Za-z0-9_-]{43}$/);
   assert.ok(Buffer.byteLength(operationId, "utf8") <= 192);
   assert.deepEqual(terminalCall, {
-    scopeId: SCOPE_ID,
-    lease: resolvedFor(canonicalRequest("send_agent_message")).target.lease,
+    targetBinding: resolvedFor(canonicalRequest("send_agent_message")).target.targetBinding,
+    owner: { kind: "relay-v2", instanceId: "relay-v2-host-instance-1" },
     pane: "0",
     message: "continue",
     submit: true,
@@ -1305,8 +1321,8 @@ test("terminal-control requires exact success correlation or explicit not-applie
           operationId: input.operationId,
           accepted: true,
           deduplicated: false,
-          controlEpoch: input.lease.controlEpoch,
-          fence: "8",
+          controlEpoch: "different-control-epoch",
+          fence: "7",
           outputGeneration: "output-generation-1",
           outputCursor: 0,
         },

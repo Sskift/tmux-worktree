@@ -1,6 +1,4 @@
 import { AlertCircle, QrCode } from "lucide-react";
-import { useEffect, useRef } from "react";
-import QRCode from "qrcode";
 import {
   deriveRelayV2EnrollmentView,
   type RelayV2EnrollmentState,
@@ -23,6 +21,7 @@ export function RelayV2EnrollmentPanel({
       onStartConnector={controller.startConnector}
       onStopConnector={controller.stopConnector}
       onCreateEnrollment={controller.createEnrollment}
+      onShowEnrollmentArtifact={controller.showEnrollmentArtifact}
       onRevokeKnownGrant={controller.revokeKnownGrant}
     />
   );
@@ -36,6 +35,7 @@ export function RelayV2EnrollmentPreviewPanel({
   onStartConnector,
   onStopConnector,
   onCreateEnrollment,
+  onShowEnrollmentArtifact,
   onRevokeKnownGrant,
 }: {
   state?: RelayV2EnrollmentState;
@@ -45,6 +45,7 @@ export function RelayV2EnrollmentPreviewPanel({
   onStartConnector?: () => void;
   onStopConnector?: () => void;
   onCreateEnrollment?: (intent: "create" | "retry" | "rebuild") => void;
+  onShowEnrollmentArtifact?: (handle: string) => void;
   onRevokeKnownGrant?: () => void;
 }) {
   if (!state) return null;
@@ -100,7 +101,7 @@ export function RelayV2EnrollmentPreviewPanel({
             </button>
           )}
         </div>
-        {view.qrPayload && view.review ? (
+        {view.qrArtifact && view.review ? (
           <div className="connections-relay-v2-preview__review">
             <div>
               <strong>One-time enrollment review</strong>
@@ -109,7 +110,14 @@ export function RelayV2EnrollmentPreviewPanel({
               <span>Host · {view.review.display.hostId}</span>
               <span>Expires · {new Date(view.review.enrollment.expiresAtMs).toLocaleString()}</span>
             </div>
-            <MobileRelayV2EnrollmentQrCode payload={view.qrPayload} previewOnly={view.previewOnly} />
+            <button
+              type="button"
+              className="connections-button"
+              disabled={view.previewOnly}
+              onClick={() => onShowEnrollmentArtifact?.(view.qrArtifact!.handle)}
+            >
+              {view.previewOnly ? "Native QR unavailable in browser preview" : "Show QR code"}
+            </button>
           </div>
         ) : (
           <button
@@ -143,48 +151,5 @@ export function RelayV2EnrollmentPreviewPanel({
         </div>
       )}
     </div>
-  );
-}
-
-function MobileRelayV2EnrollmentQrCode({
-  payload,
-  previewOnly,
-}: {
-  payload: string;
-  previewOnly: boolean;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    let active = true;
-    void QRCode.toCanvas(canvas, payload, {
-      width: 132,
-      margin: 1,
-      errorCorrectionLevel: "M",
-      color: {
-        dark: "#111113",
-        light: "#ffffff",
-      },
-    }).catch(() => {
-      if (!active) return;
-      canvas.width = 0;
-      canvas.height = 0;
-    });
-    return () => {
-      active = false;
-    };
-  }, [payload]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      className="connections-relay-pairing__qr"
-      aria-label={previewOnly
-        ? "Relay v2 one-time enrollment preview QR code"
-        : "Relay v2 one-time enrollment QR code"}
-      role="img"
-    />
   );
 }

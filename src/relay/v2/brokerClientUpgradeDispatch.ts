@@ -8,6 +8,7 @@ import {
 } from "./brokerCore.js";
 import {
   captureRelayV2BrokerProducerTarget,
+  type RelayV2BrokerClientWssCurrentHostPreparePort,
   type RelayV2BrokerClientWssAdmissionReceipt,
   type RelayV2BrokerClientWssPrepareResult,
   type RelayV2BrokerClientWssRuntimeComposition,
@@ -31,6 +32,9 @@ export type RelayV2BrokerClientWssPreflightPort = Pick<
   RelayV2BrokerClientWssRuntimeComposition,
   "prepareClientWss"
 >["prepareClientWss"];
+
+export type RelayV2BrokerClientWssCurrentHostPreflightPort =
+  RelayV2BrokerClientWssCurrentHostPreparePort;
 
 export type RelayV2BrokerClientUpgradeDispatchResult =
   | Extract<RelayBrokerUpgradeResult, { outcome: "reject" }>
@@ -60,7 +64,8 @@ function roleMismatch(): Error {
 
 function captureOwnerPorts(options: unknown): Readonly<{
   verifyV2AccessToken: RelayV2BrokerClientUpgradeVerifyPort;
-  prepareClientWss: RelayV2BrokerClientWssPreflightPort;
+  prepareClientWss: RelayV2BrokerClientWssPreflightPort | null;
+  prepareClientWssForCurrentHost: RelayV2BrokerClientWssCurrentHostPreflightPort | null;
 }> {
   if (options === null || typeof options !== "object" || isRejectedProxy(options)) {
     throw new Error("invalid Relay v2 Broker client Upgrade dispatch ports");
@@ -69,17 +74,31 @@ function captureOwnerPorts(options: unknown): Readonly<{
     const descriptors = Object.getOwnPropertyDescriptors(options);
     const verifyV2AccessToken = descriptors.verifyV2AccessToken;
     const prepareClientWss = descriptors.prepareClientWss;
+    const prepareClientWssForCurrentHost = descriptors.prepareClientWssForCurrentHost;
+    const keys = Reflect.ownKeys(descriptors);
     if (
-      !verifyV2AccessToken
+      keys.length !== 2
+      || !verifyV2AccessToken
       || !Object.hasOwn(verifyV2AccessToken, "value")
       || typeof verifyV2AccessToken.value !== "function"
-      || !prepareClientWss
-      || !Object.hasOwn(prepareClientWss, "value")
-      || typeof prepareClientWss.value !== "function"
+      || ((prepareClientWss ? 1 : 0) + (prepareClientWssForCurrentHost ? 1 : 0)) !== 1
+      || (prepareClientWss !== undefined && (
+        !Object.hasOwn(prepareClientWss, "value")
+        || typeof prepareClientWss.value !== "function"
+      ))
+      || (prepareClientWssForCurrentHost !== undefined && (
+        !Object.hasOwn(prepareClientWssForCurrentHost, "value")
+        || typeof prepareClientWssForCurrentHost.value !== "function"
+      ))
     ) throw new Error("invalid dispatch port descriptor");
     return Object.freeze({
       verifyV2AccessToken: verifyV2AccessToken.value as RelayV2BrokerClientUpgradeVerifyPort,
-      prepareClientWss: prepareClientWss.value as RelayV2BrokerClientWssPreflightPort,
+      prepareClientWss: prepareClientWss
+        ? prepareClientWss.value as RelayV2BrokerClientWssPreflightPort
+        : null,
+      prepareClientWssForCurrentHost: prepareClientWssForCurrentHost
+        ? prepareClientWssForCurrentHost.value as RelayV2BrokerClientWssCurrentHostPreflightPort
+        : null,
     });
   } catch {
     throw new Error("invalid Relay v2 Broker client Upgrade dispatch ports");
@@ -93,25 +112,33 @@ function captureOwnerPorts(options: unknown): Readonly<{
 export class RelayV2BrokerClientUpgradeDispatchOwner {
   private readonly verifyV2AccessToken: RelayV2BrokerClientUpgradeVerifyPort;
   private readonly prepareClientWss: RelayV2BrokerClientWssPreflightPort;
+  private readonly prepareClientWssForCurrentHost:
+    RelayV2BrokerClientWssCurrentHostPreflightPort | null;
 
-  constructor(options: {
+  constructor(options: Readonly<{
     verifyV2AccessToken: RelayV2BrokerClientUpgradeVerifyPort;
-    prepareClientWss: RelayV2BrokerClientWssPreflightPort;
-  }) {
+  } & (
+    | { prepareClientWss: RelayV2BrokerClientWssPreflightPort }
+    | { prepareClientWssForCurrentHost: RelayV2BrokerClientWssCurrentHostPreflightPort }
+  )>) {
     const ports = captureOwnerPorts(options);
     this.verifyV2AccessToken = ports.verifyV2AccessToken;
-    this.prepareClientWss = ports.prepareClientWss;
+    this.prepareClientWss = ports.prepareClientWss as RelayV2BrokerClientWssPreflightPort;
+    this.prepareClientWssForCurrentHost = ports.prepareClientWssForCurrentHost;
   }
 
   async dispatch(
     metadata: RelayV2BrokerClientUpgradeMetadata,
-    hostProducerTarget: RelayV2BrokerProducerTarget,
+    hostProducerTarget?: RelayV2BrokerProducerTarget,
   ): Promise<RelayV2BrokerClientUpgradeDispatchResult> {
-    const capturedHostProducerTarget = captureRelayV2BrokerProducerTarget(
-      hostProducerTarget,
-    );
-    if (!capturedHostProducerTarget) {
+    const capturedHostProducerTarget = this.prepareClientWssForCurrentHost
+      ? null
+      : captureRelayV2BrokerProducerTarget(hostProducerTarget);
+    if (!this.prepareClientWssForCurrentHost && !capturedHostProducerTarget) {
       throw new Error("invalid Relay v2 Broker Host producer target");
+    }
+    if (this.prepareClientWssForCurrentHost && hostProducerTarget !== undefined) {
+      throw new Error("current-Host Relay v2 Broker dispatch does not accept a target");
     }
     const request = captureRelayV2BrokerUpgradeMetadata(metadata, "client");
     const upgrade = await dispatchRelayBrokerUpgrade(request, {
@@ -128,11 +155,16 @@ export class RelayV2BrokerClientUpgradeDispatchOwner {
       || upgrade.selectedProtocol !== "tw-relay.v2"
     ) throw new Error("Relay v2 Broker client Upgrade dispatch invariant failed");
 
-    const prepared = this.prepareClientWss({
-      connectionId: randomUUID(),
-      trustedAuthContext: upgrade.authContext,
-      hostProducerTarget: capturedHostProducerTarget,
-    });
+    const prepared = this.prepareClientWssForCurrentHost
+      ? this.prepareClientWssForCurrentHost({
+          connectionId: randomUUID(),
+          trustedAuthContext: upgrade.authContext,
+        })
+      : this.prepareClientWss({
+          connectionId: randomUUID(),
+          trustedAuthContext: upgrade.authContext,
+          hostProducerTarget: capturedHostProducerTarget!,
+        });
     if (prepared.outcome === "reject") return prepared;
     return Object.freeze({
       outcome: "accept",

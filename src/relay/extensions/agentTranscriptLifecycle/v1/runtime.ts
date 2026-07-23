@@ -49,6 +49,11 @@ export interface RelayAgentTrustedIngestResult {
   delivery: RelayAgentRuntimeDelivery | null;
 }
 
+export interface RelayAgentTranscriptLifecycleRuntimePublicationPort {
+  publishLive(delivery: RelayAgentRuntimeDelivery): Promise<void>;
+  withdraw(error: unknown): void;
+}
+
 export type RelayAgentTrustedSourceIngressLeaseErrorCode =
   | "DISABLED"
   | "ALREADY_ENABLED"
@@ -225,7 +230,17 @@ function isUnavailableStoreFailure(error: unknown): boolean {
  * relay-host registration.
  */
 export class RelayAgentTranscriptLifecycleRuntime {
-  constructor(readonly store: RelayAgentAuthorityStore) {}
+  constructor(
+    readonly store: RelayAgentAuthorityStore,
+    private readonly publication: RelayAgentTranscriptLifecycleRuntimePublicationPort | null = null,
+  ) {
+    if (publication !== null
+      && (typeof publication !== "object"
+        || typeof publication.publishLive !== "function"
+        || typeof publication.withdraw !== "function")) {
+      throw new TypeError("Relay Agent runtime publication port is invalid");
+    }
+  }
 
   private assertRoute(request: RelayV2JsonObject, context: RelayAgentExtensionRouteContext): void {
     if (!context.capabilityNegotiated) throw new RelayAgentExtensionNotNegotiatedError();
@@ -270,6 +285,7 @@ export class RelayAgentTranscriptLifecycleRuntime {
             status = await this.store.status(target);
           } catch (error) {
             if (!isUnavailableStoreFailure(error)) throw error;
+            this.withdrawPublication(error);
             status = {
               support: "unavailable" as const,
               reason: "store_unavailable" as const,
@@ -355,6 +371,7 @@ export class RelayAgentTranscriptLifecycleRuntime {
     } catch (error) {
       const wireError = storeFailureCode(error);
       if (!wireError) throw error;
+      if (isUnavailableStoreFailure(error)) this.withdrawPublication(error);
       return delivery("CONTROL", errorFrame(
         request,
         context.hostEpoch,
@@ -364,21 +381,98 @@ export class RelayAgentTranscriptLifecycleRuntime {
     }
   }
 
+  handleUnavailableRequest(
+    bytes: Uint8Array,
+    metadata: RelayV2FrameMetadata,
+    context: RelayAgentExtensionRouteContext,
+  ): RelayAgentRuntimeDelivery {
+    const decoded = decodeRelayAgentTranscriptLifecycleFrame(bytes, metadata);
+    const request = decoded.frame;
+    if (decoded.normalized.kind !== "request") throw new RelayAgentExtensionRouteBindingError();
+    this.assertRoute(request, context);
+    if (request.expectedHostEpoch !== context.hostEpoch) {
+      return delivery("CONTROL", errorFrame(
+        request,
+        context.hostEpoch,
+        "HOST_EPOCH_MISMATCH",
+        false,
+        {
+          expectedHostEpoch: request.expectedHostEpoch as string,
+          actualHostEpoch: context.hostEpoch,
+        },
+      ));
+    }
+    if (request.type === "agent.timeline.status.get") {
+      return delivery("CONTROL", jsonFrame({
+        protocolVersion: 2,
+        kind: "response",
+        type: "agent.timeline.status",
+        requestId: request.requestId,
+        hostId: context.hostId,
+        hostEpoch: context.hostEpoch,
+        scopeId: context.scopeId,
+        sessionId: context.sessionId,
+        payload: {
+          capability: RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+          support: "unavailable",
+          reason: "store_unavailable",
+          liveSource: "absent",
+          activeSourceEpoch: null,
+          timelineEpoch: null,
+          currentAgentSeq: null,
+          earliestReplaySeq: null,
+          limits: null,
+        },
+      }));
+    }
+    return delivery("CONTROL", errorFrame(
+      request,
+      context.hostEpoch,
+      "AGENT_TIMELINE_UNAVAILABLE",
+      false,
+    ));
+  }
+
   async ingestTrustedSource(
     binding: RelayAgentTrustedAdapterBinding,
     sourceInput: unknown,
   ): Promise<RelayAgentTrustedIngestResult> {
-    const reduction = await this.store.ingest(binding, sourceInput);
-    return {
+    let reduction: RelayAgentAuthorityReduction;
+    try {
+      reduction = await this.store.ingest(binding, sourceInput);
+    } catch (error) {
+      if (isUnavailableStoreFailure(error)) this.withdrawPublication(error);
+      throw error;
+    }
+    const result: RelayAgentTrustedIngestResult = {
       reduction,
       delivery: reduction.publicEvent === null
         ? null
         : delivery("LIVE", publicEventFrame(reduction.publicEvent)),
     };
+    if (result.delivery !== null && this.publication !== null) {
+      // Durable commit is the source ACK boundary. Network fanout is bounded
+      // best effort and cannot turn a slow/stale route into a producer failure.
+      void this.publication.publishLive(result.delivery).catch(() => undefined);
+    }
+    return result;
   }
 
   async deleteTimeline(target: RelayAgentAuthorityTarget): Promise<RelayAgentRuntimeDelivery> {
-    return delivery("LIVE", resetFrame(await this.store.deleteTimeline(target)));
+    try {
+      const deleted = delivery("LIVE", resetFrame(await this.store.deleteTimeline(target)));
+      if (this.publication !== null) {
+        void this.publication.publishLive(deleted).catch(() => undefined);
+      }
+      return deleted;
+    } catch (error) {
+      if (isUnavailableStoreFailure(error)) this.withdrawPublication(error);
+      throw error;
+    }
+  }
+
+  private withdrawPublication(error: unknown): void {
+    try { this.publication?.withdraw(error); } catch {}
   }
 }
 

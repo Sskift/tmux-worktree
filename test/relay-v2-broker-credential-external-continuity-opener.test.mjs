@@ -4,6 +4,9 @@ import test from "node:test";
 const openerModule = await import(
   "../dist/relay/v2/brokerCredentialExternalContinuityOpener.js"
 );
+const serverRuntimeModule = await import(
+  "../dist/relay/v2/brokerServerRuntime.js"
+);
 const hostActivationModule = await import(
   "../dist/relay/v2/brokerHostWssNodeExternalContinuityActivation.js"
 );
@@ -236,6 +239,71 @@ function createOpener({
     genesis,
   });
 }
+
+test("production broker composition captures E0 dependencies before native open", () => {
+  const opened = nativeLoader(() => {
+    throw new Error("native open must not run during composition capture");
+  });
+  const external = backend();
+  let resolverThis;
+  const options = Object.freeze({
+    trustedHome: TRUSTED_HOME,
+    nativeLoader: opened.loader,
+    externalContinuityConfig: config(),
+    externalContinuityAttemptProvider: external.provider,
+    genesis: validGenesis(),
+    resolveHttpSourceKey: function resolveHttpSourceKey() {
+      resolverThis = this;
+      return "isolated-source";
+    },
+  });
+  const composition = serverRuntimeModule.createRelayV2BrokerProductionComposition(options);
+  assert.equal(typeof composition.openCredentialAuthority, "function");
+  assert.equal(typeof composition.resolveHttpSourceKey, "function");
+  assert.equal(composition.resolveHttpSourceKey(Object.freeze({})), "isolated-source");
+  assert.equal(resolverThis, undefined);
+  assert.deepEqual(opened.state.openCalls, 0);
+  assert.deepEqual(external.state.resolveCalls, 0);
+
+  const missing = { ...options };
+  delete missing.nativeLoader;
+  assert.throws(
+    () => serverRuntimeModule.createRelayV2BrokerProductionComposition(missing),
+    /production composition bundle is invalid/,
+  );
+  assert.equal(opened.state.openCalls, 0);
+
+  let accessorReads = 0;
+  const accessor = { ...options };
+  Object.defineProperty(accessor, "externalContinuityConfig", {
+    enumerable: true,
+    get() {
+      accessorReads += 1;
+      throw new Error("config getter must not run");
+    },
+  });
+  assert.throws(
+    () => serverRuntimeModule.createRelayV2BrokerProductionComposition(accessor),
+    /production composition bundle is invalid/,
+  );
+  assert.equal(accessorReads, 0);
+
+  let proxyTouches = 0;
+  const proxy = new Proxy(options, {
+    get() { proxyTouches += 1; throw new Error("proxy dependency touched"); },
+    ownKeys() { proxyTouches += 1; throw new Error("proxy dependency touched"); },
+    getOwnPropertyDescriptor() {
+      proxyTouches += 1;
+      throw new Error("proxy dependency touched");
+    },
+  });
+  assert.throws(
+    () => serverRuntimeModule.createRelayV2BrokerProductionComposition(proxy),
+    /production composition bundle is invalid/,
+  );
+  assert.equal(proxyTouches, 0);
+  assert.equal(opened.state.openCalls, 0);
+});
 
 function hostSharedRuntimeOptions() {
   return {
@@ -504,6 +572,10 @@ test("post-transfer authority faults retain owner mappings and close without ope
     assert.equal(published, undefined, `${selected.name}: no authority handle is published`);
     assert.equal(Object.hasOwn(opener, "ready"), false);
     assert.equal(store.closeCalls, 1, `${selected.name}: authority owns the only close`);
+    if (selected.mode === "auth") {
+      assert.equal(external.state.startCalls, 0, `${selected.name}: transport never starts`);
+      assert.equal(external.state.discardCalls, 1, `${selected.name}: resolved attempt is discarded`);
+    }
     assert.equal(core.inspectLiveAuthCompositionLatch(), "latched_fail_closed", selected.name);
     assert.deepEqual(
       core.recheckConnectionAccessExpiry("client", "missing", "missing"),

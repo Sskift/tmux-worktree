@@ -56,6 +56,49 @@
     }
   },
   {
+    "name": "terminal-open-reset-without-resume",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.open",
+    "deriveFrom": "terminal-open-new",
+    "set": {
+      "/requestId": "open-3",
+      "/payload/openId": "logical-reset-without-resume",
+      "/payload/mode": "reset"
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "terminal.open",
+      "requestId": "open-3"
+    }
+  },
+  {
+    "name": "terminal-open-reset-with-resume",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.open",
+    "deriveFrom": "terminal-open-reset-without-resume",
+    "set": {
+      "/requestId": "open-4",
+      "/payload/openId": "logical-reset-with-resume",
+      "/payload/resume": {
+        "generation": "generation-uuid",
+        "resumeToken": "opaque-token"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "terminal.open",
+      "requestId": "open-4"
+    }
+  },
+  {
     "name": "terminal-opened",
     "channel": "public",
     "direction": "host-to-client-via-broker",

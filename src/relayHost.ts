@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { types as nodeTypes } from "node:util";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
 import {
@@ -32,6 +33,10 @@ import {
   type TerminalControlRequest,
   type TerminalControlRequestInput,
 } from "./terminalControl/index.js";
+import type {
+  RelayV2HostCanonicalProductionComposition,
+  RelayV2HostCanonicalProductionCompositionOptions,
+} from "./relay/v2/hostCanonicalProductionComposition.js";
 
 export type RelayHostProfile = "v1" | "v2";
 
@@ -623,6 +628,73 @@ export function relayV2HostCarrierUrl(relay: string): string {
   }
   base.pathname = "/host";
   return base.toString();
+}
+
+function relayV2HostProductionCompositionFailure(): CliError {
+  return new CliError("Relay v2 host production composition prerequisites are invalid");
+}
+
+function captureRelayV2HostProductionDataObject(
+  value: unknown,
+  expected: readonly string[],
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || nodeTypes.isProxy(value)) throw relayV2HostProductionCompositionFailure();
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw relayV2HostProductionCompositionFailure();
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw relayV2HostProductionCompositionFailure();
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.length !== expected.length
+    || keys.some((key) => typeof key !== "string" || !expected.includes(key))
+    || expected.some((key) => {
+      const descriptor = descriptors[key];
+      return descriptor === undefined || !Object.hasOwn(descriptor, "value");
+    })) throw relayV2HostProductionCompositionFailure();
+  return Object.fromEntries(expected.map((key) => [key, descriptors[key]!.value]));
+}
+
+/**
+ * The sole default-off production H0-H3 owner root. It recovers and owns the
+ * injected durable authorities and is not called by the Relay v1 CLI run path.
+ */
+export async function openRelayV2HostCanonicalProductionComposition(
+  rawProfile: RelayV2HostOptions,
+  options: RelayV2HostCanonicalProductionCompositionOptions,
+): Promise<RelayV2HostCanonicalProductionComposition | null> {
+  const profile = captureRelayV2HostProductionDataObject(rawProfile, [
+    "profile", "relay", "hostId", "displayName", "local", "statusFile",
+    "credentialReference",
+  ]);
+  if (profile.profile !== "v2"
+    || typeof profile.relay !== "string"
+    || typeof profile.hostId !== "string"
+    || !isValidHostId(profile.hostId)
+    || typeof profile.displayName !== "string"
+    || typeof profile.local !== "string"
+    || typeof profile.statusFile !== "string"
+    || typeof profile.credentialReference !== "string"
+    || !validCredentialReference(profile.credentialReference)) {
+    throw relayV2HostProductionCompositionFailure();
+  }
+  relayV2HostCarrierUrl(profile.relay);
+  let entry: typeof import("./relay/v2/hostCanonicalProductionComposition.js");
+  try {
+    entry = await import("./relay/v2/hostCanonicalProductionComposition.js");
+  } catch {
+    throw relayV2HostProductionCompositionFailure();
+  }
+  return entry.openRelayV2HostCanonicalProductionComposition(Object.freeze({
+    relayUrl: profile.relay,
+    hostId: profile.hostId,
+    credentialReference: profile.credentialReference,
+  }), options);
 }
 
 export function parseRelayHostOptions(

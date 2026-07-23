@@ -1874,6 +1874,86 @@ class RelayV2ConnectionActorTest {
         }
 
     @Test
+    fun `terminal send uses current online generation and preserves stale and not sent`() =
+        runBlocking {
+            val harness = Harness()
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val recovery = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                val authority = recovery.repositoryAuthority
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.QUERYING)
+
+                val beforeOnline = transport.sendAttemptCount.get()
+                assertEquals(
+                    RelayV2TerminalExactGenerationSendResult.Stale,
+                    harness.actor.sendTerminalIfCurrent(authority, "querying".toByteArray()),
+                )
+                assertEquals(beforeOnline, transport.sendAttemptCount.get())
+
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        recovery,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = recovery.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+
+                val staleAuthority = authority.copy(
+                    generation = authority.generation.copy(
+                        connectionGeneration = authority.generation.connectionGeneration + 1,
+                    ),
+                )
+                val beforeStale = transport.sendAttemptCount.get()
+                assertEquals(
+                    RelayV2TerminalExactGenerationSendResult.Stale,
+                    harness.actor.sendTerminalIfCurrent(
+                        staleAuthority,
+                        "stale-terminal".toByteArray(),
+                    ),
+                )
+                assertEquals(beforeStale, transport.sendAttemptCount.get())
+
+                val terminalOversize = ByteArray(65_537)
+                assertTrue(terminalOversize.size < RelayV2Codec.PUBLIC_FRAME_BYTES)
+                assertEquals(
+                    RelayV2TerminalExactGenerationSendResult.Stale,
+                    harness.actor.sendTerminalIfCurrent(authority, terminalOversize),
+                )
+                assertEquals(beforeStale, transport.sendAttemptCount.get())
+
+                transport.sendResult = false
+                assertEquals(
+                    RelayV2TerminalExactGenerationSendResult.NotSent,
+                    harness.actor.sendTerminalIfCurrent(
+                        authority,
+                        "not-sent-terminal".toByteArray(),
+                    ),
+                )
+                assertEquals(beforeStale + 1, transport.sendAttemptCount.get())
+
+                transport.sendResult = true
+                assertEquals(
+                    RelayV2TerminalExactGenerationSendResult.Sent,
+                    harness.actor.sendTerminalIfCurrent(authority, "sent-terminal".toByteArray()),
+                )
+                assertEquals(beforeStale + 2, transport.sendAttemptCount.get())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
     fun `outbox send and disconnect fence share one actor owned serial segment`() = runBlocking {
         val sendEntered = CountDownLatch(1)
         val releaseSend = CountDownLatch(1)

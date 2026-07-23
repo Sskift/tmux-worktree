@@ -69,6 +69,8 @@ export interface CodexAppServerNotificationByteSource extends AsyncIterable<Uint
   cancel(): void | Promise<void>;
 }
 
+export type CodexAppServerNotificationUnavailableSink = (error: unknown) => void;
+
 interface NormalizedByteSource {
   openIterator(): unknown;
   cancel(): unknown;
@@ -184,6 +186,7 @@ function normalizeChunk(value: unknown): Uint8Array | null {
  */
 export class CodexAppServerNotificationSource {
   readonly #source: Readonly<NormalizedByteSource>;
+  readonly #onUnavailable: CodexAppServerNotificationUnavailableSink | null;
   readonly #frameBuffer = new Uint8Array(
     CODEX_APP_SERVER_NOTIFICATION_SOURCE_LIMITS.maxFrameBytes,
   );
@@ -202,9 +205,18 @@ export class CodexAppServerNotificationSource {
   #closeDeferred: Deferred<void> | null = null;
   #callbackPhase: object | null = null;
   #stopPhase: object | null = null;
+  #unavailableNotified = false;
 
-  constructor(byteSource: CodexAppServerNotificationByteSource) {
+  constructor(
+    byteSource: CodexAppServerNotificationByteSource,
+    onUnavailable: CodexAppServerNotificationUnavailableSink | null = null,
+  ) {
     this.#source = normalizeByteSource(byteSource);
+    if (onUnavailable !== null
+      && (typeof onUnavailable !== "function" || nodeTypes.isProxy(onUnavailable))) {
+      throw sourceError("INVALID_SOURCE");
+    }
+    this.#onUnavailable = onUnavailable;
   }
 
   get state(): CodexAppServerNotificationSourceState {
@@ -289,7 +301,10 @@ export class CodexAppServerNotificationSource {
         if (!this.#admitting) return;
         if (item.done) {
           if (this.#bufferedBytes !== 0) this.#fail("PARTIAL_EOF");
-          else this.#beginClose();
+          else {
+            this.#notifyUnavailable(new Error("Codex notification source ended"));
+            this.#beginClose();
+          }
           return;
         }
         const chunk = normalizeChunk(item.value);
@@ -355,7 +370,14 @@ export class CodexAppServerNotificationSource {
     this.#failure ??= code;
     this.#state = "sealed";
     this.#admitting = false;
+    this.#notifyUnavailable(sourceError(code));
     this.#beginClose();
+  }
+
+  #notifyUnavailable(error: unknown): void {
+    if (this.#unavailableNotified) return;
+    this.#unavailableNotified = true;
+    try { this.#onUnavailable?.(error); } catch {}
   }
 
   #beginClose(): void {

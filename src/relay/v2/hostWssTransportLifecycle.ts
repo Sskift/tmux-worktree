@@ -1,4 +1,4 @@
-import { types as nodeTypes } from "node:util";
+import { TextDecoder, types as nodeTypes } from "node:util";
 import WebSocket from "ws";
 import { RELAY_V2_CARRIER_FRAME_BYTES } from "./codec.js";
 import type {
@@ -31,6 +31,10 @@ const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1_048_576;
 const DEFAULT_CLOSE_DRAIN_DEADLINE_MS = 5_000;
 const MAX_CLOSE_DRAIN_DEADLINE_MS = 30_000;
 const factoryAuthorityKey = Object.freeze({});
+const fatalUtf8Decoder = new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: true,
+});
 
 type DataRecord = Record<string, unknown>;
 type CloseDrainScheduler = (delayMs: number, callback: () => void) => () => void;
@@ -333,10 +337,22 @@ function socketString(socket: CapturedSocket, name: "protocol" | "extensions"): 
   return typeof value === "string" ? value : null;
 }
 
-function binaryFrame(value: unknown): Uint8Array | null {
+function textFrame(value: unknown): Uint8Array | null {
+  if (typeof value === "string") return Buffer.from(value, "utf8");
   if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
   if (!(value instanceof Uint8Array) || !(value.buffer instanceof ArrayBuffer)) return null;
   return Uint8Array.from(value);
+}
+
+function strictUtf8Text(value: Uint8Array): string | null {
+  try {
+    const text = fatalUtf8Decoder.decode(value);
+    const roundTrip = Buffer.from(text, "utf8");
+    const raw = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    return roundTrip.byteLength === raw.byteLength && roundTrip.equals(raw) ? text : null;
+  } catch {
+    return null;
+  }
 }
 
 function defaultCloseDrainScheduler(delayMs: number, callback: () => void): () => void {
@@ -508,6 +524,11 @@ function createLifecycle(input: Readonly<{
       || !actorCallbacksActive || writing !== null) return;
     const item = accepted[0];
     if (item === undefined) return;
+    const text = strictUtf8Text(item.bytes);
+    if (text === null) {
+      closeSocket(1011, "write_failed");
+      return;
+    }
     writing = item;
     let returned: unknown;
     let sendAccepted = false;
@@ -557,8 +578,8 @@ function createLifecycle(input: Readonly<{
     };
     try {
       returned = Reflect.apply(socket.send, socket.receiver, [
-        item.bytes,
-        Object.freeze({ binary: true, compress: false }),
+        text,
+        Object.freeze({ binary: false, compress: false }),
         (error?: unknown): void => {
           if (callbackObserved) callbackFailed = true;
           callbackObserved = true;
@@ -599,7 +620,7 @@ function createLifecycle(input: Readonly<{
 
   const onMessage = (data: unknown, isBinary: unknown): void => {
     if (phase !== "open" || !actorCallbacksActive || connection === null) return;
-    const bytes = isBinary === true ? binaryFrame(data) : null;
+    const bytes = isBinary === false ? textFrame(data) : null;
     if (bytes === null || bytes.byteLength > RELAY_V2_CARRIER_FRAME_BYTES) {
       protocolFailure();
       return;

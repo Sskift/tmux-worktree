@@ -95,6 +95,23 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHello
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalCheckpointEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalCheckpointKey
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitBatchEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitFenceEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJournalStore
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJournalTransaction
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalRecoveryAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeClaim
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeSessionSelector
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialInstall
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialOwner
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialStore
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 import java.lang.reflect.Proxy
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
@@ -251,23 +268,49 @@ class RelayV2BaseRuntimeCompositionTest {
         runBlocking {
             data class Case(
                 val name: String,
-                val negotiated: Boolean = false,
+                val androidOffers: Boolean = false,
+                val brokerOffers: Boolean = false,
+                val hostOffers: Boolean = false,
                 val foreignCut: Boolean = false,
                 val disconnectBeforeRequest: Boolean = false,
                 val expectedRequest: Boolean = false,
             )
 
             listOf(
-                Case("extension not negotiated"),
+                Case(
+                    "Android offer missing",
+                    brokerOffers = true,
+                    hostOffers = true,
+                ),
+                Case(
+                    "Broker offer missing",
+                    androidOffers = true,
+                    hostOffers = true,
+                ),
+                Case(
+                    "Host offer missing",
+                    androidOffers = true,
+                    brokerOffers = true,
+                ),
                 Case(
                     "three-party negotiated current cut",
-                    negotiated = true,
+                    androidOffers = true,
+                    brokerOffers = true,
+                    hostOffers = true,
                     expectedRequest = true,
                 ),
-                Case("foreign cut", negotiated = true, foreignCut = true),
+                Case(
+                    "foreign cut",
+                    androidOffers = true,
+                    brokerOffers = true,
+                    hostOffers = true,
+                    foreignCut = true,
+                ),
                 Case(
                     "disconnected cut",
-                    negotiated = true,
+                    androidOffers = true,
+                    brokerOffers = true,
+                    hostOffers = true,
                     disconnectBeforeRequest = true,
                 ),
             ).forEach { case ->
@@ -275,7 +318,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 val owner = Harness(
                     autoConnect = true,
                     agentDurableRepository = agent.repository,
-                    agentOptionalCapabilities = if (case.negotiated) {
+                    agentOptionalCapabilities = if (case.androidOffers) {
                         setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
                     } else {
                         emptySet()
@@ -293,8 +336,38 @@ class RelayV2BaseRuntimeCompositionTest {
                     null
                 }
                 try {
-                    owner.connectOnline(agentCapabilityNegotiated = case.negotiated)
+                    val hello = owner.connectOnline(
+                        brokerAgentCapability = case.brokerOffers,
+                        hostAgentCapability = case.hostOffers,
+                    )
                     foreign?.connectOnline(agentCapabilityNegotiated = true)
+                    val expectedAvailable = case.androidOffers &&
+                        case.brokerOffers && case.hostOffers
+                    assertEquals(
+                        case.name,
+                        case.androidOffers,
+                        AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in
+                            hello.payload().stringList("capabilities"),
+                    )
+                    val availability = owner.composition.agentCapabilityAvailability.value
+                    if (expectedAvailable) {
+                        assertTrue(
+                            case.name,
+                            availability is RelayV2AgentCapabilityAvailability.Available,
+                        )
+                        assertEquals(
+                            case.name,
+                            1L,
+                            (availability as RelayV2AgentCapabilityAvailability.Available)
+                                .generation.connectionGeneration,
+                        )
+                    } else {
+                        assertEquals(
+                            case.name,
+                            RelayV2AgentCapabilityAvailability.Unavailable,
+                            availability,
+                        )
+                    }
                     val ownerProduct = withTimeout(TIMEOUT_MS) {
                         owner.composition.sessions.first { it.isNotEmpty() }.single()
                     }
@@ -311,6 +384,11 @@ class RelayV2BaseRuntimeCompositionTest {
                         owner.composition.disconnectAndDrain(
                             owner.profile.identity,
                             "selected-session-status-disconnect",
+                        )
+                        assertEquals(
+                            case.name,
+                            RelayV2AgentCapabilityAvailability.Unavailable,
+                            owner.composition.agentCapabilityAvailability.value,
                         )
                     }
                     val sendsBeforeRequest = owner.transport().sendCount()
@@ -369,6 +447,85 @@ class RelayV2BaseRuntimeCompositionTest {
                     owner.close()
                     foreign?.close()
                 }
+            }
+
+            val retry = ControlledRetryDelay()
+            val replacementAgent = SeededAgentDurableRepository()
+            val replacement = Harness(
+                autoConnect = true,
+                retryDelayBlock = retry::awaitDelay,
+                agentDurableRepository = replacementAgent.repository,
+                agentOptionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            try {
+                replacement.connectOnline(agentCapabilityNegotiated = true)
+                val firstTransport = replacement.transport()
+                val first = replacement.composition.agentCapabilityAvailability.value
+                    as RelayV2AgentCapabilityAvailability.Available
+                assertEquals(1L, first.generation.connectionGeneration)
+
+                firstTransport.fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(1))
+                assertEquals(
+                    RelayV2AgentCapabilityAvailability.Unavailable,
+                    replacement.composition.agentCapabilityAvailability.value,
+                )
+
+                retry.release(0)
+                replacement.connectOnline(
+                    index = 1,
+                    agentCapabilityNegotiated = true,
+                )
+                val replacementAvailable =
+                    replacement.composition.agentCapabilityAvailability.value
+                        as RelayV2AgentCapabilityAvailability.Available
+                assertEquals(2L, replacementAvailable.generation.connectionGeneration)
+
+                firstTransport.sendAgentFixture("status-available")
+                delay(50)
+                assertEquals(
+                    replacementAvailable,
+                    replacement.composition.agentCapabilityAvailability.value,
+                )
+
+                replacement.transport(1).sendAgentFixture("status-available")
+                withTimeout(TIMEOUT_MS) {
+                    replacement.composition.agentCapabilityAvailability.first {
+                        it == RelayV2AgentCapabilityAvailability.Unavailable
+                    }
+                }
+                val currentProduct = withTimeout(TIMEOUT_MS) {
+                    replacement.composition.sessions.first { it.isNotEmpty() }.single()
+                }
+                assertEquals(
+                    AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable,
+                    replacement.composition.requestSelectedSessionAgentStatus(
+                        currentProduct.replyCut,
+                    ),
+                )
+                val commitsBeforeLateFrame = replacementAgent.mutationCommits.get()
+                replacement.transport(1).sendAgentFixture("live-entry-redacted")
+                delay(50)
+                assertEquals(commitsBeforeLateFrame, replacementAgent.mutationCommits.get())
+                assertEquals("11", replacementAgent.record().state.extensionLane.lastAgentSeq)
+                assertEquals(
+                    RelayV2BaseRuntimePhase.ONLINE,
+                    replacement.composition.state.value.phase,
+                )
+
+                replacement.transport(1).fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(2))
+                retry.release(1)
+                replacement.connectOnline(index = 2, agentCapabilityNegotiated = true)
+                val restored = replacement.composition.agentCapabilityAvailability.value
+                    as RelayV2AgentCapabilityAvailability.Available
+                assertEquals(3L, restored.generation.connectionGeneration)
+            } finally {
+                replacement.close()
             }
         }
 
@@ -846,23 +1003,259 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `an unowned effect still fails closed without retry`() = runBlocking {
-        val retry = ControlledRetryDelay()
-        val unowned = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
+    fun `host presence suspends cached state snapshots gaps once and rehandshakes`() = runBlocking {
+        val harness = Harness(autoConnect = true)
         try {
-            unowned.connectOnline()
-            unowned.transport().sendFixture("host-presence-online")
-            val failed = unowned.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
-            assertEquals(
-                RelayV2BaseRuntimeFailure.RuntimeIncomplete("UNOWNED_EFFECT_host.presence"),
-                failed.failure,
+            harness.connectOnline()
+            val original = harness.transport()
+            val cachedSessions = harness.composition.sessions.first { it.isNotEmpty() }
+
+            fun presence(epoch: String, revision: String, state: String) =
+                fixture("host-presence-online").also { frame ->
+                    frame.payload()["brokerEpoch"] = epoch
+                    frame.payload()["revision"] = revision
+                    frame.payload()["state"] = state
+                    frame.payload()["reason"] =
+                        if (state == "offline") "disconnected" else "reconnected"
+                }
+
+            fun snapshot(
+                request: Map<String, Any?>,
+                epoch: String,
+                revision: String,
+                state: String,
+            ) = fixture("hosts-snapshot").also { frame ->
+                frame["requestId"] = request.stringValue("requestId")
+                frame.payload()["brokerEpoch"] = epoch
+                frame.payload()["revision"] = revision
+                @Suppress("UNCHECKED_CAST")
+                val item = frame.payload().objectList("items").single() as MutableMap<String, Any?>
+                item["state"] = state
+            }
+
+            original.sendFrame(presence("broker-process-uuid", "18", "offline"))
+            harness.awaitPhase(RelayV2BaseRuntimePhase.SUSPENDED)
+            assertEquals(cachedSessions, harness.composition.sessions.value)
+            val initialSnapshot = original.awaitSentType("hosts.snapshot.get")
+            assertTrue(initialSnapshot.payload().isEmpty())
+            original.sendFrame(presence("broker-process-uuid", "18", "offline"))
+            delay(50)
+            assertEquals(1, original.framesOfType("hosts.snapshot.get").size)
+            original.sendFrame(
+                snapshot(initialSnapshot, "broker-process-uuid", "18", "offline"),
             )
-            assertFalse(retry.awaitCount(1, 200))
-            assertEquals(1, unowned.factory.requests.size)
+
+            original.sendFrame(presence("broker-process-uuid", "20", "offline"))
+            val gapSnapshot = original.awaitSentType("hosts.snapshot.get", index = 1)
+            original.sendFrame(presence("broker-process-uuid", "20", "offline"))
+            delay(50)
+            assertEquals(2, original.framesOfType("hosts.snapshot.get").size)
+            original.sendFrame(snapshot(gapSnapshot, "broker-process-uuid", "20", "offline"))
+
+            original.sendFrame(presence("broker-process-replacement", "1", "offline"))
+            val replacementSnapshot = original.awaitSentType("hosts.snapshot.get", index = 2)
+            original.sendFrame(presence("broker-process-replacement", "1", "offline"))
+            delay(50)
+            assertEquals(3, original.framesOfType("hosts.snapshot.get").size)
+            original.sendFrame(
+                snapshot(replacementSnapshot, "broker-process-replacement", "1", "offline"),
+            )
+
+            original.sendFrame(presence("broker-process-replacement", "2", "online"))
+            val successor = harness.awaitTransport(1)
+            harness.awaitPhase(RelayV2BaseRuntimePhase.CONNECTING)
+            assertFalse(harness.composition.state.value.phase == RelayV2BaseRuntimePhase.ONLINE)
+
+            original.sendFrame(presence("broker-process-replacement", "3", "online"))
+            original.sendFrame(
+                snapshot(replacementSnapshot, "broker-process-replacement", "3", "online"),
+            )
+            delay(50)
+            assertEquals(2, harness.factory.requests.size)
+            assertTrue(original.framesOfType("terminal.closed").isEmpty())
+
+            successor.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            val relayWelcome = fixture("relay-welcome")
+            relayWelcome.payload()["brokerEpoch"] = "broker-process-replacement"
+            successor.sendFrame(relayWelcome)
+            val hello = successor.awaitSentFrame()
+            assertFalse(harness.composition.state.value.phase == RelayV2BaseRuntimePhase.ONLINE)
+            val welcome = fixture("host-welcome-caught-up")
+            welcome["requestId"] = hello.stringValue("requestId")
+            successor.sendFrame(welcome)
+            harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+            assertEquals(2, harness.factory.requests.size)
+
+            val timeoutDeadline = CompletableDeferred<Unit>()
+            val retry = ControlledRetryDelay()
+            val timed = Harness(
+                autoConnect = true,
+                retryDelayBlock = retry::awaitDelay,
+                actorRecoveryWatchdogDelay = { timeoutDeadline.await() },
+            )
+            try {
+                timed.connectOnline()
+                timed.transport().sendFrame(
+                    presence("broker-process-uuid", "18", "offline"),
+                )
+                timed.transport().awaitSentType("hosts.snapshot.get")
+                timeoutDeadline.complete(Unit)
+                assertTrue(retry.awaitCount(1))
+                retry.release(0)
+                timed.connectOnline(index = 1)
+                delay(50)
+                assertEquals(2, timed.factory.requests.size)
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, timed.composition.state.value.phase)
+            } finally {
+                timed.close()
+            }
         } finally {
-            unowned.close()
+            harness.close()
         }
     }
+
+    @Test
+    fun `auth expiring refreshes exact generation and drains old transport before successor welcome`() =
+        runBlocking {
+            val rolloverEntered = CompletableDeferred<RelayV2Profile>()
+            val rolloverResult = CompletableDeferred<RelayV2CredentialRolloverResult>()
+            val rolloverCalls = AtomicInteger()
+            val rollover = RelayV2CredentialRolloverPort { expected ->
+                rolloverCalls.incrementAndGet()
+                rolloverEntered.complete(expected)
+                rolloverResult.await()
+            }
+            val harness = Harness(autoConnect = true, credentialRollover = rollover)
+            try {
+                harness.connectOnline()
+                val original = harness.transport()
+                val offline = fixture("host-presence-online").also { frame ->
+                    frame.payload()["revision"] = "18"
+                    frame.payload()["state"] = "offline"
+                    frame.payload()["reason"] = "disconnected"
+                }
+                original.sendFrame(offline)
+                harness.awaitPhase(RelayV2BaseRuntimePhase.SUSPENDED)
+                original.awaitSentType("hosts.snapshot.get")
+
+                original.sendFixture("auth-expiring")
+                val expected = withTimeout(TIMEOUT_MS) { rolloverEntered.await() }
+                original.sendFixture("auth-expiring")
+                delay(50)
+                assertEquals(1, rolloverCalls.get())
+                assertEquals(harness.profile, expected)
+
+                harness.advanceCredentialVersion(2)
+                rolloverResult.complete(
+                    RelayV2CredentialRolloverResult.Refreshed(
+                        expected.copy(credentialVersion = 2),
+                    ),
+                )
+                val successor = harness.awaitTransport(1)
+                assertEquals(1, original.closeCount())
+                assertEquals(2, harness.factory.requests.size)
+                assertEquals("twcap2.test-access", harness.factory.requests[0].accessToken)
+                assertEquals("twcap2.test-access-v2", harness.factory.requests[1].accessToken)
+                assertFalse(
+                    harness.composition.state.value.phase == RelayV2BaseRuntimePhase.ONLINE,
+                )
+
+                original.sendFixture("auth-expiring")
+                delay(50)
+                assertEquals(1, rolloverCalls.get())
+                assertEquals(2, harness.factory.requests.size)
+
+                successor.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                successor.sendFixture("relay-welcome")
+                val hello = successor.awaitSentFrame()
+                assertFalse(
+                    harness.composition.state.value.phase == RelayV2BaseRuntimePhase.ONLINE,
+                )
+                val welcome = fixture("host-welcome-caught-up")
+                welcome["requestId"] = hello.stringValue("requestId")
+                successor.sendFrame(welcome)
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+                assertEquals(2, harness.factory.requests.size)
+            } finally {
+                rolloverResult.complete(RelayV2CredentialRolloverResult.Unavailable)
+                harness.close()
+            }
+
+            val transportLossEntered = CompletableDeferred<RelayV2Profile>()
+            val transportLossResult = CompletableDeferred<RelayV2CredentialRolloverResult>()
+            val retry = ControlledRetryDelay()
+            val retryAdmissions = AtomicInteger()
+            val transportLoss = Harness(
+                autoConnect = true,
+                credentialRollover = RelayV2CredentialRolloverPort { expected ->
+                    transportLossEntered.complete(expected)
+                    transportLossResult.await()
+                },
+                retryDelayBlock = retry::awaitDelay,
+                afterRetryableFailureAdmissionDetached = { retryAdmissions.incrementAndGet() },
+            )
+            try {
+                transportLoss.connectOnline()
+                val original = transportLoss.transport()
+                original.sendFixture("auth-expiring")
+                val expected = withTimeout(TIMEOUT_MS) { transportLossEntered.await() }
+                original.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+                transportLoss.awaitPhase(RelayV2BaseRuntimePhase.CONNECTING)
+
+                assertFalse(retry.awaitCount(1, timeoutMs = 200))
+                assertEquals(0, retryAdmissions.get())
+                assertEquals(1, transportLoss.factory.requests.size)
+                assertEquals(
+                    "twcap2.test-access",
+                    transportLoss.factory.requests.single().accessToken,
+                )
+
+                transportLoss.advanceCredentialVersion(2)
+                transportLossResult.complete(
+                    RelayV2CredentialRolloverResult.Refreshed(
+                        expected.copy(credentialVersion = 2),
+                    ),
+                )
+                transportLoss.awaitTransport(1)
+                assertEquals(2, transportLoss.factory.requests.size)
+                assertEquals(
+                    "twcap2.test-access-v2",
+                    transportLoss.factory.requests[1].accessToken,
+                )
+                delay(50)
+                assertEquals(2, transportLoss.factory.requests.size)
+            } finally {
+                transportLossResult.complete(RelayV2CredentialRolloverResult.Unavailable)
+                transportLoss.close()
+            }
+
+            val failedCalls = AtomicInteger()
+            val failed = Harness(
+                autoConnect = true,
+                credentialRollover = RelayV2CredentialRolloverPort {
+                    failedCalls.incrementAndGet()
+                    RelayV2CredentialRolloverResult.Unavailable
+                },
+            )
+            try {
+                failed.connectOnline()
+                failed.transport().sendFixture("auth-expiring")
+                failed.transport().sendFixture("auth-expiring")
+                val state = failed.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+                assertEquals(1, failedCalls.get())
+                assertEquals(1, failed.factory.requests.size)
+                assertEquals(
+                    RelayV2BaseRuntimeFailure.RuntimeIncomplete(
+                        RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE,
+                    ),
+                    state.failure,
+                )
+                delay(50)
+                assertEquals(1, failed.factory.requests.size)
+            } finally {
+                failed.close()
+            }
+        }
 
     @Test
     fun `query commits before send and empty status effects finish recovery`() = runBlocking {
@@ -1292,6 +1685,155 @@ class RelayV2BaseRuntimeCompositionTest {
             assertEquals(listOf(1), harness.authority.freshBatchSizes)
         } finally {
             harness.close()
+        }
+    }
+
+    @Test
+    fun `correlated execute errors converge only exact durable outbox attempts`() = runBlocking {
+        data class EvidenceCase(
+            val name: String,
+            val code: String,
+            val retryable: Boolean,
+            val retryAfterMs: Long?,
+            val details: Map<String, Any?>?,
+            val reissues: Boolean,
+        )
+
+        fun errorFrame(
+            execute: Map<String, Any?>,
+            case: EvidenceCase,
+            requestId: String = execute.stringValue("requestId"),
+            commandId: String = execute.stringValue("commandId"),
+            disposition: String = "not_accepted",
+        ): MutableMap<String, Any?> = linkedMapOf(
+            "protocolVersion" to 2L,
+            "kind" to "response",
+            "type" to "error",
+            "requestId" to requestId,
+            "commandId" to commandId,
+            "hostId" to HOST_ID,
+            "hostEpoch" to HOST_EPOCH,
+            "scopeId" to execute.stringValue("scopeId"),
+            "sessionId" to execute.stringValue("sessionId"),
+            "payload" to null,
+            "error" to linkedMapOf(
+                "code" to case.code,
+                "message" to "Human text is deliberately not authority",
+                "retryable" to case.retryable,
+                "retryAfterMs" to case.retryAfterMs,
+                "commandDisposition" to disposition,
+                "details" to case.details,
+            ),
+        )
+
+        val evidenceCases = listOf(
+            EvidenceCase(
+                name = "retry",
+                code = "INTERNAL",
+                retryable = true,
+                retryAfterMs = null,
+                details = null,
+                reissues = false,
+            ),
+            EvidenceCase(
+                name = "reissue",
+                code = "COMMAND_WINDOW_EXPIRED",
+                retryable = false,
+                retryAfterMs = null,
+                details = mapOf("reissueRequired" to true),
+                reissues = true,
+            ),
+        )
+        evidenceCases.forEach { case ->
+            val commandId = "correlated-${case.name}"
+            val harness = Harness(autoConnect = true, outbox = queuedOutbox(commandId))
+            try {
+                harness.connectOnline()
+                val first = harness.transport().awaitSentType("command.execute")
+                val firstRequestId = first.stringValue("requestId")
+                harness.transport().sendFrame(errorFrame(first, case))
+                val second = harness.transport().awaitSentType("command.execute", index = 1)
+                val state = harness.authority.outboxState()
+
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+                assertEquals(1, harness.authority.statusCommits.get())
+                assertFalse(firstRequestId == second.stringValue("requestId"))
+                if (case.reissues) {
+                    val original = state.entries.single { it.commandId == commandId }
+                    val replacement = state.entries.single { it.commandId != commandId }
+                    assertEquals(RelayV2OutboxStateTag.REISSUED, original.state)
+                    assertEquals(replacement.commandId, second.stringValue("commandId"))
+                    assertEquals(RelayV2OutboxStateTag.SENDING, replacement.state)
+                    assertEquals(3L, harness.composition.outboxTimelineRevision.value)
+                } else {
+                    val retried = state.entries.single()
+                    assertEquals(commandId, second.stringValue("commandId"))
+                    assertEquals(RelayV2OutboxStateTag.SENDING, retried.state)
+                    assertEquals(2, retried.attempts.size)
+                    assertEquals(2L, harness.composition.outboxTimelineRevision.value)
+                }
+            } finally {
+                harness.close()
+            }
+        }
+
+        data class InvalidCase(
+            val name: String,
+            val foreignRequest: Boolean = false,
+            val commandId: String? = null,
+            val disposition: String = "not_accepted",
+            val expectedFailure: String,
+        )
+        val invalidCases = listOf(
+            InvalidCase(
+                name = "foreign-request",
+                foreignRequest = true,
+                expectedFailure = "UNOWNED_EFFECT_error",
+            ),
+            InvalidCase(
+                name = "tampered-command",
+                commandId = "other-command",
+                expectedFailure = "COMMAND_OUTBOX_RECOVERY_PROTOCOL_VIOLATION",
+            ),
+            InvalidCase(
+                name = "tampered-disposition",
+                disposition = "completed",
+                expectedFailure = "COMMAND_OUTBOX_RECOVERY_PROTOCOL_VIOLATION",
+            ),
+        )
+        invalidCases.forEach { case ->
+            val commandId = "guarded-${case.name}"
+            val harness = Harness(autoConnect = true, outbox = queuedOutbox(commandId))
+            try {
+                harness.connectOnline()
+                val execute = harness.transport().awaitSentType("command.execute")
+                val before = harness.authority.outboxState()
+                val frame = errorFrame(
+                    execute = execute,
+                    case = evidenceCases.first(),
+                    requestId = if (case.foreignRequest) {
+                        "foreign-execute-attempt"
+                    } else {
+                        execute.stringValue("requestId")
+                    },
+                    commandId = case.commandId ?: execute.stringValue("commandId"),
+                    disposition = case.disposition,
+                )
+                harness.transport().sendFrame(frame)
+                val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+                val after = harness.authority.outboxState()
+
+                assertEquals(
+                    RelayV2BaseRuntimeFailure.RuntimeIncomplete(case.expectedFailure),
+                    failed.failure,
+                )
+                assertEquals(0, harness.authority.statusCommits.get())
+                assertEquals(before.nextCreationOrder, after.nextCreationOrder)
+                assertEquals(before.entries, after.entries)
+                assertEquals(1, harness.transport().framesOfType("command.execute").size)
+            } finally {
+                harness.close()
+            }
         }
     }
 
@@ -1884,6 +2426,7 @@ class RelayV2BaseRuntimeCompositionTest {
         outboxReadFailure: Throwable? = null,
         newCommandId: () -> String = { "reply-${System.nanoTime()}" },
         retryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
+        actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { millis -> delay(millis) },
         beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
         beforeSessionProjectionPublish: suspend () -> Unit = {},
         beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
@@ -1895,6 +2438,8 @@ class RelayV2BaseRuntimeCompositionTest {
         agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
             AgentTranscriptLifecycleRuntimeHandlePort)? = null,
         agentOptionalCapabilities: Set<String> = emptySet(),
+        credentialRollover: RelayV2CredentialRolloverPort =
+            RelayV2CredentialRolloverPort { RelayV2CredentialRolloverResult.Unavailable },
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -1938,7 +2483,11 @@ class RelayV2BaseRuntimeCompositionTest {
                 parentScope = parent,
                 profile = profile,
                 credentialStore = credentials,
+                credentialRollover = credentialRollover,
                 stateSyncAuthority = authority,
+                terminalRuntimeAuthority = authority,
+                terminalPostCommitJournal = MemoryTerminalJournal(),
+                terminalResumeCredentials = MemoryTerminalCredentials(),
                 materializedSessions = authority,
                 activationOutbox = RelayV2ActivationOutboxReadPort(authority::readOutbox),
                 outboxAuthority = authority,
@@ -1950,6 +2499,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 newCommandId = newCommandId,
                 clock = { NOW_MS },
                 retryDelay = retryDelayBlock,
+                actorRecoveryWatchdogDelay = actorRecoveryWatchdogDelay,
                 beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
                 beforeSessionProjectionPublish = beforeSessionProjectionPublish,
                 beforeOnlineResyncReceiptSubmit = beforeOnlineResyncReceiptSubmit,
@@ -1962,16 +2512,18 @@ class RelayV2BaseRuntimeCompositionTest {
         suspend fun connectOnline(
             index: Int = 0,
             agentCapabilityNegotiated: Boolean = false,
+            brokerAgentCapability: Boolean = agentCapabilityNegotiated,
+            hostAgentCapability: Boolean = agentCapabilityNegotiated,
         ): MutableMap<String, Any?> {
             val transport = awaitTransport(index)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             val relayWelcome = fixture("relay-welcome")
-            if (agentCapabilityNegotiated) relayWelcome.addAgentCapability()
+            if (brokerAgentCapability) relayWelcome.addAgentCapability()
             transport.sendFrame(relayWelcome)
             val hello = transport.awaitSentFrame()
             val welcome = fixture("host-welcome-caught-up")
             welcome["requestId"] = hello.stringValue("requestId")
-            if (agentCapabilityNegotiated) welcome.addAgentCapability()
+            if (hostAgentCapability) welcome.addAgentCapability()
             transport.sendFrame(welcome)
             awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
             return hello
@@ -2090,6 +2642,10 @@ class RelayV2BaseRuntimeCompositionTest {
             withTimeout(TIMEOUT_MS) { composition.state.first { it.phase == phase } }
 
         fun transport(index: Int = 0): FakeTransport = factory.transports[index]
+
+        fun advanceCredentialVersion(version: Long) {
+            check(credentials.advance(profile.credentialReference, version))
+        }
 
         suspend fun closeAndAwaitTransportDrain() {
             composition.close()
@@ -2561,7 +3117,8 @@ class RelayV2BaseRuntimeCompositionTest {
     ) : RelayV2StateSyncAuthority,
         RelayV2OutboxRuntimeAuthority,
         RelayV2OutboxEnqueueAuthority,
-        RelayV2MaterializedSessionReadAuthority {
+        RelayV2MaterializedSessionReadAuthority,
+        RelayV2TerminalRecoveryAuthority {
         private val outboxCore = RelayV2OutboxAuthorityCore()
 
         @Volatile
@@ -2861,6 +3418,120 @@ class RelayV2BaseRuntimeCompositionTest {
             snapshotRequestId: String,
             snapshotId: String,
         ): RelayV2StateSyncResult = error("expiry is outside matched base-sync test")
+
+        override suspend fun loadTerminalUnderApplyLease(
+            key: RelayV2TerminalCheckpointKey,
+        ): RelayV2TerminalStoredCheckpoint = RelayV2TerminalStoredCheckpoint.Missing
+
+        override suspend fun reduceTerminalUnderApplyLease(
+            key: RelayV2TerminalCheckpointKey,
+            action: RelayV2TerminalAction,
+        ): RelayV2TerminalReduction = error("terminal is outside matched base-sync test")
+
+        override suspend fun claimResumableTerminalUnderApplyLease(
+            selector: RelayV2TerminalResumeSessionSelector,
+            authority: RelayV2RepositoryEffectAuthority,
+            requestId: String,
+            openAttempt: RelayV2TerminalOpenAttempt,
+            cols: Int,
+            rows: Int,
+        ): RelayV2TerminalResumeClaim? = null
+
+        override suspend fun recoverPostCommitUnknown(
+            authority: RelayV2RepositoryEffectAuthority,
+            key: RelayV2TerminalCheckpointKey,
+        ): RelayV2TerminalReduction? = null
+    }
+
+    private class MemoryTerminalCredentials : RelayV2TerminalResumeCredentialStore {
+        private val values = mutableMapOf<String, String>()
+
+        override fun installExact(
+            owner: RelayV2TerminalResumeCredentialOwner,
+            reference: String,
+            resumeToken: String,
+        ): RelayV2TerminalResumeCredentialInstall? {
+            val key = "${owner.profileId}:${owner.profileActivationGeneration}:$reference"
+            val existing = values[key]
+            if (existing != null && existing != resumeToken) return null
+            values[key] = resumeToken
+            return RelayV2TerminalResumeCredentialInstall("test-fingerprint", existing == null)
+        }
+
+        override fun read(
+            owner: RelayV2TerminalResumeCredentialOwner,
+            reference: String,
+        ): String? = values["${owner.profileId}:${owner.profileActivationGeneration}:$reference"]
+
+        override fun clear(owner: RelayV2TerminalResumeCredentialOwner, reference: String) {
+            values.remove("${owner.profileId}:${owner.profileActivationGeneration}:$reference")
+        }
+
+        override fun clearProfile(profileId: String, throughActivationGeneration: Long) {
+            values.keys.removeAll { key ->
+                val parts = key.split(':', limit = 3)
+                parts[0] == profileId && parts[1].toLong() <= throughActivationGeneration
+            }
+        }
+    }
+
+    private class MemoryTerminalJournal :
+        RelayV2TerminalPostCommitJournalStore,
+        RelayV2TerminalPostCommitJournalTransaction {
+        private val batches = linkedMapOf<String, RelayV2TerminalPostCommitBatchEntity>()
+        private val fences = linkedMapOf<String, RelayV2TerminalPostCommitFenceEntity>()
+        private var nextOrder = 1L
+        private var closed = false
+
+        override suspend fun <T> transaction(
+            block: RelayV2TerminalPostCommitJournalTransaction.() -> T,
+        ): T = synchronized(this) { block(this) }
+
+        override fun unsettledBatches() = batches.values.filter {
+            it.state == "RESERVED" || it.state == "RUNNING"
+        }.sortedBy { it.journalOrder }
+
+        override fun allBatches() = batches.values.sortedBy { it.journalOrder }
+        override fun batch(reservationId: String) = batches[reservationId]
+        override fun fifoHead() = unsettledBatches().firstOrNull()
+        override fun unsettledBatchCount() = unsettledBatches().size
+        override fun terminalOutcomeCount() = batches.size - unsettledBatchCount()
+        override fun insertBatch(
+            batch: RelayV2TerminalPostCommitBatchEntity,
+        ): RelayV2TerminalPostCommitBatchEntity {
+            check(batch.reservationId !in batches)
+            return batch.copy(journalOrder = nextOrder++).also { batches[it.reservationId] = it }
+        }
+
+        override fun updateBatch(batch: RelayV2TerminalPostCommitBatchEntity): Boolean =
+            if (batches.containsKey(batch.reservationId)) {
+                batches[batch.reservationId] = batch
+                true
+            } else {
+                false
+            }
+
+        override fun deleteBatch(reservationId: String) = batches.remove(reservationId) != null
+        override fun fence(authorityFingerprint: String) = fences[authorityFingerprint]
+        override fun fenceCount() = fences.size
+        override fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity) {
+            check(fence.authorityFingerprint !in fences)
+            fences[fence.authorityFingerprint] = fence
+        }
+
+        override fun batchesForAuthority(authorityFingerprint: String) =
+            batches.values.filter { it.authorityFingerprint == authorityFingerprint }
+
+        override fun deleteBatchesForAuthority(authorityFingerprint: String) {
+            batches.values.removeIf { it.authorityFingerprint == authorityFingerprint }
+        }
+
+        override fun globallyClosed() = closed
+        override fun closeGlobally() { closed = true }
+        override fun deleteAllBatches() = batches.clear()
+        override fun terminalCheckpoint(
+            key: RelayV2TerminalCheckpointKey,
+        ): RelayV2TerminalCheckpointEntity? = null
     }
 
     private inner class FakeTransportFactory(
@@ -2910,6 +3581,14 @@ class RelayV2BaseRuntimeCompositionTest {
         fun open(selectedSubprotocol: String?) = listener.onOpen(this, selectedSubprotocol)
 
         fun sendFixture(name: String) = sendFrame(fixture(name))
+
+        fun sendAgentFixture(name: String) {
+            listener.onFrame(
+                this,
+                agentFixtureWire(name),
+                RelayV2FrameMetadata(),
+            )
+        }
 
         fun sendFrame(frame: Map<String, Any?>) {
             listener.onFrame(
@@ -3097,6 +3776,21 @@ class RelayV2BaseRuntimeCompositionTest {
         override fun clear(reference: RelayV2CredentialReference) {
             synchronized(values) { values.remove(reference) }
         }
+
+        fun advance(reference: RelayV2CredentialReference, version: Long): Boolean =
+            synchronized(values) {
+                val current = values[reference] ?: return@synchronized false
+                if (current.credentialVersion == Long.MAX_VALUE ||
+                    version != current.credentialVersion + 1
+                ) {
+                    return@synchronized false
+                }
+                values[reference] = current.copy(
+                    credentialVersion = version,
+                    accessToken = "twcap2.test-access-v$version",
+                )
+                true
+            }
     }
 
     private fun fixture(name: String): MutableMap<String, Any?> = deepClone(

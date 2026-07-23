@@ -18,12 +18,30 @@ import {
 import {
   RelayV2DashboardManagementHostCarrierControlAdapter,
 } from "./relayV2DashboardManagementHostCarrierControlAdapter.js";
+import {
+  consumeRelayV2HostPreCarrierOfferClaim,
+  matchesRelayV2HostPreCarrierOfferClaim,
+  releaseRelayV2HostPreCarrierOfferClaim,
+  type RelayV2HostPreCarrierOfferAttemptBinding,
+  type RelayV2HostPreCarrierOfferClaim,
+} from "./hostCapabilityReadiness.js";
+
+// The HostCarrier dist entry is canonicalized by the build. Re-export the
+// readiness owner here so managed composition shares its module-private claim
+// registry instead of constructing a second bundled copy.
+export {
+  RelayV2HostCapabilityReadiness,
+  RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES,
+  matchesRelayV2HostPreCarrierOfferClaim,
+  releaseRelayV2HostPreCarrierOfferClaim,
+} from "./hostCapabilityReadiness.js";
 
 export const RELAY_V2_HOST_SUPERSEDED_EXIT_CODE = 78;
 
 const MAX_COUNTER = 18_446_744_073_709_551_615n;
 const DEFAULT_TERMINAL_FRAME_BYTES = 65_536;
 const MAX_CARRIER_BUFFER_BYTES = 16 * 1_048_576;
+const EMPTY_ADVERTISED_CAPABILITIES: readonly [] = Object.freeze([]);
 
 export type RelayV2HostCarrierPhase =
   | "connecting"
@@ -258,6 +276,8 @@ export interface RelayV2HostCarrierOptions {
   publicPayloadDecoder?: RelayV2HostCarrierPublicPayloadDecoder;
   /** Defaults to no base capabilities. The actor is not a readiness signal. */
   advertisedCapabilities?: readonly string[];
+  /** Internal one-shot offer; only the managed canonical adapter validates its exact binding. */
+  preCarrierOfferClaim?: RelayV2HostPreCarrierOfferClaim;
   maxFrameBytes?: number;
   terminalMaxFrameBytes?: number;
   clock?: () => number;
@@ -968,6 +988,7 @@ export class RelayV2HostCarrierActor {
   private readonly idFactory: () => string;
   private readonly limits: QueueLimits;
   private readonly capabilities: string[];
+  readonly #preCarrierOfferClaim: RelayV2HostPreCarrierOfferClaim | null;
   private readonly clientDialects: RelayV2HostCarrierClientDialect[];
   private readonly v1DialectAdapter?: RelayV2HostCarrierDialectAdapter;
   private readonly publicPayloadDecoder: RelayV2HostCarrierPublicPayloadDecoder;
@@ -992,6 +1013,7 @@ export class RelayV2HostCarrierActor {
   private latestStatus: RelayV2HostCarrierStatus | null = null;
   private dashboardManagementControlAdapter:
     RelayV2DashboardManagementHostCarrierControlAdapter | null = null;
+  private currentPreCarrierOfferConsumed = false;
 
   constructor(private readonly options: RelayV2HostCarrierOptions) {
     this.#hostId = options.hostId;
@@ -1006,7 +1028,12 @@ export class RelayV2HostCarrierActor {
     });
     this.idFactory = options.idFactory ?? randomUUID;
     this.limits = makeQueueLimits(options.queueLimits);
-    this.capabilities = [...(options.advertisedCapabilities ?? [])];
+    const staticCapabilities = [...(options.advertisedCapabilities ?? [])];
+    if (staticCapabilities.length !== 0) {
+      throw new Error("Relay v2 host static capability advertisement is forbidden");
+    }
+    this.capabilities = [];
+    this.#preCarrierOfferClaim = options.preCarrierOfferClaim ?? null;
     this.clientDialects = [...(options.clientDialects ?? ["tw-relay.v2"])];
     this.v1DialectAdapter = options.dialectAdapters?.["tw-relay.v1"];
     this.publicPayloadDecoder = options.publicPayloadDecoder ?? {
@@ -1053,6 +1080,9 @@ export class RelayV2HostCarrierActor {
       hostId: string;
       hostEpoch: string;
       hostInstanceId: string;
+      controllerGeneration: string;
+      carrierAttemptGeneration: string;
+      preCarrierOfferClaim: RelayV2HostPreCarrierOfferClaim | null;
       onCarrierStatus: (status: Readonly<RelayV2HostCarrierStatus>) => void;
     }>,
   ): value is RelayV2HostCarrierActor {
@@ -1064,8 +1094,31 @@ export class RelayV2HostCarrierActor {
         && (value as RelayV2HostCarrierActor).#hostInstanceId === input.hostInstanceId
         && (value as RelayV2HostCarrierActor).#statusObserver === input.onCarrierStatus
         && (value as RelayV2HostCarrierActor).capabilities.length === 0
+        && (value as RelayV2HostCarrierActor).#preCarrierOfferClaim
+          === input.preCarrierOfferClaim
+        && (input.preCarrierOfferClaim === null
+          || matchesRelayV2HostPreCarrierOfferClaim(
+            input.preCarrierOfferClaim,
+            input,
+          ))
         && (value as RelayV2HostCarrierActor).clientDialects.length === 1
         && (value as RelayV2HostCarrierActor).clientDialects[0] === "tw-relay.v2";
+    } catch {
+      return false;
+    }
+  }
+
+  static consumedCanonicalPreCarrierOffer(
+    value: unknown,
+    binding: Readonly<RelayV2HostPreCarrierOfferAttemptBinding>,
+  ): boolean {
+    if (typeof value !== "object" || value === null) return false;
+    try {
+      const actor = value as RelayV2HostCarrierActor;
+      return Object.getPrototypeOf(actor) === RelayV2HostCarrierActor.prototype
+        && actor.#preCarrierOfferClaim !== null
+        && matchesRelayV2HostPreCarrierOfferClaim(actor.#preCarrierOfferClaim, binding)
+        && actor.currentPreCarrierOfferConsumed;
     } catch {
       return false;
     }
@@ -1367,6 +1420,17 @@ export class RelayV2HostCarrierActor {
     if (this.permanentlySuperseded) {
       throw new Error("Relay v2 host carrier was superseded and cannot reconnect");
     }
+    this.currentPreCarrierOfferConsumed = false;
+    const offeredCapabilities = this.#preCarrierOfferClaim === null
+      ? null
+      : consumeRelayV2HostPreCarrierOfferClaim(this.#preCarrierOfferClaim);
+    if (this.disposed) {
+      throw new Error("Relay v2 host carrier was disposed and cannot reconnect");
+    }
+    if (this.permanentlySuperseded) {
+      throw new Error("Relay v2 host carrier was superseded and cannot reconnect");
+    }
+    this.currentPreCarrierOfferConsumed = offeredCapabilities !== null;
     const previous = this.current;
     const connector: ConnectorState = {
       generation: ++this.generation,
@@ -1419,7 +1483,7 @@ export class RelayV2HostCarrierActor {
           hostEpoch: this.#hostEpoch,
           hostInstanceId: this.#hostInstanceId,
           clientDialects: [...this.clientDialects],
-          capabilities: [...this.capabilities],
+          capabilities: [...(offeredCapabilities ?? EMPTY_ADVERTISED_CAPABILITIES)],
           limits: {
             maxFrameBytes: this.maxFrameBytes,
             terminalMaxFrameBytes: this.terminalMaxFrameBytes,
@@ -1457,6 +1521,7 @@ export class RelayV2HostCarrierActor {
     const wasCurrent = this.current === connector;
     if (wasCurrent) this.current = null;
     connector.phase = "closed";
+    this.currentPreCarrierOfferConsumed = false;
     this.cleanupConnector(connector, "carrier_closed");
     if (wasCurrent) {
       this.publishStatus({
@@ -2711,6 +2776,7 @@ export class RelayV2HostCarrierActor {
     const connector = this.current;
     if (!connector || connector.generation !== generation || connector.phase === "closed") return;
     if (code === 4409) {
+      this.currentPreCarrierOfferConsumed = false;
       this.permanentlySuperseded = true;
       this.current = null;
       connector.phase = "closed";
@@ -2724,6 +2790,7 @@ export class RelayV2HostCarrierActor {
       return;
     }
     this.current = null;
+    this.currentPreCarrierOfferConsumed = false;
     connector.phase = "closed";
     this.cleanupConnector(connector, "carrier_closed");
     this.publishStatus({
@@ -2737,6 +2804,7 @@ export class RelayV2HostCarrierActor {
   private failConnector(connector: ConnectorState, code: number, reason: string): void {
     if (this.current !== connector || connector.phase === "closed") return;
     this.current = null;
+    this.currentPreCarrierOfferConsumed = false;
     connector.phase = "closed";
     this.cleanupConnector(connector, "carrier_closed");
     this.publishStatus({
@@ -2751,6 +2819,8 @@ export class RelayV2HostCarrierActor {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    releaseRelayV2HostPreCarrierOfferClaim(this.#preCarrierOfferClaim);
+    this.currentPreCarrierOfferConsumed = false;
     const connector = this.current;
     this.current = null;
     if (!connector || connector.phase === "closed") return;

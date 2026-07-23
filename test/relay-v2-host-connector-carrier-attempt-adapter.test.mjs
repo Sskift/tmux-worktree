@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   RelayV2HostCarrierActor,
+  RelayV2HostCapabilityReadiness,
+  RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES,
 } from "../dist/relay/v2/hostCarrier.js";
 import {
   RelayV2HostConnectorCarrierAttemptAdapter,
@@ -17,6 +19,7 @@ import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
 } from "../dist/relay/v2/codec.js";
+import { RELAY_V2_REQUIRED_CAPABILITIES } from "../dist/relay/v2/brokerCore.js";
 
 const IDENTITY = Object.freeze({
   hostId: "mac-admin",
@@ -119,7 +122,7 @@ class FakeTransport {
   }
 }
 
-function actorFor(input, sequence) {
+function actorFor(input, sequence, preCarrierOfferClaim = undefined) {
   return new RelayV2HostCarrierActor({
     hostId: input.hostId,
     hostEpoch: input.hostEpoch,
@@ -136,6 +139,7 @@ function actorFor(input, sequence) {
       },
     },
     advertisedCapabilities: [],
+    preCarrierOfferClaim,
     routeSink: {
       onRouteBound() {},
       onClientFrame() {},
@@ -165,7 +169,8 @@ function harness(options = {}) {
         drainProofs: [],
         handle: null,
       };
-      const actor = options.actor?.(input, sequence) ?? actorFor(input, sequence);
+      const actor = options.actor?.(input, sequence)
+        ?? actorFor(input, sequence, input.preCarrierOfferClaim);
       record.actor = actor;
       const handle = new RelayV2HostConnectorCarrierAttemptDrainHandle(Object.freeze({
         transport,
@@ -195,7 +200,12 @@ function harness(options = {}) {
       return result;
     },
   });
-  const attempts = new RelayV2HostConnectorCarrierAttemptAdapter(Object.freeze({ factory }));
+  const attempts = new RelayV2HostConnectorCarrierAttemptAdapter(Object.freeze({
+    factory,
+    ...(options.offerOwner === undefined
+      ? {}
+      : { preCarrierOfferIssuer: options.offerOwner }),
+  }));
   const controller = new RelayV2HostConnectorController(Object.freeze({
     attempts,
     ...IDENTITY,
@@ -365,6 +375,43 @@ test("canonical superseded is terminal, drains once, and never creates a replace
   assert.equal(h.records.length, 1);
 });
 
+test("withdrawal synchronously fences the exact full-offer attempt before one drain", async () => {
+  const offerOwner = new RelayV2HostCapabilityReadiness();
+  const sources = Object.fromEntries(
+    RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES.map((source) => [
+      source,
+      offerOwner.source(source),
+    ]),
+  );
+  for (const source of RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES) {
+    if (source === "carrier") continue;
+    assert.equal(sources[source].apply({ source, generation: "1", ready: true }), true);
+  }
+  const h = harness({ offerOwner });
+  await h.controller.start(startInput("adapter.full-offer"));
+  const record = h.records[0];
+  assert.deepEqual(record.hello.payload.capabilities, [...RELAY_V2_REQUIRED_CAPABILITIES]);
+
+  sources.h2.close();
+  assert.equal(record.transport.closes.length, 1, "transport admission closes synchronously");
+  assert.deepEqual(h.controller.inspectCut(), {
+    status: "failed",
+    retryable: true,
+    controllerGeneration: "1",
+    connectorId: "connector-1",
+    ...IDENTITY,
+  });
+  await nextTurn();
+  assert.equal(record.drainCalls, 1);
+  assert.equal(sources.h2.apply({ source: "h2", generation: "1", ready: true }), false);
+  assert.equal(sources.h2.apply({ source: "h2", generation: "2", ready: true }), true);
+
+  const retry = await h.controller.start(startInput("adapter.full-offer-retry"));
+  assert.equal(retry.controllerGeneration, "2");
+  assert.equal(h.records[1].input.carrierAttemptGeneration, "2");
+  assert.deepEqual(h.records[1].hello.payload.capabilities, [...RELAY_V2_REQUIRED_CAPABILITIES]);
+});
+
 test("malformed factory products and uncertain drain proofs fail closed with redacted errors", async (t) => {
   const secret = "twref2.secret-must-not-reflect";
 
@@ -392,6 +439,30 @@ test("malformed factory products and uncertain drain proofs fail closed with red
       (error) => isControllerFailure(error, "OPERATION_FAILED", secret),
     );
     assert.equal(h.records[0].transport.closes.length, 1);
+  });
+
+  await t.test("canonical actor cannot substitute or omit the issued offer claim", async () => {
+    const offerOwner = new RelayV2HostCapabilityReadiness();
+    for (const source of RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES) {
+      if (source === "carrier") continue;
+      assert.equal(offerOwner.source(source).apply({
+        source,
+        generation: "1",
+        ready: true,
+      }), true);
+    }
+    const h = harness({
+      offerOwner,
+      actor(input, sequence) {
+        return actorFor(input, sequence);
+      },
+    });
+    await assert.rejects(
+      h.controller.start(startInput("adapter.substituted-offer")),
+      (error) => isControllerFailure(error, "OPERATION_FAILED"),
+    );
+    assert.equal(h.records[0].transport.closes.length, 1);
+    assert.equal(h.records[0].drainCalls, 1);
   });
 
   await t.test("factory callback cannot impersonate canonical registration", async () => {
@@ -494,8 +565,10 @@ test("ordinary reflection cannot recover factory, actor, transport, callbacks, o
     ...IDENTITY,
     signal: new AbortController().signal,
     onCarrierStatus: (status) => statuses.push(status),
+    onCarrierAttemptPrepared() {},
+    onCarrierAttemptFenced() {},
   }));
-  assert.deepEqual(Reflect.ownKeys(attempt), ["disposeAndDrain"]);
+  assert.deepEqual(Reflect.ownKeys(attempt), ["fence", "disposeAndDrain"]);
   assert.equal(statuses.at(-1).phase, "connecting");
   for (const key of [
     "actor", "transport", "connection", "drainHandle", "onCarrierStatus",
@@ -525,6 +598,7 @@ test("ordinary reflection cannot recover factory, actor, transport, callbacks, o
 
   await attempt.disposeAndDrain(Object.freeze({
     controllerGeneration: "1",
+    carrierAttemptGeneration: "1",
     carrierGeneration: 1,
     connectorId: null,
   }));
@@ -540,6 +614,8 @@ test("direct adapter failures expose one fixed non-sensitive error", async () =>
       ...IDENTITY,
       signal: new AbortController().signal,
       onCarrierStatus() {},
+      onCarrierAttemptPrepared() {},
+      onCarrierAttemptFenced() {},
     })),
     (error) => error instanceof RelayV2HostConnectorCarrierAttemptAdapterError
       && !`${error.name}:${error.message}`.includes(secret),

@@ -4,6 +4,7 @@ import {
   type MobileRelayV2CreateEnrollmentInput,
   type MobileRelayV2DashboardState,
   type MobileRelayV2RevokeClientGrantInput,
+  type MobileRelayV2ShowEnrollmentArtifactInput,
 } from "./domainTypes";
 import {
   MobileRelayV2BackendOperationError,
@@ -11,11 +12,13 @@ import {
 } from "./relayV2Domain";
 
 const COMMAND = "mobile_relay_v2_management_call";
+const ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
 const DEFAULT_OFF_REASON = "Relay v2 management is unavailable (default off).";
 const REQUEST_ID_PATTERNS = {
   1: /^dmgmt1\.[A-Za-z0-9_-]{21}[AQgw]$/,
   2: /^dmgmt2\.[A-Za-z0-9_-]{21}[AQgw]$/,
 } as const;
+const NATIVE_QR_HANDLE_PATTERN = /^dqart1\.[A-Za-z0-9_-]{32}$/;
 
 const MANAGEMENT_ERRORS = {
   UNAVAILABLE: {
@@ -113,6 +116,12 @@ function credentialLike(value: string): boolean {
 function projectionOpaque(value: unknown, maximumBytes = 128): string | null {
   const parsed = opaque(value, maximumBytes);
   return parsed && !credentialLike(parsed) ? parsed : null;
+}
+
+function projectionQrHandle(value: unknown): string | null {
+  return typeof value === "string" && NATIVE_QR_HANDLE_PATTERN.test(value)
+    ? value
+    : null;
 }
 
 function projectionUrl(
@@ -365,38 +374,49 @@ function parseEnrollment(
     return { status: "idle" };
   }
   if (input.status === "active" && exactObject(input, ["status", "review"])) {
-    const review = exactObject(input.review, ["enrollment", "display"]);
+    const review = exactObject(input.review, ["enrollment", "display", "renderArtifact"]);
     const enrollment = exactObject(
       review?.enrollment,
-      ["enrollmentId", "enrollmentCode", "expiresAtMs"],
+      ["enrollmentId", "expiresAtMs"],
     );
     const display = exactObject(
       review?.display,
       ["issuerUrl", "relayUrl", "hostId", "deviceLabel"],
     );
-    if (!review || !enrollment || !display) return null;
+    const renderArtifact = exactObject(
+      review?.renderArtifact,
+      ["kind", "handle", "expiresAtMs"],
+    );
+    if (!review || !enrollment || !display || !renderArtifact) return null;
     const enrollmentId = projectionOpaque(enrollment.enrollmentId);
-    const enrollmentCode = opaque(enrollment.enrollmentCode, 512);
     const expiresAtMs = safeTimestamp(enrollment.expiresAtMs);
     const issuerUrl = projectionUrl(display.issuerUrl, "https", "/");
     const relayUrl = projectionUrl(display.relayUrl, "wss", "/client");
     const hostId = projectionOpaque(display.hostId);
     const deviceLabel = display.deviceLabel === null ? null : projectionOpaque(display.deviceLabel);
+    const artifactExpiresAtMs = safeTimestamp(renderArtifact.expiresAtMs);
+    const handle = projectionQrHandle(renderArtifact.handle);
     if (
       !enrollmentId
-      || !enrollmentCode?.startsWith("twenroll2.")
-      || enrollmentCode === "twenroll2."
       || expiresAtMs === null
       || !issuerUrl
       || !relayUrl
       || !hostId
       || (display.deviceLabel !== null && !deviceLabel)
+      || renderArtifact.kind !== "native_qr_handle"
+      || !handle
+      || artifactExpiresAtMs !== expiresAtMs
     ) return null;
     return {
       status: "active",
       review: {
-        enrollment: { enrollmentId, enrollmentCode, expiresAtMs },
+        enrollment: { enrollmentId, expiresAtMs },
         display: { issuerUrl, relayUrl, hostId, deviceLabel },
+        renderArtifact: {
+          kind: "native_qr_handle",
+          handle,
+          expiresAtMs: artifactExpiresAtMs,
+        },
       },
     };
   }
@@ -604,6 +624,11 @@ function revokeInput(input: MobileRelayV2RevokeClientGrantInput): unknown {
   return { grantId, reason: "user_revoked" };
 }
 
+function artifactInput(input: MobileRelayV2ShowEnrollmentArtifactInput): unknown {
+  if (!NATIVE_QR_HANDLE_PATTERN.test(input.handle)) throw invalidInputError();
+  return { handle: input.handle };
+}
+
 export function createRelayV2ManagementAdapter(
   invoke: ManagementInvoke,
 ): MobileRelayV2ProductAdapter {
@@ -641,6 +666,14 @@ export function createRelayV2ManagementAdapter(
     refreshHost: () => enqueue("refresh_host", null),
     startConnector: () => enqueue("start_connector", null),
     stopConnector: () => enqueue("stop_connector", null),
+    showEnrollmentArtifact: async (input) => {
+      try {
+        await invoke(ARTIFACT_COMMAND, artifactInput(input));
+      } catch (error) {
+        const code = parseManagementError(error);
+        throw code ? operationError(code) : invalidOutcomeError();
+      }
+    },
     createEnrollment: (input) => {
       try {
         return enqueue("create_enrollment", createEnrollmentInput(input));

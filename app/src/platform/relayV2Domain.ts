@@ -15,6 +15,7 @@ const HIDDEN_ENROLLMENT_ERROR =
 const REDACTED_CREDENTIAL = "[redacted Relay v2 credential]";
 const CREDENTIAL_LIKE_SOURCE =
   String.raw`(?:twcap2|twref2|twenroll2|twhostboot2)\.[^\s"'<>]+`;
+const NATIVE_QR_HANDLE_PATTERN = /^dqart1\.[A-Za-z0-9_-]{32}$/;
 
 type Parsed<T> = { valid: true; value: T } | { valid: false };
 
@@ -47,6 +48,12 @@ function opaqueIdentifier(value: unknown): string | null {
 
 function safeTimestamp(value: unknown): number | null {
   return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null;
+}
+
+function nativeQrHandle(value: unknown): string | null {
+  return typeof value === "string" && NATIVE_QR_HANDLE_PATTERN.test(value)
+    ? value
+    : null;
 }
 
 function containsCredentialLikeValue(value: string): boolean {
@@ -305,29 +312,30 @@ export function normalizeMobileRelayV2EnrollmentReview(
   const review = record(value);
   const enrollment = record(review?.enrollment);
   const display = record(review?.display);
+  const renderArtifact = record(review?.renderArtifact);
   if (
     !review
     || !enrollment
     || !display
-    || !hasOwnFields(review, ["enrollment", "display"])
-    || !hasOwnFields(enrollment, ["enrollmentId", "enrollmentCode", "expiresAtMs"])
+    || !renderArtifact
+    || !hasOwnFields(review, ["enrollment", "display", "renderArtifact"])
+    || !hasOwnFields(enrollment, ["enrollmentId", "expiresAtMs"])
     || !hasOwnFields(display, ["issuerUrl", "relayUrl", "hostId", "deviceLabel"])
+    || !hasOwnFields(renderArtifact, ["kind", "handle", "expiresAtMs"])
   ) return null;
 
   const enrollmentId = opaqueIdentifier(enrollment.enrollmentId);
-  const enrollmentCode = opaqueIdentifier(enrollment.enrollmentCode);
   const expiresAtMs = safeTimestamp(enrollment.expiresAtMs);
   const issuerUrl = opaqueIdentifier(display.issuerUrl);
   const relayUrl = opaqueIdentifier(display.relayUrl);
   const hostId = opaqueIdentifier(display.hostId);
+  const artifactExpiresAtMs = safeTimestamp(renderArtifact.expiresAtMs);
+  const handle = nativeQrHandle(renderArtifact.handle);
   const deviceLabel = display.deviceLabel === null
     ? null
     : opaqueIdentifier(display.deviceLabel);
   if (
     !enrollmentId
-    || !enrollmentCode
-    || !enrollmentCode.startsWith("twenroll2.")
-    || enrollmentCode.length === "twenroll2.".length
     || expiresAtMs === null
     || !issuerUrl
     || !validIssuerUrl(issuerUrl)
@@ -335,11 +343,19 @@ export function normalizeMobileRelayV2EnrollmentReview(
     || !validRelayUrl(relayUrl)
     || !hostId
     || (display.deviceLabel !== null && !deviceLabel)
+    || renderArtifact.kind !== "native_qr_handle"
+    || !handle
+    || artifactExpiresAtMs !== expiresAtMs
   ) return null;
 
   return {
-    enrollment: { enrollmentId, enrollmentCode, expiresAtMs },
+    enrollment: { enrollmentId, expiresAtMs },
     display: { issuerUrl, relayUrl, hostId, deviceLabel },
+    renderArtifact: {
+      kind: "native_qr_handle",
+      handle,
+      expiresAtMs: artifactExpiresAtMs,
+    },
   };
 }
 

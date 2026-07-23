@@ -1,0 +1,93 @@
+{
+  "fixtureFormatVersion": 1,
+  "validProfile": {
+    "contract": "tmux-worktree-relay-v2-host-production-profile",
+    "schemaVersion": 1,
+    "hostId": "host-production-01",
+    "relayUrl": "wss://relay.example.test/",
+    "credentialIssuerUrl": "https://issuer.example.test/",
+    "credentialReference": "relay-v2-host-credential-ref:host-production-01",
+    "bootstrapSecretReference": "host-production-bootstrap-reference",
+    "refreshSecretReference": "host-production-refresh-reference"
+  },
+  "differentProfile": {
+    "contract": "tmux-worktree-relay-v2-host-production-profile",
+    "schemaVersion": 1,
+    "hostId": "host-production-02",
+    "relayUrl": "wss://relay.example.test/",
+    "credentialIssuerUrl": "https://issuer.example.test/",
+    "credentialReference": "relay-v2-host-credential-ref:host-production-02",
+    "bootstrapSecretReference": "host-production-bootstrap-reference-02",
+    "refreshSecretReference": "host-production-refresh-reference-02"
+  },
+  "invalidInputMutations": [
+    {
+      "id": "relay-non-root-path",
+      "field": "relayUrl",
+      "value": "wss://relay.example.test/host"
+    },
+    {
+      "id": "issuer-query",
+      "field": "credentialIssuerUrl",
+      "value": "https://issuer.example.test/?tenant=one"
+    },
+    {
+      "id": "credential-userinfo",
+      "field": "relayUrl",
+      "value": "wss://user@relay.example.test/"
+    },
+    {
+      "id": "wrong-credential-namespace",
+      "field": "credentialReference",
+      "value": "host-production-01"
+    },
+    {
+      "id": "token-shaped-secret-reference",
+      "field": "bootstrapSecretReference",
+      "value": "twhostboot2.not-a-reference"
+    },
+    {
+      "id": "same-secret-reference",
+      "field": "refreshSecretReference",
+      "valueFromField": "bootstrapSecretReference"
+    },
+    {
+      "id": "unknown-secret-key",
+      "extraField": "sharedSecret",
+      "value": "forbidden"
+    },
+    {
+      "id": "unknown-native-path-key",
+      "extraField": "nativeStatePath",
+      "value": "/forbidden"
+    }
+  ],
+  "invalidExistingDocuments": [
+    {
+      "id": "corrupt-json",
+      "contents": "{\"contract\":"
+    },
+    {
+      "id": "unknown-schema",
+      "mutation": {
+        "field": "schemaVersion",
+        "value": 2
+      }
+    },
+    {
+      "id": "unknown-key",
+      "mutation": {
+        "extraField": "tlsCertificatePath",
+        "value": "/forbidden"
+      }
+    }
+  ],
+  "unsafeMetadataCases": [
+    "parent-directory-mode",
+    "profile-mode",
+    "profile-hard-link",
+    "profile-symlink",
+    "profile-non-regular",
+    "lock-symlink"
+  ]
+}

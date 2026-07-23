@@ -1961,6 +1961,13 @@ function validateGenesis(
   };
 }
 
+/** Side-effect-free closed capture reused by production composition boundaries. */
+export function captureRelayV2BrokerCredentialAuthorityGenesis(
+  genesis: RelayV2BrokerCredentialAuthorityGenesis,
+): RelayV2BrokerCredentialAuthorityGenesis {
+  return validateGenesis(genesis);
+}
+
 function mapFatalAuthorityError(
   error: unknown,
   flags: {

@@ -1006,16 +1006,30 @@ private fun validateTerminalOpenFrame(frame: RelayV2JsonObject) {
     jsonInteger(required(payload, "rows"), minimum = 1, maximum = 500)
     val mode = jsonOneOf(required(payload, "mode"), setOf("new", "resume", "reset"))
     val hasResume = payload.containsKey("resume")
-    if (mode == "new" && hasResume) schemaFailure("schema-mismatch")
-    if (mode == "resume" && !hasResume) schemaFailure("missing-field")
-    if (hasResume) validateTerminalResume(payload["resume"])
+    when (mode) {
+        "new" -> if (hasResume) schemaFailure("schema-mismatch")
+        "resume" -> {
+            if (!hasResume) schemaFailure("missing-field")
+            validateTerminalResume(payload["resume"], includeNextOffset = true)
+        }
+        "reset" -> {
+            if (hasResume) validateTerminalResume(payload["resume"], includeNextOffset = false)
+        }
+    }
 }
 
-private fun validateTerminalResume(value: Any?) {
+private fun validateTerminalResume(value: Any?, includeNextOffset: Boolean) {
     val resume = jsonObject(value)
-    exactKeys(resume, listOf("generation", "nextOffset", "resumeToken"))
+    exactKeys(
+        resume,
+        if (includeNextOffset) {
+            listOf("generation", "nextOffset", "resumeToken")
+        } else {
+            listOf("generation", "resumeToken")
+        },
+    )
     jsonId(required(resume, "generation"))
-    jsonCounter(required(resume, "nextOffset"))
+    if (includeNextOffset) jsonCounter(required(resume, "nextOffset"))
     jsonString(required(resume, "resumeToken"), maxBytes = 4_096)
 }
 

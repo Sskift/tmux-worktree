@@ -44,7 +44,7 @@ internal class RelayV2CredentialExchangeException(
 )
 
 /**
- * Strict HTTPS redeem/refresh adapter for the existing profile repository seam.
+ * Strict HTTPS redeem/refresh/self-revoke adapter for the existing profile repository seams.
  *
  * Each invocation sends exactly one caller-owned attempt. OkHttp connection retries are disabled;
  * response-loss replay and credential CAS remain repository/broker responsibilities.
@@ -52,7 +52,7 @@ internal class RelayV2CredentialExchangeException(
 internal class OkHttpRelayV2CredentialExchange(
     client: OkHttpClient = defaultClient(),
     private val codec: RelayV2Codec = RelayV2Codec(),
-) : RelayV2CredentialExchange {
+) : RelayV2CredentialExchange, RelayV2SelfRevokeExchange {
     private val client = singleAttemptClient(client)
 
     override suspend fun redeem(
@@ -90,6 +90,130 @@ internal class OkHttpRelayV2CredentialExchange(
             body = body,
         )
         return response.toRefreshResponse()
+    }
+
+    override suspend fun revoke(
+        request: RelayV2SelfRevokeRequest,
+        onPreparedForNetworkHandoff: suspend () -> Unit,
+    ): RelayV2SelfRevokeExchangeResult {
+        val call = createSelfRevokeCall(request)
+        try {
+            onPreparedForNetworkHandoff()
+        } catch (error: RelayV2CredentialExchangeException) {
+            throw error
+        } catch (_: Throwable) {
+            throw failure(RelayV2CredentialExchangeFailureKind.CONFIGURATION)
+        }
+        return executeSelfRevoke(call)
+    }
+
+    private fun createSelfRevokeCall(request: RelayV2SelfRevokeRequest): Call {
+        val url = exactEndpoint(request.issuerUrl, SELF_REVOKE_PATH)
+        val encoded = try {
+            codec.encodeHttpsBody(
+                RelayV2HttpsSchema.GRANT_SELF_REVOKE_REQUEST,
+                linkedMapOf("reason" to SELF_REVOKE_REASON),
+            )
+        } catch (_: RelayV2CodecException) {
+            throw failure(RelayV2CredentialExchangeFailureKind.SCHEMA)
+        } catch (_: Throwable) {
+            throw failure(RelayV2CredentialExchangeFailureKind.SCHEMA)
+        }
+        val httpRequest = try {
+            Request.Builder()
+                .url(url)
+                .post(SingleAttemptJsonRequestBody(encoded))
+                .header("Authorization", "Bearer ${request.accessToken}")
+                .header("Cache-Control", "no-store")
+                .header("Accept-Encoding", "identity")
+                .build()
+        } catch (_: Throwable) {
+            throw failure(RelayV2CredentialExchangeFailureKind.CONFIGURATION)
+        }
+        return try {
+            client.newCall(httpRequest)
+        } catch (_: Throwable) {
+            throw failure(RelayV2CredentialExchangeFailureKind.CONFIGURATION)
+        }
+    }
+
+    private suspend fun executeSelfRevoke(
+        call: Call,
+    ): RelayV2SelfRevokeExchangeResult = try {
+        suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { call.cancel() }
+            if (!continuation.isActive) return@suspendCancellableCoroutine
+            try {
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (continuation.isActive) {
+                            continuation.resumeWith(
+                                Result.success(
+                                    RelayV2SelfRevokeExchangeResult.MayHaveCommitted,
+                                ),
+                            )
+                        }
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        val result = try {
+                            response.use(::decodeSelfRevokeResponse)
+                        } catch (_: Throwable) {
+                            RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+                        }
+                        if (continuation.isActive) {
+                            continuation.resumeWith(Result.success(result))
+                        }
+                    }
+                })
+            } catch (_: Throwable) {
+                if (continuation.isActive) {
+                    continuation.resumeWith(
+                        Result.success(RelayV2SelfRevokeExchangeResult.MayHaveCommitted),
+                    )
+                }
+            }
+        }
+    } catch (_: Throwable) {
+        RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+    }
+
+    private fun decodeSelfRevokeResponse(
+        response: Response,
+    ): RelayV2SelfRevokeExchangeResult {
+        if (response.code != 200 && response.code != 403) {
+            return RelayV2SelfRevokeExchangeResult.MayHaveCommitted
+        }
+        if (!response.cacheControl.noStore) {
+            throw failure(
+                RelayV2CredentialExchangeFailureKind.SCHEMA,
+                httpStatus = response.code,
+            )
+        }
+        val encodings = response.headers.values("Content-Encoding")
+        if (encodings.size > 1) {
+            throw failure(
+                RelayV2CredentialExchangeFailureKind.SCHEMA,
+                httpStatus = response.code,
+            )
+        }
+        val bytes = boundedBody(response.body, response.code)
+        val schema = if (response.code == 200) {
+            RelayV2HttpsSchema.GRANT_SELF_REVOKE_RESPONSE
+        } else {
+            RelayV2HttpsSchema.ERROR_RESPONSE
+        }
+        val decoded = codec.decodeHttpsBody(schema, bytes, encodings.singleOrNull())
+        if (response.code == 403) {
+            return RelayV2SelfRevokeExchangeResult.Rejected(
+                RelayV2SelfRevokeFailureCode.FORBIDDEN,
+            )
+        }
+        return RelayV2SelfRevokeExchangeResult.Confirmed(
+            grantId = decoded.frame.string("grantId"),
+            revokedAtMs = decoded.frame.long("revokedAtMs"),
+            alreadyRevoked = decoded.frame.boolean("alreadyRevoked"),
+        )
     }
 
     private suspend fun execute(
@@ -303,6 +427,8 @@ internal class OkHttpRelayV2CredentialExchange(
     private companion object {
         const val ENROLLMENT_REDEEM_PATH = "/v2/enrollments/redeem"
         const val CLIENT_REFRESH_PATH = "/v2/tokens/refresh"
+        const val SELF_REVOKE_PATH = "/v2/grants/self/revoke"
+        const val SELF_REVOKE_REASON = "user_revoked"
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val AUTH_ERROR_CODES = setOf(
             "AUTH_REQUIRED",
@@ -376,3 +502,5 @@ internal class OkHttpRelayV2CredentialExchange(
 private fun Map<String, Any?>.string(name: String): String = getValue(name) as String
 
 private fun Map<String, Any?>.long(name: String): Long = (getValue(name) as Number).toLong()
+
+private fun Map<String, Any?>.boolean(name: String): Boolean = getValue(name) as Boolean

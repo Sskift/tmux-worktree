@@ -478,6 +478,8 @@ class RelayV2TerminalRuntimeAdapterTest {
         )
         assertEquals(1, fixture.control.inputs.size)
         assertEquals(1, fixture.control.resizes.size)
+        assertSame(fixture.authority, fixture.control.inputs.single().authority)
+        assertSame(fixture.authority, fixture.control.resizes.single().authority)
 
         val duplicateInput = fixture.adapter.handle(fixture.authority, input)
             as RelayV2TerminalRuntimeApplyResult.Rejected
@@ -1205,11 +1207,13 @@ class RelayV2TerminalRuntimeAdapterTest {
     }
 
     private data class InputCall(
+        val authority: RelayV2RepositoryEffectAuthority,
         val effect: RelayV2TerminalEffect.SendInput,
         val claim: RelayV2TerminalControlDispatchClaim.Input,
     )
 
     private data class ResizeCall(
+        val authority: RelayV2RepositoryEffectAuthority,
         val effect: RelayV2TerminalEffect.SendResize,
         val claim: RelayV2TerminalControlDispatchClaim.Resize,
     )
@@ -1224,21 +1228,23 @@ class RelayV2TerminalRuntimeAdapterTest {
         var inputFailureAfterRecord: RuntimeException? = null
 
         override fun sendInput(
+            authority: RelayV2RepositoryEffectAuthority,
             effect: RelayV2TerminalEffect.SendInput,
             claim: RelayV2TerminalControlDispatchClaim.Input,
         ): Boolean {
             onInput()
-            inputs += InputCall(effect, claim)
+            inputs += InputCall(authority, effect, claim)
             inputFailureAfterRecord?.let { throw it }
             return inputAccepted
         }
 
         override fun sendResize(
+            authority: RelayV2RepositoryEffectAuthority,
             effect: RelayV2TerminalEffect.SendResize,
             claim: RelayV2TerminalControlDispatchClaim.Resize,
         ): Boolean {
             onResize()
-            resizes += ResizeCall(effect, claim)
+            resizes += ResizeCall(authority, effect, claim)
             return resizeAccepted
         }
     }
@@ -1281,7 +1287,7 @@ class RelayV2TerminalRuntimeAdapterTest {
             var abortCalls = 0
                 private set
 
-            override fun activate(): RelayV2TerminalPostCommitEffectActivationReceipt {
+            override suspend fun activate(): RelayV2TerminalPostCommitEffectActivationReceipt {
                 check(state == SinkReservationState.RESERVED)
                 val index = reservations.indexOf(this)
                 check(index >= 0)
@@ -1354,7 +1360,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         var acceptOwner: (Reservation) -> Unit = {}
         var teardownFailureAfterRecord: RuntimeException? = null
 
-        override fun reserve(
+        override suspend fun reserve(
             reservationId: String,
             batch: RelayV2TerminalPostCommitEffectBatch,
         ): RelayV2TerminalPostCommitEffectReservationResult {
@@ -1394,11 +1400,11 @@ class RelayV2TerminalRuntimeAdapterTest {
             }
         }
 
-        override fun abort(reservationId: String) {
+        override suspend fun abort(reservationId: String) {
             reservationsById[reservationId]?.abortBeforeActivation()
         }
 
-        override fun teardownAuthority(
+        override suspend fun teardownAuthority(
             authority: RelayV2RepositoryEffectAuthority,
             key: RelayV2TerminalCheckpointKey,
         ) {
@@ -1408,6 +1414,11 @@ class RelayV2TerminalRuntimeAdapterTest {
                 it.batch.authority == authority && it.batch.key == key
             }.forEach(Reservation::teardown)
         }
+
+        override suspend fun acknowledgeCheckpointFinalized(
+            key: RelayV2TerminalCheckpointKey,
+            activation: RelayV2TerminalParserEffectActivation,
+        ) = Unit
     }
 
     private data class FatalInvalidationCall(

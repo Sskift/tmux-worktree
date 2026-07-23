@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Update
 
 internal data class RelayV2SqlStats(
     val itemCount: Long,
@@ -507,6 +508,45 @@ internal interface RelayV2StateDao {
         streamId: String,
         pane: Int,
     ): RelayV2TerminalCheckpointEntity?
+
+    @Query(
+        "SELECT * FROM relay_v2_terminal_checkpoints WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND pane = :pane LIMIT 257",
+    )
+    fun terminalCheckpointsForSession(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        pane: Int,
+    ): List<RelayV2TerminalCheckpointEntity>
+
+    @Query(
+        "DELETE FROM relay_v2_terminal_checkpoints WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND streamId = :streamId AND pane = :pane",
+    )
+    fun deleteTerminalCheckpoint(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        streamId: String,
+        pane: Int,
+    ): Int
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun putTerminalCheckpoint(checkpoint: RelayV2TerminalCheckpointEntity)
@@ -1418,6 +1458,25 @@ internal interface RelayV2StateDao {
     fun insertAgentTranscriptLifecycleNotificationClaim(
         claim: RelayV2AgentTranscriptLifecycleNotificationClaimEntity,
     )
+
+    @Update
+    fun updateAgentTranscriptLifecycleNotificationClaim(
+        claim: RelayV2AgentTranscriptLifecycleNotificationClaimEntity,
+    ): Int
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_lifecycle_notification_claims " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "ORDER BY principalId, clientInstanceId, hostId, hostEpoch, scopeId, sessionId, " +
+            "timelineEpoch, lifecycleEventId LIMIT :limit OFFSET :offset",
+    )
+    fun agentTranscriptLifecycleNotificationClaimProfilePage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptLifecycleNotificationClaimEntity>
 
     @Query(
         "DELETE FROM relay_v2_agent_transcript_lifecycle_notification_claims " +

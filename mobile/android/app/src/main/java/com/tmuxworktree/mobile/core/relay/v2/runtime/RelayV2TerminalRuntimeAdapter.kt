@@ -50,11 +50,13 @@ internal interface RelayV2TerminalParserPort {
  */
 internal interface RelayV2TerminalControlTransportPort {
     fun sendInput(
+        authority: RelayV2RepositoryEffectAuthority,
         effect: RelayV2TerminalEffect.SendInput,
         claim: RelayV2TerminalControlDispatchClaim.Input,
     ): Boolean
 
     fun sendResize(
+        authority: RelayV2RepositoryEffectAuthority,
         effect: RelayV2TerminalEffect.SendResize,
         claim: RelayV2TerminalControlDispatchClaim.Resize,
     ): Boolean
@@ -100,7 +102,7 @@ internal enum class RelayV2TerminalPostCommitEffectActivationReceipt {
 internal interface RelayV2TerminalPostCommitEffectReservation {
     val identity: RelayV2TerminalPostCommitEffectReservationIdentity
 
-    fun activate(): RelayV2TerminalPostCommitEffectActivationReceipt
+    suspend fun activate(): RelayV2TerminalPostCommitEffectActivationReceipt
 }
 
 internal sealed interface RelayV2TerminalPostCommitEffectReservationResult {
@@ -121,18 +123,27 @@ internal sealed interface RelayV2TerminalPostCommitEffectReservationResult {
  * the adapter-generated id owns nothing.
  */
 internal interface RelayV2TerminalPostCommitEffectSink {
-    fun reserve(
+    suspend fun reserve(
         reservationId: String,
         batch: RelayV2TerminalPostCommitEffectBatch,
     ): RelayV2TerminalPostCommitEffectReservationResult
 
     /** Exact and idempotent; it is valid even when [reserve] threw after partial acquisition. */
-    fun abort(reservationId: String)
+    suspend fun abort(reservationId: String)
 
     /** Rebuilds only this authority's FIFO after ownership became unknown. */
-    fun teardownAuthority(
+    suspend fun teardownAuthority(
         authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,
+    )
+
+    /**
+     * Deletes a terminal receipt only after storage proves that the checkpoint no longer owns the
+     * exact activation marker. Failure may leak bounded tombstone capacity but cannot replay work.
+     */
+    suspend fun acknowledgeCheckpointFinalized(
+        key: RelayV2TerminalCheckpointKey,
+        activation: RelayV2TerminalParserEffectActivation,
     )
 }
 
@@ -565,6 +576,23 @@ private sealed interface RelayV2TerminalControlAdmission {
     data object Poisoned : RelayV2TerminalControlAdmission
 }
 
+internal interface RelayV2TerminalControlRuntimeEntry {
+    suspend fun admit(
+        authority: RelayV2RepositoryEffectAuthority,
+        effect: RelayV2TerminalEffect.SendInput,
+    ): RelayV2TerminalRuntimeApplyResult
+
+    suspend fun admit(
+        authority: RelayV2RepositoryEffectAuthority,
+        effect: RelayV2TerminalEffect.SendResize,
+    ): RelayV2TerminalRuntimeApplyResult
+}
+
+private data class RelayV2TerminalParserRuntimePorts(
+    val parser: RelayV2TerminalParserPort,
+    val postCommitEffects: RelayV2TerminalPostCommitEffectSink,
+)
+
 /**
  * Default-off adapter between the durable terminal module and platform ports.
  *
@@ -576,16 +604,40 @@ private sealed interface RelayV2TerminalControlAdmission {
  * activate. ACCEPTED transfers durable ownership; every uncertain path keeps a restore-time marker
  * and withdraws current runtime admission.
  */
-internal class RelayV2TerminalRuntimeAdapter(
+internal class RelayV2TerminalRuntimeAdapter private constructor(
     private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
     private val terminal: RelayV2TerminalRuntimeAuthority,
-    private val parser: RelayV2TerminalParserPort,
+    private val parserRuntime: RelayV2TerminalParserRuntimePorts?,
     private val control: RelayV2TerminalControlTransportPort,
-    private val postCommitEffects: RelayV2TerminalPostCommitEffectSink,
     private val fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
-) {
+) : RelayV2TerminalControlRuntimeEntry {
+    internal constructor(
+        applyLease: RelayV2RepositoryEffectApplyLeasePort,
+        terminal: RelayV2TerminalRuntimeAuthority,
+        parser: RelayV2TerminalParserPort,
+        control: RelayV2TerminalControlTransportPort,
+        postCommitEffects: RelayV2TerminalPostCommitEffectSink,
+        fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
+    ) : this(
+        applyLease = applyLease,
+        terminal = terminal,
+        parserRuntime = RelayV2TerminalParserRuntimePorts(parser, postCommitEffects),
+        control = control,
+        fatalInvalidation = fatalInvalidation,
+    )
+
     private val runtimeAdmission = RelayV2TerminalRuntimeAdmissionFence()
     private val parserHandoffSerial = RelayV2TerminalParserHandoffSerialGate()
+
+    override suspend fun admit(
+        authority: RelayV2RepositoryEffectAuthority,
+        effect: RelayV2TerminalEffect.SendInput,
+    ): RelayV2TerminalRuntimeApplyResult = handleControl(authority, effect)
+
+    override suspend fun admit(
+        authority: RelayV2RepositoryEffectAuthority,
+        effect: RelayV2TerminalEffect.SendResize,
+    ): RelayV2TerminalRuntimeApplyResult = handleControl(authority, effect)
 
     suspend fun handle(
         authority: RelayV2RepositoryEffectAuthority,
@@ -602,6 +654,7 @@ internal class RelayV2TerminalRuntimeAdapter(
         authority: RelayV2RepositoryEffectAuthority,
         effect: RelayV2TerminalEffect,
     ): RelayV2TerminalRuntimeApplyResult {
+        val parser = requireParserRuntime().parser
         val fence = effect.parserFence()
         if (!authority.matches(fence)) {
             return RelayV2TerminalRuntimeApplyResult.Rejected(
@@ -921,7 +974,7 @@ internal class RelayV2TerminalRuntimeAdapter(
         )
         val reservationId = UUID.randomUUID().toString()
         val reserveResult = try {
-            postCommitEffects.reserve(reservationId, batch)
+            requireParserRuntime().postCommitEffects.reserve(reservationId, batch)
         } catch (cancelled: CancellationException) {
             val abortFailure = abortReservation(reservationId)
             return RelayV2TerminalEffectPreparation.Invalidate(
@@ -1116,6 +1169,18 @@ internal class RelayV2TerminalRuntimeAdapter(
                                             teardownSink = false,
                                         )
                                     } else {
+                                        try {
+                                            requireParserRuntime().postCommitEffects
+                                                .acknowledgeCheckpointFinalized(
+                                                    key,
+                                                    prepared.activation,
+                                                )
+                                        } catch (cancelled: CancellationException) {
+                                            throw cancelled
+                                        } catch (_: Exception) {
+                                            // The durable receipt intentionally remains. It may
+                                            // consume bounded capacity but cannot replay effects.
+                                        }
                                         RelayV2TerminalParserCallbackPipelineResult.Complete
                                     }
                                 }
@@ -1231,7 +1296,10 @@ internal class RelayV2TerminalRuntimeAdapter(
         }
         if (claim.teardownOwner) {
             val teardownFailure = captureNonCancellableCleanupFailure {
-                postCommitEffects.teardownAuthority(claim.key.authority, claim.key.key)
+                requireParserRuntime().postCommitEffects.teardownAuthority(
+                    claim.key.authority,
+                    claim.key.key,
+                )
             }
             failure = combineFailuresPreservingCancellation(failure, teardownFailure)
             if (teardownFailure == null) runtimeAdmission.markTeardownSucceeded(claim)
@@ -1303,8 +1371,8 @@ internal class RelayV2TerminalRuntimeAdapter(
         check(checkpoint.pendingParserEffectActivation == activation)
     }
 
-    private fun abortReservation(reservationId: String): Exception? = try {
-        postCommitEffects.abort(reservationId)
+    private suspend fun abortReservation(reservationId: String): Exception? = try {
+        requireParserRuntime().postCommitEffects.abort(reservationId)
         null
     } catch (cancelled: CancellationException) {
         cancelled
@@ -1325,6 +1393,26 @@ internal class RelayV2TerminalRuntimeAdapter(
             ?: return null
         failures.filter { it !== chosen }.forEach(chosen::addSuppressed)
         return chosen
+    }
+
+    private fun requireParserRuntime(): RelayV2TerminalParserRuntimePorts =
+        checkNotNull(parserRuntime) {
+            "Parser runtime is unavailable in the terminal control-only composition"
+        }
+
+    companion object {
+        fun controlOnly(
+            applyLease: RelayV2RepositoryEffectApplyLeasePort,
+            terminal: RelayV2TerminalRuntimeAuthority,
+            control: RelayV2TerminalControlTransportPort,
+            fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
+        ): RelayV2TerminalControlRuntimeEntry = RelayV2TerminalRuntimeAdapter(
+            applyLease = applyLease,
+            terminal = terminal,
+            parserRuntime = null,
+            control = control,
+            fatalInvalidation = fatalInvalidation,
+        )
     }
 
     private suspend fun handleControl(
@@ -1381,9 +1469,13 @@ internal class RelayV2TerminalRuntimeAdapter(
                 }
                     RelayV2TerminalControlAdmission.Completed(
                         try {
-                            dispatchClaimedControl(admission, key, effect, claim) { reached ->
-                                transportSideEffectMayHaveBeenReached = reached
-                            }
+                            dispatchClaimedControl(
+                                admission,
+                                authority,
+                                key,
+                                effect,
+                                claim,
+                            ) { reached -> transportSideEffectMayHaveBeenReached = reached }
                         } catch (cancelled: CancellationException) {
                             cancellationCleanup = admission.poison(
                                 teardownRequired = false,
@@ -1426,6 +1518,7 @@ internal class RelayV2TerminalRuntimeAdapter(
 
     private suspend fun dispatchClaimedControl(
         admission: RelayV2TerminalRuntimeAdmissionFence.Admission,
+        authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,
         effect: RelayV2TerminalEffect,
         claim: RelayV2TerminalControlDispatchClaim,
@@ -1437,12 +1530,12 @@ internal class RelayV2TerminalRuntimeAdapter(
                 effect is RelayV2TerminalEffect.SendInput &&
                     claim is RelayV2TerminalControlDispatchClaim.Input -> {
                     externalSideEffectMayHaveBeenReached(true)
-                    control.sendInput(effect, claim)
+                    control.sendInput(authority, effect, claim)
                 }
                 effect is RelayV2TerminalEffect.SendResize &&
                     claim is RelayV2TerminalControlDispatchClaim.Resize -> {
                     externalSideEffectMayHaveBeenReached(true)
-                    control.sendResize(effect, claim)
+                    control.sendResize(authority, effect, claim)
                 }
                 else -> return RelayV2TerminalRuntimeApplyResult.ControlSettlementUnknown(claim)
             }

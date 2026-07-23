@@ -936,7 +936,10 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                     AgentNotificationConfig(
                         permission = AgentNotificationPermission.GRANTED,
                         profileActive = true,
-                        policy = AgentNotificationPolicy.SUPPRESS,
+                        policy = AgentNotificationPolicy.ALLOW,
+                        waitingForUser = true,
+                        failed = true,
+                        completed = false,
                     )
                 } else {
                     enabledNotificationConfig()
@@ -1058,6 +1061,138 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 ),
             )
             assertEquals(0, activationStore.claimCount)
+
+            val currentConsumer = consumer(
+                profileId = "profile-config",
+                sessionId = "session-config",
+            )
+            val configStore = MemoryStore()
+            val configRepository = AgentTranscriptLifecycleDurableRepositoryCore(configStore)
+            val configMutation = AgentTranscriptLifecycleNotificationConfigMutationAdapter(
+                applyLease = object : AgentTranscriptLifecycleNotificationConfigMutationLeasePort {
+                    override suspend fun <T> withCurrentAgentNotificationConfigMutationLease(
+                        consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+                        block: suspend () -> T,
+                    ): RelayV2EffectApplyResult<T> = if (consumer == currentConsumer) {
+                        RelayV2EffectApplyResult.Applied(block())
+                    } else {
+                        RelayV2EffectApplyResult.Stale
+                    }
+                },
+                mutateUnderApplyLease = configRepository::applyNotificationConfigUnderApplyLease,
+            )
+            val independentConfigs = listOf(
+                AgentNotificationConfig(
+                    permission = AgentNotificationPermission.GRANTED,
+                    profileActive = true,
+                    policy = AgentNotificationPolicy.ALLOW,
+                    waitingForUser = true,
+                    failed = false,
+                    completed = false,
+                ),
+                AgentNotificationConfig(
+                    permission = AgentNotificationPermission.GRANTED,
+                    profileActive = true,
+                    policy = AgentNotificationPolicy.ALLOW,
+                    waitingForUser = false,
+                    failed = true,
+                    completed = false,
+                ),
+                AgentNotificationConfig(
+                    permission = AgentNotificationPermission.DENIED,
+                    profileActive = true,
+                    policy = AgentNotificationPolicy.ALLOW,
+                    waitingForUser = false,
+                    failed = false,
+                    completed = true,
+                ),
+            )
+            independentConfigs.forEach { config ->
+                assertEquals(
+                    AgentTranscriptLifecycleNotificationConfigMutationResult.Applied,
+                    configMutation.mutate(
+                        AgentTranscriptLifecycleNotificationConfigMutationCommand(
+                            currentConsumer,
+                            config,
+                        ),
+                    ),
+                )
+                assertEquals(
+                    config,
+                    requireNotNull(configRepository.load(currentConsumer)).state.notificationConfig,
+                )
+            }
+
+            val imageBeforeStaleMutation = configStore.durableImage()
+            listOf(
+                currentConsumer.copy(
+                    profileActivationGeneration =
+                        currentConsumer.profileActivationGeneration + 1,
+                ),
+                currentConsumer.copy(principalId = "principal-replaced"),
+            ).forEach { staleConsumer ->
+                assertEquals(
+                    AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable,
+                    configMutation.mutate(
+                        AgentTranscriptLifecycleNotificationConfigMutationCommand(
+                            staleConsumer,
+                            enabledNotificationConfig(),
+                        ),
+                    ),
+                )
+                assertEquals(imageBeforeStaleMutation, configStore.durableImage())
+            }
+
+            val currentRecord = requireNotNull(configRepository.load(currentConsumer))
+            val v3Payload = AgentTranscriptLifecycleDurableStateCodec.encode(
+                currentRecord.namespace,
+                currentRecord.state,
+                currentRecord.storageAccounting,
+            )
+            assertEquals(3, v3Payload.codecVersion)
+            assertEquals(
+                setOf(
+                    "permission",
+                    "profileActive",
+                    "policy",
+                    "waitingForUser",
+                    "failed",
+                    "completed",
+                ),
+                notificationConfigKeys(v3Payload),
+            )
+
+            val legacyConfig = AgentNotificationConfig(
+                permission = AgentNotificationPermission.DENIED,
+                profileActive = true,
+                policy = AgentNotificationPolicy.ALLOW,
+                waitingForUser = true,
+                failed = true,
+                completed = false,
+            )
+            val v2Decoded = AgentTranscriptLifecycleDurableStateCodec.decode(
+                currentRecord.namespace,
+                encodeAsLegacyV2(v3Payload),
+            )
+            assertEquals(legacyConfig, v2Decoded.state.notificationConfig)
+            assertEquals(
+                legacyConfig,
+                AgentTranscriptLifecycleDurableStateCodec.decode(
+                    currentRecord.namespace,
+                    AgentTranscriptLifecycleDurableStateCodec.encode(
+                        currentRecord.namespace,
+                        v2Decoded.state,
+                        requireNotNull(v2Decoded.storageAccounting),
+                    ).also { rewritten -> assertEquals(3, rewritten.codecVersion) },
+                ).state.notificationConfig,
+            )
+            assertEquals(
+                legacyConfig,
+                AgentTranscriptLifecycleDurableStateCodec.decode(
+                    currentRecord.namespace,
+                    encodeAsLegacyV1(v3Payload),
+                ).state.notificationConfig,
+            )
         }
 
     @Test
@@ -2395,6 +2530,9 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             permission = AgentNotificationPermission.GRANTED,
             profileActive = true,
             policy = AgentNotificationPolicy.ALLOW,
+            waitingForUser = true,
+            failed = true,
+            completed = true,
         )
 
         fun operationalState(
@@ -2452,6 +2590,13 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             @Suppress("UNCHECKED_CAST")
             val state = (root.getValue("state") as Map<String, Any?>).toMutableMap()
             @Suppress("UNCHECKED_CAST")
+            val notificationConfig =
+                (state.getValue("notificationConfig") as Map<String, Any?>).toMutableMap()
+            notificationConfig.remove("waitingForUser")
+            notificationConfig.remove("failed")
+            notificationConfig.remove("completed")
+            state["notificationConfig"] = notificationConfig
+            @Suppress("UNCHECKED_CAST")
             val extension = (state.getValue("extension") as Map<String, Any?>).toMutableMap()
             extension.remove("effectiveHostLimits")
             extension.remove("syncState")
@@ -2465,6 +2610,46 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             root["state"] = state
             root.remove("storageAccounting")
             return RelayV2StorageJson.encode(codecVersion = 1, value = root)
+        }
+
+        fun encodeAsLegacyV2(payload: RelayV2EncodedPayload): RelayV2EncodedPayload {
+            val root = RelayV2StrictJson.parseObject(
+                payload.canonicalJson,
+                RelayV2JsonLimits(
+                    maxDepth = 32,
+                    maxDirectKeys = 256,
+                    maxTotalKeys = 32_768,
+                    maxNodes = 100_000,
+                ),
+            ).toMutableMap()
+            @Suppress("UNCHECKED_CAST")
+            val state = (root.getValue("state") as Map<String, Any?>).toMutableMap()
+            @Suppress("UNCHECKED_CAST")
+            val notificationConfig =
+                (state.getValue("notificationConfig") as Map<String, Any?>).toMutableMap()
+            notificationConfig.remove("waitingForUser")
+            notificationConfig.remove("failed")
+            notificationConfig.remove("completed")
+            state["notificationConfig"] = notificationConfig
+            root["state"] = state
+            return RelayV2StorageJson.encode(codecVersion = 2, value = root)
+        }
+
+        fun notificationConfigKeys(payload: RelayV2EncodedPayload): Set<String> {
+            val root = RelayV2StrictJson.parseObject(
+                payload.canonicalJson,
+                RelayV2JsonLimits(
+                    maxDepth = 32,
+                    maxDirectKeys = 256,
+                    maxTotalKeys = 32_768,
+                    maxNodes = 100_000,
+                ),
+            )
+            @Suppress("UNCHECKED_CAST")
+            val state = root.getValue("state") as Map<String, Any?>
+            @Suppress("UNCHECKED_CAST")
+            val notificationConfig = state.getValue("notificationConfig") as Map<String, Any?>
+            return notificationConfig.keys
         }
 
         fun RelayV2EncodedPayload.withActivationGeneration(

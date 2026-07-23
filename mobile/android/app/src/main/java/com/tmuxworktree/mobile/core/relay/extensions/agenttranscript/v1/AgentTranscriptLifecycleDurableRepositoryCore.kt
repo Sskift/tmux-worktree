@@ -306,6 +306,29 @@ internal data class AgentTranscriptLifecyclePersistedNotificationClaim(
     val payload: RelayV2EncodedPayload,
 )
 
+internal data class AgentTranscriptLifecyclePostedNotificationIdentity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val claimId: String,
+) {
+    init {
+        requireStorageOpaqueIdentity(profileId, "Profile ID")
+        require(profileActivationGeneration > 0)
+        require(AgentTranscriptLifecycleNotificationClaimCodec.isValidClaimId(claimId))
+    }
+}
+
+internal data class AgentTranscriptLifecyclePostedNotificationPage(
+    val identities: List<AgentTranscriptLifecyclePostedNotificationIdentity>,
+    val nextOffset: Int?,
+)
+
+internal enum class AgentTranscriptLifecycleMarkNotificationPostedResult {
+    MARKED,
+    ALREADY_MARKED,
+    UNAVAILABLE,
+}
+
 /** Content-free authority emitted only after the immutable claim transaction commits. */
 internal data class AgentTranscriptLifecycleNotificationExecutionTicket(
     val claimId: String,
@@ -600,8 +623,21 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
         eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,
     ): List<AgentTranscriptLifecyclePersistedNotificationClaim>
 
+    fun notificationClaimProfilePage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): List<AgentTranscriptLifecyclePersistedNotificationClaim> =
+        throw UnsupportedOperationException("Notification claim profile paging is not installed")
+
     /** Must use INSERT ABORT or an equivalent no-overwrite compare-and-set. */
     fun insertNotificationClaim(claim: AgentTranscriptLifecyclePersistedNotificationClaim)
+
+    fun compareAndSetNotificationClaim(
+        expected: AgentTranscriptLifecyclePersistedNotificationClaim,
+        next: AgentTranscriptLifecyclePersistedNotificationClaim,
+    ): Int = throw UnsupportedOperationException("Notification claim CAS is not installed")
 }
 
 /**
@@ -615,6 +651,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private val publicCodec: AgentTranscriptLifecycleV1Codec = AgentTranscriptLifecycleV1Codec(),
 ) : AgentTranscriptLifecycleDurableOperationPort,
     AgentTranscriptLifecycleNotificationClaimPort,
+    AgentTranscriptLifecyclePostedNotificationDurablePort,
     AgentTranscriptLifecycleRevisionPinnedReadPort,
     AgentTranscriptLifecycleRecoveryCatalogPort {
     private val recoveryCatalogCursorIssuer = Any()
@@ -801,6 +838,48 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         AgentTranscriptLifecycleDurableOperationResult(
             reduceUnderApplyLease(command.fence.expectedNamespace, command.input, limits),
         )
+
+    override suspend fun applyNotificationConfigUnderApplyLease(
+        command: AgentTranscriptLifecycleNotificationConfigMutationCommand,
+    ): AgentTranscriptLifecycleDurableOperationResult = store.transaction {
+        var decoded = loadSingle(command.consumer)
+        if (decoded == null) {
+            val namespace = AgentTranscriptLifecycleDurableNamespace(command.consumer, null)
+            insertMissingState(
+                namespace,
+                AgentTranscriptLifecycleClientState(command.consumer.sessionIdentity),
+            )
+            decoded = loadSingle(command.consumer)
+                ?: throw AgentTranscriptLifecyclePersistenceMissingException()
+        }
+        val audited = auditSingle(decoded)
+        var current = ReadyOperationState(
+            namespace = audited.record.namespace,
+            state = audited.record.state,
+            storageAccounting = audited.record.storageAccounting,
+            payload = audited.payload,
+        )
+        val reduction = AgentTranscriptLifecycleClientReducer.reduce(
+            current.state,
+            AgentTranscriptLifecycleClientInput.ClientConfigChanged(command.config),
+        )
+        if (reduction.disposition != AgentClientDisposition.CONFIG_APPLIED) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        if (reduction.state.extensionLane.localGeneration !=
+            current.state.extensionLane.localGeneration
+        ) {
+            clearSnapshotFence(current.namespace)
+        }
+        current = persistOperationState(
+            current,
+            reduction.state,
+            current.storageAccounting,
+        )
+        AgentTranscriptLifecycleDurableOperationResult(
+            reduction.copy(state = current.state),
+        )
+    }
 
     override suspend fun prepareRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
@@ -2943,7 +3022,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             !config.profileActive -> AgentNotificationDisposition.SUPPRESSED_INACTIVE_PROFILE
             config.permission == AgentNotificationPermission.DENIED ->
                 AgentNotificationDisposition.SUPPRESSED_PERMISSION
-            config.policy == AgentNotificationPolicy.SUPPRESS ->
+            config.policy == AgentNotificationPolicy.SUPPRESS || !config.allows(record.state) ->
                 AgentNotificationDisposition.SUPPRESSED_POLICY
             else -> AgentNotificationDisposition.SHOWN
         }
@@ -3698,6 +3777,11 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             }
 
             val payload = AgentTranscriptLifecycleNotificationClaimCodec.encode(key, intent)
+            val encodedClaim = AgentTranscriptLifecycleNotificationClaimCodec.decode(
+                key,
+                intent.localGeneration,
+                payload,
+            )
             insertNotificationClaim(
                 AgentTranscriptLifecyclePersistedNotificationClaim(
                     key,
@@ -3708,7 +3792,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             NotificationClaimTransactionResult.Committed(
                 key,
                 intent,
-                payload.sha256,
+                encodedClaim.claimId,
             )
         }
 
@@ -3730,6 +3814,103 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                     transactionResult.reason,
                 )
         }
+    }
+
+    override suspend fun markNotificationPostedUnderApplyLease(
+        ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ): AgentTranscriptLifecycleMarkNotificationPostedResult = store.transaction {
+        val key = AgentTranscriptLifecycleNotificationClaimKey.exactOrNull(
+            ticket.namespace,
+            ticket.intent,
+        ) ?: return@transaction AgentTranscriptLifecycleMarkNotificationPostedResult.UNAVAILABLE
+        val existingClaims = notificationClaims(key.eventIdentity)
+        if (existingClaims.size > 1) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        val existing = existingClaims.singleOrNull()
+            ?: return@transaction AgentTranscriptLifecycleMarkNotificationPostedResult.UNAVAILABLE
+        if (existing.key != key || existing.claimedLocalGeneration != ticket.intent.localGeneration) {
+            return@transaction AgentTranscriptLifecycleMarkNotificationPostedResult.UNAVAILABLE
+        }
+        val decoded = AgentTranscriptLifecycleNotificationClaimCodec.decode(
+            existing.key,
+            existing.claimedLocalGeneration,
+            existing.payload,
+        )
+        if (decoded.intent != ticket.intent || decoded.claimId != ticket.claimId) {
+            return@transaction AgentTranscriptLifecycleMarkNotificationPostedResult.UNAVAILABLE
+        }
+        if (decoded.platformState ==
+            AgentTranscriptLifecycleNotificationClaimCodec.PlatformState.POSTED
+        ) {
+            return@transaction AgentTranscriptLifecycleMarkNotificationPostedResult.ALREADY_MARKED
+        }
+        val next = existing.copy(
+            payload = AgentTranscriptLifecycleNotificationClaimCodec.encodePosted(
+                existing.key,
+                decoded.intent,
+                decoded.claimId,
+            ),
+        )
+        if (compareAndSetNotificationClaim(existing, next) != 1) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        AgentTranscriptLifecycleMarkNotificationPostedResult.MARKED
+    }
+
+    override suspend fun readPostedNotificationPage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): AgentTranscriptLifecyclePostedNotificationPage = store.transaction {
+        requireStorageOpaqueIdentity(profileId, "Profile ID")
+        require(profileActivationGeneration > 0)
+        require(offset >= 0)
+        require(limit in 1..MAX_POSTED_NOTIFICATION_PAGE_SIZE)
+        val rows = notificationClaimProfilePage(
+            profileId,
+            profileActivationGeneration,
+            offset,
+            limit + 1,
+        )
+        if (rows.size > limit + 1) storageMalformed()
+        val pageRows = rows.take(limit)
+        val identities = pageRows.mapNotNull { row ->
+            val consumer = row.key.consumer
+            if (consumer.profileId != profileId ||
+                consumer.profileActivationGeneration != profileActivationGeneration
+            ) storageMalformed()
+            val decoded = AgentTranscriptLifecycleNotificationClaimCodec.decode(
+                row.key,
+                row.claimedLocalGeneration,
+                row.payload,
+            )
+            if (decoded.platformState !=
+                AgentTranscriptLifecycleNotificationClaimCodec.PlatformState.POSTED
+            ) {
+                null
+            } else {
+                AgentTranscriptLifecyclePostedNotificationIdentity(
+                    profileId,
+                    profileActivationGeneration,
+                    decoded.claimId,
+                )
+            }
+        }
+        if (identities.map { it.claimId }.toSet().size != identities.size) storageMalformed()
+        AgentTranscriptLifecyclePostedNotificationPage(
+            identities = identities,
+            nextOffset = if (rows.size > limit) {
+                try {
+                    Math.addExact(offset, limit)
+                } catch (_: ArithmeticException) {
+                    storageMalformed()
+                }
+            } else {
+                null
+            },
+        )
     }
 
     private data class NotificationClaimPreflightFacts(
@@ -4594,6 +4775,7 @@ private sealed interface NotificationClaimTransactionResult {
 }
 
 private const val MAX_STORAGE_OPAQUE_ID_UTF8_BYTES = 128
+private const val MAX_POSTED_NOTIFICATION_PAGE_SIZE = 128
 private val UINT64_MAX_STORAGE = BigInteger("18446744073709551615")
 /** Node authority composite: 50k active text rows plus 100k retained delete tombstones. */
 private const val MAX_MATERIALIZED_TRANSCRIPT_ROWS = 150_000L

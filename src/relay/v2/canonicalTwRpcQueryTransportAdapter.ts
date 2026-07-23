@@ -1,6 +1,7 @@
 import { spawn as spawnChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { types as nodeTypes } from "node:util";
 import { loadConfigFile, type Config } from "../../config.js";
 import type {
   RelayV2CanonicalTwRpcDiscoveryQuery,
@@ -17,6 +18,13 @@ import {
   parseRelayV2JsonObject,
   type RelayV2JsonValue,
 } from "./strictJson.js";
+import {
+  RELAY_V2_REMOTE_EXACT_COMPOUND_ENTRYPOINT,
+  RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES,
+  type RelayV2ExactCompoundProcessTargetV1,
+  type RelayV2RemoteExactCompoundChannelFactoryV1,
+  type RelayV2RemoteExactCompoundChannelV1,
+} from "./remoteExactTerminalControlCompoundV1.js";
 
 export const RELAY_V2_CANONICAL_TW_RPC_QUERY_STDOUT_MAX_BYTES = 1_048_576;
 export const RELAY_V2_CANONICAL_TW_RPC_QUERY_STDERR_MAX_BYTES = 65_536;
@@ -91,12 +99,38 @@ export interface RelayV2CanonicalTwRpcQueryProcessRunner {
   ): RelayV2CanonicalTwRpcQueryProcessHandle;
 }
 
+export interface RelayV2CanonicalTwRpcCompoundProcessRequest {
+  executable: string;
+  argv: readonly string[];
+  shell: false;
+  stdin: "pipe";
+  stdout: "pipe";
+  stderr: "pipe";
+}
+
+export interface RelayV2CanonicalTwRpcCompoundProcessHandle {
+  stdin: {
+    write(frame: Uint8Array): Promise<void>;
+    end(): void;
+  };
+  stdout: AsyncIterable<Uint8Array>;
+  stderr: AsyncIterable<Uint8Array>;
+  exited: Promise<RelayV2CanonicalTwRpcQueryProcessExit>;
+  kill(signal: "SIGKILL"): void;
+}
+
+export interface RelayV2CanonicalTwRpcCompoundProcessRunner {
+  spawnCompound(
+    request: RelayV2CanonicalTwRpcCompoundProcessRequest,
+  ): RelayV2CanonicalTwRpcCompoundProcessHandle;
+}
+
 /**
  * Default-disabled Node child runner for a future relay-host composition root.
  * Constructing it has no side effects; only an injected discovery scan spawns.
  */
 export class RelayV2CanonicalTwRpcChildProcessRunner
-implements RelayV2CanonicalTwRpcQueryProcessRunner {
+implements RelayV2CanonicalTwRpcQueryProcessRunner, RelayV2CanonicalTwRpcCompoundProcessRunner {
   spawn(
     request: RelayV2CanonicalTwRpcQueryProcessRequest,
   ): RelayV2CanonicalTwRpcQueryProcessHandle {
@@ -114,6 +148,36 @@ implements RelayV2CanonicalTwRpcQueryProcessRunner {
       child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
     });
     return {
+      stdout: child.stdout,
+      stderr: child.stderr,
+      exited,
+      kill: (signal) => { child.kill(signal); },
+    };
+  }
+
+  spawnCompound(
+    request: RelayV2CanonicalTwRpcCompoundProcessRequest,
+  ): RelayV2CanonicalTwRpcCompoundProcessHandle {
+    const child = spawnChildProcess(request.executable, [...request.argv], {
+      shell: request.shell,
+      stdio: [request.stdin, request.stdout, request.stderr],
+      windowsHide: true,
+    });
+    if (child.stdin === null || child.stdout === null || child.stderr === null) {
+      try { child.kill("SIGKILL"); } catch {}
+      throw new RelayV2CanonicalTwRpcQueryTransportError("SPAWN_FAILED");
+    }
+    const exited = new Promise<RelayV2CanonicalTwRpcQueryProcessExit>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
+    });
+    return {
+      stdin: {
+        write: (frame) => new Promise<void>((resolve, reject) => {
+          child.stdin!.write(frame, (error) => error ? reject(error) : resolve());
+        }),
+        end: () => { child.stdin!.end(); },
+      },
       stdout: child.stdout,
       stderr: child.stderr,
       exited,
@@ -439,10 +503,244 @@ function invocationFor(
   });
 }
 
+function compoundInvocationFor(
+  target: Extract<NormalizedTarget, { kind: "ssh" }>,
+): RelayV2CanonicalTwRpcCompoundProcessRequest {
+  return Object.freeze({
+    executable: target.sshExecutable,
+    argv: Object.freeze([
+      "-F", "/dev/null",
+      "-o", "BatchMode=yes",
+      "-o", "PasswordAuthentication=no",
+      "-o", "KbdInteractiveAuthentication=no",
+      "-o", "StrictHostKeyChecking=yes",
+      "-o", `UserKnownHostsFile=${target.knownHostsFile}`,
+      "-o", "GlobalKnownHostsFile=/dev/null",
+      "-o", "ClearAllForwardings=yes",
+      "-o", "RequestTTY=no",
+      "-o", "ConnectTimeout=10",
+      "-o", "IdentitiesOnly=yes",
+      "-i", target.identityFile,
+      "-p", String(target.port),
+      "-l", target.user,
+      "--",
+      target.host,
+      target.twExecutable,
+      RELAY_V2_REMOTE_EXACT_COMPOUND_ENTRYPOINT,
+    ]),
+    shell: false as const,
+    stdin: "pipe" as const,
+    stdout: "pipe" as const,
+    stderr: "pipe" as const,
+  });
+}
+
+class CanonicalRemoteExactCompoundChannel
+implements RelayV2RemoteExactCompoundChannelV1 {
+  private readonly iterator: AsyncIterator<Uint8Array>;
+  private readonly exited: Promise<RelayV2CanonicalTwRpcQueryProcessExit>;
+  private readonly fatalSignal: Promise<void>;
+  private resolveFatal: (() => void) | null = null;
+  private fatalError: RelayV2CanonicalTwRpcQueryTransportError | null = null;
+  private buffer = Buffer.alloc(0);
+  private operation: Promise<void> = Promise.resolve();
+  private closeBarrier: Promise<void> | null = null;
+  private killed = false;
+
+  constructor(
+    private readonly handle: RelayV2CanonicalTwRpcCompoundProcessHandle,
+    private readonly onClosed: () => void,
+  ) {
+    this.iterator = handle.stdout[Symbol.asyncIterator]();
+    this.exited = Promise.resolve(handle.exited).then(normalizeExit);
+    this.fatalSignal = new Promise<void>((resolve) => { this.resolveFatal = resolve; });
+    void this.watchStderr();
+  }
+
+  private kill(): void {
+    if (this.killed) return;
+    this.killed = true;
+    try { this.handle.kill("SIGKILL"); } catch {}
+  }
+
+  private fail(error: RelayV2CanonicalTwRpcQueryTransportError): void {
+    if (this.fatalError !== null) return;
+    this.fatalError = error;
+    this.kill();
+    this.resolveFatal?.();
+  }
+
+  private async watchStderr(): Promise<void> {
+    let bytes = 0;
+    try {
+      for await (const chunk of this.handle.stderr) {
+        if (!(chunk instanceof Uint8Array)) {
+          this.fail(new RelayV2CanonicalTwRpcQueryTransportError("PROCESS_FAILED"));
+          return;
+        }
+        bytes += chunk.byteLength;
+        if (bytes > 0) {
+          this.fail(new RelayV2CanonicalTwRpcQueryTransportError(
+            bytes > RELAY_V2_CANONICAL_TW_RPC_QUERY_STDERR_MAX_BYTES
+              ? "OUTPUT_LIMIT"
+              : "PROCESS_FAILED",
+          ));
+          return;
+        }
+      }
+    } catch {
+      this.fail(new RelayV2CanonicalTwRpcQueryTransportError("PROCESS_FAILED"));
+    }
+  }
+
+  private async nextFrame(): Promise<Record<string, unknown>> {
+    while (true) {
+      const newline = this.buffer.indexOf(0x0a);
+      if (newline >= 0) {
+        const frame = this.buffer.subarray(0, newline);
+        this.buffer = this.buffer.subarray(newline + 1);
+        if (frame.byteLength === 0 || frame.includes(0x0d)) {
+          throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_RESPONSE");
+        }
+        try {
+          return parseRelayV2JsonObject(decodeRelayV2StrictUtf8(frame), QUERY_JSON_LIMITS);
+        } catch {
+          throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_RESPONSE");
+        }
+      }
+      const next = await this.iterator.next();
+      if (next.done) {
+        const exit = await this.exited;
+        throw new RelayV2CanonicalTwRpcQueryTransportError(
+          exit.exitCode === 0 && exit.signal === null ? "INVALID_RESPONSE" : "PROCESS_FAILED",
+        );
+      }
+      if (!(next.value instanceof Uint8Array)) {
+        throw new RelayV2CanonicalTwRpcQueryTransportError("PROCESS_FAILED");
+      }
+      if (next.value.byteLength
+        > RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES - this.buffer.byteLength) {
+        throw new RelayV2CanonicalTwRpcQueryTransportError("OUTPUT_LIMIT");
+      }
+      this.buffer = Buffer.concat([this.buffer, Buffer.from(next.value)]);
+    }
+  }
+
+  private async requestOne(frame: Readonly<Record<string, unknown>>): Promise<unknown> {
+    if (this.closeBarrier !== null || this.fatalError !== null) {
+      throw this.fatalError ?? new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
+    const encoded = Buffer.from(`${JSON.stringify(frame)}\n`, "utf8");
+    if (encoded.byteLength > RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
+    }
+    await this.handle.stdin.write(encoded);
+    const timeout = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => {
+        this.kill();
+        reject(new RelayV2CanonicalTwRpcQueryTransportError("TIMED_OUT"));
+      }, 30_000);
+      timer.unref?.();
+      this.operation.finally(() => clearTimeout(timer)).catch(() => undefined);
+    });
+    const fatal = this.fatalSignal.then(() => {
+      throw this.fatalError ?? new RelayV2CanonicalTwRpcQueryTransportError("PROCESS_FAILED");
+    });
+    return Promise.race([this.nextFrame(), fatal, timeout]);
+  }
+
+  request(frame: Readonly<Record<string, unknown>>): Promise<unknown> {
+    const result = this.operation.then(() => this.requestOne(frame));
+    this.operation = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  fence(): void {
+    this.fail(new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE"));
+  }
+
+  async close(): Promise<void> {
+    if (this.closeBarrier !== null) return this.closeBarrier;
+    this.closeBarrier = (async () => {
+      try { this.handle.stdin.end(); } catch {}
+      const timer = setTimeout(() => this.kill(), 5_000);
+      timer.unref?.();
+      try {
+        await this.exited.catch(() => undefined);
+      } finally {
+        clearTimeout(timer);
+        this.onClosed();
+      }
+    })();
+    return this.closeBarrier;
+  }
+}
+
 function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
   return value !== null
     && typeof value === "object"
     && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === "function";
+}
+
+function closedOwnDataRecord(
+  value: unknown,
+  keys: readonly string[],
+): Record<string, unknown> | null {
+  if (!isRecord(value) || nodeTypes.isProxy(value)) return null;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (Reflect.ownKeys(descriptors).length !== keys.length
+      || keys.some((key) => {
+        const descriptor = descriptors[key];
+        return descriptor === undefined || !Object.hasOwn(descriptor, "value");
+      })) return null;
+    return Object.fromEntries(keys.map((key) => [key, descriptors[key]!.value]));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCompoundProcessHandle(
+  value: unknown,
+): RelayV2CanonicalTwRpcCompoundProcessHandle {
+  try {
+    const handle = closedOwnDataRecord(value, ["stdin", "stdout", "stderr", "exited", "kill"]);
+    const stdinValue = handle?.stdin;
+    const stdin = closedOwnDataRecord(stdinValue, ["write", "end"]);
+    if (handle === null
+      || stdin === null
+      || typeof stdin.write !== "function"
+      || typeof stdin.end !== "function"
+      || nodeTypes.isProxy(handle.stdout)
+      || nodeTypes.isProxy(handle.stderr)
+      || !isAsyncIterable(handle.stdout)
+      || !isAsyncIterable(handle.stderr)
+      || !(handle.exited instanceof Promise)
+      || typeof handle.kill !== "function") {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("SPAWN_FAILED");
+    }
+    return Object.freeze({
+      stdin: Object.freeze({
+        write: (frame: Uint8Array) => Promise.resolve(
+          Reflect.apply(stdin.write as (...args: unknown[]) => unknown, stdinValue, [frame]),
+        ).then(() => undefined),
+        end: () => {
+          Reflect.apply(stdin.end as (...args: unknown[]) => unknown, stdinValue, []);
+        },
+      }),
+      stdout: handle.stdout as AsyncIterable<Uint8Array>,
+      stderr: handle.stderr as AsyncIterable<Uint8Array>,
+      exited: handle.exited as Promise<RelayV2CanonicalTwRpcQueryProcessExit>,
+      kill: (signal: "SIGKILL") => {
+        Reflect.apply(handle.kill as (...args: unknown[]) => unknown, value, [signal]);
+      },
+    });
+  } catch (error) {
+    if (error instanceof RelayV2CanonicalTwRpcQueryTransportError) throw error;
+    throw new RelayV2CanonicalTwRpcQueryTransportError("SPAWN_FAILED");
+  }
 }
 
 function normalizeProcessHandle(value: unknown): RelayV2CanonicalTwRpcQueryProcessHandle {
@@ -593,6 +891,8 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
 
   private readonly runner: RelayV2CanonicalTwRpcQueryProcessRunner;
 
+  private readonly activeCompoundChannels = new Set<CanonicalRemoteExactCompoundChannel>();
+
   constructor(options: RelayV2CanonicalTwRpcQueryTransportAdapterOptions) {
     if (!isRecord(options)
       || !hasExactKeys(options, ["targets", "runner"])
@@ -623,6 +923,7 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
   /** Synchronously withdraws every binding while a config generation retires. */
   beginContentAddressedTargetTransition(): void {
     this.targets = new Map();
+    for (const channel of this.activeCompoundChannels) channel.fence();
   }
 
   /** Installs only descriptors whose opaque ID hashes their exact contents. */
@@ -657,6 +958,43 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
       throw new RelayV2CanonicalTwRpcQueryTransportError("PROCESS_FAILED");
     }
     return parseStdout(result.stdout);
+  }
+
+  /**
+   * Captures the same configured-target owner for a versioned, long-lived SSH
+   * child. Local targets are deliberately unavailable: they already use the
+   * in-process exact authority and must never be a remote fallback.
+   */
+  captureRemoteExactCompoundChannelFactory(
+    runner: RelayV2CanonicalTwRpcCompoundProcessRunner,
+  ): RelayV2RemoteExactCompoundChannelFactoryV1 {
+    if (!isRecord(runner) || typeof runner.spawnCompound !== "function") {
+      throw new TypeError("canonical TW RPC remote compound runner is invalid");
+    }
+    return Object.freeze({
+      open: async (rawTarget: RelayV2ExactCompoundProcessTargetV1) => {
+        const targetId = boundedString(rawTarget?.targetId, 128);
+        const target = this.targets.get(`ssh\0${targetId}`);
+        if (target === undefined || target.kind !== "ssh" || rawTarget.kind !== "ssh") {
+          throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+        }
+        let handle: RelayV2CanonicalTwRpcCompoundProcessHandle;
+        try {
+          handle = normalizeCompoundProcessHandle(
+            runner.spawnCompound(compoundInvocationFor(target)),
+          );
+        } catch (error) {
+          if (error instanceof RelayV2CanonicalTwRpcQueryTransportError) throw error;
+          throw new RelayV2CanonicalTwRpcQueryTransportError("SPAWN_FAILED");
+        }
+        const channel = new CanonicalRemoteExactCompoundChannel(
+          handle,
+          () => this.activeCompoundChannels.delete(channel),
+        );
+        this.activeCompoundChannels.add(channel);
+        return channel;
+      },
+    });
   }
 }
 

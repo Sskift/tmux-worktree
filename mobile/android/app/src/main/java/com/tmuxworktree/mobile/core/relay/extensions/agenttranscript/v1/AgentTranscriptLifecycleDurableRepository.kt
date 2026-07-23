@@ -32,6 +32,7 @@ import kotlinx.coroutines.CancellationException
 internal class AgentTranscriptLifecycleDurableRepository(
     database: RelayV2StateDatabase,
 ) : AgentTranscriptLifecycleRuntimeDurableRepository,
+    AgentTranscriptLifecyclePostedNotificationDurablePort,
     AgentTranscriptLifecycleRecoveryCatalogPort {
     private val core = AgentTranscriptLifecycleDurableRepositoryCore(
         RoomAgentTranscriptLifecycleDurableStore(database),
@@ -72,7 +73,25 @@ internal class AgentTranscriptLifecycleDurableRepository(
     ): AgentTranscriptLifecycleNotificationClaimResult =
         core.claimNotificationUnderApplyLease(expectedNamespace, intent)
 
+    override suspend fun markNotificationPostedUnderApplyLease(
+        ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ): AgentTranscriptLifecycleMarkNotificationPostedResult =
+        core.markNotificationPostedUnderApplyLease(ticket)
+
+    override suspend fun readPostedNotificationPage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): AgentTranscriptLifecyclePostedNotificationPage =
+        core.readPostedNotificationPage(profileId, profileActivationGeneration, offset, limit)
+
     /** Closed operation seam; each call is executed by the core in one Room transaction. */
+    override suspend fun applyNotificationConfigUnderApplyLease(
+        command: AgentTranscriptLifecycleNotificationConfigMutationCommand,
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.applyNotificationConfigUnderApplyLease(command)
+
     override suspend fun prepareRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
         limits: AgentClientReducerLimits,
@@ -141,7 +160,7 @@ internal class AgentTranscriptLifecycleDurableLoadOrInitializeAdapter(
         authority: RelayV2RepositoryEffectAuthority,
         namespace: AgentTranscriptLifecycleDurableNamespace,
     ): AgentTranscriptLifecycleDurableLoadOrInitializeResult {
-        if (!authority.matchesExactly(namespace.consumer)) {
+        if (!authority.ownsExactly(namespace.consumer)) {
             return AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable
         }
         return try {
@@ -165,16 +184,56 @@ internal class AgentTranscriptLifecycleDurableLoadOrInitializeAdapter(
     }
 }
 
-private fun RelayV2RepositoryEffectAuthority.matchesExactly(
-    consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
-): Boolean = generation.profileId == consumer.profileId &&
-    generation.profileGeneration == consumer.profileActivationGeneration &&
-    profileId == consumer.profileId &&
-    profileActivationGeneration == consumer.profileActivationGeneration &&
-    principalId == consumer.principalId &&
-    clientInstanceId == consumer.clientInstanceId &&
-    hostId == consumer.hostId &&
-    hostEpoch == consumer.hostEpoch
+/**
+ * The actor owns optional-capability and generation admission; the Room repository remains the
+ * sole config writer. A missing consumer is initialized fail-closed inside the same transaction
+ * before the reducer applies the requested config.
+ */
+internal class AgentTranscriptLifecycleNotificationConfigMutationAdapter(
+    private val applyLease: AgentTranscriptLifecycleNotificationConfigMutationLeasePort,
+    private val mutateUnderApplyLease:
+        suspend (AgentTranscriptLifecycleNotificationConfigMutationCommand) ->
+            AgentTranscriptLifecycleDurableOperationResult,
+) : AgentTranscriptLifecycleNotificationConfigMutationPort {
+    constructor(
+        applyLease: AgentTranscriptLifecycleNotificationConfigMutationLeasePort,
+        repository: AgentTranscriptLifecycleRuntimeDurableRepository,
+    ) : this(applyLease, repository::applyNotificationConfigUnderApplyLease)
+
+    override suspend fun mutate(
+        command: AgentTranscriptLifecycleNotificationConfigMutationCommand,
+    ): AgentTranscriptLifecycleNotificationConfigMutationResult = try {
+        when (
+            val leased = applyLease.withCurrentAgentNotificationConfigMutationLease(
+                command.consumer,
+            ) {
+                mutateUnderApplyLease(command)
+            }
+        ) {
+            is RelayV2EffectApplyResult.Applied -> {
+                val reduction = leased.value.reduction
+                if (reduction.disposition == AgentClientDisposition.CONFIG_APPLIED &&
+                    reduction.state.identity == command.consumer.sessionIdentity &&
+                    reduction.state.notificationConfig == command.config
+                ) {
+                    AgentTranscriptLifecycleNotificationConfigMutationResult.Applied
+                } else {
+                    AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+                }
+            }
+            RelayV2EffectApplyResult.Stale ->
+                AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: AgentTranscriptLifecyclePersistenceConflictException) {
+        AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+    } catch (_: AgentTranscriptLifecyclePersistenceMissingException) {
+        AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+    } catch (_: RelayV2StorageException) {
+        AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+    }
+}
 
 private class RoomAgentTranscriptLifecycleDurableStore(
     private val database: RelayV2StateDatabase,
@@ -1032,6 +1091,32 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
         claim: AgentTranscriptLifecyclePersistedNotificationClaim,
     ) {
         dao.insertAgentTranscriptLifecycleNotificationClaim(claim.toEntity())
+    }
+
+    override fun notificationClaimProfilePage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): List<AgentTranscriptLifecyclePersistedNotificationClaim> =
+        dao.agentTranscriptLifecycleNotificationClaimProfilePage(
+            profileId,
+            profileActivationGeneration,
+            offset,
+            limit,
+        ).map(RelayV2AgentTranscriptLifecycleNotificationClaimEntity::toPersisted)
+
+    override fun compareAndSetNotificationClaim(
+        expected: AgentTranscriptLifecyclePersistedNotificationClaim,
+        next: AgentTranscriptLifecyclePersistedNotificationClaim,
+    ): Int {
+        if (expected.key != next.key ||
+            expected.claimedLocalGeneration != next.claimedLocalGeneration
+        ) return 0
+        val current = notificationClaims(expected.key.eventIdentity).singleOrNull()
+            ?: return 0
+        if (current != expected) return 0
+        return dao.updateAgentTranscriptLifecycleNotificationClaim(next.toEntity())
     }
 }
 

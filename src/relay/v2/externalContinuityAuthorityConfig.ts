@@ -423,6 +423,7 @@ function createBoundAuthority(
     try {
       return Reflect.apply(resolved.authenticationHeaders, resolved.receiver, []);
     } catch {
+      try { owner.discard(); } catch {}
       throw failure();
     }
   };

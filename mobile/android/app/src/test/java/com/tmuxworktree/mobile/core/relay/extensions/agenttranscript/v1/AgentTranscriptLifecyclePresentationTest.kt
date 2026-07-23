@@ -377,6 +377,9 @@ private fun presentationState(): AgentTranscriptLifecycleClientState {
             permission = AgentNotificationPermission.GRANTED,
             profileActive = true,
             policy = AgentNotificationPolicy.ALLOW,
+            waitingForUser = true,
+            failed = true,
+            completed = true,
         ),
     )
 }

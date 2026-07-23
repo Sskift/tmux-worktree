@@ -9,6 +9,7 @@ import {
 } from "../../terminalControl/protocol.js";
 import type { TerminalControlRequestInput } from "../../terminalControl/client.js";
 import type {
+  RelayV2TerminalCanonicalTargetBindingV1,
   RelayV2TerminalAuthorityInput,
   RelayV2TerminalAuthorityResize,
   RelayV2TerminalAuthorityResult,
@@ -17,6 +18,9 @@ import type {
   RelayV2TerminalResolvedTarget,
   RelayV2TerminalStructuredError,
 } from "./terminalManager.js";
+import type {
+  RelayV2PreparedExactTerminalControlLeasePortV1,
+} from "./canonicalTerminalTargetResolverAdapter.js";
 
 const MAX_V2_TERMINAL_BYTES = 64 * 1024;
 const MAX_V2_ID_BYTES = 128;
@@ -168,6 +172,49 @@ function target(value: unknown): RelayV2TerminalResolvedTarget {
   };
 }
 
+const RELAY_V2_TERMINAL_EXACT_EFFECT_TARGET = Symbol.for(
+  "tmux-worktree.relay-v2.terminal-exact-effect-target",
+);
+
+function exactEffectTarget(value: unknown): {
+  resolved: RelayV2TerminalResolvedTarget;
+  binding: RelayV2TerminalCanonicalTargetBindingV1;
+} {
+  if (!isRecord(value)
+    || Reflect.ownKeys(value).length !== 4
+    || value.schemaVersion !== 1
+    || value[RELAY_V2_TERMINAL_EXACT_EFFECT_TARGET] !== true
+    || !Object.hasOwn(value, "resolvedTarget")
+    || !Object.hasOwn(value, "binding")) {
+    throw new AdapterInputError("PERMISSION_DENIED");
+  }
+  const resolved = target(value.resolvedTarget);
+  const raw = value.binding;
+  if (!isRecord(raw)
+    || !exactKeys(raw, [
+      "schemaVersion", "hostId", "scopeId", "sessionId", "pane", "processTarget",
+      "backendInstanceKey", "managedTarget", "exactControlIdentity",
+    ])
+    || raw.schemaVersion !== 1
+    || raw.hostId !== resolved.hostId
+    || raw.scopeId !== resolved.scopeId
+    || raw.sessionId !== resolved.sessionId
+    || raw.pane !== resolved.pane
+    || raw.backendInstanceKey !== resolved.canonicalTargetId
+    || !isRecord(raw.exactControlIdentity)
+    || !exactKeys(raw.exactControlIdentity, [
+      "schemaVersion", "controlTargetId", "controlEpoch", "targetIncarnationProof",
+    ])
+    || raw.exactControlIdentity.schemaVersion !== 1
+    || raw.exactControlIdentity.controlTargetId !== resolved.controlTargetId) {
+    throw new AdapterInputError("PERMISSION_DENIED");
+  }
+  return {
+    resolved,
+    binding: raw as unknown as RelayV2TerminalCanonicalTargetBindingV1,
+  };
+}
+
 function auth(value: unknown): void {
   if (!isRecord(value) || !exactKeys(value, ["principalId", "clientInstanceId"])) {
     throw new AdapterInputError("INTERNAL");
@@ -185,12 +232,14 @@ function binding(input: {
   auth: unknown;
   owner: unknown;
   lease: unknown;
-}): {
+}, allowExactTarget = false): {
   target: RelayV2TerminalResolvedTarget;
   owner: TerminalControlOwner;
   lease: TerminalControlLease;
 } {
-  const parsedTarget = target(input.target);
+  const parsedTarget = allowExactTarget
+    ? exactEffectTarget(input.target).resolved
+    : target(input.target);
   auth(input.auth);
   const parsedOwner = owner(input.owner);
   const parsedLease = lease(input.lease);
@@ -479,21 +528,52 @@ function throwFailure(failure: AuthorityFailure): never {
  * operation and backend-write owner; this class retains no parallel facts.
  */
 export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalControlAuthority {
-  constructor(private readonly requestPort: RelayV2TerminalControlRequestPort) {
+  constructor(
+    private readonly requestPort: RelayV2TerminalControlRequestPort,
+    private readonly preparedLeasePort?: RelayV2PreparedExactTerminalControlLeasePortV1,
+  ) {
     if (!requestPort || typeof requestPort.request !== "function") {
       throw new TypeError("Relay v2 terminal-control request port is required");
+    }
+    if (preparedLeasePort !== undefined
+      && (!isRecord(preparedLeasePort)
+        || typeof preparedLeasePort.consumePreparedLeaseForBinding !== "function")) {
+      throw new TypeError("Relay v2 prepared terminal-control lease port is invalid");
     }
   }
 
   async acquire(input: Parameters<RelayV2TerminalControlAuthority["acquire"]>[0]): Promise<RelayV2TerminalLeaseResult> {
     let parsedTarget: RelayV2TerminalResolvedTarget;
     let parsedOwner: TerminalControlOwner;
+    let exactBinding: RelayV2TerminalCanonicalTargetBindingV1 | null = null;
     try {
-      parsedTarget = target(input.target);
+      if (this.preparedLeasePort === undefined) {
+        parsedTarget = target(input.target);
+      } else {
+        const exact = exactEffectTarget(input.target);
+        parsedTarget = exact.resolved;
+        exactBinding = exact.binding;
+      }
       auth(input.auth);
       parsedOwner = owner(input.owner);
     } catch (error) {
       return leaseFailure(localFailure(error));
+    }
+    if (this.preparedLeasePort !== undefined && exactBinding !== null) {
+      try {
+        const prepared = lease(await this.preparedLeasePort.consumePreparedLeaseForBinding(
+          exactBinding,
+          parsedOwner as TerminalControlOwner & { kind: "relay-v2" },
+        ));
+        if (prepared.controlTargetId !== parsedTarget.controlTargetId
+          || prepared.controlEpoch !== exactBinding.exactControlIdentity.controlEpoch
+          || !sameOwner(prepared.owner, parsedOwner)) {
+          throw new AdapterInputError("PERMISSION_DENIED");
+        }
+        return { status: "accepted", lease: copyLease(prepared) };
+      } catch (error) {
+        return leaseFailure(authorityFailure(error));
+      }
     }
     try {
       const result = await this.requestPort.request({
@@ -513,7 +593,7 @@ export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalCo
   async renew(input: Parameters<RelayV2TerminalControlAuthority["renew"]>[0]): Promise<RelayV2TerminalLeaseResult> {
     let parsed: ReturnType<typeof binding>;
     try {
-      parsed = binding(input);
+      parsed = binding(input, this.preparedLeasePort !== undefined);
     } catch (error) {
       return leaseFailure(localFailure(error));
     }
@@ -534,7 +614,7 @@ export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalCo
   async release(input: Parameters<RelayV2TerminalControlAuthority["release"]>[0]): Promise<void> {
     let parsed: ReturnType<typeof binding>;
     try {
-      parsed = binding(input);
+      parsed = binding(input, this.preparedLeasePort !== undefined);
     } catch (error) {
       throwFailure(localFailure(error));
     }
@@ -571,7 +651,7 @@ export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalCo
   async hasContinuity(input: Parameters<RelayV2TerminalControlAuthority["hasContinuity"]>[0]): Promise<boolean> {
     let parsed: ReturnType<typeof binding>;
     try {
-      parsed = binding(input);
+      parsed = binding(input, this.preparedLeasePort !== undefined);
     } catch (error) {
       throwFailure(localFailure(error));
     }
@@ -597,7 +677,7 @@ export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalCo
     let parsedOperationId: string;
     let data: Buffer;
     try {
-      parsed = binding(input);
+      parsed = binding(input, this.preparedLeasePort !== undefined);
       parsedOperationId = operationId(input.operationId);
       if (!(input.data instanceof Uint8Array)
         || input.data.byteLength > MAX_V2_TERMINAL_BYTES
@@ -629,7 +709,7 @@ export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalCo
     let parsed: ReturnType<typeof binding>;
     let parsedOperationId: string;
     try {
-      parsed = binding(input);
+      parsed = binding(input, this.preparedLeasePort !== undefined);
       parsedOperationId = operationId(input.operationId);
       if (!Number.isSafeInteger(input.cols)
         || !Number.isSafeInteger(input.rows)

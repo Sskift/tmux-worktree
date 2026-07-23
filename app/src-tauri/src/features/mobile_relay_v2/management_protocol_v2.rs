@@ -1,5 +1,9 @@
+use qrcode::{types::Color, EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 
+use super::enrollment_artifact::{
+    EnrollmentArtifactLineage, EnrollmentArtifactRegistry, RendererEnrollmentArtifact,
+};
 use super::management_child::{ManagementInput, ManagementOperation};
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
@@ -162,6 +166,50 @@ struct EnrollmentDisplayProjection {
     device_label: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RendererEnrollmentFacts {
+    enrollment_id: String,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RendererEnrollmentReview {
+    enrollment: RendererEnrollmentFacts,
+    display: EnrollmentDisplayProjection,
+    render_artifact: RendererEnrollmentArtifact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum RendererEnrollmentProjection {
+    Idle,
+    Active {
+        review: RendererEnrollmentReview,
+    },
+    Expired {
+        #[serde(rename = "enrollmentId")]
+        enrollment_id: String,
+        #[serde(rename = "expiredAtMs")]
+        expired_at_ms: u64,
+    },
+    Failed {
+        intent: EnrollmentIntent,
+        retryable: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RendererDashboardProjection {
+    authority: ProjectionAuthority,
+    host_credential: HostCredentialProjection,
+    connector: ConnectorProjection,
+    enrollment: RendererEnrollmentProjection,
+    known_client_grant: KnownClientGrantProjection,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum KnownClientGrantProjection {
@@ -296,6 +344,123 @@ pub(crate) fn decode_response(
         }
         _ => Err(()),
     }
+}
+
+pub(crate) fn project_for_renderer(
+    value: serde_json::Value,
+    artifacts: &EnrollmentArtifactRegistry,
+) -> Result<serde_json::Value, ()> {
+    let projection: DashboardProjection = serde_json::from_value(value).map_err(|_| ())?;
+    let registered_connector_id = match &projection.connector {
+        ConnectorProjection::Registered { connector_id, .. } => Some(connector_id.clone()),
+        _ => None,
+    };
+    let enrollment = match projection.enrollment {
+        EnrollmentProjection::Idle => {
+            artifacts.clear();
+            RendererEnrollmentProjection::Idle
+        }
+        EnrollmentProjection::Active { review } => RendererEnrollmentProjection::Active {
+            review: renderer_enrollment_review(
+                review,
+                registered_connector_id.ok_or(())?,
+                artifacts,
+            )?,
+        },
+        EnrollmentProjection::Expired {
+            enrollment_id,
+            expired_at_ms,
+        } => {
+            artifacts.clear();
+            RendererEnrollmentProjection::Expired {
+                enrollment_id,
+                expired_at_ms,
+            }
+        }
+        EnrollmentProjection::Failed { intent, retryable } => {
+            artifacts.clear();
+            RendererEnrollmentProjection::Failed { intent, retryable }
+        }
+    };
+    serde_json::to_value(RendererDashboardProjection {
+        authority: projection.authority,
+        host_credential: projection.host_credential,
+        connector: projection.connector,
+        enrollment,
+        known_client_grant: projection.known_client_grant,
+    })
+    .map_err(|_| ())
+}
+
+fn renderer_enrollment_review(
+    review: EnrollmentReview,
+    connector_id: String,
+    artifacts: &EnrollmentArtifactRegistry,
+) -> Result<RendererEnrollmentReview, ()> {
+    let lineage = EnrollmentArtifactLineage {
+        enrollment_id: review.enrollment.enrollment_id.clone(),
+        host_id: review.display.host_id.clone(),
+        connector_id,
+        expires_at_ms: review.enrollment.expires_at_ms,
+    };
+    let render_artifact = artifacts.get_or_create(lineage, || render_enrollment_qr(&review))?;
+    Ok(RendererEnrollmentReview {
+        enrollment: RendererEnrollmentFacts {
+            enrollment_id: review.enrollment.enrollment_id,
+            expires_at_ms: review.enrollment.expires_at_ms,
+        },
+        display: review.display,
+        render_artifact,
+    })
+}
+
+fn render_enrollment_qr(review: &EnrollmentReview) -> Result<Vec<u8>, ()> {
+    let mut payload = tauri::Url::parse("tmuxworktree://enroll").map_err(|_| ())?;
+    {
+        let mut query = payload.query_pairs_mut();
+        query.append_pair("v", "2");
+        query.append_pair("issuerUrl", &review.display.issuer_url);
+        query.append_pair("relayUrl", &review.display.relay_url);
+        query.append_pair("hostId", &review.display.host_id);
+        query.append_pair("enrollmentId", &review.enrollment.enrollment_id);
+        query.append_pair("enrollmentCode", &review.enrollment.enrollment_code);
+    }
+    let code = QrCode::with_error_correction_level(payload.as_str().as_bytes(), EcLevel::M)
+        .map_err(|_| ())?;
+    let width = code.width();
+    const QUIET_ZONE_MODULES: usize = 4;
+    const MODULE_PIXELS: usize = 6;
+    let image_width = (width + QUIET_ZONE_MODULES * 2)
+        .checked_mul(MODULE_PIXELS)
+        .ok_or(())?;
+    let mut pixels = vec![0xff; image_width.checked_mul(image_width).ok_or(())?];
+    let colors = code.to_colors();
+    for module_y in 0..width {
+        for module_x in 0..width {
+            if colors[module_y * width + module_x] != Color::Dark {
+                continue;
+            }
+            let pixel_x = (module_x + QUIET_ZONE_MODULES) * MODULE_PIXELS;
+            let pixel_y = (module_y + QUIET_ZONE_MODULES) * MODULE_PIXELS;
+            for y in pixel_y..pixel_y + MODULE_PIXELS {
+                pixels[y * image_width + pixel_x..y * image_width + pixel_x + MODULE_PIXELS]
+                    .fill(0x11);
+            }
+        }
+    }
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(
+            &mut output,
+            u32::try_from(image_width).map_err(|_| ())?,
+            u32::try_from(image_width).map_err(|_| ())?,
+        );
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|_| ())?;
+        writer.write_image_data(&pixels).map_err(|_| ())?;
+    }
+    Ok(output)
 }
 
 fn validate_response_shape(value: &serde_json::Value) -> Result<(), ()> {
@@ -793,6 +958,62 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    #[test]
+    fn renderer_projection_replaces_the_secret_with_a_bounded_native_handle() {
+        let fixture: Value = serde_json::from_str(CASES).unwrap();
+        let exchange = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "create_enrollment")
+            .unwrap();
+        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+        let decoded = decode_response(
+            exchange["responseFrame"]
+                .as_str()
+                .unwrap()
+                .trim_end_matches('\n')
+                .as_bytes(),
+            request_id,
+            ManagementOperation::CreateEnrollment,
+        )
+        .unwrap();
+        let mut child_projection = serde_json::to_value(decoded.result.unwrap()).unwrap();
+        let expires_at_ms = super::super::enrollment_artifact::tests_now_ms() + 60_000;
+        child_projection["enrollment"]["review"]["enrollment"]["expiresAtMs"] =
+            serde_json::json!(expires_at_ms);
+        let registry = EnrollmentArtifactRegistry::new(|_| {}).unwrap();
+
+        let renderer = project_for_renderer(child_projection.clone(), &registry).unwrap();
+        let repeated = project_for_renderer(child_projection, &registry).unwrap();
+        let serialized = serde_json::to_string(&renderer).unwrap();
+        for forbidden in [
+            "enrollmentCode",
+            "twenroll2.",
+            "tmuxworktree://enroll",
+            "data:image/",
+        ] {
+            assert!(!serialized.contains(forbidden), "{forbidden}");
+        }
+        assert_eq!(
+            renderer["enrollment"]["review"]["renderArtifact"]["kind"],
+            "native_qr_handle"
+        );
+        let handle = renderer["enrollment"]["review"]["renderArtifact"]["handle"]
+            .as_str()
+            .unwrap();
+        assert!(handle.starts_with("dqart1."));
+        assert_eq!(
+            repeated["enrollment"]["review"]["renderArtifact"]["handle"],
+            handle
+        );
+        assert_eq!(
+            renderer["enrollment"]["review"]["renderArtifact"]["expiresAtMs"],
+            expires_at_ms
+        );
+        registry.close();
     }
 
     fn operation(value: &str) -> ManagementOperation {

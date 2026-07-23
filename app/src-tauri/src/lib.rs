@@ -130,6 +130,7 @@ pub fn run() {
             mobile_relay_stop,
             mobile_relay_status,
             mobile_relay_v2_management_call,
+            mobile_relay_v2_enrollment_artifact_show,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

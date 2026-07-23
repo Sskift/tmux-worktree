@@ -165,6 +165,20 @@ export type TerminalControlErrorCode =
   | "RESOURCE_EXHAUSTED"
   | "INTERNAL";
 
+export const TERMINAL_CONTROL_ERROR_CODES = Object.freeze([
+  "INVALID_REQUEST",
+  "UNSUPPORTED_VERSION",
+  "TARGET_NOT_FOUND",
+  "TARGET_GONE",
+  "PERMISSION_DENIED",
+  "HANDOFF_PENDING",
+  "RECOVERY_REQUIRED",
+  "STALE_OUTPUT_CURSOR",
+  "OPERATION_IN_DOUBT",
+  "RESOURCE_EXHAUSTED",
+  "INTERNAL",
+] as const satisfies readonly TerminalControlErrorCode[]);
+
 export interface TerminalControlError {
   code: TerminalControlErrorCode;
   message: string;

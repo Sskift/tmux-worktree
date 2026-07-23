@@ -1,0 +1,46 @@
+{
+  "contract": "tmux-worktree-relay-v2-remote-exact-compound",
+  "version": 1,
+  "status": "production-prerequisite",
+  "transport": "bounded-duplex-utf-8-json-lines-over-one-canonical-ssh-child-or-same-uid-private-daemon-sibling",
+  "entrypoint": "rpc-v2-remote-exact-v1",
+  "capabilityAdvertisementAllowed": false,
+  "extendsFrozenTwRpcV2": false,
+  "lifecycle": [
+    "hello-preflight",
+    "prepare",
+    "admit",
+    "effect",
+    "release-or-rollback"
+  ],
+  "allowedEffects": [
+    "ownership.status",
+    "lease.renew",
+    "lease.release",
+    "input.raw",
+    "input.agent-message",
+    "input.resize"
+  ],
+  "forbiddenEffects": [
+    "target.resolve",
+    "lease.acquire",
+    "handoff.begin",
+    "handoff.commit",
+    "handoff.cancel",
+    "handoff.withdraw",
+    "handoff.force",
+    "input.scroll",
+    "lifecycle.kill",
+    "output.tail"
+  ],
+  "authority": {
+    "claimSerializationAllowed": false,
+    "secondProcessAdmissionAllowed": false,
+    "directTmuxOrGitFallbackAllowed": false,
+    "localFallbackAllowed": false,
+    "explicitLocalSiblingAllowed": true,
+    "targetOwner": "terminal-control canonical authority under the daemon server-lock namespace"
+  },
+  "fixture": "cases.json",
+  "deletionCondition": "Delete this prerequisite only after an independently versioned canonical RPC contract provides the same one-process prepare/admit/effect/release authority and every Host caller has migrated."
+}

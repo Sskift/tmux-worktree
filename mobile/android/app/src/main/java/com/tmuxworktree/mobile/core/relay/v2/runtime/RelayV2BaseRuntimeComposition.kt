@@ -1,7 +1,12 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLoadOrInitializeAdapter
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentNotificationConfig
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDisabledNotificationPlatform
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationConfigMutationAdapter
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationConfigMutationCommand
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationConfigMutationResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationPlatformPort
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRuntimeCompositionResult
@@ -37,6 +42,13 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalCheckpointKey
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJournalStore
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalRecoveryAuthority
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalBytes
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalEffect
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialStore
 import java.io.Closeable
 import java.util.UUID
 import java.util.concurrent.CancellationException
@@ -59,12 +71,25 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
+internal const val RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE =
+    "V2_CREDENTIAL_ROLLOVER_UNAVAILABLE"
+
+internal sealed interface RelayV2CredentialRolloverResult {
+    data class Refreshed(val profile: RelayV2Profile) : RelayV2CredentialRolloverResult
+    data object Unavailable : RelayV2CredentialRolloverResult
+}
+
+internal fun interface RelayV2CredentialRolloverPort {
+    suspend fun rollover(expectedProfile: RelayV2Profile): RelayV2CredentialRolloverResult
+}
+
 /** The explicit v2 profile's connection state, not product readiness or capability availability. */
 internal enum class RelayV2BaseRuntimePhase {
     STOPPED,
     CONNECTING,
     RESYNCING,
     ONLINE,
+    SUSPENDED,
     FAILED,
 }
 
@@ -204,14 +229,18 @@ internal sealed interface SelectedSessionReplyReadState {
  * ready cut, it flushes recovered Execute capabilities in commit order and then asks the durable
  * Outbox producer for bounded fresh QUEUED batches. Retryable connection failures are redriven by
  * one bounded backoff owner after the actor's prior transport/apply fence. The Agent durable
- * consumer remains dormant behind empty optional capabilities; its durable presentation revision
- * is wired for live invalidation while capability advertisement remains unowned.
+ * consumer remains dormant unless its optional capability is offered and negotiated by all three
+ * peers; its durable presentation revision is wired for live invalidation.
  */
 internal class RelayV2BaseRuntimeComposition(
     parentScope: CoroutineScope,
-    private val profile: RelayV2Profile,
+    @Volatile private var profile: RelayV2Profile,
     credentialStore: RelayV2CredentialStore,
+    private val credentialRollover: RelayV2CredentialRolloverPort,
     stateSyncAuthority: RelayV2StateSyncAuthority,
+    terminalRuntimeAuthority: RelayV2TerminalRecoveryAuthority,
+    terminalPostCommitJournal: RelayV2TerminalPostCommitJournalStore,
+    terminalResumeCredentials: RelayV2TerminalResumeCredentialStore,
     private val materializedSessions: RelayV2MaterializedSessionReadAuthority,
     private val activationOutbox: RelayV2ActivationOutboxReadPort,
     outboxAuthority: RelayV2OutboxRuntimeAuthority,
@@ -226,6 +255,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val newCommandId: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = System::currentTimeMillis,
     private val retryDelay: suspend (Long) -> Unit = { delay(it) },
+    private val actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
     private val beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
     private val beforeSessionProjectionPublish: suspend () -> Unit = {},
     private val beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
@@ -256,6 +286,7 @@ internal class RelayV2BaseRuntimeComposition(
     private var retryStateFence: RetryStateFence? = null
     private var pendingOutboxAdmission: PendingOutboxAdmission? = null
     private var boundOutboxAdmission: BoundOutboxAdmission? = null
+    private var credentialRolloverAdmission: CredentialRolloverAdmission? = null
     private val actorShutdownStarted = AtomicBoolean(false)
     private val actorOwnerJob = SupervisorJob()
     private val actorScope = CoroutineScope(
@@ -275,6 +306,27 @@ internal class RelayV2BaseRuntimeComposition(
         connectPlanSource = recoveryAdapter,
         commandQueryAdmissionComposition = queryAdmissionComposition,
         optionalCapabilities = agentOptionalCapabilities,
+        recoveryWatchdogDelay = actorRecoveryWatchdogDelay,
+    )
+    private val terminalRuntime = RelayV2TerminalProductionComposition(
+        applyLease = actor,
+        terminal = terminalRuntimeAuthority,
+        journal = terminalPostCommitJournal,
+        credentials = terminalResumeCredentials,
+        sendPort = actor,
+        fatalInvalidation = object : RelayV2TerminalFatalInvalidationPort {
+            override suspend fun invalidate(
+                authority: RelayV2RepositoryEffectAuthority,
+                key: RelayV2TerminalCheckpointKey,
+                reason: RelayV2TerminalFatalInvalidationReason,
+            ) {
+                check(authority.profileId == profile.profileId)
+                check(authority.profileActivationGeneration == profile.activationGeneration)
+                check(key.profileId == authority.profileId)
+                check(key.profileActivationGeneration == authority.profileActivationGeneration)
+                failRuntimeIncomplete("TERMINAL_RUNTIME_INVALIDATED")
+            }
+        },
     )
     private val agentRuntimeComposition = agentDurableRepository?.let {
         AgentTranscriptLifecycleRuntimeComposition.dormant(
@@ -292,6 +344,9 @@ internal class RelayV2BaseRuntimeComposition(
         }
         agentRuntimeFactory?.invoke(actor)
             ?: agentRuntimeComposition
+    }
+    private val agentNotificationConfigMutation = agentDurableRepository?.let { repository ->
+        AgentTranscriptLifecycleNotificationConfigMutationAdapter(actor, repository)
     }
     private val selectedSessionSelection = agentDurableRepository?.let {
         AgentTranscriptLifecycleSessionSelectionController(
@@ -339,6 +394,8 @@ internal class RelayV2BaseRuntimeComposition(
     val outboxTimelineRevision: StateFlow<Long> = _outboxTimelineRevision.asStateFlow()
     private val _agentTimelineRevision = MutableStateFlow(0L)
     val agentTimelineRevision: StateFlow<Long> = _agentTimelineRevision.asStateFlow()
+    val agentCapabilityAvailability: StateFlow<RelayV2AgentCapabilityAvailability> =
+        actor.agentCapabilityAvailability
 
     init {
         val completionHandle = parentScope.coroutineContext[Job]?.invokeOnCompletion { close() }
@@ -362,8 +419,106 @@ internal class RelayV2BaseRuntimeComposition(
                 failRuntimeIncomplete("BASE_SYNC_APPLY_FAILED")
             }
         }
-        if (profile.autoConnect) {
-            startInitialConnectionAttempt()
+        pumpScope.launch {
+            val recovered = try {
+                terminalRuntime.recoverBeforeAdmission()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+            if (!recovered) {
+                failRuntimeIncomplete("TERMINAL_POST_COMMIT_RECOVERY_FAILED")
+            } else if (profile.autoConnect) {
+                startInitialConnectionAttempt()
+            }
+        }
+    }
+
+    private class CompositionTerminalAttachment(
+        val origin: RelayV2BaseRuntimeComposition,
+        val sessionCut: CompositionSessionReplyCut,
+        val runtimeAttachment: RelayV2TerminalAttachment,
+    ) : RelayV2TerminalAttachment
+
+    internal suspend fun attachTerminal(
+        sessionCut: RelayV2SessionReplyCut,
+        parser: RelayV2TerminalParserPort,
+        observer: RelayV2TerminalAttachmentObserver,
+    ): RelayV2TerminalAttachment? {
+        val issued = currentIssuedSession(sessionCut) ?: return null
+        val materialized = issued.materialized
+        val runtimeAttachment = terminalRuntime.attach(
+            RelayV2TerminalAttachmentTarget(
+                profileId = profile.profileId,
+                profileActivationGeneration = profile.activationGeneration,
+                principalId = profile.principalId,
+                clientInstanceId = profile.clientInstanceId,
+                hostId = profile.hostId,
+                scopeId = materialized.session.scopeId,
+                sessionId = materialized.session.sessionId,
+            ),
+            parser,
+            observer,
+        )
+        return CompositionTerminalAttachment(this, issued, runtimeAttachment)
+    }
+
+    internal suspend fun openTerminal(
+        attachment: RelayV2TerminalAttachment,
+        cols: Int,
+        rows: Int,
+    ): Boolean = withTerminalOnline(attachment) { issued, authority ->
+        terminalRuntime.open(issued.runtimeAttachment, authority, cols, rows)
+    }
+
+    internal suspend fun sendTerminalInput(
+        attachment: RelayV2TerminalAttachment,
+        bytes: ByteArray,
+    ): Boolean = withTerminalOnline(attachment) { issued, authority ->
+        terminalRuntime.enqueueInput(issued.runtimeAttachment, authority, bytes)
+    }
+
+    internal suspend fun resizeTerminal(
+        attachment: RelayV2TerminalAttachment,
+        cols: Int,
+        rows: Int,
+    ): Boolean = withTerminalOnline(attachment) { issued, authority ->
+        terminalRuntime.enqueueResize(issued.runtimeAttachment, authority, cols, rows)
+    }
+
+    internal suspend fun closeTerminal(attachment: RelayV2TerminalAttachment): Boolean =
+        withTerminalOnline(attachment) { issued, authority ->
+            terminalRuntime.close(issued.runtimeAttachment, authority)
+        }
+
+    internal suspend fun detachTerminal(attachment: RelayV2TerminalAttachment) {
+        val issued = attachment as? CompositionTerminalAttachment ?: return
+        if (issued.origin !== this) return
+        terminalRuntime.detach(issued.runtimeAttachment)
+    }
+
+    private suspend fun withTerminalOnline(
+        attachment: RelayV2TerminalAttachment,
+        block: suspend (
+            CompositionTerminalAttachment,
+            RelayV2RepositoryEffectAuthority,
+        ) -> Boolean,
+    ): Boolean {
+        val issued = attachment as? CompositionTerminalAttachment ?: return false
+        if (issued.origin !== this || currentIssuedSession(issued.sessionCut) !== issued.sessionCut) {
+            return false
+        }
+        val cut = when (val current = actor.currentOnlineCommandCut()) {
+            is RelayV2CurrentOnlineCommandCutResult.Available -> current.cut
+            RelayV2CurrentOnlineCommandCutResult.Unavailable -> return false
+        }
+        return when (val leased = actor.withCurrentOnlineCommandLease(cut) { context ->
+            if (currentIssuedSession(issued.sessionCut) !== issued.sessionCut) false
+            else block(issued, context.authority)
+        }) {
+            is RelayV2CurrentOnlineCommandLeaseResult.Current -> leased.value
+            RelayV2CurrentOnlineCommandLeaseResult.Stale -> false
         }
     }
 
@@ -377,6 +532,7 @@ internal class RelayV2BaseRuntimeComposition(
         val connectionAttempt = fenceConnectionAttempts()
         val agentRecoveryJobs = fenceAgentRecovery()
         connectionAttempt?.cancelAndJoin()
+        terminalRuntime.teardownGeneration(generation = null)
         clearRecoveredDispatch()
         try {
             return actor.disconnectAndDrain(expectedProfile, barrierId).also {
@@ -602,6 +758,40 @@ internal class RelayV2BaseRuntimeComposition(
     }
 
     /**
+     * Applies one user/platform notification configuration to every exact current product
+     * Session. The actor's optional-capability lease rejects stale generations and profiles before
+     * the sole durable repository can initialize or mutate a consumer.
+     */
+    suspend fun updateAgentNotificationConfig(
+        config: AgentNotificationConfig,
+    ): AgentTranscriptLifecycleNotificationConfigMutationResult = productMutationLock.withLock {
+        val mutation = agentNotificationConfigMutation
+            ?: return@withLock AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+        for (product in _sessions.value) {
+            val issued = currentIssuedSession(product.replyCut)
+                ?: return@withLock AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+            val materialized = issued.materialized
+            val consumer = AgentTranscriptLifecycleDurableConsumerIdentity(
+                profileId = profile.profileId,
+                profileActivationGeneration = profile.activationGeneration,
+                principalId = profile.principalId,
+                clientInstanceId = profile.clientInstanceId,
+                hostId = profile.hostId,
+                hostEpoch = materialized.cursor.hostEpoch,
+                scopeId = materialized.session.scopeId,
+                sessionId = materialized.session.sessionId,
+            )
+            if (mutation.mutate(
+                    AgentTranscriptLifecycleNotificationConfigMutationCommand(consumer, config),
+                ) != AgentTranscriptLifecycleNotificationConfigMutationResult.Applied
+            ) {
+                return@withLock AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
+            }
+        }
+        AgentTranscriptLifecycleNotificationConfigMutationResult.Applied
+    }
+
+    /**
      * Reads the latest bounded local send_agent_message rows for one exact product Session cut.
      *
      * The existing activation Outbox port performs the full namespace strict restore. This
@@ -768,8 +958,14 @@ internal class RelayV2BaseRuntimeComposition(
             is RelayV2RuntimeEffect.CompleteSnapshotRelease -> completeSnapshotRelease(effect)
             is RelayV2RuntimeEffect.ExpireSnapshotContinuation -> expireSnapshot(effect)
             is RelayV2RuntimeEffect.DeliverPostHandshakeFrame -> applyPostHandshakeFrame(effect)
+            is RelayV2RuntimeEffect.ReconnectAfterHostPresence ->
+                reconnectAfterHostPresence(effect)
+            is RelayV2RuntimeEffect.AuthRolloverRequested -> applyAuthExpiring(effect)
 
-            is RelayV2RuntimeEffect.ConnectionFailed -> handleConnectionFailure(effect)
+            is RelayV2RuntimeEffect.ConnectionFailed -> {
+                terminalRuntime.teardownGeneration(effect.generation)
+                handleConnectionFailure(effect)
+            }
             is RelayV2RuntimeEffect.ConnectRejected -> handleConnectRejected(effect)
             is RelayV2RuntimeEffect.RejectContinuity -> failConnection(
                 RelayV2ConnectionFailure(
@@ -779,6 +975,7 @@ internal class RelayV2BaseRuntimeComposition(
                 ),
             )
             is RelayV2RuntimeEffect.Disconnected -> {
+                terminalRuntime.teardownGeneration(effect.fencedGeneration)
                 fenceConnectionAttempts()
                 val agentRecoveryJobs = fenceAgentRecovery()
                 retireConnectionAdmissions()
@@ -791,7 +988,11 @@ internal class RelayV2BaseRuntimeComposition(
             }
 
             is RelayV2RuntimeEffect.RegisterCommandQueryAttempt -> applyCommandQueryAttempt(effect)
-            is RelayV2RuntimeEffect.ApplyCommandStatuses -> applyOutboxRecovery(effect)
+            is RelayV2RuntimeEffect.ApplyCommandStatuses -> {
+                if (!applyOutboxRecovery(effect)) {
+                    failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERY_NOT_OWNED")
+                }
+            }
             is RelayV2RuntimeEffect.DeliverAgentExtensionFrame,
             is RelayV2RuntimeEffect.AgentExtensionUnavailable,
             -> return consumeAgentEffect(effect)
@@ -885,8 +1086,30 @@ internal class RelayV2BaseRuntimeComposition(
         effect: RelayV2RuntimeEffect.DeliverPostHandshakeFrame,
     ) {
         val type = effect.message.frame["type"] as? String
+        if (type == "error" && applyOutboxRecovery(effect)) {
+            return
+        }
         if (type in COMMAND_RECOVERY_TYPES) {
-            applyOutboxRecovery(effect)
+            if (!applyOutboxRecovery(effect)) {
+                failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERY_NOT_OWNED")
+            }
+            return
+        }
+        if (type in TERMINAL_PUBLIC_TYPES) {
+            when (val applied = actor.withEffectApplyLease(effect) {
+                terminalRuntime.handlePublicFrame(effect.repositoryAuthority, effect.message)
+            }) {
+                is RelayV2EffectApplyResult.Applied -> when (applied.value) {
+                    RelayV2TerminalFrameResult.ProtocolViolation ->
+                        failRuntimeIncomplete("TERMINAL_FRAME_PROTOCOL_VIOLATION")
+                    RelayV2TerminalFrameResult.NotOwned ->
+                        failRuntimeIncomplete("UNOWNED_EFFECT_$type")
+                    RelayV2TerminalFrameResult.EffectRejected ->
+                        failRuntimeIncomplete("TERMINAL_FRAME_NOT_CURRENT")
+                    RelayV2TerminalFrameResult.Applied -> Unit
+                }
+                RelayV2EffectApplyResult.Stale -> Unit
+            }
             return
         }
         if (type !in BASE_STATE_EVENT_TYPES) {
@@ -926,6 +1149,111 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
+    private fun applyAuthExpiring(
+        effect: RelayV2RuntimeEffect.AuthRolloverRequested,
+    ) {
+        val admission = synchronized(connectionLock) {
+            val currentProfile = profile
+            val bound = boundOutboxAdmission
+            val pending = pendingOutboxAdmission
+            val ownsBound = bound?.generation == effect.generation &&
+                bound.connectionAttempt === effect.connectionAttempt
+            val ownsPending = pending?.connectionAttempt === effect.connectionAttempt
+            if (credentialRolloverAdmission != null ||
+                (!ownsBound && !ownsPending) ||
+                (ownsBound && ownsPending) ||
+                currentProfile.identity != effect.profile ||
+                currentProfile.grantId != effect.grantId ||
+                closed.get() || terminalFailure.get() != null
+            ) {
+                return@synchronized null
+            }
+            CredentialRolloverAdmission(
+                expectedProfile = currentProfile,
+                generation = effect.generation,
+                connectionAttempt = effect.connectionAttempt,
+            ).also { credentialRolloverAdmission = it }
+        }
+        admission ?: return
+        pumpScope.launch {
+            val result = try {
+                credentialRollover.rollover(admission.expectedProfile)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                RelayV2CredentialRolloverResult.Unavailable
+            }
+            when (result) {
+                is RelayV2CredentialRolloverResult.Refreshed ->
+                    completeCredentialRollover(admission, result.profile)
+                RelayV2CredentialRolloverResult.Unavailable ->
+                    failCredentialRollover(admission)
+            }
+        }
+    }
+
+    private fun completeCredentialRollover(
+        admission: CredentialRolloverAdmission,
+        refreshed: RelayV2Profile,
+    ) {
+        var invalid = false
+        val attempt = synchronized(connectionLock) {
+            if (credentialRolloverAdmission !== admission ||
+                closed.get() || terminalFailure.get() != null
+            ) return@synchronized null
+            val expected = admission.expectedProfile
+            val exactSuccess = expected.credentialVersion < Long.MAX_VALUE &&
+                refreshed == expected.copy(credentialVersion = expected.credentialVersion + 1)
+            val bound = boundOutboxAdmission
+            val pending = pendingOutboxAdmission
+            val ownsBound = bound?.generation == admission.generation &&
+                bound.connectionAttempt === admission.connectionAttempt
+            val ownsPending = pending?.connectionAttempt === admission.connectionAttempt
+            val ownsLostAdmission = admission.transportLost &&
+                bound == null && pending == null
+            if (!exactSuccess || connectionAttemptJob != null ||
+                (!ownsBound && !ownsPending && !ownsLostAdmission) ||
+                (ownsBound && ownsPending)
+            ) {
+                credentialRolloverAdmission = null
+                invalid = true
+                return@synchronized null
+            }
+            if (ownsBound) boundOutboxAdmission = null
+            if (ownsPending) pendingOutboxAdmission = null
+            profile = refreshed
+            credentialRolloverAdmission = null
+            retryStateFence = null
+            val fence = retryFence
+            val job = pumpScope.launch(start = CoroutineStart.LAZY) {
+                connectOnce(fence, currentCoroutineContext()[Job]!!)
+            }
+            trackConnectionAttemptLocked(job)
+            job
+        }
+        if (invalid) {
+            failRuntimeIncomplete(RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE)
+            return
+        }
+        if (attempt == null) return
+        cancelAgentRecoveryGeneration(admission.generation)
+        clearRecoveredDispatch()
+        attempt.start()
+    }
+
+    private fun failCredentialRollover(admission: CredentialRolloverAdmission) {
+        val current = synchronized(connectionLock) {
+            if (credentialRolloverAdmission !== admission) return@synchronized false
+            detachConnectionAttemptLocked(admission.connectionAttempt, admission.generation)
+            credentialRolloverAdmission = null
+            true
+        }
+        if (!current) return
+        cancelAgentRecoveryGeneration(admission.generation)
+        clearRecoveredDispatch()
+        failRuntimeIncomplete(RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE)
+    }
+
     private suspend fun applyCommandQueryAttempt(
         effect: RelayV2RuntimeEffect.RegisterCommandQueryAttempt,
     ) {
@@ -951,14 +1279,14 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
-    private suspend fun applyOutboxRecovery(effect: RelayV2RuntimeEffect) {
+    private suspend fun applyOutboxRecovery(effect: RelayV2RuntimeEffect): Boolean {
         val result = try {
             outboxRecoveryAdapter.handle(effect)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
             failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERY_APPLY_FAILED")
-            return
+            return true
         }
         when (result) {
             is RelayV2OutboxRecoveryApplyResult.Committed -> {
@@ -966,20 +1294,63 @@ internal class RelayV2BaseRuntimeComposition(
                 val commit = result.commit
                 if (commit is RelayV2OutboxRecoveryCommit.CommandStatuses) {
                     applyRecoveredCommandStatuses(effect, commit, result.dispatchIssuance)
-                } else if (commit.effects.isNotEmpty() ||
-                    result.dispatchIssuance != RelayV2OutboxDispatchIssuance.NoDispatch
-                ) {
-                    clearRecoveredDispatch()
-                    failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+                } else {
+                    applyOnlineCommandEvidence(effect, commit, result.dispatchIssuance)
                 }
+                return true
             }
-            is RelayV2OutboxRecoveryApplyResult.NotOwned ->
-                failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERY_NOT_OWNED")
+            is RelayV2OutboxRecoveryApplyResult.NotOwned -> return false
             is RelayV2OutboxRecoveryApplyResult.ProtocolViolation ->
                 failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERY_PROTOCOL_VIOLATION")
             is RelayV2OutboxRecoveryApplyResult.Rejected ->
                 failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERY_REJECTED")
             RelayV2OutboxRecoveryApplyResult.Stale -> clearRecoveredDispatch()
+        }
+        return true
+    }
+
+    private suspend fun applyOnlineCommandEvidence(
+        effect: RelayV2RuntimeEffect,
+        commit: RelayV2OutboxRecoveryCommit,
+        issuance: RelayV2OutboxDispatchIssuance,
+    ) {
+        val delivered = effect as? RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+        val evidence = commit as? RelayV2OutboxRecoveryCommit.CommandEvidence
+        if (delivered == null || evidence == null ||
+            evidence.receipt.generation != delivered.generation
+        ) {
+            failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+            return
+        }
+        val onlyEffect = evidence.effects.singleOrNull()
+        when (onlyEffect) {
+            null -> if (evidence.effects.isNotEmpty() ||
+                issuance != RelayV2OutboxDispatchIssuance.NoDispatch
+            ) {
+                failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+            }
+            is RelayV2OutboxEffect.ExecuteCommand -> {
+                val issued = issuance as? RelayV2OutboxDispatchIssuance.Issued
+                val capability = issued?.capabilities?.singleOrNull()
+                if (capability == null ||
+                    capability.identity.generation != delivered.generation ||
+                    capability.identity.commandId != onlyEffect.command.entryId.commandId ||
+                    capability.identity.requestId != onlyEffect.attempt.requestId ||
+                    outboxDispatcher.dispatch(capability) !is RelayV2OutboxDispatchOutcome.Submitted
+                ) {
+                    failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+                }
+            }
+            is RelayV2OutboxEffect.ReissueCreated -> {
+                if (issuance != RelayV2OutboxDispatchIssuance.NoDispatch ||
+                    onlyEffect.originalEntryId != evidence.receipt.entryId
+                ) {
+                    failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+                    return
+                }
+                dispatchFresh(delivered.repositoryAuthority)
+            }
+            else -> failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
         }
     }
 
@@ -1610,6 +1981,11 @@ internal class RelayV2BaseRuntimeComposition(
     }
 
     private fun handleConnectionFailure(effect: RelayV2RuntimeEffect.ConnectionFailed) {
+        if (claimCredentialRolloverTransportLoss(effect)) {
+            cancelAgentRecoveryGeneration(effect.generation)
+            clearRecoveredDispatch()
+            return
+        }
         val connectionAttempt = effect.connectionAttempt
         if (connectionAttempt == null) {
             failConnection(effect.failure)
@@ -1632,6 +2008,64 @@ internal class RelayV2BaseRuntimeComposition(
         cancelAgentRecoveryGeneration(effect.generation)
         clearRecoveredDispatch()
         failConnection(effect.failure)
+    }
+
+    private fun claimCredentialRolloverTransportLoss(
+        effect: RelayV2RuntimeEffect.ConnectionFailed,
+    ): Boolean = synchronized(connectionLock) {
+        val admission = credentialRolloverAdmission ?: return@synchronized false
+        if (effect.generation != admission.generation ||
+            effect.connectionAttempt !== admission.connectionAttempt ||
+            (!effect.failure.retryable &&
+                !(effect.failure.kind == RelayV2FailureKind.AUTH &&
+                    effect.failure.code == "AUTH_REQUIRED"))
+        ) return@synchronized false
+        detachConnectionAttemptLocked(admission.connectionAttempt, admission.generation)
+        admission.transportLost = true
+        true
+    }
+
+    private fun reconnectAfterHostPresence(
+        effect: RelayV2RuntimeEffect.ReconnectAfterHostPresence,
+    ) {
+        if (effect.profile != profile.identity) return
+        var conflicted = false
+        val attempt = synchronized(connectionLock) {
+            credentialRolloverAdmission?.let { rollover ->
+                if (rollover.generation == effect.generation &&
+                    rollover.connectionAttempt === effect.connectionAttempt
+                ) return@synchronized null
+            }
+            val bound = boundOutboxAdmission
+            val ownsBound = bound?.generation == effect.generation &&
+                bound.connectionAttempt === effect.connectionAttempt
+            val ownsPending = pendingOutboxAdmission?.connectionAttempt === effect.connectionAttempt
+            if ((!ownsBound && !ownsPending) ||
+                !reconnectEnabled || closed.get() || terminalFailure.get() != null
+            ) {
+                return@synchronized null
+            }
+            if ((ownsBound && ownsPending) || connectionAttemptJob != null) {
+                conflicted = true
+                return@synchronized null
+            }
+            if (ownsBound) boundOutboxAdmission = null else pendingOutboxAdmission = null
+            retryStateFence = null
+            val fence = retryFence
+            val job = pumpScope.launch(start = CoroutineStart.LAZY) {
+                connectOnce(fence, currentCoroutineContext()[Job]!!)
+            }
+            trackConnectionAttemptLocked(job)
+            job
+        }
+        if (conflicted) {
+            failRuntimeIncomplete("HOST_PRESENCE_RECONNECT_CONFLICT")
+            return
+        }
+        if (attempt == null) return
+        cancelAgentRecoveryGeneration(effect.generation)
+        clearRecoveredDispatch()
+        attempt.start()
     }
 
     private fun handleConnectRejected(effect: RelayV2RuntimeEffect.ConnectRejected) {
@@ -1762,6 +2196,7 @@ internal class RelayV2BaseRuntimeComposition(
         synchronized(connectionLock) {
             pendingOutboxAdmission = null
             boundOutboxAdmission = null
+            credentialRolloverAdmission = null
         }
     }
 
@@ -1794,6 +2229,7 @@ internal class RelayV2BaseRuntimeComposition(
         pumpJob.cancel()
         actorScope.launch {
             try {
+                terminalRuntime.dispose()
                 actor.disconnectAndDrain(profile.identity, CLOSE_BARRIER_ID)
             } catch (_: Throwable) {
                 // A forced transport-fence close completes the same shutdown barrier exceptionally.
@@ -1824,6 +2260,7 @@ internal class RelayV2BaseRuntimeComposition(
 
             RelayV2ConnectionPhase.RESYNCING -> RelayV2BaseRuntimePhase.RESYNCING
             RelayV2ConnectionPhase.ONLINE -> RelayV2BaseRuntimePhase.ONLINE
+            RelayV2ConnectionPhase.SUSPENDED -> RelayV2BaseRuntimePhase.SUSPENDED
             RelayV2ConnectionPhase.CONTINUITY_REJECTED,
             RelayV2ConnectionPhase.FAILED,
             -> RelayV2BaseRuntimePhase.FAILED
@@ -1833,7 +2270,11 @@ internal class RelayV2BaseRuntimeComposition(
         } else {
             actorState.failure?.let(RelayV2BaseRuntimeFailure::Connection)
         }
-        if (phase != RelayV2BaseRuntimePhase.ONLINE) clearSessionProjection()
+        if (phase != RelayV2BaseRuntimePhase.ONLINE &&
+            phase != RelayV2BaseRuntimePhase.SUSPENDED
+        ) {
+            clearSessionProjection()
+        }
         synchronized(stateLock) {
             if (!closed.get() && terminalFailure.get() == null) {
                 _state.value = RelayV2BaseRuntimeState(phase, failure)
@@ -1862,6 +2303,18 @@ internal class RelayV2BaseRuntimeComposition(
     }
 
     private companion object {
+        val TERMINAL_PUBLIC_TYPES = setOf(
+            "error",
+            "terminal.opened",
+            "terminal.output",
+            "terminal.replay_started",
+            "terminal.reset_required",
+            "terminal.input_ack",
+            "terminal.input_error",
+            "terminal.resize_ack",
+            "terminal.resize_error",
+            "terminal.closed",
+        )
         val BASE_STATE_EVENT_TYPES = setOf("scopes.changed", "sessions.changed")
         val COMMAND_RECOVERY_TYPES = setOf("command.status", "command.result")
         const val CLOSE_BARRIER_ID = "relay-v2-base-runtime-close"
@@ -1886,6 +2339,13 @@ internal class RelayV2BaseRuntimeComposition(
         val connectionAttempt: RelayV2ConnectionAttemptIdentity,
         val generation: RelayV2EffectGeneration,
         val pendingCommands: List<RelayV2PendingCommand>,
+    )
+
+    private class CredentialRolloverAdmission(
+        val expectedProfile: RelayV2Profile,
+        val generation: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
+        var transportLost: Boolean = false,
     )
 
     private data class RetryStateFence(

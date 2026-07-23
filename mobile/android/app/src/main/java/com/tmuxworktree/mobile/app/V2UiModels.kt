@@ -24,6 +24,7 @@ enum class RelayStartupAdmissionState {
     RELAY_V2_CREDENTIAL_BINDING_MISMATCH,
     RELAY_V2_CREDENTIAL_BLOB_BEHIND,
     RELAY_V2_CREDENTIAL_REPAIR_CONFLICT,
+    RELAY_V2_SELF_REVOKE_QUARANTINED,
     RELAY_V2_ADMISSION_FAILED,
 }
 
@@ -33,7 +34,13 @@ enum class RelayV2ProfileConnectionState {
     CONNECTING,
     RESYNCING,
     ONLINE,
+    SUSPENDED,
     FAILED,
+}
+
+enum class AgentCapabilityAvailability {
+    UNAVAILABLE,
+    AVAILABLE,
 }
 
 data class V2UiState(
@@ -41,6 +48,8 @@ data class V2UiState(
     val relayV2ProfileConnection: RelayV2ProfileConnectionState =
         RelayV2ProfileConnectionState.STOPPED,
     val relayV2ProfileFailureCode: String? = null,
+    val agentCapabilityAvailability: AgentCapabilityAvailability =
+        AgentCapabilityAvailability.UNAVAILABLE,
     val initialized: Boolean = false,
     val demoMode: Boolean = false,
     val networkAvailable: Boolean = true,
@@ -173,6 +182,7 @@ internal fun projectRelayV2RuntimeState(
         RelayV2BaseRuntimePhase.CONNECTING -> RelayV2ProfileConnectionState.CONNECTING
         RelayV2BaseRuntimePhase.RESYNCING -> RelayV2ProfileConnectionState.RESYNCING
         RelayV2BaseRuntimePhase.ONLINE -> RelayV2ProfileConnectionState.ONLINE
+        RelayV2BaseRuntimePhase.SUSPENDED -> RelayV2ProfileConnectionState.SUSPENDED
         RelayV2BaseRuntimePhase.FAILED -> RelayV2ProfileConnectionState.FAILED
     }
     val hostStatus = when (connection) {
@@ -182,6 +192,7 @@ internal fun projectRelayV2RuntimeState(
         RelayV2ProfileConnectionState.CONNECTING -> ConnectionStatus.CONNECTING
         RelayV2ProfileConnectionState.RESYNCING -> ConnectionStatus.RECOVERING
         RelayV2ProfileConnectionState.ONLINE -> ConnectionStatus.ONLINE
+        RelayV2ProfileConnectionState.SUSPENDED -> ConnectionStatus.PAUSED
     }
     val failureCode = when (val failure = runtime.failure) {
         is RelayV2BaseRuntimeFailure.Connection -> failure.failure.code
@@ -196,6 +207,7 @@ internal fun projectRelayV2RuntimeState(
             RelayV2ProfileConnectionState.CONNECTING -> TransportPhase.CONNECTING
             RelayV2ProfileConnectionState.RESYNCING -> TransportPhase.HANDSHAKING
             RelayV2ProfileConnectionState.ONLINE -> TransportPhase.ONLINE
+            RelayV2ProfileConnectionState.SUSPENDED -> TransportPhase.ONLINE
         },
         overall = hostStatus,
         lastSyncedAtMillis = if (connection == RelayV2ProfileConnectionState.ONLINE) {

@@ -102,6 +102,7 @@ export interface CodexAppServerProcessControllerAuthorityOptions {
   controller: CodexAppServerProcessControllerPort;
   controlledSourceIssuer: CodexControlledSourceLeaseIssuer;
   controlledSourceReceiver: CodexControlledSourceReceiver;
+  onUnavailable?: (error: unknown) => void;
 }
 
 interface NormalizedController {
@@ -321,6 +322,7 @@ export class CodexAppServerProcessControllerAuthority {
   readonly #controller: Readonly<NormalizedController>;
   readonly #controlledSourceIssuer: Readonly<NormalizedLeaseIssuer>;
   readonly #controlledSourceReceiver: CodexControlledSourceReceiver;
+  readonly #onUnavailable: ((error: unknown) => void) | null;
   readonly #controllerContext = new AsyncLocalStorage<object>();
   readonly #sourceCloseContext = new AsyncLocalStorage<object>();
   readonly #reentryBarrier = Promise.resolve();
@@ -351,6 +353,12 @@ export class CodexAppServerProcessControllerAuthority {
     this.#controlledSourceIssuer = normalizeLeaseIssuer(options.controlledSourceIssuer);
     this.#controlledSourceReceiver = options.controlledSourceReceiver;
     this.#controller = normalizeController(options.controller);
+    if (options.onUnavailable !== undefined
+      && (typeof options.onUnavailable !== "function"
+        || nodeTypes.isProxy(options.onUnavailable))) {
+      throw new TypeError("Codex process controller authority dependencies are invalid");
+    }
+    this.#onUnavailable = options.onUnavailable ?? null;
   }
 
   get state(): CodexAppServerProcessControllerAuthorityState {
@@ -442,6 +450,7 @@ export class CodexAppServerProcessControllerAuthority {
     try {
       source = new CodexAppServerNotificationSource(
         captured.notificationSource as CodexAppServerNotificationByteSource,
+        this.#onUnavailable,
       );
       this.#ownedSource = source;
     } catch {

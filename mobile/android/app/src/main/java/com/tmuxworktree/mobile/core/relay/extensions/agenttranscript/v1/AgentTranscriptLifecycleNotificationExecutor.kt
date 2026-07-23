@@ -5,6 +5,17 @@ internal fun interface AgentTranscriptLifecycleNotificationPlatformPort {
     fun post(
         ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
     ): AgentTranscriptLifecycleNotificationPlatformResult
+
+    /** Exact tag/id cancellation. The default keeps non-Android test seams closed. */
+    fun cancel(
+        identity: AgentTranscriptLifecyclePostedNotificationIdentity,
+    ): AgentTranscriptLifecycleNotificationCancellationPlatformResult =
+        AgentTranscriptLifecycleNotificationCancellationPlatformResult.Failed
+}
+
+internal sealed interface AgentTranscriptLifecycleNotificationCancellationPlatformResult {
+    data object Cancelled : AgentTranscriptLifecycleNotificationCancellationPlatformResult
+    data object Failed : AgentTranscriptLifecycleNotificationCancellationPlatformResult
 }
 
 internal enum class AgentTranscriptLifecycleNotificationSuppressionReason {

@@ -492,6 +492,11 @@ internal data class RelayV2TerminalPendingClose(
     val issuedRequestIds: List<String>,
 )
 
+internal data class RelayV2TerminalCorrelatedError(
+    val code: String,
+    val retryable: Boolean,
+)
+
 internal data class RelayV2TerminalOpenResultLineage(
     val disposition: RelayV2TerminalOpenDisposition,
     val generation: String,
@@ -804,6 +809,17 @@ internal sealed interface RelayV2TerminalAction {
         val bufferStartOffset: String?,
         val tailOffset: String?,
     ) : RelayV2TerminalAction
+
+    data class CorrelatedError(
+        val requestId: String,
+        val hostId: String?,
+        val hostEpoch: String?,
+        val scopeId: String?,
+        val sessionId: String?,
+        val streamId: String?,
+        val commandDisposition: String,
+        val error: RelayV2TerminalCorrelatedError,
+    ) : RelayV2TerminalAction
 }
 
 internal enum class RelayV2TerminalResetOrigin {
@@ -1001,6 +1017,13 @@ internal sealed interface RelayV2TerminalOutcome {
     ) : RelayV2TerminalOutcome
 
     data object ClosedFinalized : RelayV2TerminalOutcome
+
+    data class CorrelatedErrorRejected(
+        val requestId: String,
+        val code: String,
+    ) : RelayV2TerminalOutcome
+
+    data class ProtocolViolation(val code: String) : RelayV2TerminalOutcome
 }
 
 internal data class RelayV2TerminalReduction(

@@ -76,6 +76,10 @@ internal sealed interface RelayV2OutboxRecoveryApplyResult {
 }
 
 private sealed interface RelayV2OutboxRecoveryLeaseResult {
+    data class NotOwned(
+        val effect: RelayV2RuntimeEffect,
+    ) : RelayV2OutboxRecoveryLeaseResult
+
     data class Committed(
         val commit: RelayV2OutboxRecoveryCommit,
         val dispatchSeal: RelayV2OutboxDispatchCommittedSeal?,
@@ -158,6 +162,8 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
             when (snapshot.type) {
                 "command.status", "command.result" ->
                     applyCommandEvidence(effect, snapshot).toApplyResult(dispatchIssuer)
+                "error" ->
+                    applyCorrelatedExecuteError(effect, snapshot).toApplyResult(dispatchIssuer)
                 else -> RelayV2OutboxRecoveryApplyResult.NotOwned(effect)
             }
         }
@@ -224,6 +230,91 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
             )
             is RelayV2OutboxBatchResult.Rejected ->
                 RelayV2OutboxRecoveryLeaseResult.Rejected(result.reason)
+        }
+    }
+
+    private suspend fun applyCorrelatedExecuteError(
+        effect: RelayV2RuntimeEffect.DeliverPostHandshakeFrame,
+        snapshot: RelayV2OutboxValidatedFrameSnapshot,
+    ): RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult> =
+        applyLease.withEffectApplyLease(effect.repositoryAuthority) {
+            applyCorrelatedExecuteErrorUnderLease(effect, snapshot)
+        }
+
+    private suspend fun applyCorrelatedExecuteErrorUnderLease(
+        effect: RelayV2RuntimeEffect.DeliverPostHandshakeFrame,
+        snapshot: RelayV2OutboxValidatedFrameSnapshot,
+    ): RelayV2OutboxRecoveryLeaseResult {
+        requireIdentity(effect)
+        val frame = snapshot.frame
+        require(snapshot.type == "error")
+        require(frame["kind"] == "response")
+        val requestId = frame.stringValue("requestId")
+        val namespace = effect.repositoryAuthority.outboxNamespace()
+        var notOwned = false
+        var protocolViolation: RelayV2OutboxRejection? = null
+        var postCommitReceipt: RelayV2OutboxEvidenceApplied? = null
+        val result = outbox.reduceOutboxBatchUnderApplyLease(namespace) { current ->
+            val owned = current.entries.mapNotNull { entry ->
+                entry.takeIf {
+                    it.attempts.any { attempt ->
+                        attempt.requestId == requestId &&
+                            attempt.kind == RelayV2OutboxAttemptKind.EXECUTE
+                    }
+                }
+            }
+            if (owned.isEmpty()) {
+                notOwned = true
+                return@reduceOutboxBatchUnderApplyLease null
+            }
+            if (owned.size != 1) {
+                protocolViolation = RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH
+                return@reduceOutboxBatchUnderApplyLease null
+            }
+            val entry = owned.single()
+            if (!entry.matchesAuthority(effect.repositoryAuthority) ||
+                !frame.optionalIdentityMatches("commandId", entry.commandId) ||
+                !frame.optionalIdentityMatches("hostId", entry.hostId) ||
+                !frame.optionalIdentityMatches("hostEpoch", entry.expectedHostEpoch) ||
+                !frame.optionalIdentityMatches("scopeId", entry.scopeId) ||
+                !frame.optionalIdentityMatches("sessionId", entry.sessionId)
+            ) {
+                protocolViolation = RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH
+                return@reduceOutboxBatchUnderApplyLease null
+            }
+            val structured = frame.objectValue("error")
+            if (structured.stringValue("commandDisposition") !=
+                RelayV2CommandDisposition.NOT_ACCEPTED.wireValue
+            ) {
+                protocolViolation = RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING
+                return@reduceOutboxBatchUnderApplyLease null
+            }
+            val evidence = structured.toExecuteErrorEvidence(entry, requestId)
+            postCommitReceipt = evidence.toAppliedReceipt(effect.generation)
+            listOf(
+                RelayV2OutboxAction.ReconcileStatus(
+                    evidence,
+                    evidence.toExecuteErrorRecovery(effect.context),
+                ),
+            )
+        }
+        return when (result) {
+            is RelayV2OutboxBatchResult.Applied -> committed(
+                effect.repositoryAuthority,
+                RelayV2OutboxRecoveryCommit.CommandEvidence(
+                    receipt = requireNotNull(postCommitReceipt),
+                    effects = result.effects,
+                ),
+            )
+            is RelayV2OutboxBatchResult.Rejected -> when {
+                notOwned -> RelayV2OutboxRecoveryLeaseResult.NotOwned(effect)
+                protocolViolation != null -> RelayV2OutboxRecoveryLeaseResult.ProtocolViolation(
+                    requireNotNull(protocolViolation),
+                )
+                else -> RelayV2OutboxRecoveryLeaseResult.ProtocolViolation(
+                    result.reason ?: RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING,
+                )
+            }
         }
     }
 
@@ -397,6 +488,55 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
         )
     }
 
+    private fun Map<String, Any?>.toExecuteErrorEvidence(
+        entry: RelayV2OutboxEntry,
+        requestId: String,
+    ): RelayV2CommandStatusEvidence {
+        val details = get("details")?.objectValue()
+        return RelayV2CommandStatusEvidence(
+            entryId = entry.id,
+            dedupeWindowId = entry.dedupeWindowId,
+            hostEpoch = entry.expectedHostEpoch,
+            scopeId = entry.scopeId,
+            sessionId = entry.sessionId,
+            operation = entry.operation,
+            source = RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+            attemptKind = RelayV2OutboxAttemptKind.EXECUTE,
+            state = RelayV2CommandStatusState.NOT_ACCEPTED,
+            attemptRequestId = requestId,
+            retryable = booleanValue("retryable"),
+            retryAfterMs = numberOrNull("retryAfterMs"),
+            reissueRequired = details?.get("reissueRequired") == true,
+            errorCode = stringValue("code"),
+            commandDisposition = RelayV2CommandDisposition.entries.singleOrNull {
+                it.wireValue == stringValue("commandDisposition")
+            },
+            detailsReissueRequired = details?.get("reissueRequired") as? Boolean,
+            errorMessage = stringValue("message"),
+        )
+    }
+
+    private fun RelayV2CommandStatusEvidence.toExecuteErrorRecovery(
+        context: RelayV2HandshakeContext,
+    ): RelayV2OutboxRecovery = when {
+        retryable &&
+            !reissueRequired &&
+            errorCode != null &&
+            commandDisposition == RelayV2CommandDisposition.NOT_ACCEPTED &&
+            detailsReissueRequired == null -> RelayV2OutboxRecovery.RetrySameCommand(newId())
+        !retryable &&
+            retryAfterMs == null &&
+            reissueRequired &&
+            errorCode == "COMMAND_WINDOW_EXPIRED" &&
+            commandDisposition == RelayV2CommandDisposition.NOT_ACCEPTED &&
+            detailsReissueRequired == true -> RelayV2OutboxRecovery.Reissue(
+                replacementCommandId = newId(),
+                newDedupeWindowId = context.commandDedupeWindow.windowId,
+                replacementCreatedAtMillis = clock(),
+            )
+        else -> RelayV2OutboxRecovery.None
+    }
+
     private fun Map<String, Any?>.parseResult(
         entry: RelayV2OutboxEntry,
     ): RelayV2CommandResult? {
@@ -485,6 +625,18 @@ private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
         clientInstanceId,
     )
 
+private fun RelayV2OutboxEntry.matchesAuthority(
+    authority: RelayV2RepositoryEffectAuthority,
+): Boolean = profileId == authority.profileId &&
+    principalId == authority.principalId &&
+    hostId == authority.hostId &&
+    expectedHostEpoch == authority.hostEpoch
+
+private fun Map<String, Any?>.optionalIdentityMatches(
+    name: String,
+    expected: String?,
+): Boolean = !containsKey(name) || get(name) == expected
+
 private fun RelayV2CommandStatusEvidence.toAppliedReceipt(
     generation: RelayV2EffectGeneration,
 ) = RelayV2OutboxEvidenceApplied(
@@ -503,6 +655,8 @@ private fun RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult>.toApplyRe
     dispatchIssuer: RelayV2OutboxDispatchIssuePort?,
 ): RelayV2OutboxRecoveryApplyResult = when (this) {
     is RelayV2EffectApplyResult.Applied -> when (val durable = value) {
+        is RelayV2OutboxRecoveryLeaseResult.NotOwned ->
+            RelayV2OutboxRecoveryApplyResult.NotOwned(durable.effect)
         is RelayV2OutboxRecoveryLeaseResult.Committed -> {
             val dispatchIssuance = if (dispatchIssuer == null) {
                 RelayV2OutboxDispatchIssuance.Disabled

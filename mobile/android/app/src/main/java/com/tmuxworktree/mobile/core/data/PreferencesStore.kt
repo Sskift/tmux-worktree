@@ -19,6 +19,10 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationJournal
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationPhase
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileStore
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeFailureCode
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeJournal
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeJournalStore
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokePhase
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -107,11 +111,45 @@ private object Keys {
     val relayV2ActiveSwitchOperationId = stringPreferencesKey(
         "relay_v2_active_switch_operation_id",
     )
+    val relayV2SelfRevokeSchemaVersion = intPreferencesKey(
+        "relay_v2_self_revoke_schema_version",
+    )
+    val relayV2SelfRevokeOperationId = stringPreferencesKey(
+        "relay_v2_self_revoke_operation_id",
+    )
+    val relayV2SelfRevokeProfileId = stringPreferencesKey(
+        "relay_v2_self_revoke_profile_id",
+    )
+    val relayV2SelfRevokeActivationGeneration = longPreferencesKey(
+        "relay_v2_self_revoke_activation_generation",
+    )
+    val relayV2SelfRevokeCredentialReference = stringPreferencesKey(
+        "relay_v2_self_revoke_credential_reference",
+    )
+    val relayV2SelfRevokeCredentialVersion = longPreferencesKey(
+        "relay_v2_self_revoke_credential_version",
+    )
+    val relayV2SelfRevokeGrantId = stringPreferencesKey(
+        "relay_v2_self_revoke_grant_id",
+    )
+    val relayV2SelfRevokePhase = stringPreferencesKey("relay_v2_self_revoke_phase")
+    val relayV2SelfRevokeRevokedAtMs = longPreferencesKey(
+        "relay_v2_self_revoke_revoked_at_ms",
+    )
+    val relayV2SelfRevokeFailureCode = stringPreferencesKey(
+        "relay_v2_self_revoke_failure_code",
+    )
 }
 
 private const val ACTIVATION_JOURNAL_SCHEMA_VERSION = 2
 private const val ACTIVATION_PHASE_PREPARED = "prepared"
 private const val ACTIVATION_PHASE_CREDENTIAL_READY = "credential_ready"
+private const val SELF_REVOKE_JOURNAL_SCHEMA_VERSION = 1
+private const val SELF_REVOKE_PHASE_PREPARED = "prepared"
+private const val SELF_REVOKE_PHASE_MAY_HAVE_COMMITTED = "may_have_committed"
+private const val SELF_REVOKE_PHASE_CONFIRMED = "confirmed"
+private const val SELF_REVOKE_PHASE_REJECTED = "rejected"
+private const val SELF_REVOKE_FAILURE_FORBIDDEN = "forbidden"
 
 /**
  * The on-disk active-profile discriminator used by the real DataStore owner.
@@ -175,6 +213,17 @@ internal object RelayProfilePreferencesCodec {
         preferences[Keys.relayV2CredentialVersion] = profile.credentialVersion
         preferences[Keys.relayV2ActivationGeneration] = profile.activationGeneration
         preferences[Keys.relayV2AutoConnect] = profile.autoConnect
+    }
+
+    fun removeExactRelayV2Profile(
+        preferences: MutablePreferences,
+        expected: RelayV2Profile,
+    ): Boolean {
+        if (toRelayV2Profile(preferences) != expected) return false
+        preferences.removeRelayV2Profile()
+        preferences.remove(Keys.activeProfileDialect)
+        preferences.remove(Keys.activeCredentialKind)
+        return true
     }
 
     fun saveRelayV1Profile(
@@ -358,8 +407,107 @@ class PreferencesStore internal constructor(
 
     internal suspend fun activeRelayV2Profile(): RelayV2Profile? = relayV2Profile.first()
 
-    internal suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? =
-        activationJournal(rawData.first())
+    internal suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? {
+        val preferences = rawData.first()
+        val activation = activationJournal(preferences)
+        check(activation == null || selfRevokeJournal(preferences) == null) {
+            "Relay v2 activation and self-revoke journals cannot coexist"
+        }
+        return activation
+    }
+
+    internal suspend fun readSelfRevokeJournal(): RelayV2SelfRevokeJournal? {
+        val preferences = rawData.first()
+        val journal = selfRevokeJournal(preferences)
+        check(journal == null || activationJournal(preferences) == null) {
+            "Relay v2 activation and self-revoke journals cannot coexist"
+        }
+        return journal
+    }
+
+    internal suspend fun prepareSelfRevokeJournal(
+        expectedActiveProfile: RelayV2Profile,
+        operationId: String,
+    ): RelayV2SelfRevokeJournal? {
+        require(operationId.isNotBlank()) { "Self-revoke operation ID is required" }
+        var prepared: RelayV2SelfRevokeJournal? = null
+        store.edit { preferences ->
+            if (activationJournal(preferences) != null ||
+                selfRevokeJournal(preferences) != null
+            ) return@edit
+            val active = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            if (active != expectedActiveProfile) return@edit
+            val journal = RelayV2SelfRevokeJournal(
+                operationId = operationId,
+                profileId = active.profileId,
+                activationGeneration = active.activationGeneration,
+                credentialReference = active.credentialReference,
+                credentialVersion = active.credentialVersion,
+                grantId = active.grantId,
+                phase = RelayV2SelfRevokePhase.PREPARED,
+            )
+            writeSelfRevokeJournal(preferences, journal)
+            prepared = journal
+        }
+        return prepared
+    }
+
+    internal suspend fun advanceSelfRevokeJournal(
+        expected: RelayV2SelfRevokeJournal,
+        phase: RelayV2SelfRevokePhase,
+        revokedAtMs: Long?,
+        failureCode: RelayV2SelfRevokeFailureCode?,
+    ): RelayV2SelfRevokeJournal? {
+        require(
+            (expected.phase == RelayV2SelfRevokePhase.PREPARED &&
+                phase == RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED) ||
+                (expected.phase == RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED &&
+                    phase in setOf(
+                        RelayV2SelfRevokePhase.CONFIRMED,
+                        RelayV2SelfRevokePhase.REJECTED,
+                    ))
+        ) { "Self-revoke journal transition is invalid" }
+        val replacement = expected.copy(
+            phase = phase,
+            revokedAtMs = revokedAtMs,
+            failureCode = failureCode,
+        )
+        var updated: RelayV2SelfRevokeJournal? = null
+        store.edit { preferences ->
+            if (activationJournal(preferences) != null ||
+                selfRevokeJournal(preferences) != expected
+            ) return@edit
+            val active = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            if (active == null || !expected.matches(active)) return@edit
+            writeSelfRevokeJournal(preferences, replacement)
+            updated = replacement
+        }
+        return updated
+    }
+
+    internal suspend fun commitConfirmedSelfRevokeRemoval(
+        expected: RelayV2SelfRevokeJournal,
+    ): Boolean {
+        require(expected.phase == RelayV2SelfRevokePhase.CONFIRMED) {
+            "Only a confirmed self-revoke journal can remove its active profile"
+        }
+        var committed = false
+        store.edit { preferences ->
+            if (activationJournal(preferences) != null ||
+                selfRevokeJournal(preferences) != expected
+            ) return@edit
+            val active = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            if (active == null || !expected.matches(active)) return@edit
+            if (!RelayProfilePreferencesCodec.removeExactRelayV2Profile(
+                    preferences,
+                    active,
+                )
+            ) return@edit
+            clearSelfRevokeJournal(preferences)
+            committed = true
+        }
+        return committed
+    }
 
     internal suspend fun prepareRelayV2Activation(
         expectedActiveProfile: RelayActiveProfileIdentity?,
@@ -373,6 +521,7 @@ class PreferencesStore internal constructor(
     ): RelayV2ProfileActivationJournal? {
         var prepared: RelayV2ProfileActivationJournal? = null
         store.edit { preferences ->
+            if (selfRevokeJournal(preferences) != null) return@edit
             val rawActive = RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
             if (rawActive != expectedActiveProfile) return@edit
             val current = activationJournal(preferences)
@@ -427,7 +576,8 @@ class PreferencesStore internal constructor(
     ): Boolean {
         var rolledBack = false
         store.edit { preferences ->
-            if (journal.phase == RelayV2ProfileActivationPhase.PREPARED &&
+            if (selfRevokeJournal(preferences) == null &&
+                journal.phase == RelayV2ProfileActivationPhase.PREPARED &&
                 activationJournal(preferences) == journal &&
                 RelayProfilePreferencesCodec.activeProfileIdentity(preferences) ==
                 journal.previousProfile
@@ -446,7 +596,8 @@ class PreferencesStore internal constructor(
         var activated: RelayV2Profile? = null
         store.edit { preferences ->
             val currentJournal = activationJournal(preferences)
-            if (currentJournal == journal &&
+            if (selfRevokeJournal(preferences) == null &&
+                currentJournal == journal &&
                 journal.phase == RelayV2ProfileActivationPhase.CREDENTIAL_READY &&
                 journal.targets(profile) &&
                 RelayProfilePreferencesCodec.activeProfileIdentity(preferences) ==
@@ -488,6 +639,7 @@ class PreferencesStore internal constructor(
     ): RelayV2ProfileActivationJournal? {
         var updated: RelayV2ProfileActivationJournal? = null
         store.edit { preferences ->
+            if (selfRevokeJournal(preferences) != null) return@edit
             val current = activationJournal(preferences)
                 ?.takeIf { it.operationId == operationId }
                 ?: return@edit
@@ -658,6 +810,117 @@ class PreferencesStore internal constructor(
         preferences.remove(Keys.relayV2ActiveSwitchOperationId)
     }
 
+    private fun selfRevokeJournal(
+        preferences: Preferences,
+    ): RelayV2SelfRevokeJournal? {
+        val operationId = preferences[Keys.relayV2SelfRevokeOperationId]
+        if (operationId == null) {
+            check(preferences[Keys.relayV2SelfRevokeSchemaVersion] == null &&
+                preferences[Keys.relayV2SelfRevokeProfileId] == null &&
+                preferences[Keys.relayV2SelfRevokeActivationGeneration] == null &&
+                preferences[Keys.relayV2SelfRevokeCredentialReference] == null &&
+                preferences[Keys.relayV2SelfRevokeCredentialVersion] == null &&
+                preferences[Keys.relayV2SelfRevokeGrantId] == null &&
+                preferences[Keys.relayV2SelfRevokePhase] == null &&
+                preferences[Keys.relayV2SelfRevokeRevokedAtMs] == null &&
+                preferences[Keys.relayV2SelfRevokeFailureCode] == null
+            ) { "Relay v2 self-revoke journal is incomplete" }
+            return null
+        }
+        require(
+            preferences[Keys.relayV2SelfRevokeSchemaVersion] ==
+                SELF_REVOKE_JOURNAL_SCHEMA_VERSION,
+        ) { "Unsupported Relay v2 self-revoke journal schema" }
+        check(activationJournal(preferences) == null) {
+            "Relay v2 activation and self-revoke journals cannot coexist"
+        }
+        val phase = when (preferences[Keys.relayV2SelfRevokePhase]) {
+            SELF_REVOKE_PHASE_PREPARED -> RelayV2SelfRevokePhase.PREPARED
+            SELF_REVOKE_PHASE_MAY_HAVE_COMMITTED ->
+                RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED
+            SELF_REVOKE_PHASE_CONFIRMED -> RelayV2SelfRevokePhase.CONFIRMED
+            SELF_REVOKE_PHASE_REJECTED -> RelayV2SelfRevokePhase.REJECTED
+            else -> error("Unknown Relay v2 self-revoke journal phase")
+        }
+        val journal = RelayV2SelfRevokeJournal(
+            operationId = operationId,
+            profileId = requireNotNull(preferences[Keys.relayV2SelfRevokeProfileId]) {
+                "Relay v2 self-revoke profile ID is missing"
+            },
+            activationGeneration = requireNotNull(
+                preferences[Keys.relayV2SelfRevokeActivationGeneration],
+            ) { "Relay v2 self-revoke activation generation is missing" },
+            credentialReference = RelayV2CredentialReference(
+                requireNotNull(preferences[Keys.relayV2SelfRevokeCredentialReference]) {
+                    "Relay v2 self-revoke credential reference is missing"
+                },
+            ),
+            credentialVersion = requireNotNull(
+                preferences[Keys.relayV2SelfRevokeCredentialVersion],
+            ) { "Relay v2 self-revoke credential version is missing" },
+            grantId = requireNotNull(preferences[Keys.relayV2SelfRevokeGrantId]) {
+                "Relay v2 self-revoke grant ID is missing"
+            },
+            phase = phase,
+            revokedAtMs = preferences[Keys.relayV2SelfRevokeRevokedAtMs],
+            failureCode = when (preferences[Keys.relayV2SelfRevokeFailureCode]) {
+                null -> null
+                SELF_REVOKE_FAILURE_FORBIDDEN -> RelayV2SelfRevokeFailureCode.FORBIDDEN
+                else -> error("Unknown Relay v2 self-revoke failure disposition")
+            },
+        )
+        val active = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+        check(active != null && journal.matches(active)) {
+            "Relay v2 self-revoke journal does not match the active profile"
+        }
+        return journal
+    }
+
+    private fun writeSelfRevokeJournal(
+        preferences: MutablePreferences,
+        journal: RelayV2SelfRevokeJournal,
+    ) {
+        clearSelfRevokeJournal(preferences)
+        preferences[Keys.relayV2SelfRevokeSchemaVersion] =
+            SELF_REVOKE_JOURNAL_SCHEMA_VERSION
+        preferences[Keys.relayV2SelfRevokeOperationId] = journal.operationId
+        preferences[Keys.relayV2SelfRevokeProfileId] = journal.profileId
+        preferences[Keys.relayV2SelfRevokeActivationGeneration] =
+            journal.activationGeneration
+        preferences[Keys.relayV2SelfRevokeCredentialReference] =
+            journal.credentialReference.value
+        preferences[Keys.relayV2SelfRevokeCredentialVersion] = journal.credentialVersion
+        preferences[Keys.relayV2SelfRevokeGrantId] = journal.grantId
+        preferences[Keys.relayV2SelfRevokePhase] = when (journal.phase) {
+            RelayV2SelfRevokePhase.PREPARED -> SELF_REVOKE_PHASE_PREPARED
+            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED ->
+                SELF_REVOKE_PHASE_MAY_HAVE_COMMITTED
+            RelayV2SelfRevokePhase.CONFIRMED -> SELF_REVOKE_PHASE_CONFIRMED
+            RelayV2SelfRevokePhase.REJECTED -> SELF_REVOKE_PHASE_REJECTED
+        }
+        journal.revokedAtMs?.let {
+            preferences[Keys.relayV2SelfRevokeRevokedAtMs] = it
+        }
+        journal.failureCode?.let {
+            preferences[Keys.relayV2SelfRevokeFailureCode] = when (it) {
+                RelayV2SelfRevokeFailureCode.FORBIDDEN -> SELF_REVOKE_FAILURE_FORBIDDEN
+            }
+        }
+    }
+
+    private fun clearSelfRevokeJournal(preferences: MutablePreferences) {
+        preferences.remove(Keys.relayV2SelfRevokeSchemaVersion)
+        preferences.remove(Keys.relayV2SelfRevokeOperationId)
+        preferences.remove(Keys.relayV2SelfRevokeProfileId)
+        preferences.remove(Keys.relayV2SelfRevokeActivationGeneration)
+        preferences.remove(Keys.relayV2SelfRevokeCredentialReference)
+        preferences.remove(Keys.relayV2SelfRevokeCredentialVersion)
+        preferences.remove(Keys.relayV2SelfRevokeGrantId)
+        preferences.remove(Keys.relayV2SelfRevokePhase)
+        preferences.remove(Keys.relayV2SelfRevokeRevokedAtMs)
+        preferences.remove(Keys.relayV2SelfRevokeFailureCode)
+    }
+
     private fun activeProfileIsUsable(preferences: Preferences): Boolean =
         activationJournal(preferences)?.phase?.let {
             it == RelayV2ProfileActivationPhase.PREPARED
@@ -673,6 +936,7 @@ class PreferencesStore internal constructor(
         require(newVersion > expectedVersion) { "Credential version must advance" }
         var updated = false
         store.edit { preferences ->
+            if (selfRevokeJournal(preferences) != null) return@edit
             if (activationJournal(preferences)?.phase?.let {
                     it != RelayV2ProfileActivationPhase.PREPARED
                 } == true
@@ -775,6 +1039,9 @@ class PreferencesStore internal constructor(
         check(activationJournal(preferences) == null) {
             "Relay profile is immutable while Relay v2 activation is pending"
         }
+        check(selfRevokeJournal(preferences) == null) {
+            "Relay profile is immutable while Relay v2 self-revoke is pending"
+        }
     }
 
     private fun toAppPreferences(preferences: Preferences) = AppPreferences(
@@ -815,7 +1082,7 @@ enum class NotificationKind {
 /** Adapter for the Relay v2 domain; [PreferencesStore] remains the single DataStore owner. */
 internal class PreferencesRelayV2ProfileStore(
     private val preferencesStore: PreferencesStore,
-) : RelayV2ProfileStore {
+) : RelayV2ProfileStore, RelayV2SelfRevokeJournalStore {
     override suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? =
         preferencesStore.activeProfileIdentity()
 
@@ -824,6 +1091,33 @@ internal class PreferencesRelayV2ProfileStore(
 
     override suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? =
         preferencesStore.pendingRelayV2Activation()
+
+    override suspend fun readSelfRevokeJournal(): RelayV2SelfRevokeJournal? =
+        preferencesStore.readSelfRevokeJournal()
+
+    override suspend fun prepareSelfRevokeJournal(
+        expectedActiveProfile: RelayV2Profile,
+        operationId: String,
+    ): RelayV2SelfRevokeJournal? = preferencesStore.prepareSelfRevokeJournal(
+        expectedActiveProfile,
+        operationId,
+    )
+
+    override suspend fun advanceSelfRevokeJournal(
+        expected: RelayV2SelfRevokeJournal,
+        phase: RelayV2SelfRevokePhase,
+        revokedAtMs: Long?,
+        failureCode: RelayV2SelfRevokeFailureCode?,
+    ): RelayV2SelfRevokeJournal? = preferencesStore.advanceSelfRevokeJournal(
+        expected,
+        phase,
+        revokedAtMs,
+        failureCode,
+    )
+
+    override suspend fun commitConfirmedSelfRevokeRemoval(
+        expected: RelayV2SelfRevokeJournal,
+    ): Boolean = preferencesStore.commitConfirmedSelfRevokeRemoval(expected)
 
     override suspend fun prepareRelayV2Activation(
         expectedActiveProfile: RelayActiveProfileIdentity?,

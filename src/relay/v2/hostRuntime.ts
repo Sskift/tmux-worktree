@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
+  type RelayV2FrameMetadata,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import { RELAY_V2_REQUIRED_CAPABILITIES } from "./brokerCore.js";
@@ -127,12 +128,76 @@ export interface RelayV2HostRuntimeHelloBuildInput {
   hello: RelayV2JsonObject;
   cut: RelayV2WelcomeCut;
   commandDedupeWindow: RelayV2CommandDedupeWindow;
-  capabilities: readonly RelayV2RequiredCapability[];
+  capabilities: readonly string[];
 }
 
 export interface RelayV2HostRuntimeWelcomeSerializer {
   /** Must be pure and synchronous; it runs inside H2's H0 serializer. */
   build(input: RelayV2HostRuntimeHelloBuildInput): RelayV2JsonObject;
+}
+
+export interface RelayV2HostOptionalExtensionRequestDescriptor {
+  readonly requestId: string;
+  readonly hostId: string;
+  readonly expectedHostEpoch: string;
+  readonly scopeId: string;
+  readonly sessionId: string;
+}
+
+export interface RelayV2HostOptionalExtensionRouteContext {
+  readonly principalId: string;
+  readonly clientInstanceId: string;
+  readonly hostId: string;
+  readonly hostEpoch: string;
+  readonly scopeId: string;
+  readonly sessionId: string;
+}
+
+export interface RelayV2HostOptionalExtensionDelivery {
+  readonly frame: RelayV2JsonObject;
+  readonly bytes: Uint8Array;
+}
+
+export interface RelayV2HostOptionalExtensionIngressSink {
+  /** A close withdraws only this optional extension, never base readiness. */
+  apply(ready: boolean): true;
+  publish(delivery: RelayV2HostOptionalExtensionDelivery): Promise<void>;
+  close(): void;
+}
+
+export interface RelayV2HostOptionalExtensionIngressSubscription {
+  /** Synchronously fences late producer callbacks; the owner drains separately. */
+  unsubscribe(): void;
+}
+
+/**
+ * Narrow, default-off attachment for one already-owned optional extension.
+ * HostRuntime owns route admission/delivery; the attachment owns its durable
+ * reducer/store/source lifecycle and must never manufacture base readiness.
+ */
+export interface RelayV2HostOptionalExtensionAttachment {
+  readonly capability: string;
+  subscribe(
+    sink: RelayV2HostOptionalExtensionIngressSink,
+  ): RelayV2HostOptionalExtensionIngressSubscription;
+  inspectRequest(
+    bytes: Uint8Array,
+    metadata: RelayV2FrameMetadata,
+  ): RelayV2HostOptionalExtensionRequestDescriptor;
+  authorize(context: RelayV2HostOptionalExtensionRouteContext): Promise<boolean>;
+  handleRequest(
+    bytes: Uint8Array,
+    metadata: RelayV2FrameMetadata,
+    context: RelayV2HostOptionalExtensionRouteContext,
+  ): Promise<RelayV2HostOptionalExtensionDelivery>;
+  /** Pure, owner-free correlated response after this attachment withdraws. */
+  handleUnavailableRequest(
+    bytes: Uint8Array,
+    metadata: RelayV2FrameMetadata,
+    context: RelayV2HostOptionalExtensionRouteContext,
+  ): RelayV2HostOptionalExtensionDelivery;
+  isolateFailure(error: unknown): void;
+  closeAndDrain(): Promise<void>;
 }
 
 export interface RelayV2HostRuntimeResourcePort {
@@ -218,6 +283,7 @@ export interface RelayV2HostRuntimeOptions {
   terminals: RelayV2HostRuntimeTerminalPort;
   welcome: RelayV2HostRuntimeWelcomeSerializer;
   outbound: RelayV2HostRuntimeOutboundPort;
+  optionalExtension?: RelayV2HostOptionalExtensionAttachment;
   /** Tests may only make frozen limits stricter. */
   testLimits?: Partial<RuntimeLimits>;
 }
@@ -344,7 +410,7 @@ export class RelayV2HostRuntimeAuthorityError extends Error {
 /** Internal control signal carried out of H2's synchronous H0 serializer. */
 class RelayV2HostRuntimeHostSuperseded extends Error {}
 
-type RequestOwner = "hello" | "command" | "resource" | "snapshot" | "terminal";
+type RequestOwner = "hello" | "command" | "resource" | "snapshot" | "terminal" | "extension";
 
 interface PendingRequest {
   requestId: string;
@@ -399,6 +465,8 @@ interface RouteState {
   phase: "bound" | "hello_pending" | "ready" | "closing" | "closed";
   accepting: boolean;
   welcomeAccepted: boolean;
+  negotiatedCapabilities: readonly string[] | null;
+  extensionNegotiated: boolean;
   resourceUnsubscribed: boolean;
   terminalUnbound: boolean;
   closeSent: boolean;
@@ -651,7 +719,7 @@ function pendingRequest(frame: RelayV2JsonObject): PendingRequest {
     generation: type === "terminal.replay_request" || type === "terminal.close"
       ? optionalString(payload, "generation")
       : optionalString(resume ?? {}, "generation"),
-    nextOffset: type === "terminal.open"
+    nextOffset: type === "terminal.open" && payload.mode === "resume"
       ? optionalString(resume ?? {}, "nextOffset")
       : null,
     fromOffset: type === "terminal.replay_request"
@@ -665,6 +733,30 @@ function pendingRequest(frame: RelayV2JsonObject): PendingRequest {
     openResponseMetadata: type === "terminal.open"
       ? { resetLineage: null }
       : null,
+  });
+}
+
+function optionalExtensionPendingRequest(
+  descriptor: RelayV2HostOptionalExtensionRequestDescriptor,
+): PendingRequest {
+  return Object.freeze({
+    requestId: descriptor.requestId,
+    owner: "extension",
+    requestType: "optional.extension",
+    allowedResponseTypes: new Set(["error"]),
+    hostId: descriptor.hostId,
+    commandId: null,
+    scopeId: descriptor.scopeId,
+    sessionId: descriptor.sessionId,
+    streamId: null,
+    openId: null,
+    openMode: null,
+    closeId: null,
+    generation: null,
+    nextOffset: null,
+    fromOffset: null,
+    resetOrigin: null,
+    openResponseMetadata: null,
   });
 }
 
@@ -772,7 +864,12 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
   private readonly observedConnectorGenerations = new Set<string>();
   private readonly withdrawnConnectorGenerations = new Set<string>();
   private readonly readinessSubscription: RelayV2HostReadinessSubscription;
+  private readonly optionalExtension: RelayV2HostOptionalExtensionAttachment | null;
+  private optionalExtensionSubscription:
+    RelayV2HostOptionalExtensionIngressSubscription | null = null;
   private activeCapabilities: readonly RelayV2RequiredCapability[] | null = null;
+  private optionalExtensionReady = false;
+  private optionalExtensionIngressActive = false;
   private readinessObserved = false;
   private allConnectorGenerationsFenced = false;
   private nextBindingId = 0;
@@ -786,6 +883,55 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       if (!isOpaque(value)) throw new Error(`Relay v2 host runtime ${name} is invalid`);
     }
     this.limits = resolveLimits(options.testLimits);
+    this.optionalExtension = options.optionalExtension ?? null;
+    if (this.optionalExtension !== null) {
+      if (!isOpaque(this.optionalExtension.capability)
+        || (RELAY_V2_REQUIRED_CAPABILITIES as readonly string[]).includes(
+          this.optionalExtension.capability,
+        )
+        || typeof this.optionalExtension.subscribe !== "function"
+        || typeof this.optionalExtension.inspectRequest !== "function"
+        || typeof this.optionalExtension.authorize !== "function"
+        || typeof this.optionalExtension.handleRequest !== "function"
+        || typeof this.optionalExtension.handleUnavailableRequest !== "function"
+        || typeof this.optionalExtension.isolateFailure !== "function"
+        || typeof this.optionalExtension.closeAndDrain !== "function") {
+        throw new Error("Relay v2 optional Host extension attachment is invalid");
+      }
+      const extensionSink: RelayV2HostOptionalExtensionIngressSink = Object.freeze({
+        apply: (ready: boolean): true => {
+          if (this.optionalExtensionIngressActive) {
+            this.optionalExtensionReady = ready === true;
+          }
+          return true;
+        },
+        publish: (delivery: RelayV2HostOptionalExtensionDelivery) => (
+          this.publishOptionalExtensionDelivery(delivery)
+        ),
+        close: () => this.fenceOptionalExtensionIngress(),
+      });
+      this.optionalExtensionIngressActive = true;
+      let subscription: RelayV2HostOptionalExtensionIngressSubscription | null = null;
+      let subscribeFailed = false;
+      try {
+        subscription = this.optionalExtension.subscribe(extensionSink);
+      } catch (error) {
+        subscribeFailed = true;
+        this.isolateOptionalExtensionFailure(error);
+      }
+      if (!subscribeFailed
+        && (!subscription || typeof subscription.unsubscribe !== "function")) {
+        this.isolateOptionalExtensionFailure(
+          new Error("Relay v2 optional Host extension did not establish ingress"),
+        );
+      } else if (subscription !== null) {
+        if (!this.optionalExtensionIngressActive) {
+          try { subscription.unsubscribe(); } catch {}
+        } else {
+          this.optionalExtensionSubscription = subscription;
+        }
+      }
+    }
     const sink: RelayV2HostReadinessSink = Object.freeze({
       apply: (snapshot: RelayV2HostReadinessSnapshot) => this.applyReadiness(snapshot),
       close: () => this.withdrawReadiness(),
@@ -795,20 +941,44 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       || !this.readinessSubscription
       || typeof this.readinessSubscription.unsubscribe !== "function") {
       try { this.readinessSubscription?.unsubscribe(); } catch {}
+      this.fenceOptionalExtensionIngress();
       throw new Error("Relay v2 readiness source did not synchronously establish bounded state");
     }
   }
 
-  advertisedCapabilities(): RelayV2RequiredCapability[] {
-    return this.activeCapabilities === null ? [] : [...this.activeCapabilities];
+  advertisedCapabilities(): string[] {
+    if (this.activeCapabilities === null) return [];
+    return [
+      ...this.activeCapabilities,
+      ...(this.optionalExtension !== null && this.optionalExtensionReady
+        ? [this.optionalExtension.capability]
+        : []),
+    ];
+  }
+
+  advertisedOptionalCapabilities(): string[] {
+    return this.optionalExtension !== null
+      && this.optionalExtensionIngressActive
+      && this.optionalExtensionReady
+      ? [this.optionalExtension.capability]
+      : [];
   }
 
   dispose(): void {
+    this.fenceOptionalExtensionIngress();
     this.activeCapabilities = null;
     for (const route of [...this.routesByCarrierKey.values()]) {
       this.closeImmediately(route, { code: 1011, reason: "host_shutdown" });
     }
     try { this.readinessSubscription.unsubscribe(); } catch {}
+  }
+
+  fenceOptionalExtensionIngress(): void {
+    this.optionalExtensionIngressActive = false;
+    this.optionalExtensionReady = false;
+    const subscription = this.optionalExtensionSubscription;
+    this.optionalExtensionSubscription = null;
+    try { subscription?.unsubscribe(); } catch {}
   }
 
   onRouteBound(input: RelayV2HostRouteBinding): void | RelayV2HostRouteBindingRejection {
@@ -889,6 +1059,8 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       phase: "bound",
       accepting: true,
       welcomeAccepted: false,
+      negotiatedCapabilities: null,
+      extensionNegotiated: false,
       resourceUnsubscribed: false,
       terminalUnbound: false,
       closeSent: false,
@@ -930,7 +1102,9 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         compressed: false,
       }).frame;
     } catch {
-      this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
+      if (!this.admitOptionalExtensionRequest(route, payload)) {
+        this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
+      }
       return;
     }
     const type = stringField(frame, "type");
@@ -1008,6 +1182,181 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
       }
     });
+  }
+
+  private admitOptionalExtensionRequest(route: RouteState, payload: Uint8Array): boolean {
+    const extension = this.optionalExtension;
+    if (extension === null
+      || route.phase !== "ready"
+      || !route.extensionNegotiated
+      || !this.isAdmitted(route)) return false;
+    const metadata = Object.freeze({ opcode: "text" as const, compressed: false });
+    let descriptor: RelayV2HostOptionalExtensionRequestDescriptor;
+    try {
+      descriptor = extension.inspectRequest(payload, metadata);
+    } catch {
+      return false;
+    }
+    if (descriptor.hostId !== route.auth.hostId
+      || descriptor.expectedHostEpoch !== this.options.hostEpoch
+      || !isOpaque(descriptor.requestId)
+      || !isOpaque(descriptor.scopeId)
+      || !isOpaque(descriptor.sessionId)) return false;
+    const pending = optionalExtensionPendingRequest(descriptor);
+    if (route.pendingRequests.has(pending.requestId)
+      || route.pendingRequests.size >= this.limits.maxInFlightRequestsPerRoute) return false;
+    route.pendingRequests.set(pending.requestId, pending);
+    const operation = this.scheduleRouteTask(route, "operationTail", async () => {
+      try {
+        await this.dispatchOptionalExtensionRequest(
+          route,
+          pending,
+          descriptor,
+          payload,
+          metadata,
+        );
+      } catch (error) {
+        // Optional extension faults withdraw only that attachment. Its pure
+        // unavailable encoder then owns the correlated terminal response.
+        this.isolateOptionalExtensionFailure(error);
+        await this.dispatchOptionalExtensionUnavailable(
+          route,
+          pending,
+          descriptor,
+          payload,
+          metadata,
+        );
+      }
+    });
+    if (operation === null) {
+      if (!this.enqueueError(
+        route,
+        pending,
+        "BUSY",
+        "Relay v2 route operation capacity is exhausted",
+        true,
+      )) {
+        route.pendingRequests.delete(pending.requestId);
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      } else {
+        this.consumePending(route, pending);
+      }
+      return true;
+    }
+    void operation.catch(() => undefined);
+    return true;
+  }
+
+  private async dispatchOptionalExtensionRequest(
+    route: RouteState,
+    pending: PendingRequest,
+    descriptor: RelayV2HostOptionalExtensionRequestDescriptor,
+    payload: Uint8Array,
+    metadata: RelayV2FrameMetadata,
+  ): Promise<void> {
+    const extension = this.optionalExtension;
+    if (extension === null || route.pendingRequests.get(pending.requestId) !== pending) return;
+    const identity = await this.verifyCurrentIdentity(route, pending, false);
+    if (!identity || route.phase !== "ready" || !route.extensionNegotiated) return;
+    const context = Object.freeze({
+      principalId: route.auth.principalId,
+      clientInstanceId: route.auth.clientInstanceId,
+      hostId: route.auth.hostId,
+      hostEpoch: identity.hostEpoch,
+      scopeId: descriptor.scopeId,
+      sessionId: descriptor.sessionId,
+    });
+    if (!this.optionalExtensionReady) {
+      await this.dispatchOptionalExtensionUnavailable(
+        route,
+        pending,
+        descriptor,
+        payload,
+        metadata,
+      );
+      return;
+    }
+    const authorized = await extension.authorize(context);
+    if (!authorized || !this.optionalExtensionReady) {
+      await this.dispatchOptionalExtensionUnavailable(
+        route,
+        pending,
+        descriptor,
+        payload,
+        metadata,
+      );
+      return;
+    }
+    const delivery = await extension.handleRequest(payload.slice(), metadata, context);
+    if (!this.optionalExtensionReady) {
+      await this.dispatchOptionalExtensionUnavailable(
+        route,
+        pending,
+        descriptor,
+        payload,
+        metadata,
+      );
+      return;
+    }
+    const current = await this.verifyCurrentIdentity(route, pending, true);
+    if (!current
+      || route.phase !== "ready"
+      || !route.extensionNegotiated
+      || route.pendingRequests.get(pending.requestId) !== pending) return;
+    this.assertOptionalExtensionResponse(delivery, descriptor, current);
+    if (!this.enqueueOutboundBytes(route, delivery.bytes)) {
+      this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      return;
+    }
+    this.consumePending(route, pending);
+  }
+
+  private async dispatchOptionalExtensionUnavailable(
+    route: RouteState,
+    pending: PendingRequest,
+    descriptor: RelayV2HostOptionalExtensionRequestDescriptor,
+    payload: Uint8Array,
+    metadata: RelayV2FrameMetadata,
+  ): Promise<void> {
+    const extension = this.optionalExtension;
+    if (extension === null || route.pendingRequests.get(pending.requestId) !== pending) return;
+    const identity = await this.verifyCurrentIdentity(route, pending, true);
+    if (!identity || route.phase !== "ready" || !route.extensionNegotiated) return;
+    const context = Object.freeze({
+      principalId: route.auth.principalId,
+      clientInstanceId: route.auth.clientInstanceId,
+      hostId: route.auth.hostId,
+      hostEpoch: identity.hostEpoch,
+      scopeId: descriptor.scopeId,
+      sessionId: descriptor.sessionId,
+    });
+    try {
+      const delivery = extension.handleUnavailableRequest(payload.slice(), metadata, context);
+      const current = await this.verifyCurrentIdentity(route, pending, true);
+      if (!current
+        || route.phase !== "ready"
+        || !route.extensionNegotiated
+        || route.pendingRequests.get(pending.requestId) !== pending) return;
+      this.assertOptionalExtensionResponse(delivery, descriptor, current);
+      if (!this.enqueueOutboundBytes(route, delivery.bytes)) {
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+        return;
+      }
+    } catch {
+      if (!this.enqueueError(
+        route,
+        pending,
+        "CAPABILITY_UNAVAILABLE",
+        "Relay v2 optional capability is unavailable",
+        false,
+      )) {
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+        return;
+      }
+    }
+    if (route.pendingRequests.get(pending.requestId) === pending) {
+      this.consumePending(route, pending);
+    }
   }
 
   onRouteClosing(binding: RelayV2HostRouteBinding): void {
@@ -1282,9 +1631,10 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     const available = this.advertisedCapabilities();
     const offered = payload.capabilities as string[];
     const required = payload.requiredCapabilities as string[];
-    if (available.length !== RELAY_V2_REQUIRED_CAPABILITIES.length
+    const selected = available.filter((capability) => offered.includes(capability));
+    if (available.length < RELAY_V2_REQUIRED_CAPABILITIES.length
       || RELAY_V2_REQUIRED_CAPABILITIES.some((capability) => !offered.includes(capability))
-      || required.some((capability) => !available.includes(capability as RelayV2RequiredCapability))) {
+      || required.some((capability) => !selected.includes(capability))) {
       this.drainLocalError(
         route,
         pending,
@@ -1307,7 +1657,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         if (!route.welcomeAccepted
           && outbound.type === "host.welcome"
           && welcomeState.delivery !== null) return false;
-        const delivery = this.enqueueResourceEvent(route, pending, outbound);
+        const delivery = this.enqueueResourceEvent(route, pending, outbound, selected);
         if (!delivery) return false;
         if (!route.welcomeAccepted && outbound.type === "host.welcome") {
           welcomeState.delivery = delivery;
@@ -1355,7 +1705,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
             hello: structuredClone(frame),
             cut: structuredClone(cut),
             commandDedupeWindow: structuredClone(commandDedupeWindow),
-            capabilities: [...available],
+            capabilities: [...selected],
           });
           if (welcome && typeof (welcome as { then?: unknown }).then === "function") {
             throw new RelayV2HostRuntimeAuthorityError("INTERNAL");
@@ -1388,6 +1738,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     route: RouteState,
     hello: PendingRequest,
     frame: RelayV2JsonObject,
+    selectedCapabilities: readonly string[],
   ): ResourceDelivery | null {
     if (!this.isAdmitted(route)) return null;
     const reservation = this.reserveOutbound(route, frame);
@@ -1410,8 +1761,8 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
             || frame.hostInstanceId !== identity.hostInstanceId
             || !payload
             || !Array.isArray(payload.capabilities)
-            || payload.capabilities.length !== RELAY_V2_REQUIRED_CAPABILITIES.length
-            || RELAY_V2_REQUIRED_CAPABILITIES.some((capability) => (
+            || payload.capabilities.length !== selectedCapabilities.length
+            || selectedCapabilities.some((capability) => (
               !(payload.capabilities as string[]).includes(capability)
             ))) {
             throw new Error("Relay v2 H2 welcome crossed its route lineage");
@@ -1425,6 +1776,9 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         if (!this.consumeOutboundReservation(route, reservation)) return;
         if (!route.welcomeAccepted) {
           route.welcomeAccepted = true;
+          route.negotiatedCapabilities = Object.freeze([...selectedCapabilities]);
+          route.extensionNegotiated = this.optionalExtension !== null
+            && selectedCapabilities.includes(this.optionalExtension.capability);
           route.phase = "ready";
           this.consumePending(route, hello);
         }
@@ -1455,6 +1809,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     switch (type) {
       case "terminal.open": {
         const resume = Object.hasOwn(payload, "resume") ? objectField(payload, "resume") : undefined;
+        const mode = stringField(payload, "mode") as "new" | "resume" | "reset";
         await this.options.terminals.open({
           ...common,
           requestId: stringField(frame, "requestId"),
@@ -1464,11 +1819,13 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
           pane: payload.pane as number,
           cols: payload.cols as number,
           rows: payload.rows as number,
-          mode: stringField(payload, "mode") as "new" | "resume" | "reset",
+          mode,
           ...(resume === undefined ? {} : {
             resume: {
               generation: stringField(resume, "generation"),
-              nextOffset: stringField(resume, "nextOffset"),
+              ...(mode === "resume"
+                ? { nextOffset: stringField(resume, "nextOffset") }
+                : {}),
               resumeToken: stringField(resume, "resumeToken"),
             },
           }),
@@ -2034,6 +2391,19 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     } catch {
       throw new Error("Relay v2 authority returned a frame outside the frozen schema");
     }
+    return this.enqueueOutboundBytes(route, bytes, allowClosing);
+  }
+
+  private enqueueOutboundBytes(
+    route: RouteState,
+    bytesInput: Uint8Array,
+    allowClosing = false,
+  ): boolean {
+    if (!(bytesInput instanceof Uint8Array)) return false;
+    const bytes = bytesInput.slice();
+    if (!this.isCurrent(route)
+      || (!route.accepting && !allowClosing)
+      || route.phase === "closed") return false;
     if (bytes.byteLength > Math.min(MAX_PUBLIC_FRAME_BYTES, route.binding.maxFrameBytes)
       || route.outbound.length + route.outboundReservations.size
         >= this.limits.maxOutboundFramesPerRoute
@@ -2052,6 +2422,93 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     route.outboundBytes += bytes.byteLength;
     this.flushOutbound(route);
     return true;
+  }
+
+  private assertOptionalExtensionResponse(
+    delivery: RelayV2HostOptionalExtensionDelivery,
+    request: RelayV2HostOptionalExtensionRequestDescriptor,
+    identity: RelayV2HostRuntimeIdentity,
+  ): void {
+    const frame = delivery?.frame;
+    if (!(delivery?.bytes instanceof Uint8Array)
+      || !frame
+      || frame.kind !== "response"
+      || frame.requestId !== request.requestId
+      || frame.hostId !== request.hostId
+      || frame.hostEpoch !== identity.hostEpoch
+      || frame.scopeId !== request.scopeId
+      || frame.sessionId !== request.sessionId
+      || !Buffer.from(delivery.bytes).equals(Buffer.from(JSON.stringify(frame), "utf8"))) {
+      throw new Error("Relay v2 optional extension returned a mismatched response");
+    }
+  }
+
+  private publishOptionalExtensionDelivery(
+    delivery: RelayV2HostOptionalExtensionDelivery,
+  ): Promise<void> {
+    if (!this.optionalExtensionIngressActive || !this.optionalExtensionReady) {
+      return Promise.resolve();
+    }
+    const extension = this.optionalExtension;
+    if (extension === null) return Promise.resolve();
+    const frame = delivery?.frame;
+    if (!(delivery?.bytes instanceof Uint8Array)
+      || !frame
+      || frame.kind !== "event"
+      || frame.hostId !== this.options.hostId
+      || frame.hostEpoch !== this.options.hostEpoch
+      || !isOpaque(frame.scopeId)
+      || !isOpaque(frame.sessionId)
+      || !Buffer.from(delivery.bytes).equals(Buffer.from(JSON.stringify(frame), "utf8"))) {
+      this.isolateOptionalExtensionFailure(
+        new Error("Relay v2 optional extension published an invalid frame"),
+      );
+      return Promise.resolve();
+    }
+    const admitted: Promise<void>[] = [];
+    for (const route of this.routesByCarrierKey.values()) {
+      if (route.phase !== "ready" || !route.extensionNegotiated || !this.isAdmitted(route)) {
+        continue;
+      }
+      const task = this.scheduleRouteTask(route, "callbackTail", async () => {
+        if (!this.optionalExtensionIngressActive
+          || !this.optionalExtensionReady
+          || route.phase !== "ready"
+          || !route.extensionNegotiated
+          || !this.isAdmitted(route)) return;
+        const identity = await this.verifyCurrentIdentity(route, null, true);
+        if (!identity || frame.hostEpoch !== identity.hostEpoch) return;
+        // The client grant is host-wide, but an extension event is target
+        // scoped. Reuse the exact current H2 resolver cut for every route and
+        // event; do not infer authorization from the route grant alone.
+        const authorized = await extension.authorize(Object.freeze({
+          principalId: route.auth.principalId,
+          clientInstanceId: route.auth.clientInstanceId,
+          hostId: route.auth.hostId,
+          hostEpoch: identity.hostEpoch,
+          scopeId: frame.scopeId as string,
+          sessionId: frame.sessionId as string,
+        }));
+        if (!authorized || !this.optionalExtensionReady) return;
+        if (!this.enqueueOutboundBytes(route, delivery.bytes)) {
+          this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+        }
+      });
+      if (task !== null) {
+        admitted.push(task.catch((error) => {
+          this.isolateOptionalExtensionFailure(error);
+        }));
+      }
+    }
+    return Promise.all(admitted).then(() => undefined);
+  }
+
+  private isolateOptionalExtensionFailure(error: unknown): void {
+    // Host owns the permanent ingress fence. The attachment callback is
+    // untrusted and cannot retain or recover ingress even if it throws or
+    // attempts to re-apply readiness through its old sink.
+    this.fenceOptionalExtensionIngress();
+    try { this.optionalExtension?.isolateFailure(error); } catch {}
   }
 
   /**

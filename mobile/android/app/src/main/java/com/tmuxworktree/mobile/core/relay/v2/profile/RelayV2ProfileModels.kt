@@ -79,6 +79,61 @@ internal enum class RelayV2CredentialAttemptKind {
     REFRESH,
 }
 
+internal enum class RelayV2SelfRevokePhase {
+    PREPARED,
+    MAY_HAVE_COMMITTED,
+    CONFIRMED,
+    REJECTED,
+}
+
+/** Storage-local disposition for the frozen HTTP 403 self-revoke product outcome. */
+internal enum class RelayV2SelfRevokeFailureCode {
+    FORBIDDEN,
+}
+
+/** Non-sensitive durable quarantine for one exact active Relay v2 profile. */
+internal data class RelayV2SelfRevokeJournal(
+    val operationId: String,
+    val profileId: String,
+    val activationGeneration: Long,
+    val credentialReference: RelayV2CredentialReference,
+    val credentialVersion: Long,
+    val grantId: String,
+    val phase: RelayV2SelfRevokePhase,
+    val revokedAtMs: Long? = null,
+    val failureCode: RelayV2SelfRevokeFailureCode? = null,
+) {
+    init {
+        require(operationId.isNotBlank()) { "Self-revoke operation ID is required" }
+        require(profileId.isNotBlank()) { "Self-revoke profile ID is required" }
+        require(activationGeneration >= 0) {
+            "Self-revoke activation generation cannot be negative"
+        }
+        require(credentialVersion > 0) { "Self-revoke credential version must be positive" }
+        require(grantId.isNotBlank()) { "Self-revoke grant ID is required" }
+        when (phase) {
+            RelayV2SelfRevokePhase.PREPARED,
+            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+            -> require(revokedAtMs == null && failureCode == null) {
+                "Non-terminal self-revoke journal cannot retain a result"
+            }
+            RelayV2SelfRevokePhase.CONFIRMED -> require(
+                revokedAtMs != null && revokedAtMs >= 0 && failureCode == null,
+            ) { "Confirmed self-revoke journal requires only revokedAtMs" }
+            RelayV2SelfRevokePhase.REJECTED -> require(
+                revokedAtMs == null && failureCode != null,
+            ) { "Rejected self-revoke journal requires only failureCode" }
+        }
+    }
+
+    fun matches(profile: RelayV2Profile): Boolean =
+        profileId == profile.profileId &&
+            activationGeneration == profile.activationGeneration &&
+            credentialReference == profile.credentialReference &&
+            credentialVersion == profile.credentialVersion &&
+            grantId == profile.grantId
+}
+
 /** This entire object is serialized only inside the Keystore-protected credential blob. */
 internal data class RelayV2PendingCredentialAttempt(
     val kind: RelayV2CredentialAttemptKind,
@@ -311,6 +366,27 @@ internal interface RelayV2ProfileStore {
     ): Boolean
 }
 
+/** Exact-CAS durable owner for the default-off self-revoke quarantine foundation. */
+internal interface RelayV2SelfRevokeJournalStore {
+    suspend fun readSelfRevokeJournal(): RelayV2SelfRevokeJournal?
+
+    suspend fun prepareSelfRevokeJournal(
+        expectedActiveProfile: RelayV2Profile,
+        operationId: String,
+    ): RelayV2SelfRevokeJournal?
+
+    suspend fun advanceSelfRevokeJournal(
+        expected: RelayV2SelfRevokeJournal,
+        phase: RelayV2SelfRevokePhase,
+        revokedAtMs: Long? = null,
+        failureCode: RelayV2SelfRevokeFailureCode? = null,
+    ): RelayV2SelfRevokeJournal?
+
+    suspend fun commitConfirmedSelfRevokeRemoval(
+        expected: RelayV2SelfRevokeJournal,
+    ): Boolean
+}
+
 internal interface RelayProfileDisconnectBarrier {
     suspend fun disconnectAndDrain(
         profile: RelayActiveProfileIdentity,
@@ -494,10 +570,62 @@ internal data class RelayV2RefreshResponse(
             "refreshExpiresAtMs=$refreshExpiresAtMs)"
 }
 
-/** Exchange seam; the OkHttp implementation remains outside production composition. */
+/** Exchange seam injected by the default-off production profile runtime. */
 internal interface RelayV2CredentialExchange {
     suspend fun redeem(request: RelayV2EnrollmentExchangeRequest): RelayV2EnrollmentExchangeResponse
     suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse
+}
+
+internal data class RelayV2SelfRevokeRequest(
+    val issuerUrl: String,
+    val accessToken: String,
+) {
+    init {
+        require(RelayV2EndpointValidator.isIssuerUrl(issuerUrl)) {
+            "Relay v2 issuer endpoint is invalid"
+        }
+        require(RelayV2CredentialSecretValidator.isAccessToken(accessToken)) {
+            "Relay v2 access credential is invalid"
+        }
+    }
+
+    override fun toString(): String =
+        "RelayV2SelfRevokeRequest(issuerUrl=$issuerUrl, accessToken=<redacted>)"
+}
+
+internal sealed interface RelayV2SelfRevokeExchangeResult {
+    data class Confirmed(
+        val grantId: String,
+        val revokedAtMs: Long,
+        val alreadyRevoked: Boolean,
+    ) : RelayV2SelfRevokeExchangeResult {
+        init {
+            require(grantId.isNotBlank()) { "Self-revoke grant ID is required" }
+            require(revokedAtMs >= 0) { "Self-revoke timestamp cannot be negative" }
+        }
+    }
+
+    data class Rejected(
+        val failureCode: RelayV2SelfRevokeFailureCode,
+    ) : RelayV2SelfRevokeExchangeResult
+
+    data object MayHaveCommitted : RelayV2SelfRevokeExchangeResult
+}
+
+internal sealed interface RelayV2SelfRevokeResult {
+    data object ProfileRemoved : RelayV2SelfRevokeResult
+
+    data class Quarantined(
+        val phase: RelayV2SelfRevokePhase,
+    ) : RelayV2SelfRevokeResult
+}
+
+/** Strict one-attempt HTTPS seam; journal transitions remain the caller's authority. */
+internal fun interface RelayV2SelfRevokeExchange {
+    suspend fun revoke(
+        request: RelayV2SelfRevokeRequest,
+        onPreparedForNetworkHandoff: suspend () -> Unit,
+    ): RelayV2SelfRevokeExchangeResult
 }
 
 internal fun RelayV2Profile.matchesCredentialBinding(blob: RelayV2CredentialBlob): Boolean =

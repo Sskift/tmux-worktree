@@ -221,7 +221,10 @@ async function createBaseComposition(options = {}) {
     ? undefined
     : producer.registration.bindConnectionIncarnation(hostIncarnation);
   const composition = adapterModule.createRelayV2BrokerClientSocketTransportComposition({
-    brokerOptions: { now: () => NOW_MS },
+    brokerOptions: {
+      now: () => NOW_MS,
+      baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
     producerRegistry: producer.registry,
     resolveHostProducerBinding: (fence) => (
       options.resolveHostProducerBinding
@@ -279,10 +282,47 @@ async function createClientHarness(options = {}) {
     payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
   }));
   assert.equal(opened.accepted, true);
+  assert.equal(socket.state.sends.length, 0, "Core output stays closed before route_opened action");
   for (const action of opened.actions) {
     assert.equal(base.transport.applyBrokerAction(action), "applied");
   }
   await settleReadyTurns();
+  assert.equal(socket.state.sends.length, socket.state.destroys === 0 ? 1 : 0);
+  if (socket.state.sends.length === 1) {
+    codec.decodeRelayV2WebSocketFrame(
+      "public",
+      socket.state.sends[0].bytes,
+      { opcode: "text", compressed: false },
+    );
+    assert.deepEqual(JSON.parse(Buffer.from(socket.state.sends[0].bytes).toString("utf8")), {
+      protocolVersion: 2,
+      kind: "event",
+      type: "relay.welcome",
+      payload: {
+        selectedVersion: 2,
+        connectionId,
+        brokerEpoch: base.broker.brokerEpoch,
+        principalId: "client-principal",
+        capabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+        limits: {
+          maxFrameBytes: brokerModule.RELAY_V2_BROKER_LIMITS.maxFrameBytes,
+          maxCarrierFrameBytes: brokerModule.RELAY_V2_BROKER_LIMITS.maxCarrierFrameBytes,
+          brokerRouteBufferedBytesPerDirection:
+            brokerModule.RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection,
+          brokerRouteLowWaterBytesPerDirection:
+            brokerModule.RELAY_V2_BROKER_LIMITS.routeLowWaterBytesPerDirection,
+          brokerCarrierBufferedBytes: brokerModule.RELAY_V2_BROKER_LIMITS.carrierBufferedBytes,
+          brokerCarrierLowWaterBytes: brokerModule.RELAY_V2_BROKER_LIMITS.carrierLowWaterBytes,
+          maxQueuedRouteFrames: brokerModule.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames,
+          maxInFlightRequestsPerRoute:
+            brokerModule.RELAY_V2_BROKER_LIMITS.maxInFlightRequestsPerRoute,
+        },
+      },
+    });
+    socket.state.sends[0].complete("delivered");
+    await settleReadyTurns();
+    socket.state.sends.length = 0;
+  }
   base.producer.calls.apply.length = 0;
   base.producer.calls.forceTerminal.length = 0;
   return {
@@ -359,6 +399,7 @@ test("Broker ready fences are exact; client ACK does not manufacture a ready tur
   const ready = [];
   const core = new brokerModule.RelayV2BrokerCore({
     now: () => NOW_MS,
+    baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
     outputReadyPort: { ready(fence) { ready.push(fence); } },
   });
   const host = await registerCoreHost(core, "host-ready", "host-ready-incarnation");
@@ -394,7 +435,7 @@ test("Broker ready fences are exact; client ACK does not manufacture a ready tur
     routeId: openDelivery.frame.routeId,
     routeFence: openDelivery.frame.routeFence,
   };
-  for (const seq of ["1", "2"]) {
+  for (const seq of ["1"]) {
     await core.receiveHostFrame("host-ready", carrierBytes({
       carrierVersion: 1,
       type: "route.data",
@@ -421,6 +462,7 @@ test("Broker ready fences are exact; client ACK does not manufacture a ready tur
 
   const fatalCore = new brokerModule.RelayV2BrokerCore({
     now: () => NOW_MS,
+    baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
     outputReadyPort: { ready() { throw new Error("sink failed"); } },
   });
   await registerCoreHost(fatalCore, "host-fatal-ready", "host-fatal-incarnation");
@@ -439,7 +481,10 @@ test("factory closes the pre-bind gap and Host ready crosses only the opaque B7a
   let insideCoreCall = false;
   let resolverCalls = 0;
   const composition = adapterModule.createRelayV2BrokerClientSocketTransportComposition({
-    brokerOptions: { now: () => NOW_MS },
+    brokerOptions: {
+      now: () => NOW_MS,
+      baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
     producerRegistry: producer.registry,
     resolveHostProducerBinding(fence) {
       resolverCalls += 1;
@@ -469,7 +514,20 @@ test("factory closes the pre-bind gap and Host ready crosses only the opaque B7a
     producer.calls.apply[0].actions.map((action) => action.kind),
     ["host_output_ready"],
   );
-  assert.equal(socket.state.sends.length, 0, "route.open never fabricates welcome/capabilities");
+  assert.equal(socket.state.sends.length, 0, "route.open cannot emit welcome before route.opened");
+});
+
+test("route_opened opens one Core-owned relay.welcome drain before Host application data", async () => {
+  const h = await createClientHarness({ connectionId: "client-core-welcome-order" });
+  assert.equal(h.socket.state.sends.length, 0, "the helper consumed exactly the initial welcome");
+  const hostData = enqueueHostData(h, hostTerminalAck("after-welcome"));
+  await hostData.result;
+  await settleReadyTurns();
+  assert.equal(h.socket.state.sends.length, 1);
+  assert.deepEqual(
+    [...h.socket.state.sends[0].bytes],
+    [...hostData.wire],
+  );
 });
 
 test("one Host wake is coalesced until delivery, then a real ACK reissues the same epoch", async () => {
@@ -628,13 +686,12 @@ test("async completions advance one frame each; sync completions stop until writ
 });
 
 test("only the first literal completion ACKs; synchronous deadlines cannot leave immortal sends", async () => {
-  const firstReceiptSocket = createSocket({
-    synchronousCompletions: ["rejected", "delivered"],
-  });
+  const firstReceiptSocket = createSocket();
   const firstReceipt = await createClientHarness({
     connectionId: "client-first-receipt",
     socket: firstReceiptSocket,
   });
+  firstReceiptSocket.state.synchronousCompletions = ["rejected", "delivered"];
   const firstReceiptAcks = observeCoreMethod(firstReceipt.broker, "acknowledgeClientDelivery");
   await enqueueHostData(firstReceipt).result;
   await settleReadyTurns();

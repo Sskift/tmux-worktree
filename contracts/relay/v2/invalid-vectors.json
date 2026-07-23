@@ -456,6 +456,22 @@
     }
   },
   {
+    "name": "terminal-open-reset-rejects-next-offset",
+    "channel": "public",
+    "category": "unknown-field",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "terminal-open-reset-with-resume",
+      "path": "/payload/resume/nextOffset",
+      "value": "0"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "unknown-field"
+    }
+  },
+  {
     "name": "terminal-input-sequence-zero",
     "channel": "public",
     "category": "zero-sequence",

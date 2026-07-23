@@ -127,6 +127,8 @@ export async function runTerminalControlServer(options: {
   socketPath?: string;
   authority?: TerminalControlAuthority;
   signal?: AbortSignal;
+  /** Explicit private sibling ingress; never advertised on terminal-control v1. */
+  relayV2RemoteExactCompoundV1?: boolean;
 } = {}): Promise<void> {
   const socketPath = options.socketPath ?? terminalControlSocketPath();
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
@@ -144,6 +146,9 @@ export async function runTerminalControlServer(options: {
   const serverLock = await acquireTerminalControlStoreLock(`${socketPath}.server.lock`);
   const authority = options.authority ?? new TerminalControlAuthority();
   const server = createServer((socket) => handleSocket(socket, authority));
+  let compoundIngress: import(
+    "../relay/v2/remoteExactTerminalControlCompoundV1.js"
+  ).RelayV2RemoteExactCompoundDaemonIngressV1 | null = null;
   let closed = false;
   let ownsSocket = false;
   const cleanup = () => {
@@ -164,15 +169,37 @@ export async function runTerminalControlServer(options: {
     await listen(server, socketPath);
     ownsSocket = true;
     chmodSync(socketPath, 0o600);
+    if (options.relayV2RemoteExactCompoundV1 === true) {
+      const { openRelayV2RemoteExactCompoundDaemonIngressV1 } = await import(
+        "../relay/v2/remoteExactTerminalControlCompoundV1.js"
+      );
+      compoundIngress = await openRelayV2RemoteExactCompoundDaemonIngressV1({
+        daemonSocketPath: socketPath,
+        authority,
+        primaryServerLock: serverLock,
+      });
+    }
     await new Promise<void>((resolve) => {
       const stop = () => {
-        server.close(() => resolve());
+        const primaryClosed = new Promise<void>((closed) => {
+          try { server.close(() => closed()); } catch { closed(); }
+        });
+        const compoundClosed = compoundIngress?.closeAndDrain() ?? Promise.resolve();
+        void Promise.allSettled([primaryClosed, compoundClosed]).then(() => resolve());
       };
       options.signal?.addEventListener("abort", stop, { once: true });
       if (options.signal?.aborted) stop();
       server.once("close", resolve);
     });
   } finally {
-    cleanup();
+    try {
+      try {
+        await compoundIngress?.closeAndDrain();
+      } finally {
+        await authority.closeRelayV2ExactTargetAuthority();
+      }
+    } finally {
+      cleanup();
+    }
   }
 }

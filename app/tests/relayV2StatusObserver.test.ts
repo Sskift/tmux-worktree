@@ -161,7 +161,7 @@ test("Relay v2 malformed status clears cached readiness and preserves the v1 con
   assert.equal(normalized.enrollment.status, "failed");
   assert.equal(normalized.v1Profile.sharedSecretConfigured, true);
   assert.equal(view.ready, false);
-  assert.equal(view.qrPayload, null);
+  assert.equal(view.qrArtifact, null);
   assert.equal(view.enrollmentAction, null);
   assert.match(view.readinessDetail, /restore authoritative Relay v2 state/i);
   assert.doesNotMatch(JSON.stringify(normalized), /twenroll2\.must-be-cleared/);
@@ -297,7 +297,6 @@ test("Relay v2 persistent status failure clears cached readiness and late status
       review: {
         enrollment: {
           enrollmentId: "enrollment-stale",
-          enrollmentCode: "twenroll2.must-be-cleared",
           expiresAtMs: 50_000,
         },
         display: {
@@ -305,6 +304,11 @@ test("Relay v2 persistent status failure clears cached readiness and late status
           relayUrl: "wss://relay.test/client",
           hostId: "mac-admin",
           deviceLabel: null,
+        },
+        renderArtifact: {
+          kind: "native_qr_handle" as const,
+          handle: `dqart1.${"S".repeat(32)}`,
+          expiresAtMs: 50_000,
         },
       },
     },
@@ -355,8 +359,8 @@ test("Relay v2 persistent status failure clears cached readiness and late status
   assert.equal(failedState.enrollment.retryable, true);
   assert.equal(view.ready, false);
   assert.equal(view.enrollmentAction, null);
-  assert.equal(view.qrPayload, null);
-  assert.doesNotMatch(JSON.stringify(failedState), /twenroll2\./);
+  assert.equal(view.qrArtifact, null);
+  assert.doesNotMatch(JSON.stringify(failedState), /dqart1\./);
 
   clock.runNext();
   await flushPromises();
@@ -372,7 +376,7 @@ test("Relay v2 persistent status failure clears cached readiness and late status
   view = deriveRelayV2EnrollmentView(observedState(), clock.now());
   assert.equal(observedState().authority.kind, "unavailable");
   assert.equal(view.ready, false);
-  assert.equal(view.qrPayload, null);
+  assert.equal(view.qrArtifact, null);
   assert.equal(clock.count(), 0);
 });
 
@@ -386,7 +390,6 @@ test("Relay v2 enrollment expiry schedules an authoritative observation at expir
       review: {
         enrollment: {
           enrollmentId: "enrollment-1",
-          enrollmentCode: "twenroll2.one-time-code",
           expiresAtMs: 500,
         },
         display: {
@@ -394,6 +397,11 @@ test("Relay v2 enrollment expiry schedules an authoritative observation at expir
           relayUrl: "wss://relay.test/client",
           hostId: "mac-admin",
           deviceLabel: null,
+        },
+        renderArtifact: {
+          kind: "native_qr_handle" as const,
+          handle: `dqart1.${"E".repeat(32)}`,
+          expiresAtMs: 500,
         },
       },
     },
@@ -415,7 +423,7 @@ test("Relay v2 enrollment expiry schedules an authoritative observation at expir
   clock.runNext();
   await flushPromises();
   assert.equal(published[1]?.enrollment.status, "expired");
-  assert.doesNotMatch(JSON.stringify(published[1]), /twenroll2\./);
+  assert.doesNotMatch(JSON.stringify(published[1]), /dqart1\./);
   observer.stop();
 });
 

@@ -47,6 +47,15 @@ function makeReady() {
   return harness;
 }
 
+function makePreCarrierReady() {
+  const harness = createOwner();
+  for (const source of EXPECTED_SOURCES.filter((candidate) => candidate !== "carrier")) {
+    assert.equal(harness.sources[source].apply(sourceSnapshot(source, "1", true)), true);
+  }
+  assertExactIntersection(harness.owner.current(), false);
+  return harness;
+}
+
 function routeBinding(overrides = {}) {
   return Object.freeze({
     connectorGeneration: 1,
@@ -111,6 +120,67 @@ test("six typed sources default false and publish only the atomic frozen base se
   subscription.unsubscribe();
   assert.equal(sources.codec.apply(sourceSnapshot("codec", "2", true)), true);
   assert.equal(observed.length, beforeDuplicate, "unsubscribe must release the bounded slot");
+});
+
+test("pre-carrier offers are opaque one-shot exact bindings and stale cuts require a new offer", () => {
+  const { owner, sources } = makePreCarrierReady();
+  const bindings = [];
+  const fenced = [];
+  const fence = Object.freeze({
+    bind(binding) {
+      bindings.push(binding);
+      return true;
+    },
+    fence(binding) {
+      fenced.push(binding);
+    },
+  });
+  const first = owner.issuePreCarrierOffer(Object.freeze({
+    controllerGeneration: "7",
+    carrierAttemptGeneration: "11",
+    fence,
+  }));
+  assert.notEqual(first, null);
+  assert.deepEqual(Reflect.ownKeys(first), []);
+  assert.equal(bindings.length, 1);
+  assert.equal(Object.isFrozen(bindings[0]), true);
+  assert.equal(readinessModule.matchesRelayV2HostPreCarrierOfferClaim(first, {
+    controllerGeneration: "7",
+    carrierAttemptGeneration: "11",
+  }), true);
+  assert.equal(readinessModule.matchesRelayV2HostPreCarrierOfferClaim(first, {
+    controllerGeneration: "7",
+    carrierAttemptGeneration: "12",
+  }), false);
+  const advertised = readinessModule.consumeRelayV2HostPreCarrierOfferClaim(first);
+  assert.deepEqual(advertised, [...CAPABILITIES]);
+  assert.equal(Object.isFrozen(advertised), true);
+  assert.equal(readinessModule.consumeRelayV2HostPreCarrierOfferClaim(first), null);
+
+  const stale = owner.issuePreCarrierOffer(Object.freeze({
+    controllerGeneration: "8",
+    carrierAttemptGeneration: "12",
+    fence,
+  }));
+  assert.notEqual(stale, null);
+  const staleGeneration = BigInt(bindings.at(-1).offerGeneration);
+  sources.h2.close();
+  assert.deepEqual(fenced.at(-1), bindings.at(-1));
+  assert.equal(readinessModule.consumeRelayV2HostPreCarrierOfferClaim(stale), null);
+  assert.equal(sources.h2.apply(sourceSnapshot("h2", "1", true)), false);
+  assert.equal(owner.issuePreCarrierOffer(Object.freeze({
+    controllerGeneration: "9",
+    carrierAttemptGeneration: "13",
+    fence,
+  })), null);
+  assert.equal(sources.h2.apply(sourceSnapshot("h2", "2", true)), true);
+  const recovered = owner.issuePreCarrierOffer(Object.freeze({
+    controllerGeneration: "9",
+    carrierAttemptGeneration: "13",
+    fence,
+  }));
+  assert.notEqual(recovered, null);
+  assert.ok(BigInt(bindings.at(-1).offerGeneration) > staleGeneration);
 });
 
 test("false, invalid, regressed, and closed sources withdraw before a newer generation recovers", async (t) => {

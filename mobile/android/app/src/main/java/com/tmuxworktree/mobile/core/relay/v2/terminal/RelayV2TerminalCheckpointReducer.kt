@@ -389,9 +389,41 @@ internal object RelayV2TerminalCheckpointReducer {
             is RelayV2TerminalAction.CorrelatedResetRequired ->
                 correlatedResetRequired(current, action)
             is RelayV2TerminalAction.AsyncResetRequired -> asyncResetRequired(current, action)
+            is RelayV2TerminalAction.CorrelatedError -> correlatedError(current, action)
             is RelayV2TerminalAction.PreOpenResetRequired ->
                 reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
+    }
+
+    private fun correlatedError(
+        current: RelayV2TerminalCheckpoint,
+        action: RelayV2TerminalAction.CorrelatedError,
+    ): RelayV2TerminalReduction {
+        val owners = buildList {
+            current.pendingOpen?.let { if (action.requestId in it.issuedRequestIds) add("open") }
+            current.pendingReplay?.let { if (action.requestId == it.requestId) add("replay") }
+            current.pendingClose?.let { if (action.requestId in it.issuedRequestIds) add("close") }
+        }
+        if (owners.isEmpty()) return reduction(
+            current, RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_DELIVERY),
+        )
+        if (owners.size != 1) return reduction(
+            current, RelayV2TerminalOutcome.ProtocolViolation("AMBIGUOUS_TERMINAL_ERROR_OWNER"),
+        )
+        if (action.commandDisposition != "not_applicable") return reduction(
+            current, RelayV2TerminalOutcome.ProtocolViolation("INVALID_COMMAND_DISPOSITION"),
+        )
+        val identity = current.identity
+        val mismatch = (action.hostId != null && action.hostId != identity.hostId) ||
+            (action.hostEpoch != null && action.hostEpoch != identity.hostEpoch) ||
+            (action.scopeId != null && action.scopeId != identity.scopeId) ||
+            (action.sessionId != null && action.sessionId != identity.sessionId) ||
+            (action.streamId != null && action.streamId != identity.streamId)
+        if (mismatch) return reduction(current, RelayV2TerminalOutcome.ProtocolViolation("TERMINAL_ERROR_IDENTITY_MISMATCH"))
+        return reduction(
+            current,
+            RelayV2TerminalOutcome.CorrelatedErrorRejected(action.requestId, action.error.code),
+        )
     }
 
     fun reduce(
@@ -400,6 +432,30 @@ internal object RelayV2TerminalCheckpointReducer {
     ): RelayV2TerminalReduction = when (action) {
         is RelayV2TerminalAction.BeginOpenAttempt -> beginPreOpen(checkpoint, action)
         is RelayV2TerminalAction.Opened -> openedPreOpen(checkpoint, action)
+        is RelayV2TerminalAction.CorrelatedError -> {
+            val pending = checkpoint.pendingOpen
+            val owned = pending != null && action.requestId in pending.issuedRequestIds
+            if (!owned) preOpenReduction(
+                checkpoint,
+                RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_DELIVERY),
+            ) else if (action.commandDisposition != "not_applicable") preOpenReduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation("INVALID_COMMAND_DISPOSITION"),
+            ) else if (
+                action.requestId in pending!!.issuedRequestIds &&
+                (action.streamId == null || action.streamId == pending.target.streamId) &&
+                (action.hostId == null || action.hostId == pending.target.hostId) &&
+                (action.hostEpoch == null || action.hostEpoch == pending.target.hostEpoch) &&
+                (action.scopeId == null || action.scopeId == pending.target.scopeId) &&
+                (action.sessionId == null || action.sessionId == pending.target.sessionId)
+            ) preOpenReduction(
+                checkpoint,
+                RelayV2TerminalOutcome.CorrelatedErrorRejected(action.requestId, action.error.code),
+            ) else preOpenReduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation("TERMINAL_ERROR_IDENTITY_MISMATCH"),
+            )
+        }
         is RelayV2TerminalAction.PreOpenResetRequired ->
             preOpenResetRequired(checkpoint, action)
         else -> preOpenReduction(
@@ -3032,6 +3088,7 @@ internal object RelayV2TerminalCheckpointReducer {
         is RelayV2TerminalAction.RetryReplay -> deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.RequestClose -> deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.Closed -> null
+        is RelayV2TerminalAction.CorrelatedError -> null
         is RelayV2TerminalAction.CorrelatedResetRequired -> null
         is RelayV2TerminalAction.AsyncResetRequired -> fenceGuard(current, action.fence)
     }

@@ -62,11 +62,28 @@ function managerError(code) {
   };
 }
 
+function fakeManagerError(code, message) {
+  const error = new Error(message);
+  error.name = "RelayV2TerminalManagerError";
+  error.code = code;
+  return error;
+}
+
 function exactEvidence(input) {
   return {
     ...structuredClone(input),
     exactControlToken: "adapter-exact-control-token",
     exactControlIdentity: structuredClone(EXACT_IDENTITY),
+  };
+}
+
+function resourceFence(result = { kind: "positive", target: RESOURCE_TARGET }) {
+  return {
+    schemaVersion: 1,
+    token: structuredClone(RESOURCE_TOKEN),
+    expectedScopeId: TARGET.scopeId,
+    expectedSessionId: TARGET.sessionId,
+    result: structuredClone(result),
   };
 }
 
@@ -77,19 +94,18 @@ function harness(overrides = {}) {
       calls.push(["h2.capture", hostEpoch]);
       return structuredClone(RESOURCE_TOKEN);
     },
-    async resolveSession(token, scopeId, sessionId) {
-      calls.push(["h2.resolve", structuredClone(token), scopeId, sessionId]);
-      return structuredClone(RESOURCE_TARGET);
+    async resolveSessionForAdmission(token, scopeId, sessionId) {
+      calls.push(["h2.resolveAdmission", structuredClone(token), scopeId, sessionId]);
+      return overrides.resourceFence?.(token, scopeId, sessionId)
+        ?? resourceFence();
     },
-    fenceSessionForAdmission(transaction, token, scopeId, sessionId, target) {
+    fenceResourceCutForAdmission(transaction, fence) {
       calls.push([
         "h2.fence",
         transaction.hostEpoch,
-        structuredClone(token),
-        scopeId,
-        sessionId,
-        structuredClone(target),
+        structuredClone(fence),
       ]);
+      if (overrides.h2FenceThrow) throw overrides.h2FenceThrow;
       return typeof overrides.h2FenceResult === "function"
         ? overrides.h2FenceResult()
         : overrides.h2FenceResult;
@@ -104,6 +120,13 @@ function harness(overrides = {}) {
         },
         fenceExactTargetForAdmission(input, evidence) {
           calls.push(["exact.fence", structuredClone(input), structuredClone(evidence)]);
+          if (evidence.exactControlToken !== "adapter-exact-control-token"
+            || JSON.stringify(evidence.exactControlIdentity) !== JSON.stringify(EXACT_IDENTITY)) {
+            throw fakeManagerError(
+              "CAPABILITY_UNAVAILABLE",
+              "exact terminal-control identity is stale",
+            );
+          }
           return typeof overrides.exactFenceResult === "function"
             ? overrides.exactFenceResult()
             : overrides.exactFenceResult;
@@ -151,23 +174,89 @@ test("exact terminal resolver binds H2 incarnation and pane to versioned control
     canonicalTargetId: BACKEND_INSTANCE_KEY,
     controlTargetId: EXACT_IDENTITY.controlTargetId,
   });
+  assert.deepEqual(resolution.admission, {
+    resourceToken: RESOURCE_TOKEN,
+    resourceTarget: RESOURCE_TARGET,
+    exactControlToken: "adapter-exact-control-token",
+  });
 
   h.adapter.fenceSessionForAdmission({ hostEpoch: HOST_EPOCH }, resolution);
   assert.deepEqual(h.calls.map(([name]) => name), [
     "h2.capture",
-    "h2.resolve",
+    "h2.resolveAdmission",
     "exact.resolve",
-    "h2.fence",
     "exact.fence",
+    "h2.fence",
   ]);
   assert.deepEqual(h.calls.find(([name]) => name === "h2.fence"), [
     "h2.fence",
     HOST_EPOCH,
-    RESOURCE_TOKEN,
-    TARGET.scopeId,
-    TARGET.sessionId,
-    RESOURCE_TARGET,
+    resourceFence(),
   ]);
+  assert.equal(h.calls.some(([name]) => name.includes("lease")), false);
+});
+
+test("stale or complete-negative H2 materialized cuts never reach terminal resolution", async (t) => {
+  await t.test("stale generation", async () => {
+    const h = harness({
+      resourceFence: () => ({
+        ...resourceFence(),
+        token: { ...RESOURCE_TOKEN, discoveryGeneration: "stale-generation" },
+      }),
+    });
+    await assert.rejects(resolve(h), managerError("CAPABILITY_UNAVAILABLE"));
+    assert.equal(h.calls.filter(([name]) => name === "exact.resolve").length, 0);
+  });
+
+  await t.test("complete negative", async () => {
+    const h = harness({
+      resourceFence: () => resourceFence({
+        kind: "complete_negative",
+        code: "SESSION_NOT_FOUND",
+      }),
+    });
+    await assert.rejects(resolve(h), managerError("SESSION_NOT_FOUND"));
+    assert.equal(h.calls.filter(([name]) => name === "exact.resolve").length, 0);
+  });
+
+  await t.test("H2 rejects stale cut synchronously", async () => {
+    const h = harness({ h2FenceThrow: new Error("stale H2 cut") });
+    const resolution = await resolve(h);
+    assert.throws(
+      () => h.adapter.fenceSessionForAdmission({ hostEpoch: HOST_EPOCH }, resolution),
+      /stale H2 cut/,
+    );
+    assert.deepEqual(h.calls.slice(-2).map(([name]) => name), ["exact.fence", "h2.fence"]);
+  });
+});
+
+test("terminal identity swaps are rejected before the H2 authority fence", async (t) => {
+  for (const [name, mutate, expectedFenceCalls] of [
+    ["binding control epoch", (resolution) => {
+      resolution.binding.exactControlIdentity.controlEpoch = "swapped-control-epoch";
+    }, ["exact.fence"]],
+    ["resolved control target", (resolution) => {
+      resolution.target.controlTargetId = "swapped-control-target";
+    }, []],
+    ["evidence incarnation", (resolution) => {
+      resolution.admission.resourceTarget.managedTarget.incarnation =
+        `twinc2.${"d".repeat(43)}`;
+    }, []],
+  ]) {
+    await t.test(name, async () => {
+      const h = harness();
+      const resolution = await resolve(h);
+      mutate(resolution);
+      assert.throws(
+        () => h.adapter.fenceSessionForAdmission({ hostEpoch: HOST_EPOCH }, resolution),
+        managerError("CAPABILITY_UNAVAILABLE"),
+      );
+      assert.deepEqual(
+        h.calls.filter(([call]) => call.endsWith(".fence")).map(([call]) => call),
+        expectedFenceCalls,
+      );
+    });
+  }
 });
 
 test("name-only exact-control evidence is unavailable and never reaches a fence", async () => {
@@ -180,12 +269,12 @@ test("name-only exact-control evidence is unavailable and never reaches a fence"
   await assert.rejects(resolve(h), managerError("CAPABILITY_UNAVAILABLE"));
   assert.deepEqual(h.calls.map(([name]) => name), [
     "h2.capture",
-    "h2.resolve",
+    "h2.resolveAdmission",
     "exact.resolve",
   ]);
 });
 
-test("an asynchronous H2 sub-fence aborts before exact-control fencing", async () => {
+test("an asynchronous H2 sub-fence aborts after synchronous exact-control fencing", async () => {
   const h = harness({
     h2FenceResult: () => Promise.resolve("unsafe H2 completion"),
   });
@@ -195,7 +284,7 @@ test("an asynchronous H2 sub-fence aborts before exact-control fencing", async (
     managerError("CAPABILITY_UNAVAILABLE"),
   );
   assert.equal(h.calls.filter(([name]) => name === "h2.fence").length, 1);
-  assert.equal(h.calls.filter(([name]) => name === "exact.fence").length, 0);
+  assert.equal(h.calls.filter(([name]) => name === "exact.fence").length, 1);
 });
 
 test("a throwing then getter from an adapter sub-fence fails closed synchronously", async () => {
@@ -212,10 +301,10 @@ test("a throwing then getter from an adapter sub-fence fails closed synchronousl
     managerError("CAPABILITY_UNAVAILABLE"),
   );
   assert.equal(h.calls.filter(([name]) => name === "h2.fence").length, 1);
-  assert.equal(h.calls.filter(([name]) => name === "exact.fence").length, 0);
+  assert.equal(h.calls.filter(([name]) => name === "exact.fence").length, 1);
 });
 
-test("an asynchronous exact-control sub-fence aborts after synchronous H2 verification", async () => {
+test("an asynchronous exact-control sub-fence aborts before H2 verification", async () => {
   const h = harness({
     exactFenceResult: () => Promise.resolve("unsafe exact completion"),
   });
@@ -224,7 +313,7 @@ test("an asynchronous exact-control sub-fence aborts after synchronous H2 verifi
     () => h.adapter.fenceSessionForAdmission({ hostEpoch: HOST_EPOCH }, resolution),
     managerError("CAPABILITY_UNAVAILABLE"),
   );
-  assert.equal(h.calls.filter(([name]) => name === "h2.fence").length, 1);
+  assert.equal(h.calls.filter(([name]) => name === "h2.fence").length, 0);
   assert.equal(h.calls.filter(([name]) => name === "exact.fence").length, 1);
 });
 

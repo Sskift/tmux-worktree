@@ -17,9 +17,12 @@ import {
 } from "./brokerClientSocketTransport.js";
 import {
   createRelayV2BrokerClientWssAdapter,
+  createRelayV2BrokerClientWssCaptureAuthority,
   type RelayV2BrokerClientWssAdapter,
+  type RelayV2BrokerClientWssCaptureAuthority,
   type RelayV2BrokerClientWssSocket,
   type RelayV2BrokerClientWssTerminalEvidence,
+  type RelayV2BrokerClientWssTrustedSocketBrand,
 } from "./brokerClientWssAdapter.js";
 import type { RelayV2BrokerHostWssTrustedSocketBrand } from "./brokerHostWssAdapter.js";
 import {
@@ -29,6 +32,7 @@ import {
   type RelayV2AuthControlRequest,
   type RelayV2BrokerAuthControlAuthority,
   type RelayV2BrokerConnectionAuthorization,
+  type RelayV2BrokerOptionalCapabilityReadinessPort,
   type RelayV2ClientAdmission,
   type RelayV2BrokerResult,
   type RelayV2LiveAuthorizationFencePort,
@@ -68,6 +72,11 @@ const PREPARE_KEYS = Object.freeze([
   "hostProducerTarget",
 ] as const);
 
+const CURRENT_HOST_PREPARE_KEYS = Object.freeze([
+  "connectionId",
+  "trustedAuthContext",
+] as const);
+
 const ATTACH_PREPARED_KEYS = Object.freeze([
   "admissionReceipt",
   "alreadyUpgradedSocket",
@@ -99,6 +108,10 @@ export interface RelayV2BrokerClientWssRuntimeCompositionOptions {
   closeTimeoutMs?: number;
   authorizationExpiryScheduleAt?: RelayV2BrokerAuthorizationExpiryScheduleAt;
   transportCloseDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
+  /** Private one-shot capture of this composition's exact Core withdrawal cut. */
+  bindOptionalCapabilityReadinessPort?: (
+    port: RelayV2BrokerOptionalCapabilityReadinessPort,
+  ) => void;
 }
 
 /** The credential owner admitted by the default-off one-shot activation. */
@@ -129,6 +142,26 @@ export interface RelayV2BrokerClientWssPrepareInput {
   connectionId: string;
   trustedAuthContext: RelayV2BrokerConnectionAuthorization;
   hostProducerTarget: RelayV2BrokerProducerTarget;
+}
+
+export interface RelayV2BrokerClientWssCurrentHostPrepareInput {
+  connectionId: string;
+  trustedAuthContext: RelayV2BrokerConnectionAuthorization;
+}
+
+export type RelayV2BrokerClientWssCurrentHostPreparePort = (
+  input: RelayV2BrokerClientWssCurrentHostPrepareInput,
+) => RelayV2BrokerClientWssPrepareResult;
+
+export interface RelayV2BrokerClientWssPrivateIngressRuntime {
+  installTrustedSocketCapture(
+    trustedSocketPrototype: object,
+    trustedSocketBrand: RelayV2BrokerClientWssTrustedSocketBrand,
+  ): void;
+  prepareClientWssForCurrentHost: RelayV2BrokerClientWssCurrentHostPreparePort;
+  attachPreparedClientWss(
+    input: RelayV2BrokerClientWssAttachPreparedInput,
+  ): RelayV2BrokerClientWssConnectionHandle;
 }
 
 declare const RELAY_V2_BROKER_CLIENT_WSS_ADMISSION_RECEIPT: unique symbol;
@@ -505,6 +538,39 @@ function capturePrepareInput(
   }
 }
 
+function captureCurrentHostPrepareInput(
+  input: RelayV2BrokerClientWssCurrentHostPrepareInput,
+): Readonly<RelayV2BrokerClientWssCurrentHostPrepareInput> {
+  if (input === null || typeof input !== "object" || isRejectedProxy(input)) {
+    throw new Error("invalid Relay v2 Broker current-Host client WSS prepare input");
+  }
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.length !== CURRENT_HOST_PREPARE_KEYS.length
+      || !keys.every((key) => typeof key === "string" && CURRENT_HOST_PREPARE_KEYS.includes(
+        key as (typeof CURRENT_HOST_PREPARE_KEYS)[number],
+      ))
+    ) throw new Error("invalid current-Host prepare shape");
+    const connectionId = descriptors.connectionId;
+    const trustedAuthContext = descriptors.trustedAuthContext;
+    if (
+      !connectionId
+      || !Object.hasOwn(connectionId, "value")
+      || !isIdentifier(connectionId.value)
+      || !trustedAuthContext
+      || !Object.hasOwn(trustedAuthContext, "value")
+    ) throw new Error("invalid current-Host prepare descriptor");
+    return Object.freeze({
+      connectionId: connectionId.value,
+      trustedAuthContext: captureAuthorizationSnapshot(trustedAuthContext.value),
+    });
+  } catch {
+    throw new Error("invalid Relay v2 Broker current-Host client WSS prepare input");
+  }
+}
+
 function captureAttachPreparedInput(
   input: RelayV2BrokerClientWssAttachPreparedInput,
 ): Readonly<RelayV2BrokerClientWssAttachPreparedInput> {
@@ -554,6 +620,21 @@ function closingAdmissionRejection(): RelayV2BrokerClientWssPrepareResult {
     error: Object.freeze({
       code: "CAPABILITY_UNAVAILABLE" as const,
       message: "Broker client WSS runtime is closing",
+      retryable: false,
+      retryAfterMs: null,
+      commandDisposition: "not_applicable" as const,
+      details: null,
+    }),
+  });
+}
+
+function unavailableHostProducerRejection(): RelayV2BrokerClientWssPrepareResult {
+  return Object.freeze({
+    outcome: "reject" as const,
+    status: 503 as const,
+    error: Object.freeze({
+      code: "CAPABILITY_UNAVAILABLE" as const,
+      message: "Broker Host producer binding is unavailable",
       retryable: false,
       retryAfterMs: null,
       commandDisposition: "not_applicable" as const,
@@ -973,6 +1054,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   private readonly expiryOwner: RelayV2BrokerAuthorizationExpiryDeadlineOwner;
   private readonly hostWssOwnerBinding: RelayV2BrokerHostWssRuntimeOwnerBinding;
   private hostWssRuntime: RelayV2BrokerHostWssRuntimeFacade | null = null;
+  private clientWssCaptureAuthority: RelayV2BrokerClientWssCaptureAuthority | null = null;
   private readonly connections = new Map<string, ConnectionRecord>();
   private readonly attachingConnectionIds = new Set<string>();
   private readonly pendingAttaches = new Set<Deferred>();
@@ -990,6 +1072,15 @@ implements RelayV2BrokerClientWssRuntimeComposition {
   private closeDrain: Promise<void> | null = null;
 
   constructor(options: RelayV2BrokerClientWssRuntimeCompositionOptions) {
+    if (
+      options.bindOptionalCapabilityReadinessPort !== undefined
+      && (
+        typeof options.bindOptionalCapabilityReadinessPort !== "function"
+        || isRejectedProxy(options.bindOptionalCapabilityReadinessPort)
+      )
+    ) {
+      throw new Error("invalid Relay v2 Broker optional capability readiness binding");
+    }
     this.producerRegistry = options.producerRegistry;
     this.closeCoordinator = new RelayV2BrokerTransportCloseCoordinator({
       deadlineScheduler: options.transportCloseDeadlineScheduler,
@@ -1008,6 +1099,11 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     });
     this.broker = transportComposition.broker;
     this.transport = transportComposition.clientSocketTransport;
+    if (options.bindOptionalCapabilityReadinessPort) {
+      Reflect.apply(options.bindOptionalCapabilityReadinessPort, undefined, [
+        this.broker.optionalCapabilityReadinessPort,
+      ]);
+    }
     this.hostPumpBrokerAuthority = Object.freeze({
       attachHostCarrier: (...args: Parameters<RelayV2BrokerCore["attachHostCarrier"]>) => (
         this.broker.attachHostCarrier(...args)
@@ -1051,6 +1147,9 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     });
     this.hostWssOwnerBinding = Object.freeze({
       credentialAdmissionOpen: (): boolean => this.credentialAdmissionOpen(),
+      inspectHostAdmission: (
+        authContext: RelayV2BrokerConnectionAuthorization,
+      ) => this.broker.inspectHostAdmission(authContext),
       createSession: (input: Readonly<{
         producerPort: RelayV2BrokerProducerPort;
         close(code: number, reason: string): unknown;
@@ -1116,6 +1215,19 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     return runtime;
   }
 
+  installTrustedSocketCapture(
+    trustedSocketPrototype: object,
+    trustedSocketBrand: RelayV2BrokerClientWssTrustedSocketBrand,
+  ): void {
+    if (this.clientWssCaptureAuthority || this.closeDrain) {
+      throw new Error("Relay v2 Broker client WSS socket capture was already installed or closed");
+    }
+    this.clientWssCaptureAuthority = createRelayV2BrokerClientWssCaptureAuthority(
+      trustedSocketPrototype,
+      trustedSocketBrand,
+    );
+  }
+
   credentialActivationFence(): RelayV2LiveAuthorizationFencePort {
     return this.broker.liveAuthorizationFencePort;
   }
@@ -1151,14 +1263,57 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     if (admission.outcome === "reject") return frozenAdmissionRejection(admission);
     if (!this.clientAdmissionOpen) return closingAdmissionRejection();
 
+    return this.issueClientWssAdmissionReceipt(
+      captured.connectionId,
+      captured.trustedAuthContext,
+      captured.hostProducerTarget,
+    );
+  }
+
+  prepareClientWssForCurrentHost(
+    input: RelayV2BrokerClientWssCurrentHostPrepareInput,
+  ): RelayV2BrokerClientWssPrepareResult {
+    if (!this.clientAdmissionOpen) return closingAdmissionRejection();
+    const captured = captureCurrentHostPrepareInput(input);
+    if (
+      this.connections.has(captured.connectionId)
+      || this.attachingConnectionIds.has(captured.connectionId)
+    ) {
+      throw new Error("duplicate Relay v2 Broker client WSS connection ID");
+    }
+    const admission = this.broker.inspectClientProducerAdmission(
+      captured.trustedAuthContext,
+    );
+    if (admission.outcome === "reject") return frozenAdmissionRejection(admission);
+    const producerOwner = this.producerRegistry.inspectHostProducerOwner(
+      admission.carrierTransportId,
+      admission.carrierConnectionIncarnation,
+    );
+    if (producerOwner.status !== "current") {
+      return unavailableHostProducerRejection();
+    }
+    if (!this.clientAdmissionOpen) return closingAdmissionRejection();
+
+    return this.issueClientWssAdmissionReceipt(
+      captured.connectionId,
+      captured.trustedAuthContext,
+      producerOwner.target,
+    );
+  }
+
+  private issueClientWssAdmissionReceipt(
+    connectionId: string,
+    authContext: RelayV2BrokerConnectionAuthorization,
+    hostProducerTarget: RelayV2BrokerProducerTarget,
+  ): RelayV2BrokerClientWssPrepareResult {
     const admissionReceipt = Object.freeze(
       Object.create(null),
     ) as RelayV2BrokerClientWssAdmissionReceipt;
     ADMISSION_RECEIPTS.set(admissionReceipt, {
       owner: this,
-      connectionId: captured.connectionId,
-      authContext: captured.trustedAuthContext,
-      hostProducerTarget: captured.hostProducerTarget,
+      connectionId,
+      authContext,
+      hostProducerTarget,
       phase: "issued",
     });
     return Object.freeze({ outcome: "accept", admissionReceipt });
@@ -1267,13 +1422,16 @@ implements RelayV2BrokerClientWssRuntimeComposition {
           this.transport.applyBrokerAction(action)
         ),
       });
-      const adapter = createRelayV2BrokerClientWssAdapter({
+      const adapterInput = {
         connectionId: captured.connectionId,
         authContext: captured.authContext,
         hostProducerTarget: captured.hostProducerTarget,
         socket: captured.alreadyUpgradedSocket,
         transport: adapterTransport,
-      });
+      };
+      const adapter = this.clientWssCaptureAuthority
+        ? this.clientWssCaptureAuthority.create(adapterInput)
+        : createRelayV2BrokerClientWssAdapter(adapterInput);
       const closeRegistration = managedRegistration as ReturnType<
         RelayV2BrokerTransportCloseCoordinator["registerManagedClientSocket"]
       > | null;
@@ -1683,8 +1841,35 @@ async function rollbackRelayV2BrokerClientWssRuntimeActivation(
  */
 export function createRelayV2BrokerClientWssRuntimeComposition(
   options: RelayV2BrokerClientWssRuntimeCompositionOptions,
+  bindPrivateIngressRuntime?: (
+    runtime: RelayV2BrokerClientWssPrivateIngressRuntime,
+  ) => void,
 ): RelayV2BrokerClientWssRuntimeComposition {
   const owner = new RelayV2BrokerClientWssRuntimeCompositionImpl(options);
+  if (bindPrivateIngressRuntime !== undefined) {
+    try {
+      Reflect.apply(bindPrivateIngressRuntime, undefined, [
+        Object.freeze(Object.assign(Object.create(null), {
+          installTrustedSocketCapture: (
+            trustedSocketPrototype: object,
+            trustedSocketBrand: RelayV2BrokerClientWssTrustedSocketBrand,
+          ) => owner.installTrustedSocketCapture(
+            trustedSocketPrototype,
+            trustedSocketBrand,
+          ),
+          prepareClientWssForCurrentHost: (
+            input: RelayV2BrokerClientWssCurrentHostPrepareInput,
+          ) => owner.prepareClientWssForCurrentHost(input),
+          attachPreparedClientWss: (
+            input: RelayV2BrokerClientWssAttachPreparedInput,
+          ) => owner.attachPreparedClientWss(input),
+        })) as RelayV2BrokerClientWssPrivateIngressRuntime,
+      ]);
+    } catch (error) {
+      void owner.closeAndDrain().catch(() => {});
+      throw error;
+    }
+  }
   return createRelayV2BrokerClientWssRuntimeFacade(
     owner,
     () => owner.closeAndDrain(),
@@ -1702,6 +1887,9 @@ export async function activateRelayV2BrokerClientWssRuntimeComposition<
   Authority extends RelayV2BrokerActivatedCredentialAuthority,
 >(
   options: RelayV2BrokerClientWssRuntimeActivationOptions<Authority>,
+  bindPrivateIngressRuntime?: (
+    runtime: RelayV2BrokerClientWssPrivateIngressRuntime,
+  ) => void,
 ): Promise<RelayV2BrokerClientWssRuntimeActivation> {
   if (
     options === null
@@ -1731,6 +1919,8 @@ export async function activateRelayV2BrokerClientWssRuntimeComposition<
       closeTimeoutMs: options.closeTimeoutMs,
       authorizationExpiryScheduleAt: options.authorizationExpiryScheduleAt,
       transportCloseDeadlineScheduler: options.transportCloseDeadlineScheduler,
+      bindOptionalCapabilityReadinessPort:
+        options.bindOptionalCapabilityReadinessPort,
       brokerOptions: {
         ...brokerOptions,
       },
@@ -1765,6 +1955,25 @@ export async function activateRelayV2BrokerClientWssRuntimeComposition<
     bridge.bind(authority);
     if (!owner.credentialActivationPublishable()) {
       throw new Error("Relay v2 Broker credential activation crossed a fail-closed cut");
+    }
+    if (bindPrivateIngressRuntime !== undefined) {
+      Reflect.apply(bindPrivateIngressRuntime, undefined, [
+        Object.freeze(Object.assign(Object.create(null), {
+          installTrustedSocketCapture: (
+            trustedSocketPrototype: object,
+            trustedSocketBrand: RelayV2BrokerClientWssTrustedSocketBrand,
+          ) => owner.installTrustedSocketCapture(
+            trustedSocketPrototype,
+            trustedSocketBrand,
+          ),
+          prepareClientWssForCurrentHost: (
+            input: RelayV2BrokerClientWssCurrentHostPrepareInput,
+          ) => owner.prepareClientWssForCurrentHost(input),
+          attachPreparedClientWss: (
+            input: RelayV2BrokerClientWssAttachPreparedInput,
+          ) => owner.attachPreparedClientWss(input),
+        })) as RelayV2BrokerClientWssPrivateIngressRuntime,
+      ]);
     }
 
     const runtime = createRelayV2BrokerClientWssRuntimeFacade(

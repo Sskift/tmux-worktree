@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -27,12 +28,14 @@ import org.json.JSONObject
 @Stable
 class TerminalWebViewController internal constructor() {
     private val lock = Any()
+    private val parserCallbackHandler = Handler(Looper.getMainLooper())
     private var webView: WebView? = null
     private val pendingScripts = ArrayDeque<String>()
     private var pendingScriptBytes = 0
     private val pendingTerminalOutput = StringBuilder()
     private var terminalWriteInFlight = false
     private var terminalOutputGeneration = 0L
+    private var parserMutation: PendingParserMutation? = null
     @Volatile
     var isReady: Boolean = false
         private set
@@ -59,7 +62,7 @@ class TerminalWebViewController internal constructor() {
     }
 
     internal fun unbind(view: WebView) {
-        synchronized(lock) {
+        val parserMutation = synchronized(lock) {
             if (webView === view) webView = null
             isReady = false
             pendingScripts.clear()
@@ -67,7 +70,41 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            parserMutation.also { parserMutation = null }
         }
+        settleParserMutation(parserMutation, applied = false)
+    }
+
+    internal fun writeBytesWithAck(
+        callbackId: String,
+        bytes: ByteArray,
+        completion: (applied: Boolean) -> Unit,
+    ): Boolean {
+        if (bytes.isEmpty() || bytes.size > MAX_ACKED_PARSER_BYTES) return false
+        val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        return registerParserMutation(
+            callbackId = callbackId,
+            script = "window.twWriteBytesWithAck&&window.twWriteBytesWithAck(" +
+                "${JSONObject.quote(callbackId)},${JSONObject.quote(encoded)});",
+            completion = completion,
+        )
+    }
+
+    internal fun resetWithAck(
+        callbackId: String,
+        completion: (applied: Boolean) -> Unit,
+    ): Boolean = registerParserMutation(
+        callbackId = callbackId,
+        script = "window.twResetWithAck&&window.twResetWithAck(${JSONObject.quote(callbackId)});",
+        completion = completion,
+    )
+
+    internal fun completeParserMutation(callbackId: String, applied: Boolean) {
+        val mutation = synchronized(lock) {
+            parserMutation?.takeIf { it.callbackId == callbackId }
+                .also { if (it != null) parserMutation = null }
+        }
+        settleParserMutation(mutation, applied)
     }
 
     fun write(data: String) {
@@ -88,11 +125,13 @@ class TerminalWebViewController internal constructor() {
     }
 
     fun reset(message: String = "") {
-        synchronized(lock) {
+        val parserMutation = synchronized(lock) {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            parserMutation.also { parserMutation = null }
         }
+        settleParserMutation(parserMutation, applied = false)
         evaluate("window.twReset&&window.twReset(${JSONObject.quote(message)});")
     }
 
@@ -112,14 +151,16 @@ class TerminalWebViewController internal constructor() {
     fun blur() = evaluate("window.twBlur&&window.twBlur();")
 
     fun clear() {
-        val readyView = synchronized(lock) {
+        val (readyView, parserMutation) = synchronized(lock) {
             pendingScripts.clear()
             pendingScriptBytes = 0
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
-            webView?.takeIf { isReady }
+            val mutation = parserMutation.also { parserMutation = null }
+            webView?.takeIf { isReady } to mutation
         }
+        settleParserMutation(parserMutation, applied = false)
         readyView?.post {
             readyView.evaluateJavascript("window.twReset&&window.twReset('');", null)
         }
@@ -136,6 +177,59 @@ class TerminalWebViewController internal constructor() {
             }
         }
         readyView?.post { readyView.evaluateJavascript(script, null) }
+    }
+
+    private fun registerParserMutation(
+        callbackId: String,
+        script: String,
+        completion: (Boolean) -> Unit,
+    ): Boolean {
+        if (
+            callbackId.isBlank() ||
+            callbackId.length > MAX_CALLBACK_ID_CHARS ||
+            script.length > MAX_ACKED_PARSER_SCRIPT_CHARS
+        ) return false
+        val timeout = Runnable { completeParserMutation(callbackId, applied = false) }
+        val view = synchronized(lock) {
+            val readyView = webView?.takeIf { isReady } ?: return false
+            if (parserMutation != null) return false
+            parserMutation = PendingParserMutation(callbackId, completion, timeout)
+            readyView
+        }
+        if (!parserCallbackHandler.postDelayed(timeout, PARSER_CALLBACK_TIMEOUT_MILLIS)) {
+            synchronized(lock) {
+                if (parserMutation?.callbackId == callbackId) parserMutation = null
+            }
+            return false
+        }
+        val posted = view.post {
+            val current = synchronized(lock) {
+                webView === view && isReady && parserMutation?.callbackId == callbackId
+            }
+            if (!current) return@post
+            runCatching {
+                view.evaluateJavascript(script) { result ->
+                    if (result != "true") completeParserMutation(callbackId, false)
+                }
+            }.onFailure {
+                completeParserMutation(callbackId, false)
+            }
+        }
+        if (posted) return true
+        parserCallbackHandler.removeCallbacks(timeout)
+        synchronized(lock) {
+            if (parserMutation?.callbackId == callbackId) parserMutation = null
+        }
+        return false
+    }
+
+    private fun settleParserMutation(
+        mutation: PendingParserMutation?,
+        applied: Boolean,
+    ) {
+        mutation ?: return
+        parserCallbackHandler.removeCallbacks(mutation.timeout)
+        mutation.completion(applied)
     }
 
     private fun enqueuePending(script: String) {
@@ -210,9 +304,19 @@ class TerminalWebViewController internal constructor() {
     private companion object {
         const val MAX_PENDING_SCRIPT_BYTES = 2 * 1024 * 1024
         const val MAX_PENDING_TERMINAL_CHARS = 1024 * 1024
+        const val MAX_ACKED_PARSER_BYTES = 65_536
+        const val MAX_CALLBACK_ID_CHARS = 256
+        const val MAX_ACKED_PARSER_SCRIPT_CHARS = 96 * 1024
+        const val PARSER_CALLBACK_TIMEOUT_MILLIS = 5_000L
         const val TERMINAL_TRUNCATION_MARKER =
             "\r\n[Terminal output truncated: client buffer limit reached]\r\n"
     }
+
+    private data class PendingParserMutation(
+        val callbackId: String,
+        val completion: (Boolean) -> Unit,
+        val timeout: Runnable,
+    )
 }
 
 @Composable
@@ -235,7 +339,7 @@ fun TerminalWebView(
     val currentOnFailure = rememberUpdatedState(onFailure)
     val currentOnInput = rememberUpdatedState(onInput)
     val currentOnResize = rememberUpdatedState(onResize)
-    val bridge = remember {
+    val bridge = remember(controller) {
         TerminalBridge(
             onReady = {
                 controller.markReady()
@@ -244,6 +348,7 @@ fun TerminalWebView(
             onFailure = { currentOnFailure.value(it) },
             onInput = { currentOnInput.value(it) },
             onResize = { cols, rows -> currentOnResize.value(cols, rows) },
+            onParserMutationApplied = controller::completeParserMutation,
         )
     }
 
@@ -324,6 +429,7 @@ private class TerminalBridge(
     private val onFailure: (String) -> Unit,
     private val onInput: (String) -> Unit,
     private val onResize: (Int, Int) -> Unit,
+    private val onParserMutationApplied: (String, Boolean) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -345,6 +451,11 @@ private class TerminalBridge(
     @JavascriptInterface
     fun resize(cols: Int, rows: Int) {
         mainHandler.post { onResize(cols, rows) }
+    }
+
+    @JavascriptInterface
+    fun parserMutationApplied(callbackId: String, applied: Boolean) {
+        mainHandler.post { onParserMutationApplied(callbackId, applied) }
     }
 }
 

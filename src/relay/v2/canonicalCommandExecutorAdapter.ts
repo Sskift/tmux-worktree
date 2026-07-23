@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { basename, isAbsolute, normalize } from "node:path";
 import type {
   CanonicalAgentMessageResult,
-  CanonicalTerminalLease,
+  CanonicalTerminalOwner,
 } from "../../canonicalTerminalControlClient.js";
 import {
   RPC_V2_CAPABILITIES,
@@ -45,8 +45,9 @@ import {
   decodeRelayV2StrictUtf8,
   parseRelayV2JsonObject,
 } from "./strictJson.js";
+import type { RelayV2TerminalCanonicalTargetBindingV1 } from "./terminalManager.js";
 
-export const RELAY_V2_CANONICAL_ADAPTER_STATE_SCHEMA_VERSION = 1 as const;
+export const RELAY_V2_CANONICAL_ADAPTER_STATE_SCHEMA_VERSION = 2 as const;
 export const RELAY_V2_CANONICAL_PROCESS_STDOUT_BYTES = 1_048_576;
 export const RELAY_V2_CANONICAL_PROCESS_STDERR_BYTES = 65_536;
 export const RELAY_V2_CANONICAL_RPC_FRAME_BYTES = 1_048_575;
@@ -123,9 +124,7 @@ export type RelayV2CanonicalResolvedTarget =
   | {
       authority: "terminal_control";
       operation: "send_agent_message";
-      scopeId: string;
-      pane: string;
-      lease: CanonicalTerminalLease;
+      targetBinding: RelayV2TerminalCanonicalTargetBindingV1;
     };
 
 export type RelayV2CanonicalTargetResolution =
@@ -164,8 +163,10 @@ export type RelayV2CanonicalTargetResolution =
  * bind the full target carried in the command fence to its own authority proof;
  * when it delegates an embedded H2 resource cut, it must first bind the outer
  * process target, capabilities, managed incarnation, and overlapping IDs to
- * that exact cut. For terminal control this also includes the exact lease and
- * control-target identity owned by the terminal resolver.
+ * that exact cut. For terminal control this also includes the exact target and
+ * control-target identity owned by the terminal resolver. Resolution must not
+ * acquire a terminal lease; that side effect belongs exclusively to the
+ * execution port after H1 has durably committed RUNNING.
  */
 export interface RelayV2CanonicalTargetResolverPort {
   resolve(request: RelayV2CanonicalCommandRequest): Promise<RelayV2CanonicalTargetResolution>;
@@ -216,10 +217,10 @@ export type RelayV2CanonicalTerminalControlResult =
     }
   | { state: "ambiguous" | "in_doubt" };
 
-export interface RelayV2CanonicalTerminalControlPort {
-  sendAgentMessage(input: {
-    scopeId: string;
-    lease: CanonicalTerminalLease;
+export interface RelayV2CanonicalTerminalControlExecutionPort {
+  executeAgentMessage(input: {
+    targetBinding: RelayV2TerminalCanonicalTargetBindingV1;
+    owner: CanonicalTerminalOwner & { kind: "relay-v2" };
     operationId: string;
     pane: string;
     message: string;
@@ -230,7 +231,8 @@ export interface RelayV2CanonicalTerminalControlPort {
 export interface RelayV2CanonicalCommandExecutorAdapterOptions {
   resolver: RelayV2CanonicalTargetResolverPort;
   process: RelayV2StructuredProcessPort;
-  terminalControl: RelayV2CanonicalTerminalControlPort;
+  terminalControl: RelayV2CanonicalTerminalControlExecutionPort;
+  terminalOwner: CanonicalTerminalOwner & { kind: "relay-v2" };
 }
 
 interface StoredAdapterState {
@@ -519,35 +521,50 @@ function managedTarget(value: unknown): {
   };
 }
 
-function terminalLease(value: unknown): CanonicalTerminalLease {
+function terminalTargetBinding(
+  value: unknown,
+  request: RelayV2CanonicalCommandRequest,
+): RelayV2TerminalCanonicalTargetBindingV1 {
   if (!isRecord(value)
     || !exactKeys(value, [
-      "controlTargetId", "controlEpoch", "leaseId", "fence", "owner", "expiresAt",
+      "schemaVersion", "hostId", "scopeId", "sessionId", "pane", "processTarget",
+      "backendInstanceKey", "managedTarget", "exactControlIdentity",
     ])
-    || !isRecord(value.owner)
-    || !exactKeys(value.owner, ["kind", "instanceId"])
-    || value.owner.kind !== "relay-v2") {
-    throw new TypeError("canonical terminal-control lease is malformed");
-  }
-  const expiresAt = boundedString(value.expiresAt, 64);
-  const expiresAtMs = Date.parse(expiresAt);
-  if (!Number.isFinite(expiresAtMs) || new Date(expiresAtMs).toISOString() !== expiresAt) {
-    throw new TypeError("canonical terminal-control lease expiry is malformed");
-  }
-  const fence = boundedString(value.fence, 64);
-  if (!/^(?:0|[1-9][0-9]*)$/.test(fence)) {
-    throw new TypeError("canonical terminal-control fence is malformed");
+    || value.schemaVersion !== 1
+    || value.hostId !== request.hostId
+    || value.scopeId !== request.scopeId
+    || value.sessionId !== request.sessionId
+    || value.pane !== request.arguments.pane
+    || !isRecord(value.processTarget)
+    || !exactKeys(value.processTarget, ["kind", "targetId"])
+    || (value.processTarget.kind !== "local" && value.processTarget.kind !== "ssh")
+    || !isRecord(value.exactControlIdentity)
+    || !exactKeys(value.exactControlIdentity, [
+      "schemaVersion", "controlTargetId", "controlEpoch", "targetIncarnationProof",
+    ])
+    || value.exactControlIdentity.schemaVersion !== 1) {
+    throw new TypeError("canonical terminal-control target binding is malformed");
   }
   return {
-    controlTargetId: boundedString(value.controlTargetId, 1_024),
-    controlEpoch: boundedString(value.controlEpoch, 1_024),
-    leaseId: boundedString(value.leaseId, 1_024),
-    fence,
-    owner: {
-      kind: "relay-v2",
-      instanceId: boundedString(value.owner.instanceId, 1_024),
+    schemaVersion: 1,
+    hostId: request.hostId,
+    scopeId: request.scopeId,
+    sessionId: boundedString(value.sessionId),
+    pane: safeInteger(value.pane),
+    processTarget: {
+      kind: value.processTarget.kind,
+      targetId: boundedString(value.processTarget.targetId),
     },
-    expiresAt,
+    backendInstanceKey: boundedString(value.backendInstanceKey),
+    managedTarget: managedTarget(value.managedTarget),
+    exactControlIdentity: {
+      schemaVersion: 1,
+      controlTargetId: boundedString(value.exactControlIdentity.controlTargetId),
+      controlEpoch: boundedString(value.exactControlIdentity.controlEpoch),
+      targetIncarnationProof: boundedString(
+        value.exactControlIdentity.targetIncarnationProof,
+      ),
+    },
   };
 }
 
@@ -627,17 +644,13 @@ function resolvedTarget(
       managedTarget: managedTarget(value.managedTarget),
     };
   }
-  if (!exactKeys(value, ["authority", "operation", "scopeId", "pane", "lease"])
-    || value.scopeId !== request.scopeId
-    || value.pane !== String(request.arguments.pane)) {
+  if (!exactKeys(value, ["authority", "operation", "targetBinding"])) {
     throw new TypeError("canonical terminal-control target is malformed");
   }
   return {
     authority: "terminal_control",
     operation: request.operation,
-    scopeId: request.scopeId,
-    pane: boundedString(value.pane, 16),
-    lease: terminalLease(value.lease),
+    targetBinding: terminalTargetBinding(value.targetBinding, request),
   };
 }
 
@@ -877,7 +890,7 @@ function validTerminalSuccess(
   value: unknown,
   input: {
     operationId: string;
-    lease: CanonicalTerminalLease;
+    targetBinding: RelayV2TerminalCanonicalTargetBindingV1;
   },
 ): value is CanonicalAgentMessageResult {
   return isRecord(value)
@@ -888,8 +901,9 @@ function validTerminalSuccess(
     && value.operationId === input.operationId
     && value.accepted === true
     && typeof value.deduplicated === "boolean"
-    && value.controlEpoch === input.lease.controlEpoch
-    && value.fence === input.lease.fence
+    && value.controlEpoch === input.targetBinding.exactControlIdentity.controlEpoch
+    && typeof value.fence === "string"
+    && /^(?:0|[1-9][0-9]*)$/.test(value.fence)
     && typeof value.outputGeneration === "string"
     && value.outputGeneration.length > 0
     && !value.outputGeneration.includes("\0")
@@ -906,12 +920,30 @@ function validTerminalSuccess(
 export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalCommandExecutor {
   private readonly resolver: RelayV2CanonicalTargetResolverPort;
   private readonly process: RelayV2StructuredProcessPort;
-  private readonly terminalControl: RelayV2CanonicalTerminalControlPort;
+  private readonly terminalControl: RelayV2CanonicalTerminalControlExecutionPort;
+  private readonly terminalOwner: CanonicalTerminalOwner & { kind: "relay-v2" };
 
   constructor(options: RelayV2CanonicalCommandExecutorAdapterOptions) {
+    if (!isRecord(options)
+      || !isRecord(options.resolver)
+      || typeof options.resolver.resolve !== "function"
+      || typeof options.resolver.fenceResolution !== "function"
+      || !isRecord(options.process)
+      || typeof options.process.execute !== "function"
+      || !isRecord(options.terminalControl)
+      || typeof options.terminalControl.executeAgentMessage !== "function"
+      || !isRecord(options.terminalOwner)
+      || !exactKeys(options.terminalOwner, ["kind", "instanceId"])
+      || options.terminalOwner.kind !== "relay-v2") {
+      throw new TypeError("Relay v2 canonical executor ports are invalid");
+    }
     this.resolver = options.resolver;
     this.process = options.process;
     this.terminalControl = options.terminalControl;
+    this.terminalOwner = Object.freeze({
+      kind: "relay-v2",
+      instanceId: boundedString(options.terminalOwner.instanceId, 256),
+    });
   }
 
   async resolve(request: RelayV2CanonicalCommandRequest): Promise<RelayV2CommandAdmission> {
@@ -1295,16 +1327,16 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       }
       const operationId = terminalOperationId(plan);
       const input = {
-        scopeId: plan.scopeId,
-        lease: clone(state.target.lease),
+        targetBinding: clone(state.target.targetBinding),
+        owner: { ...this.terminalOwner },
         operationId,
-        pane: state.target.pane,
+        pane: String(state.target.targetBinding.pane),
         message: plan.arguments.message as string,
         submit: plan.arguments.submit as boolean,
       };
       let response: RelayV2CanonicalTerminalControlResult;
       try {
-        response = await this.terminalControl.sendAgentMessage(input);
+        response = await this.terminalControl.executeAgentMessage(input);
       } catch {
         return { state: "in_doubt" };
       }

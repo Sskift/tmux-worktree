@@ -16,6 +16,7 @@ import { MOBILE_RELAY_V2_REQUIRED_CAPABILITIES } from "./domainTypes";
 import type { PtyOpenArgs } from "./types";
 import {
   createFakeMobileRelayV2Adapter,
+  createFakeMobileRelayV2RenderArtifact,
   createFakeMobileRelayV2State,
 } from "./relayV2FakeAdapter";
 
@@ -288,6 +289,7 @@ const relayStatus = {
 };
 
 const relayV2PreviewState = createFakeMobileRelayV2State(false);
+const relayV2PreviewEnrollmentExpiresAtMs = Date.now() + 5 * 60_000;
 relayV2PreviewState.hostCredential = {
   ...relayV2PreviewState.hostCredential,
   status: "ready",
@@ -310,8 +312,7 @@ relayV2PreviewState.enrollment = {
   review: {
     enrollment: {
       enrollmentId: "fake-preview-enrollment",
-      enrollmentCode: "twenroll2.fake-preview-not-a-live-code",
-      expiresAtMs: Date.now() + 5 * 60_000,
+      expiresAtMs: relayV2PreviewEnrollmentExpiresAtMs,
     },
     display: {
       issuerUrl: "https://relay.preview.invalid",
@@ -319,6 +320,9 @@ relayV2PreviewState.enrollment = {
       hostId: "mac-admin-preview",
       deviceLabel: "Preview Android",
     },
+    renderArtifact: createFakeMobileRelayV2RenderArtifact(
+      relayV2PreviewEnrollmentExpiresAtMs,
+    ),
   },
 };
 const relayV2PreviewAdapter = createFakeMobileRelayV2Adapter({

@@ -5,6 +5,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleScope
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentNotificationConfig
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentNotificationPermission
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentNotificationPolicy
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTimelineEntryRole
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptEntryContent
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePresentationItem
@@ -13,8 +16,14 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ConfirmedEnrollment
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshApplyResult
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2AgentCapabilityAvailability
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateCut
@@ -24,8 +33,11 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionKillResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2TerminalAttachment
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2TerminalAttachmentObserver
 import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyRow
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
@@ -51,12 +63,18 @@ import com.tmuxworktree.mobile.core.relay.runtime.RelayClientEvent
 import com.tmuxworktree.mobile.core.relay.runtime.RelayRequestKind
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionActor
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionConfig
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
+import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewParserAdapter
+import com.tmuxworktree.mobile.core.terminal.TerminalWebViewController
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -100,6 +118,13 @@ class V2ViewModel(
     private val demoMode: Boolean = false,
     private val demoRecovering: Boolean = false,
 ) : ViewModel() {
+    private data class RelayV2UiTerminalAttachment(
+        val composition: RelayV2BaseRuntimeComposition,
+        val sessionStableId: String,
+        val sessionCut: RelayV2SessionReplyCut,
+        val attachment: RelayV2TerminalAttachment,
+    )
+
     private val repository = container.repository
     private val preferencesStore = container.preferences
     private val credentials = container.credentials
@@ -108,16 +133,34 @@ class V2ViewModel(
     }
     private val relay: RelayV1ConnectionActor
         get() = relayOwner.value
+    private val relayV2EnrollmentReviewSession = RelayV2EnrollmentReviewSession(
+        confirmationPort = RelayV2EnrollmentConfirmationPort(::confirmRelayV2Enrollment),
+        activationPort = RelayV2EnrollmentActivationPort(::activateRelayV2Profile),
+    )
+    private val _relayV2EnrollmentReviewState = MutableStateFlow(
+        relayV2EnrollmentReviewSession.state,
+    )
+    internal val relayV2EnrollmentReviewState = _relayV2EnrollmentReviewState.asStateFlow()
     @Volatile
     private var relayV2Composition: RelayV2BaseRuntimeComposition? = null
+    @Volatile
+    private var relayV2ProfileRuntime: RelayV2ProfileRuntimeAdapter? = null
     private val relayV2SessionReplyCuts =
         MutableStateFlow<Map<String, RelayV2SessionReplyCut>>(emptyMap())
     private val relayV2ScopeCreateCuts =
         MutableStateFlow<Map<Pair<String, String>, RelayV2ScopeCreateCut>>(emptyMap())
     private val relayV2UiFenceLock = Any()
+    private var relayV2Terminal: RelayV2UiTerminalAttachment? = null
+    private var relayV2NotificationProfileActive = false
+    private var notificationPermissionGranted = false
+    private var notificationPermissionRequestPending = false
+    private val agentNotificationConfigMutex = Mutex()
+    private val notificationPermissionRequestChannel = Channel<Unit>(capacity = 1)
+    internal val notificationPermissionRequests: Flow<Unit> =
+        notificationPermissionRequestChannel.receiveAsFlow()
     private val outboxMutex = Mutex()
     private val inFlightMessages = OutboxInFlightRegistry()
-    private val profileMutationMutex = Mutex()
+    private val profileMutationCoordinator = container.profileMutationCoordinator
     private val disconnectBarriers = mutableMapOf<String, CompletableDeferred<Unit>>()
 
     private val _uiState = MutableStateFlow(initialState())
@@ -139,6 +182,7 @@ class V2ViewModel(
     private var credentialRecoveryNotified = false
     private var effectsClosed = false
     private var profileMutationInProgress = false
+    private var profileMutationTrackerCount = 0
     private var profileExpectationInitialized = false
     private var expectedRelayUrl: String? = null
 
@@ -231,6 +275,63 @@ class V2ViewModel(
         emit(V2UiEffect.Notice(message))
     }
 
+    fun offerRelayV2Enrollment(rawPayload: String) {
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            when (relayV2EnrollmentReviewSession.offer(rawPayload)) {
+                RelayV2EnrollmentOfferResult.ACCEPTED -> publishRelayV2EnrollmentReviewState()
+                RelayV2EnrollmentOfferResult.REJECTED ->
+                    emit(V2UiEffect.Notice("This Relay v2 enrollment payload is invalid"))
+                RelayV2EnrollmentOfferResult.REVIEW_ALREADY_PRESENT ->
+                    emit(V2UiEffect.Notice("Finish or cancel the current enrollment review first"))
+            }
+        }
+    }
+
+    fun cancelRelayV2EnrollmentReview() {
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            val result = relayV2EnrollmentReviewSession.cancel()
+            publishRelayV2EnrollmentReviewState()
+            if (result == RelayV2EnrollmentCancelResult.SUBMISSION_IN_PROGRESS) {
+                emit(V2UiEffect.Notice("Enrollment confirmation is already in progress"))
+            }
+        }
+    }
+
+    fun confirmRelayV2EnrollmentReview() {
+        viewModelScope.launch {
+            val operation = async(start = CoroutineStart.UNDISPATCHED) {
+                relayV2EnrollmentReviewSession.confirm()
+            }
+            publishRelayV2EnrollmentReviewState()
+            try {
+                operation.await()
+            } finally {
+                // Direct assignment is safe under cancellation and publishes only non-sensitive
+                // state copied from the session owner after its final settlement.
+                publishRelayV2EnrollmentReviewState()
+            }
+        }
+    }
+
+    /** Explicit second user action; enrollment confirmation itself never starts a socket. */
+    fun activateConfirmedRelayV2Profile() {
+        viewModelScope.launch {
+            val operation = async(start = CoroutineStart.UNDISPATCHED) {
+                relayV2EnrollmentReviewSession.activate()
+            }
+            publishRelayV2EnrollmentReviewState()
+            try {
+                operation.await()
+            } finally {
+                publishRelayV2EnrollmentReviewState()
+            }
+        }
+    }
+
+    private fun publishRelayV2EnrollmentReviewState() {
+        _relayV2EnrollmentReviewState.value = relayV2EnrollmentReviewSession.state
+    }
+
     fun applyPairingPayload(payload: PairingPayload) {
         _uiState.update { state ->
             val importedRelayUrl = payload.relayUrl.ifBlank { state.pairingRelayUrl }
@@ -275,47 +376,90 @@ class V2ViewModel(
             _uiState.update { it.copy(paired = false, pairingRequired = true, pairingToken = "") }
             return
         }
-        if (relayV1IfAdmitted() == null) {
-            emit(V2UiEffect.Notice("Relay v2 profile removal is not connected yet"))
+        val admission = _uiState.value.relayStartupAdmission
+        if (admission != RelayStartupAdmissionState.RELAY_V1 &&
+            admission != RelayStartupAdmissionState.RELAY_V2 &&
+            admission != RelayStartupAdmissionState.RELAY_V2_SELF_REVOKE_QUARANTINED
+        ) {
+            emit(V2UiEffect.Notice("The active profile cannot be safely removed yet"))
             return
         }
         viewModelScope.launch {
             runCatching {
-                mutateProfile(expectedUrl = null) {
-                    disconnectRelayAndDrain()
-                    connectedConfigKey = null
-                    outboxRetryJob?.cancel()
-                    inFlightMessages.clear()
-                    preferencesStore.clearProfile()
-                    credentials.clear()
-                    repository.clearProfileData()
-                    persistedSnapshotRevision = 0
-                    val clearedPreferences = preferencesStore.values.first { it.relayUrl.isBlank() }
-                    _uiState.update {
-                        it.copy(
-                            paired = false,
-                            pairingRequired = true,
-                            pairingRelayUrl = "",
-                            pairingToken = "",
-                            pairingHostId = "",
-                            pairingRelayUrlError = null,
-                            pairingError = null,
-                            confirmProfileSwitch = false,
-                            preferences = clearedPreferences,
-                            hosts = emptyList(),
-                            scopes = emptyList(),
-                            sessions = emptyList(),
-                            drafts = emptyMap(),
-                            terminal = TerminalStreamState(),
-                            selectedScopeId = null,
+                when (admission) {
+                    RelayStartupAdmissionState.RELAY_V1 -> mutateProfile(expectedUrl = null) {
+                        disconnectRelayAndDrain()
+                        connectedConfigKey = null
+                        outboxRetryJob?.cancel()
+                        inFlightMessages.clear()
+                        preferencesStore.clearProfile()
+                        credentials.clear()
+                        repository.clearProfileData()
+                        persistedSnapshotRevision = 0
+                        publishProfileCleared(
+                            preferencesStore.values.first { it.relayUrl.isBlank() },
                         )
                     }
-                    emitAwait(V2UiEffect.ProfileCleared)
+
+                    RelayStartupAdmissionState.RELAY_V2,
+                    RelayStartupAdmissionState.RELAY_V2_SELF_REVOKE_QUARANTINED,
+                    -> trackProfileMutation(
+                        expectedUrl = null,
+                        updateProfileExpectation = false,
+                    ) {
+                        when (val result = requireRelayV2ProfileRuntime()
+                            .selfRevokeActiveProfile()
+                        ) {
+                            RelayV2SelfRevokeResult.ProfileRemoved -> publishProfileCleared(
+                                preferencesStore.values.first(),
+                            )
+                            is RelayV2SelfRevokeResult.Quarantined -> {
+                                val quarantined = selfRevokeQuarantineAdmission(result.phase)
+                                applyStartupAdmission(quarantined)
+                                emit(V2UiEffect.Notice(requireNotNull(quarantined.message)))
+                            }
+                        }
+                    }
+
+                    else -> error("Profile removal admission changed")
                 }
             }.onFailure { error ->
                 emit(V2UiEffect.Notice(error.message ?: "Could not forget the pairing"))
             }
         }
+    }
+
+    private suspend fun publishProfileCleared(clearedPreferences: AppPreferences) {
+        connectedConfigKey = null
+        outboxRetryJob?.cancel()
+        inFlightMessages.clear()
+        persistedSnapshotRevision = 0
+        _uiState.update {
+            it.copy(
+                relayStartupAdmission = RelayStartupAdmissionState.RELAY_V1,
+                relayV2ProfileConnection = RelayV2ProfileConnectionState.STOPPED,
+                relayV2ProfileFailureCode = null,
+                agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
+                initialized = true,
+                paired = false,
+                pairingRequired = true,
+                pairingRelayUrl = "",
+                pairingToken = "",
+                pairingHostId = "",
+                pairingRelayUrlError = null,
+                pairingError = null,
+                confirmProfileSwitch = false,
+                isConnecting = false,
+                preferences = clearedPreferences,
+                hosts = emptyList(),
+                scopes = emptyList(),
+                sessions = emptyList(),
+                drafts = emptyMap(),
+                terminal = TerminalStreamState(),
+                selectedScopeId = null,
+            )
+        }
+        emitAwait(V2UiEffect.ProfileCleared)
     }
 
     fun connectPairing() {
@@ -923,25 +1067,160 @@ class V2ViewModel(
             }
             emit(V2UiEffect.TerminalReset("Connected to ${session.title}\r\n"))
             emit(V2UiEffect.TerminalWrite("\u001b[32m${session.hostName}\u001b[0m:${session.cwd.ifBlank { "~" }}$ "))
+        } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            _uiState.update { it.copy(actionError = "Relay v2 terminal view is not attached") }
         } else {
             relayV1IfAdmitted()?.openTerminal(session.hostId, session.name)
         }
     }
 
+    fun openTerminal(session: RelaySession, controller: TerminalWebViewController) {
+        if (demoMode || _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
+            openTerminal(session)
+            return
+        }
+        val admitted = synchronized(relayV2UiFenceLock) {
+            val composition = relayV2Composition
+            val cut = relayV2SessionReplyCuts.value[session.stableId]
+            if (composition == null || cut == null) null else Triple(composition, cut, relayV2Terminal)
+        }
+        if (admitted == null) {
+            _uiState.update { it.copy(actionError = "Relay v2 Session is no longer current") }
+            return
+        }
+        viewModelScope.launch {
+            val (composition, cut, previous) = admitted
+            previous?.let { stale -> stale.composition.detachTerminal(stale.attachment) }
+            val parser = RelayV2TerminalWebViewParserAdapter(controller, viewModelScope)
+            lateinit var issued: RelayV2UiTerminalAttachment
+            val observer = object : RelayV2TerminalAttachmentObserver {
+                override fun opened(streamId: String) {
+                    updateCurrentTerminal(issued) {
+                        it.copy(
+                            terminal = TerminalStreamState(
+                                streamId = streamId,
+                                sessionId = session.stableId,
+                                status = ConnectionStatus.ONLINE,
+                            ),
+                            actionError = null,
+                        )
+                    }
+                }
+
+                override fun reset(reason: RelayV2TerminalResetReason) {
+                    updateCurrentTerminal(issued) {
+                        it.copy(
+                            terminal = TerminalStreamState(
+                                sessionId = session.stableId,
+                                status = ConnectionStatus.OFFLINE,
+                                resetReason = reason.name.lowercase(),
+                            ),
+                        )
+                    }
+                }
+
+                override fun closed(reason: RelayV2TerminalCloseReason) {
+                    updateCurrentTerminal(issued) {
+                        it.copy(
+                            terminal = TerminalStreamState(
+                                sessionId = session.stableId,
+                                status = ConnectionStatus.OFFLINE,
+                                resetReason = reason.name.lowercase(),
+                            ),
+                        )
+                    }
+                }
+            }
+            val attachment = composition.attachTerminal(cut, parser, observer)
+            if (attachment == null) {
+                _uiState.update { it.copy(actionError = "Relay v2 terminal attachment is stale") }
+                return@launch
+            }
+            issued = RelayV2UiTerminalAttachment(composition, session.stableId, cut, attachment)
+            val current = synchronized(relayV2UiFenceLock) {
+                val stillCurrent = relayV2Composition === composition &&
+                    relayV2SessionReplyCuts.value[session.stableId] === cut
+                if (stillCurrent) relayV2Terminal = issued
+                stillCurrent
+            }
+            if (!current || !composition.openTerminal(attachment, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)) {
+                composition.detachTerminal(attachment)
+                synchronized(relayV2UiFenceLock) {
+                    if (relayV2Terminal === issued) relayV2Terminal = null
+                }
+                _uiState.update { it.copy(actionError = "Relay v2 terminal could not be opened") }
+            } else {
+                _uiState.update {
+                    it.copy(
+                        terminal = TerminalStreamState(
+                            sessionId = session.stableId,
+                            status = ConnectionStatus.CONNECTING,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
     fun closeTerminal() {
-        if (!demoMode) relayV1IfAdmitted()?.closeTerminal()
+        if (demoMode) return
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+            viewModelScope.launch {
+                if (!current.composition.closeTerminal(current.attachment)) {
+                    current.composition.detachTerminal(current.attachment)
+                    synchronized(relayV2UiFenceLock) {
+                        if (relayV2Terminal === current) relayV2Terminal = null
+                    }
+                }
+            }
+        } else {
+            relayV1IfAdmitted()?.closeTerminal()
+        }
     }
 
     fun sendTerminalInput(data: String) {
         if (demoMode) {
             emit(V2UiEffect.TerminalWrite(data))
+        } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+            viewModelScope.launch {
+                if (!current.composition.sendTerminalInput(
+                        current.attachment,
+                        data.toByteArray(Charsets.UTF_8),
+                    )
+                ) {
+                    updateCurrentTerminal(current) {
+                        it.copy(actionError = "Relay v2 terminal input was not admitted")
+                    }
+                }
+            }
         } else {
             relayV1IfAdmitted()?.sendTerminalInput(data)
         }
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        if (!demoMode) relayV1IfAdmitted()?.resizeTerminal(cols, rows)
+        if (demoMode) return
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+            viewModelScope.launch {
+                current.composition.resizeTerminal(current.attachment, cols, rows)
+            }
+        } else {
+            relayV1IfAdmitted()?.resizeTerminal(cols, rows)
+        }
+    }
+
+    private fun updateCurrentTerminal(
+        expected: RelayV2UiTerminalAttachment,
+        update: (V2UiState) -> V2UiState,
+    ): Boolean = synchronized(relayV2UiFenceLock) {
+        if (relayV2Terminal !== expected || relayV2Composition !== expected.composition ||
+            relayV2SessionReplyCuts.value[expected.sessionStableId] !== expected.sessionCut
+        ) return@synchronized false
+        _uiState.value = update(_uiState.value)
+        true
     }
 
     fun setNotificationPreference(kind: NotificationKind, enabled: Boolean) {
@@ -955,7 +1234,55 @@ class V2ViewModel(
                 state.copy(preferences = preferences)
             }
         } else {
-            viewModelScope.launch { preferencesStore.setNotificationPreference(kind, enabled) }
+            if (enabled) requestNotificationPermissionFromExplicitToggle()
+            viewModelScope.launch {
+                preferencesStore.setNotificationPreference(kind, enabled)
+                val preferences = preferencesStore.values.first()
+                val composition = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition != null &&
+                        _uiState.value.relayStartupAdmission ==
+                        RelayStartupAdmissionState.RELAY_V2
+                    ) {
+                        _uiState.value = _uiState.value.copy(preferences = preferences)
+                    }
+                    relayV2Composition
+                }
+                composition?.let { syncAgentNotificationConfig(it) }
+            }
+        }
+    }
+
+    /** Activity reports the actual platform result; issuing a request never calls this method. */
+    internal fun updateNotificationPermission(granted: Boolean) {
+        val composition = synchronized(relayV2UiFenceLock) {
+            notificationPermissionGranted = granted
+            notificationPermissionRequestPending = false
+            relayV2Composition
+        }
+        composition?.let { current ->
+            viewModelScope.launch { syncAgentNotificationConfig(current) }
+        }
+    }
+
+    private fun requestNotificationPermissionFromExplicitToggle() {
+        val shouldRequest = synchronized(relayV2UiFenceLock) {
+            if (notificationPermissionGranted || notificationPermissionRequestPending ||
+                relayV2Composition == null ||
+                _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2 ||
+                _uiState.value.agentCapabilityAvailability !=
+                AgentCapabilityAvailability.AVAILABLE
+            ) {
+                false
+            } else {
+                notificationPermissionRequestPending = true
+                true
+            }
+        }
+        if (!shouldRequest) return
+        if (notificationPermissionRequestChannel.trySend(Unit).isFailure) {
+            synchronized(relayV2UiFenceLock) {
+                notificationPermissionRequestPending = false
+            }
         }
     }
 
@@ -990,15 +1317,74 @@ class V2ViewModel(
         _uiState.update { it.copy(actionError = null) }
     }
 
+    /** Default-off product port: only a reviewed draft can produce this confirmed input. */
+    internal suspend fun confirmRelayV2Enrollment(
+        confirmed: RelayV2ConfirmedEnrollment,
+    ): RelayV2EnrollmentResult {
+        val result = trackProfileMutation(
+            expectedUrl = null,
+            updateProfileExpectation = false,
+        ) {
+            requireRelayV2ProfileRuntime().confirmEnrollment(confirmed)
+        }
+        return result
+    }
+
+    private suspend fun activateRelayV2Profile(expectedProfile: RelayV2Profile) {
+        trackProfileMutation(
+            expectedUrl = null,
+            updateProfileExpectation = false,
+        ) {
+            val admission = requireRelayV2ProfileRuntime().admitStartup()
+            check(admission.state == RelayStartupAdmissionState.RELAY_V2)
+            val admittedProfile = requireNotNull(admission.relayV2Profile)
+            check(admittedProfile == expectedProfile) {
+                "Confirmed Relay v2 profile changed before activation"
+            }
+            container.legacyIdentityImporter.discardForV2Profile()
+            applyStartupAdmission(admission)
+            try {
+                startRelayV2BaseRuntime(admittedProfile)
+            } catch (failure: Throwable) {
+                applyStartupAdmission(
+                    RelayStartupAdmission(
+                        state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
+                        message = "Relay v2 base runtime activation failed closed; " +
+                            "Relay v1 fallback is disabled.",
+                    ),
+                )
+                throw failure
+            }
+        }
+    }
+
+    /** Explicit credential maintenance; this does not start or replace a socket. */
+    internal suspend fun refreshRelayV2Credential(): RelayV2RefreshApplyResult =
+        trackProfileMutation(
+            expectedUrl = null,
+            updateProfileExpectation = false,
+        ) {
+            requireRelayV2ProfileRuntime().refreshCredential()
+        }
+
+    private fun requireRelayV2ProfileRuntime(): RelayV2ProfileRuntimeAdapter =
+        checkNotNull(relayV2ProfileRuntime) {
+            "Relay v2 profile runtime is not initialized"
+        }
+
     override fun onCleared() {
         relayV2Composition?.close()
         synchronized(relayV2UiFenceLock) {
+            relayV2NotificationProfileActive = false
+            relayV2Terminal = null
             relayV2SessionReplyCuts.value = emptyMap()
             relayV2ScopeCreateCuts.value = emptyMap()
             relayV2Composition = null
         }
+        relayV2ProfileRuntime = null
         if (relayOwner.isInitialized()) relay.close()
         effectsClosed = true
+        notificationPermissionRequestChannel.close()
         effectInputChannel.close()
         effectChannel.close()
         super.onCleared()
@@ -1027,15 +1413,36 @@ class V2ViewModel(
 
     private suspend fun <T> mutateProfile(
         expectedUrl: String?,
+        updateProfileExpectation: Boolean = true,
         block: suspend () -> T,
-    ): T = profileMutationMutex.withLock {
-        profileMutationInProgress = true
-        profileExpectationInitialized = true
-        expectedRelayUrl = expectedUrl?.let(PairingInputValidator::normalizeRelayUrl)
+    ): T = profileMutationCoordinator.mutate {
+        trackProfileMutation(expectedUrl, updateProfileExpectation, block)
+    }
+
+    /** Runtime profile entries already own the process-wide mutation coordinator. */
+    private suspend fun <T> trackProfileMutation(
+        expectedUrl: String?,
+        updateProfileExpectation: Boolean = true,
+        block: suspend () -> T,
+    ): T {
+        synchronized(relayV2UiFenceLock) {
+            profileMutationTrackerCount += 1
+            profileMutationInProgress = true
+            if (updateProfileExpectation) {
+                profileExpectationInitialized = true
+                expectedRelayUrl = expectedUrl?.let(PairingInputValidator::normalizeRelayUrl)
+            }
+        }
         try {
-            block()
+            return block()
         } finally {
-            profileMutationInProgress = false
+            synchronized(relayV2UiFenceLock) {
+                check(profileMutationTrackerCount > 0) {
+                    "Profile mutation tracking underflow"
+                }
+                profileMutationTrackerCount -= 1
+                profileMutationInProgress = profileMutationTrackerCount != 0
+            }
         }
     }
 
@@ -1049,29 +1456,27 @@ class V2ViewModel(
         check(completed) { "Timed out while draining the previous connection" }
     }
 
-    private fun preferenceMatchesExpectedProfile(preferences: AppPreferences): Boolean {
-        if (!profileExpectationInitialized) return true
-        return PairingInputValidator.normalizeRelayUrl(preferences.relayUrl) ==
-            expectedRelayUrl.orEmpty()
-    }
+    private fun preferenceMatchesExpectedProfile(preferences: AppPreferences): Boolean =
+        synchronized(relayV2UiFenceLock) {
+            !profileExpectationInitialized ||
+                PairingInputValidator.normalizeRelayUrl(preferences.relayUrl) ==
+                expectedRelayUrl.orEmpty()
+        }
 
     private fun clearUnreadableProfile(observedRelayUrl: String) {
         if (credentialRecoveryNotified) return
         credentialRecoveryNotified = true
         viewModelScope.launch {
-            profileMutationMutex.withLock {
+            profileMutationCoordinator.mutate {
                 val latest = preferencesStore.values.first()
                 if (PairingInputValidator.normalizeRelayUrl(latest.relayUrl) !=
                     PairingInputValidator.normalizeRelayUrl(observedRelayUrl) ||
                     (latest.relayUrl.isNotBlank() && !credentials.read().isNullOrBlank())
                 ) {
                     credentialRecoveryNotified = false
-                    return@withLock
+                    return@mutate
                 }
-                profileMutationInProgress = true
-                profileExpectationInitialized = true
-                expectedRelayUrl = null
-                try {
+                trackProfileMutation(expectedUrl = null) {
                     disconnectRelayAndDrain()
                     connectedConfigKey = null
                     inFlightMessages.clear()
@@ -1103,8 +1508,6 @@ class V2ViewModel(
                     }
                     emitAwait(V2UiEffect.ProfileCleared)
                     emit(V2UiEffect.Notice("The saved pairing credential is no longer readable. Pair again."))
-                } finally {
-                    profileMutationInProgress = false
                 }
             }
         }
@@ -1129,6 +1532,17 @@ class V2ViewModel(
                     isConnecting = false,
                     pairingError = null,
                 )
+                admission.selfRevokePhase != null -> current.copy(
+                    relayStartupAdmission = admission.state,
+                    relayV2ProfileConnection = RelayV2ProfileConnectionState.STOPPED,
+                    relayV2ProfileFailureCode = null,
+                    agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
+                    initialized = true,
+                    paired = true,
+                    pairingRequired = true,
+                    isConnecting = false,
+                    pairingError = admission.message,
+                )
                 else -> current.copy(
                     relayStartupAdmission = admission.state,
                     initialized = true,
@@ -1142,9 +1556,10 @@ class V2ViewModel(
     }
 
     private fun startRealApp() {
-        viewModelScope.launch {
-            val startupAdmission = try {
-                container.createRelayV2StartupAdmissionRuntime(
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            var migrationNotice: String? = null
+            val effectiveAdmission = try {
+                val profileRuntime = container.createRelayV2ProfileRuntime(
                     disconnectBarrier = object : RelayProfileDisconnectBarrier {
                         override suspend fun disconnectAndDrain(
                             profile: RelayActiveProfileIdentity,
@@ -1155,56 +1570,122 @@ class V2ViewModel(
                                 RelayProfileDisconnectReceipt(profile, barrierId)
                             }
                             RelayProfileDialect.V2 -> {
+                                val composition = synchronized(relayV2UiFenceLock) {
+                                    relayV2NotificationProfileActive = false
+                                    relayV2Composition
+                                }
                                 synchronized(relayV2UiFenceLock) {
                                     relayV2SessionReplyCuts.value = emptyMap()
                                     relayV2ScopeCreateCuts.value = emptyMap()
+                                    relayV2Terminal = null
+                                    _uiState.value = _uiState.value.copy(
+                                        agentCapabilityAvailability =
+                                            AgentCapabilityAvailability.UNAVAILABLE,
+                                    )
                                 }
-                                relayV2Composition?.disconnectAndDrain(
-                                    profile,
-                                    barrierId,
-                                ) ?: noLiveRelayV2RuntimeReceipt(profile, barrierId)
+                                if (composition == null) {
+                                    noLiveRelayV2RuntimeReceipt(profile, barrierId)
+                                } else {
+                                    var drainCompleted = false
+                                    try {
+                                        syncAgentNotificationConfig(
+                                            composition = composition,
+                                            requireAvailableProjection = false,
+                                        )
+                                        composition.disconnectAndDrain(profile, barrierId).also {
+                                            drainCompleted = true
+                                        }
+                                    } finally {
+                                        // The composition is permanently fenced even when drain
+                                        // fails. Never replace a failed exact drain with a receipt.
+                                        runCatching { composition.close() }
+                                        synchronized(relayV2UiFenceLock) {
+                                            if (relayV2Composition === composition) {
+                                                if (drainCompleted) relayV2Composition = null
+                                                relayV2SessionReplyCuts.value = emptyMap()
+                                                relayV2ScopeCreateCuts.value = emptyMap()
+                                                relayV2Terminal = null
+                                                _uiState.value = _uiState.value.copy(
+                                                    agentCapabilityAvailability =
+                                                        AgentCapabilityAvailability.UNAVAILABLE,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     },
                     clearEphemeralAfterDisconnect = {
+                        connectedConfigKey = null
+                        outboxRetryJob?.cancel()
+                        inFlightMessages.clear()
+                        persistedSnapshotRevision = 0
                         synchronized(relayV2UiFenceLock) {
+                            relayV2NotificationProfileActive = false
                             relayV2SessionReplyCuts.value = emptyMap()
                             relayV2ScopeCreateCuts.value = emptyMap()
+                            relayV2Terminal = null
                             _uiState.value = V2UiState()
                         }
                     },
-                ).admitStartup()
+                )
+                relayV2ProfileRuntime = profileRuntime
+                trackProfileMutation(
+                    expectedUrl = null,
+                    updateProfileExpectation = false,
+                ) {
+                    val startupAdmission = profileRuntime.admitStartup()
+                    val admitted = if (startupAdmission.allowsRelayV1) {
+                        try {
+                            container.legacyIdentityImporter.importIfNeeded()
+                        } catch (error: Throwable) {
+                            if (error is kotlinx.coroutines.CancellationException) throw error
+                            migrationNotice = "Existing connection could not be migrated"
+                        }
+                        startupAdmission
+                    } else if (startupAdmission.relayV2Profile != null) {
+                        try {
+                            container.legacyIdentityImporter.discardForV2Profile()
+                            startupAdmission
+                        } catch (error: Throwable) {
+                            if (error is kotlinx.coroutines.CancellationException) throw error
+                            RelayStartupAdmission(
+                                state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
+                                message = "Legacy credential cleanup failed closed; " +
+                                    "Relay v1 fallback is disabled.",
+                            )
+                        }
+                    } else {
+                        startupAdmission
+                    }
+                    val settled = admitted.relayV2Profile?.let { profile ->
+                        try {
+                            applyStartupAdmission(admitted)
+                            startRelayV2BaseRuntime(profile)
+                            admitted
+                        } catch (error: Throwable) {
+                            if (error is kotlinx.coroutines.CancellationException) throw error
+                            RelayStartupAdmission(
+                                state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
+                                message = "Relay v2 base runtime composition failed closed; " +
+                                    "Relay v1 fallback is disabled.",
+                            )
+                        }
+                    } ?: admitted
+                    applyStartupAdmission(settled)
+                    settled
+                }
             } catch (error: Throwable) {
                 if (error is kotlinx.coroutines.CancellationException) throw error
-                RelayStartupAdmission(
+                val failed = RelayStartupAdmission(
                     state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
                     message = "Relay v2 startup admission failed closed; Relay v1 fallback is disabled.",
                 )
+                applyStartupAdmission(failed)
+                failed
             }
-            val effectiveAdmission = if (startupAdmission.allowsRelayV1) {
-                try {
-                    container.legacyIdentityImporter.importIfNeeded()
-                } catch (error: Throwable) {
-                    if (error is kotlinx.coroutines.CancellationException) throw error
-                    emit(V2UiEffect.Notice("Existing connection could not be migrated"))
-                }
-                startupAdmission
-            } else if (startupAdmission.relayV2Profile != null) {
-                try {
-                    container.legacyIdentityImporter.discardForV2Profile()
-                    startupAdmission
-                } catch (error: Throwable) {
-                    if (error is kotlinx.coroutines.CancellationException) throw error
-                    RelayStartupAdmission(
-                        state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
-                        message = "Legacy credential cleanup failed closed; " +
-                            "Relay v1 fallback is disabled.",
-                    )
-                }
-            } else {
-                startupAdmission
-            }
-            applyStartupAdmission(effectiveAdmission)
+            migrationNotice?.let { emit(V2UiEffect.Notice(it)) }
 
             if (effectiveAdmission.allowsRelayV1) {
                 runCatching { reconcileInterruptedOutbox() }
@@ -1212,34 +1693,25 @@ class V2ViewModel(
                         emit(V2UiEffect.Notice("Local cache could not be fully recovered"))
                 }
                 launchCollectors()
-            } else {
-                effectiveAdmission.relayV2Profile?.let { profile ->
-                    try {
-                        startRelayV2BaseRuntime(profile)
-                    } catch (error: Throwable) {
-                        if (error is kotlinx.coroutines.CancellationException) throw error
-                        applyStartupAdmission(
-                            RelayStartupAdmission(
-                                state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
-                                message = "Relay v2 base runtime composition failed closed; " +
-                                    "Relay v1 fallback is disabled.",
-                            ),
-                        )
-                    }
-                }
             }
         }
     }
 
     private fun startRelayV2BaseRuntime(profile: RelayV2Profile) {
         check(relayV2Composition == null) { "Relay v2 base runtime already exists" }
-        val composition = container.createRelayV2BaseRuntimeComposition(viewModelScope, profile)
+        val composition = container.createRelayV2BaseRuntimeComposition(
+            viewModelScope,
+            profile,
+            requireRelayV2ProfileRuntime(),
+        )
         synchronized(relayV2UiFenceLock) {
             relayV2Composition = composition
+            relayV2NotificationProfileActive = true
             relayV2SessionReplyCuts.value = emptyMap()
             relayV2ScopeCreateCuts.value = emptyMap()
             val state = _uiState.value
             _uiState.value = state.copy(
+                agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
                 preferences = state.preferences.copy(preferredHostId = profile.hostId),
                 hosts = listOf(
                     RelayHost(
@@ -1262,10 +1734,62 @@ class V2ViewModel(
                         nowMillis = System.currentTimeMillis(),
                     )
                     rawHealth = projected.health
+                    val rolloverUnavailable =
+                        (runtime.failure as? RelayV2BaseRuntimeFailure.RuntimeIncomplete)?.code ==
+                            RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE
                     _uiState.value = projected.copy(
                         health = decorateHealth(projected.health, projected),
+                        relayStartupAdmission = if (rolloverUnavailable) {
+                            RelayStartupAdmissionState.RELAY_V2_REENROLLMENT_REQUIRED
+                        } else {
+                            projected.relayStartupAdmission
+                        },
+                        paired = if (rolloverUnavailable) false else projected.paired,
+                        pairingRequired = rolloverUnavailable || projected.pairingRequired,
+                        pairingError = if (rolloverUnavailable) {
+                            "Relay v2 credential rollover failed; re-enrollment is required. " +
+                                "Relay v1 fallback is disabled."
+                        } else {
+                            projected.pairingError
+                        },
+                        agentCapabilityAvailability = if (rolloverUnavailable) {
+                            AgentCapabilityAvailability.UNAVAILABLE
+                        } else {
+                            projected.agentCapabilityAvailability
+                        },
                     )
                 }
+            }
+        }
+        viewModelScope.launch {
+            composition.agentCapabilityAvailability.collect { availability ->
+                val current = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized false
+                    _uiState.value = _uiState.value.copy(
+                        agentCapabilityAvailability = when (availability) {
+                            is RelayV2AgentCapabilityAvailability.Available ->
+                                AgentCapabilityAvailability.AVAILABLE
+                            RelayV2AgentCapabilityAvailability.Unavailable ->
+                                AgentCapabilityAvailability.UNAVAILABLE
+                        },
+                    )
+                    true
+                }
+                if (current) syncAgentNotificationConfig(composition)
+            }
+        }
+        viewModelScope.launch {
+            preferencesStore.values.collect { preferences ->
+                val current = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized false
+                    _uiState.value = _uiState.value.copy(preferences = preferences)
+                    true
+                }
+                if (current) syncAgentNotificationConfig(composition)
             }
         }
         viewModelScope.launch {
@@ -1300,15 +1824,49 @@ class V2ViewModel(
                         )
                     }
                     .sortedBy { it.scopeId }
-                synchronized(relayV2UiFenceLock) {
+                val current = synchronized(relayV2UiFenceLock) {
                     if (relayV2Composition !== composition ||
                         _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
-                    ) return@synchronized
+                    ) return@synchronized false
                     relayV2SessionReplyCuts.value = cuts
                     relayV2ScopeCreateCuts.value = scopeCreateCuts
                     _uiState.value = _uiState.value.copy(scopes = scopes, sessions = sessions)
+                    true
                 }
+                if (current) syncAgentNotificationConfig(composition)
             }
+        }
+    }
+
+    private suspend fun syncAgentNotificationConfig(
+        composition: RelayV2BaseRuntimeComposition,
+        requireAvailableProjection: Boolean = true,
+    ) {
+        agentNotificationConfigMutex.withLock {
+            val config = synchronized(relayV2UiFenceLock) {
+                if (relayV2Composition !== composition ||
+                    _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2 ||
+                    requireAvailableProjection &&
+                    _uiState.value.agentCapabilityAvailability !=
+                    AgentCapabilityAvailability.AVAILABLE
+                ) {
+                    return@synchronized null
+                }
+                val preferences = _uiState.value.preferences
+                AgentNotificationConfig(
+                    permission = if (notificationPermissionGranted) {
+                        AgentNotificationPermission.GRANTED
+                    } else {
+                        AgentNotificationPermission.DENIED
+                    },
+                    profileActive = relayV2NotificationProfileActive,
+                    policy = AgentNotificationPolicy.ALLOW,
+                    waitingForUser = preferences.waitingNotifications,
+                    failed = preferences.failedNotifications,
+                    completed = preferences.completedNotifications,
+                )
+            } ?: return@withLock
+            composition.updateAgentNotificationConfig(config)
         }
     }
 
@@ -1349,13 +1907,18 @@ class V2ViewModel(
     private fun launchCollectors() {
         viewModelScope.launch {
             preferencesStore.values.collect { preferences ->
-                if (!profileExpectationInitialized) {
-                    profileExpectationInitialized = true
-                    expectedRelayUrl = PairingInputValidator
-                        .normalizeRelayUrl(preferences.relayUrl)
-                        .ifBlank { null }
+                val mutationFenced = synchronized(relayV2UiFenceLock) {
+                    if (!profileExpectationInitialized) {
+                        profileExpectationInitialized = true
+                        expectedRelayUrl = PairingInputValidator
+                            .normalizeRelayUrl(preferences.relayUrl)
+                            .ifBlank { null }
+                    }
+                    profileMutationInProgress ||
+                        PairingInputValidator.normalizeRelayUrl(preferences.relayUrl) !=
+                        expectedRelayUrl.orEmpty()
                 }
-                if (profileMutationInProgress || !preferenceMatchesExpectedProfile(preferences)) {
+                if (mutationFenced) {
                     return@collect
                 }
                 val credential = runCatching { credentials.read() }.getOrNull()
@@ -1890,6 +2453,8 @@ class V2ViewModel(
     )
 
     companion object {
+        private const val DEFAULT_TERMINAL_COLS = 80
+        private const val DEFAULT_TERMINAL_ROWS = 24
         private const val DEFAULT_SCOPE_ID = "local"
         private const val OUTBOX_EVENT_PREFIX = "outbox-"
         private const val MAX_PENDING_UI_EFFECTS = 64

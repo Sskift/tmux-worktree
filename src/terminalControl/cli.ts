@@ -32,7 +32,10 @@ export async function terminalControlCmd(args: string[]): Promise<void> {
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);
     try {
-      await runTerminalControlServer({ signal: controller.signal });
+      await runTerminalControlServer({
+        signal: controller.signal,
+        relayV2RemoteExactCompoundV1: true,
+      });
     } finally {
       process.off("SIGTERM", stop);
       process.off("SIGINT", stop);
