@@ -84,10 +84,28 @@ export interface RelayV2RemoteExactTerminalControlCompoundAdapterOptionsV1 {
 interface HostRecord {
   readonly input: RelayV2ExactTerminalControlTargetInputV1;
   readonly inputJson: string;
-  readonly evidence: RelayV2ExactTerminalControlTargetEvidenceV1;
+  evidence: RelayV2ExactTerminalControlTargetEvidenceV1;
   readonly channel: RelayV2RemoteExactCompoundChannelV1;
-  state: "prepared" | "admitted" | "consumed" | "closed";
+  state: "prepared" | "admitted" | "consumed" | "observing" | "closed";
   lease: TerminalControlLease | null;
+  observation: RelayV2ExactCompoundObservationBindingV1 | null;
+}
+
+export interface RelayV2ExactCompoundObservationBindingV1 {
+  schemaVersion: 1;
+  controlTargetId: string;
+  controlEpoch: string;
+  targetIncarnationProof: string;
+  outputGeneration: string;
+  outputCursor: number;
+}
+
+export interface RelayV2ExactCompoundObservationTailV1 {
+  controlEpoch: string;
+  outputGeneration: string;
+  cursor: number;
+  dataBase64: string;
+  nextCursor: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -201,6 +219,67 @@ function identity(value: unknown): RelayV2ExactTerminalControlTargetEvidenceV1["
     controlEpoch: bounded(value.controlEpoch, 128),
     targetIncarnationProof: bounded(value.targetIncarnationProof, 128),
   });
+}
+
+function observationBinding(value: unknown): RelayV2ExactCompoundObservationBindingV1 {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "controlTargetId", "controlEpoch", "targetIncarnationProof",
+      "outputGeneration", "outputCursor",
+    ])
+    || value.schemaVersion !== 1
+    || !Number.isSafeInteger(value.outputCursor)
+    || (value.outputCursor as number) < 0) {
+    throw new TerminalControlProtocolError("INTERNAL", "remote exact compound observation is malformed");
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    controlTargetId: bounded(value.controlTargetId, 128),
+    controlEpoch: bounded(value.controlEpoch, 128),
+    targetIncarnationProof: bounded(value.targetIncarnationProof, 128),
+    outputGeneration: bounded(value.outputGeneration, 128),
+    outputCursor: value.outputCursor as number,
+  });
+}
+
+function observationTail(value: unknown): RelayV2ExactCompoundObservationTailV1 {
+  if (!isRecord(value)
+    || !exactKeys(value, ["controlEpoch", "outputGeneration", "cursor", "dataBase64", "nextCursor"])
+    || !Number.isSafeInteger(value.cursor)
+    || (value.cursor as number) < 0
+    || !Number.isSafeInteger(value.nextCursor)
+    || (value.nextCursor as number) < 0) {
+    throw new TerminalControlProtocolError("INTERNAL", "remote exact compound observation tail is malformed");
+  }
+  const dataBase64 = value.dataBase64;
+  if (typeof dataBase64 !== "string"
+    || /[\0\r\n]/.test(dataBase64)
+    || Buffer.byteLength(dataBase64, "utf8") > RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(dataBase64)) {
+    throw new TerminalControlProtocolError("INTERNAL", "remote exact compound observation tail is malformed");
+  }
+  return Object.freeze({
+    controlEpoch: bounded(value.controlEpoch, 128),
+    outputGeneration: bounded(value.outputGeneration, 128),
+    cursor: value.cursor as number,
+    dataBase64,
+    nextCursor: value.nextCursor as number,
+  });
+}
+
+function observationCursor(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "remote exact compound tail cursor is invalid");
+  }
+  return value as number;
+}
+
+function observationMaxBytes(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "remote exact compound tail bound is invalid");
+  }
+  return value as number;
 }
 
 function protocolError(value: unknown): TerminalControlProtocolError {
@@ -359,14 +438,15 @@ export async function runRelayV2RemoteExactCompoundServerV1(
   let preparedInput: RelayV2ExactTerminalControlTargetInputV1 | null = null;
   let preparedEvidence: RelayV2ExactTerminalControlTargetEvidenceV1 | null = null;
   let activeLease: TerminalControlLease | null = null;
-  let released = false;
+  let observationOpen = false;
+  let channelOwner: (TerminalControlOwner & { kind: "relay-v2" }) | null = null;
   try {
     while (true) {
       const next = await frames.next();
       if (next.done) break;
       const frame = next.value;
       try {
-        if (!exactKeys(frame, ["protocolVersion", "type"], ["processTarget", "owner", "input", "request"])
+        if (!exactKeys(frame, ["protocolVersion", "type"], ["processTarget", "owner", "input", "request", "cursor", "maxBytes"])
           || frame.protocolVersion !== RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION
           || typeof frame.type !== "string") {
           throw new TerminalControlProtocolError("INVALID_REQUEST", "remote exact compound frame shape is invalid");
@@ -392,22 +472,31 @@ export async function runRelayV2RemoteExactCompoundServerV1(
           break;
         }
         if (frame.type === "prepare") {
-          if (owned !== null
+          if (preparedInput !== null
+            || activeLease !== null
             || !exactKeys(frame, ["protocolVersion", "type", "processTarget", "owner", "input"])) {
             throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound preparation is not fresh");
           }
           const target = processTarget(frame.processTarget);
           const reservationOwner = owner(frame.owner);
-          owned = await options.openOwner(target);
-          if (!isRecord(owned)
-            || !isRecord(owned.authority)
-            || typeof owned.close !== "function") {
-            throw new TerminalControlProtocolError("INTERNAL", "remote exact compound owner is invalid");
+          if (owned === null) {
+            owned = await options.openOwner(target);
+            if (!isRecord(owned)
+              || !isRecord(owned.authority)
+              || typeof owned.close !== "function") {
+              throw new TerminalControlProtocolError("INTERNAL", "remote exact compound owner is invalid");
+            }
+            exact = new RelayV2TerminalControlExactTargetAuthorityAdapter({
+              authority: owned.exactAuthority ?? owned.authority,
+              owner: reservationOwner,
+            });
+            channelOwner = reservationOwner;
+          } else if (exact === null || channelOwner === null || !sameOwner(channelOwner, reservationOwner)) {
+            throw new TerminalControlProtocolError(
+              "PERMISSION_DENIED",
+              "remote exact compound preparation crossed its channel owner",
+            );
           }
-          exact = new RelayV2TerminalControlExactTargetAuthorityAdapter({
-            authority: owned.exactAuthority ?? owned.authority,
-            owner: reservationOwner,
-          });
           preparedInput = clone(frame.input) as RelayV2ExactTerminalControlTargetInputV1;
           preparedEvidence = await exact.resolveExactTarget(preparedInput);
           await writeJson(options.write, successPayload({
@@ -429,13 +518,71 @@ export async function runRelayV2RemoteExactCompoundServerV1(
             terminalBinding(preparedInput, preparedEvidence.exactControlIdentity),
             consumerOwner,
           );
+          preparedInput = null;
+          preparedEvidence = null;
           await writeJson(options.write, successPayload(clone(activeLease)));
+          continue;
+        }
+        if (frame.type === "observe") {
+          if (exact === null
+            || preparedInput === null
+            || preparedEvidence === null
+            || activeLease !== null
+            || observationOpen
+            || !exactKeys(frame, ["protocolVersion", "type"])) {
+            throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound observation is unavailable");
+          }
+          const binding = await (async () => {
+            exact.fenceExactTargetForAdmission(preparedInput, preparedEvidence);
+            return exact.consumePreparedObservationForBinding(
+              terminalBinding(preparedInput, preparedEvidence.exactControlIdentity),
+            );
+          })();
+          preparedInput = null;
+          preparedEvidence = null;
+          observationOpen = true;
+          await writeJson(options.write, successPayload(clone(binding)));
+          continue;
+        }
+        if (frame.type === "tail") {
+          if (exact === null
+            || !observationOpen
+            || !exactKeys(frame, ["protocolVersion", "type", "cursor"], ["maxBytes"])) {
+            throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound observation is unavailable");
+          }
+          try {
+            const chunk = await exact.tailObservation(
+              observationCursor(frame.cursor),
+              observationMaxBytes(frame.maxBytes),
+            );
+            await writeJson(options.write, successPayload(clone(chunk)));
+          } catch (error) {
+            if (error instanceof TerminalControlProtocolError
+              && error.code === "STALE_OUTPUT_CURSOR") {
+              // The authority already fenced this observation; drain the
+              // target-side handle so later frames see the same fence.
+              observationOpen = false;
+              await exact.closeObservation().catch(() => undefined);
+            }
+            throw error;
+          }
+          continue;
+        }
+        if (frame.type === "close-observe") {
+          if (exact === null
+            || !exactKeys(frame, ["protocolVersion", "type"])) {
+            throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound observation is unavailable");
+          }
+          if (observationOpen) {
+            await exact.closeObservation();
+            observationOpen = false;
+          }
+          await writeJson(options.write, successPayload({ closed: true }));
           continue;
         }
         if (frame.type === "effect") {
           if (owned === null
             || activeLease === null
-            || released
             || !exactKeys(frame, ["protocolVersion", "type", "request"])) {
             throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound lease is unavailable");
           }
@@ -445,9 +592,11 @@ export async function runRelayV2RemoteExactCompoundServerV1(
             const envelope = result as { lease?: unknown };
             activeLease = lease(envelope.lease);
           }
-          if (request.type === "lease.release") released = true;
           await writeJson(options.write, successPayload(result));
-          if (released) break;
+          if (request.type === "lease.release") {
+            activeLease = null;
+            if (!observationOpen) break;
+          }
           continue;
         }
         if (frame.type === "rollback") {
@@ -459,8 +608,11 @@ export async function runRelayV2RemoteExactCompoundServerV1(
             throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound rollback is unavailable");
           }
           const rolledBack = await exact.rollbackPreparedTarget(preparedInput, preparedEvidence);
+          preparedInput = null;
+          preparedEvidence = null;
           await writeJson(options.write, successPayload({ rolledBack }));
-          break;
+          if (!observationOpen) break;
+          continue;
         }
         throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound operation is not allowed");
       } catch (error) {
@@ -469,7 +621,7 @@ export async function runRelayV2RemoteExactCompoundServerV1(
       }
     }
   } finally {
-    if (owned !== null && activeLease !== null && !released) {
+    if (owned !== null && activeLease !== null) {
       try {
         await owned.authority.handle({
           protocolVersion: TERMINAL_CONTROL_PROTOCOL_VERSION,
@@ -1025,6 +1177,7 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
         channel,
         state: "prepared",
         lease: null,
+        observation: null,
       });
       return evidence;
     } catch (error) {
@@ -1089,6 +1242,213 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
     }
   }
 
+  private observationRecord(
+    binding: RelayV2ExactCompoundObservationBindingV1,
+  ): [string, HostRecord] {
+    const parsed = observationBinding(binding);
+    const matches = [...this.records.entries()].filter(([, record]) => (
+      record.observation !== null
+      && canonicalJson(record.observation) === canonicalJson(parsed)
+    ));
+    if (matches.length !== 1) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "remote exact compound observation is unavailable",
+      );
+    }
+    return matches[0];
+  }
+
+  private async retireFailedObservation(token: string, record: HostRecord, error: unknown): Promise<never> {
+    this.records.delete(token);
+    record.state = "closed";
+    await record.channel.close().catch(() => undefined);
+    if (error instanceof TerminalControlProtocolError
+      && error.code !== "INTERNAL"
+      && error.code !== "OPERATION_IN_DOUBT") throw error;
+    throw new TerminalControlProtocolError(
+      "OPERATION_IN_DOUBT",
+      "remote exact compound observation outcome is uncertain",
+    );
+  }
+
+  /**
+   * Atomically consumes the admitted claim into a read-only observation on
+   * the same compound channel. The response must re-prove the prepared
+   * HostRecord identity; any mismatch fails closed and drains the channel.
+   */
+  async observePreparedTargetForBinding(
+    binding: RelayV2TerminalCanonicalTargetBindingV1,
+  ): Promise<RelayV2ExactCompoundObservationBindingV1> {
+    const matches = [...this.records.entries()].filter(([, record]) => (
+      record.state === "admitted"
+      && canonicalJson(terminalBinding(record.input, record.evidence.exactControlIdentity))
+        === canonicalJson(binding)
+    ));
+    if (matches.length !== 1) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "remote exact compound observation claim is unavailable",
+      );
+    }
+    const [token, record] = matches[0];
+    try {
+      const observed = observationBinding(responseResult(await record.channel.request({
+        protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
+        type: "observe",
+      })));
+      if (observed.controlTargetId !== record.evidence.exactControlIdentity.controlTargetId
+        || observed.controlEpoch !== record.evidence.exactControlIdentity.controlEpoch
+        || observed.targetIncarnationProof
+          !== record.evidence.exactControlIdentity.targetIncarnationProof) {
+        throw new TerminalControlProtocolError(
+          "INTERNAL",
+          "remote exact compound observation binding changed",
+        );
+      }
+      record.state = "observing";
+      record.observation = observed;
+      return Object.freeze({ ...observed });
+    } catch (error) {
+      return this.retireFailedObservation(token, record, error);
+    }
+  }
+
+  /** Tails the pinned output generation over the same compound channel. */
+  async tailObservedTarget(
+    binding: RelayV2ExactCompoundObservationBindingV1,
+    cursor: number,
+    maxBytes?: number,
+  ): Promise<RelayV2ExactCompoundObservationTailV1> {
+    const parsedCursor = observationCursor(cursor);
+    const parsedMaxBytes = observationMaxBytes(maxBytes);
+    const [token, record] = this.observationRecord(binding);
+    try {
+      const chunk = observationTail(responseResult(await record.channel.request({
+        protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
+        type: "tail",
+        cursor: parsedCursor,
+        ...(parsedMaxBytes === undefined ? {} : { maxBytes: parsedMaxBytes }),
+      })));
+      if (chunk.controlEpoch !== record.observation!.controlEpoch
+        || chunk.outputGeneration !== record.observation!.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "INTERNAL",
+          "remote exact compound observation tail crossed its binding",
+        );
+      }
+      return Object.freeze({ ...chunk });
+    } catch (error) {
+      return this.retireFailedObservation(token, record, error);
+    }
+  }
+
+  /**
+   * Starts a fresh claim on the channel that already owns this observation,
+   * so observation and the subsequent lease acquire/renew/release stay in
+   * one canonical child.
+   */
+  async prepareObservedTargetLease(
+    binding: RelayV2ExactCompoundObservationBindingV1,
+  ): Promise<RelayV2ExactTerminalControlTargetEvidenceV1> {
+    const [token, record] = this.observationRecord(binding);
+    if (record.state !== "observing") {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "remote exact compound observation channel is busy",
+      );
+    }
+    try {
+      const result = responseResult(await record.channel.request({
+        protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
+        type: "prepare",
+        processTarget: clone(record.input.processTarget),
+        owner: clone(this.owner),
+        input: clone(record.input),
+      }));
+      if (!isRecord(result) || !exactKeys(result, ["exactControlIdentity"])) {
+        throw new TerminalControlProtocolError("INTERNAL", "remote exact compound preparation is malformed");
+      }
+      const evidence = Object.freeze({
+        ...clone(record.input),
+        processTarget: Object.freeze(clone(record.input.processTarget)),
+        managedTarget: Object.freeze(clone(record.input.managedTarget)),
+        exactControlToken: token,
+        exactControlIdentity: identity(result.exactControlIdentity),
+      });
+      record.evidence = evidence;
+      record.state = "prepared";
+      return evidence;
+    } catch (error) {
+      return this.retireFailedObservation(token, record, error);
+    }
+  }
+
+  /**
+   * Idempotently closes the observation. When the same channel still holds
+   * this observation's prepared/admitted claim, the claim is rolled back and
+   * confirmed first, so the target-side deferred reset observes FREE instead
+   * of a HELD reservation; a rollback failure keeps the record, the handle,
+   * and this close retryable. An idle channel is drained afterwards.
+   */
+  async closeObservedTarget(
+    binding: RelayV2ExactCompoundObservationBindingV1,
+  ): Promise<void> {
+    const parsed = observationBinding(binding);
+    const matches = [...this.records.entries()].filter(([, record]) => (
+      record.observation !== null
+      && canonicalJson(record.observation) === canonicalJson(parsed)
+    ));
+    if (matches.length !== 1) return;
+    const [token, record] = matches[0];
+    if (record.state === "prepared" || record.state === "admitted") {
+      let rolledBack: unknown;
+      try {
+        rolledBack = responseResult(await record.channel.request({
+          protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
+          type: "rollback",
+        }));
+      } catch (error) {
+        if (error instanceof TerminalControlProtocolError
+          && error.code !== "INTERNAL"
+          && error.code !== "OPERATION_IN_DOUBT") throw error;
+        throw new TerminalControlProtocolError(
+          "OPERATION_IN_DOUBT",
+          "remote exact compound claim rollback outcome is uncertain",
+        );
+      }
+      if (!isRecord(rolledBack)
+        || !exactKeys(rolledBack, ["rolledBack"])
+        || rolledBack.rolledBack !== true) {
+        throw new TerminalControlProtocolError(
+          "OPERATION_IN_DOUBT",
+          "remote exact compound claim rollback was not confirmed",
+        );
+      }
+      record.state = "observing";
+    }
+    try {
+      const result = responseResult(await record.channel.request({
+        protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
+        type: "close-observe",
+      }));
+      if (!isRecord(result) || !exactKeys(result, ["closed"]) || result.closed !== true) {
+        throw new TerminalControlProtocolError(
+          "INTERNAL",
+          "remote exact compound observation close is malformed",
+        );
+      }
+      record.observation = null;
+      if (record.state === "observing") {
+        this.records.delete(token);
+        record.state = "closed";
+        await record.channel.close();
+      }
+    } catch (error) {
+      return this.retireFailedObservation(token, record, error);
+    }
+  }
+
   async request<T = unknown>(input: TerminalControlRequestInput): Promise<T> {
     const candidates = [...this.records.entries()].filter(([, record]) => {
       if (record.state !== "consumed" || record.lease === null) return false;
@@ -1114,9 +1474,14 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
         record.lease = lease(envelope.lease);
       }
       if (input.type === "lease.release") {
-        this.records.delete(token);
-        record.state = "closed";
-        await record.channel.close();
+        record.lease = null;
+        if (record.observation === null) {
+          this.records.delete(token);
+          record.state = "closed";
+          await record.channel.close();
+        } else {
+          record.state = "observing";
+        }
       }
       return result as T;
     } catch (error) {

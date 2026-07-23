@@ -50,6 +50,7 @@ class FakeBackend {
     this.outputGeneration = undefined;
     this.outputs = new Map();
     this.resetCalls = 0;
+    this.failReset = false;
   }
 
   async resolveManagedSession(sessionName) {
@@ -111,6 +112,7 @@ class FakeBackend {
   }
 
   async resetOutput(controlTargetId) {
+    if (this.failReset) throw new Error("injected reset failure");
     this.resetCalls++;
     const generation = `output-${this.nextOutputGeneration++}`;
     this.outputGeneration = generation;
@@ -1430,5 +1432,274 @@ test("production tmux backend captures bounded correlated output on an isolated 
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
     }
+  }
+});
+
+test("exact read observation consumes the admitted claim without input ownership or generation reset", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"A".repeat(43)}`;
+  backend.inspectExactTarget = async (input) => {
+    assert.deepEqual(input, {
+      managedName: "managed-terminal",
+      managedKind: "terminal",
+      managedIncarnation: incarnation,
+      pane: 0,
+    });
+    return {
+      managedSession: {
+        name: "managed-terminal",
+        kind: "terminal",
+        profile: "dashboard",
+        cwd: "/tmp",
+        createdAt: backend.createdAt,
+      },
+      managedIncarnation: incarnation,
+      tmuxInstanceId: backend.instance,
+      paneIdentity: "%1",
+    };
+  };
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-observe",
+    scopeId: "scope-observe",
+    sessionId: "session-observe",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-observe",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:observer-one" },
+  };
+  try {
+    const target = await resolved(authority);
+    backend.appendOutput(target.controlTargetId, "hello\n");
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    // A foreign or tampered identity is rejected before anything is consumed.
+    await assert.rejects(
+      authority.consumeRelayV2ExactObservation(preparation.claim, exactInput, {
+        ...preparation.identity,
+        targetIncarnationProof: `twct2.${"B".repeat(43)}`,
+      }),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    const opened = await authority.consumeRelayV2ExactObservation(
+      preparation.claim,
+      exactInput,
+      preparation.identity,
+    );
+    assert.equal(opened.binding.controlTargetId, target.controlTargetId);
+    assert.equal(opened.binding.controlEpoch, target.controlEpoch);
+    assert.equal(opened.binding.targetIncarnationProof, preparation.identity.targetIncarnationProof);
+    assert.equal(opened.binding.outputCursor, Buffer.byteLength("hello\n"));
+    // Observation consumed the reservation: the target is FREE again and the
+    // observer holds no lease and no input ownership.
+    const free = terminalControl.loadTerminalControlState(temp.path).targets[0];
+    assert.equal(free.ownership.state, "FREE");
+    const firstTail = await authority.tailRelayV2ExactObservation(opened.observation, 0);
+    assert.equal(Buffer.from(firstTail.dataBase64, "base64").toString("utf8"), "hello\n");
+
+    // A later interactive lease lifecycle on the same target does not rotate
+    // the pinned generation while the observer is active.
+    const interactive = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("dashboard", "observed-pty"),
+    );
+    const written = await authority.handle(rawRequest(interactive.lease, "observed-raw", "x"));
+    assert.equal(written.outputGeneration, opened.binding.outputGeneration);
+    backend.appendOutput(target.controlTargetId, "world\n");
+    const released = await authority.handle({
+      protocolVersion: 1,
+      requestId: "observed-release",
+      type: "lease.release",
+      lease: interactive.lease,
+    });
+    assert.equal(released.state, "FREE");
+    assert.equal(released.outputGeneration, opened.binding.outputGeneration);
+    assert.equal(backend.resetCalls, 0, "release must not reset output generation while observed");
+    const continued = await authority.tailRelayV2ExactObservation(
+      opened.observation,
+      opened.binding.outputCursor,
+    );
+    assert.equal(Buffer.from(continued.dataBase64, "base64").toString("utf8"), "world\n");
+
+    // Closing the observation is idempotent and runs the deferred reset.
+    await authority.closeRelayV2ExactObservation(opened.observation);
+    await authority.closeRelayV2ExactObservation(opened.observation);
+    assert.equal(backend.resetCalls, 1);
+    await assert.rejects(
+      authority.tailRelayV2ExactObservation(opened.observation, continued.nextCursor),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
+test("exact observation consume is single-use, failed deferred reset stays retryable, stale observers retire", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"A".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-observe-race",
+    scopeId: "scope-observe-race",
+    sessionId: "session-observe-race",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-observe-race",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:observer-race" },
+  };
+  try {
+    const target = await resolved(authority);
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    // The claim is burned synchronously: while the observation consume waits
+    // on the canonical lock, no other path can consume the same claim.
+    const pending = authority.consumeRelayV2ExactObservation(
+      preparation.claim,
+      exactInput,
+      preparation.identity,
+    );
+    assert.throws(
+      () => authority.consumeRelayV2ExactTarget(preparation.claim, exactInput),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    await assert.rejects(
+      authority.consumeRelayV2ExactObservation(
+        preparation.claim,
+        exactInput,
+        preparation.identity,
+      ),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+    const opened = await pending;
+    assert.equal(
+      opened.binding.outputGeneration,
+      terminalControl.loadTerminalControlState(temp.path).targets[0].outputGeneration,
+    );
+
+    // A failed deferred reset keeps the observation open and the close
+    // retryable instead of losing the observer.
+    backend.failReset = true;
+    await assert.rejects(
+      authority.closeRelayV2ExactObservation(opened.observation),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    backend.failReset = false;
+
+    // The next tail recovers the target, rotates the generation, and fences
+    // the now-stale observer out of the per-target registry.
+    await assert.rejects(
+      authority.tailRelayV2ExactObservation(opened.observation, 0),
+      (error) => error.code === "STALE_OUTPUT_CURSOR",
+    );
+    assert.equal(backend.resetCalls, 1);
+
+    // The stale observer must not suppress the reset of a later release.
+    const interactive = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("dashboard", "observed-race-pty"),
+    );
+    const released = await authority.handle({
+      protocolVersion: 1,
+      requestId: "observed-race-release",
+      type: "lease.release",
+      lease: interactive.lease,
+    });
+    assert.equal(released.state, "FREE");
+    assert.equal(backend.resetCalls, 2);
+    assert.notEqual(released.outputGeneration, opened.binding.outputGeneration);
+
+    // Closing the fenced observation is an idempotent no-op.
+    await authority.closeRelayV2ExactObservation(opened.observation);
+    await authority.closeRelayV2ExactObservation(opened.observation);
+    assert.equal(backend.resetCalls, 2);
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
+test("exact observation consume with a changed live pane invalidates and frees the target persistently", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"A".repeat(43)}`;
+  let paneIdentity = "%1";
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity,
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-observe-gone",
+    scopeId: "scope-observe-gone",
+    sessionId: "session-observe-gone",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-observe-gone",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:observer-gone" },
+  };
+  try {
+    await resolved(authority);
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    // The live pane identity changed between prepare and consume: the burn
+    // of the claim must still invalidate and free the persisted target.
+    paneIdentity = "%2";
+    await assert.rejects(
+      authority.consumeRelayV2ExactObservation(
+        preparation.claim,
+        exactInput,
+        preparation.identity,
+      ),
+      (error) => error.code === "TARGET_GONE",
+    );
+    const persisted = terminalControl.loadTerminalControlState(temp.path).targets[0];
+    assert.equal(persisted.lifecycle, "TARGET_GONE");
+    assert.equal(persisted.ownership.state, "FREE");
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
   }
 });

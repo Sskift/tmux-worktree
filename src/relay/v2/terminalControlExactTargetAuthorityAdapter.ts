@@ -1,5 +1,8 @@
 import type { TerminalControlLease, TerminalControlOwner } from "../../terminalControl/protocol.js";
 import type {
+  TerminalControlRelayV2ExactObservation,
+  TerminalControlRelayV2ExactObservationBinding,
+  TerminalControlRelayV2ExactObservationTail,
   TerminalControlRelayV2ExactTargetClaim,
   TerminalControlRelayV2ExactTargetAuthorityPort,
   TerminalControlRelayV2ExactTargetInput,
@@ -44,6 +47,23 @@ extends RelayV2PreparedExactTerminalControlLeasePortV1 {
     evidence: RelayV2ExactTerminalControlTargetEvidenceV1,
   ): Promise<boolean>;
   close(): Promise<void>;
+}
+
+/**
+ * Process-local read-observation port for one exact terminal target. The
+ * observation pins controlEpoch/outputGeneration and never grants input
+ * ownership; the same adapter instance may afterwards run another
+ * prepare/fence/consume cycle for a lease.
+ */
+export interface RelayV2TerminalControlExactObservationPortV1 {
+  consumePreparedObservationForBinding(
+    binding: RelayV2TerminalCanonicalTargetBindingV1,
+  ): Promise<TerminalControlRelayV2ExactObservationBinding>;
+  tailObservation(
+    cursor: number,
+    maxBytes?: number,
+  ): Promise<TerminalControlRelayV2ExactObservationTail>;
+  closeObservation(): Promise<void>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -192,10 +212,14 @@ function bindingInput(value: RelayV2TerminalCanonicalTargetBindingV1): RelayV2Ex
 }
 
 export class RelayV2TerminalControlExactTargetAuthorityAdapter
-implements RelayV2PreparedExactTerminalControlTargetPortV1 {
+implements RelayV2PreparedExactTerminalControlTargetPortV1, RelayV2TerminalControlExactObservationPortV1 {
   private readonly authority: TerminalControlRelayV2ExactTargetAuthorityPort;
   private readonly owner: TerminalControlOwner & { kind: "relay-v2" };
   private readonly records = new Map<string, PreparedRecord>();
+  private observation: {
+    handle: TerminalControlRelayV2ExactObservation;
+    binding: TerminalControlRelayV2ExactObservationBinding;
+  } | null = null;
   private admissionClosed = false;
   private closeBarrier: Promise<void> | null = null;
 
@@ -205,6 +229,9 @@ implements RelayV2PreparedExactTerminalControlTargetPortV1 {
       || typeof options.authority.prepareRelayV2ExactTarget !== "function"
       || typeof options.authority.fenceRelayV2ExactTarget !== "function"
       || typeof options.authority.consumeRelayV2ExactTarget !== "function"
+      || typeof options.authority.consumeRelayV2ExactObservation !== "function"
+      || typeof options.authority.tailRelayV2ExactObservation !== "function"
+      || typeof options.authority.closeRelayV2ExactObservation !== "function"
       || typeof options.authority.rollbackRelayV2ExactTarget !== "function"
       || !isRecord(options.owner)
       || !exactKeys(options.owner, ["kind", "instanceId"])
@@ -356,6 +383,62 @@ implements RelayV2PreparedExactTerminalControlTargetPortV1 {
     return Object.freeze({ ...lease, owner: Object.freeze({ ...lease.owner }) });
   }
 
+  async consumePreparedObservationForBinding(
+    binding: RelayV2TerminalCanonicalTargetBindingV1,
+  ): Promise<TerminalControlRelayV2ExactObservationBinding> {
+    if (!isRecord(binding.exactControlIdentity)) {
+      throw new TypeError("Relay v2 exact terminal target binding is malformed");
+    }
+    if (this.observation !== null) {
+      throw new TypeError("Relay v2 exact terminal observation is already active");
+    }
+    const parsed = bindingInput(binding);
+    const matches = [...this.records.values()].filter((record) => (
+      record.state === "admitted"
+      && record.inputJson === canonicalJson(parsed)
+      && record.evidence.exactControlIdentity.controlTargetId
+        === binding.exactControlIdentity.controlTargetId
+      && record.evidence.exactControlIdentity.controlEpoch
+        === binding.exactControlIdentity.controlEpoch
+      && record.evidence.exactControlIdentity.targetIncarnationProof
+        === binding.exactControlIdentity.targetIncarnationProof
+    ));
+    if (matches.length !== 1) {
+      throw new TypeError("Relay v2 prepared terminal observation is unavailable or ambiguous");
+    }
+    const record = matches[0];
+    const opened = await this.authority.consumeRelayV2ExactObservation(
+      record.claim,
+      ownerInput(parsed, this.owner),
+      record.evidence.exactControlIdentity,
+    );
+    if (record.timer) clearTimeout(record.timer);
+    this.records.delete(record.evidence.exactControlToken);
+    this.observation = {
+      handle: opened.observation,
+      binding: Object.freeze({ ...opened.binding }),
+    };
+    return Object.freeze({ ...opened.binding });
+  }
+
+  tailObservation(
+    cursor: number,
+    maxBytes?: number,
+  ): Promise<TerminalControlRelayV2ExactObservationTail> {
+    if (this.observation === null) {
+      throw new TypeError("Relay v2 exact terminal observation is unavailable");
+    }
+    return this.authority.tailRelayV2ExactObservation(this.observation.handle, cursor, maxBytes);
+  }
+
+  async closeObservation(): Promise<void> {
+    if (this.observation === null) return;
+    // The handle is dropped only after the authority commits the close, so a
+    // failed deferred reset keeps this close retryable.
+    await this.authority.closeRelayV2ExactObservation(this.observation.handle);
+    this.observation = null;
+  }
+
   async rollbackPreparedTarget(
     rawInput: RelayV2ExactTerminalControlTargetInputV1,
     rawEvidence: RelayV2ExactTerminalControlTargetEvidenceV1,
@@ -386,10 +469,18 @@ implements RelayV2PreparedExactTerminalControlTargetPortV1 {
     this.closeBarrier = (async () => {
       const records = [...this.records.entries()];
       this.records.clear();
+      // Claims roll back before the observation closes, so a deferred output
+      // reset observes the post-rollback FREE state instead of a HELD one.
       const settled = await Promise.allSettled(records.map(([token, record]) => (
         this.rollbackRecord(token, record)
       )));
       const failure = settled.find((result) => result.status === "rejected");
+      try {
+        await this.closeObservation();
+      } catch (error) {
+        if (failure?.status === "rejected") throw failure.reason;
+        throw error;
+      }
       if (failure?.status === "rejected") throw failure.reason;
     })();
     return this.closeBarrier;

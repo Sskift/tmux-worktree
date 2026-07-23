@@ -64,6 +64,39 @@ export interface TerminalControlRelayV2ExactTargetClaim {
   readonly [terminalControlRelayV2ExactTargetClaimBrand]: true;
 }
 
+declare const terminalControlRelayV2ExactObservationBrand: unique symbol;
+
+/**
+ * Opaque, process-local read-observation handle. It pins one exact target
+ * binding and one output generation; it never grants input ownership and has
+ * no wire or persisted representation.
+ */
+export interface TerminalControlRelayV2ExactObservation {
+  readonly [terminalControlRelayV2ExactObservationBrand]: true;
+}
+
+export interface TerminalControlRelayV2ExactObservationBinding {
+  schemaVersion: 1;
+  controlTargetId: string;
+  controlEpoch: string;
+  targetIncarnationProof: string;
+  outputGeneration: string;
+  outputCursor: number;
+}
+
+export interface TerminalControlRelayV2ExactObservationOpen {
+  observation: TerminalControlRelayV2ExactObservation;
+  binding: TerminalControlRelayV2ExactObservationBinding;
+}
+
+export interface TerminalControlRelayV2ExactObservationTail {
+  controlEpoch: string;
+  outputGeneration: string;
+  cursor: number;
+  dataBase64: string;
+  nextCursor: number;
+}
+
 export interface TerminalControlRelayV2ExactTargetPreparation {
   preparationId: string;
   claim: TerminalControlRelayV2ExactTargetClaim;
@@ -84,6 +117,19 @@ export interface TerminalControlRelayV2ExactTargetAuthorityPort {
     input: TerminalControlRelayV2ExactTargetInput,
     owner?: TerminalControlOwner & { kind: "relay-v2" },
   ): TerminalControlLease;
+  consumeRelayV2ExactObservation(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+    input: TerminalControlRelayV2ExactTargetInput,
+    identity: TerminalControlRelayV2ExactTargetIdentity,
+  ): Promise<TerminalControlRelayV2ExactObservationOpen>;
+  tailRelayV2ExactObservation(
+    observation: TerminalControlRelayV2ExactObservation,
+    cursor: number,
+    maxBytes?: number,
+  ): Promise<TerminalControlRelayV2ExactObservationTail>;
+  closeRelayV2ExactObservation(
+    observation: TerminalControlRelayV2ExactObservation,
+  ): Promise<void>;
   rollbackRelayV2ExactTarget(claim: TerminalControlRelayV2ExactTargetClaim): Promise<boolean>;
 }
 
@@ -108,6 +154,15 @@ interface RelayV2ExactClaimRecord {
   readonly externalEpoch: number;
   state: RelayV2ExactClaimState;
   timer: NodeJS.Timeout | null;
+}
+
+interface RelayV2ExactObservationRecord {
+  readonly controlTargetId: string;
+  readonly controlEpoch: string;
+  readonly targetIncarnationProof: string;
+  readonly outputGeneration: string;
+  readonly pane: string;
+  state: "open" | "closed";
 }
 
 function isoNow(now: () => Date): string {
@@ -435,6 +490,20 @@ function ownerRelayV2ExactConsumer(
   };
 }
 
+function relayV2ExactIdentity(
+  value: TerminalControlRelayV2ExactTargetIdentity,
+): TerminalControlRelayV2ExactTargetIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.schemaVersion !== 1) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "Relay v2 exact target identity is malformed");
+  }
+  return {
+    schemaVersion: 1,
+    controlTargetId: relayV2ExactBoundedId(value.controlTargetId),
+    controlEpoch: relayV2ExactBoundedId(value.controlEpoch),
+    targetIncarnationProof: relayV2ExactBoundedId(value.targetIncarnationProof),
+  };
+}
+
 function relayV2TargetIncarnationProof(input: {
   request: TerminalControlRelayV2ExactTargetInput;
   state: TerminalControlState;
@@ -464,6 +533,9 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   private readonly relayV2ExactTargetTtlMs: number;
   private readonly relayV2ExactClaims = new WeakMap<object, RelayV2ExactClaimRecord>();
   private readonly relayV2ExactLiveClaims = new Set<TerminalControlRelayV2ExactTargetClaim>();
+  private readonly relayV2ExactObservations = new WeakMap<object, RelayV2ExactObservationRecord>();
+  private readonly relayV2ExactLiveObservations = new Set<TerminalControlRelayV2ExactObservation>();
+  private readonly relayV2ExactObserversByTarget = new Map<string, Set<TerminalControlRelayV2ExactObservation>>();
   private relayV2ExternalEpoch = 0;
   private relayV2ExternalOperations = 0;
   private relayV2ExactClosed = false;
@@ -646,6 +718,18 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         value: this.consumeRelayV2ExactTarget.bind(this),
         enumerable: true,
       },
+      consumeRelayV2ExactObservation: {
+        value: this.consumeRelayV2ExactObservation.bind(this),
+        enumerable: true,
+      },
+      tailRelayV2ExactObservation: {
+        value: this.tailRelayV2ExactObservation.bind(this),
+        enumerable: true,
+      },
+      closeRelayV2ExactObservation: {
+        value: this.closeRelayV2ExactObservation.bind(this),
+        enumerable: true,
+      },
       rollbackRelayV2ExactTarget: {
         value: this.rollbackRelayV2ExactTarget.bind(this),
         enumerable: true,
@@ -822,6 +906,364 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     return { ...record.lease, owner: { ...consumerOwner } };
   }
 
+  private relayV2ExactObservationRecord(
+    observation: TerminalControlRelayV2ExactObservation,
+  ): RelayV2ExactObservationRecord {
+    const record = this.relayV2ExactObservations.get(observation as object);
+    if (!record) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact observation is not owned by this authority",
+      );
+    }
+    return record;
+  }
+
+  private relayV2ExactObserverCount(controlTargetId: string): number {
+    return this.relayV2ExactObserversByTarget.get(controlTargetId)?.size ?? 0;
+  }
+
+  private relayV2ExactRetireObservation(observation: TerminalControlRelayV2ExactObservation): void {
+    const record = this.relayV2ExactObservations.get(observation as object);
+    if (record) record.state = "closed";
+    this.relayV2ExactLiveObservations.delete(observation);
+    if (!record) return;
+    const observers = this.relayV2ExactObserversByTarget.get(record.controlTargetId);
+    if (!observers) return;
+    observers.delete(observation);
+    if (observers.size === 0) this.relayV2ExactObserversByTarget.delete(record.controlTargetId);
+  }
+
+  /**
+   * Retires observers whose pinned epoch/generation or target lifecycle can
+   * no longer match, so a stale observer never suppresses the deferred
+   * output reset of a later release or close.
+   */
+  private relayV2ExactPruneStaleObservers(
+    state: TerminalControlState,
+    target: TerminalControlTargetRecord,
+  ): void {
+    const observers = this.relayV2ExactObserversByTarget.get(target.controlTargetId);
+    if (!observers) return;
+    for (const observation of [...observers]) {
+      const record = this.relayV2ExactObservations.get(observation as object);
+      if (!record
+        || record.state === "closed"
+        || target.lifecycle === "TARGET_GONE"
+        || record.controlEpoch !== state.controlEpoch
+        || record.outputGeneration !== target.outputGeneration) {
+        this.relayV2ExactRetireObservation(observation);
+      }
+    }
+  }
+
+  /**
+   * Atomically consumes an admitted claim into a read-only observation. The
+   * claim is burned synchronously, so no other path can consume it while the
+   * canonical lock is taken; inside that same lock the live backend is
+   * re-inspected (a same-name recreation since prepare is TARGET_GONE), the
+   * incarnation proof and target record are re-verified, the HELD
+   * reservation returns to FREE without an output reset, the observer is
+   * registered, and the controlEpoch/outputGeneration/outputCursor cut is
+   * returned. The resulting handle never grants input ownership.
+   */
+  async consumeRelayV2ExactObservation(
+    claim: TerminalControlRelayV2ExactTargetClaim,
+    rawInput: TerminalControlRelayV2ExactTargetInput,
+    rawIdentity: TerminalControlRelayV2ExactTargetIdentity,
+  ): Promise<TerminalControlRelayV2ExactObservationOpen> {
+    if (this.backend.inspectExactTarget === undefined) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target authority is unavailable",
+      );
+    }
+    const inspectExactTarget = this.backend.inspectExactTarget;
+    const input = relayV2ExactInput(rawInput);
+    const identity = relayV2ExactIdentity(rawIdentity);
+    const record = this.relayV2ExactClaimRecord(claim);
+    if (record.state !== "admitted"
+      || record.inputJson !== relayV2ExactCanonicalJson(input)
+      || relayV2ExactCanonicalJson(identity) !== relayV2ExactCanonicalJson(record.identity)
+      || !this.relayV2ExactClaimCurrent(record)) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact terminal target claim cannot be consumed for observation",
+      );
+    }
+    record.state = "consumed";
+    if (record.timer) clearTimeout(record.timer);
+    record.timer = null;
+    this.relayV2ExactLiveClaims.delete(claim);
+    this.relayV2ExactClaims.delete(claim as object);
+    const observation = Object.freeze(
+      Object.create(null),
+    ) as TerminalControlRelayV2ExactObservation;
+    const observed = await this.locked(async (state) => {
+      const target = state.targets.find(
+        (candidate) => candidate.controlTargetId === record.identity.controlTargetId,
+      );
+      const reservationMatches = target !== undefined
+        && state.controlEpoch === record.identity.controlEpoch
+        && target.ownership.state === "HELD"
+        && target.ownership.leaseId === record.lease.leaseId
+        && target.ownership.fence === record.lease.fence
+        && sameOwner(target.ownership.owner, record.lease.owner);
+      if (!target) {
+        throw new TerminalControlProtocolError("TARGET_NOT_FOUND", "control target is unknown");
+      }
+      if (!reservationMatches) {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "Relay v2 exact observation target record is fenced",
+        );
+      }
+      if (this.relayV2ExactClosed
+        || this.relayV2ExternalOperations !== 0
+        || this.relayV2ExternalEpoch !== record.externalEpoch) {
+        // The reservation is still ours; free it before fencing this consume.
+        this.resetInteractiveOwners(target.controlTargetId);
+        target.ownership = {
+          state: "FREE",
+          fence: nextDecimal(target.ownership.fence),
+        };
+        revision(target);
+        target.updatedAt = isoNow(this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "Relay v2 exact terminal target claim cannot be consumed for observation",
+        );
+      }
+      ensureOperable(target);
+      let inspected;
+      try {
+        inspected = await inspectExactTarget.call(this.backend, {
+          managedName: record.input.managedTarget.name,
+          managedKind: record.input.managedTarget.kind,
+          managedIncarnation: record.input.managedTarget.incarnation,
+          pane: record.input.pane,
+        });
+      } catch (error) {
+        if (
+          error instanceof TerminalControlProtocolError
+          && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
+        ) {
+          invalidateTarget(target, this.now);
+          saveTerminalControlState(state, this.statePath);
+          throw new TerminalControlProtocolError("TARGET_GONE", error.message);
+        }
+        markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          `could not prove the exact terminal backend lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (inspected.managedSession.name !== record.input.managedTarget.name
+        || inspected.managedSession.kind !== record.input.managedTarget.kind
+        || inspected.managedSession.createdAt !== target.managedSession.createdAt
+        || inspected.managedIncarnation !== record.input.managedTarget.incarnation
+        || inspected.tmuxInstanceId !== target.backend.tmuxInstanceId) {
+        invalidateTarget(target, this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError(
+          "TARGET_GONE",
+          "managed target changed before Relay v2 exact observation",
+        );
+      }
+      const proof = relayV2TargetIncarnationProof({
+        request: record.input,
+        state,
+        target,
+        paneIdentity: inspected.paneIdentity,
+      });
+      if (proof !== record.identity.targetIncarnationProof) {
+        invalidateTarget(target, this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError(
+          "TARGET_GONE",
+          "managed target changed before Relay v2 exact observation",
+        );
+      }
+      this.resetInteractiveOwners(target.controlTargetId);
+      target.ownership = {
+        state: "FREE",
+        fence: nextDecimal(target.ownership.fence),
+      };
+      revision(target);
+      target.updatedAt = isoNow(this.now);
+      const output = await this.prepareOutput(state, target);
+      const observationRecord: RelayV2ExactObservationRecord = {
+        controlTargetId: record.identity.controlTargetId,
+        controlEpoch: record.identity.controlEpoch,
+        targetIncarnationProof: record.identity.targetIncarnationProof,
+        outputGeneration: target.outputGeneration,
+        pane: String(record.input.pane),
+        state: "open",
+      };
+      this.relayV2ExactObservations.set(observation as object, observationRecord);
+      this.relayV2ExactLiveObservations.add(observation);
+      let observers = this.relayV2ExactObserversByTarget.get(observationRecord.controlTargetId);
+      if (!observers) {
+        observers = new Set();
+        this.relayV2ExactObserversByTarget.set(observationRecord.controlTargetId, observers);
+      }
+      observers.add(observation);
+      saveTerminalControlState(state, this.statePath);
+      return {
+        outputGeneration: target.outputGeneration,
+        outputCursor: output.cursor,
+        controlEpoch: record.identity.controlEpoch,
+        controlTargetId: record.identity.controlTargetId,
+        targetIncarnationProof: record.identity.targetIncarnationProof,
+      };
+    });
+    return Object.freeze({
+      observation,
+      binding: Object.freeze({
+        schemaVersion: 1 as const,
+        controlTargetId: observed.controlTargetId,
+        controlEpoch: observed.controlEpoch,
+        targetIncarnationProof: observed.targetIncarnationProof,
+        outputGeneration: observed.outputGeneration,
+        outputCursor: observed.outputCursor,
+      }),
+    });
+  }
+
+  /**
+   * Tails the pinned output generation along the exact observation binding.
+   * Cursor fencing follows the existing output.tail semantics: a rotated
+   * generation or controller epoch rejects with STALE_OUTPUT_CURSOR, a gone
+   * target rejects with TARGET_GONE.
+   */
+  async tailRelayV2ExactObservation(
+    observation: TerminalControlRelayV2ExactObservation,
+    cursor: number,
+    maxBytes = TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
+  ): Promise<TerminalControlRelayV2ExactObservationTail> {
+    if (!Number.isSafeInteger(cursor) || cursor < 0
+      || !Number.isSafeInteger(maxBytes)
+      || maxBytes < 1
+      || maxBytes > TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES) {
+      throw new TerminalControlProtocolError(
+        "INVALID_REQUEST",
+        "Relay v2 exact observation tail bounds are invalid",
+      );
+    }
+    const record = this.relayV2ExactObservationRecord(observation);
+    if (record.state !== "open" || this.relayV2ExactClosed) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Relay v2 exact observation is closed",
+      );
+    }
+    return this.locked(async (state) => {
+      if (record.state !== "open" || this.relayV2ExactClosed) {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "Relay v2 exact observation is closed",
+        );
+      }
+      const target = state.targets.find(
+        (candidate) => candidate.controlTargetId === record.controlTargetId,
+      );
+      if (!target) {
+        throw new TerminalControlProtocolError("TARGET_NOT_FOUND", "control target is unknown");
+      }
+      if (target.lifecycle === "TARGET_GONE") {
+        this.relayV2ExactPruneStaleObservers(state, target);
+        throw new TerminalControlProtocolError(
+          "TARGET_GONE",
+          "control target backend lifecycle has ended",
+        );
+      }
+      this.relayV2ExactPruneStaleObservers(state, target);
+      if (record.state !== "open") {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "terminal output cursor was fenced by an ownership or controller generation change",
+        );
+      }
+      try {
+        await this.assertTargetCurrent(state, target);
+      } catch (error) {
+        this.relayV2ExactPruneStaleObservers(state, target);
+        throw error;
+      }
+      this.relayV2ExactPruneStaleObservers(state, target);
+      if (record.state !== "open") {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "terminal output cursor was fenced by an ownership or controller generation change",
+        );
+      }
+      let chunk;
+      try {
+        chunk = await this.backend.tailOutput(
+          target.controlTargetId,
+          target.managedSession.name,
+          record.pane,
+          record.outputGeneration,
+          cursor,
+          maxBytes,
+        );
+      } catch (error) {
+        if (error instanceof TerminalControlProtocolError && error.code === "STALE_OUTPUT_CURSOR") {
+          throw error;
+        }
+        markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          `terminal output continuity is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return Object.freeze({
+        controlEpoch: state.controlEpoch,
+        outputGeneration: chunk.generation,
+        cursor: chunk.cursor,
+        dataBase64: chunk.dataBase64,
+        nextCursor: chunk.nextCursor,
+      });
+    });
+  }
+
+  /**
+   * Idempotently releases one exact observation. The deferred
+   * output-generation reset and its persistence complete before the observer
+   * is deregistered, so a failure keeps the observation open and retryable;
+   * stale observations are fenced without owing a reset.
+   */
+  async closeRelayV2ExactObservation(
+    observation: TerminalControlRelayV2ExactObservation,
+  ): Promise<void> {
+    const record = this.relayV2ExactObservations.get(observation as object);
+    if (!record || record.state === "closed") return;
+    if (!this.relayV2ExactClosed) {
+      await this.locked(async (state) => {
+        const target = state.targets.find(
+          (candidate) => candidate.controlTargetId === record.controlTargetId,
+        );
+        if (!target) return;
+        this.relayV2ExactPruneStaleObservers(state, target);
+        if (record.state !== "open"
+          || target.lifecycle !== "ACTIVE"
+          || target.ownership.state !== "FREE"
+          || target.inFlight
+          || this.relayV2ExactObserverCount(record.controlTargetId) !== 1) {
+          return;
+        }
+        await this.resetOutput(state, target);
+        revision(target);
+        target.updatedAt = isoNow(this.now);
+        saveTerminalControlState(state, this.statePath);
+      });
+    }
+    this.relayV2ExactRetireObservation(observation);
+  }
+
   async rollbackRelayV2ExactTarget(
     claim: TerminalControlRelayV2ExactTargetClaim,
   ): Promise<boolean> {
@@ -835,9 +1277,15 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
 
   async closeRelayV2ExactTargetAuthority(): Promise<void> {
     if (this.relayV2ExactClosed) return;
+    // Claim rollback precedes observation close so each deferred reset sees
+    // the post-rollback FREE state; any failure keeps this authority open
+    // and the whole close retryable.
+    await this.relayV2WithdrawAllExactClaims();
+    for (const observation of [...this.relayV2ExactLiveObservations]) {
+      await this.closeRelayV2ExactObservation(observation);
+    }
     this.relayV2ExactClosed = true;
     this.relayV2ExternalEpoch += 1;
-    await this.relayV2WithdrawAllExactClaims();
   }
 
   async initializeContinuity(): Promise<string> {
@@ -1335,7 +1783,14 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           return ownershipView(state, target, output.cursor);
         }
       }
-      const output = await this.resetOutput(state, target);
+      // An active exact read observation keeps the detached route continuous:
+      // the last interactive release still returns to FREE, but the output
+      // generation is not reset until the last observer closes. Stale
+      // observers are retired first so they cannot suppress the reset.
+      this.relayV2ExactPruneStaleObservers(state, target);
+      const output = this.relayV2ExactObserverCount(target.controlTargetId) > 0
+        ? await this.prepareOutput(state, target)
+        : await this.resetOutput(state, target);
       this.resetInteractiveOwners(target.controlTargetId);
       target.ownership = { state: "FREE", fence: nextDecimal(target.ownership.fence) };
       revision(target);

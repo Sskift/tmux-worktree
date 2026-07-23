@@ -156,5 +156,58 @@
       "protocolVersion": 1,
       "type": "rollback"
     }
+  },
+  "observe": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "observe"
+    },
+    "response": {
+      "protocolVersion": 1,
+      "ok": true,
+      "result": {
+        "schemaVersion": 1,
+        "controlTargetId": "opaque-control-target",
+        "controlEpoch": "opaque-control-epoch",
+        "targetIncarnationProof": "twct2.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "outputGeneration": "opaque-output-generation",
+        "outputCursor": 0
+      }
+    },
+    "note": "Atomically consumes the admitted claim into a read-only observation on the same live child; the HELD reservation returns to FREE without an output reset and no input ownership is granted."
+  },
+  "tail": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "tail",
+      "cursor": 0,
+      "maxBytes": 65536
+    },
+    "response": {
+      "protocolVersion": 1,
+      "ok": true,
+      "result": {
+        "controlEpoch": "opaque-control-epoch",
+        "outputGeneration": "opaque-output-generation",
+        "cursor": 0,
+        "dataBase64": "",
+        "nextCursor": 0
+      }
+    },
+    "note": "Tails only the pinned controlEpoch/outputGeneration of the live observation; a rotated generation rejects with STALE_OUTPUT_CURSOR."
+  },
+  "closeObserve": {
+    "request": {
+      "protocolVersion": 1,
+      "type": "close-observe"
+    },
+    "response": {
+      "protocolVersion": 1,
+      "ok": true,
+      "result": {
+        "closed": true
+      }
+    },
+    "note": "Idempotently closes the observation on the same live child; the deferred output-generation reset then runs under the same rules as a last interactive release. Repeating close-observe on that child returns the same closed:true result."
   }
 }

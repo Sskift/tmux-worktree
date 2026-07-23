@@ -9,9 +9,9 @@
   "lifecycle": [
     "hello-preflight",
     "prepare",
-    "admit",
-    "effect",
-    "release-or-rollback"
+    "admit-or-observe",
+    "effect-or-tail",
+    "release-rollback-or-close-observe"
   ],
   "allowedEffects": [
     "ownership.status",
@@ -39,6 +39,7 @@
     "directTmuxOrGitFallbackAllowed": false,
     "localFallbackAllowed": false,
     "explicitLocalSiblingAllowed": true,
+    "observationInputOwnershipAllowed": false,
     "targetOwner": "terminal-control canonical authority under the daemon server-lock namespace"
   },
   "fixture": "cases.json",
