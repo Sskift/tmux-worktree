@@ -54,7 +54,8 @@ export type AgentProbeId =
   | "codex"
   | "gemini"
   | "opencode"
-  | "aider";
+  | "aider"
+  | "kimi";
 
 export type AgentProbeTarget =
   | { kind: "local" }

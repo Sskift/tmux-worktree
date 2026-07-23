@@ -12,7 +12,7 @@ pub(crate) struct AgentProbeSpec {
     pub(crate) command: &'static str,
 }
 
-pub(crate) const AGENT_PROBE_SPECS: [AgentProbeSpec; 5] = [
+pub(crate) const AGENT_PROBE_SPECS: [AgentProbeSpec; 6] = [
     AgentProbeSpec {
         id: "claude",
         label: "Claude Code",
@@ -37,6 +37,11 @@ pub(crate) const AGENT_PROBE_SPECS: [AgentProbeSpec; 5] = [
         id: "aider",
         label: "Aider",
         command: "aider",
+    },
+    AgentProbeSpec {
+        id: "kimi",
+        label: "Kimi Code",
+        command: "kimi",
     },
 ];
 

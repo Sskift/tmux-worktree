@@ -327,6 +327,7 @@ transport.handlers.set("probe_agents", (payload) => {
     { id: "gemini", label: "Gemini CLI", command: "gemini", available: hostId !== null, executablePath: hostId ? `${binRoot}/gemini` : null, error: null },
     { id: "opencode", label: "OpenCode", command: "opencode", available: false, executablePath: null, error: null },
     { id: "aider", label: "Aider", command: "aider", available: false, executablePath: null, error: null },
+    { id: "kimi", label: "Kimi Code", command: "kimi", available: !hostId, executablePath: hostId ? null : "/Users/demo/.kimi-code/bin/kimi", error: null },
   ];
 });
 transport.handlers.set("list_tmux_terminals", value(terminals));

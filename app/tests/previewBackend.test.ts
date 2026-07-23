@@ -27,8 +27,10 @@ test("preview backend supplies the dashboard startup state", async () => {
     "gemini",
     "opencode",
     "aider",
+    "kimi",
   ]);
   assert.equal(agents.find((agent) => agent.id === "codex")?.available, true);
+  assert.equal(agents.find((agent) => agent.id === "kimi")?.available, true);
   assert.deepEqual(layout, {
     layout: {},
     revision: "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY",

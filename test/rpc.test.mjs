@@ -689,7 +689,7 @@ test("rpc worktree creation records a dashboard-managed remote session", () => {
       "app-fix-1",
       "-c",
       "/home/dev/.tmux-worktree/worktrees/app/app-fix-1-abc12",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex; exec \"${SHELL:-/bin/zsh}\" -l",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex; exec \"${SHELL:-/bin/zsh}\" -l",
     ]],
     ["setupClipboardBindings", []],
   ]);
@@ -739,7 +739,7 @@ test("rpc terminal creation uses the shared single-pane contract and records man
       "tw-term-abc12",
       "-c",
       "/home/dev/src/app",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
     ]],
     ["setupClipboardBindings", []],
   ]);
@@ -1239,7 +1239,7 @@ test("CLI and Dashboard provenance use the same single-pane session contract", (
       "app-fix",
       "-c",
       "/repo/app",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
     ]],
     ["setupClipboardBindings", []],
   ]);

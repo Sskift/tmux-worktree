@@ -102,7 +102,7 @@ export function setupClipboardBindings(): void {
 }
 
 export function aiCommandPathPrefix(): string {
-  return 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"';
+  return 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin"';
 }
 
 export function commandThenLoginShell(command: string): string {

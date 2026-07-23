@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 const USER_HOME_BIN_PATHS: [&str; 3] = [".local/bin", ".npm-global/bin", ".bun/bin"];
+const USER_HOME_BIN_FALLBACK_PATHS: [&str; 1] = [".kimi-code/bin"];
 const USER_ABSOLUTE_BIN_PATHS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -31,7 +32,12 @@ pub(crate) fn user_bin_path_prefix() -> String {
         )
         .collect::<Vec<_>>()
         .join(":");
-    format!("export PATH=\"{entries}:$PATH\"")
+    let fallbacks = USER_HOME_BIN_FALLBACK_PATHS
+        .iter()
+        .map(|path| format!("$HOME/{path}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!("export PATH=\"{entries}:$PATH:{fallbacks}\"")
 }
 
 pub(crate) fn user_bin_search_paths(
@@ -56,6 +62,11 @@ pub(crate) fn user_bin_search_paths(
     if let Some(inherited_path) = inherited_path {
         for path in std::env::split_paths(inherited_path) {
             push_unique(path);
+        }
+    }
+    if let Some(home) = home {
+        for relative in USER_HOME_BIN_FALLBACK_PATHS {
+            push_unique(home.join(relative));
         }
     }
     paths

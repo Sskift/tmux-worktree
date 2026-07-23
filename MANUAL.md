@@ -51,7 +51,9 @@ tw codex /Users/me/workspace/demo fix-auth
 
 Both forms always create a managed git worktree and write `~/.tmux-worktree/state.json`; a path that is not a git repository is rejected instead of becoming an untracked plain tmux session. New worktree sessions use the same single tmux pane as Dashboard-created sessions. The managed-state `profile` still records whether the request came from the CLI or Dashboard for compatibility, but it does not change the pane layout. Existing live sessions created by older releases keep their original panes and remain attachable.
 
-Create one from the Dashboard with `New worktree`: choose `Local`, choose a configured project or browse a path, then choose one of the supported agents that the Dashboard detected as available on this Mac. The field is a fixed picker; Dashboard worktree creation does not accept an arbitrary command there.
+Create one from the Dashboard with `New worktree`: choose `Local`, choose a configured project or browse a path, then choose one of the supported agents that the Dashboard detected as available on this Mac. The field is a fixed picker; Dashboard worktree creation does not accept an arbitrary command there. The picker includes Kimi Code as the `kimi` command and recognizes its default `~/.kimi-code/bin/kimi` installation without putting that directory ahead of the user's existing `PATH`.
+
+Kimi Code does not publish a running spinner through the tmux pane title. For Kimi sessions, the Dashboard therefore reports `Running` while consecutive pane-output samples change and `Stopped` once they stabilize; the first sample can briefly show an unknown status.
 
 Drag a Worktrees group header to reorder Host/Project groups. Drag an individual worktree within its own group to reorder that group; a row cannot be moved into a different Host/Project identity. Focused drag handles also accept Up/Down, and the order survives relaunch.
 
