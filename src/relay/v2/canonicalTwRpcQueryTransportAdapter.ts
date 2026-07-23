@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { types as nodeTypes } from "node:util";
 import { loadConfigFile, type Config } from "../../config.js";
+import {
+  RelayV2CanonicalStructuredProcessAdapter,
+} from "./canonicalStructuredProcessAdapter.js";
 import type {
   RelayV2CanonicalTwRpcDiscoveryQuery,
   RelayV2CanonicalTwRpcDiscoveryQueryPort,
@@ -207,6 +210,14 @@ export interface RelayV2CanonicalTwRpcConfigSnapshotFactoryOptions {
 export interface RelayV2CanonicalTwRpcConfigSnapshotFoundation {
   readonly discovery: RelayV2CanonicalTwRpcDiscoveryAdapter;
   readonly queryPort: RelayV2CanonicalTwRpcQueryTransportAdapter;
+  /**
+   * Canonical structured mutation lane bound to the same live queryPort
+   * target authority and runner. reconfigure() retires/installs descriptor
+   * generations only through queryPort, and this adapter re-resolves that
+   * live authority on every execute, so retired generations fail closed here
+   * exactly as they do for discovery and query.
+   */
+  readonly structuredProcess: RelayV2CanonicalStructuredProcessAdapter;
   reconfigure(): Promise<void>;
 }
 
@@ -1212,6 +1223,11 @@ function deriveExplicitConfigSnapshotTargets(
  * Default-off provenance factory for a future relay-host composition root.
  * The only remote scopes come from loadConfigFile() (or an injected test
  * loader). It does not read SSH config, start discovery, or wire H1/H3.
+ * It is the single target-generation owner for discovery, query, and the
+ * structured mutation process lane: one live queryPort holds the configured
+ * targets, reconfigure() switches generations only through that port's
+ * atomic retire/install transition, and the long-lived structuredProcess
+ * adapter re-resolves the same live authority on every execute.
  */
 export function createRelayV2CanonicalTwRpcConfigSnapshotFoundation(
   options: RelayV2CanonicalTwRpcConfigSnapshotFactoryOptions,
@@ -1245,6 +1261,10 @@ export function createRelayV2CanonicalTwRpcConfigSnapshotFoundation(
   };
   const initial = build(configLoader());
   const queryPort = initial.validator;
+  const structuredProcess = new RelayV2CanonicalStructuredProcessAdapter({
+    targets: queryPort,
+    runner: options.runner,
+  });
   const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
     scopes: initial.scopes,
     queryPort,
@@ -1253,6 +1273,7 @@ export function createRelayV2CanonicalTwRpcConfigSnapshotFoundation(
   return Object.freeze({
     discovery,
     queryPort,
+    structuredProcess,
     async reconfigure(): Promise<void> {
       let next: ReturnType<typeof build>;
       try {

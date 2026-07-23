@@ -270,6 +270,21 @@ test("default-off config factory derives only local plus explicit Hosts and reti
     }]),
     /not content-addressed/,
   );
+  const oldLocalTarget = initialScan[Symbol.for("tmux-worktree.relay-v2.resource-resolver-cut")]
+    .scopeTargets.find((target) => target.processTarget.kind === "local").processTarget;
+  const callsBeforeOldStructured = runner.calls.length;
+  const oldLocalMutation = await foundation.structuredProcess.execute(structuredRequest(oldLocalTarget));
+  const oldSshMutation = await foundation.structuredProcess.execute(structuredRequest(oldTarget));
+  assert.equal(oldLocalMutation.kind, "exited");
+  assert.equal(oldSshMutation.kind, "exited");
+  assert.equal(
+    runner.calls.length,
+    callsBeforeOldStructured + 2,
+    "structuredProcess must share the discovery/query runner",
+  );
+  assert.equal(runner.calls.at(-2).executable, "/opt/tw-node/bin/node");
+  assert.equal(runner.calls.at(-1).executable, "/usr/bin/ssh");
+  assert.equal(runner.calls.at(-1).argv.includes("old.example.com"), true);
   blockOld = true;
   const callsBeforeBlockedScan = runner.calls.length;
   const oldScanPromise = foundation.discovery.scan();
@@ -313,6 +328,10 @@ test("default-off config factory derives only local plus explicit Hosts and reti
     foundation.queryPort.query(query("capabilities", oldTarget)),
     assertTransportCode("TARGET_UNAVAILABLE"),
   );
+  await assert.rejects(
+    foundation.structuredProcess.execute(structuredRequest(oldTarget)),
+    assertStructuredCode("TARGET_UNAVAILABLE"),
+  );
   assert.equal(runner.calls.length, callsBeforeOldPlan, "retired plan must reach zero spawns");
 
   const currentTarget = currentScan[
@@ -323,6 +342,23 @@ test("default-off config factory derives only local plus explicit Hosts and reti
   assert.notEqual(currentTarget.targetId, oldTarget.targetId);
   assert.equal(currentScan.scopes.some((item) => item.backendIdentity === "configured-host:stable-host-id"), true);
   assert.equal(runner.calls.some((call) => call.argv.includes("new.example.com")), true);
+  const currentLocalTarget = currentScan[Symbol.for("tmux-worktree.relay-v2.resource-resolver-cut")]
+    .scopeTargets.find((target) => target.processTarget.kind === "local").processTarget;
+  const callsBeforeCurrentStructured = runner.calls.length;
+  const currentLocalMutation = await foundation.structuredProcess.execute(
+    structuredRequest(currentLocalTarget),
+  );
+  const currentSshMutation = await foundation.structuredProcess.execute(structuredRequest(currentTarget));
+  assert.equal(currentLocalMutation.kind, "exited");
+  assert.equal(currentSshMutation.kind, "exited");
+  assert.equal(
+    runner.calls.length,
+    callsBeforeCurrentStructured + 2,
+    "structuredProcess must re-resolve the live generation",
+  );
+  assert.equal(runner.calls.at(-2).executable, "/opt/tw-node/bin/node");
+  assert.equal(runner.calls.at(-1).executable, "/usr/bin/ssh");
+  assert.equal(runner.calls.at(-1).argv.includes("new.example.com"), true);
   assert.equal(oldKills, 1);
 });
 
