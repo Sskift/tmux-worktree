@@ -33,12 +33,14 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedScopeReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueFailure
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeReachability
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
@@ -63,10 +65,12 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -115,10 +119,19 @@ internal interface RelayV2SessionReplyCut
 /** Opaque Scope authority; only its issuing base composition can consume it. */
 internal interface RelayV2ScopeCreateCut
 
+internal data class RelayV2ProductScope(
+    val materialized: RelayV2MaterializedScopeReadCut,
+    val createCut: RelayV2ScopeCreateCut?,
+)
+
 internal data class RelayV2ProductSession(
     val materialized: RelayV2MaterializedSessionReadCut,
     val replyCut: RelayV2SessionReplyCut,
-    val scopeCreateCut: RelayV2ScopeCreateCut,
+)
+
+internal data class RelayV2ProductProjection(
+    val scopes: List<RelayV2ProductScope> = emptyList(),
+    val sessions: List<RelayV2ProductSession> = emptyList(),
 )
 
 internal data class RelayV2CreateWorktreeInputs(
@@ -127,6 +140,11 @@ internal data class RelayV2CreateWorktreeInputs(
     val name: String?,
     val branch: String?,
     val aiCommand: String,
+)
+
+internal data class RelayV2CreateTerminalInputs(
+    val cwd: String,
+    val label: String?,
 )
 
 internal enum class RelayV2ScopeCreateFailure {
@@ -151,10 +169,15 @@ internal sealed interface RelayV2ScopeCreateResult {
     ) : RelayV2ScopeCreateResult
 }
 
-internal fun interface RelayV2ScopeCreateCommandPort {
+internal interface RelayV2ScopeCreateCommandPort {
     suspend fun submitCreateWorktree(
         scopeCut: RelayV2ScopeCreateCut,
         inputs: RelayV2CreateWorktreeInputs,
+    ): RelayV2ScopeCreateResult
+
+    suspend fun submitCreateTerminal(
+        scopeCut: RelayV2ScopeCreateCut,
+        inputs: RelayV2CreateTerminalInputs,
     ): RelayV2ScopeCreateResult
 }
 
@@ -388,8 +411,11 @@ internal class RelayV2BaseRuntimeComposition(
     private val outboxDispatcher = outboxDispatchComposition.dispatcher(actor)
     private val _state = MutableStateFlow(RelayV2BaseRuntimeState())
     val state: StateFlow<RelayV2BaseRuntimeState> = _state.asStateFlow()
-    private val _sessions = MutableStateFlow<List<RelayV2ProductSession>>(emptyList())
-    val sessions: StateFlow<List<RelayV2ProductSession>> = _sessions.asStateFlow()
+    private val _productProjection = MutableStateFlow(RelayV2ProductProjection())
+    val productProjection: StateFlow<RelayV2ProductProjection> =
+        _productProjection.asStateFlow()
+    val sessions: Flow<List<RelayV2ProductSession>> =
+        productProjection.map { it.sessions }
     private val _outboxTimelineRevision = MutableStateFlow(0L)
     val outboxTimelineRevision: StateFlow<Long> = _outboxTimelineRevision.asStateFlow()
     private val _agentTimelineRevision = MutableStateFlow(0L)
@@ -656,6 +682,29 @@ internal class RelayV2BaseRuntimeComposition(
     override suspend fun submitCreateWorktree(
         scopeCut: RelayV2ScopeCreateCut,
         inputs: RelayV2CreateWorktreeInputs,
+    ): RelayV2ScopeCreateResult = submitScopeCreate(scopeCut) {
+        RelayV2OutboxArguments.createWorktree(
+            project = inputs.project,
+            path = inputs.path,
+            name = inputs.name,
+            branch = inputs.branch,
+            aiCommand = inputs.aiCommand,
+        )
+    }
+
+    override suspend fun submitCreateTerminal(
+        scopeCut: RelayV2ScopeCreateCut,
+        inputs: RelayV2CreateTerminalInputs,
+    ): RelayV2ScopeCreateResult = submitScopeCreate(scopeCut) {
+        RelayV2OutboxArguments.createTerminal(
+            cwd = inputs.cwd,
+            label = inputs.label,
+        )
+    }
+
+    private suspend fun submitScopeCreate(
+        scopeCut: RelayV2ScopeCreateCut,
+        createArguments: () -> RelayV2OutboxArguments,
     ): RelayV2ScopeCreateResult {
         if (closed.get() || terminalFailure.get() != null) {
             return RelayV2ScopeCreateResult.Rejected(
@@ -673,7 +722,7 @@ internal class RelayV2BaseRuntimeComposition(
         }
         val leased = actor.withCurrentOnlineCommandLease(issuedScope.onlineCut) { current ->
             productMutationLock.withLock {
-                enqueueCreateWorktreeUnderLease(issuedScope, current, inputs)
+                enqueueScopeCreateUnderLease(issuedScope, current, createArguments)
             }
         }
         val committed = when (leased) {
@@ -767,7 +816,7 @@ internal class RelayV2BaseRuntimeComposition(
     ): AgentTranscriptLifecycleNotificationConfigMutationResult = productMutationLock.withLock {
         val mutation = agentNotificationConfigMutation
             ?: return@withLock AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
-        for (product in _sessions.value) {
+        for (product in _productProjection.value.sessions) {
             val issued = currentIssuedSession(product.replyCut)
                 ?: return@withLock AgentTranscriptLifecycleNotificationConfigMutationResult.Unavailable
             val materialized = issued.materialized
@@ -857,7 +906,7 @@ internal class RelayV2BaseRuntimeComposition(
         val issuedSession = sessionCut as? CompositionSessionReplyCut ?: return null
         if (issuedSession.origin !== this) return null
         return issuedSession.takeIf { expected ->
-            _sessions.value.any { product ->
+            _productProjection.value.sessions.any { product ->
                 product.replyCut === expected && product.materialized == expected.materialized
             }
         }
@@ -870,8 +919,8 @@ internal class RelayV2BaseRuntimeComposition(
         val issuedScope = scopeCut as? CompositionScopeCreateCut ?: return null
         if (issuedScope.origin !== this) return null
         return issuedScope.takeIf { expected ->
-            _sessions.value.any { product ->
-                product.scopeCreateCut === expected &&
+            _productProjection.value.scopes.any { product ->
+                product.createCut === expected &&
                     ScopeCreateAuthority.from(
                         product.materialized,
                         expected.authority.activationNamespace,
@@ -1589,10 +1638,10 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
-    private suspend fun enqueueCreateWorktreeUnderLease(
+    private suspend fun enqueueScopeCreateUnderLease(
         scopeCut: CompositionScopeCreateCut,
         current: RelayV2CurrentOnlineCommandContext,
-        inputs: RelayV2CreateWorktreeInputs,
+        createArguments: () -> RelayV2OutboxArguments,
     ): ScopeCreateCommit {
         if (closed.get() || terminalFailure.get() != null) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.PROFILE_BARRIER)
@@ -1609,8 +1658,11 @@ internal class RelayV2BaseRuntimeComposition(
         ) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
         }
-        val projection = try {
-            materializedSessions.readMaterializedSessionCuts(namespace)
+        val materializedScope = try {
+            materializedSessions.readMaterializedScopeCut(
+                namespace,
+                issued.scope.scopeId,
+            )
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: IllegalStateException) {
@@ -1618,37 +1670,24 @@ internal class RelayV2BaseRuntimeComposition(
         } catch (_: Exception) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.STORE_FAILURE)
         }
-        if (projection.any { materialized ->
-                materialized.namespace != namespace ||
-                    materialized.cursor.hostEpoch != authority.hostEpoch ||
-                    materialized.scope.scopeId != materialized.session.scopeId
-            }
+        if (materializedScope == null) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
+        }
+        if (materializedScope.namespace != namespace ||
+            materializedScope.cursor.hostEpoch != authority.hostEpoch
         ) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.CORRUPT_STATE)
         }
-        val scopeSessions = projection.filter { materialized ->
-            materialized.scope.scopeId == issued.scope.scopeId
-        }
-        if (scopeSessions.isEmpty()) {
-            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
-        }
-        val materializedScopeAuthorities = scopeSessions
-            .map { materialized -> materialized.scopesRevision to materialized.scope }
-            .distinct()
-        if (materializedScopeAuthorities.size != 1) {
-            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.CORRUPT_STATE)
-        }
-        if (materializedScopeAuthorities.single() != (issued.scopesRevision to issued.scope)) {
+        if (ScopeCreateAuthority.from(
+                materializedScope,
+                issued.activationNamespace,
+            ) != issued ||
+            materializedScope.scope.reachability != RelayV2ScopeReachability.ONLINE
+        ) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.SCOPE_STALE)
         }
         val arguments = try {
-            RelayV2OutboxArguments.createWorktree(
-                project = inputs.project,
-                path = inputs.path,
-                name = inputs.name,
-                branch = inputs.branch,
-                aiCommand = inputs.aiCommand,
-            )
+            createArguments()
         } catch (_: Exception) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.INVALID_INPUT)
         }
@@ -1711,23 +1750,55 @@ internal class RelayV2BaseRuntimeComposition(
         val published = try {
             actor.withCurrentOnlineCommandLease(issued) { current ->
                 productMutationLock.withLock {
-                    val scopeCuts = LinkedHashMap<ScopeCreateAuthority, CompositionScopeCreateCut>()
-                    val projection = materializedSessions.readMaterializedSessionCuts(
-                        current.authority.stateNamespace(),
-                    ).map { materialized ->
-                        check(materialized.namespace == current.authority.stateNamespace()) {
-                            "Relay v2 Session projection crossed current actor authority"
+                    val namespace = current.authority.stateNamespace()
+                    val scopes = materializedSessions.readMaterializedScopeCuts(namespace)
+                    val productScopes = scopes.map { materialized ->
+                        check(materialized.namespace == namespace) {
+                            "Relay v2 Scope projection crossed current actor authority"
                         }
                         val scopeAuthority = ScopeCreateAuthority.from(
                             materialized,
                             current.authority.outboxNamespace(),
                         )
-                        val scopeCreateCut = scopeCuts.getOrPut(scopeAuthority) {
-                            CompositionScopeCreateCut(
-                                origin = this,
-                                onlineCut = issued,
-                                authority = scopeAuthority,
-                            )
+                        RelayV2ProductScope(
+                            materialized = materialized,
+                            createCut = if (
+                                materialized.scope.reachability ==
+                                RelayV2ScopeReachability.ONLINE
+                            ) {
+                                CompositionScopeCreateCut(
+                                    origin = this,
+                                    onlineCut = issued,
+                                    authority = scopeAuthority,
+                                )
+                            } else {
+                                null
+                            },
+                        )
+                    }
+                    val materializedScopes = scopes.associateBy { it.scope.scopeId }
+                    check(materializedScopes.size == scopes.size) {
+                        "Relay v2 Scope projection contains duplicate identities"
+                    }
+                    val productSessions = materializedSessions.readMaterializedSessionCuts(
+                        namespace,
+                    ).map { materialized ->
+                        check(materialized.namespace == namespace) {
+                            "Relay v2 Session projection crossed current actor authority"
+                        }
+                        val exactScope = checkNotNull(
+                            materializedScopes[materialized.scope.scopeId],
+                        ) {
+                            "Relay v2 Session projection is orphaned from its Scope cut"
+                        }
+                        check(
+                            exactScope.namespace == materialized.namespace &&
+                                exactScope.cursor == materialized.cursor &&
+                                exactScope.scopesRevision == materialized.scopesRevision &&
+                                exactScope.scope == materialized.scope &&
+                                exactScope.sessionsRevision == materialized.sessionsRevision,
+                        ) {
+                            "Relay v2 Session projection disagrees with its Scope cut"
                         }
                         RelayV2ProductSession(
                             materialized = materialized,
@@ -1736,13 +1807,16 @@ internal class RelayV2BaseRuntimeComposition(
                                 onlineCut = issued,
                                 materialized = materialized,
                             ),
-                            scopeCreateCut = scopeCreateCut,
                         )
                     }
+                    val projection = RelayV2ProductProjection(
+                        scopes = productScopes,
+                        sessions = productSessions,
+                    )
                     beforeSessionProjectionPublish()
                     val published = !closed.get() && terminalFailure.get() == null &&
                         actor.runIfCurrent(issued) {
-                            _sessions.value = projection
+                            _productProjection.value = projection
                         }
                     if (!published) {
                         clearSessionProjection()
@@ -1763,7 +1837,7 @@ internal class RelayV2BaseRuntimeComposition(
     }
 
     private fun clearSessionProjection() {
-        _sessions.value = emptyList()
+        _productProjection.value = RelayV2ProductProjection()
     }
 
     private fun clearRecoveredDispatch() {
@@ -2383,7 +2457,7 @@ internal class RelayV2BaseRuntimeComposition(
     ) {
         companion object {
             fun from(
-                materialized: RelayV2MaterializedSessionReadCut,
+                materialized: RelayV2MaterializedScopeReadCut,
                 activationNamespace: RelayV2OutboxAuthorityNamespace,
             ) = ScopeCreateAuthority(
                 activationNamespace = activationNamespace,

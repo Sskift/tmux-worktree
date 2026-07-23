@@ -37,6 +37,17 @@ internal class RelayV2StateRepository(
         RoomRelayV2DurableStateStore(database),
     )
 
+    override suspend fun readMaterializedScopeCut(
+        namespace: RelayV2StateNamespace,
+        scopeId: String,
+    ): RelayV2MaterializedScopeReadCut? =
+        core.readMaterializedScopeCut(namespace, scopeId)
+
+    override suspend fun readMaterializedScopeCuts(
+        namespace: RelayV2StateNamespace,
+    ): List<RelayV2MaterializedScopeReadCut> =
+        core.readMaterializedScopeCuts(namespace)
+
     override suspend fun readMaterializedSessionCut(
         namespace: RelayV2StateNamespace,
         scopeId: String,

@@ -69,6 +69,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedScopeReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
@@ -563,7 +564,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 AgentTranscriptLifecycleSelectedSessionPresentationState.Unavailable,
                 owner.composition.readSelectedSession(ownerCut),
             )
-            assertTrue(owner.composition.sessions.value.isEmpty())
+            assertTrue(owner.composition.productProjection.value.sessions.isEmpty())
             assertEquals(0, owner.authority.materializedSessionCutReads.get())
             assertEquals(0, ownerAgent.loadCalls.get())
         } finally {
@@ -1035,7 +1036,7 @@ class RelayV2BaseRuntimeCompositionTest {
 
             original.sendFrame(presence("broker-process-uuid", "18", "offline"))
             harness.awaitPhase(RelayV2BaseRuntimePhase.SUSPENDED)
-            assertEquals(cachedSessions, harness.composition.sessions.value)
+            assertEquals(cachedSessions, harness.composition.productProjection.value.sessions)
             val initialSnapshot = original.awaitSentType("hosts.snapshot.get")
             assertTrue(initialSnapshot.payload().isEmpty())
             original.sendFrame(presence("broker-process-uuid", "18", "offline"))
@@ -1389,18 +1390,25 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
-    fun `online current Scope create worktree commits exact create lane before one fresh dispatch`() =
+    fun `online current empty Scope queues worktree and terminal without projecting a Session`() =
         runBlocking {
-            val harness = Harness(autoConnect = true, newCommandId = { "create-command" })
+            val commandIds = ArrayDeque(listOf("create-worktree", "create-terminal"))
+            val harness = Harness(
+                autoConnect = true,
+                includeMaterializedSession = false,
+                newCommandId = { commandIds.removeFirst() },
+            )
             try {
                 harness.connectOnline()
-                val product = withTimeout(TIMEOUT_MS) {
-                    harness.composition.sessions.first { it.size == 1 }.single()
+                val projection = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { it.scopes.size == 1 }
                 }
+                val scopeCut = checkNotNull(projection.scopes.single().createCut)
+                assertTrue(projection.sessions.isEmpty())
                 harness.authority.blockReplyEnqueue = true
                 val create = async {
                     harness.composition.submitCreateWorktree(
-                        scopeCut = product.scopeCreateCut,
+                        scopeCut = scopeCut,
                         inputs = RelayV2CreateWorktreeInputs(
                             project = "project-a",
                             path = "/work/project-a",
@@ -1420,18 +1428,31 @@ class RelayV2BaseRuntimeCompositionTest {
                     withTimeout(TIMEOUT_MS) { create.await() } is
                         RelayV2ScopeCreateResult.Queued,
                 )
-                val entry = harness.authority.outboxState().entries.single()
-                assertEquals(PROFILE_ID, entry.profileId)
-                assertEquals(PRINCIPAL_ID, entry.principalId)
-                assertEquals(HOST_ID, entry.hostId)
-                assertEquals(HOST_EPOCH, entry.expectedHostEpoch)
-                assertEquals("dedupe-window-uuid", entry.dedupeWindowId)
-                assertEquals("create-command", entry.commandId)
-                assertEquals("scope-a", entry.scopeId)
-                assertEquals(null, entry.sessionId)
-                assertEquals(RelayV2OutboxOperation.CREATE_WORKTREE, entry.operation)
-                assertEquals(RelayV2OutboxOperation.CREATE_WORKTREE, entry.laneKey.createOperation)
-                assertEquals(null, entry.laneKey.sessionId)
+                assertTrue(
+                    harness.composition.submitCreateTerminal(
+                        scopeCut = scopeCut,
+                        inputs = RelayV2CreateTerminalInputs(
+                            cwd = "/work/project-a",
+                            label = "Project A shell",
+                        ),
+                    ) is RelayV2ScopeCreateResult.Queued,
+                )
+                val entries = harness.authority.outboxState().entries
+                val worktree = entries.single { it.commandId == "create-worktree" }
+                val terminal = entries.single { it.commandId == "create-terminal" }
+                assertEquals(PROFILE_ID, worktree.profileId)
+                assertEquals(PRINCIPAL_ID, worktree.principalId)
+                assertEquals(HOST_ID, worktree.hostId)
+                assertEquals(HOST_EPOCH, worktree.expectedHostEpoch)
+                assertEquals("dedupe-window-uuid", worktree.dedupeWindowId)
+                assertEquals("scope-a", worktree.scopeId)
+                assertEquals(null, worktree.sessionId)
+                assertEquals(RelayV2OutboxOperation.CREATE_WORKTREE, worktree.operation)
+                assertEquals(
+                    RelayV2OutboxOperation.CREATE_WORKTREE,
+                    worktree.laneKey.createOperation,
+                )
+                assertEquals(null, worktree.laneKey.sessionId)
                 assertEquals(
                     RelayV2OutboxArguments.CreateWorktree(
                         project = "project-a",
@@ -1440,31 +1461,43 @@ class RelayV2BaseRuntimeCompositionTest {
                         branch = "feature/a3p",
                         aiCommand = "codex",
                     ),
-                    entry.canonicalRequestArguments.value,
+                    worktree.canonicalRequestArguments.value,
                 )
-                assertEquals(RelayV2OutboxStateTag.SENDING, entry.state)
-                val execute = harness.transport().awaitSentType("command.execute")
-                assertEquals("create-command", execute.stringValue("commandId"))
-                assertEquals(HOST_ID, execute.stringValue("hostId"))
-                assertEquals(HOST_EPOCH, execute.stringValue("expectedHostEpoch"))
-                assertEquals("scope-a", execute.stringValue("scopeId"))
-                assertFalse(execute.containsKey("sessionId"))
-                val payload = execute.payloadReadOnly()
-                assertEquals("dedupe-window-uuid", payload.stringValue("dedupeWindowId"))
-                assertEquals("create_worktree", payload.stringValue("operation"))
+                assertEquals(null, terminal.sessionId)
+                assertEquals(RelayV2OutboxOperation.CREATE_TERMINAL, terminal.operation)
                 assertEquals(
-                    mapOf(
-                        "project" to "project-a",
-                        "path" to "/work/project-a",
-                        "name" to "new-worktree",
-                        "branch" to "feature/a3p",
-                        "aiCommand" to "codex",
-                    ),
-                    payload["arguments"],
+                    RelayV2OutboxOperation.CREATE_TERMINAL,
+                    terminal.laneKey.createOperation,
                 )
-                assertEquals(1, harness.authority.enqueueCommits.get())
-                assertEquals(1, harness.transport().framesOfType("command.execute").size)
-                assertEquals(listOf(product), harness.composition.sessions.value)
+                assertEquals(
+                    RelayV2OutboxArguments.CreateTerminal(
+                        cwd = "/work/project-a",
+                        label = "Project A shell",
+                    ),
+                    terminal.canonicalRequestArguments.value,
+                )
+                assertTrue(entries.all { it.state == RelayV2OutboxStateTag.SENDING })
+                val executes = withTimeout(TIMEOUT_MS) {
+                    while (harness.transport().framesOfType("command.execute").size != 2) delay(1)
+                    harness.transport().framesOfType("command.execute")
+                }
+                assertEquals(
+                    listOf("create-worktree", "create-terminal"),
+                    executes.map { it.stringValue("commandId") },
+                )
+                assertTrue(executes.all { !it.containsKey("sessionId") })
+                assertEquals(
+                    listOf("create_worktree", "create_terminal"),
+                    executes.map { it.payloadReadOnly().stringValue("operation") },
+                )
+                assertEquals(2, harness.authority.enqueueCommits.get())
+                assertEquals(
+                    listOf("scope-a"),
+                    harness.composition.productProjection.value.scopes.map {
+                        it.materialized.scope.scopeId
+                    },
+                )
+                assertTrue(harness.composition.productProjection.value.sessions.isEmpty())
             } finally {
                 harness.authority.releaseEnqueue.complete(Unit)
                 harness.close()
@@ -1505,7 +1538,7 @@ class RelayV2BaseRuntimeCompositionTest {
             assertEquals("kill-command", execute.stringValue("commandId"))
             assertEquals(1, harness.authority.enqueueCommits.get())
             assertEquals(1, harness.transport().framesOfType("command.execute").size)
-            assertEquals(listOf(product), harness.composition.sessions.value)
+            assertEquals(listOf(product), harness.composition.productProjection.value.sessions)
         } finally {
             harness.authority.releaseEnqueue.complete(Unit)
             harness.close()
@@ -1549,7 +1582,7 @@ class RelayV2BaseRuntimeCompositionTest {
                     harness.authority.outboxState().entries.single().state,
                 )
                 assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
-                assertTrue(harness.composition.sessions.value.isEmpty())
+                assertTrue(harness.composition.productProjection.value.sessions.isEmpty())
             } finally {
                 harness.authority.releaseEnqueue.complete(Unit)
                 harness.close()
@@ -1580,7 +1613,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 "projection-disconnect",
                 withTimeout(TIMEOUT_MS) { disconnect.await() }.barrierId,
             )
-            assertTrue(harness.composition.sessions.value.isEmpty())
+            assertTrue(harness.composition.productProjection.value.sessions.isEmpty())
         } finally {
             projectionGate.release.complete(Unit)
             harness.close()
@@ -2432,6 +2465,7 @@ class RelayV2BaseRuntimeCompositionTest {
         beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
         afterRetryableFailureAdmissionDetached: () -> Unit = {},
         beforeOutboxRead: suspend (Int) -> Unit = {},
+        includeMaterializedSession: Boolean = true,
         transportOpenFailure: Throwable? = null,
         afterActorConnectAdmissionHandoff: () -> Unit = {},
         agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
@@ -2443,7 +2477,12 @@ class RelayV2BaseRuntimeCompositionTest {
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
-        val authority = FakeDurableAuthority(outbox, outboxReadFailure, beforeOutboxRead)
+        val authority = FakeDurableAuthority(
+            outbox,
+            outboxReadFailure,
+            beforeOutboxRead,
+            includeMaterializedSession,
+        )
         val factory = FakeTransportFactory(transportOpenFailure)
         val profile = RelayV2Profile(
             profileId = PROFILE_ID,
@@ -3114,6 +3153,7 @@ class RelayV2BaseRuntimeCompositionTest {
         initialOutbox: RelayV2OutboxState,
         private val outboxReadFailure: Throwable?,
         private val beforeOutboxRead: suspend (Int) -> Unit,
+        private val includeMaterializedSession: Boolean,
     ) : RelayV2StateSyncAuthority,
         RelayV2OutboxRuntimeAuthority,
         RelayV2OutboxEnqueueAuthority,
@@ -3178,9 +3218,21 @@ class RelayV2BaseRuntimeCompositionTest {
             outbox = replacement
         }
 
+        override suspend fun readMaterializedScopeCuts(
+            namespace: RelayV2StateNamespace,
+        ): List<RelayV2MaterializedScopeReadCut> = listOf(materializedScope(namespace))
+
+        override suspend fun readMaterializedScopeCut(
+            namespace: RelayV2StateNamespace,
+            scopeId: String,
+        ): RelayV2MaterializedScopeReadCut? = materializedScope(namespace).takeIf {
+            it.scope.scopeId == scopeId
+        }
+
         override suspend fun readMaterializedSessionCuts(
             namespace: RelayV2StateNamespace,
-        ): List<RelayV2MaterializedSessionReadCut> = listOf(materializedSession(namespace))
+        ): List<RelayV2MaterializedSessionReadCut> =
+            if (includeMaterializedSession) listOf(materializedSession(namespace)) else emptyList()
 
         override suspend fun readMaterializedSessionCut(
             namespace: RelayV2StateNamespace,
@@ -3189,7 +3241,9 @@ class RelayV2BaseRuntimeCompositionTest {
         ): RelayV2MaterializedSessionReadCut? {
             materializedSessionCutReads.incrementAndGet()
             return materializedSession(namespace).takeIf {
-                it.session.scopeId == scopeId && it.session.sessionId == sessionId
+                includeMaterializedSession &&
+                    it.session.scopeId == scopeId &&
+                    it.session.sessionId == sessionId
             }
         }
 
@@ -3237,9 +3291,9 @@ class RelayV2BaseRuntimeCompositionTest {
             }
         }
 
-        private fun materializedSession(
+        private fun materializedScope(
             namespace: RelayV2StateNamespace,
-        ): RelayV2MaterializedSessionReadCut {
+        ): RelayV2MaterializedScopeReadCut {
             check(namespace == RelayV2StateNamespace(
                 profileId = PROFILE_ID,
                 principalId = PRINCIPAL_ID,
@@ -3253,14 +3307,27 @@ class RelayV2BaseRuntimeCompositionTest {
                 kind = RelayV2ScopeKind.LOCAL,
                 reachability = RelayV2ScopeReachability.ONLINE,
             )
-            return RelayV2MaterializedSessionReadCut(
+            return RelayV2MaterializedScopeReadCut(
                 namespace = namespace,
                 cursor = RelayV2AppliedCursor(HOST_EPOCH, "91"),
                 scopesRevision = "13",
                 scope = scope,
                 sessionsRevision = "13",
+            )
+        }
+
+        private fun materializedSession(
+            namespace: RelayV2StateNamespace,
+        ): RelayV2MaterializedSessionReadCut {
+            val scope = materializedScope(namespace)
+            return RelayV2MaterializedSessionReadCut(
+                namespace = namespace,
+                cursor = scope.cursor,
+                scopesRevision = scope.scopesRevision,
+                scope = scope.scope,
+                sessionsRevision = scope.sessionsRevision,
                 session = RelayV2SessionResource(
-                    scopeId = scope.scopeId,
+                    scopeId = scope.scope.scopeId,
                     sessionId = "session-a",
                     kind = RelayV2SessionKind.WORKTREE,
                     displayName = "Session A",

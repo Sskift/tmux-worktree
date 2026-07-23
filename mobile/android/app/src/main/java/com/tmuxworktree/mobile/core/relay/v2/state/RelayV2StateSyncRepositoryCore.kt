@@ -6,6 +6,20 @@ import java.security.MessageDigest
 import java.util.Base64
 import kotlin.math.max
 
+internal data class RelayV2MaterializedScopeReadCut(
+    val namespace: RelayV2StateNamespace,
+    val cursor: RelayV2AppliedCursor,
+    val scopesRevision: String,
+    val scope: RelayV2ScopeResource,
+    val sessionsRevision: String,
+) {
+    init {
+        require(cursor.hostEpoch == namespace.hostEpoch)
+        requireRelayV2Counter(scopesRevision)
+        requireRelayV2Counter(sessionsRevision)
+    }
+}
+
 internal data class RelayV2MaterializedSessionReadCut(
     val namespace: RelayV2StateNamespace,
     val cursor: RelayV2AppliedCursor,
@@ -24,6 +38,15 @@ internal data class RelayV2MaterializedSessionReadCut(
 
 /** Exact committed Session projection consumed only behind an actor-issued current lease. */
 internal interface RelayV2MaterializedSessionReadAuthority {
+    suspend fun readMaterializedScopeCuts(
+        namespace: RelayV2StateNamespace,
+    ): List<RelayV2MaterializedScopeReadCut>
+
+    suspend fun readMaterializedScopeCut(
+        namespace: RelayV2StateNamespace,
+        scopeId: String,
+    ): RelayV2MaterializedScopeReadCut?
+
     suspend fun readMaterializedSessionCuts(
         namespace: RelayV2StateNamespace,
     ): List<RelayV2MaterializedSessionReadCut>
@@ -47,6 +70,117 @@ internal class RelayV2StateSyncRepositoryCore(
     private val store: RelayV2StateStore,
 ) : RelayV2StateSyncAuthority,
     RelayV2MaterializedSessionReadAuthority {
+    /** Reads committed Scope resources independently of whether they currently contain Sessions. */
+    override suspend fun readMaterializedScopeCuts(
+        namespace: RelayV2StateNamespace,
+    ): List<RelayV2MaterializedScopeReadCut> = store.transaction {
+        val storedAuthority = authority(namespace)
+        val storedScopes = scopes(namespace)
+        val storedSessions = sessions(namespace)
+        if (storedAuthority == null) {
+            check(storedScopes.isEmpty() && storedSessions.isEmpty()) {
+                "Relay v2 materialized projection exists without authority"
+            }
+            return@transaction emptyList()
+        }
+        check(storedAuthority.namespace == namespace) {
+            "Relay v2 materialized projection crossed authority namespace"
+        }
+        storedAuthority.validatedPendingRelease()
+        val cursorEventSeq = storedAuthority.cursorEventSeq
+        val scopesRevision = storedAuthority.scopesRevision
+        check((cursorEventSeq == null) == (scopesRevision == null)) {
+            "Relay v2 committed cursor and scopes revision disagree"
+        }
+        if (cursorEventSeq == null) {
+            check(storedAuthority.phase == RelayV2StoredSyncPhase.RESYNCING) {
+                "Relay v2 LIVE authority has no committed materialized cut"
+            }
+            check(storedScopes.isEmpty() && storedSessions.isEmpty()) {
+                "Relay v2 materialized projection exists without a committed cut"
+            }
+            return@transaction emptyList()
+        }
+        val committedScopesRevision = checkNotNull(scopesRevision)
+        requireRelayV2Counter(cursorEventSeq)
+        requireRelayV2Counter(committedScopesRevision)
+        val materialized = storedScopes.map { storedScope ->
+            check(storedScope.namespace == namespace) {
+                "Relay v2 materialized scope crossed its exact namespace"
+            }
+            RelayV2MaterializedScopeReadCut(
+                namespace = namespace,
+                cursor = RelayV2AppliedCursor(namespace.hostEpoch, cursorEventSeq),
+                scopesRevision = committedScopesRevision,
+                scope = storedScope.item,
+                sessionsRevision = storedScope.sessionsRevision,
+            )
+        }
+        val scopeIds = materialized.map { it.scope.scopeId }.toSet()
+        check(scopeIds.size == materialized.size) {
+            "Relay v2 materialized projection contains duplicate scopes"
+        }
+        storedSessions.forEach { storedSession ->
+            check(storedSession.namespace == namespace) {
+                "Relay v2 materialized session crossed its exact namespace"
+            }
+            check(storedSession.item.scopeId in scopeIds) {
+                "Relay v2 materialized session is orphaned from its scope"
+            }
+        }
+        materialized.sortedBy { it.scope.scopeId }
+    }
+
+    /** Reads one exact committed Scope cut without requiring any Session row. */
+    override suspend fun readMaterializedScopeCut(
+        namespace: RelayV2StateNamespace,
+        scopeId: String,
+    ): RelayV2MaterializedScopeReadCut? {
+        requireRelayV2Id(scopeId)
+        return store.transaction {
+            val storedAuthority = authority(namespace)
+            val storedScope = scope(namespace, scopeId)
+            if (storedAuthority == null) {
+                check(storedScope == null) {
+                    "Relay v2 materialized scope exists without authority"
+                }
+                return@transaction null
+            }
+            check(storedAuthority.namespace == namespace) {
+                "Relay v2 materialized scope crossed authority namespace"
+            }
+            storedAuthority.validatedPendingRelease()
+            val cursorEventSeq = storedAuthority.cursorEventSeq
+            val scopesRevision = storedAuthority.scopesRevision
+            check((cursorEventSeq == null) == (scopesRevision == null)) {
+                "Relay v2 committed cursor and scopes revision disagree"
+            }
+            if (cursorEventSeq == null) {
+                check(storedAuthority.phase == RelayV2StoredSyncPhase.RESYNCING) {
+                    "Relay v2 LIVE authority has no committed materialized cut"
+                }
+                check(storedScope == null) {
+                    "Relay v2 materialized scope exists without a committed cut"
+                }
+                return@transaction null
+            }
+            val committedScopesRevision = checkNotNull(scopesRevision)
+            requireRelayV2Counter(cursorEventSeq)
+            requireRelayV2Counter(committedScopesRevision)
+            val exactScope = storedScope ?: return@transaction null
+            check(exactScope.namespace == namespace && exactScope.item.scopeId == scopeId) {
+                "Relay v2 materialized scope crossed its exact identity"
+            }
+            RelayV2MaterializedScopeReadCut(
+                namespace = namespace,
+                cursor = RelayV2AppliedCursor(namespace.hostEpoch, cursorEventSeq),
+                scopesRevision = committedScopesRevision,
+                scope = exactScope.item,
+                sessionsRevision = exactScope.sessionsRevision,
+            )
+        }
+    }
+
     /** Reads the complete committed Session projection for one exact durable namespace. */
     override suspend fun readMaterializedSessionCuts(
         namespace: RelayV2StateNamespace,
