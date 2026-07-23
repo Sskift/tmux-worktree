@@ -318,6 +318,21 @@ export interface RelayV2BrokerAuthControlAuthority {
   ): RelayV2AuthControlDecision | Promise<RelayV2AuthControlDecision>;
 }
 
+/** host.auth_expiring is due exactly once per credential at exp-60s. */
+const RELAY_V2_HOST_AUTH_EXPIRING_WARNING_LEAD_MS = 60_000;
+
+export type RelayV2BrokerHostAuthExpiringWarningResult = RelayV2BrokerResult & {
+  readonly outcome:
+    | "emitted"
+    | "deferred"
+    | "not_due"
+    | "stale"
+    | "expired"
+    /** Single-carrier terminal close (e.g. control backpressure 1013), never a composition seal. */
+    | "closed"
+    | "fail_closed";
+};
+
 export interface RelayV2BrokerResult {
   /** True only when the input was admitted to broker-owned bounded state. */
   accepted: boolean;
@@ -328,6 +343,11 @@ export interface RelayV2BrokerResult {
    */
   actions: RelayV2BrokerAction[];
   error?: RelayV2StructuredError;
+  /**
+   * Internal non-wire marker, set only when a serialized host.reauthenticate
+   * commit replaced the carrier's exact auth context. Never encoded.
+   */
+  hostAuthorizationReplaced?: boolean;
 }
 
 /**
@@ -423,6 +443,8 @@ export interface RelayV2LiveAuthorizationCommitReceipt {
 export type RelayV2BrokerConnectionAccessExpiryResult = Readonly<
   | {
       outcome: "active";
+      /** Closed credential identity captured from the installed authorization. */
+      jti: string;
       /** Captured only from BrokerCore's installed authorization. */
       expiresAtMs: number;
     }
@@ -543,6 +565,12 @@ type CarrierState = {
     deliveryId: string;
     baseDirectoryRevision: bigint;
     previousTransportId: string | null;
+  } | null;
+  /** Once-per-credential host.auth_expiring marker; written only post-enqueue. */
+  authExpiringWarning: {
+    jti: string;
+    expiresAtMs: number;
+    state: "deferred" | "emitted";
   } | null;
   controlQueue: QueuedCarrierFrame[];
   dataQueues: Map<string, QueuedCarrierFrame[]>;
@@ -1102,6 +1130,7 @@ export class RelayV2BrokerCore {
       connectorId: null,
       hello: null,
       registration: null,
+      authExpiringWarning: null,
       controlQueue: [],
       dataQueues: new Map(),
       routeIds: new Set(),
@@ -1406,6 +1435,7 @@ export class RelayV2BrokerCore {
       if (!expired) {
         return Object.freeze({
           outcome: "active",
+          jti: current.authContext.jti,
           expiresAtMs: current.authContext.expiresAtMs,
         });
       }
@@ -1420,6 +1450,7 @@ export class RelayV2BrokerCore {
       if (!expired) {
         return Object.freeze({
           outcome: "active",
+          jti: current.authContext.jti,
           expiresAtMs: current.authContext.expiresAtMs,
         });
       }
@@ -1428,6 +1459,98 @@ export class RelayV2BrokerCore {
     return this.liveAuthCompositionLatched
       ? Object.freeze({ outcome: "fail_closed" })
       : Object.freeze({ outcome: "expired" });
+  }
+
+  /**
+   * Serialized exact-incarnation host auth-expiring warning cut. The Broker
+   * owns the trusted clock, the credential fields and the carrier control
+   * queue; the caller only proves the exact connection cut plus the jti and
+   * expiresAtMs it armed. Any drift is stale and the caller must fail closed.
+   * The once marker is written only after the control frame is admitted to
+   * the queue; an uncommitted host.registered defers to the delivery-ACK
+   * commit path below, which replays the same helper.
+   */
+  recheckHostAuthExpiringWarning(
+    connectionId: string,
+    connectionIncarnation: string,
+    expectedJti: string,
+    expectedExpiresAtMs: number,
+  ): RelayV2BrokerHostAuthExpiringWarningResult {
+    if (this.liveAuthCompositionLatched) {
+      return Object.freeze({ outcome: "fail_closed", accepted: false, actions: [] });
+    }
+    const stale = (): RelayV2BrokerHostAuthExpiringWarningResult => Object.freeze({
+      outcome: "stale",
+      accepted: false,
+      actions: [],
+    });
+    const carrier = this.carriers.get(connectionId);
+    if (
+      !carrier
+      || !isIdentifier(expectedJti)
+      || !Number.isSafeInteger(expectedExpiresAtMs)
+      || expectedExpiresAtMs < 0
+      || carrier.connectionIncarnation !== connectionIncarnation
+      || carrier.authorizationState !== "active"
+      || carrier.authContext.jti !== expectedJti
+      || carrier.authContext.expiresAtMs !== expectedExpiresAtMs
+    ) return stale();
+
+    let expired: boolean;
+    try {
+      expired = this.isAuthorizationExpired(carrier.authContext);
+    } catch {
+      this.latchCredentialAuthorityUnavailable();
+      return Object.freeze({ outcome: "fail_closed", accepted: false, actions: [] });
+    }
+    if (this.liveAuthCompositionLatched) {
+      return Object.freeze({ outcome: "fail_closed", accepted: false, actions: [] });
+    }
+    const current = this.carriers.get(connectionId);
+    if (
+      current !== carrier
+      || current.connectionIncarnation !== connectionIncarnation
+      || current.authorizationState !== "active"
+      || current.authContext.jti !== expectedJti
+      || current.authContext.expiresAtMs !== expectedExpiresAtMs
+    ) return stale();
+    // The exact expiry deadline cut owns fencing an expired credential.
+    if (expired) {
+      return Object.freeze({ outcome: "expired", accepted: false, actions: [] });
+    }
+    if (this.now() < expectedExpiresAtMs - RELAY_V2_HOST_AUTH_EXPIRING_WARNING_LEAD_MS) {
+      return Object.freeze({ outcome: "not_due", accepted: false, actions: [] });
+    }
+    const marker = carrier.authExpiringWarning;
+    if (
+      marker?.state === "emitted"
+      && marker.jti === expectedJti
+      && marker.expiresAtMs === expectedExpiresAtMs
+    ) {
+      return Object.freeze({ outcome: "emitted", accepted: true, actions: [] });
+    }
+    if (carrier.status !== "active" || !carrier.connectorId) {
+      carrier.authExpiringWarning = {
+        jti: expectedJti,
+        expiresAtMs: expectedExpiresAtMs,
+        state: "deferred",
+      };
+      return Object.freeze({ outcome: "deferred", accepted: true, actions: [] });
+    }
+    if (this.enqueueHostAuthExpiringWarning(carrier, expectedJti, expectedExpiresAtMs)) {
+      return Object.freeze({ outcome: "emitted", accepted: true, actions: [] });
+    }
+    return Object.freeze({
+      outcome: "closed",
+      accepted: false,
+      actions: [Object.freeze({
+        kind: "close_host",
+        transportId: carrier.transportId,
+        connectionIncarnation: carrier.connectionIncarnation,
+        closeCode: 1013,
+        reason: "carrier_control_backpressure",
+      })],
+    });
   }
 
   /**
@@ -1808,6 +1931,7 @@ export class RelayV2BrokerCore {
       this.discardCarrier(previous);
       this.carriers.delete(previous.transportId);
     }
+    this.flushDeferredHostAuthExpiringWarning(carrier, actions);
     return { accepted: true, actions };
   }
 
@@ -2861,6 +2985,7 @@ export class RelayV2BrokerCore {
       return {
         accepted: true,
         actions: this.enqueueAuthControlResponse(carrier, response),
+        hostAuthorizationReplaced: type === "host.reauthenticate",
       };
     } catch {
       if (signal?.aborted) {
@@ -4177,6 +4302,64 @@ export class RelayV2BrokerCore {
       closeCode: 1013,
       reason: "carrier_control_backpressure",
     }];
+  }
+
+  /**
+   * Admits the exact host.auth_expiring control frame through the carrier
+   * control queue (outputReady/producer-generation fences wake the Host
+   * pump). The once marker is written only after a successful enqueue.
+   */
+  private enqueueHostAuthExpiringWarning(
+    carrier: CarrierState,
+    jti: string,
+    expiresAtMs: number,
+  ): boolean {
+    if (!carrier.connectorId) return false;
+    const frame = this.checkedCarrierFrame({
+      carrierVersion: 1,
+      type: "host.auth_expiring",
+      connectorId: carrier.connectorId,
+      payload: {
+        grantId: carrier.authContext.grantId,
+        expiresAtMs,
+        // refreshRecommendedAtMs is exactly expiresAtMs - 5 minutes.
+        refreshRecommendedAtMs: expiresAtMs - 300_000,
+      },
+    });
+    if (!this.enqueueCarrierControl(carrier, frame, null)) return false;
+    carrier.authExpiringWarning = { jti, expiresAtMs, state: "emitted" };
+    return true;
+  }
+
+  /**
+   * Replays the warning helper after the host.registered delivery ACK has
+   * committed the carrier to active. Only an exact-credential deferred
+   * marker is replayed; anything else is dropped, never retried inline.
+   */
+  private flushDeferredHostAuthExpiringWarning(
+    carrier: CarrierState,
+    actions: RelayV2BrokerAction[],
+  ): void {
+    const marker = carrier.authExpiringWarning;
+    if (!marker || marker.state !== "deferred") return;
+    if (
+      carrier.authorizationState !== "active"
+      || carrier.authContext.jti !== marker.jti
+      || carrier.authContext.expiresAtMs !== marker.expiresAtMs
+      || this.isAuthorizationExpired(carrier.authContext)
+    ) {
+      carrier.authExpiringWarning = null;
+      return;
+    }
+    if (this.enqueueHostAuthExpiringWarning(carrier, marker.jti, marker.expiresAtMs)) return;
+    carrier.authExpiringWarning = null;
+    actions.push({
+      kind: "close_host",
+      transportId: carrier.transportId,
+      connectionIncarnation: carrier.connectionIncarnation,
+      closeCode: 1013,
+      reason: "carrier_control_backpressure",
+    });
   }
 
   private checkedCarrierFrame(frame: RelayV2JsonObject): RelayV2JsonObject {

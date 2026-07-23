@@ -846,6 +846,7 @@ implements RelayV2BrokerHostWssOwnerSession {
     private readonly expiryOwner: RelayV2BrokerAuthorizationExpiryDeadlineOwner,
     private readonly closeRegistration: RelayV2BrokerTransportSocketRegistration,
     private readonly producerRegistration: RelayV2BrokerProducerRegistration,
+    private readonly serializeBrokerCall: <T>(run: () => T) => T | Promise<T>,
   ) {
     this.transportId = producerRegistration.target.transportId;
     this.connectionIncarnation = closeRegistration.connectionIncarnation;
@@ -872,7 +873,43 @@ implements RelayV2BrokerHostWssOwnerSession {
       "host",
       this.transportId,
       this.connectionIncarnation,
+      {
+        emitHostAuthExpiring: (jti: string, expiresAtMs: number) => (
+          this.emitHostAuthExpiring(jti, expiresAtMs)
+        ),
+      },
     );
+  }
+
+  private emitHostAuthExpiring(jti: string, expiresAtMs: number): Promise<string> {
+    return Promise.resolve(this.serializeBrokerCall(() => {
+      let outcome = "fail_closed";
+      const receipt = this.runBrokerCall(() => {
+        const result = this.broker.recheckHostAuthExpiringWarning(
+          this.transportId,
+          this.connectionIncarnation,
+          jti,
+          expiresAtMs,
+        );
+        outcome = result.outcome;
+        return result;
+      });
+      if (receipt === "applied") return outcome;
+      // Exact post-receipt lifecycle recheck: only the normal
+      // beginClose/disconnect window maps to single-carrier closed. An
+      // open/current rejection means a Core/authority/settlement throw
+      // and must fail closed; a Core-decided stale already arrives inside
+      // an applied result and needs no receipt guessing.
+      if (this.closingForWarning()) return "closed";
+      throw new Error("Relay v2 Broker host auth-expiring warning was rejected");
+    }));
+  }
+
+  private closingForWarning(): boolean {
+    return this.disconnected
+      || this.producerClosing
+      || this.terminalCleaned
+      || !this.attached;
   }
 
   async receiveHostFrame(
@@ -893,9 +930,16 @@ implements RelayV2BrokerHostWssOwnerSession {
       prepared.abandon();
       throw error;
     }
-    return prepared.settle(result, (settled, handoff) => (
+    const receipt = prepared.settle(result, (settled, handoff) => (
       this.settleBrokerResult(settled, handoff)
     ));
+    if (receipt === "applied" && result.hostAuthorizationReplaced) {
+      // Same serialized turn as the reauth commit: re-observe the exact
+      // credential identity so expiry and warning timers re-arm now instead
+      // of waiting for the previous exact-exp timer.
+      this.expiry?.refresh();
+    }
+    return receipt;
   }
 
   drainHostCarrier(options: Readonly<{
@@ -1194,6 +1238,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
           this.expiryOwner,
           closeRegistration,
           producerRegistration,
+          (run) => this.serialize(run),
         );
       },
     });

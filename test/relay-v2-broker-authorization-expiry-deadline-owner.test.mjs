@@ -80,10 +80,10 @@ function publicBytes(frame) {
   return codec.encodeRelayV2WebSocketFrame("public", frame);
 }
 
-async function registerHost(core, transportId) {
+async function registerHost(core, transportId, connectionIncarnation) {
   core.attachHostCarrier(transportId, authContext("host", {
     jti: `${transportId}-jti`,
-  }));
+  }), connectionIncarnation);
   const hello = {
     carrierVersion: 1,
     type: "host.hello",
@@ -165,6 +165,7 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
     const cuts = [];
     core = new broker.RelayV2BrokerCore({
       now: () => absolute.now,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
       onLiveAuthorizationClose(signal) {
         cuts.push(["close_signal", signal.reason]);
         coordinator.handleLiveAuthorizationClose(signal);
@@ -256,11 +257,11 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
     void oldDrain.then(() => { oldDrained = true; });
     const winner = owner.register("client", "reused-id", "winner-incarnation");
     assert.equal(pending.length, 2);
-    pending[0].resolve({ outcome: "active", expiresAtMs: NOW_MS + 10 });
+    pending[0].resolve({ outcome: "active", jti: "jti-old", expiresAtMs: NOW_MS + 10 });
     await oldDrain;
     assert.equal(oldDrained, true);
     assert.equal(absolute.scheduled.size, 0, "retired cut cannot arm a deadline");
-    pending[1].resolve({ outcome: "active", expiresAtMs: NOW_MS + 20 });
+    pending[1].resolve({ outcome: "active", jti: "jti-winner", expiresAtMs: NOW_MS + 20 });
     await flushTurns();
     assert.deepEqual(
       [...absolute.scheduled.values()].map((item) => item.atMs),
@@ -273,7 +274,7 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
     const replacement = owner.register("client", "reused-id", "replacement-incarnation");
     assert.equal(pending.length, 4);
     pending[2].resolve({ outcome: "expired" });
-    pending[3].resolve({ outcome: "active", expiresAtMs: NOW_MS + 40 });
+    pending[3].resolve({ outcome: "active", jti: "jti-replacement", expiresAtMs: NOW_MS + 40 });
     await flushTurns();
     assert.deepEqual(
       [...absolute.scheduled.values()].map((item) => item.atMs),
@@ -304,7 +305,7 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
           maximumCutDepth = Math.max(maximumCutDepth, cutDepth);
           cutCalls += 1;
           cutDepth -= 1;
-          return { outcome: "active", expiresAtMs: NOW_MS + cutCalls };
+          return { outcome: "active", jti: `jti-${cutCalls}`, expiresAtMs: NOW_MS + cutCalls };
         },
         failClosed() {
           failClosedCalls += 1;
@@ -340,7 +341,7 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
 
     let proxyTrapCalls = 0;
     let proxyFailClosedCalls = 0;
-    const proxyResult = new Proxy({ outcome: "active", expiresAtMs: NOW_MS + 1 }, {
+    const proxyResult = new Proxy({ outcome: "active", jti: "jti-proxy", expiresAtMs: NOW_MS + 1 }, {
       ownKeys() {
         proxyTrapCalls += 1;
         throw new Error("result descriptor trap must not run");
@@ -363,5 +364,396 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
     await proxyRegistration.unregister();
     await proxyOwner.close();
     assert.equal(proxyTrapCalls, 0);
+  });
+
+  await t.test("host warning emits via control queue exactly once per credential", async () => {
+    const absolute = new AbsoluteScheduler();
+    const core = new broker.RelayV2BrokerCore({ now: () => absolute.now });
+    await registerHost(core, "host-warning-emitted", "warning-emitted-incarnation");
+    const expiresAtMs = NOW_MS + 3_600_000;
+    const emits = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: (kind, id, incarnation) => (
+          core.recheckConnectionAccessExpiry(kind, id, incarnation)
+        ),
+        failClosed: () => core.liveAuthorizationFencePort.failClosed(),
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register(
+      "host",
+      "host-warning-emitted",
+      "warning-emitted-incarnation",
+      {
+        emitHostAuthExpiring: (jti, exp) => {
+          emits.push([jti, exp]);
+          return core.recheckHostAuthExpiringWarning(
+            "host-warning-emitted",
+            "warning-emitted-incarnation",
+            jti,
+            exp,
+          ).outcome;
+        },
+      },
+    );
+    await flushTurns();
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [expiresAtMs - 60_000, expiresAtMs],
+      "exp-60s warning and exact expiry share the entry scheduler",
+    );
+
+    absolute.now = expiresAtMs - 60_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(emits, [["host-warning-emitted-jti", expiresAtMs]]);
+    const [delivery] = core.drainHostCarrier("host-warning-emitted", { maxFrames: 1 });
+    assert.equal(delivery.frame.type, "host.auth_expiring");
+    assert.deepEqual(delivery.frame.payload, {
+      grantId: "host-grant",
+      expiresAtMs,
+      refreshRecommendedAtMs: expiresAtMs - 300_000,
+    });
+    assert.equal(core.acknowledgeHostDelivery(
+      "host-warning-emitted",
+      delivery.deliveryId,
+    ).accepted, true);
+
+    assert.equal(
+      core.recheckHostAuthExpiringWarning(
+        "host-warning-emitted",
+        "warning-emitted-incarnation",
+        "host-warning-emitted-jti",
+        expiresAtMs,
+      ).outcome,
+      "emitted",
+    );
+    assert.equal(
+      core.drainHostCarrier("host-warning-emitted", { maxFrames: 1 }).length,
+      0,
+      "the Core once marker never enqueues a second frame for one credential",
+    );
+    await registration.unregister();
+    await owner.close();
+  });
+
+  await t.test("uncommitted registration defers and the delivery ACK replays the helper", async () => {
+    const absolute = new AbsoluteScheduler();
+    const core = new broker.RelayV2BrokerCore({ now: () => absolute.now });
+    const transportId = "host-warning-deferred";
+    core.attachHostCarrier(
+      transportId,
+      authContext("host", { jti: `${transportId}-jti` }),
+      "warning-deferred-incarnation",
+    );
+    const hello = {
+      carrierVersion: 1,
+      type: "host.hello",
+      requestId: randomUUID(),
+      payload: {
+        hostId: HOST_ID,
+        hostEpoch: randomUUID(),
+        hostInstanceId: randomUUID(),
+        clientDialects: ["tw-relay.v2"],
+        capabilities: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+        limits: { maxFrameBytes: 1_048_576, terminalMaxFrameBytes: 65_536 },
+      },
+    };
+    const helloResult = await core.receiveHostFrame(transportId, carrierBytes(hello));
+    const registrationDelivery = helloResult.actions.find((action) => action.deliveryId);
+    assert.ok(registrationDelivery);
+
+    const expiresAtMs = NOW_MS + 3_600_000;
+    const outcomes = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: (kind, id, incarnation) => (
+          core.recheckConnectionAccessExpiry(kind, id, incarnation)
+        ),
+        failClosed: () => core.liveAuthorizationFencePort.failClosed(),
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register("host", transportId, "warning-deferred-incarnation", {
+      emitHostAuthExpiring: (jti, exp) => {
+        const outcome = core.recheckHostAuthExpiringWarning(
+          transportId,
+          "warning-deferred-incarnation",
+          jti,
+          exp,
+        ).outcome;
+        outcomes.push(outcome);
+        return outcome;
+      },
+    });
+    await flushTurns();
+
+    absolute.now = expiresAtMs - 60_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(outcomes, ["deferred"]);
+    assert.equal(
+      core.drainHostCarrier(transportId, { maxFrames: 1 }).length,
+      0,
+      "no frame is queued before host.registered commits",
+    );
+
+    assert.equal(
+      core.acknowledgeHostControlDelivery(transportId, registrationDelivery.deliveryId).accepted,
+      true,
+    );
+    const [delivery] = core.drainHostCarrier(transportId, { maxFrames: 1 });
+    assert.equal(delivery.frame.type, "host.auth_expiring");
+    assert.deepEqual(delivery.frame.payload, {
+      grantId: "host-grant",
+      expiresAtMs,
+      refreshRecommendedAtMs: expiresAtMs - 300_000,
+    });
+    await registration.unregister();
+    await owner.close();
+  });
+
+  await t.test("refresh re-arms earlier/same-exp replacements and stale old timers no-op", async () => {
+    const absolute = new AbsoluteScheduler();
+    let current = { outcome: "active", jti: "jti-1", expiresAtMs: NOW_MS + 600_000 };
+    let emitOutcome = "emitted";
+    let failClosedCalls = 0;
+    const emits = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: () => current,
+        failClosed() { failClosedCalls += 1; },
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register("host", "host-refresh", "incarnation-1", {
+      emitHostAuthExpiring: (jti, exp) => {
+        emits.push([jti, exp]);
+        return emitOutcome;
+      },
+    });
+    await flushTurns();
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 540_000, NOW_MS + 600_000],
+    );
+
+    current = { outcome: "active", jti: "jti-2", expiresAtMs: NOW_MS + 120_000 };
+    registration.refresh();
+    await flushTurns();
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 60_000, NOW_MS + 120_000],
+      "an earlier-exp replacement re-arms immediately, old timers are cancelled",
+    );
+
+    absolute.now = NOW_MS + 60_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(emits, [["jti-2", NOW_MS + 120_000]]);
+    assert.equal(failClosedCalls, 0);
+
+    current = { outcome: "active", jti: "jti-3", expiresAtMs: NOW_MS + 120_000 };
+    registration.refresh();
+    await flushTurns();
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(
+      emits,
+      [["jti-2", NOW_MS + 120_000], ["jti-3", NOW_MS + 120_000]],
+      "same-exp new jti is a new credential and warns again",
+    );
+
+    current = { outcome: "active", jti: "jti-4", expiresAtMs: NOW_MS + 180_000 };
+    registration.refresh();
+    await flushTurns();
+    emitOutcome = "stale";
+    current = { outcome: "active", jti: "jti-5", expiresAtMs: NOW_MS + 240_000 };
+    absolute.now = NOW_MS + 120_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.equal(failClosedCalls, 0, "replaced old-credential timer is a stale no-op");
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 180_000, NOW_MS + 240_000],
+      "a replacement uniformly re-arms exact expiry and warning from the new identity",
+    );
+    await registration.unregister();
+    await owner.close();
+
+    // Normal single-carrier termination never seals the composition.
+    for (const [name, terminalOutcome, recheck] of [
+      ["closed-control-backpressure", "closed", null],
+      ["expired-credential", "expired", null],
+      ["stale-disconnect-supersede-revoke", "stale", { outcome: "stale" }],
+    ]) {
+      const terminalScheduler = new AbsoluteScheduler();
+      let terminalCurrent = { outcome: "active", jti: "jti-t", expiresAtMs: NOW_MS + 600_000 };
+      let terminalFailClosed = 0;
+      const terminalOwner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+        serializedCutPort: {
+          recheckConnectionAccessExpiry: () => terminalCurrent,
+          failClosed() { terminalFailClosed += 1; },
+        },
+        scheduleAt: terminalScheduler.scheduleAt,
+      });
+      const terminalRegistration = terminalOwner.register("host", "host-t", "inc-t", {
+        emitHostAuthExpiring: () => terminalOutcome,
+      });
+      await flushTurns();
+      if (recheck) terminalCurrent = recheck;
+      terminalScheduler.now = NOW_MS + 540_000;
+      terminalScheduler.fireDue();
+      await flushTurns();
+      assert.equal(terminalFailClosed, 0, `${name} must not seal the composition`);
+      assert.equal(
+        terminalScheduler.scheduled.size,
+        0,
+        `${name} retires the entry and cancels both timers`,
+      );
+      await terminalRegistration.unregister();
+      await terminalOwner.close();
+    }
+  });
+
+  await t.test("refresh behind an in-flight admitted cut is serialized, never lost", async () => {
+    const absolute = new AbsoluteScheduler();
+    const pending = [];
+    let failClosedCalls = 0;
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: () => new Promise((resolve) => {
+          pending.push(resolve);
+        }),
+        failClosed() { failClosedCalls += 1; },
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register("host", "host-pending", "incarnation-p", {
+      emitHostAuthExpiring: () => "emitted",
+    });
+    registration.refresh();
+    assert.equal(pending.length, 1);
+    pending[0]({ outcome: "active", jti: "jti-p1", expiresAtMs: NOW_MS + 120_000 });
+    await flushTurns();
+    assert.equal(pending.length, 2, "the refresh re-admits after the settled cut");
+    pending[1]({ outcome: "active", jti: "jti-p2", expiresAtMs: NOW_MS + 240_000 });
+    await flushTurns();
+    assert.equal(failClosedCalls, 0);
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 180_000, NOW_MS + 240_000],
+      "only the freshest identity is armed, exactly once",
+    );
+    await registration.unregister();
+    await owner.close();
+  });
+
+  await t.test("a late old warning attempt result is a no-op after refresh", async () => {
+    const absolute = new AbsoluteScheduler();
+    let current = { outcome: "active", jti: "jti-a", expiresAtMs: NOW_MS + 600_000 };
+    let failClosedCalls = 0;
+    let emitPending = true;
+    const pendingEmits = [];
+    const emits = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: () => current,
+        failClosed() { failClosedCalls += 1; },
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register("host", "host-late", "incarnation-l", {
+      emitHostAuthExpiring: (jti, exp) => {
+        emits.push([jti, exp]);
+        if (!emitPending) return "emitted";
+        return new Promise((resolve, reject) => {
+          pendingEmits.push({ resolve, reject });
+        });
+      },
+    });
+    await flushTurns();
+    absolute.now = NOW_MS + 540_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(emits, [["jti-a", NOW_MS + 600_000]]);
+
+    current = { outcome: "active", jti: "jti-b", expiresAtMs: NOW_MS + 240_000 };
+    registration.refresh();
+    await flushTurns();
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 180_000, NOW_MS + 240_000],
+    );
+
+    pendingEmits[0].resolve("emitted");
+    await flushTurns();
+    assert.equal(failClosedCalls, 0, "late old-attempt result never seals");
+    assert.deepEqual(
+      emits,
+      [["jti-a", NOW_MS + 600_000]],
+      "late result does not re-emit or retire the replacement",
+    );
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 180_000, NOW_MS + 240_000],
+      "replacement timers survive the late result",
+    );
+
+    // A delayed REJECTION from a superseded attempt is equally a no-op.
+    current = { outcome: "active", jti: "jti-c", expiresAtMs: NOW_MS + 480_000 };
+    registration.refresh();
+    await flushTurns();
+    absolute.now = NOW_MS + 420_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(emits.at(-1), ["jti-c", NOW_MS + 480_000]);
+    current = { outcome: "active", jti: "jti-d", expiresAtMs: NOW_MS + 300_000 };
+    registration.refresh();
+    await flushTurns();
+    pendingEmits[1].reject(new Error("late transport failure"));
+    await flushTurns();
+    assert.equal(failClosedCalls, 0, "late old-attempt rejection never seals");
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [NOW_MS + 240_000, NOW_MS + 300_000],
+      "the freshest identity stays armed after the late rejection",
+    );
+
+    emitPending = false;
+    absolute.now = NOW_MS + 240_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(emits.at(-1), ["jti-d", NOW_MS + 300_000]);
+    assert.equal(failClosedCalls, 0);
+    await registration.unregister();
+    await owner.close();
+  });
+
+  await t.test("a current-attempt emit throw still seals the composition", async () => {
+    const absolute = new AbsoluteScheduler();
+    let failClosedCalls = 0;
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: () => (
+          { outcome: "active", jti: "jti-throw", expiresAtMs: NOW_MS + 600_000 }
+        ),
+        failClosed() { failClosedCalls += 1; },
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register("host", "host-throw", "incarnation-t", {
+      emitHostAuthExpiring: () => {
+        throw new Error("settlement failure");
+      },
+    });
+    await flushTurns();
+    absolute.now = NOW_MS + 540_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.equal(failClosedCalls, 1);
+    await registration.unregister();
+    await owner.close();
   });
 });

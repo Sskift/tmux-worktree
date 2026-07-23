@@ -931,3 +931,269 @@ test("host.hello handshake deadline: 4408 on timeout, only accepted host.hello c
     });
   }
 });
+
+test("host auth-expiring warning reaches the socket once per credential and reauth re-arms", async () => {
+  const now = { value: NOW_MS };
+  const scheduled = [];
+  const initialAuth = authContext();
+  const nextAuth = {
+    ...initialAuth,
+    jti: "reauth-shorter-jti",
+    expiresAtMs: NOW_MS + 3_570_000,
+  };
+  const shared = pump.createRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeUpgradedSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
+    brokerOptions: {
+      now: () => now.value,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+      authControlAuthority: {
+        handle(request) {
+          assert.equal(request.type, "host.reauthenticate");
+          return {
+            outcome: "success",
+            replayed: false,
+            nextAuthContext: nextAuth,
+            response: {
+              carrierVersion: 1,
+              type: "host.reauthenticated",
+              requestId: request.requestId,
+              connectorId: request.connectorId,
+              payload: {
+                grantId: nextAuth.grantId,
+                jti: nextAuth.jti,
+                expiresAtMs: nextAuth.expiresAtMs,
+                deduplicated: false,
+              },
+            },
+          };
+        },
+      },
+    },
+    authorizationExpiryScheduleAt: (atMs, callback) => {
+      const task = { atMs, callback, cancelled: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  const socket = new FakeUpgradedSocket({ synchronousSend: true });
+  const prepared = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: initialAuth,
+  });
+  assert.equal(prepared.outcome, "accept");
+  shared.hostWssRuntime.attachPreparedHostWss({
+    receipt: prepared.receipt,
+    alreadyUpgradedSocket: socket,
+  });
+  socket.emit("message", carrierFrame(hostHello()), false);
+  await settle();
+  assert.equal(socket.frame(0).type, "host.registered");
+  const connectorId = socket.frame(0).connectorId;
+
+  const firstWarningAt = initialAuth.expiresAtMs - 60_000;
+  const firstWarning = scheduled.find(
+    (task) => task.atMs === firstWarningAt && !task.cancelled,
+  );
+  assert.ok(firstWarning, "warning is armed at exp-60s from the closed cut");
+  now.value = firstWarningAt;
+  firstWarning.callback();
+  await settle();
+  const warningIndex = socket.sends.findIndex(
+    (_, index) => socket.frame(index).type === "host.auth_expiring",
+  );
+  assert.ok(warningIndex > 0, "the warning frame is written to the host socket");
+  assert.equal(socket.frame(warningIndex).payload.grantId, initialAuth.grantId);
+  assert.equal(socket.frame(warningIndex).payload.expiresAtMs, initialAuth.expiresAtMs);
+  assert.equal(
+    socket.frame(warningIndex).payload.refreshRecommendedAtMs,
+    initialAuth.expiresAtMs - 300_000,
+  );
+
+  socket.emit("message", carrierFrame({
+    carrierVersion: 1,
+    type: "host.reauthenticate",
+    requestId: randomUUID(),
+    connectorId,
+    payload: { accessToken: "twcap2.replacement" },
+  }), false);
+  await settle();
+  const live = scheduled.filter((task) => !task.cancelled).map((task) => task.atMs);
+  assert.deepEqual(
+    [...live].sort((a, b) => a - b),
+    [nextAuth.expiresAtMs - 60_000, nextAuth.expiresAtMs],
+    "a shorter-exp reauth re-arms warning and exact expiry in the same turn",
+  );
+
+  const sendsBeforeOldFire = socket.sends.length;
+  firstWarning.callback();
+  await settle();
+  assert.equal(
+    socket.sends.length,
+    sendsBeforeOldFire,
+    "the replaced old-identity warning is a no-op",
+  );
+
+  const replacementWarning = scheduled.find(
+    (task) => !task.cancelled && task.atMs === nextAuth.expiresAtMs - 60_000,
+  );
+  now.value = nextAuth.expiresAtMs - 60_000;
+  replacementWarning.callback();
+  await settle();
+  const replacementIndex = socket.sends.findIndex(
+    (_, index) => index > warningIndex && socket.frame(index).type === "host.auth_expiring",
+  );
+  assert.ok(replacementIndex > warningIndex, "the replacement credential warns again");
+  assert.equal(socket.frame(replacementIndex).payload.grantId, nextAuth.grantId);
+  assert.equal(socket.frame(replacementIndex).payload.expiresAtMs, nextAuth.expiresAtMs);
+  assert.equal(
+    socket.frame(replacementIndex).payload.refreshRecommendedAtMs,
+    nextAuth.expiresAtMs - 300_000,
+  );
+
+  socket.emit("close", 1000);
+  await shared.hostWssRuntime.closeAndDrain();
+});
+
+test("a warning due inside the beginClose/disconnect window maps closed and never seals", async () => {
+  const now = { value: NOW_MS };
+  const scheduled = [];
+  const shared = pump.createRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeUpgradedSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
+    brokerOptions: {
+      now: () => now.value,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
+    authorizationExpiryScheduleAt: (atMs, callback) => {
+      const task = { atMs, callback, cancelled: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  const firstSocket = new FakeUpgradedSocket();
+  const prepared = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext(),
+  });
+  assert.equal(prepared.outcome, "accept");
+  shared.hostWssRuntime.attachPreparedHostWss({
+    receipt: prepared.receipt,
+    alreadyUpgradedSocket: firstSocket,
+  });
+  firstSocket.emit("message", carrierFrame(hostHello()), false);
+  await settle();
+  assert.equal(firstSocket.frame(0).type, "host.registered");
+  firstSocket.sends[0].callback();
+  await settle();
+  const warningAt = NOW_MS + 3_600_000 - 60_000;
+  const warning = scheduled.find((task) => task.atMs === warningAt && !task.cancelled);
+  assert.ok(warning);
+
+  // Supersede runs beginClose+disconnect on the first connection but its
+  // native terminal evidence (the socket "close" event) is the drain gate
+  // and is never delivered, so terminalAndUnregister stays pending.
+  const secondSocket = new FakeUpgradedSocket({ synchronousSend: true });
+  const second = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext(),
+  });
+  assert.equal(second.outcome, "accept");
+  shared.hostWssRuntime.attachPreparedHostWss({
+    receipt: second.receipt,
+    alreadyUpgradedSocket: secondSocket,
+  });
+  secondSocket.emit("message", carrierFrame(hostHello()), false);
+  await settle();
+  assert.equal(secondSocket.frame(0).type, "host.registered");
+  assert.equal(firstSocket.frame(1).type, "host.superseded");
+  firstSocket.sends[1].callback();
+  await settle();
+  assert.ok(firstSocket.closes.length > 0, "the superseded connection entered beginClose");
+  assert.equal(
+    warning.cancelled,
+    false,
+    "the held terminal gate keeps the registration armed, so the fire really enters the lifecycle-rejected path",
+  );
+
+  now.value = warningAt;
+  warning.callback();
+  await settle();
+  assert.equal(
+    firstSocket.sends.filter((_, index) => (
+      firstSocket.frame(index).type === "host.auth_expiring"
+    )).length,
+    0,
+    "the close-window warning maps to closed before any enqueue",
+  );
+
+  const thirdSocket = new FakeUpgradedSocket({ synchronousSend: true });
+  const third = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext("other-host"),
+  });
+  assert.equal(third.outcome, "accept", "composition admits a new host after the close-window warning");
+  shared.hostWssRuntime.attachPreparedHostWss({
+    receipt: third.receipt,
+    alreadyUpgradedSocket: thirdSocket,
+  });
+  thirdSocket.emit("message", carrierFrame(hostHello("other-host")), false);
+  await settle();
+  assert.equal(thirdSocket.frame(0).type, "host.registered");
+  firstSocket.emit("close", 1000);
+  secondSocket.emit("close", 1000);
+  thirdSocket.emit("close", 1000);
+  await shared.hostWssRuntime.closeAndDrain();
+});
+
+test("an open/current warning emit failure seals the composition", async () => {
+  const now = { value: NOW_MS };
+  const scheduled = [];
+  let failClock = false;
+  let clockCalls = 0;
+  const shared = pump.createRelayV2BrokerSharedProducerRuntimeComposition({
+    hostWssTrustedSocketPrototype: FakeUpgradedSocket.prototype,
+    hostWssTrustedSocketBrand: trustedUpgradedSocketBrand,
+    brokerOptions: {
+      now: () => {
+        if (failClock) {
+          clockCalls += 1;
+          // The in-try expiry read stays numeric; the next trusted-clock
+          // read outside the try throws inside the Core cut.
+          if (clockCalls > 1) throw new Error("trusted clock failure");
+        }
+        return now.value;
+      },
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    },
+    authorizationExpiryScheduleAt: (atMs, callback) => {
+      const task = { atMs, callback, cancelled: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  const socket = new FakeUpgradedSocket({ synchronousSend: true });
+  const prepared = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext(),
+  });
+  assert.equal(prepared.outcome, "accept");
+  shared.hostWssRuntime.attachPreparedHostWss({
+    receipt: prepared.receipt,
+    alreadyUpgradedSocket: socket,
+  });
+  socket.emit("message", carrierFrame(hostHello()), false);
+  await settle();
+  assert.equal(socket.frame(0).type, "host.registered");
+  const warningAt = NOW_MS + 3_600_000 - 60_000;
+  const warning = scheduled.find((task) => task.atMs === warningAt && !task.cancelled);
+  assert.ok(warning);
+
+  now.value = warningAt;
+  failClock = true;
+  clockCalls = 0;
+  warning.callback();
+  await settle();
+
+  const late = shared.hostWssRuntime.prepareHostWss({
+    trustedAuthContext: authContext("other-host"),
+  });
+  assert.equal(late.outcome, "reject", "an open/current emit failure seals the composition");
+  socket.emit("close", 1000);
+  await shared.hostWssRuntime.closeAndDrain().catch(() => {});
+});

@@ -1670,7 +1670,7 @@ test("exact expiry cut fences only the current connection at the trusted-time bo
     "client",
     expiringClient.connectionId,
     expiringClient.connectionIncarnation,
-  ), { outcome: "active", expiresAtMs: NOW_MS + 2 });
+  ), { outcome: "active", jti: "client-exact-expiry-jti", expiresAtMs: NOW_MS + 2 });
   assert.equal(closeSignals.length, 0, "pre-expiry is a strict no-op");
 
   now = NOW_MS + 2;
