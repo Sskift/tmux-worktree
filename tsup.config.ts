@@ -25,6 +25,7 @@ export default defineConfig({
     "src/relay/v2/hostCredentialAtomicFileCell.ts",
     "src/relay/v2/hostCredentialAtomicFileCellNative.ts",
     "src/relay/v2/hostCredentialExchangeCoordinator.ts",
+    "src/relay/v2/hostReauthenticationLifecycleOwner.ts",
     "src/relay/v2/hostWssTransportLifecycle.ts",
     "src/relay/v2/hostConnectorCarrierAttemptAdapter.ts",
     "src/relay/v2/hostCapabilityReadiness.ts",
