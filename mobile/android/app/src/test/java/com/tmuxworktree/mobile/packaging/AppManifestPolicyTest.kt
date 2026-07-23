@@ -34,6 +34,31 @@ class AppManifestPolicyTest {
     }
 
     @Test
+    fun `enrollment deep link entrypoint is scoped to the tmuxworktree enroll authority`() {
+        val manifest = parseXml(appProjectDir.resolve("src/main/AndroidManifest.xml"))
+        val application = manifest.elements("application").single()
+        val v2Activity = application.elements("activity")
+            .single { it.androidAttribute("name") == ".V2Activity" }
+
+        val enrollFilters = v2Activity.intentFilters().filter { filter ->
+            filter.intentActions().contains(ACTION_VIEW)
+        }
+        val enrollFilter = enrollFilters.single()
+        assertTrue(enrollFilter.intentCategories().contains(CATEGORY_DEFAULT))
+        assertTrue(enrollFilter.intentCategories().contains(CATEGORY_BROWSABLE))
+
+        val data = enrollFilter.elements("data").single()
+        assertEquals("tmuxworktree", data.androidAttribute("scheme"))
+        assertEquals("enroll", data.androidAttribute("host"))
+        assertFalse(data.hasAttributeNS(ANDROID_NAMESPACE, "path"))
+        assertFalse(data.hasAttributeNS(ANDROID_NAMESPACE, "pathPrefix"))
+        assertFalse(data.hasAttributeNS(ANDROID_NAMESPACE, "pathPattern"))
+        assertFalse(data.hasAttributeNS(ANDROID_NAMESPACE, "pathSuffix"))
+        assertFalse(data.hasAttributeNS(ANDROID_NAMESPACE, "port"))
+        assertFalse(data.hasAttributeNS(ANDROID_NAMESPACE, "mimeType"))
+    }
+
+    @Test
     fun `backup and device transfer exclude all private app state`() {
         val manifest = parseXml(appProjectDir.resolve("src/main/AndroidManifest.xml"))
         val application = manifest.elements("application").single()
@@ -95,6 +120,12 @@ class AppManifestPolicyTest {
     private fun Element.androidAttribute(name: String): String =
         getAttributeNS(ANDROID_NAMESPACE, name)
 
+    private fun Element.intentFilters(): List<Element> =
+        (0 until childNodes.length)
+            .map { childNodes.item(it) }
+            .filterIsInstance<Element>()
+            .filter { it.tagName == "intent-filter" }
+
     private fun Element.intentActions(): Set<String> =
         elements("action").map { it.androidAttribute("name") }.toSet()
 
@@ -120,7 +151,10 @@ class AppManifestPolicyTest {
     private companion object {
         const val ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
         const val ACTION_MAIN = "android.intent.action.MAIN"
+        const val ACTION_VIEW = "android.intent.action.VIEW"
         const val CATEGORY_LAUNCHER = "android.intent.category.LAUNCHER"
+        const val CATEGORY_DEFAULT = "android.intent.category.DEFAULT"
+        const val CATEGORY_BROWSABLE = "android.intent.category.BROWSABLE"
 
         val PRIVATE_STORAGE_DOMAINS = setOf(
             "root",
