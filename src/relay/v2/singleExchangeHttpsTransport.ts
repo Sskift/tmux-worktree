@@ -4,6 +4,7 @@ import {
   type RequestOptions as NodeHttpsRequestOptions,
 } from "node:https";
 import { checkServerIdentity } from "node:tls";
+import { types as nodeUtilTypes } from "node:util";
 
 export interface RelayV2SingleExchangeHttpsTransportRequest {
   endpoint: string;
@@ -52,6 +53,125 @@ export type RelayV2SingleExchangeNodeHttpsRequest = (
   options: NodeHttpsRequestOptions,
   callback: (response: IncomingMessage) => void,
 ) => ClientRequest;
+
+/**
+ * One-attempt TLS material captured by an external trust/auth resolver. The
+ * values extend — never weaken — the pinned peer verification below.
+ */
+export interface RelayV2SingleExchangeNodeHttpsTlsOptions {
+  readonly ca?: readonly (string | Uint8Array)[];
+  readonly cert?: string | Uint8Array;
+  readonly key?: string | Uint8Array;
+}
+
+// Bounds on captured TLS material, chosen at the frozen outer-HTTPS magnitude
+// (httpsBodyBytes 16384): a private trust bundle for one exact endpoint holds
+// a small root/chain set and PEM/DER key material stays well under one body.
+const MAX_CA_ENTRIES = 8;
+const MAX_TLS_MATERIAL_BYTES = 16_384;
+const MAX_CA_TOTAL_BYTES = 32_768;
+
+function tlsMaterialBytes(value: string | Uint8Array): number {
+  return typeof value === "string" ? Buffer.byteLength(value, "utf8") : value.byteLength;
+}
+
+function captureTlsMaterial(
+  value: string | Uint8Array,
+): string | Uint8Array {
+  if (typeof value === "string") {
+    if (Buffer.byteLength(value, "utf8") > MAX_TLS_MATERIAL_BYTES) {
+      throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
+    }
+    return value;
+  }
+  if (value instanceof Uint8Array && !nodeUtilTypes.isProxy(value)) {
+    if (value.byteLength > MAX_TLS_MATERIAL_BYTES) {
+      throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
+    }
+    // Buffer.prototype.slice shares memory; always copy into an owned array.
+    return new Uint8Array(value);
+  }
+  throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
+}
+
+/**
+ * Snapshots TLS options exactly once. Every later check reads only the
+ * snapshot; no foreign property is read again.
+ */
+function captureTlsOptions(
+  value: RelayV2SingleExchangeNodeHttpsTlsOptions | undefined,
+): Readonly<{
+  ca?: readonly (string | Uint8Array)[];
+  cert?: string | Uint8Array;
+  key?: string | Uint8Array;
+}> {
+  const invalid = (): TypeError =>
+    new TypeError("Relay v2 single-exchange HTTPS TLS options are invalid");
+  if (value === undefined) return Object.freeze(Object.create(null));
+  if (!isRecord(value) || nodeUtilTypes.isProxy(value)) throw invalid();
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw invalid();
+  }
+  const allowed = ["ca", "cert", "key"];
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) {
+    throw invalid();
+  }
+  const snapshot: Record<string, unknown> = Object.create(null);
+  for (const key of keys as string[]) {
+    const descriptor = descriptors[key];
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) throw invalid();
+    snapshot[key] = descriptor.value;
+  }
+  const captured: {
+    ca?: readonly (string | Uint8Array)[];
+    cert?: string | Uint8Array;
+    key?: string | Uint8Array;
+  } = Object.create(null);
+  if (snapshot.ca !== undefined) {
+    if (!Array.isArray(snapshot.ca) || nodeUtilTypes.isProxy(snapshot.ca)) {
+      throw invalid();
+    }
+    const length = snapshot.ca.length;
+    if (length > MAX_CA_ENTRIES) throw invalid();
+    let caDescriptors: PropertyDescriptorMap;
+    try {
+      caDescriptors = Object.getOwnPropertyDescriptors(snapshot.ca);
+    } catch {
+      throw invalid();
+    }
+    const caKeys = Reflect.ownKeys(caDescriptors);
+    if (
+      caKeys.length !== length + 1
+      || caKeys.some((key) => {
+        if (key === "length") return false;
+        return typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key)
+          || Number(key) >= length;
+      })
+    ) throw invalid();
+    const authorities: (string | Uint8Array)[] = [];
+    let totalBytes = 0;
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = caDescriptors[String(index)];
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) throw invalid();
+      const authority = captureTlsMaterial(descriptor.value as string | Uint8Array);
+      totalBytes += tlsMaterialBytes(authority);
+      if (totalBytes > MAX_CA_TOTAL_BYTES) throw invalid();
+      authorities.push(authority);
+    }
+    captured.ca = Object.freeze(authorities);
+  }
+  if (snapshot.cert !== undefined) {
+    captured.cert = captureTlsMaterial(snapshot.cert as string | Uint8Array);
+  }
+  if (snapshot.key !== undefined) {
+    captured.key = captureTlsMaterial(snapshot.key as string | Uint8Array);
+  }
+  return Object.freeze(captured);
+}
 
 function transportFailure(
   code: RelayV2SingleExchangeHttpsErrorCode,
@@ -127,7 +247,9 @@ function nodeResponseHeaders(
 export function createRelayV2SingleExchangeNodeHttpsTransport(
   request: RelayV2SingleExchangeNodeHttpsRequest =
     nodeHttpsRequest as RelayV2SingleExchangeNodeHttpsRequest,
+  tls?: RelayV2SingleExchangeNodeHttpsTlsOptions,
 ): RelayV2SingleExchangeHttpsTransport {
+  const capturedTls = captureTlsOptions(tls);
   return {
     start(input): RelayV2SingleExchangeHttpsTransportExchange {
       let client: ClientRequest | undefined;
@@ -163,6 +285,15 @@ export function createRelayV2SingleExchangeNodeHttpsTransport(
             agent: false,
             rejectUnauthorized: true,
             checkServerIdentity,
+            ...(capturedTls.ca === undefined
+              ? {}
+              : { ca: capturedTls.ca as NodeHttpsRequestOptions["ca"] }),
+            ...(capturedTls.cert === undefined
+              ? {}
+              : { cert: capturedTls.cert as NodeHttpsRequestOptions["cert"] }),
+            ...(capturedTls.key === undefined
+              ? {}
+              : { key: capturedTls.key as NodeHttpsRequestOptions["key"] }),
           },
           (received) => {
             incoming = received;
