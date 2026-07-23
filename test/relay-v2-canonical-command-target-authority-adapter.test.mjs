@@ -445,3 +445,104 @@ test("uncertain acquire, send, or release is IN_DOUBT and never retried", async 
     });
   }
 });
+
+const queryTransportModule = await import(
+  "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js"
+);
+
+function localQueryPort(targetId = "canonical-local-rpc") {
+  return new queryTransportModule.RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [{ kind: "local", targetId, executable: "/usr/local/bin/tw" }],
+    runner: { spawn: () => { throw new Error("no spawn in claim tests"); } },
+  });
+}
+
+test("create target claim: same-generation exactly-once success, replay fails closed", async () => {
+  const queryPort = localQueryPort();
+  const order = [];
+  const p = ports({
+    createFence: () => order.push("create"),
+    h2Fence: () => order.push("h2"),
+  });
+  const wrapper = new targetModule.RelayV2CanonicalCreateTargetClaimAuthorityAdapterV1({
+    authority: p.createTargetAuthority,
+    claims: queryPort,
+  });
+  const resolver = resolverFor(p, { createTargetAuthority: wrapper });
+  const req = request("create_worktree");
+  const resolution = await resolver.resolve(req);
+  assert.equal(resolution.kind, "resolved");
+  const fence = {
+    schemaVersion: 1,
+    outcome: "positive",
+    authority: req.authority,
+    operation: req.operation,
+    expectedScopeId: req.scopeId,
+    expectedSessionId: req.sessionId,
+    target: structuredClone(resolution.target),
+    evidence: structuredClone(resolution.admissionFence),
+  };
+  resolver.fenceResolution({ hostEpoch: HOST_EPOCH }, req, fence);
+  assert.deepEqual(order, ["create", "h2"]);
+  assert.equal(p.calls.createFence.length, 1);
+
+  assert.throws(
+    () => resolver.fenceResolution({ hostEpoch: HOST_EPOCH }, req, fence),
+    /missing or already consumed/,
+  );
+  assert.equal(p.calls.createFence.length, 1);
+  assert.equal(p.calls.h2Fence.length, 1);
+
+  const second = await resolver.resolve(req);
+  assert.equal(second.kind, "resolved");
+  const tampered = structuredClone(fence);
+  tampered.target = structuredClone(second.target);
+  tampered.evidence = structuredClone(second.admissionFence);
+  tampered.evidence.commandProof.input.resourceTarget.processTarget.targetId = "other-target";
+  assert.throws(
+    () => resolver.fenceResolution({ hostEpoch: HOST_EPOCH }, req, tampered),
+    /crossed request or H2 authority|missing or already consumed/,
+  );
+  assert.equal(p.calls.h2Fence.length, 1);
+
+  const unconfigured = new targetModule.RelayV2CanonicalCreateTargetClaimAuthorityAdapterV1({
+    authority: p.createTargetAuthority,
+    claims: localQueryPort("unconfigured-target"),
+  });
+  const missed = await resolverFor(p, { createTargetAuthority: unconfigured }).resolve(req);
+  assert.equal(missed.kind, "unavailable");
+});
+
+test("process-target claim: foreign, replayed, and stale claims fail closed", () => {
+  const owner = localQueryPort();
+  const foreign = localQueryPort();
+
+  const foreignClaim = foreign.issueProcessTargetClaim("local", "canonical-local-rpc");
+  assert.throws(
+    () => owner.consumeProcessTargetClaim(foreignClaim, "local", "canonical-local-rpc"),
+    /TARGET_UNAVAILABLE/,
+  );
+  foreign.consumeProcessTargetClaim(foreignClaim, "local", "canonical-local-rpc");
+  assert.throws(
+    () => foreign.consumeProcessTargetClaim(foreignClaim, "local", "canonical-local-rpc"),
+    /TARGET_UNAVAILABLE/,
+  );
+
+  const mismatched = owner.issueProcessTargetClaim("local", "canonical-local-rpc");
+  assert.throws(
+    () => owner.consumeProcessTargetClaim(mismatched, "ssh", "canonical-local-rpc"),
+    /TARGET_UNAVAILABLE/,
+  );
+  owner.consumeProcessTargetClaim(mismatched, "local", "canonical-local-rpc");
+
+  const stale = owner.issueProcessTargetClaim("local", "canonical-local-rpc");
+  owner.beginContentAddressedTargetTransition();
+  assert.throws(
+    () => owner.consumeProcessTargetClaim(stale, "local", "canonical-local-rpc"),
+    /TARGET_UNAVAILABLE/,
+  );
+  assert.throws(
+    () => owner.issueProcessTargetClaim("local", "canonical-local-rpc"),
+    /TARGET_UNAVAILABLE/,
+  );
+});

@@ -192,6 +192,37 @@ implements RelayV2CanonicalTwRpcQueryProcessRunner, RelayV2CanonicalTwRpcCompoun
   }
 }
 
+declare const processTargetClaimBrand: unique symbol;
+
+/**
+ * Opaque one-shot claim privately issued by the single config process-target
+ * generation owner. It is bound to that owner, the generation live at issue,
+ * and the exact kind+targetId; only the issuing owner can consume it, and a
+ * retired/replaced generation, a foreign claim, or a replay all fail closed.
+ */
+export interface RelayV2CanonicalProcessTargetClaimV1 {
+  readonly [processTargetClaimBrand]?: never;
+}
+
+interface ProcessTargetClaimRecord {
+  generation: object;
+  kind: "local" | "ssh";
+  targetId: string;
+  consumed: boolean;
+}
+
+export interface RelayV2CanonicalProcessTargetClaimPortV1 {
+  issueProcessTargetClaim(
+    kind: "local" | "ssh",
+    targetId: string,
+  ): RelayV2CanonicalProcessTargetClaimV1;
+  consumeProcessTargetClaim(
+    claim: RelayV2CanonicalProcessTargetClaimV1,
+    kind: "local" | "ssh",
+    targetId: string,
+  ): void;
+}
+
 export interface RelayV2CanonicalTwRpcQueryTransportAdapterOptions {
   targets: readonly RelayV2CanonicalTwRpcQueryTargetDescriptor[];
   runner: RelayV2CanonicalTwRpcQueryProcessRunner;
@@ -974,8 +1005,14 @@ function parseStdout(value: Uint8Array): { [key: string]: RelayV2JsonValue } {
  * targets and the frozen read-only `tw rpc-v2 capabilities|list` entrypoints.
  */
 export class RelayV2CanonicalTwRpcQueryTransportAdapter
-implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
+implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTargetClaimPortV1 {
   private targets: ReadonlyMap<string, NormalizedTarget>;
+
+  private targetGeneration: object = {};
+
+  private generationLive = true;
+
+  private readonly targetClaims = new WeakMap<object, ProcessTargetClaimRecord>();
 
   private readonly runner: RelayV2CanonicalTwRpcQueryProcessRunner;
 
@@ -1055,6 +1092,8 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
   /** Synchronously withdraws every binding while a config generation retires. */
   beginContentAddressedTargetTransition(): void {
     this.targets = new Map();
+    this.targetGeneration = {};
+    this.generationLive = false;
     for (const channel of this.activeCompoundChannels) channel.fence();
   }
 
@@ -1063,6 +1102,55 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
     targets: readonly RelayV2CanonicalTwRpcQueryTargetDescriptor[],
   ): void {
     this.targets = normalizeContentAddressedTargets(targets);
+    this.targetGeneration = {};
+    this.generationLive = true;
+  }
+
+  /**
+   * Privately issues an opaque one-shot claim for one currently configured
+   * target of the live generation. The claim carries no authority by itself;
+   * only this owner's synchronous consume below can redeem it, and only once.
+   */
+  issueProcessTargetClaim(
+    kind: "local" | "ssh",
+    targetId: string,
+  ): RelayV2CanonicalProcessTargetClaimV1 {
+    const normalizedId = boundedString(targetId, 128);
+    if (!this.generationLive || !this.targets.has(`${kind}\0${normalizedId}`)) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
+    const claim = Object.freeze({}) as RelayV2CanonicalProcessTargetClaimV1;
+    this.targetClaims.set(claim as object, {
+      generation: this.targetGeneration,
+      kind,
+      targetId: normalizedId,
+      consumed: false,
+    });
+    return claim;
+  }
+
+  /**
+   * Synchronously and atomically consumes a claim this owner issued. A claim
+   * from another owner, an already-consumed claim, a claim from a retired or
+   * replaced generation, or a kind/targetId mismatch all fail closed.
+   */
+  consumeProcessTargetClaim(
+    claim: RelayV2CanonicalProcessTargetClaimV1,
+    kind: "local" | "ssh",
+    targetId: string,
+  ): void {
+    const normalizedId = boundedString(targetId, 128);
+    const record = this.targetClaims.get(claim as object);
+    if (record === undefined
+      || record.consumed
+      || !this.generationLive
+      || record.generation !== this.targetGeneration
+      || record.kind !== kind
+      || record.targetId !== normalizedId
+      || !this.targets.has(`${kind}\0${normalizedId}`)) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
+    record.consumed = true;
   }
 
   async query(rawRequest: RelayV2CanonicalTwRpcDiscoveryQuery): Promise<unknown> {
