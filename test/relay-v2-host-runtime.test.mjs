@@ -16,6 +16,7 @@ const resourceState = await import("../dist/relay/v2/resourceState.js");
 const snapshotSpool = await import("../dist/relay/v2/stateSnapshotSpool.js");
 const terminalManager = await import("../dist/relay/v2/terminalManager.js");
 const runtimeModule = await import("../dist/relay/v2/hostRuntime.js");
+const welcomeSerializerModule = await import("../dist/relay/v2/hostWelcomeSerializer.js");
 const agentAttachmentModule = await import(
   "../dist/relay/v2/hostAgentTranscriptLifecycleAttachment.js"
 );
@@ -3362,4 +3363,85 @@ test("unknown types, opposite-direction frames, and closed-schema extensions fai
       assert.equal(h.state.calls.terminal.length, 0);
     });
   }
+});
+
+test("production welcome serializer builds the frozen host.welcome and fails closed", async (t) => {
+  const serializer = welcomeSerializerModule.createRelayV2HostRuntimeWelcomeSerializer({
+    hostId: HOST_ID,
+  });
+  const cut = {
+    hostEpoch: HOST_EPOCH,
+    hostInstanceId: HOST_INSTANCE_ID,
+    eventSeq: "91",
+    requiresSnapshot: false,
+  };
+  const commandDedupeWindow = {
+    windowId: "dedupe-window-uuid",
+    windowSeq: "42",
+    acceptUntilMs: 1_783_786_400_000,
+    queryUntilMs: 1_784_391_200_000,
+  };
+  const helloWithResume = (resume) => {
+    const hello = fixture("client-hello-fresh");
+    hello.payload.resume = resume;
+    return hello;
+  };
+  const buildInput = (hello, cutOverrides = {}, overrides = {}) => ({
+    hello,
+    cut: { ...cut, ...cutOverrides },
+    commandDedupeWindow: structuredClone(commandDedupeWindow),
+    capabilities: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    ...overrides,
+  });
+
+  await t.test("a fresh hello reproduces the frozen golden welcome exactly", () => {
+    const frame = serializer.build(buildInput(helloWithResume(null)));
+    assert.deepEqual(frame, fixture("host-welcome-snapshot-required"));
+    codec.encodeRelayV2WebSocketFrame("public", frame);
+  });
+
+  await t.test("the resume cursor matrix matches the frozen golden dispositions", () => {
+    assert.deepEqual(
+      serializer.build(buildInput(
+        helloWithResume({ hostEpoch: HOST_EPOCH, lastEventSeq: "90" }),
+      )),
+      fixture("host-welcome-cursor-behind"),
+    );
+    assert.deepEqual(
+      serializer.build(buildInput(
+        helloWithResume({ hostEpoch: "previous-authority-uuid", lastEventSeq: "91" }),
+      )),
+      fixture("host-welcome-host-epoch-changed"),
+    );
+    assert.deepEqual(
+      serializer.build(buildInput(
+        helloWithResume({ hostEpoch: HOST_EPOCH, lastEventSeq: "91" }),
+      )),
+      fixture("host-welcome-caught-up"),
+    );
+    const fenced = serializer.build(buildInput(
+      helloWithResume({ hostEpoch: HOST_EPOCH, lastEventSeq: "91" }),
+      { requiresSnapshot: true },
+    ));
+    assert.equal(fenced.payload.resumeDisposition, "snapshot_required");
+    assert.equal(fenced.payload.resumeReason, "cursor_behind");
+  });
+
+  await t.test("an ahead cursor throws the typed EVENT_CURSOR_AHEAD with exact details", () => {
+    assert.throws(
+      () => serializer.build(buildInput(
+        helloWithResume({ hostEpoch: HOST_EPOCH, lastEventSeq: "92" }),
+      )),
+      (error) => {
+        assert.ok(error instanceof runtimeModule.RelayV2HostRuntimeAuthorityError);
+        assert.equal(error.code, "EVENT_CURSOR_AHEAD");
+        assert.deepEqual({ ...error.details }, {
+          clientLastEventSeq: "92",
+          hostEventSeq: "91",
+        });
+        return true;
+      },
+    );
+  });
+
 });

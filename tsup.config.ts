@@ -29,6 +29,7 @@ export default defineConfig({
     "src/relay/v2/hostCapabilityReadiness.ts",
     "src/relay/v2/hostCodecReadinessActivation.ts",
     "src/relay/v2/hostRuntime.ts",
+    "src/relay/v2/hostWelcomeSerializer.ts",
     "src/relay/v2/hostRuntimeComposition.ts",
     "src/relay/v2/hostAgentTranscriptLifecycleAttachment.ts",
     "src/relay/v2/hostCanonicalProductionComposition.ts",
@@ -139,6 +140,10 @@ export default defineConfig({
     // owners through their real dist entries rather than rebundled copies.
     "./relayV2DashboardManagementComposition.js",
     "./relayV2DashboardManagementStdio.js",
+    // The welcome serializer and every runtime consumer must share the
+    // canonical authority-error class and broker limit/brand instances.
+    "./brokerCore.js",
+    "./hostRuntime.js",
     "./hostWssTransportLifecycle.js",
     "./hostRuntimeComposition.js",
     "./hostState.js",
