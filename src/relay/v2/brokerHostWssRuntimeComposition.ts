@@ -173,6 +173,56 @@ type FailedConstructionCleanup = Readonly<{
   retry(): Promise<void>;
 }>;
 
+export interface RelayV2BrokerHostWssHandshakeScheduler {
+  schedule(delayMs: number, callback: () => void): () => void;
+}
+
+const DEFAULT_HOST_HELLO_TIMEOUT_MS = 5_000;
+
+const defaultHandshakeScheduler: RelayV2BrokerHostWssHandshakeScheduler = Object.freeze({
+  schedule(delayMs: number, callback: () => void): () => void {
+    const timer = setTimeout(callback, delayMs);
+    timer.unref();
+    return () => clearTimeout(timer);
+  },
+});
+
+function captureHandshakeScheduler(
+  value: unknown,
+): RelayV2BrokerHostWssHandshakeScheduler {
+  if (value === undefined) return defaultHandshakeScheduler;
+  if (value === null || typeof value !== "object" || rejectedProxy(value)) {
+    throw new Error("invalid Relay v2 Broker Host WSS handshake scheduler");
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Reflect.getOwnPropertyDescriptor(value, "schedule");
+  } catch {
+    descriptor = undefined;
+  }
+  if (
+    !descriptor
+    || !Object.hasOwn(descriptor, "value")
+    || typeof descriptor.value !== "function"
+    || rejectedProxy(descriptor.value)
+  ) {
+    throw new Error("invalid Relay v2 Broker Host WSS handshake scheduler");
+  }
+  const schedule = descriptor.value as (
+    delayMs: number,
+    callback: () => void,
+  ) => () => void;
+  return Object.freeze({
+    schedule: (delayMs, callback) => Reflect.apply(schedule, undefined, [delayMs, callback]),
+  });
+}
+
+type HandshakeDeadline = {
+  cancel: (() => void) | null;
+  armed: boolean;
+  firedEarly: boolean;
+};
+
 function rejectedProxy(value: unknown): boolean {
   if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
   try {
@@ -305,6 +355,8 @@ class HostWssConnection {
   private nativeForceRequested = false;
   private constructionRolledBack = false;
   private constructionForceApplied = false;
+  private hostHelloAccepted = false;
+  private handshakeDeadline: HandshakeDeadline | null = null;
   private readonly terminalDeferred = deferred<RelayV2BrokerHostWssTerminalEvidence>();
   private readonly drainedDeferred = deferred<void>();
 
@@ -313,6 +365,7 @@ class HostWssConnection {
     private readonly adapter: RelayV2BrokerHostWssAdapter,
     readonly session: RelayV2BrokerHostWssOwnerSession,
     private readonly authContext: RelayV2BrokerConnectionAuthorization,
+    private readonly handshakeScheduler: RelayV2BrokerHostWssHandshakeScheduler,
   ) {
     this.terminal = this.terminalDeferred.promise;
     this.drained = this.drainedDeferred.promise;
@@ -356,11 +409,60 @@ class HostWssConnection {
     }
     this.phase = "open";
     this.frameAdmission = true;
+    this.armHandshakeDeadline();
+  }
+
+  /**
+   * Frozen contract §timeout: once the upgraded carrier is attached (101
+   * complete), a legal host.hello must arrive within a fixed five seconds or
+   * the carrier closes 4408 handshake_timeout. Only the Core-produced
+   * host.registered enqueue cancels; any other outcome closes via the owner.
+   */
+  private armHandshakeDeadline(): void {
+    const deadline: HandshakeDeadline = { cancel: null, armed: false, firedEarly: false };
+    this.handshakeDeadline = deadline;
+    let cancel: unknown;
+    try {
+      cancel = this.handshakeScheduler.schedule(DEFAULT_HOST_HELLO_TIMEOUT_MS, () => {
+        if (!deadline.armed) {
+          deadline.firedEarly = true;
+          return;
+        }
+        this.handshakeDeadlineElapsed(deadline);
+      });
+      if (typeof cancel !== "function") throw new Error("invalid cancellation receipt");
+    } catch {
+      if (this.handshakeDeadline === deadline) this.handshakeDeadline = null;
+      this.beginClose(1013, "host_handshake_timer_failure", false);
+      return;
+    }
+    deadline.cancel = cancel as () => void;
+    deadline.armed = true;
+    if (deadline.firedEarly) this.handshakeDeadlineElapsed(deadline);
+  }
+
+  private handshakeDeadlineElapsed(deadline: HandshakeDeadline): void {
+    if (this.handshakeDeadline !== deadline) return;
+    this.handshakeDeadline = null;
+    if (this.phase !== "open" || this.hostHelloAccepted) return;
+    this.beginClose(4408, "handshake_timeout", false);
+  }
+
+  private cancelHandshakeDeadline(): void {
+    const deadline = this.handshakeDeadline;
+    this.handshakeDeadline = null;
+    if (!deadline?.cancel) return;
+    try {
+      deadline.cancel();
+    } catch {
+      // Cancellation failure cannot revive the elapsed deadline.
+    }
   }
 
   rollbackConstruction(): Promise<void> {
     if (this.constructionRolledBack) return this.drained;
     this.constructionRolledBack = true;
+    this.cancelHandshakeDeadline();
     this.phase = "closing";
     this.frameAdmission = false;
     this.actionAdmission = false;
@@ -601,6 +703,12 @@ class HostWssConnection {
             registration: action.frame.type === "host.registered",
           }));
           this.directBytes += bytes.byteLength;
+          // The Core enqueues host.registered only after it has accepted a
+          // legal host.hello; this is the exact handshake success signal.
+          if (action.frame.type === "host.registered" && !this.hostHelloAccepted) {
+            this.hostHelloAccepted = true;
+            this.cancelHandshakeDeadline();
+          }
           break;
         }
         case "pause_host_route":
@@ -756,6 +864,7 @@ class HostWssConnection {
     requestNative = true,
   ): void {
     if (this.phase === "terminal") return;
+    this.cancelHandshakeDeadline();
     if (this.phase !== "closing") {
       this.phase = "closing";
       this.frameAdmission = false;
@@ -793,6 +902,7 @@ class HostWssConnection {
   private observeTerminal(evidence: RelayV2BrokerHostWssTerminalEvidence): void {
     if (this.terminalSeen) return;
     this.terminalSeen = true;
+    this.cancelHandshakeDeadline();
     this.beginClose(1013, "native_terminal", false, false);
     this.phase = "terminal";
     const abandoned = this.outbound;
@@ -867,6 +977,7 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
     private readonly ownerBinding: RelayV2BrokerHostWssRuntimeOwnerBinding,
     trustedSocketPrototype: object,
     trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
+    private readonly handshakeScheduler: RelayV2BrokerHostWssHandshakeScheduler,
   ) {
     this.captureAuthority = createRelayV2BrokerHostWssCaptureAuthority(
       trustedSocketPrototype,
@@ -1028,7 +1139,13 @@ class RelayV2BrokerHostWssRuntimeCompositionImpl {
         close: (code: number, reason: string) => bridge.close(code, reason),
         forceDestroy: () => bridge.forceDestroy(),
       }));
-      connection = new HostWssConnection(this, adapter, session, record.authContext);
+      connection = new HostWssConnection(
+        this,
+        adapter,
+        session,
+        record.authContext,
+        this.handshakeScheduler,
+      );
       bridge.bind(connection);
       if (
         !this.admissionOpen
@@ -1159,11 +1276,31 @@ export function bindRelayV2BrokerHostWssRuntimeFacade(
   ownerBinding: RelayV2BrokerHostWssRuntimeOwnerBinding,
   trustedSocketPrototype: object,
   trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
+  options?: Readonly<{
+    handshakeScheduler?: RelayV2BrokerHostWssHandshakeScheduler;
+  }>,
 ): RelayV2BrokerHostWssRuntimeFacade {
+  if (options !== undefined && (options === null || typeof options !== "object" || rejectedProxy(options))) {
+    throw new Error("invalid Relay v2 Broker Host WSS runtime options");
+  }
+  let schedulerInput: unknown;
+  if (options !== undefined) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Reflect.getOwnPropertyDescriptor(options, "handshakeScheduler");
+    } catch {
+      descriptor = undefined;
+    }
+    if (descriptor && !Object.hasOwn(descriptor, "value")) {
+      throw new Error("invalid Relay v2 Broker Host WSS runtime options");
+    }
+    schedulerInput = descriptor?.value;
+  }
   const runtime = new RelayV2BrokerHostWssRuntimeCompositionImpl(
     ownerBinding,
     trustedSocketPrototype,
     trustedSocketBrand,
+    captureHandshakeScheduler(schedulerInput),
   );
   return Object.freeze({
     prepareHostWss: runtime.prepareHostWss.bind(runtime),

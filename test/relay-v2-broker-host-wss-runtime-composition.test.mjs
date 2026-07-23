@@ -773,3 +773,161 @@ test("replacement actions keep exact producer identity and total drain waits for
     true,
   );
 });
+
+test("host.hello handshake deadline: 4408 on timeout, only accepted host.hello cancels", async (t) => {
+  const hostWss = await import("../dist/relay/v2/brokerHostWssRuntimeComposition.js");
+
+  const fakeOwnerBinding = () => {
+    const captured = [];
+    return {
+      captured,
+      credentialAdmissionOpen: () => true,
+      inspectHostAdmission: () => Object.freeze({ outcome: "accept" }),
+      createSession: (input) => {
+        captured.push(input);
+        return {
+          transportId: randomUUID(),
+          connectionIncarnation: randomUUID(),
+          producerGeneration: "1",
+          attach() {},
+          registerExpiry() {},
+          receiveHostFrame: async () => "applied",
+          drainHostCarrier: () => [],
+          acknowledgeHostControlDelivery: () => "applied",
+          rejectHostControlDelivery: () => "applied",
+          acknowledgeHostDelivery: () => "applied",
+          disconnectHost: () => "applied",
+          beginProducerClose() {},
+          terminalAndUnregister: async () => {},
+          rollbackConstruction: async () => {},
+        };
+      },
+    };
+  };
+
+  const fakeScheduler = () => {
+    const scheduled = [];
+    return {
+      scheduled,
+      schedule(delayMs, callback) {
+        const entry = { delayMs, callback, cancelled: false };
+        scheduled.push(entry);
+        return () => { entry.cancelled = true; };
+      },
+    };
+  };
+
+  const attachWithScheduler = (scheduler) => {
+    const binding = fakeOwnerBinding();
+    const facade = hostWss.bindRelayV2BrokerHostWssRuntimeFacade(
+      binding,
+      FakeUpgradedSocket.prototype,
+      trustedUpgradedSocketBrand,
+      { handshakeScheduler: scheduler },
+    );
+    const prepared = facade.prepareHostWss({ trustedAuthContext: authContext() });
+    assert.equal(prepared.outcome, "accept");
+    const socket = new FakeUpgradedSocket();
+    const handle = facade.attachPreparedHostWss({
+      receipt: prepared.receipt,
+      alreadyUpgradedSocket: socket,
+    });
+    return { facade, socket, handle, binding };
+  };
+
+  const hostRegisteredFrame = {
+    carrierVersion: 1,
+    type: "host.registered",
+    requestId: randomUUID(),
+    connectorId: randomUUID(),
+    payload: {
+      brokerEpoch: randomUUID(),
+      hostsRevision: "1",
+      disposition: "connected",
+      supersededHostInstanceId: null,
+      limits: {
+        maxCarrierFrameBytes: 1_048_576,
+        brokerCarrierBufferedBytes: 8_388_608,
+        brokerCarrierLowWaterBytes: 1_048_576,
+      },
+    },
+  };
+
+  await t.test("bind rejects proxied, getter-based, or malformed handshake schedulers", () => {
+    for (const options of [
+      { handshakeScheduler: new Proxy({}, {}) },
+      { handshakeScheduler: { schedule: 42 } },
+      { handshakeScheduler: Object.create(null) },
+      Object.defineProperty({}, "handshakeScheduler", {
+        enumerable: true,
+        get() { throw new Error("options getter trap"); },
+      }),
+      new Proxy({}, {}),
+    ]) {
+      assert.throws(() => hostWss.bindRelayV2BrokerHostWssRuntimeFacade(
+        fakeOwnerBinding(),
+        FakeUpgradedSocket.prototype,
+        trustedUpgradedSocketBrand,
+        options,
+      ), /Relay v2 Broker Host WSS/);
+    }
+  });
+
+  const cases = [
+    {
+      name: "no host.hello within the frozen 5s closes 4408 handshake_timeout",
+      run: async (scheduler, { socket, handle }) => {
+        scheduler.scheduled[0].callback();
+        scheduler.scheduled[0].callback();
+        assert.deepEqual(socket.closes, [{ code: 4408, reason: "handshake_timeout" }]);
+        socket.emit("close", 4408);
+        await handle.drained;
+      },
+    },
+    {
+      name: "Core host.registered enqueue cancels the deadline and a late fire is a no-op",
+      run: async (scheduler, { socket, handle, binding }) => {
+        socket.emit("message", carrierFrame(hostHello()), false);
+        await settle();
+        assert.equal(scheduler.scheduled[0].cancelled, false);
+        const receipt = binding.captured[0].producerPort.apply(
+          [{ kind: "send_host", transportId: handle.transportId, frame: hostRegisteredFrame }],
+          {
+            mayApply: () => true,
+            target: {
+              transportId: handle.transportId,
+              generation: handle.producerGeneration,
+            },
+          },
+        );
+        assert.equal(receipt, "applied");
+        assert.equal(scheduler.scheduled[0].cancelled, true);
+        scheduler.scheduled[0].callback();
+        assert.deepEqual(socket.closes, []);
+        socket.emit("close", 1000);
+        await handle.drained;
+      },
+    },
+    {
+      name: "close before the deadline releases the timer and a late fire cannot close",
+      run: async (scheduler, { socket, handle }) => {
+        socket.emit("close", 1000);
+        assert.equal(scheduler.scheduled[0].cancelled, true);
+        scheduler.scheduled[0].callback();
+        assert.deepEqual(socket.closes, []);
+        await handle.drained;
+      },
+    },
+  ];
+
+  for (const { name, run } of cases) {
+    await t.test(name, async () => {
+      const scheduler = fakeScheduler();
+      const attached = attachWithScheduler(scheduler);
+      assert.equal(scheduler.scheduled.length, 1);
+      assert.equal(scheduler.scheduled[0].delayMs, 5_000);
+      await run(scheduler, attached);
+      await attached.facade.closeAndDrain();
+    });
+  }
+});
