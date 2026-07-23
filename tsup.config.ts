@@ -101,6 +101,7 @@ export default defineConfig({
     "src/relay/v2/canonicalTerminalTargetResolverAdapter.ts",
     "src/relay/v2/terminalControlExactTargetAuthorityAdapter.ts",
     "src/relay/v2/terminalControlAuthorityAdapter.ts",
+    "src/relay/v2/terminalControlObservedBytePlaneAdapter.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/authority.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/store.ts",

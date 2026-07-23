@@ -559,3 +559,64 @@ test("canonical production root fails closed when the external daemon is missing
     h.cleanup();
   }
 });
+
+test("canonical production root assembles the default byte plane without an injected backend", async () => {
+  const h = await makeHarness("default-byte-plane");
+  delete h.options.terminalBackend;
+  const abort = new AbortController();
+  const daemonAuthority = new terminalControl.TerminalControlAuthority({
+    statePath: h.statePath,
+    backend: h.terminalBackend,
+  });
+  let exactProcessTargetCaptures = 0;
+  const captureExactProcessTarget = daemonAuthority.captureRelayV2ExactProcessTarget
+    .bind(daemonAuthority);
+  daemonAuthority.captureRelayV2ExactProcessTarget = (target) => {
+    exactProcessTargetCaptures += 1;
+    return captureExactProcessTarget(target);
+  };
+  const daemon = terminalControl.runTerminalControlServer({
+    socketPath: h.socketPath,
+    authority: daemonAuthority,
+    signal: abort.signal,
+    relayV2RemoteExactCompoundV1: true,
+  });
+  try {
+    await waitForPath(h.socketPath);
+    await waitForPath(exactCompound.relayV2RemoteExactCompoundSocketPathV1(h.socketPath));
+    const composition = await relayHost.openRelayV2HostCanonicalProductionComposition(
+      h.profile,
+      h.options,
+    );
+    assert.notEqual(composition, null,
+      "omitting terminalBackend must assemble the default observed byte plane");
+    assert.deepEqual(composition.inspect(), {
+      status: "stopped",
+      controllerGeneration: "0",
+    });
+    assert.equal(exactProcessTargetCaptures, 1,
+      "the default byte plane keeps the single daemon preflight");
+
+    // closeAndDrain settles the managed owner, the default byte plane, and the
+    // exact compound owner in one chain before the spool: a hanging or
+    // rejecting byte-plane close would break the chain before this marker.
+    const events = [];
+    const closeSpool = h.spool.close.bind(h.spool);
+    h.spool.close = async () => {
+      events.push("spool-closed");
+      return closeSpool();
+    };
+    const firstClose = composition.closeAndDrain();
+    const secondClose = composition.closeAndDrain();
+    assert.equal(firstClose, secondClose);
+    await firstClose;
+    assert.deepEqual(events, ["spool-closed"]);
+    assert.equal(existsSync(h.socketPath), true,
+      "the default byte plane never stops the external daemon");
+    assert.equal(existsSync(`${h.socketPath}.server.lock`), true);
+  } finally {
+    abort.abort();
+    await daemon.catch(() => undefined);
+    h.cleanup();
+  }
+});

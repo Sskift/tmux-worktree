@@ -149,10 +149,10 @@ const CANONICAL_REQUIRED_KEYS = Object.freeze([
   "welcome",
   "createTargetAuthority",
   "process",
-  "terminalBackend",
   "localProcessTarget",
 ] as const);
 const CANONICAL_OPTIONAL_KEYS = Object.freeze([
+  "terminalBackend",
   "terminalControl",
   "dashboardManagement",
   "agentTranscriptLifecycle",
@@ -349,6 +349,10 @@ function captureCanonicalOptions(value: unknown): CapturedCanonicalOptions | nul
 
   const result = Object.create(null) as Record<string, unknown>;
   for (const key of CANONICAL_REQUIRED_KEYS) result[key] = fields[key];
+
+  if (fields.terminalBackend !== undefined) {
+    result.terminalBackend = fields.terminalBackend;
+  }
 
   if (fields.terminalControl !== undefined) {
     const terminalControl = snapshotExactDataRecord(

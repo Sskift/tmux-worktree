@@ -39,6 +39,12 @@ import {
 import { RelayV2TerminalDurableLineageAuthority } from "./terminalDurableLineage.js";
 import { RelayV2TerminalControlAuthorityAdapter } from "./terminalControlAuthorityAdapter.js";
 import {
+  RelayV2TerminalControlObservedBytePlaneAdapterV1,
+} from "./terminalControlObservedBytePlaneAdapter.js";
+import type {
+  RelayV2PreparedExactTerminalControlLeasePortV1,
+} from "./canonicalTerminalTargetResolverAdapter.js";
+import {
   captureRelayV2LocalExactCompoundChannelFactoryV1,
   preflightRelayV2ExactCompoundTargetsV1,
   RelayV2RemoteExactTerminalControlCompoundAdapterV1,
@@ -78,7 +84,7 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
   readonly welcome: RelayV2HostRuntimeWelcomeSerializer;
   readonly createTargetAuthority: RelayV2CanonicalCreateTargetAuthorityPortV1;
   readonly process: RelayV2StructuredProcessPort;
-  readonly terminalBackend: RelayV2TerminalByteBackend;
+  readonly terminalBackend?: RelayV2TerminalByteBackend;
   readonly localProcessTarget: Readonly<{ kind: "local"; targetId: string }>;
   readonly terminalControl?: Readonly<{
     daemonSocketPath?: string;
@@ -305,7 +311,8 @@ function validateOptions(
       "resolveCreateTarget", "fenceCreateTargetForAdmission",
     ])
     && validPort(options.process, ["execute"])
-    && validPort(options.terminalBackend, ["open"])
+    && (options.terminalBackend === undefined
+      || validPort(options.terminalBackend, ["open"]))
     && isRecord(options.localProcessTarget)
     && options.localProcessTarget.kind === "local"
     && typeof options.localProcessTarget.targetId === "string"
@@ -348,6 +355,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
   const h0 = captureRelayV2HostH0ReadinessPort(options.hostState.h0ReadinessPort);
   if (h0 === null) return null;
   let exactTargets: RelayV2RemoteExactTerminalControlCompoundAdapterV1 | null = null;
+  let observedBytePlane: RelayV2TerminalControlObservedBytePlaneAdapterV1 | null = null;
   let terminalManager: RelayV2TerminalManager | null = null;
   let optionalExtension: RelayV2HostOptionalExtensionAttachment | null = null;
   let managed: RelayV2HostManagedConnectorRuntimeComposition | null = null;
@@ -410,6 +418,13 @@ export async function openRelayV2HostCanonicalProductionComposition(
       channels: compoundChannels,
       owner: reservationOwner,
     });
+    // An injected terminal backend keeps its own byte plane and consumes the
+    // admitted claim directly; the default byte plane consumes that claim into
+    // a read-only exact observation and re-prepares the lease lazily on the
+    // same compound channel.
+    observedBytePlane = options.terminalBackend === undefined
+      ? new RelayV2TerminalControlObservedBytePlaneAdapterV1({ exactTargets })
+      : null;
     const commandTargets = new RelayV2CanonicalCommandTargetAuthorityAdapter({
       resourceResolver: h2.resourceResolver,
       createTargetAuthority: options.createTargetAuthority,
@@ -448,7 +463,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
     });
     const terminalControl = new RelayV2TerminalControlAuthorityAdapter(
       exactTargets,
-      exactTargets,
+      observedBytePlane === null
+        ? exactTargets
+        : observedBytePlane.lazyLeasePort as RelayV2PreparedExactTerminalControlLeasePortV1,
     );
     let routeFenced = false;
     const send = async (
@@ -470,7 +487,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
       hostInstanceId: options.hostState.hostInstanceId,
       resolver: terminalResolver,
       lineage: terminalLineage,
-      backend: options.terminalBackend,
+      backend: options.terminalBackend ?? observedBytePlane!,
       terminalControl,
       send,
     });
@@ -553,6 +570,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
       routeFenced = true;
       const closingManaged = managed!;
       const closingExactTargets = exactTargets!;
+      const closingObservedBytePlane = observedBytePlane;
       // Closing the preparation owner here would revoke an admitted claim
       // while H1/H3 still owns an in-flight frame. Fence only new resolution;
       // the managed owner settles admitted work before remaining claims and
@@ -563,6 +581,8 @@ export async function openRelayV2HostCanonicalProductionComposition(
         ...(dashboardManagementSession === null
           ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
         () => closingManaged.closeAndDrain(),
+        ...(closingObservedBytePlane === null
+          ? [] : [() => closingObservedBytePlane.close()]),
         () => closingExactTargets.close(),
         () => options.recoveredH2Spool.close(),
         () => options.hostState.close(),
@@ -609,6 +629,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
       ...(managed === null && optionalExtension !== null
         ? [() => optionalExtension!.closeAndDrain()]
         : []),
+      ...(observedBytePlane === null ? [] : [() => observedBytePlane!.close()]),
       ...(exactTargets === null ? [] : [() => exactTargets!.close()]),
       () => options.recoveredH2Spool.close(),
       () => options.hostState.close(),
