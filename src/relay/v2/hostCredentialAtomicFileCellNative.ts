@@ -120,6 +120,12 @@ interface RevisionRecord {
 }
 
 const publicRevisions = new WeakMap<object, RevisionRecord>();
+// Permanent raw-handle identity claim: only one NativeCellOwner may ever own a
+// captured handle receiver. This registry lives only in this module, which is
+// its own canonical tsup entry and external for the single importing bridge
+// entry, so exactly one copy exists per process. The claim is never released,
+// on success or failure.
+const claimedRawHandleIdentities = new WeakSet<object>();
 const FUNCTION_PROTOTYPE_CALL = Function.prototype.call;
 const FUNCTION_PROTOTYPE_APPLY = Function.prototype.apply;
 const REFLECT_APPLY = Reflect.apply;
@@ -718,6 +724,12 @@ export function openRelayV2HostCredentialAtomicFileCellNative(
     return fail("NATIVE_INTERFACE_INVALID");
   }
   const handle = parseOpenedHandle(rawOpen);
+  // Synchronous, atomic, permanent claim on the captured handle receiver,
+  // recorded at the parse/open publication boundary immediately before the
+  // owner is constructed. A duplicate raw handle fails closed as busy and is
+  // NEVER cleaned up or closed here: it already belongs to the first owner.
+  if (claimedRawHandleIdentities.has(handle.receiver)) return fail("CELL_BUSY");
+  claimedRawHandleIdentities.add(handle.receiver);
   const owner = new NativeCellOwner(handle);
   try {
     return frozenMethodPort<RelayV2HostCredentialAtomicFileCellNative>({

@@ -17,6 +17,7 @@ export default defineConfig({
     "src/relay/v2/hostCredentialAuthority.ts",
     "src/relay/v2/hostProductionProfileStore.ts",
     "src/relay/v2/hostPrivilegedProductionIntakeComposition.ts",
+    "src/relay/v2/hostNativeCredentialPrivilegedIntakeBridge.ts",
     "src/relay/v2/hostBootstrapSecretHandoff.ts",
     "src/relay/v2/hostBootstrapSecretSource.ts",
     "src/relay/v2/hostBootstrapSecretNodeReadableByteSource.ts",
@@ -134,6 +135,10 @@ export default defineConfig({
     "./hostCredentialAuthority.js",
     "./hostCredentialVault.js",
     "./hostCredentialExchangeCoordinator.js",
+    // The bridge must consume the canonical intake and native cell owner
+    // entries instead of bundling second private claim/revision registries.
+    "./hostPrivilegedProductionIntakeComposition.js",
+    "./hostCredentialAtomicFileCellNative.js",
     // The external-continuity opener transfers ownership to the canonical
     // credential authority entry instead of bundling a second owner class.
     "./brokerCredentialAuthority.js",

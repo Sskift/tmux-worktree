@@ -14,6 +14,12 @@ import test from "node:test";
 const intakeModule = await import(
   "../dist/relay/v2/hostPrivilegedProductionIntakeComposition.js"
 );
+const bridgeModule = await import(
+  "../dist/relay/v2/hostNativeCredentialPrivilegedIntakeBridge.js"
+);
+const nativeCellModule = await import(
+  "../dist/relay/v2/hostCredentialAtomicFileCellNative.js"
+);
 const profileStore = await import("../dist/relay/v2/hostProductionProfileStore.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
@@ -547,6 +553,379 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
     } finally {
       await daemon.close();
       h.cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+function createFakeNativeModule(events, { openError = null } = {}) {
+  const stats = { opens: 0, closes: 0 };
+  let bytes = null;
+  let revision = Object.freeze({});
+  const handle = {
+    read(request) {
+      events.push("native-read");
+      return {
+        abiVersion: 1,
+        operation: "read",
+        outcome: "ok",
+        current: bytes === null
+          ? { state: "empty", revision }
+          : { state: "present", revision, bytes: Uint8Array.from(bytes) },
+      };
+    },
+    compareAndSwap(request) {
+      events.push("native-cas");
+      bytes = Uint8Array.from(request.bytes);
+      revision = Object.freeze({});
+      return { abiVersion: 1, operation: "compare_and_swap", outcome: "swapped" };
+    },
+    close(request) {
+      stats.closes += 1;
+      events.push("native-closed");
+      return { abiVersion: 1, operation: "close", outcome: "closed" };
+    },
+  };
+  const nativeModule = {
+    openRelayV2HostCredentialAtomicFileCellV1(request) {
+      stats.opens += 1;
+      events.push("native-opened");
+      if (openError !== null) {
+        return {
+          abiVersion: 1,
+          operation: "open",
+          outcome: "error",
+          error: { code: openError },
+        };
+      }
+      return { abiVersion: 1, operation: "open", outcome: "opened", handle };
+    },
+  };
+  return { nativeModule, stats };
+}
+
+function createPlainModuleSource(nativeModule) {
+  const stats = { takes: 0 };
+  // Deliberately no internal replay guard: the bridge itself must own the
+  // one-shot claim against this exact callable identity.
+  const takeNativeModule = () => {
+    stats.takes += 1;
+    return nativeModule;
+  };
+  return { takeNativeModule, stats };
+}
+
+test("native credential privileged intake bridge transfers one-shot ownership once", async (t) => {
+  await t.test("fake native module reaches the real wrapper and intake exactly once", async () => {
+    const home = privateHome("tw-relay-v2-bridge-success-home-");
+    const h = await makeHarness("bridge-success", home);
+    const daemon = await startDaemon(h);
+    const events = [];
+    const fake = createFakeNativeModule(events);
+    const source = createPlainModuleSource(fake.nativeModule);
+    const byteSource = createByteSource(events);
+    const originalSpoolClose = h.spool.close.bind(h.spool);
+    h.spool.close = async () => {
+      events.push("canonical-spool-closed");
+      return originalSpoolClose();
+    };
+    try {
+      const facade = await bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+        takeNativeModule: source.takeNativeModule,
+        trustedHome: home,
+        bootstrapSecretByteSource: byteSource.source,
+        canonical: h.canonical,
+      });
+      events.push("facade-published");
+      assert.notEqual(facade, null);
+      assert.equal(source.stats.takes, 1);
+      assert.equal(fake.stats.opens, 1);
+      assert.deepEqual(facade.inspect(), { status: "stopped", controllerGeneration: "0" });
+      assert.ok(events.indexOf("native-cas") < events.indexOf("facade-published"));
+      for (const hidden of ["takeNativeModule", "nativeModule", "cell", "handle", "source"]) {
+        assert.equal(Reflect.get(facade, hidden), undefined);
+      }
+
+      // The bridge owns the one-shot claim: a second serial open with the same
+      // callable fails closed before touching the source, wrapper, or intake.
+      await assert.rejects(
+        bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+          takeNativeModule: source.takeNativeModule,
+          trustedHome: home,
+          bootstrapSecretByteSource: byteSource.source,
+          canonical: h.canonical,
+        }),
+        (error) => {
+          assert.equal(
+            error?.name,
+            "RelayV2HostNativeCredentialPrivilegedIntakeBridgeError",
+          );
+          return assertRedacted(error, "SOURCE_CONSUMED");
+        },
+      );
+      assert.equal(source.stats.takes, 1, "the consumed source is never retaken");
+      assert.equal(fake.stats.opens, 1, "the rejected open never reaches the native wrapper");
+
+      // A concurrent pair with the same callable admits exactly one claimant.
+      const concurrentEvents = [];
+      const concurrentFake = createFakeNativeModule(concurrentEvents);
+      const concurrentSource = createPlainModuleSource(concurrentFake.nativeModule);
+      const concurrent = await Promise.allSettled([
+        bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+          takeNativeModule: concurrentSource.takeNativeModule,
+          trustedHome: home,
+          canonical: bareCanonicalOptions(),
+        }),
+        bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+          takeNativeModule: concurrentSource.takeNativeModule,
+          trustedHome: home,
+          canonical: bareCanonicalOptions(),
+        }),
+      ]);
+      const consumed = concurrent.filter(
+        (result) => result.status === "rejected"
+          && result.reason?.code === "SOURCE_CONSUMED",
+      );
+      assert.equal(consumed.length, 1, "exactly one concurrent claimant fails closed");
+      assert.equal(concurrent.every((result) => result.status === "rejected"), true);
+      assert.equal(concurrentSource.stats.takes, 1);
+      assert.equal(concurrentFake.stats.opens, 1);
+      assert.equal(concurrentFake.stats.closes, 1,
+        "the admitted claimant's pre-publication failure still closes the cell once");
+
+      await facade.closeAndDrain();
+      assert.equal(fake.stats.closes, 1, "the opened cell closes exactly once");
+      assert.ok(events.indexOf("canonical-spool-closed")
+        < events.indexOf("native-closed"),
+      "the existing intake close order drains canonical before the cell");
+      assert.equal(source.stats.takes, 1, "close never retakes the source");
+    } finally {
+      await daemon.close();
+      h.cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("source, native, and pre-publication intake failures fail closed redacted", async () => {
+    const assertBridgeRedacted = (error, code) => {
+      assert.equal(error?.name, "RelayV2HostNativeCredentialPrivilegedIntakeBridgeError");
+      return assertRedacted(error, code);
+    };
+
+    const missingHome = privateHome("tw-relay-v2-bridge-throw-");
+    const throwEvents = [];
+    const throwFake = createFakeNativeModule(throwEvents);
+    let throwTakes = 0;
+    const throwingTake = () => {
+      throwTakes += 1;
+      throw new Error(BOOTSTRAP_SECRET);
+    };
+    await assert.rejects(
+      bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+        takeNativeModule: throwingTake,
+        trustedHome: missingHome,
+        canonical: bareCanonicalOptions(),
+      }),
+      (error) => assertBridgeRedacted(error, "SOURCE_TAKE_FAILED"),
+    );
+    assert.equal(throwTakes, 1);
+    assert.equal(throwFake.stats.opens, 0);
+    assert.equal(throwEvents.length, 0);
+    // The callable claim is permanent even after a failed take: replaying the
+    // same callable is rejected before the source runs again.
+    await assert.rejects(
+      bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+        takeNativeModule: throwingTake,
+        trustedHome: missingHome,
+        canonical: bareCanonicalOptions(),
+      }),
+      (error) => assertBridgeRedacted(error, "SOURCE_CONSUMED"),
+    );
+    assert.equal(throwTakes, 1, "the consumed callable is never retaken");
+
+    // The real wrapper owns the raw-handle claim: two different module
+    // façades whose open returns the SAME raw handle must not produce two
+    // NativeCellOwners, and the rejected second open must not close or clean
+    // up the first owner's handle.
+    {
+      const handleEvents = [];
+      let sharedHandleCloses = 0;
+      const sharedHandle = {
+        read(request) {
+          return {
+            abiVersion: 1,
+            operation: "read",
+            outcome: "ok",
+            current: { state: "empty", revision: Object.freeze({}) },
+          };
+        },
+        compareAndSwap(request) {
+          return { abiVersion: 1, operation: "compare_and_swap", outcome: "swapped" };
+        },
+        close(request) {
+          sharedHandleCloses += 1;
+          handleEvents.push("shared-handle-closed");
+          return { abiVersion: 1, operation: "close", outcome: "closed" };
+        },
+      };
+      const facadeStats = [{ opens: 0 }, { opens: 0 }];
+      const facades = facadeStats.map((stats) => ({
+        openRelayV2HostCredentialAtomicFileCellV1(request) {
+          stats.opens += 1;
+          return {
+            abiVersion: 1,
+            operation: "open",
+            outcome: "opened",
+            handle: sharedHandle,
+          };
+        },
+      }));
+      const firstCell = nativeCellModule.openRelayV2HostCredentialAtomicFileCellNative({
+        nativeModule: facades[0],
+      });
+      assert.equal(facadeStats[0].opens, 1);
+      assert.throws(
+        () => nativeCellModule.openRelayV2HostCredentialAtomicFileCellNative({
+          nativeModule: facades[1],
+        }),
+        (error) => {
+          assert.equal(error?.name, "RelayV2HostCredentialAtomicFileCellNativeError");
+          return assertRedacted(error, "CELL_BUSY");
+        },
+      );
+      assert.equal(facadeStats[1].opens, 1, "the second facade may open once");
+      assert.equal(sharedHandleCloses, 0,
+        "the rejected duplicate open never closes the first owner's handle");
+      const read = firstCell.runExclusive((transaction) => transaction.read());
+      assert.equal(read.bytes, null, "the first owner remains fully functional");
+      await firstCell.closeAndDrain();
+      assert.equal(sharedHandleCloses, 1,
+        "only the first owner's own close path closes the handle, exactly once");
+    }
+
+    for (const [label, options] of [
+      ["async take", {
+        takeNativeModule: async () => throwFake.nativeModule,
+        trustedHome: missingHome,
+        canonical: bareCanonicalOptions(),
+      }],
+      ["extra field", {
+        takeNativeModule: () => throwFake.nativeModule,
+        trustedHome: missingHome,
+        canonical: bareCanonicalOptions(),
+        loader: {},
+      }],
+    ]) {
+      await assert.rejects(
+        bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge(options),
+        (error) => assertBridgeRedacted(error, "SOURCE_INVALID"),
+        label,
+      );
+    }
+    await assert.rejects(
+      bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+        takeNativeModule: () => Promise.resolve(throwFake.nativeModule),
+        trustedHome: missingHome,
+        canonical: bareCanonicalOptions(),
+      }),
+      (error) => assertBridgeRedacted(error, "SOURCE_INVALID"),
+      "thenable take result",
+    );
+    assert.equal(throwFake.stats.opens, 0, "invalid sources never reach the native wrapper");
+    assert.equal(existsSync(join(missingHome, ".tmux-worktree")), false);
+
+    const durabilityEvents = [];
+    const durabilityFake = createFakeNativeModule(durabilityEvents, {
+      openError: "CELL_DURABILITY_UNSUPPORTED",
+    });
+    const durabilitySource = createPlainModuleSource(durabilityFake.nativeModule);
+    await assert.rejects(
+      bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+        takeNativeModule: durabilitySource.takeNativeModule,
+        trustedHome: missingHome,
+        canonical: bareCanonicalOptions(),
+      }),
+      (error) => assertBridgeRedacted(error, "CELL_DURABILITY_UNSUPPORTED"),
+    );
+    assert.equal(durabilitySource.stats.takes, 1);
+    assert.equal(durabilityFake.stats.opens, 1);
+    assert.equal(durabilityFake.stats.closes, 0, "no handle was captured, nothing to close");
+    assert.equal(existsSync(join(missingHome, ".tmux-worktree")), false,
+      "durability refusal is v2-unavailable, never a profile/H4a/v1 path");
+    rmSync(missingHome, { recursive: true, force: true });
+
+    // The module claim closes the identity bypass: two different callables —
+    // or two bind() results — that yield the same nativeModule identity can
+    // each run their own take once, but only the first reaches the wrapper.
+    for (const [label, makePair] of [
+      ["two plain functions", (module) => [
+        () => module,
+        () => module,
+      ]],
+      ["two bind() results", (module) => [
+        (function returnModule() { return module; }).bind(null),
+        (function returnModule() { return module; }).bind(null),
+      ]],
+    ]) {
+      const sharedHome = privateHome(`tw-relay-v2-bridge-shared-${label.includes("bind") ? "bind" : "plain"}-`);
+      seedProfile(sharedHome);
+      const sharedEvents = [];
+      const sharedFake = createFakeNativeModule(sharedEvents);
+      const [firstTake, secondTake] = makePair(sharedFake.nativeModule);
+      try {
+        await assert.rejects(
+          bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+            takeNativeModule: firstTake,
+            trustedHome: sharedHome,
+            canonical: bareCanonicalOptions(),
+          }),
+          (error) => assertRedacted(error, "OWNER_CONSTRUCTION_FAILED"),
+          `${label}: the first claimant reaches the intake`,
+        );
+        assert.equal(sharedFake.stats.opens, 1, label);
+        assert.equal(sharedFake.stats.closes, 1, label);
+        await assert.rejects(
+          bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+            takeNativeModule: secondTake,
+            trustedHome: sharedHome,
+            canonical: bareCanonicalOptions(),
+          }),
+          (error) => assertBridgeRedacted(error, "MODULE_CONSUMED"),
+          `${label}: the second callable yielding the same module fails closed`,
+        );
+        assert.equal(sharedFake.stats.opens, 1,
+          `${label}: the consumed module never reaches a second native open`);
+        assert.equal(sharedFake.stats.closes, 1,
+          `${label}: no second cell owner side effect occurs`);
+      } finally {
+        rmSync(sharedHome, { recursive: true, force: true });
+      }
+    }
+
+    const home = privateHome("tw-relay-v2-bridge-intake-failure-home-");
+    const failing = await makeHarness("bridge-failure", home);
+    const events = [];
+    const fake = createFakeNativeModule(events);
+    const source = createPlainModuleSource(fake.nativeModule);
+    const byteSource = createByteSource(events);
+    try {
+      await assert.rejects(
+        bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+          takeNativeModule: source.takeNativeModule,
+          trustedHome: home,
+          bootstrapSecretByteSource: byteSource.source,
+          canonical: failing.canonical,
+        }),
+        (error) => assertRedacted(error, "CANONICAL_OPEN_FAILED"),
+      );
+      assert.equal(source.stats.takes, 1, "no fallback or retry retakes the source");
+      assert.equal(fake.stats.opens, 1);
+      assert.equal(fake.stats.closes, 1, "the captured cell closes exactly once");
+      assert.equal(byteSource.stats.cancels, 1);
+      assert.equal(existsSync(failing.socketPath), false,
+        "no canonical side effect survives the failed open");
+    } finally {
+      failing.cleanup();
       rmSync(home, { recursive: true, force: true });
     }
   });
