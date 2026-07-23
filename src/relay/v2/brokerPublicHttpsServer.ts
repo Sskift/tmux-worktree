@@ -17,6 +17,12 @@ export interface RelayV2BrokerPublicHttpsListenOptions {
 export interface RelayV2BrokerPublicHttpsServerHandle {
   readonly host: string;
   readonly port: number;
+  /**
+   * Synchronously fence new HTTP/Upgrade admission (and the runtime's upgrade
+   * authorization). It neither drains nor closes anything; `shutdown()` still
+   * performs the full drain and close exactly once.
+   */
+  beginShutdown(): void;
   shutdown(): Promise<void>;
 }
 
@@ -345,6 +351,7 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
   return Object.freeze({
     host: options.host,
     port: address.port,
+    beginShutdown,
     shutdown: startShutdown,
   });
 }

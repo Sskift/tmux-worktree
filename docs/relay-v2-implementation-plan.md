@@ -86,6 +86,8 @@ E0 external contract、N1独立纯Rust binary/publication core、N0.2 spec/error
 
 B4四端点credential HTTPS ingress现由显式default-off activated Broker composition采用，并复用 B1 的严格 HTTP boundary；默认CLI不注入且qualified E0/native仍不可用，因此不改变上述 production NO-GO。
 
+显式 default-off 的 Broker shipping root 与 local privileged admin seam 已实现（`src/relay/v2/brokerShippingRoot.ts`）：reference-only runtime profile 加 deployment 注入的 privileged resolver、external continuity attempt provider 与 native state-store loader 装配现有 production composition 与 public lifecycle root，profile/inputs validate 与 durable authority open 先于 listen，启动失败 reverse-order rollback，admin bootstrap secret 只同步交付调用方受限 sink，public route 无 admin 端点。`relay-server` CLI 仅在显式 `--v2-profile` 时选择该 root；CLI 无受信 deployment resolver/E0 渠道且 native `qualifiedRecords=[]`，故在监听前 fail closed，无 v1 fallback。默认 Relay v1 行为与整体 NO-GO 不变。
+
 ### B. relay-server / broker
 
 B 内部可以按持久认证控制面、在线目录与 carrier router 三条 lane 并行，三者只通过明确的 auth context 和 connector/route contract 连接。

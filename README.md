@@ -487,6 +487,21 @@ for strict HTTP plus client/Host WSS. The default CLI omits it, Broker
 `qualifiedRecords=[]` prevents qualified native activation, and no qualified E0
 deployment, real public-TLS/device interoperability, or shipping evidence exists.
 
+A default-off shipping root (`src/relay/v2/brokerShippingRoot.ts`) now composes
+a reference-only runtime profile (listen address, root origins, trustedHome,
+and non-sensitive TLS/E0/keyring references) with deployment-injected
+privileged material resolution, external continuity attempt provider, and
+native state-store loader into that activated composition and public
+lifecycle root, and adds a local in-process admin seam for issuer/replay
+rotation and host bootstrap issuance; the bootstrap secret is delivered only
+to a caller-provided restricted sink, never to stdout, logs, or the public
+route. The `relay-server` CLI selects it only through an explicit
+`--v2-profile <path>`; the CLI has no trusted deployment resolver or external
+continuity channel, so that selection fails closed before any listener and
+never falls back to v1, while the default invocation stays Relay v1. Native
+`qualifiedRecords=[]`, qualified E0/TLS deployment evidence, and the overall
+NO-GO status are unchanged.
+
 The same canonical Host composition can optionally and exclusively own one
 same-lineage Dashboard management protocol-v2 session. It binds the accepted
 real-adapter composition to the existing serial stdio v2 owner and exposes only

@@ -92,6 +92,8 @@ export default defineConfig({
     "src/relay/v2/brokerTransportCloseCoordinator.ts",
     "src/relay/v2/brokerAuthorizationExpiryDeadlineOwner.ts",
     "src/relay/v2/brokerServerRuntime.ts",
+    "src/relay/v2/brokerPublicHttpsServer.ts",
+    "src/relay/v2/brokerShippingRoot.ts",
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
     "src/relay/v2/terminalDurableLineage.ts",
@@ -169,6 +171,12 @@ export default defineConfig({
     // from its matching dist/relay/v2 directory so private brands stay single.
     "../v2/brokerServerRuntime.js",
     "./relay/v2/brokerServerRuntime.js",
+    // The shipping root and the public relayServer facade must share the one
+    // canonical server-claim registry and activated runtime owner entries.
+    "./brokerServerRuntime.js",
+    "./brokerPublicHttpsServer.js",
+    "./relay/v2/brokerPublicHttpsServer.js",
+    "./relay/v2/brokerShippingRoot.js",
   ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
