@@ -2659,9 +2659,9 @@ export class RelayV2TerminalManager {
       kind: "reset",
       generation: outcome.generation,
       reason: "stream_lost",
-      requestedOffset: outcome.disposition === "resumed"
-        ? parseCounter(outcome.replayFromOffset, "durable replayFromOffset")
-        : null,
+      requestedOffset: outcome.disposition === "reset"
+        ? null
+        : parseCounter(outcome.replayFromOffset, "durable replayFromOffset"),
       bufferStartOffset: null,
       tailOffset: null,
     };
@@ -2890,9 +2890,9 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation: record.outcome.generation,
         reason: "stream_lost",
-        requestedOffset: record.outcome.disposition === "resumed"
-          ? record.outcome.replayFromOffset
-          : null,
+        requestedOffset: record.outcome.disposition === "reset"
+          ? null
+          : record.outcome.replayFromOffset,
         bufferStartOffset: null,
         tailOffset: null,
       });
@@ -2905,9 +2905,9 @@ export class RelayV2TerminalManager {
         kind: "reset",
         generation: stream.generation,
         reason: "stream_lost",
-        requestedOffset: record.outcome.disposition === "resumed"
-          ? record.outcome.replayFromOffset
-          : null,
+        requestedOffset: record.outcome.disposition === "reset"
+          ? null
+          : record.outcome.replayFromOffset,
         bufferStartOffset: null,
         tailOffset: null,
       });
