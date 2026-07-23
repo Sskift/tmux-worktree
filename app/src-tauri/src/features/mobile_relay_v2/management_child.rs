@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -25,6 +26,8 @@ const HIDDEN_MANAGEMENT_ENTRY: &str = "__relay-v2-dashboard-management-stdio";
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const STDOUT_OBSERVATION_CAPACITY: usize = 4;
 const STDOUT_DRAIN_BYTES: usize = (MAX_FRAME_PAYLOAD_BYTES + 1) * 2;
+const MANAGEMENT_CHILD_ENVIRONMENT_ALLOWLIST: [&str; 6] =
+    ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BundledManagementArtifact {
@@ -811,9 +814,34 @@ impl ChildFactory for ProductionFactory {
 }
 
 fn production_command(node: &Path, artifact: &BundledManagementArtifact) -> Command {
+    production_command_with_environment(node, artifact, std::env::vars_os())
+}
+
+fn production_command_with_environment(
+    node: &Path,
+    artifact: &BundledManagementArtifact,
+    inherited_environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Command {
     let mut command = Command::new(node);
+    configure_management_child_environment(&mut command, inherited_environment);
     command.arg(artifact.path()).arg(HIDDEN_MANAGEMENT_ENTRY);
     command
+}
+
+fn configure_management_child_environment(
+    command: &mut Command,
+    inherited_environment: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    command.env_clear();
+    for (key, value) in inherited_environment {
+        if MANAGEMENT_CHILD_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .any(|allowed| key == OsStr::new(allowed))
+            && !value.as_os_str().is_empty()
+        {
+            command.env(key, value);
+        }
+    }
 }
 
 fn cleanup_spawn_attempt(attempt: SpawnAttempt) {
@@ -2271,9 +2299,24 @@ mod tests {
     }
 
     #[test]
-    fn production_launch_uses_only_artifact_then_the_fixed_hidden_entry() {
+    fn production_launch_uses_only_artifact_fixed_entry_and_allowlisted_environment() {
         let artifact = artifact();
-        let command = production_command(Path::new("/fixed/node"), &artifact);
+        let command = production_command_with_environment(
+            Path::new("/fixed/node"),
+            &artifact,
+            [
+                (OsString::from("HOME"), OsString::from("/Users/fixture")),
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                (
+                    OsString::from("TW_RELAY_BOOTSTRAP_SECRET"),
+                    OsString::from("must-not-cross"),
+                ),
+                (
+                    OsString::from("NODE_OPTIONS"),
+                    OsString::from("--require=/untrusted/injection.cjs"),
+                ),
+            ],
+        );
         assert_eq!(command.get_program(), std::ffi::OsStr::new("/fixed/node"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -2281,6 +2324,30 @@ mod tests {
                 artifact.path().as_os_str(),
                 std::ffi::OsStr::new(HIDDEN_MANAGEMENT_ENTRY)
             ]
+        );
+        let child_environment = command.get_envs().collect::<Vec<_>>();
+        assert_eq!(child_environment.len(), 2);
+        assert!(child_environment.contains(&(
+            std::ffi::OsStr::new("HOME"),
+            Some(std::ffi::OsStr::new("/Users/fixture"))
+        )));
+        assert!(child_environment.contains(&(
+            std::ffi::OsStr::new("PATH"),
+            Some(std::ffi::OsStr::new("/usr/bin:/bin"))
+        )));
+
+        let mut preconfigured = Command::new("/fixed/node");
+        preconfigured.env("TW_RELAY_BOOTSTRAP_SECRET", "must-be-cleared");
+        configure_management_child_environment(
+            &mut preconfigured,
+            [(OsString::from("HOME"), OsString::from("/Users/fixture"))],
+        );
+        assert_eq!(
+            preconfigured.get_envs().collect::<Vec<_>>(),
+            vec![(
+                std::ffi::OsStr::new("HOME"),
+                Some(std::ffi::OsStr::new("/Users/fixture"))
+            )]
         );
     }
 
