@@ -12,6 +12,9 @@ import {
   RelayV2CanonicalTwRpcQueryTransportAdapter,
   createRelayV2CanonicalTwRpcConfigSnapshotFoundation,
 } from "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js";
+import {
+  RelayV2CanonicalStructuredProcessAdapter,
+} from "../dist/relay/v2/canonicalStructuredProcessAdapter.js";
 
 const encoder = new TextEncoder();
 
@@ -614,4 +617,286 @@ test("process and response failures stay partial through discovery and never aut
       assert.ok(runner.calls.every((call) => !call.argv.includes("tmux")));
     });
   }
+});
+
+const KILL_REQUEST_JSON = JSON.stringify({
+  protocolVersion: 2,
+  operation: "kill-session",
+  name: "tw-term-a1b2c",
+  expectedIncarnation: `twinc2.${"A".repeat(43)}`,
+});
+
+const KILL_RESPONSE = {
+  protocolVersion: 2,
+  operation: "kill-session",
+  state: "succeeded",
+  name: "tw-term-a1b2c",
+  kind: "terminal",
+  incarnation: `twinc2.${"A".repeat(43)}`,
+  terminated: true,
+  sessionId: "$7",
+};
+
+function structuredRequest(target, overrides = {}) {
+  return {
+    target: { kind: target.kind, scopeId: "scope-local", targetId: target.targetId },
+    executable: "tw",
+    argv: ["rpc-v2", "kill-session", "--request-json", KILL_REQUEST_JSON],
+    stdin: null,
+    timeoutMs: 50,
+    maxStdoutBytes: 1_048_576,
+    maxStderrBytes: 65_536,
+    maxResponseFrameBytes: 1_048_575,
+    ...overrides,
+  };
+}
+
+function assertStructuredCode(code) {
+  return (error) => error?.name === "RelayV2CanonicalStructuredProcessError"
+    && error.code === code;
+}
+
+test("structured mutation process lane invokes only the exact configured target and reports exited", async () => {
+  const runner = fakeRunner(() => jsonProcess(KILL_RESPONSE));
+  const authority = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [localTarget(), sshTarget()],
+    runner,
+  });
+  const process = new RelayV2CanonicalStructuredProcessAdapter({ targets: authority, runner });
+
+  const localResult = await process.execute(structuredRequest({
+    kind: "local",
+    targetId: "bundled-local-cli",
+  }));
+  const sshResult = await process.execute(structuredRequest(
+    { kind: "ssh", targetId: "configured-devbox" },
+    { timeoutMs: 120_000 },
+  ));
+
+  for (const result of [localResult, sshResult]) {
+    assert.equal(result.kind, "exited");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.signal, null);
+    assert.equal(new TextDecoder().decode(result.stdout), `${JSON.stringify(KILL_RESPONSE)}\n`);
+    assert.equal(result.stderr.byteLength, 0);
+    assert.ok(Number.isSafeInteger(result.elapsedMs) && result.elapsedMs >= 0);
+  }
+  assert.deepEqual(runner.calls[0], {
+    executable: "/opt/tw-node/bin/node",
+    argv: [
+      "/opt/tw-dashboard/tw-cli/cli.cjs",
+      "rpc-v2",
+      "kill-session",
+      "--request-json",
+      KILL_REQUEST_JSON,
+    ],
+    shell: false,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  assert.deepEqual(runner.calls[1], {
+    executable: "/usr/bin/ssh",
+    argv: [
+      "-F", "/dev/null",
+      "-o", "BatchMode=yes",
+      "-o", "PasswordAuthentication=no",
+      "-o", "KbdInteractiveAuthentication=no",
+      "-o", "StrictHostKeyChecking=yes",
+      "-o", "UserKnownHostsFile=/configured/ssh/known_hosts",
+      "-o", "GlobalKnownHostsFile=/dev/null",
+      "-o", "ClearAllForwardings=yes",
+      "-o", "RequestTTY=no",
+      "-o", "ConnectTimeout=120",
+      "-o", "IdentitiesOnly=yes",
+      "-i", "/configured/ssh/id_ed25519",
+      "-p", "2222",
+      "-l", "builder",
+      "--",
+      "devbox.example.com",
+      `'/opt/tw/bin/tw' 'rpc-v2' 'kill-session' '--request-json' '${KILL_REQUEST_JSON}'`,
+    ],
+    shell: false,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  assert.equal(JSON.stringify(runner.calls).includes("tmux"), false);
+  assert.equal(JSON.stringify(runner.calls).includes('"rpc"'), false);
+
+  await assert.rejects(
+    process.execute(structuredRequest({ kind: "ssh", targetId: "ssh-config-alias" })),
+    assertStructuredCode("TARGET_UNAVAILABLE"),
+  );
+  await assert.rejects(
+    process.execute(structuredRequest(
+      { kind: "local", targetId: "bundled-local-cli" },
+      { target: { kind: "local", scopeId: " scope-local", targetId: "bundled-local-cli" } },
+    )),
+    assertStructuredCode("INVALID_REQUEST"),
+  );
+  authority.beginContentAddressedTargetTransition();
+  await assert.rejects(
+    process.execute(structuredRequest({ kind: "local", targetId: "bundled-local-cli" })),
+    assertStructuredCode("TARGET_UNAVAILABLE"),
+  );
+  assert.equal(
+    runner.calls.length,
+    2,
+    "unknown, malformed, or retired targets must fail closed before spawn",
+  );
+});
+
+test("structured mutation timeout kills with SIGKILL and reports timed_out only after a full drain", async () => {
+  const events = [];
+  const controlled = controlledProcess(events);
+  const runner = fakeRunner(() => controlled.handle);
+  const authority = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [localTarget()],
+    runner,
+  });
+  const process = new RelayV2CanonicalStructuredProcessAdapter({ targets: authority, runner });
+
+  let settled = false;
+  const pending = process.execute(structuredRequest(
+    { kind: "local", targetId: "bundled-local-cli" },
+    { timeoutMs: 5 },
+  ));
+  pending.then(() => { settled = true; }, () => { settled = true; });
+
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(events, ["kill"]);
+  assert.equal(settled, false, "timed_out must await the child exit barrier");
+  controlled.releaseExit();
+  await Promise.resolve();
+  assert.equal(settled, false, "timed_out must await stdout and stderr after exit");
+  controlled.releaseStdout();
+  await Promise.resolve();
+  assert.equal(settled, false, "timed_out must await stderr after stdout");
+  controlled.releaseStderr();
+  const result = await pending;
+  assert.equal(result.kind, "timed_out");
+  assert.ok(result.elapsedMs >= 5);
+  assert.deepEqual(events, ["kill", "exit", "stdout", "stderr"]);
+  assert.equal(runner.calls.length, 1);
+});
+
+test("structured mutation spawn failure reports exact spawn_failed without retry", async () => {
+  const runner = fakeRunner(() => { throw new Error("ENOENT"); });
+  const authority = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [localTarget()],
+    runner,
+  });
+  const process = new RelayV2CanonicalStructuredProcessAdapter({ targets: authority, runner });
+  const result = await process.execute(structuredRequest({
+    kind: "local",
+    targetId: "bundled-local-cli",
+  }));
+  assert.equal(result.kind, "spawn_failed");
+  assert.equal(result.stdout.byteLength, 0);
+  assert.equal(result.stderr.byteLength, 0);
+  assert.ok(Number.isSafeInteger(result.elapsedMs));
+  assert.equal(runner.calls.length, 1);
+});
+
+test("structured mutation response overflow kills immediately and rejects only after a full drain", async () => {
+  const events = [];
+  let releaseExit;
+  let releaseStdout;
+  let releaseStderr;
+  const exitBarrier = new Promise((resolve) => { releaseExit = resolve; });
+  const stdoutBarrier = new Promise((resolve) => { releaseStdout = resolve; });
+  const stderrBarrier = new Promise((resolve) => { releaseStderr = resolve; });
+  const handle = {
+    stdout: {
+      async *[Symbol.asyncIterator]() {
+        yield new Uint8Array(32);
+        await stdoutBarrier;
+        events.push("stdout");
+      },
+    },
+    stderr: {
+      async *[Symbol.asyncIterator]() {
+        await stderrBarrier;
+        events.push("stderr");
+      },
+    },
+    exited: exitBarrier.then(() => {
+      events.push("exit");
+      return { exitCode: null, signal: "SIGKILL" };
+    }),
+    kill(signal) {
+      assert.equal(signal, "SIGKILL");
+      events.push("kill");
+    },
+  };
+  const runner = fakeRunner(() => handle);
+  const authority = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [localTarget()],
+    runner,
+  });
+  const process = new RelayV2CanonicalStructuredProcessAdapter({ targets: authority, runner });
+
+  let settled = false;
+  const pending = process.execute(structuredRequest(
+    { kind: "local", targetId: "bundled-local-cli" },
+    { timeoutMs: 10_000, maxResponseFrameBytes: 16 },
+  ));
+  pending.then(() => { settled = true; }, () => { settled = true; });
+
+  while (events.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.deepEqual(events, ["kill"], "first overflowing chunk must kill immediately");
+  assert.equal(settled, false);
+  releaseExit();
+  await Promise.resolve();
+  assert.equal(settled, false, "overflow must await the stdout drain after exit");
+  releaseStdout();
+  await Promise.resolve();
+  assert.equal(settled, false, "overflow must await the stderr drain after stdout");
+  releaseStderr();
+  await assert.rejects(pending, assertStructuredCode("OUTPUT_LIMIT"));
+  events.push("rejected");
+  assert.deepEqual(events, ["kill", "exit", "stdout", "stderr", "rejected"]);
+  assert.equal(runner.calls.length, 1);
+});
+
+test("structured mutation SSH lane POSIX-encodes every remote argument into one command string", async () => {
+  const dangerousJson = `{"op":"x y's $(whoami)"}`;
+  const runner = fakeRunner(() => jsonProcess(KILL_RESPONSE));
+  const authority = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [sshTarget()],
+    runner,
+  });
+  const process = new RelayV2CanonicalStructuredProcessAdapter({ targets: authority, runner });
+
+  const result = await process.execute(structuredRequest(
+    { kind: "ssh", targetId: "configured-devbox" },
+    { argv: ["rpc-v2", "kill-session", "--request-json", dangerousJson] },
+  ));
+
+  assert.equal(result.kind, "exited");
+  assert.equal(runner.calls.length, 1);
+  const call = runner.calls[0];
+  assert.equal(call.executable, "/usr/bin/ssh");
+  assert.equal(call.shell, false);
+  assert.equal(call.stdin, "ignore");
+  const hostIndex = call.argv.indexOf("devbox.example.com");
+  assert.ok(hostIndex > 0);
+  assert.equal(
+    call.argv.length,
+    hostIndex + 2,
+    "the remote command must be exactly one argv item after the host",
+  );
+  const remoteCommand = call.argv[hostIndex + 1];
+  assert.equal(
+    remoteCommand,
+    `'/opt/tw/bin/tw' 'rpc-v2' 'kill-session' '--request-json' '{"op":"x y'\\''s $(whoami)"}'`,
+  );
+  assert.equal(
+    remoteCommand.includes(dangerousJson),
+    false,
+    "raw request JSON must never cross the remote shell boundary unencoded",
+  );
+  assert.equal(JSON.stringify(runner.calls).includes("tmux"), false);
+  assert.equal(JSON.stringify(runner.calls).includes('"rpc"'), false);
 });

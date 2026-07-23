@@ -41,6 +41,9 @@ const QUERY_JSON_LIMITS = Object.freeze({
 
 const MAX_ARGUMENT_BYTES = 4_096;
 const MAX_LOCAL_ARGV_PREFIX = 16;
+const MAX_STRUCTURED_PROCESS_ARGV_ITEMS = 64;
+const MAX_STRUCTURED_PROCESS_ARGUMENT_BYTES = 1_048_576;
+const MAX_STRUCTURED_PROCESS_INVOCATION_BYTES = 1_179_648;
 
 export interface RelayV2CanonicalTwRpcLocalQueryTargetDescriptor {
   kind: "local";
@@ -222,6 +225,19 @@ export class RelayV2CanonicalTwRpcQueryTransportError extends Error {
     super(`canonical TW RPC v2 query transport failed: ${code}`);
     this.name = "RelayV2CanonicalTwRpcQueryTransportError";
   }
+}
+
+/**
+ * Exact complete process invocation of one current configured target for the
+ * canonical structured mutation lane: the concrete executable plus the final
+ * argv. Caller-supplied arguments are already carried inside the fixed local
+ * argv or encoded into the single quoted post-host remote command string, so
+ * the consumer can spawn it directly without further assembly. It carries no
+ * query, scan, compound-channel, or mutation authority of its own.
+ */
+export interface RelayV2CanonicalStructuredProcessInvocation {
+  readonly executable: string;
+  readonly argv: readonly string[];
 }
 
 type NormalizedTarget =
@@ -458,6 +474,83 @@ function normalizeQuery(value: unknown): RelayV2CanonicalTwRpcDiscoveryQuery {
   throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
 }
 
+function sshInvocationOptions(
+  target: Extract<NormalizedTarget, { kind: "ssh" }>,
+  timeoutMs: number,
+): string[] {
+  return [
+    "-F", "/dev/null",
+    "-o", "BatchMode=yes",
+    "-o", "PasswordAuthentication=no",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "StrictHostKeyChecking=yes",
+    "-o", `UserKnownHostsFile=${target.knownHostsFile}`,
+    "-o", "GlobalKnownHostsFile=/dev/null",
+    "-o", "ClearAllForwardings=yes",
+    "-o", "RequestTTY=no",
+    "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutMs / 1_000))}`,
+    "-o", "IdentitiesOnly=yes",
+    "-i", target.identityFile,
+    "-p", String(target.port),
+    "-l", target.user,
+  ];
+}
+
+function sshInvocationPrefix(
+  target: Extract<NormalizedTarget, { kind: "ssh" }>,
+  timeoutMs: number,
+): string[] {
+  return [
+    ...sshInvocationOptions(target, timeoutMs),
+    "--",
+    target.host,
+    target.twExecutable,
+  ];
+}
+
+/**
+ * Strict POSIX single-quote encoding: every byte except `'` is literal inside
+ * single quotes, and each `'` closes the quote, adds an escaped quote, and
+ * reopens it. OpenSSH joins post-host arguments into one remote shell command,
+ * so caller-controlled argv must never cross that boundary unencoded.
+ */
+function posixShellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function structuredProcessArgv(value: unknown): string[] {
+  if (!Array.isArray(value)
+    || value.length < 1
+    || value.length > MAX_STRUCTURED_PROCESS_ARGV_ITEMS
+    || value.some((item) => typeof item !== "string"
+      || (item as string).includes("\0")
+      || Buffer.byteLength(item as string, "utf8")
+        > MAX_STRUCTURED_PROCESS_ARGUMENT_BYTES)) {
+    throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
+  }
+  const argv = [...value] as string[];
+  // Aggregate bytes are validated before any quoting or join so the public
+  // lookup cannot be driven into amplified allocation by many large items.
+  if (argv.reduce((total, item) => total + Buffer.byteLength(item, "utf8"), 0)
+    > MAX_STRUCTURED_PROCESS_INVOCATION_BYTES) {
+    throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
+  }
+  return argv;
+}
+
+function boundedStructuredInvocation(
+  executable: string,
+  argv: readonly string[],
+): RelayV2CanonicalStructuredProcessInvocation {
+  // The final invocation, quoting expansion included, must fit the same hard
+  // byte cap the structured process adapter enforces before spawn.
+  if (argv.reduce((total, item) => total + Buffer.byteLength(item, "utf8"), 0)
+    > MAX_STRUCTURED_PROCESS_INVOCATION_BYTES) {
+    throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
+  }
+  return Object.freeze({ executable, argv: Object.freeze(argv) });
+}
+
 function invocationFor(
   target: NormalizedTarget,
   request: RelayV2CanonicalTwRpcDiscoveryQuery,
@@ -473,23 +566,7 @@ function invocationFor(
     });
   }
   const argv = [
-    "-F", "/dev/null",
-    "-o", "BatchMode=yes",
-    "-o", "PasswordAuthentication=no",
-    "-o", "KbdInteractiveAuthentication=no",
-    "-o", "StrictHostKeyChecking=yes",
-    "-o", `UserKnownHostsFile=${target.knownHostsFile}`,
-    "-o", "GlobalKnownHostsFile=/dev/null",
-    "-o", "ClearAllForwardings=yes",
-    "-o", "RequestTTY=no",
-    "-o", `ConnectTimeout=${Math.max(1, Math.ceil(request.timeoutMs / 1_000))}`,
-    "-o", "IdentitiesOnly=yes",
-    "-i", target.identityFile,
-    "-p", String(target.port),
-    "-l", target.user,
-    "--",
-    target.host,
-    target.twExecutable,
+    ...sshInvocationPrefix(target, request.timeoutMs),
     "rpc-v2",
     request.command,
   ];
@@ -918,6 +995,50 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
       kind: target.kind,
       targetId: target.targetId,
     };
+  }
+
+  /**
+   * Narrow additive lookup for the canonical structured mutation process lane.
+   * It resolves one current configured target and returns the exact complete
+   * invocation for the caller's canonical `tw rpc-v2` argv: local targets
+   * append it to the fixed argv prefix, while SSH targets encode the remote
+   * tw executable and every caller argument with strict POSIX single quotes
+   * into the single post-host remote command string. The lookup is
+   * re-evaluated by the caller on every execute, so retired descriptor
+   * generations fail closed instead of invoking stale bindings. It exposes no
+   * query, scan, or compound-channel authority and never falls back to
+   * another target.
+   */
+  structuredProcessInvocation(
+    kind: "local" | "ssh",
+    targetId: string,
+    argv: readonly string[],
+    timeoutMs: number,
+  ): RelayV2CanonicalStructuredProcessInvocation {
+    const normalizedId = boundedString(targetId, 128);
+    const rpcArgv = structuredProcessArgv(argv);
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
+    }
+    const target = this.targets.get(`${kind}\0${normalizedId}`);
+    if (target === undefined) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
+    if (target.kind === "local") {
+      return boundedStructuredInvocation(target.executable, [
+        ...target.argvPrefix,
+        ...rpcArgv,
+      ]);
+    }
+    const remoteCommand = [target.twExecutable, ...rpcArgv]
+      .map((item) => posixShellQuote(item))
+      .join(" ");
+    return boundedStructuredInvocation(target.sshExecutable, [
+      ...sshInvocationOptions(target, timeoutMs),
+      "--",
+      target.host,
+      remoteCommand,
+    ]);
   }
 
   /** Synchronously withdraws every binding while a config generation retires. */
