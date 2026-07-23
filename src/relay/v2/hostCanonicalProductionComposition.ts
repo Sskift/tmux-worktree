@@ -2,15 +2,13 @@ import { types as nodeTypes } from "node:util";
 import { terminalControlSocketPath } from "../../terminalControl/store.js";
 import {
   RelayV2CanonicalAgentMessageTerminalExecutionAdapter,
-  RelayV2CanonicalCommandTargetAuthorityAdapter,
-  type RelayV2CanonicalCreateTargetAuthorityPortV1,
 } from "./canonicalCommandTargetAuthorityAdapter.js";
 import {
-  RelayV2CanonicalCommandExecutorAdapter,
-  type RelayV2StructuredProcessPort,
-} from "./canonicalCommandExecutorAdapter.js";
+  captureRelayV2CanonicalCreateTargetH1FactoryV1,
+  type RelayV2CanonicalCreateTargetExecutionPairV1,
+  type RelayV2CanonicalCreateTargetH1FactoryV1,
+} from "./canonicalCreateTargetAdmissionAdapter.js";
 import { RelayV2CanonicalTerminalTargetResolverAdapter } from "./canonicalTerminalTargetResolverAdapter.js";
-import { RelayV2HostCommandPlane } from "./hostCommandPlane.js";
 import {
   openRelayV2HostManagedWssConnectorRuntimeComposition,
   type RelayV2HostManagedConnectorInspection,
@@ -82,8 +80,13 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
   readonly recoveredH2Spool: RelayV2StateSnapshotSpool;
   readonly credentialAuthority: RelayV2HostCredentialAuthority;
   readonly welcome: RelayV2HostRuntimeWelcomeSerializer;
-  readonly createTargetAuthority: RelayV2CanonicalCreateTargetAuthorityPortV1;
-  readonly process: RelayV2StructuredProcessPort;
+  /**
+   * The single opaque one-shot create target execution pair. It is consumed
+   * synchronously after option validation, before hostState.read, H2, or any
+   * lookup; its components then serve as the create target authority and the
+   * structured process lane.
+   */
+  readonly createTargetExecutionPair: RelayV2CanonicalCreateTargetExecutionPairV1;
   readonly terminalBackend?: RelayV2TerminalByteBackend;
   readonly localProcessTarget: Readonly<{ kind: "local"; targetId: string }>;
   readonly terminalControl?: Readonly<{
@@ -307,10 +310,7 @@ function validateOptions(
     ])
     && isRelayV2HostCredentialAuthority(options.credentialAuthority)
     && validPort(options.welcome, ["build"])
-    && validPort(options.createTargetAuthority, [
-      "resolveCreateTarget", "fenceCreateTargetForAdmission",
-    ])
-    && validPort(options.process, ["execute"])
+    && isRecord(options.createTargetExecutionPair)
     && (options.terminalBackend === undefined
       || validPort(options.terminalBackend, ["open"]))
     && isRecord(options.localProcessTarget)
@@ -351,6 +351,18 @@ export async function openRelayV2HostCanonicalProductionComposition(
     options.terminalControl,
   );
   if (terminalOptions === null) return null;
+  // The one-shot execution pair is captured as its one-shot H1 factory
+  // synchronously here, before hostState.read, H2, or any
+  // lookup/claim/fence/spawn; a foreign, fabricated, or replayed pair fails
+  // closed at this point.
+  let createTargetH1Factory: RelayV2CanonicalCreateTargetH1FactoryV1;
+  try {
+    createTargetH1Factory = captureRelayV2CanonicalCreateTargetH1FactoryV1(
+      options.createTargetExecutionPair,
+    );
+  } catch {
+    return null;
+  }
 
   const h0 = captureRelayV2HostH0ReadinessPort(options.hostState.h0ReadinessPort);
   if (h0 === null) return null;
@@ -425,25 +437,20 @@ export async function openRelayV2HostCanonicalProductionComposition(
     observedBytePlane = options.terminalBackend === undefined
       ? new RelayV2TerminalControlObservedBytePlaneAdapterV1({ exactTargets })
       : null;
-    const commandTargets = new RelayV2CanonicalCommandTargetAuthorityAdapter({
-      resourceResolver: h2.resourceResolver,
-      createTargetAuthority: options.createTargetAuthority,
-      exactTerminalTarget: exactTargets,
-    });
     const commandTerminal = new RelayV2CanonicalAgentMessageTerminalExecutionAdapter(
       exactTargets,
       exactTargets,
     );
-    const commandExecutor = new RelayV2CanonicalCommandExecutorAdapter({
-      resolver: commandTargets,
-      process: options.process,
-      terminalControl: commandTerminal,
-      terminalOwner: reservationOwner,
-    });
-    const h1Candidate = await RelayV2HostCommandPlane.openRecoveredAuthority({
+    // The pair's one-shot factory assembles the create command target
+    // resolver and executor around its sealed components and opens the
+    // recovered H1 authority in the same call.
+    const h1Candidate = await createTargetH1Factory({
       store: options.hostState,
       hostId: profile.hostId,
-      executor: commandExecutor,
+      resourceResolver: h2.resourceResolver,
+      exactTerminalTarget: exactTargets,
+      commandTerminal,
+      terminalOwner: reservationOwner,
       resourceMutationOwner: h2.resourceMutationOwner,
     });
     if (h1Candidate === null) {

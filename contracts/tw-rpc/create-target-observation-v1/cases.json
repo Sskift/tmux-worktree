@@ -1,0 +1,81 @@
+{
+  "createWorktree": {
+    "request": {
+      "schemaVersion": 1,
+      "operation": "create_worktree",
+      "arguments": {
+        "project": "demo",
+        "path": "/repo/demo",
+        "name": "fix",
+        "branch": "main",
+        "aiCommand": "codex"
+      }
+    },
+    "response": {
+      "schemaVersion": 1,
+      "catalogRevision": "twcat1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "observation": {
+        "operation": "create_worktree",
+        "arguments": {
+          "project": "demo",
+          "path": "/repo/demo",
+          "name": "fix",
+          "branch": "main",
+          "aiCommand": "codex"
+        },
+        "execution": {
+          "canonicalRepoPath": "/repo/demo",
+          "effectiveProject": "demo",
+          "effectiveBaseBranch": "main",
+          "rawSessionName": "demo-fix",
+          "publicDisplayName": "fix",
+          "worktreeBase": "/worktrees",
+          "worktreePath": "/worktrees/demo/demo-fix",
+          "worktreeBranch": "demo-fix"
+        },
+        "catalog": {
+          "canonicalGitIdentity": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "baseRefOid": "0123456789abcdef0123456789abcdef01234567"
+        }
+      }
+    },
+    "note": "Success observation of the exact worktree placement the resolved-create mutation would consume; placementSegment equals canonicalWorktreePlacementSegment(effectiveProject). The closed-set catalog evidence binds the canonical git-dir/common-dir identity digest and the exact resolved base-ref OID; both enter the catalogRevision digest, so identity or OID drift changes the revision."
+  },
+  "createTerminal": {
+    "request": {
+      "schemaVersion": 1,
+      "operation": "create_terminal",
+      "arguments": {
+        "cwd": "/repo/demo",
+        "label": "demo"
+      }
+    },
+    "response": {
+      "schemaVersion": 1,
+      "catalogRevision": "twcat1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "observation": {
+        "operation": "create_terminal",
+        "arguments": {
+          "cwd": "/repo/demo",
+          "label": "demo"
+        },
+        "execution": {
+          "canonicalCwd": "/repo/demo",
+          "publicDisplayName": "demo"
+        }
+      }
+    },
+    "note": "Success observation of the canonical terminal cwd and its derived public display name."
+  },
+  "malformedRequest": {
+    "request": {
+      "schemaVersion": 1,
+      "operation": "create_worktree",
+      "arguments": {
+        "project": "demo"
+      }
+    },
+    "rejected": true,
+    "note": "Missing required aiCommand: the entrypoint rejects closed with a nonzero exit / error line and never fabricates a placement or a PROJECT_NOT_FOUND business result."
+  }
+}

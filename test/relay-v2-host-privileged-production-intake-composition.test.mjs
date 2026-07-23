@@ -20,6 +20,25 @@ const bridgeModule = await import(
 const nativeCellModule = await import(
   "../dist/relay/v2/hostCredentialAtomicFileCellNative.js"
 );
+const createTargetAdmissionModule = await import(
+  "../dist/relay/v2/canonicalCreateTargetAdmissionAdapter.js"
+);
+const createTargetQueryTransportModule = await import(
+  "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js"
+);
+
+/** A real one-shot execution pair whose components stay inert in these tests. */
+function realCreateTargetExecutionPair() {
+  const runner = { spawn() { throw new Error("unexpected create observation spawn"); } };
+  return createTargetAdmissionModule.issueRelayV2CanonicalCreateTargetExecutionPairV1({
+    owner: new createTargetQueryTransportModule.RelayV2CanonicalTwRpcQueryTransportAdapter({
+      targets: [{ kind: "local", targetId: "local", executable: "/usr/local/bin/tw" }],
+      runner,
+    }),
+    runner,
+    inner: { async execute() { throw new Error("unexpected process execution"); } },
+  });
+}
 const profileStore = await import("../dist/relay/v2/hostProductionProfileStore.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
@@ -240,22 +259,7 @@ async function makeHarness(label, home) {
         throw new Error("unexpected welcome build");
       },
     },
-    createTargetAuthority: {
-      async resolveCreateTarget() {
-        effects.create += 1;
-        throw new Error("unexpected create resolution");
-      },
-      fenceCreateTargetForAdmission() {
-        effects.create += 1;
-        throw new Error("unexpected create fence");
-      },
-    },
-    process: {
-      async execute() {
-        effects.process += 1;
-        throw new Error("unexpected process execution");
-      },
-    },
+    createTargetExecutionPair: realCreateTargetExecutionPair(),
     terminalBackend: {
       async open() {
         effects.terminal += 1;
@@ -336,8 +340,7 @@ function bareCanonicalOptions() {
     hostState: { close() {} },
     recoveredH2Spool: { close() { return Promise.resolve(); } },
     welcome: {},
-    createTargetAuthority: {},
-    process: {},
+    createTargetExecutionPair: {},
     terminalBackend: {},
     localProcessTarget: {},
   };

@@ -107,6 +107,7 @@ function createEvidence(req) {
       operation: req.operation,
       arguments: structuredClone(req.arguments),
       execution,
+      catalogRevision: "twcat1.catalog-one",
       publicDisplayName: execution.publicDisplayName,
       prospectiveSession: {
         kind: "worktree",
@@ -129,6 +130,7 @@ function createEvidence(req) {
     operation: req.operation,
     arguments: structuredClone(req.arguments),
     execution,
+    catalogRevision: "twcat1.catalog-two",
     publicDisplayName: execution.publicDisplayName,
     prospectiveSession: {
       kind: "terminal",
@@ -456,62 +458,6 @@ function localQueryPort(targetId = "canonical-local-rpc") {
     runner: { spawn: () => { throw new Error("no spawn in claim tests"); } },
   });
 }
-
-test("create target claim: same-generation exactly-once success, replay fails closed", async () => {
-  const queryPort = localQueryPort();
-  const order = [];
-  const p = ports({
-    createFence: () => order.push("create"),
-    h2Fence: () => order.push("h2"),
-  });
-  const wrapper = new targetModule.RelayV2CanonicalCreateTargetClaimAuthorityAdapterV1({
-    authority: p.createTargetAuthority,
-    claims: queryPort,
-  });
-  const resolver = resolverFor(p, { createTargetAuthority: wrapper });
-  const req = request("create_worktree");
-  const resolution = await resolver.resolve(req);
-  assert.equal(resolution.kind, "resolved");
-  const fence = {
-    schemaVersion: 1,
-    outcome: "positive",
-    authority: req.authority,
-    operation: req.operation,
-    expectedScopeId: req.scopeId,
-    expectedSessionId: req.sessionId,
-    target: structuredClone(resolution.target),
-    evidence: structuredClone(resolution.admissionFence),
-  };
-  resolver.fenceResolution({ hostEpoch: HOST_EPOCH }, req, fence);
-  assert.deepEqual(order, ["create", "h2"]);
-  assert.equal(p.calls.createFence.length, 1);
-
-  assert.throws(
-    () => resolver.fenceResolution({ hostEpoch: HOST_EPOCH }, req, fence),
-    /missing or already consumed/,
-  );
-  assert.equal(p.calls.createFence.length, 1);
-  assert.equal(p.calls.h2Fence.length, 1);
-
-  const second = await resolver.resolve(req);
-  assert.equal(second.kind, "resolved");
-  const tampered = structuredClone(fence);
-  tampered.target = structuredClone(second.target);
-  tampered.evidence = structuredClone(second.admissionFence);
-  tampered.evidence.commandProof.input.resourceTarget.processTarget.targetId = "other-target";
-  assert.throws(
-    () => resolver.fenceResolution({ hostEpoch: HOST_EPOCH }, req, tampered),
-    /crossed request or H2 authority|missing or already consumed/,
-  );
-  assert.equal(p.calls.h2Fence.length, 1);
-
-  const unconfigured = new targetModule.RelayV2CanonicalCreateTargetClaimAuthorityAdapterV1({
-    authority: p.createTargetAuthority,
-    claims: localQueryPort("unconfigured-target"),
-  });
-  const missed = await resolverFor(p, { createTargetAuthority: unconfigured }).resolve(req);
-  assert.equal(missed.kind, "unavailable");
-});
 
 test("process-target claim: foreign, replayed, and stale claims fail closed", () => {
   const owner = localQueryPort();

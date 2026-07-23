@@ -147,8 +147,7 @@ const CANONICAL_REQUIRED_KEYS = Object.freeze([
   "hostState",
   "recoveredH2Spool",
   "welcome",
-  "createTargetAuthority",
-  "process",
+  "createTargetExecutionPair",
   "localProcessTarget",
 ] as const);
 const CANONICAL_OPTIONAL_KEYS = Object.freeze([

@@ -8,6 +8,7 @@ export default defineConfig({
     "src/hosts.ts",
     "src/rpc.ts",
     "src/rpcV2.ts",
+    "src/createTargetObservationV1.ts",
     "src/session.ts",
     "src/state.ts",
     "src/relayHost.ts",
@@ -42,6 +43,8 @@ export default defineConfig({
     "src/relay/v2/canonicalBackendIdentity.ts",
     "src/relay/v2/canonicalCommandExecutorAdapter.ts",
     "src/relay/v2/canonicalCommandTargetAuthorityAdapter.ts",
+    "src/relay/v2/canonicalCreateTargetObservationAuthority.ts",
+    "src/relay/v2/canonicalCreateTargetAdmissionAdapter.ts",
     "src/relay/v2/canonicalStructuredProcessAdapter.ts",
     "src/relay/v2/canonicalTwRpcDiscovery.ts",
     "src/relay/v2/canonicalTwRpcQueryTransportAdapter.ts",
@@ -146,6 +149,13 @@ export default defineConfig({
     // entries instead of bundling second private claim/revision registries.
     "./hostPrivilegedProductionIntakeComposition.js",
     "./hostCredentialAtomicFileCellNative.js",
+    // The same-owner create target authority bundle registry is module-private;
+    // every create target consumer must share this canonical entry's WeakMap.
+    "./canonicalTwRpcQueryTransportAdapter.js",
+    // The observation authority error class and the opaque pair registry are
+    // module-private; every consumer must share the canonical entry identities.
+    "./canonicalCreateTargetObservationAuthority.js",
+    "./canonicalCreateTargetAdmissionAdapter.js",
     // The external-continuity opener transfers ownership to the canonical
     // credential authority entry instead of bundling a second owner class.
     "./brokerCredentialAuthority.js",

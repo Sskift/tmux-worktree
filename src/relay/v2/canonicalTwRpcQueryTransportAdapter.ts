@@ -5,6 +5,7 @@ import { types as nodeTypes } from "node:util";
 import { loadConfigFile, type Config } from "../../config.js";
 import {
   RelayV2CanonicalStructuredProcessAdapter,
+  type RelayV2CanonicalStructuredProcessTargetLookupPort,
 } from "./canonicalStructuredProcessAdapter.js";
 import type {
   RelayV2CanonicalTwRpcDiscoveryQuery,
@@ -221,6 +222,50 @@ export interface RelayV2CanonicalProcessTargetClaimPortV1 {
     kind: "local" | "ssh",
     targetId: string,
   ): void;
+}
+
+declare const createTargetAuthorityBundleBrand: unique symbol;
+
+/**
+ * Opaque same-owner bundle privately issued by the single canonical query
+ * transport owner. It binds that owner's exact live structured-process target
+ * lookup and its process-target claim port in one private registry record.
+ * The consumer is the opaque create target execution pair issuer, which
+ * constructs exactly one observation store over this exact lookup and later
+ * assembles its private components over the same record; a foreign,
+ * fabricated, or structurally cloned bundle fails closed at the registry
+ * before any lookup or side effect.
+ */
+export interface RelayV2CanonicalCreateTargetAuthorityBundleV1 {
+  readonly [createTargetAuthorityBundleBrand]: void;
+}
+
+export interface RelayV2CanonicalCreateTargetAuthorityBundleOpenedV1 {
+  readonly targets: RelayV2CanonicalStructuredProcessTargetLookupPort;
+  readonly claims: RelayV2CanonicalProcessTargetClaimPortV1;
+}
+
+const createTargetAuthorityBundles = new WeakMap<
+  object,
+  RelayV2CanonicalCreateTargetAuthorityBundleOpenedV1
+>();
+
+/**
+ * Opens a bundle previously issued by a canonical query transport owner. A
+ * foreign, fabricated, or structurally cloned bundle fails closed; callers
+ * never receive the owner's raw lookup/claim objects through any other path.
+ */
+export function openRelayV2CanonicalCreateTargetAuthorityBundleV1(
+  bundle: RelayV2CanonicalCreateTargetAuthorityBundleV1,
+): RelayV2CanonicalCreateTargetAuthorityBundleOpenedV1 {
+  if (bundle === null || typeof bundle !== "object") {
+    throw new TypeError("canonical create target authority bundle is malformed");
+  }
+  const record = createTargetAuthorityBundles.get(bundle as object);
+  if (record === undefined) {
+    throw new TypeError("canonical create target authority bundle is foreign to every canonical target owner");
+  }
+  return record;
 }
 
 export interface RelayV2CanonicalTwRpcQueryTransportAdapterOptions {
@@ -1151,6 +1196,38 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
       throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
     }
     record.consumed = true;
+  }
+
+  /**
+   * Issues the opaque same-owner bundle for create target authorities. The
+   * bundled lookup re-resolves this owner's live target generation on every
+   * call, and the bundled claim port is this owner's exact one-shot claim
+   * lifecycle; retired generations fail closed through both, exactly as they
+   * do for the structured mutation lane and the claim wrapper.
+   */
+  issueCreateTargetAuthorityBundleV1(): RelayV2CanonicalCreateTargetAuthorityBundleV1 {
+    const bundle = Object.freeze({}) as RelayV2CanonicalCreateTargetAuthorityBundleV1;
+    createTargetAuthorityBundles.set(bundle as object, Object.freeze({
+      targets: Object.freeze({
+        structuredProcessInvocation: (
+          kind: "local" | "ssh",
+          targetId: string,
+          argv: readonly string[],
+          timeoutMs: number,
+        ) => this.structuredProcessInvocation(kind, targetId, argv, timeoutMs),
+      }),
+      claims: Object.freeze({
+        issueProcessTargetClaim: (kind: "local" | "ssh", targetId: string) => (
+          this.issueProcessTargetClaim(kind, targetId)
+        ),
+        consumeProcessTargetClaim: (
+          claim: RelayV2CanonicalProcessTargetClaimV1,
+          kind: "local" | "ssh",
+          targetId: string,
+        ) => this.consumeProcessTargetClaim(claim, kind, targetId),
+      }),
+    }));
+    return bundle;
   }
 
   async query(rawRequest: RelayV2CanonicalTwRpcDiscoveryQuery): Promise<unknown> {

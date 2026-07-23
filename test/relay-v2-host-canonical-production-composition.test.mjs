@@ -6,6 +6,26 @@ import test from "node:test";
 
 const relayHost = await import("../dist/relayHost.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
+const createTargetAdmissionModule = await import(
+  "../dist/relay/v2/canonicalCreateTargetAdmissionAdapter.js"
+);
+const createTargetQueryTransportModule = await import(
+  "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js"
+);
+
+/** A real one-shot execution pair whose components stay inert in these tests. */
+function realCreateTargetExecutionPair() {
+  const runner = { spawn() { throw new Error("unexpected create observation spawn"); } };
+  return createTargetAdmissionModule.issueRelayV2CanonicalCreateTargetExecutionPairV1({
+    owner: new createTargetQueryTransportModule.RelayV2CanonicalTwRpcQueryTransportAdapter({
+      targets: [{ kind: "local", targetId: "local", executable: "/usr/local/bin/tw" }],
+      runner,
+    }),
+    runner,
+    inner: { async execute() { throw new Error("unexpected process execution"); } },
+  });
+}
+
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const credentialAuthority = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const credentialExchange = await import(
@@ -185,11 +205,7 @@ async function makeHarness(label, { fresh = false } = {}) {
     recoveredH2Spool: spool,
     credentialAuthority: makeCredentialAuthority(),
     welcome: { build() { throw new Error("unexpected welcome build"); } },
-    createTargetAuthority: {
-      async resolveCreateTarget() { throw new Error("unexpected create resolution"); },
-      fenceCreateTargetForAdmission() { throw new Error("unexpected create fence"); },
-    },
-    process: { async execute() { throw new Error("unexpected process execution"); } },
+    createTargetExecutionPair: realCreateTargetExecutionPair(),
     terminalBackend: { async open() { throw new Error("unexpected terminal open"); } },
     localProcessTarget: { kind: "local", targetId: "local" },
     terminalControl: {
@@ -617,6 +633,43 @@ test("canonical production root assembles the default byte plane without an inje
   } finally {
     abort.abort();
     await daemon.catch(() => undefined);
+    h.cleanup();
+  }
+});
+
+test("fabricated or replayed create execution pair fails closed before hostState.read", async () => {
+  const h = await makeHarness("pair-gate");
+  let hostStateReads = 0;
+  const countingHostState = new Proxy(h.options.hostState, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver);
+      if (key !== "read" || typeof value !== "function") return value;
+      return (...args) => {
+        hostStateReads += 1;
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+  try {
+    const fabricated = await relayHost.openRelayV2HostCanonicalProductionComposition(h.profile, {
+      ...h.options,
+      hostState: countingHostState,
+      createTargetExecutionPair: {},
+    });
+    assert.equal(fabricated, null);
+    assert.equal(hostStateReads, 0);
+
+    // A pair spent by an earlier consume is a replay and fails the same way.
+    const spent = realCreateTargetExecutionPair();
+    createTargetAdmissionModule.captureRelayV2CanonicalCreateTargetH1FactoryV1(spent);
+    const replayed = await relayHost.openRelayV2HostCanonicalProductionComposition(h.profile, {
+      ...h.options,
+      hostState: countingHostState,
+      createTargetExecutionPair: spent,
+    });
+    assert.equal(replayed, null);
+    assert.equal(hostStateReads, 0);
+  } finally {
     h.cleanup();
   }
 });

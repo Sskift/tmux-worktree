@@ -1,0 +1,30 @@
+{
+  "contract": "tmux-worktree-tw-rpc-create-target-observation",
+  "version": 1,
+  "status": "production-prerequisite",
+  "transport": "utf-8-json-line-on-stdout",
+  "entrypoint": "create-target-observation-v1",
+  "capabilityAdvertisementAllowed": false,
+  "extendsFrozenTwRpcV2": false,
+  "requestEncoding": "--request-json",
+  "modes": [
+    "observe",
+    "admit"
+  ],
+  "operations": [
+    "create_worktree",
+    "create_terminal"
+  ],
+  "authority": {
+    "observeSideEffectsAllowed": false,
+    "admitMutation": "canonical-rpc-v2-resolved-create-after-exact-revalidation",
+    "retryAllowed": false,
+    "fallbackAllowed": false,
+    "directTmuxOrGitMutationAllowed": false,
+    "directSshParsingAllowed": false,
+    "revisionDeterministicOverObservedCatalog": true,
+    "unresolvableTarget": "closed-unavailable"
+  },
+  "fixture": "cases.json",
+  "deletionCondition": "Delete this prerequisite only after an independently versioned canonical RPC contract provides the same atomic target-side create target catalog observation/revision authority and every Relay v2 create target consumer has migrated."
+}

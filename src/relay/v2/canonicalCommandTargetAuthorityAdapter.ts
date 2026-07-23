@@ -3,7 +3,6 @@ import type {
   CanonicalTerminalLease,
   CanonicalTerminalOwner,
 } from "../../canonicalTerminalControlClient.js";
-import { createHash } from "node:crypto";
 import {
   RPC_V2_CAPABILITIES,
   type RpcV2CreateResolvedWorktreeRequest,
@@ -46,10 +45,6 @@ import type {
   RelayV2TerminalCanonicalTargetBindingV1,
 } from "./terminalManager.js";
 import type { RelayV2TerminalControlRequestPort } from "./terminalControlAuthorityAdapter.js";
-import type {
-  RelayV2CanonicalProcessTargetClaimPortV1,
-  RelayV2CanonicalProcessTargetClaimV1,
-} from "./canonicalTwRpcQueryTransportAdapter.js";
 
 export const RELAY_V2_CANONICAL_COMMAND_TARGET_AUTHORITY_SCHEMA_VERSION = 1 as const;
 
@@ -68,6 +63,7 @@ export type RelayV2CanonicalCreateTargetAuthorityEvidenceV1 =
       operation: "create_worktree";
       arguments: RpcV2CreateWorktreeRequest["arguments"];
       execution: RpcV2CreateResolvedWorktreeRequest["execution"];
+      catalogRevision: string;
       publicDisplayName: string;
       prospectiveSession: RelayV2CanonicalProspectiveSession;
     }
@@ -77,6 +73,7 @@ export type RelayV2CanonicalCreateTargetAuthorityEvidenceV1 =
       operation: "create_terminal";
       arguments: RpcV2CreateTerminalRequest["arguments"];
       execution: { canonicalCwd: string; publicDisplayName: string };
+      catalogRevision: string;
       publicDisplayName: string;
       prospectiveSession: RelayV2CanonicalProspectiveSession;
     };
@@ -162,7 +159,8 @@ function same(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
 }
 
-function requireSynchronous(value: unknown, label: string): void {
+/** Shared synchronous-fence guard; the create target admission module reuses it. */
+export function requireSynchronous(value: unknown, label: string): void {
   if ((typeof value !== "object" || value === null) && typeof value !== "function") return;
   let then: unknown;
   try {
@@ -360,14 +358,18 @@ function createInput(
   return { schemaVersion: 1, request: clone(request), resourceTarget: clone(target) };
 }
 
-function createEvidence(
+/**
+ * Pure closed-set parser/validator of create target evidence; shared with the
+ * create target admission module's private claim wrapper.
+ */
+export function parseRelayV2CanonicalCreateTargetEvidenceV1(
   value: unknown,
   operation: CreateOperation,
 ): RelayV2CanonicalCreateTargetAuthorityEvidenceV1 {
   if (!isRecord(value)
     || !exactKeys(value, [
       "schemaVersion", "authorityToken", "operation", "arguments", "execution",
-      "publicDisplayName", "prospectiveSession",
+      "catalogRevision", "publicDisplayName", "prospectiveSession",
     ])
     || value.schemaVersion !== 1
     || value.operation !== operation
@@ -377,6 +379,7 @@ function createEvidence(
     throw new TypeError("canonical create target evidence is malformed");
   }
   bounded(value.authorityToken);
+  bounded(value.catalogRevision);
   bounded(value.publicDisplayName);
   return clone(value) as unknown as RelayV2CanonicalCreateTargetAuthorityEvidenceV1;
 }
@@ -584,7 +587,7 @@ implements RelayV2CanonicalTargetResolverPort {
       if (request.operation === "create_worktree" || request.operation === "create_terminal") {
         if (!this.createTargetAuthority || request.sessionId !== null) return unavailable(observedAtMs);
         const input = createInput(request, resource as RelayV2CanonicalResolvedScopeTarget);
-        const create = createEvidence(
+        const create = parseRelayV2CanonicalCreateTargetEvidenceV1(
           await this.createTargetAuthority.resolveCreateTarget(clone(input)),
           request.operation,
         );
@@ -674,7 +677,7 @@ implements RelayV2CanonicalTargetResolverPort {
           ))) {
           throw new TypeError("canonical create target crossed request or H2 authority");
         }
-        const create = createEvidence(proof.evidence, request.operation as CreateOperation);
+        const create = parseRelayV2CanonicalCreateTargetEvidenceV1(proof.evidence, request.operation as CreateOperation);
         expected = createResolvedTarget(request, resource, create);
         fenceCommandOwner = () => {
           const result = this.createTargetAuthority!.fenceCreateTargetForAdmission(
@@ -726,126 +729,6 @@ implements RelayV2CanonicalTargetResolverPort {
       clone(h2),
     );
     requireSynchronous(fenced, "H2 resource admission fence");
-  }
-}
-
-const MAX_PENDING_CREATE_TARGET_CLAIMS = 64;
-
-interface CreateTargetClaimBinding {
-  operation: CreateOperation;
-  kind: "local" | "ssh";
-  targetId: string;
-}
-
-function createClaimBinding(value: unknown): CreateTargetClaimBinding {
-  if (!isRecord(value)
-    || !exactKeys(value, ["schemaVersion", "request", "resourceTarget"])
-    || value.schemaVersion !== 1
-    || !isRecord(value.request)
-    || (value.request.operation !== "create_worktree"
-      && value.request.operation !== "create_terminal")
-    || !isRecord(value.resourceTarget)
-    || !isRecord(value.resourceTarget.processTarget)
-    || !exactKeys(value.resourceTarget.processTarget, ["kind", "targetId"])
-    || (value.resourceTarget.processTarget.kind !== "local"
-      && value.resourceTarget.processTarget.kind !== "ssh")) {
-    throw new TypeError("canonical create target claim input is malformed");
-  }
-  return {
-    operation: value.request.operation,
-    kind: value.resourceTarget.processTarget.kind,
-    targetId: bounded(value.resourceTarget.processTarget.targetId),
-  };
-}
-
-function createClaimKey(
-  input: RelayV2CanonicalCreateTargetAuthorityInputV1,
-  evidence: RelayV2CanonicalCreateTargetAuthorityEvidenceV1,
-): string {
-  return createHash("sha256")
-    .update(canonicalJson({ input, evidence }), "utf8")
-    .digest("base64url");
-}
-
-export interface RelayV2CanonicalCreateTargetClaimAuthorityOptionsV1 {
-  authority: RelayV2CanonicalCreateTargetAuthorityPortV1;
-  claims: RelayV2CanonicalProcessTargetClaimPortV1;
-}
-
-/**
- * Target-side closed-catalog wrapper around an existing create target
- * authority. Every resolve binds the inner port's observed evidence field by
- * field to the request, the H2 resourceTarget, the operation, and one opaque
- * one-shot claim issued by the single config process-target generation owner
- * for that exact kind+targetId. The admission fence synchronously and
- * atomically consumes the claim before delegating, so a replayed, foreign,
- * stale-generation, or mismatched admission fails closed before any catalog
- * fence and before the H2 resource fence that the outer resolver runs after
- * this port returns.
- */
-export class RelayV2CanonicalCreateTargetClaimAuthorityAdapterV1
-implements RelayV2CanonicalCreateTargetAuthorityPortV1 {
-  private readonly authority: RelayV2CanonicalCreateTargetAuthorityPortV1;
-  private readonly claims: RelayV2CanonicalProcessTargetClaimPortV1;
-  private readonly pending = new Map<string, RelayV2CanonicalProcessTargetClaimV1>();
-
-  constructor(options: RelayV2CanonicalCreateTargetClaimAuthorityOptionsV1) {
-    if (!isRecord(options)
-      || !isRecord(options.authority)
-      || typeof options.authority.resolveCreateTarget !== "function"
-      || typeof options.authority.fenceCreateTargetForAdmission !== "function"
-      || !isRecord(options.claims)
-      || typeof options.claims.issueProcessTargetClaim !== "function"
-      || typeof options.claims.consumeProcessTargetClaim !== "function") {
-      throw new TypeError("Relay v2 canonical create target claim authority is invalid");
-    }
-    this.authority = options.authority;
-    this.claims = options.claims;
-  }
-
-  async resolveCreateTarget(
-    rawInput: RelayV2CanonicalCreateTargetAuthorityInputV1,
-  ): Promise<RelayV2CanonicalCreateTargetAuthorityEvidenceV1> {
-    const binding = createClaimBinding(rawInput);
-    const claim = this.claims.issueProcessTargetClaim(binding.kind, binding.targetId);
-    let evidence: RelayV2CanonicalCreateTargetAuthorityEvidenceV1;
-    try {
-      evidence = createEvidence(
-        await this.authority.resolveCreateTarget(clone(rawInput)),
-        binding.operation,
-      );
-    } catch (error) {
-      try {
-        this.claims.consumeProcessTargetClaim(claim, binding.kind, binding.targetId);
-      } catch {}
-      throw error;
-    }
-    const key = createClaimKey(rawInput, evidence);
-    if (this.pending.size >= MAX_PENDING_CREATE_TARGET_CLAIMS) {
-      this.pending.delete(this.pending.keys().next().value as string);
-    }
-    this.pending.set(key, claim);
-    return evidence;
-  }
-
-  fenceCreateTargetForAdmission(
-    rawInput: RelayV2CanonicalCreateTargetAuthorityInputV1,
-    rawEvidence: RelayV2CanonicalCreateTargetAuthorityEvidenceV1,
-  ): void {
-    const binding = createClaimBinding(rawInput);
-    const evidence = createEvidence(rawEvidence, binding.operation);
-    const key = createClaimKey(rawInput, evidence);
-    const claim = this.pending.get(key);
-    if (claim === undefined) {
-      throw new TypeError("canonical create target claim is missing or already consumed");
-    }
-    this.pending.delete(key);
-    this.claims.consumeProcessTargetClaim(claim, binding.kind, binding.targetId);
-    const result = this.authority.fenceCreateTargetForAdmission(
-      clone(rawInput),
-      clone(evidence),
-    );
-    requireSynchronous(result, "canonical create target catalog fence");
   }
 }
 
