@@ -480,6 +480,18 @@ credential authority, HTTPS coordinator, and canonical Host owner. It selects
 no native cell or secret source and has no CLI callsite. Host native
 `qualifiedRecords=[]` therefore still prevents a qualified real intake path.
 
+A separate default-off injected-only Host native credential module one-shot
+source/holder now fills the injected-source gap above: it declares only
+contract-fact target descriptors and exact target/platform/contract-revision/ABI
+capability, loads at most once through the injected loader, transfers the exact
+module identity one-shot to the existing bridge, and recycles bounded and fail
+closed on failure or close. It declares no artifact identity and ships no
+production source: this revision still has no Host credential N-API crate, real
+artifact, or build/stage/pack flow, and connecting one is blocked on a new
+contract revision freezing build-stage-pack identity (descriptor/digest/layout)
+plus the N-API crate and durability qualification; it is wired nowhere and
+creates no qualification, readiness, capability, or fallback.
+
 The Broker likewise has one explicit default-off activated server composition
 and a public lifecycle root that adopts an otherwise-unowned, caller-supplied
 `node:https.Server`. That root owns request/upgrade/listen and close-and-drain
