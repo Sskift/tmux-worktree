@@ -2346,6 +2346,128 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `pre-connect probe classifies the exact credential blob without network`() {
+        val harness = Harness()
+        val profile = relayV2Profile()
+
+        // Missing blob: corrupt states keep their existing typed failure, never a refresh.
+        assertEquals(
+            RelayV2RefreshRequirement.NoRefreshRequired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 2_000),
+        )
+
+        // Locally valid access with no pending attempt proceeds to connect unchanged.
+        val valid = credentialBlob(profile, accessExpiresAtMs = 5_000, refreshExpiresAtMs = 6_000)
+        assertTrue(harness.credentials.create(profile.credentialReference, valid))
+        assertEquals(
+            RelayV2RefreshRequirement.NoRefreshRequired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 2_000),
+        )
+
+        // A blob without complete credential material never reaches the expiry dereference.
+        val withoutMaterial = RelayV2CredentialBlob(
+            credentialVersion = profile.credentialVersion,
+            issuerUrl = profile.issuerUrl,
+            relayUrl = profile.relayUrl,
+            hostId = profile.hostId,
+            clientInstanceId = profile.clientInstanceId,
+        )
+        assertTrue(
+            harness.credentials.compareAndSet(
+                profile.credentialReference,
+                valid.expectation(),
+                withoutMaterial,
+            ) is RelayV2CredentialCasResult.Updated,
+        )
+        assertEquals(
+            RelayV2RefreshRequirement.NoRefreshRequired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 2_000),
+        )
+
+        // Binding mismatch keeps the existing typed actor failure, never a refresh.
+        val mismatched = credentialBlob(
+            profile,
+            accessExpiresAtMs = 1_000,
+            refreshExpiresAtMs = 3_000,
+        ).copy(hostId = "another-host")
+        assertTrue(
+            harness.credentials.compareAndSet(
+                profile.credentialReference,
+                withoutMaterial.expectation(),
+                mismatched,
+            ) is RelayV2CredentialCasResult.Updated,
+        )
+        assertEquals(
+            RelayV2RefreshRequirement.NoRefreshRequired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 2_000),
+        )
+
+        // Locally expired access with a still-valid refresh credential requires the refresh.
+        val expiredAccess = credentialBlob(
+            profile,
+            accessExpiresAtMs = 1_000,
+            refreshExpiresAtMs = 3_000,
+        )
+        assertTrue(
+            harness.credentials.compareAndSet(
+                profile.credentialReference,
+                mismatched.expectation(),
+                expiredAccess,
+            ) is RelayV2CredentialCasResult.Updated,
+        )
+        assertEquals(
+            RelayV2RefreshRequirement.RefreshRequired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 2_000),
+        )
+
+        // A durable pending refresh attempt must resume even while access is still valid.
+        val pendingRefresh = expiredAccess.copy(
+            accessExpiresAtMs = 5_000,
+            pendingAttempt = RelayV2PendingCredentialAttempt(
+                kind = RelayV2CredentialAttemptKind.REFRESH,
+                attemptId = "refresh-attempt-1",
+                oldCredentialVersion = expiredAccess.credentialVersion,
+                secretReference = "refresh-secret-reference-1",
+                secret = REFRESH_TOKEN_1,
+            ),
+        )
+        assertTrue(
+            harness.credentials.compareAndSet(
+                profile.credentialReference,
+                expiredAccess.expectation(),
+                pendingRefresh,
+            ) is RelayV2CredentialCasResult.Updated,
+        )
+        assertEquals(
+            RelayV2RefreshRequirement.RefreshRequired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 2_000),
+        )
+
+        // A locally expired refresh credential is a typed dead credential, still no network.
+        val dead = pendingRefresh.copy(
+            pendingAttempt = null,
+            accessExpiresAtMs = 1_000,
+            refreshExpiresAtMs = 2_000,
+        )
+        assertTrue(
+            harness.credentials.compareAndSet(
+                profile.credentialReference,
+                pendingRefresh.expectation(),
+                dead,
+            ) is RelayV2CredentialCasResult.Updated,
+        )
+        assertEquals(
+            RelayV2RefreshRequirement.RefreshCredentialExpired,
+            harness.repository.probeRefreshRequirement(profile, nowMillis = 3_000),
+        )
+
+        // The probe is read-only and network-free: the blob is untouched and no exchange ran.
+        assertEquals(dead, harness.credentials.read(profile.credentialReference))
+        assertEquals(0, harness.exchange.redeemCalls)
+        assertEquals(0, harness.exchange.refreshCalls)
+    }
+
+    @Test
     fun `reconfirming same profile and credential is a no-op that keeps callback fence`() =
         runBlocking {
             val harness = Harness()
@@ -3474,6 +3596,24 @@ class RelayV2ProfileRepositoryTest {
         BLOB_BEHIND,
         REPAIR_CONFLICT,
     }
+
+    private fun credentialBlob(
+        profile: RelayV2Profile,
+        accessExpiresAtMs: Long,
+        refreshExpiresAtMs: Long,
+    ): RelayV2CredentialBlob = RelayV2CredentialBlob(
+        credentialVersion = profile.credentialVersion,
+        issuerUrl = profile.issuerUrl,
+        relayUrl = profile.relayUrl,
+        hostId = profile.hostId,
+        clientInstanceId = profile.clientInstanceId,
+        principalId = profile.principalId,
+        grantId = profile.grantId,
+        accessToken = ACCESS_TOKEN_1,
+        accessExpiresAtMs = accessExpiresAtMs,
+        refreshToken = REFRESH_TOKEN_1,
+        refreshExpiresAtMs = refreshExpiresAtMs,
+    )
 
     private fun relayV2Profile(): RelayV2Profile = RelayV2Profile(
         profileId = "relay-v2-profile-1",

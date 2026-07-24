@@ -20,6 +20,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileSwitchStateMachine
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshApplyResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshCoordinator
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshRequirement
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeExchange
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokePhase
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeResult
@@ -173,6 +174,16 @@ internal class RelayV2ProfileRuntimeAdapter(
 
     suspend fun refreshCredential(): RelayV2RefreshApplyResult = profileMutationCoordinator.mutate {
         repository.refreshActiveCredential()
+    }
+
+    /**
+     * Network-free probe for the explicit Connect/Retry path only; cold-start admission and
+     * background reconnect never consult it.
+     */
+    suspend fun probeRefreshRequirement(
+        profile: RelayV2Profile,
+    ): RelayV2RefreshRequirement = profileMutationCoordinator.mutate {
+        repository.probeRefreshRequirement(profile, System.currentTimeMillis())
     }
 
     /** Exact-profile connect consent; never starts a socket by itself. */

@@ -17,9 +17,11 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ConfirmedEnrollment
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeException
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshApplyResult
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshRequirement
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2AgentCapabilityAvailability
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
@@ -144,6 +146,9 @@ class V2ViewModel(
     internal val relayV2EnrollmentReviewState = _relayV2EnrollmentReviewState.asStateFlow()
     @Volatile
     private var relayV2Composition: RelayV2BaseRuntimeComposition? = null
+
+    /** Guarded by [relayV2UiFenceLock]; see [reserveRelayV2ExplicitRefresh]. */
+    private var relayV2ExplicitRefreshReservation: Any? = null
     @Volatile
     private var relayV2ProfileRuntime: RelayV2ProfileRuntimeAdapter? = null
     private val relayV2SessionReplyCuts =
@@ -1446,6 +1451,19 @@ class V2ViewModel(
      * `autoConnect=false`: persists exact-profile consent through the CAS owner, then enters the
      * existing v2 composition owner (or starts it from the consented profile). Never touches the
      * Relay v1 path.
+     *
+     * This explicit action is also the only non-rollover callsite that may reach the network
+     * refresh owner. When the probe reports [RelayV2RefreshRequirement.RefreshRequired], one
+     * exact action reservation (a double-tap/resurrection fence under [relayV2UiFenceLock]; it
+     * owns no credential state and is not a second mutation coordinator) orders the winner as:
+     * reserve, await the old composition's exact disconnect drain, finally close and clear the
+     * owner reference, refresh through the existing owner, re-run closed startup admission, and
+     * only then start the successor. A drain failure fails closed without refreshing or
+     * starting. The probe runs only while no live composition exists (absent, terminally
+     * failed, or never connected), so a live connection is never rotated under or retired.
+     * Cold-start admission and background reconnect remain network-free; every refresh failure
+     * keeps its typed error on the existing health/pairing surfaces and never falls back to
+     * Relay v1.
      */
     private fun connectRelayV2ActiveProfile() {
         viewModelScope.launch {
@@ -1454,26 +1472,200 @@ class V2ViewModel(
                 updateProfileExpectation = false,
             ) {
                 val runtime = requireRelayV2ProfileRuntime()
-                val admission = runtime.admitStartup()
+                var admission = runtime.admitStartup()
                 if (admission.state != RelayStartupAdmissionState.RELAY_V2) {
                     return@trackProfileMutation
                 }
-                val admittedProfile = requireNotNull(admission.relayV2Profile)
-                // Consent already persisted only needs the composition owner; otherwise the
-                // explicit Connect/Retry persists exact-profile consent through the CAS owner.
-                val consentedProfile = if (admittedProfile.autoConnect) {
-                    admittedProfile
-                } else {
-                    runtime.consentAutoConnect(admittedProfile) ?: return@trackProfileMutation
-                }
+                var admittedProfile = requireNotNull(admission.relayV2Profile)
                 val composition = synchronized(relayV2UiFenceLock) { relayV2Composition }
-                if (composition == null) {
-                    startRelayV2BaseRuntime(consentedProfile)
-                } else {
-                    composition.connectExplicitly(consentedProfile)
+                val connectEligible = composition == null ||
+                    synchronized(relayV2UiFenceLock) {
+                        val phase = _uiState.value.relayV2ProfileConnection
+                        phase == RelayV2ProfileConnectionState.FAILED ||
+                            phase == RelayV2ProfileConnectionState.STOPPED
+                    }
+                var refreshed = false
+                var reservation: Any? = null
+                try {
+                    if (connectEligible) {
+                        when (runtime.probeRefreshRequirement(admittedProfile)) {
+                            RelayV2RefreshRequirement.NoRefreshRequired -> Unit
+                            RelayV2RefreshRequirement.RefreshCredentialExpired -> {
+                                reservation = reserveRelayV2ExplicitRefresh()
+                                    ?: return@trackProfileMutation
+                                applyStartupAdmission(
+                                    RelayStartupAdmission(
+                                        state = RelayStartupAdmissionState
+                                            .RELAY_V2_REENROLLMENT_REQUIRED,
+                                        message = "Relay v2 re-enrollment is required; " +
+                                            "Relay v1 fallback is disabled.",
+                                    ),
+                                )
+                                emit(
+                                    V2UiEffect.Notice(
+                                        "Relay v2 re-enrollment is required; " +
+                                            "Relay v1 fallback is disabled.",
+                                    ),
+                                )
+                                return@trackProfileMutation
+                            }
+                            RelayV2RefreshRequirement.RefreshRequired -> {
+                                reservation = reserveRelayV2ExplicitRefresh()
+                                    ?: return@trackProfileMutation
+                                if (composition != null) {
+                                    // The old owner is retired before any network call: await
+                                    // its exact disconnect drain (the same barrier the profile
+                                    // disconnect path uses), then finally close and clear the
+                                    // owner reference. A failed drain is never replaced with a
+                                    // receipt and never reaches the refresh or the successor.
+                                    var drainCompleted = false
+                                    try {
+                                        composition.disconnectAndDrain(
+                                            admittedProfile.identity,
+                                            "relay-v2-refresh-retire-${UUID.randomUUID()}",
+                                        )
+                                        drainCompleted = true
+                                    } catch (error: Throwable) {
+                                        // The actor reports a missing clean drain with its own
+                                        // CancellationException; that typed failure is never a
+                                        // receipt, while real cancellation still propagates.
+                                        if (error is CancellationException &&
+                                            coroutineContext[Job]?.isActive != true
+                                        ) {
+                                            throw error
+                                        }
+                                    } finally {
+                                        runCatching { composition.close() }
+                                        synchronized(relayV2UiFenceLock) {
+                                            if (relayV2Composition === composition) {
+                                                if (drainCompleted) relayV2Composition = null
+                                                relayV2NotificationProfileActive = false
+                                                relayV2SessionReplyCuts.value = emptyMap()
+                                                relayV2ScopeCreateCuts.value = emptyMap()
+                                                relayV2Terminal = null
+                                            }
+                                        }
+                                    }
+                                    if (!drainCompleted) {
+                                        applyRelayV2RefreshFailure(
+                                            code = "RUNTIME_DRAIN_FAILED",
+                                            message = "Relay v2 runtime could not finish its " +
+                                                "previous connection cleanly; " +
+                                                "Relay v1 fallback is disabled.",
+                                        )
+                                        return@trackProfileMutation
+                                    }
+                                }
+                                val applied = try {
+                                    runtime.refreshCredential()
+                                } catch (error: CancellationException) {
+                                    throw error
+                                } catch (error: RelayV2CredentialExchangeException) {
+                                    applyRelayV2RefreshFailure(
+                                        code = error.errorCode ?: error.kind.name,
+                                        message = "Relay v2 credential refresh failed " +
+                                            "(${error.errorCode ?: error.kind.name}); " +
+                                            "Relay v1 fallback is disabled.",
+                                    )
+                                    return@trackProfileMutation
+                                } catch (error: Throwable) {
+                                    applyRelayV2RefreshFailure(
+                                        code = "REFRESH_UNAVAILABLE",
+                                        message = "Relay v2 credential refresh failed " +
+                                            "(REFRESH_UNAVAILABLE); " +
+                                            "Relay v1 fallback is disabled.",
+                                    )
+                                    return@trackProfileMutation
+                                }
+                                when (applied) {
+                                    is RelayV2RefreshApplyResult.Applied,
+                                    is RelayV2RefreshApplyResult.StaleCredentialResponse,
+                                    -> Unit
+                                    is RelayV2RefreshApplyResult.ActiveProfileChanged -> {
+                                        // A concurrent profile switch already owns the UI.
+                                        return@trackProfileMutation
+                                    }
+                                    is RelayV2RefreshApplyResult.ProfileReconciliationFailed -> {
+                                        applyRelayV2RefreshFailure(
+                                            code = applied.failure.failure.name,
+                                            message = "Relay v2 credential refresh failed " +
+                                                "(${applied.failure.failure.name}); " +
+                                                "Relay v1 fallback is disabled.",
+                                        )
+                                        return@trackProfileMutation
+                                    }
+                                }
+                                // A concurrent winner may already hold the fresh credential;
+                                // closed admission re-reads the durable winner and only an exact
+                                // verified profile continues.
+                                admission = runtime.admitStartup()
+                                if (admission.state != RelayStartupAdmissionState.RELAY_V2) {
+                                    applyStartupAdmission(admission)
+                                    return@trackProfileMutation
+                                }
+                                admittedProfile = requireNotNull(admission.relayV2Profile)
+                                refreshed = true
+                            }
+                        }
+                    }
+                    // Consent already persisted only needs the composition owner; otherwise the
+                    // explicit Connect/Retry persists exact-profile consent through the CAS owner.
+                    val consentedProfile = if (admittedProfile.autoConnect) {
+                        admittedProfile
+                    } else {
+                        runtime.consentAutoConnect(admittedProfile) ?: return@trackProfileMutation
+                    }
+                    val currentComposition = synchronized(relayV2UiFenceLock) {
+                        if (reservation == null && relayV2ExplicitRefreshReservation != null) {
+                            // An in-flight explicit refresh action owns the pending successor.
+                            return@trackProfileMutation
+                        }
+                        relayV2Composition
+                    }
+                    if (currentComposition == null) {
+                        startRelayV2BaseRuntime(consentedProfile)
+                    } else if (!refreshed) {
+                        currentComposition.connectExplicitly(consentedProfile)
+                    }
+                    // A refreshed action already drained and cleared its exact owner above; a
+                    // non-null slot here means a concurrent owner took over the connection.
+                } finally {
+                    if (reservation != null) {
+                        synchronized(relayV2UiFenceLock) {
+                            if (relayV2ExplicitRefreshReservation === reservation) {
+                                relayV2ExplicitRefreshReservation = null
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Registers this explicit Connect/Retry refresh action under [relayV2UiFenceLock], or
+     * returns null when another such action is already in flight. The reservation only fences
+     * double-taps and old-owner resurrection for the duration of one refresh/retire action.
+     */
+    private fun reserveRelayV2ExplicitRefresh(): Any? = synchronized(relayV2UiFenceLock) {
+        if (relayV2ExplicitRefreshReservation != null) {
+            null
+        } else {
+            Any().also { relayV2ExplicitRefreshReservation = it }
+        }
+    }
+
+    /** Surfaces a typed explicit-path refresh failure on the existing health/pairing state. */
+    private fun applyRelayV2RefreshFailure(code: String, message: String) {
+        rawHealth = rawHealth.copy(errorCode = code, errorMessage = message)
+        synchronized(relayV2UiFenceLock) {
+            _uiState.value = _uiState.value.copy(
+                isConnecting = false,
+                pairingError = message,
+                health = decorateHealth(rawHealth, _uiState.value),
+            )
+        }
+        emit(V2UiEffect.Notice(message))
     }
 
     /** Explicit credential maintenance; this does not start or replace a socket. */
@@ -1498,6 +1690,7 @@ class V2ViewModel(
             relayV2SessionReplyCuts.value = emptyMap()
             relayV2ScopeCreateCuts.value = emptyMap()
             relayV2Composition = null
+            relayV2ExplicitRefreshReservation = null
         }
         relayV2ProfileRuntime = null
         if (relayOwner.isInitialized()) relay.close()

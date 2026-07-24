@@ -669,6 +669,24 @@ internal sealed interface RelayV2RefreshApplyResult {
 }
 
 /**
+ * Read-only refresh requirement for the explicit Connect/Retry path.
+ *
+ * The probe returns only this sealed type; it never carries credential material, expiry values,
+ * or profile identity. Cold-start admission, background reconnect, and the auth.expiring
+ * rollover never consult it.
+ */
+internal sealed interface RelayV2RefreshRequirement {
+    /** The access credential must refresh first; the refresh credential is still locally valid. */
+    data object RefreshRequired : RelayV2RefreshRequirement
+
+    /** Refresh is required but the refresh credential is already expired locally. */
+    data object RefreshCredentialExpired : RelayV2RefreshRequirement
+
+    /** Connect proceeds without a refresh; corrupt states keep their typed actor failure. */
+    data object NoRefreshRequired : RelayV2RefreshRequirement
+}
+
+/**
  * Canonical owner for the first Relay v2 profile/credential slice.
  *
  * Parsing a QR never reaches this repository; callers must explicitly create
@@ -1318,6 +1336,42 @@ internal class RelayV2ProfileRepository(
     ): RelayV2Profile? = credentialMutationMutex.withLock {
         requireNoSelfRevokeJournal()
         profileStore.consentRelayV2AutoConnect(expectedProfile)
+    }
+
+    /**
+     * Network-free read-only probe for the explicit Connect/Retry path.
+     *
+     * Only the admitted profile's exact credential blob decides: a durable pending refresh
+     * attempt or a locally expired access credential requires a refresh while the refresh
+     * credential is still locally valid. Every other state (missing blob, incomplete credential
+     * material, binding mismatch, version skew, a pending enrollment exchange, or a still-valid
+     * access credential) reports no requirement so the caller proceeds exactly as before and
+     * keeps the existing typed admission/actor failure for corrupt states.
+     */
+    fun probeRefreshRequirement(
+        profile: RelayV2Profile,
+        nowMillis: Long,
+    ): RelayV2RefreshRequirement {
+        val blob = credentialStore.read(profile.credentialReference)
+            ?: return RelayV2RefreshRequirement.NoRefreshRequired
+        // A blob without complete credential material never reaches the expiry dereference
+        // below; it reports no requirement so existing admission keeps its typed failure.
+        if (!blob.hasCredentialMaterial ||
+            !profile.matchesCredentialBinding(blob) ||
+            blob.credentialVersion != profile.credentialVersion ||
+            (blob.pendingAttempt != null &&
+                blob.pendingAttempt.kind != RelayV2CredentialAttemptKind.REFRESH)
+        ) {
+            return RelayV2RefreshRequirement.NoRefreshRequired
+        }
+        val refreshRequired = blob.pendingAttempt != null ||
+            blob.accessExpiresAtMs!! <= nowMillis
+        if (!refreshRequired) return RelayV2RefreshRequirement.NoRefreshRequired
+        return if (blob.refreshExpiresAtMs!! > nowMillis) {
+            RelayV2RefreshRequirement.RefreshRequired
+        } else {
+            RelayV2RefreshRequirement.RefreshCredentialExpired
+        }
     }
 
     suspend fun prepareRefresh(
