@@ -235,6 +235,7 @@ type ConnectionRecord = {
   readonly lease: RelayV2BrokerTransportCloseLease;
   readonly adapter: RelayV2BrokerClientWssAdapter;
   readonly terminalOwner: ManagedRegistrationTerminalOwner;
+  readonly hostProducerTarget: RelayV2BrokerProducerTarget;
   expiry: RelayV2BrokerAuthorizationExpiryDeadlineRegistration | null;
   readonly drained: Promise<void>;
 };
@@ -1492,6 +1493,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
         closeRegistration.lease,
         boundTerminalOwner,
         adapter,
+        captured.hostProducerTarget,
       );
       this.connections.set(record.connectionId, record);
 
@@ -1500,10 +1502,16 @@ implements RelayV2BrokerClientWssRuntimeComposition {
         throw new Error("Relay v2 Broker client WSS transport construction failed");
       }
       try {
+        const expiryRecord = record;
         record.expiry = this.expiryOwner.register(
           "client",
-          record.connectionId,
-          record.incarnation,
+          expiryRecord.connectionId,
+          expiryRecord.incarnation,
+          {
+            emitClientAuthExpiring: (jti: string, expiresAtMs: number) => (
+              this.emitClientAuthExpiring(expiryRecord, jti, expiresAtMs)
+            ),
+          },
         );
       } catch {
         this.abortPartialConnection(record);
@@ -1573,6 +1581,85 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     return this.transport.applyBrokerAction(action);
   }
 
+  /**
+   * Deadline-owner emit port for one exact client registration. The Core cut
+   * and its actions enter through the same internal-source producer call and
+   * client-effect outlet as a forwarded client frame: Host-targeted actions
+   * apply only to this record's exact Host producer target, client-targeted
+   * actions only to the client socket transport. Only the normal closing
+   * window maps a rejected receipt to single-connection "closed"; any other
+   * throw or rejection is a composition fail-closed via the owner seal.
+   */
+  private emitClientAuthExpiring(
+    record: ConnectionRecord,
+    jti: string,
+    expiresAtMs: number,
+  ): Promise<string> {
+    return Promise.resolve(this.serialize(() => {
+      let outcome = "fail_closed";
+      let receipt: RelayV2BrokerProducerReceipt;
+      try {
+        receipt = this.producerRegistry.runInternalBrokerCall(
+          () => {
+            const result = this.broker.recheckClientAuthExpiringWarning(
+              record.connectionId,
+              record.incarnation,
+              jti,
+              expiresAtMs,
+            );
+            outcome = result.outcome;
+            return result;
+          },
+          (settled, handoff) => {
+            let applied: RelayV2BrokerProducerReceipt = "applied";
+            for (const action of settled.actions) {
+              if (relayV2HostProducerAction(action)) {
+                const hostAction = action as Extract<
+                  RelayV2BrokerAction,
+                  { transportId: string }
+                >;
+                const hostApplied = hostAction.transportId
+                    === record.hostProducerTarget.transportId
+                  && handoff.apply(record.hostProducerTarget, [hostAction]) === "applied";
+                if (!hostApplied) {
+                  handoff.forceTerminal({
+                    kind: "target_failure",
+                    target: record.hostProducerTarget,
+                    reason: "client_broker_host_action_rejected",
+                  });
+                  applied = "rejected";
+                }
+                continue;
+              }
+              if (this.transport.applyBrokerAction(action) !== "applied") {
+                applied = "rejected";
+              }
+            }
+            return applied;
+          },
+        );
+      } catch (error) {
+        if (this.closingForClientWarning(record)) return "closed";
+        throw error;
+      }
+      if (receipt === "applied") return outcome;
+      // Exact post-receipt lifecycle recheck, mirroring the Host warning
+      // emit: only the normal close/drain window maps to single-connection
+      // closed. An open/current rejection means a Core/authority/settlement
+      // throw and must fail closed; a Core-decided stale already arrives
+      // inside an applied result and needs no receipt guessing.
+      if (this.closingForClientWarning(record)) return "closed";
+      throw new Error("Relay v2 Broker client auth-expiring warning was rejected");
+    }));
+  }
+
+  private closingForClientWarning(record: ConnectionRecord): boolean {
+    return this.connections.get(record.connectionId) !== record
+      || !this.clientEffectsOpen
+      || !this.clientAdmissionOpen
+      || this.closeDrain !== null;
+  }
+
   closeAndDrain(): Promise<void> {
     if (this.closeDrain) return this.closeDrain;
     let resolveClose!: () => void;
@@ -1624,6 +1711,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
     lease: RelayV2BrokerTransportCloseLease,
     terminalOwner: ManagedRegistrationTerminalOwner,
     adapter: RelayV2BrokerClientWssAdapter,
+    hostProducerTarget: RelayV2BrokerProducerTarget,
   ): ConnectionRecord {
     let record!: ConnectionRecord;
     const drained = terminalOwner.terminal.then(async () => {
@@ -1670,6 +1758,7 @@ implements RelayV2BrokerClientWssRuntimeComposition {
       lease,
       adapter,
       terminalOwner,
+      hostProducerTarget,
       expiry: null,
       drained,
     };

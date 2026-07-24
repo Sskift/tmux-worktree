@@ -37,13 +37,23 @@ export interface RelayV2BrokerAuthorizationExpiryDeadlineRegistration {
 }
 
 /**
- * Host-only warning emit port bound by the caller to the exact serialized
+ * Host warning emit port bound by the caller to the exact serialized
  * BrokerCore warning cut. It resolves with the cut outcome
  * ("emitted" | "deferred" | "not_due" | "stale" | "expired" |
  * "fail_closed"); any throw, rejection or undecodable outcome fails closed.
  */
 export interface RelayV2BrokerAuthorizationExpiryWarningPort {
   emitHostAuthExpiring(jti: string, expiresAtMs: number): unknown;
+}
+
+/**
+ * Client warning emit port bound by the caller to the exact serialized
+ * BrokerCore client warning cut, with the same outcome contract as the Host
+ * port above. A client registration never re-arms in place: a replacement
+ * credential arrives on a new socket as a new registration.
+ */
+export interface RelayV2BrokerAuthorizationExpiryClientWarningPort {
+  emitClientAuthExpiring(jti: string, expiresAtMs: number): unknown;
 }
 
 type CapturedCutPort = {
@@ -54,7 +64,7 @@ type CapturedCutPort = {
 
 type CapturedWarningPort = {
   receiver: object;
-  emitHostAuthExpiring: (...args: unknown[]) => unknown;
+  emit: (...args: unknown[]) => unknown;
 };
 
 type Deadline = {
@@ -84,8 +94,8 @@ type Entry = {
 
 const MAX_CONSECUTIVE_EARLY_FIRES = 2;
 
-/** host.auth_expiring is emitted exactly once per credential at exp-60s. */
-const HOST_AUTH_EXPIRING_WARNING_LEAD_MS = 60_000;
+/** host.auth_expiring/auth.expiring is emitted exactly once per credential at exp-60s. */
+const AUTH_EXPIRING_WARNING_LEAD_MS = 60_000;
 
 const WARNING_CUT_OUTCOMES = new Set([
   "emitted",
@@ -148,19 +158,25 @@ function captureCutPort(
 }
 
 function captureWarningPort(
-  source: RelayV2BrokerAuthorizationExpiryWarningPort,
+  source:
+    | RelayV2BrokerAuthorizationExpiryWarningPort
+    | RelayV2BrokerAuthorizationExpiryClientWarningPort,
+  connectionKind: RelayV2BrokerAuthorizationExpiryConnectionKind,
 ): CapturedWarningPort {
   if (source === null || typeof source !== "object" || isRejectedProxy(source)) {
     throw new Error("invalid Relay v2 authorization-expiry warning port");
   }
+  const method = connectionKind === "host"
+    ? "emitHostAuthExpiring"
+    : "emitClientAuthExpiring";
   try {
-    const emit = Object.getOwnPropertyDescriptor(source, "emitHostAuthExpiring");
+    const emit = Object.getOwnPropertyDescriptor(source, method);
     if (!emit || !("value" in emit) || typeof emit.value !== "function") {
       throw new Error("invalid warning emit method");
     }
     return {
       receiver: source,
-      emitHostAuthExpiring: emit.value as (...args: unknown[]) => unknown,
+      emit: emit.value as (...args: unknown[]) => unknown,
     };
   } catch {
     throw new Error("invalid Relay v2 authorization-expiry warning port");
@@ -237,7 +253,9 @@ export class RelayV2BrokerAuthorizationExpiryDeadlineOwner {
     connectionKind: RelayV2BrokerAuthorizationExpiryConnectionKind,
     connectionId: string,
     connectionIncarnation: string,
-    warningPort?: RelayV2BrokerAuthorizationExpiryWarningPort,
+    warningPort?:
+      | RelayV2BrokerAuthorizationExpiryWarningPort
+      | RelayV2BrokerAuthorizationExpiryClientWarningPort,
   ): RelayV2BrokerAuthorizationExpiryDeadlineRegistration {
     if (
       !this.accepting
@@ -245,13 +263,12 @@ export class RelayV2BrokerAuthorizationExpiryDeadlineOwner {
       || (connectionKind !== "client" && connectionKind !== "host")
       || !isIdentifier(connectionId)
       || !isIdentifier(connectionIncarnation)
-      || (warningPort !== undefined && connectionKind !== "host")
     ) {
       throw new Error("Relay v2 authorization-expiry deadline owner is unavailable");
     }
     const capturedWarning = warningPort === undefined
       ? null
-      : captureWarningPort(warningPort);
+      : captureWarningPort(warningPort, connectionKind);
     const registry = this.registryFor(connectionKind);
     const previous = registry.get(connectionId);
     if (previous) this.retire(previous);
@@ -456,7 +473,7 @@ export class RelayV2BrokerAuthorizationExpiryDeadlineOwner {
     entry.warningDeadline = deadline;
     try {
       const cancel = this.scheduleAt(
-        expiresAtMs - HOST_AUTH_EXPIRING_WARNING_LEAD_MS,
+        expiresAtMs - AUTH_EXPIRING_WARNING_LEAD_MS,
         () => {
           if (!deadline.armed) {
             deadline.firedBeforeArmed = true;
@@ -504,7 +521,7 @@ export class RelayV2BrokerAuthorizationExpiryDeadlineOwner {
     if (!port) return;
     let raw: unknown;
     try {
-      raw = Reflect.apply(port.emitHostAuthExpiring, port.receiver, [
+      raw = Reflect.apply(port.emit, port.receiver, [
         expectedJti,
         expectedExpiresAtMs,
       ]);

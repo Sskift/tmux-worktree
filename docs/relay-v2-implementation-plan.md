@@ -101,7 +101,7 @@ B 内部可以按持久认证控制面、在线目录与 carrier router 三条 l
 - 独立 v1/v2 Upgrade dispatch；twcap2 只形成 v2 auth context，legacy shared secret 只形成 v1 route。
 - brokerEpoch、授权 host 视图、host registration、duplicate/SUPERSEDED 仲裁和 presence。
 - routeId/routeFence、双向 carrier sequence、公平调度、route/carrier backpressure 和结构化 pre-forward error。
-- Broker Host/client WSS ingress 已在 socket 层执行冻结的 4408 handshake deadline（host.hello 5 秒、client.hello 5 秒、host.welcome 10 秒），一次性 token-scoped timer，scheduler 失败 fail closed 为 1013；Broker `host.auth_expiring` 的 `refreshRecommendedAtMs` authority/policy 与到期前 60 秒调度 owner 仍未交付。
+- Broker Host/client WSS ingress 已在 socket 层执行冻结的 4408 handshake deadline（host.hello 5 秒、client.hello 5 秒、host.welcome 10 秒），一次性 token-scoped timer，scheduler 失败 fail closed 为 1013；Broker 侧 `host.auth_expiring`（carrier control）与 client 侧 `auth.expiring`（broker control event，不占 host eventSeq）已由同一 deadline owner 按到期前 60 秒 lead 对每个 credential 各发一次，`refreshRecommendedAtMs` 恒为 `expiresAtMs - 300_000`；wire 未变。
 
 验收：
 

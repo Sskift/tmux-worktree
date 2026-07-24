@@ -1804,6 +1804,160 @@ test("exact expiry cut sends a throwing trusted clock through the existing fail-
   assert.equal(core.drainClient(client.connectionId).length, 0);
 });
 
+test("client auth-expiring warning cut closes the exact outcome table without a composition seal", async () => {
+  let now = NOW_MS;
+  const core = new broker.RelayV2BrokerCore({
+    now: () => now,
+    onLiveAuthorizationClose: () => {},
+  });
+  await registerHost(core, "host-client-warning-cut");
+  const expiresAtMs = NOW_MS + 3_600_000;
+  const client = await openRoute(
+    core,
+    "host-client-warning-cut",
+    "client-warning-cut",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs },
+    "client-warning-cut-incarnation",
+  );
+  const cut = (
+    jti = "client-warning-cut-jti",
+    exp = expiresAtMs,
+    incarnation = client.connectionIncarnation,
+  ) => core.recheckClientAuthExpiringWarning(client.connectionId, incarnation, jti, exp);
+
+  assert.deepEqual(
+    cut("client-warning-cut-jti", expiresAtMs, "wrong-incarnation"),
+    { outcome: "stale", accepted: false, actions: [] },
+  );
+  assert.deepEqual(cut("wrong-jti"), { outcome: "stale", accepted: false, actions: [] });
+  assert.deepEqual(
+    cut("client-warning-cut-jti", expiresAtMs + 1),
+    { outcome: "stale", accepted: false, actions: [] },
+  );
+  assert.equal(core.drainClient(client.connectionId).length, 0);
+
+  assert.deepEqual(cut(), { outcome: "not_due", accepted: false, actions: [] });
+
+  now = expiresAtMs - 60_000;
+  assert.deepEqual(cut(), { outcome: "emitted", accepted: true, actions: [] });
+  const [delivery] = core.drainClient(client.connectionId, { maxFrames: 1 });
+  assert.deepEqual(JSON.parse(Buffer.from(delivery.bytes).toString("utf8")), {
+    protocolVersion: 2,
+    kind: "event",
+    type: "auth.expiring",
+    payload: {
+      grantId: "client-grant",
+      expiresAtMs,
+      refreshRecommendedAtMs: expiresAtMs - 300_000,
+    },
+  }, "the broker control event carries no hostId/hostEpoch/eventSeq");
+  assert.equal(
+    core.acknowledgeClientDelivery(client.connectionId, delivery.deliveryId).accepted,
+    true,
+  );
+  assert.deepEqual(cut(), { outcome: "emitted", accepted: true, actions: [] });
+  assert.equal(
+    core.drainClient(client.connectionId).length,
+    0,
+    "the Core once marker never enqueues a second frame for one credential",
+  );
+
+  now = expiresAtMs;
+  assert.deepEqual(cut(), { outcome: "expired", accepted: false, actions: [] });
+  assert.equal(
+    core.inspectLiveAuthCompositionLatch(),
+    "open",
+    "the exact expiry deadline cut owns fencing an expired credential",
+  );
+
+  const deferredCore = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: () => {},
+  });
+  await registerHost(deferredCore, "host-client-warning-defer");
+  assert.equal(deferredCore.openClientRoute(
+    "client-warning-defer",
+    authContext("client", {
+      jti: "client-warning-defer-jti",
+      expiresAtMs: NOW_MS + 60_000,
+    }),
+    "client-warning-defer-incarnation",
+  ).accepted, true);
+  assert.deepEqual(
+    deferredCore.recheckClientAuthExpiringWarning(
+      "client-warning-defer",
+      "client-warning-defer-incarnation",
+      "client-warning-defer-jti",
+      NOW_MS + 60_000,
+    ),
+    { outcome: "deferred", accepted: true, actions: [] },
+  );
+  assert.equal(
+    deferredCore.drainClient("client-warning-defer").length,
+    0,
+    "no frame is queued before route.opened commits",
+  );
+
+  const overflowCore = new broker.RelayV2BrokerCore({
+    now: () => now,
+    onLiveAuthorizationClose: () => {},
+  });
+  now = expiresAtMs - 60_000;
+  await registerHost(overflowCore, "host-client-warning-overflow");
+  const overflowClient = await openRoute(
+    overflowCore,
+    "host-client-warning-overflow",
+    "client-warning-overflow",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs },
+    "client-warning-overflow-incarnation",
+  );
+  for (let index = 0; index < broker.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames; index += 1) {
+    assert.equal(
+      overflowCore.forwardClientFrame(
+        overflowClient.connectionId,
+        publicBytes(hostsSnapshotGet()),
+      ).accepted,
+      true,
+      `queued snapshot response ${index + 1}`,
+    );
+  }
+  const overflow = overflowCore.recheckClientAuthExpiringWarning(
+    overflowClient.connectionId,
+    overflowClient.connectionIncarnation,
+    "client-warning-overflow-jti",
+    expiresAtMs,
+  );
+  assert.equal(overflow.outcome, "closed");
+  assert.equal(overflow.accepted, false);
+  assert.deepEqual(
+    overflow.actions.map((action) => [action.kind, action.closeCode, action.reason]),
+    [["close_client", 1013, "slow_consumer"]],
+    "an enqueue overflow is a single-connection slow-consumer close",
+  );
+  const [unbind] = overflowCore.drainHostCarrier("host-client-warning-overflow", { maxFrames: 1 });
+  assert.equal(unbind.frame.type, "route.unbind");
+  assert.equal(unbind.frame.payload.reason, "slow_consumer");
+  assert.equal(
+    overflowCore.inspectLiveAuthCompositionLatch(),
+    "open",
+    "a single-connection slow-consumer close never seals the composition",
+  );
+  assert.equal(
+    overflowCore.recheckClientAuthExpiringWarning(
+      overflowClient.connectionId,
+      overflowClient.connectionIncarnation,
+      "client-warning-overflow-jti",
+      expiresAtMs,
+    ).outcome,
+    "deferred",
+    "no once marker was written by the failed enqueue",
+  );
+});
+
 test("throwing receipt and callback cleanup failures latch all dispatch gates", async () => {
   const receiptSignals = [];
   const receiptCore = new broker.RelayV2BrokerCore({

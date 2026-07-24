@@ -318,8 +318,8 @@ export interface RelayV2BrokerAuthControlAuthority {
   ): RelayV2AuthControlDecision | Promise<RelayV2AuthControlDecision>;
 }
 
-/** host.auth_expiring is due exactly once per credential at exp-60s. */
-const RELAY_V2_HOST_AUTH_EXPIRING_WARNING_LEAD_MS = 60_000;
+/** host.auth_expiring/auth.expiring is due exactly once per credential at exp-60s. */
+const RELAY_V2_AUTH_EXPIRING_WARNING_LEAD_MS = 60_000;
 
 export type RelayV2BrokerHostAuthExpiringWarningResult = RelayV2BrokerResult & {
   readonly outcome:
@@ -332,6 +332,10 @@ export type RelayV2BrokerHostAuthExpiringWarningResult = RelayV2BrokerResult & {
     | "closed"
     | "fail_closed";
 };
+
+/** The client warning cut shares the Host cut's closed outcome union. */
+export type RelayV2BrokerClientAuthExpiringWarningResult =
+  RelayV2BrokerHostAuthExpiringWarningResult;
 
 export interface RelayV2BrokerResult {
   /** True only when the input was admitted to broker-owned bounded state. */
@@ -586,7 +590,12 @@ type CarrierState = {
 type QueuedClientFrame = {
   bytes: Uint8Array;
   route: RouteState;
-  /** False only for the reserved handshake welcome outside Host carrier capacity. */
+  /**
+   * False only for broker-produced client control frames (the reserved
+   * handshake welcome and the broker-to-client auth.expiring): they consume
+   * no Host carrier capacity and charge only route-level buffers. Host route
+   * data remains carrier-accounted.
+   */
   carrierAccounted: boolean;
 };
 
@@ -602,6 +611,12 @@ type ClientState = {
   authorizationState: "active" | "fenced";
   authorizationCloseSignalled: boolean;
   authorizationCleanupState: "idle" | "applying" | "complete";
+  /** Once-per-credential auth.expiring marker; written only post-enqueue. */
+  authExpiringWarning: {
+    jti: string;
+    expiresAtMs: number;
+    state: "deferred" | "emitted";
+  } | null;
   routeId: string;
   queue: QueuedClientFrame[];
   inFlight: Map<string, InFlightClientFrame>;
@@ -1518,7 +1533,7 @@ export class RelayV2BrokerCore {
     if (expired) {
       return Object.freeze({ outcome: "expired", accepted: false, actions: [] });
     }
-    if (this.now() < expectedExpiresAtMs - RELAY_V2_HOST_AUTH_EXPIRING_WARNING_LEAD_MS) {
+    if (this.now() < expectedExpiresAtMs - RELAY_V2_AUTH_EXPIRING_WARNING_LEAD_MS) {
       return Object.freeze({ outcome: "not_due", accepted: false, actions: [] });
     }
     const marker = carrier.authExpiringWarning;
@@ -1551,6 +1566,94 @@ export class RelayV2BrokerCore {
         reason: "carrier_control_backpressure",
       })],
     });
+  }
+
+  /**
+   * Serialized exact-incarnation client auth-expiring warning cut, mirroring
+   * the Host cut above. The Broker owns the trusted clock, the credential
+   * fields and the client queue; the caller only proves the exact connection
+   * cut plus the jti and expiresAtMs it armed. The once marker is written
+   * only after the public frame is admitted to the queue; a route that has
+   * not committed route.opened defers to the opened path below, which
+   * replays the same helper after the reserved relay.welcome. The broker
+   * control event consumes no host eventSeq and no carrier capacity.
+   */
+  recheckClientAuthExpiringWarning(
+    connectionId: string,
+    connectionIncarnation: string,
+    expectedJti: string,
+    expectedExpiresAtMs: number,
+  ): RelayV2BrokerClientAuthExpiringWarningResult {
+    if (this.liveAuthCompositionLatched) {
+      return Object.freeze({ outcome: "fail_closed", accepted: false, actions: [] });
+    }
+    const stale = (): RelayV2BrokerClientAuthExpiringWarningResult => Object.freeze({
+      outcome: "stale",
+      accepted: false,
+      actions: [],
+    });
+    const client = this.clients.get(connectionId);
+    if (
+      !client
+      || !isIdentifier(expectedJti)
+      || !Number.isSafeInteger(expectedExpiresAtMs)
+      || expectedExpiresAtMs < 0
+      || client.connectionIncarnation !== connectionIncarnation
+      || client.authorizationState !== "active"
+      || client.authContext.jti !== expectedJti
+      || client.authContext.expiresAtMs !== expectedExpiresAtMs
+    ) return stale();
+
+    let expired: boolean;
+    try {
+      expired = this.isAuthorizationExpired(client.authContext);
+    } catch {
+      this.latchCredentialAuthorityUnavailable();
+      return Object.freeze({ outcome: "fail_closed", accepted: false, actions: [] });
+    }
+    if (this.liveAuthCompositionLatched) {
+      return Object.freeze({ outcome: "fail_closed", accepted: false, actions: [] });
+    }
+    const current = this.clients.get(connectionId);
+    if (
+      current !== client
+      || current.connectionIncarnation !== connectionIncarnation
+      || current.authorizationState !== "active"
+      || current.authContext.jti !== expectedJti
+      || current.authContext.expiresAtMs !== expectedExpiresAtMs
+    ) return stale();
+    // The exact expiry deadline cut owns fencing an expired credential.
+    if (expired) {
+      return Object.freeze({ outcome: "expired", accepted: false, actions: [] });
+    }
+    if (this.now() < expectedExpiresAtMs - RELAY_V2_AUTH_EXPIRING_WARNING_LEAD_MS) {
+      return Object.freeze({ outcome: "not_due", accepted: false, actions: [] });
+    }
+    const marker = client.authExpiringWarning;
+    if (
+      marker?.state === "emitted"
+      && marker.jti === expectedJti
+      && marker.expiresAtMs === expectedExpiresAtMs
+    ) {
+      return Object.freeze({ outcome: "emitted", accepted: true, actions: [] });
+    }
+    const route = this.routes.get(client.routeId);
+    if (!route || route.status !== "opened") {
+      // A closing/closed route never replays: the marker dies with the
+      // connection cleanup, which also retires the deadline-owner entry.
+      client.authExpiringWarning = {
+        jti: expectedJti,
+        expiresAtMs: expectedExpiresAtMs,
+        state: "deferred",
+      };
+      return Object.freeze({ outcome: "deferred", accepted: true, actions: [] });
+    }
+    return this.enqueueClientAuthExpiringWarning(
+      client,
+      route,
+      expectedJti,
+      expectedExpiresAtMs,
+    );
   }
 
   /**
@@ -1741,6 +1844,7 @@ export class RelayV2BrokerCore {
       authorizationState: "active",
       authorizationCloseSignalled: false,
       authorizationCleanupState: "idle",
+      authExpiringWarning: null,
       routeId,
       queue: [],
       inFlight: new Map(),
@@ -2652,20 +2756,19 @@ export class RelayV2BrokerCore {
     route.hostToClientBufferedBytes = welcomeBytes.byteLength;
     client.queue.push({ bytes: welcomeBytes, route, carrierAccounted: false });
     this.signalClientOutputReady(client, true);
-    return {
-      accepted: true,
-      actions: [{
-        kind: "route_opened",
-        connectionId: route.connectionId,
-        connectionIncarnation: route.connectionIncarnation,
-        routeId: route.routeId,
-        routeFence: route.routeFence,
-        hostId: route.authContext.hostId,
-        hostEpoch: carrier.hello!.hostEpoch,
-        hostInstanceId: carrier.hello!.hostInstanceId,
-        capabilities,
-      }],
-    };
+    const actions: RelayV2BrokerAction[] = [{
+      kind: "route_opened",
+      connectionId: route.connectionId,
+      connectionIncarnation: route.connectionIncarnation,
+      routeId: route.routeId,
+      routeFence: route.routeFence,
+      hostId: route.authContext.hostId,
+      hostEpoch: carrier.hello!.hostEpoch,
+      hostInstanceId: carrier.hello!.hostInstanceId,
+      capabilities,
+    }];
+    this.flushDeferredClientAuthExpiringWarning(client, route, actions);
+    return { accepted: true, actions };
   }
 
   private routeRejected(carrier: CarrierState, frame: RelayV2JsonObject): RelayV2BrokerResult {
@@ -4360,6 +4463,89 @@ export class RelayV2BrokerCore {
       closeCode: 1013,
       reason: "carrier_control_backpressure",
     });
+  }
+
+  /**
+   * Admits the exact auth.expiring broker control event through the client
+   * queue behind the reserved relay.welcome (outputReady wakes the client
+   * pump). Like the welcome it consumes no host eventSeq and no carrier
+   * capacity: only route-level hostToClient counters are charged. The once
+   * marker is written only after a successful enqueue; an enqueue failure is
+   * a single-connection slow-consumer terminal close, never a composition
+   * seal.
+   */
+  private enqueueClientAuthExpiringWarning(
+    client: ClientState,
+    route: RouteState,
+    jti: string,
+    expiresAtMs: number,
+  ): RelayV2BrokerClientAuthExpiringWarningResult {
+    const bytes = encodeRelayV2WebSocketFrame("public", {
+      protocolVersion: 2,
+      kind: "event",
+      type: "auth.expiring",
+      payload: {
+        grantId: client.authContext.grantId,
+        expiresAtMs,
+        // refreshRecommendedAtMs is exactly expiresAtMs - 5 minutes.
+        refreshRecommendedAtMs: expiresAtMs - 300_000,
+      },
+    });
+    if (
+      bytes.byteLength > RELAY_V2_BROKER_LIMITS.maxFrameBytes
+      || route.hostToClientFrames + 1 > RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames
+      || route.hostToClientBufferedBytes + bytes.byteLength
+        > RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection
+    ) {
+      const actions = this.beginRouteUnbind(route, "slow_consumer");
+      actions.push({
+        kind: "close_client",
+        connectionId: client.connectionId,
+        connectionIncarnation: client.connectionIncarnation,
+        closeCode: 1013,
+        reason: "slow_consumer",
+      });
+      return Object.freeze({ outcome: "closed", accepted: false, actions });
+    }
+    route.hostToClientFrames += 1;
+    route.hostToClientBufferedBytes += bytes.byteLength;
+    const clientQueueWasEmpty = client.queue.length === 0;
+    client.queue.push({ bytes, route, carrierAccounted: false });
+    client.authExpiringWarning = { jti, expiresAtMs, state: "emitted" };
+    if (clientQueueWasEmpty) this.signalClientOutputReady(client, true);
+    return Object.freeze({ outcome: "emitted", accepted: true, actions: [] });
+  }
+
+  /**
+   * Replays the warning helper after route.opened has committed the reserved
+   * relay.welcome. Only an exact-credential deferred marker is replayed;
+   * anything else is dropped, never retried inline.
+   */
+  private flushDeferredClientAuthExpiringWarning(
+    client: ClientState,
+    route: RouteState,
+    actions: RelayV2BrokerAction[],
+  ): void {
+    const marker = client.authExpiringWarning;
+    if (!marker || marker.state !== "deferred") return;
+    if (
+      client.authorizationState !== "active"
+      || client.authContext.jti !== marker.jti
+      || client.authContext.expiresAtMs !== marker.expiresAtMs
+      || this.isAuthorizationExpired(client.authContext)
+    ) {
+      client.authExpiringWarning = null;
+      return;
+    }
+    const result = this.enqueueClientAuthExpiringWarning(
+      client,
+      route,
+      marker.jti,
+      marker.expiresAtMs,
+    );
+    if (result.outcome === "emitted") return;
+    client.authExpiringWarning = null;
+    actions.push(...result.actions);
   }
 
   private checkedCarrierFrame(frame: RelayV2JsonObject): RelayV2JsonObject {

@@ -48,6 +48,35 @@ function publicBytes(streamId = randomUUID()) {
   });
 }
 
+function hostTerminalInputAck(streamId = "warning-stream") {
+  return {
+    protocolVersion: 2,
+    kind: "event",
+    type: "terminal.input_ack",
+    streamId,
+    payload: { generation: "generation-1", ackedThroughInputSeq: "0" },
+  };
+}
+
+function hostRouteData(identity, seq, publicFrame) {
+  return {
+    carrierVersion: 1,
+    type: "route.data",
+    connectorId: identity.connectorId,
+    routeId: identity.routeId,
+    routeFence: identity.routeFence,
+    direction: "host_to_client",
+    seq,
+    payload: {
+      opcode: "text",
+      encoding: "base64",
+      data: Buffer.from(
+        codec.encodeRelayV2WebSocketFrame("public", publicFrame),
+      ).toString("base64"),
+    },
+  };
+}
+
 function hostHello(overrides = {}) {
   return {
     carrierVersion: 1,
@@ -78,6 +107,9 @@ class StrictFakeSocket {
     this.listeners = new Map();
     this.closes = [];
     this.terminates = 0;
+    this.sends = [];
+    this.sendBlocked = false;
+    this.blockedSendCallbacks = [];
     this.log = log;
     this.onInstalled = undefined;
     this.removeListenerImpl = undefined;
@@ -110,8 +142,25 @@ class StrictFakeSocket {
     }
   }
 
-  send(_bytes, _options, callback) {
+  send(bytes, _options, callback) {
+    this.sends.push(bytes.slice());
+    if (this.sendBlocked) {
+      this.blockedSendCallbacks.push(callback);
+      return;
+    }
     callback();
+  }
+
+  releaseBlockedSends() {
+    this.sendBlocked = false;
+    const pending = this.blockedSendCallbacks.splice(0);
+    for (const callback of pending) callback();
+  }
+
+  sentFrames() {
+    return this.sends.map((bytes) => (
+      codec.decodeRelayV2WebSocketFrame("public", bytes).frame
+    ));
   }
 
   pause() {}
@@ -356,7 +405,7 @@ async function attachOpenedClient(harness, options = {}) {
   };
 }
 
-async function completeRouteUnbind(harness, capturedDelivery) {
+async function completeRouteUnbind(harness, capturedDelivery, lastHostToClientSeq = "0") {
   const delivery = capturedDelivery ?? harness.hostBroker.drainHostCarrier(
     harness.transportId,
     { maxFrames: 1 },
@@ -380,7 +429,7 @@ async function completeRouteUnbind(harness, capturedDelivery) {
       payload: {
         reason: delivery.frame.payload.reason,
         lastClientToHostSeq: delivery.frame.payload.lastClientToHostSeq,
-        lastHostToClientSeq: "0",
+        lastHostToClientSeq,
       },
     }),
   );
@@ -451,7 +500,7 @@ test("client WSS runtime keeps one incarnation through Core and drains only afte
     true,
   );
   const client = await attachOpenedClient(harness);
-  assert.equal(harness.absolute.tasks.length, 1);
+  assert.equal(harness.absolute.tasks.length, 2);
 
   client.socket.emit("close", 1000);
   const [unbind] = harness.hostBroker.drainHostCarrier(
@@ -604,6 +653,141 @@ test("absolute expiry fences frames before 4401, forces at 5s, and stale callbac
   }]);
   authorityClient.socket.emit("close", 1000);
   await authorityDrain;
+});
+
+test("client auth-expiring warning reaches the socket once per credential before the exact 4401 fence", async () => {
+  const harness = await createHarness();
+  const expiresAtMs = NOW_MS + 60_000;
+  const client = await attachOpenedClient(harness, {
+    connectionId: "client-warning-e2e",
+    expiresAtMs,
+  });
+  assert.equal(harness.absolute.tasks.length, 2);
+  const [exactExpiry, warning] = harness.absolute.tasks;
+  assert.equal(exactExpiry.expiresAtMs, expiresAtMs);
+  assert.equal(warning.expiresAtMs, expiresAtMs - 60_000);
+
+  harness.absolute.fire(warning);
+  await settle();
+  assert.deepEqual(
+    client.socket.sentFrames().map((frame) => frame.type),
+    ["relay.welcome", "auth.expiring"],
+    "the warning follows the reserved welcome on the client socket",
+  );
+  assert.deepEqual(JSON.parse(Buffer.from(client.socket.sends[1]).toString("utf8")), {
+    protocolVersion: 2,
+    kind: "event",
+    type: "auth.expiring",
+    payload: {
+      grantId: "client-warning-e2e-grant",
+      expiresAtMs,
+      refreshRecommendedAtMs: expiresAtMs - 300_000,
+    },
+  });
+
+  harness.absolute.fire(warning, { includeCancelled: true });
+  await settle();
+  assert.equal(client.socket.sends.length, 2, "the once latch never re-emits");
+
+  const firstHostData = await harness.hostBroker.receiveHostFrame(
+    harness.transportId,
+    carrierBytes(hostRouteData(client.routeOpen.frame, "1", hostTerminalInputAck())),
+  );
+  assert.equal(
+    firstHostData.accepted,
+    true,
+    "the broker-owned warning consumes no host sequence: the initial host_to_client seq is still expected after auth.expiring",
+  );
+  await settle();
+  assert.deepEqual(
+    client.socket.sentFrames().map((frame) => frame.type),
+    ["relay.welcome", "auth.expiring", "terminal.input_ack"],
+    "the first host route.data frame follows the broker control event intact",
+  );
+  assert.deepEqual(JSON.parse(Buffer.from(client.socket.sends[2]).toString("utf8")), {
+    protocolVersion: 2,
+    kind: "event",
+    type: "terminal.input_ack",
+    streamId: "warning-stream",
+    payload: { generation: "generation-1", ackedThroughInputSeq: "0" },
+  });
+
+  harness.now.value = expiresAtMs;
+  harness.absolute.fire(exactExpiry);
+  await settle();
+  assert.deepEqual(client.socket.closes, [{ code: 4401, reason: "access_expired" }]);
+  const closeDeadline = harness.closeDeadlines.tasks[0];
+  assert.equal(closeDeadline.delayMs, 5_000);
+  harness.closeDeadlines.fire(closeDeadline);
+  assert.equal(client.socket.terminates, 1);
+  client.socket.emit("close", 1006);
+  await client.handle.drained;
+  const unbind = harness.hostBroker.drainHostCarrier(harness.transportId)
+    .find((delivery) => delivery.frame.type === "route.unbind");
+  assert.ok(unbind);
+  await completeRouteUnbind(harness, unbind, "1");
+  await harness.composition.closeAndDrain();
+});
+
+test("a client warning queue overflow closes only this client and never seals the composition", async () => {
+  const harness = await createHarness();
+  const socket = new StrictFakeSocket(harness.log);
+  socket.sendBlocked = true;
+  const client = await attachOpenedClient(harness, {
+    connectionId: "client-warning-overflow",
+    expiresAtMs: NOW_MS + 60_000,
+    socket,
+  });
+  const [, warning] = harness.absolute.tasks;
+
+  // The blocked send keeps every delivery billed: the reserved welcome plus
+  // 127 contiguous host route.data frames charge the route to exactly the
+  // 128-frame budget (127+1 is still admitted), so the warning's +1 is the
+  // precise 129th frame that overflows the enqueue.
+  for (let index = 0; index < brokerModule.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames - 1; index += 1) {
+    const accepted = await harness.hostBroker.receiveHostFrame(
+      harness.transportId,
+      carrierBytes(hostRouteData(
+        client.routeOpen.frame,
+        `${index + 1}`,
+        hostTerminalInputAck(),
+      )),
+    );
+    assert.equal(accepted.accepted, true, `route.data ${index + 1} still fits the route budget`);
+  }
+
+  harness.absolute.fire(warning);
+  await settle();
+  assert.deepEqual(
+    socket.closes,
+    [{ code: 1013, reason: "slow_consumer" }],
+    "queue rejection closes only this client as a slow consumer",
+  );
+  assert.deepEqual(
+    socket.sentFrames().map((frame) => frame.type),
+    ["relay.welcome"],
+    "the overflowed warning is never queued behind the reserved welcome",
+  );
+  const [unbind] = harness.hostBroker.drainHostCarrier(harness.transportId, { maxFrames: 1 });
+  assert.equal(unbind.frame.type, "route.unbind");
+  assert.equal(unbind.frame.payload.reason, "slow_consumer");
+  await completeRouteUnbind(harness, unbind, "127");
+
+  const reopened = await attachOpenedClient(harness, {
+    connectionId: "client-after-warning-overflow",
+  });
+  assert.deepEqual(
+    reopened.socket.sentFrames().map((frame) => frame.type),
+    ["relay.welcome"],
+    "a fresh client still completes the handshake: the queue rejection never seals the composition",
+  );
+
+  socket.releaseBlockedSends();
+  socket.emit("close", 1006);
+  await client.handle.drained;
+  reopened.socket.emit("close", 1000);
+  await reopened.handle.drained;
+  await harness.composition.closeAndDrain();
 });
 
 test("partial attach and concurrent close share a real-terminal drain barrier", async () => {

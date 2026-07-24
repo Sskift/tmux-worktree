@@ -756,4 +756,268 @@ test("Relay v2 broker authorization-expiry deadline owner foundation", async (t)
     await registration.unregister();
     await owner.close();
   });
+
+  await t.test("client warning emits via the client queue exactly once per credential", async () => {
+    const absolute = new AbsoluteScheduler();
+    const core = new broker.RelayV2BrokerCore({
+      now: () => absolute.now,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    });
+    await registerHost(core, "host-client-warning", "client-warning-host-incarnation");
+    const expiresAtMs = NOW_MS + 3_600_000;
+    await openClient(
+      core,
+      "host-client-warning",
+      "client-warning-emitted",
+      "client-warning-incarnation",
+      expiresAtMs,
+    );
+    const emits = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: (kind, id, incarnation) => (
+          core.recheckConnectionAccessExpiry(kind, id, incarnation)
+        ),
+        failClosed: () => core.liveAuthorizationFencePort.failClosed(),
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register(
+      "client",
+      "client-warning-emitted",
+      "client-warning-incarnation",
+      {
+        emitClientAuthExpiring: (jti, exp) => {
+          emits.push([jti, exp]);
+          return core.recheckClientAuthExpiringWarning(
+            "client-warning-emitted",
+            "client-warning-incarnation",
+            jti,
+            exp,
+          ).outcome;
+        },
+      },
+    );
+    await flushTurns();
+    assert.deepEqual(
+      [...absolute.scheduled.values()].map((item) => item.atMs).sort((a, b) => a - b),
+      [expiresAtMs - 60_000, expiresAtMs],
+      "exp-60s warning and exact expiry share the entry scheduler",
+    );
+
+    absolute.now = expiresAtMs - 60_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(emits, [["client-warning-emitted-jti", expiresAtMs]]);
+    const deliveries = core.drainClient("client-warning-emitted", { maxFrames: 2 });
+    assert.equal(deliveries.length, 2);
+    assert.equal(
+      codec.decodeRelayV2WebSocketFrame("public", deliveries[0].bytes).frame.type,
+      "relay.welcome",
+      "the reserved welcome stays the first client frame",
+    );
+    const warning = codec.decodeRelayV2WebSocketFrame("public", deliveries[1].bytes).frame;
+    assert.equal(warning.type, "auth.expiring");
+    assert.deepEqual(JSON.parse(Buffer.from(deliveries[1].bytes).toString("utf8")), {
+      protocolVersion: 2,
+      kind: "event",
+      type: "auth.expiring",
+      payload: {
+        grantId: "client-grant",
+        expiresAtMs,
+        refreshRecommendedAtMs: expiresAtMs - 300_000,
+      },
+    });
+
+    assert.equal(
+      core.recheckClientAuthExpiringWarning(
+        "client-warning-emitted",
+        "client-warning-incarnation",
+        "client-warning-emitted-jti",
+        expiresAtMs,
+      ).outcome,
+      "emitted",
+    );
+    assert.equal(
+      core.drainClient("client-warning-emitted", { maxFrames: 1 }).length,
+      0,
+      "the Core once marker never enqueues a second frame for one credential",
+    );
+    assert.equal(emits.length, 1, "the owner once latch never re-emits");
+    await registration.unregister();
+    await owner.close();
+  });
+
+  await t.test("an unopened client route defers and route.opened replays after the welcome", async () => {
+    const absolute = new AbsoluteScheduler();
+    const core = new broker.RelayV2BrokerCore({
+      now: () => absolute.now,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    });
+    await registerHost(core, "host-client-defer", "client-defer-host-incarnation");
+    const expiresAtMs = NOW_MS + 3_600_000;
+    assert.equal(core.openClientRoute(
+      "client-warning-deferred",
+      authContext("client", {
+        jti: "client-warning-deferred-jti",
+        expiresAtMs,
+      }),
+      "client-deferred-incarnation",
+    ).accepted, true);
+    const outcomes = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: (kind, id, incarnation) => (
+          core.recheckConnectionAccessExpiry(kind, id, incarnation)
+        ),
+        failClosed: () => core.liveAuthorizationFencePort.failClosed(),
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register(
+      "client",
+      "client-warning-deferred",
+      "client-deferred-incarnation",
+      {
+        emitClientAuthExpiring: (jti, exp) => {
+          const outcome = core.recheckClientAuthExpiringWarning(
+            "client-warning-deferred",
+            "client-deferred-incarnation",
+            jti,
+            exp,
+          ).outcome;
+          outcomes.push(outcome);
+          return outcome;
+        },
+      },
+    );
+    await flushTurns();
+
+    absolute.now = expiresAtMs - 60_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(outcomes, ["deferred"]);
+    assert.equal(
+      core.drainClient("client-warning-deferred", { maxFrames: 1 }).length,
+      0,
+      "no frame is queued before route.opened commits",
+    );
+
+    const [routeOpen] = core.drainHostCarrier("host-client-defer", { maxFrames: 1 });
+    assert.equal(routeOpen.frame.type, "route.open");
+    assert.equal(core.acknowledgeHostDelivery(
+      "host-client-defer",
+      routeOpen.deliveryId,
+    ).accepted, true);
+    const opened = await core.receiveHostFrame("host-client-defer", carrierBytes({
+      carrierVersion: 1,
+      type: "route.opened",
+      requestId: routeOpen.frame.requestId,
+      connectorId: routeOpen.frame.connectorId,
+      routeId: routeOpen.frame.routeId,
+      routeFence: routeOpen.frame.routeFence,
+      payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+    }));
+    assert.equal(opened.accepted, true);
+    const deliveries = core.drainClient("client-warning-deferred", { maxFrames: 2 });
+    assert.equal(deliveries.length, 2);
+    assert.equal(
+      codec.decodeRelayV2WebSocketFrame("public", deliveries[0].bytes).frame.type,
+      "relay.welcome",
+      "the reserved welcome stays the first client frame",
+    );
+    const warning = codec.decodeRelayV2WebSocketFrame("public", deliveries[1].bytes).frame;
+    assert.equal(warning.type, "auth.expiring");
+    assert.deepEqual(JSON.parse(Buffer.from(deliveries[1].bytes).toString("utf8")), {
+      protocolVersion: 2,
+      kind: "event",
+      type: "auth.expiring",
+      payload: {
+        grantId: "client-grant",
+        expiresAtMs,
+        refreshRecommendedAtMs: expiresAtMs - 300_000,
+      },
+    });
+    await registration.unregister();
+    await owner.close();
+  });
+
+  await t.test("a revoked client credential converges the warning without a frame or seal", async () => {
+    const absolute = new AbsoluteScheduler();
+    const core = new broker.RelayV2BrokerCore({
+      now: () => absolute.now,
+      baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+      onLiveAuthorizationClose: () => {},
+    });
+    await registerHost(core, "host-client-revoke", "client-revoke-host-incarnation");
+    const expiresAtMs = NOW_MS + 3_600_000;
+    await openClient(
+      core,
+      "host-client-revoke",
+      "client-warning-revoked",
+      "client-revoke-incarnation",
+      expiresAtMs,
+    );
+    const outcomes = [];
+    const owner = new deadlineOwner.RelayV2BrokerAuthorizationExpiryDeadlineOwner({
+      serializedCutPort: {
+        recheckConnectionAccessExpiry: (kind, id, incarnation) => (
+          core.recheckConnectionAccessExpiry(kind, id, incarnation)
+        ),
+        failClosed: () => core.liveAuthorizationFencePort.failClosed(),
+      },
+      scheduleAt: absolute.scheduleAt,
+    });
+    const registration = owner.register(
+      "client",
+      "client-warning-revoked",
+      "client-revoke-incarnation",
+      {
+        emitClientAuthExpiring: (jti, exp) => {
+          const outcome = core.recheckClientAuthExpiringWarning(
+            "client-warning-revoked",
+            "client-revoke-incarnation",
+            jti,
+            exp,
+          ).outcome;
+          outcomes.push(outcome);
+          return outcome;
+        },
+      },
+    );
+    await flushTurns();
+
+    const barrier = core.liveAuthorizationFencePort.begin({
+      reason: "grant_revoked",
+      role: "client",
+      hostId: HOST_ID,
+      grantId: "client-grant",
+    });
+    barrier.committed({
+      authorizationRevision: "2",
+      authorizationFence: "authorization-fence-2",
+    });
+
+    absolute.now = expiresAtMs - 60_000;
+    absolute.fireDue();
+    await flushTurns();
+    assert.deepEqual(outcomes, ["stale"], "a fenced credential reads as a stale warning cut");
+    assert.equal(
+      core.drainClient("client-warning-revoked", { maxFrames: 1 }).length,
+      0,
+      "no warning frame is queued for a revoked credential",
+    );
+    assert.equal(
+      absolute.scheduled.size,
+      0,
+      "the stale warning retires the entry and cancels both timers",
+    );
+    assert.equal(
+      core.inspectLiveAuthCompositionLatch(),
+      "open",
+      "a revoked credential never seals the composition",
+    );
+    await registration.unregister();
+    await owner.close();
+  });
 });
