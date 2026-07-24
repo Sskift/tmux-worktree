@@ -10,7 +10,7 @@ export type RelayServerOptions = {
 export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let host = "0.0.0.0";
   let port = 8787;
-  let secret = process.env.TW_RELAY_SECRET || "";
+  let secret = "";
   let secretFlag = false;
   let listenFlag = false;
   let v2ProfilePath: string | undefined;
@@ -46,9 +46,15 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     if (listenFlag) {
       throw new CliError("relay-server --v2-profile 的监听地址只来自 profile，不能与 --host/--port 同时使用");
     }
-    // 显式 v2 profile 模式：监听/凭证/continuity 只来自 profile 与 deployment
-    // 注入；v1 shared secret 在该模式下不被读取或使用，也绝不回退 v1。
+    // 显式 v2 profile 模式：监听/凭证/continuity 只来自 profile 与 trusted
+    // deployment source；v1 shared secret 在该模式下不被读取或使用（env
+    // TW_RELAY_SECRET 也不读取），也绝不回退 v1。
     return { host, port, secret: "", v2ProfilePath };
+  }
+
+  // 仅 v1 分支读取 env：--secret 优先，缺省回落 TW_RELAY_SECRET。
+  if (!secretFlag) {
+    secret = process.env.TW_RELAY_SECRET || "";
   }
 
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -72,6 +78,7 @@ function printRelayServerHelp(): void {
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
   Dashboard 所在机器运行 tw relay-host 主动连接 relay，不需要把本机端口暴露到公网。
   --v2-profile 选择显式 default-off Relay v2 shipping：profile 只保存非敏感
-  reference/path；缺少 deployment 注入的 privileged resolver / external
-  continuity attempt provider 时在监听前 fail closed，绝不回退 v1。`);
+  reference/path；TLS/issuer keyring/E0 material 只来自 trustedHome 下固定
+  namespace 的 0600 私有 deployment 文件，缺失或 unsafe 时在监听前 fail
+  closed，绝不回退 v1。`);
 }

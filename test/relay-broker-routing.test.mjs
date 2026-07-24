@@ -293,8 +293,9 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
   Dashboard 所在机器运行 tw relay-host 主动连接 relay，不需要把本机端口暴露到公网。
   --v2-profile 选择显式 default-off Relay v2 shipping：profile 只保存非敏感
-  reference/path；缺少 deployment 注入的 privileged resolver / external
-  continuity attempt provider 时在监听前 fail closed，绝不回退 v1。
+  reference/path；TLS/issuer keyring/E0 material 只来自 trustedHome 下固定
+  namespace 的 0600 私有 deployment 文件，缺失或 unsafe 时在监听前 fail
+  closed，绝不回退 v1。
 `);
 
   for (const scenario of [

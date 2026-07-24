@@ -82,13 +82,31 @@ export async function startRelayV2BrokerShippingFromProfileFile(
     .startRelayV2BrokerShippingFromProfileFile(profilePath, deploymentInputs);
 }
 
+/**
+ * Explicit default-off Relay v2 shipping activation through the single trusted
+ * deployment source owner: the reference-only profile's TLS/keyring/E0
+ * material resolves only from fd-bound 0600 private files under the fixed
+ * trustedHome namespace. Any profile, identifier, ownership, material, E0, or
+ * native failure fails closed before any listener — never falling back to v1.
+ */
+export async function startRelayV2BrokerShippingFromTrustedDeployment(
+  profilePath: string,
+): Promise<import("./relay/v2/brokerShippingRoot.js").RelayV2BrokerShippingRootHandle> {
+  return (await import("./relay/v2/brokerShippingDeploymentSource.js"))
+    .startRelayV2BrokerShippingFromTrustedDeployment(profilePath);
+}
+
 /** Stable CLI/tsup facade for the Relay v1 broker implementation. */
 export async function run(): Promise<void> {
   const options = parseRelayServerOptions(process.argv.slice(3));
   if (options.v2ProfilePath !== undefined) {
-    // 明确的 v2 profile 选路：解析并校验 profile 后，CLI 无受信 deployment
-    // resolver/E0 attempt provider 来源，在任何监听前 fail closed；不回退 v1。
-    await startRelayV2BrokerShippingFromProfileFile(options.v2ProfilePath);
+    // 明确的 v2 profile 选路：只经唯一 trusted deployment activation/source
+    // owner 解析 TLS/issuer keyring/E0 material——全部来自 profile trustedHome
+    // 下固定 namespace（.tmux-worktree/relay-v2-broker-deployment/）按 identifier
+    // 映射的 fd-bound regular-file/no-symlink、owner、exact 0600/0700、bounded
+    // 私有文件；任何 profile/reference/ownership/TLS/E0/keyring/native 失败仍在
+    // 任何监听前 fail closed，绝不回退 v1；qualifiedRecords=[] 与 NO-GO 不变。
+    await startRelayV2BrokerShippingFromTrustedDeployment(options.v2ProfilePath);
     return;
   }
   await startRelayBroker(options);

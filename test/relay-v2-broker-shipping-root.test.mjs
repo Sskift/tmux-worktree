@@ -454,7 +454,7 @@ test("explicit v2 profile selects shipping and fails closed; default v1 path is 
 
     process.env.TW_RELAY_SECRET = "v1-secret-that-must-not-be-used";
     const blocker = await runCli(["--v2-profile", validProfilePath]);
-    assert.match(String(blocker?.message), /deployment inputs are unavailable/);
+    assert.match(String(blocker?.message), /deployment source is unavailable/);
 
     const malformedPath = path.join(tempDir, "malformed.json");
     writeFileSync(malformedPath, "{ not json", { mode: 0o600 });

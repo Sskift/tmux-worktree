@@ -1,8 +1,11 @@
 import {
   closeSync,
+  constants as fsConstants,
   fstatSync,
+  lstatSync,
   openSync,
-  readFileSync,
+  readSync,
+  type BigIntStats,
 } from "node:fs";
 import {
   createServer as createNodeHttpsServer,
@@ -125,6 +128,7 @@ export interface RelayV2BrokerShippingRootHandle {
 
 const PROFILE_INVALID = "Relay v2 broker shipping profile is invalid";
 const PROFILE_UNAVAILABLE = "Relay v2 broker shipping profile is unavailable";
+const PROFILE_UNSUPPORTED = "Relay v2 broker shipping profile is unsupported on this platform";
 const INPUTS_INVALID = "Relay v2 broker shipping deployment inputs are invalid";
 const INPUTS_UNAVAILABLE = "Relay v2 broker shipping deployment inputs are unavailable";
 const TLS_MATERIAL_FAILED = "Relay v2 broker shipping TLS material resolution failed";
@@ -725,22 +729,83 @@ export async function startRelayV2BrokerShippingRoot(
   });
 }
 
+/**
+ * Narrow profile reader for the single trusted deployment source owner: reads
+ * and validates the reference-only shipping profile file without resolving any
+ * material. It shares the exact private reader used by the profile-file entry.
+ */
+export function readRelayV2BrokerShippingProfile(
+  profilePath: string,
+): RelayV2BrokerShippingProfile {
+  return readRelayV2BrokerShippingProfileFile(profilePath);
+}
+
+function profileReaderEuid(): bigint {
+  if ((process.platform !== "darwin" && process.platform !== "linux")
+    || typeof process.geteuid !== "function"
+    || typeof fsConstants.O_NOFOLLOW !== "number") {
+    throw new Error(PROFILE_UNSUPPORTED);
+  }
+  return BigInt(process.geteuid());
+}
+
+function assertProfileFile(information: BigIntStats, euid: bigint): void {
+  if (!information.isFile()
+    || information.isSymbolicLink()
+    || information.uid !== euid
+    || Number(information.mode & 0o7777n) !== 0o600
+    || information.nlink !== 1n
+    || information.size <= 0n
+    || information.size > BigInt(PROFILE_FILE_MAX_BYTES)) {
+    throw new Error(PROFILE_UNAVAILABLE);
+  }
+}
+
+/**
+ * Fd-bound reader for the endpoint/reference-binding profile: platform gate,
+ * lstat ownership checks, O_RDONLY|O_NOFOLLOW open, fstat re-check plus
+ * dev/ino/size identity against the lstat, an exact-size bounded read, a
+ * post-read fstat recheck, and an explicit main close (a close failure is
+ * surfaced as unavailable, never swallowed). Every stat/IO/ownership failure
+ * maps to the fixed redacted unavailable message; no path or errno leaks.
+ */
 function readRelayV2BrokerShippingProfileFile(profilePath: string): CapturedProfile {
+  const euid = profileReaderEuid();
   if (!boundedReference(profilePath, 4_096)) throw new Error(PROFILE_UNAVAILABLE);
   let text: string;
+  let descriptor = -1;
   try {
-    const descriptor = openSync(profilePath, "r");
-    try {
-      const stat = fstatSync(descriptor);
-      if (!stat.isFile() || stat.size > PROFILE_FILE_MAX_BYTES) {
-        throw new Error("shipping profile is not a bounded regular file");
-      }
-      text = readFileSync(descriptor, "utf8");
-    } finally {
-      closeSync(descriptor);
+    const before = lstatSync(profilePath, { bigint: true });
+    assertProfileFile(before, euid);
+    descriptor = openSync(profilePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = fstatSync(descriptor, { bigint: true });
+    assertProfileFile(opened, euid);
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new Error(PROFILE_UNAVAILABLE);
     }
+    const size = Number(opened.size);
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const read = readSync(descriptor, bytes, offset, size - offset, offset);
+      if (read <= 0) throw new Error(PROFILE_UNAVAILABLE);
+      offset += read;
+    }
+    const after = fstatSync(descriptor, { bigint: true });
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size) {
+      throw new Error(PROFILE_UNAVAILABLE);
+    }
+    closeSync(descriptor);
+    descriptor = -1;
+    text = bytes.toString("utf8");
   } catch {
     throw new Error(PROFILE_UNAVAILABLE);
+  } finally {
+    if (descriptor >= 0) {
+      try {
+        closeSync(descriptor);
+      } catch {}
+    }
   }
   if (Buffer.byteLength(text, "utf8") > PROFILE_FILE_MAX_BYTES) {
     throw new Error(PROFILE_UNAVAILABLE);
@@ -755,12 +820,11 @@ function readRelayV2BrokerShippingProfileFile(profilePath: string): CapturedProf
 }
 
 /**
- * CLI-facing entry: reads and validates the reference-only profile file, then
- * requires deployment-provided inputs. The CLI has no trusted channel for a
- * privileged material resolver, an external continuity attempt provider, or a
- * qualified native state-store loader, and native durability qualification
- * remains empty, so without injected inputs this fails closed before any
- * listener — never falling back to Relay v1.
+ * Deployment-injected entry: reads and validates the reference-only profile
+ * file, then requires caller-provided inputs. Without injected inputs this
+ * fails closed before any listener — never falling back to Relay v1. The CLI
+ * does not call this entry; its explicit `--v2-profile` selection activates
+ * only the single trusted deployment source owner.
  */
 export async function startRelayV2BrokerShippingFromProfileFile(
   profilePath: string,

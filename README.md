@@ -508,9 +508,22 @@ lifecycle root, and adds a local in-process admin seam for issuer/replay
 rotation and host bootstrap issuance; the bootstrap secret is delivered only
 to a caller-provided restricted sink, never to stdout, logs, or the public
 route. The `relay-server` CLI selects it only through an explicit
-`--v2-profile <path>`; the CLI has no trusted deployment resolver or external
-continuity channel, so that selection fails closed before any listener and
-never falls back to v1, while the default invocation stays Relay v1. Native
+`--v2-profile <path>`, and only via the single default-off trusted deployment
+activation/source owner (`src/relay/v2/brokerShippingDeploymentSource.ts`):
+the profile still carries non-sensitive identifiers/references only, while
+TLS key/cert, issuer keyring, and E0 credential/trust material come solely
+from the fixed trustedHome namespace
+(`.tmux-worktree/relay-v2-broker-deployment/`) as identifier-mapped,
+fd-bound, owner-checked, exact 0600/0700, bounded private files under
+fixed filenames/schemas with redacted errors — the JSON keyring and
+workload-header files are closed-schema validated, while TLS PEM, CA, and
+mutual-TLS cert/key material is only owner/0600/single-link/bounded
+securely read, with its content verified by the TLS/E0 consumption
+boundaries — reusing the fixed native loader and the existing Node E0
+attempt provider; any missing, unsafe, malformed, or unqualified input
+(including the empty native `qualifiedRecords=[]`) fails closed before any
+listener or native mutation and never
+falls back to v1, while the default invocation stays Relay v1. Native
 `qualifiedRecords=[]`, qualified E0/TLS deployment evidence, and the overall
 NO-GO status are unchanged.
 
@@ -520,9 +533,11 @@ real-adapter composition to the existing serial stdio v2 owner and exposes only
 one-shot run and close-and-drain; omitting the option preserves the original
 facade. The Tauri supervisor and hidden Node child now both use exact protocol
 v2, but the child has no qualified same-lineage Host inputs and therefore
-fail-closes every operation with `UNAVAILABLE`. `relay-host`, `relay-server`,
-and E0 still have no production owner wiring or fallback, so Dashboard
-management plus Relay v2 overall remain unavailable.
+fail-closes every operation with `UNAVAILABLE`. `relay-server` now selects
+its trusted deployment source but cannot activate while native/E0
+qualification stays empty; `relay-host` and Dashboard management still have
+no production owner wiring or fallback, so Dashboard management plus Relay
+v2 overall remain unavailable.
 
 Android's admitted explicit-v2 base composition also owns a limited durable
 Outbox path: attempted commands are queried, recovered Execute capabilities are

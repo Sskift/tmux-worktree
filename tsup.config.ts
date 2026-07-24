@@ -99,6 +99,7 @@ export default defineConfig({
     "src/relay/v2/brokerServerRuntime.ts",
     "src/relay/v2/brokerPublicHttpsServer.ts",
     "src/relay/v2/brokerShippingRoot.ts",
+    "src/relay/v2/brokerShippingDeploymentSource.ts",
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
     "src/relay/v2/terminalDurableLineage.ts",
@@ -190,6 +191,12 @@ export default defineConfig({
     "./brokerPublicHttpsServer.js",
     "./relay/v2/brokerPublicHttpsServer.js",
     "./relay/v2/brokerShippingRoot.js",
+    // The trusted deployment source and the relayServer facade must consume the
+    // canonical shipping-root owner entry and the one fixed native loader
+    // instance instead of bundling second copies.
+    "./brokerShippingRoot.js",
+    "./brokerCredentialStateStoreLoader.js",
+    "./relay/v2/brokerShippingDeploymentSource.js",
   ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
