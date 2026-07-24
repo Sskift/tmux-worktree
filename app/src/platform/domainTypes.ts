@@ -331,6 +331,11 @@ export type FeishuBridgeSnapshot = {
   bindings: FeishuBinding[];
   activeTurns: Array<{ id: string; bindingId: string; status: string; deadlineAt: string }>;
   uncertainReplies: Array<{ id: string; turnId: string; status: "uncertain"; error?: string }>;
+  eventConsumer?: {
+    state: "starting" | "running" | "backoff";
+    updatedAt: string;
+    error?: string;
+  };
 };
 
 export type FeishuChat = {

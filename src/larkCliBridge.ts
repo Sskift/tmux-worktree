@@ -51,6 +51,7 @@ export interface FeishuChat {
 
 export interface FeishuEventSubscription {
   child: ChildProcess;
+  ready: Promise<void>;
   done: Promise<void>;
   stop(): void;
 }
@@ -387,6 +388,10 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     child.stderr.on("data", (chunk: string) => {
       stderr = `${stderr}${chunk}`.slice(-8192);
     });
+    const ready = new Promise<void>((resolve, reject) => {
+      child.once("spawn", () => resolve());
+      child.once("error", reject);
+    });
     const done = new Promise<void>((resolve, reject) => {
       child.once("error", reject);
       child.once("exit", (code, signal) => {
@@ -398,6 +403,7 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     });
     return {
       child,
+      ready,
       done,
       stop() {
         try { child.kill("SIGTERM"); } catch {}

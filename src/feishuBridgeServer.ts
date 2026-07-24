@@ -33,6 +33,10 @@ export const FEISHU_BRIDGE_CAPABILITIES = [
   "binding.reply-mode.v1",
   "binding.activity-completion.v1",
   "binding.structured-agent-result.v1",
+  "binding.steering.v1",
+  "binding.remove-origin.v1",
+  "bridge.consumer-health.v1",
+  "reply.durable-payload.v1",
 ] as const;
 
 type FeishuBridgeOperation =
@@ -215,10 +219,19 @@ async function dispatch(
       if (!exactKeys(params, ["bindingId"])) throw new Error("invalid binding.repair params");
       return bridge.repairBinding(text(params.bindingId, "bindingId"));
     case "binding.remove":
-      if (!exactKeys(params, ["bindingId"], ["force"]) || (params.force !== undefined && typeof params.force !== "boolean")) {
+      if (!exactKeys(params, ["bindingId"], ["force", "origin"])
+        || (params.force !== undefined && typeof params.force !== "boolean")
+        || (params.origin !== undefined
+          && params.origin !== "dashboard"
+          && params.origin !== "cli"
+          && params.origin !== "unknown-local-client")) {
         throw new Error("invalid binding.remove params");
       }
-      await bridge.removeBinding(text(params.bindingId, "bindingId"), params.force === true);
+      await bridge.removeBinding(
+        text(params.bindingId, "bindingId"),
+        params.force === true,
+        params.origin ?? "unknown-local-client",
+      );
       return { removed: true };
     case "binding.takeover":
       if (!exactKeys(params, ["bindingId", "dashboardOwnerInstance"], ["force"])
@@ -458,7 +471,7 @@ export class FeishuBridgeServer {
           });
       }, 20_000);
       this.renewTimer.unref();
-      this.startConsumer();
+      await this.startConsumer();
     } catch (error) {
       await this.stop();
       throw error;
@@ -485,17 +498,44 @@ export class FeishuBridgeServer {
     }
   }
 
-  private startConsumer(): void {
+  private async startConsumer(): Promise<void> {
     if (this.stopping) return;
+    this.bridge.setEventConsumerHealth("starting");
     this.consumer = this.lark.subscribe((event) => this.bridge.handleEvent(event));
-    void this.consumer.done.catch((error) => {
+    const consumer = this.consumer;
+    void consumer.done.then(
+      () => {
+        if (!this.stopping) {
+          this.bridge.setEventConsumerHealth("backoff", "Feishu event consumer exited");
+        }
+      },
+      (error) => {
+        if (this.stopping) return;
+        const message = error instanceof Error ? error.message : String(error);
+        this.bridge.setEventConsumerHealth("backoff", message);
+        process.stderr.write(`[feishu-bridge] event consumer stopped: ${message}\n`);
+      },
+    ).finally(() => {
       if (this.stopping) return;
-      process.stderr.write(`[feishu-bridge] event consumer stopped: ${error instanceof Error ? error.message : String(error)}\n`);
-    }).finally(() => {
-      if (this.stopping) return;
-      this.restartTimer = setTimeout(() => this.startConsumer(), 2_000);
+      this.restartTimer = setTimeout(() => {
+        void this.startConsumer().catch((error) => {
+          if (this.stopping) return;
+          const message = error instanceof Error ? error.message : String(error);
+          this.bridge.setEventConsumerHealth("backoff", message);
+        });
+      }, 2_000);
       this.restartTimer.unref();
     });
+    try {
+      await consumer.ready;
+      if (!this.stopping && this.consumer === consumer) {
+        this.bridge.setEventConsumerHealth("running");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.bridge.setEventConsumerHealth("backoff", message);
+      throw error;
+    }
   }
 }
 
@@ -622,6 +662,7 @@ export async function feishuBridgeCmd(args: string[]): Promise<void> {
       process.stdout.write(`${JSON.stringify(await client.request("binding.remove", {
         bindingId: requiredFlag(args, "--binding"),
         ...(args.includes("--force") ? { force: true } : {}),
+        origin: "cli",
       }), null, 2)}\n`);
       return;
     default:

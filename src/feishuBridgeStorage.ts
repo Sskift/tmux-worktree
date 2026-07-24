@@ -135,6 +135,13 @@ export interface FeishuOutboundReply {
   status: "prepared" | "sent" | "uncertain";
   textDigest: string;
   createdAt: string;
+  deliveryKind?: "turn-reply" | "recovery-notice";
+  text?: string;
+  sessionName?: string;
+  tone?: "answer" | "status";
+  replyMode?: FeishuReplyMode;
+  chatId?: string;
+  finalTurnStatus?: "completed" | "timed-out";
   completedAt?: string;
   replyMessageId?: string;
   error?: string;
@@ -454,11 +461,40 @@ function releaseFeishuBridgeStorageLock(lock: FeishuBridgeStorageLock): void {
 function isReply(value: unknown): value is FeishuOutboundReply {
   if (!isRecord(value) || !exactKeys(value, [
     "id", "turnId", "sourceMessageId", "idempotencyKey", "status", "textDigest", "createdAt",
-  ], ["completedAt", "replyMessageId", "error"])) return false;
+  ], [
+    "deliveryKind", "text", "sessionName", "tone", "replyMode", "chatId",
+    "finalTurnStatus", "completedAt", "replyMessageId", "error",
+  ])) return false;
+  const durablePayloadFields = [
+    value.text,
+    value.sessionName,
+    value.tone,
+    value.deliveryKind,
+  ];
+  const hasAnyDurablePayload = durablePayloadFields.some((item) => item !== undefined)
+    || value.replyMode !== undefined
+    || value.chatId !== undefined
+    || value.finalTurnStatus !== undefined;
+  const validDurablePayload = value.deliveryKind === "turn-reply"
+    ? isSafeText(value.text, 16 * 1024)
+      && isSafeText(value.sessionName)
+      && (value.replyMode === "topic" || value.replyMode === "direct")
+      && (value.finalTurnStatus === "completed" || value.finalTurnStatus === "timed-out")
+      && value.tone === (value.finalTurnStatus === "completed" ? "answer" : "status")
+      && value.chatId === undefined
+    : value.deliveryKind === "recovery-notice"
+      ? isSafeText(value.text, 16 * 1024)
+        && isSafeText(value.sessionName)
+        && value.tone === "status"
+        && isSafeText(value.chatId)
+        && value.replyMode === undefined
+        && value.finalTurnStatus === undefined
+      : false;
   return [value.id, value.turnId, value.sourceMessageId, value.idempotencyKey, value.textDigest]
     .every((item) => isSafeText(item))
     && (value.status === "prepared" || value.status === "sent" || value.status === "uncertain")
     && isIso(value.createdAt)
+    && (!hasAnyDurablePayload || validDurablePayload)
     && (value.completedAt === undefined || isIso(value.completedAt))
     && (value.replyMessageId === undefined || isSafeText(value.replyMessageId))
     && (value.error === undefined || isSafeText(value.error, 4096));

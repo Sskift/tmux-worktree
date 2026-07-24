@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  appendFileSync,
   mkdtempSync,
   existsSync,
   mkdirSync,
@@ -9,6 +10,8 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  truncateSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -822,6 +825,70 @@ test("structured Claude and Codex transcripts yield only the exact final assista
     assert.equal(terminalControl.readCompletedAgentResult({
       source: codexSource, cwd: codexCwd, home: root, maxBytes: 1024,
     }).text, "Codex final answer");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex discovery ignores unrelated oversized transcripts and parses the target bounded tail", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-agent-transcript-window-"));
+  const codexDirectory = join(root, ".codex", "sessions", "2026", "07", "23");
+  const cwd = join(root, "target-worktree");
+  const sessionId = "019f3333-3333-7333-8333-333333333333";
+  const turnId = "019f4444-4444-7444-8444-444444444444";
+  const targetPath = join(
+    codexDirectory,
+    `rollout-2026-07-23T01-00-00-${sessionId}.jsonl`,
+  );
+  const unrelatedPath = join(
+    codexDirectory,
+    "rollout-2026-07-23T02-00-00-019f5555-5555-7555-8555-555555555555.jsonl",
+  );
+  try {
+    mkdirSync(codexDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(targetPath, `${JSON.stringify({
+      type: "session_meta",
+      timestamp: "2026-07-23T01:00:00.000Z",
+      payload: { id: sessionId, cwd },
+    })}\n`, { mode: 0o600 });
+    truncateSync(targetPath, 65 * 1024 * 1024);
+    appendFileSync(targetPath, `\n${JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-07-23T01:00:01.000Z",
+      payload: { type: "task_started", turn_id: turnId },
+    })}\n`);
+
+    writeFileSync(unrelatedPath, `${JSON.stringify({
+      type: "session_meta",
+      timestamp: "2026-07-23T02:00:00.000Z",
+      payload: {
+        id: "019f5555-5555-7555-8555-555555555555",
+        cwd: join(root, "other-worktree"),
+      },
+    })}\n`, { mode: 0o600 });
+    truncateSync(unrelatedPath, 66 * 1024 * 1024);
+    const now = new Date();
+    utimesSync(targetPath, new Date(now.getTime() - 2_000), new Date(now.getTime() - 2_000));
+    utimesSync(unrelatedPath, now, now);
+
+    const source = terminalControl.discoverActiveAgentSource({
+      provider: "codex", cwd, home: root,
+    });
+    assert.equal(source.sessionId, sessionId);
+    assert.equal(source.turnId, turnId);
+
+    appendFileSync(targetPath, `${JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-07-23T01:01:00.000Z",
+      payload: {
+        type: "task_complete",
+        turn_id: turnId,
+        last_agent_message: "Oversized Codex final answer",
+      },
+    })}\n`);
+    assert.equal(terminalControl.readCompletedAgentResult({
+      source, cwd, home: root, maxBytes: 1024,
+    }).text, "Oversized Codex final answer");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

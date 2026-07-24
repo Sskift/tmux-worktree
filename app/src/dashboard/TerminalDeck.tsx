@@ -131,6 +131,8 @@ export function TerminalDeck({
 
   const bindingFor = (sessionName: string): FeishuBinding | undefined =>
     feishuSnapshot?.bindings.find((binding) => binding.sessionName === sessionName);
+  const feishuConsumerUnavailable = feishuSnapshot?.eventConsumer
+    && feishuSnapshot.eventConsumer.state !== "running";
 
   const runFeishuAction = async (operation: () => Promise<unknown>) => {
     setFeishuBusy(true);
@@ -143,6 +145,15 @@ export function TerminalDeck({
     } finally {
       setFeishuBusy(false);
     }
+  };
+
+  const confirmUnlink = async (binding: FeishuBinding) => {
+    const confirmed = await dashboardBackend.dialog.confirm({
+      title: "Unlink Feishu group?",
+      message: `Unlink ${binding.chatName} from ${binding.sessionName}? The group will stop steering this terminal, and an unresolved reply will be cancelled.`,
+    });
+    if (!confirmed) return;
+    await runFeishuAction(() => dashboardBackend.feishu.remove(binding.id, true));
   };
 
   const openBinding = (sessionName: string, ptyId: string, sessionSummary: string) => {
@@ -185,7 +196,9 @@ export function TerminalDeck({
         <div className="terminal-feishu-bar" data-state="unbound">
           <span>
             {feishuSnapshot
-              ? "Feishu not linked"
+              ? feishuConsumerUnavailable
+                ? "Feishu event consumer is reconnecting"
+                : "Feishu not linked"
               : feishuError?.includes("FEISHU_PROFILE_NOT_CONFIGURED")
                 ? "Feishu bot not configured · Settings › Integrations"
                 : feishuError
@@ -195,7 +208,7 @@ export function TerminalDeck({
           {feishuSnapshot && (
             <button
               type="button"
-              disabled={feishuBusy || !ptyId}
+              disabled={feishuBusy || !ptyId || !!feishuConsumerUnavailable}
               onClick={() => ptyId && openBinding(sessionName, ptyId, sessionSummary)}
             >
               Link group
@@ -213,11 +226,12 @@ export function TerminalDeck({
               : activeActivityWatch
                 ? " (local Agent task in progress; final response will be posted)"
                 : ""}`
-            : binding.status === "paused"
-              ? `Feishu group “${binding.chatName}” is paused; local input is active`
-              : binding.status === "pausing"
-                ? `Safely handing off from Feishu group “${binding.chatName}”…`
-                : `Feishu link needs recovery: ${binding.staleReason ?? binding.chatName}`}
+              : binding.status === "paused"
+                ? `Feishu group “${binding.chatName}” is paused; local input is active`
+                : binding.status === "pausing"
+                  ? `Safely handing off from Feishu group “${binding.chatName}”…`
+                  : `Feishu link needs recovery: ${binding.staleReason ?? binding.chatName}`}
+          {feishuConsumerUnavailable ? " · event consumer reconnecting" : ""}
         </span>
         {binding.status === "active" && !activeAgentWork && (
           <button
@@ -261,7 +275,7 @@ export function TerminalDeck({
           <button
             type="button"
             disabled={feishuBusy}
-            onClick={() => void runFeishuAction(() => dashboardBackend.feishu.remove(binding.id, true))}
+            onClick={() => void confirmUnlink(binding)}
           >
             Unlink
           </button>

@@ -9,12 +9,15 @@ export type FeishuBindingLifecycleCardKind =
   | "target-ended"
   | "target-replaced";
 
+export type FeishuBindingRemovalOrigin = "dashboard" | "cli" | "unknown-local-client";
+
 export interface FeishuBindingLifecycleCardInput {
   kind: FeishuBindingLifecycleCardKind;
   sessionName: string;
   controlTargetId: string;
   sessionKind?: "worktree" | "terminal";
   sessionSummary?: string;
+  removalOrigin?: FeishuBindingRemovalOrigin;
 }
 
 export interface FeishuLocalTaskResultCardInput {
@@ -179,14 +182,21 @@ function lifecyclePresentation(kind: FeishuBindingLifecycleCardKind): {
   }
 }
 
-function lifecycleReason(kind: Exclude<FeishuBindingLifecycleCardKind, "linked">): {
+function lifecycleReason(
+  kind: Exclude<FeishuBindingLifecycleCardKind, "linked">,
+  removalOrigin?: FeishuBindingRemovalOrigin,
+): {
   reason: string;
   action: string;
 } {
   switch (kind) {
     case "manual-unlink":
       return {
-        reason: "用户主动解除绑定",
+        reason: removalOrigin === "dashboard"
+          ? "本机 Dashboard 请求解除绑定"
+          : removalOrigin === "cli"
+            ? "本机 tw CLI 请求解除绑定"
+            : "本机管理端请求解除绑定",
         action: "群内消息不再转发到此 TW 会话。",
       };
     case "session-deleted":
@@ -213,7 +223,9 @@ export function buildFeishuBindingLifecycleCard(
 ): FeishuReplyCard {
   const presentation = lifecyclePresentation(input.kind);
   const linked = input.kind === "linked";
-  const detail = input.kind === "linked" ? undefined : lifecycleReason(input.kind);
+  const detail = input.kind === "linked"
+    ? undefined
+    : lifecycleReason(input.kind, input.removalOrigin);
   const sessionKind = input.sessionKind === "worktree"
     ? "Worktree"
     : input.sessionKind === "terminal"

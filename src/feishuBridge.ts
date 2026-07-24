@@ -30,6 +30,7 @@ import {
   buildFeishuLocalTaskResultCard,
   buildFeishuReplyCard,
   type FeishuBindingLifecycleCardKind,
+  type FeishuBindingRemovalOrigin,
 } from "./feishuReplyCard.js";
 
 const TURN_IDLE_TIMEOUT_MS = 10 * 60_000;
@@ -68,7 +69,15 @@ export interface FeishuBridgeSnapshot {
   instanceId: string;
   bindings: FeishuBinding[];
   activeTurns: FeishuTurn[];
-  uncertainReplies: FeishuOutboundReply[];
+  uncertainReplies: Array<Pick<
+    FeishuOutboundReply,
+    "id" | "turnId" | "status" | "completedAt" | "replyMessageId" | "error"
+  >>;
+  eventConsumer?: {
+    state: "starting" | "running" | "backoff";
+    updatedAt: string;
+    error?: string;
+  };
 }
 
 function nowIso(now: () => number): string {
@@ -213,12 +222,17 @@ export class FeishuBridge {
   private readonly leases = new Map<string, CanonicalTerminalLease>();
   private readonly pendingProcessingReactions = new Map<string, PendingProcessingReaction>();
   private readonly activityPollAfter = new Map<string, number>();
+  private readonly recoveryNoticeTurnIds = new Set<string>();
+  private readonly recoveryNoticeActivityIds = new Set<string>();
+  private readonly queuedOutboundAttemptIds = new Set<string>();
   private lastActivityPolledBindingId?: string;
+  private eventConsumer: NonNullable<FeishuBridgeSnapshot["eventConsumer"]>;
   private state: BridgeState;
   private mutation = Promise.resolve();
   private reactionMutation = Promise.resolve();
   private lifecycleMutation = Promise.resolve();
   private activityCompletionMutation = Promise.resolve();
+  private outboundMutation = Promise.resolve();
 
   constructor(options: {
     control: CanonicalTerminalControlClient;
@@ -235,6 +249,30 @@ export class FeishuBridge {
     this.now = options.now ?? Date.now;
     this.botOpenId = options.botOpenId;
     this.state = this.store.read();
+    for (const turn of this.state.turns) {
+      if (turn.status === "recovery-required") this.recoveryNoticeTurnIds.add(turn.id);
+    }
+    for (const binding of this.state.bindings) {
+      const watch = binding.activityWatch;
+      if (watch?.status === "uncertain" || watch?.status === "recovery-required") {
+        this.recoveryNoticeActivityIds.add(watch.id);
+      }
+    }
+    this.eventConsumer = {
+      state: "starting",
+      updatedAt: nowIso(this.now),
+    };
+  }
+
+  setEventConsumerHealth(
+    state: "starting" | "running" | "backoff",
+    error?: string,
+  ): void {
+    this.eventConsumer = {
+      state,
+      updatedAt: nowIso(this.now),
+      ...(error ? { error: boundedUtf8(error, 4096) } : {}),
+    };
   }
 
   initializeAfterRestart(): void {
@@ -257,14 +295,30 @@ export class FeishuBridge {
       }
     }
     for (const turn of this.state.turns) {
-      if (turn.status === "prepared" || turn.status === "awaiting" || turn.status === "replying") {
+      const durablePreparedReply = turn.status === "replying"
+        ? this.state.replies.find((reply) =>
+          reply.id === turn.outboundAttemptId
+          && reply.status === "prepared"
+          && this.hasDurableOutboundPayload(reply))
+        : undefined;
+      if ((turn.status === "prepared" || turn.status === "awaiting" || turn.status === "replying")
+        && !durablePreparedReply) {
         turn.status = "recovery-required";
         turn.error = "bridge continuity was lost before the turn completed";
         turn.completedAt = nowIso(this.now);
         changed = true;
       }
     }
+    for (const reply of this.state.replies) {
+      if (reply.status === "prepared" && !this.hasDurableOutboundPayload(reply)) {
+        reply.status = "uncertain";
+        reply.completedAt = nowIso(this.now);
+        reply.error = "legacy prepared reply omitted the durable payload required for recovery";
+        changed = true;
+      }
+    }
     if (changed) this.persist();
+    else this.queuePreparedOutboundAttempts();
   }
 
   snapshot(): FeishuBridgeSnapshot {
@@ -273,7 +327,17 @@ export class FeishuBridge {
       bindings: structuredClone(this.state.bindings),
       activeTurns: structuredClone(this.state.turns.filter((turn) =>
         turn.status === "prepared" || turn.status === "awaiting" || turn.status === "replying")),
-      uncertainReplies: structuredClone(this.state.replies.filter((reply) => reply.status === "uncertain")),
+      uncertainReplies: this.state.replies
+        .filter((reply) => reply.status === "uncertain")
+        .map((reply) => ({
+          id: reply.id,
+          turnId: reply.turnId,
+          status: reply.status,
+          ...(reply.completedAt ? { completedAt: reply.completedAt } : {}),
+          ...(reply.replyMessageId ? { replyMessageId: reply.replyMessageId } : {}),
+          ...(reply.error ? { error: reply.error } : {}),
+        })),
+      eventConsumer: structuredClone(this.eventConsumer),
     };
   }
 
@@ -436,6 +500,9 @@ export class FeishuBridge {
       const binding = this.requireBinding(bindingId);
       const turn = this.activeTurn(binding.id);
       const watch = this.activeActivityWatch(binding);
+      if (turn?.status === "replying") {
+        throw new Error("the Feishu reply card is being delivered; wait for its disposition before pausing");
+      }
       if (watch?.status === "sending") {
         throw new Error("the local Agent completion card is being delivered; wait for its disposition before pausing");
       }
@@ -541,11 +608,18 @@ export class FeishuBridge {
     });
   }
 
-  removeBinding(bindingId: string, force = false): Promise<void> {
+  removeBinding(
+    bindingId: string,
+    force = false,
+    removalOrigin: FeishuBindingRemovalOrigin = "unknown-local-client",
+  ): Promise<void> {
     return this.serial(async () => {
       const binding = this.requireBinding(bindingId);
       const turn = this.activeTurn(binding.id);
       const watch = this.activeActivityWatch(binding);
+      if (turn?.status === "replying") {
+        throw new Error("the Feishu reply card is being delivered; wait for its disposition before unlinking");
+      }
       if (watch?.status === "sending") {
         throw new Error("the local Agent completion card is being delivered; wait for its disposition before unlinking");
       }
@@ -576,7 +650,7 @@ export class FeishuBridge {
       this.state.bindings = this.state.bindings.filter((candidate) => candidate.id !== bindingId);
       this.persist();
       if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
-      this.queueBindingLifecycle(binding, "manual-unlink");
+      this.queueBindingLifecycle(binding, "manual-unlink", { removalOrigin });
     });
   }
 
@@ -593,6 +667,9 @@ export class FeishuBridge {
       }
       const turn = this.activeTurn(binding.id);
       const watch = this.activeActivityWatch(binding);
+      if (turn?.status === "replying") {
+        throw new Error("the Feishu reply card is being delivered; wait for its disposition before takeover");
+      }
       if (watch?.status === "sending") {
         throw new Error("the local Agent completion card is being delivered; wait for its disposition before takeover");
       }
@@ -774,23 +851,14 @@ export class FeishuBridge {
         this.rememberEvent(event.event_id);
         return;
       }
-      if (this.activeActivityWatch(binding)) {
+      const activityWatch = this.activeActivityWatch(binding);
+      if (activityWatch?.status === "sending") {
         this.rememberEvent(event.event_id);
         await this.safeInform(
           binding,
           event.message_id,
-          "绑定时终端已有本地 Agent 任务正在运行，完成后会通知本群。请等待完成通知后再试。",
-          `activity-busy-${event.event_id}`,
-        );
-        return;
-      }
-      if (this.activeTurn(binding.id)) {
-        this.rememberEvent(event.event_id);
-        await this.safeInform(
-          binding,
-          event.message_id,
-          "当前终端正在处理上一条群消息，请等待回复后再试。",
-          `busy-${event.event_id}`,
+          "当前 Agent 的完成通知正在发送，本条消息未注入终端；请在通知送达后重试。",
+          `activity-sending-${event.event_id}`,
         );
         return;
       }
@@ -809,6 +877,20 @@ export class FeishuBridge {
         return;
       }
       this.assertLeaseView(binding, lease, target);
+      const activeTurn = this.activeTurn(binding.id);
+      if (activeTurn) {
+        await this.steerActiveTurn(
+          binding,
+          lease,
+          target,
+          activeTurn,
+          event.event_id,
+          event.message_id,
+          senderId,
+          detail.text || event.content,
+        );
+        return;
+      }
       const turnId = `turn-${digest(`${binding.id}:${event.event_id}`).slice(0, 32)}`;
       const operationId = `feishu-turn-${digest(turnId).slice(0, 32)}`;
       const markerNonce = randomUUID().replaceAll("-", "");
@@ -834,7 +916,13 @@ export class FeishuBridge {
       this.state.turns.push(turn);
       this.rememberEvent(event.event_id, false);
       this.persist();
-      const text = this.formatPrompt(binding, markerNonce, senderId, detail.text || event.content);
+      const text = this.formatPrompt(
+        binding,
+        markerNonce,
+        senderId,
+        detail.text || event.content,
+        "start-or-steer",
+      );
       try {
         const accepted = await this.control.sendAgentMessage({
           lease,
@@ -873,6 +961,12 @@ export class FeishuBridge {
         if (turn.status === "recovery-required") this.markBindingStale(binding, turn.error);
         this.persist();
         throw error;
+      }
+      if (activityWatch && this.activeActivityWatch(binding)?.id === activityWatch.id) {
+        this.cancelActivityWatch(
+          binding,
+          "the inherited local task was converted into a marker-correlated Feishu steering turn",
+        );
       }
       turn.status = "awaiting";
       binding.lastActivityAt = nowIso(this.now);
@@ -973,7 +1067,7 @@ export class FeishuBridge {
     // Completion delivery has its own lane so a slow Feishu API cannot hold
     // terminal ownership mutations or lease renewal. Callers may still await
     // the observable completion result without occupying that lane.
-    await this.activityCompletionMutation;
+    await Promise.all([this.activityCompletionMutation, this.drainOutboundEffects()]);
   }
 
   reconcileHandoffs(): Promise<void> {
@@ -990,7 +1084,7 @@ export class FeishuBridge {
     // Let a completion Card that already crossed the outbound boundary settle
     // before releasing authority. A crash still recovers persisted `sending`
     // as uncertain, but a clean shutdown does not manufacture that ambiguity.
-    await this.activityCompletionMutation;
+    await Promise.all([this.activityCompletionMutation, this.drainOutboundEffects()]);
     await this.serial(async () => {
       const failedTurnMessageIds: string[] = [];
       for (const [bindingId, lease] of [...this.leases]) {
@@ -1032,6 +1126,7 @@ export class FeishuBridge {
       this.reactionMutation,
       this.lifecycleMutation,
       this.activityCompletionMutation,
+      this.drainOutboundEffects(),
     ]);
   }
 
@@ -1379,14 +1474,6 @@ export class FeishuBridge {
         }),
         idempotencyKey,
       );
-      const latest = await this.control.ownershipStatus(binding.controlTargetId);
-      this.assertLeaseView(binding, lease, latest);
-      if (latest.outputGeneration !== watch.outputGeneration) {
-        throw new CanonicalTerminalControlError(
-          "STALE_OUTPUT_CURSOR",
-          "Agent activity completion was fenced by an output generation change",
-        );
-      }
       await this.serial(async () => {
         const currentBinding = this.state.bindings.find((candidate) => candidate.id === binding.id);
         const currentWatch = currentBinding?.activityWatch;
@@ -1452,16 +1539,13 @@ export class FeishuBridge {
     text: string,
     finalStatus: "completed" | "timed-out",
   ): Promise<void> {
-    let lease: CanonicalTerminalLease;
-    let attempt: FeishuOutboundReply;
     try {
       const currentLease = this.leases.get(binding.id);
       if (!currentLease) throw new Error("Feishu lease disappeared before outbound reply");
-      lease = currentLease;
       const target = await this.control.ownershipStatus(turn.controlTargetId);
-      this.assertTurnAuthority(turn, lease, target);
+      this.assertTurnAuthority(turn, currentLease, target);
       const existing = this.state.replies.find((candidate) => candidate.id === turn.outboundAttemptId);
-      attempt = existing ?? {
+      const attempt: FeishuOutboundReply = existing ?? {
         id: turn.outboundAttemptId,
         turnId: turn.id,
         sourceMessageId: turn.messageId,
@@ -1469,9 +1553,18 @@ export class FeishuBridge {
         status: "prepared",
         textDigest: digest(text),
         createdAt: nowIso(this.now),
+        deliveryKind: "turn-reply",
+        text,
+        sessionName: binding.sessionName,
+        tone: finalStatus === "timed-out" ? "status" : "answer",
+        replyMode: binding.options.replyMode,
+        finalTurnStatus: finalStatus,
       };
       if (!existing) this.state.replies.push(attempt);
       if (attempt.textDigest !== digest(text)) throw new Error("outbound reply payload changed after preparation");
+      if (!this.hasDurableOutboundPayload(attempt)) {
+        throw new Error("outbound reply attempt omitted its durable delivery payload");
+      }
       turn.status = "replying";
       this.persist();
     } catch (error) {
@@ -1485,41 +1578,6 @@ export class FeishuBridge {
         this.queueProcessingReactionSettlement(turn.messageId, "failure");
       }
       return;
-    }
-    try {
-      const result = await this.lark.replyCard(
-        turn.messageId,
-        buildFeishuReplyCard(
-          text,
-          binding.sessionName,
-          finalStatus === "timed-out" ? "status" : "answer",
-        ),
-        attempt.idempotencyKey,
-        binding.options.replyMode,
-      );
-      const latest = await this.control.ownershipStatus(turn.controlTargetId);
-      this.assertTurnAuthority(turn, lease, latest);
-      attempt.status = "sent";
-      attempt.completedAt = nowIso(this.now);
-      if (result.messageId) attempt.replyMessageId = result.messageId;
-      turn.status = finalStatus;
-      turn.completedAt = nowIso(this.now);
-      binding.lastActivityAt = turn.completedAt;
-      this.persist();
-      this.queueProcessingReactionSettlement(
-        turn.messageId,
-        finalStatus === "completed" ? "success" : "failure",
-      );
-    } catch (error) {
-      attempt.status = "uncertain";
-      attempt.completedAt = nowIso(this.now);
-      attempt.error = error instanceof Error ? error.message : String(error);
-      turn.status = "recovery-required";
-      turn.completedAt = attempt.completedAt;
-      turn.error = "outbound Feishu reply disposition is uncertain";
-      this.markBindingStale(binding, turn.error);
-      this.persist();
-      this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
     }
   }
 
@@ -1725,10 +1783,14 @@ export class FeishuBridge {
     markerNonce: string,
     senderId: string,
     content: string,
+    mode: "start-or-steer" | "steer",
   ): string {
     const normalized = content.replace(/\0/g, "").replaceAll("[[", "[\u200b[").trim();
     return boundedUtf8([
       `[Feishu group: ${binding.chatName}; sender: ${senderId}]`,
+      mode === "steer"
+        ? "Steering update for the current in-progress task. Incorporate it into that task; do not start a separate task."
+        : "If a task is already in progress, treat this as a steering update to that task; otherwise start a new task.",
       normalized,
       "Reply for the group only when ready. Build the delimiters by concatenating each quoted fragment without spaces.",
       `Open fragments: "[[" + "notify-group:" + "${markerNonce}" + "]]".`,
@@ -1736,6 +1798,98 @@ export class FeishuBridge {
       "Place only the public reply between the constructed delimiters.",
       "Do not place private terminal context inside those markers.",
     ].join("\n"), MAX_PROMPT_BYTES);
+  }
+
+  private async steerActiveTurn(
+    binding: FeishuBinding,
+    lease: CanonicalTerminalLease,
+    target: CanonicalTerminalOwnership,
+    turn: FeishuTurn,
+    eventId: string,
+    messageId: string,
+    senderId: string,
+    content: string,
+  ): Promise<void> {
+    if (!turn.markerNonce || turn.outputGeneration === undefined || turn.cursor === undefined) {
+      turn.status = "recovery-required";
+      turn.completedAt = nowIso(this.now);
+      turn.error = "the active Feishu turn has no complete marker/output correlation for steering";
+      this.markBindingStale(binding, turn.error);
+      this.rememberEvent(eventId, false);
+      this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "failure");
+      return;
+    }
+    try {
+      this.assertTurnAuthority(turn, lease, target);
+    } catch (error) {
+      turn.status = "recovery-required";
+      turn.completedAt = nowIso(this.now);
+      turn.error = error instanceof Error ? error.message : String(error);
+      this.markBindingStale(binding, turn.error);
+      this.rememberEvent(eventId, false);
+      this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "failure");
+      throw error;
+    }
+
+    const operationId = `feishu-steer-${digest(`${turn.id}:${eventId}`).slice(0, 32)}`;
+    this.rememberEvent(eventId, false);
+    this.persist();
+    try {
+      const accepted = await this.control.sendAgentMessage({
+        lease,
+        operationId,
+        pane: "0",
+        message: this.formatPrompt(
+          binding,
+          turn.markerNonce,
+          senderId,
+          content,
+          "steer",
+        ),
+        submit: true,
+      });
+      if (accepted.operationId !== operationId
+        || accepted.controlEpoch !== turn.controlEpoch
+        || accepted.fence !== turn.fence
+        || accepted.outputGeneration !== turn.outputGeneration
+        || accepted.outputCursor < turn.cursor) {
+        const error = new Error("terminal input/output correlation changed while steering the Feishu turn");
+        Object.assign(error, { code: "RECOVERY_REQUIRED" });
+        throw error;
+      }
+    } catch (error) {
+      if (hasCode(error, "HANDOFF_PENDING")) {
+        await this.safeInform(
+          binding,
+          messageId,
+          "当前终端正在安全交接给本地控制端，本条 steering 消息未注入终端。",
+          `steer-handoff-${eventId}`,
+        );
+        await this.reconcileBindingHandoff(binding, lease);
+        return;
+      }
+      if (this.controlContinuityLost(error)) {
+        turn.status = "recovery-required";
+        turn.completedAt = nowIso(this.now);
+        turn.error = `steering input disposition is uncertain: ${error instanceof Error ? error.message : String(error)}`;
+        this.markBindingStale(binding, turn.error);
+        this.persist();
+        this.queueProcessingReactionSettlement(turn.messageId, "failure");
+      }
+      throw error;
+    }
+    const steeredAt = this.now();
+    turn.deadlineAt = new Date(steeredAt + TURN_IDLE_TIMEOUT_MS).toISOString();
+    binding.lastActivityAt = new Date(steeredAt).toISOString();
+    this.persist();
+    await this.safeInform(
+      binding,
+      messageId,
+      "已将这条消息 steer 到当前 Agent；本轮最终回复仍发送到最初触发消息。",
+      `steered-${eventId}`,
+    );
   }
 
   private validateCreateInput(input: CreateFeishuBindingInput): void {
@@ -2164,6 +2318,7 @@ export class FeishuBridge {
     details: {
       sessionKind?: "worktree" | "terminal";
       sessionSummary?: string;
+      removalOrigin?: FeishuBindingRemovalOrigin;
     } = {},
   ): void {
     const snapshot = structuredClone(binding);
@@ -2186,6 +2341,7 @@ export class FeishuBridge {
     details: {
       sessionKind?: "worktree" | "terminal";
       sessionSummary?: string;
+      removalOrigin?: FeishuBindingRemovalOrigin;
     },
   ): Promise<void> {
     try {
@@ -2317,8 +2473,204 @@ export class FeishuBridge {
     throw error;
   }
 
+  private hasDurableOutboundPayload(reply: FeishuOutboundReply): boolean {
+    if (!reply.text || !reply.sessionName || !reply.deliveryKind || !reply.tone) return false;
+    if (reply.deliveryKind === "turn-reply") {
+      return (reply.replyMode === "topic" || reply.replyMode === "direct")
+        && (reply.finalTurnStatus === "completed" || reply.finalTurnStatus === "timed-out")
+        && reply.tone === (reply.finalTurnStatus === "completed" ? "answer" : "status")
+        && reply.chatId === undefined;
+    }
+    return reply.deliveryKind === "recovery-notice"
+      && reply.tone === "status"
+      && !!reply.chatId
+      && reply.replyMode === undefined
+      && reply.finalTurnStatus === undefined;
+  }
+
+  private ensureRecoveryNoticeAttempts(): void {
+    for (const turn of this.state.turns) {
+      if (turn.status !== "recovery-required" || this.recoveryNoticeTurnIds.has(turn.id)) continue;
+      this.recoveryNoticeTurnIds.add(turn.id);
+      const binding = this.state.bindings.find((candidate) => candidate.id === turn.bindingId);
+      if (!binding) continue;
+      const id = `recovery-${digest(turn.id).slice(0, 32)}`;
+      if (this.state.replies.some((reply) => reply.id === id)) continue;
+      const text = "本轮未能完成可确认的回复投递，Agent 内容没有在不确定状态下继续发送。请先在本地检查并恢复终端控制，再从群里重新发起。";
+      this.state.replies.push({
+        id,
+        turnId: turn.id,
+        sourceMessageId: turn.messageId,
+        idempotencyKey: `tw-${digest(id).slice(0, 40)}`,
+        status: "prepared",
+        textDigest: digest(text),
+        createdAt: nowIso(this.now),
+        deliveryKind: "recovery-notice",
+        text,
+        sessionName: binding.sessionName,
+        tone: "status",
+        chatId: binding.chatId,
+      });
+    }
+    for (const binding of this.state.bindings) {
+      const watch = binding.activityWatch;
+      if (!watch
+        || (watch.status !== "uncertain" && watch.status !== "recovery-required")
+        || this.recoveryNoticeActivityIds.has(watch.id)) continue;
+      this.recoveryNoticeActivityIds.add(watch.id);
+      const id = `activity-recovery-${digest(watch.id).slice(0, 32)}`;
+      if (this.state.replies.some((reply) => reply.id === id)) continue;
+      const text = watch.status === "uncertain"
+        ? "本地 Agent 已停止，但完成卡片的投递结果无法确认。为避免重复发送 Agent 内容，请先在本地检查终端和群消息，再恢复绑定。"
+        : "本地 Agent 的运行连续性已经丢失，未发送无法确认归属的 Agent 内容。请先在本地检查并恢复终端控制。";
+      this.state.replies.push({
+        id,
+        turnId: `activity:${watch.id}`,
+        sourceMessageId: watch.messageId ?? binding.chatId,
+        idempotencyKey: `tw-${digest(id).slice(0, 40)}`,
+        status: "prepared",
+        textDigest: digest(text),
+        createdAt: nowIso(this.now),
+        deliveryKind: "recovery-notice",
+        text,
+        sessionName: binding.sessionName,
+        tone: "status",
+        chatId: binding.chatId,
+      });
+    }
+  }
+
+  private queuePreparedOutboundAttempts(): void {
+    for (const attempt of this.state.replies) {
+      if (attempt.status !== "prepared"
+        || !this.hasDurableOutboundPayload(attempt)
+        || this.queuedOutboundAttemptIds.has(attempt.id)) continue;
+      this.queuedOutboundAttemptIds.add(attempt.id);
+      const deliver = async () => {
+        await this.deliverOutboundAttempt(attempt.id);
+      };
+      const queued = this.outboundMutation.then(deliver, deliver);
+      this.outboundMutation = queued.then(
+        () => {
+          this.queuedOutboundAttemptIds.delete(attempt.id);
+        },
+        (error) => {
+          this.queuedOutboundAttemptIds.delete(attempt.id);
+          process.stderr.write(
+            `[feishu-bridge] durable outbound effect failed for ${attempt.id}: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        },
+      );
+    }
+  }
+
+  private async deliverOutboundAttempt(attemptId: string): Promise<void> {
+    const prepared = await this.serial(async (): Promise<FeishuOutboundReply | undefined> => {
+      const attempt = this.state.replies.find((candidate) => candidate.id === attemptId);
+      if (!attempt || attempt.status !== "prepared") return;
+      if (!this.hasDurableOutboundPayload(attempt)) {
+        attempt.status = "uncertain";
+        attempt.completedAt = nowIso(this.now);
+        attempt.error = "durable outbound payload is unavailable";
+        const turn = this.state.turns.find((candidate) => candidate.id === attempt.turnId);
+        if (attempt.deliveryKind === "turn-reply" && turn?.status === "replying") {
+          turn.status = "recovery-required";
+          turn.completedAt = attempt.completedAt;
+          turn.error = attempt.error;
+          const binding = this.state.bindings.find((candidate) => candidate.id === turn.bindingId);
+          if (binding) this.markBindingStale(binding, turn.error);
+        }
+        this.persist();
+        return;
+      }
+      const turn = this.state.turns.find((candidate) => candidate.id === attempt.turnId);
+      if (attempt.deliveryKind === "turn-reply" && turn?.status !== "replying") {
+        attempt.status = "uncertain";
+        attempt.completedAt = nowIso(this.now);
+        attempt.error = "turn state changed before its prepared reply was delivered";
+        this.persist();
+        return;
+      }
+      return structuredClone(attempt);
+    });
+    if (!prepared) return;
+
+    try {
+      const card = buildFeishuReplyCard(prepared.text!, prepared.sessionName!, prepared.tone!);
+      const result = prepared.deliveryKind === "turn-reply"
+        ? await this.lark.replyCard(
+          prepared.sourceMessageId,
+          card,
+          prepared.idempotencyKey,
+          prepared.replyMode!,
+        )
+        : await this.lark.sendCard(prepared.chatId!, card, prepared.idempotencyKey);
+      await this.serial(async () => {
+        const attempt = this.state.replies.find((candidate) => candidate.id === attemptId);
+        if (!attempt || attempt.status !== "prepared") return;
+        const turn = this.state.turns.find((candidate) => candidate.id === attempt.turnId);
+        attempt.status = "sent";
+        attempt.completedAt = nowIso(this.now);
+        delete attempt.error;
+        if (result.messageId) attempt.replyMessageId = result.messageId;
+        if (attempt.deliveryKind === "turn-reply" && turn?.status === "replying") {
+          turn.status = attempt.finalTurnStatus!;
+          turn.completedAt = attempt.completedAt;
+          const binding = this.state.bindings.find((candidate) => candidate.id === turn.bindingId);
+          if (binding) {
+            binding.lastActivityAt = attempt.completedAt;
+            if (attempt.finalTurnStatus === "timed-out") {
+              this.leases.delete(binding.id);
+              this.markBindingStale(
+                binding,
+                "terminal turn was idle for 10 minutes without a certain drain disposition",
+              );
+            }
+          }
+        }
+        this.persist();
+        if (attempt.deliveryKind === "turn-reply" && turn) {
+          this.queueProcessingReactionSettlement(
+            turn.messageId,
+            attempt.finalTurnStatus === "completed" ? "success" : "failure",
+          );
+        }
+      });
+    } catch (error) {
+      await this.serial(async () => {
+        const attempt = this.state.replies.find((candidate) => candidate.id === attemptId);
+        if (!attempt || attempt.status !== "prepared") return;
+        const turn = this.state.turns.find((candidate) => candidate.id === attempt.turnId);
+        attempt.status = "uncertain";
+        attempt.completedAt = nowIso(this.now);
+        attempt.error = error instanceof Error ? error.message : String(error);
+        if (attempt.deliveryKind === "turn-reply" && turn?.status === "replying") {
+          turn.status = "recovery-required";
+          turn.completedAt = attempt.completedAt;
+          turn.error = "outbound Feishu reply disposition is uncertain";
+          const binding = this.state.bindings.find((candidate) => candidate.id === turn.bindingId);
+          if (binding) this.markBindingStale(binding, turn.error);
+        }
+        this.persist();
+        if (attempt.deliveryKind === "turn-reply" && turn) {
+          this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
+        }
+      });
+    }
+  }
+
+  private async drainOutboundEffects(): Promise<void> {
+    while (true) {
+      const pending = this.outboundMutation;
+      await pending;
+      if (pending === this.outboundMutation) return;
+    }
+  }
+
   private persist(): void {
+    this.ensureRecoveryNoticeAttempts();
     this.store.write(this.state);
+    this.queuePreparedOutboundAttempts();
   }
 
   private serial<T>(operation: () => Promise<T>): Promise<T> {

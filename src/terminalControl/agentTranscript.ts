@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   lstatSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   statSync,
 } from "node:fs";
@@ -14,6 +17,7 @@ import {
 } from "./protocol";
 
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+const MAX_CODEX_HEADER_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_CANDIDATES = 4096;
 
 type AgentProvider = TerminalControlAgentSource["provider"];
@@ -43,7 +47,7 @@ function exactTimestamp(value: unknown): string | undefined {
   return new Date(milliseconds).toISOString() === text ? text : undefined;
 }
 
-function assertPrivateTranscript(path: string): { size: number; mtimeMs: number } {
+function privateTranscriptStat(path: string): { size: number; mtimeMs: number } {
   let stat;
   try {
     stat = lstatSync(path);
@@ -61,19 +65,22 @@ function assertPrivateTranscript(path: string): { size: number; mtimeMs: number 
       "Agent result transcript is not a private owned regular file",
     );
   }
+  return { size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function assertBoundedTranscript(stat: { size: number }): void {
   if (stat.size > MAX_TRANSCRIPT_BYTES) {
     throw new TerminalControlProtocolError(
       "RESOURCE_EXHAUSTED",
       "Agent result transcript exceeds the bounded parser limit",
     );
   }
-  return { size: stat.size, mtimeMs: stat.mtimeMs };
 }
 
-function readJsonLines(path: string): JsonRecord[] {
-  const before = assertPrivateTranscript(path);
-  const text = readFileSync(path, "utf8");
-  const after = assertPrivateTranscript(path);
+function assertUnchangedTranscript(
+  before: { size: number; mtimeMs: number },
+  after: { size: number; mtimeMs: number },
+): void {
   if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
     throw new TerminalControlProtocolError(
       "RESOURCE_EXHAUSTED",
@@ -81,6 +88,9 @@ function readJsonLines(path: string): JsonRecord[] {
       true,
     );
   }
+}
+
+function parseJsonLines(text: string): JsonRecord[] {
   const lines = text.split("\n");
   const records: JsonRecord[] = [];
   for (let index = 0; index < lines.length; index += 1) {
@@ -105,6 +115,83 @@ function readJsonLines(path: string): JsonRecord[] {
     }
   }
   return records;
+}
+
+function readJsonLines(path: string): JsonRecord[] {
+  const before = privateTranscriptStat(path);
+  assertBoundedTranscript(before);
+  const text = readFileSync(path, "utf8");
+  const after = privateTranscriptStat(path);
+  assertBoundedTranscript(after);
+  assertUnchangedTranscript(before, after);
+  return parseJsonLines(text);
+}
+
+function readRange(path: string, position: number, length: number): Buffer {
+  const buffer = Buffer.alloc(length);
+  const descriptor = openSync(path, "r");
+  let offset = 0;
+  try {
+    while (offset < length) {
+      const count = readSync(descriptor, buffer, offset, length - offset, position + offset);
+      if (count === 0) break;
+      offset += count;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return buffer.subarray(0, offset);
+}
+
+function completeHeadText(buffer: Buffer, wholeFile: boolean): string {
+  const text = buffer.toString("utf8");
+  if (wholeFile || text.endsWith("\n")) return text;
+  const boundary = text.lastIndexOf("\n");
+  return boundary < 0 ? "" : text.slice(0, boundary + 1);
+}
+
+function codexSessionMetadata(path: string): { sessionId: string; cwd: string } | undefined {
+  const before = privateTranscriptStat(path);
+  const length = Math.min(before.size, MAX_CODEX_HEADER_BYTES);
+  const buffer = readRange(path, 0, length);
+  const after = privateTranscriptStat(path);
+  assertUnchangedTranscript(before, after);
+  const records = parseJsonLines(completeHeadText(buffer, length === before.size));
+  for (const record of records) {
+    if (record.type !== "session_meta" || !isRecord(record.payload)) continue;
+    const sessionId = safeText(record.payload.id, 128);
+    const cwd = safeText(record.payload.cwd, 16 * 1024);
+    if (sessionId && cwd) return { sessionId, cwd };
+  }
+  return undefined;
+}
+
+function readCodexJsonLines(path: string): JsonRecord[] {
+  const before = privateTranscriptStat(path);
+  if (before.size <= MAX_TRANSCRIPT_BYTES) return readJsonLines(path);
+
+  const headLength = Math.min(before.size, MAX_CODEX_HEADER_BYTES);
+  const tailStart = Math.max(headLength, before.size - MAX_TRANSCRIPT_BYTES);
+  const head = readRange(path, 0, headLength);
+  const tailWithBoundary = readRange(path, tailStart - 1, before.size - tailStart + 1);
+  const after = privateTranscriptStat(path);
+  assertUnchangedTranscript(before, after);
+
+  const headRecords = parseJsonLines(completeHeadText(head, false));
+  const previousByte = tailWithBoundary[0];
+  let tail = tailWithBoundary.subarray(1);
+  if (previousByte !== 0x0a) {
+    const boundary = tail.indexOf(0x0a);
+    if (boundary < 0) {
+      throw new TerminalControlProtocolError(
+        "RESOURCE_EXHAUSTED",
+        "Agent result transcript has no complete record in the bounded parser tail",
+        true,
+      );
+    }
+    tail = tail.subarray(boundary + 1);
+  }
+  return [...headRecords, ...parseJsonLines(tail.toString("utf8"))];
 }
 
 function boundedUtf8Head(value: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -341,7 +428,9 @@ function codexSessionId(records: JsonRecord[]): string | undefined {
 
 function activeCodexSource(records: JsonRecord[], cwd: string): TerminalControlAgentSource | undefined {
   const sessionId = codexSessionId(records);
-  if (!sessionId) return undefined;
+  if (!sessionId || !records.some((record) =>
+    record.type === "session_meta" && isRecord(record.payload)
+    && record.payload.id === sessionId && record.payload.cwd === cwd)) return undefined;
   for (let index = records.length - 1; index >= 0; index -= 1) {
     const record = records[index];
     if (record.type !== "event_msg" || !isRecord(record.payload)
@@ -353,10 +442,7 @@ function activeCodexSource(records: JsonRecord[], cwd: string): TerminalControlA
       candidate.type === "event_msg" && isRecord(candidate.payload)
       && candidate.payload.type === "task_complete" && candidate.payload.turn_id === turnId);
     if (completed) continue;
-    const cwdMatches = records.slice(index).some((candidate) =>
-      candidate.type === "session_meta" && isRecord(candidate.payload)
-      && candidate.payload.id === sessionId && candidate.payload.cwd === cwd);
-    if (cwdMatches) return source("codex", "exact", sessionId, turnId, startedAt);
+    return source("codex", "exact", sessionId, turnId, startedAt);
   }
   return undefined;
 }
@@ -368,15 +454,15 @@ function codexResult(
   maxBytes: number,
 ): TerminalControlAgentResult | undefined {
   if (codexSessionId(records) !== expected.sessionId) return undefined;
+  const cwdMatches = records.some((candidate) =>
+    candidate.type === "session_meta" && isRecord(candidate.payload)
+    && candidate.payload.id === expected.sessionId && candidate.payload.cwd === cwd);
+  if (!cwdMatches) return undefined;
   const startIndex = records.findIndex((record) => record.type === "event_msg"
     && isRecord(record.payload) && record.payload.type === "task_started"
     && record.payload.turn_id === expected.turnId
     && exactTimestamp(record.timestamp) === expected.startedAt);
   if (startIndex < 0) return undefined;
-  const cwdMatches = records.slice(startIndex).some((candidate) =>
-    candidate.type === "session_meta" && isRecord(candidate.payload)
-    && candidate.payload.id === expected.sessionId && candidate.payload.cwd === cwd);
-  if (!cwdMatches) return undefined;
   const completion = records.slice(startIndex + 1).find((record) =>
     record.type === "event_msg" && isRecord(record.payload)
     && record.payload.type === "task_complete" && record.payload.turn_id === expected.turnId);
@@ -413,7 +499,13 @@ export function discoverActiveAgentSource(input: {
   const home = input.home ?? homedir();
   const matches: TerminalControlAgentSource[] = [];
   for (const candidate of transcriptCandidates(input.provider, input.cwd, home)) {
-    const records = readJsonLines(candidate.path);
+    if (input.provider === "codex") {
+      const metadata = codexSessionMetadata(candidate.path);
+      if (!metadata || metadata.cwd !== input.cwd) continue;
+    }
+    const records = input.provider === "codex"
+      ? readCodexJsonLines(candidate.path)
+      : readJsonLines(candidate.path);
     const found = input.provider === "claude"
       ? activeClaudeSource(records, input.cwd)
       : activeCodexSource(records, input.cwd);
@@ -451,7 +543,9 @@ export function readCompletedAgentResult(input: {
   const home = input.home ?? homedir();
   for (const candidate of transcriptCandidates(input.source.provider, input.cwd, home)) {
     if (!candidate.path.endsWith(`${input.source.sessionId}.jsonl`)) continue;
-    const records = readJsonLines(candidate.path);
+    const records = input.source.provider === "codex"
+      ? readCodexJsonLines(candidate.path)
+      : readJsonLines(candidate.path);
     const result = input.source.provider === "claude"
       ? claudeResult(records, input.cwd, input.source, input.maxBytes)
       : codexResult(records, input.cwd, input.source, input.maxBytes);

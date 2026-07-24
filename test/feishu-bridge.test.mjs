@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -621,11 +622,17 @@ class FakeLark {
     this.omitReactionId = false;
     this.failReactionDelete = false;
     this.reactionCreateBarrier = undefined;
+    this.beforeReply = undefined;
     this.beforeGroupCard = undefined;
   }
 
   subscribe() {
-    return { child: undefined, done: new Promise(() => {}), stop() {} };
+    return {
+      child: undefined,
+      ready: Promise.resolve(),
+      done: new Promise(() => {}),
+      stop() {},
+    };
   }
 
   async messageDetail(messageId) {
@@ -640,6 +647,7 @@ class FakeLark {
   async replyCard(messageId, card, idempotencyKey, replyMode) {
     const text = card.body.elements[0].content;
     this.replies.push({ messageId, text, card, idempotencyKey, replyMode });
+    await this.beforeReply?.({ messageId, text, card, idempotencyKey, replyMode });
     if (this.failReply) throw new Error("reply acknowledgement lost");
     return { messageId: `reply-${this.replies.length}`, raw: {} };
   }
@@ -1362,7 +1370,7 @@ test("binding creation and manual unlink announce the committed lifecycle to the
     assert.equal(h.store.read().bindings.length, 0);
     assert.equal(h.lark.groupCards.length, 2);
     assert.equal(h.lark.groupCards[1].card.header.template, "grey");
-    assert.match(cardText(h.lark.groupCards[1].card), /用户主动解除绑定/);
+    assert.match(cardText(h.lark.groupCards[1].card), /本机管理端请求解除绑定/);
     assert.deepEqual(observedBindingCounts, [1, 0]);
   } finally {
     await h.bridge.close();
@@ -1387,10 +1395,6 @@ test("a task already running at bind time posts its structured final answer afte
     assert.equal(binding.activityWatch.status, "armed");
     assert.equal(h.store.read().turns.length, 0, "an inherited task is not a synthetic Feishu turn");
     assert.equal(h.control.inputs.length, 0, "arming the watch never writes to the Agent");
-
-    await h.bridge.handleEvent(event({ event_id: "evt-while-local", message_id: "om-while-local" }));
-    assert.equal(h.control.inputs.length, 0, "group input must not interrupt the inherited task");
-    assert.match(h.lark.replies.at(-1).text, /本地 Agent 任务正在运行/);
 
     await h.bridge.pollTurns();
     assert.equal(h.lark.groupCards.length, 0, "running observations do not announce completion");
@@ -1421,6 +1425,47 @@ test("a task already running at bind time posts its structured final answer afte
   }
 });
 
+test("a group message converts an inherited local task into one marker-correlated steering turn", async () => {
+  const h = harness();
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "existing local task",
+      createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    assert.equal(binding.activityWatch.status, "armed");
+
+    await h.bridge.handleEvent(event({
+      event_id: "evt-steer-local",
+      message_id: "om-steer-local",
+    }));
+    assert.equal(h.control.inputs.length, 1, "the group message must enter the running Agent");
+    assert.match(h.control.inputs[0].message, /treat this as a steering update/i);
+    assert.equal(h.store.read().bindings[0].activityWatch.status, "cancelled");
+    assert.match(
+      h.store.read().bindings[0].activityWatch.error,
+      /marker-correlated Feishu steering turn/,
+    );
+    assert.equal(currentTurn(h).status, "awaiting");
+
+    h.control.output += marked(h, "answer after inherited task steering");
+    await h.bridge.pollTurns();
+    assert.deepEqual(
+      h.lark.replies.map(({ messageId, text }) => ({ messageId, text })),
+      [{ messageId: "om-steer-local", text: "answer after inherited task steering" }],
+    );
+    assert.equal(h.lark.groupCards.length, 0, "a steered inherited task has no duplicate completion card");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("an uncertain local-task completion card is never sent twice", async () => {
   let now = Date.parse("2026-07-21T13:00:00.000Z");
   const h = harness({ now: () => now });
@@ -1436,11 +1481,14 @@ test("an uncertain local-task completion card is never sent twice", async () => 
     now += 1_001;
     h.lark.failGroupCard = true;
     await h.bridge.pollTurns();
-    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards.length, 2);
+    assert.match(cardText(h.lark.groupCards[0].card), /The exact structured final answer\./);
+    assert.doesNotMatch(cardText(h.lark.groupCards[1].card), /The exact structured final answer\./);
+    assert.match(cardText(h.lark.groupCards[1].card), /投递结果无法确认/);
     assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "uncertain");
     assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
     await h.bridge.pollTurns();
-    assert.equal(h.lark.groupCards.length, 1, "unknown acknowledgement must not be retried blindly");
+    assert.equal(h.lark.groupCards.length, 2, "neither Agent content nor its recovery notice is retried blindly");
   } finally {
     h.lark.failGroupCard = false;
     await h.bridge.close();
@@ -1486,6 +1534,49 @@ test("a delayed local-task completion card never blocks terminal lease renewal",
     assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sent");
   } finally {
     releaseCard();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed turn reply never blocks lease renewal or permits concurrent unlink", async () => {
+  const h = harness();
+  let releaseReply = () => {};
+  const replyBarrier = new Promise((resolve) => { releaseReply = resolve; });
+  let markReplyStarted = () => {};
+  const replyStarted = new Promise((resolve) => { markReplyStarted = resolve; });
+  let pollPromise;
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output += marked(h, "delayed durable answer");
+    h.lark.beforeReply = async () => {
+      markReplyStarted();
+      await replyBarrier;
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await replyStarted;
+    await h.bridge.renewLeases();
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "lease.renew").length,
+      1,
+      "outbound reply I/O must not occupy the terminal mutation lane",
+    );
+    await assert.rejects(
+      h.bridge.removeBinding(h.bridge.snapshot().bindings[0].id, true),
+      /reply card is being delivered/,
+    );
+
+    releaseReply();
+    await pollPromise;
+    assert.equal(currentTurn(h).status, "completed");
+    assert.equal(h.lark.replies.length, 1);
+  } finally {
+    releaseReply();
     await pollPromise?.catch(() => {});
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -1567,7 +1658,9 @@ test("completion authority mismatch fails closed before a group Card is sent", a
     const [binding] = h.bridge.snapshot().bindings;
     assert.equal(binding.status, "stale");
     assert.equal(binding.activityWatch.status, "recovery-required");
-    assert.equal(h.lark.groupCards.length, 0);
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.doesNotMatch(cardText(h.lark.groupCards[0].card), /The exact structured final answer\./);
+    assert.match(cardText(h.lark.groupCards[0].card), /运行连续性已经丢失/);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -1729,8 +1822,11 @@ test("binding reply mode is durable, applies to source replies, and cannot chang
       /active Feishu turn/,
     );
     await h.bridge.handleEvent(event({ event_id: "evt-busy", message_id: "om-busy" }));
+    assert.equal(h.control.inputs.length, 2, "the second group message must steer the active turn");
+    assert.match(h.control.inputs[1].message, /Steering update for the current in-progress task/);
     assert.equal(h.lark.replies.length, 1);
-    assert.equal(h.lark.replies[0].replyMode, "direct", "busy status follows the binding mode");
+    assert.match(h.lark.replies[0].text, /steer 到当前 Agent/);
+    assert.equal(h.lark.replies[0].replyMode, "direct", "steering acknowledgement follows the binding mode");
 
     h.control.output += marked(h, "direct group answer");
     await h.bridge.pollTurns();
@@ -2245,7 +2341,7 @@ test("restart-stale unlink keeps the binding until Feishu ownership is recovered
     await restarted.removeBinding(binding.id, true);
     await flushBestEffortEffects();
     assert.equal(restarted.snapshot().bindings.length, 0);
-    assert.match(cardText(h.lark.groupCards.at(-1).card), /用户主动解除绑定/);
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /本机管理端请求解除绑定/);
   } finally {
     await restarted.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -2383,6 +2479,28 @@ test("agent-message response loss is operation-in-doubt and never retried", asyn
     assert.equal(state.bindings[0].status, "stale");
     await h.bridge.handleEvent(event());
     assert.equal(h.control.inputs.length, 1);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("steering response loss fences the active turn and is never replayed", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.failInputAfterCommit = true;
+    const steer = event({ event_id: "evt-steer-uncertain", message_id: "om-steer-uncertain" });
+    await assert.rejects(h.bridge.handleEvent(steer), /closed before replying/);
+    assert.equal(h.control.inputs.length, 2, "the possibly committed steering operation must not be replayed");
+    const state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.equal(state.bindings[0].status, "stale");
+    await h.bridge.handleEvent(steer);
+    assert.equal(h.control.inputs.length, 2);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -2529,7 +2647,7 @@ test("an uncertain Typing creation never stacks a contradictory CrossMark", asyn
   }
 });
 
-test("sender allowlist, exact bot mention, and one in-flight turn reject competing input", async () => {
+test("sender allowlist and exact bot mention gate one reply turn while later messages steer it", async () => {
   const h = harness();
   try {
     await h.bridge.createBinding({
@@ -2550,9 +2668,13 @@ test("sender allowlist, exact bot mention, and one in-flight turn reject competi
 
     await h.bridge.handleEvent(event());
     await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
-    assert.equal(h.control.inputs.length, 1);
+    await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
+    assert.equal(h.control.inputs.length, 2, "event dedup must keep one steering operation");
+    assert.equal(h.store.read().turns.length, 1, "steering must not create a competing reply turn");
+    assert.match(h.control.inputs[1].message, /Steering update for the current in-progress task/);
     assert.equal(h.lark.replies.length, 1);
-    assert.match(h.lark.replies[0].text, /上一条群消息/);
+    assert.equal(h.lark.replies[0].messageId, "om-two");
+    assert.match(h.lark.replies[0].text, /steer 到当前 Agent/);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -2588,7 +2710,14 @@ test("late output after a fence change and uncertain Feishu ACK fail closed", as
     uncertain.lark.failReply = true;
     await uncertain.bridge.pollTurns();
     const state = uncertain.store.read();
-    assert.equal(state.replies.at(-1).status, "uncertain");
+    assert.equal(
+      state.replies.find((reply) => reply.deliveryKind === "turn-reply")?.status,
+      "uncertain",
+    );
+    assert.equal(
+      state.replies.find((reply) => reply.deliveryKind === "recovery-notice")?.status,
+      "sent",
+    );
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.equal(state.bindings[0].status, "stale");
     assert.deepEqual(uncertain.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
@@ -2599,7 +2728,7 @@ test("late output after a fence change and uncertain Feishu ACK fail closed", as
   }
 });
 
-test("an outbound authority check failure settles the turn before any Card is sent", async () => {
+test("an outbound authority check failure keeps Agent content private and posts a recovery Card", async () => {
   const h = harness();
   try {
     await h.bridge.createBinding({
@@ -2613,7 +2742,16 @@ test("an outbound authority check failure settles the turn before any Card is se
     await new Promise((resolve) => setImmediate(resolve));
     const state = h.store.read();
     assert.equal(h.lark.replies.length, 0);
-    assert.equal(state.replies.length, 0, "authority failure happens before an outbound attempt is prepared");
+    assert.equal(
+      state.replies.some((reply) => reply.deliveryKind === "turn-reply"),
+      false,
+      "authority failure happens before an Agent-content reply is prepared",
+    );
+    const recovery = state.replies.find((reply) => reply.deliveryKind === "recovery-notice");
+    assert.equal(recovery?.status, "sent");
+    assert.equal(h.lark.groupCards.at(-1).idempotencyKey, recovery.idempotencyKey);
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /没有在不确定状态下继续发送/);
+    assert.equal(cardText(h.lark.groupCards.at(-1).card).includes("must stay private"), false);
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.match(state.turns.at(-1).error, /outbound Feishu reply was not started/);
     assert.equal(state.bindings[0].status, "stale");
@@ -2621,6 +2759,58 @@ test("an outbound authority check failure settles the turn before any Card is se
     assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing", "CrossMark"]);
   } finally {
     await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a fully persisted prepared reply resumes with the same idempotency key after restart", async () => {
+  const h = harness();
+  try {
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    await flushBestEffortEffects();
+    const state = h.store.read();
+    const turn = state.turns.at(-1);
+    const text = "durable reply recovered after restart";
+    const idempotencyKey = `tw-${createHash("sha256").update(turn.outboundAttemptId).digest("hex").slice(0, 40)}`;
+    turn.status = "replying";
+    state.replies.push({
+      id: turn.outboundAttemptId,
+      turnId: turn.id,
+      sourceMessageId: turn.messageId,
+      idempotencyKey,
+      status: "prepared",
+      textDigest: createHash("sha256").update(text).digest("hex"),
+      createdAt: new Date().toISOString(),
+      deliveryKind: "turn-reply",
+      text,
+      sessionName: binding.sessionName,
+      tone: "answer",
+      replyMode: "topic",
+      finalTurnStatus: "completed",
+    });
+    h.store.write(state);
+
+    const restarted = new FeishuBridge({
+      control: h.control,
+      lark: h.lark,
+      store: h.store,
+      instanceId: "daemon-after-crash",
+      botOpenId: "ou-bot",
+    });
+    restarted.initializeAfterRestart();
+    await restarted.pollTurns();
+
+    const recovered = h.store.read();
+    assert.equal(recovered.replies.find((reply) => reply.id === turn.outboundAttemptId)?.status, "sent");
+    assert.equal(recovered.turns.find((candidate) => candidate.id === turn.id)?.status, "completed");
+    assert.equal(h.lark.replies.at(-1).text, text);
+    assert.equal(h.lark.replies.at(-1).idempotencyKey, idempotencyKey);
+    assert.equal(restarted.snapshot().bindings[0].status, "stale");
+    await restarted.close();
+  } finally {
     rmSync(h.root, { recursive: true, force: true });
   }
 });
@@ -2887,11 +3077,15 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
       capabilities: [
         "binding.lifecycle-notices.v1",
         "binding.create.session-summary.v1",
-          "binding.target-reconciliation.v1",
-          "binding.reply-mode.v1",
-          "binding.activity-completion.v1",
-          "binding.structured-agent-result.v1",
-        ],
+        "binding.target-reconciliation.v1",
+        "binding.reply-mode.v1",
+        "binding.activity-completion.v1",
+        "binding.structured-agent-result.v1",
+        "binding.steering.v1",
+        "binding.remove-origin.v1",
+        "bridge.consumer-health.v1",
+        "reply.durable-payload.v1",
+      ],
     });
     await assert.rejects(
       client.request("bridge.info", { extra: true }),
@@ -2899,6 +3093,7 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
     );
     const snapshot = await client.request("bridge.snapshot", {});
     assert.deepEqual(snapshot.bindings, []);
+    assert.equal(snapshot.eventConsumer.state, "running");
     assert.deepEqual(await client.request("groups.list", {}), [
       { chatId: "oc-one", name: "bridge group" },
     ]);
@@ -2931,6 +3126,33 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
       client.request("binding.pause", { bindingId: binding.id, unknown: true }),
       /invalid binding.pause params/,
     );
+  } finally {
+    await server.stop();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("Feishu bridge startup fails when the event consumer cannot spawn", async () => {
+  const h = harness();
+  h.lark.subscribe = () => {
+    const readyError = new Error("spawn lark-cli ENOENT");
+    return {
+      child: undefined,
+      ready: Promise.reject(readyError),
+      done: Promise.reject(readyError),
+      stop() {},
+    };
+  };
+  const server = await FeishuBridgeServer.create({
+    paths: h.paths,
+    control: h.control,
+    lark: h.lark,
+    larkProfile: "bot",
+    botOpenId: "ou-bot",
+  });
+  try {
+    await assert.rejects(server.start(), /spawn lark-cli ENOENT/);
+    assert.equal(existsSync(h.paths.socket), false);
   } finally {
     await server.stop();
     rmSync(h.root, { recursive: true, force: true });

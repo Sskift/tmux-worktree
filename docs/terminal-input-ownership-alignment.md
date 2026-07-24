@@ -13,7 +13,7 @@
 1. 独立的 local terminal-control plane 是每个受支持 terminal 的唯一 `InputOwnershipLease` authority。
 2. terminal-control plane 随本地 TW runtime 交付，但不属于冻结的 `tw rpc v1`，不把 lease 写进 `~/.tmux-worktree/state.json`，也不接管 managed worktree/tmux lifecycle。
 3. Relay v2 的 `RelayStreamAttachmentLease` 仍由 relay-host 的 process-scoped terminal manager 持有；它只管理 Android stream 的 generation、ring、route rebind 和短断线恢复，不授予跨产品输入权。
-4. `FeishuAwaitingTurn` 仍由 Feishu Bridge 持有；它只关联一条群消息、output cursor、回复 attempt 和滑动的无输出 deadline，不是 terminal lease。每次同一 authority correlation 下观察到新 output 都会把 deadline 后移十分钟；Dashboard 的 `agent_running` 展示提示不构成发送或完成依据。
+4. `FeishuAwaitingTurn` 仍由 Feishu Bridge 持有；它关联第一条群消息、后续已去重 steering event、output cursor、回复 attempt 和滑动的无输出 deadline，不是 terminal lease。每次同一 authority correlation 下观察到新 output 或确认一个 steering operation 都会把 deadline 后移十分钟；Dashboard 的 `agent_running` 展示提示不构成发送或完成依据。
 5. Dashboard、受控本地 CLI、Feishu、Relay v1 和 Relay v2 的所有产品级真实写路径都必须进入同一个 target-scoped single writer，由它在写 backend 的同一 critical section 内校验 lease 和 fence。
    Dashboard 的滚动也属于真实输入，必须使用 authority 内的 `input.scroll` 语义操作。普通 pane 由 backend 操作 tmux copy-mode；只有 alternate-screen pane 已明确启用 SGR mouse 时，backend 才可在该 fenced mutation 内合成有界 wheel 输入交给 TUI 自身处理。受控附件仍不得把 xterm 产生的 SGR mouse transport report 当作 `input.raw` 直接注入 pane。
 6. Input ownership 只分两类：Feishu 是独占类；Dashboard、APK/Relay、受控 CLI 和 `tw serve` 都属于共享 interactive 类。interactive producer 共享同一 lease/fence，彼此不触发 takeover 或只读。
@@ -46,9 +46,9 @@ terminal-control plane 负责：
 
 ### 2.3 Feishu Bridge
 
-Feishu Bridge 拥有 Lark event 消费、群 binding、群成员精确 @Bot 触发策略、event dedup、单个 awaiting turn、`[[notify-group]]` 提取、Card JSON 2.0 回复位置和相关审计。每个 binding 持久化 `replyMode=topic|direct`：默认 `topic` 使用源消息话题，`direct` 仍回复源消息但不进入话题；两者不得互相 fallback，旧 binding 缺字段时归一化为 `topic`。该配置由 Bridge 的串行 mutation 修改，active turn 存在时拒绝修改，避免同一轮的出站位置在执行中变化。Dashboard 的正常绑定把空 `allowedSenderIds` 解释为同群任意真实用户，不要求用户填写管理员 Open ID；显式非空列表仅保留给兼容 CLI 调用。Bot/self、非用户事件和未精确 @Bot 的消息仍被过滤。处理中的 `Typing` 及确定失败时的 `CrossMark` 是 best-effort reaction，不得改变 terminal lease、turn 或 outbound reply 的确定性。Bridge 必须通过 terminal-control plane 取得 lease 和发送输入，不能保存或裁决全局 lease，也不能调用 Relay transport。
+Feishu Bridge 拥有 Lark event 消费、群 binding、群成员精确 @Bot 触发策略、event dedup、单个 awaiting turn、该 turn 的 steering input、`[[notify-group]]` 提取、Card JSON 2.0 回复位置和相关审计。每个 binding 持久化 `replyMode=topic|direct`：默认 `topic` 使用第一条源消息话题，`direct` 仍回复第一条源消息但不进入话题；两者不得互相 fallback，旧 binding 缺字段时归一化为 `topic`。该配置由 Bridge 的串行 mutation 修改，active turn 存在时拒绝修改，避免同一轮的出站位置在执行中变化。一个 active turn 后续收到的授权群消息不得创建第二个 turn：Bridge 先持久化 event dedup，再以由 `turnId + eventId` 派生的 operationId 调用同一个 `input.agent-message` authority operation，复用原 marker、output generation 和 cursor，并向该 steering 源消息尝试发送幂等的 best-effort 状态确认。确认接受会滑动无输出期限但不能跳过旧 output；写入 disposition 不确定会把原 turn 和 binding 置为 recovery，绝不自动重放。Dashboard 的正常绑定把空 `allowedSenderIds` 解释为同群任意真实用户，不要求用户填写管理员 Open ID；显式非空列表仅保留给兼容 CLI 调用。Bot/self、非用户事件和未精确 @Bot 的消息仍被过滤。处理中的 `Typing` 及确定失败时的 `CrossMark` 是 best-effort reaction，不得改变 terminal lease、turn 或 outbound reply 的确定性。回复第一次调用 Lark 前必须在同一个原子状态提交中持久化已经过 authority 证明、清洗和限长的完整卡片载荷、目的位置、最终 turn 状态与幂等键；Bridge 重启只会用同一幂等键续投仍为 `prepared` 的精确载荷，旧记录缺少载荷或出站结果不确定时不盲发 Agent 内容。此时 Bridge 单独排队不含 Agent 输出的恢复状态卡，使群内可见故障但不把不确定内容泄漏或重复投递。Bridge 必须通过 terminal-control plane 取得 lease 和发送输入，不能保存或裁决全局 lease，也不能调用 Relay transport。
 
-Feishu Bridge 是共享的本地 daemon。Dashboard 可以在首次管理 binding 时按需启动它，但 Dashboard 退出不得停止 daemon、释放 Feishu lease 或把 active binding 隐式改成 paused；daemon 的显式停止、崩溃和重启分别按 shutdown/recovery 规则处理，不能伪装成用户 handoff。
+Feishu Bridge 是共享的本地 daemon。Dashboard 可以在首次管理 binding 时按需启动它，但 Dashboard 退出不得停止 daemon、释放 Feishu lease 或把 active binding 隐式改成 paused；daemon 的显式停止、崩溃和重启分别按 shutdown/recovery 规则处理，不能伪装成用户 handoff。初次启动只有在 `lark-cli` event consumer 子进程确认 spawn 后才能宣告 ready；运行期退出进入有界错误的 `backoff` 状态并重连。该状态通过 Bridge snapshot 暴露，Dashboard 在不为 `running` 时显示故障并禁止新建 binding，不能把只剩 socket 的进程误报为可收群消息。
 
 Dashboard 的 Integrations 页面只持久化非敏感 `lark-cli` profile 名称；它既可选择已有 profile，也可把新 Bot identity 的 app secret 一次性经 stdin 交给 `lark-cli` 创建 profile。app secret、token 和 user authorization 始终由 `lark-cli` 管理，不能进入 Dashboard 配置、命令参数或日志。Bridge profile 切换不是 handoff：本地 `bridge.shutdown` 管理操作只在 binding 和 active turn 均为空时成立，随后 Bridge 以显式 `--lark-profile` 和 bot identity 重启；存在 binding 时必须拒绝，不能让绑定静默换 bot。
 
@@ -69,7 +69,7 @@ React 只能通过 `DashboardBackend` 使用 binding/ownership 能力；Tauri ad
 | --- | --- | --- | --- | --- |
 | `InputOwnershipLease` | local terminal-control plane | 一个 `controlTargetId` | Feishu 是否独占，或 interactive 类是否可写 backend | 某个 interactive 产品实例是否是唯一 writer、Relay frame 已送达、群 turn 已回复 |
 | `RelayStreamAttachmentLease` | relay-host v2 terminal manager | principal/client/stream/generation | stream、ring 和 route 短期可恢复 | Android 仍拥有全局 input ownership |
-| `FeishuAwaitingTurn` | Feishu Bridge | binding + 群消息 + lease fence | 哪条群请求等待哪个 output/reply | 其他产品不能写 terminal |
+| `FeishuAwaitingTurn` | Feishu Bridge | binding + 首条群消息 + steering events + lease fence | 哪条首消息等待哪个 output/reply，以及哪些后续消息已作为 steer 接受 | 其他产品不能写 terminal |
 
 约束：
 
@@ -150,7 +150,7 @@ any state
 
 Feishu binding active 时默认长期持有独占 lease，即使当前没有 awaiting turn。Dashboard 的 **Take over locally**、binding pause 和 force pause 是解除占用的受控入口：它们先让 Bridge drain 或取消 turn，再切回所有 App/APK 共用的 interactive 类。当前这些 graceful/force 操作只允许本机 Dashboard 或受控本地 CLI 发起；Relay v1/v2 手机端不能远程暂停 Feishu。
 
-Bridge 重启后不会伪造旧 lease token，原 active binding 因而进入 `stale`。此时手动 unlink 只有在 authority 已是 `FREE`/`TARGET_GONE`，或已经由受控 Dashboard/local CLI 持有时才能删除 binding；`HELD(feishu)`、`DRAINING` 和 `RECOVERY_REQUIRED` 必须保留记录并引导受控本地 recovery。生命周期群卡片走独立有序的 best-effort effect lane，不能占用 lease/turn mutation lane。Dashboard 迁移旧 Bridge 时只允许在 stale/pausing target 是 daemon 唯一 binding 且没有 active turn 的情况下停止整个 daemon；任何 sibling binding 都 fail closed，避免 snapshot 后 sibling 恢复所产生的 TOCTOU。已占用旧 daemon 的 active/paused binding 继续由旧 daemon canonical remove，这个一次性兼容路径无法补发新版生命周期卡。
+Bridge 重启后不会伪造旧 lease token，原 active binding 因而进入 `stale`。此时手动 unlink 只有在 authority 已是 `FREE`/`TARGET_GONE`，或已经由受控 Dashboard/local CLI 持有时才能删除 binding；`HELD(feishu)`、`DRAINING` 和 `RECOVERY_REQUIRED` 必须保留记录并引导受控本地 recovery。Dashboard 的 Terminal 和 Settings 解绑入口都必须先确认；Dashboard/CLI 把真实本地入口传给 Bridge 写入群审计卡，缺失来源时只能标为未知本地管理端，不能伪造用户意图。生命周期群卡片走独立有序的 best-effort effect lane，不能占用 lease/turn mutation lane。Dashboard 迁移旧 Bridge 时只允许在 stale/pausing target 是 daemon 唯一 binding 且没有 active turn 的情况下停止整个 daemon；任何 sibling binding 都 fail closed，避免 snapshot 后 sibling 恢复所产生的 TOCTOU。已占用旧 daemon 的 active/paused binding 继续由旧 daemon canonical remove，这个一次性兼容路径无法补发新版生命周期卡。
 
 ## 7. Handoff commit point 和 fencing
 
@@ -261,7 +261,7 @@ Relay v1 wire不变：
 - controlEpoch/authority continuity无法证明时更换epoch并使所有旧lease/fence失效。
 - output capture与controller同属一个本地daemon，但仍是read-only Feishu marker-correlation capability，不是 Dashboard、`tw serve`、Relay/Android 或受控 CLI 展示的 terminal output。每个 generation 以两个各 4 MiB segment 形成有界 ring，使用绝对 cursor 并通常保留最近约 4–8 MiB；segment 淘汰只让过旧 cursor 收到 `STALE_OUTPUT_CURSOR`，不改变 target lifecycle/ownership。旧 generation 只有在 generation fence 后才回收，不能无限写盘或回退到未fence的inspect路径。
 - 升级前由旧单文件硬上限遗留的 `OUTPUT_CONTINUITY_UNCERTAIN` 沿用 idle non-Feishu observation repair：仅在 authority 能复核 exact backend、当前 ownership 为 `FREE`、没有 in-flight/operation/handoff uncertainty，且 previous owner 不是 Feishu 时自动换代 capture 并回到可用状态。identity、Feishu turn、handoff 或 operation disposition 不明继续 fail closed。
-- Feishu awaiting turn和outbound reply attempt必须持久记录，reply response丢失需要幂等查询/重试策略；只做inbound event dedup不够。
+- Feishu awaiting turn 和 outbound reply attempt 必须持久记录。新 prepared reply 必须携带 exact bounded card payload、目的位置、最终 turn 状态和确定性幂等键，使 daemon restart 可安全续投同一载荷；Lark response 丢失后不能盲目重发 Agent 内容，只能进入 uncertain/recovery 并以独立幂等键发不含 Agent 输出的恢复状态卡。只做 inbound event dedup 不够。
 - target gone、bot membership丢失或daemon冲突必须先阻止旧turn继续tail/post，再释放或fence lease，避免接管后的本地输出被发到群。
 - owner display信息按least disclosure返回。Relay可以展示通用`feishu`/`local` owner kind，不传chatId、群名、成员或credential。
 - operation payload、terminal bytes、群消息、lease secret和cursor不得进入普通日志；只记录可信ID、owner kind、byte size和结果码。
@@ -318,11 +318,13 @@ Relay v1 wire不变：
 | 场景 | 必须证明的结果 |
 | --- | --- |
 | Feishu active但IDLE | Feishu持有lease；Dashboard、CLI、v1/v2写拒绝，所有observer仍可读 |
-| Feishu awaiting turn | 新群消息和其他产品input都拒绝；既有turn独占完成 |
+| Feishu awaiting turn | 后续授权群消息由相同 Feishu lease/fence 和 target single writer 作为 steer 注入既有 turn，使用独立 operationId 且不创建第二个 reply/marker；其他产品 input 仍拒绝 |
 | 多Dashboard/APK并发 | 所有interactive producer共享同一lease/fence并由single writer排序；任一attachment release不fence其余producer |
 | Graceful takeover | reply确定完成前不commit；commit后新owner可写且旧owner永远失败 |
 | Force takeover | cancel先持久、fence再前进；迟到marker/callback不发群回复 |
-| Reply已发送但ACK未知 | 不误报完成、不自动transfer；进入recovery或显式force policy |
+| Reply已发送但ACK未知 | 不误报完成、不自动transfer、不盲发Agent内容；primary attempt进入uncertain，另发不含Agent输出的recovery card |
+| Bridge在prepared reply后重启 | exact bounded payload用同一幂等键续投；旧prepared记录缺payload则fail closed |
+| event consumer启动/退出 | spawn失败不宣告ready；运行中退出暴露backoff并禁用新binding，既有binding不被静默删除 |
 | Dashboard PTY write竞态 | lease/fence校验和writer.write不可被handoff插入 |
 | output capture rollover | 两个 4 MiB segment 保持 generation 内绝对 cursor；保留窗口内连续 tail，已淘汰 cursor 返回 `STALE_OUTPUT_CURSOR` 且 target 不进入 recovery；同一 Feishu authority 可从保证保留窗口重建 parser 且不重放 input，generation/fence 变化仍 fail closed；可见 PTY output 不受 capture ring 影响；旧 generation 被回收 |
 | legacy capture容量recovery | 走 idle non-Feishu observation repair：只有 exact target、`FREE`、无 operation/handoff uncertainty 且 previous owner 非 Feishu 时自动换代；其他 continuity 不确定性仍 fail closed |

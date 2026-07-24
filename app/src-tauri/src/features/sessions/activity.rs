@@ -132,10 +132,22 @@ fn is_kimi_executable(value: &str) -> bool {
 
 fn command_starts_kimi(command: &str) -> bool {
     command.split([';', '\n']).any(|segment| {
-        segment
-            .split_whitespace()
-            .next()
-            .is_some_and(is_kimi_executable)
+        let mut tokens = segment.split_whitespace();
+        let Some(mut executable) = tokens.next() else {
+            return false;
+        };
+        while matches!(
+            executable.trim_matches(|character: char| {
+                character.is_whitespace() || character == '\'' || character == '"'
+            }),
+            "exec" | "command" | "nohup"
+        ) {
+            let Some(next) = tokens.next() else {
+                return false;
+            };
+            executable = next;
+        }
+        is_kimi_executable(executable)
     })
 }
 

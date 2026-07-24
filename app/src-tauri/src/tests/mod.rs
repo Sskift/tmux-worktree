@@ -612,6 +612,14 @@ fn kimi_agent_activity_uses_pane_output_changes_for_running_and_stopped() {
         None
     );
     assert_eq!(
+        agent_running_from_pane(
+            "Implement the host codec",
+            "zsh",
+            "sh -c 'zsh -lc \"export PATH=$PATH; exec kimi --auto\"; exec zsh -l'",
+        ),
+        None
+    );
+    assert_eq!(
         agent_running_from_pane("ordinary shell", "zsh", "exec zsh -l"),
         Some(false)
     );

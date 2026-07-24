@@ -38,10 +38,14 @@
       "binding.target-reconciliation.v1",
       "binding.reply-mode.v1",
       "binding.activity-completion.v1",
-      "binding.structured-agent-result.v1"
+      "binding.structured-agent-result.v1",
+      "binding.steering.v1",
+      "binding.remove-origin.v1",
+      "bridge.consumer-health.v1",
+      "reply.durable-payload.v1"
     ],
-    "rollingUpgrade": "a Dashboard may reuse a daemon for new or resumed Feishu ownership only when the selected larkProfile and required capabilities match; an empty daemon missing required capabilities may be shut down and replaced; an occupied older daemon remains available for status, canonical removal, and controlled takeover, but create/resume/repair/return fail with FEISHU_BRIDGE_UPGRADE_REQUIRED when binding.structured-agent-result.v1 is missing; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
-    "legacyCreate": "new binding creation requires binding.structured-agent-result.v1; never send fields unsupported by an old closed binding.create parser"
+    "rollingUpgrade": "a Dashboard may reuse a daemon for new or resumed Feishu ownership only when the selected larkProfile and required capabilities match; an empty daemon missing required capabilities may be shut down and replaced; an occupied older daemon remains available for status, canonical removal, and controlled takeover, but create/resume/repair/return fail with FEISHU_BRIDGE_UPGRADE_REQUIRED when binding.structured-agent-result.v1, binding.steering.v1, bridge.consumer-health.v1, or reply.durable-payload.v1 is missing; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
+    "legacyCreate": "new binding creation requires binding.structured-agent-result.v1, binding.steering.v1, bridge.consumer-health.v1, and reply.durable-payload.v1; never send fields unsupported by an old closed binding.create parser"
   },
   "eventSource": {
     "command": "lark-cli event consume im.message.receive_v1 --as bot --quiet",
@@ -57,7 +61,8 @@
     ],
     "messageVerification": "lark-cli im +messages-mget --as bot",
     "botIdentity": "GET /open-apis/bot/v3/info/ as bot",
-    "dashboardConversationPolicy": "empty allowedSenderIds means any human user in the bound group may trigger only by mentioning the exact bot; bot/self, non-user, and unmentioned messages are ignored"
+    "dashboardConversationPolicy": "empty allowedSenderIds means any human user in the bound group may trigger only by mentioning the exact bot; bot/self, non-user, and unmentioned messages are ignored",
+    "health": "initial daemon readiness requires the lark-cli event consumer child to spawn; bridge.snapshot exposes starting, running, or backoff with a bounded error; Dashboard disables new group links while the consumer is unavailable, while a later exit is retried without discarding existing bindings"
   },
   "reply": {
     "topicCommand": "lark-cli im +messages-reply --msg-type interactive --reply-in-thread --as bot",
@@ -75,18 +80,19 @@
     "rawMarkerRole": "raw generation-fenced output is used only to detect a closed current-turn nonce and is never sent as card content",
     "controllerCapability": "binding create/resume/repair/return must prove terminal-control advertises output.rendered-snapshot, activity.agent-status, and activity.agent-result before acquiring or accepting Feishu ownership; every authorized inbound turn repeats the rendered-snapshot proof before event dedup or terminal input so a rolled-back controller cannot receive a prompt that the Bridge cannot safely render",
     "renderedExtraction": "after raw close detection, extract public text only from a bounded terminal-control rendered snapshot fenced by the exact Feishu lease, pane, control epoch, fence, and output generation; an incomplete snapshot never falls back to raw terminal text",
-    "renderedObservationFailure": "bounded resource exhaustion, controller-internal capture failure, and ordinary transport failure remain read-only observations and retry until the turn inactivity deadline; permission, target, generation, protocol, or correlation failures immediately make the turn recovery-required and never send a card",
+    "renderedObservationFailure": "bounded resource exhaustion, controller-internal capture failure, and ordinary transport failure remain read-only observations and retry until the turn inactivity deadline; permission, target, generation, protocol, or correlation failures immediately make the turn recovery-required, never send Agent output, and enqueue a separate content-free recovery status card",
     "promptEchoSafe": true,
     "userMarkerInjectionEscaped": true,
     "idempotencyRequired": true,
-    "unknownAcknowledgement": "recovery-required",
+    "unknownAcknowledgement": "the primary reply becomes uncertain and the turn becomes recovery-required; its Agent content is never blindly retried unless the exact fully persisted prepared payload is still pending under the same idempotency key, and a separate content-free recovery status card is enqueued",
+    "durability": "before the first Lark call, the Bridge atomically persists the exact bounded and sanitized Card payload, destination mode, terminal-authority-proven final turn state, and deterministic idempotency key; a daemon restart resumes a still-prepared payload with that same key, while legacy prepared records without the payload fail closed as uncertain",
     "unterminatedMarker": "never-send"
   },
   "bindingLifecycleNotices": {
     "command": "lark-cli im +messages-send --msg-type interactive --as bot",
     "format": "Card JSON 2.0 top-level group card",
     "onCreate": "sent after the exact binding and Feishu lease are durable",
-    "onManualRemove": "sent after a live Feishu lease is released, or authority proves the target is FREE, TARGET_GONE, or held by a controlled local owner, and the binding is durably removed; missing lease plus Feishu/recovery ownership fails closed",
+    "onManualRemove": "sent after a live Feishu lease is released, or authority proves the target is FREE, TARGET_GONE, or held by a controlled local owner, and the binding is durably removed; missing lease plus Feishu/recovery ownership fails closed; current Dashboard and CLI callers identify their local removal origin for the audit card, while an omitted origin is reported only as an unknown local management client",
     "legacyManualRemove": "one-time removal of an active/paused binding through an already-running legacy daemon cannot emit this newer lifecycle card; Dashboard keeps that canonical legacy removal path to avoid interrupting its live authority, and later current-capability operations upgrade the empty daemon",
     "onTargetGone": "all persisted bindings, including paused and stale bindings, are reconciled by exact controlTargetId; only certain ended/replaced lifecycles are removed and announced",
     "sameNameRecreation": "never auto-retarget; announce replacement only after the old exact target is proven TARGET_GONE",
@@ -96,12 +102,12 @@
   "localTaskCompletion": {
     "capability": "binding.structured-agent-result.v1",
     "scope": "when Feishu first acquires or regains an exact binding lease, a lease-, generation-, and pane-fenced activity.agent-status observation arms a persisted watch only after Claude or Codex is observed running with an exact structured transcript source",
-    "busyPolicy": "while an inherited local task watch is active, new group messages are acknowledged as busy and are never injected into the running Agent",
+    "steeringPolicy": "while an inherited local task watch is probing, armed, or stop-candidate, the first authorized group message is submitted through the canonical fenced input.agent-message operation as a start-or-steer prompt, cancels the inherited completion watch only after accepted input, and creates the one marker-correlated Feishu reply turn; a watch already sending its completion card rejects new input until that outbound disposition settles",
     "settlement": "two stopped observations separated by at least one second complete the watch; a later running observation clears a stop candidate",
     "delivery": "after earlier binding lifecycle effects settle, an independent outbound lane uses lark-cli im +messages-send to post one top-level Card JSON 2.0 final-answer card with a deterministic idempotency key; Feishu network latency never occupies the terminal mutation lane, and topic/direct reply placement does not apply because there is no source Feishu message",
     "content": "activity.agent-result extracts only the exact final assistant text from the correlated Claude or Codex structured transcript. Terminal rendering, tool calls/results, composer content, status/footer text, and inferred answers are never eligible card content; a bounded long answer is explicitly marked truncated",
-    "unknownAcknowledgement": "persist uncertain, mark the binding stale, and never retry blindly",
-    "restart": "a sending watch becomes uncertain; an armed watch remains dormant while the binding is paused/stale and is re-correlated when controlled ownership returns to Feishu"
+    "unknownAcknowledgement": "persist uncertain, mark the binding stale, never retry Agent content blindly, and enqueue a separate content-free recovery status card",
+    "restart": "a sending watch becomes uncertain and enqueues a content-free recovery status card; an armed watch remains dormant while the binding is paused/stale and is re-correlated when controlled ownership returns to Feishu"
   },
   "reactions": {
     "processing": "Typing",
@@ -116,7 +122,7 @@
     "directoryMode": "0700",
     "atomicReplace": true,
     "failClosed": true,
-    "bindingReplyModeMigration": "a version 1 binding missing options.replyMode is read as topic and the next write persists it explicitly; sessionSummary and activityWatch are optional additive binding fields; unknown fields, unknown reply modes, and unknown activity watch states remain malformed state; after newer fields are written, an older strict daemon fails closed on downgrade instead of silently changing behavior",
+    "bindingReplyModeMigration": "a version 1 binding missing options.replyMode is read as topic and the next write persists it explicitly; sessionSummary and activityWatch are optional additive binding fields; durable outbound payload fields are optional only for reading legacy reply history and are required as one coherent closed group for every new prepared reply; unknown fields, unknown reply modes, and unknown activity watch states remain malformed state; after newer fields are written, an older strict daemon fails closed on downgrade instead of silently changing behavior",
     "handoffDrainPersistedBeforeCommit": true,
     "utf8TailRemainderPersisted": true,
     "files": [
@@ -130,6 +136,7 @@
     "oneBindingPerChat": true,
     "oneActiveBindingPerTarget": true,
     "oneInflightTurnPerTarget": true,
+    "activeTurnSteering": "later authorized group messages use distinct deterministic input.agent-message operation IDs to steer the existing turn, reuse its marker/output correlation, and trigger a best-effort idempotent status acknowledgement; they never create a second reply turn, and the final answer remains attached to the first source message",
     "eventDedupEntries": 4096,
     "turnHistoryEntries": 256,
     "replyHistoryEntries": 256,

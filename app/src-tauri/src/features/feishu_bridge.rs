@@ -30,6 +30,10 @@ const BASE_REQUIRED_BRIDGE_CAPABILITIES: [&str; 3] = [
 ];
 const REPLY_MODE_BRIDGE_CAPABILITY: &str = "binding.reply-mode.v1";
 const ACTIVITY_COMPLETION_BRIDGE_CAPABILITY: &str = "binding.structured-agent-result.v1";
+const STEERING_BRIDGE_CAPABILITY: &str = "binding.steering.v1";
+const REMOVE_ORIGIN_BRIDGE_CAPABILITY: &str = "binding.remove-origin.v1";
+const CONSUMER_HEALTH_BRIDGE_CAPABILITY: &str = "bridge.consumer-health.v1";
+const DURABLE_REPLY_BRIDGE_CAPABILITY: &str = "reply.durable-payload.v1";
 const UNKNOWN_BRIDGE_INFO_ERROR: &str = "BRIDGE_ERROR: unknown Feishu bridge operation";
 
 #[derive(Default)]
@@ -729,11 +733,54 @@ fn bridge_has_activity_completion_capability(probe: &BridgeProbe) -> bool {
         .any(|capability| capability == ACTIVITY_COMPLETION_BRIDGE_CAPABILITY)
 }
 
+fn require_steering_capability(probe: &BridgeProbe) -> Result<(), String> {
+    if bridge_has_steering_capability(probe) {
+        return Ok(());
+    }
+    Err(format!(
+        "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capability: {STEERING_BRIDGE_CAPABILITY}"
+    ))
+}
+
+fn bridge_has_steering_capability(probe: &BridgeProbe) -> bool {
+    probe
+        .capabilities
+        .iter()
+        .any(|capability| capability == STEERING_BRIDGE_CAPABILITY)
+}
+
+fn bridge_has_capability(probe: &BridgeProbe, capability: &str) -> bool {
+    probe
+        .capabilities
+        .iter()
+        .any(|candidate| candidate == capability)
+}
+
+fn require_hardened_delivery_capabilities(probe: &BridgeProbe) -> Result<(), String> {
+    let missing = [
+        CONSUMER_HEALTH_BRIDGE_CAPABILITY,
+        DURABLE_REPLY_BRIDGE_CAPABILITY,
+    ]
+    .into_iter()
+    .filter(|capability| !bridge_has_capability(probe, capability))
+    .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capabilities: {}",
+        missing.join(", ")
+    ))
+}
+
 fn should_upgrade_empty_bridge(probe: &BridgeProbe) -> Result<bool, String> {
     Ok(bridge_snapshot_is_empty(&probe.snapshot)?
         && (probe.disposition == BridgeProbeDisposition::LegacyEmpty
             || !bridge_has_reply_mode_capability(probe)
-            || !bridge_has_activity_completion_capability(probe)))
+            || !bridge_has_activity_completion_capability(probe)
+            || !bridge_has_steering_capability(probe)
+            || !bridge_has_capability(probe, CONSUMER_HEALTH_BRIDGE_CAPABILITY)
+            || !bridge_has_capability(probe, DURABLE_REPLY_BRIDGE_CAPABILITY)))
 }
 
 fn start_server(
@@ -1209,11 +1256,16 @@ fn legacy_binding_remove_action(
 fn request_binding_remove_confirming_absence(
     binding_id: &str,
     force: bool,
+    include_origin: bool,
 ) -> Result<Value, String> {
-    match request(
-        "binding.remove",
-        json!({ "bindingId": binding_id, "force": force }),
-    ) {
+    let mut params = json!({ "bindingId": binding_id, "force": force });
+    if include_origin {
+        params
+            .as_object_mut()
+            .ok_or("binding.remove params are invalid")?
+            .insert("origin".to_string(), json!("dashboard"));
+    }
+    match request("binding.remove", params) {
         Ok(result) => Ok(result),
         Err(error) => match request("bridge.snapshot", json!({})) {
             Ok(snapshot) if matches!(snapshot_binding(&snapshot, binding_id), Ok(None)) => {
@@ -1261,7 +1313,7 @@ fn remove_binding_after_legacy_migration(
                     return Ok(json!({ "removed": true }));
                 }
                 LegacyBindingRemoveAction::UseLegacy => {
-                    return request_binding_remove_confirming_absence(binding_id, force);
+                    return request_binding_remove_confirming_absence(binding_id, force, false);
                 }
                 LegacyBindingRemoveAction::UpgradeCurrent => {
                     // The user explicitly confirmed removal. SIGTERM is sent
@@ -1284,7 +1336,11 @@ fn remove_binding_after_legacy_migration(
     if snapshot_binding(&current.snapshot, binding_id)?.is_none() {
         return Ok(json!({ "removed": true }));
     }
-    request_binding_remove_confirming_absence(binding_id, force)
+    request_binding_remove_confirming_absence(
+        binding_id,
+        force,
+        bridge_has_capability(&current, REMOVE_ORIGIN_BRIDGE_CAPABILITY),
+    )
 }
 
 fn ensure_binding_matches_pty(control: &PtyControl, target: &BindingTarget) -> Result<(), String> {
@@ -1346,6 +1402,8 @@ pub(crate) fn feishu_binding_create(
         );
     }
     require_activity_completion_capability(&probe)?;
+    require_steering_capability(&probe)?;
+    require_hardened_delivery_capabilities(&probe)?;
     let reply_mode_param = reply_mode_create_param(&probe, reply_mode)?;
     let mut params = json!({
         "chatId": args.chat_id,
@@ -1432,6 +1490,8 @@ pub(crate) fn feishu_binding_resume(
 ) -> Result<Value, String> {
     let probe = ensure_server(&app, state.inner().as_ref())?;
     require_activity_completion_capability(&probe)?;
+    require_steering_capability(&probe)?;
+    require_hardened_delivery_capabilities(&probe)?;
     request("binding.resume", json!({ "bindingId": binding_id }))
 }
 
@@ -1443,6 +1503,8 @@ pub(crate) fn feishu_binding_repair(
 ) -> Result<Value, String> {
     let probe = ensure_server(&app, state.inner().as_ref())?;
     require_activity_completion_capability(&probe)?;
+    require_steering_capability(&probe)?;
+    require_hardened_delivery_capabilities(&probe)?;
     request("binding.repair", json!({ "bindingId": binding_id }))
 }
 
@@ -1470,7 +1532,11 @@ pub(crate) fn feishu_binding_remove(
             LegacyBindingRemoveAction::UseLegacy => {}
         }
     }
-    request_binding_remove_confirming_absence(&binding_id, force)
+    request_binding_remove_confirming_absence(
+        &binding_id,
+        force,
+        bridge_has_capability(&probe, REMOVE_ORIGIN_BRIDGE_CAPABILITY),
+    )
 }
 
 #[tauri::command]
@@ -1523,6 +1589,8 @@ pub(crate) fn feishu_binding_return(
 ) -> Result<Value, String> {
     let probe = ensure_server(&app, bridge_state.inner().as_ref())?;
     require_activity_completion_capability(&probe)?;
+    require_steering_capability(&probe)?;
+    require_hardened_delivery_capabilities(&probe)?;
     with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
         let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
         ensure_binding_matches_pty(control, &target)?;
@@ -1546,10 +1614,13 @@ mod tests {
         default_reply_mode, effective_profile, empty_lark_profile_config,
         generated_lark_profile_name, lark_cli_error_message, legacy_binding_remove_action,
         reply_mode_create_param, require_activity_completion_capability,
-        require_reply_mode_capability, save_configured_profile, should_upgrade_empty_bridge,
+        require_hardened_delivery_capabilities, require_reply_mode_capability,
+        require_steering_capability, save_configured_profile, should_upgrade_empty_bridge,
         validate_bridge_shutdown, BridgeProbeDisposition, FeishuBindingInput, FeishuLarkProfile,
         FeishuReplyMode, LegacyBindingRemoveAction, ACTIVITY_COMPLETION_BRIDGE_CAPABILITY,
-        BASE_REQUIRED_BRIDGE_CAPABILITIES, REPLY_MODE_BRIDGE_CAPABILITY, UNKNOWN_BRIDGE_INFO_ERROR,
+        BASE_REQUIRED_BRIDGE_CAPABILITIES, CONSUMER_HEALTH_BRIDGE_CAPABILITY,
+        DURABLE_REPLY_BRIDGE_CAPABILITY, REPLY_MODE_BRIDGE_CAPABILITY, STEERING_BRIDGE_CAPABILITY,
+        UNKNOWN_BRIDGE_INFO_ERROR,
     };
     use serde_json::json;
     use std::fs;
@@ -1789,6 +1860,9 @@ mod tests {
         assert!(require_activity_completion_capability(&occupied_base)
             .expect_err("ownership activation requires completion tracking")
             .contains(ACTIVITY_COMPLETION_BRIDGE_CAPABILITY));
+        assert!(require_steering_capability(&occupied_base)
+            .expect_err("ownership activation requires steering support")
+            .contains(STEERING_BRIDGE_CAPABILITY));
 
         let current_info = json!({
             "daemonVersion": "1.0.8",
@@ -1799,6 +1873,9 @@ mod tests {
                 BASE_REQUIRED_BRIDGE_CAPABILITIES[2],
                 REPLY_MODE_BRIDGE_CAPABILITY,
                 ACTIVITY_COMPLETION_BRIDGE_CAPABILITY,
+                STEERING_BRIDGE_CAPABILITY,
+                CONSUMER_HEALTH_BRIDGE_CAPABILITY,
+                DURABLE_REPLY_BRIDGE_CAPABILITY,
             ],
         });
         let current = classify_bridge_probe(&empty, Ok(current_info), "team-bot")
@@ -1815,6 +1892,9 @@ mod tests {
         );
         require_reply_mode_capability(&current).expect("current update capability");
         require_activity_completion_capability(&current).expect("current completion capability");
+        require_steering_capability(&current).expect("current steering capability");
+        require_hardened_delivery_capabilities(&current)
+            .expect("current durable delivery capabilities");
     }
 
     #[test]
