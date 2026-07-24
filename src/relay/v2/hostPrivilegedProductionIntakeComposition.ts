@@ -33,6 +33,16 @@ extends RelayV2HostCredentialAtomicByteCell {
   closeAndDrain(): Promise<void>;
 }
 
+/** Deterministic id/schedule overrides; production omits the whole record. */
+export type RelayV2HostPrivilegedProductionReauthenticationOptions = Readonly<{
+  idFactory?: () => string;
+  schedule?: (delayMs: number, callback: () => void) => () => void;
+}>;
+
+export type RelayV2HostPrivilegedProductionWssTransport = NonNullable<
+  RelayV2HostCanonicalProductionCompositionOptions["wssTransport"]
+>;
+
 type CanonicalDashboardManagement = NonNullable<
 RelayV2HostCanonicalProductionCompositionOptions["dashboardManagement"]
 >;
@@ -56,6 +66,10 @@ export interface RelayV2HostPrivilegedProductionIntakeCompositionOptions {
   readonly credentialCell: RelayV2HostCredentialAtomicByteCellOwner;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  /** Deterministic reauthentication overrides; omission keeps the production defaults. */
+  readonly reauthentication?: RelayV2HostPrivilegedProductionReauthenticationOptions;
+  /** Socket factory seam; production omission selects the default transport. */
+  readonly wssTransport?: RelayV2HostPrivilegedProductionWssTransport;
   readonly canonical: RelayV2HostPrivilegedProductionCanonicalOptions;
 }
 
@@ -133,6 +147,8 @@ interface CapturedOptions {
   readonly trustedHome: string | undefined;
   readonly cell: CapturedCell;
   readonly sourceOwner: { current: CapturedByteSource | null };
+  readonly reauthentication: RelayV2HostPrivilegedProductionReauthenticationOptions | undefined;
+  readonly wssTransport: RelayV2HostPrivilegedProductionWssTransport | undefined;
   readonly canonical: CapturedCanonicalOptions;
 }
 
@@ -392,26 +408,71 @@ function captureCanonicalOptions(value: unknown): CapturedCanonicalOptions | nul
   });
 }
 
+function captureFunctionField(value: unknown): boolean {
+  try {
+    return typeof value === "function"
+      && !rejectedProxy(value)
+      && !nodeTypes.isAsyncFunction(value);
+  } catch {
+    return false;
+  }
+}
+
+function captureReauthenticationOptions(
+  value: unknown,
+): RelayV2HostPrivilegedProductionReauthenticationOptions | null | undefined {
+  if (value === undefined) return undefined;
+  const fields = snapshotExactDataRecord(value, [], ["idFactory", "schedule"]);
+  if (fields === null
+    || (fields.idFactory !== undefined && !captureFunctionField(fields.idFactory))
+    || (fields.schedule !== undefined && !captureFunctionField(fields.schedule))) return null;
+  return fields as RelayV2HostPrivilegedProductionReauthenticationOptions;
+}
+
+function captureWssTransportOptions(
+  value: unknown,
+): RelayV2HostPrivilegedProductionWssTransport | null | undefined {
+  if (value === undefined) return undefined;
+  const fields = snapshotExactDataRecord(value, ["webSocketConstructor"], ["scheduleCloseDrain"]);
+  if (fields === null
+    || !captureFunctionField(fields.webSocketConstructor)
+    || (fields.scheduleCloseDrain !== undefined
+      && !captureFunctionField(fields.scheduleCloseDrain))) return null;
+  return Object.freeze(Object.assign(Object.create(null), {
+    webSocketConstructor: fields.webSocketConstructor,
+    ...(fields.scheduleCloseDrain === undefined
+      ? {}
+      : { scheduleCloseDrain: fields.scheduleCloseDrain }),
+  })) as RelayV2HostPrivilegedProductionWssTransport;
+}
+
 function captureOptions(
   value: unknown,
 ): CapturedOptions | null {
   const fields = snapshotExactDataRecord(value, ["credentialCell", "canonical"], [
     "trustedHome",
     "bootstrapSecretByteSource",
+    "reauthentication",
+    "wssTransport",
   ]);
   if (fields === null) return null;
   if (fields.trustedHome !== undefined && typeof fields.trustedHome !== "string") return null;
+  const reauthentication = captureReauthenticationOptions(fields.reauthentication);
+  const wssTransport = captureWssTransportOptions(fields.wssTransport);
   const cell = captureCell(fields.credentialCell);
   const source = fields.bootstrapSecretByteSource === undefined
     ? null
     : captureByteSource(fields.bootstrapSecretByteSource);
   const canonical = captureCanonicalOptions(fields.canonical);
   if (cell === null || source === null && fields.bootstrapSecretByteSource !== undefined
+    || reauthentication === null || wssTransport === null
     || canonical === null) return null;
   return Object.freeze({
     trustedHome: fields.trustedHome as string | undefined,
     cell,
     sourceOwner: { current: source },
+    reauthentication,
+    wssTransport,
     canonical,
   });
 }
@@ -490,17 +551,33 @@ async function closeCapturedOwners(
 }
 
 function canonicalOptions(
-  captured: CapturedCanonicalOptions,
+  captured: CapturedOptions,
   profile: Readonly<RelayV2HostProductionProfile>,
   authority: RelayV2HostCredentialAuthority,
   coordinator: RelayV2HostCredentialExchangeCoordinator,
 ): RelayV2HostCanonicalProductionCompositionOptions {
+  const values = captured.canonical.values;
   const result = Object.create(null) as Record<string, unknown>;
-  for (const key of Object.keys(captured.values)) {
-    if (key !== "dashboardManagement") result[key] = Reflect.get(captured.values, key);
+  for (const key of Object.keys(values)) {
+    if (key !== "dashboardManagement") result[key] = Reflect.get(values, key);
   }
   result.credentialAuthority = authority;
-  const dashboard = captured.values.dashboardManagement;
+  // The privileged production intake always closes over the existing
+  // reauthentication lifecycle owner: it pairs the same authority and
+  // coordinator it constructed with the profile's refresh reference. Only
+  // deterministic id/schedule overrides may come from the caller.
+  result.reauthentication = freezeRecord({
+    credentialExchangeCoordinator: coordinator,
+    refreshSecretReference: profile.refreshSecretReference,
+    ...(captured.reauthentication?.idFactory === undefined
+      ? {}
+      : { idFactory: captured.reauthentication.idFactory }),
+    ...(captured.reauthentication?.schedule === undefined
+      ? {}
+      : { schedule: captured.reauthentication.schedule }),
+  });
+  if (captured.wssTransport !== undefined) result.wssTransport = captured.wssTransport;
+  const dashboard = values.dashboardManagement;
   if (dashboard !== undefined) {
     result.dashboardManagement = freezeRecord({
       credentialExchangeCoordinator: coordinator,
@@ -667,7 +744,7 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
     stage = "CANONICAL_OPEN_FAILED";
     const canonical = await openRelayV2HostCanonicalProductionComposition(
       canonicalProfile(profile),
-      canonicalOptions(captured.canonical, profile, authority, coordinator),
+      canonicalOptions(captured, profile, authority, coordinator),
     );
     if (canonical === null) throw failure("CANONICAL_OPEN_FAILED");
     owned.canonical = canonical;

@@ -15,6 +15,7 @@ export default defineConfig({
   external: [
     "./relay/v2/hostRuntimeComposition.js",
     "./relay/v2/hostCanonicalProductionComposition.js",
+    "./relay/v2/hostShippingRoot.js",
   ],
   noExternal: ["ws"],
 });

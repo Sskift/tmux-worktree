@@ -1,4 +1,5 @@
 import { types as nodeTypes } from "node:util";
+import { randomUUID } from "node:crypto";
 import { terminalControlSocketPath } from "../../terminalControl/store.js";
 import {
   RelayV2CanonicalAgentMessageTerminalExecutionAdapter,
@@ -55,6 +56,8 @@ import {
   isRelayV2HostCredentialExchangeCoordinatorForAuthority,
   type RelayV2HostCredentialExchangeCoordinator,
 } from "./hostCredentialExchangeCoordinator.js";
+import { RelayV2HostReauthenticationLifecycleOwner } from "./hostReauthenticationLifecycleOwner.js";
+import type { RelayV2HostWssTransportLifecycleFactoryOptions } from "./hostWssTransportLifecycle.js";
 import {
   createRelayV2DashboardManagementProtocolV2CompositionSession,
   type RelayV2DashboardManagementProtocolV2CompositionSession,
@@ -107,6 +110,27 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
   readonly agentTranscriptLifecycle?: Readonly<{
     store: Omit<RelayAgentAuthorityStoreOptions, "hostId" | "hostEpoch">;
     controller: CodexAppServerProcessControllerPort;
+  }>;
+  /**
+   * Default-off. When present, the composition constructs the existing
+   * reauthentication lifecycle owner over the same credential authority and
+   * the paired exchange coordinator, binds it to the exact managed connector
+   * cut, and routes the carrier's `host.auth_expiring` signal only to it.
+   */
+  readonly reauthentication?: Readonly<{
+    credentialExchangeCoordinator: RelayV2HostCredentialExchangeCoordinator;
+    refreshSecretReference: string;
+    idFactory?: () => string;
+    schedule?: (delayMs: number, callback: () => void) => () => void;
+  }>;
+  /** Default-off socket factory seam; production omission selects `ws`. */
+  readonly wssTransport?: Readonly<{
+    webSocketConstructor: NonNullable<
+      RelayV2HostWssTransportLifecycleFactoryOptions["webSocketConstructor"]
+    >;
+    scheduleCloseDrain?: NonNullable<
+      RelayV2HostWssTransportLifecycleFactoryOptions["scheduleCloseDrain"]
+    >;
   }>;
 }
 
@@ -261,6 +285,121 @@ function captureDashboardManagementOptions(
   })) as CapturedDashboardManagementOptions;
 }
 
+type CapturedReauthenticationOptions = NonNullable<
+  RelayV2HostCanonicalProductionCompositionOptions["reauthentication"]
+>;
+type CapturedWssTransportOptions = NonNullable<
+  RelayV2HostCanonicalProductionCompositionOptions["wssTransport"]
+>;
+
+function defaultReauthenticationSchedule(
+  delayMs: number,
+  callback: () => void,
+): () => void {
+  const timer = setTimeout(callback, delayMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearTimeout(timer);
+}
+
+function captureFunctionField(value: unknown): boolean {
+  try {
+    return typeof value === "function"
+      && !nodeTypes.isProxy(value)
+      && !nodeTypes.isAsyncFunction(value);
+  } catch {
+    return false;
+  }
+}
+
+function exactOwnDataSubset(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[],
+): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || nodeTypes.isProxy(value)) return null;
+  if (Array.isArray(value)) return null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return null;
+  }
+  const allowed = [...required, ...optional];
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) return null;
+  for (const key of required) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return null;
+  }
+  for (const key of keys as string[]) {
+    if (!Object.hasOwn(descriptors[key], "value")) return null;
+  }
+  return Object.fromEntries((keys as string[]).map((key) => [key, descriptors[key].value]));
+}
+
+function ownOptionalField(
+  options: object,
+  key: string,
+): Readonly<{ present: boolean; value: unknown }> | null {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(options, key);
+  } catch {
+    return null;
+  }
+  if (descriptor === undefined || descriptor.value === undefined) {
+    return Object.freeze({ present: false, value: undefined });
+  }
+  if (!Object.hasOwn(descriptor, "value")) return null;
+  return Object.freeze({ present: true, value: descriptor.value });
+}
+
+function captureReauthenticationOptions(
+  options: RelayV2HostCanonicalProductionCompositionOptions,
+): CapturedReauthenticationOptions | undefined | null {
+  const field = ownOptionalField(options, "reauthentication");
+  if (field === null) return null;
+  if (!field.present) return undefined;
+  const fields = exactOwnDataSubset(field.value, [
+    "credentialExchangeCoordinator",
+    "refreshSecretReference",
+  ], ["idFactory", "schedule"]);
+  if (fields === null
+    || !isRelayV2HostCredentialExchangeCoordinatorForAuthority(
+      fields.credentialExchangeCoordinator,
+      options.credentialAuthority,
+    )
+    || typeof fields.refreshSecretReference !== "string"
+    || fields.refreshSecretReference.length === 0
+    || (fields.idFactory !== undefined && !captureFunctionField(fields.idFactory))
+    || (fields.schedule !== undefined && !captureFunctionField(fields.schedule))) return null;
+  return Object.freeze(Object.assign(Object.create(null), {
+    credentialExchangeCoordinator: fields.credentialExchangeCoordinator,
+    refreshSecretReference: fields.refreshSecretReference,
+    ...(fields.idFactory === undefined ? {} : { idFactory: fields.idFactory }),
+    ...(fields.schedule === undefined ? {} : { schedule: fields.schedule }),
+  })) as CapturedReauthenticationOptions;
+}
+
+function captureWssTransportOptions(
+  options: RelayV2HostCanonicalProductionCompositionOptions,
+): CapturedWssTransportOptions | undefined | null {
+  const field = ownOptionalField(options, "wssTransport");
+  if (field === null) return null;
+  if (!field.present) return undefined;
+  const fields = exactOwnDataSubset(field.value, ["webSocketConstructor"], ["scheduleCloseDrain"]);
+  if (fields === null
+    || !captureFunctionField(fields.webSocketConstructor)
+    || (fields.scheduleCloseDrain !== undefined
+      && !captureFunctionField(fields.scheduleCloseDrain))) return null;
+  return Object.freeze(Object.assign(Object.create(null), {
+    webSocketConstructor: fields.webSocketConstructor,
+    ...(fields.scheduleCloseDrain === undefined
+      ? {}
+      : { scheduleCloseDrain: fields.scheduleCloseDrain }),
+  })) as CapturedWssTransportOptions;
+}
+
 type RelayV2HostAgentAttachmentOpener = (options: Readonly<{
   store: RelayAgentAuthorityStore;
   controller: CodexAppServerProcessControllerPort;
@@ -347,6 +486,10 @@ export async function openRelayV2HostCanonicalProductionComposition(
   if (!validateOptions(profile, options)) return null;
   const dashboardManagement = captureDashboardManagementOptions(options);
   if (dashboardManagement === null) return null;
+  const reauthentication = captureReauthenticationOptions(options);
+  if (reauthentication === null) return null;
+  const wssTransport = captureWssTransportOptions(options);
+  if (wssTransport === null) return null;
   const terminalOptions = terminalControlOptions(
     options.terminalControl,
   );
@@ -371,6 +514,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
   let terminalManager: RelayV2TerminalManager | null = null;
   let optionalExtension: RelayV2HostOptionalExtensionAttachment | null = null;
   let managed: RelayV2HostManagedConnectorRuntimeComposition | null = null;
+  let reauthOwner: RelayV2HostReauthenticationLifecycleOwner | null = null;
   let dashboardManagementSession:
     RelayV2DashboardManagementProtocolV2CompositionSession | null = null;
   let claimedOwners = false;
@@ -535,8 +679,29 @@ export async function openRelayV2HostCanonicalProductionComposition(
       connector: Object.freeze({
         credentialAuthority: options.credentialAuthority,
         credentialReference: profile.credentialReference,
-        carrier: Object.freeze({}),
-        wss: Object.freeze({ relayUrl: profile.relayUrl }),
+        carrier: reauthentication === undefined
+          ? Object.freeze({})
+          : Object.freeze({
+              onAuthExpiring: (input: {
+                grantId: string;
+                expiresAtMs: number;
+                refreshRecommendedAtMs: number;
+              }): void => {
+                const owner = reauthOwner;
+                if (owner !== null) void owner.handleAuthExpiring(input);
+              },
+            }),
+        wss: Object.freeze({
+          relayUrl: profile.relayUrl,
+          ...(wssTransport === undefined
+            ? {}
+            : {
+                webSocketConstructor: wssTransport.webSocketConstructor,
+                ...(wssTransport.scheduleCloseDrain === undefined
+                  ? {}
+                  : { scheduleCloseDrain: wssTransport.scheduleCloseDrain }),
+              }),
+        }),
       }),
     }));
     if (await managed.readiness.h0.activate() !== true) {
@@ -550,6 +715,23 @@ export async function openRelayV2HostCanonicalProductionComposition(
         "CAPABILITY_UNAVAILABLE",
         "Recovered H3 authority could not activate readiness",
       );
+    }
+    if (reauthentication !== undefined) {
+      // The existing owner binds the real authority/coordinator to the exact
+      // managed connector cut. Carrier signals can only arrive after the
+      // facade is published and started, so this synchronous late binding
+      // has no observable window.
+      reauthOwner = new RelayV2HostReauthenticationLifecycleOwner(Object.freeze({
+        hostId: profile.hostId,
+        hostInstanceId: options.hostState.hostInstanceId,
+        credentialReference: profile.credentialReference,
+        refreshSecretReference: reauthentication.refreshSecretReference,
+        credentialAuthority: options.credentialAuthority,
+        credentialExchangeCoordinator: reauthentication.credentialExchangeCoordinator,
+        managedConnector: managed,
+        idFactory: reauthentication.idFactory ?? (() => randomUUID()),
+        schedule: reauthentication.schedule ?? defaultReauthenticationSchedule,
+      }));
     }
     if (dashboardManagement !== undefined) {
       dashboardManagementSession =
@@ -587,6 +769,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
       closeBarrier = settleAll([
         ...(dashboardManagementSession === null
           ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
+        // Fence new reauthentication signals and drain the in-flight job
+        // before the connector drains.
+        ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
         () => closingManaged.closeAndDrain(),
         ...(closingObservedBytePlane === null
           ? [] : [() => closingObservedBytePlane.close()]),
@@ -630,6 +815,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
     const rollback = [
       ...(dashboardManagementSession === null
         ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
+      ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
       ...(managed !== null
         ? [() => managed!.closeAndDrain()]
         : terminalManager === null ? [] : [() => terminalManager!.shutdown()]),

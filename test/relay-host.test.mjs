@@ -50,23 +50,18 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
   assert.equal(v1.secret, "legacy-shared-secret");
   assert.equal(Object.hasOwn(v1, "credentialReference"), false);
 
-  const v2 = parseRelayHostOptions([
-    "--profile", "v2",
-    "--relay", "wss://relay.example.test",
-    "--host-id", "v2-host",
-    "--credential-reference", "relay-v2-host-credential-ref:primary",
-  ], {
+  // 显式 v2 选路只接受 --profile v2 本身：endpoint/hostId/credential reference
+  // 全部来自 canonical 运行时 profile store，返回里没有任何 v1 运行时字段。
+  const v2 = parseRelayHostOptions(["--profile", "v2"], {
     TW_RELAY_SECRET: "coexisting-v1-secret",
   });
-  assert.equal(v2.profile, "v2");
-  assert.equal(v2.credentialReference, "relay-v2-host-credential-ref:primary");
+  assert.deepEqual(v2, { profile: "v2" });
   assert.equal(Object.hasOwn(v2, "secret"), false);
-  assert.equal(relayV2HostCarrierUrl(v2.relay), "wss://relay.example.test/host");
+  assert.equal(Object.hasOwn(v2, "credentialReference"), false);
+  assert.equal(Object.hasOwn(v2, "relay"), false);
 
   assert.throws(() => parseRelayHostOptions([
     "--profile", "v2",
-    "--relay", "wss://relay.example.test",
-    "--credential-reference", "relay-v2-host-credential-ref:primary",
     "--secret", "must-not-be-promoted",
   ], {}), /cannot read or promote Relay v1 shared secret|不能读取或提升/);
   assert.throws(() => parseRelayHostOptions([
@@ -76,34 +71,41 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
   ], {}), /cannot read Relay v2 credential reference|不能读取 Relay v2 credential reference/);
 });
 
-test("Relay v2 host credential argv accepts only a non-sensitive reference namespace", () => {
-  const sensitiveValues = [
-    "twcap2.payload.mac",
-    "twref2.opaque",
-    "twenroll2.opaque",
-    "twhostboot2.opaque",
-  ];
-  for (const credentialReference of [
-    "host-primary-v1",
-    ...sensitiveValues,
-    ...sensitiveValues.map((value) => `relay-v2-host-credential-ref:${value}`),
+test("Relay v2 host argv never carries endpoints or credential references", () => {
+  // v2 的 relayUrl/issuer/hostId/credential reference 只来自运行时 profile
+  // store；任何 argv 形式的 endpoint、credential reference（含合法 namespace
+  // 与敏感前缀）或 v1 运行时参数都在选路时拒绝，不会被静默忽略。
+  for (const argv of [
+    ["--profile", "v2", "--relay", "wss://relay.example.test"],
+    ["--profile", "v2", "--host-id", "v2-host"],
+    ["--profile", "v2", "--display-name", "v2 host"],
+    ["--profile", "v2", "--credential-reference", "relay-v2-host-credential-ref:primary"],
+    ["--profile", "v2", "--credential-reference", "twcap2.payload.mac"],
+    ["--profile", "v2", "--credential-reference", "twhostboot2.opaque"],
+    ["--profile", "v2", "--local", "http://127.0.0.1:8311"],
+    ["--profile", "v2", "--status-file", "/tmp/v2-status.json"],
   ]) {
-    assert.throws(() => parseRelayHostOptions([
-      "--profile", "v2",
-      "--relay", "wss://relay.example.test",
-      "--credential-reference", credentialReference,
-    ], {}), /non-sensitive credential reference|非敏感 credential reference/);
+    assert.throws(() => parseRelayHostOptions(argv, {}), /只来自运行时 profile store/);
   }
 });
 
-test("Relay v2 host missing URL names its isolated environment variable", () => {
-  assert.throws(() => parseRelayHostOptions([
-    "--profile", "v2",
-    "--credential-reference", "relay-v2-host-credential-ref:primary",
-  ], {}), /TW_RELAY_V2_URL/);
+test("Relay v2 host selection ignores legacy v2 env channels", () => {
+  // 旧的 TW_RELAY_V2_* env 不再是 endpoint/credential 来源；显式选路只读
+  // --profile，运行时 profile store 才是唯一事实来源。
+  const selected = parseRelayHostOptions(["--profile", "v2"], {
+    TW_RELAY_V2_URL: "wss://relay.example.test",
+    TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE: "relay-v2-host-credential-ref:env",
+    TW_RELAY_V2_HOST_ID: "env-host",
+  });
+  assert.deepEqual(selected, { profile: "v2" });
+  const envSelected = parseRelayHostOptions([], {
+    TW_RELAY_HOST_PROFILE: "v2",
+    TW_RELAY_SECRET: "coexisting-v1-secret",
+  });
+  assert.deepEqual(envSelected, { profile: "v2" });
 });
 
-test("relay-host help marks Relay v2 unavailable instead of advertising runnable usage", async () => {
+test("relay-host help documents the explicit Relay v2 shipping selection", async () => {
   const child = spawn(process.execPath, ["dist/cli.cjs", "relay-host", "--help"], {
     env: {
       HOME: process.env.HOME,
@@ -122,8 +124,9 @@ test("relay-host help marks Relay v2 unavailable instead of advertising runnable
   });
   const output = Buffer.concat(stdout).toString("utf8");
   assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
-  assert.match(output, /当前未启用 Relay v2/);
-  assert.doesNotMatch(output, /tw relay-host --profile v2/);
+  assert.match(output, /tw relay-host --profile v2/);
+  assert.match(output, /default-off Relay v2 Host shipping root/);
+  assert.doesNotMatch(output, /当前未启用 Relay v2/);
 });
 
 test("Relay v2 host carrier URL is exact WSS without URL credentials or fallback paths", () => {
@@ -138,7 +141,7 @@ test("Relay v2 host carrier URL is exact WSS without URL credentials or fallback
   }
 });
 
-test("explicit Relay v2 profile fails before constructing any network transport", async () => {
+test("explicit Relay v2 profile enters the shipping root and fails closed without injection", async () => {
   const previousArgv = process.argv;
   const isolatedKeys = [
     "TW_RELAY_HOST_PROFILE",
@@ -155,13 +158,18 @@ test("explicit Relay v2 profile fails before constructing any network transport"
       "cli.cjs",
       "relay-host",
       "--profile", "v2",
-      "--relay", "wss://relay.example.test",
-      "--host-id", "v2-host",
-      "--credential-reference", "relay-v2-host-credential-ref:primary",
     ];
+    // 显式 v2 选路进入新的 Host shipping root：CLI 没有受信 deployment 注入
+    // 渠道，在任何 profile/store/socket 之前 fail closed，且绝不是旧的固定 throw。
     await assert.rejects(
       run(),
-      /production dependencies are not configured; no v1 fallback was attempted/,
+      (error) => {
+        assert.equal(error?.code, "INPUTS_UNAVAILABLE");
+        assert.match(error?.message, /deployment inputs are unavailable/);
+        assert.match(error?.message, /never falls back to Relay v1/);
+        assert.doesNotMatch(error?.message, /production dependencies are not configured/);
+        return true;
+      },
     );
   } finally {
     process.argv = previousArgv;

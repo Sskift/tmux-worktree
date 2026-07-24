@@ -8,6 +8,8 @@ import {
   openRelayV2HostPrivilegedProductionIntakeComposition,
   type RelayV2HostPrivilegedProductionCanonicalOptions,
   type RelayV2HostPrivilegedProductionIntakeComposition,
+  type RelayV2HostPrivilegedProductionReauthenticationOptions,
+  type RelayV2HostPrivilegedProductionWssTransport,
 } from "./hostPrivilegedProductionIntakeComposition.js";
 import type { RelayV2HostBootstrapSecretByteSource } from "./hostBootstrapSecretSource.js";
 
@@ -21,6 +23,10 @@ export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   readonly trustedHome?: string;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  /** Deterministic reauthentication overrides forwarded to the intake. */
+  readonly reauthentication?: RelayV2HostPrivilegedProductionReauthenticationOptions;
+  /** Socket factory seam forwarded to the intake. */
+  readonly wssTransport?: RelayV2HostPrivilegedProductionWssTransport;
   readonly canonical: RelayV2HostPrivilegedProductionCanonicalOptions;
 }
 
@@ -172,7 +178,7 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
   const captured = snapshotExactDataRecord(
     options,
     ["takeNativeModule", "canonical"],
-    ["trustedHome", "bootstrapSecretByteSource"],
+    ["trustedHome", "bootstrapSecretByteSource", "reauthentication", "wssTransport"],
   );
   const take = captured?.takeNativeModule;
   if (captured === null
@@ -228,6 +234,12 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
     credentialCell: cell,
     bootstrapSecretByteSource: captured.bootstrapSecretByteSource as
       | RelayV2HostBootstrapSecretByteSource
+      | undefined,
+    reauthentication: captured.reauthentication as
+      | RelayV2HostPrivilegedProductionReauthenticationOptions
+      | undefined,
+    wssTransport: captured.wssTransport as
+      | RelayV2HostPrivilegedProductionWssTransport
       | undefined,
     canonical: captured.canonical as RelayV2HostPrivilegedProductionCanonicalOptions,
   });

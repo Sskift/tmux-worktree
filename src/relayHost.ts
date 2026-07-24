@@ -59,7 +59,16 @@ export type RelayV2HostOptions = RelayHostCommonOptions & {
   credentialReference: string;
 };
 
-export type RelayHostOptions = RelayV1HostOptions | RelayV2HostOptions;
+/**
+ * Explicit `relay-host --profile v2` selection. The CLI accepts no endpoint,
+ * hostId, or credential reference flags: those come only from the canonical
+ * runtime profile store, and the v2 branch carries no v1 runtime fields.
+ */
+export type RelayV2HostSelection = {
+  profile: "v2";
+};
+
+export type RelayHostOptions = RelayV1HostOptions | RelayV2HostSelection;
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
 
@@ -702,22 +711,33 @@ export function parseRelayHostOptions(
   env: NodeJS.ProcessEnv = process.env,
 ): RelayHostOptions {
   const profile = relayHostProfile(argv, env);
-  let relay = profile === "v2" ? env.TW_RELAY_V2_URL || "" : env.TW_RELAY_URL || "";
-  let hostId = profile === "v2"
-    ? env.TW_RELAY_V2_HOST_ID || "mac-admin"
-    : env.TW_RELAY_HOST_ID || "mac-admin";
-  let displayName = profile === "v2"
-    ? env.TW_RELAY_V2_DISPLAY_NAME || `${hostname()} admin`
-    : env.TW_RELAY_DISPLAY_NAME || `${hostname()} admin`;
-  let secret = profile === "v1" ? env.TW_RELAY_SECRET || "" : "";
-  let credentialReference = profile === "v2"
-    ? env.TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE || ""
-    : "";
+  if (profile === "v2") {
+    // 显式 default-off 选路：endpoint、hostId 与 credential reference 只来自
+    // canonical 运行时 profile store；CLI 只接受非敏感的 --profile v2 本身。
+    for (let i = 0; i < argv.length; i += 1) {
+      const arg = argv[i];
+      if (arg === "--profile") {
+        i += 1;
+      } else if (arg === "--secret") {
+        throw new CliError("Relay v2 host profile 不能读取或提升 Relay v1 shared secret");
+      } else if (arg === "-h" || arg === "--help") {
+        printHelp();
+        process.exit(0);
+      } else {
+        throw new CliError(
+          "Relay v2 host profile 的 relayUrl、issuer、hostId 与 credential reference "
+          + `只来自运行时 profile store，CLI 只接受 --profile v2 选路（不支持参数: ${arg}）`,
+        );
+      }
+    }
+    return { profile };
+  }
+  let relay = env.TW_RELAY_URL || "";
+  let hostId = env.TW_RELAY_HOST_ID || "mac-admin";
+  let displayName = env.TW_RELAY_DISPLAY_NAME || `${hostname()} admin`;
+  let secret = env.TW_RELAY_SECRET || "";
   let local = env.TW_SERVE_URL || "http://127.0.0.1:8311";
-  let statusFile = profile === "v2"
-    ? env.TW_RELAY_V2_STATUS_FILE || ""
-    : env.TW_RELAY_STATUS_FILE || "";
-  let sawV1Secret = false;
+  let statusFile = env.TW_RELAY_STATUS_FILE || "";
   let sawV2CredentialReference = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -731,11 +751,10 @@ export function parseRelayHostOptions(
     } else if (arg === "--display-name") {
       displayName = argv[++i] || displayName;
     } else if (arg === "--secret") {
-      sawV1Secret = true;
       secret = argv[++i] || "";
     } else if (arg === "--credential-reference") {
       sawV2CredentialReference = true;
-      credentialReference = argv[++i] || "";
+      i += 1;
     } else if (arg === "--local") {
       local = argv[++i] || local;
     } else if (arg === "--status-file") {
@@ -749,43 +768,19 @@ export function parseRelayHostOptions(
   }
 
   if (!relay) {
-    throw new CliError(profile === "v2"
-      ? "Relay v2 host profile 需要 --relay 或 TW_RELAY_V2_URL"
-      : "relay-host 需要 --relay 或 TW_RELAY_URL");
+    throw new CliError("relay-host 需要 --relay 或 TW_RELAY_URL");
   }
   if (!hostId || !isValidHostId(hostId)) throw new CliError("relay-host 需要合法 --host-id（字母、数字、点、下划线）");
-  if (profile === "v1") {
-    if (sawV2CredentialReference) {
-      throw new CliError("Relay v1 host profile 不能读取 Relay v2 credential reference");
-    }
-    if (!secret) throw new CliError("relay-host 需要 --secret 或 TW_RELAY_SECRET");
-    return {
-      profile,
-      relay,
-      hostId,
-      displayName,
-      secret,
-      local: local.replace(/\/+$/, ""),
-      statusFile,
-    };
+  if (sawV2CredentialReference) {
+    throw new CliError("Relay v1 host profile 不能读取 Relay v2 credential reference");
   }
-  if (sawV1Secret) {
-    throw new CliError("Relay v2 host profile 不能读取或提升 Relay v1 shared secret");
-  }
-  if (!credentialReference || !validCredentialReference(credentialReference)) {
-    throw new CliError(
-      "Relay v2 host profile 需要独立的非敏感 credential reference "
-      + `${RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE}<id>`
-      + "（--credential-reference 或 TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE）",
-    );
-  }
-  relayV2HostCarrierUrl(relay);
+  if (!secret) throw new CliError("relay-host 需要 --secret 或 TW_RELAY_SECRET");
   return {
     profile,
     relay,
     hostId,
     displayName,
-    credentialReference,
+    secret,
     local: local.replace(/\/+$/, ""),
     statusFile,
   };
@@ -796,11 +791,14 @@ function printHelp(): void {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
+  tw relay-host --profile v2
 
 Relay v2:
-  production relay-host 当前未启用 Relay v2。--profile v2 只校验隔离配置，然后在创建任何
-  network transport 前 fail closed；它不会读取 v1 secret、宣告 capability 或回退到 v1。
-  预留的非敏感 reference namespace 是 ${RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE}<id>；不接受 token 或 enrollment code。
+  --profile v2 选择显式 default-off Relay v2 Host shipping root。relayUrl、issuer、hostId 与
+  credential reference 只来自 canonical 运行时 profile store；native credential module、
+  create-target execution 与 runtime lanes 只来自受信 deployment 注入。CLI 进程没有受信注入
+  渠道，因此在任何 profile/store/socket 之前 fail closed；它不读取 v1 secret、不宣告
+  capability，也绝不回退到 v1。
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
@@ -833,7 +831,7 @@ function relayUrl(opts: RelayV1HostOptions): string {
 }
 
 function writeRelayStatus(
-  opts: RelayHostOptions,
+  opts: RelayV1HostOptions,
   ownership: RelayStatusOwnership,
   state: RelayHostConnectionState,
   details: { error?: string; retryInMs?: number; connectedAt?: number } = {},
@@ -3513,9 +3511,10 @@ async function runConnection(
 export async function run(): Promise<void> {
   const opts = parseRelayHostOptions(process.argv.slice(3));
   if (opts.profile === "v2") {
-    throw new CliError(
-      "Relay v2 host production dependencies are not configured; no v1 fallback was attempted",
-    );
+    // 显式 v2 选路进入显式 default-off Host shipping root。CLI 进程没有受信
+    // deployment 注入渠道，在任何 profile/store/socket 之前 fail closed；绝不回退 v1。
+    const { runRelayV2HostShippingFromCli } = await import("./relay/v2/hostShippingRoot.js");
+    runRelayV2HostShippingFromCli();
   }
   const statusOwnership: RelayStatusOwnership = {
     instanceId: randomUUID(),
