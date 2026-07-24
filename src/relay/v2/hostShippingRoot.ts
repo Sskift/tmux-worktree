@@ -41,7 +41,7 @@ import type {
 } from "./hostConnectorController.js";
 import type { RelayV2RemoteExactCompoundChannelFactoryV1 } from "./remoteExactTerminalControlCompoundV1.js";
 import type { RelayV2HostWssTransportLifecycleFactoryOptions } from "./hostWssTransportLifecycle.js";
-import type { RelayV2HostCanonicalProductionCompositionOptions } from "./hostCanonicalProductionComposition.js";
+import type { RelayV2CanonicalCreateTargetExecutionPairV1 } from "./canonicalCreateTargetAdmissionAdapter.js";
 
 /**
  * Explicit, default-off Relay v2 Host shipping root.
@@ -89,10 +89,12 @@ export interface RelayV2HostShippingDeploymentInputs {
   readonly nativeModuleTarget: RelayV2HostCredentialNativeModuleTarget;
   readonly nativeModuleLoader: RelayV2HostCredentialNativeModuleLoader;
   /**
-   * Single opaque create-target execution pair. The root never decomposes
-   * its semantics; see the PARALLEL CREATE-TARGET SLICE SEAM below.
+   * The single opaque one-shot create target execution pair, issued by the
+   * trusted deployment from the canonical query transport owner. The root
+   * only captures the value and hands it to the bridge/intake/canonical
+   * owner; it never decomposes, inspects, or validates it.
    */
-  readonly createTargetExecution: unknown;
+  readonly createTargetExecutionPair: RelayV2CanonicalCreateTargetExecutionPairV1;
   /** An already-owned privileged channel (0600 file/stdin opened by the caller). */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
   /** Deterministic reauthentication scheduling seam; production omits it. */
@@ -234,7 +236,7 @@ interface CapturedOptions {
   readonly trustedHome: string | undefined;
   readonly nativeModuleTarget: RelayV2HostCredentialNativeModuleTarget;
   readonly nativeModuleLoader: RelayV2HostCredentialNativeModuleLoader;
-  readonly createTargetExecution: unknown;
+  readonly createTargetExecutionPair: RelayV2CanonicalCreateTargetExecutionPairV1;
   readonly bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | undefined;
   readonly reauthentication: RelayV2HostShippingReauthenticationOptions | undefined;
   readonly wssTransport: RelayV2HostShippingWssTransport | undefined;
@@ -262,12 +264,12 @@ function captureOptions(value: unknown): CapturedOptions {
   const deployment = snapshotExactDataRecord(record.deployment, [
     "nativeModuleTarget",
     "nativeModuleLoader",
-    "createTargetExecution",
+    "createTargetExecutionPair",
   ], ["bootstrapSecretByteSource", "reauthentication", "wssTransport"]);
   if (deployment === null
     || deployment.nativeModuleTarget === undefined
     || deployment.nativeModuleLoader === undefined
-    || deployment.createTargetExecution === undefined) throw failure("INPUTS_UNAVAILABLE");
+    || deployment.createTargetExecutionPair === undefined) throw failure("INPUTS_UNAVAILABLE");
   if (isAsyncFunction(deployment.nativeModuleLoader)
     || typeof deployment.nativeModuleLoader !== "function") throw failure("INPUTS_INVALID");
   const target = snapshotExactDataRecord(deployment.nativeModuleTarget, [
@@ -320,7 +322,8 @@ function captureOptions(value: unknown): CapturedOptions {
       napiVersion: target.napiVersion,
     }) as RelayV2HostCredentialNativeModuleTarget,
     nativeModuleLoader: deployment.nativeModuleLoader as RelayV2HostCredentialNativeModuleLoader,
-    createTargetExecution: deployment.createTargetExecution,
+    createTargetExecutionPair: deployment.createTargetExecutionPair as
+      RelayV2CanonicalCreateTargetExecutionPairV1,
     bootstrapSecretByteSource: deployment.bootstrapSecretByteSource as
       | RelayV2HostBootstrapSecretByteSource
       | undefined,
@@ -358,28 +361,6 @@ function nativeModuleFailure(
     return failure("NATIVE_ARTIFACT_MISSING");
   }
   return failure("NATIVE_MODULE_INVALID");
-}
-
-/**
- * PARALLEL CREATE-TARGET SLICE SEAM. The reviewer-planned Create-target slice
- * converges the canonical options' freely mixable `createTargetAuthority` and
- * `process` fields into one opaque one-shot `createTargetExecutionPair` that
- * is consumed before hostState.read/H2. This root's public input is already
- * that single opaque value; until the slice lands, this adapter is the only
- * place that still decomposes it into the two legacy fields, and it becomes
- * a pass-through once the new canonical interface merges.
- */
-function createTargetExecutionOptions(value: unknown): Readonly<{
-  createTargetAuthority: RelayV2HostCanonicalProductionCompositionOptions["createTargetAuthority"];
-  process: RelayV2HostCanonicalProductionCompositionOptions["process"];
-}> {
-  const record = snapshotExactDataRecord(value, ["createTargetAuthority", "process"]);
-  if (record === null) throw failure("INPUTS_INVALID");
-  return Object.freeze({
-    createTargetAuthority: record.createTargetAuthority as
-      RelayV2HostCanonicalProductionCompositionOptions["createTargetAuthority"],
-    process: record.process as RelayV2HostCanonicalProductionCompositionOptions["process"],
-  });
 }
 
 function issueHandle(
@@ -503,7 +484,6 @@ export async function startRelayV2HostShippingRoot(
       ...(captured.trustedHome === undefined ? {} : { home: captured.trustedHome }),
     });
     const welcome = createRelayV2HostRuntimeWelcomeSerializer({ hostId: profile.hostId });
-    const createTarget = createTargetExecutionOptions(captured.createTargetExecution);
 
     intake = await openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
       takeNativeModule: source.takeNativeModule,
@@ -519,8 +499,7 @@ export async function startRelayV2HostShippingRoot(
         hostState: store,
         recoveredH2Spool: spool,
         welcome,
-        createTargetAuthority: createTarget.createTargetAuthority,
-        process: createTarget.process,
+        createTargetExecutionPair: captured.createTargetExecutionPair,
         localProcessTarget: captured.localProcessTarget,
         terminalControl: Object.freeze({
           remoteCompoundChannels: captured.remoteCompoundChannels,

@@ -23,6 +23,12 @@ const handoffModule = await import("../dist/relay/v2/hostBootstrapSecretHandoff.
 const bootstrapSourceModule = await import("../dist/relay/v2/hostBootstrapSecretSource.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
+const createTargetAdmissionModule = await import(
+  "../dist/relay/v2/canonicalCreateTargetAdmissionAdapter.js"
+);
+const createTargetQueryTransportModule = await import(
+  "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js"
+);
 const terminalControl = await import("../dist/terminalControl/index.js");
 const exactCompound = await import(
   "../dist/relay/v2/remoteExactTerminalControlCompoundV1.js"
@@ -332,8 +338,9 @@ function createFakeWss(records, effects) {
     }
 
     receive(frame) {
-      const isBinary = typeof frame !== "string";
-      for (const listener of this.listeners.get("message") ?? []) listener(frame, isBinary);
+      // 本测试所有入站 carrier 帧都是 text frame；真实 ws 对 text 的回调是
+      // Buffer/Uint8Array + isBinary=false，与帧的 JS 类型无关。
+      for (const listener of this.listeners.get("message") ?? []) listener(frame, false);
     }
   };
 }
@@ -353,6 +360,29 @@ function authExpiringFrame(record) {
   frame.connectorId = record.registeredConnectorId;
   frame.payload.grantId = MINT_GRANT_ID;
   return carrierWire(frame);
+}
+
+/** A real one-shot execution pair whose components stay inert in these tests. */
+function realCreateTargetExecutionPair(effects) {
+  const runner = {
+    spawn() {
+      effects.create += 1;
+      throw new Error("unexpected create observation spawn");
+    },
+  };
+  return createTargetAdmissionModule.issueRelayV2CanonicalCreateTargetExecutionPairV1({
+    owner: new createTargetQueryTransportModule.RelayV2CanonicalTwRpcQueryTransportAdapter({
+      targets: [{ kind: "local", targetId: "local", executable: "/usr/local/bin/tw" }],
+      runner,
+    }),
+    runner,
+    inner: {
+      async execute() {
+        effects.process += 1;
+        throw new Error("unexpected process execution");
+      },
+    },
+  });
 }
 
 async function waitForPath(path) {
@@ -429,26 +459,9 @@ async function makeHarness(label, home, { initialBytes = null } = {}) {
           },
           nativeModuleLoader: overrides.nativeModuleLoader
             ?? (() => ({ status: "loaded", binding: harness.native.module })),
-          createTargetExecution: "createTargetExecution" in overrides
-            ? overrides.createTargetExecution
-            : {
-                createTargetAuthority: {
-                  async resolveCreateTarget() {
-                    harness.effects.create += 1;
-                    throw new Error("unexpected create resolution");
-                  },
-                  fenceCreateTargetForAdmission() {
-                    harness.effects.create += 1;
-                    throw new Error("unexpected create fence");
-                  },
-                },
-                process: {
-                  async execute() {
-                    harness.effects.process += 1;
-                    throw new Error("unexpected process execution");
-                  },
-                },
-              },
+          createTargetExecutionPair: "createTargetExecutionPair" in overrides
+            ? overrides.createTargetExecutionPair
+            : realCreateTargetExecutionPair(harness.effects),
           ...(overrides.reauthentication === undefined
             ? {}
             : { reauthentication: overrides.reauthentication }),
@@ -519,10 +532,8 @@ test("inputs, profile, and native source all fail closed before any socket", asy
       [{ ...base, deployment: undefined }, "INPUTS_UNAVAILABLE"],
       [{ ...base, runtime: undefined }, "INPUTS_UNAVAILABLE"],
       [{ ...base, deployment: { ...base.deployment, nativeModuleLoader: 1 } }, "INPUTS_INVALID"],
-      [{ ...base, deployment: { ...base.deployment, createTargetExecution: undefined } },
+      [{ ...base, deployment: { ...base.deployment, createTargetExecutionPair: undefined } },
         "INPUTS_UNAVAILABLE"],
-      [{ ...base, deployment: { ...base.deployment, createTargetExecution: new Proxy({}, {}) } },
-        "INPUTS_INVALID"],
       [{ ...base, runtime: { ...base.runtime, discovery: null } }, "INPUTS_INVALID"],
       [{ ...base, runtime: { ...base.runtime, localProcessTarget: { kind: "ssh", targetId: "x" } } },
         "INPUTS_INVALID"],
@@ -751,15 +762,16 @@ test("startup failures roll back so the same home opens cleanly afterwards", asy
   assert.equal(h.wss.effects.constructions, 0);
   await reopenStore();
 
-  // spool 开启后的晚期输入失败同样干净回滚（Proxy pair seam）。
+  // 空 cell 且无 bootstrap byte source：intake 在 bridge 之后、canonical 之前
+  // 晚阶段 fail closed 并自 drain cell/spool/store，回滚同样干净。
   h.discovery.state.fail = null;
   await assert.rejects(
-    shippingRoot.startRelayV2HostShippingRoot(
-      h.options({ createTargetExecution: new Proxy({}, {}) }),
-    ),
-    (error) => assertRedacted(error, "INPUTS_INVALID"),
+    shippingRoot.startRelayV2HostShippingRoot(h.options()),
+    (error) => assertRedacted(error, "OWNER_CONSTRUCTION_FAILED"),
   );
+  assert.equal(h.native.state.openCalls, 1, "bridge reached and drained the claimed cell");
+  assert.equal(h.native.state.closeCalls, 1);
   await reopenStore();
-  assert.equal(h.native.state.openCalls, 0);
+  assert.equal(h.native.state.openCalls, 1, "reopen goes to the store, never the native cell");
   h.cleanup();
 });

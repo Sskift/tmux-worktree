@@ -477,8 +477,27 @@ An outer default-off privileged intake now reads the existing reference-only
 Host production profile, consumes an externally owned atomic credential cell
 and optional privileged byte source, and constructs the single Vault,
 credential authority, HTTPS coordinator, and canonical Host owner. It selects
-no native cell or secret source and has no CLI callsite. Host native
-`qualifiedRecords=[]` therefore still prevents a qualified real intake path.
+no native cell or secret source. Host native `qualifiedRecords=[]` therefore
+still prevents a qualified real intake path.
+
+A default-off Host shipping root (`src/relay/v2/hostShippingRoot.ts`) now
+closes that chain into one owner: the canonical reference-only runtime
+profile, the injected-only native credential module source/holder, the
+started materialized reconcile lifecycle owner (its startup scan is the
+first authoritative reconcile), the recovered H0 and snapshot spool, the
+production welcome serializer, and the single opaque one-shot create
+target execution pair feed the existing bridge, intake, and canonical
+H0-H3 composition, and the carrier additionally binds the existing
+reauthentication lifecycle owner to the exact managed connector cut. The
+root owns connector start/stop, signal fencing, reverse-order startup
+rollback, and close-and-drain in that existing owner order. The
+`relay-host --profile v2` CLI selects only this root; the CLI has no
+trusted native-module or deployment injection channel, so the selection
+fails closed before any profile read, state store, or socket — it never
+falls back to Relay v1. Without Host native qualification and a Host
+trusted deployment source, and with no real TLS/device evidence,
+production activation stays unreachable: default Relay v1 shipping and
+the overall NO-GO are unchanged.
 
 A separate default-off injected-only Host native credential module one-shot
 source/holder now fills the injected-source gap above: it declares only
