@@ -13,6 +13,29 @@ function readVersion(): string {
   return typeof packageMetadata.version === "string" ? packageMetadata.version : "";
 }
 
+/**
+ * The hidden Dashboard management child. Only module resolution and export
+ * capture run inside the try: a failure there leaves the channel untouched
+ * and converges to the same fail-closed UNAVAILABLE session through the
+ * bundled stdio owner (the .app ships cli.cjs only). Once the canonical
+ * child entry is obtained it is awaited outside the try; the entry never
+ * rejects, and no second session is ever started on the same channel.
+ */
+async function runRelayV2DashboardManagementHiddenChild(version: string): Promise<number> {
+  let runChildStdio;
+  try {
+    const entry = await import("./relay/v2/relayV2DashboardManagementChildRuntime.js");
+    runChildStdio = entry.runRelayV2DashboardManagementChildStdio;
+    if (typeof runChildStdio !== "function") throw new Error("missing child entry");
+  } catch {
+    const {
+      runRelayV2DashboardManagementStdio,
+    } = await import("./relay/v2/relayV2DashboardManagementStdio.js");
+    return runRelayV2DashboardManagementStdio(version);
+  }
+  return runChildStdio({ runtimeVersion: version });
+}
+
 function printHelp(): void {
   console.log(`tw — tmux + git worktree + AI 开发环境管理器  (v${readVersion()})
 
@@ -146,10 +169,7 @@ async function main() {
         process.exitCode = 1;
         return;
       }
-      const {
-        runRelayV2DashboardManagementStdio,
-      } = await import("./relay/v2/relayV2DashboardManagementStdio.js");
-      process.exitCode = await runRelayV2DashboardManagementStdio(readVersion());
+      process.exitCode = await runRelayV2DashboardManagementHiddenChild(readVersion());
       return;
     }
     case "terminal-control": {

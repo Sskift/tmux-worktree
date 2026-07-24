@@ -10,6 +10,7 @@ import {
   openRelayV2HostNativeCredentialPrivilegedIntakeBridge,
 } from "./hostNativeCredentialPrivilegedIntakeBridge.js";
 import type {
+  RelayV2HostPrivilegedProductionDashboardManagementOptions,
   RelayV2HostPrivilegedProductionIntakeComposition,
 } from "./hostPrivilegedProductionIntakeComposition.js";
 import {
@@ -68,7 +69,11 @@ import type { RelayV2CanonicalCreateTargetExecutionPairV1 } from "./canonicalCre
  * failure fails closed before any socket is constructed. The native module
  * loader, the create-target execution pair, and the runtime lanes are
  * trusted deployment injections; without them the explicit v2 selection
- * fails closed, which is exactly what the CLI path does.
+ * fails closed, which is exactly what the CLI path does. The optional
+ * `dashboardManagement` seam only threads a caller-owned exact protocol-v2
+ * channel through the bridge/intake so the canonical composition can own
+ * its same-lineage management session; omitting it leaves the facade
+ * without `runDashboardManagement` and changes nothing else.
  */
 export interface RelayV2HostShippingReauthenticationOptions {
   readonly idFactory?: () => string;
@@ -123,6 +128,14 @@ export interface RelayV2HostShippingRootOptions {
   readonly trustedHome?: string;
   readonly deployment: RelayV2HostShippingDeploymentInputs;
   readonly runtime: RelayV2HostShippingRuntimeLanes;
+  /**
+   * Default-off same-lineage Dashboard management channel. The caller owns
+   * the exact protocol-v2 stdio channel, clock, runtime version, and abort
+   * signal; the root only threads them through the bridge/intake to the
+   * canonical composition, which remains the sole owner of the management
+   * session. Omission leaves the facade without `runDashboardManagement`.
+   */
+  readonly dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions;
 }
 
 export interface RelayV2HostShippingRootHandle {
@@ -133,6 +146,8 @@ export interface RelayV2HostShippingRootHandle {
   stopAndDrain(
     input: Readonly<RelayV2HostManagedConnectorStopInput>,
   ): Promise<RelayV2HostConnectorControllerStopResult>;
+  /** Present only when the dashboardManagement option was supplied and accepted. */
+  runDashboardManagement?(): Promise<number>;
   closeAndDrain(): Promise<void>;
 }
 
@@ -245,6 +260,9 @@ interface CapturedOptions {
   readonly remoteCompoundChannels: RelayV2RemoteExactCompoundChannelFactoryV1;
   readonly terminalControlDaemonSocketPath: string | undefined;
   readonly scanIntervalMs: number;
+  readonly dashboardManagement:
+    | RelayV2HostPrivilegedProductionDashboardManagementOptions
+    | undefined;
 }
 
 /** Production reconcile cadence; the lifecycle owner owns the only timer. */
@@ -254,8 +272,37 @@ function captureObjectField(value: unknown): boolean {
   return value !== null && typeof value === "object" && !rejectedProxy(value);
 }
 
+function captureDashboardManagement(
+  value: unknown,
+): RelayV2HostPrivilegedProductionDashboardManagementOptions | undefined {
+  if (value === undefined) return undefined;
+  const dashboard = snapshotExactDataRecord(value, ["clock", "io", "runtimeVersion", "signal"]);
+  const io = dashboard === null ? null : snapshotExactDataRecord(dashboard.io, [
+    "input",
+    "writeFrame",
+  ]);
+  if (dashboard === null
+    || io === null
+    || typeof dashboard.clock !== "function"
+    || rejectedProxy(dashboard.clock)
+    || typeof dashboard.runtimeVersion !== "string"
+    || !captureObjectField(dashboard.signal)
+    || !captureObjectField(io.input)
+    || typeof io.writeFrame !== "function"
+    || rejectedProxy(io.writeFrame)) throw failure("INPUTS_INVALID");
+  return Object.freeze({
+    clock: dashboard.clock,
+    runtimeVersion: dashboard.runtimeVersion,
+    signal: dashboard.signal,
+    io: Object.freeze({ input: io.input, writeFrame: io.writeFrame }),
+  }) as RelayV2HostPrivilegedProductionDashboardManagementOptions;
+}
+
 function captureOptions(value: unknown): CapturedOptions {
-  const record = snapshotExactDataRecord(value, ["deployment", "runtime"], ["trustedHome"]);
+  const record = snapshotExactDataRecord(value, ["deployment", "runtime"], [
+    "trustedHome",
+    "dashboardManagement",
+  ]);
   if (record === null) throw failure("INPUTS_UNAVAILABLE");
   if (record.trustedHome !== undefined
     && (typeof record.trustedHome !== "string" || record.trustedHome.length === 0)) {
@@ -341,6 +388,7 @@ function captureOptions(value: unknown): CapturedOptions {
     terminalControlDaemonSocketPath: runtime.terminalControlDaemonSocketPath as string | undefined,
     scanIntervalMs: (runtime.scanIntervalMs as number | undefined)
       ?? RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
+    dashboardManagement: captureDashboardManagement(record.dashboardManagement),
   });
 }
 
@@ -424,6 +472,15 @@ function issueHandle(
     },
     closeAndDrain: { enumerable: true, value: closeAndDrain },
   });
+  if (typeof intake.runDashboardManagement === "function") {
+    Object.defineProperty(handle, "runDashboardManagement", {
+      enumerable: true,
+      value: (): Promise<number> => {
+        guard();
+        return intake.runDashboardManagement!();
+      },
+    });
+  }
   return Object.freeze(handle);
 }
 
@@ -507,6 +564,9 @@ export async function startRelayV2HostShippingRoot(
             ? {}
             : { daemonSocketPath: captured.terminalControlDaemonSocketPath }),
         }),
+        ...(captured.dashboardManagement === undefined
+          ? {}
+          : { dashboardManagement: captured.dashboardManagement }),
       }),
     });
   } catch (error) {

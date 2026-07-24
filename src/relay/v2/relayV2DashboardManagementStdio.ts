@@ -144,16 +144,26 @@ export function createRelayV2DashboardManagementProtocolV2StdioSession(options: 
 }
 
 /**
- * Owns only the bounded stdin/stdout channel. All malformed input closes the
- * channel silently with 64; no raw input reaches logs, errors, or responses.
+ * The process stdin/stdout channel for the hidden child. The stdout error
+ * observer is attached here so late pipe errors never surface as unhandled.
  */
-export async function runRelayV2DashboardManagementStdio(
-  runtimeVersion: string,
-): Promise<number> {
+export function relayV2DashboardManagementProcessStdio(): RelayV2DashboardManagementStdioIo {
   const ignoreStdoutError = (): void => {};
   stdout.on("error", ignoreStdoutError);
+  return Object.freeze({ input: stdin, writeFrame });
+}
+
+/**
+ * The fail-closed session every unqualified selection converges to. It speaks
+ * exact protocol v2 and answers each request with typed UNAVAILABLE; it is
+ * never a Relay v1 fallback.
+ */
+export function createRelayV2DashboardManagementUnavailableStdioSession(options: {
+  runtimeVersion: string;
+  io: RelayV2DashboardManagementStdioIo;
+}): RelayV2DashboardManagementProtocolV2StdioSession {
   return createRelayV2DashboardManagementProtocolV2StdioSession({
-    runtimeVersion,
+    runtimeVersion: options.runtimeVersion,
     handler: Object.freeze({
       handle: (request: RelayV2DashboardManagementProtocolV2Request) => (
         createRelayV2DashboardManagementProtocolV2FailureResponse(
@@ -162,6 +172,19 @@ export async function runRelayV2DashboardManagementStdio(
         )
       ),
     }),
-    io: Object.freeze({ input: stdin, writeFrame }),
+    io: options.io,
+  });
+}
+
+/**
+ * Owns only the bounded stdin/stdout channel. All malformed input closes the
+ * channel silently with 64; no raw input reaches logs, errors, or responses.
+ */
+export async function runRelayV2DashboardManagementStdio(
+  runtimeVersion: string,
+): Promise<number> {
+  return createRelayV2DashboardManagementUnavailableStdioSession({
+    runtimeVersion,
+    io: relayV2DashboardManagementProcessStdio(),
   }).run();
 }

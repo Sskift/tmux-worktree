@@ -103,6 +103,7 @@ export default defineConfig({
     "src/relay/v2/brokerShippingRoot.ts",
     "src/relay/v2/brokerShippingDeploymentSource.ts",
     "src/relay/v2/hostShippingRoot.ts",
+    "src/relay/v2/relayV2DashboardManagementChildRuntime.ts",
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
     "src/relay/v2/terminalDurableLineage.ts",
@@ -205,6 +206,10 @@ export default defineConfig({
     // relayHost dynamically loads the shipping root's canonical dist entry.
     "./hostNativeCredentialPrivilegedIntakeBridge.js",
     "./relay/v2/hostShippingRoot.js",
+    // The hidden Dashboard management child consumes the same canonical Host
+    // shipping root owner instead of bundling a second private registry; the
+    // CLI dynamically loads the child's canonical dist entry.
+    "./hostShippingRoot.js",
   ],
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
