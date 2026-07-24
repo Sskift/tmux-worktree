@@ -743,7 +743,7 @@ fn production_qualification_is_empty_and_resources_are_host_specific() {
         Err(CellErrorCode::CellDurabilityUnsupported)
     ));
     let spec = platform_resource_spec();
-    assert_eq!(spec.contract_revision(), 5);
+    assert_eq!(spec.contract_revision(), 6);
     assert_eq!(spec.resource_contract_version(), 1);
     assert_eq!(generated::CREDENTIAL_MUTATION_CONTRACT_VERSION, 1);
     assert!(generated::CREDENTIAL_MUTATION_IMPLEMENTED);

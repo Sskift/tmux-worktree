@@ -1,6 +1,6 @@
 {
   "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
-  "contractVersion": 5,
+  "contractVersion": 6,
   "fixtureFormatVersion": 1,
   "status": "frozen",
   "scope": "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -510,14 +510,159 @@
     "productionWired": false,
     "productionCapabilityEffect": "none"
   },
+  "nativeArtifact": {
+    "contractVersion": 1,
+    "fixtureFormatVersion": 1,
+    "fixture": "native-artifact-cases-v1.json",
+    "status": "frozen-identity-build-stage-pack-foundation-default-off-unwired",
+    "scope": "host-credential-native-artifact-identity-only-not-qualification-readiness-or-capability",
+    "supportedTargets": [
+      {
+        "target": "darwin-arm64",
+        "platform": "darwin",
+        "architecture": "arm64",
+        "cargoTargetTriple": "aarch64-apple-darwin",
+        "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.dylib",
+        "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+        "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+        "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+        "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node"
+      },
+      {
+        "target": "darwin-x64",
+        "platform": "darwin",
+        "architecture": "x64",
+        "cargoTargetTriple": "x86_64-apple-darwin",
+        "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.dylib",
+        "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node",
+        "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node",
+        "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node",
+        "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node"
+      },
+      {
+        "target": "linux-arm64",
+        "platform": "linux",
+        "architecture": "arm64",
+        "cargoTargetTriple": "aarch64-unknown-linux-gnu",
+        "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.so",
+        "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node",
+        "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node",
+        "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node",
+        "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node"
+      },
+      {
+        "target": "linux-x64",
+        "platform": "linux",
+        "architecture": "x64",
+        "cargoTargetTriple": "x86_64-unknown-linux-gnu",
+        "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.so",
+        "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node",
+        "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node",
+        "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node",
+        "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node"
+      }
+    ],
+    "crate": {
+      "path": "native/relay-v2-host-credential-atomic-file-cell-napi",
+      "packageName": "relay-v2-host-credential-atomic-file-cell-napi",
+      "crateType": "cdylib",
+      "workspaceMember": false,
+      "abi": "napi",
+      "abiVersion": 1,
+      "minimumNapiVersion": 9,
+      "synchronousOnly": true,
+      "promiseOrAsyncAllowed": false
+    },
+    "binaryIdentity": {
+      "macho": {
+        "magic": [
+          "0xCFFAEDFE",
+          "0xFEEDFACF"
+        ],
+        "fileType": 6,
+        "cpuTypes": {
+          "arm64": "0x0100000C",
+          "x64": "0x01000007"
+        }
+      },
+      "elf": {
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "type": 3,
+        "version": 1,
+        "osAbi": [
+          0,
+          3
+        ],
+        "machines": {
+          "arm64": 183,
+          "x64": 62
+        }
+      }
+    },
+    "digest": {
+      "algorithm": "SHA-256",
+      "input": "entire-cargo-artifact-bytes",
+      "sourceAndStagedDigestMatchRequiredBeforeCommitPoint": true,
+      "commitPoint": "same-directory-hard-link-to-final-name",
+      "postCommitFinalRollbackAllowed": false,
+      "postCommitCleanup": "identity-checked-private-random-staging-directory-only",
+      "packedArtifactBytesEqualStaged": true
+    },
+    "layout": {
+      "stagedNativeDirectory": "dist/relay/v2/native",
+      "stagedDirectoryEntries": "exactly-one-selected-target-runtime-artifact-of-this-owner-plus-the-same-target-frozen-sibling-owner-artifact-only",
+      "privateStagingDirectoryPrefix": ".relay-v2-native-stage-",
+      "packedNativeSubsetEntries": "exactly-one-selected-target-runtime-artifact-of-this-owner-plus-the-same-target-frozen-sibling-owner-artifact-only",
+      "packedNativeSubsetComponents": [
+        "native-directory",
+        "private-staging-prefix",
+        ".node",
+        ".dylib",
+        ".so",
+        ".dll"
+      ],
+      "npmLifecycleScriptAllowed": false,
+      "coexistingFrozenOwnerArtifacts": "the-same-target-relay-v2-broker-credential-state-store-v1-artifact-file-name-enumerated-from-the-frozen-broker-target-descriptor-module-never-copied-never-content-verified-by-this-owner",
+      "unknownDuplicateOrWrongTargetEntries": "rejected"
+    },
+    "loader": {
+      "mapping": "fixed-target-descriptor-only",
+      "candidate": "exact-current-target-only",
+      "minimumNapiVersion": 9,
+      "missingMapping": "resolve-stage-MODULE_NOT_FOUND-of-the-fixed-artifact-only",
+      "missingHolderReason": "native_artifact_missing",
+      "otherLoadOrBindingFailure": "redacted-invalid",
+      "napiVersionDecisionOwner": "injected-module-source-holder-only",
+      "dynamicScanAllowed": false,
+      "alternateCandidateAllowed": false,
+      "environmentHomeJsonBauOrV1FallbackAllowed": false
+    },
+    "qualificationReadinessCapabilityEffect": {
+      "artifactExistenceOrLoadabilityCreatesQualification": false,
+      "artifactExistenceOrLoadabilityCreatesReadinessOrCapability": false,
+      "durabilityQualificationQualifiedRecordsUnchangedEmpty": true,
+      "productionOpenMustFailBeforeRegistryOrCredentialMutation": "CELL_DURABILITY_UNSUPPORTED"
+    },
+    "productionWired": false,
+    "productionCapabilityEffect": "none",
+    "forbiddenReuse": [
+      "relay-v2-broker-credential-state-store-napi-crate",
+      "broker-runtime-artifact-file-name-or-module-specifier",
+      "broker-target-descriptor-or-loader-module",
+      "relay-v2-broker-credential-native-script",
+      "build:relay-v2-broker-credential-native-npm-script",
+      "verify:relay-v2-broker-credential-native-pack-npm-script",
+      "RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_-environment-variable-prefix"
+    ]
+  },
   "notImplemented": [
     "trusted-production-factory",
     "darwin-x86_64-validation-evidence",
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",
     "continuity",
-    "napi-binding",
-    "loader-or-packaging",
     "vault-injection",
     "relay-host-production-composition",
     "capability-advertisement"
@@ -527,6 +672,7 @@
     { "role": "native-interface", "path": "native-interface-cases.json" },
     { "role": "platform-resource-cases", "path": "platform-resource-cases.json" },
     { "role": "claim-journal-golden", "path": "claim-journal-v1.json" },
-    { "role": "credential-mutation-contract", "path": "credential-mutation-cases-v1.json" }
+    { "role": "credential-mutation-contract", "path": "credential-mutation-cases-v1.json" },
+    { "role": "native-artifact-cases", "path": "native-artifact-cases-v1.json" }
   ]
 }

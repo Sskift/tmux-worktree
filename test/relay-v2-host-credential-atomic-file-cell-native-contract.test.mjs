@@ -22,6 +22,12 @@ const claimJournalFixture = JSON.parse(
 const credentialMutationFixture = JSON.parse(
   readFileSync(new URL("credential-mutation-cases-v1.json", contractRoot), "utf8"),
 );
+const nativeArtifactFixture = JSON.parse(
+  readFileSync(new URL("native-artifact-cases-v1.json", contractRoot), "utf8"),
+);
+const nativeTargetModule = await import(
+  "../dist/relay/v2/hostCredentialNativeTarget.js"
+);
 
 const ABI_VERSION = nativeCell.RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_ABI_VERSION;
 const OPEN_METHOD = nativeCell.RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_OPEN_METHOD;
@@ -127,7 +133,7 @@ function assertCaseTable(entries, fields, expected, label) {
 
 test("Host credential native ABI manifest and every machine case stay closed", async () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-host-credential-atomic-file-cell");
-  assert.equal(manifest.contractVersion, 5);
+  assert.equal(manifest.contractVersion, 6);
   assert.equal(
     manifest.scope,
     "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -140,6 +146,7 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     { role: "platform-resource-cases", path: "platform-resource-cases.json" },
     { role: "claim-journal-golden", path: "claim-journal-v1.json" },
     { role: "credential-mutation-contract", path: "credential-mutation-cases-v1.json" },
+    { role: "native-artifact-cases", path: "native-artifact-cases-v1.json" },
   ]);
   assert.equal(manifest.nativeInterface.abiVersion, ABI_VERSION);
   assert.deepEqual(manifest.nativeInterface.moduleMethods, [OPEN_METHOD]);
@@ -218,8 +225,6 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",
     "continuity",
-    "napi-binding",
-    "loader-or-packaging",
     "vault-injection",
     "relay-host-production-composition",
     "capability-advertisement",
@@ -1004,5 +1009,177 @@ test("Host credential native ABI manifest and every machine case stay closed", a
       + fixture.compareAndSwapCases.length
       + fixture.closeCases.length
       + fixture.errorCases.length,
+  );
+});
+
+const ARTIFACT_DESCRIPTOR_FIELDS = [
+  "target",
+  "platform",
+  "architecture",
+  "cargoTargetTriple",
+  "cargoDynamicLibraryFileName",
+  "runtimeArtifactFileName",
+  "loaderModuleSpecifier",
+  "stagedRelativePath",
+  "packedRelativePath",
+];
+
+test("native artifact identity stays consistent across manifest, JS descriptors, and fixture", () => {
+  const artifact = manifest.nativeArtifact;
+  assert.equal(manifest.contractVersion, 6);
+  assert.equal(artifact.contractVersion, 1);
+  assert.equal(artifact.fixtureFormatVersion, 1);
+  assert.equal(artifact.fixture, "native-artifact-cases-v1.json");
+  assert.equal(nativeArtifactFixture.fixtureFormatVersion, 1);
+  assert.equal(nativeArtifactFixture.nativeArtifactContractVersion, 1);
+
+  // The nested revision-5 contract surfaces remain v1 byte-identical scopes.
+  assert.equal(manifest.fixtureFormatVersion, 1);
+  assert.equal(manifest.nativeInterface.abiVersion, 1);
+  assert.equal(manifest.platformResources.contractVersion, 1);
+  assert.equal(manifest.platformResources.claimJournal.formatVersion, 1);
+  assert.equal(manifest.credentialMutation.contractVersion, 1);
+
+  // The four frozen targets are exactly mirrored by the JS descriptor module
+  // and the machine fixture, field by field, in the same order.
+  const manifestTargets = artifact.supportedTargets;
+  assert.deepEqual(
+    manifestTargets.map((entry) => entry.target),
+    ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"],
+  );
+  assert.equal(nativeArtifactFixture.canonicalTargets.length, manifestTargets.length);
+  for (const [index, manifestTarget] of manifestTargets.entries()) {
+    assertExactKeys(manifestTarget, ARTIFACT_DESCRIPTOR_FIELDS, "manifest target fields");
+    const jsDescriptor = nativeTargetModule
+      .getRelayV2HostCredentialNativeTargetDescriptor(manifestTarget.target);
+    assert.notEqual(jsDescriptor, null, manifestTarget.target);
+    assert.deepEqual(
+      Object.fromEntries(ARTIFACT_DESCRIPTOR_FIELDS.map((field) => [field, jsDescriptor[field]])),
+      Object.fromEntries(ARTIFACT_DESCRIPTOR_FIELDS.map((field) => [field, manifestTarget[field]])),
+      `${manifestTarget.target} JS descriptor mirrors the manifest`,
+    );
+    assert.equal(
+      nativeTargetModule.selectRelayV2HostCredentialNativeTargetDescriptor(
+        manifestTarget.platform,
+        manifestTarget.architecture,
+      ),
+      jsDescriptor,
+      `${manifestTarget.target} select returns the same frozen identity`,
+    );
+    assert.equal(Object.isFrozen(jsDescriptor), true);
+    assert.deepEqual(
+      nativeArtifactFixture.canonicalTargets[index],
+      Object.fromEntries(ARTIFACT_DESCRIPTOR_FIELDS.map((field) => [field, manifestTarget[field]])),
+      `${manifestTarget.target} fixture descriptor mirrors the manifest`,
+    );
+    assert.equal(manifestTarget.loaderModuleSpecifier, `./native/${manifestTarget.runtimeArtifactFileName}`);
+    assert.equal(
+      manifestTarget.stagedRelativePath,
+      `dist/relay/v2/native/${manifestTarget.runtimeArtifactFileName}`,
+    );
+    assert.equal(
+      manifestTarget.packedRelativePath,
+      `package/dist/relay/v2/native/${manifestTarget.runtimeArtifactFileName}`,
+    );
+  }
+
+  // Crate and loader rules freeze ABI identity without producing capability.
+  assert.deepEqual(artifact.crate, {
+    path: "native/relay-v2-host-credential-atomic-file-cell-napi",
+    packageName: "relay-v2-host-credential-atomic-file-cell-napi",
+    crateType: "cdylib",
+    workspaceMember: false,
+    abi: "napi",
+    abiVersion: 1,
+    minimumNapiVersion: 9,
+    synchronousOnly: true,
+    promiseOrAsyncAllowed: false,
+  });
+  assert.equal(artifact.crate.abiVersion, manifest.nativeInterface.abiVersion);
+  assert.equal(artifact.loader.minimumNapiVersion, 9);
+  assert.equal(artifact.loader.mapping, "fixed-target-descriptor-only");
+  assert.equal(artifact.loader.candidate, "exact-current-target-only");
+  assert.equal(artifact.loader.missingHolderReason, "native_artifact_missing");
+  assert.equal(artifact.loader.otherLoadOrBindingFailure, "redacted-invalid");
+  assert.equal(artifact.loader.dynamicScanAllowed, false);
+  assert.equal(artifact.loader.alternateCandidateAllowed, false);
+  assert.equal(artifact.loader.environmentHomeJsonBauOrV1FallbackAllowed, false);
+  assert.equal(artifact.layout.npmLifecycleScriptAllowed, false);
+  assert.equal(artifact.digest.algorithm, "SHA-256");
+  assert.equal(artifact.digest.commitPoint, "same-directory-hard-link-to-final-name");
+  assert.equal(artifact.digest.postCommitFinalRollbackAllowed, false);
+
+  // Binary identity rules accept exactly the frozen Mach-O/ELF parameters that
+  // the fixture's accepted header cases exercise, and nothing else.
+  assert.deepEqual(artifact.binaryIdentity.macho.magic, ["0xCFFAEDFE", "0xFEEDFACF"]);
+  assert.equal(artifact.binaryIdentity.macho.fileType, 6);
+  assert.deepEqual(artifact.binaryIdentity.macho.cpuTypes, {
+    arm64: "0x0100000C",
+    x64: "0x01000007",
+  });
+  assert.deepEqual(artifact.binaryIdentity.elf, {
+    class: 2,
+    data: 1,
+    headerVersion: 1,
+    type: 3,
+    version: 1,
+    osAbi: [0, 3],
+    machines: { arm64: 183, x64: 62 },
+  });
+  for (const entry of nativeArtifactFixture.binaryHeaderCases) {
+    if (!entry.accepted) continue;
+    const descriptor = nativeTargetModule.getRelayV2HostCredentialNativeTargetDescriptor(
+      `${entry.platform}-${entry.architecture}`,
+    );
+    assert.notEqual(descriptor, null, entry.name);
+    if (entry.header.family === "macho") {
+      assert.equal(entry.header.fileType, artifact.binaryIdentity.macho.fileType, entry.name);
+      assert.equal(
+        entry.header.cpuType,
+        artifact.binaryIdentity.macho.cpuTypes[entry.architecture],
+        entry.name,
+      );
+    } else {
+      assert.equal(entry.header.type, artifact.binaryIdentity.elf.type, entry.name);
+      assert.equal(
+        entry.header.machine,
+        artifact.binaryIdentity.elf.machines[entry.architecture],
+        entry.name,
+      );
+      assert.equal(artifact.binaryIdentity.elf.osAbi.includes(entry.header.osAbi), true, entry.name);
+    }
+  }
+
+  // Artifact existence or loadability never mints qualification, readiness,
+  // or capability, and the durability allowlist stays empty.
+  assert.deepEqual(artifact.qualificationReadinessCapabilityEffect, {
+    artifactExistenceOrLoadabilityCreatesQualification: false,
+    artifactExistenceOrLoadabilityCreatesReadinessOrCapability: false,
+    durabilityQualificationQualifiedRecordsUnchangedEmpty: true,
+    productionOpenMustFailBeforeRegistryOrCredentialMutation: "CELL_DURABILITY_UNSUPPORTED",
+  });
+  assert.equal(artifact.productionWired, false);
+  assert.equal(artifact.productionCapabilityEffect, "none");
+  assert.deepEqual(manifest.platformResources.durabilityQualification.qualifiedRecords, []);
+
+  // The artifact foundation never reuses the broker namespace.
+  assert.equal(
+    artifact.forbiddenReuse.some((entry) => entry.includes("broker-credential-state-store")),
+    true,
+  );
+  assert.equal(
+    JSON.stringify(artifact.supportedTargets).toLowerCase().includes("broker"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(nativeArtifactFixture.canonicalTargets).toLowerCase().includes("broker"),
+    false,
+  );
+  assert.equal(
+    nativeArtifactFixture.packedLayoutCases.some((entry) => (
+      entry.extraNativePaths.some((path) => path.includes("relay-v2-broker-"))
+    )),
+    true,
+    "a packed-layout case guards against broker artifact contamination",
   );
 });

@@ -18,12 +18,23 @@ import {
 const targetModule = await import(
   "../dist/relay/v2/brokerCredentialStateStoreNativeTarget.js"
 );
+const hostTargetModule = await import(
+  "../dist/relay/v2/hostCredentialNativeTarget.js"
+);
 
 function descriptor(target) {
   const selected = targetModule
     .getRelayV2BrokerCredentialStateStoreNativeTargetDescriptor(target);
   assert.notEqual(selected, null);
   return selected;
+}
+
+// The same-target frozen Host sibling artifact names come from the Host
+// credential owner's own fixed descriptor module; literals are never copied.
+function siblingFileNames(target) {
+  const host = hostTargetModule.getRelayV2HostCredentialNativeTargetDescriptor(target);
+  assert.notEqual(host, null);
+  return [host.runtimeArtifactFileName];
 }
 
 function machO64(cpuType) {
@@ -105,30 +116,51 @@ test("native packaging reads Mach-O/ELF identity and rejects a selected-target m
   );
 });
 
-test("npm pack native layout contains only the fixed artifact for its selected target", () => {
+test("npm pack native layout is exact per owner with only the same-target frozen sibling allowed", () => {
   const selected = descriptor("darwin-arm64");
   const fixed = "package/dist/relay/v2/native/relay-v2-broker-credential-state-store-v1-darwin-arm64.node";
+  const siblings = siblingFileNames("darwin-arm64");
   const baseEntries = [
     { path: "package/package.json", type: "file", size: 100 },
     { path: "package/dist/cli.cjs", type: "file", size: 100 },
     { path: fixed, type: "file", size: 100 },
   ];
-  assert.equal(validateNpmPackTarEntries(baseEntries, selected), fixed);
+  assert.equal(validateNpmPackTarEntries(baseEntries, selected, siblings), fixed);
 
-  const extras = [
-    "package/dist/relay/v2/native/relay-v2-broker-credential-state-store-v1-darwin-x64.node",
-    "package/dist/relay/v2/native/stale-build.bin",
-    "package/alternate/addon.node",
-    "package/dist/relay/v2/native/raw-binding.dylib",
+  // The same-target frozen Host artifact coexists unverified by this owner.
+  const hostSibling = `package/dist/relay/v2/native/${siblings[0]}`;
+  assert.equal(
+    validateNpmPackTarEntries([
+      ...baseEntries,
+      { path: hostSibling, type: "file", size: 1 },
+    ], selected, siblings),
+    fixed,
+  );
+
+  // A directory entry for the shared native directory itself stays allowed.
+  assert.equal(
+    validateNpmPackTarEntries([
+      ...baseEntries,
+      { path: "package/dist/relay/v2/native", type: "directory", size: 0 },
+    ], selected, siblings),
+    fixed,
+  );
+
+  const wrongTargetHostSibling = `package/dist/relay/v2/native/${siblingFileNames("linux-x64")[0]}`;
+  const rejected = [
+    ["own other-target artifact", { path: "package/dist/relay/v2/native/relay-v2-broker-credential-state-store-v1-darwin-x64.node", type: "file", size: 1 }],
+    ["sibling artifact of the wrong target", { path: wrongTargetHostSibling, type: "file", size: 1 }],
+    ["unknown sibling-named artifact", { path: "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v2-darwin-arm64.node", type: "file", size: 1 }],
+    ["stale build output", { path: "package/dist/relay/v2/native/stale-build.bin", type: "file", size: 1 }],
+    ["alternate addon", { path: "package/alternate/addon.node", type: "file", size: 1 }],
+    ["raw binding library", { path: "package/dist/relay/v2/native/raw-binding.dylib", type: "file", size: 1 }],
+    ["unknown native directory", { path: "package/dist/relay/v2/native/unknown-subdirectory", type: "directory", size: 0 }],
   ];
-  for (const extra of extras) {
+  for (const [label, extra] of rejected) {
     assert.throws(
-      () => validateNpmPackTarEntries([
-        ...baseEntries,
-        { path: extra, type: "file", size: 1 },
-      ], selected),
+      () => validateNpmPackTarEntries([...baseEntries, extra], selected, siblings),
       /exactly the selected native artifact/,
-      extra,
+      label,
     );
   }
 });

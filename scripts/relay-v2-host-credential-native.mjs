@@ -34,9 +34,9 @@ const DIST_LOADER_DIRECTORY = join(REPOSITORY_ROOT, "dist", "relay", "v2");
 const NAPI_CRATE_DIRECTORY = join(
   REPOSITORY_ROOT,
   "native",
-  "relay-v2-broker-credential-state-store-napi",
+  "relay-v2-host-credential-atomic-file-cell-napi",
 );
-const NATIVE_TEST_FILE = "test/relay-v2-broker-credential-state-store-native-binding.test.mjs";
+const NATIVE_TEST_FILE = "test/relay-v2-host-credential-atomic-file-cell-native-binding.test.mjs";
 const FORBIDDEN_LIFECYCLE_SCRIPTS = Object.freeze([
   "prepack",
   "prepare",
@@ -132,7 +132,7 @@ export function assertNativeBinaryMatchesDescriptor(bytes, descriptor) {
 }
 
 function fixedRuntimeArtifactRelativePath(descriptor) {
-  const specifier = descriptor?.runtimeArtifact?.moduleSpecifier;
+  const specifier = descriptor?.loaderModuleSpecifier;
   if (
     typeof specifier !== "string"
     || !specifier.startsWith("./native/")
@@ -141,18 +141,28 @@ function fixedRuntimeArtifactRelativePath(descriptor) {
   ) {
     fail("native target descriptor is invalid");
   }
-  return specifier.slice(2);
+  const relative = specifier.slice(2);
+  if (relative !== `native/${descriptor.runtimeArtifactFileName}`) {
+    fail("native target descriptor is invalid");
+  }
+  return relative;
 }
 
 function fixedStagedArtifactPath(descriptor, loaderDirectory = DIST_LOADER_DIRECTORY) {
-  return join(loaderDirectory, ...fixedRuntimeArtifactRelativePath(descriptor).split("/"));
+  const relative = fixedRuntimeArtifactRelativePath(descriptor);
+  if (descriptor.stagedRelativePath !== `dist/relay/v2/${relative}`) {
+    fail("native target descriptor is invalid");
+  }
+  return join(loaderDirectory, ...relative.split("/"));
 }
 
 function expectedPackedArtifactPath(descriptor) {
-  return posix.join(
-    "package/dist/relay/v2",
-    fixedRuntimeArtifactRelativePath(descriptor),
-  );
+  const relative = fixedRuntimeArtifactRelativePath(descriptor);
+  const packed = posix.join("package/dist/relay/v2", relative);
+  if (descriptor.packedRelativePath !== packed) {
+    fail("native target descriptor is invalid");
+  }
+  return packed;
 }
 
 function normalizeTarEntry(entry) {
@@ -246,8 +256,9 @@ async function assertRegularFileNoFollow(path, purpose, requireSingleLink = fals
 
 async function assertLoaderBuildExists() {
   for (const name of [
-    "brokerCredentialStateStoreLoader.js",
-    "brokerCredentialStateStoreNativeTarget.js",
+    "hostCredentialNativeLoader.js",
+    "hostCredentialNativeTarget.js",
+    "hostCredentialNativeModuleSource.js",
   ]) {
     await assertRegularFileNoFollow(
       join(DIST_LOADER_DIRECTORY, name),
@@ -352,6 +363,26 @@ function runCaptured(command, args, options = {}) {
 async function loadTargetDescriptor(target) {
   const modulePath = join(
     DIST_LOADER_DIRECTORY,
+    "hostCredentialNativeTarget.js",
+  );
+  let targetModule;
+  try {
+    targetModule = await import(pathToFileURL(modulePath).href);
+  } catch {
+    fail("ordinary npm build output is required before native staging");
+  }
+  const descriptor = targetModule
+    .getRelayV2HostCredentialNativeTargetDescriptor(target);
+  if (descriptor === null) fail("native target is unsupported");
+  return descriptor;
+}
+
+// The frozen sibling-owner artifact name for the exact same target is
+// enumerated from the broker's own fixed target descriptor module; literals
+// are never copied here, and no other target's artifact is ever allowed.
+async function loadSiblingFrozenArtifactNames(target) {
+  const modulePath = join(
+    DIST_LOADER_DIRECTORY,
     "brokerCredentialStateStoreNativeTarget.js",
   );
   let targetModule;
@@ -361,9 +392,17 @@ async function loadTargetDescriptor(target) {
     fail("ordinary npm build output is required before native staging");
   }
   const descriptor = targetModule
-    .getRelayV2BrokerCredentialStateStoreNativeTargetDescriptor(target);
-  if (descriptor === null) fail("native target is unsupported");
-  return descriptor;
+    .getRelayV2BrokerCredentialStateStoreNativeTargetDescriptor?.(target);
+  const specifier = descriptor?.runtimeArtifact?.moduleSpecifier;
+  if (
+    typeof specifier !== "string"
+    || !specifier.startsWith("./native/")
+    || specifier.includes("\\")
+    || specifier.split("/").some((component) => component === ".." || component === "")
+  ) {
+    fail("frozen sibling native target descriptor is invalid");
+  }
+  return Object.freeze([specifier.slice("./native/".length)]);
 }
 
 function parseTargetArgument(args) {
@@ -376,34 +415,6 @@ function parseTargetArgument(args) {
     fail("exactly one explicit --target is required");
   }
   return args[1];
-}
-
-// The frozen sibling-owner artifact name for the exact same target is
-// enumerated from the Host credential owner's own fixed target descriptor
-// module; literals are never copied here, and no other target's artifact is
-// ever allowed.
-async function loadSiblingFrozenArtifactNames(target) {
-  const modulePath = join(
-    DIST_LOADER_DIRECTORY,
-    "hostCredentialNativeTarget.js",
-  );
-  let targetModule;
-  try {
-    targetModule = await import(pathToFileURL(modulePath).href);
-  } catch {
-    fail("ordinary npm build output is required before native staging");
-  }
-  const descriptor = targetModule
-    .getRelayV2HostCredentialNativeTargetDescriptor?.(target);
-  if (
-    typeof descriptor?.runtimeArtifactFileName !== "string"
-    || descriptor.runtimeArtifactFileName.length === 0
-    || descriptor.runtimeArtifactFileName.includes("/")
-    || descriptor.runtimeArtifactFileName.includes("\\")
-  ) {
-    fail("frozen sibling native target descriptor is invalid");
-  }
-  return Object.freeze([descriptor.runtimeArtifactFileName]);
 }
 
 async function stage(target) {
@@ -475,6 +486,18 @@ function sameStringArray(left, right) {
     && left.every((value, index) => typeof value === "string" && value === right[index]);
 }
 
+const DESCRIPTOR_FIELDS = Object.freeze([
+  "target",
+  "platform",
+  "architecture",
+  "cargoTargetTriple",
+  "cargoDynamicLibraryFileName",
+  "runtimeArtifactFileName",
+  "loaderModuleSpecifier",
+  "stagedRelativePath",
+  "packedRelativePath",
+]);
+
 async function verifyUnpackedPackage(
   extractedFiles,
   tarEntries,
@@ -488,21 +511,21 @@ async function verifyUnpackedPackage(
     siblingFileNames,
   );
   const packageJsonPath = extractedFiles.get("package/package.json");
-  const stateStoreModule = extractedFiles.get(
-    "package/dist/relay/v2/brokerCredentialStateStore.js",
+  const targetModule = extractedFiles.get(
+    "package/dist/relay/v2/hostCredentialNativeTarget.js",
   );
   const loaderModule = extractedFiles.get(
-    "package/dist/relay/v2/brokerCredentialStateStoreLoader.js",
+    "package/dist/relay/v2/hostCredentialNativeLoader.js",
   );
-  const targetModule = extractedFiles.get(
-    "package/dist/relay/v2/brokerCredentialStateStoreNativeTarget.js",
+  const holderModule = extractedFiles.get(
+    "package/dist/relay/v2/hostCredentialNativeModuleSource.js",
   );
   const artifact = extractedFiles.get(expectedTarArtifact);
   if (
     packageJsonPath === undefined
-    || stateStoreModule === undefined
-    || loaderModule === undefined
     || targetModule === undefined
+    || loaderModule === undefined
+    || holderModule === undefined
     || artifact === undefined
   ) {
     fail("npm pack tarball is missing required packed modules");
@@ -540,7 +563,7 @@ async function verifyUnpackedPackage(
     (bytes) => assertNativeBinaryMatchesDescriptor(bytes, descriptor),
     { requireSingleLink: true },
   );
-  return Object.freeze({ artifact, stateStoreModule, loaderModule });
+  return Object.freeze({ artifact, targetModule, loaderModule, holderModule });
 }
 
 function parsePackOutput(stdout, packDirectory) {
@@ -562,6 +585,90 @@ function parsePackOutput(stdout, packDirectory) {
     fail("npm pack did not produce exactly one tarball");
   }
   return join(packDirectory, records[0].filename);
+}
+
+function exactOwnDataKeys(value) {
+  if (value === null || typeof value !== "object") return null;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const descriptor of Object.values(descriptors)) {
+    if (!Object.hasOwn(descriptor, "value")) return null;
+  }
+  return Reflect.ownKeys(descriptors).sort();
+}
+
+async function verifyUnpackedClosedBinding(unpacked, descriptor) {
+  let unpackedTarget;
+  let unpackedLoader;
+  let unpackedHolder;
+  try {
+    unpackedTarget = await import(pathToFileURL(unpacked.targetModule).href);
+    unpackedLoader = await import(pathToFileURL(unpacked.loaderModule).href);
+    unpackedHolder = await import(pathToFileURL(unpacked.holderModule).href);
+  } catch {
+    fail("unpacked fixed native modules could not be imported");
+  }
+  const packedDescriptor = unpackedTarget
+    .getRelayV2HostCredentialNativeTargetDescriptor?.(descriptor.target);
+  if (
+    packedDescriptor === null
+    || packedDescriptor === undefined
+    || DESCRIPTOR_FIELDS.some((field) => packedDescriptor[field] !== descriptor[field])
+  ) {
+    fail("unpacked native target descriptor does not match the repository descriptor");
+  }
+  const fixedLoader = unpackedLoader.relayV2HostCredentialNativeModuleFixedLoader;
+  const createSource = unpackedHolder.createRelayV2HostCredentialNativeModuleSource;
+  const openMethodName = unpackedHolder.RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_OPEN_METHOD;
+  if (typeof fixedLoader !== "function"
+    || typeof createSource !== "function"
+    || openMethodName !== "openRelayV2HostCredentialAtomicFileCellV1") {
+    fail("unpacked fixed native loader surface is invalid");
+  }
+  const source = createSource(
+    Object.freeze({
+      platform: process.platform,
+      architecture: process.arch,
+      napiVersion: Number(process.versions.napi),
+    }),
+    fixedLoader,
+  );
+  if (source?.capability?.().status !== "supported") {
+    fail("unpacked fixed native loader did not load its same-package artifact");
+  }
+  let nativeModule;
+  try {
+    nativeModule = source.takeNativeModule();
+  } catch {
+    fail("unpacked native module source did not deliver its same-package artifact");
+  }
+  if (exactOwnDataKeys(nativeModule)?.length !== 1
+    || exactOwnDataKeys(nativeModule)[0] !== openMethodName
+    || typeof nativeModule[openMethodName] !== "function") {
+    fail("unpacked native module ABI is invalid");
+  }
+  let openResult;
+  try {
+    openResult = nativeModule[openMethodName](Object.freeze({
+      abiVersion: 1,
+      operation: "open",
+    }));
+  } catch {
+    fail("unpacked native module open did not return a closed result");
+  }
+  const resultKeys = exactOwnDataKeys(openResult);
+  const errorKeys = exactOwnDataKeys(openResult?.error);
+  if (
+    resultKeys === null
+    || resultKeys.join(",") !== "abiVersion,error,operation,outcome"
+    || openResult.abiVersion !== 1
+    || openResult.operation !== "open"
+    || openResult.outcome !== "error"
+    || errorKeys === null
+    || errorKeys.join(",") !== "code"
+    || openResult.error.code !== "CELL_DURABILITY_UNSUPPORTED"
+  ) {
+    fail("unpacked native module open did not fail closed before qualification");
+  }
 }
 
 async function verifyPack(target) {
@@ -610,9 +717,9 @@ async function verifyPack(target) {
       const expectedArtifact = expectedPackedArtifactPath(descriptor);
       const selectedPaths = [
         "package/package.json",
-        "package/dist/relay/v2/brokerCredentialStateStore.js",
-        "package/dist/relay/v2/brokerCredentialStateStoreLoader.js",
-        "package/dist/relay/v2/brokerCredentialStateStoreNativeTarget.js",
+        "package/dist/relay/v2/hostCredentialNativeTarget.js",
+        "package/dist/relay/v2/hostCredentialNativeLoader.js",
+        "package/dist/relay/v2/hostCredentialNativeModuleSource.js",
         expectedArtifact,
       ];
       inspection = await inspectAndExtractNpmPackTar({
@@ -643,31 +750,17 @@ async function verifyPack(target) {
       sourcePackageJson,
       siblingFileNames,
     );
-
-    let unpackedLoader;
-    try {
-      unpackedLoader = await import(pathToFileURL(unpacked.loaderModule).href);
-    } catch {
-      fail("unpacked fixed native loader could not be imported");
-    }
-    const packedCapability = unpackedLoader
-      .relayV2BrokerCredentialStateStoreNativeLoader
-      ?.capability?.();
-    if (packedCapability?.status !== "supported") {
-      fail("unpacked fixed native loader did not load its same-package artifact");
-    }
+    await verifyUnpackedClosedBinding(unpacked, descriptor);
     runCaptured(
       process.execPath,
       ["--test", "--test-concurrency=1", NATIVE_TEST_FILE],
       {
         env: {
           ...process.env,
-          RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_ARTIFACT: unpacked.artifact,
-          RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_STATE_STORE_MODULE:
-            unpacked.stateStoreModule,
-          RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_EXPECTED_PLATFORM:
+          RELAY_V2_HOST_CREDENTIAL_NATIVE_TEST_ARTIFACT: unpacked.artifact,
+          RELAY_V2_HOST_CREDENTIAL_NATIVE_TEST_EXPECTED_PLATFORM:
             descriptor.platform,
-          RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_EXPECTED_ARCHITECTURE:
+          RELAY_V2_HOST_CREDENTIAL_NATIVE_TEST_EXPECTED_ARCHITECTURE:
             descriptor.architecture,
         },
         failureMessage: "unpacked actual native-binding focused test failed",

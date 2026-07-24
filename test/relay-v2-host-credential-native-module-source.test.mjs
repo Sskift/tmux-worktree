@@ -65,6 +65,8 @@ test("injected descriptor, supported/unsupported capability, and memoization", (
   // artifact specifier or path exists anywhere on it.
   const cases = [
     ["darwin", "arm64", "darwin-arm64", "aarch64-apple-darwin"],
+    ["darwin", "x64", "darwin-x64", "x86_64-apple-darwin"],
+    ["linux", "arm64", "linux-arm64", "aarch64-unknown-linux-gnu"],
     ["linux", "x64", "linux-x64", "x86_64-unknown-linux-gnu"],
   ];
   for (const [platform, architecture, expectedTarget, cargoTargetTriple] of cases) {
@@ -89,7 +91,7 @@ test("injected descriptor, supported/unsupported capability, and memoization", (
       target: expectedTarget,
       platform,
       architecture,
-      contractRevision: 5,
+      contractRevision: 6,
       abi: "napi",
       abiVersion: 1,
     });

@@ -305,6 +305,13 @@ async function cleanupBeforeCommit(created, handles) {
   if (created.finalDirectory !== undefined) {
     if (created.finalDirectory.identity === undefined) {
       failures.push("native final directory identity was not established; preserved");
+    } else if (
+      created.finalDirectory.preExistingNames !== null
+      && created.finalDirectory.preExistingNames !== undefined
+    ) {
+      // An adopted pre-existing final directory is never removed; only its
+      // held descriptor is closed.
+      await closeRecordedHandle(created.finalDirectory, failures);
     } else {
       try {
         await removeOwnedDirectory(handles.loaderDirectory, created.finalDirectory);
@@ -376,12 +383,17 @@ export async function verifyNativeArtifactFd(path, verifyHeader, options = {}) {
 /**
  * All byte/header/digest/layout proof precedes the hard-link commit point.
  * After link succeeds, the final name is never rolled back; only the private
- * random temporary directory is identity-checked and removed.
+ * random temporary directory is identity-checked and removed. When the final
+ * directory already exists, it is adopted only if every pre-existing entry is
+ * in allowedPreExistingFinalEntries (frozen sibling-owner artifact names); an
+ * adopted directory is never replaced or removed by cleanup, and the commit
+ * still adds only the new final name.
  */
 export async function atomicallyStageFdOwnedNativeArtifact({
   sourcePath,
   finalPath,
   verifyHeader,
+  allowedPreExistingFinalEntries = [],
 }) {
   const finalDirectoryPath = dirname(finalPath);
   const loaderDirectoryPath = dirname(finalDirectoryPath);
@@ -403,8 +415,33 @@ export async function atomicallyStageFdOwnedNativeArtifact({
       "ordinary build loader directory",
     );
 
-    await verifyDirectory(handles.loaderDirectory);
-    await mkdir(finalDirectoryPath, { mode: 0o700 });
+    const allowedPreExisting = new Set(allowedPreExistingFinalEntries);
+    let preExistingFinalNames = null;
+    try {
+      await lstat(finalDirectoryPath);
+      preExistingFinalNames = (await readdir(finalDirectoryPath)).sort();
+    } catch {
+      preExistingFinalNames = null;
+    }
+    if (preExistingFinalNames === null) {
+      await verifyDirectory(handles.loaderDirectory);
+      await mkdir(finalDirectoryPath, { mode: 0o700 });
+    } else {
+      if (preExistingFinalNames.some((name) => !allowedPreExisting.has(name))) {
+        fail("native final directory contains stale or unknown entries");
+      }
+      for (const name of preExistingFinalNames) {
+        let status;
+        try {
+          status = await lstat(join(finalDirectoryPath, name));
+        } catch {
+          fail("native final directory entry cannot be inspected");
+        }
+        if (!status.isFile() || status.isSymbolicLink()) {
+          fail("native final directory entry is not a regular sibling artifact");
+        }
+      }
+    }
     created.finalDirectory = {
       path: finalDirectoryPath,
       purpose: "native final directory",
@@ -416,6 +453,7 @@ export async function atomicallyStageFdOwnedNativeArtifact({
       "native final directory",
       true,
     );
+    created.finalDirectory.preExistingNames = preExistingFinalNames;
     await verifyDirectory(handles.loaderDirectory);
 
     await verifyDirectory(handles.loaderDirectory);
@@ -507,10 +545,18 @@ export async function atomicallyStageFdOwnedNativeArtifact({
       created.temporaryFile.identity,
       "native staging temporary",
     );
-    const finalNames = await readdir(created.finalDirectory.path);
+    const finalNames = (await readdir(created.finalDirectory.path)).sort();
     const temporaryNames = await readdir(created.temporaryDirectory.path);
-    if (finalNames.length !== 0) {
-      fail("native final directory is not empty before publication");
+    const expectedPreExisting = created.finalDirectory.preExistingNames;
+    if (expectedPreExisting === null || expectedPreExisting === undefined) {
+      if (finalNames.length !== 0) {
+        fail("native final directory is not empty before publication");
+      }
+    } else if (
+      finalNames.length !== expectedPreExisting.length
+      || finalNames.some((name, index) => name !== expectedPreExisting[index])
+    ) {
+      fail("native final directory contents changed before publication");
     }
     if (temporaryNames.length !== 1 || temporaryNames[0] !== basename(temporaryPath)) {
       fail("private native staging directory contains an unknown entry");

@@ -354,7 +354,17 @@ npm run build:relay-v2-broker-credential-native -- --target darwin-arm64
 npm run verify:relay-v2-broker-credential-native-pack -- --target darwin-arm64
 ```
 
-The opt-in stage command builds the target's locked Rust release artifact, verifies its Mach-O/ELF target identity, and publishes the one fixed loader-relative `.node` at a hard-link commit point after all byte and empty-layout checks. It never rolls back the final name after that commit and only identity-checks cleanup of its private random staging directory. The pack verifier runs `npm pack --ignore-scripts` in its own temporary directory, accepts only bounded pure-ustar regular/directory entries, streams an exact file allowlist into inspector-created directories, checks the fixed tar/unpacked layout, imports the unpacked fixed loader, and runs the focused closed native-binding test against unpacked JavaScript and native artifacts. This Node-only foundation detects and preserves observed identity replacements, but does not claim protection against a malicious same-uid final-directory rename race because Node exposes no `openat/linkat/unlinkat` path.
+The opt-in stage command builds the target's locked Rust release artifact, verifies its Mach-O/ELF target identity, and publishes the one fixed loader-relative `.node` at a hard-link commit point after all byte and empty-layout checks. It never rolls back the final name after that commit and only identity-checks cleanup of its private random staging directory. Each owner verifies exactly its own selected artifact: within the shared `dist/relay/v2/native` directory and the packed tar, only the same-target frozen artifact of the other credential owner may coexist (enumerated from that owner's fixed descriptor module, never content-verified here), while unknown, duplicate, wrong-target, or non-regular entries are rejected, and a pre-existing directory is adopted only when it holds allowed siblings. The pack verifier runs `npm pack --ignore-scripts` in its own temporary directory, accepts only bounded pure-ustar regular/directory entries, streams an exact file allowlist into inspector-created directories, checks the fixed tar/unpacked layout, imports the unpacked fixed loader, and runs the focused closed native-binding test against unpacked JavaScript and native artifacts. This Node-only foundation detects and preserves observed identity replacements, but does not claim protection against a malicious same-uid final-directory rename race because Node exposes no `openat/linkat/unlinkat` path.
+
+The Host credential N-API artifact has the same kind of separate, explicitly unwired local-target flow in its own namespace; its closed binding fails at the empty durability allowlist before any registry or credential mutation:
+
+```bash
+npm run build
+npm run build:relay-v2-host-credential-native -- --target darwin-arm64
+npm run verify:relay-v2-host-credential-native-pack -- --target darwin-arm64
+```
+
+It reuses the same fd-owned staging and bounded ustar inspection boundaries, checks the Host fixed descriptor, binary header, tar and unpacked layout with the same per-owner exact-artifact rule (its own selected artifact plus only the same-target frozen Broker sibling), imports the unpacked Host fixed loader and holder to prove the packed artifact loads and fails closed with `CELL_DURABILITY_UNSUPPORTED`, and then runs the focused Host native-binding test. It is likewise absent from the ordinary build, npm lifecycle, Dashboard bundle, and production Relay runtime, and creates no qualification, readiness, or capability.
 
 Run the Dashboard:
 
@@ -504,12 +514,18 @@ source/holder now fills the injected-source gap above: it declares only
 contract-fact target descriptors and exact target/platform/contract-revision/ABI
 capability, loads at most once through the injected loader, transfers the exact
 module identity one-shot to the existing bridge, and recycles bounded and fail
-closed on failure or close. It declares no artifact identity and ships no
-production source: this revision still has no Host credential N-API crate, real
-artifact, or build/stage/pack flow, and connecting one is blocked on a new
-contract revision freezing build-stage-pack identity (descriptor/digest/layout)
-plus the N-API crate and durability qualification; it is wired nowhere and
-creates no qualification, readiness, capability, or fallback.
+closed on failure or close. Contract revision 6 now freezes the Host native
+artifact identity (four fixed target descriptors plus binary, digest, layout,
+and loader rules); the Host N-API crate, the JS fixed target descriptor module,
+the fixed loader, and the local-target build/stage/pack verification foundation
+exist as default-off, unwired foundations, and the fixed loader is a narrow
+source a trusted deployment may explicitly select. Verified evidence covers
+only this machine's single target (darwin-arm64) and proves only that the
+packed artifact loads and fails closed before registry or mutation:
+`qualifiedRecords=[]`, a trusted production factory, durability qualification,
+real open, evidence for the other three targets, signing/notarization,
+bit-reproducibility, Dashboard bundling, and production wiring are all still
+missing, so the NO-GO status is unchanged.
 
 The Broker likewise has one explicit default-off activated server composition
 and a public lifecycle root that adopts an otherwise-unowned, caller-supplied

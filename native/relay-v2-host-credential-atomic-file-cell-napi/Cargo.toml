@@ -1,0 +1,16 @@
+[package]
+name = "relay-v2-host-credential-atomic-file-cell-napi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.10.5", default-features = false, features = ["napi9"] }
+napi-derive = { version = "3.5.7", default-features = false }
+relay-v2-host-credential-atomic-file-cell-platform-common = { path = "../relay-v2-host-credential-atomic-file-cell-platform-common" }
+
+[build-dependencies]
+napi-build = "2.3.2"

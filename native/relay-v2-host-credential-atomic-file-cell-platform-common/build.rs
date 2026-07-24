@@ -45,6 +45,15 @@ fn exact_string_array(value: &Value, label: &str, expected: &[&str]) {
     }
 }
 
+fn no_broker_namespace<'a>(value: &'a Value, label: &str) -> &'a str {
+    let text = string(value, label);
+    assert!(
+        !text.to_ascii_lowercase().contains("broker"),
+        "{label} must not reuse the broker namespace"
+    );
+    text
+}
+
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let contract_dir =
@@ -52,9 +61,11 @@ fn main() {
     let manifest_path = format!("{contract_dir}/manifest.json");
     let journal_path = format!("{contract_dir}/claim-journal-v1.json");
     let mutation_path = format!("{contract_dir}/credential-mutation-cases-v1.json");
+    let artifact_path = format!("{contract_dir}/native-artifact-cases-v1.json");
     println!("cargo:rerun-if-changed={manifest_path}");
     println!("cargo:rerun-if-changed={journal_path}");
     println!("cargo:rerun-if-changed={mutation_path}");
+    println!("cargo:rerun-if-changed={artifact_path}");
 
     let manifest: Value = serde_json::from_slice(
         &fs::read(&manifest_path).expect("read host credential cell manifest"),
@@ -66,7 +77,7 @@ fn main() {
     );
     assert_eq!(
         unsigned(member(&manifest, "contractVersion"), "contractVersion"),
-        5
+        6
     );
     assert_eq!(member(&manifest, "status"), "frozen");
     assert_eq!(member(&manifest, "productionWired"), false);
@@ -149,7 +160,7 @@ fn main() {
             .as_array()
             .expect("qualifiedRecords array")
             .is_empty(),
-        "contract revision 5 must remain deny-by-default"
+        "contract revision 6 must remain deny-by-default"
     );
     let target_facts = member(platform, "targetFacts");
     for target in ["darwin", "linux"] {
@@ -244,8 +255,6 @@ fn main() {
             "orphan-cleanup-or-recovery",
             "production-durability-qualification",
             "continuity",
-            "napi-binding",
-            "loader-or-packaging",
             "vault-injection",
             "relay-host-production-composition",
             "capability-advertisement",
@@ -445,7 +454,7 @@ fn main() {
             .as_array()
             .expect("credential mutation qualifiedRecords array")
             .is_empty(),
-        "contract revision 5 credential mutation must remain deny-by-default"
+        "contract revision 6 credential mutation must remain deny-by-default"
     );
     assert_eq!(
         member(mutation_qualification, "productionProofConstructible"),
@@ -462,8 +471,174 @@ fn main() {
         "none"
     );
 
+    let artifact_manifest = member(&manifest, "nativeArtifact");
+    assert_eq!(
+        unsigned(
+            member(artifact_manifest, "contractVersion"),
+            "nativeArtifact.contractVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(artifact_manifest, "fixtureFormatVersion"),
+            "nativeArtifact.fixtureFormatVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        member(artifact_manifest, "fixture"),
+        "native-artifact-cases-v1.json"
+    );
+    let artifact_targets = member(artifact_manifest, "supportedTargets")
+        .as_array()
+        .expect("nativeArtifact supportedTargets array");
+    assert_eq!(
+        artifact_targets.len(),
+        4,
+        "nativeArtifact supportedTargets length changed"
+    );
+    for (index, expected) in ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]
+        .iter()
+        .enumerate()
+    {
+        let target = &artifact_targets[index];
+        assert_eq!(
+            no_broker_namespace(member(target, "target"), "nativeArtifact target"),
+            *expected,
+            "nativeArtifact supportedTargets[{index}] changed"
+        );
+        for field in [
+            "platform",
+            "architecture",
+            "cargoTargetTriple",
+            "cargoDynamicLibraryFileName",
+            "runtimeArtifactFileName",
+            "loaderModuleSpecifier",
+            "stagedRelativePath",
+            "packedRelativePath",
+        ] {
+            no_broker_namespace(member(target, field), "nativeArtifact target field");
+        }
+    }
+    let artifact_crate = member(artifact_manifest, "crate");
+    assert_eq!(
+        no_broker_namespace(member(artifact_crate, "path"), "nativeArtifact crate path"),
+        "native/relay-v2-host-credential-atomic-file-cell-napi"
+    );
+    assert_eq!(
+        no_broker_namespace(
+            member(artifact_crate, "packageName"),
+            "nativeArtifact crate packageName"
+        ),
+        "relay-v2-host-credential-atomic-file-cell-napi"
+    );
+    assert_eq!(
+        unsigned(
+            member(artifact_crate, "minimumNapiVersion"),
+            "nativeArtifact crate minimumNapiVersion"
+        ),
+        9
+    );
+    assert_eq!(
+        unsigned(
+            member(artifact_crate, "abiVersion"),
+            "nativeArtifact crate abiVersion"
+        ),
+        1
+    );
+    let artifact_layout = member(artifact_manifest, "layout");
+    assert_eq!(
+        member(artifact_layout, "stagedNativeDirectory"),
+        "dist/relay/v2/native"
+    );
+    for layout_key in ["stagedDirectoryEntries", "packedNativeSubsetEntries"] {
+        assert_eq!(
+            member(artifact_layout, layout_key),
+            "exactly-one-selected-target-runtime-artifact-of-this-owner-plus-the-same-target-frozen-sibling-owner-artifact-only",
+            "nativeArtifact layout per-owner rule changed"
+        );
+    }
+    assert_eq!(
+        member(artifact_layout, "coexistingFrozenOwnerArtifacts").as_str().expect("coexisting rule string"),
+        "the-same-target-relay-v2-broker-credential-state-store-v1-artifact-file-name-enumerated-from-the-frozen-broker-target-descriptor-module-never-copied-never-content-verified-by-this-owner"
+    );
+    assert_eq!(
+        member(artifact_layout, "unknownDuplicateOrWrongTargetEntries"),
+        "rejected"
+    );
+    assert_eq!(member(artifact_layout, "npmLifecycleScriptAllowed"), false);
+
+    let artifact_effect = member(artifact_manifest, "qualificationReadinessCapabilityEffect");
+    assert_eq!(
+        member(
+            artifact_effect,
+            "artifactExistenceOrLoadabilityCreatesQualification"
+        ),
+        false
+    );
+    assert_eq!(
+        member(
+            artifact_effect,
+            "artifactExistenceOrLoadabilityCreatesReadinessOrCapability"
+        ),
+        false
+    );
+    assert_eq!(
+        member(
+            artifact_effect,
+            "durabilityQualificationQualifiedRecordsUnchangedEmpty"
+        ),
+        true
+    );
+    assert_eq!(
+        member(
+            artifact_effect,
+            "productionOpenMustFailBeforeRegistryOrCredentialMutation"
+        ),
+        "CELL_DURABILITY_UNSUPPORTED"
+    );
+    assert_eq!(member(artifact_manifest, "productionWired"), false);
+    assert_eq!(
+        member(artifact_manifest, "productionCapabilityEffect"),
+        "none"
+    );
+
+    let artifact_fixture: Value =
+        serde_json::from_slice(&fs::read(&artifact_path).expect("read native artifact fixture"))
+            .expect("parse native artifact fixture");
+    assert_eq!(
+        unsigned(
+            member(&artifact_fixture, "fixtureFormatVersion"),
+            "native artifact fixture version"
+        ),
+        1
+    );
+    assert_eq!(
+        unsigned(
+            member(&artifact_fixture, "nativeArtifactContractVersion"),
+            "native artifact fixture contract version"
+        ),
+        1
+    );
+    let fixture_targets = member(&artifact_fixture, "canonicalTargets")
+        .as_array()
+        .expect("native artifact fixture canonicalTargets array");
+    assert_eq!(
+        fixture_targets.len(),
+        artifact_targets.len(),
+        "native artifact fixture canonicalTargets length changed"
+    );
+    for (fixture_target, manifest_target) in fixture_targets.iter().zip(artifact_targets.iter()) {
+        assert_eq!(
+            member(fixture_target, "target"),
+            member(manifest_target, "target"),
+            "native artifact fixture canonicalTargets order changed"
+        );
+    }
+
     let mut generated = String::new();
-    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 5;").unwrap();
+    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 6;").unwrap();
     writeln!(
         generated,
         "pub(super) const RESOURCE_CONTRACT_VERSION: u32 = 1;"

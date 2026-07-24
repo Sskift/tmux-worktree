@@ -1,0 +1,339 @@
+{
+  "fixtureFormatVersion": 1,
+  "nativeArtifactContractVersion": 1,
+  "canonicalTargets": [
+    {
+      "target": "darwin-arm64",
+      "platform": "darwin",
+      "architecture": "arm64",
+      "cargoTargetTriple": "aarch64-apple-darwin",
+      "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.dylib",
+      "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+      "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+      "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+      "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node"
+    },
+    {
+      "target": "darwin-x64",
+      "platform": "darwin",
+      "architecture": "x64",
+      "cargoTargetTriple": "x86_64-apple-darwin",
+      "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.dylib",
+      "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node",
+      "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node",
+      "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node",
+      "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node"
+    },
+    {
+      "target": "linux-arm64",
+      "platform": "linux",
+      "architecture": "arm64",
+      "cargoTargetTriple": "aarch64-unknown-linux-gnu",
+      "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.so",
+      "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node",
+      "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node",
+      "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node",
+      "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-arm64.node"
+    },
+    {
+      "target": "linux-x64",
+      "platform": "linux",
+      "architecture": "x64",
+      "cargoTargetTriple": "x86_64-unknown-linux-gnu",
+      "cargoDynamicLibraryFileName": "librelay_v2_host_credential_atomic_file_cell_napi.so",
+      "runtimeArtifactFileName": "relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node",
+      "loaderModuleSpecifier": "./native/relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node",
+      "stagedRelativePath": "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node",
+      "packedRelativePath": "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-linux-x64.node"
+    }
+  ],
+  "binaryHeaderCases": [
+    {
+      "name": "macho-little-endian-arm64-dylib-accepted",
+      "header": {
+        "family": "macho",
+        "byteOrder": "little",
+        "cpuType": "0x0100000C",
+        "fileType": 6
+      },
+      "accepted": true,
+      "platform": "darwin",
+      "architecture": "arm64"
+    },
+    {
+      "name": "macho-big-endian-arm64-dylib-accepted",
+      "header": {
+        "family": "macho",
+        "byteOrder": "big",
+        "cpuType": "0x0100000C",
+        "fileType": 6
+      },
+      "accepted": true,
+      "platform": "darwin",
+      "architecture": "arm64"
+    },
+    {
+      "name": "macho-little-endian-x64-dylib-accepted",
+      "header": {
+        "family": "macho",
+        "byteOrder": "little",
+        "cpuType": "0x01000007",
+        "fileType": 6
+      },
+      "accepted": true,
+      "platform": "darwin",
+      "architecture": "x64"
+    },
+    {
+      "name": "macho-executable-rejected",
+      "header": {
+        "family": "macho",
+        "byteOrder": "little",
+        "cpuType": "0x0100000C",
+        "fileType": 2
+      },
+      "accepted": false
+    },
+    {
+      "name": "macho-unknown-cpu-rejected",
+      "header": {
+        "family": "macho",
+        "byteOrder": "little",
+        "cpuType": "0x0000000C",
+        "fileType": 6
+      },
+      "accepted": false
+    },
+    {
+      "name": "elf-aarch64-shared-object-accepted",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 0,
+        "type": 3,
+        "version": 1,
+        "machine": 183
+      },
+      "accepted": true,
+      "platform": "linux",
+      "architecture": "arm64"
+    },
+    {
+      "name": "elf-x86-64-shared-object-system-v-accepted",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 0,
+        "type": 3,
+        "version": 1,
+        "machine": 62
+      },
+      "accepted": true,
+      "platform": "linux",
+      "architecture": "x64"
+    },
+    {
+      "name": "elf-x86-64-shared-object-linux-gnu-accepted",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 3,
+        "type": 3,
+        "version": 1,
+        "machine": 62
+      },
+      "accepted": true,
+      "platform": "linux",
+      "architecture": "x64"
+    },
+    {
+      "name": "elf-executable-rejected",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 0,
+        "type": 2,
+        "version": 1,
+        "machine": 62
+      },
+      "accepted": false
+    },
+    {
+      "name": "elf-32-bit-rejected",
+      "header": {
+        "family": "elf",
+        "class": 1,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 0,
+        "type": 3,
+        "version": 1,
+        "machine": 62
+      },
+      "accepted": false
+    },
+    {
+      "name": "elf-big-endian-rejected",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 2,
+        "headerVersion": 1,
+        "osAbi": 0,
+        "type": 3,
+        "version": 1,
+        "machine": 62
+      },
+      "accepted": false
+    },
+    {
+      "name": "elf-unsupported-os-abi-rejected",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 1,
+        "type": 3,
+        "version": 1,
+        "machine": 62
+      },
+      "accepted": false
+    },
+    {
+      "name": "elf-unknown-machine-rejected",
+      "header": {
+        "family": "elf",
+        "class": 2,
+        "data": 1,
+        "headerVersion": 1,
+        "osAbi": 0,
+        "type": 3,
+        "version": 1,
+        "machine": 243
+      },
+      "accepted": false
+    },
+    {
+      "name": "non-native-format-rejected",
+      "header": {
+        "family": "unknown"
+      },
+      "accepted": false
+    }
+  ],
+  "packedLayoutCases": [
+    {
+      "name": "exact-single-selected-artifact-accepted",
+      "selectedTarget": "darwin-arm64",
+      "extraNativePaths": [],
+      "accepted": true
+    },
+    {
+      "name": "frozen-broker-sibling-same-target-accepted",
+      "selectedTarget": "darwin-arm64",
+      "brokerSiblingTarget": "darwin-arm64",
+      "extraNativePaths": [],
+      "accepted": true
+    },
+    {
+      "name": "broker-sibling-wrong-target-rejected",
+      "selectedTarget": "darwin-arm64",
+      "brokerSiblingTarget": "linux-x64",
+      "extraNativePaths": [],
+      "accepted": false
+    },
+    {
+      "name": "second-host-target-artifact-rejected",
+      "selectedTarget": "darwin-arm64",
+      "extraNativePaths": [
+        "package/dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-x64.node"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "unknown-sibling-named-artifact-rejected",
+      "selectedTarget": "darwin-arm64",
+      "extraNativePaths": [
+        "package/dist/relay/v2/native/relay-v2-broker-credential-state-store-v2-darwin-arm64.node"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "unknown-native-directory-entry-rejected",
+      "selectedTarget": "darwin-arm64",
+      "extraNativeDirectories": [
+        "package/dist/relay/v2/native/unknown-subdirectory"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "private-staging-entry-rejected",
+      "selectedTarget": "darwin-arm64",
+      "extraNativePaths": [
+        "package/dist/relay/v2/.relay-v2-native-stage-0-00000000-0000-0000-0000-000000000000-/artifact.tmp"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "alternate-node-addon-rejected",
+      "selectedTarget": "darwin-arm64",
+      "extraNativePaths": [
+        "package/alternate/addon.node"
+      ],
+      "accepted": false
+    }
+  ],
+  "loaderCases": [
+    {
+      "name": "fixed-artifact-resolve-missing-is-native-artifact-missing",
+      "resolveErrorCode": "MODULE_NOT_FOUND",
+      "expectedLoaderOutcome": "missing",
+      "expectedHolderCapability": {
+        "status": "unsupported",
+        "reason": "native_artifact_missing"
+      }
+    },
+    {
+      "name": "resolve-failure-is-redacted-invalid",
+      "resolveErrorCode": "EACCES",
+      "expectedLoaderOutcome": "throw",
+      "expectedHolderCapability": {
+        "status": "invalid",
+        "error": {
+          "code": "NATIVE_INTERFACE_INVALID"
+        }
+      }
+    },
+    {
+      "name": "load-failure-is-redacted-invalid",
+      "loadErrorCode": "ERR_DLOPEN_FAILED",
+      "expectedLoaderOutcome": "throw",
+      "expectedHolderCapability": {
+        "status": "invalid",
+        "error": {
+          "code": "NATIVE_INTERFACE_INVALID"
+        }
+      }
+    },
+    {
+      "name": "invalid-resolved-identity-is-redacted-invalid",
+      "resolvedIdentity": "",
+      "expectedLoaderOutcome": "throw",
+      "expectedHolderCapability": {
+        "status": "invalid",
+        "error": {
+          "code": "NATIVE_INTERFACE_INVALID"
+        }
+      }
+    }
+  ]
+}

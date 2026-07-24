@@ -1,6 +1,12 @@
 import { types as nodeTypes } from "node:util";
 
-export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_CONTRACT_REVISION = 5 as const;
+import {
+  selectRelayV2HostCredentialNativeTargetDescriptor,
+  type RelayV2HostCredentialNativeSupportedTarget,
+  type RelayV2HostCredentialNativeTargetDescriptor,
+} from "./hostCredentialNativeTarget.js";
+
+export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_CONTRACT_REVISION = 6 as const;
 export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_ABI = "napi" as const;
 export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_ABI_VERSION = 1 as const;
 export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_MINIMUM_NAPI_VERSION = 9 as const;
@@ -8,8 +14,7 @@ export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_OPEN_METHOD =
   "openRelayV2HostCredentialAtomicFileCellV1" as const;
 
 export type RelayV2HostCredentialNativeModuleSupportedTarget =
-  | "darwin-arm64"
-  | "linux-x64";
+  RelayV2HostCredentialNativeSupportedTarget;
 
 export interface RelayV2HostCredentialNativeModuleTarget {
   readonly platform: string;
@@ -17,38 +22,20 @@ export interface RelayV2HostCredentialNativeModuleTarget {
   readonly napiVersion: number;
 }
 
-// Contract facts only. Each descriptor mirrors one entry of the frozen
-// manifest's platformResources.targetFacts.validatedTargets (Darwin
-// aarch64-apple-darwin, Linux x86_64-unknown-linux-gnu); there is no wildcard,
-// alternate candidate, or caller override. The frozen contract freezes no
-// artifact descriptor, digest, or layout, so these descriptors deliberately
-// carry no module specifier, path, or artifact identity.
+// Contract facts only. Each descriptor is projected from one entry of the
+// frozen manifest's nativeArtifact.supportedTargets (contract revision 6,
+// native artifact v1), whose single JavaScript source of truth is the
+// hostCredentialNativeTarget module; there is no wildcard, alternate
+// candidate, or caller override. The loader-facing projection deliberately
+// carries no module specifier, path, or artifact identity: the fixed loader
+// alone maps the exact target to the one frozen loader-relative specifier.
 export interface RelayV2HostCredentialNativeModuleTargetDescriptor {
   readonly target: RelayV2HostCredentialNativeModuleSupportedTarget;
   readonly platform: "darwin" | "linux";
   readonly architecture: "arm64" | "x64";
-  readonly cargoTargetTriple: "aarch64-apple-darwin" | "x86_64-unknown-linux-gnu";
+  readonly cargoTargetTriple:
+    RelayV2HostCredentialNativeTargetDescriptor["cargoTargetTriple"];
 }
-
-const TARGET_DESCRIPTORS: Readonly<
-  Record<
-    RelayV2HostCredentialNativeModuleSupportedTarget,
-    RelayV2HostCredentialNativeModuleTargetDescriptor
-  >
-> = Object.freeze({
-  "darwin-arm64": Object.freeze({
-    target: "darwin-arm64" as const,
-    platform: "darwin" as const,
-    architecture: "arm64" as const,
-    cargoTargetTriple: "aarch64-apple-darwin" as const,
-  }),
-  "linux-x64": Object.freeze({
-    target: "linux-x64" as const,
-    platform: "linux" as const,
-    architecture: "x64" as const,
-    cargoTargetTriple: "x86_64-unknown-linux-gnu" as const,
-  }),
-});
 
 export type RelayV2HostCredentialNativeModuleUnsupportedReason =
   | "native_artifact_missing"
@@ -332,10 +319,17 @@ function selectTargetDescriptor(
   platform: string,
   architecture: string,
 ): RelayV2HostCredentialNativeModuleTargetDescriptor | null {
-  const target = `${platform}-${architecture}`;
-  return Object.hasOwn(TARGET_DESCRIPTORS, target)
-    ? TARGET_DESCRIPTORS[target as RelayV2HostCredentialNativeModuleSupportedTarget]
-    : null;
+  const fixed = selectRelayV2HostCredentialNativeTargetDescriptor(
+    platform,
+    architecture,
+  );
+  if (fixed === null) return null;
+  return Object.freeze({
+    target: fixed.target,
+    platform: fixed.platform,
+    architecture: fixed.architecture,
+    cargoTargetTriple: fixed.cargoTargetTriple,
+  });
 }
 
 function takeFailure(
@@ -361,11 +355,13 @@ function takeFailure(
  * Vault/authority/composition. Loading happens at most once per source and
  * is memoized; every failure is stable, redacted, and fail closed.
  *
- * This foundation deliberately does not know where a real native module would
- * come from: the frozen contract revision freezes no artifact descriptor,
- * digest, or layout, so a real artifact path requires a NEW contract revision
- * freezing build/stage/pack identity. Nothing here is wired, and nothing
- * produces a qualification, readiness, capability, or productionWired claim.
+ * This foundation does not choose where a real native module comes from:
+ * contract revision 6 freezes the artifact identity (descriptor, digest, and
+ * layout rules) in the manifest's nativeArtifact section, and the separate
+ * fixed loader maps these exact descriptors to that one frozen loader-relative
+ * specifier as a narrow source a trusted deployment may explicitly select.
+ * Nothing here is wired, and nothing produces a qualification, readiness,
+ * capability, or productionWired claim.
  */
 export function createRelayV2HostCredentialNativeModuleSource(
   target: unknown,
