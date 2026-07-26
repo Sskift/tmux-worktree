@@ -2468,6 +2468,63 @@ class RelayV2ProfileRepositoryTest {
     }
 
     @Test
+    fun `explicit refresh requires the exact active profile and never refreshes a switch`() =
+        runBlocking {
+            // Normal A: the exact admitted profile refreshes through the existing owner.
+            val harness = Harness()
+            val activated = harness.repository.confirmEnrollment(
+                enrollmentDraft().confirm(deviceLabel = "Pixel"),
+            ) as RelayV2EnrollmentResult.Activated
+            val deferred = harness.exchange.deferRefresh()
+            val refresh = async { harness.repository.refreshActiveCredential(activated.profile) }
+            val request = withTimeout(1_000) { deferred.request.await() }
+            deferred.response.complete(refreshResponse(request, version = 2))
+            assertEquals(
+                RelayV2RefreshApplyResult.Applied(2, repairedProfileVersion = true),
+                refresh.await(),
+            )
+            assertEquals(1, harness.exchange.refreshCalls)
+
+            // A stale expectation behind the current credential version is drift as well.
+            assertTrue(
+                harness.repository.refreshActiveCredential(activated.profile)
+                    is RelayV2RefreshApplyResult.ActiveProfileChanged,
+            )
+            assertEquals(1, harness.exchange.refreshCalls)
+
+            // A gated action arriving after a switch to B detects the drift before any
+            // prepare/exchange: B is never refreshed and A's blob keeps no pending attempt.
+            val switched = Harness()
+            val activatedA = switched.repository.confirmEnrollment(
+                enrollmentDraft().confirm(deviceLabel = "Pixel"),
+            ) as RelayV2EnrollmentResult.Activated
+            val profileB = activatedA.profile.copy(
+                profileId = "relay-v2-profile-b",
+                credentialReference = RelayV2CredentialReference("credential-reference-b"),
+                activationGeneration = activatedA.profile.activationGeneration + 1,
+            )
+            assertEquals(
+                profileB,
+                switched.profiles.forceActivateRelayV2Profile(
+                    expectedActiveProfile = activatedA.profile.identity,
+                    profile = profileB,
+                ),
+            )
+            assertEquals(
+                RelayV2RefreshApplyResult.ActiveProfileChanged(
+                    credentialVersion = profileB.credentialVersion,
+                    activeProfile = profileB.identity,
+                ),
+                switched.repository.refreshActiveCredential(activatedA.profile),
+            )
+            assertEquals(0, switched.exchange.refreshCalls)
+            assertEquals(
+                null,
+                switched.credentials.read(activatedA.profile.credentialReference)?.pendingAttempt,
+            )
+        }
+
+    @Test
     fun `reconfirming same profile and credential is a no-op that keeps callback fence`() =
         runBlocking {
             val harness = Harness()

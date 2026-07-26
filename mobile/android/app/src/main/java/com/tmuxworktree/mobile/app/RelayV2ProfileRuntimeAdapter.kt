@@ -51,6 +51,106 @@ internal data class RelayStartupAdmission(
         get() = state == RelayStartupAdmissionState.RELAY_V1
 }
 
+/** Closed outcome of the explicit Connect/Retry refresh orchestration. */
+internal sealed interface RelayV2ExplicitConnectRefreshResult {
+    /** Refresh, exact re-admission, consent, and successor install all settled. */
+    data class SuccessorInstalled(
+        val profile: RelayV2Profile,
+    ) : RelayV2ExplicitConnectRefreshResult
+
+    /** Identity/slot drift; a concurrent profile switch owns the outcome. */
+    data class ActiveProfileChanged(
+        val activeProfile: RelayActiveProfileIdentity?,
+    ) : RelayV2ExplicitConnectRefreshResult
+
+    /** Re-admission after a successful refresh settled on its own typed admission surface. */
+    data class AdmissionSettled(
+        val admission: RelayV2StartupAdmissionResult,
+    ) : RelayV2ExplicitConnectRefreshResult
+
+    /** Post-refresh reconciliation failed closed with its typed durable failure. */
+    data class ProfileReconciliationFailed(
+        val failure: RelayV2CredentialReconciliationResult.Failed,
+    ) : RelayV2ExplicitConnectRefreshResult
+}
+
+/**
+ * Pure explicit Connect/Retry refresh orchestration: refresh the exact admitted profile, then
+ * re-admit, consent, and synchronously install the successor, comparing every step against the
+ * expected identity before proceeding so a switched-to profile is never refreshed, consented,
+ * or installed by this action. Callers must hold the process-wide profile mutation lease for
+ * the whole sequence.
+ */
+internal suspend fun explicitConnectRefreshOrchestration(
+    expectedProfile: RelayV2Profile,
+    refreshActiveCredential: suspend (RelayV2Profile) -> RelayV2RefreshApplyResult,
+    admitStartup: suspend () -> RelayV2StartupAdmissionResult,
+    consentAutoConnect: suspend (RelayV2Profile) -> RelayV2Profile?,
+    installExact: (RelayV2Profile) -> Boolean,
+): RelayV2ExplicitConnectRefreshResult {
+    when (val applied = refreshActiveCredential(expectedProfile)) {
+        is RelayV2RefreshApplyResult.ActiveProfileChanged ->
+            return RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged(applied.activeProfile)
+        is RelayV2RefreshApplyResult.ProfileReconciliationFailed ->
+            return RelayV2ExplicitConnectRefreshResult.ProfileReconciliationFailed(applied.failure)
+        is RelayV2RefreshApplyResult.Applied,
+        is RelayV2RefreshApplyResult.StaleCredentialResponse,
+        -> Unit
+    }
+    val admission = admitStartup()
+    val readmitted = (admission as? RelayV2StartupAdmissionResult.Ready)?.profile
+        ?: return RelayV2ExplicitConnectRefreshResult.AdmissionSettled(admission)
+    if (readmitted.identity != expectedProfile.identity ||
+        readmitted.credentialReference != expectedProfile.credentialReference ||
+        readmitted.credentialVersion <= expectedProfile.credentialVersion
+    ) {
+        return RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged(null)
+    }
+    val consented = if (readmitted.autoConnect) {
+        readmitted
+    } else {
+        consentAutoConnect(readmitted)
+    }
+    if (consented == null || consented != readmitted.copy(autoConnect = true)) {
+        return RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged(null)
+    }
+    return if (installExact(consented)) {
+        RelayV2ExplicitConnectRefreshResult.SuccessorInstalled(consented)
+    } else {
+        RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged(null)
+    }
+}
+
+internal fun RelayV2StartupAdmissionResult.toRelayStartupAdmission(): RelayStartupAdmission =
+    when (this) {
+        RelayV2StartupAdmissionResult.NoActiveProfile -> RelayStartupAdmission(
+            state = RelayStartupAdmissionState.RELAY_V1,
+        )
+
+        is RelayV2StartupAdmissionResult.Ready -> RelayStartupAdmission(
+            state = RelayStartupAdmissionState.RELAY_V2,
+            relayV2Profile = profile,
+        )
+
+        is RelayV2StartupAdmissionResult.ReenrollmentRequired -> RelayStartupAdmission(
+            state = RelayStartupAdmissionState.RELAY_V2_REENROLLMENT_REQUIRED,
+            message = "Relay v2 re-enrollment is required; Relay v1 fallback is disabled.",
+        )
+
+        is RelayV2StartupAdmissionResult.RecoveryRequired -> RelayStartupAdmission(
+            state = RelayStartupAdmissionState.RELAY_V2_RECOVERY_REQUIRED,
+            message = "Relay v2 profile recovery is required; Relay v1 fallback is disabled.",
+        )
+
+        is RelayV2StartupAdmissionResult.CredentialUnavailable -> RelayStartupAdmission(
+            state = credentialUnavailableState(reason),
+            message = "Relay v2 credential is unavailable; Relay v1 fallback is disabled.",
+        )
+
+        is RelayV2StartupAdmissionResult.SelfRevokeQuarantined ->
+            selfRevokeQuarantineAdmission(phase)
+    }
+
 /**
  * Canonical production composition for the Android Relay v2 profile and credential owner.
  *
@@ -136,34 +236,7 @@ internal class RelayV2ProfileRuntimeAdapter(
     }
 
     suspend fun admitStartup(): RelayStartupAdmission = profileMutationCoordinator.mutate {
-        when (val result = repository.admitStartup()) {
-            RelayV2StartupAdmissionResult.NoActiveProfile -> RelayStartupAdmission(
-                state = RelayStartupAdmissionState.RELAY_V1,
-            )
-
-            is RelayV2StartupAdmissionResult.Ready -> RelayStartupAdmission(
-                state = RelayStartupAdmissionState.RELAY_V2,
-                relayV2Profile = result.profile,
-            )
-
-            is RelayV2StartupAdmissionResult.ReenrollmentRequired -> RelayStartupAdmission(
-                state = RelayStartupAdmissionState.RELAY_V2_REENROLLMENT_REQUIRED,
-                message = "Relay v2 re-enrollment is required; Relay v1 fallback is disabled.",
-            )
-
-            is RelayV2StartupAdmissionResult.RecoveryRequired -> RelayStartupAdmission(
-                state = RelayStartupAdmissionState.RELAY_V2_RECOVERY_REQUIRED,
-                message = "Relay v2 profile recovery is required; Relay v1 fallback is disabled.",
-            )
-
-            is RelayV2StartupAdmissionResult.CredentialUnavailable -> RelayStartupAdmission(
-                state = credentialUnavailableState(result.reason),
-                message = "Relay v2 credential is unavailable; Relay v1 fallback is disabled.",
-            )
-
-            is RelayV2StartupAdmissionResult.SelfRevokeQuarantined ->
-                selfRevokeQuarantineAdmission(result.phase)
-        }
+        repository.admitStartup().toRelayStartupAdmission()
     }
 
     suspend fun confirmEnrollment(
@@ -174,6 +247,24 @@ internal class RelayV2ProfileRuntimeAdapter(
 
     suspend fun refreshCredential(): RelayV2RefreshApplyResult = profileMutationCoordinator.mutate {
         repository.refreshActiveCredential()
+    }
+
+    /**
+     * The explicit Connect/Retry refresh orchestration as one coordinator mutation: refresh,
+     * exact re-admission, consent, and the synchronous exact-owner install callback all settle
+     * inside this single lease, so a concurrent profile switch cannot interleave between them.
+     */
+    suspend fun orchestrateExplicitConnectRefresh(
+        expectedProfile: RelayV2Profile,
+        installExact: (RelayV2Profile) -> Boolean,
+    ): RelayV2ExplicitConnectRefreshResult = profileMutationCoordinator.mutate {
+        explicitConnectRefreshOrchestration(
+            expectedProfile = expectedProfile,
+            refreshActiveCredential = repository::refreshActiveCredential,
+            admitStartup = repository::admitStartup,
+            consentAutoConnect = repository::consentAutoConnect,
+            installExact = installExact,
+        )
     }
 
     /**

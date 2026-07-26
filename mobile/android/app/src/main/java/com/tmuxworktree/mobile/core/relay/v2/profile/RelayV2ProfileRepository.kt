@@ -1415,6 +1415,38 @@ internal class RelayV2ProfileRepository(
     suspend fun refreshActiveCredential(): RelayV2RefreshApplyResult {
         val profile = profileStore.activeRelayV2Profile()
             ?: error("No active Relay v2 profile is available for refresh")
+        return refreshActiveCredentialPrepared(profile)
+    }
+
+    /**
+     * Explicit-path refresh for one exact admitted profile. The caller's mutation coordinator
+     * lease makes this compare atomic with the profile switch owner: a concurrent switch or
+     * version advance returns [RelayV2RefreshApplyResult.ActiveProfileChanged] before any
+     * prepare or exchange, so a switched-to profile is never refreshed by this action.
+     */
+    suspend fun refreshActiveCredential(
+        expectedProfile: RelayV2Profile,
+    ): RelayV2RefreshApplyResult {
+        val profile = profileStore.activeRelayV2Profile()
+            ?: return RelayV2RefreshApplyResult.ActiveProfileChanged(
+                credentialVersion = null,
+                activeProfile = profileStore.activeProfileIdentity(),
+            )
+        if (profile.identity != expectedProfile.identity ||
+            profile.credentialReference != expectedProfile.credentialReference ||
+            profile.credentialVersion != expectedProfile.credentialVersion
+        ) {
+            return RelayV2RefreshApplyResult.ActiveProfileChanged(
+                credentialVersion = profile.credentialVersion,
+                activeProfile = profileStore.activeProfileIdentity(),
+            )
+        }
+        return refreshActiveCredentialPrepared(profile)
+    }
+
+    private suspend fun refreshActiveCredentialPrepared(
+        profile: RelayV2Profile,
+    ): RelayV2RefreshApplyResult {
         val prepared = prepareRefresh(profile)
         return refreshCoordinator.coordinate(prepared) {
             applyRefreshResponse(prepared, exchange.refresh(prepared.request))
