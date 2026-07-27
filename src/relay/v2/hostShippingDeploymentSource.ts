@@ -20,8 +20,10 @@ import {
   requireRelayV2HostProductionProfileSnapshot,
   type RelayV2HostProductionProfile,
 } from "./hostProductionProfileStore.js";
-import { runRelayV2HostShippingProcessLifecycle } from
-  "./hostShippingProcessLifecycle.js";
+import {
+  RelayV2HostShippingProcessSignalOwner,
+  runRelayV2HostShippingProcessLifecycle,
+} from "./hostShippingProcessLifecycle.js";
 import type { RelayV2HostShippingRootHandle } from "./hostShippingRoot.js";
 import {
   captureRelayV2HostSystemTlsTrustCut,
@@ -46,6 +48,7 @@ export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly terminalControlDaemonSocketPath: string;
   readonly credentialHttpsTlsTrustCut: RelayV2HostTlsCaTrustCut;
   readonly carrierWssTlsTrustCut: RelayV2HostTlsCaTrustCut;
+  readonly startupSignal?: AbortSignal;
   closeAndDrain(): Promise<void>;
 }
 
@@ -82,6 +85,10 @@ function failure(
   code: RelayV2HostShippingDeploymentSourceErrorCode,
 ): RelayV2HostShippingDeploymentSourceError {
   return new RelayV2HostShippingDeploymentSourceError(code);
+}
+
+function requireStartupOpen(signal?: AbortSignal): void {
+  if (signal?.aborted) throw failure("ACTIVATION_FAILED");
 }
 
 function exactRegularPath(value: string, label: "Node executable" | "CLI entrypoint"): string {
@@ -133,14 +140,16 @@ async function closeOwned(
   return failed;
 }
 
-async function createActivationOwner(): Promise<ActivationOwner> {
+async function createActivationOwner(signal?: AbortSignal): Promise<ActivationOwner> {
   let nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null = null;
   let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
   try {
+    requireStartupOpen(signal);
     const trustedHome = realpathSync.native(homedir());
     const profileSnapshot = requireRelayV2HostProductionProfileSnapshot(
       readRelayV2HostProductionProfile({ trustedHome }),
     );
+    requireStartupOpen(signal);
 
     nativeModuleSource = createRelayV2HostCredentialNativeModuleSource({
       platform: process.platform,
@@ -153,6 +162,7 @@ async function createActivationOwner(): Promise<ActivationOwner> {
     if (nativeModuleSource.capability().status !== "supported") {
       throw failure("ACTIVATION_FAILED");
     }
+    requireStartupOpen(signal);
 
     const terminalControlDaemonSocketPath = defaultTerminalControlSocketPath(trustedHome);
     const localCliTarget = currentCliTarget();
@@ -162,14 +172,17 @@ async function createActivationOwner(): Promise<ActivationOwner> {
         socketPath: terminalControlDaemonSocketPath,
         autoStart: true,
         autoStartCliTarget: localCliTarget,
+        ...(signal === undefined ? {} : { signal }),
       },
     );
+    requireStartupOpen(signal);
     runtimeOwner = await createRelayV2CanonicalHostRuntimeBundleOwnerV1({
       localCliTarget,
       terminalControlDaemonSocketPath,
       knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
       sshExecutable: "/usr/bin/ssh",
     });
+    requireStartupOpen(signal);
 
     // The frozen profile carries no TLS material by contract. Still issue two
     // distinct process-local cuts so HTTPS and WSS cannot share, split, or
@@ -201,6 +214,7 @@ async function createActivationOwner(): Promise<ActivationOwner> {
       terminalControlDaemonSocketPath,
       credentialHttpsTlsTrustCut,
       carrierWssTlsTrustCut,
+      ...(signal === undefined ? {} : { startupSignal: signal }),
       closeAndDrain,
     })) as RelayV2HostTrustedDeploymentActivationRecord;
     activationRecords.set(activation as object, record);
@@ -235,9 +249,17 @@ export function takeRelayV2HostTrustedDeploymentActivation(
 export async function startRelayV2HostShippingFromTrustedDeployment(
 ): Promise<RelayV2HostShippingRootHandle> {
   if (arguments.length !== 0) throw failure("ACTIVATION_INVALID");
-  const owner = await createActivationOwner();
+  return openRelayV2HostShippingFromTrustedDeployment();
+}
+
+async function openRelayV2HostShippingFromTrustedDeployment(
+  signal?: AbortSignal,
+): Promise<RelayV2HostShippingRootHandle> {
+  const owner = await createActivationOwner(signal);
   try {
+    requireStartupOpen(signal);
     const root = await import("./hostShippingRoot.js");
+    requireStartupOpen(signal);
     return await root.startRelayV2HostShippingRootFromTrustedDeployment(
       owner.activation,
     );
@@ -252,13 +274,33 @@ export async function startRelayV2HostShippingFromTrustedDeployment(
 }
 
 /**
- * The process entry for the explicit v2 Host lane. The trusted source opens
- * exactly one shipping root, then the dedicated process lifecycle owner
- * retains and drives it until signal, failure, or permanent supersession.
+ * The process entry for the explicit v2 Host lane. Its signal owner is
+ * installed before trusted activation and threads one fence through startup.
+ * The trusted source opens exactly one shipping root, then the connector
+ * lifecycle retains and drives that same handle until signal, failure, or
+ * permanent supersession.
  */
 export async function runRelayV2HostShippingFromTrustedDeployment(): Promise<number> {
   if (arguments.length !== 0) throw failure("ACTIVATION_INVALID");
-  const handle = await startRelayV2HostShippingFromTrustedDeployment();
-  const result = await runRelayV2HostShippingProcessLifecycle(handle);
-  return result.exitCode;
+  const processSignals = new RelayV2HostShippingProcessSignalOwner();
+  try {
+    try {
+      const handle = await openRelayV2HostShippingFromTrustedDeployment(
+        processSignals.signal,
+      );
+      const result = await runRelayV2HostShippingProcessLifecycle(handle, {
+        signal: processSignals.signal,
+      });
+      return result.exitCode;
+    } catch (error) {
+      if (processSignals.signal.aborted
+        && error instanceof RelayV2HostShippingDeploymentSourceError
+        && error.code === "ACTIVATION_FAILED") {
+        return 0;
+      }
+      throw error;
+    }
+  } finally {
+    processSignals.close();
+  }
 }

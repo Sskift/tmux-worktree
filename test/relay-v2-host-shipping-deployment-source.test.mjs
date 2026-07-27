@@ -101,9 +101,24 @@ const virtualModules = new Map([
     }
   `],
   ["./hostShippingProcessLifecycle.js", `
-    export async function runRelayV2HostShippingProcessLifecycle(handle) {
+    export class RelayV2HostShippingProcessSignalOwner {
+      constructor() {
+        const h = globalThis.__hostDeploymentHarness;
+        this.controller = new AbortController();
+        h.processSignalController = this.controller;
+        h.events.push(["signal.install"]);
+      }
+      get signal() { return this.controller.signal; }
+      close() {
+        globalThis.__hostDeploymentHarness.events.push(["signal.close"]);
+      }
+    }
+    export async function runRelayV2HostShippingProcessLifecycle(handle, options) {
       const h = globalThis.__hostDeploymentHarness;
-      h.events.push(["process.run", handle.inspect()]);
+      if (options.signal !== h.processSignalController.signal) {
+        throw new Error("process signal owner was split");
+      }
+      h.events.push(["process.run", handle.inspect(), options.signal]);
       await handle.closeAndDrain();
       return { status: "superseded", exitCode: 78 };
     }
@@ -175,8 +190,10 @@ const virtualModules = new Map([
         globalThis.__hostDeploymentHarness.events.push(["lifecycle.create"]);
       }
       async start() {
-        globalThis.__hostDeploymentHarness.events.push(["lifecycle.start"]);
+        const h = globalThis.__hostDeploymentHarness;
+        h.events.push(["lifecycle.start"]);
         await this.options.reconcilePort.reconcile();
+        if (h.abortDuringLifecycleStart) h.processSignalController.abort();
         return "reconciled";
       }
       async close() {
@@ -293,6 +310,8 @@ function createHarness(home) {
     sources: [],
     trustCuts: [],
     failIntake: false,
+    abortDuringLifecycleStart: false,
+    processSignalController: null,
     openedRuntime: Object.freeze(Object.assign(Object.create(null), {
       discovery: Object.freeze({ scan: async () => ({}) }),
       localProcessTarget: Object.freeze({ kind: "local", targetId: "local-exact" }),
@@ -375,12 +394,51 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     const processOwned = createHarness(home);
     globalThis.__hostDeploymentHarness = processOwned;
     assert.equal(await module.runRelayV2HostShippingFromTrustedDeployment(), 78);
-    assert.deepEqual(
-      processOwned.events.find(([name]) => name === "process.run"),
-      ["process.run", { status: "stopped", controllerGeneration: "0" }],
-    );
+    const signalInstallIndex = processOwned.events
+      .findIndex(([name]) => name === "signal.install");
+    const profileReadIndex = processOwned.events
+      .findIndex(([name]) => name === "profile.read");
+    assert.ok(signalInstallIndex >= 0 && profileReadIndex > signalInstallIndex);
+    const processRun = processOwned.events.find(([name]) => name === "process.run");
+    assert.deepEqual(processRun.slice(0, 2), [
+      "process.run",
+      { status: "stopped", controllerGeneration: "0" },
+    ]);
+    assert.strictEqual(processRun[2], processOwned.processSignalController.signal);
     assert.ok(processOwned.events.some(([name]) => name === "runtime.close"));
     assert.ok(processOwned.events.some(([name]) => name === "native.close"));
+    assert.equal(processOwned.events.at(-1)[0], "signal.close");
+
+    const startupInterrupted = createHarness(home);
+    startupInterrupted.abortDuringLifecycleStart = true;
+    globalThis.__hostDeploymentHarness = startupInterrupted;
+    assert.equal(await module.runRelayV2HostShippingFromTrustedDeployment(), 0);
+    assert.equal(
+      startupInterrupted.events.some(([name]) => name === "process.run"),
+      false,
+    );
+    assert.deepEqual(
+      startupInterrupted.events
+        .filter(([name]) => [
+          "signal.install",
+          "lifecycle.start",
+          "lifecycle.close",
+          "state.close",
+          "runtime.close",
+          "native.close",
+          "signal.close",
+        ].includes(name))
+        .map(([name]) => name),
+      [
+        "signal.install",
+        "lifecycle.start",
+        "lifecycle.close",
+        "state.close",
+        "runtime.close",
+        "native.close",
+        "signal.close",
+      ],
+    );
 
     const second = createHarness(home);
     second.failIntake = true;

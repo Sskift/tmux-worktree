@@ -40,6 +40,34 @@ export class RelayV2HostShippingProcessLifecycleError extends Error {
   }
 }
 
+/**
+ * Installs the explicit-v2 process signal fence before trusted activation
+ * begins. The same signal is handed through startup and connector lifetime;
+ * close only removes this owner's process listeners after every owned drain
+ * has settled.
+ */
+export class RelayV2HostShippingProcessSignalOwner {
+  readonly #controller = new AbortController();
+  readonly #stop = () => this.#controller.abort();
+  #closed = false;
+
+  constructor() {
+    process.once("SIGINT", this.#stop);
+    process.once("SIGTERM", this.#stop);
+  }
+
+  get signal(): AbortSignal {
+    return this.#controller.signal;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    process.off("SIGINT", this.#stop);
+    process.off("SIGTERM", this.#stop);
+  }
+}
+
 function positiveDelay(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   if (!Number.isSafeInteger(value) || value < 1) {
@@ -138,10 +166,15 @@ export class RelayV2HostShippingProcessLifecycleOwner {
     const processStop = new AbortController();
     const stop = () => processStop.abort();
     const externalStop = () => processStop.abort();
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-    if (this.#externalSignal?.aborted) processStop.abort();
-    else this.#externalSignal?.addEventListener("abort", externalStop, { once: true });
+    const ownsProcessSignals = this.#externalSignal === undefined;
+    if (ownsProcessSignals) {
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    } else if (this.#externalSignal!.aborted) {
+      processStop.abort();
+    } else {
+      this.#externalSignal!.addEventListener("abort", externalStop, { once: true });
+    }
 
     let result: RelayV2HostShippingProcessLifecycleResult | null = null;
     let lifecycleError: unknown = null;
@@ -150,9 +183,12 @@ export class RelayV2HostShippingProcessLifecycleOwner {
     } catch (error) {
       lifecycleError = error;
     } finally {
-      process.off("SIGINT", stop);
-      process.off("SIGTERM", stop);
-      this.#externalSignal?.removeEventListener("abort", externalStop);
+      if (ownsProcessSignals) {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+      } else {
+        this.#externalSignal!.removeEventListener("abort", externalStop);
+      }
     }
 
     let cleanupFailed = false;

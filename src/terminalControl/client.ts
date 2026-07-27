@@ -20,8 +20,29 @@ export interface TerminalControlAutoStartCliTarget {
   readonly entrypoint: string;
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function aborted(): Error {
+  const error = new Error("terminal-control request aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(aborted());
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(aborted());
+    };
+    const timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }
 
 function clientError(error: NodeJS.ErrnoException): boolean {
@@ -50,7 +71,9 @@ function sendRequest(
   socketPath: string,
   request: TerminalControlRequest,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<TerminalControlResponse> {
+  if (signal?.aborted) return Promise.reject(aborted());
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     socket.setEncoding("utf8");
@@ -60,6 +83,7 @@ function sendRequest(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       socket.destroy();
       if (error) reject(error);
       else resolve(response!);
@@ -67,7 +91,10 @@ function sendRequest(
     const timer = setTimeout(() => {
       finish(new Error("terminal-control request timed out"));
     }, timeoutMs);
+    const onAbort = () => finish(aborted());
     timer.unref();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     socket.once("connect", () => {
       socket.write(`${JSON.stringify(request)}\n`);
     });
@@ -109,6 +136,7 @@ export async function requestTerminalControl<T = unknown>(
     timeoutMs?: number;
     autoStart?: boolean;
     autoStartCliTarget?: Readonly<TerminalControlAutoStartCliTarget>;
+    signal?: AbortSignal;
   } = {},
 ): Promise<T> {
   const socketPath = options.socketPath ?? terminalControlSocketPath();
@@ -120,22 +148,23 @@ export async function requestTerminalControl<T = unknown>(
   } as TerminalControlRequest;
   let response: TerminalControlResponse;
   try {
-    response = await sendRequest(socketPath, request, timeoutMs);
+    response = await sendRequest(socketPath, request, timeoutMs, options.signal);
   } catch (error) {
     if (options.autoStart === false || !(error instanceof Error) || !clientError(error as NodeJS.ErrnoException)) {
       throw error;
     }
+    if (options.signal?.aborted) throw aborted();
     startServer(options.autoStartCliTarget);
     const deadline = Date.now() + Math.min(timeoutMs, 5_000);
     while (true) {
       try {
-        response = await sendRequest(socketPath, request, timeoutMs);
+        response = await sendRequest(socketPath, request, timeoutMs, options.signal);
         break;
       } catch (retryError) {
         if (!(retryError instanceof Error) || !clientError(retryError as NodeJS.ErrnoException) || Date.now() >= deadline) {
           throw retryError;
         }
-        await delay(25);
+        await delay(25, options.signal);
       }
     }
   }

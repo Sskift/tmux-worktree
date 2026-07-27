@@ -206,6 +206,10 @@ function failure(code: RelayV2HostShippingRootErrorCode): RelayV2HostShippingRoo
   return new RelayV2HostShippingRootError(code);
 }
 
+function requireStartupOpen(signal?: AbortSignal): void {
+  if (signal?.aborted) throw failure("COMPOSITION_CLOSED");
+}
+
 const NODE_IS_ASYNC_FUNCTION = nodeUtilTypes.isAsyncFunction;
 const NODE_IS_PROXY = nodeUtilTypes.isProxy;
 const OBJECT_PROTOTYPE = Object.prototype;
@@ -601,20 +605,25 @@ async function startCapturedShippingRoot(
   profile: Readonly<RelayV2HostProductionProfile>,
   source: RelayV2HostCredentialNativeModuleSource,
   closeDeployment: () => Promise<void>,
+  startupSignal?: AbortSignal,
 ): Promise<RelayV2HostShippingRootHandle> {
   let store: RelayV2HostStateStore | null = null;
   let spool: { close(): Promise<void> } | null = null;
   let lifecycleOwner: RelayV2MaterializedReconcileLifecycleOwner | null = null;
+  let startupAbortListener: (() => void) | null = null;
   let intake: RelayV2HostPrivilegedProductionIntakeComposition;
   try {
+    requireStartupOpen(startupSignal);
     // Absent/unsupported native sources fail here, before the one-shot take
     // is consumed and long before any socket could exist.
     const capability = source.capability();
     if (capability.status !== "supported") throw nativeModuleFailure(capability);
+    requireStartupOpen(startupSignal);
 
     store = await RelayV2HostStateStore.open({
       paths: relayV2HostStatePaths(captured.trustedHome),
     });
+    requireStartupOpen(startupSignal);
     const foundation = new RelayV2MaterializedStateFoundation({
       hostId: profile.hostId,
       discovery: captured.discovery,
@@ -628,12 +637,21 @@ async function startCapturedShippingRoot(
       reconcilePort: Object.freeze({ reconcile: () => foundation.reconcile() }),
       scanIntervalMs: captured.scanIntervalMs,
     }));
+    const ownedLifecycle = lifecycleOwner;
+    startupAbortListener = () => {
+      void ownedLifecycle.close().catch(() => undefined);
+    };
+    startupSignal?.addEventListener("abort", startupAbortListener, { once: true });
+    if (startupSignal?.aborted) startupAbortListener();
+    requireStartupOpen(startupSignal);
     if (await lifecycleOwner.start() !== "reconciled") throw failure("RECONCILE_FAILED");
+    requireStartupOpen(startupSignal);
     spool = await foundation.openStateSnapshotSpool({
       hostId: profile.hostId,
       ownerInstanceId: store.hostInstanceId,
       ...(captured.trustedHome === undefined ? {} : { home: captured.trustedHome }),
     });
+    requireStartupOpen(startupSignal);
     const welcome = createRelayV2HostRuntimeWelcomeSerializer({ hostId: profile.hostId });
 
     intake = await openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
@@ -671,6 +689,9 @@ async function startCapturedShippingRoot(
       }),
     });
   } catch (error) {
+    if (startupAbortListener !== null) {
+      startupSignal?.removeEventListener("abort", startupAbortListener);
+    }
     // The bridge and intake drain the claimed cell and close the spool and
     // HostState on every failure after they claim them, and both owners make
     // those closes idempotent, so repeating them here is safe and also covers
@@ -708,6 +729,9 @@ async function startCapturedShippingRoot(
     throw error;
   }
 
+  if (startupAbortListener !== null) {
+    startupSignal?.removeEventListener("abort", startupAbortListener);
+  }
   return issueHandle(intake, lifecycleOwner!, closeDeployment);
 }
 
@@ -722,8 +746,10 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
   activation: RelayV2HostTrustedDeploymentActivation,
 ): Promise<RelayV2HostShippingRootHandle> {
   const deployment = takeRelayV2HostTrustedDeploymentActivation(activation);
+  const startupSignal = deployment.startupSignal;
   let openedRuntime: ReturnType<typeof consumeRelayV2CanonicalHostRuntimeBundleV1>;
   try {
+    requireStartupOpen(startupSignal);
     if (!isRelayV2HostTlsTrustCut(deployment.credentialHttpsTlsTrustCut)
       || !isRelayV2HostTlsTrustCut(deployment.carrierWssTlsTrustCut)
       || deployment.credentialHttpsTlsTrustCut === deployment.carrierWssTlsTrustCut) {
@@ -732,6 +758,7 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
     openedRuntime = consumeRelayV2CanonicalHostRuntimeBundleV1(
       deployment.runtimeBundle,
     );
+    requireStartupOpen(startupSignal);
   } catch {
     try {
       await deployment.closeAndDrain();
@@ -774,5 +801,6 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
     deployment.profileSnapshot,
     deployment.nativeModuleSource,
     deployment.closeAndDrain,
+    startupSignal,
   );
 }
