@@ -30,9 +30,11 @@ const TYPED_ARRAY_SET = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
   "set",
 )?.value;
 const WEAK_MAP_GET = WeakMap.prototype.get;
+const WEAK_MAP_HAS = WeakMap.prototype.has;
 const WEAK_MAP_SET = WeakMap.prototype.set;
+const SYSTEM_TLS_TRUST = OBJECT_FREEZE(OBJECT_CREATE(null));
 const HOST_CA_TRUST_CUTS =
-  new WeakMap<object, RelayV2HostTlsCaTrust>();
+  new WeakMap<object, RelayV2HostTlsCaTrust | typeof SYSTEM_TLS_TRUST>();
 
 /**
  * Injected-only CA extension for one exact Host TLS client lane.
@@ -215,13 +217,34 @@ export function captureRelayV2HostTlsCaTrustCut(
   return cut;
 }
 
+/**
+ * Issues an explicit system-trust cut. Two callers receive two independent
+ * process-local authorities even though both lanes intentionally omit an
+ * additive CA bundle at the transport boundary.
+ */
+export function captureRelayV2HostSystemTlsTrustCut(): RelayV2HostTlsCaTrustCut {
+  const cut = OBJECT_FREEZE(OBJECT_CREATE(null)) as RelayV2HostTlsCaTrustCut;
+  REFLECT_APPLY(WEAK_MAP_SET, HOST_CA_TRUST_CUTS, [cut, SYSTEM_TLS_TRUST]);
+  return cut;
+}
+
+export function isRelayV2HostTlsTrustCut(value: unknown): value is RelayV2HostTlsCaTrustCut {
+  if (value === null || typeof value !== "object") return false;
+  try {
+    return REFLECT_APPLY(WEAK_MAP_HAS, HOST_CA_TRUST_CUTS, [value]) as boolean;
+  } catch {
+    return false;
+  }
+}
+
 export function readRelayV2HostTlsCaTrustCut(
   value: unknown,
 ): RelayV2HostTlsCaTrust | undefined {
   if (value === null || typeof value !== "object") return undefined;
   try {
-    return REFLECT_APPLY(WEAK_MAP_GET, HOST_CA_TRUST_CUTS, [value]) as
-      RelayV2HostTlsCaTrust | undefined;
+    const trust = REFLECT_APPLY(WEAK_MAP_GET, HOST_CA_TRUST_CUTS, [value]) as
+      RelayV2HostTlsCaTrust | typeof SYSTEM_TLS_TRUST | undefined;
+    return trust === SYSTEM_TLS_TRUST ? undefined : trust;
   } catch {
     return undefined;
   }

@@ -138,13 +138,17 @@ export function terminalControlStatePath(home = homedir()): string {
     || join(terminalControlHome(home), "terminal-control-state-v1.json");
 }
 
-export function terminalControlSocketPath(home = homedir()): string {
-  const configured = process.env.TW_TERMINAL_CONTROL_SOCKET?.trim();
-  if (configured) return configured;
+export function defaultTerminalControlSocketPath(home = homedir()): string {
   const preferred = join(terminalControlHome(home), "terminal-control-v1.sock");
   if (Buffer.byteLength(preferred, "utf8") <= 100) return preferred;
   const homeHash = createHash("sha256").update(home, "utf8").digest("hex").slice(0, 16);
   return join(tmpdir(), `tw-terminal-control-${homeHash}`, "v1.sock");
+}
+
+export function terminalControlSocketPath(home = homedir()): string {
+  const configured = process.env.TW_TERMINAL_CONTROL_SOCKET?.trim();
+  if (configured) return configured;
+  return defaultTerminalControlSocketPath(home);
 }
 
 export function terminalControlOwnsSocketDirectory(path: string, home = homedir()): boolean {

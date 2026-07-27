@@ -12,6 +12,7 @@ import {
   type RelayV2HostPrivilegedProductionWssTransport,
 } from "./hostPrivilegedProductionIntakeComposition.js";
 import type { RelayV2HostBootstrapSecretByteSource } from "./hostBootstrapSecretSource.js";
+import type { RelayV2HostProductionProfile } from "./hostProductionProfileStore.js";
 import {
   captureRelayV2HostTlsCaTrust,
   type RelayV2HostTlsCaTrust,
@@ -25,6 +26,8 @@ export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   readonly takeNativeModule: () => unknown;
   /** Test isolation only; production omission selects the canonical account home. */
   readonly trustedHome?: string;
+  /** Exact snapshot already frozen by the outer shipping activation. */
+  readonly profileSnapshot?: Readonly<RelayV2HostProductionProfile>;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
   /** Deterministic reauthentication overrides forwarded to the intake. */
@@ -229,6 +232,7 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
     ["takeNativeModule", "canonical"],
     [
       "trustedHome",
+      "profileSnapshot",
       "bootstrapSecretByteSource",
       "reauthentication",
       "wssTransport",
@@ -299,6 +303,9 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
 
   const intake = await openRelayV2HostPrivilegedProductionIntakeComposition({
     trustedHome: captured.trustedHome as string | undefined,
+    profileSnapshot: captured.profileSnapshot as
+      | Readonly<RelayV2HostProductionProfile>
+      | undefined,
     credentialCell: cell,
     bootstrapSecretByteSource: captured.bootstrapSecretByteSource as
       | RelayV2HostBootstrapSecretByteSource

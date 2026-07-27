@@ -25,6 +25,7 @@ import {
 } from "./hostCredentialVault.js";
 import {
   readRelayV2HostProductionProfile,
+  requireRelayV2HostProductionProfileSnapshot,
   type RelayV2HostProductionProfile,
 } from "./hostProductionProfileStore.js";
 import {
@@ -66,6 +67,11 @@ RelayV2HostCanonicalProductionCompositionOptions,
 export interface RelayV2HostPrivilegedProductionIntakeCompositionOptions {
   /** Test isolation only; production omission selects the canonical account home. */
   readonly trustedHome?: string;
+  /**
+   * Exact snapshot already read by the outer shipping activation. When
+   * present, this composition must not read the profile store again.
+   */
+  readonly profileSnapshot?: Readonly<RelayV2HostProductionProfile>;
   /** Ownership transfers to this composition after successful exact capture. */
   readonly credentialCell: RelayV2HostCredentialAtomicByteCellOwner;
   /** An already-owned privileged channel. No source is selected by this owner. */
@@ -153,6 +159,7 @@ interface CapturedCanonicalOptions {
 
 interface CapturedOptions {
   readonly trustedHome: string | undefined;
+  readonly profileSnapshot: Readonly<RelayV2HostProductionProfile> | undefined;
   readonly cell: CapturedCell;
   readonly sourceOwner: { current: CapturedByteSource | null };
   readonly reauthentication: RelayV2HostPrivilegedProductionReauthenticationOptions | undefined;
@@ -488,6 +495,7 @@ function captureOptions(
 ): CapturedOptions | null {
   const fields = snapshotExactDataRecord(value, ["credentialCell", "canonical"], [
     "trustedHome",
+    "profileSnapshot",
     "bootstrapSecretByteSource",
     "reauthentication",
     "wssTransport",
@@ -503,9 +511,13 @@ function captureOptions(
     ? null
     : captureByteSource(fields.bootstrapSecretByteSource);
   const canonical = captureCanonicalOptions(fields.canonical);
+  let profileSnapshot: Readonly<RelayV2HostProductionProfile> | undefined;
   let credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
   let carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
   try {
+    profileSnapshot = fields.profileSnapshot === undefined
+      ? undefined
+      : requireRelayV2HostProductionProfileSnapshot(fields.profileSnapshot);
     credentialHttpsTlsTrust = fields.credentialHttpsTlsTrust === undefined
       ? undefined
       : captureRelayV2HostTlsCaTrust(fields.credentialHttpsTlsTrust);
@@ -520,6 +532,7 @@ function captureOptions(
     || canonical === null) return null;
   return REFLECT_APPLY(OBJECT_FREEZE, undefined, [{
     trustedHome: fields.trustedHome as string | undefined,
+    profileSnapshot,
     cell,
     sourceOwner: { current: source },
     reauthentication,
@@ -530,7 +543,9 @@ function captureOptions(
   }]);
 }
 
-function readProfile(trustedHome: string | undefined): Readonly<RelayV2HostProductionProfile> {
+function readProfile(captured: CapturedOptions): Readonly<RelayV2HostProductionProfile> {
+  if (captured.profileSnapshot !== undefined) return captured.profileSnapshot;
+  const trustedHome = captured.trustedHome;
   return trustedHome === undefined
     ? readRelayV2HostProductionProfile()
     : readRelayV2HostProductionProfile({ trustedHome });
@@ -755,7 +770,7 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
   let stage: RelayV2HostPrivilegedProductionIntakeCompositionErrorCode =
     "PROFILE_UNAVAILABLE";
   try {
-    const profile = readProfile(captured.trustedHome);
+    const profile = readProfile(captured);
     stage = "OWNER_CONSTRUCTION_FAILED";
     const handoff = createRelayV2HostBootstrapSecretHandoffAuthority();
     owned.handoff = handoff;

@@ -247,6 +247,48 @@ function captureProfile(
   })) as Readonly<RelayV2HostProductionProfile>;
 }
 
+/**
+ * Retains one exact, already-canonical profile snapshot for an outer
+ * activation owner. This is deliberately stricter than profile decoding:
+ * callers cannot hand an equivalent mutable copy to an inner owner after the
+ * trusted reader has frozen its deployment snapshot.
+ */
+export function requireRelayV2HostProductionProfileSnapshot(
+  value: unknown,
+): Readonly<RelayV2HostProductionProfile> {
+  const captured = captureProfile(
+    value,
+    "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS",
+  );
+  if (value === null
+    || typeof value !== "object"
+    || nodeUtilTypes.isProxy(value)
+    || Object.getPrototypeOf(value) !== null
+    || !Object.isFrozen(value)) {
+    return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.length !== PROFILE_KEYS.length
+    || keys.some((key) => typeof key !== "string" || !PROFILE_KEYS.includes(
+      key as typeof PROFILE_KEYS[number],
+    ))) {
+    return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS");
+  }
+  for (const key of PROFILE_KEYS) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !Object.hasOwn(descriptor, "value")
+      || descriptor.enumerable !== true
+      || descriptor.configurable !== false
+      || descriptor.writable !== false
+      || descriptor.value !== captured[key]) {
+      return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS");
+    }
+  }
+  return value as Readonly<RelayV2HostProductionProfile>;
+}
+
 function sameProfile(
   left: Readonly<RelayV2HostProductionProfile>,
   right: Readonly<RelayV2HostProductionProfile>,

@@ -4,6 +4,7 @@ import {
   createRelayV2HostCredentialNativeModuleSource,
   type RelayV2HostCredentialNativeModuleCapability,
   type RelayV2HostCredentialNativeModuleLoader,
+  type RelayV2HostCredentialNativeModuleSource,
   type RelayV2HostCredentialNativeModuleTarget,
 } from "./hostCredentialNativeModuleSource.js";
 import {
@@ -45,8 +46,16 @@ import type { RelayV2HostWssTransportLifecycleFactoryOptions } from "./hostWssTr
 import type { RelayV2CanonicalCreateTargetExecutionPairV1 } from "./canonicalCreateTargetAdmissionAdapter.js";
 import {
   captureRelayV2HostTlsCaTrust,
+  isRelayV2HostTlsTrustCut,
+  readRelayV2HostTlsCaTrustCut,
   type RelayV2HostTlsCaTrust,
 } from "./hostTlsTrustMaterial.js";
+import { consumeRelayV2CanonicalHostRuntimeBundleV1 } from
+  "./canonicalHostRuntimeBundle.js";
+import {
+  takeRelayV2HostTrustedDeploymentActivation,
+  type RelayV2HostTrustedDeploymentActivation,
+} from "./hostShippingDeploymentSource.js";
 
 /**
  * Explicit, default-off Relay v2 Host shipping root.
@@ -66,14 +75,15 @@ import {
  * reauthentication lifecycle owner bound inside it to the real
  * authority/coordinator and the exact managed connector cut.
  *
- * The root creates no credential, secret source, native loader, artifact,
+ * The root creates no credential, secret source, artifact,
  * discovery backend, listener, process, retry timer, readiness, or
  * capability advertisement of its own, and it never falls back to Relay
  * v1: any profile, deployment-input, native-source, recovery, or intake
- * failure fails closed before any socket is constructed. The native module
- * loader, the create-target execution pair, and the runtime lanes are
- * trusted deployment injections; without them the explicit v2 selection
- * fails closed, which is exactly what the CLI path does. The optional
+ * failure fails closed before any socket is constructed. The low-level
+ * injected seam remains only for isolated foundations. Production consumes
+ * one opaque ticket from the unique trusted deployment source, so the native
+ * source, create-target pair, runtime lanes, profile snapshot, and two TLS
+ * trust cuts cannot be split or replaced by its caller. The optional
  * `dashboardManagement` seam only threads a caller-owned exact protocol-v2
  * channel through the bridge/intake so the canonical composition can own
  * its same-lineage management session; omitting it leaves the facade
@@ -479,7 +489,7 @@ function nativeModuleFailure(
 function issueHandle(
   intake: RelayV2HostPrivilegedProductionIntakeComposition,
   lifecycleOwner: RelayV2MaterializedReconcileLifecycleOwner,
-  closeSource: () => void,
+  closeDeployment: () => Promise<void>,
 ): RelayV2HostShippingRootHandle {
   let lifecycle: "open" | "closing" | "closed" = "open";
   let closePromise: Promise<void> | null = null;
@@ -505,7 +515,11 @@ function issueHandle(
       } catch {
         failed = true;
       }
-      closeSource();
+      try {
+        await closeDeployment();
+      } catch {
+        failed = true;
+      }
       lifecycle = "closed";
       if (failed) throw failure("CLOSE_FAILED");
     })();
@@ -565,14 +579,29 @@ export async function startRelayV2HostShippingRoot(
     captured.nativeModuleTarget,
     captured.nativeModuleLoader,
   );
-  const closeSource = (): void => {
-    try {
+  let closePromise: Promise<void> | null = null;
+  const closeDeployment = (): Promise<void> => {
+    if (closePromise !== null) return closePromise;
+    closePromise = Promise.resolve().then(() => {
       source.close();
-    } catch {
-      // The bounded fail-closed recycle never throws; keep rollback moving.
-    }
+    });
+    void closePromise.catch(() => undefined);
+    return closePromise;
   };
+  return startCapturedShippingRoot(
+    captured,
+    profile,
+    source,
+    closeDeployment,
+  );
+}
 
+async function startCapturedShippingRoot(
+  captured: CapturedOptions,
+  profile: Readonly<RelayV2HostProductionProfile>,
+  source: RelayV2HostCredentialNativeModuleSource,
+  closeDeployment: () => Promise<void>,
+): Promise<RelayV2HostShippingRootHandle> {
   let store: RelayV2HostStateStore | null = null;
   let spool: { close(): Promise<void> } | null = null;
   let lifecycleOwner: RelayV2MaterializedReconcileLifecycleOwner | null = null;
@@ -610,6 +639,7 @@ export async function startRelayV2HostShippingRoot(
     intake = await openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
       takeNativeModule: source.takeNativeModule,
       ...(captured.trustedHome === undefined ? {} : { trustedHome: captured.trustedHome }),
+      profileSnapshot: profile,
       ...(captured.bootstrapSecretByteSource === undefined
         ? {}
         : { bootstrapSecretByteSource: captured.bootstrapSecretByteSource }),
@@ -645,7 +675,8 @@ export async function startRelayV2HostShippingRoot(
     // HostState on every failure after they claim them, and both owners make
     // those closes idempotent, so repeating them here is safe and also covers
     // failures before the bridge was reached. Roll back in reverse order:
-    // reconcile lifecycle first, then spool, HostState, and the native source.
+    // reconcile lifecycle first, then spool, HostState, and the deployment
+    // activation (canonical runtime owner followed by native source).
     let closeFailed = false;
     if (lifecycleOwner !== null) {
       try {
@@ -668,21 +699,80 @@ export async function startRelayV2HostShippingRoot(
         closeFailed = true;
       }
     }
-    closeSource();
+    try {
+      await closeDeployment();
+    } catch {
+      closeFailed = true;
+    }
     if (closeFailed) throw failure("CLOSE_FAILED");
     throw error;
   }
 
-  return issueHandle(intake, lifecycleOwner!, closeSource);
+  return issueHandle(intake, lifecycleOwner!, closeDeployment);
 }
 
 /**
- * CLI-facing entry for `relay-host --profile v2`. The CLI process has no
- * trusted channel for the deployment injections above (native module
- * source, create-target execution, runtime lanes), so the explicit v2
- * selection fails closed here — before reading the profile, opening the
- * state store, or constructing any socket — and never falls back to v1.
+ * Canonical consumer for the one ticket issued by the trusted deployment
+ * source. Ticket consumption, canonical runtime-bundle consumption, and both
+ * TLS-cut captures all occur before H0 recovery. From here onward the same
+ * frozen profile object feeds H0/H2/welcome and the privileged intake's
+ * Vault/HTTPS/WSS chain.
  */
-export function runRelayV2HostShippingFromCli(): never {
-  throw failure("INPUTS_UNAVAILABLE");
+export async function startRelayV2HostShippingRootFromTrustedDeployment(
+  activation: RelayV2HostTrustedDeploymentActivation,
+): Promise<RelayV2HostShippingRootHandle> {
+  const deployment = takeRelayV2HostTrustedDeploymentActivation(activation);
+  let openedRuntime: ReturnType<typeof consumeRelayV2CanonicalHostRuntimeBundleV1>;
+  try {
+    if (!isRelayV2HostTlsTrustCut(deployment.credentialHttpsTlsTrustCut)
+      || !isRelayV2HostTlsTrustCut(deployment.carrierWssTlsTrustCut)
+      || deployment.credentialHttpsTlsTrustCut === deployment.carrierWssTlsTrustCut) {
+      throw failure("INPUTS_UNAVAILABLE");
+    }
+    openedRuntime = consumeRelayV2CanonicalHostRuntimeBundleV1(
+      deployment.runtimeBundle,
+    );
+  } catch {
+    try {
+      await deployment.closeAndDrain();
+    } catch {
+      throw failure("CLOSE_FAILED");
+    }
+    throw failure("INPUTS_UNAVAILABLE");
+  }
+
+  const captured = Object.freeze({
+    trustedHome: deployment.trustedHome,
+    nativeModuleTarget: Object.freeze({
+      platform: process.platform,
+      architecture: process.arch,
+      napiVersion: Number(process.versions.napi),
+    }),
+    nativeModuleLoader: (() => {
+      throw failure("INPUTS_UNAVAILABLE");
+    }) as RelayV2HostCredentialNativeModuleLoader,
+    createTargetExecutionPair: openedRuntime.createTargetExecutionPair,
+    bootstrapSecretByteSource: undefined,
+    reauthentication: undefined,
+    wssTransport: undefined,
+    credentialHttpsTlsTrust: readRelayV2HostTlsCaTrustCut(
+      deployment.credentialHttpsTlsTrustCut,
+    ),
+    carrierWssTlsTrust: readRelayV2HostTlsCaTrustCut(
+      deployment.carrierWssTlsTrustCut,
+    ),
+    discovery: openedRuntime.discovery,
+    localProcessTarget: openedRuntime.localProcessTarget,
+    remoteCompoundChannels: openedRuntime.remoteCompoundChannels,
+    terminalControlDaemonSocketPath: deployment.terminalControlDaemonSocketPath,
+    scanIntervalMs: RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
+    dashboardManagement: undefined,
+  }) as CapturedOptions;
+
+  return startCapturedShippingRoot(
+    captured,
+    deployment.profileSnapshot,
+    deployment.nativeModuleSource,
+    deployment.closeAndDrain,
+  );
 }

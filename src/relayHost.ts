@@ -795,10 +795,10 @@ function printHelp(): void {
 
 Relay v2:
   --profile v2 选择显式 default-off Relay v2 Host shipping root。relayUrl、issuer、hostId 与
-  credential reference 只来自 canonical 运行时 profile store；native credential module、
-  create-target execution 与 runtime lanes 只来自受信 deployment 注入。CLI 进程没有受信注入
-  渠道，因此在任何 profile/store/socket 之前 fail closed；它不读取 v1 secret、不宣告
-  capability，也绝不回退到 v1。
+  credential reference 只来自 canonical 运行时 profile store；rev7 trusted native source、
+  canonical runtime bundle 与两条独立 TLS trust cut 只由唯一 trusted deployment activation
+  owner 冻结并以 opaque one-shot ticket 交给 shipping root。任一 prerequisite 失败都逆序
+  drain、fail closed；它不读取 v1 secret、不宣告 capability，也绝不回退到 v1。
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
@@ -3511,10 +3511,14 @@ async function runConnection(
 export async function run(): Promise<void> {
   const opts = parseRelayHostOptions(process.argv.slice(3));
   if (opts.profile === "v2") {
-    // 显式 v2 选路进入显式 default-off Host shipping root。CLI 进程没有受信
-    // deployment 注入渠道，在任何 profile/store/socket 之前 fail closed；绝不回退 v1。
-    const { runRelayV2HostShippingFromCli } = await import("./relay/v2/hostShippingRoot.js");
-    runRelayV2HostShippingFromCli();
+    // 显式 v2 选路只能进入唯一 trusted deployment activation/source
+    // owner。profile snapshot、rev7 native source、canonical runtime bundle
+    // 与两条独立 TLS trust cut 以同一个 opaque one-shot ticket 交给 Host
+    // shipping root；任何失败逆序 drain 且绝不回退 v1。
+    const { startRelayV2HostShippingFromTrustedDeployment } =
+      await import("./relay/v2/hostShippingDeploymentSource.js");
+    await startRelayV2HostShippingFromTrustedDeployment();
+    return;
   }
   const statusOwnership: RelayStatusOwnership = {
     instanceId: randomUUID(),

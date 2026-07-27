@@ -16,6 +16,7 @@ export default defineConfig({
     "./relay/v2/hostRuntimeComposition.js",
     "./relay/v2/hostCanonicalProductionComposition.js",
     "./relay/v2/hostShippingRoot.js",
+    "./relay/v2/hostShippingDeploymentSource.js",
     // The hidden Dashboard management child stays on the same canonical dist
     // owners as the Host shipping chain instead of bundling second private
     // registries; the bundled .app converges to the fail-closed session when

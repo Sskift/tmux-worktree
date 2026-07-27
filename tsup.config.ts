@@ -28,6 +28,7 @@ export default defineConfig({
     "src/relay/v2/hostCredentialNativeModuleSource.ts",
     "src/relay/v2/hostCredentialNativeTarget.ts",
     "src/relay/v2/hostCredentialNativeLoader.ts",
+    "src/relay/v2/hostTlsTrustMaterial.ts",
     "src/relay/v2/hostCredentialExchangeCoordinator.ts",
     "src/relay/v2/hostReauthenticationLifecycleOwner.ts",
     "src/relay/v2/hostWssTransportLifecycle.ts",
@@ -104,6 +105,7 @@ export default defineConfig({
     "src/relay/v2/brokerShippingRoot.ts",
     "src/relay/v2/brokerShippingDeploymentSource.ts",
     "src/relay/v2/hostShippingRoot.ts",
+    "src/relay/v2/hostShippingDeploymentSource.ts",
     "src/relay/v2/relayV2DashboardManagementChildRuntime.ts",
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
@@ -206,7 +208,14 @@ export default defineConfig({
     // one-shot source/module claim registries are never duplicated, and
     // relayHost dynamically loads the shipping root's canonical dist entry.
     "./hostNativeCredentialPrivilegedIntakeBridge.js",
+    // The trusted Host source owns the only activation-ticket registry. The
+    // source and root must also share the canonical runtime-bundle and TLS-cut
+    // registries instead of bundling private copies.
+    "./canonicalHostRuntimeBundle.js",
+    "./hostTlsTrustMaterial.js",
+    "./hostShippingDeploymentSource.js",
     "./relay/v2/hostShippingRoot.js",
+    "./relay/v2/hostShippingDeploymentSource.js",
     // The hidden Dashboard management child consumes the same canonical Host
     // shipping root owner instead of bundling a second private registry; the
     // CLI dynamically loads the child's canonical dist entry.
