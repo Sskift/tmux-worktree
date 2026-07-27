@@ -661,6 +661,7 @@ async function startCapturedShippingRoot(
       ...(captured.bootstrapSecretByteSource === undefined
         ? {}
         : { bootstrapSecretByteSource: captured.bootstrapSecretByteSource }),
+      ...(startupSignal === undefined ? {} : { startupSignal }),
       ...(captured.reauthentication === undefined
         ? {}
         : { reauthentication: captured.reauthentication }),

@@ -7,6 +7,7 @@ import {
 import {
   openRelayV2HostPrivilegedProductionIntakeComposition,
   type RelayV2HostPrivilegedProductionCanonicalOptions,
+  type RelayV2HostPrivilegedProductionCredentialHttpsTransport,
   type RelayV2HostPrivilegedProductionIntakeComposition,
   type RelayV2HostPrivilegedProductionReauthenticationOptions,
   type RelayV2HostPrivilegedProductionWssTransport,
@@ -30,8 +31,13 @@ export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   readonly profileSnapshot?: Readonly<RelayV2HostProductionProfile>;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  /** Exact outer startup signal forwarded unchanged to the intake owner. */
+  readonly startupSignal?: AbortSignal;
   /** Deterministic reauthentication overrides forwarded to the intake. */
   readonly reauthentication?: RelayV2HostPrivilegedProductionReauthenticationOptions;
+  /** Isolated test seam; the production shipping root never supplies it. */
+  readonly credentialHttpsTransport?:
+    RelayV2HostPrivilegedProductionCredentialHttpsTransport;
   /** Socket factory seam forwarded to the intake. */
   readonly wssTransport?: RelayV2HostPrivilegedProductionWssTransport;
   /** Independent CA-only extension for the credential issuer HTTPS lane. */
@@ -215,9 +221,12 @@ function isAsynchronousResult(value: unknown): boolean {
  * native module source to the existing Host credential cell wrapper and the
  * existing privileged production intake composition. It never reads a path,
  * HOME, environment, process, or network; never selects an artifact, target,
- * loader, or secret source; never opens the H4a path cell; never constructs a
- * second Vault/authority/coordinator/canonical owner; and never starts a CLI,
- * connector, capability advertisement, retry, or fallback. The bridge itself
+ * loader, secret source, or network transport; never opens the H4a path cell;
+ * never constructs a second Vault/authority/coordinator/canonical owner; and
+ * never starts a CLI, connector, capability advertisement, retry, or fallback.
+ * The intake may use its isolated injected test transport; production shipping
+ * omits that seam and selects HTTPS only inside the existing intake owner.
+ * The bridge itself
  * owns the one-shot claim: the exact source callable identity is claimed
  * synchronously and permanently before any user code runs, so a duplicate or
  * concurrent open with the same source fails closed before touching anything.
@@ -234,7 +243,9 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
       "trustedHome",
       "profileSnapshot",
       "bootstrapSecretByteSource",
+      "startupSignal",
       "reauthentication",
+      "credentialHttpsTransport",
       "wssTransport",
       "credentialHttpsTlsTrust",
       "carrierWssTlsTrust",
@@ -310,8 +321,12 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
     bootstrapSecretByteSource: captured.bootstrapSecretByteSource as
       | RelayV2HostBootstrapSecretByteSource
       | undefined,
+    startupSignal: captured.startupSignal as AbortSignal | undefined,
     reauthentication: captured.reauthentication as
       | RelayV2HostPrivilegedProductionReauthenticationOptions
+      | undefined,
+    credentialHttpsTransport: captured.credentialHttpsTransport as
+      | RelayV2HostPrivilegedProductionCredentialHttpsTransport
       | undefined,
     wssTransport: captured.wssTransport as
       | RelayV2HostPrivilegedProductionWssTransport

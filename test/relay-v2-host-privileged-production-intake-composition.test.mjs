@@ -43,6 +43,8 @@ const profileStore = await import("../dist/relay/v2/hostProductionProfileStore.j
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const credentialVault = await import("../dist/relay/v2/hostCredentialVault.js");
+const credentialCodec = await import("../dist/relay/v2/codec.js");
+const credentialIssuer = await import("../dist/relay/v2/issuer.js");
 const bootstrapHandoff = await import(
   "../dist/relay/v2/hostBootstrapSecretHandoff.js"
 );
@@ -57,6 +59,7 @@ const profileCases = JSON.parse(readFileSync(new URL(
 ), "utf8"));
 const PROFILE = Object.freeze(profileCases.validProfile);
 const BOOTSTRAP_SECRET = "twhostboot2.privileged-intake-secret-never-reflect";
+const REFRESH_SECRET = "twref2.privileged-intake-refresh-never-reflect";
 
 function privateHome(prefix) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), prefix)));
@@ -201,6 +204,85 @@ function createByteSource(events) {
   return { source, stats };
 }
 
+function createCredentialHttpsTransport(
+  events,
+  expectedSnapshot,
+  { fail = false } = {},
+) {
+  let keyring = credentialIssuer.createRelayV2IssuerKeyring({
+    issuerId: "relay-issuer-id",
+    kid: "privileged-intake-bootstrap-key",
+    secretBase64url: Buffer.alloc(32, 0x69).toString("base64url"),
+    nowSeconds: 1_783_700_000,
+  });
+  const stats = {
+    calls: 0,
+    aborts: 0,
+    attemptIds: [],
+    hostEpochs: [],
+    hostInstanceIds: [],
+  };
+  const transport = Object.freeze({
+    start(request) {
+      stats.calls += 1;
+      events.push("credential-https-started");
+      const frame = credentialCodec.decodeRelayV2HttpsBody(
+        "host.bootstrap.request",
+        request.body,
+      ).frame;
+      stats.attemptIds.push(frame.bootstrapAttemptId);
+      stats.hostEpochs.push(frame.hostEpoch);
+      stats.hostInstanceIds.push(frame.hostInstanceId);
+      assert.equal(frame.hostEpoch, expectedSnapshot.hostEpoch);
+      assert.equal(frame.hostInstanceId, expectedSnapshot.hostInstanceId);
+      if (fail) {
+        return Object.freeze({
+          response: Promise.reject(new Error(`foreign transport ${BOOTSTRAP_SECRET}`)),
+          abort() { stats.aborts += 1; },
+        });
+      }
+      const issued = credentialIssuer.prepareRelayV2AccessTokenIssuance(keyring, {
+        role: "host",
+        hostId: frame.hostId,
+        principalId: "privileged-intake-principal",
+        grantId: "privileged-intake-grant",
+        nowSeconds: 1_783_700_001 + stats.calls,
+        jti: `privileged-intake-access-${stats.calls}`,
+      });
+      keyring = issued.nextKeyring;
+      const bytes = credentialCodec.encodeRelayV2HttpsBody(
+        "host.bootstrap.response",
+        {
+          bootstrapAttemptId: frame.bootstrapAttemptId,
+          principalId: "privileged-intake-principal",
+          grantId: "privileged-intake-grant",
+          hostId: frame.hostId,
+          accessToken: issued.token,
+          accessExpiresAtMs: issued.claims.exp * 1_000,
+          refreshToken: REFRESH_SECRET,
+          refreshExpiresAtMs: (issued.claims.exp + 86_400) * 1_000,
+        },
+      );
+      return Object.freeze({
+        response: Promise.resolve(Object.freeze({
+          statusCode: 200,
+          headers: Object.freeze([
+            Object.freeze(["Content-Type", "application/json"]),
+            Object.freeze(["Cache-Control", "no-store"]),
+            Object.freeze(["Content-Length", String(bytes.byteLength)]),
+          ]),
+          body: Object.freeze({
+            async *[Symbol.asyncIterator]() { yield bytes; },
+          }),
+          destroy() {},
+        })),
+        abort() { stats.aborts += 1; },
+      });
+    },
+  });
+  return { transport, stats };
+}
+
 function seedProfile(home) {
   return profileStore.loadOrCreateRelayV2HostProductionProfile({
     profile: PROFILE,
@@ -289,6 +371,7 @@ async function makeHarness(label, home) {
   return {
     root,
     store,
+    hostSnapshot: seeded.snapshot,
     spool,
     socketPath,
     statePath,
@@ -337,7 +420,11 @@ async function startDaemon(harness) {
 
 function bareCanonicalOptions() {
   return {
-    hostState: { close() {} },
+    hostState: {
+      hostInstanceId: "bare-host-instance",
+      async read() { return { hostEpoch: "bare-host-epoch" }; },
+      close() {},
+    },
     recoveredH2Spool: { close() { return Promise.resolve(); } },
     welcome: {},
     createTargetExecutionPair: {},
@@ -411,6 +498,10 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
     const backend = new FakeCellBackend();
     const cell = new FakeCellOwner(backend);
     const source = createByteSource(backend.events);
+    const credentialHttps = createCredentialHttpsTransport(
+      backend.events,
+      h.hostSnapshot,
+    );
     const originalSpoolClose = h.spool.close.bind(h.spool);
     h.spool.close = async () => {
       backend.events.push("canonical-spool-closed");
@@ -421,6 +512,7 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
         trustedHome: home,
         credentialCell: cell,
         bootstrapSecretByteSource: source.source,
+        credentialHttpsTransport: credentialHttps.transport,
         canonical: h.canonical,
       });
       backend.events.push("facade-published");
@@ -441,8 +533,9 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       assert.equal(source.stats.iterators, 1);
       assert.equal(source.stats.nextCalls, 2);
       assert.equal(source.stats.cancels, 1);
-      assert.equal(backend.swaps, 1);
-      assert.ok(backend.events.indexOf("cell-swapped")
+      assert.equal(credentialHttps.stats.calls, 1);
+      assert.equal(backend.swaps, 3);
+      assert.ok(backend.events.lastIndexOf("cell-swapped")
         < backend.events.indexOf("facade-published"));
       assert.deepEqual(h.effects, {
         welcome: 0, create: 0, process: 0, terminal: 0, remote: 0,
@@ -471,24 +564,30 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
     }
   });
 
-  await t.test("canonical failure preserves the committed cell and no-source recovery is inert", async () => {
+  await t.test("canonical failure preserves ready credential and recovery does not rebootstrap", async () => {
     const home = privateHome("tw-relay-v2-intake-recovery-home-");
     const backend = new FakeCellBackend();
     const source = createByteSource(backend.events);
     const failing = await makeHarness("failure", home);
+    const credentialHttps = createCredentialHttpsTransport(
+      backend.events,
+      failing.hostSnapshot,
+    );
     try {
       await assert.rejects(
         intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
           trustedHome: home,
           credentialCell: new FakeCellOwner(backend),
           bootstrapSecretByteSource: source.source,
+          credentialHttpsTransport: credentialHttps.transport,
           canonical: failing.canonical,
         }),
         (error) => assertRedacted(error, "CANONICAL_OPEN_FAILED"),
       );
       assert.equal(source.stats.iterators, 1);
       assert.equal(source.stats.cancels, 1);
-      assert.equal(backend.swaps, 1);
+      assert.equal(credentialHttps.stats.calls, 1);
+      assert.equal(backend.swaps, 3);
       assert.ok(backend.bytes?.byteLength > 0, "canonical rollback must preserve the envelope");
     } finally {
       failing.cleanup();
@@ -504,26 +603,91 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       cell: proofCell,
       bootstrapSecretHandoff: proofHandoff.handoff,
     });
-    assert.equal(proofVault.resolve(PROFILE.bootstrapSecretReference), BOOTSTRAP_SECRET);
+    assert.throws(() => proofVault.resolve(PROFILE.bootstrapSecretReference));
+    assert.equal(proofVault.resolve(PROFILE.refreshSecretReference), REFRESH_SECRET);
     await proofVault.closeAndDrain();
     await proofHandoff.closeAndDrain();
     await proofCell.closeAndDrain();
 
     const recovering = await makeHarness("recovery", home);
     const daemon = await startDaemon(recovering);
+    const recoveryHttps = createCredentialHttpsTransport(
+      backend.events,
+      recovering.hostSnapshot,
+      { fail: true },
+    );
     try {
       const swapsBefore = backend.swaps;
       const facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
         trustedHome: home,
         credentialCell: new FakeCellOwner(backend),
+        credentialHttpsTransport: recoveryHttps.transport,
         canonical: recovering.canonical,
       });
       assert.notEqual(facade, null);
       assert.deepEqual(facade.inspect(), { status: "stopped", controllerGeneration: "0" });
       assert.equal(backend.swaps, swapsBefore, "recovery without a source must remain read-only");
+      assert.equal(recoveryHttps.stats.calls, 0, "ready credential must not bootstrap again");
       assert.deepEqual(recovering.effects, {
         welcome: 0, create: 0, process: 0, terminal: 0, remote: 0,
       });
+      await facade.closeAndDrain();
+    } finally {
+      await daemon.close();
+      recovering.cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("pending version-zero bootstrap recovery reuses the durable attempt", async () => {
+    const home = privateHome("tw-relay-v2-intake-pending-home-");
+    const backend = new FakeCellBackend();
+    const source = createByteSource(backend.events);
+    const first = await makeHarness("pending-first", home);
+    const failedHttps = createCredentialHttpsTransport(
+      backend.events,
+      first.hostSnapshot,
+      { fail: true },
+    );
+    try {
+      await assert.rejects(
+        intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+          trustedHome: home,
+          credentialCell: new FakeCellOwner(backend),
+          bootstrapSecretByteSource: source.source,
+          credentialHttpsTransport: failedHttps.transport,
+          canonical: first.canonical,
+        }),
+        (error) => assertRedacted(error, "BOOTSTRAP_PROVISION_FAILED"),
+      );
+      assert.equal(failedHttps.stats.calls, 1);
+      assert.equal(backend.swaps, 2, "source provision and pending attempt are durable");
+      assert.equal(source.stats.cancels, 1);
+    } finally {
+      first.cleanup();
+    }
+
+    const recovering = await makeHarness("pending-recovery", home);
+    const daemon = await startDaemon(recovering);
+    const recoveredHttps = createCredentialHttpsTransport(
+      backend.events,
+      recovering.hostSnapshot,
+    );
+    try {
+      const facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+        trustedHome: home,
+        credentialCell: new FakeCellOwner(backend),
+        credentialHttpsTransport: recoveredHttps.transport,
+        canonical: recovering.canonical,
+      });
+      assert.notEqual(facade, null);
+      assert.equal(recoveredHttps.stats.calls, 1);
+      assert.equal(
+        recoveredHttps.stats.attemptIds[0],
+        failedHttps.stats.attemptIds[0],
+        "authority must retain and reuse the pending bootstrap attempt",
+      );
+      assert.equal(backend.swaps, 3, "recovery commits the ready credential once");
       await facade.closeAndDrain();
     } finally {
       await daemon.close();
@@ -541,11 +705,16 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       closeFailure: new Error(`foreign close leaked ${BOOTSTRAP_SECRET}`),
     });
     const source = createByteSource(backend.events);
+    const credentialHttps = createCredentialHttpsTransport(
+      backend.events,
+      h.hostSnapshot,
+    );
     try {
       const facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
         trustedHome: home,
         credentialCell: cell,
         bootstrapSecretByteSource: source.source,
+        credentialHttpsTransport: credentialHttps.transport,
         canonical: h.canonical,
       });
       assert.notEqual(facade, null);
@@ -627,6 +796,10 @@ test("native credential privileged intake bridge transfers one-shot ownership on
     const fake = createFakeNativeModule(events);
     const source = createPlainModuleSource(fake.nativeModule);
     const byteSource = createByteSource(events);
+    const credentialHttps = createCredentialHttpsTransport(
+      events,
+      h.hostSnapshot,
+    );
     const originalSpoolClose = h.spool.close.bind(h.spool);
     h.spool.close = async () => {
       events.push("canonical-spool-closed");
@@ -637,6 +810,7 @@ test("native credential privileged intake bridge transfers one-shot ownership on
         takeNativeModule: source.takeNativeModule,
         trustedHome: home,
         bootstrapSecretByteSource: byteSource.source,
+        credentialHttpsTransport: credentialHttps.transport,
         canonical: h.canonical,
       });
       events.push("facade-published");
@@ -911,12 +1085,17 @@ test("native credential privileged intake bridge transfers one-shot ownership on
     const fake = createFakeNativeModule(events);
     const source = createPlainModuleSource(fake.nativeModule);
     const byteSource = createByteSource(events);
+    const credentialHttps = createCredentialHttpsTransport(
+      events,
+      failing.hostSnapshot,
+    );
     try {
       await assert.rejects(
         bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
           takeNativeModule: source.takeNativeModule,
           trustedHome: home,
           bootstrapSecretByteSource: byteSource.source,
+          credentialHttpsTransport: credentialHttps.transport,
           canonical: failing.canonical,
         }),
         (error) => assertRedacted(error, "CANONICAL_OPEN_FAILED"),

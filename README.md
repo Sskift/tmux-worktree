@@ -502,8 +502,15 @@ An outer default-off privileged intake now reads the existing reference-only
 Host production profile, consumes an externally owned atomic credential cell
 and optional privileged byte source, and constructs the single Vault,
 credential authority, HTTPS coordinator, and canonical Host owner. It selects
-no native cell or secret source. Host native `qualifiedRecords=[]` therefore
-still prevents a qualified real intake path.
+no native cell or secret source. A newly provisioned bootstrap secret, a
+durable bootstrap-only envelope, or recovered credential version `0` is
+exchanged through that same coordinator and committed by the same
+authority/Vault before canonical Host/WSS publication; a recovered ready
+credential skips bootstrap. The exchange uses the exact current HostState
+epoch/instance and the outer startup signal, reuses any authority-owned
+pending attempt, and follows the existing reverse-order rollback on failure.
+Host native `qualifiedRecords=[]` therefore still prevents a qualified real
+intake path.
 
 A default-off Host shipping root (`src/relay/v2/hostShippingRoot.ts`) and its
 unique trusted deployment activation/source
@@ -670,7 +677,10 @@ source to the existing bootstrap-source → handoff → Vault chain. The fd is
 never exposed to business code or child stdio; source cancellation/close owns
 its descriptor lifecycle. That chain
 consumes the Broker's single trailing LF directly, performs bootstrap, and
-persists the credential in the existing profile/Vault owner. It never moves
+persists the credential through HTTPS exchange in the existing
+authority/Vault owner before the canonical connector can start. A restart
+resumes an existing pending bootstrap attempt, while an already-ready
+credential is not bootstrapped again. It never moves
 the raw token into argv, env, logs, errors, stdout, or a second credential
 store. After Host registration/credential bootstrap is confirmed, the
 operator removes the transferred file; the CLI never deletes it

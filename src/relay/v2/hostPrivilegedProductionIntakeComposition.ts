@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { types as nodeTypes } from "node:util";
 
 import {
@@ -17,7 +18,10 @@ import {
 import { RelayV2HostCredentialAuthority } from "./hostCredentialAuthority.js";
 import { RelayV2HostCredentialExchangeCoordinator } from
   "./hostCredentialExchangeCoordinator.js";
-import { RelayV2HostCredentialHttpsAdapter } from "./hostCredentialHttpsAdapter.js";
+import {
+  RelayV2HostCredentialHttpsAdapter,
+  type RelayV2HostCredentialHttpsAdapterOptions,
+} from "./hostCredentialHttpsAdapter.js";
 import {
   type RelayV2HostCredentialAtomicByteCell,
   RelayV2HostCredentialVault,
@@ -48,6 +52,10 @@ export type RelayV2HostPrivilegedProductionWssTransport = NonNullable<
   RelayV2HostCanonicalProductionCompositionOptions["wssTransport"]
 >;
 
+export type RelayV2HostPrivilegedProductionCredentialHttpsTransport = NonNullable<
+  RelayV2HostCredentialHttpsAdapterOptions["transport"]
+>;
+
 type CanonicalDashboardManagement = NonNullable<
 RelayV2HostCanonicalProductionCompositionOptions["dashboardManagement"]
 >;
@@ -76,8 +84,13 @@ export interface RelayV2HostPrivilegedProductionIntakeCompositionOptions {
   readonly credentialCell: RelayV2HostCredentialAtomicByteCellOwner;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  /** Exact outer startup signal; shipping forwards its existing process-owned signal. */
+  readonly startupSignal?: AbortSignal;
   /** Deterministic reauthentication overrides; omission keeps the production defaults. */
   readonly reauthentication?: RelayV2HostPrivilegedProductionReauthenticationOptions;
+  /** Isolated test seam; the production shipping root never accepts or supplies it. */
+  readonly credentialHttpsTransport?:
+    RelayV2HostPrivilegedProductionCredentialHttpsTransport;
   /** Socket factory seam; production omission selects the default transport. */
   readonly wssTransport?: RelayV2HostPrivilegedProductionWssTransport;
   /** Independent CA-only extension for the credential issuer HTTPS lane. */
@@ -153,6 +166,8 @@ interface CapturedByteSource {
 
 interface CapturedCanonicalOptions {
   readonly values: RelayV2HostPrivilegedProductionCanonicalOptions;
+  readonly readHostState: CapturedMethod;
+  readonly hostInstanceId: string;
   readonly closeSpool: CapturedMethod;
   readonly closeHostState: CapturedMethod;
 }
@@ -162,7 +177,10 @@ interface CapturedOptions {
   readonly profileSnapshot: Readonly<RelayV2HostProductionProfile> | undefined;
   readonly cell: CapturedCell;
   readonly sourceOwner: { current: CapturedByteSource | null };
+  readonly startupSignal: AbortSignal | undefined;
   readonly reauthentication: RelayV2HostPrivilegedProductionReauthenticationOptions | undefined;
+  readonly credentialHttpsTransport:
+    RelayV2HostPrivilegedProductionCredentialHttpsTransport | undefined;
   readonly wssTransport: RelayV2HostPrivilegedProductionWssTransport | undefined;
   readonly credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
   readonly carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
@@ -213,6 +231,15 @@ const OBJECT_HAS_OWN = Object.hasOwn;
 const REFLECT_APPLY = Reflect.apply;
 const REFLECT_OWN_KEYS = Reflect.ownKeys;
 const ARRAY_IS_ARRAY = Array.isArray;
+const ABORT_SIGNAL_OVERRIDE_KEYS = Object.freeze([
+  "aborted",
+  "addEventListener",
+  "removeEventListener",
+] as const);
+const NATIVE_ABORTED_GETTER = Object.getOwnPropertyDescriptor(
+  AbortSignal.prototype,
+  "aborted",
+)?.get;
 
 function failure(
   code: RelayV2HostPrivilegedProductionIntakeCompositionErrorCode,
@@ -316,6 +343,40 @@ function invoke(captured: CapturedMethod, args: readonly unknown[]): unknown {
   return Reflect.apply(captured.method, captured.receiver, args);
 }
 
+function captureOwnString(value: unknown, key: string): string | null {
+  if (value === null || typeof value !== "object" || rejectedProxy(value)) return null;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined
+      && Object.hasOwn(descriptor, "value")
+      && typeof descriptor.value === "string"
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function captureNativeAbortSignal(
+  value: unknown,
+): AbortSignal | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null
+    || typeof value !== "object"
+    || rejectedProxy(value)
+    || NATIVE_ABORTED_GETTER === undefined) return null;
+  try {
+    if (Object.getPrototypeOf(value) !== AbortSignal.prototype
+      || ABORT_SIGNAL_OVERRIDE_KEYS.some(
+        (key) => Object.getOwnPropertyDescriptor(value, key) !== undefined,
+      )
+      || typeof Reflect.apply(NATIVE_ABORTED_GETTER, value, []) !== "boolean") return null;
+  } catch {
+    return null;
+  }
+  return value as AbortSignal;
+}
+
 function isNativePromise(value: unknown): value is Promise<unknown> {
   if (!(value instanceof Promise) || rejectedProxy(value)) return false;
   try {
@@ -402,9 +463,14 @@ function captureCanonicalOptions(value: unknown): CapturedCanonicalOptions | nul
     CANONICAL_OPTIONAL_KEYS,
   );
   if (fields === null) return null;
+  const readHostState = captureDataMethod(fields.hostState, "read");
+  const hostInstanceId = captureOwnString(fields.hostState, "hostInstanceId");
   const closeSpool = captureDataMethod(fields.recoveredH2Spool, "close");
   const closeHostState = captureDataMethod(fields.hostState, "close");
-  if (closeSpool === null || closeHostState === null) return null;
+  if (readHostState === null
+    || hostInstanceId === null
+    || closeSpool === null
+    || closeHostState === null) return null;
 
   const result = Object.create(null) as Record<string, unknown>;
   for (const key of CANONICAL_REQUIRED_KEYS) result[key] = fields[key];
@@ -447,6 +513,8 @@ function captureCanonicalOptions(value: unknown): CapturedCanonicalOptions | nul
   }
   return Object.freeze({
     values: freezeRecord(result) as RelayV2HostPrivilegedProductionCanonicalOptions,
+    readHostState,
+    hostInstanceId,
     closeSpool,
     closeHostState,
   });
@@ -490,6 +558,23 @@ function captureWssTransportOptions(
   })) as RelayV2HostPrivilegedProductionWssTransport;
 }
 
+function captureCredentialHttpsTransportOptions(
+  value: unknown,
+): RelayV2HostPrivilegedProductionCredentialHttpsTransport | null | undefined {
+  if (value === undefined) return undefined;
+  const start = captureDataMethod(value, "start");
+  if (start === null) return null;
+  let port!: RelayV2HostPrivilegedProductionCredentialHttpsTransport;
+  port = Object.freeze(Object.assign(Object.create(null), {
+    start: (
+      request: Parameters<RelayV2HostPrivilegedProductionCredentialHttpsTransport["start"]>[0],
+    ) => invoke(start, [request]) as ReturnType<
+      RelayV2HostPrivilegedProductionCredentialHttpsTransport["start"]
+    >,
+  })) as RelayV2HostPrivilegedProductionCredentialHttpsTransport;
+  return port;
+}
+
 function captureOptions(
   value: unknown,
 ): CapturedOptions | null {
@@ -497,14 +582,19 @@ function captureOptions(
     "trustedHome",
     "profileSnapshot",
     "bootstrapSecretByteSource",
+    "startupSignal",
     "reauthentication",
+    "credentialHttpsTransport",
     "wssTransport",
     "credentialHttpsTlsTrust",
     "carrierWssTlsTrust",
   ]);
   if (fields === null) return null;
   if (fields.trustedHome !== undefined && typeof fields.trustedHome !== "string") return null;
+  const startupSignal = captureNativeAbortSignal(fields.startupSignal);
   const reauthentication = captureReauthenticationOptions(fields.reauthentication);
+  const credentialHttpsTransport =
+    captureCredentialHttpsTransportOptions(fields.credentialHttpsTransport);
   const wssTransport = captureWssTransportOptions(fields.wssTransport);
   const cell = captureCell(fields.credentialCell);
   const source = fields.bootstrapSecretByteSource === undefined
@@ -528,14 +618,19 @@ function captureOptions(
     return null;
   }
   if (cell === null || source === null && fields.bootstrapSecretByteSource !== undefined
-    || reauthentication === null || wssTransport === null
+    || startupSignal === null
+    || reauthentication === null
+    || credentialHttpsTransport === null
+    || wssTransport === null
     || canonical === null) return null;
   return REFLECT_APPLY(OBJECT_FREEZE, undefined, [{
     trustedHome: fields.trustedHome as string | undefined,
     profileSnapshot,
     cell,
     sourceOwner: { current: source },
+    startupSignal,
     reauthentication,
+    credentialHttpsTransport,
     wssTransport,
     credentialHttpsTlsTrust,
     carrierWssTlsTrust,
@@ -790,17 +885,22 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
     // A read-only recovery pass validates the complete existing envelope even
     // when no privileged source was supplied.
     const recoveredCredential = authority.inspect(profile.credentialReference);
+    let bootstrapRequired = recoveredCredential?.credentialVersion === "0";
     if (captured.sourceOwner.current === null && recoveredCredential === null) {
       // The Vault is the only envelope decoder. A successful resolve proves
       // the permitted durable bootstrap-only intermediate state; discard the
       // returned secret immediately and never retain it in this composition.
       void vault.resolve(profile.bootstrapSecretReference);
+      bootstrapRequired = true;
     }
     const httpsAdapter = new RelayV2HostCredentialHttpsAdapter({
       issuerUrl: profile.credentialIssuerUrl,
       ...(captured.credentialHttpsTlsTrust === undefined
         ? {}
         : { tlsTrust: captured.credentialHttpsTlsTrust }),
+      ...(captured.credentialHttpsTransport === undefined
+        ? {}
+        : { transport: captured.credentialHttpsTransport }),
     });
     const coordinator = new RelayV2HostCredentialExchangeCoordinator({
       authority,
@@ -813,6 +913,25 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
       owned.sourceHandle = sourceHandle;
       const candidate = await sourceHandle.readCandidate();
       vault.provisionBootstrap(candidate);
+      bootstrapRequired = true;
+    }
+
+    if (bootstrapRequired) {
+      stage = "BOOTSTRAP_PROVISION_FAILED";
+      const snapshotPromise = invoke(captured.canonical.readHostState, []);
+      if (!isNativePromise(snapshotPromise)) throw failure(stage);
+      const snapshot = await Reflect.apply(promiseThen, snapshotPromise, []);
+      const hostEpoch = captureOwnString(snapshot, "hostEpoch");
+      if (hostEpoch === null) throw failure(stage);
+      const commit = await coordinator.bootstrap({
+        credentialReference: profile.credentialReference,
+        hostId: profile.hostId,
+        attemptId: randomUUID(),
+        oldSecretReference: profile.bootstrapSecretReference,
+        hostEpoch,
+        hostInstanceId: captured.canonical.hostInstanceId,
+      }, captured.startupSignal ?? new AbortController().signal);
+      if (commit.status !== "applied") throw failure(stage);
     }
 
     stage = "CANONICAL_OPEN_FAILED";
