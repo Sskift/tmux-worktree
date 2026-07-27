@@ -555,8 +555,12 @@ covers only this machine's single target (darwin-arm64) and proves only that
 the packed artifact loads, the raw open fails closed before registry or
 mutation, and the factory's two contract-closed branches (closed error
 union, or ready followed by one-shot bind and a final exact-open that still
-fails at the durability gate) hold with an exactly-once `CELL_CLOSED` replay:
-`qualifiedRecords=[]`, trusted factory production driver
+fails at the durability gate) hold with an exactly-once `CELL_CLOSED` replay.
+The final module now also contains the frozen qualified-success path: it
+transfers the sole prebound descriptor into platform-common's unique
+`AdmissionOwner` and exposes that same owner's synchronous read/CAS/close
+handle, without a JavaScript file store or second credential owner. This path
+remains unreachable in production because `qualifiedRecords=[]`; trusted factory production driver
 selection/deployment, durability qualification, real open, evidence for the
 other three targets, signing/notarization, bit-reproducibility, Dashboard
 bundling, and production wiring are all still missing, so the NO-GO status is

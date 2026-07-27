@@ -11,11 +11,14 @@
 //! trusted loader, and no visibility isolation is claimed. The factory mints
 //! an unforgeable capability over the contract-fixed private cell directory
 //! and its one-shot binder returns the final `{ open }` module whose `open`
-//! runs the same frozen gate. The factory never accepts a path, descriptor,
-//! HOME, environment, or credential from JavaScript, and neither it nor the
-//! raw v1 path is wired to any production composition.
+//! runs the same frozen gate. Its qualified branch alone transfers the exact
+//! prebound descriptor into platform-common and publishes the frozen
+//! read/CAS/close handle over that same owner. The factory never accepts a
+//! path, descriptor, HOME, environment, or credential from JavaScript, and
+//! neither it nor the raw v1 path is wired to any production composition.
 
 mod factory;
+mod native_cell;
 
 use napi::bindgen_prelude::{
     Array, FromNapiValue, Function, FunctionCallContext, FunctionRef, JsObjectValue, Object,
@@ -25,7 +28,7 @@ use napi::{sys, Env, Error, JsValue, Property, Result, Status, ValueType};
 use napi_derive::napi;
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
     initialize_process_lifecycle, production_durability_qualification, CellErrorCode,
-    ProcessLifecycleToken,
+    DurabilityQualification, ProcessLifecycleToken,
 };
 use std::ptr;
 use std::sync::{Arc, OnceLock};
@@ -136,7 +139,7 @@ fn clear_pending_exception(env: &Env) {
     }
 }
 
-fn exact_string_keys(array: &Array<'_>, expected: &[&str]) -> Result<bool> {
+pub(crate) fn exact_string_keys(array: &Array<'_>, expected: &[&str]) -> Result<bool> {
     if array.len() as usize != expected.len() {
         return Ok(false);
     }
@@ -159,7 +162,7 @@ fn exact_string_keys(array: &Array<'_>, expected: &[&str]) -> Result<bool> {
     Ok(found == expected)
 }
 
-fn data_descriptor_value<'env>(
+pub(crate) fn data_descriptor_value<'env>(
     descriptors: &Object<'env>,
     name: &str,
 ) -> Result<Option<Unknown<'env>>> {
@@ -221,21 +224,27 @@ fn decode_open_request(
     Ok(OpenRequestDecode::Valid)
 }
 
-/// Closed gate order: compile target first, then the eagerly captured
-/// lifecycle, then the deny-by-default production durability qualification. A
-/// future qualified record would still fail closed here because this revision
-/// has no open seam to receive one.
+/// Closed gate order shared by raw and trusted-bound open. Only the bound
+/// factory path may consume a successful qualification; the raw module has no
+/// descriptor capability and therefore remains closed even after a future
+/// qualified contract revision.
+fn production_open_gate<'a>(
+    target_supported: bool,
+    lifecycle: &'a std::result::Result<ProcessLifecycleToken, CellErrorCode>,
+) -> std::result::Result<(&'a ProcessLifecycleToken, DurabilityQualification), CellErrorCode> {
+    if !target_supported {
+        return Err(CellErrorCode::NativeInterfaceInvalid);
+    }
+    let lifecycle = lifecycle.as_ref().map_err(|code| *code)?;
+    let qualification = production_durability_qualification()?;
+    Ok((lifecycle, qualification))
+}
+
 fn open_gate_code(
     target_supported: bool,
     lifecycle: &std::result::Result<ProcessLifecycleToken, CellErrorCode>,
 ) -> CellErrorCode {
-    if !target_supported {
-        return CellErrorCode::NativeInterfaceInvalid;
-    }
-    if let Err(code) = lifecycle {
-        return *code;
-    }
-    match production_durability_qualification() {
+    match production_open_gate(target_supported, lifecycle) {
         Ok(_) => CellErrorCode::NativeInterfaceInvalid,
         Err(code) => code,
     }

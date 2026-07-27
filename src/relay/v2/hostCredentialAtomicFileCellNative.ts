@@ -706,6 +706,10 @@ function parseOpenedHandle(raw: unknown): CapturedHandle {
 
 /**
  * Default-off, injected-only closed wrapper for the Host credential cell ABI.
+ * ABI v1 already admits the production native module's exact synchronous
+ * opened handle; ownership, revision branding, uncertainty fencing, and
+ * close-and-drain remain here unchanged when that qualified handle is
+ * eventually reachable.
  * It never loads an addon and never reads a path, HOME, environment, process,
  * network, credential envelope, broker store, or fallback source.
  */

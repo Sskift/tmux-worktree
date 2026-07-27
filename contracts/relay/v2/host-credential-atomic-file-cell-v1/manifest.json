@@ -11,12 +11,14 @@
   "nativeModuleAuthority": {
     "source": "future-production-composition-single-trusted-factory",
     "binding": "pre-bound-exact-host-credential-cell-directory-descriptor-capability",
-    "futureNativeHolder": "4b2a-host-platform-common-admission-owner",
+    "futureNativeHolder": "platform-common-AdmissionOwner",
     "wrapperOpenConsumesBoundCapabilityOnly": true,
     "pathOrDescriptorArgumentInAbi": false,
     "homePathEnvironmentOrGlobalLookupAllowed": false,
     "factoryLoaderOrPathImplementedIn4b1": false,
     "platformAdmissionImplementedIn4b2a": true,
+    "boundOpenDescriptorAdoptionImplemented": true,
+    "openedHandleReadCompareAndSwapCloseImplemented": true,
     "platformAdmissionProductionWired": false
   },
   "nativeInterface": {
@@ -76,7 +78,7 @@
     "compareAndSwapOwnership": "synchronous-node-copy-before-native-mutation"
   },
   "revision": {
-    "raw": "opaque-native-owner-bound-token",
+    "raw": "opaque-native-type-tagged-wrapped-owner-bound-object",
     "rawEscapesNodeWrapper": false,
     "public": "empty-frozen-node-owner-bound-token",
     "publicFields": [],
@@ -767,12 +769,13 @@
       "abi": "existing-raw-v1-module-abi-version-1",
       "acceptsPathDescriptorHomeEnvironmentOrCredential": false,
       "openFailureBeforeRegistryReservationOrCredentialMutation": "CELL_DURABILITY_UNSUPPORTED",
-      "descriptorAdoptionIntoAdmissionOwner": "only-after-future-qualified-durability-record"
+      "descriptorAdoptionIntoAdmissionOwner": "after-successful-production-durability-qualification",
+      "openedHandle": "exact-own-data-read-compareAndSwap-close-over-the-same-AdmissionOwner"
     },
     "lifecycle": {
       "pidFork": "CELL_CLOSED-and-never-close-inherited-descriptor",
       "boundCallbackPrecedence": "capability-origin-pid-before-argument-observation-decode-mutex-take-or-descriptor-handling",
-      "finalClose": "exactly-once-raw-close-no-retry",
+      "finalClose": "unadopted-capability-or-adopted-AdmissionOwner-exactly-once-no-retry",
       "openFallbackToRawV1ModuleAllowed": false,
       "dualRoutingAllowed": false
     },

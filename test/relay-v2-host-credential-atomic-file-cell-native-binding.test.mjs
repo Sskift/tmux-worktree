@@ -229,7 +229,8 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
     // Exactly-once factory drive. On a machine without the deployed private
     // cell directory the producer fails closed with one closed code; on a
     // machine that has it, the one-shot binder returns the final module whose
-    // open still fails at the durability gate. Either way the factory never
+    // now-wired owner/handle path is still blocked at the durability gate.
+    // Either way the factory never
     // reads the redirected HOME and the replayed second call is CELL_CLOSED.
     const beforeFactory = setterCalls;
     const factoryResult = factory();
@@ -267,7 +268,7 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
         "bound module open",
       );
       // The canonical wrapper admits the final module and decodes the same
-      // closed gate error without opening a cell.
+      // closed gate error before the qualified owner/handle branch is reached.
       assert.throws(
         () => nativeCell.openRelayV2HostCredentialAtomicFileCellNative({
           nativeModule: bindResult.module,

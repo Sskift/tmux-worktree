@@ -156,15 +156,21 @@ test("Host credential native ABI manifest and every machine case stay closed", a
   assert.deepEqual(manifest.nativeModuleAuthority, {
     source: "future-production-composition-single-trusted-factory",
     binding: "pre-bound-exact-host-credential-cell-directory-descriptor-capability",
-    futureNativeHolder: "4b2a-host-platform-common-admission-owner",
+    futureNativeHolder: "platform-common-AdmissionOwner",
     wrapperOpenConsumesBoundCapabilityOnly: true,
     pathOrDescriptorArgumentInAbi: false,
     homePathEnvironmentOrGlobalLookupAllowed: false,
     factoryLoaderOrPathImplementedIn4b1: false,
     platformAdmissionImplementedIn4b2a: true,
+    boundOpenDescriptorAdoptionImplemented: true,
+    openedHandleReadCompareAndSwapCloseImplemented: true,
     platformAdmissionProductionWired: false,
   });
   assert.equal(manifest.bytes.maximumBytes, 65_536);
+  assert.equal(
+    manifest.revision.raw,
+    "opaque-native-type-tagged-wrapped-owner-bound-object",
+  );
   assert.deepEqual(manifest.revision.publicFields, []);
   assert.deepEqual(manifest.revision.rejectedBeforeRawMutation,
     ["foreign", "copy", "replay", "stale", "forged"]);
@@ -299,6 +305,18 @@ test("Host credential native ABI manifest and every machine case stay closed", a
   assert.equal(
     trustedFactory.finalModule.openFailureBeforeRegistryReservationOrCredentialMutation,
     "CELL_DURABILITY_UNSUPPORTED",
+  );
+  assert.equal(
+    trustedFactory.finalModule.descriptorAdoptionIntoAdmissionOwner,
+    "after-successful-production-durability-qualification",
+  );
+  assert.equal(
+    trustedFactory.finalModule.openedHandle,
+    "exact-own-data-read-compareAndSwap-close-over-the-same-AdmissionOwner",
+  );
+  assert.equal(
+    trustedFactory.lifecycle.finalClose,
+    "unadopted-capability-or-adopted-AdmissionOwner-exactly-once-no-retry",
   );
   assert.equal(trustedFactory.lifecycle.openFallbackToRawV1ModuleAllowed, false);
   assert.equal(trustedFactory.lifecycle.dualRoutingAllowed, false);

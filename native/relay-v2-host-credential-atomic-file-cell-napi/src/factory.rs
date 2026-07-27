@@ -15,27 +15,30 @@
 //! object. Rollback, replay, PID-fork, and final close all fail closed, the
 //! descriptor is raw-closed exactly once with no dup or reopen, and the empty
 //! durability qualification still stops every open at the existing gate
-//! before registry, descriptor adoption, or credential mutation.
+//! before registry, descriptor adoption, or credential mutation. Once a
+//! future frozen qualification is actually available, the final module alone
+//! transfers the exact descriptor into platform-common and publishes its
+//! read/CAS/close handle.
 
 use napi::bindgen_prelude::{FunctionCallContext, Object, Unknown};
 use napi::{Env, JsValue, Result as NapiResult};
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
-    CellErrorCode, DescriptorRelativePlatform, ProcessLifecycleToken,
+    adopt_prebound_directory, CellErrorCode, DescriptorRelativePlatform, ProcessLifecycleToken,
 };
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
-    create_open_error_result, define_own_data, lifecycle, open_cell_gated, open_gate_code,
-    supported_target, Intrinsics, RawValue,
+    create_open_error_result, decode_open_request, define_own_data, lifecycle, native_cell,
+    production_open_gate, supported_target, Intrinsics, OpenRequestDecode, RawValue,
 };
 
 pub(crate) const TRUSTED_FACTORY_METHOD: &str =
     "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
 
 #[cfg(target_os = "macos")]
-mod cell_platform {
+pub(crate) mod cell_platform {
     #[cfg(test)]
     pub(crate) use relay_v2_host_credential_atomic_file_cell_platform_darwin::prebound_directory_from_owned_raw_fd;
     pub(crate) use relay_v2_host_credential_atomic_file_cell_platform_darwin::{
@@ -45,7 +48,7 @@ mod cell_platform {
 }
 
 #[cfg(target_os = "linux")]
-mod cell_platform {
+pub(crate) mod cell_platform {
     #[cfg(test)]
     pub(crate) use relay_v2_host_credential_atomic_file_cell_platform_linux::prebound_directory_from_owned_raw_fd;
     pub(crate) use relay_v2_host_credential_atomic_file_cell_platform_linux::{
@@ -147,6 +150,22 @@ impl TrustedCellCapability {
         }
     }
 
+    /// One-shot ownership transfer into platform-common. From this point the
+    /// common adoption attempt owns descriptor cleanup on every outcome.
+    fn take_platform_parts(
+        &mut self,
+    ) -> Result<(cell_platform::Platform, cell_platform::Descriptor), CellErrorCode> {
+        self.check_origin()?;
+        if self.closed || self.platform.is_none() || self.directory.is_none() {
+            return Err(CellErrorCode::CellClosed);
+        }
+        self.closed = true;
+        Ok((
+            self.platform.take().ok_or(CellErrorCode::CellClosed)?,
+            self.directory.take().ok_or(CellErrorCode::CellClosed)?,
+        ))
+    }
+
     /// One raw close attempt, exactly once, in the origin process only.
     fn close_once(&mut self) {
         if self.closed {
@@ -160,6 +179,40 @@ impl TrustedCellCapability {
         {
             let _ = platform.raw_close(directory);
         }
+    }
+}
+
+/// The final module's one-shot open authority. Qualification and exact
+/// request validation happen before this mutex is entered; a successful take
+/// permanently transfers descriptor ownership to platform-common.
+struct BoundCellOpener {
+    origin_pid: u32,
+    capability: Mutex<Option<TrustedCellCapability>>,
+}
+
+impl BoundCellOpener {
+    fn new(capability: TrustedCellCapability) -> Self {
+        Self {
+            origin_pid: capability.pid,
+            capability: Mutex::new(Some(capability)),
+        }
+    }
+
+    fn check_origin(&self) -> Result<(), CellErrorCode> {
+        if std::process::id() == self.origin_pid {
+            Ok(())
+        } else {
+            Err(CellErrorCode::CellClosed)
+        }
+    }
+
+    fn take_capability(&self) -> Result<TrustedCellCapability, CellErrorCode> {
+        self.check_origin()?;
+        self.capability
+            .lock()
+            .map_err(|_| CellErrorCode::CellClosed)?
+            .take()
+            .ok_or(CellErrorCode::CellClosed)
     }
 }
 
@@ -383,24 +436,24 @@ fn bind_trusted_module<'env>(
         Ok(capability) => capability,
         Err(code) => return outcome_error_result(env, code),
     };
-    let publication = CallbackPublicationOwner::new(capability);
-    let capability_slot = publication.callback_slot();
+    let publication = CallbackPublicationOwner::new(BoundCellOpener::new(capability));
+    let opener_slot = publication.callback_slot();
     let open_intrinsics = Arc::clone(intrinsics);
     let open = env.create_function_from_closure::<(Unknown,), RawValue, _>(
         "openRelayV2HostCredentialAtomicFileCellV1",
         move |context: FunctionCallContext<'_>| {
-            let Some(capability) = capability_slot.get() else {
+            let Some(opener) = opener_slot.get() else {
                 return create_open_error_result(context.env, CellErrorCode::CellClosed)
                     .map(|value| RawValue(value.raw()));
             };
             run_bound_open_callback(
-                capability,
+                opener,
                 || context.get::<Unknown<'_>>(0).map_err(|_| ()),
                 |code| {
                     create_open_error_result(context.env, code).map(|value| RawValue(value.raw()))
                 },
                 |input| {
-                    open_bound_cell(context.env, &open_intrinsics, capability, input)
+                    open_bound_cell(context.env, &open_intrinsics, opener, input)
                         .map(|value| RawValue(value.raw()))
                 },
             )
@@ -427,12 +480,12 @@ fn bind_trusted_module<'env>(
 /// the boundary may observe/decode the JavaScript request, encode a missing
 /// argument, or enter the frozen open continuation.
 fn run_bound_open_callback<I, R>(
-    capability: &TrustedCellCapability,
+    opener: &BoundCellOpener,
     observe_input: impl FnOnce() -> Result<I, ()>,
     encode_error: impl FnOnce(CellErrorCode) -> R,
     open: impl FnOnce(I) -> R,
 ) -> R {
-    if let Err(code) = capability.check_origin() {
+    if let Err(code) = opener.check_origin() {
         return encode_error(code);
     }
     match observe_input() {
@@ -441,43 +494,61 @@ fn run_bound_open_callback<I, R>(
     }
 }
 
-/// The bound module's open gate composition: the capability's synchronous PID
-/// fence runs before any request handling, so a fork child only ever receives
-/// `CELL_CLOSED` and the inherited descriptor is never read, adopted, or
-/// closed. In the origin process the frozen v1 gate chain decides.
-fn bound_open_gate_code(
-    capability: &TrustedCellCapability,
-    target_supported: bool,
-    lifecycle_token: &std::result::Result<ProcessLifecycleToken, CellErrorCode>,
-) -> CellErrorCode {
-    if capability.check_origin().is_err() {
-        return CellErrorCode::CellClosed;
-    }
-    open_gate_code(target_supported, lifecycle_token)
-}
-
-/// The final module's `open` runs the identical frozen v1 request decode and
-/// gate chain as the raw v1 module, fenced by the bound capability's origin
-/// pid before anything touches the descriptor. The bound capability stays
-/// owned by this exact closure and is never adopted before the existing
-/// durability gate; with the empty qualification every open fails closed
-/// there.
+/// The final module's `open` keeps the raw v1 request shape and gate order,
+/// with the capability's PID fence before request observation. A qualified,
+/// valid open transfers the exact bound capability into the sole common
+/// owner; a fork child never reads, adopts, or closes the inherited
+/// descriptor.
 fn open_bound_cell<'env>(
     env: &'env Env,
-    intrinsics: &Intrinsics,
-    capability: &TrustedCellCapability,
+    intrinsics: &Arc<Intrinsics>,
+    opener: &BoundCellOpener,
     input: Unknown<'env>,
 ) -> NapiResult<Object<'env>> {
-    if capability.check_origin().is_err() {
+    if opener.check_origin().is_err() {
         return create_open_error_result(env, CellErrorCode::CellClosed);
     }
-    let gate = bound_open_gate_code(capability, supported_target(), lifecycle());
-    open_cell_gated(env, intrinsics, input, gate)
+    let decode = match decode_open_request(env, intrinsics, input) {
+        Ok(decode) => decode,
+        Err(_) => {
+            crate::clear_pending_exception(env);
+            return create_open_error_result(env, CellErrorCode::NativeInterfaceInvalid);
+        }
+    };
+    match decode {
+        OpenRequestDecode::Valid => {}
+        OpenRequestDecode::InvalidArgument => {
+            return create_open_error_result(env, CellErrorCode::InvalidArgument)
+        }
+        OpenRequestDecode::NativeInterfaceInvalid => {
+            return create_open_error_result(env, CellErrorCode::NativeInterfaceInvalid)
+        }
+    }
+    let (lifecycle_token, qualification) =
+        match production_open_gate(supported_target(), lifecycle()) {
+            Ok(gate) => gate,
+            Err(code) => return create_open_error_result(env, code),
+        };
+    let mut capability = match opener.take_capability() {
+        Ok(capability) => capability,
+        Err(code) => return create_open_error_result(env, code),
+    };
+    let (platform, directory) = match capability.take_platform_parts() {
+        Ok(parts) => parts,
+        Err(code) => return create_open_error_result(env, code),
+    };
+    let owner = match adopt_prebound_directory(lifecycle_token, platform, directory, &qualification)
+    {
+        Ok(owner) => owner,
+        Err(code) => return create_open_error_result(env, code),
+    };
+    native_cell::create_opened_result(env, intrinsics, owner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open_gate_code;
     use std::fs;
     use std::os::fd::{IntoRawFd, RawFd};
     use std::os::unix::fs::PermissionsExt;
@@ -518,6 +589,18 @@ mod tests {
 
     fn fd_is_open(raw_fd: RawFd) -> bool {
         (unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }) >= 0
+    }
+
+    fn bound_open_gate_code(
+        capability: &TrustedCellCapability,
+        target_supported: bool,
+        lifecycle_token: &std::result::Result<ProcessLifecycleToken, CellErrorCode>,
+    ) -> CellErrorCode {
+        if capability.check_origin().is_err() {
+            CellErrorCode::CellClosed
+        } else {
+            open_gate_code(target_supported, lifecycle_token)
+        }
     }
 
     /// Real descriptor over the real 0700 temp cell directory, adopted through
@@ -642,6 +725,31 @@ mod tests {
             !fd_is_open(raw_fd),
             "module drop closes the descriptor once"
         );
+    }
+
+    #[test]
+    fn bound_open_transfers_the_descriptor_without_dup_or_capability_close() {
+        let (capability, raw_fd, _home) = produce_test_capability();
+        let opener = BoundCellOpener::new(capability);
+        let mut capability = opener
+            .take_capability()
+            .expect("final open takes the bound capability once");
+        assert!(
+            matches!(opener.take_capability(), Err(CellErrorCode::CellClosed)),
+            "the final open authority cannot transfer twice"
+        );
+        let (mut platform, directory) = capability
+            .take_platform_parts()
+            .expect("capability transfers exact platform and descriptor");
+        drop(capability);
+        assert!(
+            fd_is_open(raw_fd),
+            "capability drop is disarmed after ownership transfer"
+        );
+        platform
+            .raw_close(directory)
+            .expect("the receiving owner closes the transferred descriptor");
+        assert!(!fd_is_open(raw_fd));
     }
 
     #[test]
@@ -800,7 +908,8 @@ mod tests {
         );
 
         pin_process_origin();
-        let (mut capability, raw_fd, _home) = produce_test_capability();
+        let (capability, raw_fd, _home) = produce_test_capability();
+        let opener = BoundCellOpener::new(capability);
 
         let child_pid = unsafe { libc::fork() };
         assert!(child_pid >= 0, "fork bound-open-driver child");
@@ -808,7 +917,7 @@ mod tests {
             let mut input_observations = 0_u8;
             let mut open_entries = 0_u8;
             let missing = run_bound_open_callback(
-                &capability,
+                &opener,
                 || {
                     input_observations |= 0b01;
                     Err(())
@@ -820,7 +929,7 @@ mod tests {
                 },
             );
             let malformed = run_bound_open_callback(
-                &capability,
+                &opener,
                 || {
                     input_observations |= 0b10;
                     Ok(0_u8)
@@ -853,7 +962,11 @@ mod tests {
             fd_is_open(raw_fd),
             "parent retains the descriptor after child open probes"
         );
-        capability.close_once();
+        drop(
+            opener
+                .take_capability()
+                .expect("parent can still take the bound-open capability"),
+        );
         assert!(!fd_is_open(raw_fd));
     }
 }
