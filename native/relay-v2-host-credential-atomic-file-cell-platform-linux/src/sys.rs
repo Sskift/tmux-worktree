@@ -7,6 +7,58 @@ fn errno() -> libc::c_int {
         .unwrap_or(libc::EIO)
 }
 
+pub(crate) fn real_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+pub(crate) fn real_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+/// Closed account-database lookup failures for the trusted cell factory.
+/// `Missing` means the effective uid has no account entry or no home; `Io`
+/// means the account database itself could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountHomeError {
+    Missing,
+    Io,
+}
+
+/// Native account-database home for `uid` (getpwuid family only; never the
+/// HOME environment variable, a caller path, or a global lookup).
+pub(crate) fn account_home(uid: u32) -> Result<Vec<u8>, AccountHomeError> {
+    let mut capacity = 16 * 1024_usize;
+    loop {
+        let mut record = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; capacity];
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && capacity < 1024 * 1024 {
+            capacity *= 2;
+            continue;
+        }
+        if status != 0 {
+            return Err(AccountHomeError::Io);
+        }
+        if result.is_null() {
+            return Err(AccountHomeError::Missing);
+        }
+        let record = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            return Err(AccountHomeError::Missing);
+        }
+        return Ok(unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes().to_vec());
+    }
+}
+
 pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }

@@ -743,7 +743,7 @@ fn production_qualification_is_empty_and_resources_are_host_specific() {
         Err(CellErrorCode::CellDurabilityUnsupported)
     ));
     let spec = platform_resource_spec();
-    assert_eq!(spec.contract_revision(), 6);
+    assert_eq!(spec.contract_revision(), 7);
     assert_eq!(spec.resource_contract_version(), 1);
     assert_eq!(generated::CREDENTIAL_MUTATION_CONTRACT_VERSION, 1);
     assert!(generated::CREDENTIAL_MUTATION_IMPLEMENTED);
@@ -751,6 +751,17 @@ fn production_qualification_is_empty_and_resources_are_host_specific() {
     assert_eq!(CLAIM_JOURNAL_STATE_ADMISSION_HELD_NO_CREDENTIAL_MUTATION, 1);
     assert_eq!(spec.claim_journal_length(), CLAIM_JOURNAL_LENGTH);
     for component in [spec.credential_name(), spec.lock_name(), spec.claim_name()] {
+        assert!(!component.to_ascii_lowercase().contains("broker"));
+        assert!(!component.contains('/'));
+    }
+    assert_eq!(
+        trusted_cell_private_location_components(),
+        [
+            ".tmux-worktree",
+            "relay-v2-host-credential-atomic-file-cell-v1"
+        ]
+    );
+    for component in trusted_cell_private_location_components() {
         assert!(!component.to_ascii_lowercase().contains("broker"));
         assert!(!component.contains('/'));
     }

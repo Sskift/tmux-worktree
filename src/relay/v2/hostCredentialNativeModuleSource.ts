@@ -6,7 +6,7 @@ import {
   type RelayV2HostCredentialNativeTargetDescriptor,
 } from "./hostCredentialNativeTarget.js";
 
-export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_CONTRACT_REVISION = 6 as const;
+export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_CONTRACT_REVISION = 7 as const;
 export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_ABI = "napi" as const;
 export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_ABI_VERSION = 1 as const;
 export const RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_MINIMUM_NAPI_VERSION = 9 as const;
@@ -23,7 +23,7 @@ export interface RelayV2HostCredentialNativeModuleTarget {
 }
 
 // Contract facts only. Each descriptor is projected from one entry of the
-// frozen manifest's nativeArtifact.supportedTargets (contract revision 6,
+// frozen manifest's nativeArtifact.supportedTargets (contract revision 7,
 // native artifact v1), whose single JavaScript source of truth is the
 // hostCredentialNativeTarget module; there is no wildcard, alternate
 // candidate, or caller override. The loader-facing projection deliberately
@@ -356,7 +356,7 @@ function takeFailure(
  * is memoized; every failure is stable, redacted, and fail closed.
  *
  * This foundation does not choose where a real native module comes from:
- * contract revision 6 freezes the artifact identity (descriptor, digest, and
+ * contract revision 7 freezes the artifact identity (descriptor, digest, and
  * layout rules) in the manifest's nativeArtifact section, and the separate
  * fixed loader maps these exact descriptors to that one frozen loader-relative
  * specifier as a narrow source a trusted deployment may explicitly select.

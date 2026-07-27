@@ -1,11 +1,21 @@
 //! Raw N-API binding foundation for the Relay v2 Host credential atomic file
 //! cell. The module eagerly captures the platform-common process lifecycle
-//! exactly once at init and exposes only the frozen synchronous `open` method.
-//! This revision has no open seam: after closed request validation, compile
-//! target admission, and lifecycle capture, the production durability
-//! qualification gate is deny-by-default, so every open fails closed before any
-//! registry reservation, descriptor, filesystem, path, HOME, environment, or
-//! credential mutation. It is not wired to any production composition.
+//! exactly once at init and exports exactly the frozen synchronous v1 `open`
+//! method; the frozen v1 module surface is unchanged. After closed request
+//! validation, compile target admission, and lifecycle capture, the production
+//! durability qualification gate is deny-by-default, so every open fails
+//! closed before any registry reservation, descriptor, filesystem, path,
+//! HOME, environment, or credential mutation. Since contract revision 7 the
+//! trusted native capability factory v1 rides as an additive own-data entry
+//! on the raw `open` function; its only production driver is the fixed
+//! trusted loader, and no visibility isolation is claimed. The factory mints
+//! an unforgeable capability over the contract-fixed private cell directory
+//! and its one-shot binder returns the final `{ open }` module whose `open`
+//! runs the same frozen gate. The factory never accepts a path, descriptor,
+//! HOME, environment, or credential from JavaScript, and neither it nor the
+//! raw v1 path is wired to any production composition.
+
+mod factory;
 
 use napi::bindgen_prelude::{
     Array, FromNapiValue, Function, FunctionCallContext, FunctionRef, JsObjectValue, Object,
@@ -246,10 +256,11 @@ fn create_open_error_result<'env>(env: &'env Env, code: CellErrorCode) -> Result
     Ok(result)
 }
 
-fn open_cell<'env>(
+fn open_cell_gated<'env>(
     env: &'env Env,
     intrinsics: &Intrinsics,
     input: Unknown<'env>,
+    gate: CellErrorCode,
 ) -> Result<Object<'env>> {
     let decode = match decode_open_request(env, intrinsics, input) {
         Ok(decode) => decode,
@@ -267,14 +278,29 @@ fn open_cell<'env>(
             return create_open_error_result(env, CellErrorCode::NativeInterfaceInvalid);
         }
     }
-    create_open_error_result(env, open_gate_code(supported_target(), lifecycle()))
+    create_open_error_result(env, gate)
+}
+
+fn open_cell<'env>(
+    env: &'env Env,
+    intrinsics: &Intrinsics,
+    input: Unknown<'env>,
+) -> Result<Object<'env>> {
+    open_cell_gated(
+        env,
+        intrinsics,
+        input,
+        open_gate_code(supported_target(), lifecycle()),
+    )
 }
 
 #[napi(module_exports)]
 fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
     // Eager, exactly once, immutable after failure or fork.
     let _ = lifecycle();
+    factory::pin_process_origin();
     let intrinsics = Arc::new(Intrinsics::capture(&env)?);
+    let factory_intrinsics = Arc::clone(&intrinsics);
 
     let open = env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
         "openRelayV2HostCredentialAtomicFileCellV1",
@@ -288,6 +314,23 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
             };
             open_cell(context.env, &intrinsics, input).map(|value| RawValue(value.raw()))
         },
+    )?;
+
+    let trusted_factory = env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
+        factory::TRUSTED_FACTORY_METHOD,
+        move |context: FunctionCallContext<'_>| {
+            factory::run_trusted_factory_callback(context, &factory_intrinsics)
+        },
+    )?;
+    // The frozen v1 module surface stays exactly `{ open }`: the trusted
+    // factory rides only as an additive own-data entry on the raw open
+    // function, and the fixed trusted loader is its only production driver.
+    let mut open_object = unsafe { Object::from_napi_value(env.raw(), open.raw())? };
+    define_own_data(
+        &env,
+        &mut open_object,
+        factory::TRUSTED_FACTORY_METHOD,
+        trusted_factory,
     )?;
     define_own_data(
         &env,

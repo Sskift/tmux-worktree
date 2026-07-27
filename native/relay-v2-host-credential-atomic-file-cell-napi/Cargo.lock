@@ -300,10 +300,13 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 name = "relay-v2-host-credential-atomic-file-cell-napi"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",
  "relay-v2-host-credential-atomic-file-cell-platform-common",
+ "relay-v2-host-credential-atomic-file-cell-platform-darwin",
+ "relay-v2-host-credential-atomic-file-cell-platform-linux",
 ]
 
 [[package]]
@@ -313,6 +316,22 @@ dependencies = [
  "getrandom",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "relay-v2-host-credential-atomic-file-cell-platform-darwin"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "relay-v2-host-credential-atomic-file-cell-platform-common",
+]
+
+[[package]]
+name = "relay-v2-host-credential-atomic-file-cell-platform-linux"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "relay-v2-host-credential-atomic-file-cell-platform-common",
 ]
 
 [[package]]

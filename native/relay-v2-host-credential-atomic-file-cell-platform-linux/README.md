@@ -8,24 +8,31 @@ descriptor through an explicit unsafe constructor and implements the common
 crate's stateless `DescriptorRelativePlatform` and
 `CredentialMutationPlatform` operations.
 
-The adapter uses contract-derived relative names from
-`platform_resource_spec()`. It does not accept or discover HOME, cwd,
-environment, or a filesystem path, and it does not duplicate or reopen an
-adopted descriptor. Locking is a nonblocking traditional whole-file
+The adopted-descriptor adapter uses contract-derived relative names from
+`platform_resource_spec()`. That seam does not accept or discover HOME, cwd,
+environment, or a caller filesystem path, and it does not duplicate or reopen
+an adopted descriptor. Locking is a nonblocking traditional whole-file
 `F_SETLK` write lock. Descriptor release is one raw `close` attempt with no
 explicit unlock and no retry after `EINTR`. Credential mutation uses only the
 contract-derived fixed credential name and validates common-generated dynamic
 temporary names before exact `*at` operations; same-directory `renameat` is the
 only publication syscall exposed by this adapter.
 
+Revision 7 also adds the target-native directory producer used by the trusted
+factory. It proves matching non-root real/effective credentials, resolves only
+the effective uid's native account-database home, and securely opens the
+contract-fixed private-location components without following links. This path
+accepts no JavaScript path, descriptor, HOME, environment, or credential and
+never creates, chmods, repairs, or selects an alternate directory.
+
 Platform-common remains the sole owner of admission, revision/CAS state,
 CSPRNG and temporary-name generation, retry/gating/cleanup, commit and
-uncertainty decisions, fencing, and recovery policy. This crate does not
-construct `DurabilityQualification`, open the complete admission owner,
-implement orphan recovery, or connect N-API, a loader, Vault, Authority,
-`relay-host`, production composition, readiness, or capability advertisement.
-It has no dependency on the broker credential native crates and provides no
-fallback.
+uncertainty decisions, fencing, and recovery policy. This crate produces only
+the pre-bound descriptor for the trusted factory; it does not construct the
+N-API factory/loader, `DurabilityQualification`, or complete admission owner,
+implement orphan recovery, or connect Vault, Authority, `relay-host`,
+production composition, readiness, or capability advertisement. It has no
+dependency on the broker credential native crates and provides no fallback.
 
 The shared contract still records empty durability qualification and incomplete
 production/qualification gates. This local adapter seam therefore remains

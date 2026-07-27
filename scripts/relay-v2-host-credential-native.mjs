@@ -596,6 +596,38 @@ function exactOwnDataKeys(value) {
   return Reflect.ownKeys(descriptors).sort();
 }
 
+function assertClosedDurabilityOpen(openResult, label) {
+  const resultKeys = exactOwnDataKeys(openResult);
+  const errorKeys = exactOwnDataKeys(openResult?.error);
+  if (
+    resultKeys === null
+    || resultKeys.join(",") !== "abiVersion,error,operation,outcome"
+    || openResult.abiVersion !== 1
+    || openResult.operation !== "open"
+    || openResult.outcome !== "error"
+    || errorKeys === null
+    || errorKeys.join(",") !== "code"
+    || openResult.error.code !== "CELL_DURABILITY_UNSUPPORTED"
+  ) {
+    fail(`${label} did not fail closed before qualification`);
+  }
+}
+
+const CLOSED_CELL_ERROR_CODES = new Set([
+  "NATIVE_INTERFACE_INVALID",
+  "CELL_BUSY",
+  "CELL_CLOSED",
+  "CELL_CORRUPT",
+  "CELL_IDENTITY_UNCERTAIN",
+  "CELL_IO",
+  "CELL_PERMISSION_INVALID",
+  "CELL_DURABILITY_UNSUPPORTED",
+  "CELL_RECOVERY_REQUIRED",
+  "INVALID_ARGUMENT",
+  "INVALID_REVISION",
+  "VALUE_TOO_LARGE",
+]);
+
 async function verifyUnpackedClosedBinding(unpacked, descriptor) {
   let unpackedTarget;
   let unpackedLoader;
@@ -617,57 +649,134 @@ async function verifyUnpackedClosedBinding(unpacked, descriptor) {
     fail("unpacked native target descriptor does not match the repository descriptor");
   }
   const fixedLoader = unpackedLoader.relayV2HostCredentialNativeModuleFixedLoader;
+  const trustedLoader = unpackedLoader.relayV2HostCredentialNativeModuleTrustedLoader;
   const createSource = unpackedHolder.createRelayV2HostCredentialNativeModuleSource;
   const openMethodName = unpackedHolder.RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_OPEN_METHOD;
+  const factoryMethodName = "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
   if (typeof fixedLoader !== "function"
+    || typeof trustedLoader !== "function"
     || typeof createSource !== "function"
     || openMethodName !== "openRelayV2HostCredentialAtomicFileCellV1") {
     fail("unpacked fixed native loader surface is invalid");
   }
-  const source = createSource(
-    Object.freeze({
-      platform: process.platform,
-      architecture: process.arch,
-      napiVersion: Number(process.versions.napi),
-    }),
-    fixedLoader,
-  );
-  if (source?.capability?.().status !== "supported") {
+  // The frozen v1 module surface stays exactly `{ open }`: the trusted
+  // factory rides only as an additive own-data entry on the raw open
+  // function, driven here directly (its production driver is the fixed
+  // trusted loader). The factory outcome is machine-dependent and both
+  // contract-closed branches are valid: a closed error union when the
+  // contract-fixed private cell directory is absent or unsafe, or
+  // ready + one-shot bind whose final exact-open module still fails at the
+  // durability gate when the directory exists. Either way the replayed
+  // second factory call must be CELL_CLOSED; nothing here creates, repairs,
+  // or falls back.
+  const load = fixedLoader(Object.freeze({
+    target: descriptor.target,
+    platform: descriptor.platform,
+    architecture: descriptor.architecture,
+    cargoTargetTriple: descriptor.cargoTargetTriple,
+  }));
+  if (load?.status !== "loaded") {
     fail("unpacked fixed native loader did not load its same-package artifact");
   }
-  let nativeModule;
-  try {
-    nativeModule = source.takeNativeModule();
-  } catch {
-    fail("unpacked native module source did not deliver its same-package artifact");
+  const artifact = load.binding;
+  const artifactKeys = exactOwnDataKeys(artifact);
+  if (artifactKeys === null
+    || artifactKeys.length !== 1
+    || artifactKeys[0] !== openMethodName
+    || typeof artifact[openMethodName] !== "function") {
+    fail("unpacked native artifact raw surface is invalid");
   }
-  if (exactOwnDataKeys(nativeModule)?.length !== 1
-    || exactOwnDataKeys(nativeModule)[0] !== openMethodName
-    || typeof nativeModule[openMethodName] !== "function") {
-    fail("unpacked native module ABI is invalid");
+  const factoryDescriptor =
+    Object.getOwnPropertyDescriptor(artifact[openMethodName], factoryMethodName);
+  if (factoryDescriptor === undefined
+    || !Object.hasOwn(factoryDescriptor, "value")
+    || Object.hasOwn(factoryDescriptor, "get")
+    || Object.hasOwn(factoryDescriptor, "set")
+    || typeof factoryDescriptor.value !== "function") {
+    fail("unpacked trusted factory entry on the raw open function is invalid");
   }
+  const factory = factoryDescriptor.value;
   let openResult;
   try {
-    openResult = nativeModule[openMethodName](Object.freeze({
+    openResult = artifact[openMethodName](Object.freeze({
       abiVersion: 1,
       operation: "open",
     }));
   } catch {
     fail("unpacked native module open did not return a closed result");
   }
-  const resultKeys = exactOwnDataKeys(openResult);
-  const errorKeys = exactOwnDataKeys(openResult?.error);
-  if (
-    resultKeys === null
-    || resultKeys.join(",") !== "abiVersion,error,operation,outcome"
-    || openResult.abiVersion !== 1
-    || openResult.operation !== "open"
-    || openResult.outcome !== "error"
-    || errorKeys === null
-    || errorKeys.join(",") !== "code"
-    || openResult.error.code !== "CELL_DURABILITY_UNSUPPORTED"
-  ) {
-    fail("unpacked native module open did not fail closed before qualification");
+  assertClosedDurabilityOpen(openResult, "unpacked native module open");
+  let factoryResult;
+  try {
+    factoryResult = factory();
+  } catch {
+    fail("unpacked trusted factory did not return a closed result");
+  }
+  const factoryKeys = exactOwnDataKeys(factoryResult);
+  if (factoryKeys === null) {
+    fail("unpacked trusted factory result is not own-data");
+  }
+  if (factoryResult.outcome === "error") {
+    if (factoryKeys.join(",") !== "error,outcome"
+      || exactOwnDataKeys(factoryResult.error)?.join(",") !== "code"
+      || !CLOSED_CELL_ERROR_CODES.has(factoryResult.error.code)) {
+      fail("unpacked trusted factory did not fail closed with a closed code");
+    }
+  } else if (factoryResult.outcome === "ready") {
+    if (factoryKeys.join(",") !== "bind,outcome"
+      || typeof factoryResult.bind !== "function") {
+      fail("unpacked trusted factory ready result is invalid");
+    }
+    let bindResult;
+    try {
+      bindResult = factoryResult.bind();
+    } catch {
+      fail("unpacked trusted factory bind did not return a closed result");
+    }
+    if (exactOwnDataKeys(bindResult)?.join(",") !== "module,outcome"
+      || bindResult.outcome !== "bound"
+      || exactOwnDataKeys(bindResult.module)?.join(",") !== openMethodName
+      || typeof bindResult.module[openMethodName] !== "function"
+      || Object.getOwnPropertyDescriptor(
+        bindResult.module[openMethodName],
+        factoryMethodName,
+      ) !== undefined) {
+      fail("unpacked trusted factory bound module is invalid");
+    }
+    let boundOpenResult;
+    try {
+      boundOpenResult = bindResult.module[openMethodName](Object.freeze({
+        abiVersion: 1,
+        operation: "open",
+      }));
+    } catch {
+      fail("unpacked trusted factory module open did not return a closed result");
+    }
+    assertClosedDurabilityOpen(boundOpenResult, "unpacked trusted factory module open");
+    let bindReplay;
+    try {
+      bindReplay = factoryResult.bind();
+    } catch {
+      fail("unpacked trusted factory bind replay did not return a closed result");
+    }
+    if (exactOwnDataKeys(bindReplay)?.join(",") !== "error,outcome"
+      || bindReplay.outcome !== "error"
+      || bindReplay.error?.code !== "CELL_CLOSED") {
+      fail("unpacked trusted factory bind replay is not one-shot CELL_CLOSED");
+    }
+  } else {
+    fail("unpacked trusted factory result is not the closed union");
+  }
+  let replayResult;
+  try {
+    replayResult = factory();
+  } catch {
+    fail("unpacked trusted factory replay did not return a closed result");
+  }
+  if (exactOwnDataKeys(replayResult)?.join(",") !== "error,outcome"
+    || replayResult.outcome !== "error"
+    || replayResult.error?.code !== "CELL_CLOSED") {
+    fail("unpacked trusted factory replay is not exactly-once CELL_CLOSED");
   }
 }
 

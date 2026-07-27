@@ -5,7 +5,7 @@ export type RelayV2HostCredentialNativeSupportedTarget =
   | "linux-x64";
 
 // Contract facts only. Each descriptor mirrors one frozen entry of the
-// manifest's nativeArtifact.supportedTargets (contract revision 6, native
+// manifest's nativeArtifact.supportedTargets (contract revision 7, native
 // artifact v1); there is no wildcard, alternate candidate, or caller override.
 // The descriptor carries the complete frozen artifact identity: cargo build
 // identity, runtime artifact file name, loader-relative module specifier, and

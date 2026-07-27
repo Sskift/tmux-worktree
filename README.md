@@ -514,18 +514,31 @@ source/holder now fills the injected-source gap above: it declares only
 contract-fact target descriptors and exact target/platform/contract-revision/ABI
 capability, loads at most once through the injected loader, transfers the exact
 module identity one-shot to the existing bridge, and recycles bounded and fail
-closed on failure or close. Contract revision 6 now freezes the Host native
-artifact identity (four fixed target descriptors plus binary, digest, layout,
-and loader rules); the Host N-API crate, the JS fixed target descriptor module,
-the fixed loader, and the local-target build/stage/pack verification foundation
-exist as default-off, unwired foundations, and the fixed loader is a narrow
-source a trusted deployment may explicitly select. Verified evidence covers
-only this machine's single target (darwin-arm64) and proves only that the
-packed artifact loads and fails closed before registry or mutation:
-`qualifiedRecords=[]`, a trusted production factory, durability qualification,
-real open, evidence for the other three targets, signing/notarization,
-bit-reproducibility, Dashboard bundling, and production wiring are all still
-missing, so the NO-GO status is unchanged.
+closed on failure or close. Contract revision 7 additively freezes the trusted
+native capability factory v1 on top of the revision 6 Host native artifact
+identity (four fixed target descriptors plus binary, digest, layout, and
+loader rules). The raw artifact keeps the frozen v1 exact single-`open`
+module surface (the existing fixed loader, module source, and wrapper
+behavior is unchanged); the raw factory rides only as an additive own-data
+entry on the raw open function — no visibility isolation is claimed — and the
+new fixed trusted loader is its only production driver, capturing the entry
+after the fixed resolve/load, calling it exactly once with no arguments, and
+delivering only the one-shot binder's final exact own-data `{ open }` module,
+which never carries the factory entry. The native producer in each platform
+adapter proves the credential snapshot and the getpwuid account-database
+home, then securely opens only the contract-fixed 0700 private cell
+directory; it accepts no path, descriptor, HOME, environment, or credential
+from JavaScript, and never creates, repairs, or falls back. Verified evidence
+covers only this machine's single target (darwin-arm64) and proves only that
+the packed artifact loads, the raw open fails closed before registry or
+mutation, and the factory's two contract-closed branches (closed error
+union, or ready followed by one-shot bind and a final exact-open that still
+fails at the durability gate) hold with an exactly-once `CELL_CLOSED` replay:
+`qualifiedRecords=[]`, trusted factory production driver
+selection/deployment, durability qualification, real open, evidence for the
+other three targets, signing/notarization, bit-reproducibility, Dashboard
+bundling, and production wiring are all still missing, so the NO-GO status is
+unchanged.
 
 The Broker likewise has one explicit default-off activated server composition
 and a public lifecycle root that adopts an otherwise-unowned, caller-supplied

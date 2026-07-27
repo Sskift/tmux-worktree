@@ -133,7 +133,7 @@ function assertCaseTable(entries, fields, expected, label) {
 
 test("Host credential native ABI manifest and every machine case stay closed", async () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-host-credential-atomic-file-cell");
-  assert.equal(manifest.contractVersion, 6);
+  assert.equal(manifest.contractVersion, 7);
   assert.equal(
     manifest.scope,
     "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -220,7 +220,7 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     },
   });
   assert.deepEqual(manifest.notImplemented, [
-    "trusted-production-factory",
+    "trusted-factory-production-driver-selection",
     "darwin-x86_64-validation-evidence",
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",
@@ -229,6 +229,88 @@ test("Host credential native ABI manifest and every machine case stay closed", a
     "relay-host-production-composition",
     "capability-advertisement",
   ]);
+
+  // Contract revision 7 additive trusted factory v1: the frozen v1 module
+  // surface stays exactly `{ open }`; the factory rides as an additive
+  // own-data entry on the raw open function and its only production driver is
+  // the fixed trusted loader (no visibility isolation is claimed). The
+  // one-shot binder returns the final module whose only method is the raw v1
+  // open, and the final module never carries the factory entry. The nested
+  // raw module ABI, fixtures, platform, mutation, claim journal, and
+  // read/CAS/close contracts stay v1.
+  const trustedFactory = manifest.trustedFactory;
+  assert.equal(trustedFactory.contractVersion, 1);
+  assert.equal(trustedFactory.rawFactoryMethod,
+    "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1");
+  assert.equal(trustedFactory.driver, "fixed-trusted-loader-only");
+  assert.deepEqual(trustedFactory.rawArtifactSurface, {
+    exactOwnDataMethods: ["openRelayV2HostCredentialAtomicFileCellV1"],
+    nativeInterfaceV1ModuleSurfaceUnchanged: true,
+    trustedFactoryEntry: "additive-own-data-entry-on-the-raw-open-function",
+    trustedFactoryProductionDriver: "fixed-trusted-loader-only",
+    visibilityIsolationClaimed: false,
+    frozenV1ConsumersDoNotDependOnTheEntry: true,
+    finalModuleCarriesTrustedFactoryEntry: false,
+    proxyAllowed: false,
+    accessorAllowed: false,
+    asyncFunctionAllowed: false,
+  });
+  assert.equal(trustedFactory.call.argumentsAllowed, false);
+  assert.equal(trustedFactory.call.exactlyOncePerProcess, true);
+  assert.equal(trustedFactory.call.replayError, "CELL_CLOSED");
+  assert.deepEqual(trustedFactory.call.precedence, [
+    "process-origin-pid-fence",
+    "exactly-once-claim",
+    "argument-observation-and-validation",
+    "native-producer",
+  ]);
+  assert.equal(trustedFactory.call.invalidArgumentConsumesClaim, true);
+  assert.equal(trustedFactory.call.forkChildArgumentObservationAllowed, false);
+  assert.equal(trustedFactory.producer.accountHome,
+    "native-account-database-home-for-effective-uid");
+  assert.deepEqual(trustedFactory.producer.privateLocation, {
+    derivationVersion: 1,
+    base: "native-account-database-home",
+    relativeComponents: [
+      ".tmux-worktree",
+      "relay-v2-host-credential-atomic-file-cell-v1",
+    ],
+    callerOverrideAllowed: false,
+    alternateCandidateLookupAllowed: false,
+    environmentHomeOrGlobalLookupAllowed: false,
+    pathOrDescriptorArgumentFromJavaScriptAllowed: false,
+  });
+  assert.equal(trustedFactory.capability.unforgeable, true);
+  assert.equal(trustedFactory.capability.exposedToJavaScriptAsValue, false);
+  assert.equal(trustedFactory.capability.rawFileDescriptorNumberExposedToJavaScript, false);
+  assert.equal(trustedFactory.capability.descriptorOneShotTakeover, true);
+  assert.equal(trustedFactory.capability.dupOrReopenAllowed, false);
+  assert.equal(trustedFactory.capability.admissionOwnerRegistry,
+    "existing-platform-common-AdmissionOwner-only");
+  assert.equal(trustedFactory.capability.newMutationOwnerOrRegistryAllowed, false);
+  assert.equal(trustedFactory.binder.oneShot, true);
+  assert.deepEqual(trustedFactory.binder.finalModuleExactOwnDataMethods, [
+    "openRelayV2HostCredentialAtomicFileCellV1",
+  ]);
+  assert.equal(trustedFactory.binder.factoryAndOpenSideBySideInFinalModule, false);
+  assert.equal(trustedFactory.finalModule.abi, "existing-raw-v1-module-abi-version-1");
+  assert.equal(trustedFactory.finalModule.acceptsPathDescriptorHomeEnvironmentOrCredential,
+    false);
+  assert.equal(
+    trustedFactory.finalModule.openFailureBeforeRegistryReservationOrCredentialMutation,
+    "CELL_DURABILITY_UNSUPPORTED",
+  );
+  assert.equal(trustedFactory.lifecycle.openFallbackToRawV1ModuleAllowed, false);
+  assert.equal(trustedFactory.lifecycle.dualRoutingAllowed, false);
+  assert.equal(
+    trustedFactory.lifecycle.boundCallbackPrecedence,
+    "capability-origin-pid-before-argument-observation-decode-mutex-take-or-descriptor-handling",
+  );
+  assert.equal(trustedFactory.productionWired, false);
+  assert.equal(trustedFactory.productionDriverSelected, false);
+  assert.equal(trustedFactory.durabilityQualificationEffect,
+    "qualifiedRecords-unchanged-empty");
+  assert.equal(trustedFactory.productionCapabilityEffect, "none");
 
   const mutation = manifest.credentialMutation;
   assertExactKeys(mutation, [
@@ -1026,14 +1108,14 @@ const ARTIFACT_DESCRIPTOR_FIELDS = [
 
 test("native artifact identity stays consistent across manifest, JS descriptors, and fixture", () => {
   const artifact = manifest.nativeArtifact;
-  assert.equal(manifest.contractVersion, 6);
+  assert.equal(manifest.contractVersion, 7);
   assert.equal(artifact.contractVersion, 1);
   assert.equal(artifact.fixtureFormatVersion, 1);
   assert.equal(artifact.fixture, "native-artifact-cases-v1.json");
   assert.equal(nativeArtifactFixture.fixtureFormatVersion, 1);
   assert.equal(nativeArtifactFixture.nativeArtifactContractVersion, 1);
 
-  // The nested revision-5 contract surfaces remain v1 byte-identical scopes.
+  // The nested contract surfaces remain v1 byte-identical scopes across revision 7.
   assert.equal(manifest.fixtureFormatVersion, 1);
   assert.equal(manifest.nativeInterface.abiVersion, 1);
   assert.equal(manifest.platformResources.contractVersion, 1);

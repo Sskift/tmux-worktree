@@ -260,8 +260,7 @@ test("fixed loader and holder integrate over a fake module runtime exactly once"
   assert.equal(loadCalls, 1, "fixed candidate loaded exactly once");
 });
 
-test("default fixed loader resolves the current target missing without a staged artifact", () => {
-  const descriptor = targetModule.selectRelayV2HostCredentialNativeTargetDescriptor(
+test("default fixed loader resolves the current target missing without a staged artifact", () => {  const descriptor = targetModule.selectRelayV2HostCredentialNativeTargetDescriptor(
     process.platform,
     process.arch,
   );
@@ -300,5 +299,190 @@ test("default fixed loader resolves the current target missing without a staged 
   assert.throws(
     () => source.takeNativeModule(),
     (error) => error?.code === "NATIVE_ARTIFACT_MISSING",
+  );
+});
+
+const TRUSTED_FACTORY_METHOD = "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
+
+function fakeFinalModule(openResult) {
+  return Object.freeze({
+    [OPEN_METHOD]() {
+      return openResult;
+    },
+  });
+}
+
+function fakeRawArtifact({ factoryResult, bindResult, onFactory }) {
+  const module = fakeFinalModule({
+    abiVersion: 1,
+    operation: "open",
+    outcome: "error",
+    error: { code: "CELL_DURABILITY_UNSUPPORTED" },
+  });
+  const open = () => {
+    throw new Error("raw open export must never be invoked by the trusted loader");
+  };
+  // The frozen v1 surface stays exactly `{ open }`: the factory rides as an
+  // additive own-data entry on the raw open function.
+  Object.defineProperty(open, TRUSTED_FACTORY_METHOD, {
+    value: () => {
+      onFactory?.();
+      if (factoryResult !== undefined) return factoryResult;
+      return Object.freeze({
+        outcome: "ready",
+        bind: Object.freeze(() => {
+          if (bindResult !== undefined) return bindResult;
+          return Object.freeze({ outcome: "bound", module });
+        }),
+      });
+    },
+    enumerable: true,
+  });
+  return Object.freeze({ [OPEN_METHOD]: open });
+}
+
+function trustedLoaderWith(artifact, calls) {
+  return loaderModule.createRelayV2HostCredentialNativeModuleTrustedLoader(
+    (specifier) => {
+      calls.push(["resolve", specifier]);
+      return "/resolved/trusted.node";
+    },
+    (resolved) => {
+      calls.push(["load", resolved]);
+      return artifact;
+    },
+  );
+}
+
+test("trusted loader drives the factory exactly once and delivers only the final module", () => {
+  const calls = [];
+  let factoryCalls = 0;
+  const artifact = fakeRawArtifact({ onFactory: () => { factoryCalls += 1; } });
+  const source = createSource(trustedLoaderWith(artifact, calls));
+  const capability = source.capability();
+  assert.deepEqual(capability, {
+    status: "supported",
+    target: "darwin-arm64",
+    platform: "darwin",
+    architecture: "arm64",
+    contractRevision: CONTRACT_REVISION,
+    abi: "napi",
+    abiVersion: 1,
+  });
+  const taken = source.takeNativeModule();
+  assert.notStrictEqual(taken, artifact, "the raw artifact is never delivered");
+  assert.deepEqual(Reflect.ownKeys(taken), [OPEN_METHOD], "final module carries only open");
+  assert.equal(Object.hasOwn(taken, TRUSTED_FACTORY_METHOD), false);
+  assert.equal(
+    Object.getOwnPropertyDescriptor(taken[OPEN_METHOD], TRUSTED_FACTORY_METHOD),
+    undefined,
+    "the final module's open never carries the trusted factory entry",
+  );
+  assert.deepEqual(taken[OPEN_METHOD]({ abiVersion: 1, operation: "open" }), {
+    abiVersion: 1,
+    operation: "open",
+    outcome: "error",
+    error: { code: "CELL_DURABILITY_UNSUPPORTED" },
+  });
+  assert.equal(factoryCalls, 1, "factory driven exactly once");
+  assert.deepEqual(calls, [
+    ["resolve", "./native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node"],
+    ["load", "/resolved/trusted.node"],
+  ]);
+});
+
+test("trusted loader fails closed on factory error, bind replay, and hostile shapes", () => {
+  const cases = [
+    ["factory closed error result", fakeRawArtifact({
+      factoryResult: Object.freeze({ outcome: "error", error: Object.freeze({ code: "CELL_IO" }) }),
+    })],
+    ["bind replay closed error result", fakeRawArtifact({
+      bindResult: Object.freeze({ outcome: "error", error: Object.freeze({ code: "CELL_CLOSED" }) }),
+    })],
+    ["factory result with extra key", fakeRawArtifact({
+      factoryResult: Object.freeze({
+        outcome: "ready",
+        bind: Object.freeze(() => ({})),
+        fallback: Object.freeze({}),
+      }),
+    })],
+    ["bound module with factory side by side", fakeRawArtifact({
+      bindResult: Object.freeze({
+        outcome: "bound",
+        module: Object.freeze({
+          [OPEN_METHOD]() {},
+          [TRUSTED_FACTORY_METHOD]() {},
+        }),
+      }),
+    })],
+    ["bound module open carries the factory entry", fakeRawArtifact({
+      bindResult: (() => {
+        const open = () => {};
+        Object.defineProperty(open, TRUSTED_FACTORY_METHOD, {
+          value: () => ({}),
+          enumerable: true,
+        });
+        return Object.freeze({
+          outcome: "bound",
+          module: Object.freeze({ [OPEN_METHOD]: open }),
+        });
+      })(),
+    })],
+    ["artifact missing the factory entry", Object.freeze({ [OPEN_METHOD]() {} })],
+    ["artifact with an extra export", Object.freeze({
+      [OPEN_METHOD]() {},
+      [TRUSTED_FACTORY_METHOD]() {},
+      alternate() {},
+    })],
+    ["artifact factory as accessor", (() => {
+      const open = () => {};
+      Object.defineProperty(open, TRUSTED_FACTORY_METHOD, {
+        enumerable: true,
+        get() { return () => ({}); },
+      });
+      return Object.freeze({ [OPEN_METHOD]: open });
+    })()],
+    ["factory result is a proxy", fakeRawArtifact({ factoryResult: new Proxy({}, {}) })],
+  ];
+  for (const [label, artifact] of cases) {
+    const calls = [];
+    const loader = trustedLoaderWith(artifact, calls);
+    assert.throws(
+      () => loader(darwinArm64Descriptor()),
+      /^Error: Relay v2 Host credential native module trusted loader: /,
+      label,
+    );
+    const source = createSource(loader);
+    const capability = source.capability();
+    assert.deepEqual(capability, {
+      status: "invalid",
+      error: { code: "NATIVE_INTERFACE_INVALID" },
+    }, label);
+    assert.doesNotMatch(JSON.stringify(capability), /CELL_IO|CELL_CLOSED/, label);
+    assert.throws(
+      () => source.takeNativeModule(),
+      (error) => error?.code === "SOURCE_INVALID",
+      label,
+    );
+  }
+});
+
+test("trusted loader never falls back to the raw v1 module", () => {
+  // A closed factory error is redacted to invalid; the raw `{ open }` module
+  // riding the same artifact is never delivered as a fallback.
+  const artifact = fakeRawArtifact({
+    factoryResult: Object.freeze({
+      outcome: "error",
+      error: Object.freeze({ code: "CELL_IO" }),
+    }),
+  });
+  const source = createSource(trustedLoaderWith(artifact, []));
+  assert.deepEqual(source.capability(), {
+    status: "invalid",
+    error: { code: "NATIVE_INTERFACE_INVALID" },
+  });
+  assert.throws(
+    () => source.takeNativeModule(),
+    (error) => error?.code === "SOURCE_INVALID",
   );
 });

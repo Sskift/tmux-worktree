@@ -12,5 +12,14 @@ napi = { version = "3.10.5", default-features = false, features = ["napi9"] }
 napi-derive = { version = "3.5.7", default-features = false }
 relay-v2-host-credential-atomic-file-cell-platform-common = { path = "../relay-v2-host-credential-atomic-file-cell-platform-common" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+relay-v2-host-credential-atomic-file-cell-platform-darwin = { path = "../relay-v2-host-credential-atomic-file-cell-platform-darwin" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+relay-v2-host-credential-atomic-file-cell-platform-linux = { path = "../relay-v2-host-credential-atomic-file-cell-platform-linux" }
+
+[dev-dependencies]
+libc = "0.2"
+
 [build-dependencies]
 napi-build = "2.3.2"

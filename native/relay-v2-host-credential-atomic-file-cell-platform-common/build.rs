@@ -77,7 +77,7 @@ fn main() {
     );
     assert_eq!(
         unsigned(member(&manifest, "contractVersion"), "contractVersion"),
-        6
+        7
     );
     assert_eq!(member(&manifest, "status"), "frozen");
     assert_eq!(member(&manifest, "productionWired"), false);
@@ -160,7 +160,7 @@ fn main() {
             .as_array()
             .expect("qualifiedRecords array")
             .is_empty(),
-        "contract revision 6 must remain deny-by-default"
+        "contract revision 7 must remain deny-by-default"
     );
     let target_facts = member(platform, "targetFacts");
     for target in ["darwin", "linux"] {
@@ -250,7 +250,7 @@ fn main() {
         member(&manifest, "notImplemented"),
         "notImplemented",
         &[
-            "trusted-production-factory",
+            "trusted-factory-production-driver-selection",
             "darwin-x86_64-validation-evidence",
             "orphan-cleanup-or-recovery",
             "production-durability-qualification",
@@ -259,6 +259,106 @@ fn main() {
             "relay-host-production-composition",
             "capability-advertisement",
         ],
+    );
+    let trusted_factory = member(&manifest, "trustedFactory");
+    assert_eq!(
+        unsigned(
+            member(trusted_factory, "contractVersion"),
+            "trustedFactory.contractVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        member(trusted_factory, "rawFactoryMethod"),
+        "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1"
+    );
+    assert_eq!(
+        member(trusted_factory, "driver"),
+        "fixed-trusted-loader-only"
+    );
+    let trusted_factory_call = member(trusted_factory, "call");
+    assert_eq!(member(trusted_factory_call, "argumentsAllowed"), false);
+    assert_eq!(member(trusted_factory_call, "exactlyOncePerProcess"), true);
+    assert_eq!(member(trusted_factory_call, "replayError"), "CELL_CLOSED");
+    exact_string_array(
+        member(trusted_factory_call, "precedence"),
+        "trustedFactory.call.precedence",
+        &[
+            "process-origin-pid-fence",
+            "exactly-once-claim",
+            "argument-observation-and-validation",
+            "native-producer",
+        ],
+    );
+    assert_eq!(
+        member(trusted_factory_call, "invalidArgumentConsumesClaim"),
+        true
+    );
+    assert_eq!(
+        member(trusted_factory_call, "forkChildArgumentObservationAllowed"),
+        false
+    );
+    let trusted_factory_producer = member(trusted_factory, "producer");
+    assert_eq!(
+        member(trusted_factory_producer, "accountHome"),
+        "native-account-database-home-for-effective-uid"
+    );
+    let trusted_factory_location = member(trusted_factory_producer, "privateLocation");
+    assert_eq!(
+        unsigned(
+            member(trusted_factory_location, "derivationVersion"),
+            "trustedFactory privateLocation derivationVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        member(trusted_factory_location, "base"),
+        "native-account-database-home"
+    );
+    assert_eq!(
+        member(trusted_factory_location, "callerOverrideAllowed"),
+        false
+    );
+    assert_eq!(
+        member(trusted_factory_location, "alternateCandidateLookupAllowed"),
+        false
+    );
+    assert_eq!(
+        member(
+            trusted_factory_location,
+            "environmentHomeOrGlobalLookupAllowed"
+        ),
+        false
+    );
+    assert_eq!(
+        member(
+            trusted_factory_location,
+            "pathOrDescriptorArgumentFromJavaScriptAllowed"
+        ),
+        false
+    );
+    let trusted_factory_components = member(trusted_factory_location, "relativeComponents")
+        .as_array()
+        .expect("trustedFactory privateLocation relativeComponents array");
+    assert_eq!(
+        trusted_factory_components.len(),
+        2,
+        "trustedFactory privateLocation relativeComponents length changed"
+    );
+    let trusted_factory_components = trusted_factory_components
+        .iter()
+        .map(|component| {
+            relative_component(
+                component,
+                "trustedFactory privateLocation relativeComponents",
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(member(trusted_factory, "productionWired"), false);
+    assert_eq!(member(trusted_factory, "productionDriverSelected"), false);
+    assert_eq!(
+        member(trusted_factory, "productionCapabilityEffect"),
+        "none"
     );
     let mutation_maximum_bytes = unsigned(
         member(mutation_manifest, "maximumCredentialBytes"),
@@ -454,7 +554,7 @@ fn main() {
             .as_array()
             .expect("credential mutation qualifiedRecords array")
             .is_empty(),
-        "contract revision 6 credential mutation must remain deny-by-default"
+        "contract revision 7 credential mutation must remain deny-by-default"
     );
     assert_eq!(
         member(mutation_qualification, "productionProofConstructible"),
@@ -638,10 +738,21 @@ fn main() {
     }
 
     let mut generated = String::new();
-    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 6;").unwrap();
+    writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 7;").unwrap();
     writeln!(
         generated,
         "pub(super) const RESOURCE_CONTRACT_VERSION: u32 = 1;"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub const TRUSTED_CELL_PRIVATE_LOCATION_COMPONENTS: [&str; {}] = [{}];",
+        trusted_factory_components.len(),
+        trusted_factory_components
+            .iter()
+            .map(|component| format!("{component:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
     .unwrap();
     writeln!(

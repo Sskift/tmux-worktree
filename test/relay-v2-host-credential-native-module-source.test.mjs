@@ -91,7 +91,7 @@ test("injected descriptor, supported/unsupported capability, and memoization", (
       target: expectedTarget,
       platform,
       architecture,
-      contractRevision: 6,
+      contractRevision: 7,
       abi: "napi",
       abiVersion: 1,
     });

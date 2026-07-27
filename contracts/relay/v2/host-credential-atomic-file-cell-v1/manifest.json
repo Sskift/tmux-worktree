@@ -1,6 +1,6 @@
 {
   "contract": "tmux-worktree-relay-v2-host-credential-atomic-file-cell",
-  "contractVersion": 6,
+  "contractVersion": 7,
   "fixtureFormatVersion": 1,
   "status": "frozen",
   "scope": "host-credential-native-abi-platform-admission-and-credential-mutation-contract-foundation",
@@ -657,8 +657,132 @@
       "RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_-environment-variable-prefix"
     ]
   },
+  "trustedFactory": {
+    "contractVersion": 1,
+    "status": "frozen-default-off-unwired-foundation",
+    "scope": "trusted-native-capability-factory-and-fixed-trusted-loader-boundary-only-not-qualification-readiness-or-capability",
+    "rawFactoryMethod": "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1",
+    "driver": "fixed-trusted-loader-only",
+    "rawArtifactSurface": {
+      "exactOwnDataMethods": ["openRelayV2HostCredentialAtomicFileCellV1"],
+      "nativeInterfaceV1ModuleSurfaceUnchanged": true,
+      "trustedFactoryEntry": "additive-own-data-entry-on-the-raw-open-function",
+      "trustedFactoryProductionDriver": "fixed-trusted-loader-only",
+      "visibilityIsolationClaimed": false,
+      "frozenV1ConsumersDoNotDependOnTheEntry": true,
+      "finalModuleCarriesTrustedFactoryEntry": false,
+      "proxyAllowed": false,
+      "accessorAllowed": false,
+      "asyncFunctionAllowed": false
+    },
+    "call": {
+      "argumentsAllowed": false,
+      "exactlyOncePerProcess": true,
+      "replayError": "CELL_CLOSED",
+      "argumentError": "INVALID_ARGUMENT",
+      "precedence": [
+        "process-origin-pid-fence",
+        "exactly-once-claim",
+        "argument-observation-and-validation",
+        "native-producer"
+      ],
+      "invalidArgumentConsumesClaim": true,
+      "forkChildArgumentObservationAllowed": false,
+      "javascriptBoundaryError": "NATIVE_INTERFACE_INVALID",
+      "resultUnion": {
+        "ready": ["outcome", "bind"],
+        "error": ["outcome", "error"]
+      },
+      "exactFields": true
+    },
+    "producer": {
+      "credentialSnapshot": {
+        "beforeAnyPathObservation": true,
+        "realUidEqualsEffectiveUid": true,
+        "realGidEqualsEffectiveGid": true,
+        "realUidNonRoot": true,
+        "effectiveUidNonRoot": true
+      },
+      "accountHome": "native-account-database-home-for-effective-uid",
+      "privateLocation": {
+        "derivationVersion": 1,
+        "base": "native-account-database-home",
+        "relativeComponents": [
+          ".tmux-worktree",
+          "relay-v2-host-credential-atomic-file-cell-v1"
+        ],
+        "callerOverrideAllowed": false,
+        "alternateCandidateLookupAllowed": false,
+        "environmentHomeOrGlobalLookupAllowed": false,
+        "pathOrDescriptorArgumentFromJavaScriptAllowed": false
+      },
+      "traversal": {
+        "homeOpen": "single-open-O_RDONLY-O_NOFOLLOW-O_CLOEXEC",
+        "homeRequired": {
+          "type": "directory",
+          "ownerUid": "effective-uid",
+          "groupWriteAllowed": false,
+          "otherWriteAllowed": false
+        },
+        "componentOpen": "fstatat-AT_SYMLINK_NOFOLLOW-then-openat-O_RDONLY-O_NOFOLLOW-O_CLOEXEC-then-fstat",
+        "componentStableFields": ["device", "inode", "type"],
+        "derivedComponentRequired": {
+          "type": "directory",
+          "ownerUid": "effective-uid",
+          "ownerGid": "effective-gid",
+          "exactModeOctal": "0700"
+        },
+        "finalDescriptorFlag": "FD_CLOEXEC",
+        "creationChmodRepairOrFallbackAllowed": false
+      },
+      "failureMapping": {
+        "credentialOrAccountRuleViolation": "CELL_PERMISSION_INVALID",
+        "missingEntryOrComponent": "CELL_IO",
+        "symlinkSpecialTypeOrIdentityRace": "CELL_IDENTITY_UNCERTAIN",
+        "accountDatabaseOrDescriptorIo": "CELL_IO"
+      }
+    },
+    "capability": {
+      "unforgeable": true,
+      "exposedToJavaScriptAsValue": false,
+      "rawFileDescriptorNumberExposedToJavaScript": false,
+      "descriptorOneShotTakeover": true,
+      "dupOrReopenAllowed": false,
+      "admissionOwnerRegistry": "existing-platform-common-AdmissionOwner-only",
+      "newMutationOwnerOrRegistryAllowed": false
+    },
+    "binder": {
+      "oneShot": true,
+      "replayError": "CELL_CLOSED",
+      "resultUnion": {
+        "bound": ["outcome", "module"],
+        "error": ["outcome", "error"]
+      },
+      "exactFields": true,
+      "finalModuleExactOwnDataMethods": ["openRelayV2HostCredentialAtomicFileCellV1"],
+      "factoryAndOpenSideBySideInFinalModule": false,
+      "rollback": "capability-descriptor-raw-closed-exactly-once"
+    },
+    "finalModule": {
+      "abi": "existing-raw-v1-module-abi-version-1",
+      "acceptsPathDescriptorHomeEnvironmentOrCredential": false,
+      "openFailureBeforeRegistryReservationOrCredentialMutation": "CELL_DURABILITY_UNSUPPORTED",
+      "descriptorAdoptionIntoAdmissionOwner": "only-after-future-qualified-durability-record"
+    },
+    "lifecycle": {
+      "pidFork": "CELL_CLOSED-and-never-close-inherited-descriptor",
+      "boundCallbackPrecedence": "capability-origin-pid-before-argument-observation-decode-mutex-take-or-descriptor-handling",
+      "finalClose": "exactly-once-raw-close-no-retry",
+      "openFallbackToRawV1ModuleAllowed": false,
+      "dualRoutingAllowed": false
+    },
+    "productionWired": false,
+    "productionDriverSelected": false,
+    "durabilityQualificationEffect": "qualifiedRecords-unchanged-empty",
+    "productionCapabilityEffect": "none"
+  },
   "notImplemented": [
-    "trusted-production-factory",
+    "trusted-factory-production-driver-selection",
     "darwin-x86_64-validation-evidence",
     "orphan-cleanup-or-recovery",
     "production-durability-qualification",

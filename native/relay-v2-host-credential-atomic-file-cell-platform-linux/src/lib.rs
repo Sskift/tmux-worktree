@@ -2,14 +2,19 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 //! Linux syscall adapter for the Host credential atomic-file-cell admission
-//! and mutation owner. This crate owns no registry, journal, revision, random
-//! naming, retry, commit decision, durability qualification, path lookup, or
-//! production composition.
+//! and mutation owner. Revision 7 additionally owns the trusted factory's
+//! native directory producer: account-database home proof plus contract-fixed
+//! private-location secure open. This crate owns no registry, journal,
+//! revision, random naming, retry, commit decision, durability qualification,
+//! caller-supplied path lookup, or production composition.
 
+mod factory;
 mod sys;
 
 #[cfg(test)]
 mod tests;
+
+pub use factory::{produce_trusted_cell_directory, secure_open_trusted_cell_directory};
 
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
     platform_resource_spec, CredentialMutationPlatform, DescriptorRelativePlatform,

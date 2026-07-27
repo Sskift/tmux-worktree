@@ -8,10 +8,12 @@
 //! This crate implements the common read/CAS mutation owner through the
 //! additive [`CredentialMutationPlatform`] subtrait; the companion Darwin and
 //! Linux crates implement stateless descriptor-relative syscall adapters for
-//! that seam. There is still no trusted production factory, durability
-//! qualification, N-API, Vault or Authority injection, recovery, loader,
-//! readiness, capability advertisement, or production composition. No path,
-//! HOME, environment, or broker N0 type is accepted here.
+//! that seam. Revision 7 also exposes only the contract-derived private-location
+//! components consumed by the target adapters' trusted-factory directory
+//! producers; the factory and N-API driver remain outside this owner. There is
+//! still no durability qualification, Vault or Authority injection, recovery,
+//! readiness, capability advertisement, or production composition here. No
+//! path, HOME, environment, or broker N0 type is accepted by this owner.
 
 mod claim_journal;
 mod credential_mutation;
@@ -86,6 +88,14 @@ static PLATFORM_RESOURCE_SPEC: PlatformResourceSpec = PlatformResourceSpec {
 
 pub fn platform_resource_spec() -> &'static PlatformResourceSpec {
     &PLATFORM_RESOURCE_SPEC
+}
+
+/// Contract-fixed Host credential cell private-location derivation components,
+/// relative to the native account-database home of the effective uid. This is
+/// the single point every trusted-factory producer consumes; no adapter,
+/// loader, or JavaScript boundary may restate, override, or extend them.
+pub fn trusted_cell_private_location_components() -> &'static [&'static str] {
+    &generated::TRUSTED_CELL_PRIVATE_LOCATION_COMPONENTS
 }
 
 /// Exact closed errors shared with the frozen raw Host cell ABI.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,11 +24,29 @@ assert.match(expectedArchitecture, /^(arm64|x64)$/);
 const nativeCell = await import("../dist/relay/v2/hostCredentialAtomicFileCellNative.js");
 
 const OPEN_METHOD = "openRelayV2HostCredentialAtomicFileCellV1";
+const FACTORY_METHOD = "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
+const CLOSED_CODES = new Set([
+  "NATIVE_INTERFACE_INVALID",
+  "CELL_BUSY",
+  "CELL_CLOSED",
+  "CELL_CORRUPT",
+  "CELL_IDENTITY_UNCERTAIN",
+  "CELL_IO",
+  "CELL_PERMISSION_INVALID",
+  "CELL_DURABILITY_UNSUPPORTED",
+  "CELL_RECOVERY_REQUIRED",
+  "INVALID_ARGUMENT",
+  "INVALID_REVISION",
+  "VALUE_TOO_LARGE",
+]);
 const POISONED_NAMES = [
   OPEN_METHOD,
+  FACTORY_METHOD,
   "abiVersion",
   "operation",
   "outcome",
+  "bind",
+  "module",
   "handle",
   "error",
   "code",
@@ -60,6 +79,42 @@ function assertExactErrorResult(result, code, setterCalls, beforeCalls, label) {
     error: { code },
   }, label);
 }
+
+test("actual selected-target factory invalid-first call consumes the process claim", {
+  skip: nativeArtifact === undefined
+    ? "RELAY_V2_HOST_CREDENTIAL_NATIVE_TEST_ARTIFACT is required for the focused native run"
+    : false,
+}, () => {
+  const probe = spawnSync(process.execPath, ["-e", `
+    const assert = require("node:assert/strict");
+    const binding = require(process.env.RELAY_V2_HOST_CREDENTIAL_NATIVE_TEST_ARTIFACT);
+    const open = binding.openRelayV2HostCredentialAtomicFileCellV1;
+    const factory = Object.getOwnPropertyDescriptor(
+      open,
+      "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1",
+    ).value;
+    assert.deepStrictEqual(factory({ path: "/tmp" }), {
+      outcome: "error",
+      error: { code: "INVALID_ARGUMENT" },
+    });
+    assert.deepStrictEqual(factory(), {
+      outcome: "error",
+      error: { code: "CELL_CLOSED" },
+    });
+    assert.deepStrictEqual(factory({ malformed: true }), {
+      outcome: "error",
+      error: { code: "CELL_CLOSED" },
+    });
+  `], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      RELAY_V2_HOST_CREDENTIAL_NATIVE_TEST_ARTIFACT: nativeArtifact,
+    },
+  });
+  assert.equal(probe.signal, null);
+  assert.equal(probe.status, 0, probe.stderr);
+});
 
 test("actual selected-target binding is exact, prototype-safe, and closed before registry or mutation", {
   skip: nativeArtifact === undefined
@@ -96,8 +151,20 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
     const beforeRequire = setterCalls;
     const binding = createRequire(import.meta.url)(artifact);
     assert.equal(setterCalls, beforeRequire, "module exports bypass prototype setters");
+    // The frozen v1 module surface stays exactly `{ open }`: contract
+    // revision 7 carries the trusted factory only as an additive own-data
+    // entry on the raw open function. Its only production driver is the
+    // fixed trusted loader; nothing here depends on entry visibility.
     assert.deepEqual(exactOwnDataKeys(binding), [OPEN_METHOD]);
     assert.equal(typeof binding[OPEN_METHOD], "function");
+    const factoryDescriptor =
+      Object.getOwnPropertyDescriptor(binding[OPEN_METHOD], FACTORY_METHOD);
+    assert.notEqual(factoryDescriptor, undefined, "factory entry on the raw open function");
+    assert.equal(Object.hasOwn(factoryDescriptor, "value"), true);
+    assert.equal(Object.hasOwn(factoryDescriptor, "get"), false);
+    assert.equal(Object.hasOwn(factoryDescriptor, "set"), false);
+    assert.equal(typeof factoryDescriptor.value, "function");
+    const factory = factoryDescriptor.value;
 
     const beforeOpen = setterCalls;
     const openResult = binding[OPEN_METHOD](Object.freeze({
@@ -159,8 +226,80 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
     );
     assert.equal(existsSync(ignoredEnvironmentHome), false);
 
-    // The canonical wrapper decodes the same closed error and throws its
-    // own stable code without opening a cell.
+    // Exactly-once factory drive. On a machine without the deployed private
+    // cell directory the producer fails closed with one closed code; on a
+    // machine that has it, the one-shot binder returns the final module whose
+    // open still fails at the durability gate. Either way the factory never
+    // reads the redirected HOME and the replayed second call is CELL_CLOSED.
+    const beforeFactory = setterCalls;
+    const factoryResult = factory();
+    assert.equal(setterCalls, beforeFactory, "factory result bypasses prototype setters");
+    const factoryKeys = exactOwnDataKeys(factoryResult);
+    if (factoryResult.outcome === "error") {
+      assert.deepEqual(factoryKeys, ["error", "outcome"]);
+      assert.deepEqual(exactOwnDataKeys(factoryResult.error), ["code"]);
+      assert.equal(CLOSED_CODES.has(factoryResult.error.code), true);
+    } else {
+      assert.deepEqual(factoryKeys, ["bind", "outcome"]);
+      assert.equal(factoryResult.outcome, "ready");
+      assert.equal(typeof factoryResult.bind, "function");
+      const beforeBind = setterCalls;
+      const bindResult = factoryResult.bind();
+      assert.equal(setterCalls, beforeBind, "bind result bypasses prototype setters");
+      assert.deepEqual(exactOwnDataKeys(bindResult), ["module", "outcome"]);
+      assert.equal(bindResult.outcome, "bound");
+      assert.deepEqual(exactOwnDataKeys(bindResult.module), [OPEN_METHOD]);
+      assert.equal(
+        Object.getOwnPropertyDescriptor(bindResult.module[OPEN_METHOD], FACTORY_METHOD),
+        undefined,
+        "final module open never carries the trusted factory entry",
+      );
+      const beforeBoundOpen = setterCalls;
+      const boundOpenResult = bindResult.module[OPEN_METHOD](Object.freeze({
+        abiVersion: 1,
+        operation: "open",
+      }));
+      assertExactErrorResult(
+        boundOpenResult,
+        "CELL_DURABILITY_UNSUPPORTED",
+        setterCalls,
+        beforeBoundOpen,
+        "bound module open",
+      );
+      // The canonical wrapper admits the final module and decodes the same
+      // closed gate error without opening a cell.
+      assert.throws(
+        () => nativeCell.openRelayV2HostCredentialAtomicFileCellNative({
+          nativeModule: bindResult.module,
+        }),
+        (error) => {
+          assert.equal(error?.name, "RelayV2HostCredentialAtomicFileCellNativeError");
+          assert.equal(error?.code, "CELL_DURABILITY_UNSUPPORTED");
+          return true;
+        },
+      );
+      const replayBindResult = factoryResult.bind();
+      assert.deepEqual(exactOwnDataKeys(replayBindResult), ["error", "outcome"]);
+      assert.deepEqual(replayBindResult, {
+        outcome: "error",
+        error: { code: "CELL_CLOSED" },
+      });
+    }
+    const replayFactoryResult = factory(Object.freeze({ path: "/tmp" }));
+    assert.deepEqual(exactOwnDataKeys(replayFactoryResult), ["error", "outcome"]);
+    assert.deepEqual(replayFactoryResult, {
+      outcome: "error",
+      error: { code: "CELL_CLOSED" },
+    });
+    assert.deepEqual(factory(), {
+      outcome: "error",
+      error: { code: "CELL_CLOSED" },
+    });
+    assert.equal(existsSync(ignoredEnvironmentHome), false);
+
+    // The frozen v1 observable behavior is unchanged: the canonical wrapper
+    // admits the raw artifact and decodes the same closed gate error without
+    // opening a cell.
     assert.throws(
       () => nativeCell.openRelayV2HostCredentialAtomicFileCellNative({ nativeModule: binding }),
       (error) => {
