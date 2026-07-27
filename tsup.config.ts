@@ -50,6 +50,7 @@ export default defineConfig({
     "src/relay/v2/canonicalStructuredProcessAdapter.ts",
     "src/relay/v2/canonicalTwRpcDiscovery.ts",
     "src/relay/v2/canonicalTwRpcQueryTransportAdapter.ts",
+    "src/relay/v2/canonicalHostRuntimeBundle.ts",
     "src/relay/v2/remoteExactTerminalControlCompoundV1.ts",
     "src/relay/v2/materializedReconcileLifecycleOwner.ts",
     "src/relay/v2/resourceState.ts",

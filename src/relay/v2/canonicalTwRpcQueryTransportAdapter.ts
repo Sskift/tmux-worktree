@@ -287,6 +287,12 @@ export interface RelayV2CanonicalTwRpcConfigSnapshotFoundation {
   readonly discovery: RelayV2CanonicalTwRpcDiscoveryAdapter;
   readonly queryPort: RelayV2CanonicalTwRpcQueryTransportAdapter;
   /**
+   * The fixed local bundled/same-version CLI target selected by the caller.
+   * Only its opaque descriptor identity is exposed; executable and argv
+   * remain private to the live queryPort generation.
+   */
+  readonly localProcessTarget: Readonly<{ kind: "local"; targetId: string }>;
+  /**
    * Canonical structured mutation lane bound to the same live queryPort
    * target authority and runner. reconfigure() retires/installs descriptor
    * generations only through queryPort, and this adapter re-resolves that
@@ -295,6 +301,8 @@ export interface RelayV2CanonicalTwRpcConfigSnapshotFoundation {
    */
   readonly structuredProcess: RelayV2CanonicalStructuredProcessAdapter;
   reconfigure(): Promise<void>;
+  /** Permanently fences every target and drains owned remote compound children. */
+  closeAndDrain(): Promise<void>;
 }
 
 export type RelayV2CanonicalTwRpcQueryTransportErrorCode =
@@ -1063,6 +1071,10 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
 
   private readonly activeCompoundChannels = new Set<CanonicalRemoteExactCompoundChannel>();
 
+  private closed = false;
+
+  private closeBarrier: Promise<void> | null = null;
+
   constructor(options: RelayV2CanonicalTwRpcQueryTransportAdapterOptions) {
     if (!isRecord(options)
       || !hasExactKeys(options, ["targets", "runner"])
@@ -1136,6 +1148,13 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
 
   /** Synchronously withdraws every binding while a config generation retires. */
   beginContentAddressedTargetTransition(): void {
+    if (this.closed) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
+    this.retireTargets();
+  }
+
+  private retireTargets(): void {
     this.targets = new Map();
     this.targetGeneration = {};
     this.generationLive = false;
@@ -1146,9 +1165,32 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
   installContentAddressedTargets(
     targets: readonly RelayV2CanonicalTwRpcQueryTargetDescriptor[],
   ): void {
+    if (this.closed) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
     this.targets = normalizeContentAddressedTargets(targets);
     this.targetGeneration = {};
     this.generationLive = true;
+  }
+
+  /**
+   * Permanently retires this target owner. The synchronous prefix prevents
+   * every later lookup/claim/open from spawning, then the returned barrier
+   * drains only remote compound children already owned by this adapter.
+   */
+  closeAndDrain(): Promise<void> {
+    if (this.closeBarrier !== null) return this.closeBarrier;
+    this.closed = true;
+    this.retireTargets();
+    const channels = [...this.activeCompoundChannels];
+    this.closeBarrier = Promise.allSettled(channels.map((channel) => channel.close()))
+      .then((results) => {
+        const failure = results.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failure !== undefined) throw failure.reason;
+      });
+    return this.closeBarrier;
   }
 
   /**
@@ -1206,6 +1248,9 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
    * do for the structured mutation lane and the claim wrapper.
    */
   issueCreateTargetAuthorityBundleV1(): RelayV2CanonicalCreateTargetAuthorityBundleV1 {
+    if (this.closed) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
     const bundle = Object.freeze({}) as RelayV2CanonicalCreateTargetAuthorityBundleV1;
     createTargetAuthorityBundles.set(bundle as object, Object.freeze({
       targets: Object.freeze({
@@ -1411,21 +1456,30 @@ export function createRelayV2CanonicalTwRpcConfigSnapshotFoundation(
   }
   const build = (snapshot: Pick<Config, "hosts"> | null) => {
     const derived = deriveExplicitConfigSnapshotTargets(snapshot, fixed);
-    const validator = new RelayV2CanonicalTwRpcQueryTransportAdapter({
-      targets: derived.descriptors,
-      runner: options.runner,
+    const validated = normalizeContentAddressedTargets(derived.descriptors);
+    const scopes = derived.scopes.map((scope) => {
+      const target = validated.get(`${scope.kind}\0${scope.targetId}`);
+      if (target === undefined) {
+        throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+      }
+      return {
+        backendIdentity: scope.backendIdentity,
+        displayName: scope.displayName,
+        kind: scope.kind,
+        processTarget: Object.freeze({
+          kind: target.kind,
+          targetId: target.targetId,
+        }),
+      };
     });
-    validator.installContentAddressedTargets(derived.descriptors);
-    const scopes = derived.scopes.map((scope) => ({
-      backendIdentity: scope.backendIdentity,
-      displayName: scope.displayName,
-      kind: scope.kind,
-      processTarget: validator.processTarget(scope.kind, scope.targetId),
-    }));
-    return { ...derived, scopes, validator };
+    return { ...derived, scopes };
   };
   const initial = build(configLoader());
-  const queryPort = initial.validator;
+  const queryPort = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: initial.descriptors,
+    runner: options.runner,
+  });
+  queryPort.installContentAddressedTargets(initial.descriptors);
   const structuredProcess = new RelayV2CanonicalStructuredProcessAdapter({
     targets: queryPort,
     runner: options.runner,
@@ -1435,30 +1489,91 @@ export function createRelayV2CanonicalTwRpcConfigSnapshotFoundation(
     queryPort,
     queryTimeoutMs: options.queryTimeoutMs,
   });
+  const localProcessTarget = queryPort.processTarget(
+    "local",
+    initial.scopes.find((scope) => scope.kind === "local")!.processTarget.targetId,
+  );
+  let closed = false;
+  let closeBarrier: Promise<void> | null = null;
+  let latestTransitionRequest = 0n;
+  let transitionTail: Promise<void> = Promise.resolve();
+  const unavailable = (): RelayV2CanonicalTwRpcQueryTransportError => (
+    new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE")
+  );
   return Object.freeze({
     discovery,
     queryPort,
+    localProcessTarget: Object.freeze(localProcessTarget),
     structuredProcess,
-    async reconfigure(): Promise<void> {
-      let next: ReturnType<typeof build>;
-      try {
-        next = build(configLoader());
-        new RelayV2CanonicalTwRpcDiscoveryAdapter({
-          scopes: next.scopes,
-          queryPort: next.validator,
-          queryTimeoutMs: options.queryTimeoutMs,
-        });
-      } catch (error) {
-        queryPort.beginContentAddressedTargetTransition();
-        await discovery.withdrawAfterRetirement();
-        throw error;
+    reconfigure(): Promise<void> {
+      if (closed) {
+        return Promise.reject(unavailable());
       }
-      queryPort.beginContentAddressedTargetTransition();
-      await discovery.reconfigureAfterRetirement({
-        scopes: next.scopes,
-        queryPort,
-        queryTimeoutMs: options.queryTimeoutMs,
-      }, () => queryPort.installContentAddressedTargets(next.descriptors));
+      latestTransitionRequest += 1n;
+      const requestGeneration = latestTransitionRequest;
+      try {
+        // This synchronous prefix is the public transition linearization
+        // point. No config loader or validation code can re-enter while the
+        // old target generation still has spawn authority.
+        queryPort.beginContentAddressedTargetTransition();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      const result = transitionTail.then(async () => {
+        if (closed || requestGeneration !== latestTransitionRequest) {
+          throw unavailable();
+        }
+        let next: ReturnType<typeof build>;
+        try {
+          // Config capture and all descriptor/discovery validation happen
+          // only after the old generation has been synchronously retired.
+          next = build(configLoader());
+          new RelayV2CanonicalTwRpcDiscoveryAdapter({
+            scopes: next.scopes,
+            queryPort,
+            queryTimeoutMs: options.queryTimeoutMs,
+          });
+        } catch (error) {
+          if (!closed && requestGeneration === latestTransitionRequest) {
+            await discovery.withdrawAfterRetirement();
+          }
+          throw error;
+        }
+        if (closed || requestGeneration !== latestTransitionRequest) {
+          throw unavailable();
+        }
+        await discovery.reconfigureAfterRetirement({
+          scopes: next.scopes,
+          queryPort,
+          queryTimeoutMs: options.queryTimeoutMs,
+        }, () => {
+          // A reentrant/newer reconfigure or close permanently wins before
+          // any older queued task can republish a target.
+          if (closed || requestGeneration !== latestTransitionRequest) {
+            throw unavailable();
+          }
+          queryPort.installContentAddressedTargets(next.descriptors);
+        });
+      });
+      transitionTail = result.then(() => undefined, () => undefined);
+      return result;
+    },
+    closeAndDrain(): Promise<void> {
+      if (closeBarrier !== null) return closeBarrier;
+      closed = true;
+      latestTransitionRequest += 1n;
+      const queryClose = queryPort.closeAndDrain();
+      const discoveryClose = transitionTail.then(() => discovery.withdrawAfterRetirement());
+      closeBarrier = Promise.allSettled([
+        discoveryClose,
+        queryClose,
+      ]).then((results) => {
+        const failure = results.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failure !== undefined) throw failure.reason;
+      });
+      return closeBarrier;
     },
   });
 }

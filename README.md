@@ -483,6 +483,17 @@ capability advertisement still do not call this opener, the carrier advertises
 no v2 capabilities, and no protocol fallback is added. No real TLS socket,
 device qualification, signing, or production process path has been exercised.
 
+An independent default-off canonical Host runtime bundle now closes the
+existing bundled same-version local TW target, explicit Host config snapshot,
+fixed SSH/known-hosts target factory, one child runner/query target generation,
+the create observation/admission pair, remote exact compound factory, and an
+already-running terminal-control daemon authority. Its one-shot frozen output
+contains only a scan-only discovery facade, the opaque local process target,
+remote compound channels, and the opaque create execution pair; reconfigure
+and close synchronously retire stale targets before any later child spawn. No
+CLI, shipping root, profile, TLS/native intake, capability advertisement,
+fallback, or daemon startup consumes this foundation.
+
 An outer default-off privileged intake now reads the existing reference-only
 Host production profile, consumes an externally owned atomic credential cell
 and optional privileged byte source, and constructs the single Vault,
