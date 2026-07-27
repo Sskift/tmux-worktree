@@ -774,7 +774,8 @@ export async function openRelayV2HostCanonicalProductionComposition(
         optionalExtension = null;
       }
     }
-    managed = await openRelayV2HostManagedWssConnectorRuntimeComposition(Object.freeze({
+    managed = await openRelayV2HostManagedWssConnectorRuntimeComposition(
+      OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
       runtime: Object.freeze({
         hostId: profile.hostId,
         hostEpoch: snapshot.hostEpoch,
@@ -788,7 +789,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
         welcome: options.welcome,
         ...(optionalExtension === null ? {} : { optionalExtension }),
       }),
-      connector: Object.freeze({
+      connector: OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
         credentialAuthority: options.credentialAuthority,
         credentialReference: profile.credentialReference,
         carrier: reauthentication === undefined
@@ -817,8 +818,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
                   : { scheduleCloseDrain: wssTransport.scheduleCloseDrain }),
               }),
         }]),
-      }),
-    }));
+      }]),
+    }]),
+    );
     if (await managed.readiness.h0.activate() !== true) {
       throw new RelayV2TerminalManagerError(
         "CAPABILITY_UNAVAILABLE",
