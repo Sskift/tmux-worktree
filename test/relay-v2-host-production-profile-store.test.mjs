@@ -42,6 +42,7 @@ const {
   RELAY_V2_HOST_PRODUCTION_PROFILE_SCHEMA_VERSION,
   loadOrCreateRelayV2HostProductionProfile,
   readRelayV2HostProductionProfile,
+  readRelayV2HostProductionProfileProvisioningInput,
   relayV2HostProductionProfilePath,
 } = profileStore;
 
@@ -119,8 +120,17 @@ test("frozen Host production profile contract creates once and reopens idempoten
   assert.equal(existsSync(join(missingHome, ".tmux-worktree")), false);
 
   const home = privateHome(t);
+  const provisioningInput = join(home, "host-profile-input.json");
+  writeFileSync(provisioningInput, render(cases.validProfile), { mode: 0o600 });
+  chmodSync(provisioningInput, 0o600);
+  const imported = readRelayV2HostProductionProfileProvisioningInput({
+    inputPath: provisioningInput,
+  });
+  assert.equal(Object.getPrototypeOf(imported), null);
+  assert.equal(Object.isFrozen(imported), true);
+  assert.deepEqual({ ...imported }, cases.validProfile);
   assert.equal(relayV2HostProductionProfilePath(home), profilePath(home));
-  const created = store(cases.validProfile, home);
+  const created = store(imported, home);
   const persisted = readFileSync(profilePath(home));
   assert.ok(persisted.byteLength <= manifest.maximumBytes);
   assert.equal(persisted.toString("utf8"), render(cases.validProfile));
@@ -152,6 +162,107 @@ test("frozen Host production profile contract creates once and reopens idempoten
   assert.deepEqual({ ...reopened }, cases.validProfile);
   assert.deepEqual(readFileSync(profilePath(home)), persisted);
   assert.equal(existsSync(lockPath(home)), false);
+
+  const unsafeInputHome = privateHome(t, "tw-relay-v2-host-profile-input-mode-");
+  const unsafeInput = join(unsafeInputHome, "host-profile-input.json");
+  writeFileSync(unsafeInput, render(cases.validProfile), { mode: 0o644 });
+  chmodSync(unsafeInput, 0o644);
+  assert.throws(
+    () => readRelayV2HostProductionProfileProvisioningInput({
+      inputPath: unsafeInput,
+    }),
+    hasCode("RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNSAFE"),
+  );
+  assert.equal(existsSync(join(unsafeInputHome, ".tmux-worktree")), false);
+
+  const duplicateInputHome = privateHome(t, "tw-relay-v2-host-profile-input-duplicate-");
+  const duplicateInput = join(duplicateInputHome, "host-profile-input.json");
+  const contractLine = `  "contract": ${JSON.stringify(cases.validProfile.contract)},\n`;
+  writeFileSync(
+    duplicateInput,
+    render(cases.validProfile).replace(contractLine, `${contractLine}${contractLine}`),
+    { mode: 0o600 },
+  );
+  chmodSync(duplicateInput, 0o600);
+  assert.throws(
+    () => readRelayV2HostProductionProfileProvisioningInput({
+      inputPath: duplicateInput,
+    }),
+    hasCode("RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID"),
+  );
+  assert.equal(existsSync(join(duplicateInputHome, ".tmux-worktree")), false);
+
+  const base64url16 = Buffer.alloc(16, 0xab).toString("base64url");
+  const base64url32 = Buffer.alloc(32, 0xab).toString("base64url");
+  const sensitiveTokens = [
+    `twcap2.e30.${base64url32}`,
+    `twref2.${base64url32}`,
+    `twenroll2.${base64url32}`,
+    `twhostboot2.${base64url16}.${base64url32}`,
+  ];
+  const embeddedValue = {
+    hostId: (token) => `host-prefix-${token}-host-suffix`,
+    relayUrl: (token) => `wss://prefix-${token}-suffix.example/`,
+    credentialIssuerUrl: (token) => `https://prefix-${token}-suffix.example/`,
+    credentialReference: (token) =>
+      `relay-v2-host-credential-ref:prefix-${token}-suffix`,
+    bootstrapSecretReference: (token) => `bootstrap-prefix-${token}-suffix`,
+    refreshSecretReference: (token) => `refresh-prefix-${token}-suffix`,
+  };
+  for (const [field, embed] of Object.entries(embeddedValue)) {
+    for (const token of sensitiveTokens) {
+      const secretInputHome = privateHome(
+        t,
+        `tw-relay-v2-host-profile-input-secret-${field}-`,
+      );
+      const secretInput = join(secretInputHome, "host-profile-input.json");
+      writeFileSync(
+        secretInput,
+        render({ ...cases.validProfile, [field]: embed(token) }),
+        { mode: 0o600 },
+      );
+      chmodSync(secretInput, 0o600);
+      assert.throws(
+        () => readRelayV2HostProductionProfileProvisioningInput({
+          inputPath: secretInput,
+        }),
+        (error) =>
+          error?.code
+            === "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID"
+          && error.message
+            === "Relay v2 Host production profile provisioning input is invalid"
+          && !error.message.includes(token),
+      );
+      assert.equal(existsSync(join(secretInputHome, ".tmux-worktree")), false);
+    }
+  }
+
+  const directWriterHome = privateHome(
+    t,
+    "tw-relay-v2-host-profile-direct-writer-secret-",
+  );
+  const directWriterToken = sensitiveTokens[3];
+  assert.throws(
+    () => store({
+      ...cases.validProfile,
+      hostId: `host-prefix-${directWriterToken}-host-suffix`,
+    }, directWriterHome),
+    (error) =>
+      error?.code === "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS"
+      && error.message === "Relay v2 Host production profile options are invalid"
+      && !error.message.includes(directWriterToken),
+  );
+  assert.equal(existsSync(join(directWriterHome, ".tmux-worktree")), false);
+
+  const nearShapeHome = privateHome(
+    t,
+    "tw-relay-v2-host-profile-non-token-prefix-",
+  );
+  const nearShapeHostId = "host-prefix-twhostboot2.not-a-token-host-suffix";
+  assert.equal(
+    store({ ...cases.validProfile, hostId: nearShapeHostId }, nearShapeHome).hostId,
+    nearShapeHostId,
+  );
 });
 
 test("different, corrupt, and unknown profiles fail closed without overwrite", async (t) => {

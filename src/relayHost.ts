@@ -62,11 +62,13 @@ export type RelayV2HostOptions = RelayHostCommonOptions & {
 /**
  * Explicit `relay-host --profile v2` selection. Endpoint, hostId, and
  * credential references come only from the canonical runtime profile store.
- * The optional path names a privileged bootstrap input file; it is not secret
- * material and the v2 branch still carries no v1 runtime fields.
+ * The optional paths name a reference-only provisioning document and a
+ * privileged bootstrap input file; neither path is secret material and the v2
+ * branch still carries no v1 runtime fields.
  */
 export type RelayV2HostSelection = {
   profile: "v2";
+  provisionProfileInputPath?: string;
   bootstrapSecretInputPath?: string;
 };
 
@@ -715,12 +717,28 @@ export function parseRelayHostOptions(
   const profile = relayHostProfile(argv, env);
   if (profile === "v2") {
     // 显式 default-off 选路：endpoint、hostId 与 credential reference 只来自
-    // canonical 运行时 profile store；CLI 可额外传入非敏感 bootstrap 文件路径。
+    // canonical 运行时 profile store；CLI 只可额外传入非敏感 provisioning /
+    // bootstrap 文件路径。
+    let explicitProfileCount = 0;
+    let explicitV2Profile = false;
+    let provisionProfileInputPath: string | undefined;
     let bootstrapSecretInputPath: string | undefined;
     for (let i = 0; i < argv.length; i += 1) {
       const arg = argv[i];
       if (arg === "--profile") {
+        explicitProfileCount += 1;
+        explicitV2Profile = argv[i + 1] === "v2";
         i += 1;
+      } else if (arg === "--provision-profile-input") {
+        if (provisionProfileInputPath !== undefined) {
+          throw new CliError("relay-host --provision-profile-input 只能指定一次");
+        }
+        const inputPath = argv[i + 1];
+        if (inputPath === undefined || inputPath === "" || inputPath.startsWith("--")) {
+          throw new CliError("relay-host --provision-profile-input 需要非空文件路径");
+        }
+        i += 1;
+        provisionProfileInputPath = inputPath;
       } else if (arg === "--bootstrap-secret-input") {
         if (bootstrapSecretInputPath !== undefined) {
           throw new CliError("relay-host --bootstrap-secret-input 只能指定一次");
@@ -740,12 +758,22 @@ export function parseRelayHostOptions(
         throw new CliError(
           "Relay v2 host profile 的 relayUrl、issuer、hostId 与 credential reference "
           + "只来自运行时 profile store，CLI 只接受 --profile v2 与 "
-          + `--bootstrap-secret-input 选路（不支持参数: ${arg}）`,
+          + "--provision-profile-input/--bootstrap-secret-input 文件选路"
+          + "（存在不支持参数）",
         );
       }
     }
+    if (provisionProfileInputPath !== undefined
+      && (explicitProfileCount !== 1 || !explicitV2Profile)) {
+      throw new CliError(
+        "relay-host provisioning 要求本次 argv 唯一显式指定 --profile v2",
+      );
+    }
     return {
       profile,
+      ...(provisionProfileInputPath === undefined
+        ? {}
+        : { provisionProfileInputPath }),
       ...(bootstrapSecretInputPath === undefined ? {} : { bootstrapSecretInputPath }),
     };
   }
@@ -772,6 +800,8 @@ export function parseRelayHostOptions(
     } else if (arg === "--credential-reference") {
       sawV2CredentialReference = true;
       i += 1;
+    } else if (arg === "--provision-profile-input") {
+      throw new CliError("relay-host --provision-profile-input 只适用于 --profile v2");
     } else if (arg === "--bootstrap-secret-input") {
       throw new CliError("relay-host --bootstrap-secret-input 只适用于 --profile v2");
     } else if (arg === "--local") {
@@ -810,11 +840,15 @@ function printHelp(): void {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
-  tw relay-host --profile v2 [--bootstrap-secret-input <path>]
+  tw relay-host --profile v2 [--provision-profile-input <path>] [--bootstrap-secret-input <path>]
 
 Relay v2:
   --profile v2 选择显式 default-off Relay v2 Host shipping root。relayUrl、issuer、hostId 与
-  credential reference 只来自 canonical 运行时 profile store；rev7 trusted native source、
+  reference 字段只来自 canonical 运行时 profile store。首次 provisioning 可用
+  --provision-profile-input 指定 current-user-owned、regular、single-link、exact 0600 的
+  严格冻结 contract JSON；CLI 只把它交给唯一 safe writer，canonical profile 已存在且不同、
+  corrupt 或 unsafe 时绝不覆盖。该文件不能含 credential/bootstrap/refresh secret 或 token。
+  rev7 trusted native source、
   canonical runtime bundle 与两条独立 TLS trust cut 只由唯一 trusted deployment activation
   owner 冻结并以 opaque one-shot ticket 交给 shipping root。任一 prerequisite 失败都逆序
   drain、fail closed。trusted source 会按需启动 canonical terminal-control daemon，随后唯一
@@ -3534,6 +3568,16 @@ async function runConnection(
 export async function run(): Promise<void> {
   const opts = parseRelayHostOptions(process.argv.slice(3));
   if (opts.profile === "v2") {
+    if (opts.provisionProfileInputPath !== undefined) {
+      const {
+        loadOrCreateRelayV2HostProductionProfile,
+        readRelayV2HostProductionProfileProvisioningInput,
+      } = await import("./relay/v2/hostProductionProfileStore.js");
+      const profile = readRelayV2HostProductionProfileProvisioningInput({
+        inputPath: opts.provisionProfileInputPath,
+      });
+      loadOrCreateRelayV2HostProductionProfile({ profile });
+    }
     // 显式 v2 选路只能进入唯一 trusted deployment activation/source
     // owner。profile snapshot、rev7 native source、canonical runtime bundle
     // 与两条独立 TLS trust cut 以同一个 opaque one-shot ticket 交给 Host

@@ -104,7 +104,7 @@ Automation:
 其它:
   tw serve [--host HOST] [--port N]  启动网页终端（默认监听所有网卡）
   tw relay-server             启动实验性远程 relay 服务（显式 v2 可写一次 Host bootstrap）
-  tw relay-host               连接 relay 并转发本机 tw serve
+  tw relay-host               连接 relay；显式 v2 可从 owner-only 文件 provision Host profile
   tw terminal-control ...     运行 / 查询本机 terminal input ownership authority
   tw setup                    安装 / 配置向导
   tw doctor                   检查 tmux/git/node 与配置是否就绪

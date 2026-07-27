@@ -516,8 +516,15 @@ binds those authorities and the same profile/Host lineage to recovered H0,
 the H2 snapshot spool, the production welcome serializer, and the privileged
 intake's Vault/HTTPS/WSS chain; callers cannot replace or split the deployment
 inputs. Startup failure and close drain in reverse owner order. The explicit
-`relay-host --profile v2` path can open the shipping root only through this
-source; the default CLI remains Relay v1, and no failure falls back to v1.
+`relay-host --profile v2` path may first import one operator-owned,
+reference-only frozen-contract document with
+`--provision-profile-input <path>`; the CLI passes that strict snapshot to
+`loadOrCreateRelayV2HostProductionProfile`, the sole safe writer, before the
+trusted source independently reads the canonical fixed profile. The import is
+create-once: an exact existing profile is idempotent, while a different,
+corrupt, locked, or unsafe profile fails closed without replacement. The
+shipping root still opens only through the trusted source; the default CLI
+remains Relay v1, and no failure falls back to v1.
 The profile contract contains no TLS material, so both independent cuts
 currently select system trust. Host native `qualifiedRecords=[]`, missing
 qualification/recovery and real TLS/device interoperability evidence still
@@ -607,18 +614,51 @@ resulting file is exactly mode `0600` and contains only the token plus a
 trailing newline. The token is not printed to stdout or logs.
 
 Securely transfer that file to an owner-only directory on the new Host,
-preserving or restoring exact mode `0600`, then start the Host with the
-non-secret path:
+preserving or restoring exact mode `0600`. On the Host, also prepare one
+reference-only profile document. It must be a current-user-owned regular file
+with one link, exact mode `0600`, no more than 16 KiB, and exactly this frozen
+schema (replace every example value with the deployment's real non-secret
+identifier or root URL):
+
+```json
+{
+  "contract": "tmux-worktree-relay-v2-host-production-profile",
+  "schemaVersion": 1,
+  "hostId": "mac-admin",
+  "relayUrl": "wss://relay.example.com/",
+  "credentialIssuerUrl": "https://relay.example.com/",
+  "credentialReference": "relay-v2-host-credential-ref:mac-admin",
+  "bootstrapSecretReference": "mac-admin-bootstrap-reference",
+  "refreshSecretReference": "mac-admin-refresh-reference"
+}
+```
+
+The reference fields are logical identifiers, not credential values. This
+document must not contain `twcap2.*`, `twref2.*`, `twhostboot2.*`, a Relay v1
+shared secret, TLS material, or filesystem paths. Start the first Host with
+both non-secret paths so the same invocation provisions the canonical profile
+and then consumes the separately restricted bootstrap file:
 
 ```bash
 install -d -m 700 /secure/relay-bootstrap
+chmod 600 /secure/relay-bootstrap/host-profile-v1.json
 chmod 600 /secure/relay-bootstrap/new-host.twhostboot2
 tw relay-host \
   --profile v2 \
+  --provision-profile-input /secure/relay-bootstrap/host-profile-v1.json \
   --bootstrap-secret-input /secure/relay-bootstrap/new-host.twhostboot2
 ```
 
-The Host trusted deployment source opens that exact file with
+The provisioning reader is fd-bound and rejects missing values, duplicate JSON
+keys, unknown fields, unsafe metadata, malformed URLs/references, and contract
+errors before canonical storage mutation. The existing profile store publishes
+only the fixed
+`~/.tmux-worktree/relay-v2-host/profile-v1.json` with atomic create/no-replace
+semantics and exact mode `0600`; provisioning emits no profile or secret to
+stdout. Both v1 and an invocation without explicit `--profile v2` reject the
+provisioning option.
+
+The Host trusted deployment source opens that exact bootstrap file with
 `O_RDONLY|O_NOFOLLOW`, verifies through its descriptor that it is a
 current-user-owned regular file with one link, exact mode `0600`, and no more
 than the existing bootstrap raw-byte limit, then gives its sole Readable byte
@@ -631,8 +671,8 @@ the raw token into argv, env, logs, errors, stdout, or a second credential
 store. After Host registration/credential bootstrap is confirmed, the
 operator removes the transferred file; the CLI never deletes it
 automatically. Subsequent starts use `tw relay-host --profile v2` without the
-input option, and the same profile/Vault remains the authority for the
-same-lineage Dashboard management child.
+provisioning or bootstrap input options, and the same canonical profile/Vault
+remains the authority for the same-lineage Dashboard management child.
 
 A Broker file-publication failure shuts down its just-opened v2 shipping
 handle. Any Host file validation, read, startup, abort, or close failure drains

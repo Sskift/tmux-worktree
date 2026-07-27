@@ -62,11 +62,32 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
 
   assert.deepEqual(parseRelayHostOptions([
     "--profile", "v2",
+    "--provision-profile-input", "/private/host-profile.json",
     "--bootstrap-secret-input", "/private/new-host.twhostboot2",
   ], {}), {
     profile: "v2",
+    provisionProfileInputPath: "/private/host-profile.json",
     bootstrapSecretInputPath: "/private/new-host.twhostboot2",
   });
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--provision-profile-input",
+  ], {}), /需要非空文件路径/);
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--provision-profile-input", "/private/first",
+    "--provision-profile-input", "/private/second",
+  ], {}), /只能指定一次/);
+  assert.throws(() => parseRelayHostOptions([
+    "--provision-profile-input", "/private/host-profile.json",
+  ], {
+    TW_RELAY_HOST_PROFILE: "v2",
+  }), /本次 argv 唯一显式指定 --profile v2/);
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--profile", "v2",
+    "--provision-profile-input", "/private/host-profile.json",
+  ], {}), /本次 argv 唯一显式指定 --profile v2/);
   assert.throws(() => parseRelayHostOptions([
     "--profile", "v2",
     "--bootstrap-secret-input",
@@ -88,6 +109,11 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
   assert.throws(() => parseRelayHostOptions([
     "--relay", "wss://legacy.example.test",
     "--secret", "legacy-shared-secret",
+    "--provision-profile-input", "/private/host-profile.json",
+  ], {}), /只适用于 --profile v2/);
+  assert.throws(() => parseRelayHostOptions([
+    "--relay", "wss://legacy.example.test",
+    "--secret", "legacy-shared-secret",
     "--bootstrap-secret-input", "/private/new-host.twhostboot2",
   ], {}), /只适用于 --profile v2/);
   assert.throws(() => parseRelayHostOptions([
@@ -97,7 +123,7 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
   ], {}), /cannot read Relay v2 credential reference|不能读取 Relay v2 credential reference/);
 });
 
-test("Relay v2 host argv carries no endpoint, credential reference, or raw secret", () => {
+test("Relay v2 host argv carries only non-secret provisioning and bootstrap paths", () => {
   // v2 的 relayUrl/issuer/hostId/credential reference 只来自运行时 profile
   // store；任何 argv 形式的 endpoint、credential reference（含合法 namespace
   // 与敏感前缀）或 v1 运行时参数都在选路时拒绝，不会被静默忽略。
@@ -113,6 +139,11 @@ test("Relay v2 host argv carries no endpoint, credential reference, or raw secre
   ]) {
     assert.throws(() => parseRelayHostOptions(argv, {}), /只来自运行时 profile store/);
   }
+  const rawCredential = "twcap2.must-never-be-reflected";
+  assert.throws(
+    () => parseRelayHostOptions(["--profile", "v2", rawCredential], {}),
+    (error) => !String(error?.message).includes(rawCredential),
+  );
 });
 
 test("Relay v2 host selection ignores legacy v2 env channels", () => {
@@ -151,7 +182,9 @@ test("relay-host help documents the explicit Relay v2 shipping selection", async
   const output = Buffer.concat(stdout).toString("utf8");
   assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
   assert.match(output, /tw relay-host --profile v2/);
+  assert.match(output, /--provision-profile-input <path>/);
   assert.match(output, /--bootstrap-secret-input <path>/);
+  assert.match(output, /唯一 safe writer/);
   assert.match(output, /default-off Relay v2 Host shipping root/);
   assert.doesNotMatch(output, /当前未启用 Relay v2/);
 });

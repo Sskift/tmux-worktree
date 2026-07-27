@@ -38,8 +38,11 @@ const PROFILE_FILENAME = "profile-v1.json";
 const LOCK_FILENAME = "profile-v1.json.lock";
 const TEMPORARY_PREFIX = ".profile-v1.json.tmp-";
 const MAX_URL_BYTES = 2_048;
+const MAX_PROVISIONING_INPUT_PATH_BYTES = 4_096;
 const MAX_LOCK_BYTES = 128;
 const TEMPORARY_ATTEMPTS = 8;
+const RELAY_V2_TOKEN_SHAPED_SECRET =
+  /(?:twcap2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}|(?:twref2|twenroll2)\.[A-Za-z0-9_-]{43}|twhostboot2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})/;
 const PROFILE_KEYS = [
   "contract",
   "schemaVersion",
@@ -75,9 +78,17 @@ export interface RelayV2HostProductionProfileReadOptions {
   readonly trustedHome?: string;
 }
 
+export interface RelayV2HostProductionProfileProvisioningInputOptions {
+  /** Non-secret path to one owner-only frozen-contract profile document. */
+  readonly inputPath: string;
+}
+
 export type RelayV2HostProductionProfileStoreErrorCode =
   | "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS"
   | "RELAY_V2_HOST_PRODUCTION_PROFILE_PLATFORM_UNSUPPORTED"
+  | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNAVAILABLE"
+  | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNSAFE"
+  | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID"
   | "RELAY_V2_HOST_PRODUCTION_PROFILE_NOT_FOUND"
   | "RELAY_V2_HOST_PRODUCTION_PROFILE_DIRECTORY_UNSAFE"
   | "RELAY_V2_HOST_PRODUCTION_PROFILE_LOCKED"
@@ -132,6 +143,12 @@ function messageForCode(code: RelayV2HostProductionProfileStoreErrorCode): strin
       return "Relay v2 Host production profile options are invalid";
     case "RELAY_V2_HOST_PRODUCTION_PROFILE_PLATFORM_UNSUPPORTED":
       return "Relay v2 Host production profile storage is unsupported on this platform";
+    case "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNAVAILABLE":
+      return "Relay v2 Host production profile provisioning input is unavailable";
+    case "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNSAFE":
+      return "Relay v2 Host production profile provisioning input is unsafe";
+    case "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID":
+      return "Relay v2 Host production profile provisioning input is invalid";
     case "RELAY_V2_HOST_PRODUCTION_PROFILE_NOT_FOUND":
       return "Relay v2 Host production profile does not exist";
     case "RELAY_V2_HOST_PRODUCTION_PROFILE_DIRECTORY_UNSAFE":
@@ -217,16 +234,29 @@ function exactRootUrl(value: unknown, protocol: "wss:" | "https:"): value is str
     && parsed.toString() === value;
 }
 
+function isReferenceOnlyProfileString(value: unknown): value is string {
+  return typeof value === "string" && !RELAY_V2_TOKEN_SHAPED_SECRET.test(value);
+}
+
 function captureProfile(
   value: unknown,
   errorCode: "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS"
-    | "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID",
+    | "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID"
+    | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID",
 ): Readonly<RelayV2HostProductionProfile> {
   const fields = captureExactDataRecord(value, PROFILE_KEYS);
   if (fields === null
     || fields.contract !== RELAY_V2_HOST_PRODUCTION_PROFILE_CONTRACT
     || fields.schemaVersion !== RELAY_V2_HOST_PRODUCTION_PROFILE_SCHEMA_VERSION
     || !isRelayV2AuthIdentifier(fields.hostId)
+    || ![
+      fields.hostId,
+      fields.relayUrl,
+      fields.credentialIssuerUrl,
+      fields.credentialReference,
+      fields.bootstrapSecretReference,
+      fields.refreshSecretReference,
+    ].every(isReferenceOnlyProfileString)
     || !exactRootUrl(fields.relayUrl, "wss:")
     || !exactRootUrl(fields.credentialIssuerUrl, "https:")
     || !isRelayV2HostCredentialReference(fields.credentialReference)
@@ -361,6 +391,7 @@ function assertOwnedRegularFile(
   maximumBytes: number,
   code: "RELAY_V2_HOST_PRODUCTION_PROFILE_LOCK_UNSAFE"
     | "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE"
+    | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNSAFE"
     | "RELAY_V2_HOST_PRODUCTION_PROFILE_RECOVERY_REQUIRED",
   expectedLinkCount = 1n,
 ): void {
@@ -558,19 +589,26 @@ function readExact(descriptor: number, size: number): Buffer {
   return bytes;
 }
 
-function inspectProfile(path: string, uid: bigint): ProfileInspection {
+function inspectProfileFile(
+  path: string,
+  uid: bigint,
+  unsafeCode: "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE"
+    | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNSAFE",
+  invalidCode: "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID"
+    | "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID",
+): ProfileInspection {
   let before: BigIntStats;
   try {
     before = statPath(path);
   } catch (error) {
     if (isMissing(error)) return Object.freeze({ status: "missing" });
-    return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE");
+    return fail(unsafeCode);
   }
   assertOwnedRegularFile(
     before,
     uid,
     RELAY_V2_HOST_PRODUCTION_PROFILE_MAX_BYTES,
-    "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE",
+    unsafeCode,
   );
   let descriptor = -1;
   try {
@@ -583,10 +621,10 @@ function inspectProfile(path: string, uid: bigint): ProfileInspection {
       opened,
       uid,
       RELAY_V2_HOST_PRODUCTION_PROFILE_MAX_BYTES,
-      "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE",
+      unsafeCode,
     );
     if (!sameIdentity(identityOf(before), identityOf(opened)) || before.size !== opened.size) {
-      return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE");
+      return fail(unsafeCode);
     }
     const bytes = readExact(descriptor, Number(opened.size));
     const afterDescriptor = statDescriptor(descriptor);
@@ -595,19 +633,19 @@ function inspectProfile(path: string, uid: bigint): ProfileInspection {
       afterDescriptor,
       uid,
       RELAY_V2_HOST_PRODUCTION_PROFILE_MAX_BYTES,
-      "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE",
+      unsafeCode,
     );
     assertOwnedRegularFile(
       afterPath,
       uid,
       RELAY_V2_HOST_PRODUCTION_PROFILE_MAX_BYTES,
-      "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE",
+      unsafeCode,
     );
     if (!sameIdentity(identityOf(opened), identityOf(afterDescriptor))
       || !sameIdentity(identityOf(opened), identityOf(afterPath))
       || opened.size !== afterDescriptor.size
       || opened.size !== afterPath.size) {
-      return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE");
+      return fail(unsafeCode);
     }
     let decoded: unknown;
     try {
@@ -617,20 +655,29 @@ function inspectProfile(path: string, uid: bigint): ProfileInspection {
         maxNodes: PROFILE_KEYS.length + 1,
       });
     } catch {
-      return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID");
+      return fail(invalidCode);
     }
     return Object.freeze({
       status: "present",
-      profile: captureProfile(decoded, "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID"),
+      profile: captureProfile(decoded, invalidCode),
     });
   } catch (error) {
     if (isTypedError(error)) throw error;
-    return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE");
+    return fail(unsafeCode);
   } finally {
     if (descriptor >= 0) {
       try { closeSync(descriptor); } catch {}
     }
   }
+}
+
+function inspectProfile(path: string, uid: bigint): ProfileInspection {
+  return inspectProfileFile(
+    path,
+    uid,
+    "RELAY_V2_HOST_PRODUCTION_PROFILE_FILE_UNSAFE",
+    "RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID",
+  );
 }
 
 function assertOwnedOpenFile(
@@ -1051,6 +1098,37 @@ function publishProfile(
 
 export function relayV2HostProductionProfilePath(trustedHome = homedir()): string {
   return join(trustedHome, ...PROFILE_DIRECTORY_COMPONENTS, PROFILE_FILENAME);
+}
+
+/**
+ * Reads one explicit operator provisioning document without creating or
+ * mutating canonical profile storage. The document contains only the frozen
+ * reference-only profile fields; it is fd-bound, owner-only, single-link and
+ * strictly decoded before the caller may pass it to the sole writer below.
+ */
+export function readRelayV2HostProductionProfileProvisioningInput(
+  options: RelayV2HostProductionProfileProvisioningInputOptions,
+): Readonly<RelayV2HostProductionProfile> {
+  const capturedOptions = captureExactDataRecord(options, ["inputPath"]);
+  const inputPath = capturedOptions?.inputPath;
+  if (capturedOptions === null
+    || typeof inputPath !== "string"
+    || inputPath.length === 0
+    || inputPath.includes("\0")
+    || Buffer.byteLength(inputPath, "utf8") > MAX_PROVISIONING_INPUT_PATH_BYTES) {
+    return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_INVALID_OPTIONS");
+  }
+  const uid = requireSupportedPlatform();
+  const input = inspectProfileFile(
+    inputPath,
+    uid,
+    "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNSAFE",
+    "RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_INVALID",
+  );
+  if (input.status === "missing") {
+    return fail("RELAY_V2_HOST_PRODUCTION_PROFILE_PROVISIONING_INPUT_UNAVAILABLE");
+  }
+  return input.profile;
 }
 
 /**
