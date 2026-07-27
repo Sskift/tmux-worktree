@@ -317,47 +317,138 @@ function captureFunctionField(value: unknown): boolean {
   }
 }
 
+const OUTER_NODE_IS_PROXY = nodeTypes.isProxy;
+const OUTER_OBJECT_CREATE = Object.create;
+const OUTER_OBJECT_FREEZE = Object.freeze;
+const OUTER_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OUTER_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const OUTER_OBJECT_HAS_OWN = Object.hasOwn;
+const OUTER_REFLECT_APPLY = Reflect.apply;
+const OUTER_REFLECT_OWN_KEYS = Reflect.ownKeys;
+const OUTER_ARRAY_IS_ARRAY = Array.isArray;
+
+function rejectedOuterProxy(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return false;
+  }
+  try {
+    return OUTER_REFLECT_APPLY(OUTER_NODE_IS_PROXY, undefined, [value]);
+  } catch {
+    return true;
+  }
+}
+
 function exactOwnDataSubset(
   value: unknown,
   required: readonly string[],
   optional: readonly string[],
 ): Record<string, unknown> | null {
-  if (typeof value !== "object" || value === null || nodeTypes.isProxy(value)) return null;
-  if (Array.isArray(value)) return null;
+  if (typeof value !== "object"
+    || value === null
+    || OUTER_REFLECT_APPLY(OUTER_ARRAY_IS_ARRAY, undefined, [value])
+    || rejectedOuterProxy(value)) return null;
   let descriptors: PropertyDescriptorMap;
   try {
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = OUTER_REFLECT_APPLY(
+      OUTER_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS,
+      undefined,
+      [value],
+    );
   } catch {
     return null;
   }
-  const allowed = [...required, ...optional];
-  const keys = Reflect.ownKeys(descriptors);
-  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) return null;
-  for (const key of required) {
+  const keys = OUTER_REFLECT_APPLY(OUTER_REFLECT_OWN_KEYS, undefined, [descriptors]);
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+    const key = keys[keyIndex];
+    if (typeof key !== "string") return null;
+    let allowed = false;
+    for (let index = 0; index < required.length; index += 1) {
+      if (required[index] === key) allowed = true;
+    }
+    for (let index = 0; index < optional.length; index += 1) {
+      if (optional[index] === key) allowed = true;
+    }
+    if (!allowed) return null;
+  }
+  const result = OUTER_REFLECT_APPLY(
+    OUTER_OBJECT_CREATE,
+    undefined,
+    [null],
+  ) as Record<string, unknown>;
+  for (let index = 0; index < required.length; index += 1) {
+    const key = required[index];
+    if (!OUTER_REFLECT_APPLY(
+      OUTER_OBJECT_HAS_OWN,
+      undefined,
+      [descriptors, key],
+    )) return null;
     const descriptor = descriptors[key];
-    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return null;
+    if (descriptor === undefined
+      || !OUTER_REFLECT_APPLY(
+        OUTER_OBJECT_HAS_OWN,
+        undefined,
+        [descriptor, "value"],
+      )) return null;
+    result[key] = descriptor.value;
   }
-  for (const key of keys as string[]) {
-    if (!Object.hasOwn(descriptors[key], "value")) return null;
+  for (let index = 0; index < optional.length; index += 1) {
+    const key = optional[index];
+    if (!OUTER_REFLECT_APPLY(
+      OUTER_OBJECT_HAS_OWN,
+      undefined,
+      [descriptors, key],
+    )) continue;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !OUTER_REFLECT_APPLY(
+        OUTER_OBJECT_HAS_OWN,
+        undefined,
+        [descriptor, "value"],
+      )) return null;
+    result[key] = descriptor.value;
   }
-  return Object.fromEntries((keys as string[]).map((key) => [key, descriptors[key].value]));
+  return result;
 }
 
 function ownOptionalField(
   options: object,
   key: string,
 ): Readonly<{ present: boolean; value: unknown }> | null {
+  if (rejectedOuterProxy(options)) return null;
   let descriptor: PropertyDescriptor | undefined;
   try {
-    descriptor = Object.getOwnPropertyDescriptor(options, key);
+    descriptor = OUTER_REFLECT_APPLY(
+      OUTER_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR,
+      undefined,
+      [options, key],
+    );
   } catch {
     return null;
   }
-  if (descriptor === undefined || descriptor.value === undefined) {
-    return Object.freeze({ present: false, value: undefined });
+  if (descriptor === undefined) {
+    return OUTER_REFLECT_APPLY(
+      OUTER_OBJECT_FREEZE,
+      undefined,
+      [{ present: false, value: undefined }],
+    );
   }
-  if (!Object.hasOwn(descriptor, "value")) return null;
-  return Object.freeze({ present: true, value: descriptor.value });
+  if (!OUTER_REFLECT_APPLY(
+    OUTER_OBJECT_HAS_OWN,
+    undefined,
+    [descriptor, "value"],
+  )) return null;
+  if (descriptor.value === undefined) {
+    return OUTER_REFLECT_APPLY(
+      OUTER_OBJECT_FREEZE,
+      undefined,
+      [{ present: false, value: undefined }],
+    );
+  }
+  return OUTER_REFLECT_APPLY(
+    OUTER_OBJECT_FREEZE,
+    undefined,
+    [{ present: true, value: descriptor.value }],
+  );
 }
 
 function captureReauthenticationOptions(

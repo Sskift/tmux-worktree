@@ -1397,6 +1397,28 @@ function captureManagedWssCarrierOptions(
   )) as RelayV2HostManagedWssConnectorCarrierOptions;
 }
 
+const MANAGED_WSS_NODE_IS_PROXY = nodeTypes.isProxy;
+const MANAGED_WSS_OBJECT_PROTOTYPE = Object.prototype;
+const MANAGED_WSS_OBJECT_CREATE = Object.create;
+const MANAGED_WSS_OBJECT_FREEZE = Object.freeze;
+const MANAGED_WSS_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const MANAGED_WSS_OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const MANAGED_WSS_OBJECT_HAS_OWN = Object.hasOwn;
+const MANAGED_WSS_REFLECT_APPLY = Reflect.apply;
+const MANAGED_WSS_REFLECT_OWN_KEYS = Reflect.ownKeys;
+const MANAGED_WSS_ARRAY_IS_ARRAY = Array.isArray;
+
+function rejectedManagedWssProxy(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return false;
+  }
+  try {
+    return MANAGED_WSS_REFLECT_APPLY(MANAGED_WSS_NODE_IS_PROXY, undefined, [value]);
+  } catch {
+    return true;
+  }
+}
+
 function captureManagedWssOptions(
   value: unknown,
 ): RelayV2HostManagedWssTransportLifecycleOptions {
@@ -1408,30 +1430,95 @@ function captureManagedWssOptions(
     "scheduleCloseDrain",
     "tlsTrust",
   ] as const;
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || nodeTypes.isProxy(value)) throw managedCompositionFailure();
+  if (typeof value !== "object"
+    || value === null
+    || MANAGED_WSS_REFLECT_APPLY(MANAGED_WSS_ARRAY_IS_ARRAY, undefined, [value])
+    || rejectedManagedWssProxy(value)) throw managedCompositionFailure();
   let descriptors: PropertyDescriptorMap;
   try {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
+    const prototype = MANAGED_WSS_REFLECT_APPLY(
+      MANAGED_WSS_OBJECT_GET_PROTOTYPE_OF,
+      undefined,
+      [value],
+    );
+    if (prototype !== MANAGED_WSS_OBJECT_PROTOTYPE && prototype !== null) {
       throw managedCompositionFailure();
     }
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = MANAGED_WSS_REFLECT_APPLY(
+      MANAGED_WSS_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS,
+      undefined,
+      [value],
+    );
   } catch (error) {
     if (error instanceof RelayV2HostConnectorControllerError) throw error;
     throw managedCompositionFailure();
   }
-  const allowed = new Set<string>([...required, ...optional]);
-  const keys = Reflect.ownKeys(descriptors);
-  if (keys.some((key) => typeof key !== "string"
-    || !allowed.has(key)
-    || !Object.hasOwn(descriptors[key], "value"))
-    || required.some((key) => !Object.hasOwn(descriptors, key))) {
-    throw managedCompositionFailure();
+  const keys = MANAGED_WSS_REFLECT_APPLY(
+    MANAGED_WSS_REFLECT_OWN_KEYS,
+    undefined,
+    [descriptors],
+  );
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+    const key = keys[keyIndex];
+    if (typeof key !== "string") throw managedCompositionFailure();
+    let allowed = false;
+    for (let index = 0; index < required.length; index += 1) {
+      if (required[index] === key) allowed = true;
+    }
+    for (let index = 0; index < optional.length; index += 1) {
+      if (optional[index] === key) allowed = true;
+    }
+    const descriptor = descriptors[key];
+    if (!allowed
+      || descriptor === undefined
+      || !MANAGED_WSS_REFLECT_APPLY(
+        MANAGED_WSS_OBJECT_HAS_OWN,
+        undefined,
+        [descriptor, "value"],
+      )) throw managedCompositionFailure();
   }
-  return Object.freeze(Object.fromEntries(
-    (keys as string[]).map((key) => [key, descriptors[key].value]),
-  )) as RelayV2HostManagedWssTransportLifecycleOptions;
+  const result = MANAGED_WSS_REFLECT_APPLY(
+    MANAGED_WSS_OBJECT_CREATE,
+    undefined,
+    [null],
+  ) as Record<string, unknown>;
+  for (let index = 0; index < required.length; index += 1) {
+    const key = required[index];
+    if (!MANAGED_WSS_REFLECT_APPLY(
+      MANAGED_WSS_OBJECT_HAS_OWN,
+      undefined,
+      [descriptors, key],
+    )) throw managedCompositionFailure();
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !MANAGED_WSS_REFLECT_APPLY(
+        MANAGED_WSS_OBJECT_HAS_OWN,
+        undefined,
+        [descriptor, "value"],
+      )) throw managedCompositionFailure();
+    result[key] = descriptor.value;
+  }
+  for (let index = 0; index < optional.length; index += 1) {
+    const key = optional[index];
+    if (!MANAGED_WSS_REFLECT_APPLY(
+      MANAGED_WSS_OBJECT_HAS_OWN,
+      undefined,
+      [descriptors, key],
+    )) continue;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !MANAGED_WSS_REFLECT_APPLY(
+        MANAGED_WSS_OBJECT_HAS_OWN,
+        undefined,
+        [descriptor, "value"],
+      )) throw managedCompositionFailure();
+    result[key] = descriptor.value;
+  }
+  return MANAGED_WSS_REFLECT_APPLY(
+    MANAGED_WSS_OBJECT_FREEZE,
+    undefined,
+    [result],
+  ) as RelayV2HostManagedWssTransportLifecycleOptions;
 }
 
 function captureManagedWssRuntimeOptions(

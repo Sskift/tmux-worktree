@@ -196,6 +196,17 @@ const claimedCells = new WeakSet<object>();
 const claimedSources = new WeakSet<object>();
 const promiseThen = Promise.prototype.then;
 
+const NODE_IS_PROXY = nodeTypes.isProxy;
+const OBJECT_PROTOTYPE = Object.prototype;
+const OBJECT_CREATE = Object.create;
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const REFLECT_APPLY = Reflect.apply;
+const REFLECT_OWN_KEYS = Reflect.ownKeys;
+const ARRAY_IS_ARRAY = Array.isArray;
+
 function failure(
   code: RelayV2HostPrivilegedProductionIntakeCompositionErrorCode,
 ): RelayV2HostPrivilegedProductionIntakeCompositionError {
@@ -207,7 +218,7 @@ function rejectedProxy(value: unknown): boolean {
     return false;
   }
   try {
-    return nodeTypes.isProxy(value);
+    return REFLECT_APPLY(NODE_IS_PROXY, undefined, [value]);
   } catch {
     return true;
   }
@@ -220,36 +231,52 @@ function snapshotExactDataRecord(
 ): Readonly<Record<string, unknown>> | null {
   if (value === null
     || typeof value !== "object"
-    || Array.isArray(value)
+    || REFLECT_APPLY(ARRAY_IS_ARRAY, undefined, [value])
     || rejectedProxy(value)) return null;
   let descriptors: PropertyDescriptorMap;
   let prototype: object | null;
   try {
-    descriptors = Object.getOwnPropertyDescriptors(value);
-    prototype = Object.getPrototypeOf(value);
+    descriptors = REFLECT_APPLY(
+      OBJECT_GET_OWN_PROPERTY_DESCRIPTORS,
+      undefined,
+      [value],
+    );
+    prototype = REFLECT_APPLY(OBJECT_GET_PROTOTYPE_OF, undefined, [value]);
   } catch {
     return null;
   }
-  if (prototype !== Object.prototype && prototype !== null) return null;
-  const allowed = [...required, ...optional];
-  const keys = Reflect.ownKeys(descriptors);
-  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) return null;
-  if (required.some((key) => {
-    const descriptor = descriptors[key];
-    return descriptor === undefined || !Object.hasOwn(descriptor, "value");
-  })) return null;
-  for (const key of optional) {
-    const descriptor = descriptors[key];
-    if (descriptor !== undefined && !Object.hasOwn(descriptor, "value")) return null;
-  }
-  const result = Object.create(null) as Record<string, unknown>;
-  for (const key of allowed) {
-    const descriptor = descriptors[key];
-    if (descriptor !== undefined && descriptor.value !== undefined) {
-      result[key] = descriptor.value;
+  if (prototype !== OBJECT_PROTOTYPE && prototype !== null) return null;
+  const keys = REFLECT_APPLY(REFLECT_OWN_KEYS, undefined, [descriptors]);
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+    const key = keys[keyIndex];
+    if (typeof key !== "string") return null;
+    let allowed = false;
+    for (let index = 0; index < required.length; index += 1) {
+      if (required[index] === key) allowed = true;
     }
+    for (let index = 0; index < optional.length; index += 1) {
+      if (optional[index] === key) allowed = true;
+    }
+    if (!allowed) return null;
   }
-  return Object.freeze(result);
+  const result = REFLECT_APPLY(OBJECT_CREATE, undefined, [null]) as Record<string, unknown>;
+  for (let index = 0; index < required.length; index += 1) {
+    const key = required[index];
+    if (!REFLECT_APPLY(OBJECT_HAS_OWN, undefined, [descriptors, key])) return null;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !REFLECT_APPLY(OBJECT_HAS_OWN, undefined, [descriptor, "value"])) return null;
+    if (descriptor.value !== undefined) result[key] = descriptor.value;
+  }
+  for (let index = 0; index < optional.length; index += 1) {
+    const key = optional[index];
+    if (!REFLECT_APPLY(OBJECT_HAS_OWN, undefined, [descriptors, key])) continue;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !REFLECT_APPLY(OBJECT_HAS_OWN, undefined, [descriptor, "value"])) return null;
+    if (descriptor.value !== undefined) result[key] = descriptor.value;
+  }
+  return REFLECT_APPLY(OBJECT_FREEZE, undefined, [result]);
 }
 
 function captureDataMethod(value: unknown, key: PropertyKey): CapturedMethod | null {
