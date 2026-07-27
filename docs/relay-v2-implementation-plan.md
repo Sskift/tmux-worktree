@@ -188,14 +188,14 @@ Host侧另有reference-only production profile store与显式default-off privile
 
 ### D. macOS Dashboard
 
-Dashboard 与 B/H 并行开发 domain state、fake backend和 UI；只有真实 enrollment/credential 操作进入 Tauri/bundled `tw` adapter，React 不直接持有 secret或 WebSocket。 当前 default-off canonical Host production composition 已在 facade 发布前依次激活 H0/H3，并可选唯一拥有同 lineage 的 protocol-v2 Dashboard management session，省略配置时 facade 不变；Tauri bundled management supervisor 的 production expected protocol 已固定为 v2，v1 ready 或其他 mismatch 均 fail closed 且无 fallback。hidden Node child现固定使用exact protocol v2，并已有 default-off 的 selection owner：production wrapper 经注入的窄 factory 只消费 canonical Host shipping root 的 default-off `dashboardManagement` seam；qualified injected Host owner 才运行真实 session，qualification/owner/cleanup 缺口收敛到唯一 typed `UNAVAILABLE` 或 ordinary failure，绝不启动第二 session。hidden child production CLI 不取得 trusted activation，且 .app 只携带 cli.cjs（child entry 为 standalone external），因此 child 对所有 operation 仍只返回 fail-closed `UNAVAILABLE`；独立 `relay-host --profile v2` 虽已接唯一 trusted source，但 Host qualification 与 E0/真实 TLS/device 证据仍缺失，因此 Dashboard management 和 Relay v2 整体继续 NO-GO，且没有新增 qualification、TLS、真实设备或签名证据。
+Dashboard 与 B/H 并行开发 domain state、fake backend和 UI；只有真实 enrollment/credential 操作进入 Tauri/bundled `tw` adapter，React 不直接持有 secret或 WebSocket。 当前 default-off canonical Host production composition 已在 facade 发布前依次激活 H0/H3，并可选唯一拥有同 lineage 的 protocol-v2 Dashboard management session，省略配置时 facade 不变；Tauri bundled management supervisor 的 production expected protocol 已固定为 v2，v1 ready 或其他 mismatch 均 fail closed 且无 fallback。hidden Node child现固定使用exact protocol v2，并只把自身stdio IO、runtimeVersion、clock与同一个signal交给唯一Host trusted deployment opener；该opener在child进程内打开一个explicit-v2 root，把这些输入经既有`dashboardManagement` seam交给same-lineage credential/controller/carrier composition。child不接受raw deployment/runtime inputs，也不采用独立`relay-host --profile v2`的auto-start/retry process lifecycle；`start_connector`和`enrollment.create`只经同一management session进入现有owner，结束时先drain session/controller再关闭root。activation/qualification/owner/cleanup缺口仍收敛到唯一typed `UNAVAILABLE`或ordinary failure，绝不启动第二session或v1 fallback。Host `qualifiedRecords=[]`与E0/真实TLS/device证据仍缺失，因此当前Dashboard management和Relay v2整体继续NO-GO，且没有新增qualification、TLS、真实设备或签名证据。
 
 工作边界：
 
 - 明确区分 v1 shared-secret profile 与 v2 host/client credential状态，不原地升级或共用字段。
 - host bootstrap/refresh 状态、connector registration/capability，以及 client enrollment create和已知 grant revoke；基础契约没有设备枚举 API，不从本地记录伪造设备列表。
 - v2 QR review信息、过期/撤销/重建流程，以及 SUPERSEDED 退出码 78 的进程编排。
-- broker issuer/bootstrap、host credential、enrollment attempt和grant状态由 Node 本地管理接口持有；Tauri只编排，不能另建issuer、keyring或credential owner。Node protocol-v2 authority/session与same-lineage Host credential/connector adapters已由可选canonical Host composition闭合；renderer/model仍使用fake；bundled child虽已固定protocol v2，但只返回`UNAVAILABLE`，qualified Host session与CLI activation仍不可用。
+- broker issuer/bootstrap、host credential、enrollment attempt和grant状态由 Node 本地管理接口持有；Tauri只编排，不能另建issuer、keyring或credential owner。Node protocol-v2 authority/session与same-lineage Host credential/connector adapters已由可选canonical Host composition闭合；renderer/model仍使用fake；bundled child已通过唯一trusted opener接到同一Host root，但当前qualification为空，仍只返回`UNAVAILABLE`。
 
 验收：
 

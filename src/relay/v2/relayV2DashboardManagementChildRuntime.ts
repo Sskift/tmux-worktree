@@ -1,9 +1,11 @@
 import { types as nodeUtilTypes } from "node:util";
 
 import {
-  startRelayV2HostShippingRoot,
-  type RelayV2HostShippingRootOptions,
-} from "./hostShippingRoot.js";
+  startRelayV2HostDashboardManagementFromTrustedDeployment,
+} from "./hostShippingDeploymentSource.js";
+import type {
+  RelayV2HostPrivilegedProductionDashboardManagementOptions,
+} from "./hostPrivilegedProductionIntakeComposition.js";
 import {
   RELAY_V2_DASHBOARD_MANAGEMENT_BAD_REQUEST_EXIT_CODE,
   RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE,
@@ -12,19 +14,6 @@ import {
   type RelayV2DashboardManagementStdioIo,
 } from "./relayV2DashboardManagementStdio.js";
 
-/**
- * Trusted deployment injections accepted by the hidden child. The real
- * session is reachable only through the existing Host shipping root with
- * these qualified inputs; this owner never constructs credentials, native
- * sources, discovery, listeners, worktree/tmux, retry, or a v1 fallback.
- */
-export interface RelayV2DashboardManagementChildShippingOptions {
-  /** Test isolation only; production omission selects the canonical account home. */
-  readonly trustedHome?: string;
-  readonly deployment: RelayV2HostShippingRootOptions["deployment"];
-  readonly runtime: RelayV2HostShippingRootOptions["runtime"];
-}
-
 /** The narrow lifecycle the child consumes from the Host shipping root handle. */
 export interface RelayV2DashboardManagementChildHostHandle {
   readonly runDashboardManagement?: () => Promise<number>;
@@ -32,26 +21,23 @@ export interface RelayV2DashboardManagementChildHostHandle {
 }
 
 /**
- * Narrow factory port for the qualified Host owner. The production wrapper
- * binds the canonical `startRelayV2HostShippingRoot`; nothing else may
- * supply a Host owner to this child.
+ * Narrow factory port for the trusted Host owner. Production binds the sole
+ * trusted deployment source; the child supplies only its exact management
+ * channel and cannot inject or replace deployment/runtime authorities.
  */
 export type RelayV2DashboardManagementChildHostFactory = (
-  options: RelayV2HostShippingRootOptions,
+  options: RelayV2HostPrivilegedProductionDashboardManagementOptions,
 ) => Promise<RelayV2DashboardManagementChildHostHandle>;
 
 export interface RelayV2DashboardManagementChildStdioOptions {
   readonly runtimeVersion: string;
   /** Test seam; omission selects the process stdin/stdout channel. */
   readonly io?: RelayV2DashboardManagementStdioIo;
-  /** Default-off. Omission selects the typed UNAVAILABLE session. */
-  readonly shipping?: RelayV2DashboardManagementChildShippingOptions;
 }
 
 interface CapturedOptions {
   readonly runtimeVersion: string;
   readonly io: RelayV2DashboardManagementStdioIo;
-  readonly shipping: RelayV2DashboardManagementChildShippingOptions | null;
 }
 
 function rejectedProxy(value: unknown): boolean {
@@ -116,7 +102,7 @@ function captureIo(value: unknown): RelayV2DashboardManagementStdioIo | null {
 }
 
 function captureOptions(value: unknown): CapturedOptions | null {
-  const fields = captureRecord(value, ["runtimeVersion"], ["io", "shipping"]);
+  const fields = captureRecord(value, ["runtimeVersion"], ["io"]);
   if (fields === null || typeof fields.runtimeVersion !== "string") return null;
   let io: RelayV2DashboardManagementStdioIo;
   if (fields.io === undefined) {
@@ -126,27 +112,9 @@ function captureOptions(value: unknown): CapturedOptions | null {
     if (capturedIo === null) return null;
     io = capturedIo;
   }
-  let shipping: RelayV2DashboardManagementChildShippingOptions | null = null;
-  if (fields.shipping !== undefined) {
-    const captured = captureRecord(fields.shipping, ["deployment", "runtime"], ["trustedHome"]);
-    if (captured === null
-      || (captured.trustedHome !== undefined && typeof captured.trustedHome !== "string")
-      || captured.deployment === null
-      || typeof captured.deployment !== "object"
-      || captured.runtime === null
-      || typeof captured.runtime !== "object") return null;
-    shipping = Object.freeze({
-      ...(captured.trustedHome === undefined
-        ? {}
-        : { trustedHome: captured.trustedHome as string }),
-      deployment: captured.deployment as RelayV2HostShippingRootOptions["deployment"],
-      runtime: captured.runtime as RelayV2HostShippingRootOptions["runtime"],
-    });
-  }
   return Object.freeze({
     runtimeVersion: fields.runtimeVersion as string,
     io,
-    shipping,
   });
 }
 
@@ -277,23 +245,16 @@ async function closeVerified(
  */
 async function runQualifiedSession(
   openHostRoot: RelayV2DashboardManagementChildHostFactory,
-  captured: CapturedOptions & { shipping: RelayV2DashboardManagementChildShippingOptions },
+  captured: CapturedOptions,
 ): Promise<number | null> {
   const abort = new AbortController();
   let rawHandle: unknown;
   try {
     rawHandle = await openHostRoot(Object.freeze({
-      ...(captured.shipping.trustedHome === undefined
-        ? {}
-        : { trustedHome: captured.shipping.trustedHome }),
-      deployment: captured.shipping.deployment,
-      runtime: captured.shipping.runtime,
-      dashboardManagement: Object.freeze({
-        clock: () => Date.now(),
-        runtimeVersion: captured.runtimeVersion,
-        signal: abort.signal,
-        io: captured.io,
-      }),
+      clock: () => Date.now(),
+      runtimeVersion: captured.runtimeVersion,
+      signal: abort.signal,
+      io: captured.io,
     }));
   } catch {
     return null;
@@ -336,13 +297,8 @@ export function createRelayV2DashboardManagementChildStdioRunner(
     if (captured === null || factory === null) {
       return RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE;
     }
-    if (captured.shipping !== null) {
-      const qualified = await runQualifiedSession(factory, {
-        ...captured,
-        shipping: captured.shipping,
-      });
-      if (qualified !== null) return qualified;
-    }
+    const qualified = await runQualifiedSession(factory, captured);
+    if (qualified !== null) return qualified;
     return createRelayV2DashboardManagementUnavailableStdioSession({
       runtimeVersion: captured.runtimeVersion,
       io: captured.io,
@@ -351,15 +307,16 @@ export function createRelayV2DashboardManagementChildStdioRunner(
 }
 
 /**
- * The hidden child's single selection entry. It never rejects: qualified
- * injected Host shipping inputs run the real same-lineage protocol-v2
- * management session owned by the canonical Host shipping root; every
- * qualification gap converges to the typed UNAVAILABLE session. The
- * production CLI passes no shipping inputs, so the shipping behavior stays
- * fail-closed unavailable with no Relay v1 fallback.
+ * The hidden child's single selection entry. It never rejects: the unique
+ * trusted deployment source opens one explicit-v2 Host root and threads this
+ * child's channel into that root's same-lineage protocol-v2 management
+ * session. Any activation/qualification gap converges to typed UNAVAILABLE,
+ * with no second Host owner, process lifecycle, or Relay v1 fallback.
  */
 export function runRelayV2DashboardManagementChildStdio(
   options: RelayV2DashboardManagementChildStdioOptions,
 ): Promise<number> {
-  return createRelayV2DashboardManagementChildStdioRunner(startRelayV2HostShippingRoot)(options);
+  return createRelayV2DashboardManagementChildStdioRunner(
+    startRelayV2HostDashboardManagementFromTrustedDeployment,
+  )(options);
 }

@@ -24,6 +24,9 @@ import {
   RelayV2HostShippingProcessSignalOwner,
   runRelayV2HostShippingProcessLifecycle,
 } from "./hostShippingProcessLifecycle.js";
+import type {
+  RelayV2HostPrivilegedProductionDashboardManagementOptions,
+} from "./hostPrivilegedProductionIntakeComposition.js";
 import type { RelayV2HostShippingRootHandle } from "./hostShippingRoot.js";
 import {
   captureRelayV2HostSystemTlsTrustCut,
@@ -254,6 +257,7 @@ export async function startRelayV2HostShippingFromTrustedDeployment(
 
 async function openRelayV2HostShippingFromTrustedDeployment(
   signal?: AbortSignal,
+  dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
 ): Promise<RelayV2HostShippingRootHandle> {
   const owner = await createActivationOwner(signal);
   try {
@@ -262,6 +266,7 @@ async function openRelayV2HostShippingFromTrustedDeployment(
     requireStartupOpen(signal);
     return await root.startRelayV2HostShippingRootFromTrustedDeployment(
       owner.activation,
+      dashboardManagement,
     );
   } catch {
     try {
@@ -271,6 +276,28 @@ async function openRelayV2HostShippingFromTrustedDeployment(
     }
     throw failure("ACTIVATION_FAILED");
   }
+}
+
+/**
+ * Dashboard hidden-child entry for the same trusted Host deployment owner.
+ * The caller supplies only its protocol-v2 channel identity; profile,
+ * credential, runtime, transport, and native authorities still come from the
+ * one trusted activation above. Unlike the relay-host process entry, this
+ * opener does not auto-start or retry the connector: the same root's
+ * management session exclusively drives start/stop and enrollment.
+ */
+export async function startRelayV2HostDashboardManagementFromTrustedDeployment(
+  dashboardManagement: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  if (arguments.length !== 1
+    || dashboardManagement === null
+    || typeof dashboardManagement !== "object") {
+    throw failure("ACTIVATION_INVALID");
+  }
+  return openRelayV2HostShippingFromTrustedDeployment(
+    dashboardManagement.signal,
+    dashboardManagement,
+  );
 }
 
 /**

@@ -1,7 +1,48 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import test from "node:test";
 
-const childRuntime = await import("../dist/relay/v2/relayV2DashboardManagementChildRuntime.js");
+const { build } = createRequire(import.meta.url)("esbuild");
+const sourcePath = new URL(
+  "../src/relay/v2/relayV2DashboardManagementChildRuntime.ts",
+  import.meta.url,
+).pathname;
+const compiled = await build({
+  entryPoints: [sourcePath],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  write: false,
+  plugins: [{
+    name: "trusted-host-dashboard-management-source",
+    setup(esbuild) {
+      esbuild.onResolve(
+        { filter: /^\.\/hostShippingDeploymentSource\.js$/ },
+        () => ({
+          path: "hostShippingDeploymentSource.js",
+          namespace: "trusted-host-source",
+        }),
+      );
+      esbuild.onLoad(
+        { filter: /.*/, namespace: "trusted-host-source" },
+        () => ({
+          contents: `
+            export async function startRelayV2HostDashboardManagementFromTrustedDeployment(
+              options,
+            ) {
+              return globalThis.__relayV2DashboardManagementTrustedHostFactory(options);
+            }
+          `,
+          loader: "js",
+        }),
+      );
+    },
+  }],
+});
+const childRuntime = await import(
+  `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
+);
 
 const RUNTIME_VERSION = "0.0.0-child-test";
 const CONTRACT = "tmux-worktree-dashboard-relay-v2-management-ipc";
@@ -69,14 +110,6 @@ function makeIo() {
   };
 }
 
-function shipping() {
-  return Object.freeze({
-    trustedHome: "/tmp/child-runtime-test",
-    deployment: Object.freeze({ marker: "deployment" }),
-    runtime: Object.freeze({ marker: "runtime" }),
-  });
-}
-
 async function assertUnavailableSession(channel, run) {
   await waitFor(() => channel.lines().length === 1, "ready frame");
   const ready = channel.lines()[0];
@@ -101,8 +134,13 @@ async function assertUnavailableSession(channel, run) {
   assert.equal(channel.lines().length, 2);
 }
 
-test("absent or unqualified inputs keep exactly-one ready and typed UNAVAILABLE", async (t) => {
-  await t.test("shipping absent selects the fail-closed session", async () => {
+test("trusted activation gaps keep exactly-one ready and typed UNAVAILABLE", async (t) => {
+  await t.test("production selection always calls the trusted opener", async () => {
+    const calls = [];
+    globalThis.__relayV2DashboardManagementTrustedHostFactory = async (options) => {
+      calls.push(options);
+      throw new Error("unqualified");
+    };
     const channel = makeIo();
     await assertUnavailableSession(
       channel,
@@ -111,6 +149,15 @@ test("absent or unqualified inputs keep exactly-one ready and typed UNAVAILABLE"
         io: channel.io,
       }),
     );
+    assert.equal(calls.length, 1);
+    assert.deepEqual(Reflect.ownKeys(calls[0]).sort(), [
+      "clock", "io", "runtimeVersion", "signal",
+    ]);
+    assert.equal(calls[0].io.input, channel.io.input);
+    assert.equal(calls[0].io.writeFrame, channel.io.writeFrame);
+    assert.equal(calls[0].runtimeVersion, RUNTIME_VERSION);
+    assert.equal(calls[0].signal instanceof AbortSignal, true);
+    assert.equal(typeof calls[0].clock, "function");
   });
 
   await t.test("factory failure before the channel still converges to the one UNAVAILABLE session", async () => {
@@ -122,26 +169,19 @@ test("absent or unqualified inputs keep exactly-one ready and typed UNAVAILABLE"
       },
     );
     const channel = makeIo();
-    const inputs = shipping();
     await assertUnavailableSession(channel, runner({
       runtimeVersion: RUNTIME_VERSION,
       io: channel.io,
-      shipping: inputs,
     }));
     assert.equal(calls.length, 1);
-    // Shipping inputs pass through verbatim; the child adds only the exact
-    // protocol-v2 management channel and never touches the wire itself.
-    assert.equal(calls[0].trustedHome, inputs.trustedHome);
-    assert.equal(calls[0].deployment, inputs.deployment);
-    assert.equal(calls[0].runtime, inputs.runtime);
-    assert.equal(calls[0].dashboardManagement.io.input, channel.io.input);
-    assert.equal(calls[0].dashboardManagement.io.writeFrame, channel.io.writeFrame);
-    assert.equal(calls[0].dashboardManagement.runtimeVersion, RUNTIME_VERSION);
-    assert.equal(calls[0].dashboardManagement.signal instanceof AbortSignal, true);
-    assert.equal(typeof calls[0].dashboardManagement.clock, "function");
+    assert.equal(calls[0].io.input, channel.io.input);
+    assert.equal(calls[0].io.writeFrame, channel.io.writeFrame);
+    assert.equal(calls[0].runtimeVersion, RUNTIME_VERSION);
+    assert.equal(calls[0].signal instanceof AbortSignal, true);
+    assert.equal(typeof calls[0].clock, "function");
   });
 
-  await t.test("malformed selection options exit ordinary without any ready", async () => {
+  await t.test("malformed or raw shipping selection options exit ordinary without any ready", async () => {
     const channel = makeIo();
     assert.equal(
       await childRuntime.runRelayV2DashboardManagementChildStdio(new Proxy({
@@ -154,7 +194,11 @@ test("absent or unqualified inputs keep exactly-one ready and typed UNAVAILABLE"
       await childRuntime.runRelayV2DashboardManagementChildStdio({
         runtimeVersion: RUNTIME_VERSION,
         io: channel.io,
-        shipping: { trustedHome: "/tmp", unexpected: true },
+        shipping: {
+          trustedHome: "/tmp",
+          deployment: {},
+          runtime: {},
+        },
       }),
       1,
     );
@@ -177,7 +221,6 @@ test("qualified owner runs exactly once and drains exactly once", async () => {
   assert.equal(await runner({
     runtimeVersion: RUNTIME_VERSION,
     io: channel.io,
-    shipping: shipping(),
   }), 0);
   assert.deepEqual(calls, ["run", "close"]);
   // The wrapper never writes a frame of its own on the qualified path.
@@ -200,7 +243,6 @@ test("session or close uncertainty exits ordinary failure without a second sessi
     assert.equal(await runner({
       runtimeVersion: RUNTIME_VERSION,
       io: channel.io,
-      shipping: shipping(),
     }), 1);
     assert.deepEqual(calls, ["run", "close"]);
     assert.equal(channel.raw(), "");
@@ -222,7 +264,6 @@ test("session or close uncertainty exits ordinary failure without a second sessi
     assert.equal(await runner({
       runtimeVersion: RUNTIME_VERSION,
       io: channel.io,
-      shipping: shipping(),
     }), 1);
     assert.deepEqual(calls, ["run", "close"]);
     assert.equal(channel.raw(), "");
@@ -236,7 +277,7 @@ test("session or close uncertainty exits ordinary failure without a second sessi
           calls.push("run");
           // The frame may already be published before the illegal resolution,
           // so the wrapper must not start the UNAVAILABLE session on top of it.
-          return options.dashboardManagement.io.writeFrame(
+          return options.io.writeFrame(
             `${JSON.stringify({
               contract: CONTRACT,
               protocolVersion: 2,
@@ -253,7 +294,6 @@ test("session or close uncertainty exits ordinary failure without a second sessi
     assert.equal(await runner({
       runtimeVersion: RUNTIME_VERSION,
       io: channel.io,
-      shipping: shipping(),
     }), 1);
     assert.deepEqual(calls, ["run", "close"]);
     assert.equal(channel.lines().length, 1);
@@ -273,7 +313,6 @@ test("session or close uncertainty exits ordinary failure without a second sessi
     assert.equal(await runner({
       runtimeVersion: RUNTIME_VERSION,
       io: channel.io,
-      shipping: shipping(),
     }), 1);
     assert.deepEqual(calls, ["close"]);
     assert.equal(channel.raw(), "");
@@ -293,8 +332,11 @@ test("session or close uncertainty exits ordinary failure without a second sessi
     await assertUnavailableSession(channel, runner({
       runtimeVersion: RUNTIME_VERSION,
       io: channel.io,
-      shipping: shipping(),
     }));
     assert.deepEqual(calls, ["factory", "close"]);
   });
+});
+
+test.after(() => {
+  delete globalThis.__relayV2DashboardManagementTrustedHostFactory;
 });

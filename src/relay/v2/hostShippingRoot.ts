@@ -752,12 +752,17 @@ async function startCapturedShippingRoot(
  */
 export async function startRelayV2HostShippingRootFromTrustedDeployment(
   activation: RelayV2HostTrustedDeploymentActivation,
+  dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
 ): Promise<RelayV2HostShippingRootHandle> {
   const deployment = takeRelayV2HostTrustedDeploymentActivation(activation);
   const startupSignal = deployment.startupSignal;
+  let capturedDashboardManagement:
+    | RelayV2HostPrivilegedProductionDashboardManagementOptions
+    | undefined;
   let openedRuntime: ReturnType<typeof consumeRelayV2CanonicalHostRuntimeBundleV1>;
   try {
     requireStartupOpen(startupSignal);
+    capturedDashboardManagement = captureDashboardManagement(dashboardManagement);
     if (!isRelayV2HostTlsTrustCut(deployment.credentialHttpsTlsTrustCut)
       || !isRelayV2HostTlsTrustCut(deployment.carrierWssTlsTrustCut)
       || deployment.credentialHttpsTlsTrustCut === deployment.carrierWssTlsTrustCut) {
@@ -801,7 +806,7 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
     remoteCompoundChannels: openedRuntime.remoteCompoundChannels,
     terminalControlDaemonSocketPath: deployment.terminalControlDaemonSocketPath,
     scanIntervalMs: RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
-    dashboardManagement: undefined,
+    dashboardManagement: capturedDashboardManagement,
   }) as CapturedOptions;
 
   return startCapturedShippingRoot(

@@ -226,10 +226,20 @@ const virtualModules = new Map([
       }
       options.takeNativeModule();
       let closed = false;
+      const management = options.canonical.dashboardManagement;
       const intake = Object.freeze({
         inspect: () => ({ status: "stopped", controllerGeneration: "0" }),
-        start: async () => ({ status: "failed" }),
+        start: async () => {
+          h.events.push(["intake.start"]);
+          return { status: "failed" };
+        },
         stopAndDrain: async () => ({ status: "already_stopped" }),
+        ...(management === undefined ? {} : {
+          runDashboardManagement: async () => {
+            h.events.push(["management.run", management]);
+            return 0;
+          },
+        }),
         closeAndDrain: async () => {
           if (closed) return;
           closed = true;
@@ -393,6 +403,85 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       "runtime.close",
       "native.close",
     ]);
+
+    const dashboardOwned = createHarness(home);
+    globalThis.__hostDeploymentHarness = dashboardOwned;
+    const dashboardAbort = new AbortController();
+    const dashboardInput = Object.freeze({
+      async *[Symbol.asyncIterator]() {},
+    });
+    const dashboardWrite = async () => undefined;
+    const dashboardClock = () => 1_783_700_000_000;
+    const dashboardHandle =
+      await module.startRelayV2HostDashboardManagementFromTrustedDeployment(
+        Object.freeze({
+          clock: dashboardClock,
+          runtimeVersion: "0.0.0-dashboard-trusted-test",
+          signal: dashboardAbort.signal,
+          io: Object.freeze({
+            input: dashboardInput,
+            writeFrame: dashboardWrite,
+          }),
+        }),
+      );
+    assert.deepEqual(Reflect.ownKeys(dashboardHandle).sort(), [
+      "closeAndDrain",
+      "inspect",
+      "runDashboardManagement",
+      "start",
+      "stopAndDrain",
+    ]);
+    assert.deepEqual(dashboardHandle.inspect(), {
+      status: "stopped",
+      controllerGeneration: "0",
+    });
+    const dashboardTerminalReady = dashboardOwned.events
+      .find(([name]) => name === "terminal.ready");
+    assert.strictEqual(dashboardTerminalReady[2].signal, dashboardAbort.signal);
+    const dashboardIntake = dashboardOwned.events
+      .find(([name]) => name === "intake.open");
+    const dashboardManagement = dashboardIntake[2].dashboardManagement;
+    assert.strictEqual(dashboardManagement.clock, dashboardClock);
+    assert.equal(
+      dashboardManagement.runtimeVersion,
+      "0.0.0-dashboard-trusted-test",
+    );
+    assert.strictEqual(dashboardManagement.signal, dashboardAbort.signal);
+    assert.strictEqual(dashboardManagement.io.input, dashboardInput);
+    assert.strictEqual(dashboardManagement.io.writeFrame, dashboardWrite);
+    assert.equal(await dashboardHandle.runDashboardManagement(), 0);
+    assert.equal(
+      dashboardOwned.events.some(([name]) => name === "intake.start"),
+      false,
+      "the Dashboard owner never adopts the relay-host auto-start lifecycle",
+    );
+    assert.equal(
+      dashboardOwned.events.some(([name]) => name === "process.run"),
+      false,
+    );
+    await dashboardHandle.closeAndDrain();
+    assert.deepEqual(
+      dashboardOwned.events
+        .filter(([name]) => [
+          "management.run",
+          "lifecycle.close",
+          "intake.close",
+          "spool.close",
+          "state.close",
+          "runtime.close",
+          "native.close",
+        ].includes(name))
+        .map(([name]) => name),
+      [
+        "management.run",
+        "lifecycle.close",
+        "intake.close",
+        "spool.close",
+        "state.close",
+        "runtime.close",
+        "native.close",
+      ],
+    );
 
     const processOwned = createHarness(home);
     globalThis.__hostDeploymentHarness = processOwned;
