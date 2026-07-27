@@ -424,6 +424,7 @@ Generated asset inputs:
 - [Architecture](ARCHITECTURE.md): code map, runtime state, release boundaries, and maintenance rules.
 - [Android architecture](docs/android-v2-architecture.md): Compose UI V2, state management, Relay v1 limits, and Android acceptance gates.
 - [Android relay guide](docs/remote-relay-android.md): persistent broker, Mac connector, phone pairing, and APK development.
+- [Feishu Meeting Agent integration plan](docs/feishu-meeting-agent-integration-plan.md): proposed, not-yet-implemented design for visible bot meeting participation without duplicating credentials or terminal ownership.
 - [Relay v2 contract](docs/relay-v2-contract.md): frozen future protocol contract; no Relay v2 implementation exists yet.
 - [Relay v2 implementation plan](docs/relay-v2-implementation-plan.md): parallel broker, relay-host, Dashboard, Android, Agent-extension work packages and their interoperability gates.
 
