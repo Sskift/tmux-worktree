@@ -191,6 +191,13 @@ export interface TerminalControlBackend {
     pane: string,
     previousGeneration: string,
   ): Promise<TerminalControlOutputPosition>;
+  recoverOutput(
+    controlTargetId: string,
+    sessionName: string,
+    pane: string,
+    previousGeneration: string,
+    recoveryGeneration: string,
+  ): Promise<TerminalControlOutputPosition>;
   tailOutput(
     controlTargetId: string,
     sessionName: string,
@@ -978,6 +985,48 @@ function outputCaptureCommand(paths: OutputCapturePaths, current: OutputSegment)
   ].join(" ");
 }
 
+async function outputCaptureBackendState(
+  paneTarget: string,
+): Promise<{ generation: string; pipeActive: boolean }> {
+  const fields = (await runTmux([
+    "display-message",
+    "-p",
+    "-t",
+    paneTarget,
+    `#{@${OUTPUT_GENERATION_OPTION.slice(1)}}\u001f#{pane_pipe}`,
+  ])).stdout.trimEnd().split("\u001f");
+  if (fields.length !== 2 || (fields[1] !== "0" && fields[1] !== "1")) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output capture state is malformed",
+    );
+  }
+  return { generation: fields[0], pipeActive: fields[1] === "1" };
+}
+
+async function replaceSegmentedOutputCapture(
+  sessionId: string,
+  paneTarget: string,
+  paths: OutputCapturePaths,
+  generation: string,
+  current: OutputSegment,
+): Promise<TerminalControlOutputPosition> {
+  await runTmux(["set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, generation]);
+  // Uppercase -O selects pane output; unlike lowercase -o it replaces any
+  // existing pipe. This makes retrying the exact recovery generation converge
+  // on the canonical capture command instead of trusting an unknown live pipe.
+  await runTmux(["pipe-pane", "-O", "-t", paneTarget, outputCaptureCommand(paths, current)]);
+  const confirmed = await outputCaptureBackendState(paneTarget);
+  if (confirmed.generation !== generation || !confirmed.pipeActive) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output capture generation or pipe could not be established",
+    );
+  }
+  pruneObsoleteOutputFiles(paths);
+  return outputPositionFromSegments(generation, currentOutputSegments(paths));
+}
+
 async function establishSegmentedOutputCapture(
   sessionId: string,
   paneTarget: string,
@@ -991,19 +1040,29 @@ async function establishSegmentedOutputCapture(
     );
   }
   const current = createInitialOutputSegment(paths)[0];
-  await runTmux(["set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, generation]);
-  await runTmux(["pipe-pane", "-O", "-t", paneTarget, outputCaptureCommand(paths, current)]);
-  const confirmed = (await runTmux(
-    ["display-message", "-p", "-t", paneTarget, "#{pane_pipe}"],
-  )).stdout.trim() === "1";
-  if (!confirmed) {
+  return replaceSegmentedOutputCapture(sessionId, paneTarget, paths, generation, current);
+}
+
+async function resumeSegmentedOutputCapture(
+  sessionId: string,
+  paneTarget: string,
+  paths: OutputCapturePaths,
+  generation: string,
+): Promise<TerminalControlOutputPosition> {
+  if (outputCaptureKind(paths) !== "segmented") {
     throw new TerminalControlProtocolError(
       "RECOVERY_REQUIRED",
-      "terminal output capture could not be established",
+      "planned terminal output recovery data is missing",
     );
   }
-  pruneObsoleteOutputFiles(paths);
-  return outputPositionFromSegments(generation, currentOutputSegments(paths));
+  const current = currentOutputSegments(paths).at(-1);
+  if (!current) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "planned terminal output recovery has no retained segment",
+    );
+  }
+  return replaceSegmentedOutputCapture(sessionId, paneTarget, paths, generation, current);
 }
 
 function legacyCaptureRequiresRotation(path: string): never {
@@ -1519,26 +1578,67 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     previousGeneration: string,
   ): Promise<TerminalControlOutputPosition> {
     const { sessionId, paneTarget: target } = await requirePane(sessionName, pane);
-    const configured = (await runTmux(
-      ["show-options", "-v", "-t", sessionId, OUTPUT_GENERATION_OPTION],
-      { allowFailure: true },
-    )).stdout.trim();
-    if (configured && configured !== previousGeneration) {
+    const configured = await outputCaptureBackendState(target);
+    if (configured.generation && configured.generation !== previousGeneration) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
         "terminal output generation changed outside the authority",
       );
     }
-    const pipeActive = (await runTmux(
-      ["display-message", "-p", "-t", target, "#{pane_pipe}"],
-    )).stdout.trim() === "1";
-    if (pipeActive) await runTmux(["pipe-pane", "-t", target]);
     const nextGeneration = randomUUID();
     return establishSegmentedOutputCapture(
       sessionId,
       target,
       outputCapturePaths(controlTargetId, nextGeneration),
       nextGeneration,
+    );
+  }
+
+  async recoverOutput(
+    controlTargetId: string,
+    sessionName: string,
+    pane: string,
+    previousGeneration: string,
+    recoveryGeneration: string,
+  ): Promise<TerminalControlOutputPosition> {
+    const { sessionId, paneTarget: target } = await requirePane(sessionName, pane);
+    const configured = await outputCaptureBackendState(target);
+    const isPreviousGeneration = !configured.generation
+      || configured.generation === previousGeneration;
+    const isPlannedGeneration = configured.generation === recoveryGeneration;
+    if (!isPreviousGeneration && !isPlannedGeneration && configured.pipeActive) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal output generation changed outside the recovery transaction",
+      );
+    }
+    if (configured.pipeActive) {
+      // Freeze the exact planned segment set before deciding which file to
+      // append. A live writer could otherwise rotate between the scan and the
+      // replacement pipe, leaving the resumed writer on a stale full segment.
+      await runTmux(["pipe-pane", "-t", target]);
+    }
+    const paths = outputCapturePaths(controlTargetId, recoveryGeneration);
+    const kind = outputCaptureKind(paths);
+    if (kind === "missing") {
+      return establishSegmentedOutputCapture(
+        sessionId,
+        target,
+        paths,
+        recoveryGeneration,
+      );
+    }
+    if (kind === "legacy") {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "planned terminal output recovery has incompatible legacy data",
+      );
+    }
+    return resumeSegmentedOutputCapture(
+      sessionId,
+      target,
+      paths,
+      recoveryGeneration,
     );
   }
 

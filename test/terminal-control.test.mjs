@@ -308,6 +308,13 @@ class FakeBackend {
     return { generation, cursor: 0 };
   }
 
+  async recoverOutput(controlTargetId, _session, _pane, _previousGeneration, recoveryGeneration) {
+    this.resetCalls++;
+    this.outputGeneration = recoveryGeneration;
+    this.outputs.set(`${controlTargetId}:${recoveryGeneration}`, Buffer.alloc(0));
+    return { generation: recoveryGeneration, cursor: 0 };
+  }
+
   async tailOutput(controlTargetId, _session, _pane, generation, cursor, maxBytes) {
     const bytes = this.outputs.get(`${controlTargetId}:${generation}`);
     if (!bytes || generation !== this.outputGeneration || cursor > bytes.byteLength) {
@@ -1924,12 +1931,30 @@ test("clean ownership release rotates output generation and fences every old mar
   }
 });
 
-test("only a controlled local owner can cross the explicit force-recovery boundary", async () => {
+test("force recovery requires a durable recovery target and a controlled local owner", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
   const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
   try {
     const target = await resolved(authority);
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "healthy-target-force",
+        type: "handoff.force",
+        controlTargetId: target.controlTargetId,
+        expectedControlEpoch: target.controlEpoch,
+        nextOwner: owner("dashboard", "dashboard:healthy-force"),
+        proof: {
+          kind: "operator-acknowledged-in-doubt",
+          recordId: "healthy-target-force-proof",
+          recordedAt: new Date().toISOString(),
+        },
+        acknowledgeUncertainOperation: true,
+      }),
+      (error) => error.code === "PERMISSION_DENIED"
+        && /durably fenced recovery target/.test(error.message),
+    );
     await acquired(authority, target.controlTargetId, owner("feishu", "binding-force:daemon-old"));
     await assert.rejects(
       authority.handle({
@@ -2260,6 +2285,130 @@ test("production backend fails closed when a held capture pipe disappears", asyn
       }),
       (error) => error.code === "RECOVERY_REQUIRED",
     );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("explicit recovery resumes only its exact planned output generation after interruption", async (t) => {
+  const harness = isolatedManagedTmux(t, "planned-generation-recovery");
+  if (!harness) return;
+  try {
+    const tmux = (...args) => {
+      const result = spawnSync(harness.wrapper, args, { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    const setGeneration = (generation) => tmux(
+      "set-option",
+      "-t",
+      harness.sessionName,
+      "@tw_terminal_control_output_generation_v1",
+      generation,
+    );
+    const captureState = () => tmux(
+      "display-message",
+      "-p",
+      "-t",
+      harness.sessionName,
+      "#{@tw_terminal_control_output_generation_v1}\u001f#{pane_pipe}",
+    ).split("\u001f");
+    class InterruptingRecoveryBackend extends terminalControl.TmuxTerminalControlBackend {
+      interrupted = false;
+      plannedGeneration = undefined;
+
+      async recoverOutput(...args) {
+        const output = await super.recoverOutput(...args);
+        this.plannedGeneration = output.generation;
+        if (!this.interrupted) {
+          this.interrupted = true;
+          throw new Error("injected interruption after output recovery");
+        }
+        return output;
+      }
+    }
+    const backend = new InterruptingRecoveryBackend();
+    const authority = new terminalControl.TerminalControlAuthority({
+      statePath: harness.temp.path,
+      backend,
+    });
+    const target = await resolved(authority, harness.sessionName);
+    await acquired(
+      authority,
+      target.controlTargetId,
+      owner("feishu", "planned-generation:binding-1"),
+    );
+    tmux("pipe-pane", "-t", harness.sessionName);
+    setGeneration("interrupted-generation-outside-authority");
+
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "planned-generation-status",
+        type: "ownership.status",
+        controlTargetId: target.controlTargetId,
+      }),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    const recoveryState = terminalControl.loadTerminalControlState(harness.temp.path);
+    assert.equal(recoveryState.targets[0].recovery.reason, "OUTPUT_CONTINUITY_UNCERTAIN");
+    const forceRequest = (expectedControlEpoch, requestId) => ({
+      protocolVersion: 1,
+      requestId,
+      type: "handoff.force",
+      controlTargetId: target.controlTargetId,
+      expectedControlEpoch,
+      nextOwner: owner("dashboard", "planned-generation:pty-1"),
+      proof: {
+        kind: "operator-acknowledged-in-doubt",
+        recordId: requestId,
+        recordedAt: new Date().toISOString(),
+      },
+      acknowledgeUncertainOperation: true,
+    });
+
+    await assert.rejects(
+      authority.handle(forceRequest(recoveryState.controlEpoch, "planned-generation-interrupted")),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    assert.ok(backend.plannedGeneration);
+    assert.deepEqual(captureState(), [backend.plannedGeneration, "1"]);
+    assert.deepEqual(
+      terminalControl.loadTerminalControlState(harness.temp.path).targets[0],
+      recoveryState.targets[0],
+    );
+
+    const restarted = new terminalControl.TerminalControlAuthority({ statePath: harness.temp.path, backend });
+    const restartedEpoch = await restarted.initializeContinuity();
+    const recovered = await restarted.handle(
+      forceRequest(restartedEpoch, "planned-generation-resumed"),
+    );
+    assert.equal(recovered.ownership.state, "HELD");
+    assert.equal(recovered.ownership.ownerKind, "dashboard");
+    assert.equal(recovered.ownership.outputGeneration, backend.plannedGeneration);
+    assert.deepEqual(captureState(), [backend.plannedGeneration, "1"]);
+
+    setGeneration("unrelated-active-generation");
+    await assert.rejects(
+      restarted.handle({
+        protocolVersion: 1,
+        requestId: "unrelated-generation-status",
+        type: "ownership.status",
+        controlTargetId: target.controlTargetId,
+      }),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    const unrelatedState = terminalControl.loadTerminalControlState(harness.temp.path);
+    await assert.rejects(
+      restarted.handle(forceRequest(unrelatedState.controlEpoch, "unrelated-generation-force")),
+      (error) => error.code === "RECOVERY_REQUIRED"
+        && /generation changed outside the recovery transaction/.test(error.message),
+    );
+    assert.deepEqual(
+      terminalControl.loadTerminalControlState(harness.temp.path).targets[0],
+      unrelatedState.targets[0],
+    );
+    assert.deepEqual(captureState(), ["unrelated-active-generation", "1"]);
   } finally {
     await harness.cleanup();
   }

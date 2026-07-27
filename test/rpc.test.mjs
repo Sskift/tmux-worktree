@@ -563,9 +563,21 @@ case "$1" in
     fi
     ;;
   display-message)
-    if [ "$5" = '#{session_id}' ]; then
-      printf '$0\n'
-    elif [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '1\n'; else printf '0\n'; fi
+    case "$5" in
+      '#{session_id}')
+        printf '$0\n'
+        ;;
+      *'@tw_terminal_control_output_generation_v1'*'pane_pipe'*)
+        if [ -f "$TW_TEST_TMUX_LOG.output-generation" ]; then
+          generation=$(cat "$TW_TEST_TMUX_LOG.output-generation")
+          printf '%s' "$generation"
+        fi
+        if [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '\\0371\\n'; else printf '\\0370\\n'; fi
+        ;;
+      *)
+        if [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '1\n'; else printf '0\n'; fi
+        ;;
+    esac
     ;;
   pipe-pane)
     if [ "$2" = '-O' ]; then
@@ -1026,7 +1038,19 @@ if [ "$1" = "list-panes" ]; then
   exit 0
 fi
 if [ "$1" = "display-message" ]; then
-  if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '1\\n'; else printf '0\\n'; fi
+  for arg in "$@"; do last="$arg"; done
+  case "$last" in
+    *'@tw_terminal_control_output_generation_v1'*'pane_pipe'*)
+      if [ -f "$TW_TEST_TMUX_OUTPUT" ]; then
+        generation=$(cat "$TW_TEST_TMUX_OUTPUT")
+        printf '%s' "$generation"
+      fi
+      if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '\\0371\\n'; else printf '\\0370\\n'; fi
+      ;;
+    *)
+      if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '1\\n'; else printf '0\\n'; fi
+      ;;
+  esac
   exit 0
 fi
 if [ "$1" = "pipe-pane" ]; then

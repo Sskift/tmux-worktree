@@ -107,6 +107,13 @@ class JointTerminalBackend {
     return { generation, cursor: 0 };
   }
 
+  async recoverOutput(controlTargetId, _session, _pane, _previousGeneration, recoveryGeneration) {
+    this.outputGeneration = recoveryGeneration;
+    this.outputs.set(`${controlTargetId}:${recoveryGeneration}`, Buffer.alloc(0));
+    this.renderedOutputs.set(recoveryGeneration, Buffer.alloc(0));
+    return { generation: recoveryGeneration, cursor: 0 };
+  }
+
   async tailOutput(controlTargetId, _session, _pane, generation, cursor, maxBytes) {
     const bytes = this.outputs.get(`${controlTargetId}:${generation}`);
     if (!bytes || generation !== this.outputGeneration || cursor > bytes.byteLength) {

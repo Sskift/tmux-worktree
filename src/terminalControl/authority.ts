@@ -51,6 +51,31 @@ function revision(target: TerminalControlTargetRecord): void {
   target.revision = nextDecimal(target.revision);
 }
 
+function plannedOutputRecoveryGeneration(target: TerminalControlTargetRecord): string {
+  if (target.lifecycle !== "RECOVERY_REQUIRED" || !target.recovery) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output recovery has no persisted recovery identity",
+    );
+  }
+  return createHash("sha256").update(JSON.stringify([
+    "terminal-output-recovery-v1",
+    target.controlTargetId,
+    target.managedSession.name,
+    target.managedSession.kind,
+    target.managedSession.createdAt,
+    target.backend.tmuxInstanceId,
+    target.outputGeneration,
+    target.ownership.fence,
+    target.revision,
+    target.recovery.reason,
+    target.recovery.since,
+    target.recovery.previousControlEpoch,
+    target.recovery.previousOwnerKind ?? null,
+    target.recovery.operationId ?? null,
+  ])).digest("hex");
+}
+
 function ownershipView(
   state: TerminalControlState,
   target: TerminalControlTargetRecord,
@@ -416,8 +441,8 @@ export class TerminalControlAuthority {
         saveTerminalControlState(state, this.statePath);
         throw new TerminalControlProtocolError("TARGET_GONE", error.message);
       }
-      markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
-      saveTerminalControlState(state, this.statePath);
+      // A transient identity probe cannot supersede an existing durable
+      // recovery transaction. Keep it fenced and retry the exact proof later.
       return false;
     }
 
@@ -430,8 +455,9 @@ export class TerminalControlAuthority {
       );
       target.outputGeneration = output.generation;
     } catch {
-      markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
-      saveTerminalControlState(state, this.statePath);
+      // The target is already durably fenced. Preserve its exact recovery
+      // identity so an interrupted explicit recovery derives the same planned
+      // output generation on every retry and after controller restart.
       return false;
     }
     target.lifecycle = "ACTIVE";
@@ -542,6 +568,27 @@ export class TerminalControlAuthority {
     } catch (error) {
       markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
       saveTerminalControlState(state, this.statePath);
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `terminal output continuity is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private async recoverOutput(
+    target: TerminalControlTargetRecord,
+  ): Promise<{ generation: string; cursor: number }> {
+    try {
+      const output = await this.backend.recoverOutput(
+        target.controlTargetId,
+        target.managedSession.name,
+        "0",
+        target.outputGeneration,
+        plannedOutputRecoveryGeneration(target),
+      );
+      target.outputGeneration = output.generation;
+      return output;
+    } catch (error) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
         `terminal output continuity is uncertain: ${error instanceof Error ? error.message : String(error)}`,
@@ -1079,8 +1126,21 @@ export class TerminalControlAuthority {
       if (target.lifecycle === "TARGET_GONE") {
         throw new TerminalControlProtocolError("TARGET_GONE", "control target backend lifecycle has ended");
       }
+      if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
+        markRecovery(state, target, "LEASE_EXPIRED", this.now);
+        // Persist the recovery identity before touching tmux. The planned
+        // output generation is derived only from this durable target record,
+        // so a retry after any later interruption computes the same value.
+        saveTerminalControlState(state, this.statePath);
+      }
+      if (target.lifecycle !== "RECOVERY_REQUIRED" || !target.recovery) {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "force recovery is only available for a durably fenced recovery target",
+        );
+      }
       const previousOwnerKind = target.ownership.state === "FREE"
-        ? target.recovery?.previousOwnerKind
+        ? target.recovery.previousOwnerKind
         : target.ownership.owner.kind;
       if (previousOwnerKind === "feishu" && proof.kind === "owner-unreachable") {
         throw new TerminalControlProtocolError(
@@ -1088,41 +1148,29 @@ export class TerminalControlAuthority {
           "force takeover from Feishu requires a persisted turn cancellation or explicit in-doubt acknowledgement",
         );
       }
-      if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
-        markRecovery(state, target, "LEASE_EXPIRED", this.now);
-      }
-      if (target.lifecycle === "RECOVERY_REQUIRED" || target.inFlight) {
-        try {
-          await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
-        } catch (error) {
-          if (
-            error instanceof TerminalControlProtocolError
-            && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
-          ) {
-            invalidateTarget(target, this.now);
-            saveTerminalControlState(state, this.statePath);
-            throw new TerminalControlProtocolError(
-              "TARGET_GONE",
-              error.message,
-            );
-          }
-          if (target.lifecycle !== "RECOVERY_REQUIRED") {
-            markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
-          }
+      try {
+        await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
+      } catch (error) {
+        if (
+          error instanceof TerminalControlProtocolError
+          && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
+        ) {
+          invalidateTarget(target, this.now);
           saveTerminalControlState(state, this.statePath);
           throw new TerminalControlProtocolError(
-            "RECOVERY_REQUIRED",
-            `force recovery could not prove the exact terminal backend lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+            "TARGET_GONE",
+            error.message,
           );
         }
-        // The explicit acknowledgement accepts that the persisted in-flight
-        // operation may have taken effect. Advancing the fence is the recovery
-        // boundary; the old operation is never replayed by this authority.
-        completeInFlightAsInDoubt(target, this.now);
-      } else {
-        await this.assertTargetCurrent(state, target);
+        throw new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          `force recovery could not prove the exact terminal backend lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-      const output = await this.resetOutput(state, target);
+      // The explicit acknowledgement accepts that a persisted in-flight
+      // operation may have taken effect. It is never replayed.
+      completeInFlightAsInDoubt(target, this.now);
+      const output = await this.recoverOutput(target);
       this.resetInteractiveOwners(target.controlTargetId);
       target.lifecycle = "ACTIVE";
       target.recovery = undefined;

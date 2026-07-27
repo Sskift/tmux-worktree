@@ -122,6 +122,19 @@ if (args[0] === "display-message" && args.at(-1) === "#{session_id}") {
   process.stdout.write("$0\\n");
   process.exit(0);
 }
+if (
+  args[0] === "display-message"
+  && args.at(-1) === "#{@tw_terminal_control_output_generation_v1}\\u001f#{pane_pipe}"
+) {
+  const generationPath = join(gateDir, key + ".output-generation");
+  const generation = existsSync(generationPath) ? readFileSync(generationPath, "utf8").trim() : "";
+  process.stdout.write(
+    generation
+      + "\\u001f"
+      + (existsSync(join(gateDir, key + ".output-pipe")) ? "1\\n" : "0\\n"),
+  );
+  process.exit(0);
+}
 if (args[0] === "display-message" && args.at(-1) === "#{pane_pipe}") {
   process.stdout.write(existsSync(join(gateDir, key + ".output-pipe")) ? "1\\n" : "0\\n");
   process.exit(0);

@@ -145,7 +145,7 @@ any state
 - `HELD(interactive)`：所有非 Feishu producer 使用同一 leaseId/fence，在同一个 target critical section 中串行提交；producer owner identity 不形成互斥。
 - `HELD(feishu)`：只有精确 Feishu owner/leaseId/fence 可以提交，所有 interactive input 只读。
 - `DRAINING`：拒绝所有新业务输入，只允许在进入该状态前已经由 single writer 接受的原子 operation完成。
-- `RECOVERY_REQUIRED`：无法证明旧写入、handoff 或 Feishu lease continuity；所有新写入 fail closed。只有受控本地 owner 在外部持久化取消/人工确认记录，并显式承认旧 operation 可能已生效后，才能用 force recovery 验证 exact backend、推进 fence 且不重放旧 operation；无 operation/handoff 的非 Feishu陈旧 lease 会走上面的安全回收，不要求用户确认。
+- `RECOVERY_REQUIRED`：无法证明旧写入、handoff 或 Feishu lease continuity；所有新写入 fail closed。只有受控本地 owner 在外部持久化取消/人工确认记录，并显式承认旧 operation 可能已生效后，才能对已持久化的 recovery target 使用 force recovery；它先验证 exact backend，再从该 target 的稳定 identity 确定性派生唯一 planned output generation、重建 capture、推进 fence，且不重放旧 operation。若在 backend mutation 与 authority commit 之间中断，后续确认只续接这个 exact generation；任意其他活跃 generation 仍需 fail closed。无 operation/handoff 的非 Feishu 陈旧 lease 会走上面的安全回收，不要求用户确认。
 - `TARGET_GONE`：exact backend lifecycle 已结束；Bridge 清除对应 binding 并通知群聊，且不能按名称恢复或自动指向同名新 session。
 
 Feishu binding active 时默认长期持有独占 lease，即使当前没有 awaiting turn。Dashboard 的 **Take over locally**、binding pause 和 force pause 是解除占用的受控入口：它们先让 Bridge drain 或取消 turn，再切回所有 App/APK 共用的 interactive 类。当前这些 graceful/force 操作只允许本机 Dashboard 或受控本地 CLI 发起；Relay v1/v2 手机端不能远程暂停 Feishu。
