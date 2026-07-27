@@ -226,7 +226,7 @@ const virtualModules = new Map([
       }
       options.takeNativeModule();
       let closed = false;
-      return Object.freeze({
+      const intake = Object.freeze({
         inspect: () => ({ status: "stopped", controllerGeneration: "0" }),
         start: async () => ({ status: "failed" }),
         stopAndDrain: async () => ({ status: "already_stopped" }),
@@ -238,6 +238,8 @@ const virtualModules = new Map([
           await options.canonical.hostState.close();
         },
       });
+      if (h.abortAfterIntakeOpen) h.processSignalController.abort();
+      return intake;
     }
   `],
 ]);
@@ -311,6 +313,7 @@ function createHarness(home) {
     trustCuts: [],
     failIntake: false,
     abortDuringLifecycleStart: false,
+    abortAfterIntakeOpen: false,
     processSignalController: null,
     openedRuntime: Object.freeze(Object.assign(Object.create(null), {
       discovery: Object.freeze({ scan: async () => ({}) }),
@@ -433,6 +436,37 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
         "signal.install",
         "lifecycle.start",
         "lifecycle.close",
+        "state.close",
+        "runtime.close",
+        "native.close",
+        "signal.close",
+      ],
+    );
+
+    const finalFenceInterrupted = createHarness(home);
+    finalFenceInterrupted.abortAfterIntakeOpen = true;
+    globalThis.__hostDeploymentHarness = finalFenceInterrupted;
+    assert.equal(await module.runRelayV2HostShippingFromTrustedDeployment(), 0);
+    assert.equal(
+      finalFenceInterrupted.events.some(([name]) => name === "process.run"),
+      false,
+    );
+    assert.deepEqual(
+      finalFenceInterrupted.events
+        .filter(([name]) => [
+          "lifecycle.close",
+          "intake.close",
+          "spool.close",
+          "state.close",
+          "runtime.close",
+          "native.close",
+          "signal.close",
+        ].includes(name))
+        .map(([name]) => name),
+      [
+        "lifecycle.close",
+        "intake.close",
+        "spool.close",
         "state.close",
         "runtime.close",
         "native.close",

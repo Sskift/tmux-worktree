@@ -611,7 +611,7 @@ async function startCapturedShippingRoot(
   let spool: { close(): Promise<void> } | null = null;
   let lifecycleOwner: RelayV2MaterializedReconcileLifecycleOwner | null = null;
   let startupAbortListener: (() => void) | null = null;
-  let intake: RelayV2HostPrivilegedProductionIntakeComposition;
+  let intake: RelayV2HostPrivilegedProductionIntakeComposition | null = null;
   try {
     requireStartupOpen(startupSignal);
     // Absent/unsupported native sources fail here, before the one-shot take
@@ -688,16 +688,16 @@ async function startCapturedShippingRoot(
           : { dashboardManagement: captured.dashboardManagement }),
       }),
     });
+    requireStartupOpen(startupSignal);
   } catch (error) {
     if (startupAbortListener !== null) {
       startupSignal?.removeEventListener("abort", startupAbortListener);
     }
-    // The bridge and intake drain the claimed cell and close the spool and
-    // HostState on every failure after they claim them, and both owners make
-    // those closes idempotent, so repeating them here is safe and also covers
-    // failures before the bridge was reached. Roll back in reverse order:
-    // reconcile lifecycle first, then spool, HostState, and the deployment
-    // activation (canonical runtime owner followed by native source).
+    // A published intake owns canonical composition, spool, and HostState;
+    // close it as one owner. Before publication, the bridge drains its claimed
+    // cell on failure and this root still owns spool and HostState directly.
+    // In both cases rollback starts with reconcile lifecycle and ends with the
+    // deployment activation (canonical runtime owner followed by native source).
     let closeFailed = false;
     if (lifecycleOwner !== null) {
       try {
@@ -706,18 +706,26 @@ async function startCapturedShippingRoot(
         closeFailed = true;
       }
     }
-    if (spool !== null) {
+    if (intake !== null) {
       try {
-        await spool.close();
+        await intake.closeAndDrain();
       } catch {
         closeFailed = true;
       }
-    }
-    if (store !== null) {
-      try {
-        await store.close();
-      } catch {
-        closeFailed = true;
+    } else {
+      if (spool !== null) {
+        try {
+          await spool.close();
+        } catch {
+          closeFailed = true;
+        }
+      }
+      if (store !== null) {
+        try {
+          await store.close();
+        } catch {
+          closeFailed = true;
+        }
       }
     }
     try {
@@ -732,7 +740,7 @@ async function startCapturedShippingRoot(
   if (startupAbortListener !== null) {
     startupSignal?.removeEventListener("abort", startupAbortListener);
   }
-  return issueHandle(intake, lifecycleOwner!, closeDeployment);
+  return issueHandle(intake!, lifecycleOwner!, closeDeployment);
 }
 
 /**
