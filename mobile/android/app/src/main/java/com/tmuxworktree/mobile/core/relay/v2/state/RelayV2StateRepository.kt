@@ -70,6 +70,10 @@ internal class RelayV2StateRepository(
     ): RelayV2StateSyncResult =
         core.applyHelloUnderApplyLease(connectPlan, hello)
 
+    override suspend fun beginManualResyncUnderApplyLease(
+        namespace: RelayV2StateNamespace,
+    ): RelayV2StateSyncResult = core.beginManualResyncUnderApplyLease(namespace)
+
     override suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult = core.stageSnapshotChunkUnderApplyLease(chunk)

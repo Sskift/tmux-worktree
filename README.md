@@ -619,6 +619,11 @@ rereads the Room Outbox for every successor; `SENDING` remains query-only.
 The exact failed-attempt admission detach and timer claim are atomic under the
 same retry fence, so a concurrent disconnect either cancels the installed timer
 or makes the failure stale without terminalizing the barrier.
+The user-visible **Retry now** action cancels an owned backoff timer under that
+same fence and claims a fresh attempt immediately. A terminal failure is not
+reused: the UI owner drains and closes that exact composition, clears its cuts,
+re-runs admission, and installs a fresh composition only for the still-current
+v2 profile, with no Relay v1 fallback.
 That one tracked attempt job spans backoff, the Room snapshot read, and actor
 admission. Disconnect cancels and joins it before returning its receipt, close
 cancels it, and a read error observed after its exact fence is stale.
@@ -630,7 +635,12 @@ exact current connection admission through the actor apply drain, and retire it
 only after that barrier completes.
 Owned backoff remains observably `CONNECTING`, with the retired generation's
 late actor `FAILED` fenced; non-retryable and runtime-incomplete failures remain
-terminal `FAILED`. The same Room owner exposes an internal durable enqueue
+terminal `FAILED`. **Refresh sessions** and the create-page target retry now
+enter one bounded actor manual-resync admission bound to the exact current
+profile, connection generation, and transport. It sends the existing
+`hosts.snapshot.get` and full state snapshot requests, then reuses the existing
+Room staging/commit and recovery handoff; the UI never writes Room state
+directly. The same Room owner exposes an internal durable enqueue
 authority for an already-stable activation namespace and exact draft; it
 commits the sole Outbox mutation before returning non-sensitive row correlation.
 The explicit-v2 Session detail reply, already-admitted existing-Session kill,

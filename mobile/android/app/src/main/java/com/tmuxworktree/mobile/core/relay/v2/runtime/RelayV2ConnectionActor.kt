@@ -560,6 +560,8 @@ internal class RelayV2ConnectionActor(
     private var onlineQueryWindow: OnlineQueryWindow? = null
     private var hostAvailability: HostAvailability? = null
     private var pendingHostsSnapshot: PendingHostsSnapshot? = null
+    /** Guarded by [lifecycleLock]; reserves the single bounded manual-resync action. */
+    private var pendingManualResync: ManualResyncReservation? = null
     private var hostReconnectGeneration: RelayV2EffectGeneration? = null
     private var authRolloverGeneration: RelayV2EffectGeneration? = null
     @Volatile
@@ -727,6 +729,70 @@ internal class RelayV2ConnectionActor(
         }
         signalQueueSaturation(overload.first, overload.second)
         return false
+    }
+
+    /**
+     * Admits one user-requested full resync against the exact current ONLINE cut. The queued action
+     * retains the actor's current profile/generation/transport identities and revalidates all of
+     * them on the serialized actor lane before sending either existing snapshot request.
+     */
+    fun requestManualResync(
+        expectedProfile: RelayActiveProfileIdentity,
+        cut: RelayV2CurrentOnlineCommandCut,
+        pendingCommands: List<RelayV2PendingCommand>,
+    ): RelayV2ManualResyncResult {
+        if (pendingCommands.size > MAX_MANUAL_RESYNC_PENDING_COMMANDS ||
+            pendingCommands.distinctBy { it.commandId }.size != pendingCommands.size
+        ) {
+            return RelayV2ManualResyncResult.Unavailable
+        }
+        val actorCut = cut as? ActorCurrentOnlineCommandCut
+            ?: return RelayV2ManualResyncResult.NotOnline
+        var overload: Pair<CallbackOwnerKey?, RelayV2Transport?>? = null
+        val result = synchronized(lifecycleLock) {
+            val profile = activeProfile
+            if (profile?.identity != expectedProfile) {
+                return@synchronized RelayV2ManualResyncResult.ProfileMismatch
+            }
+            if (actorCut.originActor !== this) {
+                return@synchronized RelayV2ManualResyncResult.NotOnline
+            }
+            val ready = currentOnlineCommandReadyLocked()
+                ?: return@synchronized RelayV2ManualResyncResult.NotOnline
+            if (ready.first !== actorCut.originReady || ready.second != actorCut.context) {
+                return@synchronized RelayV2ManualResyncResult.NotOnline
+            }
+            if (pendingManualResync != null) {
+                return@synchronized RelayV2ManualResyncResult.AlreadyInProgress
+            }
+            val committed = committedCallbackOwner
+                ?: return@synchronized RelayV2ManualResyncResult.NotOnline
+            val source = activeTransport
+                ?: return@synchronized RelayV2ManualResyncResult.NotOnline
+            val reservation = ManualResyncReservation(
+                profile = expectedProfile,
+                generation = ready.second.authority.generation,
+                owner = committed.key,
+                source = source,
+                pendingCommands = pendingCommands.toList(),
+            )
+            val action = Action.ManualResync(reservation)
+            if (!reserveBytes(queuedActionBytes, action.rawBytes, actionByteCapacity)) {
+                overload = committed.key to source
+                return@synchronized RelayV2ManualResyncResult.Unavailable
+            }
+            pendingManualResync = reservation
+            if (actions.trySendNormal(action)) {
+                RelayV2ManualResyncResult.Started
+            } else {
+                pendingManualResync = null
+                releaseBytes(queuedActionBytes, action.rawBytes)
+                overload = committed.key to source
+                RelayV2ManualResyncResult.Unavailable
+            }
+        }
+        overload?.let { signalQueueSaturation(it.first, it.second) }
+        return result
     }
 
     override fun send(
@@ -1033,6 +1099,7 @@ internal class RelayV2ConnectionActor(
                 throw failure
             }
             is Action.OnlineResyncRequired -> handleOnlineResyncRequired(action.receipt)
+            is Action.ManualResync -> handleManualResync(action.reservation)
             is Action.RecoveryStepTimedOut -> handleRecoveryTimeout(action)
             is Action.HostsSnapshotTimedOut -> handleHostsSnapshotTimeout(action)
             Action.Shutdown -> shutdownNow()
@@ -2129,15 +2196,30 @@ internal class RelayV2ConnectionActor(
         profile: RelayV2Profile,
         trigger: HostPresence,
         rawBytes: Int,
-    ) {
-        if (pendingHostsSnapshot != null) return
-        val requestId = issueId() ?: return
+    ): Boolean = requestHostsSnapshot(
+        profile = profile,
+        triggerBrokerEpoch = trigger.brokerEpoch,
+        triggerRevision = trigger.revision,
+        rawBytes = rawBytes,
+        manualRefresh = false,
+    )
+
+    private fun requestHostsSnapshot(
+        profile: RelayV2Profile,
+        triggerBrokerEpoch: String,
+        triggerRevision: BigInteger,
+        rawBytes: Int,
+        manualRefresh: Boolean,
+    ): Boolean {
+        if (pendingHostsSnapshot != null) return false
+        val requestId = issueId() ?: return false
         val generation = currentEffectGeneration(profile)
         val pending = PendingHostsSnapshot(
             requestId = requestId,
             generation = generation,
-            triggerBrokerEpoch = trigger.brokerEpoch,
-            triggerRevision = trigger.revision,
+            triggerBrokerEpoch = triggerBrokerEpoch,
+            triggerRevision = triggerRevision,
+            manualRefresh = manualRefresh,
         )
         pendingHostsSnapshot = pending
         val frame = linkedMapOf<String, Any?>(
@@ -2160,10 +2242,14 @@ internal class RelayV2ConnectionActor(
                 else -> RecoverySendResult.FAILED
             }
         }
-        when (sent) {
-            RecoverySendResult.SENT -> scheduleHostsSnapshotWatchdog(pending)
-            RecoverySendResult.STALE -> if (pendingHostsSnapshot === pending) {
-                clearPendingHostsSnapshot()
+        return when (sent) {
+            RecoverySendResult.SENT -> {
+                scheduleHostsSnapshotWatchdog(pending)
+                true
+            }
+            RecoverySendResult.STALE -> {
+                if (pendingHostsSnapshot === pending) clearPendingHostsSnapshot()
+                false
             }
             RecoverySendResult.FAILED -> {
                 if (pendingHostsSnapshot === pending) clearPendingHostsSnapshot()
@@ -2174,6 +2260,7 @@ internal class RelayV2ConnectionActor(
                     closeCode = null,
                     rawBytes = rawBytes,
                 )
+                false
             }
         }
     }
@@ -2218,7 +2305,9 @@ internal class RelayV2ConnectionActor(
             rejectHostDirectoryFrame(rawBytes)
             return
         }
-        applyHostAvailability(profile, snapshot)
+        if (!pending.manualRefresh || snapshot.state == "offline") {
+            applyHostAvailability(profile, snapshot)
+        }
     }
 
     private fun rejectHostDirectoryFrame(rawBytes: Int) {
@@ -3513,30 +3602,110 @@ internal class RelayV2ConnectionActor(
                 return
             }
         }
+        synchronized(lifecycleLock) {
+            pendingManualResync?.takeIf { it.generation == receipt.generation }?.let {
+                pendingManualResync = null
+            }
+        }
+        beginOnlineResync(
+            profile = profile,
+            context = context,
+            generation = receipt.generation,
+            pendingCommands = receipt.pendingCommands,
+            release = receipt.release,
+            restart = receipt.restart,
+        )
+    }
+
+    private fun handleManualResync(reservation: ManualResyncReservation) {
+        val admission = synchronized(lifecycleLock) {
+            if (pendingManualResync !== reservation) return@synchronized null
+            val profile = activeProfile ?: return@synchronized null
+            val context = onlineContext ?: return@synchronized null
+            val ready = currentOnlineCommandReadyLocked() ?: return@synchronized null
+            val committed = committedCallbackOwner ?: return@synchronized null
+            val currentBrokerEpoch = brokerEpoch ?: return@synchronized null
+            if (profile.identity != reservation.profile ||
+                ready.second.authority.generation != reservation.generation ||
+                committed.key != reservation.owner ||
+                activeTransport !== reservation.source ||
+                !isCurrentCallbackLocked(reservation.owner, reservation.source) ||
+                recoveryAttempt != null ||
+                pendingHostsSnapshot != null
+            ) {
+                return@synchronized null
+            }
+            val minimumRevision = hostAvailability
+                ?.takeIf { it.brokerEpoch == currentBrokerEpoch }
+                ?.revision
+                ?: BigInteger.ZERO
+            ManualResyncAdmission(
+                profile,
+                context,
+                currentBrokerEpoch,
+                minimumRevision,
+                committed.connectionAttempt,
+            )
+        } ?: return
+        if (!requestHostsSnapshot(
+                profile = admission.profile,
+                triggerBrokerEpoch = admission.brokerEpoch,
+                triggerRevision = admission.minimumHostsRevision,
+                rawBytes = 0,
+                manualRefresh = true,
+            )
+        ) {
+            synchronized(lifecycleLock) {
+                if (pendingManualResync === reservation) pendingManualResync = null
+            }
+            return
+        }
+        if (!emitEffect(
+            RelayV2RuntimeEffect.ManualResyncRequested(
+                context = admission.context,
+                generation = reservation.generation,
+                connectionAttempt = admission.connectionAttempt,
+                pendingCommands = reservation.pendingCommands,
+            ),
+            reservation.estimatedRawBytes(),
+        )) {
+            synchronized(lifecycleLock) {
+                if (pendingManualResync === reservation) pendingManualResync = null
+            }
+        }
+    }
+
+    private fun beginOnlineResync(
+        profile: RelayV2Profile,
+        context: RelayV2HandshakeContext,
+        generation: RelayV2EffectGeneration,
+        pendingCommands: List<RelayV2PendingCommand>,
+        release: RelayV2RecoveryReleaseDirective?,
+        restart: RelayV2RecoveryRestartDirective,
+    ) {
         val lineageId = issueId() ?: return
         val recovery = RecoveryAttempt(
             context = context,
             outcome = RelayV2HelloOutcome.CURSOR_BEHIND,
             connectPlan = requireNotNull(activeConnectPlan),
-            generation = receipt.generation,
+            generation = generation,
             helloRequestId = lineageId,
             step = 1,
             stage = RecoveryStage.AWAITING_HELLO_RECEIPT,
         )
         onlineQueryWindow = null
         recoveryAttempt = recovery
-        recovery.pendingCommands = receipt.pendingCommands
+        recovery.pendingCommands = pendingCommands
         recovery.nextCommandIndex = 0
         recovery.step += 1
         updateState(RelayV2ConnectionPhase.RESYNCING, profile)
-        val release = receipt.release
         if (release == null) {
             beginStateSnapshot(recovery, continuation = null)
         } else {
             sendSnapshotRelease(
                 recovery,
                 release,
-                ReleaseFollowUp.RestartAfterAbandon(receipt.restart),
+                ReleaseFollowUp.RestartAfterAbandon(restart),
             )
         }
     }
@@ -5431,6 +5600,7 @@ internal class RelayV2ConnectionActor(
 
     private fun revokeCallbackOwnersLocked() {
         withdrawOutboxExecuteReadyLocked()
+        pendingManualResync = null
         provisionalCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
         committedCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
         provisionalCallbackOwner = null
@@ -5648,6 +5818,12 @@ internal class RelayV2ConnectionActor(
             override val rawBytes: Int = receipt.estimatedRawBytes()
         }
 
+        data class ManualResync(
+            val reservation: ManualResyncReservation,
+        ) : Action {
+            override val rawBytes: Int = reservation.estimatedRawBytes()
+        }
+
         data class RecoveryStepTimedOut(
             val ownerTokenId: Long,
             val effectGeneration: RelayV2EffectGeneration,
@@ -5722,7 +5898,34 @@ internal class RelayV2ConnectionActor(
         val generation: RelayV2EffectGeneration,
         val triggerBrokerEpoch: String,
         val triggerRevision: BigInteger,
+        val manualRefresh: Boolean,
         var latestPresence: HostPresence? = null,
+    )
+
+    private data class ManualResyncReservation(
+        val profile: RelayActiveProfileIdentity,
+        val generation: RelayV2EffectGeneration,
+        val owner: CallbackOwnerKey,
+        val source: RelayV2Transport,
+        val pendingCommands: List<RelayV2PendingCommand>,
+    ) {
+        fun estimatedRawBytes(): Int {
+            fun String.bytes(): Long = toByteArray(Charsets.UTF_8).size.toLong()
+            val total = generation.profileId.bytes() +
+                pendingCommands.sumOf {
+                    it.commandId.bytes() + it.dedupeWindowId.bytes()
+                } +
+                128L
+            return total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        }
+    }
+
+    private data class ManualResyncAdmission(
+        val profile: RelayV2Profile,
+        val context: RelayV2HandshakeContext,
+        val brokerEpoch: String,
+        val minimumHostsRevision: BigInteger,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
     )
 
     private class ActorCurrentOnlineCommandCut(
@@ -6280,6 +6483,7 @@ internal class RelayV2ConnectionActor(
         private const val MAX_QUERY_WINDOW_BINDINGS = 129
         private const val MAX_PENDING_AGENT_EXTENSION_REQUESTS = 64
         private const val MAX_TRACKED_AGENT_EXTENSION_REQUESTS = 1_024
+        private const val MAX_MANUAL_RESYNC_PENDING_COMMANDS = 4_096
 
         private val AGENT_EXTENSION_INBOUND_PHASES = setOf(
             RelayV2ConnectionPhase.QUERYING,

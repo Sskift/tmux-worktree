@@ -506,6 +506,44 @@ internal class RelayV2StateSyncRepositoryCore(
         ) { "Relay v2 snapshot continuation changed after the connection barrier" }
     }
 
+    override suspend fun beginManualResyncUnderApplyLease(
+        namespace: RelayV2StateNamespace,
+    ): RelayV2StateSyncResult = store.transaction {
+        val authority = authority(namespace) ?: return@transaction unknownEpoch(namespace)
+        authority.pendingRelease?.let { pending ->
+            return@transaction RelayV2StateSyncResult.ReleasePending(
+                namespace,
+                pending,
+                requireNotNull(authority.afterReleasePhase),
+            )
+        }
+        val staged = snapshot(namespace)
+        val release = staged?.releaseDirective()?.let { directive ->
+            authority.releaseObligation(
+                directive,
+                RelayV2SnapshotReleaseReason.SNAPSHOT_RESTART_REQUIRED,
+            )
+        }
+        deleteSnapshot(namespace)
+        deleteBufferedEvents(namespace)
+        putAuthority(authority.copy(
+            phase = RelayV2StoredSyncPhase.RESYNCING,
+            pendingRelease = release,
+            afterReleasePhase =
+                release?.let { RelayV2PostReleasePhase.RESTART_SNAPSHOT },
+        ))
+        RelayV2StateSyncResult.ResyncRequired(
+            namespace = namespace,
+            reason = RelayV2ResyncReason.SNAPSHOT_RESTART_REQUIRED,
+            release = release,
+            afterReleasePhase =
+                release?.let { RelayV2PostReleasePhase.RESTART_SNAPSHOT },
+            durableCursorEventSeq = authority.cursorEventSeq,
+            requiredThroughEventSeq = authority.requiredThroughEventSeq,
+            supersedesQueryCompletion = false,
+        )
+    }
+
     override suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult = store.transaction {

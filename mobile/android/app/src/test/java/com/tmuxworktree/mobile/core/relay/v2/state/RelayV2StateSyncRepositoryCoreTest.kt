@@ -13,6 +13,31 @@ import org.junit.Test
 
 class RelayV2StateSyncRepositoryCoreTest {
     @Test
+    fun `manual resync durably leaves live before accepting a replacement snapshot`() = runBlocking {
+        val store = FakeStateStore()
+        val repository = RelayV2StateSyncRepositoryCore(store)
+        val namespace = namespace()
+        repository.applyHelloForTest(
+            hello(namespace, "5", null, RelayV2StateHelloDisposition.FRESH),
+        )
+        commitCut(repository, namespace, "5", session("session-a", "stable"))
+
+        val resync = repository.beginManualResyncUnderApplyLease(namespace)
+            as RelayV2StateSyncResult.ResyncRequired
+        assertEquals(RelayV2ResyncReason.SNAPSHOT_RESTART_REQUIRED, resync.reason)
+        assertEquals("5", resync.durableCursorEventSeq)
+        assertEquals("5", resync.requiredThroughEventSeq)
+        assertFalse(resync.supersedesQueryCompletion)
+        assertEquals(RelayV2StoredSyncPhase.RESYNCING, store.authority(namespace)?.phase)
+        assertEquals("stable", store.session(namespace, "scope-a", "session-a")?.item?.displayName)
+
+        val staged = repository.stageSnapshotChunkUnderApplyLease(
+            snapshotChunk(namespace, "5", "manual", session("session-a", "refreshed")),
+        )
+        assertTrue(staged is RelayV2StateSyncResult.SnapshotStaged)
+    }
+
+    @Test
     fun `five hello dispositions persist monotonic watermark and isolate epoch changes`() = runBlocking {
         val store = FakeStateStore()
         val repository = RelayV2StateSyncRepositoryCore(store)

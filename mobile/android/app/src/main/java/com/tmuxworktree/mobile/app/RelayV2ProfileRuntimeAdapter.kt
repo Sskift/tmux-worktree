@@ -239,6 +239,31 @@ internal class RelayV2ProfileRuntimeAdapter(
         repository.admitStartup().toRelayStartupAdmission()
     }
 
+    /**
+     * Re-admits and installs a replacement base runtime under one profile-mutation lease.
+     * The caller must already have drained the retired composition; this operation only selects
+     * the still-current admitted profile and prevents a profile switch from interleaving before
+     * the synchronous exact-slot install.
+     */
+    suspend fun installCurrentRuntimeReplacement(
+        expectedIdentity: RelayActiveProfileIdentity,
+        installExact: (RelayV2Profile) -> Boolean,
+    ): RelayV2ExplicitConnectRefreshResult = profileMutationCoordinator.mutate {
+        val admission = repository.admitStartup()
+        val admitted = (admission as? RelayV2StartupAdmissionResult.Ready)?.profile
+            ?: return@mutate RelayV2ExplicitConnectRefreshResult.AdmissionSettled(admission)
+        if (admitted.identity != expectedIdentity || !admitted.autoConnect) {
+            return@mutate RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged(
+                admitted.identity,
+            )
+        }
+        if (installExact(admitted)) {
+            RelayV2ExplicitConnectRefreshResult.SuccessorInstalled(admitted)
+        } else {
+            RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged(admitted.identity)
+        }
+    }
+
     suspend fun confirmEnrollment(
         confirmed: RelayV2ConfirmedEnrollment,
     ): RelayV2EnrollmentResult = profileMutationCoordinator.mutate {

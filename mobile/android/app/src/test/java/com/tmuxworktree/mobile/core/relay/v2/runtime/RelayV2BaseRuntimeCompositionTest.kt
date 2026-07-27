@@ -1009,14 +1009,14 @@ class RelayV2BaseRuntimeCompositionTest {
             val name: String,
             val autoConnect: Boolean,
             val explicitProfiles: List<(RelayV2Profile) -> RelayV2Profile>,
-            val expectedAccepted: List<Boolean>,
+            val expectedResults: List<RelayV2RetryNowResult>,
         )
         val cases = listOf(
             Case(
                 name = "recovery pending arms consent then starts exactly once",
                 autoConnect = false,
                 explicitProfiles = listOf({ it.copy(autoConnect = true) }),
-                expectedAccepted = listOf(true),
+                expectedResults = listOf(RelayV2RetryNowResult.ArmedForRecovery),
             ),
             Case(
                 name = "version drift is rejected without arming",
@@ -1025,7 +1025,10 @@ class RelayV2BaseRuntimeCompositionTest {
                     { it.copy(credentialVersion = it.credentialVersion + 1, autoConnect = true) },
                     { it.copy(autoConnect = true) },
                 ),
-                expectedAccepted = listOf(false, true),
+                expectedResults = listOf(
+                    RelayV2RetryNowResult.ProfileMismatch,
+                    RelayV2RetryNowResult.ArmedForRecovery,
+                ),
             ),
             Case(
                 name = "duplicate explicit calls claim once",
@@ -1034,13 +1037,16 @@ class RelayV2BaseRuntimeCompositionTest {
                     { it.copy(autoConnect = true) },
                     { it.copy(autoConnect = true) },
                 ),
-                expectedAccepted = listOf(true, true),
+                expectedResults = listOf(
+                    RelayV2RetryNowResult.ArmedForRecovery,
+                    RelayV2RetryNowResult.ArmedForRecovery,
+                ),
             ),
             Case(
                 name = "auto-connect and early explicit retry do not double open",
                 autoConnect = true,
                 explicitProfiles = listOf({ it.copy(autoConnect = true) }),
-                expectedAccepted = listOf(true),
+                expectedResults = listOf(RelayV2RetryNowResult.ArmedForRecovery),
             ),
         )
         cases.forEach { case ->
@@ -1053,8 +1059,8 @@ class RelayV2BaseRuntimeCompositionTest {
                 case.explicitProfiles.forEachIndexed { index, explicit ->
                     assertEquals(
                         "${case.name}: call $index",
-                        case.expectedAccepted[index],
-                        harness.composition.connectExplicitly(explicit(harness.profile)),
+                        case.expectedResults[index],
+                        harness.composition.retryNow(explicit(harness.profile)),
                     )
                 }
                 // Recovery still pending: consent may be armed, but no socket is opened.
@@ -1197,6 +1203,49 @@ class RelayV2BaseRuntimeCompositionTest {
             harness.close()
         }
     }
+
+    @Test
+    fun `manual resync binds current transport and reuses host plus durable state snapshots`() =
+        runBlocking {
+            val harness = Harness(autoConnect = true)
+            try {
+                harness.connectOnline()
+
+                assertEquals(
+                    RelayV2ManualResyncResult.Started,
+                    harness.composition.manualResync(),
+                )
+                val hostRequest = harness.transport().awaitSentType("hosts.snapshot.get")
+                val stateRequest = harness.transport().awaitSentType("state.snapshot.get")
+                assertTrue(hostRequest.payload().isEmpty())
+                assertEquals(1, harness.authority.manualResyncCommits.get())
+                assertEquals(
+                    RelayV2BaseRuntimePhase.RESYNCING,
+                    harness.awaitPhase(RelayV2BaseRuntimePhase.RESYNCING).phase,
+                )
+                assertEquals(
+                    RelayV2ManualResyncResult.NotOnline,
+                    harness.composition.manualResync(),
+                )
+
+                val hostSnapshot = fixture("hosts-snapshot")
+                hostSnapshot["requestId"] = hostRequest.stringValue("requestId")
+                harness.transport().sendFrame(hostSnapshot)
+
+                val stateChunk = fixture("state-snapshot-chunk")
+                stateChunk["requestId"] = stateRequest.stringValue("requestId")
+                stateChunk.payload()["snapshotRequestId"] =
+                    stateRequest.payload().stringValue("snapshotRequestId")
+                harness.transport().sendFrame(stateChunk)
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.authority.snapshotCommits.get() != 1) delay(1)
+                }
+                assertEquals(1, harness.authority.snapshotCommits.get())
+                assertEquals(1, harness.factory.requests.size)
+            } finally {
+                harness.close()
+            }
+        }
 
     @Test
     fun `auth expiring refreshes exact generation and drains old transport before successor welcome`() =
@@ -2180,6 +2229,52 @@ class RelayV2BaseRuntimeCompositionTest {
             harness.close()
         }
     }
+
+    @Test
+    fun `retry now cancels owned backoff and terminal failure requires replacement`() =
+        runBlocking {
+            val retry = ControlledRetryDelay()
+            val retrying = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
+            try {
+                retrying.awaitTransport(0).fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(retry.awaitCount(1))
+
+                assertEquals(
+                    RelayV2RetryNowResult.Started,
+                    retrying.composition.retryNow(
+                        retrying.profile.copy(autoConnect = true),
+                    ),
+                )
+                retrying.awaitTransport(1)
+                assertEquals(2, retrying.factory.requests.size)
+                assertEquals(listOf(1_000L), retry.delays)
+            } finally {
+                retrying.close()
+            }
+
+            val terminal = Harness(autoConnect = true)
+            try {
+                terminal.awaitTransport(0).fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.TLS_VALIDATION),
+                )
+                val failure = requireNotNull(
+                    terminal.awaitPhase(RelayV2BaseRuntimePhase.FAILED).failure,
+                )
+
+                assertEquals(
+                    RelayV2RetryNowResult.TerminalFailure(failure),
+                    terminal.composition.retryNow(
+                        terminal.profile.copy(autoConnect = true),
+                    ),
+                )
+                delay(50)
+                assertEquals(1, terminal.factory.requests.size)
+            } finally {
+                terminal.close()
+            }
+        }
 
     @Test
     fun `non-retryable connection failure never schedules a successor`() = runBlocking {
@@ -3269,6 +3364,7 @@ class RelayV2BaseRuntimeCompositionTest {
         val releaseEnqueue = CompletableDeferred<Unit>()
         val snapshotApplyEntered = CompletableDeferred<Unit>()
         val snapshotCommits = AtomicInteger()
+        val manualResyncCommits = AtomicInteger()
 
         @Volatile
         var blockStateEvents: Boolean = false
@@ -3519,6 +3615,19 @@ class RelayV2BaseRuntimeCompositionTest {
             check(connectPlan.identity.profileId == hello.namespace.profileId)
             helloCommits.incrementAndGet()
             return RelayV2StateSyncResult.Live(hello.namespace, hello.welcomeEventSeq)
+        }
+
+        override suspend fun beginManualResyncUnderApplyLease(
+            namespace: RelayV2StateNamespace,
+        ): RelayV2StateSyncResult {
+            manualResyncCommits.incrementAndGet()
+            return RelayV2StateSyncResult.ResyncRequired(
+                namespace = namespace,
+                reason = RelayV2ResyncReason.SNAPSHOT_RESTART_REQUIRED,
+                durableCursorEventSeq = "91",
+                requiredThroughEventSeq = "91",
+                supersedesQueryCompletion = false,
+            )
         }
 
         override suspend fun applyStateEventUnderApplyLease(

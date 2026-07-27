@@ -20,6 +20,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ConfirmedEnrollment
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeException
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2StartupAdmissionResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshApplyResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshRequirement
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeResult
@@ -28,7 +29,9 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeCompositi
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateTerminalInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ManualResyncResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RetryNowResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateResult
@@ -78,6 +81,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -692,6 +696,43 @@ class V2ViewModel(
     }
 
     fun refresh() {
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val composition = synchronized(relayV2UiFenceLock) { relayV2Composition }
+            if (composition == null) {
+                _uiState.update {
+                    it.copy(actionError = "Reconnect before refreshing Relay v2 sessions")
+                }
+                return
+            }
+            viewModelScope.launch {
+                val result = composition.manualResync()
+                synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission !=
+                        RelayStartupAdmissionState.RELAY_V2
+                    ) {
+                        return@synchronized
+                    }
+                    _uiState.value = when (result) {
+                        RelayV2ManualResyncResult.Started,
+                        RelayV2ManualResyncResult.AlreadyInProgress,
+                        -> _uiState.value.copy(actionError = null)
+                        RelayV2ManualResyncResult.NotOnline ->
+                            _uiState.value.copy(
+                                actionError =
+                                    "Reconnect before refreshing Relay v2 sessions",
+                            )
+                        RelayV2ManualResyncResult.ProfileMismatch,
+                        RelayV2ManualResyncResult.Unavailable,
+                        -> _uiState.value.copy(
+                            actionError =
+                                "Relay v2 session refresh is unavailable for this connection",
+                        )
+                    }
+                }
+            }
+            return
+        }
         val relay = relayV1IfAdmitted() ?: return
         val hostId = selectedHostId()
         relay.refreshHosts()
@@ -1664,7 +1705,36 @@ class V2ViewModel(
                     if (currentComposition == null) {
                         startRelayV2BaseRuntime(consentedProfile)
                     } else {
-                        currentComposition.connectExplicitly(consentedProfile)
+                        when (val retry = currentComposition.retryNow(consentedProfile)) {
+                            RelayV2RetryNowResult.Started,
+                            RelayV2RetryNowResult.ArmedForRecovery,
+                            RelayV2RetryNowResult.AlreadyInProgress,
+                            -> Unit
+                            is RelayV2RetryNowResult.TerminalFailure -> {
+                                reservation = reserveRelayV2ExplicitRefresh(
+                                    expectedIdentity = consentedProfile.identity,
+                                    retiredComposition = currentComposition,
+                                ) ?: return@trackProfileMutation
+                                replaceTerminalRelayV2Composition(
+                                    runtime = runtime,
+                                    failedComposition = currentComposition,
+                                    expectedProfile = consentedProfile,
+                                    reservation = checkNotNull(reservation),
+                                )
+                            }
+                            RelayV2RetryNowResult.Closed ->
+                                applyRelayV2RefreshFailure(
+                                    code = "RUNTIME_CLOSED",
+                                    message = "Relay v2 runtime is closed; " +
+                                        "Relay v1 fallback is disabled.",
+                                )
+                            RelayV2RetryNowResult.ProfileMismatch ->
+                                applyRelayV2RefreshFailure(
+                                    code = "PROFILE_CHANGED",
+                                    message = "Relay v2 profile changed before retry; " +
+                                        "Relay v1 fallback is disabled.",
+                                )
+                        }
                     }
                 } finally {
                     if (reservation != null) {
@@ -1675,6 +1745,122 @@ class V2ViewModel(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Retires a terminally failed composition and installs a fresh owner from a newly admitted
+     * view of the same exact profile. A missing drain, changed profile, or install failure clears
+     * the retired UI slot and fails closed without entering the Relay v1 path.
+     */
+    private suspend fun replaceTerminalRelayV2Composition(
+        runtime: RelayV2ProfileRuntimeAdapter,
+        failedComposition: RelayV2BaseRuntimeComposition,
+        expectedProfile: RelayV2Profile,
+        reservation: RelayV2ExplicitRefreshReservation,
+    ) {
+        var drainCompleted = false
+        try {
+            failedComposition.disconnectAndDrain(
+                expectedProfile.identity,
+                "relay-v2-retry-retire-${UUID.randomUUID()}",
+            )
+            drainCompleted = true
+        } catch (error: Throwable) {
+            if (error is CancellationException &&
+                currentCoroutineContext()[Job]?.isActive != true
+            ) {
+                throw error
+            }
+        } finally {
+            runCatching { failedComposition.close() }
+            synchronized(relayV2UiFenceLock) {
+                if (relayV2Composition === failedComposition &&
+                    relayV2ExplicitRefreshReservation === reservation
+                ) {
+                    relayV2Composition = null
+                    relayV2NotificationProfileActive = false
+                    relayV2SessionReplyCuts.value = emptyMap()
+                    relayV2ScopeCreateCuts.value = emptyMap()
+                    relayV2Terminal = null
+                    _uiState.value = _uiState.value.copy(
+                        agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
+                        scopes = emptyList(),
+                        sessions = emptyList(),
+                        terminal = TerminalStreamState(),
+                    )
+                }
+            }
+        }
+        if (!drainCompleted) {
+            applyRelayV2RefreshFailure(
+                code = "RUNTIME_DRAIN_FAILED",
+                message = "Relay v2 runtime could not finish its previous connection cleanly; " +
+                    "Relay v1 fallback is disabled.",
+            )
+            return
+        }
+
+        var installFailed = false
+        val outcome = runtime.installCurrentRuntimeReplacement(
+            expectedIdentity = expectedProfile.identity,
+        ) { currentProfile ->
+            val installCurrent = synchronized(relayV2UiFenceLock) {
+                relayV2ExplicitRefreshReservation === reservation &&
+                    reservation.expectedIdentity == currentProfile.identity &&
+                    reservation.retiredComposition === failedComposition &&
+                    relayV2Composition == null &&
+                    _uiState.value.relayStartupAdmission ==
+                    RelayStartupAdmissionState.RELAY_V2
+            }
+            if (!installCurrent) {
+                false
+            } else {
+                try {
+                    startRelayV2BaseRuntime(currentProfile)
+                    true
+                } catch (_: Throwable) {
+                    installFailed = true
+                    false
+                }
+            }
+        }
+        when (outcome) {
+            is RelayV2ExplicitConnectRefreshResult.SuccessorInstalled -> Unit
+            is RelayV2ExplicitConnectRefreshResult.AdmissionSettled -> {
+                if (outcome.admission == RelayV2StartupAdmissionResult.NoActiveProfile) {
+                    applyRelayV2RefreshFailure(
+                        code = "PROFILE_CHANGED",
+                        message = "Relay v2 profile changed before retry; " +
+                            "Relay v1 fallback is disabled.",
+                    )
+                } else {
+                    applyStartupAdmission(outcome.admission.toRelayStartupAdmission())
+                }
+            }
+            is RelayV2ExplicitConnectRefreshResult.ProfileReconciliationFailed ->
+                applyRelayV2RefreshFailure(
+                    code = outcome.failure.failure.name,
+                    message = "Relay v2 runtime could not restart " +
+                        "(${outcome.failure.failure.name}); " +
+                        "Relay v1 fallback is disabled.",
+                )
+            is RelayV2ExplicitConnectRefreshResult.ActiveProfileChanged -> {
+                if (installFailed) {
+                    applyRelayV2RefreshFailure(
+                        code = "SUCCESSOR_INSTALL_FAILED",
+                        message = "Relay v2 runtime could not restart; " +
+                            "Relay v1 fallback is disabled.",
+                    )
+                } else if (outcome.activeProfile == expectedProfile.identity) {
+                    applyRelayV2RefreshFailure(
+                        code = "PROFILE_CHANGED",
+                        message = "Relay v2 profile changed before retry; " +
+                            "Relay v1 fallback is disabled.",
+                    )
+                }
+                // Otherwise the profile or UI slot changed while the retired owner drained.
             }
         }
     }

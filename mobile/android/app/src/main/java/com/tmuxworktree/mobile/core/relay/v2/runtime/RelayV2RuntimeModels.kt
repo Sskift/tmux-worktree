@@ -942,6 +942,22 @@ internal sealed interface RelayV2RuntimeEffect {
             get() = connectPlan.requestedResume
     }
 
+    /** Current-transport user request to durably enter the existing full snapshot recovery. */
+    data class ManualResyncRequested(
+        val context: RelayV2HandshakeContext,
+        override val generation: RelayV2EffectGeneration,
+        val connectionAttempt: RelayV2ConnectionAttemptIdentity,
+        val pendingCommands: List<RelayV2PendingCommand>,
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
+        init {
+            require(connectionAttempt.profile == context.profile)
+            require(pendingCommands.size <= 4_096)
+            require(pendingCommands.distinctBy { it.commandId }.size == pendingCommands.size)
+        }
+    }
+
     data class ApplyCommandStatuses(
         val context: RelayV2HandshakeContext,
         val message: RelayV2DecodedMessage,

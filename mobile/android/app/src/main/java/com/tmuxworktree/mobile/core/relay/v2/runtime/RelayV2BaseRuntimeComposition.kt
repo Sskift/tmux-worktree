@@ -87,6 +87,36 @@ internal fun interface RelayV2CredentialRolloverPort {
     suspend fun rollover(expectedProfile: RelayV2Profile): RelayV2CredentialRolloverResult
 }
 
+/** Typed outcome of the explicit user's retry request for one exact v2 composition. */
+internal sealed interface RelayV2RetryNowResult {
+    data object Started : RelayV2RetryNowResult
+
+    data object ArmedForRecovery : RelayV2RetryNowResult
+
+    data object AlreadyInProgress : RelayV2RetryNowResult
+
+    data class TerminalFailure(
+        val failure: RelayV2BaseRuntimeFailure,
+    ) : RelayV2RetryNowResult
+
+    data object Closed : RelayV2RetryNowResult
+
+    data object ProfileMismatch : RelayV2RetryNowResult
+}
+
+/** Typed outcome of one bounded full-state refresh on the current v2 transport. */
+internal sealed interface RelayV2ManualResyncResult {
+    data object Started : RelayV2ManualResyncResult
+
+    data object AlreadyInProgress : RelayV2ManualResyncResult
+
+    data object NotOnline : RelayV2ManualResyncResult
+
+    data object ProfileMismatch : RelayV2ManualResyncResult
+
+    data object Unavailable : RelayV2ManualResyncResult
+}
+
 /** The explicit v2 profile's connection state, not product readiness or capability availability. */
 internal enum class RelayV2BaseRuntimePhase {
     STOPPED,
@@ -961,32 +991,93 @@ internal class RelayV2BaseRuntimeComposition(
 
     /**
      * Explicit user connect/retry for this exact profile after the durable CAS owner persisted
-     * `autoConnect=true`. The full-profile compare, consent re-arm, and single-attempt claim are
-     * one [connectionLock] critical section, so a concurrent credential rollover cannot make a
-     * retry resurrect a stale profile. While durable terminal recovery is still pending this only
-     * persists/arm consent without opening a socket; recovery completion starts the attempt
-     * exactly once through the same claim. Returns false — without mutating, re-arming, or
-     * starting anything — when the profile is not this composition's exact profile or the runtime
-     * is already closed/terminally failed.
+     * `autoConnect=true`. The full-profile compare, consent re-arm, backoff fence, and fresh
+     * single-attempt claim are one [connectionLock] critical section. A retry therefore cancels a
+     * currently owned backoff timer without waiting for it to expire, while an in-flight actor
+     * admission remains the sole owner. Terminal failure is returned to the UI owner so that this
+     * composition can be drained and replaced rather than silently reused.
      */
-    internal fun connectExplicitly(consentedProfile: RelayV2Profile): Boolean {
-        var accepted = false
+    internal fun retryNow(consentedProfile: RelayV2Profile): RelayV2RetryNowResult {
+        var previousBackoff: Job? = null
+        var result: RelayV2RetryNowResult = RelayV2RetryNowResult.AlreadyInProgress
         val attempt = synchronized(connectionLock) {
             if (!consentedProfile.autoConnect ||
-                closed.get() || terminalFailure.get() != null ||
                 consentedProfile != profile.copy(autoConnect = true)
             ) {
+                result = RelayV2RetryNowResult.ProfileMismatch
                 return@synchronized null
             }
+            if (closed.get()) {
+                result = RelayV2RetryNowResult.Closed
+                return@synchronized null
+            }
+            terminalFailure.get()?.let { failure ->
+                result = RelayV2RetryNowResult.TerminalFailure(failure)
+                return@synchronized null
+            }
+
             profile = consentedProfile
             reconnectEnabled = true
             retryAttempt = 0
-            retryStateFence = null
-            accepted = true
-            claimConnectionAttemptLocked()
+            if (retryStateFence != null && connectionAttemptJob != null) {
+                previousBackoff = connectionAttemptJob
+                connectionAttemptJob = null
+                retryFence = Any()
+                retryStateFence = null
+                previousBackoff?.cancel()
+            }
+
+            val claimed = claimConnectionAttemptLocked()
+            result = when {
+                claimed != null -> RelayV2RetryNowResult.Started
+                !terminalRecoveryReady &&
+                    connectionAttemptJob == null &&
+                    pendingOutboxAdmission == null &&
+                    boundOutboxAdmission == null ->
+                    RelayV2RetryNowResult.ArmedForRecovery
+                else -> RelayV2RetryNowResult.AlreadyInProgress
+            }
+            claimed
         }
         attempt?.start()
-        return accepted
+        return result
+    }
+
+    /**
+     * Starts one actor-owned manual full resync for this composition's current ONLINE generation.
+     * The actor admission binds the exact profile, generation, transport, and current Outbox
+     * recovery set; all state mutation continues through the existing snapshot/Room commit path.
+     */
+    internal suspend fun manualResync(): RelayV2ManualResyncResult {
+        val expectedProfile = synchronized(connectionLock) {
+            when {
+                closed.get() || terminalFailure.get() != null -> null
+                else -> profile.identity
+            }
+        } ?: return RelayV2ManualResyncResult.Unavailable
+        val cut = when (val current = actor.currentOnlineCommandCut()) {
+            is RelayV2CurrentOnlineCommandCutResult.Available -> current.cut
+            RelayV2CurrentOnlineCommandCutResult.Unavailable ->
+                return RelayV2ManualResyncResult.NotOnline
+        }
+        return when (val leased = actor.withCurrentOnlineCommandLease(cut) { context ->
+            val pending = synchronized(connectionLock) {
+                if (closed.get() || terminalFailure.get() != null ||
+                    profile.identity != expectedProfile
+                ) {
+                    return@synchronized null
+                }
+                boundOutboxAdmission
+                    ?.takeIf { it.generation == context.authority.generation }
+                    ?.pendingCommands
+                    ?.toList()
+            } ?: return@withCurrentOnlineCommandLease RelayV2ManualResyncResult.NotOnline
+            actor.requestManualResync(expectedProfile, cut, pending)
+        }) {
+            is RelayV2CurrentOnlineCommandLeaseResult.Current -> leased.value
+            RelayV2CurrentOnlineCommandLeaseResult.Stale ->
+                RelayV2ManualResyncResult.NotOnline
+        }
     }
 
     private suspend fun connectOnce(expectedFence: Any, expectedJob: Job) {
@@ -1050,6 +1141,7 @@ internal class RelayV2BaseRuntimeComposition(
             is RelayV2RuntimeEffect.ApplyStateSnapshotChunk -> applySnapshotChunk(effect)
             is RelayV2RuntimeEffect.CompleteSnapshotRelease -> completeSnapshotRelease(effect)
             is RelayV2RuntimeEffect.ExpireSnapshotContinuation -> expireSnapshot(effect)
+            is RelayV2RuntimeEffect.ManualResyncRequested -> applyManualResync(effect)
             is RelayV2RuntimeEffect.DeliverPostHandshakeFrame -> applyPostHandshakeFrame(effect)
             is RelayV2RuntimeEffect.ReconnectAfterHostPresence ->
                 reconnectAfterHostPresence(effect)
@@ -1122,6 +1214,32 @@ internal class RelayV2BaseRuntimeComposition(
                 // Late/forged Hello effects close as Stale below without touching job ownership.
                 activateAgentRecoveryGeneration(effect.generation)
                 applied.value?.let { submitRecovery(it) }
+            }
+            RelayV2EffectApplyResult.Stale -> Unit
+        }
+    }
+
+    private suspend fun applyManualResync(
+        effect: RelayV2RuntimeEffect.ManualResyncRequested,
+    ) {
+        clearRecoveredDispatch()
+        when (val applied = actor.withEffectApplyLease(effect) {
+            productMutationLock.withLock {
+                val admission = synchronized(connectionLock) {
+                    boundOutboxAdmission?.takeIf {
+                        it.generation == effect.generation &&
+                            it.connectionAttempt === effect.connectionAttempt &&
+                            it.pendingCommands == effect.pendingCommands
+                    }
+                } ?: return@withLock null
+                check(admission.pendingCommands.size <= MAX_RECOVERED_DISPATCH_CAPABILITIES)
+                recoveryAdapter.beginManualResync(effect)
+            }
+        }) {
+            is RelayV2EffectApplyResult.Applied -> applied.value?.let { receipt ->
+                clearSessionProjection()
+                beforeOnlineResyncReceiptSubmit()
+                submitOnlineResync(receipt)
             }
             RelayV2EffectApplyResult.Stale -> Unit
         }

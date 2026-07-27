@@ -164,6 +164,34 @@ internal class RelayV2RecoveryRepositoryAdapter(
         return snapshotReceipt(effect, result, pendingCommands)
     }
 
+    suspend fun beginManualResync(
+        effect: RelayV2RuntimeEffect.ManualResyncRequested,
+    ): RelayV2OnlineResyncRequired {
+        requireIdentity(effect.context, effect.generation, effect.repositoryAuthority)
+        val namespace = effect.context.namespace()
+        return when (val result = state.beginManualResyncUnderApplyLease(namespace)) {
+            is RelayV2StateSyncResult.ResyncRequired -> RelayV2OnlineResyncRequired(
+                generation = effect.generation,
+                hostId = namespace.hostId,
+                hostEpoch = namespace.hostEpoch,
+                durableCursorEventSeq = result.durableCursorEventSeq,
+                pendingCommands = effect.pendingCommands,
+                release = result.release?.toRuntimeObligation(),
+                restart = RelayV2RecoveryRestartDirective.SNAPSHOT,
+            )
+            is RelayV2StateSyncResult.ReleasePending -> RelayV2OnlineResyncRequired(
+                generation = effect.generation,
+                hostId = namespace.hostId,
+                hostEpoch = namespace.hostEpoch,
+                durableCursorEventSeq = result.release.durableCursorEventSeq,
+                pendingCommands = effect.pendingCommands,
+                release = result.release.toRuntimeObligation(),
+                restart = RelayV2RecoveryRestartDirective.SNAPSHOT,
+            )
+            else -> error("Unexpected manual resync repository result: $result")
+        }
+    }
+
     suspend fun completeRelease(
         effect: RelayV2RuntimeEffect.CompleteSnapshotRelease,
     ): RelayV2RecoveryReceipt.SnapshotReleaseCompleted? {

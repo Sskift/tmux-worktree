@@ -145,6 +145,9 @@ internal interface RelayV2StateSyncAuthority {
         connectPlan: RelayV2StateConnectPlan,
         hello: RelayV2StateHello,
     ): RelayV2StateSyncResult
+    suspend fun beginManualResyncUnderApplyLease(
+        namespace: RelayV2StateNamespace,
+    ): RelayV2StateSyncResult
     suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult
