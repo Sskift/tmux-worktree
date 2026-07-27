@@ -590,6 +590,57 @@ falls back to v1, while the default invocation stays Relay v1. Native
 `qualifiedRecords=[]`, qualified E0/TLS deployment evidence, and the overall
 NO-GO status are unchanged.
 
+For the first Host only, the Broker and Host commands form one explicit
+restricted-file handoff. On the Broker:
+
+```bash
+install -d -m 700 /secure/relay-bootstrap
+tw relay-server \
+  --v2-profile /etc/tmux-worktree/relay-v2-broker-profile.json \
+  --host-bootstrap-output /secure/relay-bootstrap/new-host.twhostboot2
+```
+
+The broker stays in the foreground. After the shipping root has opened, it
+creates one token with the authority's five-minute default expiry and
+atomically replaces the named file from a same-directory temporary file; the
+resulting file is exactly mode `0600` and contains only the token plus a
+trailing newline. The token is not printed to stdout or logs.
+
+Securely transfer that file to an owner-only directory on the new Host,
+preserving or restoring exact mode `0600`, then start the Host with the
+non-secret path:
+
+```bash
+install -d -m 700 /secure/relay-bootstrap
+chmod 600 /secure/relay-bootstrap/new-host.twhostboot2
+tw relay-host \
+  --profile v2 \
+  --bootstrap-secret-input /secure/relay-bootstrap/new-host.twhostboot2
+```
+
+The Host trusted deployment source opens that exact file with
+`O_RDONLY|O_NOFOLLOW`, verifies through its descriptor that it is a
+current-user-owned regular file with one link, exact mode `0600`, and no more
+than the existing bootstrap raw-byte limit, then gives its sole Readable byte
+source to the existing bootstrap-source → handoff → Vault chain. The fd is
+never exposed to business code or child stdio; source cancellation/close owns
+its descriptor lifecycle. That chain
+consumes the Broker's single trailing LF directly, performs bootstrap, and
+persists the credential in the existing profile/Vault owner. It never moves
+the raw token into argv, env, logs, errors, stdout, or a second credential
+store. After Host registration/credential bootstrap is confirmed, the
+operator removes the transferred file; the CLI never deletes it
+automatically. Subsequent starts use `tw relay-host --profile v2` without the
+input option, and the same profile/Vault remains the authority for the
+same-lineage Dashboard management child.
+
+A Broker file-publication failure shuts down its just-opened v2 shipping
+handle. Any Host file validation, read, startup, abort, or close failure drains
+the same source/root and fails closed. Neither side falls back to v1. Omitting
+either one-shot option preserves the respective existing startup, and both v1
+lanes reject their v2-only option. Do not copy the token into an argument, URL,
+env var, shell history, or ordinary JSON output.
+
 The same canonical Host composition can optionally and exclusively own one
 same-lineage Dashboard management protocol-v2 session. The Tauri supervisor
 starts one hidden Node child with exact protocol v2; that child now supplies

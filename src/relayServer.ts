@@ -11,6 +11,7 @@ import {
 } from "./relay/v2/brokerPublicHttpsServer.js";
 import type { Server as NodeHttpsServer } from "node:https";
 import type { RelayServerOptions } from "./relay/broker/options.js";
+import { createRelayV2HostBootstrapOutputSink } from "./relay/broker/hostBootstrapOutput.js";
 
 export type {
   RelayBrokerServerHandle,
@@ -106,7 +107,18 @@ export async function run(): Promise<void> {
     // 映射的 fd-bound regular-file/no-symlink、owner、exact 0600/0700、bounded
     // 私有文件；任何 profile/reference/ownership/TLS/E0/keyring/native 失败仍在
     // 任何监听前 fail closed，绝不回退 v1；qualifiedRecords=[] 与 NO-GO 不变。
-    await startRelayV2BrokerShippingFromTrustedDeployment(options.v2ProfilePath);
+    const bootstrapSink = options.v2HostBootstrapOutputPath === undefined
+      ? undefined
+      : createRelayV2HostBootstrapOutputSink(options.v2HostBootstrapOutputPath);
+    const handle = await startRelayV2BrokerShippingFromTrustedDeployment(options.v2ProfilePath);
+    if (bootstrapSink !== undefined) {
+      try {
+        await handle.admin.createHostBootstrap({}, bootstrapSink);
+      } catch (error) {
+        await handle.shutdown();
+        throw error;
+      }
+    }
     return;
   }
   await startRelayBroker(options);

@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -224,6 +232,14 @@ const virtualModules = new Map([
         || options.carrierWssTlsTrust !== undefined) {
         throw new Error("system TLS cuts were replaced");
       }
+      h.bootstrapSecretByteSource = options.bootstrapSecretByteSource;
+      if (options.bootstrapSecretByteSource !== undefined) {
+        const chunks = [];
+        for await (const chunk of options.bootstrapSecretByteSource) {
+          chunks.push(Buffer.from(chunk));
+        }
+        h.bootstrapSecretRaw = Buffer.concat(chunks).toString("utf8");
+      }
       options.takeNativeModule();
       let closed = false;
       const management = options.canonical.dashboardManagement;
@@ -325,6 +341,8 @@ function createHarness(home) {
     abortDuringLifecycleStart: false,
     abortAfterIntakeOpen: false,
     processSignalController: null,
+    bootstrapSecretByteSource: undefined,
+    bootstrapSecretRaw: null,
     openedRuntime: Object.freeze(Object.assign(Object.create(null), {
       discovery: Object.freeze({ scan: async () => ({}) }),
       localProcessTarget: Object.freeze({ kind: "local", targetId: "local-exact" }),
@@ -500,6 +518,72 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     assert.ok(processOwned.events.some(([name]) => name === "runtime.close"));
     assert.ok(processOwned.events.some(([name]) => name === "native.close"));
     assert.equal(processOwned.events.at(-1)[0], "signal.close");
+
+    const bootstrapPath = join(home, "first-host.twhostboot2");
+    const bootstrapRecord = "twhostboot2.trusted-file-bootstrap-secret\n";
+    writeFileSync(bootstrapPath, bootstrapRecord, { mode: 0o600 });
+    chmodSync(bootstrapPath, 0o600);
+    const bootstrapOwned = createHarness(home);
+    globalThis.__hostDeploymentHarness = bootstrapOwned;
+    assert.equal(
+      await module.runRelayV2HostShippingFromTrustedDeployment(bootstrapPath),
+      78,
+    );
+    assert.ok(bootstrapOwned.bootstrapSecretByteSource);
+    assert.equal(bootstrapOwned.bootstrapSecretRaw, bootstrapRecord);
+    assert.ok(
+      bootstrapOwned.events.some(([name]) => name === "intake.open"),
+      "valid fd-bound input must not depend on an optional O_CLOEXEC fs constant",
+    );
+    assert.equal(bootstrapOwned.events.at(-1)[0], "signal.close");
+
+    const unsafeInputs = [];
+    const broadMode = join(home, "bootstrap-broad-mode");
+    writeFileSync(broadMode, bootstrapRecord, { mode: 0o600 });
+    chmodSync(broadMode, 0o640);
+    unsafeInputs.push(broadMode);
+
+    const linkedSource = join(home, "bootstrap-linked-source");
+    const linkedInput = join(home, "bootstrap-linked-input");
+    writeFileSync(linkedSource, bootstrapRecord, { mode: 0o600 });
+    linkSync(linkedSource, linkedInput);
+    unsafeInputs.push(linkedInput);
+
+    const symlinkTarget = join(home, "bootstrap-symlink-target");
+    const symlinkInput = join(home, "bootstrap-symlink-input");
+    writeFileSync(symlinkTarget, bootstrapRecord, { mode: 0o600 });
+    symlinkSync(symlinkTarget, symlinkInput);
+    unsafeInputs.push(symlinkInput);
+
+    const directoryInput = join(home, "bootstrap-directory");
+    mkdirSync(directoryInput, { mode: 0o700 });
+    unsafeInputs.push(directoryInput);
+
+    const oversizedInput = join(home, "bootstrap-oversized");
+    writeFileSync(oversizedInput, Buffer.alloc(8_194, 0x61), { mode: 0o600 });
+    chmodSync(oversizedInput, 0o600);
+    unsafeInputs.push(oversizedInput);
+
+    const emptyInput = join(home, "bootstrap-empty");
+    writeFileSync(emptyInput, "", { mode: 0o600 });
+    chmodSync(emptyInput, 0o600);
+    unsafeInputs.push(emptyInput);
+
+    for (const inputPath of unsafeInputs) {
+      const rejected = createHarness(home);
+      globalThis.__hostDeploymentHarness = rejected;
+      await assert.rejects(
+        module.runRelayV2HostShippingFromTrustedDeployment(inputPath),
+        (error) => error?.code === "ACTIVATION_FAILED"
+          && error?.cause === undefined
+          && !String(error).includes(inputPath),
+      );
+      assert.equal(
+        rejected.events.some(([name]) => name === "native.create"),
+        false,
+      );
+      assert.equal(rejected.events.at(-1)[0], "signal.close");
+    }
 
     const startupInterrupted = createHarness(home);
     startupInterrupted.abortDuringLifecycleStart = true;

@@ -5,6 +5,7 @@ export type RelayServerOptions = {
   port: number;
   secret: string;
   v2ProfilePath?: string;
+  v2HostBootstrapOutputPath?: string;
 };
 
 export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
@@ -14,6 +15,7 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let secretFlag = false;
   let listenFlag = false;
   let v2ProfilePath: string | undefined;
+  let v2HostBootstrapOutputPath: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -28,6 +30,11 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
       secretFlag = true;
     } else if (arg === "--v2-profile") {
       v2ProfilePath = argv[++i] || "";
+    } else if (arg === "--host-bootstrap-output") {
+      if (v2HostBootstrapOutputPath !== undefined) {
+        throw new CliError("relay-server --host-bootstrap-output 只能指定一次");
+      }
+      v2HostBootstrapOutputPath = argv[++i] || "";
     } else if (arg === "-h" || arg === "--help") {
       printRelayServerHelp();
       process.exit(0);
@@ -46,10 +53,17 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     if (listenFlag) {
       throw new CliError("relay-server --v2-profile 的监听地址只来自 profile，不能与 --host/--port 同时使用");
     }
+    if (v2HostBootstrapOutputPath === "") {
+      throw new CliError("relay-server --host-bootstrap-output 需要非空输出路径");
+    }
     // 显式 v2 profile 模式：监听/凭证/continuity 只来自 profile 与 trusted
     // deployment source；v1 shared secret 在该模式下不被读取或使用（env
     // TW_RELAY_SECRET 也不读取），也绝不回退 v1。
-    return { host, port, secret: "", v2ProfilePath };
+    return { host, port, secret: "", v2ProfilePath, v2HostBootstrapOutputPath };
+  }
+
+  if (v2HostBootstrapOutputPath !== undefined) {
+    throw new CliError("relay-server --host-bootstrap-output 只适用于 --v2-profile");
   }
 
   // 仅 v1 分支读取 env：--secret 优先，缺省回落 TW_RELAY_SECRET。
@@ -72,7 +86,7 @@ function printRelayServerHelp(): void {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-server [--host 0.0.0.0] [--port 8787]
-  tw relay-server --v2-profile <path>
+  tw relay-server --v2-profile <path> [--host-bootstrap-output <path>]
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -80,5 +94,8 @@ function printRelayServerHelp(): void {
   --v2-profile 选择显式 default-off Relay v2 shipping：profile 只保存非敏感
   reference/path；TLS/issuer keyring/E0 material 只来自 trustedHome 下固定
   namespace 的 0600 私有 deployment 文件，缺失或 unsafe 时在监听前 fail
-  closed，绝不回退 v1。`);
+  closed，绝不回退 v1。
+  --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
+  privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600
+  文件。token 不写入 argv、URL、日志或 stdout。`);
 }

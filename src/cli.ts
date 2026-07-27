@@ -103,7 +103,7 @@ Automation:
 
 其它:
   tw serve [--host HOST] [--port N]  启动网页终端（默认监听所有网卡）
-  tw relay-server             启动实验性远程 relay 服务
+  tw relay-server             启动实验性远程 relay 服务（显式 v2 可写一次 Host bootstrap）
   tw relay-host               连接 relay 并转发本机 tw serve
   tw terminal-control ...     运行 / 查询本机 terminal input ownership authority
   tw setup                    安装 / 配置向导

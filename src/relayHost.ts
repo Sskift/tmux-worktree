@@ -60,12 +60,14 @@ export type RelayV2HostOptions = RelayHostCommonOptions & {
 };
 
 /**
- * Explicit `relay-host --profile v2` selection. The CLI accepts no endpoint,
- * hostId, or credential reference flags: those come only from the canonical
- * runtime profile store, and the v2 branch carries no v1 runtime fields.
+ * Explicit `relay-host --profile v2` selection. Endpoint, hostId, and
+ * credential references come only from the canonical runtime profile store.
+ * The optional path names a privileged bootstrap input file; it is not secret
+ * material and the v2 branch still carries no v1 runtime fields.
  */
 export type RelayV2HostSelection = {
   profile: "v2";
+  bootstrapSecretInputPath?: string;
 };
 
 export type RelayHostOptions = RelayV1HostOptions | RelayV2HostSelection;
@@ -713,11 +715,22 @@ export function parseRelayHostOptions(
   const profile = relayHostProfile(argv, env);
   if (profile === "v2") {
     // 显式 default-off 选路：endpoint、hostId 与 credential reference 只来自
-    // canonical 运行时 profile store；CLI 只接受非敏感的 --profile v2 本身。
+    // canonical 运行时 profile store；CLI 可额外传入非敏感 bootstrap 文件路径。
+    let bootstrapSecretInputPath: string | undefined;
     for (let i = 0; i < argv.length; i += 1) {
       const arg = argv[i];
       if (arg === "--profile") {
         i += 1;
+      } else if (arg === "--bootstrap-secret-input") {
+        if (bootstrapSecretInputPath !== undefined) {
+          throw new CliError("relay-host --bootstrap-secret-input 只能指定一次");
+        }
+        const inputPath = argv[i + 1];
+        if (inputPath === undefined || inputPath === "" || inputPath.startsWith("--")) {
+          throw new CliError("relay-host --bootstrap-secret-input 需要非空文件路径");
+        }
+        i += 1;
+        bootstrapSecretInputPath = inputPath;
       } else if (arg === "--secret") {
         throw new CliError("Relay v2 host profile 不能读取或提升 Relay v1 shared secret");
       } else if (arg === "-h" || arg === "--help") {
@@ -726,11 +739,15 @@ export function parseRelayHostOptions(
       } else {
         throw new CliError(
           "Relay v2 host profile 的 relayUrl、issuer、hostId 与 credential reference "
-          + `只来自运行时 profile store，CLI 只接受 --profile v2 选路（不支持参数: ${arg}）`,
+          + "只来自运行时 profile store，CLI 只接受 --profile v2 与 "
+          + `--bootstrap-secret-input 选路（不支持参数: ${arg}）`,
         );
       }
     }
-    return { profile };
+    return {
+      profile,
+      ...(bootstrapSecretInputPath === undefined ? {} : { bootstrapSecretInputPath }),
+    };
   }
   let relay = env.TW_RELAY_URL || "";
   let hostId = env.TW_RELAY_HOST_ID || "mac-admin";
@@ -755,6 +772,8 @@ export function parseRelayHostOptions(
     } else if (arg === "--credential-reference") {
       sawV2CredentialReference = true;
       i += 1;
+    } else if (arg === "--bootstrap-secret-input") {
+      throw new CliError("relay-host --bootstrap-secret-input 只适用于 --profile v2");
     } else if (arg === "--local") {
       local = argv[++i] || local;
     } else if (arg === "--status-file") {
@@ -791,7 +810,7 @@ function printHelp(): void {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
-  tw relay-host --profile v2
+  tw relay-host --profile v2 [--bootstrap-secret-input <path>]
 
 Relay v2:
   --profile v2 选择显式 default-off Relay v2 Host shipping root。relayUrl、issuer、hostId 与
@@ -800,7 +819,9 @@ Relay v2:
   owner 冻结并以 opaque one-shot ticket 交给 shipping root。任一 prerequisite 失败都逆序
   drain、fail closed。trusted source 会按需启动 canonical terminal-control daemon，随后唯一
   v2 进程 owner 执行初始 start、同 hostInstanceId 的有界退避重连与 signal/superseded drain；
-  它不读取 v1 secret、不宣告 capability，也绝不回退到 v1。
+  首次 Host 可用 --bootstrap-secret-input 指定 owner-only 0600 文件；path 本身非 secret，
+  trusted source 将 fd-bound 输入交给既有 handoff/vault。后续已持久化 credential 的启动省略
+  该参数。它不读取 v1 secret、不宣告 capability，也绝不回退到 v1。
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
@@ -3519,7 +3540,9 @@ export async function run(): Promise<void> {
     // shipping root；任何失败逆序 drain 且绝不回退 v1。
     const { runRelayV2HostShippingFromTrustedDeployment } =
       await import("./relay/v2/hostShippingDeploymentSource.js");
-    process.exitCode = await runRelayV2HostShippingFromTrustedDeployment();
+    process.exitCode = opts.bootstrapSecretInputPath === undefined
+      ? await runRelayV2HostShippingFromTrustedDeployment()
+      : await runRelayV2HostShippingFromTrustedDeployment(opts.bootstrapSecretInputPath);
     return;
   }
   const statusOwnership: RelayStatusOwnership = {

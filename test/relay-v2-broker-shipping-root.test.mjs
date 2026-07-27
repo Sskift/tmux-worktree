@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http";
 import net from "node:net";
@@ -9,6 +16,7 @@ import test from "node:test";
 import tls from "node:tls";
 
 const relayServer = await import("../dist/relayServer.js");
+const hostBootstrapOutput = await import("../dist/relay/broker/hostBootstrapOutput.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
 
 const ENDPOINT = "https://continuity.example.test/external/continuity/v1";
@@ -442,6 +450,32 @@ async function runCli(argv) {
   }
 }
 
+test("host bootstrap output sink atomically publishes only a 0600 file", () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "tw-v2-host-bootstrap-output-"));
+  const outputPath = path.join(tempDir, "new-host.bootstrap");
+  const token = "twhostboot2.test-only-bootstrap-token";
+  try {
+    const sink = hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(outputPath);
+    sink(token);
+
+    assert.equal(readFileSync(outputPath, "utf8"), `${token}\n`);
+    assert.equal(lstatSync(outputPath).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(tempDir), ["new-host.bootstrap"]);
+
+    const missingParentPath = path.join(tempDir, "missing", "bootstrap");
+    assert.throws(
+      () => hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(missingParentPath)(token),
+      (error) => {
+        assert.equal(error?.message, "Relay v2 host bootstrap output failed");
+        assert.equal(String(error).includes(token), false);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("explicit v2 profile selects shipping and fails closed; default v1 path is unchanged", async () => {
   delete process.env.TW_RELAY_SECRET;
   const missingSecret = await runCli([]);
@@ -455,6 +489,19 @@ test("explicit v2 profile selects shipping and fails closed; default v1 path is 
     process.env.TW_RELAY_SECRET = "v1-secret-that-must-not-be-used";
     const blocker = await runCli(["--v2-profile", validProfilePath]);
     assert.match(String(blocker?.message), /deployment source is unavailable/);
+
+    const outputPath = path.join(tempDir, "first-host.bootstrap");
+    const bootstrapBlocker = await runCli([
+      "--v2-profile",
+      validProfilePath,
+      "--host-bootstrap-output",
+      outputPath,
+    ]);
+    assert.match(String(bootstrapBlocker?.message), /deployment source is unavailable/);
+    assert.equal(readdirSync(tempDir).includes("first-host.bootstrap"), false);
+
+    const v1Bootstrap = await runCli(["--host-bootstrap-output", outputPath]);
+    assert.match(String(v1Bootstrap?.message), /--v2-profile|只适用于/);
 
     const malformedPath = path.join(tempDir, "malformed.json");
     writeFileSync(malformedPath, "{ not json", { mode: 0o600 });

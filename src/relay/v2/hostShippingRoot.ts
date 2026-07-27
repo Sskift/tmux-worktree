@@ -792,7 +792,7 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
       throw failure("INPUTS_UNAVAILABLE");
     }) as RelayV2HostCredentialNativeModuleLoader,
     createTargetExecutionPair: openedRuntime.createTargetExecutionPair,
-    bootstrapSecretByteSource: undefined,
+    bootstrapSecretByteSource: deployment.bootstrapSecretByteSource,
     reauthentication: undefined,
     wssTransport: undefined,
     credentialHttpsTlsTrust: readRelayV2HostTlsCaTrustCut(

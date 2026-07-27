@@ -1,4 +1,12 @@
-import { realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  createReadStream,
+  fstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -20,6 +28,13 @@ import {
   requireRelayV2HostProductionProfileSnapshot,
   type RelayV2HostProductionProfile,
 } from "./hostProductionProfileStore.js";
+import {
+  RELAY_V2_HOST_BOOTSTRAP_SECRET_SOURCE_LIMITS,
+  type RelayV2HostBootstrapSecretByteSource,
+} from "./hostBootstrapSecretSource.js";
+import {
+  createRelayV2HostBootstrapSecretNodeReadableByteSource,
+} from "./hostBootstrapSecretNodeReadableByteSource.js";
 import {
   RelayV2HostShippingProcessSignalOwner,
   runRelayV2HostShippingProcessLifecycle,
@@ -51,6 +66,7 @@ export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly terminalControlDaemonSocketPath: string;
   readonly credentialHttpsTlsTrustCut: RelayV2HostTlsCaTrustCut;
   readonly carrierWssTlsTrustCut: RelayV2HostTlsCaTrustCut;
+  readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
   readonly startupSignal?: AbortSignal;
   closeAndDrain(): Promise<void>;
 }
@@ -121,7 +137,55 @@ function currentCliTarget(): Readonly<{ executable: string; entrypoint: string }
   return Object.freeze({ executable, entrypoint });
 }
 
+function openBootstrapSecretByteSource(
+  path: string | undefined,
+): RelayV2HostBootstrapSecretByteSource | null {
+  if (path === undefined) return null;
+  if ((process.platform !== "darwin" && process.platform !== "linux")
+    || path.length === 0
+    || path.includes("\0")
+    || typeof fsConstants.O_NOFOLLOW !== "number"
+    || typeof process.geteuid !== "function") {
+    throw failure("ACTIVATION_FAILED");
+  }
+
+  let descriptor = -1;
+  let readable: ReturnType<typeof createReadStream> | null = null;
+  try {
+    descriptor = openSync(
+      path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    const opened = fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile()
+      || opened.uid !== BigInt(process.geteuid())
+      || opened.nlink !== 1n
+      || (opened.mode & 0o7777n) !== 0o600n
+      || opened.size <= 0n
+      || opened.size > BigInt(RELAY_V2_HOST_BOOTSTRAP_SECRET_SOURCE_LIMITS.maxRawBytes)) {
+      throw failure("ACTIVATION_FAILED");
+    }
+    readable = createReadStream(path, {
+      fd: descriptor,
+      autoClose: true,
+      emitClose: true,
+      highWaterMark: RELAY_V2_HOST_BOOTSTRAP_SECRET_SOURCE_LIMITS.maxRawBytes,
+    });
+    descriptor = -1;
+    return createRelayV2HostBootstrapSecretNodeReadableByteSource(readable);
+  } catch {
+    if (readable !== null) {
+      try { readable.destroy(); } catch {}
+    }
+    if (descriptor >= 0) {
+      try { closeSync(descriptor); } catch {}
+    }
+    throw failure("ACTIVATION_FAILED");
+  }
+}
+
 async function closeOwned(
+  bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null,
   runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null,
   nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null,
 ): Promise<boolean> {
@@ -140,10 +204,21 @@ async function closeOwned(
       failed = true;
     }
   }
+  if (bootstrapSecretByteSource !== null) {
+    try {
+      await bootstrapSecretByteSource.cancel();
+    } catch {
+      failed = true;
+    }
+  }
   return failed;
 }
 
-async function createActivationOwner(signal?: AbortSignal): Promise<ActivationOwner> {
+async function createActivationOwner(
+  signal?: AbortSignal,
+  bootstrapSecretInputPath?: string,
+): Promise<ActivationOwner> {
+  let bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null = null;
   let nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null = null;
   let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
   try {
@@ -151,6 +226,10 @@ async function createActivationOwner(signal?: AbortSignal): Promise<ActivationOw
     const trustedHome = realpathSync.native(homedir());
     const profileSnapshot = requireRelayV2HostProductionProfileSnapshot(
       readRelayV2HostProductionProfile({ trustedHome }),
+    );
+    requireStartupOpen(signal);
+    bootstrapSecretByteSource = openBootstrapSecretByteSource(
+      bootstrapSecretInputPath,
     );
     requireStartupOpen(signal);
 
@@ -193,13 +272,14 @@ async function createActivationOwner(signal?: AbortSignal): Promise<ActivationOw
     // their own Node system-trust lane.
     const credentialHttpsTlsTrustCut = captureRelayV2HostSystemTlsTrustCut();
     const carrierWssTlsTrustCut = captureRelayV2HostSystemTlsTrustCut();
+    const ownedBootstrapSource = bootstrapSecretByteSource;
     const ownedRuntime = runtimeOwner;
     const ownedSource = nativeModuleSource;
     let closePromise: Promise<void> | null = null;
     const closeAndDrain = (): Promise<void> => {
       if (closePromise !== null) return closePromise;
       closePromise = (async () => {
-        if (await closeOwned(ownedRuntime, ownedSource)) {
+        if (await closeOwned(ownedBootstrapSource, ownedRuntime, ownedSource)) {
           throw failure("CLEANUP_FAILED");
         }
       })();
@@ -217,13 +297,20 @@ async function createActivationOwner(signal?: AbortSignal): Promise<ActivationOw
       terminalControlDaemonSocketPath,
       credentialHttpsTlsTrustCut,
       carrierWssTlsTrustCut,
+      ...(ownedBootstrapSource === null
+        ? {}
+        : { bootstrapSecretByteSource: ownedBootstrapSource }),
       ...(signal === undefined ? {} : { startupSignal: signal }),
       closeAndDrain,
     })) as RelayV2HostTrustedDeploymentActivationRecord;
     activationRecords.set(activation as object, record);
     return Object.freeze({ activation, closeAndDrain });
   } catch {
-    const cleanupFailed = await closeOwned(runtimeOwner, nativeModuleSource);
+    const cleanupFailed = await closeOwned(
+      bootstrapSecretByteSource,
+      runtimeOwner,
+      nativeModuleSource,
+    );
     throw failure(cleanupFailed ? "CLEANUP_FAILED" : "ACTIVATION_FAILED");
   }
 }
@@ -244,10 +331,12 @@ export function takeRelayV2HostTrustedDeploymentActivation(
 
 /**
  * The sole default-off Host trusted deployment activation/source. It accepts
- * no caller authority input: the exact existing profile, revision-7 trusted
- * native source, canonical runtime bundle, and the two independent TLS trust
- * cuts are frozen into one opaque one-shot ticket before the shipping root is
- * called. Any failure drains in reverse order and never selects Relay v1.
+ * no caller authority input; the process entry may only add one non-secret
+ * bootstrap file path, which this owner opens and captures. The exact existing
+ * profile, optional byte source, revision-7 trusted native source, canonical
+ * runtime bundle, and the two independent TLS trust cuts are frozen into one
+ * opaque one-shot ticket before the shipping root is called. Any failure
+ * drains in reverse order and never selects Relay v1.
  */
 export async function startRelayV2HostShippingFromTrustedDeployment(
 ): Promise<RelayV2HostShippingRootHandle> {
@@ -257,9 +346,10 @@ export async function startRelayV2HostShippingFromTrustedDeployment(
 
 async function openRelayV2HostShippingFromTrustedDeployment(
   signal?: AbortSignal,
+  bootstrapSecretInputPath?: string,
   dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
 ): Promise<RelayV2HostShippingRootHandle> {
-  const owner = await createActivationOwner(signal);
+  const owner = await createActivationOwner(signal, bootstrapSecretInputPath);
   try {
     requireStartupOpen(signal);
     const root = await import("./hostShippingRoot.js");
@@ -296,6 +386,7 @@ export async function startRelayV2HostDashboardManagementFromTrustedDeployment(
   }
   return openRelayV2HostShippingFromTrustedDeployment(
     dashboardManagement.signal,
+    undefined,
     dashboardManagement,
   );
 }
@@ -307,14 +398,24 @@ export async function startRelayV2HostDashboardManagementFromTrustedDeployment(
  * lifecycle retains and drives that same handle until signal, failure, or
  * permanent supersession.
  */
-export async function runRelayV2HostShippingFromTrustedDeployment(): Promise<number> {
-  if (arguments.length !== 0) throw failure("ACTIVATION_INVALID");
+export async function runRelayV2HostShippingFromTrustedDeployment(
+  bootstrapSecretInputPath?: string,
+): Promise<number> {
+  if (arguments.length > 1
+    || (bootstrapSecretInputPath !== undefined
+      && (typeof bootstrapSecretInputPath !== "string"
+        || bootstrapSecretInputPath.length === 0
+        || bootstrapSecretInputPath.includes("\0")))) {
+    throw failure("ACTIVATION_INVALID");
+  }
   const processSignals = new RelayV2HostShippingProcessSignalOwner();
   try {
     try {
-      const handle = await openRelayV2HostShippingFromTrustedDeployment(
-        processSignals.signal,
-      );
+    const handle = await openRelayV2HostShippingFromTrustedDeployment(
+      processSignals.signal,
+      bootstrapSecretInputPath,
+      undefined,
+    );
       const result = await runRelayV2HostShippingProcessLifecycle(handle, {
         signal: processSignals.signal,
       });
