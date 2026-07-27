@@ -1189,6 +1189,7 @@ test("post-load tampering keeps complete Host HTTPS and WSS TLS lanes fixed", as
     Object.hasOwn = originalObjectHasOwn;
     Object.keys = originalObjectKeys;
     Array.from = originalArrayFrom;
+    Array.isArray = originalArrayIsArray;
     String.prototype.charCodeAt = originalStringCharCodeAt;
     String.prototype.includes = originalStringIncludes;
     String.prototype.slice = originalStringSlice;
@@ -1239,6 +1240,10 @@ test("post-load tampering keeps complete Host HTTPS and WSS TLS lanes fixed", as
     Array.from = function poisonedArrayFrom(value, ...args) {
       if (isTokenBearingString(value)) observeTokenPrimitive("Array.from");
       return TEST_REFLECT_APPLY(originalArrayFrom, this, [value, ...args]);
+    };
+    Array.isArray = function poisonedTokenArrayIsArray(value) {
+      if (objectCarriesSecret(value)) observeTokenPrimitive("Array.isArray");
+      return TEST_REFLECT_APPLY(originalArrayIsArray, this, [value]);
     };
     WeakMap.prototype.delete = function poisonedWeakMapDelete(key) {
       if (isOpaqueTokenKey(key)) observeTokenPrimitive("WeakMap.delete");
@@ -1577,6 +1582,7 @@ test("post-load tampering keeps complete Host HTTPS and WSS TLS lanes fixed", as
     );
   const tokenPoisonedObjectHasOwn = Object.hasOwn;
   const tokenPoisonedObjectKeys = Object.keys;
+  const tokenPoisonedArrayIsArray = Array.isArray;
   Object.hasOwn = targetPoison("Object.hasOwn", tokenPoisonedObjectHasOwn);
   Object.create = function poisonedObjectCreate(prototype, properties) {
     if (prototype === null) {
@@ -1656,7 +1662,7 @@ test("post-load tampering keeps complete Host HTTPS and WSS TLS lanes fixed", as
     }
     return TEST_REFLECT_APPLY(originalReflectOwnKeys, this, [value]);
   };
-  Array.isArray = targetPoison("Array.isArray", originalArrayIsArray);
+  Array.isArray = targetPoison("Array.isArray", tokenPoisonedArrayIsArray);
   String.prototype.startsWith = function poisonedStringStartsWith(...args) {
     liveWssBearerStartsWithCalls += 1;
     return TEST_REFLECT_APPLY(originalStringStartsWith, this, args);

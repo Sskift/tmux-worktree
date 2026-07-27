@@ -11,6 +11,7 @@ const STRING_INCLUDES = String.prototype.includes;
 const STRING_TRIM = String.prototype.trim;
 const ARRAY_CONSTRUCTOR = Array;
 const ARRAY_FROM = ARRAY_CONSTRUCTOR.from;
+const ARRAY_IS_ARRAY = ARRAY_CONSTRUCTOR.isArray;
 
 export type RelayV2CodecFailureClass =
   | "base64-decoded-limit"
@@ -142,7 +143,10 @@ function reject(failureClass: RelayV2CodecFailureClass): never {
 
 function object(value: RelayV2JsonValue): RelayV2JsonObject {
   if (value === null) reject("forbidden-null");
-  if (typeof value !== "object" || Array.isArray(value)) reject("type-coercion");
+  if (typeof value !== "object"
+    || REFLECT_APPLY(ARRAY_IS_ARRAY, ARRAY_CONSTRUCTOR, [value])) {
+    reject("type-coercion");
+  }
   return value;
 }
 
@@ -270,7 +274,9 @@ function array(
   minimum = 0,
 ): RelayV2JsonValue[] {
   if (value === null) reject("forbidden-null");
-  if (!Array.isArray(value)) reject("type-coercion");
+  if (!REFLECT_APPLY(ARRAY_IS_ARRAY, ARRAY_CONSTRUCTOR, [value])) {
+    reject("type-coercion");
+  }
   if (value.length < minimum || value.length > maximum) reject("invalid-argument");
   for (const item of value) validator(item);
   return value;

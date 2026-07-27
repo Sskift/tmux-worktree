@@ -34,6 +34,7 @@ export interface RelayV2JsonInspection {
 
 const OBJECT_CREATE = Object.create;
 const REFLECT_APPLY = Reflect.apply;
+const ARRAY_IS_ARRAY = Array.isArray;
 const JSON_OBJECT = JSON;
 const JSON_PARSE = JSON_OBJECT.parse;
 const REGEXP_EXEC = RegExp.prototype.exec;
@@ -284,7 +285,9 @@ class StrictJsonParser {
 function isJsonObject(
   value: RelayV2JsonValue | undefined,
 ): value is { [key: string]: RelayV2JsonValue } {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return value !== null
+    && typeof value === "object"
+    && !REFLECT_APPLY(ARRAY_IS_ARRAY, undefined, [value]);
 }
 
 export function decodeRelayV2StrictUtf8(bytes: Uint8Array): string {
