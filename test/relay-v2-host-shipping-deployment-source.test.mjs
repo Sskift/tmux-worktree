@@ -23,6 +23,13 @@ const virtualModules = new Map([
       return home + "/.tmux-worktree/terminal-control-v1.sock";
     }
   `],
+  ["../../terminalControl/client.js", `
+    export async function requestTerminalControl(input, options) {
+      const h = globalThis.__hostDeploymentHarness;
+      h.events.push(["terminal.ready", input, options]);
+      return { protocolVersion: 1, authority: "local-terminal-control" };
+    }
+  `],
   ["./hostProductionProfileStore.js", `
     export function readRelayV2HostProductionProfile(options) {
       const h = globalThis.__hostDeploymentHarness;
@@ -91,6 +98,14 @@ const virtualModules = new Map([
       bundles.delete(bundle);
       h.events.push(["runtime.consume"]);
       return opened;
+    }
+  `],
+  ["./hostShippingProcessLifecycle.js", `
+    export async function runRelayV2HostShippingProcessLifecycle(handle) {
+      const h = globalThis.__hostDeploymentHarness;
+      h.events.push(["process.run", handle.inspect()]);
+      await handle.closeAndDrain();
+      return { status: "superseded", exitCode: 78 };
     }
   `],
   ["./hostTlsTrustMaterial.js", `
@@ -221,6 +236,10 @@ const plugin = {
       path: "../../terminalControl/store.js",
       namespace: "host-deployment-stub",
     }));
+    esbuild.onResolve({ filter: /^\.\.\/\.\.\/terminalControl\/client\.js$/ }, () => ({
+      path: "../../terminalControl/client.js",
+      namespace: "host-deployment-stub",
+    }));
     esbuild.onResolve({ filter: /^\.\/hostShippingRoot\.js$/ }, () => ({
       path: rootPath,
     }));
@@ -285,7 +304,7 @@ function createHarness(home) {
   };
 }
 
-test("Host trusted deployment activation freezes one lineage and rolls back as one opaque owner", async () => {
+test("Relay v2 Host normal process lifecycle prepares terminal control and freezes one trusted lineage", async () => {
   const home = mkdtempSync(join(tmpdir(), "tw-v2-host-deployment-"));
   const cli = join(home, "cli.cjs");
   writeFileSync(cli, "/* fixture */\n");
@@ -303,6 +322,22 @@ test("Host trusted deployment activation freezes one lineage and rolls back as o
 
     const handle = await module.startRelayV2HostShippingFromTrustedDeployment();
     assert.equal(first.profileReads, 1);
+    const terminalReadyIndex = first.events.findIndex(([name]) => name === "terminal.ready");
+    const runtimeCreateIndex = first.events.findIndex(([name]) => name === "runtime.create");
+    assert.ok(terminalReadyIndex >= 0);
+    assert.ok(runtimeCreateIndex > terminalReadyIndex);
+    const [, terminalRequest, terminalOptions] = first.events[terminalReadyIndex];
+    assert.deepEqual(terminalRequest, { type: "ping" });
+    assert.equal(terminalOptions.socketPath, join(
+      home,
+      ".tmux-worktree",
+      "terminal-control-v1.sock",
+    ));
+    assert.equal(terminalOptions.autoStart, true);
+    assert.deepEqual(terminalOptions.autoStartCliTarget, {
+      executable: process.execPath,
+      entrypoint: cli,
+    });
     assert.equal(first.foundationProfileHostId, first.profile.hostId);
     assert.equal(first.spoolProfileHostId, first.profile.hostId);
     assert.equal(first.welcomeProfileHostId, first.profile.hostId);
@@ -336,6 +371,16 @@ test("Host trusted deployment activation freezes one lineage and rolls back as o
       "runtime.close",
       "native.close",
     ]);
+
+    const processOwned = createHarness(home);
+    globalThis.__hostDeploymentHarness = processOwned;
+    assert.equal(await module.runRelayV2HostShippingFromTrustedDeployment(), 78);
+    assert.deepEqual(
+      processOwned.events.find(([name]) => name === "process.run"),
+      ["process.run", { status: "stopped", controllerGeneration: "0" }],
+    );
+    assert.ok(processOwned.events.some(([name]) => name === "runtime.close"));
+    assert.ok(processOwned.events.some(([name]) => name === "native.close"));
 
     const second = createHarness(home);
     second.failIntake = true;

@@ -798,7 +798,9 @@ Relay v2:
   credential reference 只来自 canonical 运行时 profile store；rev7 trusted native source、
   canonical runtime bundle 与两条独立 TLS trust cut 只由唯一 trusted deployment activation
   owner 冻结并以 opaque one-shot ticket 交给 shipping root。任一 prerequisite 失败都逆序
-  drain、fail closed；它不读取 v1 secret、不宣告 capability，也绝不回退到 v1。
+  drain、fail closed。trusted source 会按需启动 canonical terminal-control daemon，随后唯一
+  v2 进程 owner 执行初始 start、同 hostInstanceId 的有界退避重连与 signal/superseded drain；
+  它不读取 v1 secret、不宣告 capability，也绝不回退到 v1。
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
@@ -3515,9 +3517,9 @@ export async function run(): Promise<void> {
     // owner。profile snapshot、rev7 native source、canonical runtime bundle
     // 与两条独立 TLS trust cut 以同一个 opaque one-shot ticket 交给 Host
     // shipping root；任何失败逆序 drain 且绝不回退 v1。
-    const { startRelayV2HostShippingFromTrustedDeployment } =
+    const { runRelayV2HostShippingFromTrustedDeployment } =
       await import("./relay/v2/hostShippingDeploymentSource.js");
-    await startRelayV2HostShippingFromTrustedDeployment();
+    process.exitCode = await runRelayV2HostShippingFromTrustedDeployment();
     return;
   }
   const statusOwnership: RelayStatusOwnership = {

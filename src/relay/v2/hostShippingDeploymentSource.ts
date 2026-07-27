@@ -2,6 +2,7 @@ import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
+import { requestTerminalControl } from "../../terminalControl/client.js";
 import { defaultTerminalControlSocketPath } from "../../terminalControl/store.js";
 import {
   createRelayV2CanonicalHostRuntimeBundleOwnerV1,
@@ -19,6 +20,8 @@ import {
   requireRelayV2HostProductionProfileSnapshot,
   type RelayV2HostProductionProfile,
 } from "./hostProductionProfileStore.js";
+import { runRelayV2HostShippingProcessLifecycle } from
+  "./hostShippingProcessLifecycle.js";
 import type { RelayV2HostShippingRootHandle } from "./hostShippingRoot.js";
 import {
   captureRelayV2HostSystemTlsTrustCut,
@@ -151,10 +154,18 @@ async function createActivationOwner(): Promise<ActivationOwner> {
       throw failure("ACTIVATION_FAILED");
     }
 
-    const terminalControlDaemonSocketPath =
-      defaultTerminalControlSocketPath(trustedHome);
+    const terminalControlDaemonSocketPath = defaultTerminalControlSocketPath(trustedHome);
+    const localCliTarget = currentCliTarget();
+    await requestTerminalControl(
+      { type: "ping" },
+      {
+        socketPath: terminalControlDaemonSocketPath,
+        autoStart: true,
+        autoStartCliTarget: localCliTarget,
+      },
+    );
     runtimeOwner = await createRelayV2CanonicalHostRuntimeBundleOwnerV1({
-      localCliTarget: currentCliTarget(),
+      localCliTarget,
       terminalControlDaemonSocketPath,
       knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
       sshExecutable: "/usr/bin/ssh",
@@ -238,4 +249,16 @@ export async function startRelayV2HostShippingFromTrustedDeployment(
     }
     throw failure("ACTIVATION_FAILED");
   }
+}
+
+/**
+ * The process entry for the explicit v2 Host lane. The trusted source opens
+ * exactly one shipping root, then the dedicated process lifecycle owner
+ * retains and drives it until signal, failure, or permanent supersession.
+ */
+export async function runRelayV2HostShippingFromTrustedDeployment(): Promise<number> {
+  if (arguments.length !== 0) throw failure("ACTIVATION_INVALID");
+  const handle = await startRelayV2HostShippingFromTrustedDeployment();
+  const result = await runRelayV2HostShippingProcessLifecycle(handle);
+  return result.exitCode;
 }

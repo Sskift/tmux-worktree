@@ -15,6 +15,11 @@ type DistributiveRequestInput<T> = T extends TerminalControlRequest
 
 export type TerminalControlRequestInput = DistributiveRequestInput<TerminalControlRequest>;
 
+export interface TerminalControlAutoStartCliTarget {
+  readonly executable: string;
+  readonly entrypoint: string;
+}
+
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -23,12 +28,17 @@ function clientError(error: NodeJS.ErrnoException): boolean {
   return error.code === "ENOENT" || error.code === "ECONNREFUSED";
 }
 
-function startServer(): void {
-  const cli = process.env.TW_TERMINAL_CONTROL_CLI?.trim()
+function startServer(target?: Readonly<TerminalControlAutoStartCliTarget>): void {
+  const cli = target?.entrypoint
+    || process.env.TW_TERMINAL_CONTROL_CLI?.trim()
     || process.env.TW_DASHBOARD_CLI?.trim()
     || process.argv[1];
   if (!cli) throw new Error("cannot locate tw CLI to start terminal-control server");
-  const child = spawn(process.execPath, [cli, "terminal-control", "serve"], {
+  const child = spawn(target?.executable || process.execPath, [
+    cli,
+    "terminal-control",
+    "serve",
+  ], {
     detached: true,
     stdio: "ignore",
     env: process.env,
@@ -98,6 +108,7 @@ export async function requestTerminalControl<T = unknown>(
     socketPath?: string;
     timeoutMs?: number;
     autoStart?: boolean;
+    autoStartCliTarget?: Readonly<TerminalControlAutoStartCliTarget>;
   } = {},
 ): Promise<T> {
   const socketPath = options.socketPath ?? terminalControlSocketPath();
@@ -114,7 +125,7 @@ export async function requestTerminalControl<T = unknown>(
     if (options.autoStart === false || !(error instanceof Error) || !clientError(error as NodeJS.ErrnoException)) {
       throw error;
     }
-    startServer();
+    startServer(options.autoStartCliTarget);
     const deadline = Date.now() + Math.min(timeoutMs, 5_000);
     while (true) {
       try {

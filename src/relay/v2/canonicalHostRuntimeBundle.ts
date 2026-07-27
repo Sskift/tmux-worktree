@@ -26,7 +26,8 @@ declare const canonicalHostRuntimeBundleBrand: unique symbol;
 /**
  * One-shot, fieldless ticket for the default-off canonical Host runtime
  * foundation. Its private record binds one config generation owner, one
- * child runner, and the already-running local terminal-control authority.
+ * child runner, and the process-owner-prepared local terminal-control
+ * authority.
  */
 export interface RelayV2CanonicalHostRuntimeBundleV1 {
   readonly [canonicalHostRuntimeBundleBrand]: void;
@@ -58,7 +59,7 @@ export interface RelayV2CanonicalHostRuntimeBundleOptionsV1 {
     executable: string;
     entrypoint?: string;
   }>;
-  /** Exact primary terminal-control daemon socket; this owner never starts it. */
+  /** Exact ready primary terminal-control daemon socket; this owner never starts it. */
   terminalControlDaemonSocketPath: string;
   /** Fixed trust store for every configured SSH Host. */
   knownHostsFile: string;
@@ -196,9 +197,10 @@ export function consumeRelayV2CanonicalHostRuntimeBundleV1(
 
 /**
  * Creates the default-off canonical Host runtime bundle owner. Construction
- * reads only the explicit Host config and preflights the already-running
- * local exact terminal-control sibling ingress. It does not start a daemon,
- * connector, WSS, CLI shipping root, or advertise any capability.
+ * reads only the explicit Host config and preflights the local exact
+ * terminal-control sibling ingress already made ready by its process owner.
+ * The bundle itself does not start a daemon, connector, WSS, CLI shipping
+ * root, or advertise any capability.
  */
 export async function createRelayV2CanonicalHostRuntimeBundleOwnerV1(
   rawOptions: RelayV2CanonicalHostRuntimeBundleOptionsV1,
