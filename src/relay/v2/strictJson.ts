@@ -32,6 +32,19 @@ export interface RelayV2JsonInspection {
   totalNodes: number;
 }
 
+const OBJECT_CREATE = Object.create;
+const REFLECT_APPLY = Reflect.apply;
+const JSON_OBJECT = JSON;
+const JSON_PARSE = JSON_OBJECT.parse;
+const REGEXP_EXEC = RegExp.prototype.exec;
+const REGEXP_TEST = RegExp.prototype.test;
+const STRING_CHAR_CODE_AT = String.prototype.charCodeAt;
+const STRING_SLICE = String.prototype.slice;
+const TEXT_DECODER_CONSTRUCTOR = TextDecoder;
+const TEXT_DECODER_DECODE = TEXT_DECODER_CONSTRUCTOR.prototype.decode;
+const STRICT_UTF8_TEXT_DECODER =
+  new TEXT_DECODER_CONSTRUCTOR("utf-8", { fatal: true });
+
 export class RelayV2JsonError extends Error {
   constructor(readonly failureClass: RelayV2JsonFailureClass) {
     super("Relay v2 JSON is invalid");
@@ -106,7 +119,7 @@ class StrictJsonParser {
     this.offset += 1;
     this.skipWhitespace();
     const result = this.build
-      ? Object.create(null) as { [key: string]: RelayV2JsonValue }
+      ? OBJECT_CREATE(null) as { [key: string]: RelayV2JsonValue }
       : undefined;
     const seen = new Set<string>();
     let directKeys = 0;
@@ -177,11 +190,20 @@ class StrictJsonParser {
     const start = this.offset;
     this.offset += 1;
     while (this.offset < this.source.length) {
-      const char = this.source.charCodeAt(this.offset);
+      const char = REFLECT_APPLY(
+        STRING_CHAR_CODE_AT,
+        this.source,
+        [this.offset],
+      ) as number;
       if (char === 0x22) {
         this.offset += 1;
         try {
-          return JSON.parse(this.source.slice(start, this.offset)) as string;
+          const encoded = REFLECT_APPLY(
+            STRING_SLICE,
+            this.source,
+            [start, this.offset],
+          ) as string;
+          return REFLECT_APPLY(JSON_PARSE, JSON_OBJECT, [encoded]) as string;
         } catch {
           return this.fail("malformed-json");
         }
@@ -191,7 +213,11 @@ class StrictJsonParser {
         this.offset += 1;
         const escape = this.source[this.offset];
         if (escape === "u") {
-          if (!/^[0-9a-fA-F]{4}$/.test(this.source.slice(this.offset + 1, this.offset + 5))) {
+          const escapeDigits = REFLECT_APPLY(STRING_SLICE, this.source, [
+            this.offset + 1,
+            this.offset + 5,
+          ]) as string;
+          if (!REFLECT_APPLY(REGEXP_TEST, /^[0-9a-fA-F]{4}$/, [escapeDigits])) {
             this.fail("malformed-json");
           }
           this.offset += 5;
@@ -207,12 +233,19 @@ class StrictJsonParser {
   }
 
   private parseNumber(): number {
-    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(
-      this.source.slice(this.offset),
-    );
+    const remainder = REFLECT_APPLY(
+      STRING_SLICE,
+      this.source,
+      [this.offset],
+    ) as string;
+    const match = REFLECT_APPLY(
+      REGEXP_EXEC,
+      /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/,
+      [remainder],
+    ) as RegExpExecArray | null;
     if (!match) return this.fail("malformed-json");
     this.offset += match[0].length;
-    if (!/[.eE]/.test(match[0])) {
+    if (!REFLECT_APPLY(REGEXP_TEST, /[.eE]/, [match[0]])) {
       let integer: bigint;
       try {
         integer = BigInt(match[0]);
@@ -229,7 +262,10 @@ class StrictJsonParser {
   }
 
   private parseLiteral<T extends null | boolean>(text: string, value: T): T {
-    if (this.source.slice(this.offset, this.offset + text.length) !== text) {
+    if (REFLECT_APPLY(STRING_SLICE, this.source, [
+      this.offset,
+      this.offset + text.length,
+    ]) !== text) {
       this.fail("malformed-json");
     }
     this.offset += text.length;
@@ -253,7 +289,11 @@ function isJsonObject(
 
 export function decodeRelayV2StrictUtf8(bytes: Uint8Array): string {
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return REFLECT_APPLY(
+      TEXT_DECODER_DECODE,
+      STRICT_UTF8_TEXT_DECODER,
+      [bytes],
+    ) as string;
   } catch {
     throw new RelayV2JsonError("invalid-utf8");
   }

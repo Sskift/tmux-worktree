@@ -1406,6 +1406,7 @@ function captureManagedWssOptions(
     "maxBufferedBytes",
     "closeDrainDeadlineMs",
     "scheduleCloseDrain",
+    "tlsTrust",
   ] as const;
   if (typeof value !== "object" || value === null || Array.isArray(value)
     || nodeTypes.isProxy(value)) throw managedCompositionFailure();

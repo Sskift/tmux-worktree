@@ -1,6 +1,23 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { decodeRelayV2AuthUtf8, parseRelayV2AuthJson } from "./authJson.js";
 
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const OBJECT_KEYS = Object.keys;
+const REFLECT_APPLY = Reflect.apply;
+const BUFFER_CONSTRUCTOR = Buffer;
+const BUFFER_BYTE_LENGTH = BUFFER_CONSTRUCTOR.byteLength;
+const BUFFER_FROM = BUFFER_CONSTRUCTOR.from;
+const BUFFER_TO_STRING = BUFFER_CONSTRUCTOR.prototype.toString;
+const REGEXP_TEST = RegExp.prototype.test;
+const STRING_CHAR_CODE_AT = String.prototype.charCodeAt;
+const STRING_SPLIT = String.prototype.split;
+const STRING_TRIM = String.prototype.trim;
+const TYPED_ARRAY_PROTOTYPE = OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
+const TYPED_ARRAY_BYTE_LENGTH_GETTER =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TYPED_ARRAY_PROTOTYPE, "byteLength")?.get;
+
 export const RELAY_V2_ACCESS_TOKEN_PREFIX = "twcap2";
 export const RELAY_V2_ACCESS_TOKEN_AUDIENCE = "tw-relay-ws";
 export const RELAY_V2_MAX_ACCESS_TTL_SECONDS = 3_600;
@@ -67,15 +84,28 @@ function invalid(): never {
   throw new RelayV2AccessTokenError();
 }
 
+function typedArrayByteLength(value: Uint8Array): number {
+  if (typeof TYPED_ARRAY_BYTE_LENGTH_GETTER !== "function") return invalid();
+  try {
+    return REFLECT_APPLY(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []) as number;
+  } catch {
+    return invalid();
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function hasUnpairedSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
+    const code = REFLECT_APPLY(STRING_CHAR_CODE_AT, value, [index]) as number;
     if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
+      const next = REFLECT_APPLY(
+        STRING_CHAR_CODE_AT,
+        value,
+        [index + 1],
+      ) as number;
       if (next < 0xdc00 || next > 0xdfff) return true;
       index += 1;
     } else if (code >= 0xdc00 && code <= 0xdfff) {
@@ -88,9 +118,9 @@ function hasUnpairedSurrogate(value: string): boolean {
 export function isRelayV2AuthIdentifier(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value)
+    && BUFFER_BYTE_LENGTH(value, "utf8") <= 128
+    && REFLECT_APPLY(STRING_TRIM, value, []) === value
+    && !REFLECT_APPLY(REGEXP_TEST, /[\0\r\n]/, [value])
     && !hasUnpairedSurrogate(value);
 }
 
@@ -102,8 +132,8 @@ function isTimestamp(value: unknown): value is number {
 
 function hasExactKeys(value: Record<string, unknown>): boolean {
   const allowed = new Set<string>([...REQUIRED_CLAIM_KEYS, ...OPTIONAL_CLAIM_KEYS]);
-  return REQUIRED_CLAIM_KEYS.every((key) => Object.hasOwn(value, key))
-    && Object.keys(value).every((key) => allowed.has(key));
+  return REQUIRED_CLAIM_KEYS.every((key) => OBJECT_HAS_OWN(value, key))
+    && OBJECT_KEYS(value).every((key) => allowed.has(key));
 }
 
 function validateClaimSemantics(claims: RelayV2AccessTokenClaims): void {
@@ -152,21 +182,32 @@ export function decodeCanonicalRelayV2Base64Url(
     typeof value !== "string"
     || value.length === 0
     || value.length % 4 === 1
-    || !/^[A-Za-z0-9_-]+$/.test(value)
+    || !REFLECT_APPLY(REGEXP_TEST, /^[A-Za-z0-9_-]+$/, [value])
     || Math.floor(value.length * 3 / 4) > maxDecodedBytes
   ) {
     invalid();
   }
-  const decoded = Buffer.from(value, "base64url");
-  if (decoded.byteLength > maxDecodedBytes || decoded.toString("base64url") !== value) invalid();
+  const decoded = REFLECT_APPLY(
+    BUFFER_FROM,
+    BUFFER_CONSTRUCTOR,
+    [value, "base64url"],
+  ) as Buffer;
+  if (typedArrayByteLength(decoded) > maxDecodedBytes
+    || REFLECT_APPLY(BUFFER_TO_STRING, decoded, ["base64url"]) !== value) invalid();
   return decoded;
 }
 
 function validateSecret(secret: Uint8Array): Buffer {
-  if (!(secret instanceof Uint8Array) || secret.byteLength < 32 || secret.byteLength > 64) {
+  if (!(secret instanceof Uint8Array)
+    || typedArrayByteLength(secret) < 32
+    || typedArrayByteLength(secret) > 64) {
     invalid();
   }
-  return Buffer.from(secret);
+  return REFLECT_APPLY(
+    BUFFER_FROM,
+    BUFFER_CONSTRUCTOR,
+    [secret],
+  ) as Buffer;
 }
 
 function canonicalClaimsObject(claims: RelayV2AccessTokenClaims): Record<string, unknown> {
@@ -197,8 +238,16 @@ export function encodeRelayV2AccessToken(
     if (!isRecord(claims) || !hasExactKeys(claims)) invalid();
     validateClaimSemantics(claims);
     const key = validateSecret(secret);
-    const payload = Buffer.from(JSON.stringify(canonicalClaimsObject(claims)), "utf8")
-      .toString("base64url");
+    const payloadBytes = REFLECT_APPLY(
+      BUFFER_FROM,
+      BUFFER_CONSTRUCTOR,
+      [JSON.stringify(canonicalClaimsObject(claims)), "utf8"],
+    ) as Buffer;
+    const payload = REFLECT_APPLY(
+      BUFFER_TO_STRING,
+      payloadBytes,
+      ["base64url"],
+    ) as string;
     const mac = createHmac("sha256", key)
       .update(`${RELAY_V2_ACCESS_TOKEN_PREFIX}.${payload}`, "ascii")
       .digest("base64url");
@@ -216,18 +265,18 @@ export function verifyRelayV2AccessToken(
     if (
       typeof token !== "string"
       || token.length === 0
-      || Buffer.byteLength(token, "utf8") > MAX_TOKEN_BYTES
-      || /\s/.test(token)
+      || BUFFER_BYTE_LENGTH(token, "utf8") > MAX_TOKEN_BYTES
+      || REFLECT_APPLY(REGEXP_TEST, /\s/, [token])
     ) {
       invalid();
     }
-    const segments = token.split(".");
+    const segments = REFLECT_APPLY(STRING_SPLIT, token, ["."]) as string[];
     if (segments.length !== 3 || segments[0] !== RELAY_V2_ACCESS_TOKEN_PREFIX) invalid();
     const payloadSegment = segments[1];
     const macSegment = segments[2];
     const payload = decodeCanonicalRelayV2Base64Url(payloadSegment, MAX_PAYLOAD_BYTES);
     const mac = decodeCanonicalRelayV2Base64Url(macSegment, MAC_BYTES);
-    if (mac.byteLength !== MAC_BYTES) invalid();
+    if (typedArrayByteLength(mac) !== MAC_BYTES) invalid();
 
     const claims = parseClaims(payload);
     const secret = options.resolveSecret(claims.kid);

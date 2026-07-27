@@ -7,13 +7,87 @@ import type {
   RelayV2HttpsSchema,
   RelayV2JsonObject,
 } from "./codecSchema.js";
+import { types as nodeTypes } from "node:util";
 import {
-  createRelayV2SingleExchangeNodeHttpsTransport,
+  createRelayV2HostCaOnlySingleExchangeNodeHttpsTransport,
   performRelayV2SingleExchangeHttps,
   readRelayV2SingleExchangeAbortState,
   type RelayV2SingleExchangeHttpsTransport,
   type RelayV2SingleExchangeHttpsTransportResponse,
 } from "./singleExchangeHttpsTransport.js";
+import {
+  captureRelayV2HostTlsCaTrustCut,
+  type RelayV2HostTlsCaTrust,
+  type RelayV2HostTlsCaTrustCut,
+} from "./hostTlsTrustMaterial.js";
+
+const NODE_IS_PROXY = nodeTypes.isProxy;
+const NODE_IS_UINT8_ARRAY = nodeTypes.isUint8Array;
+const OBJECT_PROTOTYPE = Object.prototype;
+const OBJECT_CREATE = Object.create;
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const REFLECT_APPLY = Reflect.apply;
+const REFLECT_OWN_KEYS = Reflect.ownKeys;
+const ARRAY_IS_ARRAY = Array.isArray;
+const BUFFER_CONSTRUCTOR = Buffer;
+const BUFFER_ALLOC_UNSAFE = BUFFER_CONSTRUCTOR.allocUnsafe;
+const BUFFER_BYTE_LENGTH = BUFFER_CONSTRUCTOR.byteLength;
+const REGEXP_TEST = RegExp.prototype.test;
+const STRING_TRIM = String.prototype.trim;
+const STRING_INCLUDES = String.prototype.includes;
+const STRING_INDEX_OF = String.prototype.indexOf;
+const STRING_SLICE = String.prototype.slice;
+const TYPED_ARRAY_PROTOTYPE = OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
+const TYPED_ARRAY_BYTE_LENGTH_GETTER =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TYPED_ARRAY_PROTOTYPE, "byteLength")?.get;
+const TYPED_ARRAY_SET =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TYPED_ARRAY_PROTOTYPE, "set")?.value;
+const TYPED_ARRAY_SUBARRAY =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TYPED_ARRAY_PROTOTYPE, "subarray")?.value;
+const URL_CONSTRUCTOR = URL;
+const URL_PROTOTYPE = URL_CONSTRUCTOR.prototype;
+const URL_PROTOCOL_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "protocol");
+const URL_HOSTNAME_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "hostname");
+const URL_USERNAME_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "username");
+const URL_PASSWORD_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "password");
+const URL_PATHNAME_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "pathname");
+const URL_SEARCH_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "search");
+const URL_HASH_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "hash");
+const URL_PORT_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "port");
+const URL_ORIGIN_DESCRIPTOR =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(URL_PROTOTYPE, "origin");
+const URL_PROTOCOL_GETTER = URL_PROTOCOL_DESCRIPTOR?.get;
+const URL_HOSTNAME_GETTER = URL_HOSTNAME_DESCRIPTOR?.get;
+const URL_USERNAME_GETTER = URL_USERNAME_DESCRIPTOR?.get;
+const URL_PASSWORD_GETTER = URL_PASSWORD_DESCRIPTOR?.get;
+const URL_PATHNAME_GETTER = URL_PATHNAME_DESCRIPTOR?.get;
+const URL_SEARCH_GETTER = URL_SEARCH_DESCRIPTOR?.get;
+const URL_HASH_GETTER = URL_HASH_DESCRIPTOR?.get;
+const URL_PORT_GETTER = URL_PORT_DESCRIPTOR?.get;
+const URL_ORIGIN_GETTER = URL_ORIGIN_DESCRIPTOR?.get;
+const URL_GETTER_DESCRIPTORS_VALID =
+  isUrlGetterDescriptor(URL_PROTOCOL_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_HOSTNAME_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_USERNAME_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_PASSWORD_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_PATHNAME_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_SEARCH_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_HASH_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_PORT_DESCRIPTOR)
+  && isUrlGetterDescriptor(URL_ORIGIN_DESCRIPTOR);
+const INVALID_ISSUER_CHARACTERS = /[\0\r\n\s]/;
 
 const MAX_ISSUER_URL_BYTES = 2_048;
 const JSON_CONTENT_TYPE = "application/json";
@@ -26,6 +100,31 @@ const CREDENTIAL_ERROR_STATUSES = new Set([
 export const RELAY_V2_HOST_BOOTSTRAP_HTTPS_PATH = "/v2/hosts/bootstrap";
 export const RELAY_V2_HOST_TOKEN_REFRESH_HTTPS_PATH = "/v2/hosts/tokens/refresh";
 export const RELAY_V2_HOST_CREDENTIAL_HTTPS_BODY_BYTES = RELAY_V2_HTTP_BODY_BYTES;
+
+function isUrlGetterDescriptor(
+  descriptor: PropertyDescriptor | undefined,
+): boolean {
+  return descriptor !== undefined
+    && typeof descriptor.get === "function"
+    && descriptor.enumerable === true
+    && descriptor.configurable === true
+    && !OBJECT_HAS_OWN(descriptor, "value")
+    && !OBJECT_HAS_OWN(descriptor, "writable");
+}
+
+function typedArrayByteLength(value: Uint8Array): number | null {
+  if (typeof TYPED_ARRAY_BYTE_LENGTH_GETTER !== "function") return null;
+  try {
+    const length = REFLECT_APPLY(
+      TYPED_ARRAY_BYTE_LENGTH_GETTER,
+      value,
+      [],
+    );
+    return typeof length === "number" && length >= 0 ? length : null;
+  } catch {
+    return null;
+  }
+}
 
 export type RelayV2HostCredentialHttpsAdapterErrorCode =
   | "CONFIGURATION_INVALID"
@@ -107,6 +206,8 @@ extends RelayV2HostCredentialHttpsResponseFields {
 export interface RelayV2HostCredentialHttpsAdapterOptions {
   /** Exact HTTPS issuer origin; request paths are selected only by this adapter. */
   readonly issuerUrl: string;
+  /** Default-off CA-only extension; omission keeps explicit system trust. */
+  readonly tlsTrust?: RelayV2HostTlsCaTrust;
   /** Isolated test seam. No production composition is constructed here. */
   readonly transport?: RelayV2SingleExchangeHttpsTransport;
 }
@@ -123,11 +224,11 @@ class RelayV2HostCredentialInternalFailure {
   constructor(readonly rejection: CredentialRejectionMetadata | null) {}
 }
 
-const NON_RETRYABLE_CREDENTIAL_ERROR = Object.freeze({
+const NON_RETRYABLE_CREDENTIAL_ERROR = OBJECT_FREEZE({
   retryable: false,
   retryAfter: "null",
 } as const);
-const RETRYABLE_CREDENTIAL_ERROR = Object.freeze({
+const RETRYABLE_CREDENTIAL_ERROR = OBJECT_FREEZE({
   retryable: true,
   retryAfter: "nonnegative_integer",
 } as const);
@@ -195,18 +296,54 @@ function internalCredentialRejection(value: unknown): CredentialRejectionMetadat
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !ARRAY_IS_ARRAY(value);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   let actual: PropertyKey[];
   try {
-    actual = Reflect.ownKeys(value);
+    actual = REFLECT_OWN_KEYS(value);
   } catch {
     return false;
   }
-  return actual.length === expected.length
-    && expected.every((key) => actual.includes(key));
+  if (actual.length !== expected.length) return false;
+  for (let expectedIndex = 0; expectedIndex < expected.length; expectedIndex += 1) {
+    let found = false;
+    for (let actualIndex = 0; actualIndex < actual.length; actualIndex += 1) {
+      if (actual[actualIndex] === expected[expectedIndex]) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+function captureAdapterOptions(value: unknown): Readonly<Record<string, unknown>> | null {
+  if (!isRecord(value) || NODE_IS_PROXY(value)) return null;
+  let descriptors: PropertyDescriptorMap;
+  let prototype: object | null;
+  try {
+    descriptors = OBJECT_GET_OWN_PROPERTY_DESCRIPTORS(value);
+    prototype = OBJECT_GET_PROTOTYPE_OF(value);
+  } catch {
+    return null;
+  }
+  if (prototype !== OBJECT_PROTOTYPE && prototype !== null) return null;
+  const keys = REFLECT_OWN_KEYS(descriptors);
+  const captured: Record<string, unknown> = OBJECT_CREATE(null);
+  let hasIssuerUrl = false;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (typeof key !== "string"
+      || (key !== "issuerUrl" && key !== "tlsTrust" && key !== "transport")) return null;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !OBJECT_HAS_OWN(descriptor, "value")) return null;
+    if (key === "issuerUrl") hasIssuerUrl = true;
+    captured[key] = descriptor.value;
+  }
+  return hasIssuerUrl ? OBJECT_FREEZE(captured) : null;
 }
 
 function isAbortSignal(value: unknown): value is AbortSignal {
@@ -217,38 +354,79 @@ function validateIssuerOrigin(value: unknown): string {
   if (
     typeof value !== "string"
     || value.length === 0
-    || value !== value.trim()
-    || Buffer.byteLength(value, "utf8") > MAX_ISSUER_URL_BYTES
-    || /[\0\r\n\s]/.test(value)
-    || value.includes("?")
-    || value.includes("#")
+    || value !== REFLECT_APPLY(STRING_TRIM, value, [])
+    || BUFFER_BYTE_LENGTH(value, "utf8") > MAX_ISSUER_URL_BYTES
+    || REFLECT_APPLY(REGEXP_TEST, INVALID_ISSUER_CHARACTERS, [value])
+    || REFLECT_APPLY(STRING_INCLUDES, value, ["?"])
+    || REFLECT_APPLY(STRING_INCLUDES, value, ["#"])
   ) throw failure("CONFIGURATION_INVALID");
 
   let parsed: URL;
   try {
-    parsed = new URL(value);
+    parsed = new URL_CONSTRUCTOR(value);
   } catch {
     throw failure("CONFIGURATION_INVALID");
   }
-  const authoritySlash = value.indexOf("/", "https://".length);
-  const rawAuthority = value.slice(
+  if (!URL_GETTER_DESCRIPTORS_VALID
+    || typeof URL_PROTOCOL_GETTER !== "function"
+    || typeof URL_HOSTNAME_GETTER !== "function"
+    || typeof URL_USERNAME_GETTER !== "function"
+    || typeof URL_PASSWORD_GETTER !== "function"
+    || typeof URL_PATHNAME_GETTER !== "function"
+    || typeof URL_SEARCH_GETTER !== "function"
+    || typeof URL_HASH_GETTER !== "function"
+    || typeof URL_PORT_GETTER !== "function"
+    || typeof URL_ORIGIN_GETTER !== "function") {
+    throw failure("CONFIGURATION_INVALID");
+  }
+  let protocol: unknown;
+  let hostname: unknown;
+  let username: unknown;
+  let password: unknown;
+  let pathname: unknown;
+  let search: unknown;
+  let hash: unknown;
+  let port: unknown;
+  let origin: unknown;
+  try {
+    protocol = REFLECT_APPLY(URL_PROTOCOL_GETTER, parsed, []);
+    hostname = REFLECT_APPLY(URL_HOSTNAME_GETTER, parsed, []);
+    username = REFLECT_APPLY(URL_USERNAME_GETTER, parsed, []);
+    password = REFLECT_APPLY(URL_PASSWORD_GETTER, parsed, []);
+    pathname = REFLECT_APPLY(URL_PATHNAME_GETTER, parsed, []);
+    search = REFLECT_APPLY(URL_SEARCH_GETTER, parsed, []);
+    hash = REFLECT_APPLY(URL_HASH_GETTER, parsed, []);
+    port = REFLECT_APPLY(URL_PORT_GETTER, parsed, []);
+    origin = REFLECT_APPLY(URL_ORIGIN_GETTER, parsed, []);
+  } catch {
+    throw failure("CONFIGURATION_INVALID");
+  }
+  const authoritySlash = REFLECT_APPLY(STRING_INDEX_OF, value, [
+    "/",
+    "https://".length,
+  ]);
+  const rawAuthority = REFLECT_APPLY(STRING_SLICE, value, [
     "https://".length,
     authoritySlash === -1 ? value.length : authoritySlash,
-  );
-  const rawPath = authoritySlash === -1 ? "" : value.slice(authoritySlash);
+  ]);
+  const rawPath = authoritySlash === -1
+    ? ""
+    : REFLECT_APPLY(STRING_SLICE, value, [authoritySlash]);
   if (
-    parsed.protocol !== "https:"
-    || parsed.hostname.length === 0
-    || rawAuthority.includes("@")
-    || parsed.username.length !== 0
-    || parsed.password.length !== 0
-    || parsed.pathname !== "/"
+    protocol !== "https:"
+    || typeof hostname !== "string"
+    || hostname.length === 0
+    || REFLECT_APPLY(STRING_INCLUDES, rawAuthority, ["@"])
+    || username !== ""
+    || password !== ""
+    || pathname !== "/"
     || (rawPath !== "" && rawPath !== "/")
-    || parsed.search.length !== 0
-    || parsed.hash.length !== 0
-    || parsed.port === "0"
+    || search !== ""
+    || hash !== ""
+    || port === "0"
+    || typeof origin !== "string"
   ) throw failure("CONFIGURATION_INVALID");
-  return parsed.origin;
+  return origin;
 }
 
 function endpoint(origin: string, path: string): string {
@@ -256,7 +434,7 @@ function endpoint(origin: string, path: string): string {
 }
 
 function requestHeaders(bodyLength: number): Readonly<Record<string, string>> {
-  return Object.freeze({
+  return OBJECT_FREEZE({
     Accept: JSON_CONTENT_TYPE,
     "Content-Type": JSON_CONTENT_TYPE,
     "Cache-Control": NO_STORE,
@@ -272,12 +450,12 @@ function rawHeaderValues(
   const values: string[] = [];
   for (const pair of headers) {
     if (
-      !Array.isArray(pair)
+      !ARRAY_IS_ARRAY(pair)
       || pair.length !== 2
       || typeof pair[0] !== "string"
       || typeof pair[1] !== "string"
     ) return null;
-    if (pair[0].toLowerCase() === requestedName) values.push(pair[1]);
+    if (pair[0].toLowerCase() === requestedName) values[values.length] = pair[1];
   }
   return values;
 }
@@ -288,7 +466,9 @@ function acceptedContentLength(
   const values = rawHeaderValues(headers, "content-length");
   if (values === null || values.length > 1) return undefined;
   if (values.length === 0) return null;
-  if (!/^(0|[1-9][0-9]*)$/.test(values[0]!)) return undefined;
+  if (!REFLECT_APPLY(REGEXP_TEST, /^(0|[1-9][0-9]*)$/, [values[0]!])) {
+    return undefined;
+  }
   const length = Number(values[0]);
   if (!Number.isSafeInteger(length) || length > RELAY_V2_HTTP_BODY_BYTES) {
     return undefined;
@@ -327,20 +507,45 @@ async function readBoundedBody(
   response: RelayV2SingleExchangeHttpsTransportResponse,
   declaredLength: number | null,
 ): Promise<Uint8Array> {
-  const storage = Buffer.allocUnsafe(RELAY_V2_HTTP_BODY_BYTES);
+  if (typeof BUFFER_ALLOC_UNSAFE !== "function"
+    || typeof TYPED_ARRAY_SET !== "function"
+    || typeof TYPED_ARRAY_SUBARRAY !== "function") {
+    throw internalExchangeFailure();
+  }
+  let storage: Buffer;
+  try {
+    storage = REFLECT_APPLY(BUFFER_ALLOC_UNSAFE, BUFFER_CONSTRUCTOR, [
+      RELAY_V2_HTTP_BODY_BYTES,
+    ]) as Buffer;
+  } catch {
+    throw internalExchangeFailure();
+  }
   let received = 0;
   for await (const chunk of response.body) {
-    if (
-      !(chunk instanceof Uint8Array)
-      || chunk.byteLength > RELAY_V2_HTTP_BODY_BYTES - received
-    ) throw internalExchangeFailure();
-    storage.set(chunk, received);
-    received += chunk.byteLength;
+    if (!NODE_IS_UINT8_ARRAY(chunk)) throw internalExchangeFailure();
+    const chunkLength = typedArrayByteLength(chunk);
+    if (chunkLength === null) throw internalExchangeFailure();
+    if (chunkLength > RELAY_V2_HTTP_BODY_BYTES - received) {
+      throw internalExchangeFailure();
+    }
+    try {
+      REFLECT_APPLY(TYPED_ARRAY_SET, storage, [chunk, received]);
+    } catch {
+      throw internalExchangeFailure();
+    }
+    received += chunkLength;
   }
   if (declaredLength !== null && declaredLength !== received) {
     throw internalExchangeFailure();
   }
-  return storage.subarray(0, received);
+  try {
+    return REFLECT_APPLY(TYPED_ARRAY_SUBARRAY, storage, [
+      0,
+      received,
+    ]) as Uint8Array;
+  } catch {
+    throw internalExchangeFailure();
+  }
 }
 
 function credentialRejection(
@@ -370,7 +575,7 @@ function credentialRejection(
         || structured.retryAfterMs < 0))
   ) throw internalExchangeFailure();
 
-  return new RelayV2HostCredentialInternalFailure(Object.freeze({
+  return new RelayV2HostCredentialInternalFailure(OBJECT_FREEZE({
     httpStatus,
     errorCode: structured.code,
     retryable: structured.retryable,
@@ -386,7 +591,7 @@ function bootstrapResponse(
     frame.bootstrapAttemptId !== request.bootstrapAttemptId
     || frame.hostId !== request.hostId
   ) throw internalExchangeFailure();
-  return Object.freeze({
+  return OBJECT_FREEZE({
     bootstrapAttemptId: frame.bootstrapAttemptId as string,
     principalId: frame.principalId as string,
     grantId: frame.grantId as string,
@@ -406,7 +611,7 @@ function refreshResponse(
     frame.refreshAttemptId !== request.refreshAttemptId
     || frame.grantId !== request.grantId
   ) throw internalExchangeFailure();
-  return Object.freeze({
+  return OBJECT_FREEZE({
     refreshAttemptId: frame.refreshAttemptId as string,
     principalId: frame.principalId as string,
     grantId: frame.grantId as string,
@@ -432,26 +637,28 @@ export class RelayV2HostCredentialHttpsAdapter {
   constructor(options: RelayV2HostCredentialHttpsAdapterOptions) {
     let issuerUrl: unknown;
     let transport: unknown;
+    let tlsTrustCut: RelayV2HostTlsCaTrustCut | undefined;
     let validOptions = false;
     try {
-      validOptions = isRecord(options)
-        && hasExactKeys(options, [
-          "issuerUrl",
-          ...(Object.hasOwn(options, "transport") ? ["transport"] : []),
-        ]);
-      issuerUrl = validOptions ? options.issuerUrl : undefined;
-      transport = validOptions ? options.transport : undefined;
+      const captured = captureAdapterOptions(options);
+      validOptions = captured !== null;
+      issuerUrl = captured?.issuerUrl;
+      transport = captured?.transport;
+      tlsTrustCut = captured !== null && captured.tlsTrust !== undefined
+        ? captureRelayV2HostTlsCaTrustCut(captured.tlsTrust)
+        : undefined;
     } catch {
       throw failure("CONFIGURATION_INVALID");
     }
     if (
       !validOptions
+      || (transport !== undefined && tlsTrustCut !== undefined)
       || (transport !== undefined
         && (!isRecord(transport) || typeof transport.start !== "function"))
     ) throw failure("CONFIGURATION_INVALID");
     this.issuerOrigin = validateIssuerOrigin(issuerUrl);
     this.transport = transport as RelayV2SingleExchangeHttpsTransport | undefined
-      ?? createRelayV2SingleExchangeNodeHttpsTransport();
+      ?? createRelayV2HostCaOnlySingleExchangeNodeHttpsTransport(tlsTrustCut);
   }
 
   bootstrap(
@@ -527,6 +734,8 @@ export class RelayV2HostCredentialHttpsAdapter {
     } catch {
       throw failure("REQUEST_INVALID");
     }
+    const bodyLength = typedArrayByteLength(body);
+    if (bodyLength === null) throw failure("REQUEST_INVALID");
 
     const outcome = await performRelayV2SingleExchangeHttps<
       Result,
@@ -536,7 +745,7 @@ export class RelayV2HostCredentialHttpsAdapter {
       request: {
         endpoint: endpoint(this.issuerOrigin, path),
         method: "POST",
-        headers: requestHeaders(body.byteLength),
+        headers: requestHeaders(bodyLength),
         body,
       },
       signal,

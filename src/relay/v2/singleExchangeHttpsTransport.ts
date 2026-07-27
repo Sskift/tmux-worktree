@@ -5,6 +5,56 @@ import {
 } from "node:https";
 import { checkServerIdentity } from "node:tls";
 import { types as nodeUtilTypes } from "node:util";
+import {
+  readRelayV2HostTlsCaTrustCut,
+  type RelayV2HostTlsCaTrustCut,
+} from "./hostTlsTrustMaterial.js";
+
+const NODE_HTTPS_REQUEST =
+  nodeHttpsRequest as RelayV2SingleExchangeNodeHttpsRequest;
+const NODE_CHECK_SERVER_IDENTITY = checkServerIdentity;
+const NODE_IS_PROXY = nodeUtilTypes.isProxy;
+const NODE_IS_UINT8_ARRAY = nodeUtilTypes.isUint8Array;
+const OBJECT_CREATE = Object.create;
+const OBJECT_DEFINE_PROPERTIES = Object.defineProperties;
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const REFLECT_APPLY = Reflect.apply;
+const REFLECT_OWN_KEYS = Reflect.ownKeys;
+const ARRAY_IS_ARRAY = Array.isArray;
+const NUMBER_IS_SAFE_INTEGER = Number.isSafeInteger;
+const BUFFER_CONSTRUCTOR = Buffer;
+const BUFFER_BYTE_LENGTH = BUFFER_CONSTRUCTOR.byteLength;
+const BUFFER_FROM = BUFFER_CONSTRUCTOR.from;
+const STRING_CONSTRUCTOR = String;
+const ARRAY_BUFFER_CONSTRUCTOR = ArrayBuffer;
+const UINT8_ARRAY_CONSTRUCTOR = Uint8Array;
+const URL_CONSTRUCTOR = URL;
+const TYPED_ARRAY_PROTOTYPE =
+  OBJECT_GET_PROTOTYPE_OF(UINT8_ARRAY_CONSTRUCTOR.prototype);
+const TYPED_ARRAY_BUFFER_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer",
+)?.get;
+const TYPED_ARRAY_BYTE_OFFSET_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+)?.get;
+const TYPED_ARRAY_BYTE_LENGTH_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+)?.get;
+const TYPED_ARRAY_LENGTH_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "length",
+)?.get;
+const TYPED_ARRAY_SET = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "set",
+)?.value;
 
 export interface RelayV2SingleExchangeHttpsTransportRequest {
   endpoint: string;
@@ -64,6 +114,21 @@ export interface RelayV2SingleExchangeNodeHttpsTlsOptions {
   readonly key?: string | Uint8Array;
 }
 
+interface CapturedTlsOptions {
+  readonly ca?: readonly (string | Uint8Array)[];
+  readonly cert?: string | Uint8Array;
+  readonly key?: string | Uint8Array;
+}
+
+interface MutableCapturedTlsOptions {
+  ca?: readonly (string | Uint8Array)[];
+  cert?: string | Uint8Array;
+  key?: string | Uint8Array;
+}
+
+const EMPTY_CAPTURED_TLS_OPTIONS =
+  OBJECT_FREEZE(OBJECT_CREATE(null)) as CapturedTlsOptions;
+
 // Bounds on captured TLS material, chosen at the frozen outer-HTTPS magnitude
 // (httpsBodyBytes 16384): a private trust bundle for one exact endpoint holds
 // a small root/chain set and PEM/DER key material stays well under one body.
@@ -71,25 +136,45 @@ const MAX_CA_ENTRIES = 8;
 const MAX_TLS_MATERIAL_BYTES = 16_384;
 const MAX_CA_TOTAL_BYTES = 32_768;
 
-function tlsMaterialBytes(value: string | Uint8Array): number {
-  return typeof value === "string" ? Buffer.byteLength(value, "utf8") : value.byteLength;
+interface CapturedTlsMaterial {
+  readonly material: string | Uint8Array;
+  readonly byteLength: number;
 }
 
 function captureTlsMaterial(
   value: string | Uint8Array,
-): string | Uint8Array {
+): CapturedTlsMaterial {
   if (typeof value === "string") {
-    if (Buffer.byteLength(value, "utf8") > MAX_TLS_MATERIAL_BYTES) {
+    const byteLength = BUFFER_BYTE_LENGTH(value, "utf8");
+    if (byteLength > MAX_TLS_MATERIAL_BYTES) {
       throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
     }
-    return value;
+    return OBJECT_FREEZE({ material: value, byteLength });
   }
-  if (value instanceof Uint8Array && !nodeUtilTypes.isProxy(value)) {
-    if (value.byteLength > MAX_TLS_MATERIAL_BYTES) {
+  if (value !== null
+    && typeof value === "object"
+    && !NODE_IS_PROXY(value)
+    && NODE_IS_UINT8_ARRAY(value)
+    && typeof TYPED_ARRAY_BYTE_LENGTH_GETTER === "function"
+    && typeof TYPED_ARRAY_SET === "function") {
+    let byteLength: unknown;
+    try {
+      byteLength = REFLECT_APPLY(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []);
+    } catch {
       throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
     }
-    // Buffer.prototype.slice shares memory; always copy into an owned array.
-    return new Uint8Array(value);
+    if (typeof byteLength !== "number"
+      || !NUMBER_IS_SAFE_INTEGER(byteLength)
+      || byteLength > MAX_TLS_MATERIAL_BYTES) {
+      throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
+    }
+    const copy = new UINT8_ARRAY_CONSTRUCTOR(byteLength);
+    try {
+      REFLECT_APPLY(TYPED_ARRAY_SET, copy, [value]);
+    } catch {
+      throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
+    }
+    return OBJECT_FREEZE({ material: copy, byteLength });
   }
   throw new TypeError("Relay v2 single-exchange HTTPS TLS material is invalid");
 }
@@ -100,77 +185,73 @@ function captureTlsMaterial(
  */
 function captureTlsOptions(
   value: RelayV2SingleExchangeNodeHttpsTlsOptions | undefined,
-): Readonly<{
-  ca?: readonly (string | Uint8Array)[];
-  cert?: string | Uint8Array;
-  key?: string | Uint8Array;
-}> {
+): CapturedTlsOptions {
   const invalid = (): TypeError =>
     new TypeError("Relay v2 single-exchange HTTPS TLS options are invalid");
-  if (value === undefined) return Object.freeze(Object.create(null));
-  if (!isRecord(value) || nodeUtilTypes.isProxy(value)) throw invalid();
+  if (value === undefined) return EMPTY_CAPTURED_TLS_OPTIONS;
+  if (!isRecord(value) || NODE_IS_PROXY(value)) throw invalid();
   let descriptors: PropertyDescriptorMap;
   try {
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = OBJECT_GET_OWN_PROPERTY_DESCRIPTORS(value);
   } catch {
     throw invalid();
   }
-  const allowed = ["ca", "cert", "key"];
-  const keys = Reflect.ownKeys(descriptors);
-  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) {
-    throw invalid();
-  }
-  const snapshot: Record<string, unknown> = Object.create(null);
-  for (const key of keys as string[]) {
+  const keys = REFLECT_OWN_KEYS(descriptors);
+  const snapshot: Record<string, unknown> = OBJECT_CREATE(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (typeof key !== "string"
+      || (key !== "ca" && key !== "cert" && key !== "key")) throw invalid();
     const descriptor = descriptors[key];
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) throw invalid();
+    if (!descriptor || !OBJECT_HAS_OWN(descriptor, "value")) throw invalid();
     snapshot[key] = descriptor.value;
   }
-  const captured: {
-    ca?: readonly (string | Uint8Array)[];
-    cert?: string | Uint8Array;
-    key?: string | Uint8Array;
-  } = Object.create(null);
+  const captured: MutableCapturedTlsOptions = OBJECT_CREATE(null);
   if (snapshot.ca !== undefined) {
-    if (!Array.isArray(snapshot.ca) || nodeUtilTypes.isProxy(snapshot.ca)) {
+    if (!ARRAY_IS_ARRAY(snapshot.ca) || NODE_IS_PROXY(snapshot.ca)) {
       throw invalid();
     }
-    const length = snapshot.ca.length;
-    if (length > MAX_CA_ENTRIES) throw invalid();
+    let lengthDescriptor: PropertyDescriptor | undefined;
     let caDescriptors: PropertyDescriptorMap;
     try {
-      caDescriptors = Object.getOwnPropertyDescriptors(snapshot.ca);
+      lengthDescriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(snapshot.ca, "length");
+      caDescriptors = OBJECT_GET_OWN_PROPERTY_DESCRIPTORS(snapshot.ca);
     } catch {
       throw invalid();
     }
-    const caKeys = Reflect.ownKeys(caDescriptors);
-    if (
-      caKeys.length !== length + 1
-      || caKeys.some((key) => {
-        if (key === "length") return false;
-        return typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key)
-          || Number(key) >= length;
-      })
-    ) throw invalid();
+    if (lengthDescriptor === undefined
+      || !OBJECT_HAS_OWN(lengthDescriptor, "value")
+      || typeof lengthDescriptor.value !== "number"
+      || !NUMBER_IS_SAFE_INTEGER(lengthDescriptor.value)
+      || lengthDescriptor.value > MAX_CA_ENTRIES) throw invalid();
+    const length = lengthDescriptor.value;
+    const caKeys = REFLECT_OWN_KEYS(caDescriptors);
+    if (caKeys.length !== length + 1 || caKeys[length] !== "length") throw invalid();
     const authorities: (string | Uint8Array)[] = [];
     let totalBytes = 0;
     for (let index = 0; index < length; index += 1) {
-      const descriptor = caDescriptors[String(index)];
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) throw invalid();
+      const key = STRING_CONSTRUCTOR(index);
+      if (caKeys[index] !== key) throw invalid();
+      const descriptor = caDescriptors[key];
+      if (!descriptor || !OBJECT_HAS_OWN(descriptor, "value")) throw invalid();
       const authority = captureTlsMaterial(descriptor.value as string | Uint8Array);
-      totalBytes += tlsMaterialBytes(authority);
+      totalBytes += authority.byteLength;
       if (totalBytes > MAX_CA_TOTAL_BYTES) throw invalid();
-      authorities.push(authority);
+      authorities[index] = authority.material;
     }
-    captured.ca = Object.freeze(authorities);
+    captured.ca = OBJECT_FREEZE(authorities);
   }
   if (snapshot.cert !== undefined) {
-    captured.cert = captureTlsMaterial(snapshot.cert as string | Uint8Array);
+    captured.cert = captureTlsMaterial(
+      snapshot.cert as string | Uint8Array,
+    ).material;
   }
   if (snapshot.key !== undefined) {
-    captured.key = captureTlsMaterial(snapshot.key as string | Uint8Array);
+    captured.key = captureTlsMaterial(
+      snapshot.key as string | Uint8Array,
+    ).material;
   }
-  return Object.freeze(captured);
+  return OBJECT_FREEZE(captured);
 }
 
 function transportFailure(
@@ -180,22 +261,22 @@ function transportFailure(
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !ARRAY_IS_ARRAY(value);
 }
 
 function isAbortSignal(value: unknown): value is AbortSignal {
   return value instanceof AbortSignal;
 }
 
-const ABORT_SIGNAL_ABORTED_GETTER = Object.getOwnPropertyDescriptor(
+const ABORT_SIGNAL_ABORTED_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
   AbortSignal.prototype,
   "aborted",
 )?.get;
-const EVENT_TARGET_ADD_EVENT_LISTENER = Object.getOwnPropertyDescriptor(
+const EVENT_TARGET_ADD_EVENT_LISTENER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
   EventTarget.prototype,
   "addEventListener",
 )?.value as unknown;
-const EVENT_TARGET_REMOVE_EVENT_LISTENER = Object.getOwnPropertyDescriptor(
+const EVENT_TARGET_REMOVE_EVENT_LISTENER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
   EventTarget.prototype,
   "removeEventListener",
 )?.value as unknown;
@@ -235,21 +316,129 @@ function nodeResponseHeaders(
 ): readonly (readonly [string, string])[] {
   const headers: Array<readonly [string, string]> = [];
   for (let index = 0; index < response.rawHeaders.length; index += 2) {
-    headers.push([response.rawHeaders[index]!, response.rawHeaders[index + 1]!]);
+    headers[index / 2] = [
+      response.rawHeaders[index]!,
+      response.rawHeaders[index + 1]!,
+    ];
   }
   return headers;
+}
+
+function captureNodeRequestBody(value: Uint8Array): Buffer {
+  if (typeof TYPED_ARRAY_BUFFER_GETTER !== "function"
+    || typeof TYPED_ARRAY_BYTE_OFFSET_GETTER !== "function"
+    || typeof TYPED_ARRAY_BYTE_LENGTH_GETTER !== "function"
+    || typeof TYPED_ARRAY_LENGTH_GETTER !== "function"
+    || typeof TYPED_ARRAY_SET !== "function") {
+    throw new TypeError("Relay v2 single-exchange HTTPS body is invalid");
+  }
+  let sourceBuffer: ArrayBufferLike;
+  let sourceByteOffset: number;
+  let sourceByteLength: number;
+  try {
+    sourceBuffer = REFLECT_APPLY(TYPED_ARRAY_BUFFER_GETTER, value, []) as ArrayBufferLike;
+    sourceByteOffset = REFLECT_APPLY(
+      TYPED_ARRAY_BYTE_OFFSET_GETTER,
+      value,
+      [],
+    ) as number;
+    sourceByteLength = REFLECT_APPLY(
+      TYPED_ARRAY_BYTE_LENGTH_GETTER,
+      value,
+      [],
+    ) as number;
+  } catch {
+    throw new TypeError("Relay v2 single-exchange HTTPS body is invalid");
+  }
+  if (!NUMBER_IS_SAFE_INTEGER(sourceByteOffset)
+    || sourceByteOffset < 0
+    || !NUMBER_IS_SAFE_INTEGER(sourceByteLength)
+    || sourceByteLength < 0) {
+    throw new TypeError("Relay v2 single-exchange HTTPS body is invalid");
+  }
+
+  let body: Buffer;
+  try {
+    const source = new UINT8_ARRAY_CONSTRUCTOR(
+      sourceBuffer,
+      sourceByteOffset,
+      sourceByteLength,
+    );
+    const copiedBuffer = new ARRAY_BUFFER_CONSTRUCTOR(sourceByteLength);
+    const copiedBytes = new UINT8_ARRAY_CONSTRUCTOR(copiedBuffer);
+    REFLECT_APPLY(TYPED_ARRAY_SET, copiedBytes, [source]);
+    body = REFLECT_APPLY(
+      BUFFER_FROM,
+      BUFFER_CONSTRUCTOR,
+      [copiedBuffer, 0, sourceByteLength],
+    ) as Buffer;
+
+    const bodyBuffer = REFLECT_APPLY(
+      TYPED_ARRAY_BUFFER_GETTER,
+      body,
+      [],
+    ) as ArrayBufferLike;
+    const bodyByteOffset = REFLECT_APPLY(
+      TYPED_ARRAY_BYTE_OFFSET_GETTER,
+      body,
+      [],
+    ) as number;
+    const bodyByteLength = REFLECT_APPLY(
+      TYPED_ARRAY_BYTE_LENGTH_GETTER,
+      body,
+      [],
+    ) as number;
+    const bodyLength = REFLECT_APPLY(
+      TYPED_ARRAY_LENGTH_GETTER,
+      body,
+      [],
+    ) as number;
+    if (bodyBuffer !== copiedBuffer
+      || bodyByteOffset !== 0
+      || bodyByteLength !== sourceByteLength
+      || bodyLength !== sourceByteLength) {
+      throw new TypeError("Relay v2 single-exchange HTTPS body is invalid");
+    }
+    OBJECT_DEFINE_PROPERTIES(body, {
+      buffer: {
+        configurable: false,
+        enumerable: false,
+        value: bodyBuffer,
+        writable: false,
+      },
+      byteOffset: {
+        configurable: false,
+        enumerable: false,
+        value: bodyByteOffset,
+        writable: false,
+      },
+      byteLength: {
+        configurable: false,
+        enumerable: false,
+        value: bodyByteLength,
+        writable: false,
+      },
+      length: {
+        configurable: false,
+        enumerable: false,
+        value: bodyLength,
+        writable: false,
+      },
+    });
+  } catch {
+    throw new TypeError("Relay v2 single-exchange HTTPS body is invalid");
+  }
+  return body;
 }
 
 /**
  * System-TLS Node transport for one POST. Node follows no redirects and this
  * layer adds no proxy, decompression, cookie, cache, retry, or authentication.
  */
-export function createRelayV2SingleExchangeNodeHttpsTransport(
-  request: RelayV2SingleExchangeNodeHttpsRequest =
-    nodeHttpsRequest as RelayV2SingleExchangeNodeHttpsRequest,
-  tls?: RelayV2SingleExchangeNodeHttpsTlsOptions,
+function createCapturedRelayV2SingleExchangeNodeHttpsTransport(
+  request: RelayV2SingleExchangeNodeHttpsRequest,
+  capturedTls: CapturedTlsOptions,
 ): RelayV2SingleExchangeHttpsTransport {
-  const capturedTls = captureTlsOptions(tls);
   return {
     start(input): RelayV2SingleExchangeHttpsTransportExchange {
       let client: ClientRequest | undefined;
@@ -277,24 +466,26 @@ export function createRelayV2SingleExchangeNodeHttpsTransport(
       };
 
       try {
+        const requestBody = captureNodeRequestBody(input.body);
+        const requestOptions = OBJECT_FREEZE({
+          method: "POST",
+          headers: input.headers,
+          agent: false,
+          rejectUnauthorized: true,
+          checkServerIdentity: NODE_CHECK_SERVER_IDENTITY,
+          ...(capturedTls.ca === undefined
+            ? {}
+            : { ca: capturedTls.ca as NodeHttpsRequestOptions["ca"] }),
+          ...(capturedTls.cert === undefined
+            ? {}
+            : { cert: capturedTls.cert as NodeHttpsRequestOptions["cert"] }),
+          ...(capturedTls.key === undefined
+            ? {}
+            : { key: capturedTls.key as NodeHttpsRequestOptions["key"] }),
+        });
         client = request(
-          new URL(input.endpoint),
-          {
-            method: "POST",
-            headers: input.headers,
-            agent: false,
-            rejectUnauthorized: true,
-            checkServerIdentity,
-            ...(capturedTls.ca === undefined
-              ? {}
-              : { ca: capturedTls.ca as NodeHttpsRequestOptions["ca"] }),
-            ...(capturedTls.cert === undefined
-              ? {}
-              : { cert: capturedTls.cert as NodeHttpsRequestOptions["cert"] }),
-            ...(capturedTls.key === undefined
-              ? {}
-              : { key: capturedTls.key as NodeHttpsRequestOptions["key"] }),
-          },
+          new URL_CONSTRUCTOR(input.endpoint),
+          requestOptions,
           (received) => {
             incoming = received;
             if (aborted || responseSettled) {
@@ -311,7 +502,7 @@ export function createRelayV2SingleExchangeNodeHttpsTransport(
           },
         );
         client.once("error", rejectSafely);
-        client.end(Buffer.from(input.body.buffer, input.body.byteOffset, input.body.byteLength));
+        client.end(requestBody);
       } catch {
         rejectSafely();
       }
@@ -332,6 +523,42 @@ export function createRelayV2SingleExchangeNodeHttpsTransport(
   };
 }
 
+export function createRelayV2SingleExchangeNodeHttpsTransport(
+  request: RelayV2SingleExchangeNodeHttpsRequest =
+    NODE_HTTPS_REQUEST,
+  tls?: RelayV2SingleExchangeNodeHttpsTlsOptions,
+): RelayV2SingleExchangeHttpsTransport {
+  return createCapturedRelayV2SingleExchangeNodeHttpsTransport(
+    request,
+    captureTlsOptions(tls),
+  );
+}
+
+/**
+ * Host credential lane opener. Only a process-local Host CA cut can extend
+ * system trust; this path has no cert/key or arbitrary TLS-options surface.
+ */
+export function createRelayV2HostCaOnlySingleExchangeNodeHttpsTransport(
+  tlsTrustCut?: RelayV2HostTlsCaTrustCut,
+): RelayV2SingleExchangeHttpsTransport {
+  if (tlsTrustCut === undefined) {
+    return createCapturedRelayV2SingleExchangeNodeHttpsTransport(
+      NODE_HTTPS_REQUEST,
+      EMPTY_CAPTURED_TLS_OPTIONS,
+    );
+  }
+  const tlsTrust = readRelayV2HostTlsCaTrustCut(tlsTrustCut);
+  if (tlsTrust === undefined) {
+    throw new TypeError("Relay v2 Host TLS trust authority is invalid");
+  }
+  const captured: MutableCapturedTlsOptions = OBJECT_CREATE(null);
+  captured.ca = tlsTrust.certificateAuthorities;
+  return createCapturedRelayV2SingleExchangeNodeHttpsTransport(
+    NODE_HTTPS_REQUEST,
+    OBJECT_FREEZE(captured),
+  );
+}
+
 export interface RelayV2SingleExchangeHttpsOptions<Result, Failure = undefined> {
   readonly transport: RelayV2SingleExchangeHttpsTransport;
   readonly request: RelayV2SingleExchangeHttpsTransportRequest;
@@ -347,8 +574,8 @@ export type RelayV2SingleExchangeHttpsOutcome<Result, Failure = undefined> =
   | { readonly kind: "transport_failed" }
   | { readonly kind: "consume_failed"; readonly failure: Failure | undefined };
 
-const ABORTED_OUTCOME = Object.freeze({ kind: "aborted" } as const);
-const TRANSPORT_FAILED_OUTCOME = Object.freeze({ kind: "transport_failed" } as const);
+const ABORTED_OUTCOME = OBJECT_FREEZE({ kind: "aborted" } as const);
+const TRANSPORT_FAILED_OUTCOME = OBJECT_FREEZE({ kind: "transport_failed" } as const);
 
 /**
  * Owns exactly one start/settle/cancel lifecycle. The protocol adapter owns
@@ -422,7 +649,7 @@ export function performRelayV2SingleExchangeHttps<Result, Failure = undefined>(
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(Object.freeze({ kind: "completed", value }));
+      resolve(OBJECT_FREEZE({ kind: "completed", value }));
     };
     const onAbort = (): void => {
       if (!abortSettlementEnabled) {
@@ -466,7 +693,7 @@ export function performRelayV2SingleExchangeHttps<Result, Failure = undefined>(
       if (
         !isRecord(exchange)
         || typeof exchange.abort !== "function"
-        || !Object.hasOwn(exchange, "response")
+        || !OBJECT_HAS_OWN(exchange, "response")
       ) {
         fail(TRANSPORT_FAILED_OUTCOME);
         return;
@@ -507,7 +734,7 @@ export function performRelayV2SingleExchangeHttps<Result, Failure = undefined>(
             const mapper = options.mapConsumeFailure;
             if (typeof mapper === "function") mappedFailure = mapper(consumerFailure);
           } catch {}
-          fail(Object.freeze({ kind: "consume_failed", failure: mappedFailure }));
+          fail(OBJECT_FREEZE({ kind: "consume_failed", failure: mappedFailure }));
         }
       })();
     }, () => {

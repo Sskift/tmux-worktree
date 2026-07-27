@@ -12,6 +12,30 @@ import {
   type RelayV2AccessTokenClaims,
 } from "./token.js";
 
+const OBJECT_CREATE = Object.create;
+const OBJECT_DEFINE_PROPERTY = Object.defineProperty;
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const OBJECT_IS_FROZEN = Object.isFrozen;
+const OBJECT_KEYS = Object.keys;
+const REFLECT_APPLY = Reflect.apply;
+const REFLECT_OWN_KEYS = Reflect.ownKeys;
+const ARRAY_IS_ARRAY = Array.isArray;
+const BUFFER_BYTE_LENGTH = Buffer.byteLength;
+const REGEXP_TEST = RegExp.prototype.test;
+const STRING_SLICE = String.prototype.slice;
+const STRING_SPLIT = String.prototype.split;
+const STRING_STARTS_WITH = String.prototype.startsWith;
+const WEAK_MAP_DELETE = WeakMap.prototype.delete;
+const WEAK_MAP_GET = WeakMap.prototype.get;
+const WEAK_MAP_SET = WeakMap.prototype.set;
+const TYPED_ARRAY_PROTOTYPE = OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
+const TYPED_ARRAY_BYTE_LENGTH_GETTER =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TYPED_ARRAY_PROTOTYPE, "byteLength")?.get;
+
 export const RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE =
   "relay-v2-host-credential-ref:" as const;
 
@@ -387,7 +411,7 @@ object,
 RelayV2HostCredentialConnectionAuthorizationRecord
 >();
 const hostCredentialConnectionAuthorizationSecrets = new WeakMap<object, string>();
-const connectionAdmissionAuthorityKey = Object.freeze({});
+const connectionAdmissionAuthorityKey = OBJECT_FREEZE({});
 
 export function isRelayV2HostCredentialAuthority(
   value: unknown,
@@ -424,18 +448,54 @@ function fail(code: RelayV2HostCredentialAuthorityErrorCode): never {
   throw new RelayV2HostCredentialAuthorityError(code);
 }
 
+function weakMapGet<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key,
+): Value | undefined {
+  return REFLECT_APPLY(WEAK_MAP_GET, map, [key]) as Value | undefined;
+}
+
+function weakMapSet<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key,
+  value: Value,
+): void {
+  REFLECT_APPLY(WEAK_MAP_SET, map, [key, value]);
+}
+
+function weakMapDelete<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key,
+): void {
+  REFLECT_APPLY(WEAK_MAP_DELETE, map, [key]);
+}
+
+function typedArrayByteLength(value: Uint8Array): number {
+  if (typeof TYPED_ARRAY_BYTE_LENGTH_GETTER !== "function") {
+    return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
+  }
+  try {
+    return REFLECT_APPLY(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []) as number;
+  } catch {
+    return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
+  }
+}
+
 function isRecord(value: unknown): value is JsonObject {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return value !== null && typeof value === "object" && !ARRAY_IS_ARRAY(value);
 }
 
 function hasExactKeys(value: JsonObject, fields: readonly string[]): boolean {
   const expected = new Set(fields);
-  return fields.every((field) => Object.hasOwn(value, field))
-    && Object.keys(value).every((field) => expected.has(field));
+  return fields.every((field) => OBJECT_HAS_OWN(value, field))
+    && OBJECT_KEYS(value).every((field) => expected.has(field));
 }
 
 function isCanonicalCounter(value: unknown): value is string {
-  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) return false;
+  if (typeof value !== "string"
+    || !REFLECT_APPLY(REGEXP_TEST, /^(?:0|[1-9][0-9]*)$/, [value])) {
+    return false;
+  }
   try {
     return BigInt(value) <= MAX_COUNTER;
   } catch {
@@ -457,23 +517,35 @@ function isTimestamp(value: unknown): value is number {
 
 export function isRelayV2HostCredentialReference(value: unknown): value is string {
   if (typeof value !== "string"
-    || !value.startsWith(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE)
-    || Buffer.byteLength(value, "utf8") > 128) return false;
-  const identifier = value.slice(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE.length);
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(identifier)
-    && !/^(?:twcap2|twref2|twenroll2|twhostboot2)\./.test(identifier);
+    || !REFLECT_APPLY(STRING_STARTS_WITH, value, [
+      RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE,
+    ])
+    || BUFFER_BYTE_LENGTH(value, "utf8") > 128) return false;
+  const identifier = REFLECT_APPLY(STRING_SLICE, value, [
+    RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE.length,
+  ]) as string;
+  return REFLECT_APPLY(REGEXP_TEST, /^[A-Za-z0-9][A-Za-z0-9._-]*$/, [identifier])
+    && !REFLECT_APPLY(
+      REGEXP_TEST,
+      /^(?:twcap2|twref2|twenroll2|twhostboot2)\./,
+      [identifier],
+    );
 }
 
 export function isRelayV2HostCredentialSecretReference(value: unknown): value is string {
   return isRelayV2AuthIdentifier(value)
-    && !/^(?:twcap2|twref2|twenroll2|twhostboot2)\./.test(value);
+    && !REFLECT_APPLY(
+      REGEXP_TEST,
+      /^(?:twcap2|twref2|twenroll2|twhostboot2)\./,
+      [value],
+    );
 }
 
 function isVisibleToken(value: unknown, prefix: string): value is string {
   return typeof value === "string"
-    && value.startsWith(prefix)
-    && Buffer.byteLength(value, "utf8") <= MAX_TOKEN_BYTES
-    && /^[\x21-\x7e]+$/.test(value);
+    && REFLECT_APPLY(STRING_STARTS_WITH, value, [prefix])
+    && BUFFER_BYTE_LENGTH(value, "utf8") <= MAX_TOKEN_BYTES
+    && REFLECT_APPLY(REGEXP_TEST, /^[\x21-\x7e]+$/, [value]);
 }
 
 function parseHostAccessToken(value: unknown): RelayV2AccessTokenClaims {
@@ -481,13 +553,13 @@ function parseHostAccessToken(value: unknown): RelayV2AccessTokenClaims {
     if (!isVisibleToken(value, "twcap2.")) {
       return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
     }
-    const segments = value.split(".");
+    const segments = REFLECT_APPLY(STRING_SPLIT, value, ["."]) as string[];
     if (segments.length !== 3 || segments[0] !== "twcap2") {
       return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
     }
     const payload = decodeCanonicalRelayV2Base64Url(segments[1], MAX_ACCESS_PAYLOAD_BYTES);
     const mac = decodeCanonicalRelayV2Base64Url(segments[2], MAX_ACCESS_MAC_BYTES);
-    if (mac.byteLength !== MAX_ACCESS_MAC_BYTES) {
+    if (typedArrayByteLength(mac) !== MAX_ACCESS_MAC_BYTES) {
       return fail("RELAY_V2_HOST_CREDENTIAL_STATE_INVALID");
     }
     const parsed = parseRelayV2AuthJson(decodeRelayV2AuthUtf8(payload), {
@@ -828,7 +900,7 @@ function validateConnectionAttemptBinding(
     || !isRelayV2HostCredentialReference(value.credentialReference)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
   }
-  return Object.freeze({
+  return OBJECT_FREEZE({
     requestId: value.requestId,
     controllerGeneration: value.controllerGeneration,
     hostId: value.hostId,
@@ -851,7 +923,7 @@ function validateConnectionCarrierBinding(
     || !isRelayV2HostCredentialReference(value.credentialReference)) {
     return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
   }
-  return Object.freeze({
+  return OBJECT_FREEZE({
     hostId: value.hostId,
     hostEpoch: value.hostEpoch,
     hostInstanceId: value.hostInstanceId,
@@ -1035,10 +1107,10 @@ implements RelayV2HostCarrierCredentialReferences {
       || !isRelayV2HostCredentialAuthority(authority)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
-    const owner = Object.freeze(
-      Object.create(null),
+    const owner = OBJECT_FREEZE(
+      OBJECT_CREATE(null),
     ) as RelayV2HostCredentialConnectionTransportOwner;
-    hostCredentialConnectionTransportOwners.set(owner, {
+    weakMapSet(hostCredentialConnectionTransportOwners, owner, {
       owner: authority,
     });
     return owner;
@@ -1052,7 +1124,8 @@ implements RelayV2HostCarrierCredentialReferences {
   ): RelayV2HostCredentialConnectionAdmission {
     if (authorityKey !== connectionAdmissionAuthorityKey
       || !isRelayV2HostCredentialAuthority(authority)
-      || hostCredentialConnectionTransportOwners.get(transportOwner)?.owner !== authority) {
+      || weakMapGet(hostCredentialConnectionTransportOwners, transportOwner)?.owner
+        !== authority) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
     const binding = validateConnectionAttemptBinding(rawBinding);
@@ -1065,10 +1138,10 @@ implements RelayV2HostCarrierCredentialReferences {
       if (cut.hostId !== binding.hostId) {
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
       }
-      const admission = Object.freeze(
-        Object.create(null),
+      const admission = OBJECT_FREEZE(
+        OBJECT_CREATE(null),
       ) as RelayV2HostCredentialConnectionAdmission;
-      hostCredentialConnectionAdmissions.set(admission, {
+      weakMapSet(hostCredentialConnectionAdmissions, admission, {
         owner: authority,
         transportOwner,
         binding,
@@ -1076,7 +1149,7 @@ implements RelayV2HostCarrierCredentialReferences {
         carrierConsumed: false,
         phase: "issued",
       });
-      hostCredentialConnectionSecrets.set(admission, state!.accessToken!);
+      weakMapSet(hostCredentialConnectionSecrets, admission, state!.accessToken!);
       return admission;
     });
   }
@@ -1093,7 +1166,7 @@ implements RelayV2HostCarrierCredentialReferences {
     }
     const binding = validateConnectionCarrierBinding(rawBinding);
     const record = typeof admission === "object" && admission !== null
-      ? hostCredentialConnectionAdmissions.get(admission)
+      ? weakMapGet(hostCredentialConnectionAdmissions, admission)
       : undefined;
     if (!record
       || record.owner !== authority
@@ -1110,15 +1183,15 @@ implements RelayV2HostCarrierCredentialReferences {
       if (!stateMatchesConnectionCut(
         state,
         record.cut,
-        hostCredentialConnectionSecrets.get(admission),
+        weakMapGet(hostCredentialConnectionSecrets, admission),
       )) {
         record.phase = "released";
-        hostCredentialConnectionAdmissions.delete(admission);
-        hostCredentialConnectionSecrets.delete(admission);
+        weakMapDelete(hostCredentialConnectionAdmissions, admission);
+        weakMapDelete(hostCredentialConnectionSecrets, admission);
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
       }
       record.carrierConsumed = true;
-      return Object.freeze({
+      return OBJECT_FREEZE({
         reference: record.cut.reference,
         version: record.cut.version,
         grantId: record.cut.grantId,
@@ -1137,9 +1210,12 @@ implements RelayV2HostCarrierCredentialReferences {
       || !isRelayV2HostCredentialAuthority(authority)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
-    const transport = hostCredentialConnectionTransportOwners.get(transportOwner);
+    const transport = weakMapGet(
+      hostCredentialConnectionTransportOwners,
+      transportOwner,
+    );
     const record = typeof admission === "object" && admission !== null
-      ? hostCredentialConnectionAdmissions.get(admission)
+      ? weakMapGet(hostCredentialConnectionAdmissions, admission)
       : undefined;
     if (!transport
       || transport.owner !== authority
@@ -1158,21 +1234,25 @@ implements RelayV2HostCarrierCredentialReferences {
           ? null
           : decodeRelayV2HostCredentialState(read.state, record.binding.credentialReference);
         record.phase = "released";
-        hostCredentialConnectionAdmissions.delete(admission);
-        const accessToken = hostCredentialConnectionSecrets.get(admission);
-        hostCredentialConnectionSecrets.delete(admission);
+        weakMapDelete(hostCredentialConnectionAdmissions, admission);
+        const accessToken = weakMapGet(hostCredentialConnectionSecrets, admission);
+        weakMapDelete(hostCredentialConnectionSecrets, admission);
         if (!stateMatchesConnectionCut(state, record.cut, accessToken)) {
           return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
         }
-        const authorization = Object.freeze(
-          Object.create(null),
+        const authorization = OBJECT_FREEZE(
+          OBJECT_CREATE(null),
         ) as RelayV2HostCredentialConnectionAuthorization;
-        hostCredentialConnectionAuthorizations.set(authorization, {
+        weakMapSet(hostCredentialConnectionAuthorizations, authorization, {
           owner: authority,
           transportOwner,
           cut: record.cut,
         });
-        hostCredentialConnectionAuthorizationSecrets.set(authorization, accessToken!);
+        weakMapSet(
+          hostCredentialConnectionAuthorizationSecrets,
+          authorization,
+          accessToken!,
+        );
         return authorization;
       },
     );
@@ -1190,17 +1270,17 @@ implements RelayV2HostCarrierCredentialReferences {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
     const record = typeof authorization === "object" && authorization !== null
-      ? hostCredentialConnectionAuthorizations.get(authorization)
+      ? weakMapGet(hostCredentialConnectionAuthorizations, authorization)
       : undefined;
     let descriptors: PropertyDescriptorMap;
     try {
       if (typeof finalizationPort !== "object"
         || finalizationPort === null
-        || Object.getPrototypeOf(finalizationPort) !== null
-        || !Object.isFrozen(finalizationPort)) {
+        || OBJECT_GET_PROTOTYPE_OF(finalizationPort) !== null
+        || !OBJECT_IS_FROZEN(finalizationPort)) {
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
       }
-      descriptors = Object.getOwnPropertyDescriptors(finalizationPort);
+      descriptors = OBJECT_GET_OWN_PROPERTY_DESCRIPTORS(finalizationPort);
     } catch {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
@@ -1208,7 +1288,7 @@ implements RelayV2HostCarrierCredentialReferences {
     if (!record
       || record.owner !== authority
       || record.transportOwner !== transportOwner
-      || Reflect.ownKeys(descriptors).length !== 1
+      || REFLECT_OWN_KEYS(descriptors).length !== 1
       || !descriptor
       || descriptor.enumerable !== false
       || descriptor.configurable !== false
@@ -1216,13 +1296,16 @@ implements RelayV2HostCarrierCredentialReferences {
       || typeof descriptor.value !== "function") {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
-    const accessToken = hostCredentialConnectionAuthorizationSecrets.get(authorization);
-    hostCredentialConnectionAuthorizations.delete(authorization);
-    hostCredentialConnectionAuthorizationSecrets.delete(authorization);
+    const accessToken = weakMapGet(
+      hostCredentialConnectionAuthorizationSecrets,
+      authorization,
+    );
+    weakMapDelete(hostCredentialConnectionAuthorizations, authorization);
+    weakMapDelete(hostCredentialConnectionAuthorizationSecrets, authorization);
     if (accessToken === undefined) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
-    const validationProof = Object.freeze(Object.create(null));
+    const validationProof = OBJECT_FREEZE(OBJECT_CREATE(null));
     const validated = authority.exclusive(record.cut.reference, (transaction) => {
       const read = authority.validateRead(transaction.read());
       const state = read.state === null
@@ -1236,7 +1319,7 @@ implements RelayV2HostCarrierCredentialReferences {
     if (validated !== validationProof) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
-    Reflect.apply(descriptor.value, finalizationPort, [`Bearer ${accessToken}`]);
+    REFLECT_APPLY(descriptor.value, finalizationPort, [`Bearer ${accessToken}`]);
   }
 
   static releaseConnectionAuthorization(
@@ -1248,11 +1331,11 @@ implements RelayV2HostCarrierCredentialReferences {
     if (authorityKey !== connectionAdmissionAuthorityKey
       || !isRelayV2HostCredentialAuthority(authority)) return;
     const record = typeof authorization === "object" && authorization !== null
-      ? hostCredentialConnectionAuthorizations.get(authorization)
+      ? weakMapGet(hostCredentialConnectionAuthorizations, authorization)
       : undefined;
     if (!record || record.owner !== authority || record.transportOwner !== transportOwner) return;
-    hostCredentialConnectionAuthorizations.delete(authorization);
-    hostCredentialConnectionAuthorizationSecrets.delete(authorization);
+    weakMapDelete(hostCredentialConnectionAuthorizations, authorization);
+    weakMapDelete(hostCredentialConnectionAuthorizationSecrets, authorization);
   }
 
   static releaseConnectionAdmission(
@@ -1264,12 +1347,12 @@ implements RelayV2HostCarrierCredentialReferences {
     if (authorityKey !== connectionAdmissionAuthorityKey
       || !isRelayV2HostCredentialAuthority(authority)) return;
     const record = typeof admission === "object" && admission !== null
-      ? hostCredentialConnectionAdmissions.get(admission)
+      ? weakMapGet(hostCredentialConnectionAdmissions, admission)
       : undefined;
     if (!record || record.owner !== authority || record.transportOwner !== transportOwner) return;
     record.phase = "released";
-    hostCredentialConnectionAdmissions.delete(admission);
-    hostCredentialConnectionSecrets.delete(admission);
+    weakMapDelete(hostCredentialConnectionAdmissions, admission);
+    weakMapDelete(hostCredentialConnectionSecrets, admission);
   }
 
   read(reference: string): RelayV2HostCredentialRecord {
@@ -1290,13 +1373,13 @@ implements RelayV2HostCarrierCredentialReferences {
       grantId: state.grantId,
       accessJti: state.accessJti,
     } as RelayV2HostCredentialRecord;
-    Object.defineProperty(record, "accessToken", {
+    OBJECT_DEFINE_PROPERTY(record, "accessToken", {
       configurable: false,
       enumerable: false,
       writable: false,
       value: state.accessToken,
     });
-    return Object.freeze(record);
+    return OBJECT_FREEZE(record);
   }
 
   inspect(reference: string): RelayV2HostCredentialInspection | null {
@@ -1346,7 +1429,7 @@ implements RelayV2HostCarrierCredentialReferences {
         };
         this.activeExchangeCuts.set(input.credentialReference, group);
       }
-      const cut = Object.freeze(Object.create(null)) as RelayV2HostCredentialExchangeCut;
+      const cut = OBJECT_FREEZE(OBJECT_CREATE(null)) as RelayV2HostCredentialExchangeCut;
       const record: RelayV2HostCredentialExchangeCutRecord = {
         owner: this,
         cut,
@@ -1356,7 +1439,7 @@ implements RelayV2HostCarrierCredentialReferences {
       };
       group.members.add(record);
       if (group.phase === "issued" && group.candidate === null) group.candidate = record;
-      hostCredentialExchangeCuts.set(cut, record);
+      weakMapSet(hostCredentialExchangeCuts, cut, record);
       return {
         inspection: current === null ? null : inspectCredentialState(current),
         cut,
@@ -1366,7 +1449,7 @@ implements RelayV2HostCarrierCredentialReferences {
 
   releaseIssuedExchangeCut(cut: RelayV2HostCredentialExchangeCut): void {
     const record = typeof cut === "object" && cut !== null
-      ? hostCredentialExchangeCuts.get(cut)
+      ? weakMapGet(hostCredentialExchangeCuts, cut)
       : undefined;
     if (!record || record.owner !== this || record.phase !== "issued") return;
     record.phase = "released";
@@ -1385,7 +1468,7 @@ implements RelayV2HostCarrierCredentialReferences {
     cut: RelayV2HostCredentialExchangeCut,
     input: RelayV2HostBootstrapPreparation,
   ): RelayV2HostPreparedBootstrapFromCut {
-    const consumption = { cut, consumer: Object.freeze({}) };
+    const consumption = { cut, consumer: OBJECT_FREEZE({}) };
     try {
       const prepared = this.prepareBootstrapAtCut(consumption, input);
       return {
@@ -1512,7 +1595,7 @@ implements RelayV2HostCarrierCredentialReferences {
     cut: RelayV2HostCredentialExchangeCut,
     input: RelayV2HostRefreshPreparation,
   ): RelayV2HostPreparedRefreshFromCut {
-    const consumption = { cut, consumer: Object.freeze({}) };
+    const consumption = { cut, consumer: OBJECT_FREEZE({}) };
     try {
       const prepared = this.prepareRefreshAtCut(consumption, input);
       return {
@@ -1576,7 +1659,7 @@ implements RelayV2HostCarrierCredentialReferences {
       };
     }, consumption);
     if (consumption !== null) {
-      const record = hostCredentialExchangeCuts.get(consumption.cut);
+      const record = weakMapGet(hostCredentialExchangeCuts, consumption.cut);
       if (!record || record.owner !== this) {
         return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
       }
@@ -1785,7 +1868,7 @@ implements RelayV2HostCarrierCredentialReferences {
         if (result.status === "uncertain") {
           return fail("RELAY_V2_HOST_CREDENTIAL_COMMIT_UNCERTAIN");
         }
-        if (result.status !== "conflict" || !Object.hasOwn(result, "current")) {
+        if (result.status !== "conflict" || !OBJECT_HAS_OWN(result, "current")) {
           return fail("RELAY_V2_HOST_CREDENTIAL_STORAGE_UNAVAILABLE");
         }
         if (conflicts === MAX_CAS_CONFLICTS) {
@@ -1803,7 +1886,7 @@ implements RelayV2HostCarrierCredentialReferences {
   ): RelayV2HostCredentialExchangeCutRecord {
     const cut = consumption.cut;
     const record = typeof cut === "object" && cut !== null
-      ? hostCredentialExchangeCuts.get(cut)
+      ? weakMapGet(hostCredentialExchangeCuts, cut)
       : undefined;
     if (!record
       || record.owner !== this
@@ -1825,7 +1908,7 @@ implements RelayV2HostCarrierCredentialReferences {
   private releaseExchangeCutForConsumer(
     consumption: RelayV2HostCredentialExchangeCutConsumption,
   ): void {
-    const record = hostCredentialExchangeCuts.get(consumption.cut);
+    const record = weakMapGet(hostCredentialExchangeCuts, consumption.cut);
     if (!record
       || record.owner !== this
       || record.consumer !== consumption.consumer) return;
@@ -1834,7 +1917,7 @@ implements RelayV2HostCarrierCredentialReferences {
 
   releaseExchangeLease(lease: RelayV2HostCredentialExchangeLease): void {
     const leaseRecord = typeof lease === "object" && lease !== null
-      ? hostCredentialExchangeLeases.get(lease)
+      ? weakMapGet(hostCredentialExchangeLeases, lease)
       : undefined;
     if (!leaseRecord
       || leaseRecord.owner !== this
@@ -1848,7 +1931,7 @@ implements RelayV2HostCarrierCredentialReferences {
   private createExchangeLease(
     consumption: RelayV2HostCredentialExchangeCutConsumption,
   ): RelayV2HostCredentialExchangeLease {
-    const record = hostCredentialExchangeCuts.get(consumption.cut);
+    const record = weakMapGet(hostCredentialExchangeCuts, consumption.cut);
     if (!record
       || record.owner !== this
       || record.phase !== "consumed"
@@ -1856,8 +1939,8 @@ implements RelayV2HostCarrierCredentialReferences {
       || record.group.winner !== record) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
-    const lease = Object.freeze(Object.create(null)) as RelayV2HostCredentialExchangeLease;
-    hostCredentialExchangeLeases.set(lease, {
+    const lease = OBJECT_FREEZE(OBJECT_CREATE(null)) as RelayV2HostCredentialExchangeLease;
+    weakMapSet(hostCredentialExchangeLeases, lease, {
       owner: this,
       lease,
       cutRecord: record,
@@ -1887,7 +1970,7 @@ implements RelayV2HostCarrierCredentialReferences {
     fence: RelayV2HostCredentialAttemptFence,
     hostId: string,
   ): void {
-    const record = hostCredentialExchangeCuts.get(cut);
+    const record = weakMapGet(hostCredentialExchangeCuts, cut);
     if (!record
       || record.owner !== this
       || record.phase !== "consumed"

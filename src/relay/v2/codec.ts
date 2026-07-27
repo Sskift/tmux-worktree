@@ -17,6 +17,18 @@ import {
   type RelayV2JsonLimits,
 } from "./strictJson.js";
 
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const REFLECT_APPLY = Reflect.apply;
+const JSON_OBJECT = JSON;
+const JSON_STRINGIFY = JSON_OBJECT.stringify;
+const TYPED_ARRAY_PROTOTYPE = OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
+const TYPED_ARRAY_BYTE_LENGTH_GETTER =
+  OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TYPED_ARRAY_PROTOTYPE, "byteLength")?.get;
+const TEXT_ENCODER_CONSTRUCTOR = TextEncoder;
+const TEXT_ENCODER_ENCODE = TEXT_ENCODER_CONSTRUCTOR.prototype.encode;
+const TEXT_ENCODER = new TEXT_ENCODER_CONSTRUCTOR();
+
 export const RELAY_V2_PUBLIC_FRAME_BYTES = 1_048_576;
 export const RELAY_V2_CARRIER_FRAME_BYTES = 1_500_000;
 export const RELAY_V2_HTTP_BODY_BYTES = 16_384;
@@ -54,6 +66,33 @@ export class RelayV2CodecError extends Error {
     );
     this.name = "RelayV2CodecError";
   }
+}
+
+function typedArrayByteLength(value: Uint8Array): number {
+  if (typeof TYPED_ARRAY_BYTE_LENGTH_GETTER !== "function") {
+    throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
+  }
+  try {
+    return REFLECT_APPLY(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []) as number;
+  } catch {
+    throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
+  }
+}
+
+function stringifyFrame(frame: RelayV2JsonObject): string {
+  const wire = REFLECT_APPLY(JSON_STRINGIFY, JSON_OBJECT, [frame]);
+  if (typeof wire !== "string") {
+    throw new RelayV2CodecError("INVALID_ENVELOPE", "malformed-json");
+  }
+  return wire;
+}
+
+function encodeUtf8(source: string): Uint8Array {
+  return REFLECT_APPLY(
+    TEXT_ENCODER_ENCODE,
+    TEXT_ENCODER,
+    [source],
+  ) as Uint8Array;
 }
 
 const STANDARD_JSON_LIMITS: RelayV2JsonLimits = {
@@ -99,7 +138,7 @@ function parseWebSocketObject(
   const frameLimit = channel === "public"
     ? RELAY_V2_PUBLIC_FRAME_BYTES
     : RELAY_V2_CARRIER_FRAME_BYTES;
-  if (bytes.byteLength > frameLimit) {
+  if (typedArrayByteLength(bytes) > frameLimit) {
     throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
   }
   const source = decodeRelayV2StrictUtf8(bytes);
@@ -132,7 +171,7 @@ function parseHttpObject(
   ) {
     throw new RelayV2CodecError("PROTOCOL_UNSUPPORTED", "compression-not-allowed");
   }
-  if (bytes.byteLength > RELAY_V2_HTTP_BODY_BYTES) {
+  if (typedArrayByteLength(bytes) > RELAY_V2_HTTP_BODY_BYTES) {
     throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
   }
   const source = decodeRelayV2StrictUtf8(bytes);
@@ -152,7 +191,7 @@ export function decodeRelayV2WebSocketFrame(
     return {
       frame,
       normalized,
-      canonicalWire: JSON.stringify(frame),
+      canonicalWire: stringifyFrame(frame),
     };
   } catch (error) {
     return codecFailure(error);
@@ -168,7 +207,7 @@ export function decodeRelayV2CommandRouteEnvelope(
     return {
       frame,
       envelope: validateRelayV2CommandRouteEnvelopeSchema(frame),
-      canonicalWire: JSON.stringify(frame),
+      canonicalWire: stringifyFrame(frame),
     };
   } catch (error) {
     return codecFailure(error);
@@ -185,7 +224,7 @@ export function decodeRelayV2HttpsBody(
     return {
       frame,
       normalized: validateRelayV2HttpsBody(schema, frame),
-      canonicalWire: JSON.stringify(frame),
+      canonicalWire: stringifyFrame(frame),
     };
   } catch (error) {
     return codecFailure(error);
@@ -197,8 +236,8 @@ function encodeChecked(
   normalized: RelayV2NormalizedMessage,
   limit: number,
 ): Uint8Array {
-  const bytes = new TextEncoder().encode(JSON.stringify(frame));
-  if (bytes.byteLength > limit) {
+  const bytes = encodeUtf8(stringifyFrame(frame));
+  if (typedArrayByteLength(bytes) > limit) {
     throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
   }
   void normalized;
@@ -230,8 +269,8 @@ export function validateRelayV2CommandRouteEnvelope(
 ): RelayV2CommandRouteEnvelope {
   try {
     const envelope = validateRelayV2CommandRouteEnvelopeSchema(frame);
-    const bytes = new TextEncoder().encode(JSON.stringify(frame));
-    if (bytes.byteLength > RELAY_V2_PUBLIC_FRAME_BYTES) {
+    const bytes = encodeUtf8(stringifyFrame(frame));
+    if (typedArrayByteLength(bytes) > RELAY_V2_PUBLIC_FRAME_BYTES) {
       throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
     }
     return envelope;

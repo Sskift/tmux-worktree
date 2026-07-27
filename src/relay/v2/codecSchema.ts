@@ -1,5 +1,17 @@
 import type { RelayV2JsonValue } from "./strictJson.js";
 
+const BUFFER_CONSTRUCTOR = Buffer;
+const BUFFER_BYTE_LENGTH = BUFFER_CONSTRUCTOR.byteLength;
+const BUFFER_FROM = BUFFER_CONSTRUCTOR.from;
+const BUFFER_TO_STRING = BUFFER_CONSTRUCTOR.prototype.toString;
+const OBJECT_HAS_OWN = Object.hasOwn;
+const OBJECT_KEYS = Object.keys;
+const REFLECT_APPLY = Reflect.apply;
+const STRING_INCLUDES = String.prototype.includes;
+const STRING_TRIM = String.prototype.trim;
+const ARRAY_CONSTRUCTOR = Array;
+const ARRAY_FROM = ARRAY_CONSTRUCTOR.from;
+
 export type RelayV2CodecFailureClass =
   | "base64-decoded-limit"
   | "forbidden-null"
@@ -141,15 +153,15 @@ function exact(
 ): void {
   const allowed = new Set([...required, ...optional]);
   for (const key of required) {
-    if (!Object.hasOwn(value, key)) reject("missing-field");
+    if (!OBJECT_HAS_OWN(value, key)) reject("missing-field");
   }
-  for (const key of Object.keys(value)) {
+  for (const key of OBJECT_KEYS(value)) {
     if (!allowed.has(key)) reject("unknown-field");
   }
 }
 
 function field(value: RelayV2JsonObject, name: string): RelayV2JsonValue {
-  if (!Object.hasOwn(value, name)) reject("missing-field");
+  if (!OBJECT_HAS_OWN(value, name)) reject("missing-field");
   return value[name]!;
 }
 
@@ -166,17 +178,21 @@ function stringValue(
   if (value === null) reject("forbidden-null");
   if (typeof value !== "string") reject("type-coercion");
   if (!options.allowEmpty && value.length === 0) reject("invalid-argument");
-  if (!options.allowNul && value.includes("\0")) reject("invalid-argument");
-  if (!options.allowOuterWhitespace && value.trim() !== value) reject("invalid-argument");
+  if (!options.allowNul
+    && REFLECT_APPLY(STRING_INCLUDES, value, ["\0"])) reject("invalid-argument");
+  if (!options.allowOuterWhitespace
+    && REFLECT_APPLY(STRING_TRIM, value, []) !== value) reject("invalid-argument");
   if (
     options.maxBytes !== undefined
-    && Buffer.byteLength(value, "utf8") > options.maxBytes
+    && BUFFER_BYTE_LENGTH(value, "utf8") > options.maxBytes
   ) {
     reject("id-byte-limit");
   }
   if (
     options.maxCharacters !== undefined
-    && Array.from(value).length > options.maxCharacters
+    && (
+      REFLECT_APPLY(ARRAY_FROM, ARRAY_CONSTRUCTOR, [value]) as unknown[]
+    ).length > options.maxCharacters
   ) {
     reject("invalid-argument");
   }
@@ -280,7 +296,9 @@ function canonicalBase64(value: RelayV2JsonValue, maxDecodedBytes: number): stri
   if (value === null) reject("forbidden-null");
   if (typeof value !== "string") reject("type-coercion");
   const encoded = value;
-  if (encoded.length === 0 || encoded.trim() !== encoded || encoded.includes("\0")) {
+  if (encoded.length === 0
+    || REFLECT_APPLY(STRING_TRIM, encoded, []) !== encoded
+    || REFLECT_APPLY(STRING_INCLUDES, encoded, ["\0"])) {
     reject("invalid-argument");
   }
   if (
@@ -308,7 +326,8 @@ function canonicalBase64(value: RelayV2JsonValue, maxDecodedBytes: number): stri
 
 function canonicalBase64Url(value: RelayV2JsonValue, decodedBytes?: number): string {
   const encoded = stringValue(value, { maxBytes: 2_048 });
-  if (!/^(?:[A-Za-z0-9_-]{2,})$/.test(encoded) || encoded.includes("=")) {
+  if (!/^(?:[A-Za-z0-9_-]{2,})$/.test(encoded)
+    || REFLECT_APPLY(STRING_INCLUDES, encoded, ["="])) {
     reject("non-canonical-base64url");
   }
   if (decodedBytes !== undefined) {
@@ -317,7 +336,16 @@ function canonicalBase64Url(value: RelayV2JsonValue, decodedBytes?: number): str
   }
   const padded = encoded.replace(/-/g, "+").replace(/_/g, "/")
     + "=".repeat((4 - encoded.length % 4) % 4);
-  const roundTrip = Buffer.from(padded, "base64").toString("base64url");
+  const decoded = REFLECT_APPLY(
+    BUFFER_FROM,
+    BUFFER_CONSTRUCTOR,
+    [padded, "base64"],
+  ) as Buffer;
+  const roundTrip = REFLECT_APPLY(
+    BUFFER_TO_STRING,
+    decoded,
+    ["base64url"],
+  ) as string;
   if (roundTrip !== encoded) reject("non-canonical-base64url");
   return encoded;
 }
@@ -347,10 +375,10 @@ function validateStructuredError(value: RelayV2JsonValue): void {
   });
   booleanValue(field(error, "retryable"));
   oneOf(field(error, "commandDisposition"), COMMAND_DISPOSITIONS);
-  if (Object.hasOwn(error, "retryAfterMs")) {
+  if (OBJECT_HAS_OWN(error, "retryAfterMs")) {
     nullable(field(error, "retryAfterMs"), (item) => integer(item));
   }
-  if (!Object.hasOwn(error, "details") || error.details === null) return;
+  if (!OBJECT_HAS_OWN(error, "details") || error.details === null) return;
   const details = object(error.details);
   switch (code) {
     case "HOST_EPOCH_MISMATCH":
@@ -445,9 +473,9 @@ function validateTopLevelIdentifiers(frame: RelayV2JsonObject): void {
     "sessionId",
     "streamId",
   ]) {
-    if (Object.hasOwn(frame, name)) id(frame[name]!);
+    if (OBJECT_HAS_OWN(frame, name)) id(frame[name]!);
   }
-  if (Object.hasOwn(frame, "eventSeq")) counter(frame.eventSeq!);
+  if (OBJECT_HAS_OWN(frame, "eventSeq")) counter(frame.eventSeq!);
 }
 
 function publicRoot(
@@ -586,24 +614,25 @@ function validateCommandArguments(
   switch (operation) {
     case "create_worktree": {
       exact(argumentsValue, ["aiCommand"], ["project", "path", "name", "branch"]);
-      if (!Object.hasOwn(argumentsValue, "project") && !Object.hasOwn(argumentsValue, "path")) {
+      if (!OBJECT_HAS_OWN(argumentsValue, "project")
+        && !OBJECT_HAS_OWN(argumentsValue, "path")) {
         reject("invalid-argument");
       }
-      if (Object.hasOwn(argumentsValue, "project")) {
+      if (OBJECT_HAS_OWN(argumentsValue, "project")) {
         stringValue(argumentsValue.project!, { maxBytes: 128 });
       }
-      if (Object.hasOwn(argumentsValue, "path")) {
+      if (OBJECT_HAS_OWN(argumentsValue, "path")) {
         stringValue(argumentsValue.path!, {
           maxBytes: 4_096,
         });
       }
-      if (Object.hasOwn(argumentsValue, "name")) {
+      if (OBJECT_HAS_OWN(argumentsValue, "name")) {
         stringValue(argumentsValue.name!, {
           maxBytes: 128,
           maxCharacters: 20,
         });
       }
-      if (Object.hasOwn(argumentsValue, "branch")) {
+      if (OBJECT_HAS_OWN(argumentsValue, "branch")) {
         stringValue(argumentsValue.branch!, { maxBytes: 255 });
       }
       stringValue(field(argumentsValue, "aiCommand"), {
@@ -616,7 +645,7 @@ function validateCommandArguments(
       stringValue(field(argumentsValue, "cwd"), {
         maxBytes: 4_096,
       });
-      if (Object.hasOwn(argumentsValue, "label")) {
+      if (OBJECT_HAS_OWN(argumentsValue, "label")) {
         stringValue(argumentsValue.label!, {
           maxBytes: 128,
         });
@@ -641,19 +670,19 @@ function validateCommandArguments(
 
 function validateCommandResult(value: RelayV2JsonValue): void {
   const result = object(value);
-  if (Object.hasOwn(result, "session")) {
+  if (OBJECT_HAS_OWN(result, "session")) {
     exact(result, ["session"]);
     validateSession(field(result, "session"));
     return;
   }
-  if (Object.hasOwn(result, "messageUtf8Bytes")) {
+  if (OBJECT_HAS_OWN(result, "messageUtf8Bytes")) {
     exact(result, ["pane", "submit", "messageUtf8Bytes"]);
     integer(field(result, "pane"), 0, 65_535);
     booleanValue(field(result, "submit"));
     integer(field(result, "messageUtf8Bytes"), 0, 65_536);
     return;
   }
-  if (Object.hasOwn(result, "terminated")) {
+  if (OBJECT_HAS_OWN(result, "terminated")) {
     exact(result, ["sessionId", "terminated"]);
     id(field(result, "sessionId"));
     literal(field(result, "terminated"), true);
@@ -1090,7 +1119,7 @@ export function validateRelayV2CommandRouteEnvelope(
       hostId: frame.hostId as string,
       expectedHostEpoch: frame.expectedHostEpoch as string,
       scopeId: frame.scopeId as string,
-      sessionId: Object.hasOwn(frame, "sessionId") ? frame.sessionId as string : null,
+      sessionId: OBJECT_HAS_OWN(frame, "sessionId") ? frame.sessionId as string : null,
     };
   }
   if (type === "command.query") {
@@ -1250,7 +1279,7 @@ export function validateRelayV2PublicFrame(
         "kill_session",
       ] as const);
       const requiresSession = operation === "send_agent_message" || operation === "kill_session";
-      if (requiresSession !== Object.hasOwn(frame, "sessionId")) reject("schema-mismatch");
+      if (requiresSession !== OBJECT_HAS_OWN(frame, "sessionId")) reject("schema-mismatch");
       validateCommandArguments(operation, field(payload, "arguments"));
       break;
     }
@@ -1518,7 +1547,7 @@ export function validateRelayV2PublicFrame(
       integer(field(payload, "cols"), 1, 1_000);
       integer(field(payload, "rows"), 1, 500);
       const mode = oneOf(field(payload, "mode"), ["new", "resume", "reset"] as const);
-      const hasResume = Object.hasOwn(payload, "resume");
+      const hasResume = OBJECT_HAS_OWN(payload, "resume");
       if (mode === "new" && hasResume) reject("schema-mismatch");
       if (mode === "resume" && !hasResume) reject("missing-field");
       if (hasResume && mode !== "new") validateTerminalResume(payload.resume!, mode);
@@ -1740,7 +1769,7 @@ export function validateRelayV2PublicFrame(
     version: 2,
     kind: frame.kind as RelayV2NormalizedPublicFrame["kind"],
     type,
-    requestId: Object.hasOwn(frame, "requestId") ? frame.requestId as string : null,
+    requestId: OBJECT_HAS_OWN(frame, "requestId") ? frame.requestId as string : null,
   };
 }
 
@@ -1755,7 +1784,7 @@ function carrierRoot(
   literal(field(frame, "carrierVersion"), 1);
   literal(field(frame, "type"), type);
   for (const name of ["requestId", "connectorId", "routeId", "routeFence"]) {
-    if (!Object.hasOwn(frame, name)) continue;
+    if (!OBJECT_HAS_OWN(frame, name)) continue;
     if (name === "connectorId" && nullableConnector && frame[name] === null) continue;
     id(frame[name]!);
   }
@@ -2134,7 +2163,7 @@ export function validateRelayV2CarrierFrame(
     channel: "carrier",
     version: 1,
     type,
-    requestId: Object.hasOwn(frame, "requestId") ? frame.requestId as string : null,
+    requestId: OBJECT_HAS_OWN(frame, "requestId") ? frame.requestId as string : null,
   };
 }
 

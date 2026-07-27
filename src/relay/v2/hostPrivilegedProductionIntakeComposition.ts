@@ -27,6 +27,10 @@ import {
   readRelayV2HostProductionProfile,
   type RelayV2HostProductionProfile,
 } from "./hostProductionProfileStore.js";
+import {
+  captureRelayV2HostTlsCaTrust,
+  type RelayV2HostTlsCaTrust,
+} from "./hostTlsTrustMaterial.js";
 
 export interface RelayV2HostCredentialAtomicByteCellOwner
 extends RelayV2HostCredentialAtomicByteCell {
@@ -54,7 +58,7 @@ CanonicalDashboardManagement,
 
 export type RelayV2HostPrivilegedProductionCanonicalOptions = Omit<
 RelayV2HostCanonicalProductionCompositionOptions,
-"credentialAuthority" | "dashboardManagement"
+"credentialAuthority" | "dashboardManagement" | "carrierWssTlsTrust"
 > & Readonly<{
   dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions;
 }>;
@@ -70,6 +74,10 @@ export interface RelayV2HostPrivilegedProductionIntakeCompositionOptions {
   readonly reauthentication?: RelayV2HostPrivilegedProductionReauthenticationOptions;
   /** Socket factory seam; production omission selects the default transport. */
   readonly wssTransport?: RelayV2HostPrivilegedProductionWssTransport;
+  /** Independent CA-only extension for the credential issuer HTTPS lane. */
+  readonly credentialHttpsTlsTrust?: RelayV2HostTlsCaTrust;
+  /** Independent CA-only extension for the carrier WSS lane. */
+  readonly carrierWssTlsTrust?: RelayV2HostTlsCaTrust;
   readonly canonical: RelayV2HostPrivilegedProductionCanonicalOptions;
 }
 
@@ -149,6 +157,8 @@ interface CapturedOptions {
   readonly sourceOwner: { current: CapturedByteSource | null };
   readonly reauthentication: RelayV2HostPrivilegedProductionReauthenticationOptions | undefined;
   readonly wssTransport: RelayV2HostPrivilegedProductionWssTransport | undefined;
+  readonly credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  readonly carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
   readonly canonical: CapturedCanonicalOptions;
 }
 
@@ -454,6 +464,8 @@ function captureOptions(
     "bootstrapSecretByteSource",
     "reauthentication",
     "wssTransport",
+    "credentialHttpsTlsTrust",
+    "carrierWssTlsTrust",
   ]);
   if (fields === null) return null;
   if (fields.trustedHome !== undefined && typeof fields.trustedHome !== "string") return null;
@@ -464,6 +476,18 @@ function captureOptions(
     ? null
     : captureByteSource(fields.bootstrapSecretByteSource);
   const canonical = captureCanonicalOptions(fields.canonical);
+  let credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  let carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  try {
+    credentialHttpsTlsTrust = fields.credentialHttpsTlsTrust === undefined
+      ? undefined
+      : captureRelayV2HostTlsCaTrust(fields.credentialHttpsTlsTrust);
+    carrierWssTlsTrust = fields.carrierWssTlsTrust === undefined
+      ? undefined
+      : captureRelayV2HostTlsCaTrust(fields.carrierWssTlsTrust);
+  } catch {
+    return null;
+  }
   if (cell === null || source === null && fields.bootstrapSecretByteSource !== undefined
     || reauthentication === null || wssTransport === null
     || canonical === null) return null;
@@ -473,6 +497,8 @@ function captureOptions(
     sourceOwner: { current: source },
     reauthentication,
     wssTransport,
+    credentialHttpsTlsTrust,
+    carrierWssTlsTrust,
     canonical,
   });
 }
@@ -577,6 +603,9 @@ function canonicalOptions(
       : { schedule: captured.reauthentication.schedule }),
   });
   if (captured.wssTransport !== undefined) result.wssTransport = captured.wssTransport;
+  if (captured.carrierWssTlsTrust !== undefined) {
+    result.carrierWssTlsTrust = captured.carrierWssTlsTrust;
+  }
   const dashboard = values.dashboardManagement;
   if (dashboard !== undefined) {
     result.dashboardManagement = freezeRecord({
@@ -727,6 +756,9 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
     }
     const httpsAdapter = new RelayV2HostCredentialHttpsAdapter({
       issuerUrl: profile.credentialIssuerUrl,
+      ...(captured.credentialHttpsTlsTrust === undefined
+        ? {}
+        : { tlsTrust: captured.credentialHttpsTlsTrust }),
     });
     const coordinator = new RelayV2HostCredentialExchangeCoordinator({
       authority,

@@ -12,6 +12,10 @@ import {
   type RelayV2HostPrivilegedProductionWssTransport,
 } from "./hostPrivilegedProductionIntakeComposition.js";
 import type { RelayV2HostBootstrapSecretByteSource } from "./hostBootstrapSecretSource.js";
+import {
+  captureRelayV2HostTlsCaTrust,
+  type RelayV2HostTlsCaTrust,
+} from "./hostTlsTrustMaterial.js";
 
 export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   /**
@@ -27,6 +31,10 @@ export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   readonly reauthentication?: RelayV2HostPrivilegedProductionReauthenticationOptions;
   /** Socket factory seam forwarded to the intake. */
   readonly wssTransport?: RelayV2HostPrivilegedProductionWssTransport;
+  /** Independent CA-only extension for the credential issuer HTTPS lane. */
+  readonly credentialHttpsTlsTrust?: RelayV2HostTlsCaTrust;
+  /** Independent CA-only extension for the carrier WSS lane. */
+  readonly carrierWssTlsTrust?: RelayV2HostTlsCaTrust;
   readonly canonical: RelayV2HostPrivilegedProductionCanonicalOptions;
 }
 
@@ -178,12 +186,31 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
   const captured = snapshotExactDataRecord(
     options,
     ["takeNativeModule", "canonical"],
-    ["trustedHome", "bootstrapSecretByteSource", "reauthentication", "wssTransport"],
+    [
+      "trustedHome",
+      "bootstrapSecretByteSource",
+      "reauthentication",
+      "wssTransport",
+      "credentialHttpsTlsTrust",
+      "carrierWssTlsTrust",
+    ],
   );
   const take = captured?.takeNativeModule;
   if (captured === null
     || typeof take !== "function"
     || isAsyncFunction(take)) throw failure("SOURCE_INVALID");
+  let credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  let carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  try {
+    credentialHttpsTlsTrust = captured.credentialHttpsTlsTrust === undefined
+      ? undefined
+      : captureRelayV2HostTlsCaTrust(captured.credentialHttpsTlsTrust);
+    carrierWssTlsTrust = captured.carrierWssTlsTrust === undefined
+      ? undefined
+      : captureRelayV2HostTlsCaTrust(captured.carrierWssTlsTrust);
+  } catch {
+    throw failure("SOURCE_INVALID");
+  }
   // Synchronous, atomic, permanent claim on the exact callable identity. It is
   // recorded before the source, the native wrapper, or the intake are touched,
   // and is never released: once claimed, success or failure, the source is
@@ -241,6 +268,8 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
     wssTransport: captured.wssTransport as
       | RelayV2HostPrivilegedProductionWssTransport
       | undefined,
+    credentialHttpsTlsTrust,
+    carrierWssTlsTrust,
     canonical: captured.canonical as RelayV2HostPrivilegedProductionCanonicalOptions,
   });
   // A thrown intake error is already stable and redacted, and the intake has

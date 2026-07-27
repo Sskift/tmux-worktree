@@ -8,13 +8,160 @@ import {
 } from "node:fs/promises";
 import {
   createServer as createHttpsServer,
-  request as nodeHttpsRequest,
 } from "node:https";
+import {
+  createRequire,
+  syncBuiltinESMExports,
+} from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
+const require = createRequire(import.meta.url);
+const mutableNodeHttps = require("node:https");
+const mutableNodeTls = require("node:tls");
+const mutableNodeUtil = require("node:util");
+const TEST_REFLECT_APPLY = Reflect.apply;
+const TEST_REFLECT_OWN_KEYS = Reflect.ownKeys;
+const TEST_OBJECT_DEFINE_PROPERTY = Object.defineProperty;
+const TEST_OBJECT_FREEZE = Object.freeze;
+const TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const TEST_OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const TEST_OBJECT_HAS_OWN = Object.hasOwn;
+const TEST_OBJECT_IS_FROZEN = Object.isFrozen;
+const TEST_JSON_STRINGIFY = JSON.stringify;
+const TEST_TYPED_ARRAY_PROTOTYPE =
+  TEST_OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
+const TEST_TYPED_ARRAY_BYTE_LENGTH_DESCRIPTOR =
+  TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    TEST_TYPED_ARRAY_PROTOTYPE,
+    "byteLength",
+  );
+const TEST_TYPED_ARRAY_BUFFER_DESCRIPTOR =
+  TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    TEST_TYPED_ARRAY_PROTOTYPE,
+    "buffer",
+  );
+const TEST_TYPED_ARRAY_BYTE_OFFSET_DESCRIPTOR =
+  TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    TEST_TYPED_ARRAY_PROTOTYPE,
+    "byteOffset",
+  );
+const TEST_TYPED_ARRAY_LENGTH_DESCRIPTOR =
+  TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    TEST_TYPED_ARRAY_PROTOTYPE,
+    "length",
+  );
+const TEST_TYPED_ARRAY_BYTE_LENGTH =
+    TEST_TYPED_ARRAY_BYTE_LENGTH_DESCRIPTOR.get;
+const TEST_TEXT_DECODER = new TextDecoder("utf-8");
+const TEST_TEXT_DECODER_DECODE = TextDecoder.prototype.decode;
+const TEST_URL_PROTOTYPE = URL.prototype;
+const TEST_URL_MEMBER_NAMES = [
+  "protocol",
+  "hostname",
+  "username",
+  "password",
+  "pathname",
+  "search",
+  "hash",
+  "port",
+  "origin",
+  "toString",
+];
+const TEST_URL_MEMBER_DESCRIPTORS = new Map(
+  TEST_URL_MEMBER_NAMES.map((name) => [
+    name,
+    TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(TEST_URL_PROTOTYPE, name),
+  ]),
+);
+
+function installUrlPrototypePoison(onCall) {
+  for (const name of TEST_URL_MEMBER_NAMES) {
+    const descriptor = TEST_URL_MEMBER_DESCRIPTORS.get(name);
+    assert.notEqual(descriptor, undefined);
+    const poisoned = { ...descriptor };
+    if (typeof descriptor.get === "function") {
+      poisoned.get = function poisonedUrlGetter() {
+        onCall(name, "get", this);
+        return TEST_REFLECT_APPLY(descriptor.get, this, []);
+      };
+    }
+    if (typeof descriptor.set === "function") {
+      poisoned.set = function poisonedUrlSetter(value) {
+        onCall(name, "set", this);
+        return TEST_REFLECT_APPLY(descriptor.set, this, [value]);
+      };
+    }
+    if (typeof descriptor.value === "function") {
+      poisoned.value = function poisonedUrlMethod(...args) {
+        onCall(name, "value", this);
+        return TEST_REFLECT_APPLY(descriptor.value, this, args);
+      };
+    }
+    TEST_OBJECT_DEFINE_PROPERTY(TEST_URL_PROTOTYPE, name, poisoned);
+  }
+}
+
+function restoreUrlPrototype() {
+  for (const name of TEST_URL_MEMBER_NAMES) {
+    TEST_OBJECT_DEFINE_PROPERTY(
+      TEST_URL_PROTOTYPE,
+      name,
+      TEST_URL_MEMBER_DESCRIPTORS.get(name),
+    );
+  }
+}
+
+function testTypedArrayByteLength(value) {
+  return TEST_REFLECT_APPLY(TEST_TYPED_ARRAY_BYTE_LENGTH, value, []);
+}
+
+function fixTestBufferSlots(value) {
+  const buffer = TEST_REFLECT_APPLY(
+    TEST_TYPED_ARRAY_BUFFER_DESCRIPTOR.get,
+    value,
+    [],
+  );
+  const byteOffset = TEST_REFLECT_APPLY(
+    TEST_TYPED_ARRAY_BYTE_OFFSET_DESCRIPTOR.get,
+    value,
+    [],
+  );
+  const byteLength = testTypedArrayByteLength(value);
+  const length = TEST_REFLECT_APPLY(
+    TEST_TYPED_ARRAY_LENGTH_DESCRIPTOR.get,
+    value,
+    [],
+  );
+  TEST_OBJECT_DEFINE_PROPERTY(value, "buffer", {
+    configurable: false,
+    enumerable: false,
+    value: buffer,
+    writable: false,
+  });
+  TEST_OBJECT_DEFINE_PROPERTY(value, "byteOffset", {
+    configurable: false,
+    enumerable: false,
+    value: byteOffset,
+    writable: false,
+  });
+  TEST_OBJECT_DEFINE_PROPERTY(value, "byteLength", {
+    configurable: false,
+    enumerable: false,
+    value: byteLength,
+    writable: false,
+  });
+  TEST_OBJECT_DEFINE_PROPERTY(value, "length", {
+    configurable: false,
+    enumerable: false,
+    value: length,
+    writable: false,
+  });
+  return value;
+}
 const REPOSITORY = fileURLToPath(new URL("../", import.meta.url));
 const BUILD_DIRECTORY = await mkdtemp(join(tmpdir(), "tw-host-credential-https-build-"));
 const TLS_DIRECTORY = await mkdtemp(join(tmpdir(), "tw-host-credential-https-tls-"));
@@ -24,14 +171,20 @@ const CERTIFICATE_PATH = join(TLS_DIRECTORY, "localhost-cert.pem");
 execFileSync(
   join(REPOSITORY, "node_modules", ".bin", "tsup"),
   [
+    "src/relay/v2/brokerCore.ts",
     "src/relay/v2/hostCredentialHttpsAdapter.ts",
+    "src/relay/v2/hostCarrier.ts",
+    "src/relay/v2/hostCredentialAuthority.ts",
+    "src/relay/v2/hostTlsTrustMaterial.ts",
+    "src/relay/v2/hostWssTransportLifecycle.ts",
+    "src/relay/v2/issuer.ts",
     "src/relay/v2/singleExchangeHttpsTransport.ts",
     "--format", "esm",
     "--target", "node20",
     "--platform", "node",
     "--out-dir", BUILD_DIRECTORY,
     "--clean",
-    "--splitting", "false",
+    "--splitting", "true",
   ],
   { cwd: REPOSITORY, stdio: "pipe" },
 );
@@ -51,8 +204,20 @@ execFileSync(
 const adapterModule = await import(pathToFileURL(
   join(BUILD_DIRECTORY, "hostCredentialHttpsAdapter.js"),
 ).href);
-const transportModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "singleExchangeHttpsTransport.js"),
+const trustMaterialModule = await import(pathToFileURL(
+  join(BUILD_DIRECTORY, "hostTlsTrustMaterial.js"),
+).href);
+const carrierModule = await import(pathToFileURL(
+  join(BUILD_DIRECTORY, "hostCarrier.js"),
+).href);
+const credentialModule = await import(pathToFileURL(
+  join(BUILD_DIRECTORY, "hostCredentialAuthority.js"),
+).href);
+const issuerModule = await import(pathToFileURL(
+  join(BUILD_DIRECTORY, "issuer.js"),
+).href);
+const wssModule = await import(pathToFileURL(
+  join(BUILD_DIRECTORY, "hostWssTransportLifecycle.js"),
 ).href);
 const PRIVATE_KEY = await readFile(PRIVATE_KEY_PATH);
 const CERTIFICATE = await readFile(CERTIFICATE_PATH);
@@ -121,13 +286,21 @@ function nextTurn() {
 }
 
 function jsonBytes(value) {
-  return Buffer.from(typeof value === "string" ? value : JSON.stringify(value), "utf8");
+  return Buffer.from(
+    typeof value === "string"
+      ? value
+      : TEST_REFLECT_APPLY(TEST_JSON_STRINGIFY, JSON, [value]),
+    "utf8",
+  );
 }
 
 function assertRedactedError(error, expectedCode) {
   assert.ok(error instanceof adapterModule.RelayV2HostCredentialHttpsAdapterError);
   assert.equal(error.code, expectedCode);
-  const diagnostic = `${error.name}\n${error.message}\n${String(error.stack)}\n${JSON.stringify(error)}`;
+  const diagnostic =
+    `${error.name}\n${error.message}\n${String(error.stack)}\n${
+      TEST_REFLECT_APPLY(TEST_JSON_STRINGIFY, JSON, [error])
+    }`;
   for (const secret of ALL_SECRETS) assert.equal(diagnostic.includes(secret), false);
   assert.equal(Object.hasOwn(error, "cause"), false);
   return true;
@@ -157,7 +330,7 @@ function writeJson(response, status, body, extraHeaders = {}) {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
     "Content-Encoding": "identity",
-    "Content-Length": String(bytes.byteLength),
+    "Content-Length": String(testTypedArrayByteLength(bytes)),
     ...extraHeaders,
   });
   response.end(bytes);
@@ -199,14 +372,201 @@ async function startTlsServer(handler) {
   };
 }
 
-function trustedNodeTransport() {
-  return transportModule.createRelayV2SingleExchangeNodeHttpsTransport(
-    (url, options, callback) => nodeHttpsRequest(
-      url,
-      { ...options, ca: CERTIFICATE },
-      callback,
-    ),
+const WSS_HOST_ID = "mac-admin";
+const WSS_HOST_EPOCH = "host-epoch-one";
+const WSS_HOST_INSTANCE_ID = "host-instance-one";
+const WSS_CREDENTIAL_REFERENCE = "relay-v2-host-credential-ref:primary";
+
+class InMemoryCredentialStorage {
+  slots = new Map();
+  exclusiveDepth = 0;
+
+  runExclusive(reference, operation) {
+    if (this.exclusiveDepth !== 0) throw new Error("non-reentrant storage");
+    let slot = this.slots.get(reference);
+    if (slot === undefined) {
+      slot = { state: null, revision: 0 };
+      this.slots.set(reference, slot);
+    }
+    this.exclusiveDepth += 1;
+    try {
+      return operation({
+        read: () => ({
+          state: slot.state === null ? null : structuredClone(slot.state),
+          revision: TEST_OBJECT_FREEZE({ revision: slot.revision }),
+        }),
+        compareAndSwap: (_expected, replacement) => {
+          slot.state = replacement === null ? null : structuredClone(replacement);
+          slot.revision += 1;
+          return { status: "swapped" };
+        },
+      });
+    } finally {
+      this.exclusiveDepth -= 1;
+    }
+  }
+}
+
+function wssCredentialHarness() {
+  const storage = new InMemoryCredentialStorage();
+  const authority = new credentialModule.RelayV2HostCredentialAuthority({
+    storage,
+    secretResolver: {
+      resolve(reference) {
+        if (reference === "bootstrap-secret-one") return "twhostboot2.bootstrap-one";
+        throw new Error("unexpected secret reference");
+      },
+    },
+  });
+  const prepared = authority.prepareBootstrap({
+    credentialReference: WSS_CREDENTIAL_REFERENCE,
+    hostId: WSS_HOST_ID,
+    attemptId: "bootstrap-attempt-one",
+    oldSecretReference: "bootstrap-secret-one",
+  });
+  const keyring = issuerModule.createRelayV2IssuerKeyring({
+    issuerId: "relay-issuer-id",
+    kid: "host-tls-integration-key",
+    secretBase64url: Buffer.alloc(32, 0x61).toString("base64url"),
+    nowSeconds: 1_783_700_000,
+  });
+  const issued = issuerModule.prepareRelayV2AccessTokenIssuance(keyring, {
+    role: "host",
+    hostId: WSS_HOST_ID,
+    principalId: "host-principal-one",
+    grantId: "host-grant-one",
+    nowSeconds: 1_783_700_001,
+    jti: "host-access-one",
+  });
+  const accessToken = issued.token;
+  authority.applyBootstrapResponse(prepared.fence, {
+    bootstrapAttemptId: "bootstrap-attempt-one",
+    principalId: "host-principal-one",
+    grantId: "host-grant-one",
+    hostId: WSS_HOST_ID,
+    accessToken,
+    accessExpiresAtMs: issued.claims.exp * 1_000,
+    refreshToken: "twref2.refresh-one",
+    refreshExpiresAtMs: issued.claims.exp * 1_000 + 86_400_000,
+  });
+  return { authority, accessToken };
+}
+
+function inspectingWebSockets() {
+  const sockets = [];
+  class FakeHandshakeRequest {
+    authorization = null;
+    setHeaderCalls = 0;
+    endCalls = 0;
+    destroyCalls = 0;
+
+    setHeader(name, value) {
+      this.setHeaderCalls += 1;
+      if (name === "Authorization") this.authorization = value;
+    }
+
+    end() {
+      this.endCalls += 1;
+    }
+
+    destroy() {
+      this.destroyCalls += 1;
+    }
+  }
+
+  class FakeWebSocket {
+    readyState = 0;
+    protocol = "";
+    extensions = "";
+    bufferedAmount = 0;
+    listeners = new Map();
+
+    constructor(address, protocols, options) {
+      this.request = new FakeHandshakeRequest();
+      this.construction = {
+        address,
+        protocols: [...protocols],
+        optionKeys: TEST_REFLECT_OWN_KEYS(options),
+        optionsFrozen: TEST_OBJECT_IS_FROZEN(options),
+        rejectUnauthorized: options.rejectUnauthorized,
+        checkServerIdentity: options.checkServerIdentity,
+        ca: options.ca,
+        hasCert: TEST_OBJECT_HAS_OWN(options, "cert"),
+        hasKey: TEST_OBJECT_HAS_OWN(options, "key"),
+        hasHeaders: TEST_OBJECT_HAS_OWN(options, "headers"),
+      };
+      sockets.push(this);
+      options.finishRequest(this.request, this);
+    }
+
+    on(event, listener) {
+      this.listeners.set(event, listener);
+      return this;
+    }
+
+    removeListener(event, listener) {
+      if (this.listeners.get(event) === listener) this.listeners.delete(event);
+      return this;
+    }
+
+    send() {}
+
+    close() {
+      this.readyState = 2;
+    }
+
+    terminate() {
+      this.readyState = 3;
+    }
+
+    emitClose(code = 1000) {
+      this.readyState = 3;
+      this.listeners.get("close")?.(code);
+    }
+  }
+  return { sockets, FakeWebSocket };
+}
+
+function wssAttempt(signal = new AbortController().signal) {
+  return TEST_OBJECT_FREEZE({
+    requestId: "wss-tls-integration-attempt",
+    controllerGeneration: "1",
+    hostId: WSS_HOST_ID,
+    hostEpoch: WSS_HOST_EPOCH,
+    hostInstanceId: WSS_HOST_INSTANCE_ID,
+    credentialReference: WSS_CREDENTIAL_REFERENCE,
+    signal,
+  });
+}
+
+function prepareWssLifecycle(factory, authority, input) {
+  const admission = wssModule.prepareRelayV2HostWssTransportLifecycleAttempt(
+    factory,
+    TEST_OBJECT_FREEZE({ ...input, credentialReferences: authority }),
   );
+  assert.notEqual(admission, null);
+  const lifecycle = factory.createTransportLifecycle(input);
+  const actor = new carrierModule.RelayV2HostCarrierActor({
+    hostId: WSS_HOST_ID,
+    hostEpoch: WSS_HOST_EPOCH,
+    hostInstanceId: WSS_HOST_INSTANCE_ID,
+    credentialReferences: authority,
+    credentialConnectionAdmission: admission,
+    routeSink: {
+      onRouteBound() {},
+      onClientFrame() {},
+      onRouteUnbound() {},
+    },
+    advertisedCapabilities: [],
+    clientDialects: ["tw-relay.v2"],
+    dialectAdapters: TEST_OBJECT_FREEZE({}),
+    idFactory: () => "host-hello-one",
+    onStatus() {},
+  });
+  return {
+    lifecycle,
+    connection: actor.connect(lifecycle.transport, WSS_CREDENTIAL_REFERENCE),
+  };
 }
 
 function credentialErrorBody({ errorCode, retryable, retryAfterMs }, overrides = {}) {
@@ -234,7 +594,7 @@ function fakeResponse(options = {}) {
   const headers = options.headers ?? [
     ["Content-Type", "application/json"],
     ["Cache-Control", "no-store"],
-    ["Content-Length", String(bytes.byteLength)],
+    ["Content-Length", String(testTypedArrayByteLength(bytes))],
   ];
   const value = {
     statusCode: options.statusCode ?? 200,
@@ -313,21 +673,46 @@ test("local TLS exchanges use the two exact POST paths and keep credentials only
     }
   });
   try {
-    const adapter = new adapterModule.RelayV2HostCredentialHttpsAdapter({
-      issuerUrl: server.issuerUrl,
-      transport: trustedNodeTransport(),
-    });
-    const bootstrap = await adapter.bootstrap(
-      BOOTSTRAP_REQUEST,
-      activeSignal(),
-    );
-    const refresh = await adapter.refresh(
-      REFRESH_REQUEST,
-      activeSignal(),
-    );
+    const credentialIssuerCa = Uint8Array.from(CERTIFICATE);
+    const originalNodeHttpsRequest = mutableNodeHttps.request;
+    const originalNodeCheckServerIdentity = mutableNodeTls.checkServerIdentity;
+    let poisonedNodeHttpsRequestCalls = 0;
+    let poisonedNodeCheckServerIdentityCalls = 0;
+    mutableNodeHttps.request = function poisonedNodeHttpsRequest(...args) {
+      poisonedNodeHttpsRequestCalls += 1;
+      return TEST_REFLECT_APPLY(originalNodeHttpsRequest, this, args);
+    };
+    mutableNodeTls.checkServerIdentity = function poisonedNodeCheckServerIdentity(...args) {
+      poisonedNodeCheckServerIdentityCalls += 1;
+      return TEST_REFLECT_APPLY(originalNodeCheckServerIdentity, this, args);
+    };
+    syncBuiltinESMExports();
+    let bootstrap;
+    let refresh;
+    try {
+      const adapter = new adapterModule.RelayV2HostCredentialHttpsAdapter({
+        issuerUrl: server.issuerUrl,
+        tlsTrust: { certificateAuthorities: [credentialIssuerCa] },
+      });
+      credentialIssuerCa.fill(0);
+      bootstrap = await adapter.bootstrap(
+        BOOTSTRAP_REQUEST,
+        activeSignal(),
+      );
+      refresh = await adapter.refresh(
+        REFRESH_REQUEST,
+        activeSignal(),
+      );
+    } finally {
+      mutableNodeHttps.request = originalNodeHttpsRequest;
+      mutableNodeTls.checkServerIdentity = originalNodeCheckServerIdentity;
+      syncBuiltinESMExports();
+    }
 
     assert.deepEqual(bootstrap, BOOTSTRAP_RESPONSE);
     assert.deepEqual(refresh, REFRESH_RESPONSE);
+    assert.equal(poisonedNodeHttpsRequestCalls, 0);
+    assert.equal(poisonedNodeCheckServerIdentityCalls, 0);
     assert.equal(Object.isFrozen(bootstrap), true);
     assert.equal(Object.isFrozen(refresh), true);
     assert.equal(ownAbortedGetterReads, 0);
@@ -351,9 +736,1033 @@ test("local TLS exchanges use the two exact POST paths and keep credentials only
       const metadata = JSON.stringify({ url: request.url, headers: request.headers });
       for (const secret of ALL_SECRETS) assert.equal(metadata.includes(secret), false);
     }
+    let ownByteLengthGetterCalls = 0;
+    const ownByteLengthEntry = new Uint8Array([1]);
+    Object.defineProperty(ownByteLengthEntry, "byteLength", {
+      get() {
+        ownByteLengthGetterCalls += 1;
+        throw new Error("own byteLength getter must not run");
+      },
+    });
+    let subclassByteLengthGetterCalls = 0;
+    class ByteLengthSubclass extends Uint8Array {
+      get byteLength() {
+        subclassByteLengthGetterCalls += 1;
+        throw new Error("subclass byteLength getter must not run");
+      }
+    }
+    let proxyTrapCalls = 0;
+    const proxyEntry = new Proxy(new Uint8Array([1]), {
+      get() { proxyTrapCalls += 1; throw new Error("proxy get trap must not run"); },
+      getOwnPropertyDescriptor() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy descriptor trap must not run");
+      },
+      getPrototypeOf() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy prototype trap must not run");
+      },
+      ownKeys() { proxyTrapCalls += 1; throw new Error("proxy ownKeys trap must not run"); },
+    });
+    for (const tlsTrust of [
+      { certificateAuthorities: [] },
+      { certificateAuthorities: [""] },
+      { certificateAuthorities: ["A".repeat(16_385)] },
+      { certificateAuthorities: [CERTIFICATE], rejectUnauthorized: false },
+      { certificateAuthorities: [CERTIFICATE], cert: CERTIFICATE },
+      { certificateAuthorities: [CERTIFICATE], key: PRIVATE_KEY },
+      { certificateAuthorities: [CERTIFICATE], checkServerIdentity: () => undefined },
+      { certificateAuthorities: [ownByteLengthEntry] },
+      { certificateAuthorities: [new ByteLengthSubclass([1])] },
+      { certificateAuthorities: [proxyEntry] },
+    ]) {
+      assert.throws(
+        () => new adapterModule.RelayV2HostCredentialHttpsAdapter({
+          issuerUrl: server.issuerUrl,
+          tlsTrust,
+        }),
+        (error) => assertRedactedError(error, "CONFIGURATION_INVALID"),
+      );
+    }
+    assert.equal(ownByteLengthGetterCalls, 0);
+    assert.equal(subclassByteLengthGetterCalls, 0);
+    assert.equal(proxyTrapCalls, 0);
+    assert.equal(requests.length, 2, "hostile trust is rejected before network");
   } finally {
     await server.close();
   }
+});
+
+test("post-load tampering keeps complete Host HTTPS and WSS TLS lanes fixed", async (t) => {
+  let httpsApplicationRequests = 0;
+  const httpsResponseBody = fixTestBufferSlots(jsonBytes(BOOTSTRAP_RESPONSE));
+  const httpsResponseBodyLength = String(testTypedArrayByteLength(httpsResponseBody));
+  const server = await startTlsServer((_request, response) => {
+    httpsApplicationRequests += 1;
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Content-Encoding": "identity",
+      "Content-Length": httpsResponseBodyLength,
+    });
+    response.end(httpsResponseBody);
+  });
+  t.after(() => server.close());
+  const wssCredential = wssCredentialHarness();
+  const inspectingSockets = inspectingWebSockets();
+  let ownByteLengthGetterCalls = 0;
+  const ownByteLengthEntry = new Uint8Array([1]);
+  Object.defineProperty(ownByteLengthEntry, "byteLength", {
+    get() {
+      ownByteLengthGetterCalls += 1;
+      throw new Error("own byteLength getter must not run");
+    },
+  });
+  let subclassByteLengthGetterCalls = 0;
+  class ByteLengthSubclass extends Uint8Array {
+    get byteLength() {
+      subclassByteLengthGetterCalls += 1;
+      throw new Error("subclass byteLength getter must not run");
+    }
+  }
+  let proxyTrapCalls = 0;
+  const proxyEntry = new Proxy(new Uint8Array([1]), {
+    get() { proxyTrapCalls += 1; throw new Error("proxy get trap must not run"); },
+    getOwnPropertyDescriptor() {
+      proxyTrapCalls += 1;
+      throw new Error("proxy descriptor trap must not run");
+    },
+    getPrototypeOf() {
+      proxyTrapCalls += 1;
+      throw new Error("proxy prototype trap must not run");
+    },
+    ownKeys() { proxyTrapCalls += 1; throw new Error("proxy ownKeys trap must not run"); },
+  });
+  let listAccessorCalls = 0;
+  const accessorList = [];
+  Object.defineProperty(accessorList, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      listAccessorCalls += 1;
+      throw new Error("list accessor must not run");
+    },
+  });
+  class ArraySubclass extends Array {}
+  const subclassList = new ArraySubclass("ca");
+  const customPrototypeList = ["ca"];
+  Object.setPrototypeOf(customPrototypeList, Object.create(Array.prototype));
+  const extraFieldList = ["ca"];
+  Object.defineProperty(extraFieldList, "extra", { value: true });
+  const extraSymbolList = ["ca"];
+  Object.defineProperty(extraSymbolList, Symbol("extra"), { value: true });
+  const validBytes = new Uint8Array([0x43, 0x41]);
+  const httpsCa = Uint8Array.from(CERTIFICATE);
+
+  const originalObjectGetPrototypeOf = Object.getPrototypeOf;
+  const originalObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const originalObjectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+  const originalObjectHasOwn = Object.hasOwn;
+  const originalObjectFreeze = Object.freeze;
+  const originalObjectCreate = Object.create;
+  const originalObjectDefineProperty = Object.defineProperty;
+  const originalObjectIsFrozen = Object.isFrozen;
+  const originalObjectKeys = Object.keys;
+  const originalReflectApply = Reflect.apply;
+  const originalReflectConstruct = Reflect.construct;
+  const originalReflectOwnKeys = Reflect.ownKeys;
+  const originalJsonParse = JSON.parse;
+  const originalJsonStringify = JSON.stringify;
+  const originalWeakMapDelete = WeakMap.prototype.delete;
+  const originalWeakMapGet = WeakMap.prototype.get;
+  const originalWeakMapSet = WeakMap.prototype.set;
+  const originalStringCharCodeAt = String.prototype.charCodeAt;
+  const originalStringIncludes = String.prototype.includes;
+  const originalStringSlice = String.prototype.slice;
+  const originalStringSplit = String.prototype.split;
+  const originalStringStartsWith = String.prototype.startsWith;
+  const originalStringTrim = String.prototype.trim;
+  const originalArrayFrom = Array.from;
+  const originalArrayIsArray = Array.isArray;
+  const originalNumberIsSafeInteger = Number.isSafeInteger;
+  const originalBufferAllocUnsafe = Buffer.allocUnsafe;
+  const originalBufferByteLength = Buffer.byteLength;
+  const originalBufferFrom = Buffer.from;
+  const originalBufferToString = Buffer.prototype.toString;
+  const originalTextEncoder = globalThis.TextEncoder;
+  const originalTextEncoderEncode = originalTextEncoder.prototype.encode;
+  const originalTextDecoder = globalThis.TextDecoder;
+  const originalTextDecoderDecode = originalTextDecoder.prototype.decode;
+  const originalString = globalThis.String;
+  const originalArraySome = Array.prototype.some;
+  const originalArrayPush = Array.prototype.push;
+  const originalRegExpTest = RegExp.prototype.test;
+  const originalNodeUtilTypes = mutableNodeUtil.types;
+  const originalNodeHttpsRequest = mutableNodeHttps.request;
+  const originalNodeCheckServerIdentity = mutableNodeTls.checkServerIdentity;
+  const typedArrayPrototype = TEST_TYPED_ARRAY_PROTOTYPE;
+  const originalTypedArrayByteLength = TEST_TYPED_ARRAY_BYTE_LENGTH_DESCRIPTOR;
+  const originalTypedArrayBuffer = TEST_TYPED_ARRAY_BUFFER_DESCRIPTOR;
+  const originalTypedArrayByteOffset = TEST_TYPED_ARRAY_BYTE_OFFSET_DESCRIPTOR;
+  const originalTypedArraySet = TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    typedArrayPrototype,
+    "set",
+  );
+  const originalTypedArraySubarray = TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    typedArrayPrototype,
+    "subarray",
+  );
+  let tamperedIntrinsicCalls = 0;
+  let lastTamperedIntrinsic = "";
+  const poison = (original) => function poisonedIntrinsic(...args) {
+    tamperedIntrinsicCalls += 1;
+    lastTamperedIntrinsic = original.name;
+    return TEST_REFLECT_APPLY(original, this, args);
+  };
+
+  let capturedValid;
+  let ownRejected = false;
+  let subclassRejected = false;
+  let proxyRejected = false;
+  let accessorListRejected = false;
+  let subclassListRejected = false;
+  let customPrototypeListRejected = false;
+  let extraFieldListRejected = false;
+  let extraSymbolListRejected = false;
+  let networkStarts = 0;
+  let poisonedNodeHttpsRequestCalls = 0;
+  let poisonedNodeCheckServerIdentityCalls = 0;
+  let httpsAdapter;
+  const admitThenStartNetwork = (tlsTrust) => {
+    const captured = trustMaterialModule.captureRelayV2HostTlsCaTrust(tlsTrust);
+    networkStarts += 1;
+    return captured;
+  };
+
+  mutableNodeHttps.request = function poisonedNodeHttpsRequest(...args) {
+    poisonedNodeHttpsRequestCalls += 1;
+    return TEST_REFLECT_APPLY(originalNodeHttpsRequest, this, args);
+  };
+  mutableNodeTls.checkServerIdentity = function poisonedNodeCheckServerIdentity(...args) {
+    poisonedNodeCheckServerIdentityCalls += 1;
+    return TEST_REFLECT_APPLY(originalNodeCheckServerIdentity, this, args);
+  };
+  mutableNodeUtil.types = {
+    ...originalNodeUtilTypes,
+    isProxy: poison(originalNodeUtilTypes.isProxy),
+  };
+  syncBuiltinESMExports();
+  Object.getPrototypeOf = poison(originalObjectGetPrototypeOf);
+  Object.getOwnPropertyDescriptor = poison(originalObjectGetOwnPropertyDescriptor);
+  Object.getOwnPropertyDescriptors = poison(originalObjectGetOwnPropertyDescriptors);
+  Object.hasOwn = poison(originalObjectHasOwn);
+  Object.freeze = poison(originalObjectFreeze);
+  Reflect.apply = poison(originalReflectApply);
+  Reflect.ownKeys = poison(originalReflectOwnKeys);
+  Array.isArray = poison(originalArrayIsArray);
+  Number.isSafeInteger = poison(originalNumberIsSafeInteger);
+  Buffer.byteLength = poison(originalBufferByteLength);
+  globalThis.String = poison(originalString);
+  Array.prototype.some = poison(originalArraySome);
+  Array.prototype.push = poison(originalArrayPush);
+  RegExp.prototype.test = poison(originalRegExpTest);
+  TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "byteLength", {
+    ...originalTypedArrayByteLength,
+    get: poison(originalTypedArrayByteLength.get),
+  });
+  TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "set", {
+    ...originalTypedArraySet,
+    value: poison(originalTypedArraySet.value),
+  });
+  installUrlPrototypePoison((name, kind) => {
+    tamperedIntrinsicCalls += 1;
+    lastTamperedIntrinsic = `URL.prototype.${name}.${kind}`;
+  });
+  try {
+    httpsAdapter = new adapterModule.RelayV2HostCredentialHttpsAdapter({
+      issuerUrl: server.issuerUrl,
+      tlsTrust: {
+        certificateAuthorities: [httpsCa],
+      },
+    });
+    capturedValid = trustMaterialModule.captureRelayV2HostTlsCaTrust({
+      certificateAuthorities: ["private-ca", validBytes],
+    });
+    try {
+      admitThenStartNetwork({ certificateAuthorities: [ownByteLengthEntry] });
+    } catch {
+      ownRejected = true;
+    }
+    try {
+      admitThenStartNetwork({
+        certificateAuthorities: [new ByteLengthSubclass([1])],
+      });
+    } catch {
+      subclassRejected = true;
+    }
+    try {
+      admitThenStartNetwork({ certificateAuthorities: [proxyEntry] });
+    } catch {
+      proxyRejected = true;
+    }
+    try {
+      admitThenStartNetwork({ certificateAuthorities: accessorList });
+    } catch {
+      accessorListRejected = true;
+    }
+    try {
+      admitThenStartNetwork({ certificateAuthorities: subclassList });
+    } catch {
+      subclassListRejected = true;
+    }
+    try {
+      admitThenStartNetwork({ certificateAuthorities: customPrototypeList });
+    } catch {
+      customPrototypeListRejected = true;
+    }
+    try {
+      admitThenStartNetwork({ certificateAuthorities: extraFieldList });
+    } catch {
+      extraFieldListRejected = true;
+    }
+    try {
+      admitThenStartNetwork({ certificateAuthorities: extraSymbolList });
+    } catch {
+      extraSymbolListRejected = true;
+    }
+    for (const tlsTrust of [
+      { certificateAuthorities: [ownByteLengthEntry] },
+      { certificateAuthorities: [new ByteLengthSubclass([1])] },
+      { certificateAuthorities: [proxyEntry] },
+      { certificateAuthorities: accessorList },
+      { certificateAuthorities: subclassList },
+      { certificateAuthorities: customPrototypeList },
+      { certificateAuthorities: extraFieldList },
+      { certificateAuthorities: extraSymbolList },
+      { certificateAuthorities: ["private-ca"], cert: CERTIFICATE },
+      { certificateAuthorities: ["private-ca"], key: PRIVATE_KEY },
+    ]) {
+      try {
+        new adapterModule.RelayV2HostCredentialHttpsAdapter({
+          issuerUrl: server.issuerUrl,
+          tlsTrust,
+        });
+      } catch {
+        continue;
+      }
+      throw new Error("hostile HTTPS trust reached transport construction");
+    }
+  } finally {
+    restoreUrlPrototype();
+    Object.getPrototypeOf = originalObjectGetPrototypeOf;
+    Object.getOwnPropertyDescriptor = originalObjectGetOwnPropertyDescriptor;
+    Object.getOwnPropertyDescriptors = originalObjectGetOwnPropertyDescriptors;
+    Object.hasOwn = originalObjectHasOwn;
+    Object.freeze = originalObjectFreeze;
+    Reflect.apply = originalReflectApply;
+    Reflect.ownKeys = originalReflectOwnKeys;
+    Array.isArray = originalArrayIsArray;
+    Number.isSafeInteger = originalNumberIsSafeInteger;
+    Buffer.byteLength = originalBufferByteLength;
+    globalThis.String = originalString;
+    Array.prototype.some = originalArraySome;
+    Array.prototype.push = originalArrayPush;
+    RegExp.prototype.test = originalRegExpTest;
+    TEST_OBJECT_DEFINE_PROPERTY(
+      typedArrayPrototype,
+      "byteLength",
+      originalTypedArrayByteLength,
+    );
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "set", originalTypedArraySet);
+    mutableNodeUtil.types = originalNodeUtilTypes;
+    mutableNodeHttps.request = originalNodeHttpsRequest;
+    mutableNodeTls.checkServerIdentity = originalNodeCheckServerIdentity;
+    syncBuiltinESMExports();
+  }
+
+  validBytes.fill(0);
+  assert.deepEqual(capturedValid.certificateAuthorities, [
+    "private-ca",
+    new Uint8Array([0x43, 0x41]),
+  ]);
+  assert.equal(tamperedIntrinsicCalls, 0, lastTamperedIntrinsic);
+  assert.equal(ownRejected, true);
+  assert.equal(subclassRejected, true);
+  assert.equal(proxyRejected, true);
+  assert.equal(accessorListRejected, true);
+  assert.equal(subclassListRejected, true);
+  assert.equal(customPrototypeListRejected, true);
+  assert.equal(extraFieldListRejected, true);
+  assert.equal(extraSymbolListRejected, true);
+  assert.equal(ownByteLengthGetterCalls, 0);
+  assert.equal(subclassByteLengthGetterCalls, 0);
+  assert.equal(proxyTrapCalls, 0);
+  assert.equal(listAccessorCalls, 0);
+  assert.equal(networkStarts, 0);
+  assert.equal(httpsApplicationRequests, 0);
+
+  const wssTokenSegments = TEST_REFLECT_APPLY(
+    originalStringSplit,
+    wssCredential.accessToken,
+    ["."],
+  );
+  const tokenBearingMarkers = [
+    ...ALL_SECRETS,
+    wssCredential.accessToken,
+    wssTokenSegments[1],
+    wssTokenSegments[2],
+  ];
+  const isTokenBearingString = (value) => {
+    if (typeof value !== "string") return false;
+    for (const marker of tokenBearingMarkers) {
+      if (typeof marker === "string"
+        && TEST_REFLECT_APPLY(originalStringIncludes, value, [marker])) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const typedArrayCarriesSecret = (value) => {
+    try {
+      const decoded = TEST_REFLECT_APPLY(
+        TEST_TEXT_DECODER_DECODE,
+        TEST_TEXT_DECODER,
+        [value],
+      );
+      for (const marker of [
+        ...ALL_SECRETS,
+        wssCredential.accessToken,
+        wssTokenSegments[1],
+        wssTokenSegments[2],
+      ]) {
+        if (typeof marker === "string"
+          && TEST_REFLECT_APPLY(originalStringIncludes, decoded, [marker])) {
+          return true;
+        }
+      }
+    } catch {}
+    return false;
+  };
+  const objectCarriesSecret = (value) => {
+    try {
+      if (typeof value !== "object" || value === null) return false;
+      try {
+        TEST_REFLECT_APPLY(TEST_TYPED_ARRAY_BYTE_LENGTH, value, []);
+        return typedArrayCarriesSecret(value);
+      } catch {}
+      const descriptors = TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS(value);
+      for (const key of TEST_REFLECT_OWN_KEYS(descriptors)) {
+        const descriptor = descriptors[key];
+        if (TEST_OBJECT_HAS_OWN(descriptor, "value")
+          && typeof descriptor.value === "string"
+          && isTokenBearingString(descriptor.value)) {
+          return true;
+        }
+      }
+    } catch {}
+    return false;
+  };
+  const isOpaqueTokenKey = (value) => {
+    try {
+      return typeof value === "object"
+        && value !== null
+        && TEST_OBJECT_GET_PROTOTYPE_OF(value) === null;
+    } catch {
+      return false;
+    }
+  };
+  let tokenPrimitivePoisonCalls = 0;
+  let lastTokenPrimitivePoison = "";
+  let tokenPrimitivePoisonRestored = false;
+  const observeTokenPrimitive = (label) => {
+    tokenPrimitivePoisonCalls += 1;
+    lastTokenPrimitivePoison = label;
+  };
+  const restoreTokenPrimitivePoison = () => {
+    if (tokenPrimitivePoisonRestored) return;
+    tokenPrimitivePoisonRestored = true;
+    WeakMap.prototype.delete = originalWeakMapDelete;
+    WeakMap.prototype.get = originalWeakMapGet;
+    WeakMap.prototype.set = originalWeakMapSet;
+    JSON.parse = originalJsonParse;
+    JSON.stringify = originalJsonStringify;
+    Object.hasOwn = originalObjectHasOwn;
+    Object.keys = originalObjectKeys;
+    Array.from = originalArrayFrom;
+    String.prototype.charCodeAt = originalStringCharCodeAt;
+    String.prototype.includes = originalStringIncludes;
+    String.prototype.slice = originalStringSlice;
+    String.prototype.split = originalStringSplit;
+    String.prototype.trim = originalStringTrim;
+    Buffer.allocUnsafe = originalBufferAllocUnsafe;
+    Buffer.byteLength = originalBufferByteLength;
+    Buffer.from = originalBufferFrom;
+    Buffer.prototype.toString = originalBufferToString;
+    RegExp.prototype.test = originalRegExpTest;
+    originalTextEncoder.prototype.encode = originalTextEncoderEncode;
+    originalTextDecoder.prototype.decode = originalTextDecoderDecode;
+    globalThis.TextEncoder = originalTextEncoder;
+    globalThis.TextDecoder = originalTextDecoder;
+    TEST_OBJECT_DEFINE_PROPERTY(
+      typedArrayPrototype,
+      "buffer",
+      originalTypedArrayBuffer,
+    );
+    TEST_OBJECT_DEFINE_PROPERTY(
+      typedArrayPrototype,
+      "byteOffset",
+      originalTypedArrayByteOffset,
+    );
+    TEST_OBJECT_DEFINE_PROPERTY(
+      typedArrayPrototype,
+      "byteLength",
+      originalTypedArrayByteLength,
+    );
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "set", originalTypedArraySet);
+    TEST_OBJECT_DEFINE_PROPERTY(
+      typedArrayPrototype,
+      "subarray",
+      originalTypedArraySubarray,
+    );
+  };
+  t.after(restoreTokenPrimitivePoison);
+
+  const installTokenPrimitivePoison = () => {
+    Object.hasOwn = function poisonedTokenObjectHasOwn(value, key) {
+      if (objectCarriesSecret(value)) observeTokenPrimitive("Object.hasOwn");
+      return TEST_REFLECT_APPLY(originalObjectHasOwn, this, [value, key]);
+    };
+    Object.keys = function poisonedTokenObjectKeys(value) {
+      if (objectCarriesSecret(value)) observeTokenPrimitive("Object.keys");
+      return TEST_REFLECT_APPLY(originalObjectKeys, this, [value]);
+    };
+    Array.from = function poisonedArrayFrom(value, ...args) {
+      if (isTokenBearingString(value)) observeTokenPrimitive("Array.from");
+      return TEST_REFLECT_APPLY(originalArrayFrom, this, [value, ...args]);
+    };
+    WeakMap.prototype.delete = function poisonedWeakMapDelete(key) {
+      if (isOpaqueTokenKey(key)) observeTokenPrimitive("WeakMap.delete");
+      return TEST_REFLECT_APPLY(originalWeakMapDelete, this, [key]);
+    };
+    WeakMap.prototype.get = function poisonedWeakMapGet(key) {
+      if (isOpaqueTokenKey(key)) observeTokenPrimitive("WeakMap.get");
+      const value = TEST_REFLECT_APPLY(originalWeakMapGet, this, [key]);
+      if (value === wssCredential.accessToken) {
+        observeTokenPrimitive("WeakMap.get:value");
+      }
+      return value;
+    };
+    WeakMap.prototype.set = function poisonedWeakMapSet(key, value) {
+      if (isOpaqueTokenKey(key) || value === wssCredential.accessToken) {
+        observeTokenPrimitive("WeakMap.set");
+      }
+      return TEST_REFLECT_APPLY(originalWeakMapSet, this, [key, value]);
+    };
+    JSON.parse = function poisonedJsonParse(...args) {
+      observeTokenPrimitive("JSON.parse");
+      return TEST_REFLECT_APPLY(originalJsonParse, this, args);
+    };
+    JSON.stringify = function poisonedJsonStringify(...args) {
+      observeTokenPrimitive("JSON.stringify");
+      return TEST_REFLECT_APPLY(originalJsonStringify, this, args);
+    };
+    String.prototype.charCodeAt = function poisonedStringCharCodeAt(...args) {
+      if (isTokenBearingString(this)) observeTokenPrimitive("String.charCodeAt");
+      return TEST_REFLECT_APPLY(originalStringCharCodeAt, this, args);
+    };
+    String.prototype.includes = function poisonedStringIncludes(...args) {
+      if (isTokenBearingString(this)) observeTokenPrimitive("String.includes");
+      return TEST_REFLECT_APPLY(originalStringIncludes, this, args);
+    };
+    String.prototype.slice = function poisonedStringSlice(...args) {
+      if (isTokenBearingString(this)) observeTokenPrimitive("String.slice");
+      return TEST_REFLECT_APPLY(originalStringSlice, this, args);
+    };
+    String.prototype.split = function poisonedStringSplit(...args) {
+      if (isTokenBearingString(this)) observeTokenPrimitive("String.split");
+      return TEST_REFLECT_APPLY(originalStringSplit, this, args);
+    };
+    String.prototype.trim = function poisonedStringTrim(...args) {
+      if (isTokenBearingString(this)) observeTokenPrimitive("String.trim");
+      return TEST_REFLECT_APPLY(originalStringTrim, this, args);
+    };
+    Buffer.allocUnsafe = function poisonedBufferAllocUnsafe(...args) {
+      if (args[0] === adapterModule.RELAY_V2_HOST_CREDENTIAL_HTTPS_BODY_BYTES) {
+        observeTokenPrimitive("Buffer.allocUnsafe");
+      }
+      return TEST_REFLECT_APPLY(originalBufferAllocUnsafe, this, args);
+    };
+    Buffer.byteLength = function poisonedBufferByteLength(...args) {
+      if (isTokenBearingString(args[0])) {
+        observeTokenPrimitive("Buffer.byteLength");
+      }
+      return TEST_REFLECT_APPLY(originalBufferByteLength, this, args);
+    };
+    Buffer.from = function poisonedBufferFrom(...args) {
+      if (isTokenBearingString(args[0])
+        || typedArrayCarriesSecret(args[0])) {
+        observeTokenPrimitive("Buffer.from");
+      }
+      return TEST_REFLECT_APPLY(originalBufferFrom, this, args);
+    };
+    Buffer.prototype.toString = function poisonedBufferToString(...args) {
+      if (args[0] === "base64url" || typedArrayCarriesSecret(this)) {
+        observeTokenPrimitive("Buffer.toString");
+      }
+      return TEST_REFLECT_APPLY(originalBufferToString, this, args);
+    };
+    RegExp.prototype.test = function poisonedRegExpTest(...args) {
+      if (isTokenBearingString(args[0])) observeTokenPrimitive("RegExp.test");
+      return TEST_REFLECT_APPLY(originalRegExpTest, this, args);
+    };
+    originalTextEncoder.prototype.encode = function poisonedTextEncoderEncode(...args) {
+      if (isTokenBearingString(args[0])) {
+        observeTokenPrimitive("TextEncoder.encode");
+      }
+      return TEST_REFLECT_APPLY(originalTextEncoderEncode, this, args);
+    };
+    originalTextDecoder.prototype.decode = function poisonedTextDecoderDecode(...args) {
+      if (typedArrayCarriesSecret(args[0])) {
+        observeTokenPrimitive("TextDecoder.decode");
+      }
+      return TEST_REFLECT_APPLY(originalTextDecoderDecode, this, args);
+    };
+    globalThis.TextEncoder = function poisonedTextEncoder(...args) {
+      observeTokenPrimitive("TextEncoder");
+      return TEST_REFLECT_APPLY(originalReflectConstruct, Reflect, [
+        originalTextEncoder,
+        args,
+      ]);
+    };
+    globalThis.TextDecoder = function poisonedTextDecoder(...args) {
+      observeTokenPrimitive("TextDecoder");
+      return TEST_REFLECT_APPLY(originalReflectConstruct, Reflect, [
+        originalTextDecoder,
+        args,
+      ]);
+    };
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "buffer", {
+      ...originalTypedArrayBuffer,
+      get() {
+        if (typedArrayCarriesSecret(this)) {
+          observeTokenPrimitive("TypedArray.buffer");
+        }
+        return TEST_REFLECT_APPLY(originalTypedArrayBuffer.get, this, []);
+      },
+    });
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "byteOffset", {
+      ...originalTypedArrayByteOffset,
+      get() {
+        if (typedArrayCarriesSecret(this)) {
+          observeTokenPrimitive("TypedArray.byteOffset");
+        }
+        return TEST_REFLECT_APPLY(originalTypedArrayByteOffset.get, this, []);
+      },
+    });
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "byteLength", {
+      ...originalTypedArrayByteLength,
+      get() {
+        if (typedArrayCarriesSecret(this)) {
+          observeTokenPrimitive("TypedArray.byteLength");
+        }
+        return TEST_REFLECT_APPLY(originalTypedArrayByteLength.get, this, []);
+      },
+    });
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "set", {
+      ...originalTypedArraySet,
+      value(...args) {
+        if (typedArrayCarriesSecret(this) || typedArrayCarriesSecret(args[0])) {
+          observeTokenPrimitive("TypedArray.set");
+        }
+        return TEST_REFLECT_APPLY(originalTypedArraySet.value, this, args);
+      },
+    });
+    TEST_OBJECT_DEFINE_PROPERTY(typedArrayPrototype, "subarray", {
+      ...originalTypedArraySubarray,
+      value(...args) {
+        if (typedArrayCarriesSecret(this)) {
+          observeTokenPrimitive("TypedArray.subarray");
+        }
+        return TEST_REFLECT_APPLY(originalTypedArraySubarray.value, this, args);
+      },
+    });
+  };
+
+  const tamperedResponse = fakeResponse({ body: BOOTSTRAP_RESPONSE });
+  const tamperedExchange = immediateExchange(tamperedResponse.value);
+  const tamperedTransport = new RecordingTransport(() => tamperedExchange.exchange);
+  installTokenPrimitivePoison();
+  mutableNodeHttps.request = function poisonedNodeHttpsRequest(...args) {
+    poisonedNodeHttpsRequestCalls += 1;
+    return TEST_REFLECT_APPLY(originalNodeHttpsRequest, this, args);
+  };
+  mutableNodeTls.checkServerIdentity = function poisonedNodeCheckServerIdentity(...args) {
+    poisonedNodeCheckServerIdentityCalls += 1;
+    return TEST_REFLECT_APPLY(originalNodeCheckServerIdentity, this, args);
+  };
+  syncBuiltinESMExports();
+  let bootstrap;
+  try {
+    bootstrap = await httpsAdapter.bootstrap(
+      BOOTSTRAP_REQUEST,
+      new AbortController().signal,
+    );
+  } finally {
+    mutableNodeHttps.request = originalNodeHttpsRequest;
+    mutableNodeTls.checkServerIdentity = originalNodeCheckServerIdentity;
+    syncBuiltinESMExports();
+  }
+  try {
+    assert.equal(poisonedNodeHttpsRequestCalls, 0);
+    assert.equal(poisonedNodeCheckServerIdentityCalls, 0);
+    assert.equal(httpsApplicationRequests, 1);
+    const systemTrustAdapter =
+      new adapterModule.RelayV2HostCredentialHttpsAdapter({
+        issuerUrl: server.issuerUrl,
+      });
+    await assert.rejects(
+      systemTrustAdapter.bootstrap(
+        BOOTSTRAP_REQUEST,
+        new AbortController().signal,
+      ),
+      (error) => assertRedactedError(error, "EXCHANGE_FAILED"),
+    );
+    assert.equal(httpsApplicationRequests, 1);
+  } finally {
+    await server.close();
+  }
+
+  const tamperedAdapter = fakeAdapter(tamperedTransport);
+  const tamperedBootstrap = await tamperedAdapter.bootstrap(
+    BOOTSTRAP_REQUEST,
+    new AbortController().signal,
+  );
+  assert.equal(tamperedTransport.calls.length, 1);
+  assert.equal(tamperedResponse.state.bodyReads, 1);
+
+  const validWssTrust = {
+    certificateAuthorities: [new Uint8Array([0x43, 0x41])],
+  };
+  const validWssFactoryOptions = {
+    relayUrl: "wss://relay.example.test/",
+    credentialAuthority: wssCredential.authority,
+    webSocketConstructor: inspectingSockets.FakeWebSocket,
+    tlsTrust: validWssTrust,
+  };
+  const invalidWssFactoryOptions = [
+    {
+      relayUrl: "wss://relay.example.test/",
+      credentialAuthority: wssCredential.authority,
+      webSocketConstructor: inspectingSockets.FakeWebSocket,
+      tlsTrust: { certificateAuthorities: [ownByteLengthEntry] },
+    },
+    {
+      relayUrl: "wss://relay.example.test/",
+      credentialAuthority: wssCredential.authority,
+      webSocketConstructor: inspectingSockets.FakeWebSocket,
+      tlsTrust: { certificateAuthorities: [new ByteLengthSubclass([1])] },
+    },
+    {
+      relayUrl: "wss://relay.example.test/",
+      credentialAuthority: wssCredential.authority,
+      webSocketConstructor: inspectingSockets.FakeWebSocket,
+      tlsTrust: { certificateAuthorities: [proxyEntry] },
+    },
+    {
+      relayUrl: "wss://relay.example.test/",
+      credentialAuthority: wssCredential.authority,
+      webSocketConstructor: inspectingSockets.FakeWebSocket,
+      tlsTrust: { certificateAuthorities: accessorList },
+    },
+    {
+      relayUrl: "wss://relay.example.test/",
+      credentialAuthority: wssCredential.authority,
+      webSocketConstructor: inspectingSockets.FakeWebSocket,
+      tlsTrust: { certificateAuthorities: ["private-ca"], cert: CERTIFICATE },
+    },
+  ];
+  const wssFactoryTargets = new Set([
+    validWssFactoryOptions,
+    validWssTrust,
+    validWssTrust.certificateAuthorities,
+    ...invalidWssFactoryOptions,
+    ...invalidWssFactoryOptions.map((options) => options.tlsTrust),
+    ownByteLengthEntry,
+    proxyEntry,
+    accessorList,
+    inspectingSockets.FakeWebSocket,
+  ]);
+  for (const options of invalidWssFactoryOptions) {
+    wssFactoryTargets.add(options.tlsTrust.certificateAuthorities);
+  }
+  let liveWssFactoryIntrinsicCalls = 0;
+  let lastLiveWssFactoryIntrinsic = "";
+  let liveWssUrlPrototypeCalls = 0;
+  let liveWssBearerStartsWithCalls = 0;
+  let liveWssBearerReflectApplyCalls = 0;
+  let liveWssFinalizationObjectCalls = 0;
+  let lastLiveWssFinalizationObject = "";
+  let liveWssConstructCalls = 0;
+  let liveWssTlsOptionsFreezeCalls = 0;
+  const expectedAuthorization = `Bearer ${wssCredential.accessToken}`;
+  const isCredentialState = (value) => {
+    try {
+      return typeof value === "object"
+        && value !== null
+        && TEST_OBJECT_HAS_OWN(value, "credentialVersion")
+        && TEST_OBJECT_HAS_OWN(value, "accessToken")
+        && TEST_OBJECT_HAS_OWN(value, "accessJti");
+    } catch {
+      return false;
+    }
+  };
+  const isFinalizationPort = (value) => {
+    try {
+      if (typeof value !== "object"
+        || value === null
+        || TEST_OBJECT_GET_PROTOTYPE_OF(value) !== null) return false;
+      const descriptor = TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, "finalize");
+      return descriptor !== undefined
+        && TEST_OBJECT_HAS_OWN(descriptor, "value")
+        && typeof descriptor.value === "function";
+    } catch {
+      return false;
+    }
+  };
+  const isFinalizationDescriptorMap = (value) => {
+    try {
+      if (typeof value !== "object" || value === null) return false;
+      const outer = TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, "finalize");
+      const inner = outer?.value;
+      return inner !== null
+        && typeof inner === "object"
+        && TEST_OBJECT_HAS_OWN(inner, "value")
+        && typeof inner.value === "function";
+    } catch {
+      return false;
+    }
+  };
+  const isSensitiveObjectTarget = (value) =>
+    wssFactoryTargets.has(value)
+    || isCredentialState(value)
+    || isFinalizationPort(value)
+    || isFinalizationDescriptorMap(value);
+  const targetPoison = (label, original) => function poisonedWssFactoryIntrinsic(...args) {
+    if (isSensitiveObjectTarget(args[0])) {
+      liveWssFactoryIntrinsicCalls += 1;
+      lastLiveWssFactoryIntrinsic = label;
+    }
+    return TEST_REFLECT_APPLY(original, this, args);
+  };
+  const attempt = wssAttempt();
+  let wssFactory;
+  let preparedWss;
+  let socketsBeforeBind = -1;
+
+  mutableNodeUtil.types = {
+    ...originalNodeUtilTypes,
+    isProxy: targetPoison("nodeTypes.isProxy", originalNodeUtilTypes.isProxy),
+  };
+  Object.getPrototypeOf =
+    targetPoison("Object.getPrototypeOf", originalObjectGetPrototypeOf);
+  Object.getOwnPropertyDescriptor =
+    targetPoison(
+      "Object.getOwnPropertyDescriptor",
+      originalObjectGetOwnPropertyDescriptor,
+    );
+  Object.getOwnPropertyDescriptors =
+    targetPoison(
+      "Object.getOwnPropertyDescriptors",
+      originalObjectGetOwnPropertyDescriptors,
+    );
+  const tokenPoisonedObjectHasOwn = Object.hasOwn;
+  const tokenPoisonedObjectKeys = Object.keys;
+  Object.hasOwn = targetPoison("Object.hasOwn", tokenPoisonedObjectHasOwn);
+  Object.create = function poisonedObjectCreate(prototype, properties) {
+    if (prototype === null) {
+      liveWssFinalizationObjectCalls += 1;
+      lastLiveWssFinalizationObject = "Object.create";
+    }
+    return properties === undefined
+      ? TEST_REFLECT_APPLY(originalObjectCreate, this, [prototype])
+      : TEST_REFLECT_APPLY(originalObjectCreate, this, [prototype, properties]);
+  };
+  Object.defineProperty = function poisonedObjectDefineProperty(
+    value,
+    property,
+    descriptor,
+  ) {
+    if (property === "finalize") {
+      liveWssFinalizationObjectCalls += 1;
+      lastLiveWssFinalizationObject = "Object.defineProperty";
+    }
+    return TEST_REFLECT_APPLY(originalObjectDefineProperty, this, [
+      value,
+      property,
+      descriptor,
+    ]);
+  };
+  Object.freeze = function poisonedObjectFreeze(value) {
+    try {
+      const descriptors = TEST_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS(value);
+      if (TEST_OBJECT_HAS_OWN(descriptors, "rejectUnauthorized")
+        && TEST_OBJECT_HAS_OWN(descriptors, "checkServerIdentity")
+        && TEST_OBJECT_HAS_OWN(descriptors, "finishRequest")) {
+        liveWssTlsOptionsFreezeCalls += 1;
+      }
+      if (isFinalizationPort(value)) {
+        liveWssFinalizationObjectCalls += 1;
+        lastLiveWssFinalizationObject = "Object.freeze";
+      }
+    } catch {}
+    return TEST_REFLECT_APPLY(originalObjectFreeze, this, [value]);
+  };
+  Object.isFrozen = function poisonedObjectIsFrozen(value) {
+    if (isFinalizationPort(value)) {
+      liveWssFinalizationObjectCalls += 1;
+      lastLiveWssFinalizationObject = "Object.isFrozen";
+    }
+    return TEST_REFLECT_APPLY(originalObjectIsFrozen, this, [value]);
+  };
+  Object.keys = function poisonedObjectKeys(value) {
+    if (isCredentialState(value)) {
+      liveWssFinalizationObjectCalls += 1;
+      lastLiveWssFinalizationObject = "Object.keys";
+    }
+    return TEST_REFLECT_APPLY(tokenPoisonedObjectKeys, this, [value]);
+  };
+  Reflect.apply = function poisonedReflectApply(target, receiver, args) {
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === expectedAuthorization) {
+        liveWssBearerReflectApplyCalls += 1;
+      }
+    }
+    return TEST_REFLECT_APPLY(originalReflectApply, this, [target, receiver, args]);
+  };
+  Reflect.construct = function poisonedReflectConstruct(target, args, newTarget) {
+    if (target === inspectingSockets.FakeWebSocket) liveWssConstructCalls += 1;
+    return newTarget === undefined
+      ? TEST_REFLECT_APPLY(originalReflectConstruct, this, [target, args])
+      : TEST_REFLECT_APPLY(originalReflectConstruct, this, [
+          target,
+          args,
+          newTarget,
+        ]);
+  };
+  Reflect.ownKeys = function poisonedReflectOwnKeys(value) {
+    if (isSensitiveObjectTarget(value)) {
+      liveWssFactoryIntrinsicCalls += 1;
+      lastLiveWssFactoryIntrinsic = "Reflect.ownKeys";
+    }
+    return TEST_REFLECT_APPLY(originalReflectOwnKeys, this, [value]);
+  };
+  Array.isArray = targetPoison("Array.isArray", originalArrayIsArray);
+  String.prototype.startsWith = function poisonedStringStartsWith(...args) {
+    liveWssBearerStartsWithCalls += 1;
+    return TEST_REFLECT_APPLY(originalStringStartsWith, this, args);
+  };
+  mutableNodeTls.checkServerIdentity = function poisonedNodeCheckServerIdentity(...args) {
+    poisonedNodeCheckServerIdentityCalls += 1;
+    return TEST_REFLECT_APPLY(originalNodeCheckServerIdentity, this, args);
+  };
+  installUrlPrototypePoison(() => {
+    liveWssUrlPrototypeCalls += 1;
+  });
+  syncBuiltinESMExports();
+  try {
+    wssFactory = new wssModule.RelayV2HostWssTransportLifecycleFactory(
+      validWssFactoryOptions,
+    );
+    for (const options of invalidWssFactoryOptions) {
+      try {
+        new wssModule.RelayV2HostWssTransportLifecycleFactory(options);
+      } catch {
+        continue;
+      }
+      throw new Error("hostile WSS trust reached socket construction");
+    }
+    socketsBeforeBind = inspectingSockets.sockets.length;
+    preparedWss = prepareWssLifecycle(
+      wssFactory,
+      wssCredential.authority,
+      attempt,
+    );
+    preparedWss.lifecycle.bindConnection(preparedWss.connection);
+  } finally {
+    restoreUrlPrototype();
+    String.prototype.startsWith = originalStringStartsWith;
+    Object.getPrototypeOf = originalObjectGetPrototypeOf;
+    Object.getOwnPropertyDescriptor = originalObjectGetOwnPropertyDescriptor;
+    Object.getOwnPropertyDescriptors = originalObjectGetOwnPropertyDescriptors;
+    Object.hasOwn = originalObjectHasOwn;
+    Object.create = originalObjectCreate;
+    Object.defineProperty = originalObjectDefineProperty;
+    Object.freeze = originalObjectFreeze;
+    Object.isFrozen = originalObjectIsFrozen;
+    Object.keys = originalObjectKeys;
+    Reflect.apply = originalReflectApply;
+    Reflect.construct = originalReflectConstruct;
+    Reflect.ownKeys = originalReflectOwnKeys;
+    Array.isArray = originalArrayIsArray;
+    mutableNodeUtil.types = originalNodeUtilTypes;
+    mutableNodeTls.checkServerIdentity = originalNodeCheckServerIdentity;
+    restoreTokenPrimitivePoison();
+    syncBuiltinESMExports();
+  }
+  assert.equal(
+    liveWssFactoryIntrinsicCalls,
+    0,
+    lastLiveWssFactoryIntrinsic,
+  );
+  assert.equal(liveWssUrlPrototypeCalls, 0);
+  assert.equal(liveWssBearerStartsWithCalls, 0);
+  assert.equal(liveWssBearerReflectApplyCalls, 0);
+  assert.equal(
+    liveWssFinalizationObjectCalls,
+    0,
+    lastLiveWssFinalizationObject,
+  );
+  assert.equal(liveWssConstructCalls, 0);
+  assert.equal(liveWssTlsOptionsFreezeCalls, 0);
+  assert.equal(
+    tokenPrimitivePoisonCalls,
+    0,
+    lastTokenPrimitivePoison,
+  );
+  assert.deepEqual(bootstrap, BOOTSTRAP_RESPONSE);
+  assert.deepEqual(tamperedBootstrap, BOOTSTRAP_RESPONSE);
+  assert.equal(poisonedNodeCheckServerIdentityCalls, 0);
+  assert.equal(socketsBeforeBind, 0);
+  assert.equal(ownByteLengthGetterCalls, 0);
+  assert.equal(subclassByteLengthGetterCalls, 0);
+  assert.equal(proxyTrapCalls, 0);
+  assert.equal(listAccessorCalls, 0);
+  assert.equal(inspectingSockets.sockets.length, 1);
+  const socket = inspectingSockets.sockets[0];
+  assert.equal(socket.construction.address, "wss://relay.example.test/host");
+  assert.equal(socket.construction.optionsFrozen, true);
+  assert.equal(socket.construction.rejectUnauthorized, true);
+  assert.equal(
+    socket.construction.checkServerIdentity,
+    originalNodeCheckServerIdentity,
+  );
+  assert.equal(socket.construction.hasCert, false);
+  assert.equal(socket.construction.hasKey, false);
+  assert.equal(socket.construction.hasHeaders, false);
+  assert.deepEqual(
+    [...socket.construction.ca[0]],
+    [0x43, 0x41],
+  );
+  assert.equal(socket.request.setHeaderCalls, 1);
+  assert.equal(socket.request.endCalls, 1);
+  assert.equal(socket.request.destroyCalls, 0);
+  assert.equal(socket.request.authorization, expectedAuthorization);
+
+  preparedWss.lifecycle.transport.close(1000, "host_shutdown");
+  const proof = Object.freeze({});
+  const drained = preparedWss.lifecycle.awaitDrained(proof);
+  socket.emitClose();
+  assert.equal(await drained, proof);
 });
 
 test("system TLS rejects an untrusted issuer and the adapter performs no fallback", async () => {
@@ -395,7 +1804,7 @@ test("a real HTTPS redirect is rejected once and never forwards the bootstrap se
   try {
     const adapter = new adapterModule.RelayV2HostCredentialHttpsAdapter({
       issuerUrl: server.issuerUrl,
-      transport: trustedNodeTransport(),
+      tlsTrust: { certificateAuthorities: [Uint8Array.from(CERTIFICATE)] },
     });
     await assert.rejects(
       adapter.bootstrap(BOOTSTRAP_REQUEST, new AbortController().signal),

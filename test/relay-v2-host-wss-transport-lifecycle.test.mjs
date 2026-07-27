@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import {
+  createRequire,
+  syncBuiltinESMExports,
+} from "node:module";
+import { checkServerIdentity } from "node:tls";
 import test from "node:test";
 
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
+const require = createRequire(import.meta.url);
+const mutableNodeTls = require("node:tls");
+const TEST_NODE_CHECK_SERVER_IDENTITY = checkServerIdentity;
 const carrierModule = await import("../dist/relay/v2/hostCarrier.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const attemptAdapterModule = await import(
@@ -255,9 +263,16 @@ function fakeWebSockets(expectedAuthorizationDigest, behavior = {}) {
         protocols: [...protocols],
         optionKeys: Reflect.ownKeys(options),
         hasHeadersOption: Object.hasOwn(options, "headers"),
+        hasCaOption: Object.hasOwn(options, "ca"),
+        ca: options.ca?.map((entry) => (
+          typeof entry === "string" ? entry : Uint8Array.from(entry)
+        )),
         finishRequestIsFunction: typeof options.finishRequest === "function",
         perMessageDeflate: options.perMessageDeflate,
         maxPayload: options.maxPayload,
+        rejectUnauthorized: options.rejectUnauthorized,
+        checkServerIdentityIsNode:
+          options.checkServerIdentity === TEST_NODE_CHECK_SERVER_IDENTITY,
       });
       sockets.push(this);
       behavior.onConstructor?.(this);
@@ -517,18 +532,41 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
     writables: [],
     bufferedAmount: () => lifecycle.transport.bufferedAmount(),
   };
-  lifecycle.bindConnection(observedConnection(connection, observations));
+  const originalNodeCheckServerIdentity = mutableNodeTls.checkServerIdentity;
+  let poisonedNodeCheckServerIdentityCalls = 0;
+  mutableNodeTls.checkServerIdentity = function poisonedNodeCheckServerIdentity() {
+    poisonedNodeCheckServerIdentityCalls += 1;
+    throw new Error("post-load hostname verifier must not be used");
+  };
+  syncBuiltinESMExports();
+  try {
+    lifecycle.bindConnection(observedConnection(connection, observations));
+  } finally {
+    mutableNodeTls.checkServerIdentity = originalNodeCheckServerIdentity;
+    syncBuiltinESMExports();
+  }
+  assert.equal(poisonedNodeCheckServerIdentityCalls, 0);
   assert.throws(() => lifecycle.bindConnection(connection));
   assert.equal(sockets.sockets.length, 1);
   const socket = sockets.sockets[0];
   assert.deepEqual(socket.construction, {
     address: "wss://relay.example.test/host",
     protocols: ["tw-relay.host.v2"],
-    optionKeys: ["perMessageDeflate", "maxPayload", "finishRequest"],
+    optionKeys: [
+      "perMessageDeflate",
+      "maxPayload",
+      "rejectUnauthorized",
+      "checkServerIdentity",
+      "finishRequest",
+    ],
     hasHeadersOption: false,
+    hasCaOption: false,
+    ca: undefined,
     finishRequestIsFunction: true,
     perMessageDeflate: false,
     maxPayload: codec.RELAY_V2_CARRIER_FRAME_BYTES,
+    rejectUnauthorized: true,
+    checkServerIdentityIsNode: true,
   });
   assert.equal(socket.request.authorizationHeaderNameIsExact, true);
   assert.equal(socket.request.authorizationIsExact, true);
@@ -573,6 +611,118 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
   assert.equal(observations.receives, 2);
 
   await closeLifecycle(lifecycle, socket);
+});
+
+test("carrier private CA trust is exact, immutable, and cannot weaken TLS", async () => {
+  const h = credentialHarness();
+  const sockets = fakeWebSockets(h.expectedAuthorizationDigest);
+  const scheduler = deadlineScheduler();
+  const caBytes = Uint8Array.from([0x43, 0x41, 0x2d, 0x42]);
+  const authorities = [caBytes];
+  const trust = { certificateAuthorities: authorities };
+  const factory = createFactory(h, sockets, scheduler, { tlsTrust: trust });
+
+  caBytes.fill(0);
+  authorities[0] = "mutated-after-capture";
+  trust.certificateAuthorities = [];
+
+  const input = attempt();
+  const admission = prepare(factory, h.authority, input);
+  const lifecycle = factory.createTransportLifecycle(input);
+  const connection = actor(h.authority, admission).connect(lifecycle.transport, REFERENCE);
+  lifecycle.bindConnection(connection);
+  const socket = sockets.sockets[0];
+  assert.deepEqual(socket.construction.optionKeys, [
+    "perMessageDeflate",
+    "maxPayload",
+    "rejectUnauthorized",
+    "checkServerIdentity",
+    "ca",
+    "finishRequest",
+  ]);
+  assert.equal(socket.construction.rejectUnauthorized, true);
+  assert.equal(socket.construction.checkServerIdentityIsNode, true);
+  assert.equal(socket.construction.hasHeadersOption, false);
+  assert.equal(socket.construction.hasCaOption, true);
+  assert.deepEqual(
+    [...socket.construction.ca[0]],
+    [0x43, 0x41, 0x2d, 0x42],
+  );
+  assert.equal(socket.request.authorizationIsExact, true);
+  await closeLifecycle(lifecycle, socket);
+
+  const accessorTrust = {};
+  Object.defineProperty(accessorTrust, "certificateAuthorities", {
+    enumerable: true,
+    get() { throw new Error("trust accessor must not run"); },
+  });
+  let ownByteLengthGetterCalls = 0;
+  const ownByteLengthEntry = new Uint8Array([1]);
+  Object.defineProperty(ownByteLengthEntry, "byteLength", {
+    get() {
+      ownByteLengthGetterCalls += 1;
+      throw new Error("own byteLength getter must not run");
+    },
+  });
+  let subclassByteLengthGetterCalls = 0;
+  class ByteLengthSubclass extends Uint8Array {
+    get byteLength() {
+      subclassByteLengthGetterCalls += 1;
+      throw new Error("subclass byteLength getter must not run");
+    }
+  }
+  let proxyTrapCalls = 0;
+  const proxyEntry = new Proxy(new Uint8Array([1]), {
+    get() { proxyTrapCalls += 1; throw new Error("proxy get trap must not run"); },
+    getOwnPropertyDescriptor() {
+      proxyTrapCalls += 1;
+      throw new Error("proxy descriptor trap must not run");
+    },
+    getPrototypeOf() {
+      proxyTrapCalls += 1;
+      throw new Error("proxy prototype trap must not run");
+    },
+    ownKeys() { proxyTrapCalls += 1; throw new Error("proxy ownKeys trap must not run"); },
+  });
+  const extraFieldEntry = new Uint8Array([1]);
+  Object.defineProperty(extraFieldEntry, "extra", { value: true });
+  const extraSymbolEntry = new Uint8Array([1]);
+  Object.defineProperty(extraSymbolEntry, Symbol("extra"), { value: true });
+  const invalidTrust = [
+    new Proxy({ certificateAuthorities: ["ca"] }, {}),
+    accessorTrust,
+    { certificateAuthorities: [] },
+    { certificateAuthorities: [new Uint8Array()] },
+    { certificateAuthorities: ["A".repeat(16_385)] },
+    { certificateAuthorities: ["ca"], rejectUnauthorized: false },
+    { certificateAuthorities: ["ca"], cert: "client-certificate" },
+    { certificateAuthorities: ["ca"], key: "client-private-key" },
+    { certificateAuthorities: ["ca"], checkServerIdentity: () => undefined },
+    { certificateAuthorities: [ownByteLengthEntry] },
+    { certificateAuthorities: [new ByteLengthSubclass([1])] },
+    { certificateAuthorities: [proxyEntry] },
+    { certificateAuthorities: [extraFieldEntry] },
+    { certificateAuthorities: [extraSymbolEntry] },
+  ];
+  for (const tlsTrust of invalidTrust) {
+    const rejectedSockets = fakeWebSockets(h.expectedAuthorizationDigest);
+    assert.throws(() => createFactory(
+      h,
+      rejectedSockets,
+      scheduler,
+      { tlsTrust },
+    ));
+    assert.equal(rejectedSockets.sockets.length, 0);
+  }
+  assert.equal(ownByteLengthGetterCalls, 0);
+  assert.equal(subclassByteLengthGetterCalls, 0);
+  assert.equal(proxyTrapCalls, 0);
+  assert.throws(() => createFactory(
+    h,
+    fakeWebSockets(h.expectedAuthorizationDigest),
+    scheduler,
+    { rejectUnauthorized: false },
+  ));
 });
 
 test("pre-OPEN FIFO is byte-bounded and refuses overflow without a ws queue", async () => {

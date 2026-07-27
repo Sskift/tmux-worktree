@@ -43,6 +43,10 @@ import type {
 import type { RelayV2RemoteExactCompoundChannelFactoryV1 } from "./remoteExactTerminalControlCompoundV1.js";
 import type { RelayV2HostWssTransportLifecycleFactoryOptions } from "./hostWssTransportLifecycle.js";
 import type { RelayV2CanonicalCreateTargetExecutionPairV1 } from "./canonicalCreateTargetAdmissionAdapter.js";
+import {
+  captureRelayV2HostTlsCaTrust,
+  type RelayV2HostTlsCaTrust,
+} from "./hostTlsTrustMaterial.js";
 
 /**
  * Explicit, default-off Relay v2 Host shipping root.
@@ -106,6 +110,10 @@ export interface RelayV2HostShippingDeploymentInputs {
   readonly reauthentication?: RelayV2HostShippingReauthenticationOptions;
   /** Socket factory seam for tests/deployment; production omission selects `ws`. */
   readonly wssTransport?: RelayV2HostShippingWssTransport;
+  /** Injected-only CA extension for the credential issuer HTTPS lane. */
+  readonly credentialHttpsTlsTrust?: RelayV2HostTlsCaTrust;
+  /** Injected-only CA extension for the carrier WSS lane. */
+  readonly carrierWssTlsTrust?: RelayV2HostTlsCaTrust;
 }
 
 export interface RelayV2HostShippingRuntimeLanes {
@@ -255,6 +263,8 @@ interface CapturedOptions {
   readonly bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | undefined;
   readonly reauthentication: RelayV2HostShippingReauthenticationOptions | undefined;
   readonly wssTransport: RelayV2HostShippingWssTransport | undefined;
+  readonly credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  readonly carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
   readonly discovery: RelayV2ResourceDiscovery;
   readonly localProcessTarget: Readonly<{ kind: "local"; targetId: string }>;
   readonly remoteCompoundChannels: RelayV2RemoteExactCompoundChannelFactoryV1;
@@ -312,7 +322,13 @@ function captureOptions(value: unknown): CapturedOptions {
     "nativeModuleTarget",
     "nativeModuleLoader",
     "createTargetExecutionPair",
-  ], ["bootstrapSecretByteSource", "reauthentication", "wssTransport"]);
+  ], [
+    "bootstrapSecretByteSource",
+    "reauthentication",
+    "wssTransport",
+    "credentialHttpsTlsTrust",
+    "carrierWssTlsTrust",
+  ]);
   if (deployment === null
     || deployment.nativeModuleTarget === undefined
     || deployment.nativeModuleLoader === undefined
@@ -328,7 +344,13 @@ function captureOptions(value: unknown): CapturedOptions {
     || typeof target.platform !== "string"
     || typeof target.architecture !== "string"
     || !Number.isSafeInteger(target.napiVersion)) throw failure("INPUTS_INVALID");
-  for (const optional of ["bootstrapSecretByteSource", "reauthentication", "wssTransport"] as const) {
+  for (const optional of [
+    "bootstrapSecretByteSource",
+    "reauthentication",
+    "wssTransport",
+    "credentialHttpsTlsTrust",
+    "carrierWssTlsTrust",
+  ] as const) {
     const field = deployment[optional];
     if (field !== undefined && !captureObjectField(field)) throw failure("INPUTS_INVALID");
   }
@@ -361,6 +383,18 @@ function captureOptions(value: unknown): CapturedOptions {
         > RELAY_V2_MATERIALIZED_RECONCILE_LIFECYCLE_MAX_SCAN_INTERVAL_MS)) {
     throw failure("INPUTS_INVALID");
   }
+  let credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  let carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  try {
+    credentialHttpsTlsTrust = deployment.credentialHttpsTlsTrust === undefined
+      ? undefined
+      : captureRelayV2HostTlsCaTrust(deployment.credentialHttpsTlsTrust);
+    carrierWssTlsTrust = deployment.carrierWssTlsTrust === undefined
+      ? undefined
+      : captureRelayV2HostTlsCaTrust(deployment.carrierWssTlsTrust);
+  } catch {
+    throw failure("INPUTS_INVALID");
+  }
   return Object.freeze({
     trustedHome: record.trustedHome as string | undefined,
     nativeModuleTarget: Object.freeze({
@@ -378,6 +412,8 @@ function captureOptions(value: unknown): CapturedOptions {
       | RelayV2HostShippingReauthenticationOptions
       | undefined,
     wssTransport: deployment.wssTransport as RelayV2HostShippingWssTransport | undefined,
+    credentialHttpsTlsTrust,
+    carrierWssTlsTrust,
     discovery: runtime.discovery as RelayV2ResourceDiscovery,
     localProcessTarget: Object.freeze({
       kind: "local" as const,
@@ -552,6 +588,12 @@ export async function startRelayV2HostShippingRoot(
         ? {}
         : { reauthentication: captured.reauthentication }),
       ...(captured.wssTransport === undefined ? {} : { wssTransport: captured.wssTransport }),
+      ...(captured.credentialHttpsTlsTrust === undefined
+        ? {}
+        : { credentialHttpsTlsTrust: captured.credentialHttpsTlsTrust }),
+      ...(captured.carrierWssTlsTrust === undefined
+        ? {}
+        : { carrierWssTlsTrust: captured.carrierWssTlsTrust }),
       canonical: Object.freeze({
         hostState: store,
         recoveredH2Spool: spool,

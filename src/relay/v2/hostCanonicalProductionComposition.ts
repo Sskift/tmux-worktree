@@ -59,6 +59,10 @@ import {
 import { RelayV2HostReauthenticationLifecycleOwner } from "./hostReauthenticationLifecycleOwner.js";
 import type { RelayV2HostWssTransportLifecycleFactoryOptions } from "./hostWssTransportLifecycle.js";
 import {
+  captureRelayV2HostTlsCaTrust,
+  type RelayV2HostTlsCaTrust,
+} from "./hostTlsTrustMaterial.js";
+import {
   createRelayV2DashboardManagementProtocolV2CompositionSession,
   type RelayV2DashboardManagementProtocolV2CompositionSession,
 } from "./relayV2DashboardManagementProtocolV2CompositionSession.js";
@@ -123,6 +127,8 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
     idFactory?: () => string;
     schedule?: (delayMs: number, callback: () => void) => () => void;
   }>;
+  /** Independent CA-only trust extension for the carrier WSS lane. */
+  readonly carrierWssTlsTrust?: RelayV2HostTlsCaTrust;
   /** Default-off socket factory seam; production omission selects `ws`. */
   readonly wssTransport?: Readonly<{
     webSocketConstructor: NonNullable<
@@ -400,6 +406,19 @@ function captureWssTransportOptions(
   })) as CapturedWssTransportOptions;
 }
 
+function captureCarrierWssTlsTrust(
+  options: RelayV2HostCanonicalProductionCompositionOptions,
+): RelayV2HostTlsCaTrust | undefined | null {
+  const field = ownOptionalField(options, "carrierWssTlsTrust");
+  if (field === null) return null;
+  if (!field.present) return undefined;
+  try {
+    return captureRelayV2HostTlsCaTrust(field.value);
+  } catch {
+    return null;
+  }
+}
+
 type RelayV2HostAgentAttachmentOpener = (options: Readonly<{
   store: RelayAgentAuthorityStore;
   controller: CodexAppServerProcessControllerPort;
@@ -490,6 +509,8 @@ export async function openRelayV2HostCanonicalProductionComposition(
   if (reauthentication === null) return null;
   const wssTransport = captureWssTransportOptions(options);
   if (wssTransport === null) return null;
+  const carrierWssTlsTrust = captureCarrierWssTlsTrust(options);
+  if (carrierWssTlsTrust === null) return null;
   const terminalOptions = terminalControlOptions(
     options.terminalControl,
   );
@@ -693,6 +714,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
             }),
         wss: Object.freeze({
           relayUrl: profile.relayUrl,
+          ...(carrierWssTlsTrust === undefined
+            ? {}
+            : { tlsTrust: carrierWssTlsTrust }),
           ...(wssTransport === undefined
             ? {}
             : {
