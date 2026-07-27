@@ -1261,23 +1261,79 @@ function managedCompositionFailure(): RelayV2HostConnectorControllerError {
   return new RelayV2HostConnectorControllerError("OPERATION_FAILED");
 }
 
+const MANAGED_DATA_NODE_IS_PROXY = nodeTypes.isProxy;
+const MANAGED_DATA_OBJECT_CREATE = Object.create;
+const MANAGED_DATA_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const MANAGED_DATA_OBJECT_HAS_OWN = Object.hasOwn;
+const MANAGED_DATA_REFLECT_APPLY = Reflect.apply;
+const MANAGED_DATA_REFLECT_OWN_KEYS = Reflect.ownKeys;
+const MANAGED_DATA_ARRAY_IS_ARRAY = Array.isArray;
+
+function rejectedManagedDataProxy(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return false;
+  }
+  try {
+    return MANAGED_DATA_REFLECT_APPLY(MANAGED_DATA_NODE_IS_PROXY, undefined, [value]);
+  } catch {
+    return true;
+  }
+}
+
 function exactManagedDataObject(value: unknown, expected: readonly string[]): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || nodeTypes.isProxy(value)) throw managedCompositionFailure();
+  if (typeof value !== "object"
+    || value === null
+    || rejectedManagedDataProxy(value)
+    || MANAGED_DATA_REFLECT_APPLY(MANAGED_DATA_ARRAY_IS_ARRAY, undefined, [value])) {
+    throw managedCompositionFailure();
+  }
   let descriptors: PropertyDescriptorMap;
   try {
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = MANAGED_DATA_REFLECT_APPLY(
+      MANAGED_DATA_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS,
+      undefined,
+      [value],
+    );
   } catch {
     throw managedCompositionFailure();
   }
-  const keys = Reflect.ownKeys(descriptors);
-  if (keys.length !== expected.length
-    || keys.some((key) => typeof key !== "string" || !expected.includes(key))
-    || expected.some((key) => {
-      const descriptor = descriptors[key];
-      return !descriptor || !Object.hasOwn(descriptor, "value");
-    })) throw managedCompositionFailure();
-  return Object.fromEntries(expected.map((key) => [key, descriptors[key].value]));
+  const keys = MANAGED_DATA_REFLECT_APPLY(
+    MANAGED_DATA_REFLECT_OWN_KEYS,
+    undefined,
+    [descriptors],
+  );
+  if (keys.length !== expected.length) throw managedCompositionFailure();
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+    const key = keys[keyIndex];
+    if (typeof key !== "string") throw managedCompositionFailure();
+    let allowed = false;
+    for (let index = 0; index < expected.length; index += 1) {
+      if (expected[index] === key) allowed = true;
+    }
+    if (!allowed) throw managedCompositionFailure();
+  }
+  const result = MANAGED_DATA_REFLECT_APPLY(
+    MANAGED_DATA_OBJECT_CREATE,
+    undefined,
+    [null],
+  ) as Record<string, unknown>;
+  for (let index = 0; index < expected.length; index += 1) {
+    const key = expected[index];
+    if (!MANAGED_DATA_REFLECT_APPLY(
+      MANAGED_DATA_OBJECT_HAS_OWN,
+      undefined,
+      [descriptors, key],
+    )) throw managedCompositionFailure();
+    const descriptor = descriptors[key];
+    if (descriptor === undefined
+      || !MANAGED_DATA_REFLECT_APPLY(
+        MANAGED_DATA_OBJECT_HAS_OWN,
+        undefined,
+        [descriptor, "value"],
+      )) throw managedCompositionFailure();
+    result[key] = descriptor.value;
+  }
+  return result;
 }
 
 function captureManagedMethod(value: unknown, name: string): Function {

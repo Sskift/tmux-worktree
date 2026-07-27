@@ -518,7 +518,7 @@ function captureOptions(
   if (cell === null || source === null && fields.bootstrapSecretByteSource !== undefined
     || reauthentication === null || wssTransport === null
     || canonical === null) return null;
-  return Object.freeze({
+  return REFLECT_APPLY(OBJECT_FREEZE, undefined, [{
     trustedHome: fields.trustedHome as string | undefined,
     cell,
     sourceOwner: { current: source },
@@ -527,7 +527,7 @@ function captureOptions(
     credentialHttpsTlsTrust,
     carrierWssTlsTrust,
     canonical,
-  });
+  }]);
 }
 
 function readProfile(trustedHome: string | undefined): Readonly<RelayV2HostProductionProfile> {

@@ -803,7 +803,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
                 if (owner !== null) void owner.handleAuthExpiring(input);
               },
             }),
-        wss: Object.freeze({
+        wss: OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
           relayUrl: profile.relayUrl,
           ...(carrierWssTlsTrust === undefined
             ? {}
@@ -816,7 +816,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
                   ? {}
                   : { scheduleCloseDrain: wssTransport.scheduleCloseDrain }),
               }),
-        }),
+        }]),
       }),
     }));
     if (await managed.readiness.h0.activate() !== true) {

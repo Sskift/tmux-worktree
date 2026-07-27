@@ -424,7 +424,7 @@ function captureOptions(value: unknown): CapturedOptions {
   } catch {
     throw failure("INPUTS_INVALID");
   }
-  return Object.freeze({
+  return REFLECT_APPLY(OBJECT_FREEZE, undefined, [{
     trustedHome: record.trustedHome as string | undefined,
     nativeModuleTarget: Object.freeze({
       platform: target.platform,
@@ -454,7 +454,7 @@ function captureOptions(value: unknown): CapturedOptions {
     scanIntervalMs: (runtime.scanIntervalMs as number | undefined)
       ?? RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
     dashboardManagement: captureDashboardManagement(record.dashboardManagement),
-  });
+  }]);
 }
 
 function readProfile(trustedHome: string | undefined): Readonly<RelayV2HostProductionProfile> {

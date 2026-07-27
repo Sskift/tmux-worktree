@@ -87,10 +87,13 @@ function failure(
 const claimedSourceTakeIdentities = new WeakSet<object>();
 const claimedNativeModuleIdentities = new WeakSet<object>();
 
+const NODE_IS_ASYNC_FUNCTION = nodeTypes.isAsyncFunction;
+const NODE_IS_PROMISE = nodeTypes.isPromise;
 const NODE_IS_PROXY = nodeTypes.isProxy;
 const OBJECT_PROTOTYPE = Object.prototype;
 const OBJECT_CREATE = Object.create;
 const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
 const OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
 const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
 const OBJECT_HAS_OWN = Object.hasOwn;
@@ -166,7 +169,8 @@ function snapshotExactDataRecord(
 
 function isAsyncFunction(value: unknown): boolean {
   try {
-    return rejectedProxy(value) || nodeTypes.isAsyncFunction(value);
+    return rejectedProxy(value)
+      || REFLECT_APPLY(NODE_IS_ASYNC_FUNCTION, undefined, [value]);
   } catch {
     return true;
   }
@@ -174,18 +178,28 @@ function isAsyncFunction(value: unknown): boolean {
 
 function isAsynchronousResult(value: unknown): boolean {
   try {
-    if (nodeTypes.isPromise(value)) return true;
     if ((typeof value !== "object" || value === null) && typeof value !== "function") {
       return false;
     }
+    if (rejectedProxy(value)) return true;
+    if (REFLECT_APPLY(NODE_IS_PROMISE, undefined, [value])) return true;
     let current: object | null = value as object;
     while (current !== null) {
-      if (nodeTypes.isProxy(current)) return true;
-      const descriptor = Object.getOwnPropertyDescriptor(current, "then");
+      if (rejectedProxy(current)) return true;
+      const descriptor = REFLECT_APPLY(
+        OBJECT_GET_OWN_PROPERTY_DESCRIPTOR,
+        undefined,
+        [current, "then"],
+      );
       if (descriptor !== undefined) {
-        return descriptor.get !== undefined || typeof descriptor.value === "function";
+        return !REFLECT_APPLY(OBJECT_HAS_OWN, undefined, [descriptor, "value"])
+          || typeof descriptor.value === "function";
       }
-      current = Object.getPrototypeOf(current) as object | null;
+      current = REFLECT_APPLY(
+        OBJECT_GET_PROTOTYPE_OF,
+        undefined,
+        [current],
+      ) as object | null;
     }
     return false;
   } catch {
