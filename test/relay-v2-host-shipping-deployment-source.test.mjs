@@ -240,10 +240,24 @@ const virtualModules = new Map([
       return Object.freeze({ hostId: options.hostId });
     }
   `],
+  ["./hostRuntimeComposition.js", `
+    export function issueRelayV2HostLocalDevelopmentCapabilityActivationHandoff(cell) {
+      const h = globalThis.__hostDeploymentHarness;
+      const handoff = Object.freeze(Object.create(null));
+      h.localCapabilityHandoffs.set(handoff, cell);
+      h.localCapabilityHandoffIssueCount += 1;
+      h.events.push(["local.capability-handoff.issue", cell, handoff]);
+      return handoff;
+    }
+  `],
   ["./hostNativeCredentialPrivilegedIntakeBridge.js", `
     export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(options) {
       const h = globalThis.__hostDeploymentHarness;
       h.events.push(["intake.open", options.profileSnapshot, options.canonical]);
+      h.nativeIntakeOptions = options;
+      if (Object.hasOwn(options, "localDevelopmentCapabilityActivationHandoff")) {
+        throw new Error("production intake received local-development handoff");
+      }
       if (h.failIntake) throw new Error("injected intake failure");
       if (options.profileSnapshot !== h.profile) throw new Error("profile snapshot split");
       if (options.canonical.welcome.hostId !== h.profile.hostId) {
@@ -294,6 +308,13 @@ const virtualModules = new Map([
       const h = globalThis.__hostDeploymentHarness;
       h.events.push(["local.intake.open", options.profileSnapshot, options.canonical]);
       if (options.profileSnapshot !== h.profile) throw new Error("profile snapshot split");
+      const localCapabilityHandoff =
+        options.localDevelopmentCapabilityActivationHandoff;
+      if (h.localCapabilityHandoffs.get(localCapabilityHandoff)
+        !== options.credentialCell) {
+        throw new Error("local capability handoff is not bound to the exact cell");
+      }
+      h.localIntakeOptions = options;
       const initial = options.credentialCell.runExclusive((transaction) => transaction.read());
       if (initial.bytes !== null) throw new Error("local cell did not start empty");
       const replacement = Uint8Array.from([1, 2, 3]);
@@ -439,6 +460,10 @@ function createHarness(home) {
     bootstrapSecretRaw: null,
     localCredentialCell: null,
     localTlsTrust: null,
+    localCapabilityHandoffs: new WeakMap(),
+    localCapabilityHandoffIssueCount: 0,
+    localIntakeOptions: null,
+    nativeIntakeOptions: null,
     inheritedThenableErrorCode: null,
     hostileThenableErrorCode: null,
     hostileThenGetterReads: 0,
@@ -499,6 +524,15 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     assert.equal(Reflect.get(handle, "profileSnapshot"), undefined);
     assert.equal(Reflect.get(handle, "runtimeBundle"), undefined);
     assert.equal(Reflect.get(handle, "nativeModuleSource"), undefined);
+    assert.equal(first.localCapabilityHandoffIssueCount, 0);
+    assert.equal(
+      Object.hasOwn(
+        first.nativeIntakeOptions,
+        "localDevelopmentCapabilityActivationHandoff",
+      ),
+      false,
+      "production shipping must omit the local-development handoff field",
+    );
 
     const close = handle.closeAndDrain();
     assert.strictEqual(handle.closeAndDrain(), close);
@@ -665,6 +699,15 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       "local development must never probe or manufacture native qualification",
     );
     assert.ok(localDevelopment.events.some(([name]) => name === "local.intake.open"));
+    assert.equal(localDevelopment.localCapabilityHandoffIssueCount, 1);
+    assert.strictEqual(
+      localDevelopment.localCapabilityHandoffs.get(
+        localDevelopment.localIntakeOptions
+          .localDevelopmentCapabilityActivationHandoff,
+      ),
+      localDevelopment.localCredentialCell,
+      "auto-start local shipping passes the handoff bound to its exact cell",
+    );
     assert.equal(localDevelopment.trustCuts.length, 2);
     assert.notStrictEqual(localDevelopment.trustCuts[0], localDevelopment.trustCuts[1]);
     assert.equal(
@@ -731,6 +774,15 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     assert.strictEqual(
       localDashboardIntake[2].dashboardManagement.signal,
       localDashboardAbort.signal,
+    );
+    assert.equal(localDashboardOwned.localCapabilityHandoffIssueCount, 1);
+    assert.strictEqual(
+      localDashboardOwned.localCapabilityHandoffs.get(
+        localDashboardOwned.localIntakeOptions
+          .localDevelopmentCapabilityActivationHandoff,
+      ),
+      localDashboardOwned.localCredentialCell,
+      "local management shipping reuses the exact-cell handoff path",
     );
     assert.equal(await localDashboardHandle.runDashboardManagement(), 0);
     assert.equal(

@@ -39,6 +39,9 @@ import type {
   RelayV2HostManagedConnectorStartInput,
   RelayV2HostManagedConnectorStopInput,
 } from "./hostRuntimeComposition.js";
+import {
+  issueRelayV2HostLocalDevelopmentCapabilityActivationHandoff,
+} from "./hostRuntimeComposition.js";
 import type {
   RelayV2HostConnectorControllerStartResult,
   RelayV2HostConnectorControllerStopResult,
@@ -720,8 +723,11 @@ async function startCapturedShippingRoot(
       });
     } else {
       const credentialCell = credentialIntakeActivation.takeCredentialCell();
+      const localDevelopmentCapabilityActivationHandoff =
+        issueRelayV2HostLocalDevelopmentCapabilityActivationHandoff(credentialCell);
       intake = await openRelayV2HostPrivilegedProductionIntakeComposition({
         credentialCell,
+        localDevelopmentCapabilityActivationHandoff,
         ...intakeOptions,
       });
       if (intake === null) throw failure("INPUTS_UNAVAILABLE");
