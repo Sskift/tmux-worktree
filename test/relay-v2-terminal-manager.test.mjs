@@ -220,6 +220,7 @@ class FakeTerminalControl {
   continuityResults = [];
   continuous = true;
   leaseCounter = 0;
+  leaseTtlMs = 60_000;
 
   lease(target, owner) {
     const id = ++this.leaseCounter;
@@ -229,7 +230,7 @@ class FakeTerminalControl {
       leaseId: `lease-${id}`,
       fence: `lease-fence-${id}`,
       owner: clone(owner),
-      expiresAt: new Date(this.now() + 60_000).toISOString(),
+      expiresAt: new Date(this.now() + this.leaseTtlMs).toISOString(),
     };
   }
 
@@ -249,7 +250,7 @@ class FakeTerminalControl {
       status: "accepted",
       lease: {
         ...clone(input.lease),
-        expiresAt: new Date(this.now() + 60_000).toISOString(),
+        expiresAt: new Date(this.now() + this.leaseTtlMs).toISOString(),
       },
     };
   }
@@ -640,6 +641,7 @@ function harness(options = {}) {
     terminalControl: authority,
     now: () => now,
     issueToken: () => `resume-token-${++nextToken}`,
+    schedule: options.schedule,
     limits: options.limits,
     send: async (route, frame, responseLineage) => {
       // Every manager output must remain consumable by the frozen production codec.
@@ -3216,6 +3218,64 @@ test("producer lease detach clears pending windows, renews, and continuity loss 
   assert.equal(h.backend.opens[0].handle.closeCalls, 0);
   assert.equal(h.sent.at(-1).frame.type, "terminal.input_error");
   assert.equal(h.sent.at(-1).frame.payload.error.code, "PERMISSION_DENIED");
+});
+
+test("live terminal schedules producer lease renewal before exact observation expiry", async () => {
+  const scheduled = [];
+  const h = harness({
+    schedule(delayMs, callback) {
+      const task = { delayMs, callback, cancelled: false, fired: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  h.authority.leaseTtlMs = 30_000;
+  const request = goldenOpen();
+  await h.manager.open(request);
+  const frame = opened(h.sent, request.requestId);
+  await h.manager.input({
+    ...streamContext(frame),
+    inputSeq: "1",
+    data: Buffer.from("keep-observation-live"),
+  });
+
+  const first = scheduled.find((task) => !task.cancelled && !task.fired);
+  assert.ok(first, "an accepted producer lease must own a maintenance deadline");
+  assert.equal(first.delayMs, 15_000, "maintenance begins at the exact lease half-life");
+
+  h.advance(first.delayMs);
+  first.fired = true;
+  first.callback();
+  for (let attempt = 0; attempt < 20 && h.authority.renewCalls.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const second = scheduled.find((task) => !task.cancelled && !task.fired);
+  assert.ok(second, "the first renewal must own its successor deadline");
+  assert.equal(second.delayMs, 15_000);
+  h.advance(second.delayMs + 1);
+  second.fired = true;
+  second.callback();
+  for (let attempt = 0; attempt < 20 && h.authority.renewCalls.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(h.authority.continuityCalls.length, 2);
+  assert.equal(h.authority.renewCalls.length, 2, "an idle stream stays renewed beyond 30 seconds");
+  assert.equal(h.authority.releaseCalls.length, 0);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 0);
+  await h.backend.opens[0].handle.emit(Buffer.from("observer-after-30s"));
+  assert.equal(outputBytes(h.sent).toString("utf8"), "observer-after-30s");
+  assert.ok(
+    scheduled.some((task) => !task.cancelled && !task.fired),
+    "the renewed lease owns its successor deadline",
+  );
+  await h.manager.shutdown();
+  assert.equal(
+    scheduled.some((task) => !task.cancelled && !task.fired),
+    false,
+    "shutdown cancels lease maintenance before releasing the producer",
+  );
 });
 
 test("renewal cannot rotate epoch, lease, fence, or owner identity", async () => {

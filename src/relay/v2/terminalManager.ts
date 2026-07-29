@@ -707,6 +707,8 @@ export interface RelayV2TerminalManagerOptions {
   ): Promise<void>;
   now?: () => number;
   issueToken?: () => string;
+  /** Injectable only so the producer-lease half-life owner is deterministic in tests. */
+  schedule?: (delayMs: number, callback: () => void) => () => void;
   /** Stricter limits for bounded simulators; values may never exceed the contract. */
   limits?: Partial<RelayV2TerminalLimits>;
 }
@@ -893,6 +895,12 @@ interface TerminalStream {
   pendingResize?: PendingSequence;
   controlInDoubt?: RelayV2TerminalStructuredError;
   lastUsedAt: number;
+}
+
+interface ProducerLeaseMaintenance {
+  active: boolean;
+  deadlineMs: number;
+  cancel(): void;
 }
 
 type OpenRecordOutcome =
@@ -1807,6 +1815,7 @@ export class RelayV2TerminalManager {
   private stopping = false;
   private shutdownBarrier: Promise<void> | null = null;
   private fatalSink: ((error: unknown) => void) | null = null;
+  private producerLeaseMaintenance: ProducerLeaseMaintenance | null = null;
 
   private readonly hostId: string;
   private readonly hostEpoch: string;
@@ -1818,6 +1827,7 @@ export class RelayV2TerminalManager {
   private readonly sendFrame: RelayV2TerminalManagerOptions["send"];
   private readonly now: () => number;
   private readonly issueToken: () => string;
+  private readonly schedule: NonNullable<RelayV2TerminalManagerOptions["schedule"]>;
 
   constructor(options: RelayV2TerminalManagerOptions) {
     this.hostId = options.hostId;
@@ -1831,6 +1841,11 @@ export class RelayV2TerminalManager {
     this.now = options.now ?? Date.now;
     this.issueToken = options.issueToken
       ?? (() => randomBytes(32).toString("base64url"));
+    this.schedule = options.schedule ?? ((delayMs, callback) => {
+      const timer = setTimeout(callback, delayMs);
+      timer.unref?.();
+      return () => clearTimeout(timer);
+    });
     this.limits = Object.freeze(resolveLimits(options.limits));
 
     const manager = this;
@@ -1910,8 +1925,9 @@ export class RelayV2TerminalManager {
 
   shutdown(): Promise<void> {
     if (this.shutdownBarrier !== null) return this.shutdownBarrier;
+    this.stopping = true;
+    this.cancelProducerLeaseMaintenance();
     this.shutdownBarrier = this.enqueue(async () => {
-      this.stopping = true;
       for (const stream of this.streams.values()) {
         stream.binding = undefined;
         await this.releaseProducerLease(stream);
@@ -2527,6 +2543,7 @@ export class RelayV2TerminalManager {
     for (const [recordKey, record] of this.openRecords) {
       if (record.streamKey === stream.key) this.openRecords.delete(recordKey);
     }
+    this.refreshProducerLeaseMaintenance();
   }
 
   private async fenceDivergentLocalStream(
@@ -3631,7 +3648,66 @@ export class RelayV2TerminalManager {
       owner: { ...lease.owner },
     };
     stream.renewLeaseAfter = now + Math.max(1, Math.floor((expiresAtMs - now) / 2));
+    this.refreshProducerLeaseMaintenance();
     return lease;
+  }
+
+  private cancelProducerLeaseMaintenance(): void {
+    const current = this.producerLeaseMaintenance;
+    if (current === null) return;
+    this.producerLeaseMaintenance = null;
+    current.active = false;
+    current.cancel();
+  }
+
+  /**
+   * The terminal manager owns every producer lease, so it also owns the sole
+   * half-life deadline. Without this deadline an otherwise idle live stream
+   * lets its exact 30s lease expire under the observation pump; terminal-control
+   * must then rotate output and fence that observer before any later input can
+   * ask the manager to renew.
+   */
+  private refreshProducerLeaseMaintenance(): void {
+    let deadlineMs = Number.POSITIVE_INFINITY;
+    if (!this.stopping) {
+      for (const stream of this.streams.values()) {
+        if (stream.status !== "live" || stream.producerLease === undefined) continue;
+        deadlineMs = Math.min(deadlineMs, stream.renewLeaseAfter ?? this.now());
+      }
+    }
+    const current = this.producerLeaseMaintenance;
+    if (Number.isFinite(deadlineMs)
+      && current !== null
+      && current.active
+      && current.deadlineMs === deadlineMs) return;
+    this.cancelProducerLeaseMaintenance();
+    if (!Number.isFinite(deadlineMs)) return;
+
+    const maintenance: ProducerLeaseMaintenance = {
+      active: true,
+      deadlineMs,
+      cancel: () => undefined,
+    };
+    this.producerLeaseMaintenance = maintenance;
+    const callback = (): void => {
+      if (!maintenance.active || this.producerLeaseMaintenance !== maintenance) return;
+      maintenance.active = false;
+      this.producerLeaseMaintenance = null;
+      void this.sweep().catch(() => undefined).finally(() => {
+        this.refreshProducerLeaseMaintenance();
+      });
+    };
+    const cancel = this.schedule(Math.max(0, deadlineMs - this.now()), callback);
+    if (typeof cancel !== "function") {
+      maintenance.active = false;
+      if (this.producerLeaseMaintenance === maintenance) this.producerLeaseMaintenance = null;
+      throw new TypeError("Relay v2 terminal lease scheduler returned an invalid cancel handle");
+    }
+    maintenance.cancel = cancel;
+    // A deterministic scheduler may fire inline before returning its cancel
+    // handle. In that case the callback already transferred ownership to the
+    // serialized sweep; cancel only the now-obsolete scheduled handle.
+    if (!maintenance.active) cancel();
   }
 
   private async acquireProducerLease(stream: TerminalStream): Promise<RelayV2TerminalLeaseResult> {
@@ -3756,12 +3832,14 @@ export class RelayV2TerminalManager {
   private dropProducerLease(stream: TerminalStream): void {
     stream.producerLease = undefined;
     stream.renewLeaseAfter = undefined;
+    this.refreshProducerLeaseMaintenance();
   }
 
   private async releaseProducerLease(stream: TerminalStream): Promise<ProducerReleaseResult> {
     const lease = stream.producerLease;
     stream.producerLease = undefined;
     stream.renewLeaseAfter = undefined;
+    this.refreshProducerLeaseMaintenance();
     if (!lease) {
       if (stream.retiringLease) {
         return {
