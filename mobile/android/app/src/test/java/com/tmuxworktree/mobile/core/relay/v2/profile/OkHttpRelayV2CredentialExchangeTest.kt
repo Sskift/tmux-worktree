@@ -357,13 +357,22 @@ class OkHttpRelayV2CredentialExchangeTest {
                         clientCredentialResponse(
                             attemptField = "exchangeAttemptId",
                             attemptId = EXCHANGE_ATTEMPT,
+                            relayUrl = "${tls.issuerUrl.replaceFirst("https://", "wss://")}/",
+                        ),
+                    ),
+                )
+                tls.server.enqueue(
+                    jsonResponse(
+                        clientCredentialResponse(
+                            attemptField = "exchangeAttemptId",
+                            attemptId = EXCHANGE_ATTEMPT,
                             relayUrl = "${tls.relayUrl}?accessToken=$ACCESS_TOKEN_1",
                         ),
                     ),
                 )
                 val exchange = OkHttpRelayV2CredentialExchange(tls.client)
 
-                repeat(4) {
+                repeat(5) {
                     val failure = captureExchangeFailure {
                         exchange.redeem(enrollmentRequest(tls.issuerUrl))
                     }

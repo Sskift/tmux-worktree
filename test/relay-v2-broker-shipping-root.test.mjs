@@ -313,7 +313,7 @@ function shippingProfile(overrides = {}) {
     configVersion: 1,
     listen: { host: "127.0.0.1", port: 0 },
     issuerUrl: "https://broker.example.test",
-    relayUrl: "wss://broker.example.test",
+    relayUrl: "wss://broker.example.test/client",
     trustedHome: TRUSTED_HOME,
     tls: { keyReference: "tls-key-ref", certificateReference: "tls-cert-ref" },
     issuerKeyringReference: "issuer-keyring-ref",
@@ -527,6 +527,8 @@ test("durable authorities open before listen and only the frozen public surface 
   const handle = await shipping.start();
   try {
     assert.ok(handle.port > 0);
+    assert.equal(handle.issuerUrl, "https://broker.example.test/");
+    assert.equal(handle.relayUrl, "wss://broker.example.test/client");
     const at = (name) => shipping.events.indexOf(name);
     assert.ok(at("keyring.resolve") !== -1 && at("keyring.resolve") < at("https.listening"));
     assert.ok(at("tls.resolve") !== -1 && at("tls.resolve") < at("https.listening"));
@@ -836,5 +838,18 @@ test("profile file entry keeps only non-sensitive references and starts with dep
     relayServer.startRelayV2BrokerShippingRoot(accessor, shipping.inputs),
     /profile is invalid/,
   );
+  for (const relayUrl of [
+    "wss://broker.example.test/",
+    "wss://broker.example.test/client/",
+    "wss://broker.example.test/client?token=forbidden",
+  ]) {
+    await assert.rejects(
+      relayServer.startRelayV2BrokerShippingRoot(
+        shippingProfile({ relayUrl }),
+        shipping.inputs,
+      ),
+      /profile is invalid/,
+    );
+  }
   assert.equal(shipping.events.length, 0);
 });

@@ -105,6 +105,7 @@ export default defineConfig({
     "src/relay/v2/brokerPublicHttpsServer.ts",
     "src/relay/v2/brokerShippingRoot.ts",
     "src/relay/v2/brokerShippingDeploymentSource.ts",
+    "src/relay/v2/brokerLocalDevelopmentActivation.ts",
     "src/relay/v2/hostShippingRoot.ts",
     "src/relay/v2/hostShippingDeploymentSource.ts",
     "src/relay/v2/relayV2DashboardManagementChildRuntime.ts",
@@ -203,6 +204,7 @@ export default defineConfig({
     "./brokerPublicHttpsServer.js",
     "./relay/v2/brokerPublicHttpsServer.js",
     "./relay/v2/brokerShippingRoot.js",
+    "./relay/v2/brokerLocalDevelopmentActivation.js",
     // The trusted deployment source and the relayServer facade must consume the
     // canonical shipping-root owner entry and the one fixed native loader
     // instance instead of bundling second copies.

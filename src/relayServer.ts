@@ -97,9 +97,38 @@ export async function startRelayV2BrokerShippingFromTrustedDeployment(
     .startRelayV2BrokerShippingFromTrustedDeployment(profilePath);
 }
 
+/**
+ * Explicit loopback-only developer root. It still uses the canonical shipping
+ * root but injects process-local, non-durable credential/E0 owners. It is not
+ * production qualification and is never selected by default or --v2-profile.
+ */
+export async function startRelayV2BrokerLocalDevelopment(
+  options: import("./relay/v2/brokerLocalDevelopmentActivation.js").RelayV2BrokerLocalDevelopmentOptions,
+): Promise<import("./relay/v2/brokerShippingRoot.js").RelayV2BrokerShippingRootHandle> {
+  return (await import("./relay/v2/brokerLocalDevelopmentActivation.js"))
+    .startRelayV2BrokerLocalDevelopment(options);
+}
+
 /** Stable CLI/tsup facade for the Relay v1 broker implementation. */
 export async function run(): Promise<void> {
   const options = parseRelayServerOptions(process.argv.slice(3));
+  if (options.v2LocalDevelopment === true) {
+    const bootstrapSink = createRelayV2HostBootstrapOutputSink(
+      options.v2HostBootstrapOutputPath!,
+    );
+    const handle = await startRelayV2BrokerLocalDevelopment({
+      port: options.port,
+      tlsKeyPath: options.v2LocalDevelopmentTlsKeyPath!,
+      tlsCertificatePath: options.v2LocalDevelopmentTlsCertificatePath!,
+    });
+    try {
+      await handle.admin.createHostBootstrap({}, bootstrapSink);
+    } catch (error) {
+      await handle.shutdown();
+      throw error;
+    }
+    return;
+  }
   if (options.v2ProfilePath !== undefined) {
     // 明确的 v2 profile 选路：只经唯一 trusted deployment activation/source
     // owner 解析 TLS/issuer keyring/E0 material——全部来自 profile trustedHome

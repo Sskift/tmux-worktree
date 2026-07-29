@@ -584,8 +584,9 @@ for strict HTTP plus client/Host WSS. The default CLI omits it, Broker
 deployment, real public-TLS/device interoperability, or shipping evidence exists.
 
 A default-off shipping root (`src/relay/v2/brokerShippingRoot.ts`) now composes
-a reference-only runtime profile (listen address, root origins, trustedHome,
-and non-sensitive TLS/E0/keyring references) with deployment-injected
+a reference-only runtime profile (listen address, root HTTPS issuer URL, exact
+`/client` WSS relay endpoint, trustedHome, and non-sensitive TLS/E0/keyring
+references) with deployment-injected
 privileged material resolution, external continuity attempt provider, and
 native state-store loader into that activated composition and public
 lifecycle root, and adds a local in-process admin seam for issuer/replay
@@ -610,6 +611,38 @@ listener or native mutation and never
 falls back to v1, while the default invocation stays Relay v1. Native
 `qualifiedRecords=[]`, qualified E0/TLS deployment evidence, and the overall
 NO-GO status are unchanged.
+
+For local Broker development only, a separate explicit lane bypasses those two
+deployment blockers without changing their production evidence:
+
+```bash
+install -d -m 700 .local/relay-v2
+chmod 600 .local/relay-v2/localhost.key.pem .local/relay-v2/localhost.cert.pem
+tw relay-server \
+  --v2-local-dev \
+  --port 8787 \
+  --v2-dev-tls-key "$PWD/.local/relay-v2/localhost.key.pem" \
+  --v2-dev-tls-cert "$PWD/.local/relay-v2/localhost.cert.pem" \
+  --host-bootstrap-output "$PWD/.local/relay-v2/new-host.twhostboot2"
+```
+
+This mode requires an explicit non-zero port and always binds `127.0.0.1`;
+`--host` is rejected. It advertises one endpoint identity:
+`https://localhost:<port>/` for the issuer and
+`wss://localhost:<port>/client` for the Android client. For an emulator, run
+`adb reverse tcp:<port> tcp:<port>`; the local Host uses the corresponding
+`wss://localhost:<port>/` root and continues to derive its separate `/host`
+carrier endpoint. The TLS files must be absolute-path, current-user-owned,
+regular, single-link files with exact mode `0600`; the certificate must cover
+`localhost` and already be trusted by the local Host/client used for the test.
+The command uses the canonical Broker shipping composition and HTTPS/WSS
+lifecycle, but its credential store, issuer keyring, and E0 continuity backend
+exist only in memory. It atomically writes the bootstrap secret as an exact
+`0600` file and never prints it. Stopping the process loses all issued
+credential and continuity state, so this lane has no restart, recovery, HA, or
+production value. It neither reads nor mutates the production deployment
+namespace or `qualifiedRecords`; default Relay v1 and `--v2-profile` production
+fail-closed behavior are unchanged.
 
 For the first Host only, the Broker and Host commands form one explicit
 restricted-file handoff. On the Broker:

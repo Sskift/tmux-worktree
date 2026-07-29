@@ -5,6 +5,9 @@ export type RelayServerOptions = {
   port: number;
   secret: string;
   v2ProfilePath?: string;
+  v2LocalDevelopment?: true;
+  v2LocalDevelopmentTlsKeyPath?: string;
+  v2LocalDevelopmentTlsCertificatePath?: string;
   v2HostBootstrapOutputPath?: string;
 };
 
@@ -13,23 +16,42 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let port = 8787;
   let secret = "";
   let secretFlag = false;
-  let listenFlag = false;
+  let hostFlag = false;
+  let portFlag = false;
   let v2ProfilePath: string | undefined;
+  let v2LocalDevelopment = false;
+  let v2LocalDevelopmentTlsKeyPath: string | undefined;
+  let v2LocalDevelopmentTlsCertificatePath: string | undefined;
   let v2HostBootstrapOutputPath: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--host") {
       host = argv[++i] || host;
-      listenFlag = true;
+      hostFlag = true;
     } else if (arg === "--port") {
       port = Number(argv[++i] || port);
-      listenFlag = true;
+      portFlag = true;
     } else if (arg === "--secret") {
       secret = argv[++i] || "";
       secretFlag = true;
     } else if (arg === "--v2-profile") {
       v2ProfilePath = argv[++i] || "";
+    } else if (arg === "--v2-local-dev") {
+      if (v2LocalDevelopment) {
+        throw new CliError("relay-server --v2-local-dev 只能指定一次");
+      }
+      v2LocalDevelopment = true;
+    } else if (arg === "--v2-dev-tls-key") {
+      if (v2LocalDevelopmentTlsKeyPath !== undefined) {
+        throw new CliError("relay-server --v2-dev-tls-key 只能指定一次");
+      }
+      v2LocalDevelopmentTlsKeyPath = argv[++i] || "";
+    } else if (arg === "--v2-dev-tls-cert") {
+      if (v2LocalDevelopmentTlsCertificatePath !== undefined) {
+        throw new CliError("relay-server --v2-dev-tls-cert 只能指定一次");
+      }
+      v2LocalDevelopmentTlsCertificatePath = argv[++i] || "";
     } else if (arg === "--host-bootstrap-output") {
       if (v2HostBootstrapOutputPath !== undefined) {
         throw new CliError("relay-server --host-bootstrap-output 只能指定一次");
@@ -43,6 +65,10 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     }
   }
 
+  if (v2ProfilePath !== undefined && v2LocalDevelopment) {
+    throw new CliError("relay-server --v2-profile 不能与 --v2-local-dev 同时使用");
+  }
+
   if (v2ProfilePath !== undefined) {
     if (v2ProfilePath === "") {
       throw new CliError("relay-server --v2-profile 需要非空 profile 路径");
@@ -50,8 +76,12 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     if (secretFlag) {
       throw new CliError("relay-server --v2-profile 不能与 --secret 同时使用");
     }
-    if (listenFlag) {
+    if (hostFlag || portFlag) {
       throw new CliError("relay-server --v2-profile 的监听地址只来自 profile，不能与 --host/--port 同时使用");
+    }
+    if (v2LocalDevelopmentTlsKeyPath !== undefined
+      || v2LocalDevelopmentTlsCertificatePath !== undefined) {
+      throw new CliError("relay-server --v2-dev-tls-key/--v2-dev-tls-cert 只适用于 --v2-local-dev");
     }
     if (v2HostBootstrapOutputPath === "") {
       throw new CliError("relay-server --host-bootstrap-output 需要非空输出路径");
@@ -62,8 +92,45 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     return { host, port, secret: "", v2ProfilePath, v2HostBootstrapOutputPath };
   }
 
+  if (v2LocalDevelopment) {
+    if (secretFlag) {
+      throw new CliError("relay-server --v2-local-dev 不能与 --secret 同时使用");
+    }
+    if (hostFlag) {
+      throw new CliError("relay-server --v2-local-dev 固定监听 127.0.0.1，不能指定 --host");
+    }
+    if (!portFlag) {
+      throw new CliError("relay-server --v2-local-dev 需要显式 --port");
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw new CliError(`无效端口: ${port}`);
+    }
+    if (!v2LocalDevelopmentTlsKeyPath) {
+      throw new CliError("relay-server --v2-local-dev 需要 --v2-dev-tls-key");
+    }
+    if (!v2LocalDevelopmentTlsCertificatePath) {
+      throw new CliError("relay-server --v2-local-dev 需要 --v2-dev-tls-cert");
+    }
+    if (!v2HostBootstrapOutputPath) {
+      throw new CliError("relay-server --v2-local-dev 需要 --host-bootstrap-output");
+    }
+    return {
+      host: "127.0.0.1",
+      port,
+      secret: "",
+      v2LocalDevelopment: true,
+      v2LocalDevelopmentTlsKeyPath,
+      v2LocalDevelopmentTlsCertificatePath,
+      v2HostBootstrapOutputPath,
+    };
+  }
+
+  if (v2LocalDevelopmentTlsKeyPath !== undefined
+    || v2LocalDevelopmentTlsCertificatePath !== undefined) {
+    throw new CliError("relay-server --v2-dev-tls-key/--v2-dev-tls-cert 只适用于 --v2-local-dev");
+  }
   if (v2HostBootstrapOutputPath !== undefined) {
-    throw new CliError("relay-server --host-bootstrap-output 只适用于 --v2-profile");
+    throw new CliError("relay-server --host-bootstrap-output 只适用于 --v2-profile 或 --v2-local-dev");
   }
 
   // 仅 v1 分支读取 env：--secret 优先，缺省回落 TW_RELAY_SECRET。
@@ -87,6 +154,8 @@ function printRelayServerHelp(): void {
 用法:
   TW_RELAY_SECRET=<secret> tw relay-server [--host 0.0.0.0] [--port 8787]
   tw relay-server --v2-profile <path> [--host-bootstrap-output <path>]
+  tw relay-server --v2-local-dev --port <1-65535> --v2-dev-tls-key <path>
+    --v2-dev-tls-cert <path> --host-bootstrap-output <path>
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -95,6 +164,11 @@ function printRelayServerHelp(): void {
   reference/path；TLS/issuer keyring/E0 material 只来自 trustedHome 下固定
   namespace 的 0600 私有 deployment 文件，缺失或 unsafe 时在监听前 fail
   closed，绝不回退 v1。
+  --v2-local-dev 是严格 loopback-only、进程内且不持久的本机开发 lane；
+  要求显式非零端口并固定监听 127.0.0.1，复用 canonical v2
+  shipping/composition，绝不构成 production qualification/readiness，也不
+  改变 --v2-profile 的 fail-closed。
+  TLS key/cert 必须是当前用户拥有、single-link、exact 0600 的本机文件。
   --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
   privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600
   文件。token 不写入 argv、URL、日志或 stdout。`);

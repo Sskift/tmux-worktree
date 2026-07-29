@@ -41,7 +41,8 @@ import type { RelayV2BrokerServerComposition } from "../broker/server.js";
  * Explicit, default-off Relay v2 broker shipping root.
  *
  * The profile carries only non-sensitive references (listen address, public
- * root origins, TLS/E0 reference identifiers, trustedHome). Sensitive material
+ * issuer root and exact client relay endpoint, TLS/E0 reference identifiers,
+ * trustedHome). Sensitive material
  * (TLS key/cert, issuer keyring) enters the process only through the injected
  * narrow privileged resolver; E0 auth/trust material stays behind the injected
  * attempt provider. This root creates no credential/E0/backend/resolver of its
@@ -191,7 +192,11 @@ function boundedReference(value: unknown, maxBytes = 1_024): value is string {
     && !value.includes("\0");
 }
 
-function captureRootUrl(value: unknown, protocol: "https:" | "wss:"): string | null {
+function captureEndpointUrl(
+  value: unknown,
+  protocol: "https:" | "wss:",
+  pathname: "/" | "/client",
+): string | null {
   if (typeof value !== "string" || value.length === 0 || value.length > 2_048) return null;
   let parsed: URL;
   try {
@@ -205,7 +210,7 @@ function captureRootUrl(value: unknown, protocol: "https:" | "wss:"): string | n
     || parsed.password !== ""
     || parsed.search !== ""
     || parsed.hash !== ""
-    || parsed.pathname !== "/"
+    || parsed.pathname !== pathname
   ) return null;
   return parsed.toString();
 }
@@ -242,8 +247,8 @@ function captureProfile(value: unknown): CapturedProfile {
   ]);
   if (record === null || record.configVersion !== 1) throw new TypeError(PROFILE_INVALID);
   const listen = captureOwnDataRecord(record.listen, ["host", "port"]);
-  const issuerUrl = captureRootUrl(record.issuerUrl, "https:");
-  const relayUrl = captureRootUrl(record.relayUrl, "wss:");
+  const issuerUrl = captureEndpointUrl(record.issuerUrl, "https:", "/");
+  const relayUrl = captureEndpointUrl(record.relayUrl, "wss:", "/client");
   const tls = captureOwnDataRecord(record.tls, [
     "keyReference",
     "certificateReference",

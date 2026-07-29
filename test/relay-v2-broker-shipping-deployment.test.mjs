@@ -305,7 +305,7 @@ function deploymentProfile(home, port, overrides = {}) {
     configVersion: 1,
     listen: { host: "127.0.0.1", port },
     issuerUrl: "https://broker.example.test",
-    relayUrl: "wss://broker.example.test",
+    relayUrl: "wss://broker.example.test/client",
     trustedHome: home,
     tls: {
       keyReference: "broker-tls-key",
