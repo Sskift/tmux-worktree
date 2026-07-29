@@ -538,9 +538,6 @@ internal class RelayV2DurableStateRepositoryCore(
                 throw (invalid.second as RelayV2TerminalStoredCheckpoint.Invalid)
                     .asStorageException()
             }
-            check(decoded.none { it.second is RelayV2TerminalStoredCheckpoint.PreOpen }) {
-                "A terminal open attempt is already pending for this Session"
-            }
             decoded.filter { (_, stored) ->
                 (stored as? RelayV2TerminalStoredCheckpoint.Present)
                     ?.checkpoint?.phase == RelayV2TerminalPhase.FINALIZED
@@ -554,56 +551,103 @@ internal class RelayV2DurableStateRepositoryCore(
                 }
             }
             val candidates = decoded.mapNotNull { (key, stored) ->
-                val present = stored as? RelayV2TerminalStoredCheckpoint.Present
-                    ?: return@mapNotNull null
-                if (present.checkpoint.phase == RelayV2TerminalPhase.FINALIZED) null
-                else key to present
+                when (stored) {
+                    is RelayV2TerminalStoredCheckpoint.PreOpen -> key to stored
+                    is RelayV2TerminalStoredCheckpoint.Present ->
+                        if (stored.checkpoint.phase == RelayV2TerminalPhase.FINALIZED) null
+                        else key to stored
+                    is RelayV2TerminalStoredCheckpoint.Invalid -> error("Handled above")
+                    RelayV2TerminalStoredCheckpoint.Missing -> null
+                }
             }
             check(candidates.size <= 1) {
                 "Multiple resumable terminal checkpoints exist for one Session"
             }
             val (key, stored) = candidates.singleOrNull() ?: return@transaction null
-            val checkpoint = stored.checkpoint
-            check(key == RelayV2TerminalCheckpointKey.from(checkpoint.identity.target()))
-            check(checkpoint.deliveryToken.authorityGeneration < Long.MAX_VALUE) {
+            val previousDeliveryToken = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen -> stored.checkpoint.deliveryToken
+                is RelayV2TerminalStoredCheckpoint.Present -> stored.checkpoint.deliveryToken
+                else -> error("Candidate kind is not resumable")
+            }
+            check(previousDeliveryToken.authorityGeneration < Long.MAX_VALUE) {
                 "Terminal delivery authority generation is exhausted"
             }
             val deliveryToken = RelayV2TerminalDeliveryToken(
                 actorGeneration = authority.generation,
-                authorityGeneration = checkpoint.deliveryToken.authorityGeneration + 1,
+                authorityGeneration = previousDeliveryToken.authorityGeneration + 1,
                 localDispatchToken = 1,
             )
-            val restored = RelayV2TerminalCheckpointReducer.restore(
-                stored = stored,
-                expectedIdentity = checkpoint.identity,
-                expectedOpenAttempt = checkpoint.openAttempt,
-                currentDeliveryToken = deliveryToken,
-                currentParserContinuityId = checkpoint.parserContinuityId,
-                parserOperationProof = null,
-            )
+            val restored = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen ->
+                    RelayV2TerminalCheckpointReducer.restorePreOpen(
+                        stored = stored,
+                        expectedTarget = key.toTarget(),
+                        expectedOpenAttempt = stored.checkpoint.pendingOpen?.openAttempt
+                            ?: stored.checkpoint.resetFence?.openAttempt
+                            ?: openAttempt,
+                        currentDeliveryToken = deliveryToken,
+                        currentParserContinuityId = stored.checkpoint.parserContinuityId,
+                    )
+                is RelayV2TerminalStoredCheckpoint.Present -> {
+                    val checkpoint = stored.checkpoint
+                    check(key == RelayV2TerminalCheckpointKey.from(checkpoint.identity.target()))
+                    RelayV2TerminalCheckpointReducer.restore(
+                        stored = stored,
+                        expectedIdentity = checkpoint.identity,
+                        expectedOpenAttempt = checkpoint.openAttempt,
+                        currentDeliveryToken = deliveryToken,
+                        currentParserContinuityId = checkpoint.parserContinuityId,
+                        parserOperationProof = null,
+                    )
+                }
+                else -> error("Candidate kind is not resumable")
+            }
             val reduction = if (restored.outcome is RelayV2TerminalOutcome.Restored) {
-                val current = requireNotNull(restored.checkpoint)
-                RelayV2TerminalCheckpointReducer.reduce(
-                    current,
-                    RelayV2TerminalAction.BeginOpenAttempt(
-                        deliveryToken = deliveryToken,
-                        requestId = requestId,
-                        openAttempt = openAttempt,
-                        mode = RelayV2TerminalOpenMode.RESUME,
-                        cols = cols,
-                        rows = rows,
-                        target = current.identity.target(),
-                        parserContinuityId = current.parserContinuityId,
-                        resume = RelayV2TerminalOpenResume(
-                            generation = current.identity.generation,
-                            nextOffset = current.parserAppliedNextOffset,
-                            resumeTokenCredentialReference =
-                                current.identity.resumeTokenCredentialReference,
-                            resumeTokenCredentialFingerprint =
-                                current.identity.resumeTokenCredentialFingerprint,
-                        ),
-                    ),
-                )
+                when (stored) {
+                    is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+                        val current = requireNotNull(restored.preOpenCheckpoint)
+                        val pending = requireNotNull(current.pendingOpen)
+                        RelayV2TerminalCheckpointReducer.reduce(
+                            current,
+                            RelayV2TerminalAction.BeginOpenAttempt(
+                                deliveryToken = deliveryToken,
+                                requestId = requestId,
+                                openAttempt = pending.openAttempt,
+                                mode = pending.mode,
+                                cols = pending.cols,
+                                rows = pending.rows,
+                                target = pending.target,
+                                parserContinuityId = pending.parserContinuityId,
+                                resume = pending.resume,
+                            ),
+                        )
+                    }
+                    is RelayV2TerminalStoredCheckpoint.Present -> {
+                        val current = requireNotNull(restored.checkpoint)
+                        RelayV2TerminalCheckpointReducer.reduce(
+                            current,
+                            RelayV2TerminalAction.BeginOpenAttempt(
+                                deliveryToken = deliveryToken,
+                                requestId = requestId,
+                                openAttempt = openAttempt,
+                                mode = RelayV2TerminalOpenMode.RESUME,
+                                cols = cols,
+                                rows = rows,
+                                target = current.identity.target(),
+                                parserContinuityId = current.parserContinuityId,
+                                resume = RelayV2TerminalOpenResume(
+                                    generation = current.identity.generation,
+                                    nextOffset = current.parserAppliedNextOffset,
+                                    resumeTokenCredentialReference =
+                                        current.identity.resumeTokenCredentialReference,
+                                    resumeTokenCredentialFingerprint =
+                                        current.identity.resumeTokenCredentialFingerprint,
+                                ),
+                            ),
+                        )
+                    }
+                    else -> error("Candidate kind is not resumable")
+                }
             } else {
                 restored
             }

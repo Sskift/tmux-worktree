@@ -592,6 +592,97 @@ class RelayV2DurableStateRepositoryCoreTest {
         }
 
     @Test
+    fun pendingPreOpenReopenReclaimsSameAttemptWithoutParallelOpen() = runBlocking {
+        val store = MemoryStore()
+        val initialRepository = RelayV2DurableStateRepositoryCore(store)
+        val target = terminalIdentity().target()
+        val key = RelayV2TerminalCheckpointKey.from(target)
+        val initialDelivery = terminalDelivery()
+        val initialAttempt = RelayV2TerminalOpenAttempt(
+            "open-pending",
+            "open-pending-fingerprint",
+        )
+        initialRepository.reduceTerminalUnderApplyLease(
+            key,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = initialDelivery,
+                requestId = "open-pending-request",
+                openAttempt = initialAttempt,
+                mode = RelayV2TerminalOpenMode.NEW,
+                cols = 120,
+                rows = 36,
+                target = target,
+                parserContinuityId = PARSER_CONTINUITY,
+                resume = null,
+            ),
+        )
+
+        val selector = RelayV2TerminalResumeSessionSelector(
+            "profile-v2",
+            7,
+            "principal-v2",
+            "android-install-v2",
+            "host-a",
+            "scope-a",
+            "session-a",
+            0,
+        )
+        val resumedGeneration = RelayV2EffectGeneration("profile-v2", 7, 2)
+        val authority = RelayV2RepositoryEffectAuthority(
+            resumedGeneration,
+            "profile-v2",
+            7,
+            "principal-v2",
+            "android-install-v2",
+            "host-a",
+            "epoch-a",
+        )
+        val discardedNewAttempt = RelayV2TerminalOpenAttempt(
+            "open-must-not-replace-pending",
+            "open-must-not-replace-pending-fingerprint",
+        )
+        val claim = requireNotNull(
+            RelayV2DurableStateRepositoryCore(store)
+                .claimResumableTerminalUnderApplyLease(
+                    selector,
+                    authority,
+                    "open-retry-request",
+                    discardedNewAttempt,
+                    132,
+                    40,
+                ),
+        )
+
+        assertEquals(key, claim.key)
+        assertEquals(RelayV2TerminalOutcome.Applied, claim.reduction.outcome)
+        val send = claim.reduction.effects
+            .filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+            .single()
+        assertEquals(RelayV2TerminalOpenMode.NEW, send.mode)
+        assertEquals("open-retry-request", send.requestId)
+        assertEquals(initialAttempt, send.openFence.openAttempt)
+        assertFalse(send.openFence.openAttempt == discardedNewAttempt)
+        assertEquals(target, send.openFence.target)
+        assertEquals(120, send.cols)
+        assertEquals(36, send.rows)
+        assertEquals(resumedGeneration, send.openFence.deliveryToken.actorGeneration)
+        assertEquals(
+            initialDelivery.authorityGeneration + 1,
+            send.openFence.deliveryToken.authorityGeneration,
+        )
+
+        val stored = store.lastCommittedTerminal(key) as RelayV2TerminalStoredCheckpoint.PreOpen
+        val pending = requireNotNull(stored.checkpoint.pendingOpen)
+        assertEquals(initialAttempt, pending.openAttempt)
+        assertEquals(
+            listOf("open-pending-request", "open-retry-request"),
+            pending.issuedRequestIds,
+        )
+        assertTrue(pending.requiresDeduplicatedResponse)
+        assertEquals(1, store.terminalCheckpointsForSession(selector, authority.hostEpoch).size)
+    }
+
+    @Test
     fun `resumable Session claim atomically preserves identity and emits exact RESUME`() =
         runBlocking {
             val store = MemoryStore()
