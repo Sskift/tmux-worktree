@@ -102,6 +102,9 @@ async function createHarness({
   reenterDisposeOnOffline = false,
   terminalManagerOverrides,
   h1ExecutorOverrides = {},
+  h1Now = () => 1_783_700_000_000,
+  carrierClock = () => 1_783_700_100_000,
+  carrierSchedule,
 } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-carrier-runtime-"));
   const store = await hostState.RelayV2HostStateStore.open({
@@ -166,7 +169,7 @@ async function createHarness({
     .openRecoveredAuthority({
       store,
       hostId: HOST_ID,
-      now: () => 1_783_700_000_000,
+      now: h1Now,
       executor: {
         async resolve(request) {
           if (h1ExecutorOverrides.resolve) return h1ExecutorOverrides.resolve(request);
@@ -246,7 +249,8 @@ async function createHarness({
         "tw-relay.v1": { validate() {} },
       },
       idFactory: () => "carrier-runtime-host-hello",
-      clock: () => 1_783_700_100_000,
+      clock: carrierClock,
+      schedule: carrierSchedule,
       onStatus(status) {
         if (composition === null) throw new Error("carrier status preceded composition");
         statusObservations.push({
@@ -322,23 +326,31 @@ function registerCarrier(active, connectorId, disposition = "connected") {
   return registered;
 }
 
-async function openRoute(harness) {
-  const active = connectCarrier(harness);
+function bindRoute(
+  active,
+  connectorId,
+  suffix = "",
+  clientInstanceId = "composition-client",
+) {
   const { transport, connection } = active;
-  const registered = registerCarrier(active, "carrier-runtime-connector");
-
   const route = fixture("route-open");
-  route.connectorId = registered.connectorId;
-  route.routeId = "carrier-runtime-route";
-  route.routeFence = "carrier-runtime-fence";
-  route.payload.connectionId = "carrier-runtime-connection";
+  route.connectorId = connectorId;
+  route.routeId = `carrier-runtime-route${suffix}`;
+  route.routeFence = `carrier-runtime-fence${suffix}`;
+  route.payload.connectionId = `carrier-runtime-connection${suffix}`;
   route.payload.authContext.hostId = HOST_ID;
   route.payload.authContext.principalId = "carrier-runtime-principal";
-  route.payload.authContext.clientInstanceId = "composition-client";
+  route.payload.authContext.clientInstanceId = clientInstanceId;
   connection.receive(carrierWire(route));
   assert.equal(decodeCarrier(transport.sent.at(-1)).type, "route.opened");
   acknowledgeAll(connection, transport);
   return { transport, connection, route, nextClientSequence: 0 };
+}
+
+async function openRoute(harness) {
+  const active = connectCarrier(harness);
+  const registered = registerCarrier(active, "carrier-runtime-connector");
+  return bindRoute(active, registered.connectorId);
 }
 
 function sendClientFrame(route, frame) {
@@ -429,6 +441,12 @@ function hostDataFrames(transport) {
     }));
 }
 
+function publicFramesFor(route) {
+  return hostDataFrames(route.transport)
+    .filter(({ carrier }) => carrier.routeId === route.route.routeId)
+    .map(({ bytes }) => codec.decodeRelayV2WebSocketFrame("public", bytes).frame);
+}
+
 test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and route-only close", async () => {
   const h = await createHarness();
   try {
@@ -491,6 +509,175 @@ test("combined carrier/runtime bridges copied bindings, exact bytes, FIFO, and r
     });
     assert.equal(h.composition.carrier.status().phase, "registered");
     await h1Close;
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("long-lived route rotates before H1 expiry and replacement executes with fresh window", async () => {
+  let now = 1_783_700_000_000;
+  const scheduled = [];
+  const h = await createHarness({
+    h1Now: () => now,
+    carrierClock: () => now,
+    carrierSchedule(delayMs, callback) {
+      const timer = {
+        deadlineMs: now + delayMs,
+        callback,
+        cancelled: false,
+      };
+      scheduled.push(timer);
+      return () => { timer.cancelled = true; };
+    },
+    h1ExecutorOverrides: {
+      resolve(request) {
+        return {
+          kind: "executable",
+          adapterState: { resolvedTarget: request.sessionId },
+          resolutionFence: {
+            schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+            outcome: "positive",
+            authority: request.authority,
+            operation: request.operation,
+            expectedScopeId: request.scopeId,
+            expectedSessionId: request.sessionId,
+            target: { sessionId: request.sessionId },
+            evidence: { source: "rolling-window-test" },
+          },
+        };
+      },
+      executeTerminalControl(plan) {
+        return {
+          state: "succeeded",
+          result: {
+            pane: plan.arguments.pane,
+            submit: plan.arguments.submit,
+            messageUtf8Bytes: Buffer.byteLength(plan.arguments.message, "utf8"),
+          },
+        };
+      },
+    },
+  });
+  try {
+    const first = await openRoute(h);
+    const firstHello = fixture("client-hello-fresh");
+    firstHello.hostId = HOST_ID;
+    firstHello.payload.clientInstanceId = first.route.payload.authContext.clientInstanceId;
+    sendClientFrame(first, firstHello);
+    await settle();
+    const firstWelcome = publicFramesFor(first).find(
+      (frame) => frame.type === "host.welcome",
+    );
+    assert.ok(firstWelcome);
+    const firstWindow = structuredClone(firstWelcome.payload.commandDedupeWindow);
+    acknowledgeAll(first.connection, first.transport);
+
+    const historical = fixture("command-execute-send-agent-message");
+    historical.expectedHostEpoch = h.identity.hostEpoch;
+    historical.requestId = "rolling-history-attempt";
+    historical.commandId = "rolling-history-command";
+    historical.payload.dedupeWindowId = firstWindow.windowId;
+    sendClientFrame(first, historical);
+    await settle();
+    assert.equal(
+      publicFramesFor(first).find(
+        (frame) => frame.requestId === historical.requestId,
+      )?.payload.state,
+      "succeeded",
+    );
+    acknowledgeAll(first.connection, first.transport);
+
+    const rotation = scheduled.find((timer) => !timer.cancelled);
+    assert.ok(rotation);
+    assert.equal(rotation.deadlineMs, firstWindow.acceptUntilMs - 60_000);
+    now = rotation.deadlineMs;
+    rotation.callback();
+    await settle();
+    assert.deepEqual(first.transport.closes, [{
+      code: 1013,
+      reason: "command_window_rotation",
+    }]);
+    assert.equal(
+      first.transport.sent.map(decodeCarrier).some((frame) => frame.type === "route.close"),
+      false,
+      "window rotation uses transient carrier retirement, not a false slow-consumer route close",
+    );
+    assert.equal(h.composition.carrier.status().phase, "offline");
+
+    const replacementCarrier = connectCarrier(h);
+    const replacementRegistration = registerCarrier(
+      replacementCarrier,
+      "carrier-runtime-connector-rotated",
+    );
+    const second = bindRoute(
+      replacementCarrier,
+      replacementRegistration.connectorId,
+      "-rotated",
+    );
+    const secondHello = fixture("client-hello-fresh");
+    secondHello.requestId = "rolling-replacement-hello";
+    secondHello.hostId = HOST_ID;
+    secondHello.payload.clientInstanceId = second.route.payload.authContext.clientInstanceId;
+    sendClientFrame(second, secondHello);
+    await settle();
+
+    const secondWindow = publicFramesFor(second).find(
+      (frame) => frame.type === "host.welcome",
+    )?.payload.commandDedupeWindow;
+    assert.ok(secondWindow);
+    assert.notEqual(secondWindow.windowId, firstWindow.windowId);
+    assert.equal(BigInt(secondWindow.windowSeq), BigInt(firstWindow.windowSeq) + 1n);
+    assert.equal(
+      secondWindow.acceptUntilMs,
+      now + commandPlane.RELAY_V2_COMMAND_ACCEPT_WINDOW_MS,
+    );
+    acknowledgeAll(second.connection, second.transport);
+
+    const fresh = fixture("command-execute-send-agent-message");
+    fresh.expectedHostEpoch = h.identity.hostEpoch;
+    fresh.requestId = "rolling-fresh-attempt";
+    fresh.commandId = "rolling-fresh-command";
+    fresh.payload.dedupeWindowId = secondWindow.windowId;
+    sendClientFrame(second, fresh);
+    await settle();
+    assert.equal(
+      publicFramesFor(second).find(
+        (frame) => frame.requestId === fresh.requestId,
+      )?.payload.state,
+      "succeeded",
+    );
+    acknowledgeAll(second.connection, second.transport);
+
+    now = firstWindow.acceptUntilMs + 1;
+    const expired = fixture("command-execute-send-agent-message");
+    expired.expectedHostEpoch = h.identity.hostEpoch;
+    expired.requestId = "rolling-expired-attempt";
+    expired.commandId = "rolling-expired-command";
+    expired.payload.dedupeWindowId = firstWindow.windowId;
+    sendClientFrame(second, expired);
+    await settle();
+    assert.equal(
+      publicFramesFor(second).find(
+        (frame) => frame.requestId === expired.requestId,
+      )?.error.code,
+      "COMMAND_WINDOW_EXPIRED",
+    );
+    acknowledgeAll(second.connection, second.transport);
+
+    const query = fixture("command-query");
+    query.expectedHostEpoch = h.identity.hostEpoch;
+    query.requestId = "rolling-history-query";
+    query.payload.items = [{
+      commandId: historical.commandId,
+      dedupeWindowId: firstWindow.windowId,
+    }];
+    sendClientFrame(second, query);
+    await settle();
+    const history = publicFramesFor(second).find(
+      (frame) => frame.requestId === query.requestId,
+    );
+    assert.equal(history.payload.items[0].state, "succeeded");
+    assert.equal(history.payload.items[0].dedupeWindowId, firstWindow.windowId);
   } finally {
     await h.cleanup();
   }

@@ -41,6 +41,10 @@ export const RELAY_V2_HOST_SUPERSEDED_EXIT_CODE = 78;
 const MAX_COUNTER = 18_446_744_073_709_551_615n;
 const DEFAULT_TERMINAL_FRAME_BYTES = 65_536;
 const MAX_CARRIER_BUFFER_BYTES = 16 * 1_048_576;
+// host.welcome cannot be repeated on a live public route. Retire the carrier
+// early enough for the existing transient-offline reconnect path to establish
+// a new route/hello without mislabeling normal rotation as route backpressure.
+const COMMAND_WINDOW_ROUTE_ROTATION_LEAD_MS = 60_000;
 const EMPTY_ADVERTISED_CAPABILITIES: readonly [] = Object.freeze([]);
 
 export type RelayV2HostCarrierPhase =
@@ -506,6 +510,10 @@ interface RouteState {
   outstandingPayloadBytes: number;
   outstandingCarrierBytes: number;
   pressureSinceMs: number | null;
+  commandWindowRotation: {
+    deadlineMs: number;
+    cancel: () => void;
+  } | null;
 }
 
 interface ConnectorState {
@@ -1658,8 +1666,9 @@ export class RelayV2HostCarrierActor {
       this.finishReceiptAdmission(receiptCell, false);
       return false;
     }
+    let publicFrame: RelayV2JsonObject | null;
     try {
-      this.validatePublicPayload(route, payload);
+      publicFrame = this.validatePublicPayload(route, payload);
     } catch {
       this.failRoute(connector, route, ROUTE_CLOSE_PROTOCOL_ERROR);
       this.finishReceiptAdmission(receiptCell, false);
@@ -1694,6 +1703,15 @@ export class RelayV2HostCarrierActor {
       payload.byteLength,
       receiptCell,
     );
+    if (accepted && publicFrame?.type === "host.welcome") {
+      const welcomePayload = objectField(publicFrame, "payload");
+      const commandWindow = objectField(welcomePayload, "commandDedupeWindow");
+      this.armCommandWindowRotation(
+        connector,
+        route,
+        commandWindow.acceptUntilMs as number,
+      );
+    }
     this.finishReceiptAdmission(receiptCell, accepted);
     return accepted;
   }
@@ -2071,6 +2089,7 @@ export class RelayV2HostCarrierActor {
       outstandingPayloadBytes: 0,
       outstandingCarrierBytes: 0,
       pressureSinceMs: null,
+      commandWindowRotation: null,
     };
     connector.routes.set(routeId, route);
     try {
@@ -2213,6 +2232,7 @@ export class RelayV2HostCarrierActor {
       return;
     }
     route.phase = "closing";
+    this.cancelCommandWindowRotation(route);
     connector.routes.delete(route.binding.routeId);
     const detached = this.detachQueuedDataForRoute(connector, route);
     this.removeControlItems(connector, (item) => item.route === route);
@@ -2256,6 +2276,7 @@ export class RelayV2HostCarrierActor {
       && this.carrierPressureOwner(connector) === route;
     route.phase = "closing";
     route.pressureSinceMs = null;
+    this.cancelCommandWindowRotation(route);
     if (ownsCarrierPressure) {
       connector.carrierPressureSinceMs = null;
     }
@@ -2588,15 +2609,91 @@ export class RelayV2HostCarrierActor {
     return owner && owner.outstandingCarrierBytes > unownedBytes ? owner : null;
   }
 
-  private validatePublicPayload(route: RouteState, payload: Uint8Array): void {
+  private validatePublicPayload(
+    route: RouteState,
+    payload: Uint8Array,
+  ): RelayV2JsonObject | null {
     if (route.binding.clientDialect === "tw-relay.v2") {
-      decodeRelayV2WebSocketFrame("public", payload, {
+      return decodeRelayV2WebSocketFrame("public", payload, {
         opcode: "text",
         compressed: false,
-      });
-      return;
+      }).frame;
     }
     this.v1DialectAdapter!.validate(payload.slice());
+    return null;
+  }
+
+  private armCommandWindowRotation(
+    connector: ConnectorState,
+    route: RouteState,
+    acceptUntilMs: number,
+  ): void {
+    if (route.commandWindowRotation !== null
+      || !Number.isSafeInteger(acceptUntilMs)
+      || acceptUntilMs < COMMAND_WINDOW_ROUTE_ROTATION_LEAD_MS) {
+      this.failConnector(connector, 4400, "invalid_command_window_lifetime");
+      return;
+    }
+    const timer = {
+      deadlineMs: acceptUntilMs - COMMAND_WINDOW_ROUTE_ROTATION_LEAD_MS,
+      cancel: () => {},
+    };
+    route.commandWindowRotation = timer;
+    const schedule = (): void => {
+      const delayMs = Math.max(0, timer.deadlineMs - safeNow(this.clock));
+      let registrationReturned = false;
+      let firedBeforeRegistration = false;
+      const cancel = this.schedule(delayMs, () => {
+        if (!registrationReturned) {
+          firedBeforeRegistration = true;
+          return;
+        }
+        try {
+          if (this.current !== connector
+            || connector.phase === "closed"
+            || connector.routes.get(route.binding.routeId) !== route
+            || route.phase !== "open"
+            || route.commandWindowRotation !== timer) return;
+          if (safeNow(this.clock) < timer.deadlineMs) {
+            schedule();
+            return;
+          }
+          route.commandWindowRotation = null;
+          this.failConnector(connector, 1013, "command_window_rotation");
+        } catch {
+          if (this.current === connector && connector.phase !== "closed") {
+            route.commandWindowRotation = null;
+            this.failConnector(connector, 1013, "command_window_rotation");
+          }
+        }
+      });
+      registrationReturned = true;
+      if (typeof cancel !== "function") {
+        throw new Error("Relay v2 command-window scheduler did not return a cancel handle");
+      }
+      let cancelled = false;
+      timer.cancel = () => {
+        if (cancelled) return;
+        cancelled = true;
+        cancel();
+      };
+      if (firedBeforeRegistration) {
+        timer.cancel();
+        throw new Error("Relay v2 command-window scheduler reentered registration");
+      }
+    };
+    try {
+      schedule();
+    } catch {
+      if (route.commandWindowRotation === timer) route.commandWindowRotation = null;
+      this.failConnector(connector, 1013, "command_window_rotation");
+    }
+  }
+
+  private cancelCommandWindowRotation(route: RouteState): void {
+    const timer = route.commandWindowRotation;
+    route.commandWindowRotation = null;
+    try { timer?.cancel(); } catch {}
   }
 
   private refreshPressureTimer(connector: ConnectorState): void {
@@ -2848,7 +2945,10 @@ export class RelayV2HostCarrierActor {
       );
     }
     const routes = [...connector.routes.values()];
-    for (const route of routes) route.phase = "closing";
+    for (const route of routes) {
+      route.phase = "closing";
+      this.cancelCommandWindowRotation(route);
+    }
     connector.routes.clear();
     const detached = this.detachConnectorQueues(connector, routes);
     for (const route of routes) {
