@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { types as nodeTypes } from "node:util";
 
+import type { Config } from "../../config.js";
 import { requestTerminalControl } from "../../terminalControl/client.js";
 import {
   defaultTerminalControlSocketPath,
@@ -420,10 +421,16 @@ async function closeOwned(
   return failed;
 }
 
+const loadLocalDevelopmentHostConfig = (): Pick<Config, "hosts"> => ({
+  hosts: [],
+});
+
 async function openCanonicalRuntimeOwner(
   trustedHome: string,
   signal?: AbortSignal,
-  exactTerminalControlStatePath?: string,
+  localDevelopmentIsolation?: Readonly<{
+    terminalControlStatePath: string;
+  }>,
 ): Promise<Readonly<{
   terminalControlDaemonSocketPath: string;
   runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1;
@@ -436,9 +443,12 @@ async function openCanonicalRuntimeOwner(
       socketPath: terminalControlDaemonSocketPath,
       autoStart: true,
       autoStartCliTarget: localCliTarget,
-      ...(exactTerminalControlStatePath === undefined
+      ...(localDevelopmentIsolation === undefined
         ? {}
-        : { autoStartStatePath: exactTerminalControlStatePath }),
+        : {
+            autoStartStatePath:
+              localDevelopmentIsolation.terminalControlStatePath,
+          }),
       ...(signal === undefined ? {} : { signal }),
     },
   );
@@ -448,6 +458,9 @@ async function openCanonicalRuntimeOwner(
     terminalControlDaemonSocketPath,
     knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
     sshExecutable: "/usr/bin/ssh",
+    ...(localDevelopmentIsolation === undefined
+      ? {}
+      : { configLoader: loadLocalDevelopmentHostConfig }),
   });
   return Object.freeze({ terminalControlDaemonSocketPath, runtimeOwner });
 }
@@ -575,7 +588,9 @@ async function createLocalDevelopmentActivationOwner(
     const openedRuntime = await openCanonicalRuntimeOwner(
       trustedHome,
       signal,
-      defaultTerminalControlStatePath(trustedHome),
+      Object.freeze({
+        terminalControlStatePath: defaultTerminalControlStatePath(trustedHome),
+      }),
     );
     const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
     runtimeOwner = openedRuntime.runtimeOwner;

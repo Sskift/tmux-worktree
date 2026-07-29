@@ -505,6 +505,12 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     const runtimeCreateIndex = first.events.findIndex(([name]) => name === "runtime.create");
     assert.ok(terminalReadyIndex >= 0);
     assert.ok(runtimeCreateIndex > terminalReadyIndex);
+    const productionRuntimeOptions = first.events[runtimeCreateIndex][1];
+    assert.equal(
+      Object.hasOwn(productionRuntimeOptions, "configLoader"),
+      false,
+      "production runtime keeps the real config owner",
+    );
     const [, terminalRequest, terminalOptions] = first.events[terminalReadyIndex];
     assert.deepEqual(terminalRequest, { type: "ping" });
     assert.equal(terminalOptions.socketPath, join(
@@ -713,6 +719,10 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       localTerminalReady[2].autoStartStatePath,
       join(home, ".tmux-worktree", "terminal-control-state-v1.json"),
     );
+    const localRuntimeOptions = localDevelopment.events
+      .find(([name]) => name === "runtime.create")[1];
+    assert.equal(typeof localRuntimeOptions.configLoader, "function");
+    assert.deepEqual(localRuntimeOptions.configLoader(), { hosts: [] });
     assert.ok(localDevelopment.events.some(([name]) => name === "local.intake.open"));
     assert.equal(localDevelopment.localCapabilityHandoffIssueCount, 1);
     assert.strictEqual(

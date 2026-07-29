@@ -65,7 +65,7 @@ export interface RelayV2CanonicalHostRuntimeBundleOptionsV1 {
   knownHostsFile: string;
   /** Fixed SSH executable; SSH config is never consulted. */
   sshExecutable: string;
-  /** Test-only seams; production construction uses the existing owners. */
+  /** Explicit owner seams; trusted production construction omits these fields. */
   configLoader?: () => Pick<Config, "hosts"> | null;
   runner?: CanonicalRunner;
   queryTimeoutMs?: number;

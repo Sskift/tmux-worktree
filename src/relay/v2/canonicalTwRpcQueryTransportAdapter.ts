@@ -1431,8 +1431,8 @@ function deriveExplicitConfigSnapshotTargets(
 
 /**
  * Default-off provenance factory for a future relay-host composition root.
- * The only remote scopes come from loadConfigFile() (or an injected test
- * loader). It does not read SSH config, start discovery, or wire H1/H3.
+ * The only remote scopes come from loadConfigFile() or an explicitly
+ * owner-bound loader. It does not read SSH config, start discovery, or wire H1/H3.
  * It is the single target-generation owner for discovery, query, and the
  * structured mutation process lane: one live queryPort holds the configured
  * targets, reconfigure() switches generations only through that port's
