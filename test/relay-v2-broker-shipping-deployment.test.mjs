@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   linkSync,
@@ -465,6 +466,38 @@ test("explicit v2 profile CLI routes through the trusted deployment source owner
     assert.match(String(ambiguousListen?.message), /--host\/--port/);
   } finally {
     delete process.env.TW_RELAY_SECRET;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("standalone CJS CLI reaches the trusted deployment fail-closed path without v1 fallback", async () => {
+  const home = makeHome("tw-v2-deploy-standalone-cli-");
+  const v1Secret = "v1-secret-that-must-not-be-used";
+  try {
+    const port = await reserveFreePort();
+    const profilePath = writeProfile(home, deploymentProfile(home, port));
+    const result = spawnSync(process.execPath, [
+      path.resolve("dist/cli.cjs"),
+      "relay-server",
+      "--v2-profile",
+      profilePath,
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TW_RELAY_SECRET: v1Secret,
+      },
+      timeout: 5_000,
+    });
+
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /deployment source is unavailable/);
+    assert.equal(result.stderr.includes(v1Secret), false);
+    assert.equal(await connectRefused(port), true);
+  } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });

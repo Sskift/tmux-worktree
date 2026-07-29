@@ -54,7 +54,10 @@ test("standalone CLI build and every automatic consumer use the canonical CJS ar
   }
 
   const tauri = JSON.parse(read("app/src-tauri/tauri.conf.json"));
+  // The CJS launcher keeps canonical Relay v2 owners in the ESM sibling tree,
+  // so Dashboard must ship both the full dist tree and its module boundary.
   assert.deepEqual(tauri.bundle.resources, {
-    "../../dist/cli.cjs": "tw-cli/cli.cjs",
+    "../../dist/": "tw-cli/",
+    "../../package.json": "tw-cli/package.json",
   });
 });

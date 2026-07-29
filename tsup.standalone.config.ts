@@ -10,9 +10,11 @@ export default defineConfig({
   outExtension: () => ({ js: ".cjs" }),
   clean: false,
   splitting: false,
-  // Keep the default-off relay-host v2 seam on the same canonical dist owner
-  // as snapshot-spool H2 recovery instead of bundling a second private registry.
+  // Keep the default-off Relay v2 shipping seams on their canonical ESM dist
+  // owners instead of bundling second private registries into the CJS CLI.
   external: [
+    "./relay/v2/brokerShippingRoot.js",
+    "./relay/v2/brokerShippingDeploymentSource.js",
     "./relay/v2/hostRuntimeComposition.js",
     "./relay/v2/hostCanonicalProductionComposition.js",
     "./relay/v2/hostShippingRoot.js",
