@@ -602,9 +602,9 @@ internal class RelayV2DurableStateRepositoryCore(
                 }
                 else -> error("Candidate kind is not resumable")
             }
-            val reduction = if (restored.outcome is RelayV2TerminalOutcome.Restored) {
-                when (stored) {
-                    is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+            val reduction = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+                    if (restored.outcome is RelayV2TerminalOutcome.Restored) {
                         val current = requireNotNull(restored.preOpenCheckpoint)
                         val pending = requireNotNull(current.pendingOpen)
                         RelayV2TerminalCheckpointReducer.reduce(
@@ -621,23 +621,46 @@ internal class RelayV2DurableStateRepositoryCore(
                                 resume = pending.resume,
                             ),
                         )
+                    } else {
+                        restored
                     }
-                    is RelayV2TerminalStoredCheckpoint.Present -> {
-                        val current = requireNotNull(restored.checkpoint)
+                }
+                is RelayV2TerminalStoredCheckpoint.Present -> {
+                    val current = restored.checkpoint
+                    val resetRequired =
+                        restored.outcome is RelayV2TerminalOutcome.ResetRequired &&
+                            current?.phase == RelayV2TerminalPhase.RESET_REQUIRED
+                    if (restored.outcome is RelayV2TerminalOutcome.Restored ||
+                        resetRequired
+                    ) {
+                        checkNotNull(current)
+                        val mode = if (resetRequired) {
+                            RelayV2TerminalOpenMode.RESET
+                        } else {
+                            RelayV2TerminalOpenMode.RESUME
+                        }
                         RelayV2TerminalCheckpointReducer.reduce(
                             current,
                             RelayV2TerminalAction.BeginOpenAttempt(
                                 deliveryToken = deliveryToken,
                                 requestId = requestId,
                                 openAttempt = openAttempt,
-                                mode = RelayV2TerminalOpenMode.RESUME,
+                                mode = mode,
                                 cols = cols,
                                 rows = rows,
                                 target = current.identity.target(),
-                                parserContinuityId = current.parserContinuityId,
+                                parserContinuityId = if (resetRequired) {
+                                    // The production caller owns this fresh attempt. Reusing its
+                                    // bounded openId creates a fresh parser lineage without adding
+                                    // a second random-ID owner inside the durable transaction.
+                                    openAttempt.openId
+                                } else {
+                                    current.parserContinuityId
+                                },
                                 resume = RelayV2TerminalOpenResume(
                                     generation = current.identity.generation,
-                                    nextOffset = current.parserAppliedNextOffset,
+                                    nextOffset = current.parserAppliedNextOffset
+                                        .takeUnless { resetRequired },
                                     resumeTokenCredentialReference =
                                         current.identity.resumeTokenCredentialReference,
                                     resumeTokenCredentialFingerprint =
@@ -645,11 +668,11 @@ internal class RelayV2DurableStateRepositoryCore(
                                 ),
                             ),
                         )
+                    } else {
+                        restored
                     }
-                    else -> error("Candidate kind is not resumable")
                 }
-            } else {
-                restored
+                else -> error("Candidate kind is not resumable")
             }
             persistTerminalReduction(key, reduction)
             RelayV2TerminalResumeClaim(key, reduction)
