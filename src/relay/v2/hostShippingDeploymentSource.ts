@@ -25,6 +25,8 @@ import {
   type RelayV2CanonicalHostRuntimeBundleOwnerV1,
   type RelayV2CanonicalHostRuntimeBundleV1,
 } from "./canonicalHostRuntimeBundle.js";
+import { relayV2RemoteExactCompoundSocketPathV1 } from
+  "./remoteExactTerminalControlCompoundV1.js";
 import { relayV2HostCredentialNativeModuleTrustedLoader } from
   "./hostCredentialNativeLoader.js";
 import {
@@ -150,6 +152,7 @@ const activationRecords =
   new WeakMap<object, RelayV2HostTrustedDeploymentActivationRecord>();
 const localDevelopmentActivationRecords =
   new WeakMap<object, RelayV2HostLocalDevelopmentActivationRecord>();
+const LOCAL_DEVELOPMENT_UNIX_SOCKET_PATH_MAX_BYTES = 100;
 
 function failure(
   code: RelayV2HostShippingDeploymentSourceErrorCode,
@@ -191,6 +194,26 @@ function requireLocalDevelopmentTrustedHome(value: string): string {
   } catch {
     throw failure("ACTIVATION_FAILED");
   }
+}
+
+function localDevelopmentTerminalControlSocketPath(trustedHome: string): string {
+  const fits = (socketPath: string): boolean => (
+    Buffer.byteLength(socketPath, "utf8") <= LOCAL_DEVELOPMENT_UNIX_SOCKET_PATH_MAX_BYTES
+    && Buffer.byteLength(
+      relayV2RemoteExactCompoundSocketPathV1(socketPath),
+      "utf8",
+    ) <= LOCAL_DEVELOPMENT_UNIX_SOCKET_PATH_MAX_BYTES
+  );
+  const canonicalPreferred = join(
+    trustedHome,
+    ".tmux-worktree",
+    "terminal-control-v1.sock",
+  );
+  const preferred = defaultTerminalControlSocketPath(trustedHome);
+  if (preferred === canonicalPreferred && fits(preferred)) return preferred;
+  const candidate = join(trustedHome, ".relay-v2-tc-v1.sock");
+  if (!fits(candidate)) throw failure("ACTIVATION_FAILED");
+  return candidate;
 }
 
 function exactRegularPath(value: string, label: "Node executable" | "CLI entrypoint"): string {
@@ -435,7 +458,9 @@ async function openCanonicalRuntimeOwner(
   terminalControlDaemonSocketPath: string;
   runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1;
 }>> {
-  const terminalControlDaemonSocketPath = defaultTerminalControlSocketPath(trustedHome);
+  const terminalControlDaemonSocketPath = localDevelopmentIsolation === undefined
+    ? defaultTerminalControlSocketPath(trustedHome)
+    : localDevelopmentTerminalControlSocketPath(trustedHome);
   const localCliTarget = currentCliTarget();
   await requestTerminalControl(
     { type: "ping" },

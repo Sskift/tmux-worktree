@@ -10,11 +10,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 const { build } = createRequire(import.meta.url)("esbuild");
+const exactCompound = await import(
+  "../dist/relay/v2/remoteExactTerminalControlCompoundV1.js"
+);
 
 const sourcePath = new URL(
   "../src/relay/v2/hostShippingDeploymentSource.ts",
@@ -27,9 +29,16 @@ const virtualModules = new Map([
     export function homedir() { return globalThis.__hostDeploymentHarness.home; }
   `],
   ["../../terminalControl/store.js", `
+    import { createHash } from "node:crypto";
     export function defaultTerminalControlSocketPath(home) {
-      globalThis.__hostDeploymentHarness.events.push(["terminal.path", home]);
-      return home + "/.tmux-worktree/terminal-control-v1.sock";
+      const preferred = home + "/.tmux-worktree/terminal-control-v1.sock";
+      const selected = Buffer.byteLength(preferred, "utf8") <= 100
+        ? preferred
+        : "/tmp/tw-terminal-control-"
+          + createHash("sha256").update(home, "utf8").digest("hex").slice(0, 16)
+          + "/v1.sock";
+      globalThis.__hostDeploymentHarness.events.push(["terminal.path", home, selected]);
+      return selected;
     }
     export function defaultTerminalControlStatePath(home) {
       globalThis.__hostDeploymentHarness.events.push(["terminal.state-path", home]);
@@ -122,6 +131,17 @@ const virtualModules = new Map([
       bundles.delete(bundle);
       h.events.push(["runtime.consume"]);
       return opened;
+    }
+  `],
+  ["./remoteExactTerminalControlCompoundV1.js", `
+    import { createHash } from "node:crypto";
+    import { dirname, join } from "node:path";
+    export function relayV2RemoteExactCompoundSocketPathV1(daemonSocketPath) {
+      const digest = createHash("sha256")
+        .update(daemonSocketPath, "utf8")
+        .digest("hex")
+        .slice(0, 16);
+      return join(dirname(daemonSocketPath), ".relay-v2-exact-" + digest + ".sock");
     }
   `],
   ["./hostShippingProcessLifecycle.js", `
@@ -482,9 +502,22 @@ function createHarness(home) {
   };
 }
 
-test("Relay v2 Host normal process lifecycle prepares terminal control and freezes one trusted lineage", async () => {
-  const home = realpathSync.native(mkdtempSync(join(tmpdir(), "tw-v2-host-deployment-")));
+function createPrivateHome(targetBytes) {
+  const shortRoot = process.platform === "darwin" ? "/private/tmp" : "/tmp";
+  const homePrefix = join(shortRoot, "tw-v2-host-");
+  const home = realpathSync.native(mkdtempSync(
+    `${homePrefix}${"x".repeat(
+      targetBytes - Buffer.byteLength(homePrefix, "utf8") - 6,
+    )}`,
+  ));
   chmodSync(home, 0o700);
+  assert.equal(Buffer.byteLength(home, "utf8"), targetBytes);
+  return home;
+}
+
+test("Relay v2 Host normal process lifecycle prepares terminal control and freezes one trusted lineage", async () => {
+  const home = createPrivateHome(58);
+  const tooLongHome = createPrivateHome(96);
   const cli = join(home, "cli.cjs");
   writeFileSync(cli, "/* fixture */\n");
   const savedArgv = process.argv;
@@ -720,6 +753,25 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     );
     const localTerminalReady = localDevelopment.events
       .find(([name]) => name === "terminal.ready");
+    const preferredLocalSocket = join(
+      home,
+      ".tmux-worktree",
+      "terminal-control-v1.sock",
+    );
+    assert.ok(Buffer.byteLength(preferredLocalSocket, "utf8") <= 100);
+    assert.ok(Buffer.byteLength(
+      exactCompound.relayV2RemoteExactCompoundSocketPathV1(preferredLocalSocket),
+      "utf8",
+    ) > 100);
+    assert.notEqual(localTerminalReady[2].socketPath, preferredLocalSocket);
+    assert.ok(Buffer.byteLength(localTerminalReady[2].socketPath, "utf8") <= 100);
+    assert.ok(Buffer.byteLength(
+      exactCompound.relayV2RemoteExactCompoundSocketPathV1(
+        localTerminalReady[2].socketPath,
+      ),
+      "utf8",
+    ) <= 100);
+    assert.equal(dirname(localTerminalReady[2].socketPath), home);
     assert.equal(
       localTerminalReady[2].autoStartStatePath,
       join(home, ".tmux-worktree", "terminal-control-state-v1.json"),
@@ -785,6 +837,34 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       ),
       (error) => error?.code === "CLOSED",
       "the process-local credential bytes are fenced and discarded at close",
+    );
+
+    const tooLongLocalDevelopment = createHarness(tooLongHome);
+    tooLongLocalDevelopment.profile = localDevelopmentProfile();
+    globalThis.__hostDeploymentHarness = tooLongLocalDevelopment;
+    await assert.rejects(
+      module.runRelayV2HostShippingFromLocalDevelopment({
+        trustedHome: tooLongHome,
+        credentialHttpsCaInputPath: credentialCaPath,
+        carrierWssCaInputPath: carrierCaPath,
+      }),
+      (error) => error?.code === "ACTIVATION_FAILED",
+    );
+    const externalFallback = tooLongLocalDevelopment.events
+      .find(([name]) => name === "terminal.path")[2];
+    assert.notEqual(
+      externalFallback,
+      join(tooLongHome, ".tmux-worktree", "terminal-control-v1.sock"),
+    );
+    assert.notEqual(dirname(externalFallback), tooLongHome);
+    assert.ok(Buffer.byteLength(externalFallback, "utf8") <= 100);
+    assert.ok(Buffer.byteLength(
+      exactCompound.relayV2RemoteExactCompoundSocketPathV1(externalFallback),
+      "utf8",
+    ) <= 100);
+    assert.equal(
+      tooLongLocalDevelopment.events.some(([name]) => name === "terminal.ready"),
+      false,
     );
 
     const localDashboardOwned = createHarness(home);
@@ -1021,6 +1101,7 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     process.argv = savedArgv;
     delete globalThis.__hostDeploymentHarness;
     delete globalThis.__hostDeploymentTrustedLoader;
+    rmSync(tooLongHome, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
   }
 });
