@@ -47,11 +47,13 @@ export interface RelayV2ExactTerminalControlTargetEvidenceV1
  * of frozen terminal-control v1 target.resolve, whose name-only lookup may
  * persist targets and mutate pipe-pane output.
  *
- * Both methods are closed read/verify operations: they must perform zero
- * observation attachment, backend mutation, lease acquisition/renewal,
- * input/resize, output preparation, or target persistence. The synchronous
- * fence must definitely reject a stale token or any changed process target,
- * twinc2 incarnation, pane, control epoch, or target-incarnation proof.
+ * Resolution may ask the unique target-side terminal-control authority to
+ * provision a missing record from the exact process target, twinc2
+ * incarnation, managed kind, and pane. It must never fall back to the
+ * name-only v1 target.resolve path. Existing exact-current records remain
+ * closed inspect/verify operations. The synchronous fence must definitely
+ * reject a stale token or any changed process target, twinc2 incarnation,
+ * pane, control epoch, or target-incarnation proof.
  */
 export interface RelayV2ExactTerminalControlTargetPortV1 {
   resolveExactTarget(

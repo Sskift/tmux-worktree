@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { lstatSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { isAbsolute } from "node:path";
 import type { TerminalControlRequest, TerminalControlResponse } from "./protocol";
@@ -20,6 +21,8 @@ export type TerminalControlRequestInput = DistributiveRequestInput<TerminalContr
 export interface TerminalControlAutoStartCliTarget {
   readonly executable: string;
   readonly entrypoint: string;
+  /** Exact local-development home; production callers must omit it. */
+  readonly home?: string;
 }
 
 interface TerminalControlAutoStartPaths {
@@ -56,10 +59,49 @@ function clientError(error: NodeJS.ErrnoException): boolean {
   return error.code === "ENOENT" || error.code === "ECONNREFUSED";
 }
 
+function localDevelopmentHome(
+  target?: Readonly<TerminalControlAutoStartCliTarget>,
+): string | undefined {
+  if (target === undefined || !Object.hasOwn(target, "home")) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(target, "home");
+  const value = descriptor?.value;
+  if ((process.platform !== "darwin" && process.platform !== "linux")
+    || typeof process.geteuid !== "function"
+    || typeof value !== "string"
+    || !isAbsolute(value)
+    || value.includes("\0")) {
+    throw new TypeError("terminal-control local-development home is unsafe");
+  }
+  try {
+    const before = lstatSync(value, { bigint: true });
+    if (!before.isDirectory()
+      || before.isSymbolicLink()
+      || before.uid !== BigInt(process.geteuid())
+      || (before.mode & 0o7777n) !== 0o700n) {
+      throw new TypeError("terminal-control local-development home is unsafe");
+    }
+    const canonical = realpathSync.native(value);
+    const after = lstatSync(value, { bigint: true });
+    if (canonical !== value
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.uid !== before.uid
+      || after.mode !== before.mode
+      || !after.isDirectory()
+      || after.isSymbolicLink()) {
+      throw new TypeError("terminal-control local-development home is unsafe");
+    }
+    return canonical;
+  } catch {
+    throw new TypeError("terminal-control local-development home is unsafe");
+  }
+}
+
 function startServer(
   target?: Readonly<TerminalControlAutoStartCliTarget>,
   paths?: Readonly<TerminalControlAutoStartPaths>,
 ): void {
+  const home = localDevelopmentHome(target);
   const cli = target?.entrypoint
     || process.env.TW_TERMINAL_CONTROL_CLI?.trim()
     || process.env.TW_DASHBOARD_CLI?.trim()
@@ -80,7 +122,7 @@ function startServer(
   ], {
     detached: true,
     stdio: "ignore",
-    env: process.env,
+    env: home === undefined ? process.env : { ...process.env, HOME: home },
   });
   child.unref();
 }

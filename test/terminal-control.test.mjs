@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   truncateSync,
@@ -21,6 +22,10 @@ import { fileURLToPath } from "node:url";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
 const terminalControlCli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
+const exactCompound = await import(
+  "../dist/relay/v2/remoteExactTerminalControlCompoundV1.js"
+);
+const backendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
 const {
   CanonicalTerminalControlSocketClient,
   parseCanonicalAgentResultResult,
@@ -219,6 +224,7 @@ function isolatedManagedTmux(t, sessionName) {
 
   return {
     temp,
+    home,
     twHome,
     outputRoot,
     wrapper,
@@ -798,6 +804,194 @@ test("exact auto-start hands the bound socket and state paths to one terminal-co
     if (previousStatePath === undefined) delete process.env.TW_TERMINAL_CONTROL_STATE;
     else process.env.TW_TERMINAL_CONTROL_STATE = previousStatePath;
     temp.cleanup();
+  }
+});
+
+test("local-development exact auto-start binds the child to its validated managed-state home", async (t) => {
+  const sessionName = `isolated-auto-start-${process.pid}`;
+  const harness = isolatedManagedTmux(t, sessionName);
+  if (harness === undefined) return;
+  const socketPath = join(
+    tmpdir(),
+    `twv2-home-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+  );
+  const statePath = join(
+    harness.twHome,
+    "terminal-control-state-v1.json",
+  );
+  const unrelatedHome = join(harness.temp.root, "unrelated-parent-home");
+  mkdirSync(unrelatedHome, { mode: 0o700 });
+  const isolatedHome = realpathSync.native(harness.home);
+  const listExactSession = () => {
+    const listed = spawnSync(
+      process.execPath,
+      [terminalControlCli, "rpc-v2", "list"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, HOME: isolatedHome },
+      },
+    );
+    assert.equal(listed.status, 0, listed.stderr);
+    const session = JSON.parse(listed.stdout).sessions.find(
+      (candidate) => candidate.name === sessionName,
+    );
+    assert.ok(session);
+    return session;
+  };
+  let exactTargets;
+  try {
+    process.env.HOME = unrelatedHome;
+    assert.deepEqual(
+      await terminalControl.requestTerminalControl(
+        { type: "ping" },
+        {
+          socketPath,
+          autoStart: true,
+          autoStartCliTarget: {
+            executable: process.execPath,
+            entrypoint: terminalControlCli,
+            home: isolatedHome,
+          },
+          autoStartStatePath: statePath,
+          timeoutMs: 4_000,
+        },
+      ),
+      {
+        protocolVersion: 1,
+        authority: "local-terminal-control",
+        capabilities: [
+          "output.rendered-snapshot",
+          "activity.agent-status",
+          "activity.agent-result",
+        ],
+      },
+    );
+    assert.deepEqual(
+      terminalControl.loadTerminalControlState(statePath).targets,
+      [],
+      "the v2 path must not depend on prior name-only target registration",
+    );
+
+    const session = listExactSession();
+    const processTarget = {
+      kind: "local",
+      targetId: "local-development-isolated-home",
+    };
+    exactTargets = new exactCompound.RelayV2RemoteExactTerminalControlCompoundAdapterV1({
+      channels: exactCompound.captureRelayV2LocalExactCompoundChannelFactoryV1({
+        daemonSocketPath: socketPath,
+        processTarget,
+      }),
+      owner: {
+        kind: "relay-v2",
+        instanceId: "relay-v2:isolated-home-test",
+      },
+    });
+    const input = {
+      schemaVersion: 1,
+      hostId: "host-isolated-home",
+      scopeId: "scope-isolated-home",
+      sessionId: "session-isolated-home",
+      pane: 0,
+      processTarget,
+      backendInstanceKey: backendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+        processTarget,
+        incarnation: session.incarnation,
+      }),
+      managedTarget: {
+        name: sessionName,
+        kind: "terminal",
+        incarnation: session.incarnation,
+      },
+    };
+    const evidence = await exactTargets.resolveExactTarget(input);
+    const [provisioned] = terminalControl.loadTerminalControlState(statePath).targets;
+    assert.equal(provisioned.managedSession.name, sessionName);
+    assert.equal(provisioned.managedSession.kind, "terminal");
+    assert.equal(
+      evidence.exactControlIdentity.controlTargetId,
+      provisioned.controlTargetId,
+    );
+    exactTargets.fenceExactTargetForAdmission(input, evidence);
+
+    const staleControlTargetId = provisioned.controlTargetId;
+    const staleTmuxInstanceId = provisioned.backend.tmuxInstanceId;
+    await exactTargets.close();
+    exactTargets = undefined;
+    const beforeReplacement = terminalControl.loadTerminalControlState(statePath)
+      .targets.find((candidate) => candidate.controlTargetId === staleControlTargetId);
+    assert.equal(beforeReplacement.lifecycle, "ACTIVE");
+    assert.equal(beforeReplacement.ownership.state, "FREE");
+    const killed = spawnSync(
+      harness.wrapper,
+      ["kill-session", "-t", `=${sessionName}`],
+      { encoding: "utf8" },
+    );
+    assert.equal(killed.status, 0, killed.stderr);
+    const recreated = spawnSync(
+      harness.wrapper,
+      ["new-session", "-d", "-s", sessionName, "-c", harness.temp.root],
+      { encoding: "utf8" },
+    );
+    assert.equal(recreated.status, 0, recreated.stderr);
+    writeFileSync(join(harness.twHome, "state.json"), `${JSON.stringify({
+      version: 1,
+      sessions: [{
+        name: sessionName,
+        kind: "terminal",
+        profile: "dashboard",
+        cwd: harness.temp.root,
+        createdAt: "2026-07-14T00:00:00.000Z",
+      }],
+    })}\n`, { mode: 0o600 });
+    const replacementSession = listExactSession();
+    assert.notEqual(replacementSession.incarnation, session.incarnation);
+
+    exactTargets = new exactCompound.RelayV2RemoteExactTerminalControlCompoundAdapterV1({
+      channels: exactCompound.captureRelayV2LocalExactCompoundChannelFactoryV1({
+        daemonSocketPath: socketPath,
+        processTarget,
+      }),
+      owner: {
+        kind: "relay-v2",
+        instanceId: "relay-v2:isolated-home-replacement-test",
+      },
+    });
+    const replacementInput = {
+      ...input,
+      sessionId: "session-isolated-home-replacement",
+      backendInstanceKey: backendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+        processTarget,
+        incarnation: replacementSession.incarnation,
+      }),
+      managedTarget: {
+        ...input.managedTarget,
+        incarnation: replacementSession.incarnation,
+      },
+    };
+    const replacementEvidence = await exactTargets.resolveExactTarget(replacementInput);
+    const refreshedTargets = terminalControl.loadTerminalControlState(statePath).targets;
+    const stale = refreshedTargets.find(
+      (candidate) => candidate.controlTargetId === staleControlTargetId,
+    );
+    const replacement = refreshedTargets.find(
+      (candidate) => candidate.controlTargetId
+        === replacementEvidence.exactControlIdentity.controlTargetId,
+    );
+    assert.equal(stale.lifecycle, "TARGET_GONE");
+    assert.ok(replacement);
+    assert.equal(replacement.lifecycle, "ACTIVE");
+    assert.equal(replacement.managedSession.name, sessionName);
+    assert.equal(replacement.managedSession.kind, "terminal");
+    assert.equal(replacement.managedSession.createdAt, "2026-07-14T00:00:00.000Z");
+    assert.notEqual(replacement.controlTargetId, staleControlTargetId);
+    assert.notEqual(replacement.backend.tmuxInstanceId, staleTmuxInstanceId);
+    exactTargets.fenceExactTargetForAdmission(replacementInput, replacementEvidence);
+  } finally {
+    await exactTargets?.close().catch(() => undefined);
+    await stopAutoStartedTerminalControl(socketPath);
+    process.env.HOME = harness.home;
+    await harness.cleanup();
   }
 });
 

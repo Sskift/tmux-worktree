@@ -467,7 +467,12 @@ async function openCanonicalRuntimeOwner(
     {
       socketPath: terminalControlDaemonSocketPath,
       autoStart: true,
-      autoStartCliTarget: localCliTarget,
+      autoStartCliTarget: localDevelopmentIsolation === undefined
+        ? localCliTarget
+        : Object.freeze({
+            ...localCliTarget,
+            home: trustedHome,
+          }),
       ...(localDevelopmentIsolation === undefined
         ? {}
         : {

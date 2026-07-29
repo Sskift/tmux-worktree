@@ -18,7 +18,11 @@ import {
   TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TerminalControlProtocolError,
 } from "./protocol";
-import { TmuxTerminalControlBackend, type TerminalControlBackend } from "./backend";
+import {
+  TmuxTerminalControlBackend,
+  type TerminalControlBackend,
+  type TerminalControlExactTargetObservation,
+} from "./backend";
 import {
   acquireTerminalControlStoreLock,
   leaseFromTarget,
@@ -520,6 +524,49 @@ function relayV2ExactInput(value: TerminalControlRelayV2ExactTargetInput): Termi
   };
 }
 
+function relayV2ExactObservedIdentity(
+  input: TerminalControlRelayV2ExactTargetInput,
+  observed: TerminalControlExactTargetObservation,
+  requireTmuxIdentity: boolean,
+): string | null {
+  if (!observed
+    || typeof observed !== "object"
+    || !observed.managedSession
+    || typeof observed.managedSession !== "object"
+    || observed.managedSession.name !== input.managedTarget.name
+    || observed.managedSession.kind !== input.managedTarget.kind
+    || observed.managedIncarnation !== input.managedTarget.incarnation) {
+    throw new TerminalControlProtocolError(
+      "TARGET_GONE",
+      "managed target changed during Relay v2 exact preparation",
+    );
+  }
+  const createdAtMs = Date.parse(observed.managedSession.createdAt);
+  if (!Number.isFinite(createdAtMs)
+    || new Date(createdAtMs).toISOString() !== observed.managedSession.createdAt
+    || typeof observed.paneIdentity !== "string"
+    || observed.paneIdentity.length === 0
+    || observed.paneIdentity.length > 128
+    || /[\0\r\n]/.test(observed.paneIdentity)
+    || (observed.tmuxInstanceId !== null
+      && (typeof observed.tmuxInstanceId !== "string"
+        || observed.tmuxInstanceId.length === 0
+        || observed.tmuxInstanceId.length > 128
+        || /[\0\r\n]/.test(observed.tmuxInstanceId)))) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "exact terminal backend identity is malformed",
+    );
+  }
+  if (requireTmuxIdentity && observed.tmuxInstanceId === null) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "exact terminal backend identity is unavailable",
+    );
+  }
+  return observed.tmuxInstanceId;
+}
+
 function ownerRelayV2ExactConsumer(
   value: TerminalControlOwner & { kind: "relay-v2" },
 ): TerminalControlOwner & { kind: "relay-v2" } {
@@ -717,9 +764,12 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   }
 
   /**
-   * Atomically reserves an already-existing exact terminal target. This never
-   * invokes v1 target.resolve, creates a target, prepares output, or attaches
-   * observation. The returned object is useful only to this live authority.
+   * Atomically reserves an exact terminal target. A missing exact current
+   * record may be provisioned only through the backend's exact
+   * kind/incarnation/pane seam; this never invokes the name-only v1
+   * target.resolve path. Existing exact-current records retain the closed
+   * inspect-only preparation path. The returned object is useful only to this
+   * live authority.
    */
   async prepareRelayV2ExactTarget(
     rawInput: TerminalControlRelayV2ExactTargetInput,
@@ -813,34 +863,99 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         || this.relayV2ExternalEpoch !== externalEpoch) {
         throw new TerminalControlProtocolError("RESOURCE_EXHAUSTED", "terminal-control is busy", true);
       }
-      const inspected = await this.backend.inspectExactTarget!({
+      const exactInput = {
         managedName: input.managedTarget.name,
         managedKind: input.managedTarget.kind,
         managedIncarnation: input.managedTarget.incarnation,
         pane: input.pane,
-      });
-      if (inspected.managedSession.name !== input.managedTarget.name
-        || inspected.managedSession.kind !== input.managedTarget.kind
-        || inspected.managedIncarnation !== input.managedTarget.incarnation) {
-        throw new TerminalControlProtocolError(
-          "TARGET_GONE",
-          "managed target changed during Relay v2 exact preparation",
-        );
-      }
-      const matches = state.targets.filter((candidate) => (
+      };
+      const namedTargets = state.targets.filter((candidate) => (
         candidate.lifecycle !== "TARGET_GONE"
         && candidate.managedSession.name === input.managedTarget.name
-        && candidate.managedSession.kind === input.managedTarget.kind
-        && candidate.managedSession.createdAt === inspected.managedSession.createdAt
-        && candidate.backend.tmuxInstanceId === inspected.tmuxInstanceId
       ));
-      if (matches.length !== 1) {
-        throw new TerminalControlProtocolError(
-          matches.length === 0 ? "TARGET_NOT_FOUND" : "RECOVERY_REQUIRED",
-          "exact terminal-control target is missing or ambiguous",
+      let provisionTarget = namedTargets.length === 0;
+      let inspected: TerminalControlExactTargetObservation | null = null;
+      if (namedTargets.length > 0 && this.backend.observeExactTarget !== undefined) {
+        const observed = await this.backend.observeExactTarget(exactInput);
+        const observedTmuxInstanceId = relayV2ExactObservedIdentity(
+          input,
+          observed,
+          false,
         );
+        const sameLifecycle = namedTargets.filter((candidate) => (
+          candidate.managedSession.kind === observed.managedSession.kind
+          && candidate.managedSession.createdAt === observed.managedSession.createdAt
+        ));
+        const exactMatches = observedTmuxInstanceId === null
+          ? []
+          : sameLifecycle.filter((candidate) => (
+              candidate.backend.tmuxInstanceId === observedTmuxInstanceId
+            ));
+        // A missing tmux identity on the same persisted lifecycle is an
+        // uncertainty, not authority to replace that lifecycle. The original
+        // inspect-only path below must reject it.
+        provisionTarget = exactMatches.length === 0
+          && !(observedTmuxInstanceId === null && sameLifecycle.length > 0);
       }
-      const target = matches[0];
+      if (!provisionTarget) {
+        inspected = await this.backend.inspectExactTarget!(exactInput);
+        const inspectedTmuxInstanceId = relayV2ExactObservedIdentity(
+          input,
+          inspected,
+          true,
+        )!;
+        const matches = namedTargets.filter((candidate) => (
+          candidate.managedSession.kind === inspected!.managedSession.kind
+          && candidate.managedSession.createdAt === inspected!.managedSession.createdAt
+          && candidate.backend.tmuxInstanceId === inspectedTmuxInstanceId
+        ));
+        if (matches.length !== 1) {
+          throw new TerminalControlProtocolError(
+            matches.length === 0 ? "TARGET_NOT_FOUND" : "RECOVERY_REQUIRED",
+            "exact terminal-control target is missing or ambiguous",
+          );
+        }
+      } else {
+        if (this.backend.establishExactTarget === undefined) {
+          throw new TerminalControlProtocolError(
+            "TARGET_NOT_FOUND",
+            "exact terminal-control target is missing",
+          );
+        }
+        inspected = await this.backend.establishExactTarget(exactInput);
+        relayV2ExactObservedIdentity(input, inspected, true);
+      }
+      const inspectedTmuxInstanceId = inspected!.tmuxInstanceId!;
+      const matches = namedTargets.filter((candidate) => (
+        candidate.managedSession.kind === inspected!.managedSession.kind
+        && candidate.managedSession.createdAt === inspected!.managedSession.createdAt
+        && candidate.backend.tmuxInstanceId === inspectedTmuxInstanceId
+      ));
+      const target: TerminalControlTargetRecord = provisionTarget
+        ? {
+            controlTargetId: randomUUID(),
+            lifecycle: "ACTIVE",
+            managedSession: {
+              name: inspected!.managedSession.name,
+              kind: inspected!.managedSession.kind,
+              createdAt: inspected!.managedSession.createdAt,
+            },
+            backend: {
+              kind: "tmux",
+              tmuxInstanceId: inspectedTmuxInstanceId,
+            },
+            outputGeneration: randomUUID(),
+            ownership: { state: "FREE", fence: "0" },
+            revision: "1",
+            completedOperations: [],
+            updatedAt: isoNow(this.now),
+          }
+        : matches[0];
+      if (provisionTarget) {
+        for (const stale of namedTargets) invalidateTarget(stale, this.now);
+        state.targets.push(target);
+        await this.prepareOutput(state, target);
+      }
       ensureOperable(target);
       if (target.ownership.state !== "FREE") {
         throw new TerminalControlProtocolError(

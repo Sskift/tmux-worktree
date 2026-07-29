@@ -786,9 +786,9 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       "the local-development owner hands off its exact validated trustedHome",
     );
     assert.equal(
-      Object.hasOwn(localTerminalReady[2].autoStartCliTarget, "home"),
-      false,
-      "terminal-control auto-start target does not gain a caller-selected home",
+      localTerminalReady[2].autoStartCliTarget.home,
+      home,
+      "the validated local-development home reaches the terminal-control child",
     );
     assert.ok(localDevelopment.events.some(([name]) => name === "local.intake.open"));
     assert.equal(localDevelopment.localCapabilityHandoffIssueCount, 1);
