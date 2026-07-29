@@ -1928,15 +1928,26 @@ export class RelayV2TerminalManager {
     this.stopping = true;
     this.cancelProducerLeaseMaintenance();
     this.shutdownBarrier = this.enqueue(async () => {
+      let uncertainProducerRelease = false;
       for (const stream of this.streams.values()) {
         stream.binding = undefined;
-        await this.releaseProducerLease(stream);
+        const released = await this.releaseProducerLease(stream);
         this.clearControlWindows(stream);
+        if (released.status === "uncertain") {
+          stream.controlInDoubt = released.error;
+          uncertainProducerRelease = true;
+        }
         await this.disposeBackend(stream);
       }
       for (const [handle, quarantined] of this.quarantinedBackends) {
         this.quarantinedBackends.delete(handle);
         await this.closeQuarantinedBackend(quarantined);
+      }
+      if (uncertainProducerRelease) {
+        throw new RelayV2TerminalManagerError(
+          "INTERNAL",
+          "terminal-control producer release did not converge during shutdown",
+        );
       }
     });
     return this.shutdownBarrier;
@@ -3693,9 +3704,9 @@ export class RelayV2TerminalManager {
       if (!maintenance.active || this.producerLeaseMaintenance !== maintenance) return;
       maintenance.active = false;
       this.producerLeaseMaintenance = null;
-      void this.sweep().catch(() => undefined).finally(() => {
+      void this.sweep().finally(() => {
         this.refreshProducerLeaseMaintenance();
-      });
+      }).catch(() => undefined);
     };
     const cancel = this.schedule(Math.max(0, deadlineMs - this.now()), callback);
     if (typeof cancel !== "function") {
@@ -3755,21 +3766,17 @@ export class RelayV2TerminalManager {
         lease: { ...lease, owner: { ...lease.owner } },
       });
     } catch (error) {
-      const failure = controlFailure(error);
-      if (failure.status === "uncertain") {
-        this.dropProducerLease(stream);
-        stream.controlInDoubt = failure.error;
+      if (isRelayV2TerminalManagerError(error) && error.code === "INTERNAL") {
+        const released = await this.releaseProducerLease(stream);
+        this.clearControlWindows(stream);
+        if (released.status === "uncertain") stream.controlInDoubt = released.error;
+        throw error;
       }
-      return failure;
+      const failure = controlFailure(error);
+      return this.settleProducerLeaseFailure(stream, failure);
     }
     if (continuous !== true) {
-      const released = await this.releaseProducerLease(stream);
-      this.clearControlWindows(stream);
-      if (released.status === "uncertain") {
-        stream.controlInDoubt = released.error;
-        return { status: "uncertain", error: released.error };
-      }
-      return {
+      return this.settleProducerLeaseFailure(stream, {
         status: "rejected",
         error: {
           code: "PERMISSION_DENIED",
@@ -3778,7 +3785,7 @@ export class RelayV2TerminalManager {
           details: null,
           commandDisposition: "not_applicable",
         },
-      };
+      });
     }
     if (this.now() < (stream.renewLeaseAfter ?? 0)) {
       return { status: "accepted", lease: { ...lease, owner: { ...lease.owner } } };
@@ -3800,33 +3807,29 @@ export class RelayV2TerminalManager {
         this.setProducerLease(stream, renewed.lease);
         return renewed;
       }
-      if (renewed.status === "uncertain") {
-        this.dropProducerLease(stream);
-        stream.controlInDoubt = renewed.error;
-        return renewed;
-      }
-      const released = await this.releaseProducerLease(stream);
-      this.clearControlWindows(stream);
-      if (released.status === "uncertain") {
-        stream.controlInDoubt = released.error;
-        return { status: "uncertain", error: released.error };
-      }
-      return renewed;
+      return this.settleProducerLeaseFailure(stream, renewed);
     } catch (error) {
-      const failure = controlFailure(error);
-      if (failure.status === "uncertain") {
-        this.dropProducerLease(stream);
-        stream.controlInDoubt = failure.error;
-      } else {
+      if (isRelayV2TerminalManagerError(error) && error.code === "INTERNAL") {
         const released = await this.releaseProducerLease(stream);
         this.clearControlWindows(stream);
-        if (released.status === "uncertain") {
-          stream.controlInDoubt = released.error;
-          return { status: "uncertain", error: released.error };
-        }
+        if (released.status === "uncertain") stream.controlInDoubt = released.error;
+        throw error;
       }
+      const failure = controlFailure(error);
+      return this.settleProducerLeaseFailure(stream, failure);
+    }
+  }
+
+  private async settleProducerLeaseFailure(
+    stream: TerminalStream,
+    failure: Exclude<RelayV2TerminalLeaseResult, { status: "accepted" }>,
+  ): Promise<Exclude<RelayV2TerminalLeaseResult, { status: "accepted" }>> {
+    const released = await this.releaseProducerLease(stream);
+    this.clearControlWindows(stream);
+    if (failure.error.code === "INTERNAL" || released.status !== "uncertain") {
       return failure;
     }
+    return { status: "uncertain", error: released.error };
   }
 
   private dropProducerLease(stream: TerminalStream): void {
@@ -5345,16 +5348,17 @@ export class RelayV2TerminalManager {
     for (const stream of this.streams.values()) {
       if (maintainProducerLeases && stream.status === "live" && stream.producerLease) {
         if (Date.parse(stream.producerLease.expiresAt) <= now) {
-          await this.releaseProducerLease(stream);
+          const released = await this.releaseProducerLease(stream);
           this.clearControlWindows(stream);
+          if (released.status === "uncertain") stream.controlInDoubt = released.error;
           continue;
         }
-        try {
-          await this.ensureProducerLease(stream);
-        } catch {
-          await this.releaseProducerLease(stream);
-          this.clearControlWindows(stream);
-          continue;
+        const leaseResult = await this.ensureProducerLease(stream);
+        if (leaseResult.status !== "accepted") {
+          stream.controlInDoubt = leaseResult.error;
+          if (leaseResult.error.code === "INTERNAL") {
+            throw new RelayV2TerminalManagerError("INTERNAL", leaseResult.error.message);
+          }
         }
       }
       if (

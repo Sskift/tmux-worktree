@@ -3278,6 +3278,124 @@ test("live terminal schedules producer lease renewal before exact observation ex
   );
 });
 
+test("maintenance failures retain exact lease and shutdown refuses uncertain release", async () => {
+  const scheduled = [];
+  const h = harness({
+    schedule(delayMs, callback) {
+      const task = { delayMs, callback, cancelled: false, fired: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  h.authority.leaseTtlMs = 30_000;
+  const requests = [
+    goldenOpen({
+      requestId: "maintenance-uncertain-open",
+      streamId: "maintenance-uncertain-stream",
+      openId: "maintenance-uncertain-open-id",
+    }),
+    goldenOpen({
+      route: {
+        connectorId: "maintenance-internal-connector",
+        routeId: "maintenance-internal-route",
+        routeFence: "maintenance-internal-fence",
+      },
+      requestId: "maintenance-internal-open",
+      streamId: "maintenance-internal-stream",
+      openId: "maintenance-internal-open-id",
+    }),
+    goldenOpen({
+      route: {
+        connectorId: "shutdown-uncertain-connector",
+        routeId: "shutdown-uncertain-route",
+        routeFence: "shutdown-uncertain-fence",
+      },
+      requestId: "shutdown-uncertain-open",
+      streamId: "shutdown-uncertain-stream",
+      openId: "shutdown-uncertain-open-id",
+    }),
+  ];
+  for (const [index, request] of requests.entries()) {
+    await h.manager.open(request);
+    const frame = opened(h.sent, request.requestId);
+    await h.manager.input({
+      ...streamContext(frame, request.route),
+      inputSeq: "1",
+      data: Buffer.from(`lease-${index}`),
+    });
+  }
+  const exactLeases = h.authority.inputCalls.map((call) => clone(call.lease));
+  const fatalErrors = [];
+  const recovery = terminal.captureRelayV2TerminalManagerRecoveryBinding(
+    h.manager,
+    h.lineage,
+  );
+  assert.ok(recovery);
+  assert.equal(recovery.installFatalSink((error) => fatalErrors.push(error)), true);
+
+  h.authority.renewResults.push(
+    {
+      status: "uncertain",
+      error: {
+        code: "COMMAND_IN_DOUBT",
+        message: "renewal settlement was lost",
+        retryable: false,
+        details: null,
+      },
+    },
+    {
+      status: "rejected",
+      error: {
+        code: "INTERNAL",
+        message: "renewal authority failed closed",
+        retryable: false,
+        details: null,
+      },
+    },
+  );
+  h.authority.releaseResults.push(
+    new Error("uncertain renewal release settlement"),
+    undefined,
+    new Error("uncertain shutdown release settlement"),
+  );
+  const deadline = scheduled.find((task) => !task.cancelled && !task.fired);
+  assert.ok(deadline);
+  h.advance(deadline.delayMs);
+  deadline.fired = true;
+  deadline.callback();
+  for (let attempt = 0; attempt < 20 && fatalErrors.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(fatalErrors.length, 1, "maintenance INTERNAL reaches the lifecycle fatal sink");
+  assert.ok(fatalErrors[0] instanceof terminal.RelayV2TerminalManagerError);
+  assert.equal(fatalErrors[0].code, "INTERNAL");
+  const streams = [...h.manager.streams.values()];
+  assert.deepEqual(
+    streams[0].retiringLease,
+    exactLeases[0],
+    "uncertain renewal preserves the exact lease as a cleanup candidate",
+  );
+  assert.equal(streams[0].producerLease, undefined);
+  assert.equal(streams[0].controlInDoubt.code, "COMMAND_IN_DOUBT");
+  assert.deepEqual(h.authority.releaseCalls[0].lease, exactLeases[0]);
+  assert.deepEqual(h.authority.releaseCalls[1].lease, exactLeases[1]);
+
+  await assert.rejects(h.manager.shutdown(), managerError("INTERNAL"));
+  assert.deepEqual(
+    h.authority.releaseCalls[2].lease,
+    exactLeases[2],
+    "shutdown attempts the final exact producer release",
+  );
+  assert.deepEqual(streams[0].retiringLease, exactLeases[0]);
+  assert.deepEqual(streams[2].retiringLease, exactLeases[2]);
+  assert.deepEqual(
+    h.backend.opens.map(({ handle }) => handle.closeCalls),
+    [1, 1, 1],
+    "uncertain release does not skip backend drain",
+  );
+});
+
 test("renewal cannot rotate epoch, lease, fence, or owner identity", async () => {
   const h = harness();
   const request = goldenOpen();
