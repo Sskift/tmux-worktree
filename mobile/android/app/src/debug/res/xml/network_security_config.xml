@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
+    <!--
+      Debug builds may trust an operator-installed local development CA.
+      Relay v2 still performs its own strict certificate-hostname check, and
+      the release resource never includes this override.
+    -->
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
     <!-- Emulator/loopback smoke tests only; device and release pairing require WSS. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">10.0.2.2</domain>
