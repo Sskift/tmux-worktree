@@ -429,7 +429,7 @@ internal class OkHttpRelayV2CredentialExchange(
         const val CLIENT_REFRESH_PATH = "/v2/tokens/refresh"
         const val SELF_REVOKE_PATH = "/v2/grants/self/revoke"
         const val SELF_REVOKE_REASON = "user_revoked"
-        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        val JSON_MEDIA_TYPE = "application/json".toMediaType()
         val AUTH_ERROR_CODES = setOf(
             "AUTH_REQUIRED",
             "AUTH_INVALID",

@@ -199,7 +199,7 @@ class OkHttpRelayV2CredentialExchangeTest {
                 assertEquals("Bearer $ACCESS_TOKEN_1", recorded.getHeader("Authorization"))
                 assertEquals("no-store", recorded.getHeader("Cache-Control"))
                 assertEquals("identity", recorded.getHeader("Accept-Encoding"))
-                assertTrue(recorded.getHeader("Content-Type")?.startsWith("application/json") == true)
+                assertEquals("application/json", recorded.getHeader("Content-Type"))
                 assertTrue(recorded.requestLine.endsWith(" HTTP/1.1"))
                 assertEquals("""{"reason":"user_revoked"}""", recorded.body.readUtf8())
             }
@@ -427,7 +427,7 @@ class OkHttpRelayV2CredentialExchangeTest {
         assertNull(request.getHeader("Authorization"))
         assertEquals("no-store", request.getHeader("Cache-Control"))
         assertEquals("identity", request.getHeader("Accept-Encoding"))
-        assertTrue(request.getHeader("Content-Type")?.startsWith("application/json") == true)
+        assertEquals("application/json", request.getHeader("Content-Type"))
         val url = request.requestUrl.toString()
         assertFalse(url.contains(ENROLLMENT_CODE))
         assertFalse(url.contains(ACCESS_TOKEN_1))
