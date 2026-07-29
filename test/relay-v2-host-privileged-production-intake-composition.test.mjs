@@ -11,8 +11,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+
 const intakeModule = await import(
   "../dist/relay/v2/hostPrivilegedProductionIntakeComposition.js"
+);
+const runtimeCompositionModule = await import(
+  "../dist/relay/v2/hostRuntimeComposition.js"
 );
 const bridgeModule = await import(
   "../dist/relay/v2/hostNativeCredentialPrivilegedIntakeBridge.js"
@@ -60,6 +65,15 @@ const profileCases = JSON.parse(readFileSync(new URL(
 const PROFILE = Object.freeze(profileCases.validProfile);
 const BOOTSTRAP_SECRET = "twhostboot2.privileged-intake-secret-never-reflect";
 const REFRESH_SECRET = "twref2.privileged-intake-refresh-never-reflect";
+const relayV2Corpus = loadRelayV2FixtureCorpus();
+const LOCAL_DEVELOPMENT_BASE_CAPABILITIES = Object.freeze([
+  "error.structured.v1",
+  "command.ledger.v1",
+  "command.query.v1",
+  "snapshot.revision.v1",
+  "event.sequence.v1",
+  "terminal.stream.resume.v1",
+]);
 
 function privateHome(prefix) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), prefix)));
@@ -283,6 +297,86 @@ function createCredentialHttpsTransport(
   return { transport, stats };
 }
 
+function createCapabilityWssHarness() {
+  const records = [];
+  class FakeCapabilityWss {
+    readyState = 1;
+    protocol = "tw-relay.host.v2";
+    extensions = "";
+    listeners = new Map();
+
+    constructor(address, protocols, options) {
+      const record = {
+        address,
+        protocols: [...protocols],
+        headers: [],
+        requestEnds: 0,
+        sent: [],
+        closes: [],
+        socket: this,
+        hello: null,
+      };
+      records.push(record);
+      options.finishRequest({
+        setHeader(name, value) { record.headers.push([name, value]); },
+        end() { record.requestEnds += 1; },
+        destroy() {},
+      }, this);
+    }
+
+    on(event, listener) {
+      const listeners = this.listeners.get(event) ?? [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+    }
+
+    removeListener(event, listener) {
+      const listeners = this.listeners.get(event) ?? [];
+      this.listeners.set(
+        event,
+        listeners.filter((candidate) => candidate !== listener),
+      );
+    }
+
+    send(bytes, options, callback) {
+      const record = records.find((candidate) => candidate.socket === this);
+      const copy = typeof bytes === "string"
+        ? Uint8Array.from(Buffer.from(bytes, "utf8"))
+        : Uint8Array.from(bytes);
+      record.sent.push({ bytes: copy, options });
+      record.hello ??= credentialCodec.decodeRelayV2WebSocketFrame(
+        "carrier",
+        copy,
+      ).frame;
+      queueMicrotask(() => callback());
+    }
+
+    close(code, reason) {
+      const record = records.find((candidate) => candidate.socket === this);
+      record.closes.push({ code, reason });
+      this.readyState = 3;
+      for (const listener of this.listeners.get("close") ?? []) listener(code);
+    }
+
+    terminate() {
+      this.readyState = 3;
+      for (const listener of this.listeners.get("close") ?? []) listener(1006);
+    }
+
+    receive(frame) {
+      const bytes = credentialCodec.encodeRelayV2WebSocketFrame("carrier", frame);
+      const text = Buffer.from(bytes).toString("utf8");
+      for (const listener of this.listeners.get("message") ?? []) {
+        listener(text, false);
+      }
+    }
+  }
+  return {
+    records,
+    transport: Object.freeze({ webSocketConstructor: FakeCapabilityWss }),
+  };
+}
+
 function seedProfile(home) {
   return profileStore.loadOrCreateRelayV2HostProductionProfile({
     profile: PROFILE,
@@ -392,6 +486,14 @@ async function waitForPath(path) {
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.fail(`timed out waiting for ${path}`);
+}
+
+async function waitFor(predicate, message) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(message);
 }
 
 async function startDaemon(harness) {
@@ -558,6 +660,98 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
         < backend.events.indexOf("cell-closed"));
       assert.equal(source.stats.cancels, 1, "close must not reopen or recancel the source");
     } finally {
+      await daemon.close();
+      h.cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("exact-cell local handoff reaches only the intake-owned canonical authority", async () => {
+    const home = privateHome("tw-relay-v2-intake-local-capability-home-");
+    const h = await makeHarness("local-capability", home);
+    const daemon = await startDaemon(h);
+    const backend = new FakeCellBackend();
+    const cell = new FakeCellOwner(backend);
+    const foreignCell = new FakeCellOwner(new FakeCellBackend());
+    const source = createByteSource(backend.events);
+    const credentialHttps = createCredentialHttpsTransport(
+      backend.events,
+      h.hostSnapshot,
+    );
+    const wss = createCapabilityWssHarness();
+    const canonical = { ...h.canonical };
+    delete canonical.dashboardManagement;
+    let facade = null;
+    try {
+      const foreignHandoff = runtimeCompositionModule
+        .issueRelayV2HostLocalDevelopmentCapabilityActivationHandoff(foreignCell);
+      assert.equal(
+        await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+          trustedHome: home,
+          credentialCell: cell,
+          bootstrapSecretByteSource: source.source,
+          credentialHttpsTransport: credentialHttps.transport,
+          wssTransport: wss.transport,
+          localDevelopmentCapabilityActivationHandoff: foreignHandoff,
+          canonical,
+        }),
+        null,
+        "a handoff for another exact cell must fail before claiming this intake",
+      );
+      assert.equal(source.stats.iterators, 0);
+      assert.deepEqual(backend.events, []);
+
+      const localHandoff = runtimeCompositionModule
+        .issueRelayV2HostLocalDevelopmentCapabilityActivationHandoff(cell);
+      facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+        trustedHome: home,
+        credentialCell: cell,
+        bootstrapSecretByteSource: source.source,
+        credentialHttpsTransport: credentialHttps.transport,
+        wssTransport: wss.transport,
+        localDevelopmentCapabilityActivationHandoff: localHandoff,
+        canonical,
+      });
+      assert.notEqual(facade, null);
+      assert.equal(
+        runtimeCompositionModule
+          .matchesRelayV2HostLocalDevelopmentCapabilityActivationHandoff(
+            localHandoff,
+            cell,
+          ),
+        false,
+        "the intake must consume the exact-cell handoff during its one-shot transfer",
+      );
+      assert.equal(
+        Reflect.get(facade, "localDevelopmentCapabilityActivationHandoff"),
+        undefined,
+      );
+
+      const pendingStart = facade.start({
+        requestId: "privileged-intake-local-capability-start",
+        signal: new AbortController().signal,
+      });
+      await waitFor(
+        () => wss.records[0]?.hello !== null,
+        "intake-owned canonical connector did not send host.hello",
+      );
+      const record = wss.records[0];
+      assert.deepEqual(
+        record.hello.payload.capabilities,
+        LOCAL_DEVELOPMENT_BASE_CAPABILITIES,
+      );
+      assert.deepEqual(record.hello.payload.clientDialects, ["tw-relay.v2"]);
+      const registered = structuredClone(
+        relayV2Corpus.goldenByName.get("host-registered").frame,
+      );
+      registered.requestId = record.hello.requestId;
+      registered.connectorId = "privileged-intake-local-connector";
+      record.socket.receive(registered);
+      const started = await pendingStart;
+      assert.equal(started.connectorId, registered.connectorId);
+    } finally {
+      await facade?.closeAndDrain().catch(() => undefined);
+      await foreignCell.closeAndDrain();
       await daemon.close();
       h.cleanup();
       rmSync(home, { recursive: true, force: true });

@@ -137,10 +137,20 @@ declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
 declare const relayV2HostDashboardManagementPortBrand: unique symbol;
 declare const relayV2HostDashboardManagementBindingBrand: unique symbol;
 declare const relayV2HostLocalDevelopmentCapabilityActivationBrand: unique symbol;
+declare const relayV2HostLocalDevelopmentCapabilityActivationHandoffBrand: unique symbol;
 
 /** Process-local, owner-bound, one-shot opt-in for the local-development lane. */
 export interface RelayV2HostLocalDevelopmentCapabilityActivation {
   readonly [relayV2HostLocalDevelopmentCapabilityActivationBrand]: true;
+}
+
+/**
+ * Process-local, one-shot handoff which lets an outer local-development root
+ * bind the opt-in to its exact credential cell without observing the
+ * credential authority later constructed by the privileged intake owner.
+ */
+export interface RelayV2HostLocalDevelopmentCapabilityActivationHandoff {
+  readonly [relayV2HostLocalDevelopmentCapabilityActivationHandoffBrand]: true;
 }
 
 interface RelayV2HostLocalDevelopmentCapabilityActivationRecord {
@@ -151,6 +161,16 @@ interface RelayV2HostLocalDevelopmentCapabilityActivationRecord {
 const localDevelopmentCapabilityActivations = new WeakMap<
   object,
   RelayV2HostLocalDevelopmentCapabilityActivationRecord
+>();
+
+interface RelayV2HostLocalDevelopmentCapabilityActivationHandoffRecord {
+  readonly credentialCell: object;
+  consumed: boolean;
+}
+
+const localDevelopmentCapabilityActivationHandoffs = new WeakMap<
+  object,
+  RelayV2HostLocalDevelopmentCapabilityActivationHandoffRecord
 >();
 
 /** Opaque, owner-bound claim token emitted by one managed Host composition. */
@@ -1298,6 +1318,66 @@ export function issueRelayV2HostLocalDevelopmentCapabilityActivation(
     consumed: false,
   });
   return activation;
+}
+
+/**
+ * Issues the outer half of the local-development opt-in for one exact
+ * credential cell. The cell is identity only: this owner never reads,
+ * mutates, closes, or otherwise structurally inspects it.
+ */
+export function issueRelayV2HostLocalDevelopmentCapabilityActivationHandoff(
+  credentialCell: object,
+): RelayV2HostLocalDevelopmentCapabilityActivationHandoff {
+  if ((typeof credentialCell !== "object" && typeof credentialCell !== "function")
+    || credentialCell === null
+    || nodeTypes.isProxy(credentialCell)) throw managedCompositionFailure();
+  const handoff = Object.freeze(Object.create(null)) as
+    RelayV2HostLocalDevelopmentCapabilityActivationHandoff;
+  localDevelopmentCapabilityActivationHandoffs.set(handoff, {
+    credentialCell,
+    consumed: false,
+  });
+  return handoff;
+}
+
+/**
+ * Non-consuming exact-cell preflight used by the privileged intake before it
+ * claims any caller-owned lifecycle.
+ */
+export function matchesRelayV2HostLocalDevelopmentCapabilityActivationHandoff(
+  handoff: unknown,
+  credentialCell: object,
+): handoff is RelayV2HostLocalDevelopmentCapabilityActivationHandoff {
+  if ((typeof handoff !== "object" && typeof handoff !== "function")
+    || handoff === null
+    || nodeTypes.isProxy(handoff)) return false;
+  const record = localDevelopmentCapabilityActivationHandoffs.get(handoff);
+  return record !== undefined
+    && !record.consumed
+    && record.credentialCell === credentialCell;
+}
+
+/**
+ * One-shot owner-preserving transfer performed only after the privileged
+ * intake has constructed the credential authority for the exact bound cell.
+ * The returned value is the existing authority-bound activation consumed by
+ * the canonical managed Host composition.
+ */
+export function transferRelayV2HostLocalDevelopmentCapabilityActivationHandoff(
+  handoff: RelayV2HostLocalDevelopmentCapabilityActivationHandoff,
+  credentialCell: object,
+  credentialOwner: object,
+): RelayV2HostLocalDevelopmentCapabilityActivation {
+  if (!matchesRelayV2HostLocalDevelopmentCapabilityActivationHandoff(
+    handoff,
+    credentialCell,
+  )
+    || (typeof credentialOwner !== "object" && typeof credentialOwner !== "function")
+    || credentialOwner === null
+    || nodeTypes.isProxy(credentialOwner)) throw managedCompositionFailure();
+  const record = localDevelopmentCapabilityActivationHandoffs.get(handoff as object)!;
+  record.consumed = true;
+  return issueRelayV2HostLocalDevelopmentCapabilityActivation(credentialOwner);
 }
 
 function consumeRelayV2HostLocalDevelopmentCapabilityActivation(
