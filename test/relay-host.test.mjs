@@ -70,6 +70,21 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
     provisionProfileInputPath: "/private/host-profile.json",
     bootstrapSecretInputPath: "/private/new-host.twhostboot2",
   });
+  assert.deepEqual(parseRelayHostOptions([
+    "--profile", "v2",
+    "--local-development",
+    "--trusted-home", "/private/relay-v2-local-home",
+    "--credential-https-ca-input", "/private/credential-issuer-ca.pem",
+    "--carrier-wss-ca-input", "/private/carrier-ca.pem",
+    "--bootstrap-secret-input", "/private/new-host.twhostboot2",
+  ], {}), {
+    profile: "v2",
+    bootstrapSecretInputPath: "/private/new-host.twhostboot2",
+    localDevelopment: true,
+    trustedHome: "/private/relay-v2-local-home",
+    credentialHttpsCaInputPath: "/private/credential-issuer-ca.pem",
+    carrierWssCaInputPath: "/private/carrier-ca.pem",
+  });
   assert.throws(() => parseRelayHostOptions([
     "--profile", "v2",
     "--provision-profile-input",
@@ -103,6 +118,32 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
     "--bootstrap-secret-input", "/private/first",
     "--bootstrap-secret-input", "/private/second",
   ], {}), /只能指定一次/);
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--local-development",
+    "--trusted-home", "/private/relay-v2-local-home",
+    "--credential-https-ca-input", "/private/credential-issuer-ca.pem",
+  ], {}), /同时指定/);
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--local-development",
+    "--credential-https-ca-input", "/private/credential-issuer-ca.pem",
+    "--carrier-wss-ca-input", "/private/carrier-ca.pem",
+  ], {}), /--trusted-home/);
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--trusted-home", "/private/relay-v2-local-home",
+    "--credential-https-ca-input", "/private/credential-issuer-ca.pem",
+    "--carrier-wss-ca-input", "/private/carrier-ca.pem",
+  ], {}), /只适用于 --local-development/);
+  assert.throws(() => parseRelayHostOptions([
+    "--local-development",
+    "--trusted-home", "/private/relay-v2-local-home",
+    "--credential-https-ca-input", "/private/credential-issuer-ca.pem",
+    "--carrier-wss-ca-input", "/private/carrier-ca.pem",
+  ], {
+    TW_RELAY_HOST_PROFILE: "v2",
+  }), /唯一显式指定 --profile v2/);
   assert.throws(() => parseRelayHostOptions([
     "--profile", "v2",
     "--secret", "must-not-be-promoted",
@@ -185,6 +226,11 @@ test("relay-host help documents the explicit Relay v2 shipping selection", async
   assert.match(output, /tw relay-host --profile v2/);
   assert.match(output, /--provision-profile-input <path>/);
   assert.match(output, /--bootstrap-secret-input <path>/);
+  assert.match(output, /--local-development/);
+  assert.match(output, /--trusted-home <absolute-path>/);
+  assert.match(output, /--credential-https-ca-input <path>/);
+  assert.match(output, /--carrier-wss-ca-input <path>/);
+  assert.match(output, /qualifiedRecords/);
   assert.match(output, /唯一 safe writer/);
   assert.match(output, /default-off Relay v2 Host shipping root/);
   assert.doesNotMatch(output, /当前未启用 Relay v2/);

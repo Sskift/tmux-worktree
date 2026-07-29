@@ -1,7 +1,8 @@
 import { types as nodeUtilTypes } from "node:util";
 
 const MAX_CA_ENTRIES = 8;
-const MAX_CA_ENTRY_BYTES = 16_384;
+export const RELAY_V2_HOST_TLS_CA_MAX_ENTRY_BYTES = 16_384;
+const MAX_CA_ENTRY_BYTES = RELAY_V2_HOST_TLS_CA_MAX_ENTRY_BYTES;
 const MAX_CA_TOTAL_BYTES = 32_768;
 const NODE_IS_PROXY = nodeUtilTypes.isProxy;
 const OBJECT_PROTOTYPE = Object.prototype;

@@ -4,6 +4,7 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -39,6 +40,17 @@ const virtualModules = new Map([
     }
   `],
   ["./hostProductionProfileStore.js", `
+    export function readRelayV2HostProductionProfileProvisioningInput(options) {
+      const h = globalThis.__hostDeploymentHarness;
+      h.events.push(["profile.provisioning.read", options.inputPath]);
+      return h.provisioningProfile ?? h.profile;
+    }
+    export function loadOrCreateRelayV2HostProductionProfile(options) {
+      const h = globalThis.__hostDeploymentHarness;
+      h.events.push(["profile.create", options.trustedHome, options.profile]);
+      h.profile = options.profile;
+      return h.profile;
+    }
     export function readRelayV2HostProductionProfile(options) {
       const h = globalThis.__hostDeploymentHarness;
       h.events.push(["profile.read", options.trustedHome]);
@@ -132,13 +144,22 @@ const virtualModules = new Map([
     }
   `],
   ["./hostTlsTrustMaterial.js", `
-    const cuts = new WeakSet();
+    const cuts = new WeakMap();
+    export const RELAY_V2_HOST_TLS_CA_MAX_ENTRY_BYTES = 16384;
     export function captureRelayV2HostSystemTlsTrustCut() {
       const h = globalThis.__hostDeploymentHarness;
       const cut = Object.freeze(Object.create(null));
-      cuts.add(cut);
+      cuts.set(cut, undefined);
       h.trustCuts.push(cut);
       h.events.push(["tls.cut", cut]);
+      return cut;
+    }
+    export function captureRelayV2HostTlsCaTrustCut(value) {
+      const h = globalThis.__hostDeploymentHarness;
+      const cut = Object.freeze(Object.create(null));
+      cuts.set(cut, value);
+      h.trustCuts.push(cut);
+      h.events.push(["tls.ca-cut", value]);
       return cut;
     }
     export function isRelayV2HostTlsTrustCut(value) {
@@ -147,7 +168,7 @@ const virtualModules = new Map([
     }
     export function readRelayV2HostTlsCaTrustCut(value) {
       if (!cuts.has(value)) throw new Error("foreign TLS cut");
-      return undefined;
+      return cuts.get(value);
     }
     export function captureRelayV2HostTlsCaTrust(value) { return value; }
   `],
@@ -268,6 +289,71 @@ const virtualModules = new Map([
       return intake;
     }
   `],
+  ["./hostPrivilegedProductionIntakeComposition.js", `
+    export async function openRelayV2HostPrivilegedProductionIntakeComposition(options) {
+      const h = globalThis.__hostDeploymentHarness;
+      h.events.push(["local.intake.open", options.profileSnapshot, options.canonical]);
+      if (options.profileSnapshot !== h.profile) throw new Error("profile snapshot split");
+      const initial = options.credentialCell.runExclusive((transaction) => transaction.read());
+      if (initial.bytes !== null) throw new Error("local cell did not start empty");
+      const replacement = Uint8Array.from([1, 2, 3]);
+      const swapped = options.credentialCell.runExclusive((transaction) =>
+        transaction.compareAndSwap(initial.revision, replacement));
+      if (swapped.status !== "swapped") throw new Error("local cell did not swap");
+      const inheritedThenable = Object.create({ then() {} });
+      try {
+        options.credentialCell.runExclusive(() => inheritedThenable);
+      } catch (error) {
+        h.inheritedThenableErrorCode = error?.code;
+      }
+      const hostileThenable = {};
+      Object.defineProperty(hostileThenable, "then", {
+        get() {
+          h.hostileThenGetterReads += 1;
+          throw new Error("then getter must not be assimilated");
+        },
+      });
+      try {
+        options.credentialCell.runExclusive(() => hostileThenable);
+      } catch (error) {
+        h.hostileThenableErrorCode = error?.code;
+      }
+      h.localCredentialCell = options.credentialCell;
+      h.localTlsTrust = {
+        credential: options.credentialHttpsTlsTrust,
+        carrier: options.carrierWssTlsTrust,
+      };
+      h.bootstrapSecretByteSource = options.bootstrapSecretByteSource;
+      if (options.bootstrapSecretByteSource !== undefined) {
+        const chunks = [];
+        for await (const chunk of options.bootstrapSecretByteSource) {
+          chunks.push(Buffer.from(chunk));
+        }
+        h.bootstrapSecretRaw = Buffer.concat(chunks).toString("utf8");
+      }
+      let closed = false;
+      const management = options.canonical.dashboardManagement;
+      return Object.freeze({
+        inspect: () => ({ status: "stopped", controllerGeneration: "0" }),
+        start: async () => ({ status: "failed" }),
+        stopAndDrain: async () => ({ status: "already_stopped" }),
+        ...(management === undefined ? {} : {
+          runDashboardManagement: async () => {
+            h.events.push(["management.run", management]);
+            return 0;
+          },
+        }),
+        closeAndDrain: async () => {
+          if (closed) return;
+          closed = true;
+          h.events.push(["local.intake.close"]);
+          await options.canonical.recoveredH2Spool.close();
+          await options.canonical.hostState.close();
+          await options.credentialCell.closeAndDrain();
+        },
+      });
+    }
+  `],
 ]);
 
 const plugin = {
@@ -327,6 +413,14 @@ function canonicalProfile() {
   }));
 }
 
+function localDevelopmentProfile() {
+  return Object.freeze(Object.assign(Object.create(null), {
+    ...canonicalProfile(),
+    relayUrl: "wss://localhost:9443/",
+    credentialIssuerUrl: "https://localhost:9443/",
+  }));
+}
+
 function createHarness(home) {
   return {
     home,
@@ -343,6 +437,11 @@ function createHarness(home) {
     processSignalController: null,
     bootstrapSecretByteSource: undefined,
     bootstrapSecretRaw: null,
+    localCredentialCell: null,
+    localTlsTrust: null,
+    inheritedThenableErrorCode: null,
+    hostileThenableErrorCode: null,
+    hostileThenGetterReads: 0,
     openedRuntime: Object.freeze(Object.assign(Object.create(null), {
       discovery: Object.freeze({ scan: async () => ({}) }),
       localProcessTarget: Object.freeze({ kind: "local", targetId: "local-exact" }),
@@ -355,7 +454,8 @@ function createHarness(home) {
 }
 
 test("Relay v2 Host normal process lifecycle prepares terminal control and freezes one trusted lineage", async () => {
-  const home = mkdtempSync(join(tmpdir(), "tw-v2-host-deployment-"));
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), "tw-v2-host-deployment-")));
+  chmodSync(home, 0o700);
   const cli = join(home, "cli.cjs");
   writeFileSync(cli, "/* fixture */\n");
   const savedArgv = process.argv;
@@ -536,6 +636,160 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       "valid fd-bound input must not depend on an optional O_CLOEXEC fs constant",
     );
     assert.equal(bootstrapOwned.events.at(-1)[0], "signal.close");
+
+    const credentialCaPath = join(home, "local-credential-issuer-ca.pem");
+    const carrierCaPath = join(home, "local-carrier-ca.pem");
+    const credentialCa = "local-development-credential-ca";
+    const carrierCa = "local-development-carrier-ca";
+    writeFileSync(credentialCaPath, credentialCa, { mode: 0o600 });
+    writeFileSync(carrierCaPath, carrierCa, { mode: 0o600 });
+    chmodSync(credentialCaPath, 0o600);
+    chmodSync(carrierCaPath, 0o600);
+    const localDevelopment = createHarness(home);
+    localDevelopment.profile = localDevelopmentProfile();
+    localDevelopment.provisioningProfile = localDevelopment.profile;
+    globalThis.__hostDeploymentHarness = localDevelopment;
+    assert.equal(
+      await module.runRelayV2HostShippingFromLocalDevelopment({
+        trustedHome: home,
+        credentialHttpsCaInputPath: credentialCaPath,
+        carrierWssCaInputPath: carrierCaPath,
+        provisionProfileInputPath: join(home, "local-profile-input.json"),
+        bootstrapSecretInputPath: bootstrapPath,
+      }),
+      78,
+    );
+    assert.equal(
+      localDevelopment.events.some(([name]) => name === "native.create"),
+      false,
+      "local development must never probe or manufacture native qualification",
+    );
+    assert.ok(localDevelopment.events.some(([name]) => name === "local.intake.open"));
+    assert.equal(localDevelopment.trustCuts.length, 2);
+    assert.notStrictEqual(localDevelopment.trustCuts[0], localDevelopment.trustCuts[1]);
+    assert.equal(
+      Buffer.from(
+        localDevelopment.localTlsTrust.credential.certificateAuthorities[0],
+      ).toString("utf8"),
+      credentialCa,
+    );
+    assert.equal(
+      Buffer.from(
+        localDevelopment.localTlsTrust.carrier.certificateAuthorities[0],
+      ).toString("utf8"),
+      carrierCa,
+    );
+    assert.equal(localDevelopment.bootstrapSecretRaw, bootstrapRecord);
+    assert.ok(localDevelopment.events.some(([name, trustedHome]) =>
+      name === "profile.create" && trustedHome === home));
+    assert.equal(
+      localDevelopment.inheritedThenableErrorCode,
+      "ASYNC_OPERATION_UNSUPPORTED",
+    );
+    assert.equal(
+      localDevelopment.hostileThenableErrorCode,
+      "ASYNC_OPERATION_UNSUPPORTED",
+    );
+    assert.equal(
+      localDevelopment.hostileThenGetterReads,
+      0,
+      "hostile then getters are identified without assimilation",
+    );
+    assert.equal(localDevelopment.events.at(-1)[0], "signal.close");
+    assert.throws(
+      () => localDevelopment.localCredentialCell.runExclusive(
+        (transaction) => transaction.read(),
+      ),
+      (error) => error?.code === "CLOSED",
+      "the process-local credential bytes are fenced and discarded at close",
+    );
+
+    const localDashboardOwned = createHarness(home);
+    localDashboardOwned.profile = localDevelopmentProfile();
+    globalThis.__hostDeploymentHarness = localDashboardOwned;
+    const localDashboardAbort = new AbortController();
+    const localDashboardHandle =
+      await module.startRelayV2HostDashboardManagementFromLocalDevelopment(
+        Object.freeze({
+          trustedHome: home,
+          credentialHttpsCaInputPath: credentialCaPath,
+          carrierWssCaInputPath: carrierCaPath,
+        }),
+        Object.freeze({
+          clock: dashboardClock,
+          runtimeVersion: "0.0.0-dashboard-local-development-test",
+          signal: localDashboardAbort.signal,
+          io: Object.freeze({
+            input: dashboardInput,
+            writeFrame: dashboardWrite,
+          }),
+        }),
+      );
+    assert.equal(typeof localDashboardHandle.runDashboardManagement, "function");
+    const localDashboardIntake = localDashboardOwned.events
+      .find(([name]) => name === "local.intake.open");
+    assert.strictEqual(
+      localDashboardIntake[2].dashboardManagement.signal,
+      localDashboardAbort.signal,
+    );
+    assert.equal(await localDashboardHandle.runDashboardManagement(), 0);
+    assert.equal(
+      localDashboardOwned.events.some(([name]) => name === "process.run"),
+      false,
+      "upper-layer management adoption does not start a competing process lifecycle",
+    );
+    await localDashboardHandle.closeAndDrain();
+
+    const nonLoopback = createHarness(home);
+    globalThis.__hostDeploymentHarness = nonLoopback;
+    await assert.rejects(
+      module.runRelayV2HostShippingFromLocalDevelopment({
+        trustedHome: home,
+        credentialHttpsCaInputPath: credentialCaPath,
+        carrierWssCaInputPath: carrierCaPath,
+      }),
+      (error) => error?.code === "ACTIVATION_FAILED",
+    );
+    assert.equal(nonLoopback.events.some(([name]) => name === "terminal.ready"), false);
+    assert.equal(nonLoopback.events.some(([name]) => name === "native.create"), false);
+
+    const unsafeLocalTrust = createHarness(home);
+    unsafeLocalTrust.profile = localDevelopmentProfile();
+    globalThis.__hostDeploymentHarness = unsafeLocalTrust;
+    chmodSync(carrierCaPath, 0o644);
+    await assert.rejects(
+      module.runRelayV2HostShippingFromLocalDevelopment({
+        trustedHome: home,
+        credentialHttpsCaInputPath: credentialCaPath,
+        carrierWssCaInputPath: carrierCaPath,
+      }),
+      (error) => error?.code === "ACTIVATION_FAILED"
+        && !String(error).includes(carrierCaPath),
+    );
+    assert.equal(unsafeLocalTrust.events.some(([name]) => name === "terminal.ready"), false);
+    assert.equal(unsafeLocalTrust.events.some(([name]) => name === "native.create"), false);
+    chmodSync(carrierCaPath, 0o600);
+
+    const broadLocalHome = join(home, "broad-local-home");
+    mkdirSync(broadLocalHome, { mode: 0o755 });
+    chmodSync(broadLocalHome, 0o755);
+    const unsafeLocalHome = createHarness(broadLocalHome);
+    unsafeLocalHome.profile = localDevelopmentProfile();
+    globalThis.__hostDeploymentHarness = unsafeLocalHome;
+    await assert.rejects(
+      module.runRelayV2HostShippingFromLocalDevelopment({
+        trustedHome: broadLocalHome,
+        credentialHttpsCaInputPath: credentialCaPath,
+        carrierWssCaInputPath: carrierCaPath,
+      }),
+      (error) => error?.code === "ACTIVATION_FAILED"
+        && !String(error).includes(broadLocalHome),
+    );
+    assert.equal(unsafeLocalHome.profileReads, 0);
+    assert.equal(
+      unsafeLocalHome.events.some(([name]) => name === "terminal.ready"),
+      false,
+    );
 
     const unsafeInputs = [];
     const broadMode = join(home, "bootstrap-broad-mode");

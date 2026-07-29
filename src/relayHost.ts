@@ -68,11 +68,29 @@ export type RelayV2HostOptions = RelayHostCommonOptions & {
  * privileged bootstrap input file; neither path is secret material and the v2
  * branch still carries no v1 runtime fields.
  */
-export type RelayV2HostSelection = {
+type RelayV2HostProductionSelection = {
   profile: "v2";
   provisionProfileInputPath?: string;
   bootstrapSecretInputPath?: string;
+  localDevelopment?: never;
+  trustedHome?: never;
+  credentialHttpsCaInputPath?: never;
+  carrierWssCaInputPath?: never;
 };
+
+type RelayV2HostLocalDevelopmentSelection = {
+  profile: "v2";
+  provisionProfileInputPath?: string;
+  bootstrapSecretInputPath?: string;
+  localDevelopment: true;
+  trustedHome: string;
+  credentialHttpsCaInputPath: string;
+  carrierWssCaInputPath: string;
+};
+
+export type RelayV2HostSelection =
+  | RelayV2HostProductionSelection
+  | RelayV2HostLocalDevelopmentSelection;
 
 export type RelayHostOptions = RelayV1HostOptions | RelayV2HostSelection;
 
@@ -942,6 +960,10 @@ export function parseRelayHostOptions(
     let explicitV2Profile = false;
     let provisionProfileInputPath: string | undefined;
     let bootstrapSecretInputPath: string | undefined;
+    let localDevelopmentCount = 0;
+    let trustedHome: string | undefined;
+    let credentialHttpsCaInputPath: string | undefined;
+    let carrierWssCaInputPath: string | undefined;
     for (let i = 0; i < argv.length; i += 1) {
       const arg = argv[i];
       if (arg === "--profile") {
@@ -968,6 +990,41 @@ export function parseRelayHostOptions(
         }
         i += 1;
         bootstrapSecretInputPath = inputPath;
+      } else if (arg === "--local-development") {
+        localDevelopmentCount += 1;
+        if (localDevelopmentCount > 1) {
+          throw new CliError("relay-host --local-development 只能指定一次");
+        }
+      } else if (arg === "--trusted-home") {
+        if (trustedHome !== undefined) {
+          throw new CliError("relay-host --trusted-home 只能指定一次");
+        }
+        const inputPath = argv[i + 1];
+        if (inputPath === undefined || inputPath === "" || inputPath.startsWith("--")) {
+          throw new CliError("relay-host --trusted-home 需要非空绝对目录路径");
+        }
+        i += 1;
+        trustedHome = inputPath;
+      } else if (arg === "--credential-https-ca-input") {
+        if (credentialHttpsCaInputPath !== undefined) {
+          throw new CliError("relay-host --credential-https-ca-input 只能指定一次");
+        }
+        const inputPath = argv[i + 1];
+        if (inputPath === undefined || inputPath === "" || inputPath.startsWith("--")) {
+          throw new CliError("relay-host --credential-https-ca-input 需要非空文件路径");
+        }
+        i += 1;
+        credentialHttpsCaInputPath = inputPath;
+      } else if (arg === "--carrier-wss-ca-input") {
+        if (carrierWssCaInputPath !== undefined) {
+          throw new CliError("relay-host --carrier-wss-ca-input 只能指定一次");
+        }
+        const inputPath = argv[i + 1];
+        if (inputPath === undefined || inputPath === "" || inputPath.startsWith("--")) {
+          throw new CliError("relay-host --carrier-wss-ca-input 需要非空文件路径");
+        }
+        i += 1;
+        carrierWssCaInputPath = inputPath;
       } else if (arg === "--secret") {
         throw new CliError("Relay v2 host profile 不能读取或提升 Relay v1 shared secret");
       } else if (arg === "-h" || arg === "--help") {
@@ -977,7 +1034,8 @@ export function parseRelayHostOptions(
         throw new CliError(
           "Relay v2 host profile 的 relayUrl、issuer、hostId 与 credential reference "
           + "只来自运行时 profile store，CLI 只接受 --profile v2 与 "
-          + "--provision-profile-input/--bootstrap-secret-input 文件选路"
+          + "--provision-profile-input/--bootstrap-secret-input 文件选路，或严格显式的 "
+          + "--local-development、--trusted-home 与两条 CA 输入"
           + "（存在不支持参数）",
         );
       }
@@ -988,12 +1046,42 @@ export function parseRelayHostOptions(
         "relay-host provisioning 要求本次 argv 唯一显式指定 --profile v2",
       );
     }
-    return {
+    const localDevelopmentRequested = localDevelopmentCount === 1
+      || trustedHome !== undefined
+      || credentialHttpsCaInputPath !== undefined
+      || carrierWssCaInputPath !== undefined;
+    if (localDevelopmentRequested) {
+      if (explicitProfileCount !== 1 || !explicitV2Profile) {
+        throw new CliError(
+          "relay-host 本机开发 activation 要求本次 argv 唯一显式指定 --profile v2",
+        );
+      }
+      if (localDevelopmentCount !== 1) {
+        throw new CliError("Relay v2 Host 本机开发输入只适用于 --local-development");
+      }
+      if (trustedHome === undefined
+        || credentialHttpsCaInputPath === undefined
+        || carrierWssCaInputPath === undefined) {
+        throw new CliError(
+          "relay-host --local-development 要求同时指定 --trusted-home、"
+          + "--credential-https-ca-input 与 --carrier-wss-ca-input",
+        );
+      }
+    }
+    const commonSelection = {
       profile,
       ...(provisionProfileInputPath === undefined
         ? {}
         : { provisionProfileInputPath }),
       ...(bootstrapSecretInputPath === undefined ? {} : { bootstrapSecretInputPath }),
+    } as const;
+    if (localDevelopmentCount === 0) return commonSelection;
+    return {
+      ...commonSelection,
+      localDevelopment: true,
+      trustedHome: trustedHome!,
+      credentialHttpsCaInputPath: credentialHttpsCaInputPath!,
+      carrierWssCaInputPath: carrierWssCaInputPath!,
     };
   }
   let relay = env.TW_RELAY_URL || "";
@@ -1023,6 +1111,11 @@ export function parseRelayHostOptions(
       throw new CliError("relay-host --provision-profile-input 只适用于 --profile v2");
     } else if (arg === "--bootstrap-secret-input") {
       throw new CliError("relay-host --bootstrap-secret-input 只适用于 --profile v2");
+    } else if (arg === "--local-development"
+      || arg === "--trusted-home"
+      || arg === "--credential-https-ca-input"
+      || arg === "--carrier-wss-ca-input") {
+      throw new CliError(`relay-host ${arg} 只适用于显式 --profile v2 本机开发 activation`);
     } else if (arg === "--local") {
       local = argv[++i] || local;
     } else if (arg === "--status-file") {
@@ -1060,6 +1153,10 @@ function printHelp(): void {
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
   tw relay-host --profile v2 [--provision-profile-input <path>] [--bootstrap-secret-input <path>]
+  tw relay-host --profile v2 --local-development \\
+    --trusted-home <absolute-path> \\
+    --credential-https-ca-input <path> --carrier-wss-ca-input <path> \\
+    [--provision-profile-input <path>] [--bootstrap-secret-input <path>]
 
 Relay v2:
   --profile v2 选择显式 default-off Relay v2 Host shipping root。relayUrl、issuer、hostId 与
@@ -1075,6 +1172,16 @@ Relay v2:
   首次 Host 可用 --bootstrap-secret-input 指定 owner-only 0600 文件；path 本身非 secret，
   trusted source 将 fd-bound 输入交给既有 handoff/vault。后续已持久化 credential 的启动省略
   该参数。它不读取 v1 secret、不宣告 capability，也绝不回退到 v1。
+
+  --local-development 仅打开 loopback relayUrl/credentialIssuerUrl 的本机开发 activation。
+  它复用同一 profile/bootstrap、canonical shipping/composition/runtime 与进程生命周期 owner，
+  但 credential cell 仅存在于当前进程，冷启动为空；它不读取、不修改也不伪造 production
+  qualifiedRecords。--trusted-home 必须显式指向当前用户拥有、已存在、canonical 且 exact
+  0700 的绝对目录；profile、terminal-control 与 runtime 均只使用该隔离目录，production
+  trusted source 仍固定使用 homedir。两条 TLS lane 必须分别通过 --credential-https-ca-input 与
+  --carrier-wss-ca-input 提供 current-user-owned、regular、single-link、exact 0600 的 CA
+  文件；证书链与 hostname 验证仍严格启用。该开发入口没有 env 等价项，也不改变省略该 flag
+  时 --profile v2 的 production fail-closed 行为。
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
@@ -3844,6 +3951,26 @@ async function runConnection(
 export async function run(): Promise<void> {
   const opts = parseRelayHostOptions(process.argv.slice(3));
   if (opts.profile === "v2") {
+    if (opts.localDevelopment === true) {
+      const deployment = await import("./relay/v2/hostShippingDeploymentSource.js");
+      // Strictly explicit loopback development uses the same profile,
+      // bootstrap, runtime, shipping and process owners, but substitutes one
+      // process-local credential cell and requires an isolated trustedHome
+      // plus two caller-supplied CA inputs. The deployment owner validates the
+      // home before asking the canonical profile writer to create anything.
+      process.exitCode = await deployment.runRelayV2HostShippingFromLocalDevelopment({
+        trustedHome: opts.trustedHome,
+        credentialHttpsCaInputPath: opts.credentialHttpsCaInputPath,
+        carrierWssCaInputPath: opts.carrierWssCaInputPath,
+        ...(opts.provisionProfileInputPath === undefined
+          ? {}
+          : { provisionProfileInputPath: opts.provisionProfileInputPath }),
+        ...(opts.bootstrapSecretInputPath === undefined
+          ? {}
+          : { bootstrapSecretInputPath: opts.bootstrapSecretInputPath }),
+      });
+      return;
+    }
     if (opts.provisionProfileInputPath !== undefined) {
       const {
         loadOrCreateRelayV2HostProductionProfile,
@@ -3854,15 +3981,14 @@ export async function run(): Promise<void> {
       });
       loadOrCreateRelayV2HostProductionProfile({ profile });
     }
-    // 显式 v2 选路只能进入唯一 trusted deployment activation/source
-    // owner。profile snapshot、rev7 native source、canonical runtime bundle
-    // 与两条独立 TLS trust cut 以同一个 opaque one-shot ticket 交给 Host
-    // shipping root；任何失败逆序 drain 且绝不回退 v1。
-    const { runRelayV2HostShippingFromTrustedDeployment } =
-      await import("./relay/v2/hostShippingDeploymentSource.js");
+    const deployment = await import("./relay/v2/hostShippingDeploymentSource.js");
+    // Explicit production v2 still enters only the unique trusted deployment
+    // activation/source owner and remains fail-closed on native qualification.
     process.exitCode = opts.bootstrapSecretInputPath === undefined
-      ? await runRelayV2HostShippingFromTrustedDeployment()
-      : await runRelayV2HostShippingFromTrustedDeployment(opts.bootstrapSecretInputPath);
+      ? await deployment.runRelayV2HostShippingFromTrustedDeployment()
+      : await deployment.runRelayV2HostShippingFromTrustedDeployment(
+        opts.bootstrapSecretInputPath,
+      );
     return;
   }
   const statusOwnership: RelayStatusOwnership = {

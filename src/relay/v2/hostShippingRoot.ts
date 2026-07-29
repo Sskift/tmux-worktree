@@ -10,9 +10,11 @@ import {
 import {
   openRelayV2HostNativeCredentialPrivilegedIntakeBridge,
 } from "./hostNativeCredentialPrivilegedIntakeBridge.js";
-import type {
-  RelayV2HostPrivilegedProductionDashboardManagementOptions,
-  RelayV2HostPrivilegedProductionIntakeComposition,
+import {
+  openRelayV2HostPrivilegedProductionIntakeComposition,
+  type RelayV2HostCredentialAtomicByteCellOwner,
+  type RelayV2HostPrivilegedProductionDashboardManagementOptions,
+  type RelayV2HostPrivilegedProductionIntakeComposition,
 } from "./hostPrivilegedProductionIntakeComposition.js";
 import {
   readRelayV2HostProductionProfile,
@@ -53,7 +55,9 @@ import {
 import { consumeRelayV2CanonicalHostRuntimeBundleV1 } from
   "./canonicalHostRuntimeBundle.js";
 import {
+  takeRelayV2HostLocalDevelopmentActivation,
   takeRelayV2HostTrustedDeploymentActivation,
+  type RelayV2HostLocalDevelopmentActivation,
   type RelayV2HostTrustedDeploymentActivation,
 } from "./hostShippingDeploymentSource.js";
 
@@ -318,6 +322,21 @@ interface CapturedOptions {
     | undefined;
 }
 
+type CapturedShippingOptions = Omit<
+CapturedOptions,
+"nativeModuleTarget" | "nativeModuleLoader"
+>;
+
+type CredentialIntakeActivation =
+  | Readonly<{
+    kind: "native";
+    source: RelayV2HostCredentialNativeModuleSource;
+  }>
+  | Readonly<{
+    kind: "local-development";
+    takeCredentialCell(): RelayV2HostCredentialAtomicByteCellOwner;
+  }>;
+
 /** Production reconcile cadence; the lifecycle owner owns the only timer. */
 const RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS = 30_000;
 
@@ -468,7 +487,7 @@ function captureOptions(value: unknown): CapturedOptions {
     scanIntervalMs: (runtime.scanIntervalMs as number | undefined)
       ?? RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
     dashboardManagement: captureDashboardManagement(record.dashboardManagement),
-  }]);
+  }]) as CapturedOptions;
 }
 
 function readProfile(trustedHome: string | undefined): Readonly<RelayV2HostProductionProfile> {
@@ -595,29 +614,34 @@ export async function startRelayV2HostShippingRoot(
   return startCapturedShippingRoot(
     captured,
     profile,
-    source,
+    Object.freeze({ kind: "native", source }),
     closeDeployment,
   );
 }
 
 async function startCapturedShippingRoot(
-  captured: CapturedOptions,
+  captured: CapturedShippingOptions,
   profile: Readonly<RelayV2HostProductionProfile>,
-  source: RelayV2HostCredentialNativeModuleSource,
+  credentialIntakeActivation: CredentialIntakeActivation,
   closeDeployment: () => Promise<void>,
   startupSignal?: AbortSignal,
 ): Promise<RelayV2HostShippingRootHandle> {
   let store: RelayV2HostStateStore | null = null;
-  let spool: { close(): Promise<void> } | null = null;
+  let spool: Awaited<
+    ReturnType<RelayV2MaterializedStateFoundation["openStateSnapshotSpool"]>
+  > | null = null;
   let lifecycleOwner: RelayV2MaterializedReconcileLifecycleOwner | null = null;
   let startupAbortListener: (() => void) | null = null;
   let intake: RelayV2HostPrivilegedProductionIntakeComposition | null = null;
   try {
     requireStartupOpen(startupSignal);
-    // Absent/unsupported native sources fail here, before the one-shot take
-    // is consumed and long before any socket could exist.
-    const capability = source.capability();
-    if (capability.status !== "supported") throw nativeModuleFailure(capability);
+    // Production native support is checked before H0 recovery. The explicit
+    // local-development activation has no native source and therefore cannot
+    // observe, alter, or manufacture a production qualification result.
+    if (credentialIntakeActivation.kind === "native") {
+      const capability = credentialIntakeActivation.source.capability();
+      if (capability.status !== "supported") throw nativeModuleFailure(capability);
+    }
     requireStartupOpen(startupSignal);
 
     store = await RelayV2HostStateStore.open({
@@ -654,8 +678,23 @@ async function startCapturedShippingRoot(
     requireStartupOpen(startupSignal);
     const welcome = createRelayV2HostRuntimeWelcomeSerializer({ hostId: profile.hostId });
 
-    intake = await openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
-      takeNativeModule: source.takeNativeModule,
+    const canonical = Object.freeze({
+      hostState: store,
+      recoveredH2Spool: spool,
+      welcome,
+      createTargetExecutionPair: captured.createTargetExecutionPair,
+      localProcessTarget: captured.localProcessTarget,
+      terminalControl: Object.freeze({
+        remoteCompoundChannels: captured.remoteCompoundChannels,
+        ...(captured.terminalControlDaemonSocketPath === undefined
+          ? {}
+          : { daemonSocketPath: captured.terminalControlDaemonSocketPath }),
+      }),
+      ...(captured.dashboardManagement === undefined
+        ? {}
+        : { dashboardManagement: captured.dashboardManagement }),
+    });
+    const intakeOptions = {
       ...(captured.trustedHome === undefined ? {} : { trustedHome: captured.trustedHome }),
       profileSnapshot: profile,
       ...(captured.bootstrapSecretByteSource === undefined
@@ -672,23 +711,21 @@ async function startCapturedShippingRoot(
       ...(captured.carrierWssTlsTrust === undefined
         ? {}
         : { carrierWssTlsTrust: captured.carrierWssTlsTrust }),
-      canonical: Object.freeze({
-        hostState: store,
-        recoveredH2Spool: spool,
-        welcome,
-        createTargetExecutionPair: captured.createTargetExecutionPair,
-        localProcessTarget: captured.localProcessTarget,
-        terminalControl: Object.freeze({
-          remoteCompoundChannels: captured.remoteCompoundChannels,
-          ...(captured.terminalControlDaemonSocketPath === undefined
-            ? {}
-            : { daemonSocketPath: captured.terminalControlDaemonSocketPath }),
-        }),
-        ...(captured.dashboardManagement === undefined
-          ? {}
-          : { dashboardManagement: captured.dashboardManagement }),
-      }),
-    });
+      canonical,
+    };
+    if (credentialIntakeActivation.kind === "native") {
+      intake = await openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+        takeNativeModule: credentialIntakeActivation.source.takeNativeModule,
+        ...intakeOptions,
+      });
+    } else {
+      const credentialCell = credentialIntakeActivation.takeCredentialCell();
+      intake = await openRelayV2HostPrivilegedProductionIntakeComposition({
+        credentialCell,
+        ...intakeOptions,
+      });
+      if (intake === null) throw failure("INPUTS_UNAVAILABLE");
+    }
     requireStartupOpen(startupSignal);
   } catch (error) {
     if (startupAbortListener !== null) {
@@ -784,14 +821,6 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
 
   const captured = Object.freeze({
     trustedHome: deployment.trustedHome,
-    nativeModuleTarget: Object.freeze({
-      platform: process.platform,
-      architecture: process.arch,
-      napiVersion: Number(process.versions.napi),
-    }),
-    nativeModuleLoader: (() => {
-      throw failure("INPUTS_UNAVAILABLE");
-    }) as RelayV2HostCredentialNativeModuleLoader,
     createTargetExecutionPair: openedRuntime.createTargetExecutionPair,
     bootstrapSecretByteSource: deployment.bootstrapSecretByteSource,
     reauthentication: undefined,
@@ -808,12 +837,90 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
     terminalControlDaemonSocketPath: deployment.terminalControlDaemonSocketPath,
     scanIntervalMs: RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
     dashboardManagement: capturedDashboardManagement,
-  }) as CapturedOptions;
+  }) as CapturedShippingOptions;
 
   return startCapturedShippingRoot(
     captured,
     deployment.profileSnapshot,
-    deployment.nativeModuleSource,
+    Object.freeze({ kind: "native", source: deployment.nativeModuleSource }),
+    deployment.closeAndDrain,
+    startupSignal,
+  );
+}
+
+/**
+ * Canonical consumer for the explicit loopback development ticket. The
+ * profile, runtime bundle, bootstrap source, and TLS cuts are the same owner
+ * shapes as production; only the credential intake starts from the ticket's
+ * isolated process-local cell rather than a native qualification source.
+ */
+export async function startRelayV2HostShippingRootFromLocalDevelopmentActivation(
+  activation: RelayV2HostLocalDevelopmentActivation,
+  dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  const deployment = takeRelayV2HostLocalDevelopmentActivation(activation);
+  const startupSignal = deployment.startupSignal;
+  let capturedDashboardManagement:
+    | RelayV2HostPrivilegedProductionDashboardManagementOptions
+    | undefined;
+  let openedRuntime: ReturnType<typeof consumeRelayV2CanonicalHostRuntimeBundleV1>;
+  let credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  let carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
+  try {
+    requireStartupOpen(startupSignal);
+    capturedDashboardManagement = captureDashboardManagement(dashboardManagement);
+    if (!isRelayV2HostTlsTrustCut(deployment.credentialHttpsTlsTrustCut)
+      || !isRelayV2HostTlsTrustCut(deployment.carrierWssTlsTrustCut)
+      || deployment.credentialHttpsTlsTrustCut === deployment.carrierWssTlsTrustCut) {
+      throw failure("INPUTS_UNAVAILABLE");
+    }
+    credentialHttpsTlsTrust = readRelayV2HostTlsCaTrustCut(
+      deployment.credentialHttpsTlsTrustCut,
+    );
+    carrierWssTlsTrust = readRelayV2HostTlsCaTrustCut(
+      deployment.carrierWssTlsTrustCut,
+    );
+    // Unlike production's deliberate system-trust omission, development
+    // requires both explicit additive CA bundles.
+    if (credentialHttpsTlsTrust === undefined || carrierWssTlsTrust === undefined) {
+      throw failure("INPUTS_UNAVAILABLE");
+    }
+    openedRuntime = consumeRelayV2CanonicalHostRuntimeBundleV1(
+      deployment.runtimeBundle,
+    );
+    requireStartupOpen(startupSignal);
+  } catch {
+    try {
+      await deployment.closeAndDrain();
+    } catch {
+      throw failure("CLOSE_FAILED");
+    }
+    throw failure("INPUTS_UNAVAILABLE");
+  }
+
+  const captured = Object.freeze({
+    trustedHome: deployment.trustedHome,
+    createTargetExecutionPair: openedRuntime.createTargetExecutionPair,
+    bootstrapSecretByteSource: deployment.bootstrapSecretByteSource,
+    reauthentication: undefined,
+    wssTransport: undefined,
+    credentialHttpsTlsTrust,
+    carrierWssTlsTrust,
+    discovery: openedRuntime.discovery,
+    localProcessTarget: openedRuntime.localProcessTarget,
+    remoteCompoundChannels: openedRuntime.remoteCompoundChannels,
+    terminalControlDaemonSocketPath: deployment.terminalControlDaemonSocketPath,
+    scanIntervalMs: RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
+    dashboardManagement: capturedDashboardManagement,
+  }) as CapturedShippingOptions;
+
+  return startCapturedShippingRoot(
+    captured,
+    deployment.profileSnapshot,
+    Object.freeze({
+      kind: "local-development",
+      takeCredentialCell: deployment.takeCredentialCell,
+    }),
     deployment.closeAndDrain,
     startupSignal,
   );

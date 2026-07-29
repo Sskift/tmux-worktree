@@ -3,12 +3,16 @@ import {
   constants as fsConstants,
   createReadStream,
   fstatSync,
+  lstatSync,
   openSync,
+  readSync,
   realpathSync,
   statSync,
 } from "node:fs";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
+import { types as nodeTypes } from "node:util";
 
 import { requestTerminalControl } from "../../terminalControl/client.js";
 import { defaultTerminalControlSocketPath } from "../../terminalControl/store.js";
@@ -24,7 +28,9 @@ import {
   type RelayV2HostCredentialNativeModuleSource,
 } from "./hostCredentialNativeModuleSource.js";
 import {
+  loadOrCreateRelayV2HostProductionProfile,
   readRelayV2HostProductionProfile,
+  readRelayV2HostProductionProfileProvisioningInput,
   requireRelayV2HostProductionProfileSnapshot,
   type RelayV2HostProductionProfile,
 } from "./hostProductionProfileStore.js";
@@ -40,11 +46,17 @@ import {
   runRelayV2HostShippingProcessLifecycle,
 } from "./hostShippingProcessLifecycle.js";
 import type {
+  RelayV2HostCredentialAtomicByteCellOwner,
   RelayV2HostPrivilegedProductionDashboardManagementOptions,
 } from "./hostPrivilegedProductionIntakeComposition.js";
+import {
+  createRelayV2HostLocalDevelopmentCredentialCell,
+} from "./hostLocalDevelopmentCredentialCell.js";
 import type { RelayV2HostShippingRootHandle } from "./hostShippingRoot.js";
 import {
+  captureRelayV2HostTlsCaTrustCut,
   captureRelayV2HostSystemTlsTrustCut,
+  RELAY_V2_HOST_TLS_CA_MAX_ENTRY_BYTES,
   type RelayV2HostTlsCaTrustCut,
 } from "./hostTlsTrustMaterial.js";
 
@@ -58,6 +70,13 @@ export interface RelayV2HostTrustedDeploymentActivation {
   readonly [relayV2HostTrustedDeploymentActivationBrand]: void;
 }
 
+declare const relayV2HostLocalDevelopmentActivationBrand: unique symbol;
+
+/** Fieldless ticket issued only for the explicit loopback development lane. */
+export interface RelayV2HostLocalDevelopmentActivation {
+  readonly [relayV2HostLocalDevelopmentActivationBrand]: void;
+}
+
 export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly trustedHome: string;
   readonly profileSnapshot: Readonly<RelayV2HostProductionProfile>;
@@ -69,6 +88,27 @@ export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
   readonly startupSignal?: AbortSignal;
   closeAndDrain(): Promise<void>;
+}
+
+export interface RelayV2HostLocalDevelopmentActivationRecord {
+  readonly trustedHome: string;
+  readonly profileSnapshot: Readonly<RelayV2HostProductionProfile>;
+  readonly runtimeBundle: RelayV2CanonicalHostRuntimeBundleV1;
+  readonly terminalControlDaemonSocketPath: string;
+  readonly credentialHttpsTlsTrustCut: RelayV2HostTlsCaTrustCut;
+  readonly carrierWssTlsTrustCut: RelayV2HostTlsCaTrustCut;
+  readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  readonly startupSignal?: AbortSignal;
+  takeCredentialCell(): RelayV2HostCredentialAtomicByteCellOwner;
+  closeAndDrain(): Promise<void>;
+}
+
+export interface RelayV2HostLocalDevelopmentShippingOptions {
+  readonly trustedHome: string;
+  readonly credentialHttpsCaInputPath: string;
+  readonly carrierWssCaInputPath: string;
+  readonly provisionProfileInputPath?: string;
+  readonly bootstrapSecretInputPath?: string;
 }
 
 export type RelayV2HostShippingDeploymentSourceErrorCode =
@@ -92,13 +132,20 @@ export class RelayV2HostShippingDeploymentSourceError extends Error {
   }
 }
 
-interface ActivationOwner {
+interface TrustedActivationOwner {
   readonly activation: RelayV2HostTrustedDeploymentActivation;
+  closeAndDrain(): Promise<void>;
+}
+
+interface LocalDevelopmentActivationOwner {
+  readonly activation: RelayV2HostLocalDevelopmentActivation;
   closeAndDrain(): Promise<void>;
 }
 
 const activationRecords =
   new WeakMap<object, RelayV2HostTrustedDeploymentActivationRecord>();
+const localDevelopmentActivationRecords =
+  new WeakMap<object, RelayV2HostLocalDevelopmentActivationRecord>();
 
 function failure(
   code: RelayV2HostShippingDeploymentSourceErrorCode,
@@ -108,6 +155,38 @@ function failure(
 
 function requireStartupOpen(signal?: AbortSignal): void {
   if (signal?.aborted) throw failure("ACTIVATION_FAILED");
+}
+
+function requireLocalDevelopmentTrustedHome(value: string): string {
+  if ((process.platform !== "darwin" && process.platform !== "linux")
+    || typeof process.geteuid !== "function"
+    || !isAbsolute(value)
+    || value.includes("\0")) {
+    throw failure("ACTIVATION_FAILED");
+  }
+  try {
+    const before = lstatSync(value, { bigint: true });
+    if (!before.isDirectory()
+      || before.isSymbolicLink()
+      || before.uid !== BigInt(process.geteuid())
+      || (before.mode & 0o7777n) !== 0o700n) {
+      throw failure("ACTIVATION_FAILED");
+    }
+    const canonical = realpathSync.native(value);
+    const after = lstatSync(value, { bigint: true });
+    if (canonical !== value
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.uid !== before.uid
+      || after.mode !== before.mode
+      || !after.isDirectory()
+      || after.isSymbolicLink()) {
+      throw failure("ACTIVATION_FAILED");
+    }
+    return canonical;
+  } catch {
+    throw failure("ACTIVATION_FAILED");
+  }
 }
 
 function exactRegularPath(value: string, label: "Node executable" | "CLI entrypoint"): string {
@@ -184,10 +263,127 @@ function openBootstrapSecretByteSource(
   }
 }
 
+function readLocalDevelopmentTlsCaInput(path: string): Uint8Array {
+  if ((process.platform !== "darwin" && process.platform !== "linux")
+    || typeof path !== "string"
+    || path.length === 0
+    || path.includes("\0")
+    || typeof fsConstants.O_NOFOLLOW !== "number"
+    || typeof process.geteuid !== "function") {
+    throw failure("ACTIVATION_FAILED");
+  }
+  let descriptor = -1;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile()
+      || opened.uid !== BigInt(process.geteuid())
+      || opened.nlink !== 1n
+      || (opened.mode & 0o7777n) !== 0o600n
+      || opened.size <= 0n
+      || opened.size > BigInt(RELAY_V2_HOST_TLS_CA_MAX_ENTRY_BYTES)) {
+      throw failure("ACTIVATION_FAILED");
+    }
+    const bytes = Buffer.alloc(Number(opened.size));
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = readSync(
+        descriptor,
+        bytes,
+        offset,
+        bytes.byteLength - offset,
+        offset,
+      );
+      if (count <= 0) throw failure("ACTIVATION_FAILED");
+      offset += count;
+    }
+    return Uint8Array.from(bytes);
+  } catch {
+    throw failure("ACTIVATION_FAILED");
+  } finally {
+    if (descriptor >= 0) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        throw failure("ACTIVATION_FAILED");
+      }
+    }
+  }
+}
+
+function isLoopbackDevelopmentEndpoint(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === "localhost") return true;
+    const unwrapped = hostname.startsWith("[") && hostname.endsWith("]")
+      ? hostname.slice(1, -1)
+      : hostname;
+    const family = isIP(unwrapped);
+    if (family === 6) return unwrapped === "::1";
+    if (family !== 4) return false;
+    return Number(unwrapped.split(".")[0]) === 127;
+  } catch {
+    return false;
+  }
+}
+
+function requireLocalDevelopmentProfile(
+  profile: Readonly<RelayV2HostProductionProfile>,
+): void {
+  if (!isLoopbackDevelopmentEndpoint(profile.relayUrl)
+    || !isLoopbackDevelopmentEndpoint(profile.credentialIssuerUrl)) {
+    throw failure("ACTIVATION_FAILED");
+  }
+}
+
+function captureLocalDevelopmentOptions(
+  value: unknown,
+): Readonly<RelayV2HostLocalDevelopmentShippingOptions> {
+  if (value === null || typeof value !== "object" || nodeTypes.isProxy(value)) {
+    throw failure("ACTIVATION_INVALID");
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw failure("ACTIVATION_INVALID");
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw failure("ACTIVATION_INVALID");
+  }
+  const required = [
+    "trustedHome",
+    "credentialHttpsCaInputPath",
+    "carrierWssCaInputPath",
+  ] as const;
+  const optional = ["provisionProfileInputPath", "bootstrapSecretInputPath"] as const;
+  const allowed = new Set<string>([...required, ...optional]);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string" || !allowed.has(key))
+    || required.some((key) => !Object.hasOwn(descriptors[key] ?? {}, "value"))) {
+    throw failure("ACTIVATION_INVALID");
+  }
+  const result = Object.create(null) as Record<string, string>;
+  for (const key of [...required, ...optional]) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined) continue;
+    if (!Object.hasOwn(descriptor, "value")
+      || typeof descriptor.value !== "string"
+      || descriptor.value.length === 0
+      || descriptor.value.includes("\0")) throw failure("ACTIVATION_INVALID");
+    result[key] = descriptor.value;
+  }
+  return Object.freeze(result) as unknown as
+    Readonly<RelayV2HostLocalDevelopmentShippingOptions>;
+}
+
 async function closeOwned(
   bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null,
   runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null,
   nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null,
+  localDevelopmentCredentialCell: RelayV2HostCredentialAtomicByteCellOwner | null = null,
 ): Promise<boolean> {
   let failed = false;
   if (runtimeOwner !== null) {
@@ -204,6 +400,13 @@ async function closeOwned(
       failed = true;
     }
   }
+  if (localDevelopmentCredentialCell !== null) {
+    try {
+      await localDevelopmentCredentialCell.closeAndDrain();
+    } catch {
+      failed = true;
+    }
+  }
   if (bootstrapSecretByteSource !== null) {
     try {
       await bootstrapSecretByteSource.cancel();
@@ -214,10 +417,38 @@ async function closeOwned(
   return failed;
 }
 
-async function createActivationOwner(
+async function openCanonicalRuntimeOwner(
+  trustedHome: string,
+  signal?: AbortSignal,
+): Promise<Readonly<{
+  terminalControlDaemonSocketPath: string;
+  runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1;
+}>> {
+  const terminalControlDaemonSocketPath = defaultTerminalControlSocketPath(trustedHome);
+  const localCliTarget = currentCliTarget();
+  await requestTerminalControl(
+    { type: "ping" },
+    {
+      socketPath: terminalControlDaemonSocketPath,
+      autoStart: true,
+      autoStartCliTarget: localCliTarget,
+      ...(signal === undefined ? {} : { signal }),
+    },
+  );
+  requireStartupOpen(signal);
+  const runtimeOwner = await createRelayV2CanonicalHostRuntimeBundleOwnerV1({
+    localCliTarget,
+    terminalControlDaemonSocketPath,
+    knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
+    sshExecutable: "/usr/bin/ssh",
+  });
+  return Object.freeze({ terminalControlDaemonSocketPath, runtimeOwner });
+}
+
+async function createTrustedActivationOwner(
   signal?: AbortSignal,
   bootstrapSecretInputPath?: string,
-): Promise<ActivationOwner> {
+): Promise<TrustedActivationOwner> {
   let bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null = null;
   let nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null = null;
   let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
@@ -246,24 +477,9 @@ async function createActivationOwner(
     }
     requireStartupOpen(signal);
 
-    const terminalControlDaemonSocketPath = defaultTerminalControlSocketPath(trustedHome);
-    const localCliTarget = currentCliTarget();
-    await requestTerminalControl(
-      { type: "ping" },
-      {
-        socketPath: terminalControlDaemonSocketPath,
-        autoStart: true,
-        autoStartCliTarget: localCliTarget,
-        ...(signal === undefined ? {} : { signal }),
-      },
-    );
-    requireStartupOpen(signal);
-    runtimeOwner = await createRelayV2CanonicalHostRuntimeBundleOwnerV1({
-      localCliTarget,
-      terminalControlDaemonSocketPath,
-      knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
-      sshExecutable: "/usr/bin/ssh",
-    });
+    const openedRuntime = await openCanonicalRuntimeOwner(trustedHome, signal);
+    const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
+    runtimeOwner = openedRuntime.runtimeOwner;
     requireStartupOpen(signal);
 
     // The frozen profile carries no TLS material by contract. Still issue two
@@ -315,6 +531,101 @@ async function createActivationOwner(
   }
 }
 
+async function createLocalDevelopmentActivationOwner(
+  signal: AbortSignal | undefined,
+  options: Readonly<RelayV2HostLocalDevelopmentShippingOptions>,
+): Promise<LocalDevelopmentActivationOwner> {
+  let bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null = null;
+  let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
+  let credentialCell: RelayV2HostCredentialAtomicByteCellOwner | null = null;
+  try {
+    requireStartupOpen(signal);
+    const trustedHome = requireLocalDevelopmentTrustedHome(options.trustedHome);
+    if (options.provisionProfileInputPath !== undefined) {
+      const profile = readRelayV2HostProductionProfileProvisioningInput({
+        inputPath: options.provisionProfileInputPath,
+      });
+      loadOrCreateRelayV2HostProductionProfile({ profile, trustedHome });
+    }
+    const profileSnapshot = requireRelayV2HostProductionProfileSnapshot(
+      readRelayV2HostProductionProfile({ trustedHome }),
+    );
+    requireLocalDevelopmentProfile(profileSnapshot);
+    requireStartupOpen(signal);
+
+    bootstrapSecretByteSource = openBootstrapSecretByteSource(
+      options.bootstrapSecretInputPath,
+    );
+    const credentialHttpsCa = readLocalDevelopmentTlsCaInput(
+      options.credentialHttpsCaInputPath,
+    );
+    const carrierWssCa = readLocalDevelopmentTlsCaInput(
+      options.carrierWssCaInputPath,
+    );
+    credentialCell = createRelayV2HostLocalDevelopmentCredentialCell();
+    requireStartupOpen(signal);
+
+    const openedRuntime = await openCanonicalRuntimeOwner(trustedHome, signal);
+    const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
+    runtimeOwner = openedRuntime.runtimeOwner;
+    requireStartupOpen(signal);
+
+    const credentialHttpsTlsTrustCut = captureRelayV2HostTlsCaTrustCut({
+      certificateAuthorities: [credentialHttpsCa],
+    });
+    const carrierWssTlsTrustCut = captureRelayV2HostTlsCaTrustCut({
+      certificateAuthorities: [carrierWssCa],
+    });
+    const ownedBootstrapSource = bootstrapSecretByteSource;
+    const ownedRuntime = runtimeOwner;
+    const ownedCell = credentialCell;
+    let cellTaken = false;
+    const takeCredentialCell = (): RelayV2HostCredentialAtomicByteCellOwner => {
+      if (cellTaken) throw failure("ACTIVATION_INVALID");
+      cellTaken = true;
+      return ownedCell;
+    };
+    let closePromise: Promise<void> | null = null;
+    const closeAndDrain = (): Promise<void> => {
+      if (closePromise !== null) return closePromise;
+      closePromise = (async () => {
+        if (await closeOwned(ownedBootstrapSource, ownedRuntime, null, ownedCell)) {
+          throw failure("CLEANUP_FAILED");
+        }
+      })();
+      void closePromise.catch(() => undefined);
+      return closePromise;
+    };
+
+    const activation =
+      Object.freeze(Object.create(null)) as RelayV2HostLocalDevelopmentActivation;
+    const record = Object.freeze(Object.assign(Object.create(null), {
+      trustedHome,
+      profileSnapshot,
+      runtimeBundle: ownedRuntime.bundle,
+      terminalControlDaemonSocketPath,
+      credentialHttpsTlsTrustCut,
+      carrierWssTlsTrustCut,
+      takeCredentialCell,
+      ...(ownedBootstrapSource === null
+        ? {}
+        : { bootstrapSecretByteSource: ownedBootstrapSource }),
+      ...(signal === undefined ? {} : { startupSignal: signal }),
+      closeAndDrain,
+    })) as RelayV2HostLocalDevelopmentActivationRecord;
+    localDevelopmentActivationRecords.set(activation as object, record);
+    return Object.freeze({ activation, closeAndDrain });
+  } catch {
+    const cleanupFailed = await closeOwned(
+      bootstrapSecretByteSource,
+      runtimeOwner,
+      null,
+      credentialCell,
+    );
+    throw failure(cleanupFailed ? "CLEANUP_FAILED" : "ACTIVATION_FAILED");
+  }
+}
+
 /**
  * Canonical root-only one-shot consumer. A copied, forged, replayed, or
  * already-consumed ticket cannot expose any deployment authority.
@@ -326,6 +637,17 @@ export function takeRelayV2HostTrustedDeploymentActivation(
   const record = activationRecords.get(value as object);
   if (record === undefined) throw failure("ACTIVATION_INVALID");
   activationRecords.delete(value as object);
+  return record;
+}
+
+/** Root-only one-shot consumer for the isolated local-development ticket. */
+export function takeRelayV2HostLocalDevelopmentActivation(
+  value: unknown,
+): RelayV2HostLocalDevelopmentActivationRecord {
+  if (value === null || typeof value !== "object") throw failure("ACTIVATION_INVALID");
+  const record = localDevelopmentActivationRecords.get(value as object);
+  if (record === undefined) throw failure("ACTIVATION_INVALID");
+  localDevelopmentActivationRecords.delete(value as object);
   return record;
 }
 
@@ -349,12 +671,36 @@ async function openRelayV2HostShippingFromTrustedDeployment(
   bootstrapSecretInputPath?: string,
   dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
 ): Promise<RelayV2HostShippingRootHandle> {
-  const owner = await createActivationOwner(signal, bootstrapSecretInputPath);
+  const owner = await createTrustedActivationOwner(signal, bootstrapSecretInputPath);
   try {
     requireStartupOpen(signal);
     const root = await import("./hostShippingRoot.js");
     requireStartupOpen(signal);
     return await root.startRelayV2HostShippingRootFromTrustedDeployment(
+      owner.activation,
+      dashboardManagement,
+    );
+  } catch {
+    try {
+      await owner.closeAndDrain();
+    } catch {
+      throw failure("CLEANUP_FAILED");
+    }
+    throw failure("ACTIVATION_FAILED");
+  }
+}
+
+async function openRelayV2HostShippingFromLocalDevelopment(
+  signal: AbortSignal,
+  options: Readonly<RelayV2HostLocalDevelopmentShippingOptions>,
+  dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  const owner = await createLocalDevelopmentActivationOwner(signal, options);
+  try {
+    requireStartupOpen(signal);
+    const root = await import("./hostShippingRoot.js");
+    requireStartupOpen(signal);
+    return await root.startRelayV2HostShippingRootFromLocalDevelopmentActivation(
       owner.activation,
       dashboardManagement,
     );
@@ -392,6 +738,30 @@ export async function startRelayV2HostDashboardManagementFromTrustedDeployment(
 }
 
 /**
+ * Upper-layer adoption seam for the explicit local-development activation.
+ * It opens the same canonical management session as production, but keeps the
+ * isolated trustedHome, explicit CA cuts, and in-memory credential cell owned
+ * by the one local activation. It deliberately does not adopt the relay-host
+ * auto-start/retry process lifecycle.
+ */
+export async function startRelayV2HostDashboardManagementFromLocalDevelopment(
+  options: unknown,
+  dashboardManagement: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  if (arguments.length !== 2
+    || dashboardManagement === null
+    || typeof dashboardManagement !== "object") {
+    throw failure("ACTIVATION_INVALID");
+  }
+  const captured = captureLocalDevelopmentOptions(options);
+  return openRelayV2HostShippingFromLocalDevelopment(
+    dashboardManagement.signal,
+    captured,
+    dashboardManagement,
+  );
+}
+
+/**
  * The process entry for the explicit v2 Host lane. Its signal owner is
  * installed before trusted activation and threads one fence through startup.
  * The trusted source opens exactly one shipping root, then the connector
@@ -416,6 +786,43 @@ export async function runRelayV2HostShippingFromTrustedDeployment(
       bootstrapSecretInputPath,
       undefined,
     );
+      const result = await runRelayV2HostShippingProcessLifecycle(handle, {
+        signal: processSignals.signal,
+      });
+      return result.exitCode;
+    } catch (error) {
+      if (processSignals.signal.aborted
+        && error instanceof RelayV2HostShippingDeploymentSourceError
+        && error.code === "ACTIVATION_FAILED") {
+        return 0;
+      }
+      throw error;
+    }
+  } finally {
+    processSignals.close();
+  }
+}
+
+/**
+ * Strictly explicit loopback-only development process entry. It shares the
+ * canonical profile/runtime/shipping/process owners with production, but its
+ * credential bytes live only in one isolated process-local atomic cell. Both
+ * TLS lanes require caller-named CA files and retain normal chain and hostname
+ * verification. This entry never reads or changes native qualification.
+ */
+export async function runRelayV2HostShippingFromLocalDevelopment(
+  options: unknown,
+): Promise<number> {
+  if (arguments.length !== 1) throw failure("ACTIVATION_INVALID");
+  const captured = captureLocalDevelopmentOptions(options);
+  const processSignals = new RelayV2HostShippingProcessSignalOwner();
+  try {
+    try {
+      const handle = await openRelayV2HostShippingFromLocalDevelopment(
+        processSignals.signal,
+        captured,
+        undefined,
+      );
       const result = await runRelayV2HostShippingProcessLifecycle(handle, {
         signal: processSignals.signal,
       });
