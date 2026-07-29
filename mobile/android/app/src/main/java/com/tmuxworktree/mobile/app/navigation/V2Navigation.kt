@@ -58,6 +58,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -315,8 +316,7 @@ private fun MainNavigation(
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val agentCapabilityAvailable =
-        state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE
+    val latestState by rememberUpdatedState(state)
     val navigateRoot: (RootDestination) -> Unit = { destination ->
         val route = destination.route()
         navController.navigate(route) {
@@ -351,25 +351,27 @@ private fun MainNavigation(
             modifier = Modifier.fillMaxSize(),
         ) {
             composable(V2Routes.INBOX) {
+                val routeState = latestState
                 InboxScreen(
-                    sessions = state.activeSessions,
-                    connectionStatus = state.health.overall,
+                    sessions = routeState.activeSessions,
+                    connectionStatus = routeState.health.overall,
                     nowMillis = rememberNowMillis(),
                     onMenuClick = { scope.launch { drawerState.open() } },
                     onConnectionStatusClick = { navController.navigate(V2Routes.HEALTH) },
                     onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
                     onReplyClick = { navController.navigate(V2Routes.session(it.stableId, focusReply = true)) },
                     onBottomDestinationSelected = navigateRoot,
-                    agentEvidenceAvailability = state.agentEvidenceAvailability,
+                    agentEvidenceAvailability = routeState.agentEvidenceAvailability,
                 )
             }
             composable(V2Routes.WORKSPACES) {
+                val routeState = latestState
                 WorkspacesScreen(
-                    sessions = state.sessions,
-                    scopes = state.scopes,
-                    connectionStatus = state.health.overall,
-                    selectedScopeId = state.selectedScopeId,
-                    attentionCount = state.attentionCount,
+                    sessions = routeState.sessions,
+                    scopes = routeState.scopes,
+                    connectionStatus = routeState.health.overall,
+                    selectedScopeId = routeState.selectedScopeId,
+                    attentionCount = routeState.attentionCount,
                     onConnectionStatusClick = { navController.navigate(V2Routes.HEALTH) },
                     onScopeSelected = viewModel::selectScope,
                     onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
@@ -377,17 +379,18 @@ private fun MainNavigation(
                     onNewWorktreeClick = { navController.navigate(V2Routes.NEW_WORKTREE) },
                     onNewTerminalClick = { navController.navigate(V2Routes.NEW_TERMINAL) },
                     onBottomDestinationSelected = navigateRoot,
-                    activeHostId = state.activeHostId,
+                    activeHostId = routeState.activeHostId,
                 )
             }
             composable(V2Routes.SETTINGS) {
+                val routeState = latestState
                 SettingsScreen(
-                    connectionStatus = state.health.overall,
-                    preferences = state.preferences,
-                    pairedDeviceName = state.hosts.firstOrNull {
-                        it.hostId == state.activeHostId
+                    connectionStatus = routeState.health.overall,
+                    preferences = routeState.preferences,
+                    pairedDeviceName = routeState.hosts.firstOrNull {
+                        it.hostId == routeState.activeHostId
                     }?.displayName.orEmpty(),
-                    attentionCount = state.attentionCount,
+                    attentionCount = routeState.attentionCount,
                     versionName = BuildConfig.VERSION_NAME,
                     onHealthClick = { navController.navigate(V2Routes.HEALTH) },
                     onPairedDeviceClick = viewModel::showPairing,
@@ -397,12 +400,14 @@ private fun MainNavigation(
                         copyText(context, "tmux-worktree diagnostics", viewModel.diagnostics())
                     },
                     onBottomDestinationSelected = navigateRoot,
-                    notificationsAvailable = agentCapabilityAvailable,
+                    notificationsAvailable = routeState.agentCapabilityAvailability ==
+                        AgentCapabilityAvailability.AVAILABLE,
                 )
             }
             composable(V2Routes.HEALTH) {
+                val routeState = latestState
                 ConnectionHealthScreen(
-                    health = state.health,
+                    health = routeState.health,
                     nowMillis = rememberNowMillis(),
                     onBack = { navController.popBackStack() },
                     onRetryNow = viewModel::retryConnection,
@@ -412,15 +417,17 @@ private fun MainNavigation(
                 )
             }
             composable(V2Routes.NEW_WORKTREE) {
+                val routeState = latestState
                 NewWorktreeRoute(
-                    state = state,
+                    state = routeState,
                     viewModel = viewModel,
                     onBack = { navController.popBackStack() },
                 )
             }
             composable(V2Routes.NEW_TERMINAL) {
+                val routeState = latestState
                 NewTerminalRoute(
-                    state = state,
+                    state = routeState,
                     viewModel = viewModel,
                     onBack = { navController.popBackStack() },
                 )
@@ -435,15 +442,16 @@ private fun MainNavigation(
                     },
                 ),
             ) { entry ->
+                val routeState = latestState
                 val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
                 val focusReply = entry.arguments?.getBoolean("focusReply") ?: false
-                val session = state.session(sessionId)
+                val session = routeState.session(sessionId)
                 if (session == null) {
                     MissingSession(onBack = { navController.popBackStack() })
                 } else {
                     SessionRoute(
                         session = session,
-                        state = state,
+                        state = routeState,
                         viewModel = viewModel,
                         onBack = { navController.popBackStack() },
                         onHealth = { navController.navigate(V2Routes.HEALTH) },
@@ -456,14 +464,15 @@ private fun MainNavigation(
                 route = V2Routes.TERMINAL,
                 arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
             ) { entry ->
+                val routeState = latestState
                 val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
-                val session = state.session(sessionId)
+                val session = routeState.session(sessionId)
                 if (session == null) {
                     MissingSession(onBack = { navController.popBackStack() })
                 } else {
                     TerminalRoute(
                         session = session,
-                        state = state,
+                        state = routeState,
                         viewModel = viewModel,
                         controller = terminalController,
                         onBack = { navController.popBackStack() },
