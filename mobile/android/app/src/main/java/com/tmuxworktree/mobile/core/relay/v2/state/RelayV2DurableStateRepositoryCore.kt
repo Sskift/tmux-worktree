@@ -634,30 +634,38 @@ internal class RelayV2DurableStateRepositoryCore(
                         resetRequired
                     ) {
                         checkNotNull(current)
-                        val mode = if (resetRequired) {
+                        val pendingReset = current.pendingOpen?.takeIf { resetRequired }
+                        check(
+                            pendingReset == null ||
+                                pendingReset.mode == RelayV2TerminalOpenMode.RESET
+                        )
+                        val mode = pendingReset?.mode ?: if (resetRequired) {
                             RelayV2TerminalOpenMode.RESET
                         } else {
                             RelayV2TerminalOpenMode.RESUME
+                        }
+                        val parserContinuityId = when {
+                            pendingReset != null -> pendingReset.parserContinuityId
+                            resetRequired -> {
+                                // The production caller owns this fresh attempt. Reusing its
+                                // bounded openId creates a fresh parser lineage without adding
+                                // a second random-ID owner inside the durable transaction.
+                                openAttempt.openId
+                            }
+                            else -> current.parserContinuityId
                         }
                         RelayV2TerminalCheckpointReducer.reduce(
                             current,
                             RelayV2TerminalAction.BeginOpenAttempt(
                                 deliveryToken = deliveryToken,
                                 requestId = requestId,
-                                openAttempt = openAttempt,
+                                openAttempt = pendingReset?.openAttempt ?: openAttempt,
                                 mode = mode,
-                                cols = cols,
-                                rows = rows,
-                                target = current.identity.target(),
-                                parserContinuityId = if (resetRequired) {
-                                    // The production caller owns this fresh attempt. Reusing its
-                                    // bounded openId creates a fresh parser lineage without adding
-                                    // a second random-ID owner inside the durable transaction.
-                                    openAttempt.openId
-                                } else {
-                                    current.parserContinuityId
-                                },
-                                resume = RelayV2TerminalOpenResume(
+                                cols = pendingReset?.cols ?: cols,
+                                rows = pendingReset?.rows ?: rows,
+                                target = pendingReset?.target ?: current.identity.target(),
+                                parserContinuityId = parserContinuityId,
+                                resume = pendingReset?.resume ?: RelayV2TerminalOpenResume(
                                     generation = current.identity.generation,
                                     nextOffset = current.parserAppliedNextOffset
                                         .takeUnless { resetRequired },

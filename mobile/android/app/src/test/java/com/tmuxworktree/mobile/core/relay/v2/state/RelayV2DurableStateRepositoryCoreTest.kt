@@ -807,7 +807,62 @@ class RelayV2DurableStateRepositoryCoreTest {
         assertEquals(RelayV2TerminalOpenMode.RESET, pending.pendingOpen?.mode)
         assertEquals(1, store.terminalCheckpointsForSession(selector, authority.hostEpoch).size)
 
-        val stale = restarted.reduceTerminalUnderApplyLease(
+        val retryGeneration = RelayV2EffectGeneration("profile-v2", 7, 3)
+        val retryAuthority = RelayV2RepositoryEffectAuthority(
+            retryGeneration,
+            "profile-v2",
+            7,
+            "principal-v2",
+            "android-install-v2",
+            "host-a",
+            "epoch-a",
+        )
+        val discardedRetryAttempt = RelayV2TerminalOpenAttempt(
+            "open-must-not-replace-pending-reset",
+            "open-must-not-replace-pending-reset-fingerprint",
+        )
+        val secondRestart = RelayV2DurableStateRepositoryCore(store)
+        val retryClaim = requireNotNull(
+            secondRestart.claimResumableTerminalUnderApplyLease(
+                selector = selector,
+                authority = retryAuthority,
+                requestId = "open-after-reset-retry-request",
+                openAttempt = discardedRetryAttempt,
+                cols = 80,
+                rows = 24,
+            ),
+        )
+        assertEquals(RelayV2TerminalOutcome.Applied, retryClaim.reduction.outcome)
+        assertEquals(1, retryClaim.reduction.effects.size)
+        val retrySend = retryClaim.reduction.effects
+            .filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+            .single()
+        assertEquals(RelayV2TerminalOpenMode.RESET, retrySend.mode)
+        assertEquals(resetAttempt, retrySend.openFence.openAttempt)
+        assertFalse(retrySend.openFence.openAttempt == discardedRetryAttempt)
+        assertEquals(send.openFence.parserContinuityId, retrySend.openFence.parserContinuityId)
+        assertEquals(send.resume, retrySend.resume)
+        assertEquals(send.openFence.target, retrySend.openFence.target)
+        assertEquals(send.cols, retrySend.cols)
+        assertEquals(send.rows, retrySend.rows)
+        assertEquals("open-after-reset-retry-request", retrySend.requestId)
+        assertFalse(send.requestId == retrySend.requestId)
+        assertEquals(retryGeneration, retrySend.openFence.deliveryToken.actorGeneration)
+        assertEquals(
+            send.openFence.deliveryToken.authorityGeneration + 1,
+            retrySend.openFence.deliveryToken.authorityGeneration,
+        )
+        val retried = (store.lastCommittedTerminal(key)
+            as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+        val retriedPending = requireNotNull(retried.pendingOpen)
+        assertEquals(
+            listOf("open-after-reset-request", "open-after-reset-retry-request"),
+            retriedPending.issuedRequestIds,
+        )
+        assertTrue(retriedPending.requiresDeduplicatedResponse)
+        assertEquals(retrySend.openFence.deliveryToken, retriedPending.deliveryToken)
+
+        val stale = secondRestart.reduceTerminalUnderApplyLease(
             key,
             RelayV2TerminalAction.Opened(
                 identity = identity,
@@ -827,7 +882,7 @@ class RelayV2DurableStateRepositoryCoreTest {
             (stale.outcome as RelayV2TerminalOutcome.Ignored).reason,
         )
         assertEquals(
-            pending,
+            retried,
             (store.lastCommittedTerminal(key) as RelayV2TerminalStoredCheckpoint.Present)
                 .checkpoint,
         )
@@ -838,7 +893,7 @@ class RelayV2DurableStateRepositoryCoreTest {
             resumeTokenCredentialReference = "resume-reference-after-reset",
             resumeTokenCredentialFingerprint = "resume-fingerprint-after-reset",
         )
-        val replacement = restarted.reduceTerminalUnderApplyLease(
+        val staleFirstReset = secondRestart.reduceTerminalUnderApplyLease(
             key,
             RelayV2TerminalAction.Opened(
                 identity = replacementIdentity,
@@ -851,6 +906,33 @@ class RelayV2DurableStateRepositoryCoreTest {
                 rows = send.rows,
                 replayFromOffset = "0",
                 tailOffset = "0",
+                deduplicated = true,
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE,
+            (staleFirstReset.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertEquals(
+            retried,
+            (store.lastCommittedTerminal(key) as RelayV2TerminalStoredCheckpoint.Present)
+                .checkpoint,
+        )
+
+        val replacement = secondRestart.reduceTerminalUnderApplyLease(
+            key,
+            RelayV2TerminalAction.Opened(
+                identity = replacementIdentity,
+                requestId = retrySend.requestId,
+                openAttempt = retrySend.openFence.openAttempt,
+                deliveryToken = retrySend.openFence.deliveryToken,
+                parserContinuityId = retrySend.openFence.parserContinuityId,
+                disposition = RelayV2TerminalOpenDisposition.RESET,
+                cols = retrySend.cols,
+                rows = retrySend.rows,
+                replayFromOffset = "0",
+                tailOffset = "0",
+                deduplicated = true,
             ),
         )
         val replaced = requireNotNull(replacement.checkpoint)
