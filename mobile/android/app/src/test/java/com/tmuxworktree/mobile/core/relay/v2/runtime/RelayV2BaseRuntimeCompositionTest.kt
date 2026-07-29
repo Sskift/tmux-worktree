@@ -54,6 +54,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAttemptKind
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
@@ -68,6 +69,9 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2DurableStateRepositoryCore
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2DurableStateStore
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2DurableStateTransaction
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedScopeReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
@@ -79,6 +83,9 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxFreshDispatchResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRuntimeAuthority
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2PersistedOutboxEntry
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2PersistedOutboxMeta
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2PersistedTerminalCheckpoint
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ResyncReason
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeKind
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeReachability
@@ -106,9 +113,12 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalRecoveryAuthor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeClaim
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeSessionSelector
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserCallbackToken
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialInstall
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialOwner
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialStore
@@ -174,6 +184,132 @@ class RelayV2BaseRuntimeCompositionTest {
                 harness.close()
             }
         }
+
+    @Test
+    fun `authoritative Session refresh keeps exact terminal attachment writable`() = runBlocking {
+        val terminalAuthority = RelayV2DurableStateRepositoryCore(TerminalMemoryStore())
+        val harness = Harness(
+            autoConnect = true,
+            terminalRuntimeAuthority = terminalAuthority,
+        )
+        try {
+            harness.connectOnline()
+            val initial = withTimeout(TIMEOUT_MS) {
+                harness.composition.productProjection.first { it.sessions.size == 1 }
+            }.sessions.single()
+            val opened = CompletableDeferred<String>()
+            val attachment = checkNotNull(
+                harness.composition.attachTerminal(
+                    initial.replyCut,
+                    RejectingTerminalParser,
+                    object : RelayV2TerminalAttachmentObserver {
+                        override fun opened(streamId: String) {
+                            opened.complete(streamId)
+                        }
+
+                        override fun reset(reason: RelayV2TerminalResetReason) = Unit
+
+                        override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+                    },
+                ),
+            )
+            assertTrue(harness.composition.openTerminal(attachment, 120, 36))
+            val open = harness.transport().awaitSentType("terminal.open")
+            val openPayload = open.payloadReadOnly()
+            harness.transport().sendFrame(
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "terminal.opened",
+                    "requestId" to open.stringValue("requestId"),
+                    "hostId" to open.stringValue("hostId"),
+                    "hostEpoch" to open.stringValue("expectedHostEpoch"),
+                    "scopeId" to open.stringValue("scopeId"),
+                    "sessionId" to open.stringValue("sessionId"),
+                    "streamId" to open.stringValue("streamId"),
+                    "hostInstanceId" to "host-process-terminal",
+                    "payload" to linkedMapOf(
+                        "openId" to openPayload.stringValue("openId"),
+                        "deduplicated" to false,
+                        "generation" to "terminal-generation",
+                        "resumeToken" to "terminal-resume-token",
+                        "disposition" to "new",
+                        "replayFromOffset" to "0",
+                        "bufferStartOffset" to "0",
+                        "tailOffset" to "0",
+                        "maxUnackedBytes" to 524_288L,
+                        "resetReason" to null,
+                    ),
+                ),
+            )
+            assertEquals(
+                open.stringValue("streamId"),
+                withTimeout(TIMEOUT_MS) { opened.await() },
+            )
+
+            assertTrue(
+                harness.composition.sendTerminalInput(
+                    attachment,
+                    "before-refresh".toByteArray(),
+                ),
+            )
+            val firstInput = harness.transport().awaitSentType("terminal.input")
+            val firstInputPayload = firstInput.payloadReadOnly()
+            harness.transport().sendFrame(
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "event",
+                    "type" to "terminal.input_ack",
+                    "streamId" to firstInput.stringValue("streamId"),
+                    "payload" to linkedMapOf(
+                        "generation" to firstInputPayload.stringValue("generation"),
+                        "ackedThroughInputSeq" to
+                            firstInputPayload.stringValue("inputSeq"),
+                    ),
+                ),
+            )
+
+            harness.transport().sendFixture("sessions-changed-upsert")
+            val refreshed = withTimeout(TIMEOUT_MS) {
+                harness.composition.productProjection.first { projection ->
+                    projection.sessions.singleOrNull()?.replyCut?.let {
+                        it !== initial.replyCut
+                    } == true
+                }
+            }.sessions.single()
+            assertEquals(initial.materialized, refreshed.materialized)
+
+            assertTrue(
+                harness.composition.sendTerminalInput(
+                    attachment,
+                    "after-refresh".toByteArray(),
+                ),
+            )
+            val secondInput = harness.transport().awaitSentType("terminal.input", index = 1)
+            assertEquals(
+                "2",
+                secondInput.payloadReadOnly().stringValue("inputSeq"),
+            )
+
+            val replacement = checkNotNull(
+                harness.composition.attachTerminal(
+                    refreshed.replyCut,
+                    RejectingTerminalParser,
+                    RelayV2TerminalNoopAttachmentObserver,
+                ),
+            )
+            assertFalse(
+                harness.composition.sendTerminalInput(
+                    attachment,
+                    "replaced-attachment".toByteArray(),
+                ),
+            )
+            harness.composition.detachTerminal(replacement)
+            assertEquals(2, harness.transport().framesOfType("terminal.input").size)
+        } finally {
+            harness.close()
+        }
+    }
 
     @Test
     fun `exact current generation delegates Agent effect without degrading base`() = runBlocking {
@@ -2742,6 +2878,7 @@ class RelayV2BaseRuntimeCompositionTest {
         agentOptionalCapabilities: Set<String> = emptySet(),
         credentialRollover: RelayV2CredentialRolloverPort =
             RelayV2CredentialRolloverPort { RelayV2CredentialRolloverResult.Unavailable },
+        terminalRuntimeAuthority: RelayV2TerminalRecoveryAuthority? = null,
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -2792,7 +2929,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 credentialStore = credentials,
                 credentialRollover = credentialRollover,
                 stateSyncAuthority = authority,
-                terminalRuntimeAuthority = authority,
+                terminalRuntimeAuthority = terminalRuntimeAuthority ?: authority,
                 terminalPostCommitJournal = MemoryTerminalJournal(),
                 terminalResumeCredentials = MemoryTerminalCredentials(),
                 materializedSessions = authority,
@@ -3826,6 +3963,82 @@ class RelayV2BaseRuntimeCompositionTest {
             authority: RelayV2RepositoryEffectAuthority,
             key: RelayV2TerminalCheckpointKey,
         ): RelayV2TerminalReduction? = null
+    }
+
+    private object RejectingTerminalParser : RelayV2TerminalParserPort {
+        override suspend fun write(
+            callbackToken: RelayV2TerminalParserCallbackToken,
+            bytes: ByteArray,
+            completion: suspend (Boolean) -> Unit,
+        ) = false
+
+        override suspend fun reset(
+            callbackToken: RelayV2TerminalParserCallbackToken,
+            completion: suspend (Boolean) -> Unit,
+        ) = false
+    }
+
+    private class TerminalMemoryStore :
+        RelayV2DurableStateStore,
+        RelayV2DurableStateTransaction {
+        private var terminals =
+            linkedMapOf<RelayV2TerminalCheckpointKey, RelayV2PersistedTerminalCheckpoint>()
+
+        override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T =
+            synchronized(this) {
+                val before = LinkedHashMap(terminals)
+                try {
+                    block(this)
+                } catch (failure: Throwable) {
+                    terminals = before
+                    throw failure
+                }
+            }
+
+        override fun outboxMeta(
+            namespace: RelayV2OutboxAuthorityNamespace,
+        ): RelayV2PersistedOutboxMeta? = null
+
+        override fun outboxEntries(
+            namespace: RelayV2OutboxAuthorityNamespace,
+        ): List<RelayV2PersistedOutboxEntry> = emptyList()
+
+        override fun putOutboxMeta(meta: RelayV2PersistedOutboxMeta) =
+            error("outbox is outside the terminal attachment test")
+
+        override fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry) =
+            error("outbox is outside the terminal attachment test")
+
+        override fun replaceOutboxEntry(
+            namespace: RelayV2OutboxAuthorityNamespace,
+            previousId: RelayV2OutboxEntryId,
+            replacement: RelayV2PersistedOutboxEntry,
+        ): Boolean = error("outbox is outside the terminal attachment test")
+
+        override fun terminalCheckpoint(
+            key: RelayV2TerminalCheckpointKey,
+        ): RelayV2PersistedTerminalCheckpoint? = terminals[key]
+
+        override fun terminalCheckpointsForSession(
+            selector: RelayV2TerminalResumeSessionSelector,
+            hostEpoch: String,
+        ): List<RelayV2PersistedTerminalCheckpoint> = terminals.values.filter { row ->
+            val key = row.key
+            key.profileId == selector.profileId &&
+                key.profileActivationGeneration == selector.profileActivationGeneration &&
+                key.principalId == selector.principalId &&
+                key.clientInstanceId == selector.clientInstanceId &&
+                key.hostId == selector.hostId && key.hostEpoch == hostEpoch &&
+                key.scopeId == selector.scopeId && key.sessionId == selector.sessionId &&
+                key.pane == selector.pane
+        }
+
+        override fun deleteTerminalCheckpoint(key: RelayV2TerminalCheckpointKey): Boolean =
+            terminals.remove(key) != null
+
+        override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) {
+            terminals[checkpoint.key] = checkpoint
+        }
     }
 
     private class MemoryTerminalCredentials : RelayV2TerminalResumeCredentialStore {

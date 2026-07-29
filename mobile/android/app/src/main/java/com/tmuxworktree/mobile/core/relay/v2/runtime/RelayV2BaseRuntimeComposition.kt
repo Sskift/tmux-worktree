@@ -503,9 +503,15 @@ internal class RelayV2BaseRuntimeComposition(
 
     private class CompositionTerminalAttachment(
         val origin: RelayV2BaseRuntimeComposition,
-        val sessionCut: CompositionSessionReplyCut,
+        val sessionBinding: TerminalSessionBinding,
         val runtimeAttachment: RelayV2TerminalAttachment,
     ) : RelayV2TerminalAttachment
+
+    private data class TerminalSessionBinding(
+        val namespace: RelayV2StateNamespace,
+        val scopeId: String,
+        val sessionId: String,
+    )
 
     internal suspend fun attachTerminal(
         sessionCut: RelayV2SessionReplyCut,
@@ -527,7 +533,15 @@ internal class RelayV2BaseRuntimeComposition(
             parser,
             observer,
         )
-        return CompositionTerminalAttachment(this, issued, runtimeAttachment)
+        return CompositionTerminalAttachment(
+            this,
+            TerminalSessionBinding(
+                namespace = materialized.namespace,
+                scopeId = materialized.session.scopeId,
+                sessionId = materialized.session.sessionId,
+            ),
+            runtimeAttachment,
+        )
     }
 
     internal suspend fun openTerminal(
@@ -572,20 +586,44 @@ internal class RelayV2BaseRuntimeComposition(
         ) -> Boolean,
     ): Boolean {
         val issued = attachment as? CompositionTerminalAttachment ?: return false
-        if (issued.origin !== this || currentIssuedSession(issued.sessionCut) !== issued.sessionCut) {
-            return false
+        if (issued.origin !== this) return false
+        while (true) {
+            val currentSession = currentTerminalSession(issued) ?: return false
+            when (val leased = actor.withCurrentOnlineCommandLease(
+                currentSession.onlineCut,
+            ) { context ->
+                productMutationLock.withLock {
+                    if (currentTerminalSession(issued) !== currentSession) null
+                    else block(issued, context.authority)
+                }
+            }) {
+                is RelayV2CurrentOnlineCommandLeaseResult.Current ->
+                    leased.value?.let { return it }
+                RelayV2CurrentOnlineCommandLeaseResult.Stale -> return false
+            }
         }
-        val cut = when (val current = actor.currentOnlineCommandCut()) {
-            is RelayV2CurrentOnlineCommandCutResult.Available -> current.cut
-            RelayV2CurrentOnlineCommandCutResult.Unavailable -> return false
-        }
-        return when (val leased = actor.withCurrentOnlineCommandLease(cut) { context ->
-            if (currentIssuedSession(issued.sessionCut) !== issued.sessionCut) false
-            else block(issued, context.authority)
-        }) {
-            is RelayV2CurrentOnlineCommandLeaseResult.Current -> leased.value
-            RelayV2CurrentOnlineCommandLeaseResult.Stale -> false
-        }
+    }
+
+    /**
+     * A product Session cut is one-revision authority and remains stale after replacement. The
+     * opaque terminal attachment minted from it has its own lifecycle: it follows only the same
+     * exact namespace/scope/Session identity in the current projection. The current cut still
+     * supplies every ONLINE lease, so delete, host-epoch change and actor replacement fail closed.
+     */
+    private fun currentTerminalSession(
+        attachment: CompositionTerminalAttachment,
+    ): CompositionSessionReplyCut? {
+        if (closed.get() || terminalFailure.get() != null) return null
+        return _productProjection.value.sessions.mapNotNull { product ->
+            val current = product.replyCut as? CompositionSessionReplyCut
+                ?: return@mapNotNull null
+            current.takeIf {
+                it.origin === this &&
+                    it.materialized.namespace == attachment.sessionBinding.namespace &&
+                    it.materialized.session.scopeId == attachment.sessionBinding.scopeId &&
+                    it.materialized.session.sessionId == attachment.sessionBinding.sessionId
+            }
+        }.singleOrNull()
     }
 
     suspend fun disconnectAndDrain(
