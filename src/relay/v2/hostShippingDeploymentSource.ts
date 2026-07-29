@@ -454,7 +454,12 @@ async function openCanonicalRuntimeOwner(
   );
   requireStartupOpen(signal);
   const runtimeOwner = await createRelayV2CanonicalHostRuntimeBundleOwnerV1({
-    localCliTarget,
+    localCliTarget: localDevelopmentIsolation === undefined
+      ? localCliTarget
+      : Object.freeze({
+          ...localCliTarget,
+          home: trustedHome,
+        }),
     terminalControlDaemonSocketPath,
     knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
     sshExecutable: "/usr/bin/ssh",

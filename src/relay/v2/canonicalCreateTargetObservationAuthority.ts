@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
 import { types as nodeTypes } from "node:util";
 
 import {
@@ -422,7 +423,11 @@ export function normalizeInvocation(value: unknown): RelayV2CanonicalStructuredP
   let invocation: Record<string, unknown>;
   let argv: string[];
   try {
-    invocation = dataRecord(value, ["executable", "argv"]);
+    try {
+      invocation = dataRecord(value, ["executable", "argv"]);
+    } catch {
+      invocation = dataRecord(value, ["executable", "argv", "home"]);
+    }
     argv = ownDataStringArray(invocation.argv);
   } catch {
     throw new RelayV2CanonicalCreateTargetObservationError("TARGET_UNAVAILABLE");
@@ -442,7 +447,20 @@ export function normalizeInvocation(value: unknown): RelayV2CanonicalStructuredP
     > MAX_INVOCATION_ARGV_BYTES) {
     throw new RelayV2CanonicalCreateTargetObservationError("TARGET_UNAVAILABLE");
   }
-  return Object.freeze({ executable, argv: Object.freeze(argv) });
+  let home: string | undefined;
+  try {
+    home = invocation.home === undefined ? undefined : bounded(invocation.home, 4_096);
+  } catch {
+    throw new RelayV2CanonicalCreateTargetObservationError("TARGET_UNAVAILABLE");
+  }
+  if (home !== undefined && !isAbsolute(home)) {
+    throw new RelayV2CanonicalCreateTargetObservationError("TARGET_UNAVAILABLE");
+  }
+  return Object.freeze({
+    executable,
+    argv: Object.freeze(argv),
+    ...(home === undefined ? {} : { home }),
+  });
 }
 
 /**
@@ -709,6 +727,7 @@ implements RelayV2CanonicalCreateTargetAuthorityPortV1,
       handle = normalizeProcessHandle(this.runner.spawn(Object.freeze({
         executable: invocation.executable,
         argv: invocation.argv,
+        ...(invocation.home === undefined ? {} : { home: invocation.home }),
         shell: false as const,
         stdin: "ignore" as const,
         stdout: "pipe" as const,

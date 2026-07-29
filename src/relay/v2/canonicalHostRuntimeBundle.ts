@@ -58,6 +58,8 @@ export interface RelayV2CanonicalHostRuntimeBundleOptionsV1 {
   localCliTarget: Readonly<{
     executable: string;
     entrypoint?: string;
+    /** Exact local-development home; production construction omits it. */
+    home?: string;
   }>;
   /** Exact ready primary terminal-control daemon socket; this owner never starts it. */
   terminalControlDaemonSocketPath: string;
@@ -126,7 +128,9 @@ function captureOptions(
     }
   }
   const localKeys = Reflect.ownKeys(value.localCliTarget);
-  if (localKeys.some((key) => key !== "executable" && key !== "entrypoint")
+  if (localKeys.some((key) => (
+    key !== "executable" && key !== "entrypoint" && key !== "home"
+  ))
     || !localKeys.includes("executable")) {
     throw new TypeError("canonical Host runtime local CLI target is malformed");
   }
@@ -140,6 +144,9 @@ function captureOptions(
   const entrypoint = value.localCliTarget.entrypoint === undefined
     ? undefined
     : absolutePath(value.localCliTarget.entrypoint, "local CLI entrypoint");
+  const home = value.localCliTarget.home === undefined
+    ? undefined
+    : absolutePath(value.localCliTarget.home, "local CLI home");
   const terminalControlDaemonSocketPath = absolutePath(
     value.terminalControlDaemonSocketPath,
     "terminal-control daemon socket",
@@ -163,6 +170,7 @@ function captureOptions(
     localCliTarget: Object.freeze({
       executable,
       ...(entrypoint === undefined ? {} : { entrypoint }),
+      ...(home === undefined ? {} : { home }),
     }),
     terminalControlDaemonSocketPath,
     knownHostsFile,
@@ -216,6 +224,9 @@ export async function createRelayV2CanonicalHostRuntimeBundleOwnerV1(
       argvPrefix: options.localCliTarget.entrypoint === undefined
         ? []
         : [options.localCliTarget.entrypoint],
+      ...(options.localCliTarget.home === undefined
+        ? {}
+        : { home: options.localCliTarget.home }),
     },
     knownHostsFile: options.knownHostsFile,
     sshExecutable: options.sshExecutable,

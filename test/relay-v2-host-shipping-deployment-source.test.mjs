@@ -511,6 +511,11 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       false,
       "production runtime keeps the real config owner",
     );
+    assert.equal(
+      Object.hasOwn(productionRuntimeOptions.localCliTarget, "home"),
+      false,
+      "production bundled CLI target inherits the unchanged process environment",
+    );
     const [, terminalRequest, terminalOptions] = first.events[terminalReadyIndex];
     assert.deepEqual(terminalRequest, { type: "ping" });
     assert.equal(terminalOptions.socketPath, join(
@@ -723,6 +728,16 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       .find(([name]) => name === "runtime.create")[1];
     assert.equal(typeof localRuntimeOptions.configLoader, "function");
     assert.deepEqual(localRuntimeOptions.configLoader(), { hosts: [] });
+    assert.equal(
+      localRuntimeOptions.localCliTarget.home,
+      home,
+      "the local-development owner hands off its exact validated trustedHome",
+    );
+    assert.equal(
+      Object.hasOwn(localTerminalReady[2].autoStartCliTarget, "home"),
+      false,
+      "terminal-control auto-start target does not gain a caller-selected home",
+    );
     assert.ok(localDevelopment.events.some(([name]) => name === "local.intake.open"));
     assert.equal(localDevelopment.localCapabilityHandoffIssueCount, 1);
     assert.strictEqual(

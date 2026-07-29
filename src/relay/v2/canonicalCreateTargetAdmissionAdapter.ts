@@ -545,6 +545,7 @@ class CreateTargetAdmissionAdapter implements RelayV2StructuredProcessPort {
       handle = normalizeProcessHandle(this.runner.spawn(Object.freeze({
         executable: invocation.executable,
         argv: invocation.argv,
+        ...(invocation.home === undefined ? {} : { home: invocation.home }),
         shell: false as const,
         stdin: "ignore" as const,
         stdout: "pipe" as const,

@@ -204,6 +204,7 @@ test("canonical Host runtime bundle keeps one target generation and fences every
         executable: request.executable,
         argv: [...request.argv],
         shell: request.shell,
+        ...(Object.hasOwn(request, "home") ? { home: request.home } : {}),
       });
       if (request.argv.includes("create-target-observation-v1")) {
         const raw = JSON.parse(request.argv.at(-1));
@@ -325,6 +326,7 @@ test("canonical Host runtime bundle keeps one target generation and fences every
       localCliTarget: {
         executable: "/opt/tw-node/bin/node",
         entrypoint: "/opt/tw-dashboard/tw-cli/cli.cjs",
+        home: root,
       },
       terminalControlDaemonSocketPath: socketPath,
       knownHostsFile: "/configured/ssh/known_hosts",
@@ -515,6 +517,20 @@ test("canonical Host runtime bundle keeps one target generation and fences every
     );
     assert.deepEqual(observationModes, ["observe", "admit"]);
     assert.equal(terminalCreates, 1);
+    assert.equal(
+      processCalls
+        .filter((call) => call.executable === "/opt/tw-node/bin/node")
+        .every((call) => call.home === root),
+      true,
+      "every local query and structured child keeps the exact home lineage",
+    );
+    assert.equal(
+      processCalls
+        .filter((call) => call.executable === "/usr/bin/ssh")
+        .every((call) => !Object.hasOwn(call, "home")),
+      true,
+      "remote children never inherit the local home override",
+    );
 
     // Republish the materialized resolver after the successful create, then
     // hold one discovery child so the queued transition cannot install while

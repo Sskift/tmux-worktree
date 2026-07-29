@@ -1,4 +1,12 @@
 import assert from "node:assert/strict";
+import {
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { RPC_V2_CAPABILITIES } from "../dist/rpcV2.js";
@@ -9,6 +17,7 @@ import {
   RELAY_V2_CANONICAL_TW_RPC_QUERY_JSON_MAX_NODES,
   RELAY_V2_CANONICAL_TW_RPC_QUERY_STDERR_MAX_BYTES,
   RELAY_V2_CANONICAL_TW_RPC_QUERY_STDOUT_MAX_BYTES,
+  RelayV2CanonicalTwRpcChildProcessRunner,
   RelayV2CanonicalTwRpcQueryTransportAdapter,
   createRelayV2CanonicalTwRpcConfigSnapshotFoundation,
 } from "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js";
@@ -60,6 +69,7 @@ function fakeRunner(handler) {
         stdin: request.stdin,
         stdout: request.stdout,
         stderr: request.stderr,
+        ...(Object.hasOwn(request, "home") ? { home: request.home } : {}),
       });
       return handler(request, calls.length - 1);
     },
@@ -781,6 +791,50 @@ test("structured mutation process lane invokes only the exact configured target 
     2,
     "unknown, malformed, or retired targets must fail closed before spawn",
   );
+});
+
+test("local query and structured mutation children use one exact target home without mutating process.env", async () => {
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), "tw-v2-local-child-home-")));
+  const entrypoint = join(home, "child-home.cjs");
+  writeFileSync(entrypoint, `
+process.stdout.write(JSON.stringify({
+  home: process.env.HOME,
+  argv: process.argv.slice(2),
+}) + "\\n");
+`);
+  const parentHome = process.env.HOME;
+  try {
+    const runner = new RelayV2CanonicalTwRpcChildProcessRunner();
+    const authority = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+      targets: [{
+        kind: "local",
+        targetId: "local-development-bundled-cli",
+        executable: process.execPath,
+        argvPrefix: [entrypoint],
+        home,
+      }],
+      runner,
+    });
+    const target = authority.processTarget("local", "local-development-bundled-cli");
+    const queryResult = await authority.query(query("capabilities", target));
+    const structured = new RelayV2CanonicalStructuredProcessAdapter({
+      targets: authority,
+      runner,
+    });
+    const mutationResult = await structured.execute(structuredRequest(target, {
+      timeoutMs: 5_000,
+    }));
+
+    assert.equal(queryResult.home, home);
+    assert.deepEqual(queryResult.argv, ["rpc-v2", "capabilities"]);
+    assert.equal(mutationResult.kind, "exited");
+    const mutationOutput = JSON.parse(new TextDecoder().decode(mutationResult.stdout));
+    assert.equal(mutationOutput.home, home);
+    assert.deepEqual(mutationOutput.argv, structuredRequest(target).argv);
+    assert.equal(process.env.HOME, parentHome, "the parent environment must remain unchanged");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("structured mutation timeout kills with SIGKILL and reports timed_out only after a full drain", async () => {

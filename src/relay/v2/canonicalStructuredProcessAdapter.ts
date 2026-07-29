@@ -1,4 +1,5 @@
 import { performance } from "node:perf_hooks";
+import { isAbsolute } from "node:path";
 
 import type {
   RelayV2StructuredProcessPort,
@@ -148,16 +149,21 @@ function normalizeRequest(value: unknown): NormalizedStructuredProcessRequest {
 function normalizeInvocation(value: unknown): RelayV2CanonicalStructuredProcessInvocation {
   try {
     if (!isRecord(value)
-      || !hasExactKeys(value, ["executable", "argv"])
+      || !hasExactKeys(value, ["executable", "argv"], ["home"])
       || !Array.isArray(value.argv)
       || value.argv.length < 1
       || value.argv.length > RELAY_V2_CANONICAL_STRUCTURED_PROCESS_MAX_INVOCATION_ARGV_ITEMS
-      || value.argv.some((item) => !boundedArgument(item))) {
+      || value.argv.some((item) => !boundedArgument(item))
+      || (value.home !== undefined
+        && (typeof value.home !== "string"
+          || !isAbsolute(value.home)
+          || boundedId(value.home, 4_096) !== value.home))) {
       throw new RelayV2CanonicalStructuredProcessError("TARGET_UNAVAILABLE");
     }
     return Object.freeze({
       executable: boundedId(value.executable, 4_096),
       argv: Object.freeze([...(value.argv as string[])]),
+      ...(value.home === undefined ? {} : { home: value.home }),
     });
   } catch (error) {
     if (error instanceof RelayV2CanonicalStructuredProcessError) throw error;
@@ -393,6 +399,7 @@ export class RelayV2CanonicalStructuredProcessAdapter implements RelayV2Structur
       handle = normalizeProcessHandle(this.runner.spawn(Object.freeze({
         executable: invocation.executable,
         argv: invocation.argv,
+        ...(invocation.home === undefined ? {} : { home: invocation.home }),
         shell: false as const,
         stdin: "ignore" as const,
         stdout: "pipe" as const,

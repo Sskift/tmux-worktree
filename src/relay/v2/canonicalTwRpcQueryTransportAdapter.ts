@@ -56,6 +56,8 @@ export interface RelayV2CanonicalTwRpcLocalQueryTargetDescriptor {
   executable: string;
   /** Optional structured prefix, for example an absolute bundled cli.cjs path. */
   argvPrefix?: readonly string[];
+  /** Exact validated home for this local child lineage; absent outside local development. */
+  home?: string;
 }
 
 export interface RelayV2CanonicalTwRpcSshQueryTargetDescriptor {
@@ -78,6 +80,8 @@ export type RelayV2CanonicalTwRpcQueryTargetDescriptor =
 export interface RelayV2CanonicalTwRpcQueryProcessRequest {
   executable: string;
   argv: readonly string[];
+  /** Narrow per-child HOME override; no arbitrary environment record is accepted. */
+  home?: string;
   shell: false;
   stdin: "ignore";
   stdout: "pipe";
@@ -145,6 +149,9 @@ implements RelayV2CanonicalTwRpcQueryProcessRunner, RelayV2CanonicalTwRpcCompoun
       shell: request.shell,
       stdio: [request.stdin, request.stdout, request.stderr],
       windowsHide: true,
+      ...(request.home === undefined
+        ? {}
+        : { env: { ...process.env, HOME: absolutePath(request.home) } }),
     });
     if (child.stdout === null || child.stderr === null) {
       try { child.kill("SIGKILL"); } catch {}
@@ -333,6 +340,7 @@ export class RelayV2CanonicalTwRpcQueryTransportError extends Error {
 export interface RelayV2CanonicalStructuredProcessInvocation {
   readonly executable: string;
   readonly argv: readonly string[];
+  readonly home?: string;
 }
 
 type NormalizedTarget =
@@ -341,6 +349,7 @@ type NormalizedTarget =
       targetId: string;
       executable: string;
       argvPrefix: readonly string[];
+      home?: string;
     }>
   | Readonly<{
       kind: "ssh";
@@ -416,6 +425,7 @@ function targetDescriptorForHash(target: NormalizedTarget): object {
       kind: target.kind,
       executable: target.executable,
       argvPrefix: [...target.argvPrefix],
+      ...(target.home === undefined ? {} : { home: target.home }),
     }
     : {
       kind: target.kind,
@@ -444,7 +454,7 @@ function normalizeContentAddressedTargets(
 function normalizeLocalTarget(
   value: Record<string, unknown>,
 ): Extract<NormalizedTarget, { kind: "local" }> {
-  if (!hasExactKeys(value, ["kind", "targetId", "executable"], ["argvPrefix"])) {
+  if (!hasExactKeys(value, ["kind", "targetId", "executable"], ["argvPrefix", "home"])) {
     throw new TypeError("invalid canonical TW RPC v2 local query target");
   }
   const rawPrefix = value.argvPrefix ?? [];
@@ -457,6 +467,7 @@ function normalizeLocalTarget(
     targetId: boundedString(value.targetId, 128),
     executable: boundedString(value.executable),
     argvPrefix,
+    ...(value.home === undefined ? {} : { home: absolutePath(value.home) }),
   });
 }
 
@@ -636,6 +647,7 @@ function structuredProcessArgv(value: unknown): string[] {
 function boundedStructuredInvocation(
   executable: string,
   argv: readonly string[],
+  home?: string,
 ): RelayV2CanonicalStructuredProcessInvocation {
   // The final invocation, quoting expansion included, must fit the same hard
   // byte cap the structured process adapter enforces before spawn.
@@ -643,7 +655,11 @@ function boundedStructuredInvocation(
     > MAX_STRUCTURED_PROCESS_INVOCATION_BYTES) {
     throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
   }
-  return Object.freeze({ executable, argv: Object.freeze(argv) });
+  return Object.freeze({
+    executable,
+    argv: Object.freeze(argv),
+    ...(home === undefined ? {} : { home }),
+  });
 }
 
 function invocationFor(
@@ -654,6 +670,7 @@ function invocationFor(
     return Object.freeze({
       executable: target.executable,
       argv: Object.freeze([...target.argvPrefix, "rpc-v2", request.command]),
+      ...(target.home === undefined ? {} : { home: target.home }),
       shell: false as const,
       stdin: "ignore" as const,
       stdout: "pipe" as const,
@@ -1133,7 +1150,7 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
       return boundedStructuredInvocation(target.executable, [
         ...target.argvPrefix,
         ...rpcArgv,
-      ]);
+      ], target.home);
     }
     const remoteCommand = [target.twExecutable, ...rpcArgv]
       .map((item) => posixShellQuote(item))
@@ -1359,6 +1376,9 @@ function deriveExplicitConfigSnapshotTargets(
 ): DerivedConfigSnapshotTargets {
   if (typeof options.localTarget?.executable !== "string"
     || !isAbsolute(options.localTarget.executable)
+    || (options.localTarget.home !== undefined
+      && (typeof options.localTarget.home !== "string"
+        || !isAbsolute(options.localTarget.home)))
     || !Array.isArray(options.localTarget.argvPrefix ?? [])
     || (options.localTarget.argvPrefix ?? []).some((argument) => (
       typeof argument !== "string" || !isAbsolute(argument)
@@ -1377,6 +1397,7 @@ function deriveExplicitConfigSnapshotTargets(
     kind: "local" as const,
     executable: options.localTarget.executable,
     argvPrefix: [...(options.localTarget.argvPrefix ?? [])],
+    ...(options.localTarget.home === undefined ? {} : { home: options.localTarget.home }),
   };
   const localTargetId = effectiveTargetId(localDescriptor);
   const descriptors: RelayV2CanonicalTwRpcQueryTargetDescriptor[] = [{
@@ -1384,6 +1405,7 @@ function deriveExplicitConfigSnapshotTargets(
     targetId: localTargetId,
     executable: localDescriptor.executable,
     argvPrefix: localDescriptor.argvPrefix,
+    ...(localDescriptor.home === undefined ? {} : { home: localDescriptor.home }),
   }];
   const scopes: DerivedConfigSnapshotTargets["scopes"] = [{
     backendIdentity: `local:${options.localTarget.targetId}`,
