@@ -3,11 +3,23 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.state.*
 import com.tmuxworktree.mobile.core.relay.v2.terminal.*
+import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewParserAdapter
+import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewResetPort
+import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewWritePort
+import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.CoroutineContext
+import kotlin.concurrent.thread
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -402,7 +414,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         }
 
     @Test
-    fun `parser claim precedes registration and false or unaccepted callbacks stay inert`() =
+    fun `parser claim precedes registration and rejected early callbacks stay fail closed`() =
         runBlocking {
             val failedClaim = fixture()
             val blockedWrite = failedClaim.enqueueOutput("0", "claim-commit-failure")
@@ -430,18 +442,193 @@ class RelayV2TerminalRuntimeAdapterTest {
             assertEquals(before, fixture.checkpoint())
             assertTrue(fixture.sink.batches.isEmpty())
 
-            listOf(false, true).forEach { returnedAcceptance ->
-                val early = fixture()
-                val earlyWrite = early.enqueueOutput("0", "early-$returnedAcceptance")
-                early.parser.writeAccepted = returnedAcceptance
-                early.parser.completionInsideWrite = true
+            val earlyCallbackJob = Job()
+            try {
+                val earlyCallbackScope =
+                    CoroutineScope(earlyCallbackJob + Dispatchers.Unconfined)
+                val earlyFalse = fixture()
+                val earlyFalseWrite = earlyFalse.enqueueOutput("0", "early-false")
+                earlyFalse.parser.writeAccepted = false
+                earlyFalse.parser.completionInsideWrite = true
+                earlyFalse.parser.completionInsideWriteScope = earlyCallbackScope
+                val falseUnknown = earlyFalse.adapter.handle(
+                    earlyFalse.authority,
+                    earlyFalseWrite,
+                ) as RelayV2TerminalRuntimeApplyResult.ParserSettlementUnknown
+                assertEquals(
+                    falseUnknown.claim,
+                    earlyFalse.checkpoint().pendingParserDispatchClaim,
+                )
+                assertEquals("0", earlyFalse.checkpoint().parserAppliedNextOffset)
+                assertTrue(earlyFalse.sink.batches.isEmpty())
 
-                val unknown = early.adapter.handle(early.authority, earlyWrite)
-                    as RelayV2TerminalRuntimeApplyResult.ParserSettlementUnknown
+                val earlyThrow = fixture()
+                val earlyThrowWrite = earlyThrow.enqueueOutput("0", "early-throw")
+                earlyThrow.parser.completionInsideWrite = true
+                earlyThrow.parser.completionInsideWriteScope = earlyCallbackScope
+                earlyThrow.parser.writeFailureAfterRecord =
+                    IllegalStateException("early throw")
+                val throwUnknown = earlyThrow.adapter.handle(
+                    earlyThrow.authority,
+                    earlyThrowWrite,
+                ) as RelayV2TerminalRuntimeApplyResult.ParserSettlementUnknown
+                assertEquals(
+                    throwUnknown.claim,
+                    earlyThrow.checkpoint().pendingParserDispatchClaim,
+                )
+                assertEquals("0", earlyThrow.checkpoint().parserAppliedNextOffset)
+                assertTrue(earlyThrow.sink.batches.isEmpty())
+            } finally {
+                earlyCallbackJob.cancel()
+            }
+        }
 
-                assertEquals(unknown.claim, early.checkpoint().pendingParserDispatchClaim)
-                assertEquals("0", early.checkpoint().parserAppliedNextOffset)
-                assertTrue(early.sink.batches.isEmpty())
+    @Test
+    fun `accepted early callback crosses threads and waits for current effect transfer`() =
+        runBlocking {
+            val fixture = fixture()
+            val firstWrite = fixture.enqueueOutput("0", "two-thread")
+            val firstRuntimeCompletion = CompletableDeferred<suspend (Boolean) -> Unit>()
+            val platformCallback = CompletableDeferred<(Boolean) -> Unit>()
+            val innerRegistrationAccepted = CompletableDeferred<Thread>()
+            val resumeOuterAcceptance = CompletableDeferred<Unit>()
+            val callbackJob = Job()
+            val callbackDispatcher = QueuedDispatcher()
+            val webViewParser = RelayV2TerminalWebViewParserAdapter(
+                callbackScope = CoroutineScope(callbackJob + callbackDispatcher),
+                writePort = RelayV2TerminalWebViewWritePort { _, _, callback ->
+                    platformCallback.complete(callback)
+                    true
+                },
+                resetPort = RelayV2TerminalWebViewResetPort { _, _ -> false },
+                newCallbackNonce = { "two-thread" },
+            )
+            val pausedParser = object : RelayV2TerminalParserPort {
+                override suspend fun write(
+                    callbackToken: RelayV2TerminalParserCallbackToken,
+                    bytes: ByteArray,
+                    completion: suspend (Boolean) -> Unit,
+                ): Boolean {
+                    if (callbackToken == firstWrite.callbackToken) {
+                        firstRuntimeCompletion.complete(completion)
+                        return true
+                    }
+                    val accepted = webViewParser.write(callbackToken, bytes, completion)
+                    innerRegistrationAccepted.complete(Thread.currentThread())
+                    resumeOuterAcceptance.await()
+                    return accepted
+                }
+
+                override suspend fun reset(
+                    callbackToken: RelayV2TerminalParserCallbackToken,
+                    completion: suspend (Boolean) -> Unit,
+                ): Boolean = webViewParser.reset(callbackToken, completion)
+            }
+            lateinit var adapter: RelayV2TerminalRuntimeAdapter
+            val nestedDispatched =
+                AtomicReference<RelayV2TerminalRuntimeApplyResult.ParserDispatched>()
+            val nestedWrite = AtomicReference<RelayV2TerminalEffect.WriteParser>()
+            val callbackEffectExecutions = AtomicInteger()
+            val orderingSink = RelayV2SynchronousTerminalPostCommitEffectSink(
+                executor = RelayV2TerminalSynchronousEffectExecutor { execution ->
+                    val effect = execution.effect
+                    if (effect is RelayV2TerminalEffect.WriteParser) {
+                        val dispatched = runBlocking {
+                            adapter.handle(fixture.authority, effect)
+                        } as RelayV2TerminalRuntimeApplyResult.ParserDispatched
+                        nestedWrite.set(effect)
+                        nestedDispatched.set(dispatched)
+                        RelayV2TerminalSynchronousEffectExecutionReceipt
+                            .transferredToDurableCallback(dispatched.transferredCallbackGate)
+                    } else {
+                        callbackEffectExecutions.incrementAndGet()
+                        RelayV2TerminalSynchronousEffectExecutionReceipt.COMPLETED
+                    }
+                },
+            )
+            adapter = RelayV2TerminalRuntimeAdapter(
+                fixture.lease,
+                fixture.repository,
+                pausedParser,
+                fixture.control,
+                orderingSink,
+                fixture.fatalInvalidation,
+            )
+
+            try {
+                val firstDispatched = adapter.handle(fixture.authority, firstWrite)
+                    as RelayV2TerminalRuntimeApplyResult.ParserDispatched
+                assertTrue(
+                    firstDispatched.transferredCallbackGate.settle(
+                        RelayV2TerminalTransferredCallbackSettlement.COMMITTED,
+                    ),
+                )
+                val afterFirstDispatch = fixture.checkpoint()
+                val queuedSecond = fixture.repository.reduceTerminalUnderApplyLease(
+                    fixture.key,
+                    RelayV2TerminalAction.Output(
+                        actionFence(afterFirstDispatch),
+                        firstWrite.callbackToken.endOffset,
+                        RelayV2TerminalBytes.utf8("-nested"),
+                    ),
+                )
+                assertTrue(queuedSecond.effects.isEmpty())
+
+                val firstCallbackSettlement = async(Dispatchers.Default) {
+                    firstRuntimeCompletion.await()(true)
+                }
+                val registrationThread = innerRegistrationAccepted.await()
+                val registeredCallback = platformCallback.await()
+                val callbackThread = AtomicReference<Thread>()
+                val callbackFailure = AtomicReference<Throwable?>()
+                val callback = thread(name = "terminal-parser-callback") {
+                    callbackThread.set(Thread.currentThread())
+                    try {
+                        registeredCallback(true)
+                    } catch (failure: Throwable) {
+                        callbackFailure.set(failure)
+                    }
+                }
+                callback.join()
+
+                assertEquals(null, callbackFailure.get())
+                assertFalse(registrationThread === callbackThread.get())
+                callbackDispatcher.runCurrent()
+                assertFalse(callbackDispatcher.hasTasks())
+                assertEquals(
+                    firstWrite.callbackToken.endOffset,
+                    fixture.checkpoint().parserAppliedNextOffset,
+                )
+                assertEquals(1, callbackEffectExecutions.get())
+
+                resumeOuterAcceptance.complete(Unit)
+                firstCallbackSettlement.await()
+
+                val dispatched = requireNotNull(nestedDispatched.get())
+                val nextWrite = requireNotNull(nestedWrite.get())
+                assertEquals(nextWrite.callbackToken, dispatched.callbackToken)
+                assertTrue(callbackDispatcher.hasTasks())
+                assertEquals(
+                    firstWrite.callbackToken.endOffset,
+                    fixture.checkpoint().parserAppliedNextOffset,
+                )
+                assertEquals(
+                    nextWrite.callbackToken,
+                    fixture.checkpoint().pendingParserDispatchClaim?.callbackToken,
+                )
+
+                callbackDispatcher.runCurrent()
+
+                assertEquals(
+                    nextWrite.callbackToken.endOffset,
+                    fixture.checkpoint().parserAppliedNextOffset,
+                )
+                assertEquals(null, fixture.checkpoint().pendingParserDispatchClaim)
+                assertEquals(2, callbackEffectExecutions.get())
+                assertTrue(fixture.fatalInvalidation.calls.isEmpty())
+            } finally {
+                callbackJob.cancel()
+                resumeOuterAcceptance.complete(Unit)
             }
         }
 
@@ -1086,13 +1273,15 @@ class RelayV2TerminalRuntimeAdapterTest {
             control,
             sink,
             fatalInvalidation,
-            RelayV2TerminalRuntimeAdapter(
-                lease,
-                repository,
-                parser,
-                control,
-                sink,
-                fatalInvalidation,
+            TestRuntimeAdapter(
+                RelayV2TerminalRuntimeAdapter(
+                    lease,
+                    repository,
+                    parser,
+                    control,
+                    sink,
+                    fatalInvalidation,
+                ),
             ),
         )
     }
@@ -1107,7 +1296,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         val control: CapturingControl,
         val sink: CapturingSink,
         val fatalInvalidation: CapturingFatalInvalidation,
-        val adapter: RelayV2TerminalRuntimeAdapter,
+        val adapter: TestRuntimeAdapter,
     ) {
         suspend fun checkpoint(): RelayV2TerminalCheckpoint =
             (repository.loadTerminal(key) as RelayV2TerminalStoredCheckpoint.Present).checkpoint
@@ -1158,6 +1347,25 @@ class RelayV2TerminalRuntimeAdapterTest {
         }
     }
 
+    private class TestRuntimeAdapter(
+        private val delegate: RelayV2TerminalRuntimeAdapter,
+    ) {
+        suspend fun handle(
+            authority: RelayV2RepositoryEffectAuthority,
+            effect: RelayV2TerminalEffect,
+        ): RelayV2TerminalRuntimeApplyResult {
+            val result = delegate.handle(authority, effect)
+            if (result is RelayV2TerminalRuntimeApplyResult.ParserDispatched) {
+                check(
+                    result.transferredCallbackGate.settle(
+                        RelayV2TerminalTransferredCallbackSettlement.COMMITTED,
+                    ),
+                )
+            }
+            return result
+        }
+    }
+
     private class TestApplyLease(
         var currentAuthority: RelayV2RepositoryEffectAuthority?,
     ) : RelayV2RepositoryEffectApplyLeasePort {
@@ -1184,6 +1392,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         var writeFailureAfterRecord: RuntimeException? = null
         var writeAccepted = true
         var completionInsideWrite: Boolean? = null
+        var completionInsideWriteScope: CoroutineScope? = null
 
         override suspend fun write(
             callbackToken: RelayV2TerminalParserCallbackToken,
@@ -1192,7 +1401,13 @@ class RelayV2TerminalRuntimeAdapterTest {
         ): Boolean {
             writes += Pending(callbackToken, bytes.copyOf(), completion)
             afterWriteRecorded()
-            completionInsideWrite?.let { completion(it) }
+            completionInsideWrite?.let { applied ->
+                requireNotNull(completionInsideWriteScope).launch(
+                    start = CoroutineStart.UNDISPATCHED,
+                ) {
+                    completion(applied)
+                }
+            }
             writeFailureAfterRecord?.let { throw it }
             return writeAccepted
         }
@@ -1203,6 +1418,30 @@ class RelayV2TerminalRuntimeAdapterTest {
         ): Boolean {
             resets += Pending(callbackToken, null, completion)
             return true
+        }
+    }
+
+    private class QueuedDispatcher : CoroutineDispatcher() {
+        private val tasks = ArrayDeque<Runnable>()
+
+        override fun dispatch(
+            context: CoroutineContext,
+            block: Runnable,
+        ) {
+            synchronized(tasks) {
+                tasks.addLast(block)
+            }
+        }
+
+        fun hasTasks(): Boolean = synchronized(tasks) { tasks.isNotEmpty() }
+
+        fun runCurrent() {
+            while (true) {
+                val task = synchronized(tasks) {
+                    if (tasks.isEmpty()) null else tasks.removeFirst()
+                } ?: return
+                task.run()
+            }
         }
     }
 

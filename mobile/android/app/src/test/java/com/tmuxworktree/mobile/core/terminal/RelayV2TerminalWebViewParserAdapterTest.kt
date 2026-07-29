@@ -9,6 +9,7 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserCallb
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -18,29 +19,33 @@ import org.junit.Test
 
 class RelayV2TerminalWebViewParserAdapterTest {
     @Test
-    fun `registration returns before an early platform callback can settle`() = runBlocking {
+    fun `early callback waits for the platform registration decision`() = runBlocking {
         val completion = CompletableDeferred<Boolean>()
-        val registrationReturned = AtomicBoolean(false)
+        val platformRegistrationActive = AtomicBoolean(false)
         var capturedId = ""
         var capturedBytes = byteArrayOf()
         val adapter = RelayV2TerminalWebViewParserAdapter(
-            callbackScope = CoroutineScope(coroutineContext),
+            callbackScope = CoroutineScope(Dispatchers.Unconfined),
             writePort = RelayV2TerminalWebViewWritePort { callbackId, bytes, callback ->
                 capturedId = callbackId
                 capturedBytes = bytes.copyOf()
-                callback(true)
-                assertFalse(completion.isCompleted)
-                true
+                platformRegistrationActive.set(true)
+                try {
+                    callback(true)
+                    assertFalse(completion.isCompleted)
+                    true
+                } finally {
+                    platformRegistrationActive.set(false)
+                }
             },
             resetPort = RelayV2TerminalWebViewResetPort { _, _ -> false },
             newCallbackNonce = { "nonce" },
         )
 
         val accepted = adapter.write(token(), byteArrayOf(0, 0x7f, -1)) {
-            assertTrue(registrationReturned.get())
+            assertFalse(platformRegistrationActive.get())
             completion.complete(it)
         }
-        registrationReturned.set(true)
 
         assertTrue(accepted)
         assertEquals("operation.nonce", capturedId)

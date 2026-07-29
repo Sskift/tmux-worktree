@@ -9,6 +9,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitFenc
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJournalState
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJournalStore
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJournalTransaction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalBytes
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpoint
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalControlDispatchLease
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
@@ -195,6 +196,59 @@ class RelayV2DurableTerminalPostCommitEffectSinkTest {
     }
 
     @Test
+    fun `settlement commit failure after block aborts transferred callback gate`() = runBlocking {
+        val store = MemoryJournalStore()
+        val template = batch("parser")
+        val parserBatch = template.copy(
+            effects = listOf(
+                RelayV2TerminalEffect.WriteParser(
+                    template.callbackToken,
+                    RelayV2TerminalBytes.utf8("output"),
+                ),
+            ),
+        )
+        val gateSettlements = mutableListOf<RelayV2TerminalTransferredCallbackSettlement>()
+        val gate = RelayV2TerminalTransferredCallbackGate { settlement ->
+            gateSettlements += settlement
+            true
+        }
+        val runner = sink(store, "process-commit-failure") {
+            store.failCommitsAfterBlock = 2
+            RelayV2TerminalSynchronousEffectExecutionReceipt
+                .transferredToDurableCallback(gate)
+        }
+        val reserved = runner.reserve("reservation-commit-failure", parserBatch).reserved()
+
+        val failure = try {
+            reserved.reservation.activate()
+            null
+        } catch (caught: Throwable) {
+            caught
+        }
+
+        assertNotNull(failure)
+        assertEquals(
+            listOf(RelayV2TerminalTransferredCallbackSettlement.ABORTED),
+            gateSettlements,
+        )
+        assertEquals(
+            RelayV2TerminalPostCommitJournalState.RUNNING.name,
+            store.batch("reservation-commit-failure")?.state,
+        )
+
+        runner.teardownAuthority(parserBatch.authority, parserBatch.key)
+
+        assertEquals(
+            RelayV2TerminalPostCommitJournalState.UNKNOWN.name,
+            store.batch("reservation-commit-failure")?.state,
+        )
+        assertEquals(
+            listOf(RelayV2TerminalTransferredCallbackSettlement.ABORTED),
+            gateSettlements,
+        )
+    }
+
+    @Test
     fun `teardown fence survives restart but does not fence a later connection generation`() =
         runBlocking {
             val store = MemoryJournalStore()
@@ -331,6 +385,7 @@ class RelayV2DurableTerminalPostCommitEffectSinkTest {
         private var fences = linkedMapOf<String, RelayV2TerminalPostCommitFenceEntity>()
         private var checkpoints = linkedMapOf<RelayV2TerminalCheckpointKey, RelayV2TerminalCheckpointEntity>()
         private var closed = false
+        var failCommitsAfterBlock = 0
 
         override suspend fun <T> transaction(
             block: RelayV2TerminalPostCommitJournalTransaction.() -> T,
@@ -340,7 +395,12 @@ class RelayV2DurableTerminalPostCommitEffectSinkTest {
             val beforeClosed = closed
             val beforeOrder = nextOrder
             try {
-                block()
+                val result = block()
+                if (failCommitsAfterBlock > 0) {
+                    failCommitsAfterBlock -= 1
+                    error("injected journal commit failure after block")
+                }
+                result
             } catch (failure: Throwable) {
                 rows = beforeRows
                 fences = beforeFences

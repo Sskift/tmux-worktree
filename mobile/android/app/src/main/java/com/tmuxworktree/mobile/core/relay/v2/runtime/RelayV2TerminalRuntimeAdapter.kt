@@ -17,8 +17,8 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPhase
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -189,6 +189,7 @@ internal sealed interface RelayV2TerminalRuntimeApplyResult {
 
     data class ParserDispatched(
         val callbackToken: RelayV2TerminalParserCallbackToken,
+        val transferredCallbackGate: RelayV2TerminalTransferredCallbackGate,
     ) : RelayV2TerminalRuntimeApplyResult
 
     data class ParserFailedClosed(
@@ -225,6 +226,7 @@ internal sealed interface RelayV2TerminalRuntimeApplyResult {
 private sealed interface RelayV2TerminalParserAdmission {
     data class Dispatched(
         val claim: RelayV2TerminalParserDispatchClaim,
+        val latch: RelayV2TerminalParserAdmissionLatch,
     ) : RelayV2TerminalParserAdmission
 
     data class FailedClosed(
@@ -274,9 +276,9 @@ private sealed interface RelayV2TerminalParserHandoffGateResult<out T> {
 
 private enum class RelayV2TerminalParserLatchState {
     PENDING,
-    ACCEPTED,
-    MISSED_BEFORE_ACCEPT,
-    REJECTED,
+    TRANSFER_PENDING,
+    COMMITTED,
+    ABORTED,
     SETTLING,
 }
 
@@ -286,69 +288,108 @@ private enum class RelayV2TerminalParserRegistrationAdmission {
 }
 
 private enum class RelayV2TerminalParserRejectionAdmission {
-    SAFE_FALSE,
-    CALLBACK_MISSED,
+    CLEAN,
+    CALLBACK_OBSERVED,
 }
 
-/** Local race gate; only a callback observing ACCEPTED can enter durable settlement. */
-private class RelayV2TerminalParserAdmissionLatch {
-    private val state = AtomicReference(RelayV2TerminalParserLatchState.PENDING)
+private enum class RelayV2TerminalParserCallbackAdmission {
+    CLAIMED,
+    IGNORED,
+}
 
-    fun acceptRegistration(): RelayV2TerminalParserRegistrationAdmission =
-        if (state.compareAndSet(
-                RelayV2TerminalParserLatchState.PENDING,
-                RelayV2TerminalParserLatchState.ACCEPTED,
-            )
-        ) {
-            RelayV2TerminalParserRegistrationAdmission.ACCEPTED
+/** Local race gate; the callback waiter never executes the pipeline before durable COMMITTED. */
+private class RelayV2TerminalParserAdmissionLatch : RelayV2TerminalTransferredCallbackGate {
+    private val lock = Any()
+    private var state = RelayV2TerminalParserLatchState.PENDING
+    private var callbackClaimed = false
+    private val settlement =
+        CompletableDeferred<RelayV2TerminalTransferredCallbackSettlement>()
+
+    fun acceptRegistration(): RelayV2TerminalParserRegistrationAdmission = synchronized(lock) {
+        if (state != RelayV2TerminalParserLatchState.PENDING) {
+            return@synchronized RelayV2TerminalParserRegistrationAdmission.CALLBACK_MISSED
+        }
+        state = RelayV2TerminalParserLatchState.TRANSFER_PENDING
+        RelayV2TerminalParserRegistrationAdmission.ACCEPTED
+    }
+
+    fun rejectRegistration(): RelayV2TerminalParserRejectionAdmission = synchronized(lock) {
+        val observed = callbackClaimed
+        val abort = when (state) {
+            RelayV2TerminalParserLatchState.PENDING -> {
+                state = RelayV2TerminalParserLatchState.ABORTED
+                true
+            }
+            RelayV2TerminalParserLatchState.ABORTED,
+            RelayV2TerminalParserLatchState.COMMITTED,
+            RelayV2TerminalParserLatchState.SETTLING,
+            RelayV2TerminalParserLatchState.TRANSFER_PENDING,
+            -> false
+        }
+        abort to observed
+    }.let { (abort, observed) ->
+        if (abort) {
+            check(settlement.complete(RelayV2TerminalTransferredCallbackSettlement.ABORTED))
+        }
+        if (observed) {
+            RelayV2TerminalParserRejectionAdmission.CALLBACK_OBSERVED
         } else {
-            RelayV2TerminalParserRegistrationAdmission.CALLBACK_MISSED
+            RelayV2TerminalParserRejectionAdmission.CLEAN
         }
+    }
 
-    fun rejectFalseRegistration(): RelayV2TerminalParserRejectionAdmission {
-        while (true) {
-            when (val current = state.get()) {
-                RelayV2TerminalParserLatchState.PENDING -> if (
-                    state.compareAndSet(current, RelayV2TerminalParserLatchState.REJECTED)
-                ) {
-                    return RelayV2TerminalParserRejectionAdmission.SAFE_FALSE
+    fun admitCallback(): RelayV2TerminalParserCallbackAdmission = synchronized(lock) {
+        if (callbackClaimed) {
+            RelayV2TerminalParserCallbackAdmission.IGNORED
+        } else {
+            when (state) {
+                RelayV2TerminalParserLatchState.PENDING,
+                RelayV2TerminalParserLatchState.TRANSFER_PENDING,
+                RelayV2TerminalParserLatchState.COMMITTED,
+                -> {
+                    callbackClaimed = true
+                    RelayV2TerminalParserCallbackAdmission.CLAIMED
                 }
-                RelayV2TerminalParserLatchState.MISSED_BEFORE_ACCEPT ->
-                    return RelayV2TerminalParserRejectionAdmission.CALLBACK_MISSED
-                RelayV2TerminalParserLatchState.REJECTED,
-                RelayV2TerminalParserLatchState.ACCEPTED,
+                RelayV2TerminalParserLatchState.ABORTED,
                 RelayV2TerminalParserLatchState.SETTLING,
-                -> return RelayV2TerminalParserRejectionAdmission.CALLBACK_MISSED
+                -> RelayV2TerminalParserCallbackAdmission.IGNORED
             }
         }
     }
 
-    fun rejectAfterException() {
-        state.set(RelayV2TerminalParserLatchState.REJECTED)
-    }
-
-    fun tryBeginCallbackSettlement(): Boolean {
-        while (true) {
-            when (val current = state.get()) {
-                RelayV2TerminalParserLatchState.ACCEPTED -> if (
-                    state.compareAndSet(current, RelayV2TerminalParserLatchState.SETTLING)
-                ) {
-                    return true
-                }
-                RelayV2TerminalParserLatchState.PENDING -> if (
-                    state.compareAndSet(
-                        current,
-                        RelayV2TerminalParserLatchState.MISSED_BEFORE_ACCEPT,
-                    )
-                ) {
-                    return false
-                }
-                RelayV2TerminalParserLatchState.MISSED_BEFORE_ACCEPT,
-                RelayV2TerminalParserLatchState.REJECTED,
-                RelayV2TerminalParserLatchState.SETTLING,
-                -> return false
+    suspend fun awaitCommittedAndBeginSettlement(): Boolean {
+        if (settlement.await() != RelayV2TerminalTransferredCallbackSettlement.COMMITTED) {
+            return false
+        }
+        return synchronized(lock) {
+            if (state != RelayV2TerminalParserLatchState.COMMITTED || !callbackClaimed) {
+                false
+            } else {
+                state = RelayV2TerminalParserLatchState.SETTLING
+                true
             }
         }
+    }
+
+    override fun settle(settlement: RelayV2TerminalTransferredCallbackSettlement): Boolean {
+        val accepted = synchronized(lock) {
+            if (state != RelayV2TerminalParserLatchState.TRANSFER_PENDING) {
+                false
+            } else {
+                state = when (settlement) {
+                    RelayV2TerminalTransferredCallbackSettlement.COMMITTED ->
+                        RelayV2TerminalParserLatchState.COMMITTED
+                    RelayV2TerminalTransferredCallbackSettlement.ABORTED ->
+                        RelayV2TerminalParserLatchState.ABORTED
+                }
+                true
+            }
+        }
+        if (!accepted) return false
+        if (!this.settlement.complete(settlement)) {
+            return false
+        }
+        return true
     }
 }
 
@@ -668,7 +709,7 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
             var parserSideEffectMayHaveBeenReached = false
             var cancellationCleanup: RelayV2TerminalRuntimeCleanupClaim? = null
             val leased = try {
-                applyLease.withEffectApplyLease(authority) {
+                applyLease.withEffectApplyLease<RelayV2TerminalParserAdmission>(authority) {
                     if (!admission.isOpen()) {
                         return@withEffectApplyLease RelayV2TerminalParserAdmission.Poisoned
                     }
@@ -713,8 +754,15 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                 val token = claim.callbackToken
                 val latch = RelayV2TerminalParserAdmissionLatch()
                 val completion: suspend (Boolean) -> Unit = { applied ->
-                    if (latch.tryBeginCallbackSettlement()) {
-                        applyParserCallback(authority, key, claim, applied)
+                    when (latch.admitCallback()) {
+                        RelayV2TerminalParserCallbackAdmission.CLAIMED ->
+                            withContext(NonCancellable) {
+                                if (latch.awaitCommittedAndBeginSettlement()) {
+                                    applyParserCallback(authority, key, claim, applied)
+                                }
+                            }
+                        RelayV2TerminalParserCallbackAdmission.IGNORED,
+                        -> Unit
                     }
                 }
                 parserSideEffectMayHaveBeenReached = true
@@ -729,13 +777,19 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                         else -> error("Not a parser effect")
                     }
                 } catch (cancelled: CancellationException) {
-                    latch.rejectAfterException()
+                    latch.rejectRegistration()
                     cancellationCleanup = admission.poison(teardownRequired = false)
                     throw cancelled
                 } catch (_: Exception) {
-                    latch.rejectAfterException()
+                    val rejection = latch.rejectRegistration()
                     if (!admission.isOpen()) {
                         return@withEffectApplyLease RelayV2TerminalParserAdmission.Poisoned
+                    }
+                    if (rejection ==
+                        RelayV2TerminalParserRejectionAdmission.CALLBACK_OBSERVED
+                    ) {
+                        return@withEffectApplyLease RelayV2TerminalParserAdmission
+                            .SettlementUnknown(claim)
                     }
                     return@withEffectApplyLease try {
                         val failed = terminal.reduceTerminalUnderApplyLease(
@@ -751,16 +805,16 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                     }
                 }
                 if (!accepted) {
-                    // A conforming false proves the parser was untouched; later cancellation in
-                    // exact claim release does not need authority teardown.
-                    parserSideEffectMayHaveBeenReached = false
-                    if (latch.rejectFalseRegistration() !=
-                        RelayV2TerminalParserRejectionAdmission.SAFE_FALSE
+                    if (latch.rejectRegistration() !=
+                        RelayV2TerminalParserRejectionAdmission.CLEAN
                     ) {
                         return@withEffectApplyLease RelayV2TerminalParserAdmission.SettlementUnknown(
                             claim,
                         )
                     }
+                    // A conforming false with no callback proves the parser was untouched; later
+                    // cancellation in exact claim release does not need authority teardown.
+                    parserSideEffectMayHaveBeenReached = false
                     if (!admission.isOpen()) {
                         return@withEffectApplyLease RelayV2TerminalParserAdmission.Poisoned
                     }
@@ -782,7 +836,7 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                 if (latch.acceptRegistration() ==
                     RelayV2TerminalParserRegistrationAdmission.ACCEPTED
                 ) {
-                    RelayV2TerminalParserAdmission.Dispatched(claim)
+                    RelayV2TerminalParserAdmission.Dispatched(claim, latch)
                 } else {
                     RelayV2TerminalParserAdmission.SettlementUnknown(claim)
                 }
@@ -807,6 +861,7 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                     is RelayV2TerminalParserAdmission.Dispatched ->
                         RelayV2TerminalRuntimeApplyResult.ParserDispatched(
                             result.claim.callbackToken,
+                            result.latch,
                         )
                     is RelayV2TerminalParserAdmission.FailedClosed ->
                         RelayV2TerminalRuntimeApplyResult.ParserFailedClosed(result.reduction)

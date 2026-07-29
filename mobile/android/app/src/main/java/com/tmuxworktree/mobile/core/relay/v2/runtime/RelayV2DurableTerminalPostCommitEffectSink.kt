@@ -16,6 +16,7 @@ import java.util.UUID
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -71,6 +72,8 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         val batch: RelayV2TerminalPostCommitEffectBatch,
         val replayReceipt: RelayV2TerminalPostCommitEffectActivationReceipt? = null,
         var state: HandleState = HandleState.INACTIVE,
+        val transferredCallbackGates: MutableList<RelayV2TerminalTransferredCallbackGate> =
+            mutableListOf(),
     )
 
     private inner class Reservation(
@@ -86,6 +89,8 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
 
     private val mutex = Mutex()
     private val handles = mutableMapOf<String, HandleRecord>()
+    private val transferredCallbackGatesPendingAbort =
+        mutableListOf<RelayV2TerminalTransferredCallbackGate>()
     private var recovered = false
     private var globallyClosed = false
     private val recoveredLineages = mutableListOf<RelayV2TerminalPostCommitRecoveredLineage>()
@@ -97,12 +102,16 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         require(ownerIncarnation.isNotBlank())
     }
 
-    suspend fun recover(): RelayV2TerminalPostCommitRecoveryReceipt = mutex.withLock {
-        recoverLocked()
-        RelayV2TerminalPostCommitRecoveryReceipt(
-            recoveredLineages = recoveredLineages.toList(),
-            globallyClosed = globallyClosed,
-        )
+    suspend fun recover(): RelayV2TerminalPostCommitRecoveryReceipt = try {
+        mutex.withLock {
+            recoverLocked()
+            RelayV2TerminalPostCommitRecoveryReceipt(
+                recoveredLineages = recoveredLineages.toList(),
+                globallyClosed = globallyClosed,
+            )
+        }
+    } finally {
+        settlePendingTransferredCallbackAborts()
     }
 
     override suspend fun reserve(
@@ -123,89 +132,99 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         )
         val token = Any()
 
-        return mutex.withLock {
-            recoverLocked()
-            if (globallyClosed) {
-                return@withLock RelayV2TerminalPostCommitEffectReservationResult.Rejected
-            }
-            if (reservationId in handles) {
-                journal.transaction { closeGloballyLocked() }
-                throw IllegalStateException("Terminal post-commit reservation identity was reused")
-            }
-            val storedAndReceipt = journal.transaction {
-                pruneTerminalOutcomesInTransaction()
-                if (globallyClosed()) return@transaction null
-                val existing = batch(reservationId)
-                if (existing != null) {
-                    if (!existing.matchesEncodedBatch(
+        return try {
+            mutex.withLock {
+                recoverLocked()
+                if (globallyClosed) {
+                    return@withLock RelayV2TerminalPostCommitEffectReservationResult.Rejected
+                }
+                if (reservationId in handles) {
+                    journal.transaction { closeGloballyLocked() }
+                    throw IllegalStateException(
+                        "Terminal post-commit reservation identity was reused",
+                    )
+                }
+                val storedAndReceipt = journal.transaction {
+                    pruneTerminalOutcomesInTransaction()
+                    if (globallyClosed()) return@transaction null
+                    val existing = batch(reservationId)
+                    if (existing != null) {
+                        if (!existing.matchesEncodedBatch(
+                                immutableBatch,
+                                encoded.payload,
+                                encoded.authorityFingerprint,
+                            )
+                        ) {
+                            closeGloballyLocked()
+                            throw IllegalStateException(
+                                "Terminal post-commit reservation identity conflicted",
+                            )
+                        }
+                        val replay = existing.terminalReceipt()
+                        if (replay == null) {
+                            closeGloballyLocked()
+                            throw IllegalStateException(
+                                "Live terminal post-commit reservation identity was reused",
+                            )
+                        }
+                        return@transaction existing to replay
+                    }
+                    if (fence(encoded.authorityFingerprint) != null ||
+                        allBatches().size >= outcomeCapacity ||
+                        unsettledBatchCount() >= reservationCapacity
+                    ) {
+                        return@transaction null
+                    }
+                    insertBatch(
+                        entity(
+                            reservationId,
                             immutableBatch,
                             encoded.payload,
                             encoded.authorityFingerprint,
-                        )
-                    ) {
-                        closeGloballyLocked()
-                        throw IllegalStateException(
-                            "Terminal post-commit reservation identity conflicted",
-                        )
-                    }
-                    val replay = existing.terminalReceipt()
-                    if (replay == null) {
-                        closeGloballyLocked()
-                        throw IllegalStateException(
-                            "Live terminal post-commit reservation identity was reused",
-                        )
-                    }
-                    return@transaction existing to replay
-                }
-                if (fence(encoded.authorityFingerprint) != null ||
-                    allBatches().size >= outcomeCapacity ||
-                    unsettledBatchCount() >= reservationCapacity
-                ) {
-                    return@transaction null
-                }
-                insertBatch(
-                    entity(
-                        reservationId,
-                        immutableBatch,
-                        encoded.payload,
-                        encoded.authorityFingerprint,
-                    ),
-                ) to null
-            } ?: return@withLock RelayV2TerminalPostCommitEffectReservationResult.Rejected
-            check(storedAndReceipt.first.batchFingerprint == identity.batchFingerprint)
-            val record = HandleRecord(
-                privateToken = token,
-                identity = identity,
-                authorityFingerprint = encoded.authorityFingerprint,
-                batch = immutableBatch,
-                replayReceipt = storedAndReceipt.second,
-            )
-            handles[reservationId] = record
-            val reservation = Reservation(record, token)
-            RelayV2TerminalPostCommitEffectReservationResult.Reserved(identity, reservation)
+                        ),
+                    ) to null
+                } ?: return@withLock RelayV2TerminalPostCommitEffectReservationResult.Rejected
+                check(storedAndReceipt.first.batchFingerprint == identity.batchFingerprint)
+                val record = HandleRecord(
+                    privateToken = token,
+                    identity = identity,
+                    authorityFingerprint = encoded.authorityFingerprint,
+                    batch = immutableBatch,
+                    replayReceipt = storedAndReceipt.second,
+                )
+                handles[reservationId] = record
+                val reservation = Reservation(record, token)
+                RelayV2TerminalPostCommitEffectReservationResult.Reserved(identity, reservation)
+            }
+        } finally {
+            settlePendingTransferredCallbackAborts()
         }
     }
 
     override suspend fun abort(reservationId: String) {
-        mutex.withLock {
-            recoverLocked()
-            val record = handles[reservationId] ?: return@withLock
-            if (record.state != HandleState.INACTIVE) return@withLock
-            if (record.replayReceipt != null) {
-                retireLocked(record)
-                return@withLock
-            }
-            val removed = journal.transaction {
-                val row = batch(reservationId) ?: return@transaction false
-                if (row.ownerIncarnation != ownerIncarnation ||
-                    row.state != RelayV2TerminalPostCommitJournalState.RESERVED.name ||
-                    row.nextEffectIndex != 0 || row.runningEffectIndex != null
-                ) {
-                    return@transaction false
+        try {
+            mutex.withLock {
+                recoverLocked()
+                val record = handles[reservationId] ?: return@withLock
+                if (record.state != HandleState.INACTIVE) return@withLock
+                if (record.replayReceipt != null) {
+                    retireLocked(record)
+                    return@withLock
                 }
-                deleteBatch(reservationId)
+                val removed = journal.transaction {
+                    val row = batch(reservationId) ?: return@transaction false
+                    if (row.ownerIncarnation != ownerIncarnation ||
+                        row.state != RelayV2TerminalPostCommitJournalState.RESERVED.name ||
+                        row.nextEffectIndex != 0 || row.runningEffectIndex != null
+                    ) {
+                        return@transaction false
+                    }
+                    deleteBatch(reservationId)
+                }
+                if (removed) retireLocked(record) else poisonAuthorityLocked(record)
             }
-            if (removed) retireLocked(record) else poisonAuthorityLocked(record)
+        } finally {
+            settlePendingTransferredCallbackAborts()
         }
     }
 
@@ -215,17 +234,36 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
     ) {
         requireAuthorityMatchesKey(authority, key)
         val fingerprint = RelayV2TerminalPostCommitBatchCodec.ownerFingerprint(authority, key)
-        mutex.withLock {
-            recoverLocked()
-            if (globallyClosed) return@withLock
-            journal.transaction {
-                fenceExactOrClose(authority, key, fingerprint)
-                markAuthorityUnknown(fingerprint)
+        var gatesToAbort = emptyList<RelayV2TerminalTransferredCallbackGate>()
+        try {
+            mutex.withLock {
+                val matching = handles.values.filter {
+                    it.authorityFingerprint == fingerprint
+                }
+                gatesToAbort = matching.flatMap(::takeTransferredCallbackGatesLocked)
+                try {
+                    recoverLocked()
+                    if (!globallyClosed) {
+                        journal.transaction {
+                            fenceExactOrClose(authority, key, fingerprint)
+                            markAuthorityUnknown(fingerprint)
+                        }
+                    }
+                } finally {
+                    matching.forEach {
+                        it.state = HandleState.TERMINAL
+                    }
+                    handles.entries.removeAll {
+                        it.value.authorityFingerprint == fingerprint
+                    }
+                    gatesToAbort += takePendingTransferredCallbackAbortsLocked()
+                }
             }
-            handles.values.filter { it.authorityFingerprint == fingerprint }.forEach {
-                it.state = HandleState.TERMINAL
-            }
-            handles.entries.removeAll { it.value.authorityFingerprint == fingerprint }
+        } finally {
+            settleTransferredCallbackGates(
+                gatesToAbort,
+                RelayV2TerminalTransferredCallbackSettlement.ABORTED,
+            )
         }
     }
 
@@ -233,20 +271,24 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         key: RelayV2TerminalCheckpointKey,
         activation: RelayV2TerminalParserEffectActivation,
     ) {
-        mutex.withLock {
-            recoverLocked()
-            if (globallyClosed) return@withLock
-            journal.transaction {
-                val row = batch(activation.reservationId) ?: return@transaction
-                if (row.batchFingerprint != activation.batchFingerprint || row.key() != key ||
-                    row.terminalReceipt() == null
-                ) {
-                    closeGloballyLocked()
-                    return@transaction
+        try {
+            mutex.withLock {
+                recoverLocked()
+                if (globallyClosed) return@withLock
+                journal.transaction {
+                    val row = batch(activation.reservationId) ?: return@transaction
+                    if (row.batchFingerprint != activation.batchFingerprint || row.key() != key ||
+                        row.terminalReceipt() == null
+                    ) {
+                        closeGloballyLocked()
+                        return@transaction
+                    }
+                    if (checkpointOwnsActivation(key, activation)) return@transaction
+                    check(deleteBatch(row.reservationId))
                 }
-                if (checkpointOwnsActivation(key, activation)) return@transaction
-                check(deleteBatch(row.reservationId))
             }
+        } finally {
+            settlePendingTransferredCallbackAborts()
         }
     }
 
@@ -255,7 +297,7 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         privateToken: Any,
     ): RelayV2TerminalPostCommitEffectActivationReceipt {
         record.replayReceipt?.let { replay ->
-            return mutex.withLock {
+            val receipt = mutex.withLock {
                 if (record.privateToken !== privateToken ||
                     handles[record.identity.reservationId] !== record ||
                     record.state != HandleState.INACTIVE
@@ -266,77 +308,131 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                     replay
                 }
             }
+            settlePendingTransferredCallbackAborts()
+            return receipt
         }
-        val admitted = mutex.withLock {
-            recoverLocked()
-            if (record.privateToken !== privateToken ||
-                handles[record.identity.reservationId] !== record ||
-                record.state != HandleState.INACTIVE
-            ) {
-                return@withLock null
-            }
-            if (globallyClosed) {
-                retireLocked(record)
-                return@withLock null
-            }
-            val outcome = journal.transaction {
-                val row = batch(record.identity.reservationId) ?: return@transaction null
-                if (!row.exactlyMatches(record, ownerIncarnation) ||
-                    fence(record.authorityFingerprint) != null
-                ) {
-                    return@transaction null
+        val admitted = try {
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    recoverLocked()
+                    if (record.privateToken !== privateToken ||
+                        handles[record.identity.reservationId] !== record ||
+                        record.state != HandleState.INACTIVE
+                    ) {
+                        return@withLock null
+                    }
+                    if (globallyClosed) {
+                        retireLocked(record)
+                        return@withLock null
+                    }
+                    val outcome = journal.transaction {
+                        val row = batch(record.identity.reservationId) ?: return@transaction null
+                        if (!row.exactlyMatches(record, ownerIncarnation) ||
+                            fence(record.authorityFingerprint) != null
+                        ) {
+                            return@transaction null
+                        }
+                        if (fifoHead()?.reservationId != row.reservationId) {
+                            check(
+                                updateBatch(
+                                    row.terminal(
+                                        RelayV2TerminalPostCommitJournalState.REJECTED,
+                                        nextEffectIndex = 0,
+                                    ),
+                                ),
+                            )
+                            return@transaction RelayV2TerminalPostCommitEffectActivationReceipt
+                                .REJECTED
+                        }
+                        RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED
+                    }
+                    if (outcome ==
+                        RelayV2TerminalPostCommitEffectActivationReceipt.REJECTED
+                    ) {
+                        retireLocked(record)
+                        return@withLock outcome
+                    }
+                    if (outcome == null) {
+                        poisonAuthorityLocked(record)
+                        return@withLock null
+                    }
+                    record.state = HandleState.ACTIVATING
+                    outcome
                 }
-                if (fifoHead()?.reservationId != row.reservationId) {
-                    check(
-                        updateBatch(
-                            row.terminal(
-                                RelayV2TerminalPostCommitJournalState.REJECTED,
-                                nextEffectIndex = 0,
-                            ),
-                        ),
-                    )
-                    return@transaction RelayV2TerminalPostCommitEffectActivationReceipt.REJECTED
-                }
-                RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED
             }
-            if (outcome == RelayV2TerminalPostCommitEffectActivationReceipt.REJECTED) {
-                retireLocked(record)
-                return@withLock outcome
-            }
-            if (outcome == null) {
-                poisonAuthorityLocked(record)
-                return@withLock null
-            }
-            record.state = HandleState.ACTIVATING
-            outcome
+        } catch (failure: Throwable) {
+            settlePendingTransferredCallbackAborts()
+            throw failure
         }
-        if (admitted == null) return RelayV2TerminalPostCommitEffectActivationReceipt.UNKNOWN
+        if (admitted == null) {
+            settlePendingTransferredCallbackAborts()
+            return RelayV2TerminalPostCommitEffectActivationReceipt.UNKNOWN
+        }
         if (admitted == RelayV2TerminalPostCommitEffectActivationReceipt.REJECTED) return admitted
 
         for (index in record.batch.effects.indices) {
-            val markedRunning = mutex.withLock { markRunningLocked(record, index) }
+            val markedRunning = try {
+                withContext(NonCancellable) {
+                    mutex.withLock { markRunningLocked(record, index) }
+                }
+            } catch (_: Throwable) {
+                return finishUnknown(record)
+            }
             if (!markedRunning) return finishUnknown(record)
 
             val executionReceipt = try {
-                withContext(executionContext) {
-                    executor.execute(
-                        RelayV2TerminalSynchronousEffectExecution(
-                            authority = record.batch.authority,
-                            key = record.batch.key,
-                            callbackToken = record.batch.callbackToken,
-                            effectIndex = index,
-                            effectCount = record.batch.effects.size,
-                            effect = record.batch.effects[index],
-                        ),
-                    )
+                withContext(NonCancellable) {
+                    val receipt = withContext(executionContext.minusKey(Job)) {
+                        executor.execute(
+                            RelayV2TerminalSynchronousEffectExecution(
+                                authority = record.batch.authority,
+                                key = record.batch.key,
+                                callbackToken = record.batch.callbackToken,
+                                effectIndex = index,
+                                effectCount = record.batch.effects.size,
+                                effect = record.batch.effects[index],
+                            ),
+                        )
+                    }
+                    mutex.withLock {
+                        receipt.transferredCallbackGate?.let {
+                            record.transferredCallbackGates += it
+                        }
+                    }
+                    receipt
                 }
             } catch (_: Throwable) {
                 return finishUnknown(record)
             }
 
-            val settled = withContext(NonCancellable) {
-                mutex.withLock { settleExecutionLocked(record, index, executionReceipt) }
+            val (settled, terminalGates) = try {
+                withContext(NonCancellable) {
+                    mutex.withLock {
+                        val receipt = settleExecutionLocked(record, index, executionReceipt)
+                        val gates = if (
+                            receipt != RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED ||
+                            index == record.batch.effects.lastIndex
+                        ) {
+                            takeTransferredCallbackGatesLocked(record) +
+                                takePendingTransferredCallbackAbortsLocked()
+                        } else {
+                            emptyList()
+                        }
+                        receipt to gates
+                    }
+                }
+            } catch (_: Throwable) {
+                return finishUnknown(record)
             }
+            val gatesSettled = settleTransferredCallbackGates(
+                terminalGates,
+                if (settled == RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED) {
+                    RelayV2TerminalTransferredCallbackSettlement.COMMITTED
+                } else {
+                    RelayV2TerminalTransferredCallbackSettlement.ABORTED
+                },
+            )
+            if (!gatesSettled) return finishUnknown(record)
             when (settled) {
                 RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED -> {
                     if (index == record.batch.effects.lastIndex) return settled
@@ -377,7 +473,7 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         if (globallyClosed || record.state != HandleState.ACTIVATING) {
             return poisonAuthorityLocked(record)
         }
-        return journal.transaction {
+        val settled = journal.transaction {
             val row = batch(record.identity.reservationId)
             if (row == null || fence(record.authorityFingerprint) != null ||
                 !row.exactlyMatches(record, ownerIncarnation) ||
@@ -386,9 +482,9 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
             ) {
                 return@transaction poisonAuthorityInTransaction(record)
             }
-            when (receipt) {
-                RelayV2TerminalSynchronousEffectExecutionReceipt.COMPLETED,
-                RelayV2TerminalSynchronousEffectExecutionReceipt
+            when (receipt.disposition) {
+                RelayV2TerminalSynchronousEffectExecutionReceipt.Disposition.COMPLETED,
+                RelayV2TerminalSynchronousEffectExecutionReceipt.Disposition
                     .TRANSFERRED_TO_DURABLE_CALLBACK,
                 -> {
                     if (index == record.batch.effects.lastIndex) {
@@ -400,7 +496,6 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                                 ),
                             ),
                         )
-                        retireLocked(record)
                         RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED
                     } else {
                         val advanced = updateBatch(
@@ -414,7 +509,9 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                         else RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED
                     }
                 }
-                RelayV2TerminalSynchronousEffectExecutionReceipt.REJECTED_WITHOUT_EXECUTION -> {
+                RelayV2TerminalSynchronousEffectExecutionReceipt.Disposition
+                    .REJECTED_WITHOUT_EXECUTION,
+                -> {
                     if (index == 0) {
                         check(
                             updateBatch(
@@ -424,7 +521,6 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                                 ),
                             ),
                         )
-                        retireLocked(record)
                         RelayV2TerminalPostCommitEffectActivationReceipt.REJECTED
                     } else {
                         poisonAuthorityInTransaction(record)
@@ -432,12 +528,30 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                 }
             }
         }
+        if (settled != RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED ||
+            index == record.batch.effects.lastIndex
+        ) {
+            retireLocked(record)
+        }
+        return settled
     }
 
     private suspend fun finishUnknown(
         record: HandleRecord,
     ): RelayV2TerminalPostCommitEffectActivationReceipt = withContext(NonCancellable) {
-        mutex.withLock { poisonAuthorityLocked(record) }
+        val gatesToAbort = mutex.withLock {
+            takeTransferredCallbackGatesLocked(record) +
+                takePendingTransferredCallbackAbortsLocked()
+        }
+        try {
+            mutex.withLock { poisonAuthorityLocked(record) }
+        } finally {
+            settleTransferredCallbackGates(
+                gatesToAbort,
+                RelayV2TerminalTransferredCallbackSettlement.ABORTED,
+            )
+            settlePendingTransferredCallbackAborts()
+        }
     }
 
     private suspend fun poisonAuthorityLocked(
@@ -459,7 +573,6 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
             record.authorityFingerprint,
         )
         markAuthorityUnknown(record.authorityFingerprint)
-        retireLocked(record)
         return RelayV2TerminalPostCommitEffectActivationReceipt.UNKNOWN
     }
 
@@ -683,8 +796,9 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
             updateBatch(row.terminal(RelayV2TerminalPostCommitJournalState.UNKNOWN))
         }
         globallyClosed = true
-        handles.values.forEach { it.state = HandleState.TERMINAL }
-        handles.clear()
+        handles.values.forEach {
+            transferredCallbackGatesPendingAbort += takeTransferredCallbackGatesLocked(it)
+        }
     }
 
     private fun entity(
@@ -801,6 +915,39 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         record.state = HandleState.TERMINAL
         handles.remove(record.identity.reservationId, record)
     }
+
+    private fun takeTransferredCallbackGatesLocked(
+        record: HandleRecord,
+    ): List<RelayV2TerminalTransferredCallbackGate> {
+        if (record.transferredCallbackGates.isEmpty()) return emptyList()
+        return record.transferredCallbackGates.toList().also {
+            record.transferredCallbackGates.clear()
+        }
+    }
+
+    private fun takePendingTransferredCallbackAbortsLocked():
+        List<RelayV2TerminalTransferredCallbackGate> {
+        if (globallyClosed) {
+            handles.values.forEach {
+                transferredCallbackGatesPendingAbort += takeTransferredCallbackGatesLocked(it)
+                it.state = HandleState.TERMINAL
+            }
+            handles.clear()
+        }
+        if (transferredCallbackGatesPendingAbort.isEmpty()) return emptyList()
+        return transferredCallbackGatesPendingAbort.toList().also {
+            transferredCallbackGatesPendingAbort.clear()
+        }
+    }
+
+    private suspend fun settlePendingTransferredCallbackAborts() =
+        withContext(NonCancellable) {
+            val gates = mutex.withLock { takePendingTransferredCallbackAbortsLocked() }
+            settleTransferredCallbackGates(
+                gates,
+                RelayV2TerminalTransferredCallbackSettlement.ABORTED,
+            )
+        }
 
     private fun validReservationId(value: String): Boolean =
         value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= MAX_RESERVATION_ID_BYTES

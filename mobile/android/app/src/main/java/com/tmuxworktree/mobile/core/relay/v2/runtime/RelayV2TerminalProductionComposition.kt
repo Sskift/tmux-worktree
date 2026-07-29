@@ -555,10 +555,16 @@ internal class RelayV2TerminalProductionComposition(
                     RelayV2TerminalExactGenerationSendResult.Sent
                 is RelayV2TerminalEffect.WriteParser,
                 is RelayV2TerminalEffect.ResetParser,
+                -> when (val result = runtime.handle(state.authority, effect)) {
+                    is RelayV2TerminalRuntimeApplyResult.ParserDispatched ->
+                        result.transferredCallbackGate.settle(
+                            RelayV2TerminalTransferredCallbackSettlement.COMMITTED,
+                        )
+                    else -> false
+                }
                 is RelayV2TerminalEffect.SendInput,
                 is RelayV2TerminalEffect.SendResize,
                 -> when (runtime.handle(state.authority, effect)) {
-                    is RelayV2TerminalRuntimeApplyResult.ParserDispatched,
                     is RelayV2TerminalRuntimeApplyResult.ControlCommitted,
                     -> true
                     else -> false
@@ -596,10 +602,11 @@ internal class RelayV2TerminalProductionComposition(
         when (val effect = execution.effect) {
             is RelayV2TerminalEffect.WriteParser,
             is RelayV2TerminalEffect.ResetParser,
-            -> when (runtime.handle(execution.authority, effect)) {
-                is RelayV2TerminalRuntimeApplyResult.ParserDispatched ->
+            -> when (val result = runtime.handle(execution.authority, effect)) {
+                is RelayV2TerminalRuntimeApplyResult.ParserDispatched -> {
                     RelayV2TerminalSynchronousEffectExecutionReceipt
-                        .TRANSFERRED_TO_DURABLE_CALLBACK
+                        .transferredToDurableCallback(result.transferredCallbackGate)
+                }
                 else -> RelayV2TerminalSynchronousEffectExecutionReceipt.REJECTED_WITHOUT_EXECUTION
             }
             is RelayV2TerminalEffect.SendInput,

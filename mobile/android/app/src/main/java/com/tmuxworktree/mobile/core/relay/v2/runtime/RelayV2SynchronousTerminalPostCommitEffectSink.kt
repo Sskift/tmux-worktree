@@ -13,14 +13,75 @@ import java.util.UUID
  *
  * [COMPLETED] means the exact effect completed before the executor returned.
  * [TRANSFERRED_TO_DURABLE_CALLBACK] means a parser mutation was registered only after its exact
- * callback claim became durable; it does not claim evaluateJavascript/xterm has completed.
+ * callback claim became durable; it does not claim evaluateJavascript/xterm has completed. An
+ * attached gate may be settled COMMITTED only after the sink has accepted and retired the current
+ * FIFO reservation, so its callback batch cannot overtake the effect that transferred ownership.
  * [REJECTED_WITHOUT_EXECUTION] proves that the executor performed no mutation and retained no
  * ownership for the exact effect.
  */
-internal enum class RelayV2TerminalSynchronousEffectExecutionReceipt {
-    COMPLETED,
-    TRANSFERRED_TO_DURABLE_CALLBACK,
-    REJECTED_WITHOUT_EXECUTION,
+internal enum class RelayV2TerminalTransferredCallbackSettlement {
+    COMMITTED,
+    ABORTED,
+}
+
+internal fun interface RelayV2TerminalTransferredCallbackGate {
+    /** Non-blocking and one-shot; false means this gate was already settled. */
+    fun settle(settlement: RelayV2TerminalTransferredCallbackSettlement): Boolean
+}
+
+internal fun settleTransferredCallbackGates(
+    gates: List<RelayV2TerminalTransferredCallbackGate>,
+    settlement: RelayV2TerminalTransferredCallbackSettlement,
+): Boolean {
+    var allSettled = true
+    gates.forEach { gate ->
+        val settled = try {
+            gate.settle(settlement)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!settled) allSettled = false
+    }
+    return allSettled
+}
+
+internal class RelayV2TerminalSynchronousEffectExecutionReceipt private constructor(
+    internal val disposition: Disposition,
+    internal val transferredCallbackGate: RelayV2TerminalTransferredCallbackGate?,
+) {
+    internal enum class Disposition {
+        COMPLETED,
+        TRANSFERRED_TO_DURABLE_CALLBACK,
+        REJECTED_WITHOUT_EXECUTION,
+    }
+
+    companion object {
+        val COMPLETED = RelayV2TerminalSynchronousEffectExecutionReceipt(
+            Disposition.COMPLETED,
+            transferredCallbackGate = null,
+        )
+        val TRANSFERRED_TO_DURABLE_CALLBACK =
+            RelayV2TerminalSynchronousEffectExecutionReceipt(
+                Disposition.TRANSFERRED_TO_DURABLE_CALLBACK,
+                transferredCallbackGate = null,
+            )
+        val REJECTED_WITHOUT_EXECUTION = RelayV2TerminalSynchronousEffectExecutionReceipt(
+            Disposition.REJECTED_WITHOUT_EXECUTION,
+            transferredCallbackGate = null,
+        )
+
+        fun transferredToDurableCallback(
+            gate: RelayV2TerminalTransferredCallbackGate?,
+        ): RelayV2TerminalSynchronousEffectExecutionReceipt =
+            if (gate == null) {
+                TRANSFERRED_TO_DURABLE_CALLBACK
+            } else {
+                RelayV2TerminalSynchronousEffectExecutionReceipt(
+                    Disposition.TRANSFERRED_TO_DURABLE_CALLBACK,
+                    gate,
+                )
+            }
+    }
 }
 
 /** Immutable context supplied for exactly one synchronous effect execution. */
@@ -85,6 +146,8 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
         val privateToken: Any,
         var state: ReservationState = ReservationState.INACTIVE,
         var teardownRequested: Boolean = false,
+        val transferredCallbackGates: MutableList<RelayV2TerminalTransferredCallbackGate> =
+            mutableListOf(),
     )
 
     private inner class Reservation(
@@ -112,34 +175,46 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
     override suspend fun reserve(
         reservationId: String,
         batch: RelayV2TerminalPostCommitEffectBatch,
-    ): RelayV2TerminalPostCommitEffectReservationResult = synchronized(monitor) {
-        if (!validReservationId(reservationId) || globallyClosed) {
-            return@synchronized RelayV2TerminalPostCommitEffectReservationResult.Rejected
-        }
-        val owner = AuthorityKey(batch.authority, batch.key)
-        if (owner in fencedAuthorities || fifo.size >= reservationCapacity) {
-            return@synchronized RelayV2TerminalPostCommitEffectReservationResult.Rejected
-        }
-        if (reservationId in reservationsById) {
-            closeAllLocked()
-            throw IllegalStateException("Terminal post-commit reservation identity was reused")
-        }
+    ): RelayV2TerminalPostCommitEffectReservationResult {
+        var gatesToAbort = emptyList<RelayV2TerminalTransferredCallbackGate>()
+        try {
+            return synchronized(monitor) {
+                if (!validReservationId(reservationId) || globallyClosed) {
+                    return@synchronized RelayV2TerminalPostCommitEffectReservationResult.Rejected
+                }
+                val owner = AuthorityKey(batch.authority, batch.key)
+                if (owner in fencedAuthorities || fifo.size >= reservationCapacity) {
+                    return@synchronized RelayV2TerminalPostCommitEffectReservationResult.Rejected
+                }
+                if (reservationId in reservationsById) {
+                    gatesToAbort = closeAllLocked()
+                    throw IllegalStateException(
+                        "Terminal post-commit reservation identity was reused",
+                    )
+                }
 
-        val immutableBatch = batch.copy(
-            effects = Collections.unmodifiableList(ArrayList(batch.effects)),
-        )
-        // The fingerprint is an opaque capability name. Exact batch binding comes from the
-        // private record/token below, not from a second terminal-effect serializer.
-        val identity = RelayV2TerminalPostCommitEffectReservationIdentity(
-            reservationId = reservationId,
-            batchFingerprint = "terminal-post-commit-${UUID.randomUUID()}",
-        )
-        val privateToken = Any()
-        val record = ReservationRecord(owner, identity, immutableBatch, privateToken)
-        val reservation = Reservation(record, privateToken)
-        fifo.addLast(record)
-        reservationsById[reservationId] = record
-        RelayV2TerminalPostCommitEffectReservationResult.Reserved(identity, reservation)
+                val immutableBatch = batch.copy(
+                    effects = Collections.unmodifiableList(ArrayList(batch.effects)),
+                )
+                // The fingerprint is an opaque capability name. Exact batch binding comes from
+                // the private record/token below, not from a second terminal-effect serializer.
+                val identity = RelayV2TerminalPostCommitEffectReservationIdentity(
+                    reservationId = reservationId,
+                    batchFingerprint = "terminal-post-commit-${UUID.randomUUID()}",
+                )
+                val privateToken = Any()
+                val record = ReservationRecord(owner, identity, immutableBatch, privateToken)
+                val reservation = Reservation(record, privateToken)
+                fifo.addLast(record)
+                reservationsById[reservationId] = record
+                RelayV2TerminalPostCommitEffectReservationResult.Reserved(identity, reservation)
+            }
+        } finally {
+            settleTransferredCallbackGates(
+                gatesToAbort,
+                RelayV2TerminalTransferredCallbackSettlement.ABORTED,
+            )
+        }
     }
 
     override suspend fun abort(reservationId: String) {
@@ -154,20 +229,21 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
         authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,
     ) {
-        synchronized(monitor) {
-            if (globallyClosed) return
+        val gatesToAbort = synchronized(monitor) {
+            if (globallyClosed) return@synchronized emptyList()
             val owner = AuthorityKey(authority, key)
             if (owner !in fencedAuthorities &&
                 fencedAuthorities.size >= fencedAuthorityCapacity
             ) {
-                closeAllLocked()
-                return
+                return@synchronized closeAllLocked()
             }
             fencedAuthorities += owner
+            val gates = mutableListOf<RelayV2TerminalTransferredCallbackGate>()
             val iterator = fifo.iterator()
             while (iterator.hasNext()) {
                 val record = iterator.next()
                 if (record.owner != owner) continue
+                gates += takeTransferredCallbackGatesLocked(record)
                 when (record.state) {
                     ReservationState.INACTIVE -> {
                         record.state = ReservationState.TORN_DOWN
@@ -183,7 +259,12 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
                     -> Unit
                 }
             }
+            gates
         }
+        settleTransferredCallbackGates(
+            gatesToAbort,
+            RelayV2TerminalTransferredCallbackSettlement.ABORTED,
+        )
     }
 
     override suspend fun acknowledgeCheckpointFinalized(
@@ -240,13 +321,38 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
                 receipt = RelayV2TerminalPostCommitEffectActivationReceipt.UNKNOWN
                 return@forEachIndexed
             }
-            when (executionReceipt) {
-                RelayV2TerminalSynchronousEffectExecutionReceipt.COMPLETED,
-                RelayV2TerminalSynchronousEffectExecutionReceipt
+            val transferredGate = executionReceipt.transferredCallbackGate
+            if (transferredGate != null) {
+                val captured = synchronized(monitor) {
+                    if (record.state != ReservationState.ACTIVATING ||
+                        record.teardownRequested ||
+                        globallyClosed ||
+                        record.owner in fencedAuthorities
+                    ) {
+                        false
+                    } else {
+                        record.transferredCallbackGates += transferredGate
+                        true
+                    }
+                }
+                if (!captured) {
+                    transferredGate.settle(
+                        RelayV2TerminalTransferredCallbackSettlement.ABORTED,
+                    )
+                    receipt = RelayV2TerminalPostCommitEffectActivationReceipt.UNKNOWN
+                    return@forEachIndexed
+                }
+            }
+            when (executionReceipt.disposition) {
+                RelayV2TerminalSynchronousEffectExecutionReceipt.Disposition.COMPLETED,
+                RelayV2TerminalSynchronousEffectExecutionReceipt.Disposition
                     .TRANSFERRED_TO_DURABLE_CALLBACK,
-                ->
+                -> {
                     completedEffects += 1
-                RelayV2TerminalSynchronousEffectExecutionReceipt.REJECTED_WITHOUT_EXECUTION -> {
+                }
+                RelayV2TerminalSynchronousEffectExecutionReceipt.Disposition
+                    .REJECTED_WITHOUT_EXECUTION,
+                -> {
                     receipt = if (completedEffects == 0) {
                         RelayV2TerminalPostCommitEffectActivationReceipt.REJECTED
                     } else {
@@ -256,7 +362,7 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
             }
         }
 
-        return synchronized(monitor) {
+        val (finalReceipt, transferredGates) = synchronized(monitor) {
             val finalReceipt = if (record.teardownRequested ||
                 globallyClosed ||
                 record.owner in fencedAuthorities
@@ -265,6 +371,7 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
             } else {
                 receipt
             }
+            val transferredGates = takeTransferredCallbackGatesLocked(record)
             retireLocked(
                 record,
                 when (finalReceipt) {
@@ -276,8 +383,26 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
                         ReservationState.UNKNOWN
                 },
             )
-            finalReceipt
+            finalReceipt to transferredGates
         }
+        val gatesSettled = settleTransferredCallbackGates(
+            transferredGates,
+            if (finalReceipt == RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED) {
+                RelayV2TerminalTransferredCallbackSettlement.COMMITTED
+            } else {
+                RelayV2TerminalTransferredCallbackSettlement.ABORTED
+            },
+        )
+        if (!gatesSettled &&
+            finalReceipt == RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED
+        ) {
+            teardownAuthority(record.owner.authority, record.owner.key)
+            return RelayV2TerminalPostCommitEffectActivationReceipt.UNKNOWN
+        }
+        if (finalReceipt != RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED) {
+            return finalReceipt
+        }
+        return finalReceipt
     }
 
     private fun teardownRequested(record: ReservationRecord): Boolean = synchronized(monitor) {
@@ -293,12 +418,23 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
         fifo.remove(record)
     }
 
-    private fun closeAllLocked() {
+    private fun takeTransferredCallbackGatesLocked(
+        record: ReservationRecord,
+    ): List<RelayV2TerminalTransferredCallbackGate> {
+        if (record.transferredCallbackGates.isEmpty()) return emptyList()
+        return record.transferredCallbackGates.toList().also {
+            record.transferredCallbackGates.clear()
+        }
+    }
+
+    private fun closeAllLocked(): List<RelayV2TerminalTransferredCallbackGate> {
         globallyClosed = true
         fencedAuthorities.clear()
+        val gates = mutableListOf<RelayV2TerminalTransferredCallbackGate>()
         val iterator = fifo.iterator()
         while (iterator.hasNext()) {
             val record = iterator.next()
+            gates += takeTransferredCallbackGatesLocked(record)
             if (record.state == ReservationState.ACTIVATING) {
                 record.teardownRequested = true
             } else {
@@ -307,6 +443,7 @@ internal class RelayV2SynchronousTerminalPostCommitEffectSink(
                 iterator.remove()
             }
         }
+        return gates
     }
 
     private fun validReservationId(value: String): Boolean =
