@@ -10,6 +10,7 @@ import {
   request as nodeHttpsRequest,
 } from "node:https";
 import { createConnection, createServer } from "node:net";
+import { connect as createTlsConnection } from "node:tls";
 import test from "node:test";
 import { WebSocket } from "ws";
 
@@ -441,11 +442,20 @@ function upgradeAttempt(port, { role, token }) {
   return { socket, outcome };
 }
 
-function connectV2(port, { role = "host", token = `twcap2.${role}` } = {}) {
+function connectV2(port, {
+  role = "host",
+  token = `twcap2.${role}`,
+  secure = false,
+  createConnection: createWebSocketConnection,
+} = {}) {
   const path = role === "host" ? "/host" : "/client";
   const protocol = role === "host" ? "tw-relay.host.v2" : "tw-relay.v2";
-  const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`, protocol, {
+  const socket = new WebSocket(`${secure ? "wss" : "ws"}://127.0.0.1:${port}${path}`, protocol, {
     headers: { Authorization: `Bearer ${token}` },
+    ...(secure ? { ca: TEST_LOOPBACK_CERT_PEM } : {}),
+    ...(createWebSocketConnection
+      ? { createConnection: createWebSocketConnection }
+      : {}),
   });
   const messages = [];
   const waiters = [];
@@ -538,8 +548,13 @@ async function registerFakeHost(
   port,
   token = "twcap2.host-online",
   helloOverrides = {},
+  connectionOptions = {},
 ) {
-  const connection = connectV2(port, { role: "host", token });
+  const connection = connectV2(port, {
+    role: "host",
+    token,
+    ...connectionOptions,
+  });
   await connection.opened;
   const hello = fakeHostHello(helloOverrides);
   connection.socket.send(carrierFrame(hello), { binary: false });
@@ -706,26 +721,28 @@ test("public v2 HTTPS root claims one listener lifecycle and drains every termin
   assert.equal(externalCloseAuthority.closed, true);
 });
 
-test("public v2 HTTPS root owns client errors without shutting down the listener", async () => {
-  const callerOwnedServer = createHttpsServer();
-  callerOwnedServer.on("clientError", () => undefined);
-  const callerOwnedFake = fakeComposition();
-  let callerOwnedOpenCount = 0;
-  await assert.rejects(
-    startRelayV2BrokerPublicHttpsServer(
-      callerOwnedServer,
-      { host: "127.0.0.1", port: 0 },
-      {
-        ...callerOwnedFake.composition,
-        async openCredentialAuthority(input) {
-          callerOwnedOpenCount += 1;
-          return callerOwnedFake.composition.openCredentialAuthority(input);
+test("public v2 HTTPS root contains pre-handshake and upgraded TLS resets", async () => {
+  for (const eventName of ["clientError", "secureConnection"]) {
+    const callerOwnedServer = createHttpsServer();
+    callerOwnedServer.on(eventName, () => undefined);
+    const callerOwnedFake = fakeComposition();
+    let callerOwnedOpenCount = 0;
+    await assert.rejects(
+      startRelayV2BrokerPublicHttpsServer(
+        callerOwnedServer,
+        { host: "127.0.0.1", port: 0 },
+        {
+          ...callerOwnedFake.composition,
+          async openCredentialAuthority(input) {
+            callerOwnedOpenCount += 1;
+            return callerOwnedFake.composition.openCredentialAuthority(input);
+          },
         },
-      },
-    ),
-    /already has a listener owner/,
-  );
-  assert.equal(callerOwnedOpenCount, 0);
+      ),
+      /already has a listener owner/,
+    );
+    assert.equal(callerOwnedOpenCount, 0);
+  }
 
   const fake = fakeComposition();
   const server = createHttpsServer({
@@ -733,9 +750,12 @@ test("public v2 HTTPS root owns client errors without shutting down the listener
     cert: TEST_LOOPBACK_CERT_PEM,
   });
   const listen = server.listen;
-  let listenerCountAtListen = 0;
+  let listenerCountsAtListen;
   server.listen = function (...args) {
-    listenerCountAtListen = this.listenerCount("clientError");
+    listenerCountsAtListen = {
+      clientError: this.listenerCount("clientError"),
+      secureConnection: this.listenerCount("secureConnection"),
+    };
     return Reflect.apply(listen, this, args);
   };
   const handle = await startRelayV2BrokerPublicHttpsServer(
@@ -744,10 +764,17 @@ test("public v2 HTTPS root owns client errors without shutting down the listener
     fake.composition,
   );
   const authority = await fake.opened.promise;
-  assert.equal(listenerCountAtListen, 1);
+  assert.deepEqual(listenerCountsAtListen, {
+    clientError: 1,
+    secureConnection: 2,
+  });
   assert.equal(server.listenerCount("clientError"), 1);
+  assert.equal(server.listenerCount("secureConnection"), 2);
   assert.equal(server.listenerCount("tlsClientError"), 1);
 
+  let host;
+  let firstClient;
+  let secondClient;
   try {
     for (let index = 0; index < 20; index += 1) {
       const tlsClientError = new Promise((resolve) => {
@@ -771,6 +798,78 @@ test("public v2 HTTPS root owns client errors without shutting down the listener
       await new Promise((resolve) => setImmediate(resolve));
     }
 
+    host = await registerFakeHost(
+      handle.port,
+      "twcap2.host-online",
+      {},
+      { secure: true },
+    );
+    let clientTcpSocket;
+    firstClient = connectV2(handle.port, {
+      role: "client",
+      token: "twcap2.client-online",
+      secure: true,
+      createConnection(options) {
+        clientTcpSocket = createConnection({
+          host: options.host,
+          port: options.port,
+        });
+        return createTlsConnection({
+          ...options,
+          path: undefined,
+          servername: "",
+          socket: clientTcpSocket,
+        });
+      },
+    });
+    await firstClient.opened;
+    const firstRoute = decodeFrame(
+      "carrier",
+      await within(host.nextMessage(), "first secure route.open"),
+    );
+    assert.equal(firstRoute.type, "route.open");
+    host.socket.send(carrierFrame(routeOpenedFrame(firstRoute)), { binary: false });
+    assert.equal(
+      decodeFrame(
+        "public",
+        await within(firstClient.nextMessage(), "first secure relay.welcome"),
+      ).type,
+      "relay.welcome",
+    );
+
+    const clientTlsSocket = firstClient.socket._socket;
+    assert.equal(clientTlsSocket.encrypted, true);
+    assert.equal(typeof clientTcpSocket?.resetAndDestroy, "function");
+    const firstClientClosed = new Promise((resolve) => {
+      firstClient.socket.once("close", resolve);
+    });
+    clientTcpSocket.resetAndDestroy();
+    await within(firstClientClosed, "upgraded TLS reset close");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    secondClient = connectV2(handle.port, {
+      role: "client",
+      token: "twcap2.client-reconnected",
+      secure: true,
+    });
+    await secondClient.opened;
+    let secondRoute;
+    while (!secondRoute) {
+      const frame = decodeFrame(
+        "carrier",
+        await within(host.nextMessage(), "reconnected secure route.open"),
+      );
+      if (frame.type === "route.open") secondRoute = frame;
+    }
+    host.socket.send(carrierFrame(routeOpenedFrame(secondRoute)), { binary: false });
+    assert.equal(
+      decodeFrame(
+        "public",
+        await within(secondClient.nextMessage(), "reconnected secure relay.welcome"),
+      ).type,
+      "relay.welcome",
+    );
+
     const probeStatus = await new Promise((resolve, reject) => {
       const request = nodeHttpsRequest({
         host: "127.0.0.1",
@@ -789,9 +888,13 @@ test("public v2 HTTPS root owns client errors without shutting down the listener
     assert.equal(server.listening, true);
     assert.equal(authority.closed, false);
   } finally {
+    firstClient?.socket.terminate();
+    secondClient?.socket.terminate();
+    host?.socket.terminate();
     await handle.shutdown();
   }
   assert.equal(server.listenerCount("clientError"), 0);
+  assert.equal(server.listenerCount("secureConnection"), 1);
   assert.equal(server.listenerCount("tlsClientError"), 1);
   assert.equal(authority.closed, true);
 });

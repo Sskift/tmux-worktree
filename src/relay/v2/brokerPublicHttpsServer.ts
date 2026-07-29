@@ -6,6 +6,7 @@ import type {
   ServerResponse,
 } from "node:http";
 import type { Socket } from "node:net";
+import type { TLSSocket } from "node:tls";
 
 import type { RelayV2BrokerServerRuntimeV2 } from "./brokerServerRuntime.js";
 
@@ -56,6 +57,9 @@ function assertAvailableHttpsServer(server: unknown): asserts server is NodeHttp
     || server.listenerCount("request") !== 0
     || server.listenerCount("upgrade") !== 0
     || server.listenerCount("clientError") !== 0
+    // node:https owns one internal secureConnection adapter. Any additional
+    // listener at claim time belongs to the caller.
+    || server.listenerCount("secureConnection") !== 1
   ) {
     throw new Error(
       "Relay v2 Broker public HTTPS Server already has a listener owner",
@@ -141,6 +145,16 @@ function waitForResponseSettlement(response: ServerResponse): Promise<void> {
   });
 }
 
+function isExpectedPeerReset(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  try {
+    const code = Reflect.getOwnPropertyDescriptor(error, "code");
+    return Boolean(code && Object.hasOwn(code, "value") && code.value === "ECONNRESET");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Process-local lifecycle root used by the public relayServer facade. The
  * supplied HTTPS Server is consumed for one listener lifetime. Runtime
@@ -177,7 +191,10 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
 
   const server = serverInput;
   const activeRequests = new Set<Promise<void>>();
+  const activeSecureSockets = new Map<TLSSocket, Promise<void>>();
   const guardedClientSockets = new WeakSet<Socket>();
+  let secureSocketCloseFailed = false;
+  let forceSecureSocketClose = false;
   let shuttingDown = false;
   let didListen = false;
   let closeObserved = false;
@@ -262,10 +279,57 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
     try { socket.destroy(); } catch {}
   };
 
+  const onSecureConnection = (socket: TLSSocket): void => {
+    let unexpectedError = false;
+    let settled = false;
+    let resolveSettled!: () => void;
+    let rejectSettled!: (error: Error) => void;
+    const socketSettled = new Promise<void>((resolve, reject) => {
+      resolveSettled = resolve;
+      rejectSettled = reject;
+    });
+    void socketSettled.catch(() => undefined);
+    const onSocketError = (error: unknown): void => {
+      if (!isExpectedPeerReset(error)) {
+        unexpectedError = true;
+        secureSocketCloseFailed = true;
+      }
+      try { socket.destroy(); } catch {
+        unexpectedError = true;
+        secureSocketCloseFailed = true;
+      }
+    };
+    const onSocketClose = (): void => {
+      if (settled) return;
+      settled = true;
+      socket.off("error", onSocketError);
+      socket.off("close", onSocketClose);
+      activeSecureSockets.delete(socket);
+      if (unexpectedError) {
+        rejectSettled(new Error("Relay v2 Broker TLS transport close failed"));
+      } else {
+        resolveSettled();
+      }
+    };
+    activeSecureSockets.set(socket, socketSettled);
+    socket.on("error", onSocketError);
+    socket.on("close", onSocketClose);
+    if (socket.destroyed) {
+      onSocketClose();
+    } else if (forceSecureSocketClose) {
+      try { socket.destroy(); } catch {
+        unexpectedError = true;
+        secureSocketCloseFailed = true;
+        onSocketClose();
+      }
+    }
+  };
+
   const removeOwnedListeners = (): void => {
     server.off("request", onRequest);
     server.off("upgrade", onUpgrade);
     server.off("clientError", onClientError);
+    server.off("secureConnection", onSecureConnection);
     server.off("error", onServerError);
     server.off("close", onServerClose);
   };
@@ -301,15 +365,31 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
       while (activeRequests.size > 0) {
         await Promise.all([...activeRequests]);
       }
-      const outcomes = await Promise.allSettled([
-        runtime.shutdown(),
-        serverClosed,
-      ]);
+      const [runtimeOutcome] = await Promise.allSettled([runtime.shutdown()]);
+      forceSecureSocketClose = true;
+      for (const socket of activeSecureSockets.keys()) {
+        try { socket.destroy(); } catch {
+          secureSocketCloseFailed = true;
+        }
+      }
+      try { server.closeAllConnections(); } catch {
+        secureSocketCloseFailed = true;
+      }
+      const [serverOutcome] = await Promise.allSettled([serverClosed]);
+      const secureSocketOutcomes: PromiseSettledResult<void>[] = [];
+      while (activeSecureSockets.size > 0) {
+        const pending = [...activeSecureSockets.values()];
+        secureSocketOutcomes.push(...await Promise.allSettled(pending));
+      }
       removeOwnedListeners();
-      const failure = outcomes.find(
-        (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
-      );
-      if (failure) throw failure.reason;
+      if (runtimeOutcome?.status === "rejected") throw runtimeOutcome.reason;
+      if (serverOutcome?.status === "rejected") throw serverOutcome.reason;
+      if (
+        secureSocketCloseFailed
+        || secureSocketOutcomes.some((outcome) => outcome.status === "rejected")
+      ) {
+        throw new Error("Relay v2 Broker TLS transport close failed");
+      }
     });
     void shutdownPromise.catch(() => undefined);
     return shutdownPromise;
@@ -330,6 +410,7 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
   server.on("request", onRequest);
   server.on("upgrade", onUpgrade);
   server.on("clientError", onClientError);
+  server.prependListener("secureConnection", onSecureConnection);
   server.on("close", onServerClose);
   server.on("error", onServerError);
 
