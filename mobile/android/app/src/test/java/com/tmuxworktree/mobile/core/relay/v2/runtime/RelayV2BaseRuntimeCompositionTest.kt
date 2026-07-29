@@ -1753,6 +1753,94 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `retry OnlineReady republishes unchanged Room state with fresh product cuts`() =
+        runBlocking {
+            val retry = ControlledRetryDelay()
+            val staleClear = NonOnlineProjectionClearGate()
+            val projectionReads = ProjectionPublishProbe()
+            val harness = Harness(
+                autoConnect = true,
+                retryDelayBlock = retry::awaitDelay,
+                beforeSessionProjectionPublish = projectionReads::observe,
+                beforeNonOnlineProjectionClear = staleClear::awaitRelease,
+            )
+            try {
+                harness.connectOnline()
+                val initial = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first {
+                        it.scopes.singleOrNull()?.createCut != null &&
+                            it.sessions.size == 1
+                    }
+                }
+                val oldScope = initial.scopes.single()
+                val oldScopeCut = checkNotNull(oldScope.createCut)
+                val oldSession = initial.sessions.single()
+
+                staleClear.arm()
+                harness.transport().fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                assertTrue(staleClear.entered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                assertTrue(retry.awaitCount(1))
+                assertEquals(
+                    RelayV2SessionReplyResult.Rejected(
+                        RelayV2SessionReplyFailure.NOT_ONLINE,
+                    ),
+                    harness.composition.submitReply(oldSession.replyCut, "stale reply"),
+                )
+                assertEquals(
+                    RelayV2ScopeCreateResult.Rejected(
+                        RelayV2ScopeCreateFailure.NOT_ONLINE,
+                    ),
+                    harness.composition.submitCreateTerminal(
+                        oldScopeCut,
+                        RelayV2CreateTerminalInputs(
+                            cwd = "/work/project-a",
+                            label = "stale terminal",
+                        ),
+                    ),
+                )
+
+                retry.release(0)
+                harness.openThroughHostWelcome(1)
+                withTimeout(TIMEOUT_MS) { projectionReads.secondPublish.await() }
+                val republished = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { projection ->
+                        projection.scopes.singleOrNull()?.createCut?.let {
+                            it !== oldScopeCut
+                        } == true &&
+                            projection.sessions.singleOrNull()?.replyCut?.let {
+                                it !== oldSession.replyCut
+                            } == true
+                    }
+                }
+                staleClear.release.countDown()
+
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+                val restored = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { projection ->
+                        projection.scopes.singleOrNull()?.createCut ===
+                            republished.scopes.single().createCut &&
+                            projection.sessions.singleOrNull()?.replyCut ===
+                            republished.sessions.single().replyCut
+                    }
+                }
+                assertEquals(oldScope.materialized, restored.scopes.single().materialized)
+                assertEquals(oldSession.materialized, restored.sessions.single().materialized)
+                assertEquals(2, harness.authority.productProjectionReads.get())
+                assertEquals(
+                    RelayV2SessionReplyResult.Rejected(
+                        RelayV2SessionReplyFailure.NOT_ONLINE,
+                    ),
+                    harness.composition.submitReply(oldSession.replyCut, "still stale"),
+                )
+            } finally {
+                staleClear.release.countDown()
+                harness.close()
+            }
+        }
+
+    @Test
     fun `resync snapshot mutation waits for an entered reply enqueue commit`() = runBlocking {
         val resyncGate = BeforeHelloAdmissionGate()
         val harness = Harness(
@@ -2641,6 +2729,7 @@ class RelayV2BaseRuntimeCompositionTest {
         beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
         beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
         beforeSessionProjectionPublish: suspend () -> Unit = {},
+        beforeNonOnlineProjectionClear: () -> Unit = {},
         beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
         afterRetryableFailureAdmissionDetached: () -> Unit = {},
         beforeOutboxRead: suspend (Int) -> Unit = {},
@@ -2721,6 +2810,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
                 beforeTerminalRecoveryAdmission = beforeTerminalRecoveryAdmission,
                 beforeSessionProjectionPublish = beforeSessionProjectionPublish,
+                beforeNonOnlineProjectionClear = beforeNonOnlineProjectionClear,
                 beforeOnlineResyncReceiptSubmit = beforeOnlineResyncReceiptSubmit,
                 afterRetryableFailureAdmissionDetached =
                     afterRetryableFailureAdmissionDetached,
@@ -3278,6 +3368,33 @@ class RelayV2BaseRuntimeCompositionTest {
         }
     }
 
+    private class ProjectionPublishProbe {
+        private val publishes = AtomicInteger()
+        val secondPublish = CompletableDeferred<Unit>()
+
+        suspend fun observe() {
+            if (publishes.incrementAndGet() == 2) secondPublish.complete(Unit)
+        }
+    }
+
+    private class NonOnlineProjectionClearGate {
+        private val state = AtomicInteger()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+
+        fun arm() {
+            check(state.compareAndSet(0, 1))
+        }
+
+        fun awaitRelease() {
+            if (!state.compareAndSet(1, 2)) return
+            entered.countDown()
+            check(release.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                "Timed out holding stale non-ONLINE product projection clear"
+            }
+        }
+    }
+
     private class RetryScheduleClaimGate {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -3351,6 +3468,7 @@ class RelayV2BaseRuntimeCompositionTest {
         val statusCommits = AtomicInteger()
         val enqueueCommits = AtomicInteger()
         val materializedSessionCutReads = AtomicInteger()
+        val productProjectionReads = AtomicInteger()
         val freshBatchSizes = CopyOnWriteArrayList<Int>()
         val stateEventApplyEntered = CompletableDeferred<Unit>()
         val releaseStateEventApply = CompletableDeferred<Unit>()
@@ -3412,8 +3530,14 @@ class RelayV2BaseRuntimeCompositionTest {
 
         override suspend fun readMaterializedSessionCuts(
             namespace: RelayV2StateNamespace,
-        ): List<RelayV2MaterializedSessionReadCut> =
-            if (includeMaterializedSession) listOf(materializedSession(namespace)) else emptyList()
+        ): List<RelayV2MaterializedSessionReadCut> {
+            productProjectionReads.incrementAndGet()
+            return if (includeMaterializedSession) {
+                listOf(materializedSession(namespace))
+            } else {
+                emptyList()
+            }
+        }
 
         override suspend fun readMaterializedSessionCut(
             namespace: RelayV2StateNamespace,

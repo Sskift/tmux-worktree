@@ -312,6 +312,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
     private val beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
     private val beforeSessionProjectionPublish: suspend () -> Unit = {},
+    private val beforeNonOnlineProjectionClear: () -> Unit = {},
     private val beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
     private val afterRetryableFailureAdmissionDetached: () -> Unit = {},
     private val afterActorConnectAdmissionHandoff: () -> Unit = {},
@@ -1978,7 +1979,13 @@ internal class RelayV2BaseRuntimeComposition(
                     beforeSessionProjectionPublish()
                     val published = !closed.get() && terminalFailure.get() == null &&
                         actor.runIfCurrent(issued) {
-                            _productProjection.value = projection
+                            // State and effect are independent collectors. Serialize this exact
+                            // OnlineReady publication with stale non-ONLINE projection clears.
+                            synchronized(stateLock) {
+                                if (!closed.get() && terminalFailure.get() == null) {
+                                    _productProjection.value = projection
+                                }
+                            }
                         }
                     if (!published) {
                         clearSessionProjection()
@@ -2506,15 +2513,17 @@ internal class RelayV2BaseRuntimeComposition(
         } else {
             actorState.failure?.let(RelayV2BaseRuntimeFailure::Connection)
         }
-        if (phase != RelayV2BaseRuntimePhase.ONLINE &&
+        val clearProjection = phase != RelayV2BaseRuntimePhase.ONLINE &&
             phase != RelayV2BaseRuntimePhase.SUSPENDED
-        ) {
-            clearSessionProjection()
-        }
+        if (clearProjection) beforeNonOnlineProjectionClear()
         synchronized(stateLock) {
-            if (!closed.get() && terminalFailure.get() == null) {
-                _state.value = RelayV2BaseRuntimeState(phase, failure)
-            }
+            // A collected pre-ready value may resume after the actor and Room publication have
+            // already advanced. Only the actor's still-current state may clear product cuts.
+            if (closed.get() || terminalFailure.get() != null ||
+                actor.state.value != actorState
+            ) return
+            if (clearProjection) clearSessionProjection()
+            _state.value = RelayV2BaseRuntimeState(phase, failure)
         }
     }
 
