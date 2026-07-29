@@ -6528,6 +6528,18 @@ internal class RelayV2ConnectionActor(
             "sessions.changed",
         )
 
+        private val TERMINAL_HOST_TO_CLIENT_INBOUND_TYPES = setOf(
+            "terminal.opened",
+            "terminal.output",
+            "terminal.replay_started",
+            "terminal.reset_required",
+            "terminal.input_ack",
+            "terminal.input_error",
+            "terminal.resize_ack",
+            "terminal.resize_error",
+            "terminal.closed",
+        )
+
         private val QUERYING_INBOUND_TYPES = POST_HANDSHAKE_COMMON_INBOUND_TYPES
 
         private val RESYNCING_INBOUND_TYPES = POST_HANDSHAKE_COMMON_INBOUND_TYPES + setOf(
@@ -6537,7 +6549,7 @@ internal class RelayV2ConnectionActor(
 
         private val ONLINE_INBOUND_TYPES = POST_HANDSHAKE_COMMON_INBOUND_TYPES + setOf(
             "state.snapshot.released",
-        )
+        ) + TERMINAL_HOST_TO_CLIENT_INBOUND_TYPES
 
         private val STATE_CHANGE_INBOUND_TYPES = setOf("scopes.changed", "sessions.changed")
 

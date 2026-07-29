@@ -6487,6 +6487,56 @@ class RelayV2ConnectionActorTest {
         }
 
     @Test
+    fun `online delivers Host terminal responses but rejects client terminal requests`() =
+        runBlocking {
+            val harness = Harness()
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val query = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        query,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = query.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+
+                val opened = fixture("terminal-opened")
+                opened.payload()["deduplicated"] = true
+                opened.payload()["resumeToken"] = "r".repeat(43)
+                transport.sendFrame(opened)
+                val delivered = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                assertEquals("terminal.opened", delivered.message.frame["type"])
+                val deliveredPayload = delivered.message.frame["payload"] as Map<*, *>
+                assertEquals("0", deliveredPayload["replayFromOffset"])
+                assertEquals("0", deliveredPayload["bufferStartOffset"])
+                assertEquals("0", deliveredPayload["tailOffset"])
+                assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+                assertTrue(transport.closeCodes.isEmpty())
+
+                transport.sendFixture("terminal-open-new")
+                val failed = harness.actor.awaitFailure(RelayV2FailureKind.SCHEMA)
+                assertEquals("INVALID_ENVELOPE", failed.failure?.code)
+                assertFalse(requireNotNull(failed.failure).retryable)
+                assertEquals(listOf(4400), transport.closeCodes)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
     fun `post-handshake direction and phase allowlists protocol-close invalid inbound frames`() =
         runBlocking {
             val scopedHarness = Harness()
