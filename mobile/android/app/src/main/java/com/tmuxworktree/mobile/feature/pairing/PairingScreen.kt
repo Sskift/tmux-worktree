@@ -59,6 +59,7 @@ internal fun RelayV2EnrollmentReviewScreen(
     relayUrl: String,
     hostId: String,
     enrollmentId: String,
+    deviceLabel: String,
     submitting: Boolean,
     completed: Boolean,
     activating: Boolean,
@@ -110,6 +111,7 @@ internal fun RelayV2EnrollmentReviewScreen(
         EnrollmentReviewFact("Relay", relayUrl)
         EnrollmentReviewFact("Computer", hostId)
         EnrollmentReviewFact("Enrollment", enrollmentId)
+        EnrollmentReviewFact("Android device", deviceLabel)
 
         if (submitting || activating) {
             Spacer(Modifier.height(20.dp))

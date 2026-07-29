@@ -18,10 +18,10 @@ internal data class RelayV2EnrollmentReviewDraft(
     val enrollmentId: String,
     internal val enrollmentCode: String,
 ) {
-    fun confirm(deviceLabel: String?): RelayV2ConfirmedEnrollment =
+    fun confirm(deviceLabel: String): RelayV2ConfirmedEnrollment =
         RelayV2ConfirmedEnrollment(
             draft = this,
-            deviceLabel = deviceLabel?.trim()?.takeIf(String::isNotEmpty),
+            deviceLabel = deviceLabel.trim(),
         )
 
     override fun toString(): String =
@@ -31,24 +31,27 @@ internal data class RelayV2EnrollmentReviewDraft(
 
 internal data class RelayV2ConfirmedEnrollment(
     val draft: RelayV2EnrollmentReviewDraft,
-    val deviceLabel: String?,
+    val deviceLabel: String,
 ) {
     init {
-        require(deviceLabel == null || deviceLabel.toByteArray(Charsets.UTF_8).size <= MAX_DEVICE_LABEL_BYTES) {
-            "Device label is too long"
-        }
-        require(deviceLabel?.none { it == '\u0000' || it == '\r' || it == '\n' } != false) {
-            "Device label contains invalid characters"
-        }
+        requireValidRelayV2EnrollmentDeviceLabel(deviceLabel)
     }
 
     override fun toString(): String =
         "RelayV2ConfirmedEnrollment(draft=$draft, deviceLabel=$deviceLabel)"
+}
 
-    private companion object {
-        const val MAX_DEVICE_LABEL_BYTES = 128
+internal fun requireValidRelayV2EnrollmentDeviceLabel(deviceLabel: String) {
+    require(deviceLabel.isNotEmpty()) { "Device label is required" }
+    require(deviceLabel.toByteArray(Charsets.UTF_8).size <= MAX_DEVICE_LABEL_BYTES) {
+        "Device label is too long"
+    }
+    require(deviceLabel.none { it == '\u0000' || it == '\r' || it == '\n' }) {
+        "Device label contains invalid characters"
     }
 }
+
+private const val MAX_DEVICE_LABEL_BYTES = 128
 
 internal object RelayV2EnrollmentReviewParser {
     fun parse(raw: String?): RelayV2EnrollmentReviewDraft? {

@@ -1569,6 +1569,27 @@ internal class RelayV2ProfileRepository(
                 }
                 val pending = existing.pendingAttempt
                     ?: error("Enrollment credential has no pending attempt")
+                if (pending.kind == RelayV2CredentialAttemptKind.ENROLLMENT_EXCHANGE &&
+                    pending.enrollmentId == draft.enrollmentId &&
+                    pending.deviceLabel == null &&
+                    pending.secret == draft.enrollmentCode
+                ) {
+                    // Earlier Android builds could persist this attempt before their strict HTTPS
+                    // encoder rejected the missing required label. Upgrade only that exact,
+                    // pre-network attempt through the existing credential CAS owner.
+                    val labeled = existing.copy(
+                        pendingAttempt = pending.copy(deviceLabel = confirmed.deviceLabel),
+                    )
+                    when (credentialStore.compareAndSet(
+                        reference,
+                        existing.expectation(),
+                        labeled,
+                    )) {
+                        is RelayV2CredentialCasResult.Stale,
+                        is RelayV2CredentialCasResult.Updated,
+                        -> continue
+                    }
+                }
                 require(pending.kind == RelayV2CredentialAttemptKind.ENROLLMENT_EXCHANGE &&
                     pending.enrollmentId == draft.enrollmentId &&
                     pending.deviceLabel == confirmed.deviceLabel &&
@@ -2033,7 +2054,9 @@ internal class RelayV2ProfileRepository(
         enrollmentId = enrollmentId!!,
         enrollmentCode = secret,
         clientInstanceId = clientInstanceId,
-        deviceLabel = deviceLabel,
+        deviceLabel = requireNotNull(deviceLabel) {
+            "Enrollment attempt has no device label"
+        },
     )
 
     private sealed interface PreparedEnrollment {

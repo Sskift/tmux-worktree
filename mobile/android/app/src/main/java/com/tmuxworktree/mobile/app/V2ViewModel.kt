@@ -144,6 +144,7 @@ class V2ViewModel(
     private val relayV2EnrollmentReviewSession = RelayV2EnrollmentReviewSession(
         confirmationPort = RelayV2EnrollmentConfirmationPort(::confirmRelayV2Enrollment),
         activationPort = RelayV2EnrollmentActivationPort(::activateRelayV2Profile),
+        deviceLabel = container.relayV2EnrollmentDeviceLabel,
     )
     private val _relayV2EnrollmentReviewState = MutableStateFlow(
         relayV2EnrollmentReviewSession.state,

@@ -28,6 +28,7 @@ import com.tmuxworktree.mobile.designsystem.TwTheme
 import com.tmuxworktree.mobile.feature.connection.ConnectionHealthScreen
 import com.tmuxworktree.mobile.feature.inbox.InboxScreen
 import com.tmuxworktree.mobile.feature.pairing.PairingScreen
+import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
 import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
@@ -495,5 +496,34 @@ class CoreScreensInstrumentedTest {
             .assertIsDisplayed()
         composeRule.onNodeWithTag("pairing_connect")
             .assertIsNotEnabled()
+    }
+
+    @Test
+    fun relayV2EnrollmentReviewShowsTheOwnedDeviceLabelBeforeConfirm() {
+        var confirmCount = 0
+        composeRule.setContent {
+            TwTheme {
+                RelayV2EnrollmentReviewScreen(
+                    issuerUrl = "https://relay.example.com",
+                    relayUrl = "wss://relay.example.com/client",
+                    hostId = "mac-admin",
+                    enrollmentId = "enrollment-1",
+                    deviceLabel = "Pixel 9 Pro",
+                    submitting = false,
+                    completed = false,
+                    activating = false,
+                    activationFailureMessage = null,
+                    failureMessage = null,
+                    onConfirm = { confirmCount++ },
+                    onActivate = {},
+                    onCancel = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("Android device").assertIsDisplayed()
+        composeRule.onNodeWithText("Pixel 9 Pro").assertIsDisplayed()
+        composeRule.onNodeWithTag("relay_v2_enrollment_confirm").performClick()
+        composeRule.runOnIdle { assertEquals(1, confirmCount) }
     }
 }

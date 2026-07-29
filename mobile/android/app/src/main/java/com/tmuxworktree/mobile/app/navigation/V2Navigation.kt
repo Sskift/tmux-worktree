@@ -233,6 +233,7 @@ private fun RelayV2EnrollmentReviewGate(
         relayUrl = facts.relayUrl,
         hostId = facts.hostId,
         enrollmentId = facts.enrollmentId,
+        deviceLabel = facts.deviceLabel,
         submitting = state is RelayV2EnrollmentReviewState.Submitting,
         completed = state is RelayV2EnrollmentReviewState.Completed ||
             state is RelayV2EnrollmentReviewState.ActivationFailure,

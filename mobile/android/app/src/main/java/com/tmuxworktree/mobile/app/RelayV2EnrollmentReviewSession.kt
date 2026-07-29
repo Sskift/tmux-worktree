@@ -5,6 +5,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentReviewDraft
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentReviewParser
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.profile.requireValidRelayV2EnrollmentDeviceLabel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
@@ -29,6 +30,7 @@ internal data class RelayV2EnrollmentReviewFacts(
     val relayUrl: String,
     val hostId: String,
     val enrollmentId: String,
+    val deviceLabel: String,
 )
 
 internal sealed interface RelayV2EnrollmentReviewState {
@@ -86,17 +88,24 @@ internal enum class RelayV2EnrollmentActivateResult {
 internal class RelayV2EnrollmentReviewSession(
     private val confirmationPort: RelayV2EnrollmentConfirmationPort,
     private val activationPort: RelayV2EnrollmentActivationPort,
+    private val deviceLabel: String,
 ) {
     constructor(
+        deviceLabel: String,
         confirmationPort: RelayV2EnrollmentConfirmationPort,
     ) : this(
         confirmationPort,
         RelayV2EnrollmentActivationPort {
             error("Relay v2 enrollment activation port is unavailable")
         },
+        deviceLabel,
     )
 
     private val mutex = Mutex()
+
+    init {
+        requireValidRelayV2EnrollmentDeviceLabel(deviceLabel)
+    }
 
     @Volatile
     private var currentState: RelayV2EnrollmentReviewState = RelayV2EnrollmentReviewState.Idle
@@ -114,7 +123,9 @@ internal class RelayV2EnrollmentReviewSession(
                 return@withLock RelayV2EnrollmentOfferResult.REVIEW_ALREADY_PRESENT
             }
             privateDraft = parsed
-            currentState = RelayV2EnrollmentReviewState.Review(parsed.toReviewFacts())
+            currentState = RelayV2EnrollmentReviewState.Review(
+                parsed.toReviewFacts(deviceLabel),
+            )
             RelayV2EnrollmentOfferResult.ACCEPTED
         }
     }
@@ -135,7 +146,7 @@ internal class RelayV2EnrollmentReviewSession(
         }
     }
 
-    suspend fun confirm(deviceLabel: String? = null): RelayV2EnrollmentConfirmResult {
+    suspend fun confirm(): RelayV2EnrollmentConfirmResult {
         val submission = mutex.withLock {
             when (val observed = currentState) {
                 is RelayV2EnrollmentReviewState.Submitting ->
@@ -275,12 +286,15 @@ internal class RelayV2EnrollmentReviewSession(
     }
 }
 
-private fun RelayV2EnrollmentReviewDraft.toReviewFacts(): RelayV2EnrollmentReviewFacts =
+private fun RelayV2EnrollmentReviewDraft.toReviewFacts(
+    deviceLabel: String,
+): RelayV2EnrollmentReviewFacts =
     RelayV2EnrollmentReviewFacts(
         issuerUrl = issuerUrl,
         relayUrl = relayUrl,
         hostId = hostId,
         enrollmentId = enrollmentId,
+        deviceLabel = deviceLabel,
     )
 
 private const val FIXED_FAILURE_MESSAGE = "Relay v2 enrollment confirmation failed"

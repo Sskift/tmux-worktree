@@ -33,8 +33,19 @@ private object AndroidProcessProfileOwners {
     val refreshCoordinator = RelayV2RefreshCoordinator()
 }
 
-class AppContainer(context: Context) {
+class AppContainer internal constructor(
+    context: Context,
+    relayV2EnrollmentDeviceLabelSource: RelayV2EnrollmentDeviceLabelSource,
+) {
+    constructor(context: Context) : this(
+        context,
+        AndroidRelayV2EnrollmentDeviceLabelSource,
+    )
+
     private val appContext = context.applicationContext
+    internal val relayV2EnrollmentDeviceLabel: String = normalizedRelayV2EnrollmentDeviceLabel(
+        relayV2EnrollmentDeviceLabelSource.readDeviceModel(),
+    )
 
     val database: TwDatabase by lazy { TwDatabase.get(appContext) }
     val repository: TwRepository by lazy { TwRepository(database) }

@@ -686,6 +686,50 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `retry upgrades an exact pre-network pending enrollment that has no device label`() =
+        runBlocking {
+            val harness = Harness()
+            val confirmed = enrollmentDraft(
+                enrollmentId = "enrollment-missing-device-label",
+                enrollmentCode = "twenroll2.code-missing-device-label",
+            ).confirm(deviceLabel = "Pixel 9 Pro")
+            harness.credentials.failNextCasBeforeWriteCount = 2
+
+            assertTrue(runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure)
+            val (reference, pendingBlob) = harness.credentials.entries().entries.single()
+            val pending = requireNotNull(pendingBlob.pendingAttempt)
+            assertEquals("Pixel 9 Pro", pending.deviceLabel)
+            assertEquals(
+                RelayV2CredentialCasResult.Updated(pendingBlob.credentialVersion),
+                harness.credentials.compareAndSet(
+                    reference,
+                    RelayV2CredentialCasExpectation(
+                        credentialVersion = pendingBlob.credentialVersion,
+                        pendingAttemptId = pending.attemptId,
+                        pendingSecretReference = pending.secretReference,
+                    ),
+                    pendingBlob.copy(
+                        pendingAttempt = pending.copy(deviceLabel = null),
+                    ),
+                ),
+            )
+
+            harness.restartRepository()
+            val gate = harness.exchange.deferEnrollment(confirmed.draft.enrollmentId)
+            val retry = async { harness.repository.confirmEnrollment(confirmed) }
+            val request = withTimeout(1_000) { gate.request.await() }
+            assertEquals("Pixel 9 Pro", request.deviceLabel)
+            gate.response.complete(
+                harness.exchange.completedResponse(request.exchangeAttemptId),
+            )
+
+            assertTrue(retry.await() is RelayV2EnrollmentResult.Activated)
+            val completed = requireNotNull(harness.credentials.read(reference))
+            assertEquals(null, completed.pendingAttempt)
+            assertTrue(completed.hasCredentialMaterial)
+        }
+
+    @Test
     fun `startup admission recovers a completed journal then reconciles the exact winner`() =
         runBlocking {
             val harness = Harness()

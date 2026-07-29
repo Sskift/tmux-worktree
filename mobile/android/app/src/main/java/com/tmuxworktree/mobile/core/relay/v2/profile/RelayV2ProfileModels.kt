@@ -505,12 +505,13 @@ internal data class RelayV2EnrollmentExchangeRequest(
     val enrollmentId: String,
     val enrollmentCode: String,
     val clientInstanceId: String,
-    val deviceLabel: String?,
+    val deviceLabel: String,
 ) {
     init {
         require(RelayV2EndpointValidator.isIssuerUrl(issuerUrl)) {
             "Relay v2 issuer endpoint is invalid"
         }
+        requireValidRelayV2EnrollmentDeviceLabel(deviceLabel)
     }
 
     override fun toString(): String =

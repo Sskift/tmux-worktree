@@ -2,6 +2,8 @@ package com.tmuxworktree.mobile.app
 
 import com.tmuxworktree.mobile.PairingPayloadRoute
 import com.tmuxworktree.mobile.pairingPayloadRoute
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2HttpsSchema
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
@@ -39,7 +41,7 @@ class RelayV2EnrollmentReviewSessionTest {
     @Test
     fun `offer and cancel are network free and expose no enrollment code`() = runBlocking {
         val calls = AtomicInteger()
-        val session = RelayV2EnrollmentReviewSession {
+        val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
             calls.incrementAndGet()
             error("confirmation must not run")
         }
@@ -66,7 +68,7 @@ class RelayV2EnrollmentReviewSessionTest {
             val calls = AtomicInteger()
             val started = CompletableDeferred<Unit>()
             val release = CompletableDeferred<Unit>()
-            val session = RelayV2EnrollmentReviewSession {
+            val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
                 calls.incrementAndGet()
                 started.complete(Unit)
                 release.await()
@@ -74,10 +76,10 @@ class RelayV2EnrollmentReviewSessionTest {
             }
             assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
 
-            val first = async { session.confirm(deviceLabel = "Pixel") }
+            val first = async { session.confirm() }
             started.await()
             assertEquals(RelayV2EnrollmentReviewState.Submitting::class, session.state::class)
-            assertEquals(RelayV2EnrollmentConfirmResult.BUSY, session.confirm(deviceLabel = "Pixel"))
+            assertEquals(RelayV2EnrollmentConfirmResult.BUSY, session.confirm())
             assertEquals(1, calls.get())
 
             release.complete(Unit)
@@ -104,6 +106,7 @@ class RelayV2EnrollmentReviewSessionTest {
                 activationStarted.complete(Unit)
                 releaseActivation.await()
             },
+            deviceLabel = DEVICE_LABEL,
         )
         assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
         assertEquals(RelayV2EnrollmentConfirmResult.COMPLETED, session.confirm())
@@ -126,7 +129,7 @@ class RelayV2EnrollmentReviewSessionTest {
         val calls = AtomicInteger()
         val started = CompletableDeferred<Unit>()
         val neverCompletes = CompletableDeferred<Unit>()
-        val session = RelayV2EnrollmentReviewSession {
+        val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
             calls.incrementAndGet()
             started.complete(Unit)
             neverCompletes.await()
@@ -154,7 +157,7 @@ class RelayV2EnrollmentReviewSessionTest {
     fun `cancellation after a successful port return settles state before propagating`() =
         runBlocking {
             val calls = AtomicInteger()
-            val session = RelayV2EnrollmentReviewSession {
+            val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
                 calls.incrementAndGet()
                 currentCoroutineContext()[Job]!!.cancel(
                     CancellationException("cancel after side effect"),
@@ -178,7 +181,7 @@ class RelayV2EnrollmentReviewSessionTest {
     @Test
     fun `pair malformed and replacement payloads cannot overwrite an existing review`() =
         runBlocking {
-            val session = RelayV2EnrollmentReviewSession {
+            val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
                 error("confirmation must not run")
             }
             assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
@@ -199,6 +202,38 @@ class RelayV2EnrollmentReviewSessionTest {
                 session.offer(enrollmentPayload(enrollmentId = "replacement-enrollment")),
             )
             assertEquals(original, session.state)
+        }
+
+    @Test
+    fun `product confirm binds the reviewable Android label to the strict redeem schema`() =
+        runBlocking {
+            val codec = RelayV2Codec()
+            val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) { enrollment ->
+                assertEquals(DEVICE_LABEL, enrollment.deviceLabel)
+                val encoded = codec.encodeHttpsBody(
+                    RelayV2HttpsSchema.ENROLLMENT_REDEEM_REQUEST,
+                    linkedMapOf(
+                        "exchangeAttemptId" to "exchange-attempt-1",
+                        "enrollmentId" to enrollment.draft.enrollmentId,
+                        "enrollmentCode" to enrollment.draft.enrollmentCode,
+                        "clientInstanceId" to "android-install-1",
+                        "deviceLabel" to enrollment.deviceLabel,
+                    ),
+                )
+                assertEquals(
+                    DEVICE_LABEL,
+                    codec.decodeHttpsBody(
+                        RelayV2HttpsSchema.ENROLLMENT_REDEEM_REQUEST,
+                        encoded,
+                    ).frame["deviceLabel"],
+                )
+                RelayV2EnrollmentResult.Activated(activeProfile())
+            }
+
+            assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
+            val review = session.state as RelayV2EnrollmentReviewState.Review
+            assertEquals(DEVICE_LABEL, review.facts.deviceLabel)
+            assertEquals(RelayV2EnrollmentConfirmResult.COMPLETED, session.confirm())
         }
 
     private fun enrollmentPayload(enrollmentId: String = ENROLLMENT_ID): String =
@@ -227,5 +262,6 @@ class RelayV2EnrollmentReviewSessionTest {
         const val HOST_ID = "mac-admin"
         const val ENROLLMENT_ID = "enrollment-1"
         const val ENROLLMENT_CODE = "twenroll2.one-time-code"
+        const val DEVICE_LABEL = "Pixel 9 Pro"
     }
 }
