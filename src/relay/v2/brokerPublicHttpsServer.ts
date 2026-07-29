@@ -55,6 +55,7 @@ function assertAvailableHttpsServer(server: unknown): asserts server is NodeHttp
     server.listening
     || server.listenerCount("request") !== 0
     || server.listenerCount("upgrade") !== 0
+    || server.listenerCount("clientError") !== 0
   ) {
     throw new Error(
       "Relay v2 Broker public HTTPS Server already has a listener owner",
@@ -247,9 +248,14 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
     }
   };
 
+  const onClientError = (_error: Error, socket: Socket): void => {
+    try { socket.destroy(); } catch {}
+  };
+
   const removeOwnedListeners = (): void => {
     server.off("request", onRequest);
     server.off("upgrade", onUpgrade);
+    server.off("clientError", onClientError);
     server.off("error", onServerError);
     server.off("close", onServerClose);
   };
@@ -313,6 +319,7 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
 
   server.on("request", onRequest);
   server.on("upgrade", onUpgrade);
+  server.on("clientError", onClientError);
   server.on("close", onServerClose);
   server.on("error", onServerError);
 

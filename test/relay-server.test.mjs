@@ -6,7 +6,7 @@ import {
   request as nodeHttpRequest,
 } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { createConnection, createServer } from "node:net";
+import { createConnection, createServer, Socket } from "node:net";
 import test from "node:test";
 import { WebSocket } from "ws";
 
@@ -697,6 +697,59 @@ test("public v2 HTTPS root claims one listener lifecycle and drains every termin
   await externalCloseHandle.shutdown();
   assert.equal(externalClose.openCount(), 1);
   assert.equal(externalCloseAuthority.closed, true);
+});
+
+test("public v2 HTTPS root owns client errors without shutting down the listener", async () => {
+  const callerOwnedServer = createHttpsServer();
+  callerOwnedServer.on("clientError", () => undefined);
+  const callerOwnedFake = fakeComposition();
+  let callerOwnedOpenCount = 0;
+  await assert.rejects(
+    startRelayV2BrokerPublicHttpsServer(
+      callerOwnedServer,
+      { host: "127.0.0.1", port: 0 },
+      {
+        ...callerOwnedFake.composition,
+        async openCredentialAuthority(input) {
+          callerOwnedOpenCount += 1;
+          return callerOwnedFake.composition.openCredentialAuthority(input);
+        },
+      },
+    ),
+    /already has a listener owner/,
+  );
+  assert.equal(callerOwnedOpenCount, 0);
+
+  const fake = fakeComposition();
+  const server = createHttpsServer();
+  const listen = server.listen;
+  let listenerCountAtListen = 0;
+  server.listen = function (...args) {
+    listenerCountAtListen = this.listenerCount("clientError");
+    return Reflect.apply(listen, this, args);
+  };
+  const handle = await startRelayV2BrokerPublicHttpsServer(
+    server,
+    { host: "127.0.0.1", port: 0 },
+    fake.composition,
+  );
+  const authority = await fake.opened.promise;
+  assert.equal(listenerCountAtListen, 1);
+  assert.equal(server.listenerCount("clientError"), 1);
+
+  const socket = new Socket();
+  server.emit(
+    "tlsClientError",
+    Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+    socket,
+  );
+  assert.equal(socket.destroyed, true);
+  assert.equal(server.listening, true);
+  assert.equal(authority.closed, false);
+
+  await handle.shutdown();
+  assert.equal(server.listenerCount("clientError"), 0);
+  assert.equal(authority.closed, true);
 });
 
 test("default relay listener keeps twcap2 credentials out of the v1 verifier", async () => {
