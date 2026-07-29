@@ -121,6 +121,29 @@ internal suspend fun collectRelayV2SelectedSessionCut(
     }
 }
 
+/**
+ * UI attachment identity is only a local lifecycle fence. Session authority remains the exact
+ * current composition-issued cut and is rechecked for every operation.
+ */
+internal class RelayV2TerminalUiAttachmentFence(
+    val sessionStableId: String,
+    private val attachmentId: String,
+    val sessionCut: RelayV2SessionReplyCut,
+) {
+    fun ownsRoute(expectedAttachmentId: String): Boolean =
+        attachmentId == expectedAttachmentId
+
+    fun isCurrent(
+        expectedAttachmentId: String,
+        currentCuts: Map<String, RelayV2SessionReplyCut>,
+    ): Boolean =
+        ownsRoute(expectedAttachmentId) &&
+            isCurrent(currentCuts)
+
+    fun isCurrent(currentCuts: Map<String, RelayV2SessionReplyCut>): Boolean =
+        currentCuts[sessionStableId] === sessionCut
+}
+
 class V2ViewModel(
     private val container: AppContainer,
     private val demoMode: Boolean = false,
@@ -128,8 +151,7 @@ class V2ViewModel(
 ) : ViewModel() {
     private data class RelayV2UiTerminalAttachment(
         val composition: RelayV2BaseRuntimeComposition,
-        val sessionStableId: String,
-        val sessionCut: RelayV2SessionReplyCut,
+        val fence: RelayV2TerminalUiAttachmentFence,
         val attachment: RelayV2TerminalAttachment,
     )
 
@@ -1194,8 +1216,8 @@ class V2ViewModel(
             emit(V2UiEffect.TerminalReset("Connected to ${session.title}\r\n"))
             emit(V2UiEffect.TerminalWrite("\u001b[32m${session.hostName}\u001b[0m:${session.cwd.ifBlank { "~" }}$ "))
         } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-            // The WebView-ready callback opens the composition-issued v2
-            // attachment. This attachment-scoped entry belongs only to v1.
+            // The controller-bearing WebView callback opens the composition-issued v2
+            // attachment. This controller-free entry belongs only to v1.
             return
         } else {
             relayV1IfAdmitted()?.openTerminal(
@@ -1206,7 +1228,11 @@ class V2ViewModel(
         }
     }
 
-    fun openTerminal(session: RelaySession, controller: TerminalWebViewController) {
+    fun openTerminal(
+        session: RelaySession,
+        attachmentId: String,
+        controller: TerminalWebViewController,
+    ) {
         if (demoMode || _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
             return
         }
@@ -1267,10 +1293,17 @@ class V2ViewModel(
                 _uiState.update { it.copy(actionError = "Relay v2 terminal attachment is stale") }
                 return@launch
             }
-            issued = RelayV2UiTerminalAttachment(composition, session.stableId, cut, attachment)
+            issued = RelayV2UiTerminalAttachment(
+                composition,
+                RelayV2TerminalUiAttachmentFence(session.stableId, attachmentId, cut),
+                attachment,
+            )
             val current = synchronized(relayV2UiFenceLock) {
                 val stillCurrent = relayV2Composition === composition &&
-                    relayV2SessionReplyCuts.value[session.stableId] === cut
+                    issued.fence.isCurrent(
+                        attachmentId,
+                        relayV2SessionReplyCuts.value,
+                    )
                 if (stillCurrent) relayV2Terminal = issued
                 stillCurrent
             }
@@ -1289,7 +1322,10 @@ class V2ViewModel(
                 synchronized(relayV2UiFenceLock) {
                     val stillCurrent = relayV2Terminal === issued &&
                         relayV2Composition === composition &&
-                        relayV2SessionReplyCuts.value[session.stableId] === cut
+                        issued.fence.isCurrent(
+                            attachmentId,
+                            relayV2SessionReplyCuts.value,
+                        )
                     if (stillCurrent) {
                         relayV2Terminal = null
                         _uiState.value = _uiState.value.copy(
@@ -1321,13 +1357,13 @@ class V2ViewModel(
     fun closeTerminal(attachmentId: String) {
         if (demoMode) return
         if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-            val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+            val current = synchronized(relayV2UiFenceLock) {
+                relayV2Terminal?.takeIf { it.fence.ownsRoute(attachmentId) }
+                    .also { if (it != null) relayV2Terminal = null }
+            } ?: return
             viewModelScope.launch {
                 if (!current.composition.closeTerminal(current.attachment)) {
                     current.composition.detachTerminal(current.attachment)
-                    synchronized(relayV2UiFenceLock) {
-                        if (relayV2Terminal === current) relayV2Terminal = null
-                    }
                 }
             }
         } else {
@@ -1344,7 +1380,11 @@ class V2ViewModel(
             RelayStartupAdmissionState.RELAY_V2 -> {
                 val admittedData =
                     TerminalAttachmentInputPolicy.RELAY_V2_RAW_BYTES.admit(data) ?: return
-                val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+                val current = synchronized(relayV2UiFenceLock) {
+                    relayV2Terminal?.takeIf {
+                        it.fence.isCurrent(attachmentId, relayV2SessionReplyCuts.value)
+                    }
+                } ?: return
                 viewModelScope.launch {
                     if (!current.composition.sendTerminalInput(
                             current.attachment,
@@ -1369,7 +1409,11 @@ class V2ViewModel(
     fun resizeTerminal(cols: Int, rows: Int, attachmentId: String) {
         if (demoMode) return
         if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-            val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+            val current = synchronized(relayV2UiFenceLock) {
+                relayV2Terminal?.takeIf {
+                    it.fence.isCurrent(attachmentId, relayV2SessionReplyCuts.value)
+                }
+            } ?: return
             viewModelScope.launch {
                 current.composition.resizeTerminal(current.attachment, cols, rows)
             }
@@ -1383,7 +1427,7 @@ class V2ViewModel(
         update: (V2UiState) -> V2UiState,
     ): Boolean = synchronized(relayV2UiFenceLock) {
         if (relayV2Terminal !== expected || relayV2Composition !== expected.composition ||
-            relayV2SessionReplyCuts.value[expected.sessionStableId] !== expected.sessionCut
+            !expected.fence.isCurrent(relayV2SessionReplyCuts.value)
         ) return@synchronized false
         _uiState.value = update(_uiState.value)
         true

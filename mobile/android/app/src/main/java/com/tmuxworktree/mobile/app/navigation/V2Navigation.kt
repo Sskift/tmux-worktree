@@ -920,7 +920,7 @@ private fun TerminalRoute(
         onConnectionStatusClick = onHealth,
         onReconnect = {
             if (state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-                viewModel.openTerminal(session, controller)
+                viewModel.openTerminal(session, attachmentId, controller)
             } else {
                 viewModel.openTerminal(session, attachmentId)
             }
@@ -940,7 +940,7 @@ private fun TerminalRoute(
                     controller.setReadOnly(readOnly)
                     controller.setFontSize(fontSize)
                     controller.fit()
-                    viewModel.openTerminal(session, controller)
+                    viewModel.openTerminal(session, attachmentId, controller)
                 },
                 onFailure = viewModel::reportTerminalError,
                 onInput = { if (!readOnly) viewModel.sendTerminalInput(it, attachmentId) },

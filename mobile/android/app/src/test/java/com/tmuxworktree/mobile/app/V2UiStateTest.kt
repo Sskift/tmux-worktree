@@ -9,6 +9,7 @@ import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -161,6 +162,21 @@ class V2UiStateTest {
         assertFalse(staleRejection.applied)
         assertEquals(newProfileState, staleSuccess.state)
         assertEquals(newProfileState, staleRejection.state)
+    }
+
+    @Test
+    fun relayV2TerminalAttachmentRequiresFreshCutAndExactRoute() {
+        val staleCut = object : RelayV2SessionReplyCut {}
+        val freshCut = object : RelayV2SessionReplyCut {}
+        val stale = RelayV2TerminalUiAttachmentFence("session-a", "route-old", staleCut)
+        val fresh = RelayV2TerminalUiAttachmentFence("session-a", "route-new", freshCut)
+
+        assertTrue(stale.isCurrent("route-old", mapOf("session-a" to staleCut)))
+        assertFalse(stale.isCurrent("route-old", emptyMap()))
+        assertFalse(stale.isCurrent("route-old", mapOf("session-a" to freshCut)))
+        assertFalse(stale.ownsRoute("route-new"))
+        assertTrue(fresh.isCurrent("route-new", mapOf("session-a" to freshCut)))
+        assertFalse(fresh.ownsRoute("route-old"))
     }
 
     @Test
