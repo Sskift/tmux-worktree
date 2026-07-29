@@ -1,5 +1,6 @@
 import { types as nodeTypes } from "node:util";
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import { RELAY_V2_REQUIRED_CAPABILITIES } from "./brokerCore.js";
 import {
   RelayV2HostCarrierActor,
   RelayV2HostCapabilityReadiness,
@@ -128,10 +129,29 @@ const runtimePreCarrierOfferIssuers = new WeakMap<object, Readonly<{
   issue(input: Readonly<RelayV2HostPreCarrierOfferIssueInput>):
   RelayV2HostPreCarrierOfferClaim | null;
 }>>();
+const LOCAL_DEVELOPMENT_BASE_CAPABILITIES = Object.freeze([
+  ...RELAY_V2_REQUIRED_CAPABILITIES,
+]);
 
 declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
 declare const relayV2HostDashboardManagementPortBrand: unique symbol;
 declare const relayV2HostDashboardManagementBindingBrand: unique symbol;
+declare const relayV2HostLocalDevelopmentCapabilityActivationBrand: unique symbol;
+
+/** Process-local, owner-bound, one-shot opt-in for the local-development lane. */
+export interface RelayV2HostLocalDevelopmentCapabilityActivation {
+  readonly [relayV2HostLocalDevelopmentCapabilityActivationBrand]: true;
+}
+
+interface RelayV2HostLocalDevelopmentCapabilityActivationRecord {
+  readonly credentialOwner: object;
+  consumed: boolean;
+}
+
+const localDevelopmentCapabilityActivations = new WeakMap<
+  object,
+  RelayV2HostLocalDevelopmentCapabilityActivationRecord
+>();
 
 /** Opaque, owner-bound claim token emitted by one managed Host composition. */
 export interface RelayV2HostDashboardManagementPort {
@@ -1261,6 +1281,40 @@ function managedCompositionFailure(): RelayV2HostConnectorControllerError {
   return new RelayV2HostConnectorControllerError("OPERATION_FAILED");
 }
 
+/**
+ * Explicit local-development authority. The opaque activation is bound to one
+ * exact credential owner and may open exactly one managed composition.
+ */
+export function issueRelayV2HostLocalDevelopmentCapabilityActivation(
+  credentialOwner: object,
+): RelayV2HostLocalDevelopmentCapabilityActivation {
+  if ((typeof credentialOwner !== "object" && typeof credentialOwner !== "function")
+    || credentialOwner === null
+    || nodeTypes.isProxy(credentialOwner)) throw managedCompositionFailure();
+  const activation = Object.freeze(Object.create(null)) as
+    RelayV2HostLocalDevelopmentCapabilityActivation;
+  localDevelopmentCapabilityActivations.set(activation, {
+    credentialOwner,
+    consumed: false,
+  });
+  return activation;
+}
+
+function consumeRelayV2HostLocalDevelopmentCapabilityActivation(
+  activation: RelayV2HostLocalDevelopmentCapabilityActivation | undefined,
+  credentialOwner: object,
+): boolean {
+  if (activation === undefined) return false;
+  if ((typeof activation !== "object" && typeof activation !== "function")
+    || activation === null
+    || nodeTypes.isProxy(activation)) throw managedCompositionFailure();
+  const record = localDevelopmentCapabilityActivations.get(activation);
+  if (record === undefined || record.consumed
+    || record.credentialOwner !== credentialOwner) throw managedCompositionFailure();
+  record.consumed = true;
+  return true;
+}
+
 const MANAGED_DATA_NODE_IS_PROXY = nodeTypes.isProxy;
 const MANAGED_DATA_OBJECT_CREATE = Object.create;
 const MANAGED_DATA_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
@@ -1861,6 +1915,22 @@ function projectManagedConnectorCut(
  */
 export async function openRelayV2HostManagedConnectorRuntimeComposition(
   options: RelayV2HostManagedConnectorRuntimeCompositionOptions,
+  localDevelopmentActivation?: RelayV2HostLocalDevelopmentCapabilityActivation,
+): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
+  const credentialOwner = options.connector.carrier.credentialReferences;
+  const localDevelopmentCapabilities = consumeRelayV2HostLocalDevelopmentCapabilityActivation(
+    localDevelopmentActivation,
+    credentialOwner,
+  );
+  return openRelayV2HostManagedConnectorRuntimeCompositionInternal(
+    options,
+    localDevelopmentCapabilities,
+  );
+}
+
+async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
+  options: RelayV2HostManagedConnectorRuntimeCompositionOptions,
+  localDevelopmentCapabilities: boolean,
 ): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
   const runtimeOptions = captureRelayV2HostCarrierRuntimeOptions(options.runtime);
   const connectorOptions = options.connector;
@@ -1880,6 +1950,9 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
       connectorId: string,
     ): RelayV2DashboardManagementCarrierControlPort | null;
     requestReauthentication(requestId: string, connectorId: string): boolean;
+    negotiatedCapabilityIntersection(
+      connectorId: string,
+    ): readonly RelayV2RequiredCapability[];
     fenceReauthentication(): void;
     observe(status: Readonly<RelayV2HostCarrierStatus>): void;
     reject(): void;
@@ -1996,14 +2069,18 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
         }
       },
     });
-    const attemptAdapter = new RelayV2HostConnectorCarrierAttemptAdapter({
-      factory: carrierAttemptFactory,
-      preCarrierOfferIssuer: Object.freeze({
-        issuePreCarrierOffer: (
-          input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
-        ) => bridge.issuePreCarrierOffer(input),
-      }),
-    });
+    const attemptAdapter = new RelayV2HostConnectorCarrierAttemptAdapter(
+      localDevelopmentCapabilities
+        ? {
+            factory: carrierAttemptFactory,
+            preCarrierOfferIssuer: Object.freeze({
+              issuePreCarrierOffer: (
+                input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
+              ) => bridge.issuePreCarrierOffer(input),
+            }),
+          }
+        : { factory: carrierAttemptFactory },
+    );
     const attempts: RelayV2HostConnectorAttemptFactoryPort = Object.freeze({
       startAttempt(
         input: Readonly<RelayV2HostConnectorAttemptStartInput>,
@@ -2106,6 +2183,17 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
             } finally {
               reauthenticationInFlight = false;
             }
+          },
+          negotiatedCapabilityIntersection(
+            connectorId: string,
+          ): readonly RelayV2RequiredCapability[] {
+            if (rejected || !controllerAdmitted || actor === null
+              || !consumedFullOffer()
+              || latestStatus?.phase !== "registered"
+              || latestStatus.connectorId !== connectorId
+              || attemptRuntimeBindings.get(input.controllerGeneration)
+                !== runtimeBinding) return Object.freeze([]);
+            return LOCAL_DEVELOPMENT_BASE_CAPABILITIES;
           },
           fenceReauthentication(): void {
             reauthenticationFenced = true;
@@ -2283,9 +2371,21 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
       }
       return cut;
     };
+    const inspectDashboardManagementCut = (): RelayV2HostConnectorControllerCut => {
+      const cut = ensureExactGeneration();
+      if (cut.status !== "registered") return cut;
+      const negotiatedCapabilityIntersection = attemptRuntimeBindings.get(
+        cut.controllerGeneration,
+      )?.negotiatedCapabilityIntersection(cut.connectorId) ?? Object.freeze([]);
+      if (negotiatedCapabilityIntersection.length === 0) return cut;
+      return Object.freeze({
+        ...cut,
+        negotiatedCapabilityIntersection,
+      });
+    };
     const connectorLifecycle: RelayV2HostConnectorControllerPort = Object.freeze({
       inspectCut(): RelayV2HostConnectorControllerCut {
-        return ensureExactGeneration();
+        return inspectDashboardManagementCut();
       },
       start(rawInput): Promise<RelayV2HostConnectorControllerStartResult> {
         let fields: Record<string, unknown>;
@@ -2499,11 +2599,13 @@ export async function openRelayV2HostManagedConnectorRuntimeComposition(
  *
  * Construction only closes the existing managed composition and WSS factory
  * over one canonical credential authority/reference. It does not open a
- * socket, resolve credential material, start a process/timer/retry, advertise
- * capabilities, or provide a Relay v1 fallback.
+ * socket, resolve credential material, start a process/timer/retry, or provide
+ * a Relay v1 fallback. Capabilities remain empty unless the exact credential
+ * owner supplies its explicit one-shot local-development activation.
  */
 export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
   rawOptions: RelayV2HostManagedWssConnectorRuntimeCompositionOptions,
+  localDevelopmentActivation?: RelayV2HostLocalDevelopmentCapabilityActivation,
 ): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
   let fields: Record<string, unknown>;
   let connectorFields: Record<string, unknown>;
@@ -2532,6 +2634,10 @@ export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
 
   const credentialAuthority = connectorFields.credentialAuthority as
     RelayV2HostCredentialAuthority;
+  const localDevelopmentCapabilities = consumeRelayV2HostLocalDevelopmentCapabilityActivation(
+    localDevelopmentActivation,
+    credentialAuthority,
+  );
   let transportLifecycleFactory: RelayV2HostWssTransportLifecycleFactory;
   try {
     transportLifecycleFactory = new RelayV2HostWssTransportLifecycleFactory({
@@ -2542,7 +2648,7 @@ export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
     throw managedCompositionFailure();
   }
 
-  return openRelayV2HostManagedConnectorRuntimeComposition(Object.freeze({
+  return openRelayV2HostManagedConnectorRuntimeCompositionInternal(Object.freeze({
     runtime,
     connector: Object.freeze({
       credentialReference: connectorFields.credentialReference as string,
@@ -2552,5 +2658,5 @@ export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
       }),
       transportLifecycleFactory,
     }),
-  }));
+  }), localDevelopmentCapabilities);
 }

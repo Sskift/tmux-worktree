@@ -35,6 +35,10 @@ const dashboardManagementStartFrame = dashboardManagementContract.goldenExchange
 const dashboardManagementStatusFrame = dashboardManagementContract.goldenExchanges.find(
   ({ operation }) => operation === "status",
 ).requestFrame;
+const dashboardManagementCreateEnrollmentFrame =
+  dashboardManagementContract.goldenExchanges.find(
+    ({ operation }) => operation === "create_enrollment",
+  ).requestFrame;
 
 function fixture(name) {
   return structuredClone(corpus.goldenByName.get(name).frame);
@@ -347,7 +351,9 @@ function createManagedWssConstructor(records, effects) {
 
     send(bytes, options, callback) {
       const record = records.find((candidate) => candidate.socket === this);
-      const copy = Uint8Array.from(bytes);
+      const copy = typeof bytes === "string"
+        ? Uint8Array.from(Buffer.from(bytes, "utf8"))
+        : Uint8Array.from(bytes);
       record.sent.push({ bytes: copy, options });
       record.hello ??= decodeCarrier(copy);
       queueMicrotask(() => callback());
@@ -366,7 +372,8 @@ function createManagedWssConstructor(records, effects) {
     }
 
     receive(bytes) {
-      for (const listener of this.listeners.get("message") ?? []) listener(bytes, true);
+      const text = Buffer.from(bytes).toString("utf8");
+      for (const listener of this.listeners.get("message") ?? []) listener(text, false);
     }
   };
 }
@@ -493,6 +500,44 @@ async function createHarness(options = {}) {
     idFactory: () => `managed-host-hello-${++helloSequence}`,
     clock: () => 1_783_700_100_000,
   };
+  const managedCredentialReferences = {
+    read(reference) {
+      credentialReadCount += 1;
+      if (options.rejectCredentialRead?.(credentialReadCount) === true) {
+        throw new Error("injected credential read rejection");
+      }
+      return {
+        reference,
+        version: "1",
+        grantId: "managed-host-grant",
+        accessJti: "managed-host-access-jti",
+        accessToken: "twcap2.host.payload.mac",
+      };
+    },
+    prepareReauthentication(input) {
+      reauthenticationPreparations.push(structuredClone(input));
+      const prepared = {
+        fence: {
+          reference: CREDENTIAL_REFERENCE,
+          version: "2",
+          requestId: "managed-reauth-authority-winner",
+          grantId: "managed-host-grant",
+          accessJti: "managed-host-access-jti-2",
+        },
+        accessToken: "twcap2.managed-reauth.payload.mac",
+      };
+      return options.prepareReauthentication?.(input, prepared) ?? prepared;
+    },
+    acknowledgeReauthentication(fence) {
+      reauthenticationAcknowledgements.push(structuredClone(fence));
+      return true;
+    },
+  };
+  const localDevelopmentActivation = options.localDevelopment === false
+    ? undefined
+    : compositionModule.issueRelayV2HostLocalDevelopmentCapabilityActivation(
+      usesManagedWss ? managedWssCredential.authority : managedCredentialReferences,
+    );
   if (composition === null) composition = options.managedWss
     ? await compositionModule.openRelayV2HostManagedWssConnectorRuntimeComposition({
       runtime: runtimeOptions,
@@ -509,50 +554,18 @@ async function createHarness(options = {}) {
           },
         },
       },
-    })
+    }, localDevelopmentActivation)
     : await compositionModule.openRelayV2HostManagedConnectorRuntimeComposition({
       runtime: runtimeOptions,
       connector: {
         credentialReference: CREDENTIAL_REFERENCE,
         carrier: {
-          credentialReferences: {
-            read(reference) {
-              credentialReadCount += 1;
-              if (options.rejectCredentialRead?.(credentialReadCount) === true) {
-                throw new Error("injected credential read rejection");
-              }
-              return {
-                reference,
-                version: "1",
-                grantId: "managed-host-grant",
-                accessJti: "managed-host-access-jti",
-                accessToken: "twcap2.host.payload.mac",
-              };
-            },
-            prepareReauthentication(input) {
-              reauthenticationPreparations.push(structuredClone(input));
-              const prepared = {
-                fence: {
-                  reference: CREDENTIAL_REFERENCE,
-                  version: "2",
-                  requestId: "managed-reauth-authority-winner",
-                  grantId: "managed-host-grant",
-                  accessJti: "managed-host-access-jti-2",
-                },
-                accessToken: "twcap2.managed-reauth.payload.mac",
-              };
-              return options.prepareReauthentication?.(input, prepared) ?? prepared;
-            },
-            acknowledgeReauthentication(fence) {
-              reauthenticationAcknowledgements.push(structuredClone(fence));
-              return true;
-            },
-          },
+          credentialReferences: managedCredentialReferences,
           ...carrierOptions,
         },
         transportLifecycleFactory,
       },
-    });
+    }, localDevelopmentActivation);
 
   assert.equal(await composition.readiness.h0.activate(), true);
   assert.equal(composition.readiness.h3.activate(), true);
@@ -572,6 +585,7 @@ async function createHarness(options = {}) {
     }),
     reauthenticationPreparations,
     reauthenticationAcknowledgements,
+    localDevelopmentActivation,
     managedWssCredential,
     managedWssEffects,
     async cleanup() {
@@ -859,7 +873,56 @@ test("managed WSS composition keeps construction inert and binds one credential 
   });
 });
 
-test("exact current Dashboard management port is claimed once through the protocol-v2 session", async () => {
+test("local-development activation is opaque, exact-owner-bound, and one-shot", async () => {
+  const h = await createHarness({ managedWss: true });
+  try {
+    assert.equal(Object.isFrozen(h.localDevelopmentActivation), true);
+    assert.equal(Object.getPrototypeOf(h.localDevelopmentActivation), null);
+    assert.deepEqual(Reflect.ownKeys(h.localDevelopmentActivation), []);
+    const options = {
+      runtime: {
+        hostId: HOST_ID,
+        hostEpoch: h.identity.hostEpoch,
+        hostInstanceId: h.identity.hostInstanceId,
+        authorities: {},
+        welcome: {},
+      },
+      connector: {
+        credentialAuthority: h.managedWssCredential.authority,
+        credentialReference: CREDENTIAL_REFERENCE,
+        carrier: {},
+        wss: {
+          relayUrl: "wss://relay.example.com/",
+          webSocketConstructor: class {},
+        },
+      },
+    };
+    const before = structuredClone(h.managedWssEffects);
+    await assert.rejects(
+      compositionModule.openRelayV2HostManagedWssConnectorRuntimeComposition(
+        options,
+        h.localDevelopmentActivation,
+      ),
+      (error) => error?.name === "RelayV2HostConnectorControllerError"
+        && error.code === "OPERATION_FAILED",
+    );
+    const foreignActivation =
+      compositionModule.issueRelayV2HostLocalDevelopmentCapabilityActivation({});
+    await assert.rejects(
+      compositionModule.openRelayV2HostManagedWssConnectorRuntimeComposition(
+        options,
+        foreignActivation,
+      ),
+      (error) => error?.name === "RelayV2HostConnectorControllerError"
+        && error.code === "OPERATION_FAILED",
+    );
+    assert.deepEqual(h.managedWssEffects, before);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("local-development activation lets the same Dashboard session start and enroll", async () => {
   const h = await createHarness({ managedWss: true });
   try {
     const owner = createDashboardManagementOwner(h);
@@ -889,10 +952,29 @@ test("exact current Dashboard management port is claimed once through the protoc
     }
 
     owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    owner.input.push(Buffer.from(dashboardManagementCreateEnrollmentFrame));
     owner.input.push(Buffer.from(dashboardManagementStatusFrame));
     owner.input.end();
     const run = session.run();
     const record = await registerPendingManagedWss(h);
+    let enrollmentCreate;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      enrollmentCreate = record.sent
+        .map(({ bytes }) => decodeCarrier(bytes))
+        .find(({ type }) => type === "enrollment.create");
+      if (enrollmentCreate !== undefined) break;
+      await settle(1);
+    }
+    assert.notEqual(enrollmentCreate, undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(enrollmentCreate.payload)), {
+      expiresInMs: 300_000,
+      deviceLabel: "Pixel",
+    });
+    const enrollmentCreated = fixture("enrollment-created");
+    enrollmentCreated.requestId = enrollmentCreate.requestId;
+    enrollmentCreated.connectorId = `managed-connector-${record.sequence}`;
+    enrollmentCreated.payload.hostId = HOST_ID;
+    record.socket.receive(carrierWire(enrollmentCreated));
     assert.equal(await run, 0);
 
     const responses = owner.writes.map((frame) => JSON.parse(frame));
@@ -901,20 +983,29 @@ test("exact current Dashboard management port is claimed once through the protoc
       JSON.parse(dashboardManagementContract.startupReadyFrame),
     );
     const startRequestId = JSON.parse(dashboardManagementStartFrame).requestId;
+    const createRequestId =
+      JSON.parse(dashboardManagementCreateEnrollmentFrame).requestId;
     const statusRequestId = JSON.parse(dashboardManagementStatusFrame).requestId;
     const startResponse = responses.find(({ requestId }) => requestId === startRequestId);
+    const createResponse = responses.find(({ requestId }) => requestId === createRequestId);
     const statusResponse = responses.find(({ requestId }) => requestId === statusRequestId);
     assert.equal(startResponse.ok, true);
+    assert.equal(createResponse.ok, true);
     assert.equal(statusResponse.ok, true);
     for (const response of [startResponse, statusResponse]) {
       assert.deepEqual(response.result.connector, {
-        status: "registered_incomplete",
+        status: "registered",
         acknowledgement: "host.registered",
         hostId: HOST_ID,
         connectorId: `managed-connector-${record.sequence}`,
-        negotiatedCapabilityIntersection: [],
+        negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
       });
     }
+    assert.equal(createResponse.result.enrollment.status, "active");
+    assert.equal(
+      createResponse.result.enrollment.review.enrollment.enrollmentCode,
+      enrollmentCreated.payload.enrollmentCode,
+    );
     assert.deepEqual(
       record.hello.payload.capabilities,
       [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
@@ -1221,7 +1312,57 @@ test("managed WSS composition rejects malformed or foreign ownership input befor
   });
 });
 
-test("managed composition advertises the atomic full offer and becomes ready only after registration", async () => {
+test("ordinary managed compositions keep capabilities empty and management fail-closed", async (t) => {
+  await t.test("injected transport composition", async () => {
+    const h = await createHarness({ localDevelopment: false });
+    try {
+      const { record } = await startRegistered(h, "managed.ordinary.start");
+      assert.deepEqual(record.hello.payload.capabilities, []);
+      assert.equal(readinessReady(h.composition.readiness.current()), false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  await t.test("production-shaped WSS composition", async () => {
+    const h = await createHarness({
+      managedWss: true,
+      localDevelopment: false,
+    });
+    try {
+      const owner = createDashboardManagementOwner(h);
+      const session = dashboardManagementSessionModule
+        .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+      owner.input.push(Buffer.from(dashboardManagementStartFrame));
+      owner.input.push(Buffer.from(dashboardManagementCreateEnrollmentFrame));
+      owner.input.end();
+      const run = session.run();
+      const record = await registerPendingManagedWss(h);
+      assert.equal(await run, 0);
+      assert.deepEqual(record.hello.payload.capabilities, []);
+      assert.equal(readinessReady(h.composition.readiness.current()), false);
+      assert.equal(
+        record.sent.map(({ bytes }) => decodeCarrier(bytes))
+          .some(({ type }) => type === "enrollment.create"),
+        false,
+      );
+      const createRequestId =
+        JSON.parse(dashboardManagementCreateEnrollmentFrame).requestId;
+      const createResponse = owner.writes
+        .map((frame) => JSON.parse(frame))
+        .find(({ requestId }) => requestId === createRequestId);
+      assert.deepEqual(createResponse.error, {
+        code: "NOT_READY",
+        message: "Relay v2 management is not ready",
+        retryable: false,
+      });
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+test("local-development activation advertises the atomic full offer and becomes ready", async () => {
   const h = await createHarness();
   try {
     const { result, record } = await startRegistered(h);

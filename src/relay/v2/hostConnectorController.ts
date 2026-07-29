@@ -37,7 +37,7 @@ export type RelayV2HostConnectorControllerCut =
       status: "registered";
       connectorId: string;
       acknowledgement: "host.registered";
-      negotiatedCapabilityIntersection: readonly [];
+      negotiatedCapabilityIntersection: readonly string[];
     }> & Omit<RelayV2HostConnectorControllerBinding, "connectorId">)
   | (Readonly<{
       status: "failed";

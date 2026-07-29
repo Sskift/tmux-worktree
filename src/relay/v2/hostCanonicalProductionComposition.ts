@@ -17,6 +17,7 @@ import {
   type RelayV2HostManagedConnectorStartInput,
   type RelayV2HostManagedConnectorStopInput,
   type RelayV2HostManagedConnectorReauthenticationInput,
+  type RelayV2HostLocalDevelopmentCapabilityActivation,
 } from "./hostRuntimeComposition.js";
 import { captureRelayV2HostH0ReadinessPort, type RelayV2HostStateStore } from "./hostState.js";
 import {
@@ -110,6 +111,13 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
     signal: AbortSignal;
     io: RelayV2DashboardManagementStdioIo;
   }>;
+  /**
+   * Explicit local-development-only capability activation. It must be issued
+   * for this composition's exact credentialAuthority; omission is the
+   * production/default fail-closed path.
+   */
+  readonly localDevelopmentCapabilityActivation?:
+    RelayV2HostLocalDevelopmentCapabilityActivation;
   /** Default-off. The root supplies the recovered Host lineage itself. */
   readonly agentTranscriptLifecycle?: Readonly<{
     store: Omit<RelayAgentAuthorityStoreOptions, "hostId" | "hostEpoch">;
@@ -289,6 +297,25 @@ function captureDashboardManagementOptions(
       writeFrame: io.writeFrame,
     })),
   })) as CapturedDashboardManagementOptions;
+}
+
+function captureLocalDevelopmentCapabilityActivation(
+  options: RelayV2HostCanonicalProductionCompositionOptions,
+): RelayV2HostLocalDevelopmentCapabilityActivation | undefined | null {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(
+      options,
+      "localDevelopmentCapabilityActivation",
+    );
+  } catch {
+    return null;
+  }
+  if (descriptor === undefined) return undefined;
+  if (!Object.hasOwn(descriptor, "value")) return null;
+  return descriptor.value === undefined
+    ? undefined
+    : descriptor.value as RelayV2HostLocalDevelopmentCapabilityActivation;
 }
 
 type CapturedReauthenticationOptions = NonNullable<
@@ -587,7 +614,8 @@ async function settleAll(steps: readonly (() => void | Promise<void>)[]): Promis
 
 /**
  * Default-off production owner. Construction recovers existing durable owners
- * but never starts the connector, opens WSS, or advertises a capability.
+ * but never starts the connector or opens WSS. With no explicit owner-bound
+ * local-development activation, the managed carrier advertises no capability.
  */
 export async function openRelayV2HostCanonicalProductionComposition(
   profile: RelayV2HostCanonicalProductionProfile,
@@ -596,6 +624,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
   if (!validateOptions(profile, options)) return null;
   const dashboardManagement = captureDashboardManagementOptions(options);
   if (dashboardManagement === null) return null;
+  const localDevelopmentCapabilityActivation =
+    captureLocalDevelopmentCapabilityActivation(options);
+  if (localDevelopmentCapabilityActivation === null) return null;
   const reauthentication = captureReauthenticationOptions(options);
   if (reauthentication === null) return null;
   const wssTransport = captureWssTransportOptions(options);
@@ -820,6 +851,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
         }]),
       }]),
     }]),
+      localDevelopmentCapabilityActivation,
     );
     if (await managed.readiness.h0.activate() !== true) {
       throw new RelayV2TerminalManagerError(

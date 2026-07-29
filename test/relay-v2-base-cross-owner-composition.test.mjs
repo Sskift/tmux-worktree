@@ -680,6 +680,8 @@ test("isolated base-v2 composition crosses activated Broker and canonical manage
     const h3RecoveryCandidate = await terminalLineage.recoverForHostH3(terminal);
     assert.notEqual(h3RecoveryCandidate, null);
 
+    const localDevelopmentCapabilityActivation = hostRuntimeComposition
+      .issueRelayV2HostLocalDevelopmentCapabilityActivation(localHostCredential);
     hostComposition = await hostRuntimeComposition
       .openRelayV2HostManagedWssConnectorRuntimeComposition({
         runtime: {
@@ -718,7 +720,7 @@ test("isolated base-v2 composition crosses activated Broker and canonical manage
             webSocketConstructor: LoopbackHostWebSocket,
           },
         },
-      });
+      }, localDevelopmentCapabilityActivation);
     composedTerminalSender = hostComposition.sendTerminalFrame;
     assert.equal(await hostComposition.readiness.h0.activate(), true);
     assert.equal(hostComposition.readiness.h3.activate(), true);
