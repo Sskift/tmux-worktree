@@ -177,6 +177,7 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
 
   const server = serverInput;
   const activeRequests = new Set<Promise<void>>();
+  const guardedClientSockets = new WeakSet<Socket>();
   let shuttingDown = false;
   let didListen = false;
   let closeObserved = false;
@@ -249,6 +250,15 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
   };
 
   const onClientError = (_error: Error, socket: Socket): void => {
+    if (!guardedClientSockets.has(socket)) {
+      guardedClientSockets.add(socket);
+      const onSocketError = (): void => undefined;
+      socket.on("error", onSocketError);
+      socket.once("close", () => {
+        socket.off("error", onSocketError);
+        guardedClientSockets.delete(socket);
+      });
+    }
     try { socket.destroy(); } catch {}
   };
 

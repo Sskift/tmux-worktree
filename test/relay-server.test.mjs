@@ -5,12 +5,19 @@ import {
   createServer as createHttpServer,
   request as nodeHttpRequest,
 } from "node:http";
-import { createServer as createHttpsServer } from "node:https";
-import { createConnection, createServer, Socket } from "node:net";
+import {
+  createServer as createHttpsServer,
+  request as nodeHttpsRequest,
+} from "node:https";
+import { createConnection, createServer } from "node:net";
 import test from "node:test";
 import { WebSocket } from "ws";
 
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import {
+  TEST_LOOPBACK_CERT_PEM,
+  TEST_LOOPBACK_KEY_PEM,
+} from "./support/relayV2LoopbackTls.mjs";
 
 const {
   startRelayBroker,
@@ -721,7 +728,10 @@ test("public v2 HTTPS root owns client errors without shutting down the listener
   assert.equal(callerOwnedOpenCount, 0);
 
   const fake = fakeComposition();
-  const server = createHttpsServer();
+  const server = createHttpsServer({
+    key: TEST_LOOPBACK_KEY_PEM,
+    cert: TEST_LOOPBACK_CERT_PEM,
+  });
   const listen = server.listen;
   let listenerCountAtListen = 0;
   server.listen = function (...args) {
@@ -736,19 +746,53 @@ test("public v2 HTTPS root owns client errors without shutting down the listener
   const authority = await fake.opened.promise;
   assert.equal(listenerCountAtListen, 1);
   assert.equal(server.listenerCount("clientError"), 1);
+  assert.equal(server.listenerCount("tlsClientError"), 1);
 
-  const socket = new Socket();
-  server.emit(
-    "tlsClientError",
-    Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
-    socket,
-  );
-  assert.equal(socket.destroyed, true);
-  assert.equal(server.listening, true);
-  assert.equal(authority.closed, false);
+  try {
+    for (let index = 0; index < 20; index += 1) {
+      const tlsClientError = new Promise((resolve) => {
+        server.once("tlsClientError", resolve);
+      });
+      await new Promise((resolve, reject) => {
+        const socket = createConnection({
+          host: "127.0.0.1",
+          port: handle.port,
+        });
+        socket.once("connect", () => {
+          socket.resetAndDestroy();
+          resolve();
+        });
+        socket.once("error", reject);
+      });
+      assert.equal(
+        (await within(tlsClientError, `TLS reset ${index}`)).code,
+        "ECONNRESET",
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+    }
 
-  await handle.shutdown();
+    const probeStatus = await new Promise((resolve, reject) => {
+      const request = nodeHttpsRequest({
+        host: "127.0.0.1",
+        port: handle.port,
+        path: "/",
+        method: "GET",
+        ca: TEST_LOOPBACK_CERT_PEM,
+      }, (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode));
+      });
+      request.once("error", reject);
+      request.end();
+    });
+    assert.equal(probeStatus, 404);
+    assert.equal(server.listening, true);
+    assert.equal(authority.closed, false);
+  } finally {
+    await handle.shutdown();
+  }
   assert.equal(server.listenerCount("clientError"), 0);
+  assert.equal(server.listenerCount("tlsClientError"), 1);
   assert.equal(authority.closed, true);
 });
 
