@@ -1274,20 +1274,32 @@ class V2ViewModel(
                 if (stillCurrent) relayV2Terminal = issued
                 stillCurrent
             }
-            if (!current || !composition.openTerminal(attachment, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)) {
+            val openingCurrent = current && updateCurrentTerminal(issued) {
+                it.copy(
+                    terminal = TerminalStreamState(
+                        sessionId = session.stableId,
+                        status = ConnectionStatus.CONNECTING,
+                    ),
+                )
+            }
+            if (!openingCurrent ||
+                !composition.openTerminal(attachment, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+            ) {
                 composition.detachTerminal(attachment)
                 synchronized(relayV2UiFenceLock) {
-                    if (relayV2Terminal === issued) relayV2Terminal = null
-                }
-                _uiState.update { it.copy(actionError = "Relay v2 terminal could not be opened") }
-            } else {
-                _uiState.update {
-                    it.copy(
-                        terminal = TerminalStreamState(
-                            sessionId = session.stableId,
-                            status = ConnectionStatus.CONNECTING,
-                        ),
-                    )
+                    val stillCurrent = relayV2Terminal === issued &&
+                        relayV2Composition === composition &&
+                        relayV2SessionReplyCuts.value[session.stableId] === cut
+                    if (stillCurrent) {
+                        relayV2Terminal = null
+                        _uiState.value = _uiState.value.copy(
+                            terminal = TerminalStreamState(
+                                sessionId = session.stableId,
+                                status = ConnectionStatus.OFFLINE,
+                            ),
+                            actionError = "Relay v2 terminal could not be opened",
+                        )
+                    }
                 }
             }
         }
