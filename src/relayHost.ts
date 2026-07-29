@@ -5,6 +5,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { types as nodeTypes } from "node:util";
+import { lookup as systemDnsLookup, promises as dnsPromises, type LookupOptions } from "node:dns";
+import { isIP, type LookupFunction } from "node:net";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
 import {
@@ -75,6 +77,209 @@ export type RelayV2HostSelection = {
 export type RelayHostOptions = RelayV1HostOptions | RelayV2HostSelection;
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
+
+type RelayDnsResolver = Pick<InstanceType<typeof dnsPromises.Resolver>, "resolve4" | "resolve6">
+  & Partial<Pick<InstanceType<typeof dnsPromises.Resolver>, "cancel">>;
+
+type RelayLookupDependencies = {
+  lookup: LookupFunction;
+  platform: NodeJS.Platform;
+  dnsServers: () => string[];
+  createResolver: (server?: string) => RelayDnsResolver;
+  fetch: typeof fetch;
+  fallbackTimeoutMs: number;
+};
+
+const QUICK_TUNNEL_DOH_ENDPOINT = "https://doh.pub/dns-query";
+const QUICK_TUNNEL_DNS_FALLBACK_TIMEOUT_MS = 5_000;
+const MAX_QUICK_TUNNEL_DOH_RESPONSE_BYTES = 64 * 1024;
+
+function isQuickTunnelHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  const label = normalized.slice(0, -".trycloudflare.com".length);
+  return normalized.endsWith(".trycloudflare.com")
+    && label.length > 0
+    && label.length <= 63
+    && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label);
+}
+
+function isRetryableSystemDnsError(error: NodeJS.ErrnoException): boolean {
+  return error.code === "ENOTFOUND" || error.code === "EAI_AGAIN";
+}
+
+async function fetchQuickTunnelDnsJson(
+  url: URL,
+  signal: AbortSignal,
+  fetcher: typeof fetch,
+): Promise<unknown> {
+  const response = await fetcher(url, {
+    cache: "no-store",
+    credentials: "omit",
+    headers: { accept: "application/json" },
+    redirect: "error",
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`HTTPS DNS returned ${response.status}`);
+  }
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_QUICK_TUNNEL_DOH_RESPONSE_BYTES) {
+    throw new Error("HTTPS DNS response is too large");
+  }
+  const body = await response.text();
+  if (Buffer.byteLength(body, "utf8") > MAX_QUICK_TUNNEL_DOH_RESPONSE_BYTES) {
+    throw new Error("HTTPS DNS response is too large");
+  }
+  return JSON.parse(body) as unknown;
+}
+
+function withTimeout<T>(task: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref();
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function resolveQuickTunnelAddressesOverHttps(
+  hostname: string,
+  family: 4 | 6,
+  signal: AbortSignal,
+  dependencies: RelayLookupDependencies,
+): Promise<string[]> {
+  const url = new URL(QUICK_TUNNEL_DOH_ENDPOINT);
+  url.searchParams.set("name", hostname);
+  url.searchParams.set("type", family === 4 ? "A" : "AAAA");
+  const payload = await fetchQuickTunnelDnsJson(
+    url,
+    signal,
+    dependencies.fetch,
+  );
+  if (!payload || typeof payload !== "object") {
+    throw new Error("HTTPS DNS returned an invalid response");
+  }
+  const response = payload as { Status?: unknown; Answer?: unknown };
+  if (response.Status !== 0) {
+    throw new Error("HTTPS DNS lookup failed");
+  }
+  if (response.Answer === undefined) return [];
+  if (!Array.isArray(response.Answer)) {
+    throw new Error("HTTPS DNS returned invalid answers");
+  }
+  const recordType = family === 4 ? 1 : 28;
+  return [...new Set(response.Answer.flatMap((record) => {
+    if (!record || typeof record !== "object") return [];
+    const answer = record as { type?: unknown; data?: unknown };
+    return answer.type === recordType
+      && typeof answer.data === "string"
+      && isIP(answer.data) === family
+      ? [answer.data]
+      : [];
+  }))];
+}
+
+async function resolveQuickTunnelAddresses(
+  hostname: string,
+  family: LookupOptions["family"],
+  dependencies: RelayLookupDependencies,
+): Promise<Array<{ address: string; family: number }>> {
+  const families: Array<4 | 6> = family === 4 || family === "IPv4"
+    ? [4]
+    : family === 6 || family === "IPv6"
+      ? [6]
+      : [4, 6];
+  const configuredServers = [...new Set(dependencies.dnsServers())];
+  const servers = configuredServers.length > 0 ? configuredServers : [undefined];
+  const fallbackSignal = AbortSignal.timeout(dependencies.fallbackTimeoutMs);
+  const settled = await Promise.allSettled(families.map(async (candidate) => {
+    const resolvers: RelayDnsResolver[] = [];
+    const fetchController = new AbortController();
+    const familySignal = AbortSignal.any([fallbackSignal, fetchController.signal]);
+    try {
+      const direct = Promise.any(servers.map(async (server) => {
+        const resolver = dependencies.createResolver(server);
+        resolvers.push(resolver);
+        const addresses = candidate === 4
+          ? await resolver.resolve4(hostname)
+          : await resolver.resolve6(hostname);
+        if (addresses.length === 0) throw new Error("direct DNS returned no addresses");
+        return addresses;
+      }));
+      const addresses = await withTimeout(
+        Promise.any([
+          direct,
+          resolveQuickTunnelAddressesOverHttps(hostname, candidate, familySignal, dependencies),
+        ]),
+        dependencies.fallbackTimeoutMs,
+        "Quick Tunnel DNS fallback timed out",
+      );
+      return { family: candidate, addresses };
+    } finally {
+      fetchController.abort();
+      for (const resolver of resolvers) {
+        try { resolver.cancel?.(); } catch {}
+      }
+    }
+  }));
+  return settled.flatMap((result) => result.status === "fulfilled"
+    ? result.value.addresses.map((address) => ({ address, family: result.value.family }))
+    : []);
+}
+
+export function createRelayLookup(
+  overrides: Partial<RelayLookupDependencies> = {},
+): LookupFunction {
+  const dependencies: RelayLookupDependencies = {
+    lookup: overrides.lookup ?? systemDnsLookup,
+    platform: overrides.platform ?? process.platform,
+    dnsServers: overrides.dnsServers ?? dnsPromises.getServers,
+    createResolver: overrides.createResolver ?? ((server) => {
+      const resolver = new dnsPromises.Resolver();
+      if (server) resolver.setServers([server]);
+      return resolver;
+    }),
+    fetch: overrides.fetch ?? globalThis.fetch,
+    fallbackTimeoutMs: overrides.fallbackTimeoutMs ?? QUICK_TUNNEL_DNS_FALLBACK_TIMEOUT_MS,
+  };
+  return (hostname, options, callback) => {
+    dependencies.lookup(hostname, options, (error, address, family) => {
+      if (!error) {
+        callback(null, address, family);
+        return;
+      }
+      if (
+        dependencies.platform !== "darwin"
+        || !isQuickTunnelHostname(hostname)
+        || !isRetryableSystemDnsError(error)
+      ) {
+        callback(error, address, family);
+        return;
+      }
+      void resolveQuickTunnelAddresses(hostname, options.family, dependencies).then((addresses) => {
+        if (addresses.length === 0) {
+          callback(error, address, family);
+          return;
+        }
+        if (options.all) {
+          callback(null, addresses);
+          return;
+        }
+        callback(null, addresses[0].address, addresses[0].family);
+      }, () => callback(error, address, family));
+    });
+  };
+}
+
+const relayLookup = createRelayLookup();
 
 type RelayStatusOwnership = {
   instanceId: string;
@@ -190,12 +395,24 @@ type RelayControlLeaseRecord = {
   renewing?: Promise<void>;
 };
 
+type PendingRelayRawInput = {
+  targetKey: string;
+  tailToken: symbol;
+  chunks: Buffer[];
+  byteLength: number;
+  frameCount: number;
+  started: boolean;
+  task: Promise<void>;
+};
+
 type RelayTerminalControl = {
   connectorId: string;
   accepting: boolean;
   closedClients: Set<string>;
   leases: Map<string, RelayControlLeaseRecord>;
   lanes: Map<string, Promise<void>>;
+  laneTailTokens: Map<string, symbol>;
+  pendingRawInputs: Map<string, PendingRelayRawInput>;
   nextOperation: number;
 };
 
@@ -303,6 +520,8 @@ const MAX_RELAY_FRAME_BYTES = 1 * 1024 * 1024;
 const MAX_RELAY_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
 const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
 const MAX_PENDING_INPUT_BYTES_PER_STREAM = 256 * 1024;
+const MAX_RELAY_RAW_INPUT_BATCH_BYTES = 4 * 1024;
+const MAX_RELAY_RAW_INPUT_BATCH_FRAMES = 64;
 const MAX_REMOTE_STDIN_BUFFERED_BYTES = 256 * 1024;
 const MAX_LOCAL_SOCKET_BUFFERED_BYTES = 1 * 1024 * 1024;
 const MAX_ACTIVE_STREAMS_PER_CLIENT = 128;
@@ -2201,54 +2420,78 @@ function failCurrentStream(
   });
 }
 
-async function writeControlledRawInput(
+function relayRawInputRouteKey(route: StreamRoute): string {
+  return `${route.clientId}\x1f${route.streamId}\x1f${route.generation}`;
+}
+
+function isBatchableRelayRawInput(data: string): boolean {
+  return data.length > 0
+    && !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(data);
+}
+
+function writeControlledRawInput(
   control: RelayTerminalControl,
   route: StreamRoute,
   data: string,
 ): Promise<void> {
-  await controlledRelayInput(
-    control,
-    route.clientId,
-    route.scope,
-    route.rawName,
-    async (lease, operationId) => {
-      const paneIndex = await resolvePaneIndex(route.scope, route.rawName, route.pane);
-      return {
+  const targetKey = relayControlLeaseKey(route.clientId, route.scope, route.rawName);
+  const routeKey = relayRawInputRouteKey(route);
+  const bytes = Buffer.from(data, "utf8");
+  const batchable = isBatchableRelayRawInput(data)
+    && bytes.byteLength <= MAX_RELAY_RAW_INPUT_BATCH_BYTES;
+  const pending = batchable ? control.pendingRawInputs.get(routeKey) : undefined;
+  if (
+    pending
+    && !pending.started
+    && pending.targetKey === targetKey
+    && control.laneTailTokens.get(targetKey) === pending.tailToken
+    && pending.frameCount < MAX_RELAY_RAW_INPUT_BATCH_FRAMES
+    && pending.byteLength + bytes.byteLength <= MAX_RELAY_RAW_INPUT_BATCH_BYTES
+  ) {
+    pending.chunks.push(bytes);
+    pending.byteLength += bytes.byteLength;
+    pending.frameCount += 1;
+    // The first frame owns the batch error report. Followers still wait for
+    // the same terminal-control boundary, but must not fan one ownership or
+    // recovery failure out into dozens of identical Relay error frames.
+    return pending.task.catch(() => undefined);
+  }
+
+  const tailToken = Symbol("relay-raw-input");
+  const batch = {
+    targetKey,
+    tailToken,
+    chunks: [bytes],
+    byteLength: bytes.byteLength,
+    frameCount: 1,
+    started: false,
+    task: Promise.resolve(),
+  } satisfies PendingRelayRawInput;
+  batch.task = runRelayControlLane(control, targetKey, async () => {
+    batch.started = true;
+    if (control.pendingRawInputs.get(routeKey) === batch) {
+      control.pendingRawInputs.delete(routeKey);
+    }
+    const payload = batch.chunks.length === 1
+      ? batch.chunks[0]!
+      : Buffer.concat(batch.chunks, batch.byteLength);
+    await executeControlledRelayInput(
+      control,
+      route.clientId,
+      route.scope,
+      route.rawName,
+      (lease, operationId) => ({
         type: "input.raw",
         lease,
         operationId,
-        pane: paneIndex,
-        dataBase64: Buffer.from(data, "utf8").toString("base64"),
-      };
-    },
-    `stream:${route.streamId}:input`,
-  );
-}
-
-async function writeControlledResize(
-  control: RelayTerminalControl,
-  route: StreamRoute,
-  cols: number,
-  rows: number,
-): Promise<void> {
-  await controlledRelayInput(
-    control,
-    route.clientId,
-    route.scope,
-    route.rawName,
-    async (lease, operationId) => {
-      const paneIndex = await resolvePaneIndex(route.scope, route.rawName, route.pane);
-      return {
-        type: "input.resize",
-        lease,
-        operationId,
-        pane: paneIndex,
-        cols,
-        rows,
-      };
-    },
-    `stream:${route.streamId}:resize`,
-  );
+        pane: "0",
+        dataBase64: payload.toString("base64"),
+      }),
+      `stream:${route.streamId}:input`,
+    );
+  }, tailToken);
+  if (batchable) control.pendingRawInputs.set(routeKey, batch);
+  return batch.task;
 }
 
 function sendRelayControlError(stream: LocalStream, error: unknown): void {
@@ -2319,13 +2562,19 @@ function runRelayControlLane<T>(
   control: RelayTerminalControl,
   key: string,
   operation: () => Promise<T>,
+  tailToken = Symbol("relay-control-lane"),
 ): Promise<T> {
   const previous = control.lanes.get(key) ?? Promise.resolve();
   const running = previous.catch(() => undefined).then(operation);
   const settled = running.then(() => undefined, () => undefined);
   control.lanes.set(key, settled);
+  control.laneTailTokens.set(key, tailToken);
   void settled.then(() => {
-    if (control.lanes.get(key) === settled) control.lanes.delete(key);
+    if (control.lanes.get(key) !== settled) return;
+    control.lanes.delete(key);
+    if (control.laneTailTokens.get(key) === tailToken) {
+      control.laneTailTokens.delete(key);
+    }
   });
   return running;
 }
@@ -2379,7 +2628,15 @@ async function relayControlLease(
   rawName: string,
 ): Promise<TerminalControlLease> {
   const key = relayControlLeaseKey(clientId, scope, rawName);
-  const cached = control.leases.get(key);
+  let cached = control.leases.get(key);
+  if (cached?.renewing) {
+    await cached.renewing;
+    cached = control.leases.get(key);
+  }
+  if (cached && relayControlLeaseNeedsRenewal(cached.lease)) {
+    await renewRelayControlRecord(control, cached);
+    cached = control.leases.get(key);
+  }
   if (cached) return cached.lease;
   const target = await requestScopedTerminalControl<{
     controlTargetId: string;
@@ -2421,14 +2678,57 @@ function shouldForgetControlLease(error: unknown): boolean {
   return error.code !== "INVALID_REQUEST" && error.code !== "RESOURCE_EXHAUSTED";
 }
 
+function relayControlLeaseNeedsRenewal(lease: TerminalControlLease): boolean {
+  const expiresAt = Date.parse(lease.expiresAt);
+  return !Number.isFinite(expiresAt)
+    || expiresAt - Date.now() <= TERMINAL_CONTROL_RENEW_INTERVAL_MS;
+}
+
 function relayV1ErrorMessage(error: unknown): string {
   if (
     error instanceof TerminalControlProtocolError
-    && ["PERMISSION_DENIED", "HANDOFF_PENDING", "TARGET_GONE", "RECOVERY_REQUIRED"].includes(error.code)
+    && (
+      (error.code === "PERMISSION_DENIED" && error.message === "terminal input is owned by feishu")
+      || error.code === "HANDOFF_PENDING"
+      || error.code === "RECOVERY_REQUIRED"
+    )
   ) {
     return `[input-ownership:${error.code}] ${error.message}`;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+async function executeControlledRelayInput<T>(
+  control: RelayTerminalControl,
+  clientId: string,
+  scope: AdminScope,
+  rawName: string,
+  input: (
+    lease: TerminalControlLease,
+    operationId: string,
+  ) => TerminalControlRequestInput | Promise<TerminalControlRequestInput>,
+  lane: string,
+): Promise<T> {
+  if (!control.accepting || control.closedClients.has(clientId)) {
+    throw new Error("relay client closed before terminal input was accepted");
+  }
+  const operationId = nextRelayControlOperation(control, clientId, lane);
+  const lease = await relayControlLease(control, clientId, scope, rawName);
+  const request = await input(lease, operationId);
+  if (!control.accepting || control.closedClients.has(clientId)) {
+    throw new Error("relay client closed before terminal input was accepted");
+  }
+  try {
+    return await requestScopedTerminalControl<T>(scope, request);
+  } catch (error) {
+    if (shouldForgetControlLease(error)) {
+      forgetRelayControlLease(control, clientId, scope, rawName);
+    }
+    // Never replay a terminal mutation here. A stale lease is forgotten so
+    // the next explicit input reacquires it, while every ambiguous response
+    // remains visible to the caller.
+    throw error;
+  }
 }
 
 function controlledRelayInput<T>(
@@ -2443,32 +2743,17 @@ function controlledRelayInput<T>(
   lane: string,
 ): Promise<T> {
   const key = relayControlLeaseKey(clientId, scope, rawName);
-  return runRelayControlLane(control, key, async () => {
-    if (!control.accepting || control.closedClients.has(clientId)) {
-      throw new Error("relay client closed before terminal input was accepted");
-    }
-    const lease = await relayControlLease(control, clientId, scope, rawName);
-    const operationId = nextRelayControlOperation(control, clientId, lane);
-    const request = await input(lease, operationId);
-    if (!control.accepting || control.closedClients.has(clientId)) {
-      throw new Error("relay client closed before terminal input was accepted");
-    }
-    try {
-      return await requestScopedTerminalControl<T>(scope, request);
-    } catch (error) {
-      if (shouldForgetControlLease(error)) {
-        forgetRelayControlLease(control, clientId, scope, rawName);
-      }
-      throw error;
-    }
-  });
+  return runRelayControlLane(
+    control,
+    key,
+    () => executeControlledRelayInput(control, clientId, scope, rawName, input, lane),
+  );
 }
 
 async function sendControlledAgentMessage(
   control: RelayTerminalControl,
   clientId: string,
   session: string,
-  pane: string | number | undefined,
   message: string,
   submit: boolean,
 ): Promise<void> {
@@ -2478,17 +2763,14 @@ async function sendControlledAgentMessage(
     clientId,
     scope,
     rawName,
-    async (lease, operationId) => {
-      const paneIndex = await resolvePaneIndex(scope, rawName, pane);
-      return {
-        type: "input.agent-message",
-        lease,
-        operationId,
-        pane: paneIndex,
-        message,
-        submit,
-      };
-    },
+    (lease, operationId) => ({
+      type: "input.agent-message",
+      lease,
+      operationId,
+      pane: "0",
+      message,
+      submit,
+    }),
     "agent-message",
   );
 }
@@ -2524,29 +2806,37 @@ async function releaseAllRelayControl(control: RelayTerminalControl): Promise<vo
   );
 }
 
+function renewRelayControlRecord(
+  control: RelayTerminalControl,
+  record: RelayControlLeaseRecord,
+): Promise<void> {
+  if (record.renewing) return record.renewing;
+  const lease = record.lease;
+  const renewal = requestScopedTerminalControl<{ lease: TerminalControlLease }>(record.scope, {
+    type: "lease.renew",
+    lease,
+  }).then(
+    (result) => {
+      if (control.leases.get(record.key) === record && record.lease.leaseId === lease.leaseId) {
+        record.lease = result.lease;
+      }
+    },
+    () => {
+      if (control.leases.get(record.key) === record && record.lease.leaseId === lease.leaseId) {
+        control.leases.delete(record.key);
+      }
+    },
+  ).finally(() => {
+    if (record.renewing === renewal) record.renewing = undefined;
+  });
+  record.renewing = renewal;
+  return renewal;
+}
+
 function renewRelayControlLeases(control: RelayTerminalControl): void {
   if (!control.accepting) return;
   for (const record of control.leases.values()) {
-    if (record.renewing) continue;
-    const lease = record.lease;
-    const renewal = requestScopedTerminalControl<{ lease: TerminalControlLease }>(record.scope, {
-      type: "lease.renew",
-      lease,
-    }).then(
-      (result) => {
-        if (control.leases.get(record.key) === record && record.lease.leaseId === lease.leaseId) {
-          record.lease = result.lease;
-        }
-      },
-      () => {
-        if (control.leases.get(record.key) === record && record.lease.leaseId === lease.leaseId) {
-          control.leases.delete(record.key);
-        }
-      },
-    ).finally(() => {
-      if (record.renewing === renewal) record.renewing = undefined;
-    });
-    record.renewing = renewal;
+    void renewRelayControlRecord(control, record);
   }
 }
 
@@ -2931,12 +3221,7 @@ async function openRemoteStream(
   const pendingResize = stream.pendingResize;
   stream.pendingResize = undefined;
   if (pendingResize) {
-    try {
-      await writeControlledResize(control, route, pendingResize.cols, pendingResize.rows);
-      stream.resize(pendingResize.cols, pendingResize.rows);
-    } catch (error) {
-      sendRelayControlError(stream, error);
-    }
+    stream.resize(pendingResize.cols, pendingResize.rows);
   }
   await flushPendingInputs(control, streams, routes, key, stream);
 }
@@ -2973,26 +3258,21 @@ async function openLocalStream(
     stream.pendingResize = undefined;
     void (async () => {
       if (pendingResize) {
-        try {
-          await writeControlledResize(control, route, pendingResize.cols, pendingResize.rows);
-          const result = sendToStream(
+        const result = sendToStream(
+          stream,
+          JSON.stringify({ type: "attachment_resize", cols: pendingResize.cols, rows: pendingResize.rows }),
+        );
+        if (result !== "sent") {
+          failCurrentStream(
+            streams,
+            routes,
+            key,
             stream,
-            JSON.stringify({ type: "attachment_resize", cols: pendingResize.cols, rows: pendingResize.rows }),
+            result === "overloaded"
+              ? "terminal input buffer limit reached"
+              : "terminal stream closed while applying attachment resize",
           );
-          if (result !== "sent") {
-            failCurrentStream(
-              streams,
-              routes,
-              key,
-              stream,
-              result === "overloaded"
-                ? "terminal input buffer limit reached"
-                : "terminal stream closed while applying attachment resize",
-            );
-            return;
-          }
-        } catch (error) {
-          sendRelayControlError(stream, error);
+          return;
         }
       }
       await flushPendingInputs(control, streams, routes, key, stream);
@@ -3151,6 +3431,7 @@ async function runConnection(
     headers: { Authorization: `Bearer ${opts.secret}` },
     perMessageDeflate: false,
     maxPayload: MAX_RELAY_FRAME_BYTES,
+    lookup: relayLookup,
   });
   onSocket(relaySocket);
   const streams = new Map<string, LocalStream>();
@@ -3161,6 +3442,8 @@ async function runConnection(
     closedClients: new Set(),
     leases: new Map(),
     lanes: new Map(),
+    laneTailTokens: new Map(),
+    pendingRawInputs: new Map(),
     nextOperation: 0,
   };
   const terminalControlRenewal = setInterval(
@@ -3413,7 +3696,6 @@ async function runConnection(
             terminalControl,
             clientId,
             message.session,
-            message.pane,
             message.message,
             message.submit !== false,
           );
@@ -3513,12 +3795,6 @@ async function runConnection(
             stream.pendingResize = { cols: message.cols, rows: message.rows };
             return;
           }
-          await writeControlledResize(
-            terminalControl,
-            stream.route,
-            message.cols,
-            message.rows,
-          );
           if (stream.resize) {
             stream.resize(message.cols, message.rows);
           } else {

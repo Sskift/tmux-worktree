@@ -4,7 +4,13 @@ import {
   createLatestRequestGate,
   requestSourceKey,
 } from "../src/latestRequestGate.ts";
-import { shouldApplyWorktreeCatalogDefault } from "../src/NewWorktreeModal.tsx";
+import {
+  availableWorktreeAgents,
+  isWorktreeAgentSelectionAvailable,
+  resolveWorktreeAgentCommand,
+  shouldApplyWorktreeCatalogDefault,
+} from "../src/NewWorktreeModal.tsx";
+import type { AgentProbeResult } from "../src/platform/domainTypes.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -103,4 +109,69 @@ test("new worktree catalog defaults never replace a Custom draft edited for the 
 
   assert.equal(project, "__custom__");
   assert.equal(customPath, "/srv/repos/custom-dashboard");
+});
+
+const agentResults: AgentProbeResult[] = [
+  {
+    id: "claude",
+    label: "Claude Code",
+    command: "claude",
+    available: false,
+    executablePath: null,
+    error: "not found",
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    command: "codex",
+    available: true,
+    executablePath: "/opt/homebrew/bin/codex",
+    error: null,
+  },
+  {
+    id: "gemini",
+    label: "Gemini CLI",
+    command: "gemini",
+    available: true,
+    executablePath: "/opt/homebrew/bin/gemini",
+    error: null,
+  },
+];
+
+test("new worktree agent choice is restricted to detected available commands", () => {
+  assert.deepEqual(
+    availableWorktreeAgents(agentResults).map((agent) => agent.command),
+    ["codex", "gemini"],
+  );
+  assert.equal(resolveWorktreeAgentCommand(agentResults, "gemini"), "gemini");
+  assert.equal(resolveWorktreeAgentCommand(agentResults, "codex --full-auto"), "codex");
+  assert.equal(resolveWorktreeAgentCommand(agentResults, "claude"), "codex");
+  assert.equal(
+    resolveWorktreeAgentCommand(agentResults.map((agent) => ({ ...agent, available: false })), "codex"),
+    "",
+  );
+  assert.equal(
+    isWorktreeAgentSelectionAvailable(
+      { source: "host-a", results: agentResults },
+      "host-a",
+      "codex",
+    ),
+    true,
+  );
+  assert.equal(
+    isWorktreeAgentSelectionAvailable(
+      { source: "host-a", results: agentResults },
+      "host-b",
+      "codex",
+    ),
+    false,
+  );
+  assert.equal(
+    isWorktreeAgentSelectionAvailable(
+      { source: "host-b", results: [] },
+      "host-b",
+      "codex",
+    ),
+    false,
+  );
 });

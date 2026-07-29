@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +14,8 @@ const {
 } = await import("../dist/feishuBridgeStorage.js");
 const { FeishuBridgeClient, FeishuBridgeServer } = await import("../dist/feishuBridgeServer.js");
 const {
+  CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+  CanonicalTerminalControlError,
   CanonicalTerminalControlSocketClient,
   canonicalTerminalControlSocketPath,
 } = await import("../dist/canonicalTerminalControlClient.js");
@@ -23,8 +26,15 @@ const {
   parseFeishuBotOpenId,
   parseFeishuInboundEvent,
   parseFeishuMessageDetail,
+  parseFeishuReactionId,
 } = await import("../dist/larkCliBridge.js");
+const {
+  buildFeishuBindingLifecycleCard,
+  buildFeishuLocalTaskResultCard,
+  buildFeishuReplyCard,
+} = await import("../dist/feishuReplyCard.js");
 const terminalControl = await import("../dist/terminalControl/index.js");
+const packageVersion = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")).version;
 
 class JointTerminalBackend {
   constructor() {
@@ -34,6 +44,16 @@ class JointTerminalBackend {
     this.outputGeneration = undefined;
     this.nextOutputGeneration = 1;
     this.outputs = new Map();
+    this.renderedOutputs = new Map();
+    this.agentRunning = false;
+    this.agentSource = {
+      provider: "claude",
+      boundary: "exact",
+      sourceId: "a".repeat(64),
+      sessionId: "claude-session-one",
+      turnId: "claude-turn-one",
+      startedAt: "2026-07-13T00:00:00.000Z",
+    };
   }
 
   async resolveManagedSession(sessionName) {
@@ -75,6 +95,7 @@ class JointTerminalBackend {
     this.outputGeneration = next;
     const key = `${controlTargetId}:${next}`;
     if (!this.outputs.has(key)) this.outputs.set(key, Buffer.alloc(0));
+    if (!this.renderedOutputs.has(next)) this.renderedOutputs.set(next, Buffer.alloc(0));
     return { generation: next, cursor: this.outputs.get(key).byteLength };
   }
 
@@ -82,7 +103,15 @@ class JointTerminalBackend {
     const generation = `joint-output-${this.nextOutputGeneration++}`;
     this.outputGeneration = generation;
     this.outputs.set(`${controlTargetId}:${generation}`, Buffer.alloc(0));
+    this.renderedOutputs.set(generation, Buffer.alloc(0));
     return { generation, cursor: 0 };
+  }
+
+  async recoverOutput(controlTargetId, _session, _pane, _previousGeneration, recoveryGeneration) {
+    this.outputGeneration = recoveryGeneration;
+    this.outputs.set(`${controlTargetId}:${recoveryGeneration}`, Buffer.alloc(0));
+    this.renderedOutputs.set(recoveryGeneration, Buffer.alloc(0));
+    return { generation: recoveryGeneration, cursor: 0 };
   }
 
   async tailOutput(controlTargetId, _session, _pane, generation, cursor, maxBytes) {
@@ -102,10 +131,59 @@ class JointTerminalBackend {
     };
   }
 
+  async captureRenderedSnapshot(
+    managedSession,
+    tmuxInstanceId,
+    outputGeneration,
+    pane,
+    maxBytes,
+  ) {
+    assert.equal(managedSession.createdAt, this.createdAt);
+    assert.equal(tmuxInstanceId, this.instance);
+    assert.equal(outputGeneration, this.outputGeneration);
+    assert.equal(pane, "0");
+    const source = this.renderedOutputs.get(outputGeneration) ?? Buffer.alloc(0);
+    const truncated = source.byteLength > maxBytes;
+    const data = truncated ? source.subarray(source.byteLength - maxBytes) : source;
+    return {
+      dataBase64: data.toString("base64"),
+      truncated,
+    };
+  }
+
+  async agentStatus(managedSession, tmuxInstanceId, outputGeneration, pane) {
+    assert.equal(managedSession.createdAt, this.createdAt);
+    assert.equal(tmuxInstanceId, this.instance);
+    assert.equal(outputGeneration, this.outputGeneration);
+    assert.equal(pane, "0");
+    return {
+      agentRunning: this.agentRunning,
+      ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
+    };
+  }
+
+  async agentResult(managedSession, tmuxInstanceId, outputGeneration, pane, source, maxBytes) {
+    assert.equal(managedSession.createdAt, this.createdAt);
+    assert.equal(tmuxInstanceId, this.instance);
+    assert.equal(outputGeneration, this.outputGeneration);
+    assert.equal(pane, "0");
+    assert.deepEqual(source, this.agentSource);
+    assert.equal(maxBytes, 16 * 1024);
+    return {
+      source: structuredClone(source),
+      completedAt: "2026-07-13T01:00:00.000Z",
+      text: "Structured final answer",
+      truncated: false,
+    };
+  }
+
   appendOutput(controlTargetId, text) {
     const key = `${controlTargetId}:${this.outputGeneration}`;
     const current = this.outputs.get(key) ?? Buffer.alloc(0);
-    this.outputs.set(key, Buffer.concat([current, Buffer.from(text, "utf8")]));
+    const appended = Buffer.from(text, "utf8");
+    this.outputs.set(key, Buffer.concat([current, appended]));
+    const rendered = this.renderedOutputs.get(this.outputGeneration) ?? Buffer.alloc(0);
+    this.renderedOutputs.set(this.outputGeneration, Buffer.concat([rendered, appended]));
   }
 }
 class FakeControlClient {
@@ -113,14 +191,44 @@ class FakeControlClient {
     this.requests = [];
     this.inputs = [];
     this.output = "";
+    this.renderedOutput = undefined;
+    this.renderedSnapshotCapability = true;
+    this.agentStatusCapability = true;
+    this.agentResultCapability = true;
+    this.agentRunning = false;
+    this.agentSource = {
+      provider: "claude",
+      boundary: "exact",
+      sourceId: "a".repeat(64),
+      sessionId: "claude-session-one",
+      turnId: "claude-turn-one",
+      startedAt: "2026-07-21T11:00:00.000Z",
+    };
+    this.agentResultText = "The exact structured final answer.";
+    this.agentResultTruncated = false;
+    this.agentResultErrors = [];
+    this.agentStatusErrors = [];
     this.failRelease = false;
     this.failRenew = false;
     this.tailFence = undefined;
     this.tailOwnerKind = undefined;
     this.tailChunkBytes = undefined;
+    this.snapshotControlTargetId = undefined;
+    this.snapshotControlEpoch = undefined;
+    this.snapshotLeaseId = undefined;
+    this.snapshotFence = undefined;
+    this.snapshotOwnerKind = undefined;
+    this.snapshotOutputGeneration = undefined;
+    this.snapshotPane = undefined;
+    this.snapshotTruncated = undefined;
+    this.snapshotErrors = [];
+    this.retainedFloor = 0;
+    this.beforeRetainedStale = undefined;
     this.beforeInput = undefined;
     this.beforeCommit = undefined;
     this.failInputAfterCommit = false;
+    this.ownershipStatusCalls = 0;
+    this.failOwnershipStatusAt = undefined;
     this.outputGenerationSequence = 1;
     this.target = {
       controlEpoch: "epoch-one",
@@ -137,6 +245,15 @@ class FakeControlClient {
     this.requests.push({ type, fields });
   }
 
+  async capabilities() {
+    this.record("ping", {});
+    return {
+      renderedSnapshot: this.renderedSnapshotCapability,
+      agentStatus: this.agentStatusCapability,
+      agentResult: this.agentResultCapability,
+    };
+  }
+
   nextFence() {
     this.target.fence = (BigInt(this.target.fence) + 1n).toString();
     this.target.revision = (BigInt(this.target.revision) + 1n).toString();
@@ -146,6 +263,7 @@ class FakeControlClient {
     this.outputGenerationSequence += 1;
     this.target.outputGeneration = `out-${this.outputGenerationSequence}`;
     this.output = "";
+    this.renderedOutput = undefined;
   }
 
   ownership() {
@@ -221,7 +339,59 @@ class FakeControlClient {
   async ownershipStatus(controlTargetId) {
     this.record("ownership.status", { controlTargetId });
     assert.equal(controlTargetId, this.target.controlTargetId);
+    this.ownershipStatusCalls += 1;
+    if (this.ownershipStatusCalls === this.failOwnershipStatusAt) {
+      const error = new Error("controller unavailable during outbound authority check");
+      error.code = "CONTROLLER_UNAVAILABLE";
+      throw error;
+    }
     return this.ownership();
+  }
+
+  async agentStatus(input) {
+    this.record("activity.agent-status", { input: structuredClone(input) });
+    this.assertLease(input.lease, true);
+    const activityError = this.agentStatusErrors.shift();
+    if (activityError) throw activityError;
+    if (input.outputGeneration !== this.target.outputGeneration || input.pane !== "0") {
+      const error = new Error("stale Agent activity observation");
+      error.code = "STALE_OUTPUT_CURSOR";
+      throw error;
+    }
+    return {
+      controlTargetId: this.target.controlTargetId,
+      controlEpoch: this.target.controlEpoch,
+      leaseId: this.target.leaseId,
+      fence: this.target.fence,
+      ownerKind: "feishu",
+      outputGeneration: this.target.outputGeneration,
+      pane: "0",
+      agentRunning: this.agentRunning,
+      ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
+    };
+  }
+
+  async agentResult(input) {
+    this.record("activity.agent-result", { input: structuredClone(input) });
+    this.assertLease(input.lease, true);
+    const resultError = this.agentResultErrors.shift();
+    if (resultError) throw resultError;
+    assert.equal(input.outputGeneration, this.target.outputGeneration);
+    assert.equal(input.pane, "0");
+    assert.deepEqual(input.source, this.agentSource);
+    return {
+      controlTargetId: this.target.controlTargetId,
+      controlEpoch: this.target.controlEpoch,
+      leaseId: this.target.leaseId,
+      fence: this.target.fence,
+      ownerKind: "feishu",
+      outputGeneration: this.target.outputGeneration,
+      pane: "0",
+      source: structuredClone(this.agentSource),
+      completedAt: "2026-07-21T12:30:00.000Z",
+      text: this.agentResultText,
+      truncated: this.agentResultTruncated,
+    };
   }
 
   async acquireLease(controlTargetId, owner, ttlMs) {
@@ -397,6 +567,12 @@ class FakeControlClient {
       error.code = "STALE_OUTPUT_CURSOR";
       throw error;
     }
+    if (input.cursor < this.retainedFloor) {
+      await this.beforeRetainedStale?.(input);
+      const error = new Error("output cursor precedes the retained window");
+      error.code = "STALE_OUTPUT_CURSOR";
+      throw error;
+    }
     const source = Buffer.from(this.output, "utf8");
     const maxBytes = Math.min(input.maxBytes, this.tailChunkBytes ?? input.maxBytes);
     const data = source.subarray(input.cursor, input.cursor + maxBytes);
@@ -411,17 +587,59 @@ class FakeControlClient {
       nextCursor: input.cursor + data.length,
     };
   }
+
+  async renderedSnapshot(input) {
+    this.record("output.rendered-snapshot", structuredClone(input));
+    this.assertLease(input.lease, true);
+    if (input.outputGeneration !== this.target.outputGeneration) {
+      const error = new Error("stale rendered snapshot generation");
+      error.code = "STALE_OUTPUT_CURSOR";
+      throw error;
+    }
+    assert.equal(input.pane, "0");
+    const snapshotError = this.snapshotErrors.shift();
+    if (snapshotError) throw snapshotError;
+    const source = Buffer.from(this.renderedOutput ?? this.output, "utf8");
+    const truncated = source.byteLength > input.maxBytes;
+    const data = truncated ? source.subarray(source.byteLength - input.maxBytes) : source;
+    return {
+      controlTargetId: this.snapshotControlTargetId ?? this.target.controlTargetId,
+      controlEpoch: this.snapshotControlEpoch ?? this.target.controlEpoch,
+      leaseId: this.snapshotLeaseId ?? this.target.leaseId,
+      fence: this.snapshotFence ?? this.target.fence,
+      ownerKind: this.snapshotOwnerKind ?? this.target.owner?.kind,
+      outputGeneration: this.snapshotOutputGeneration ?? this.target.outputGeneration,
+      pane: this.snapshotPane ?? input.pane,
+      dataBase64: data.toString("base64"),
+      truncated: this.snapshotTruncated ?? truncated,
+    };
+  }
 }
 
 class FakeLark {
   constructor() {
     this.details = new Map();
     this.replies = [];
+    this.groupCards = [];
+    this.reactionCreates = [];
+    this.reactionDeletes = [];
     this.failReply = false;
+    this.failGroupCard = false;
+    this.failReactionCreateAcknowledgement = false;
+    this.omitReactionId = false;
+    this.failReactionDelete = false;
+    this.reactionCreateBarrier = undefined;
+    this.beforeReply = undefined;
+    this.beforeGroupCard = undefined;
   }
 
   subscribe() {
-    return { child: undefined, done: new Promise(() => {}), stop() {} };
+    return {
+      child: undefined,
+      ready: Promise.resolve(),
+      done: new Promise(() => {}),
+      stop() {},
+    };
   }
 
   async messageDetail(messageId) {
@@ -433,10 +651,35 @@ class FakeLark {
     };
   }
 
-  async reply(messageId, text, idempotencyKey) {
-    this.replies.push({ messageId, text, idempotencyKey });
+  async replyCard(messageId, card, idempotencyKey, replyMode) {
+    const text = card.body.elements[0].content;
+    this.replies.push({ messageId, text, card, idempotencyKey, replyMode });
+    await this.beforeReply?.({ messageId, text, card, idempotencyKey, replyMode });
     if (this.failReply) throw new Error("reply acknowledgement lost");
     return { messageId: `reply-${this.replies.length}`, raw: {} };
+  }
+
+  async sendCard(chatId, card, idempotencyKey) {
+    const sent = { chatId, card, idempotencyKey };
+    this.groupCards.push(sent);
+    await this.beforeGroupCard?.(sent);
+    if (this.failGroupCard) throw new Error("group card acknowledgement lost");
+    return { messageId: `group-card-${this.groupCards.length}`, raw: {} };
+  }
+
+  async addReaction(messageId, emojiType) {
+    const reactionId = `reaction-${this.reactionCreates.length + 1}`;
+    this.reactionCreates.push({ messageId, emojiType, reactionId });
+    if (this.reactionCreateBarrier) await this.reactionCreateBarrier;
+    if (this.failReactionCreateAcknowledgement) {
+      throw new Error("reaction create acknowledgement lost");
+    }
+    return { ...(this.omitReactionId ? {} : { reactionId }), raw: {} };
+  }
+
+  async deleteReaction(messageId, reactionId) {
+    this.reactionDeletes.push({ messageId, reactionId });
+    if (this.failReactionDelete) throw new Error("reaction delete acknowledgement lost");
   }
 
   async listGroups() {
@@ -487,6 +730,33 @@ function marked(h, text) {
   const turn = currentTurn(h);
   const markers = feishuTurnMarkers(turn.markerNonce);
   return `${markers.open}${text}${markers.close}`;
+}
+
+function installRetainedMarkedOutput(h, text) {
+  const droppedBytes = 257;
+  const payload = marked(h, text);
+  const fillerBytes = CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES
+    - Buffer.byteLength(payload, "utf8");
+  assert.ok(fillerBytes > 0);
+  h.control.output = `${"d".repeat(droppedBytes)}${payload}${"r".repeat(fillerBytes)}`;
+  h.control.renderedOutput = payload;
+  h.control.retainedFloor = droppedBytes;
+  assert.equal(
+    Buffer.byteLength(h.control.output, "utf8")
+      - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+    droppedBytes,
+  );
+  return droppedBytes;
+}
+
+function cardText(value) {
+  if (Array.isArray(value)) return value.map(cardText).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return typeof value === "string" ? value : "";
+  return Object.values(value).map(cardText).filter(Boolean).join("\n");
+}
+
+async function flushBestEffortEffects() {
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 test("canonical socket path matches Relay long-HOME fallback semantics", () => {
@@ -797,6 +1067,89 @@ test("Lark CLI bridge collects every bot group page and keeps the group owner", 
   );
 });
 
+test("Lark CLI bridge selects topic or direct Card replies and manages bot reactions", async () => {
+  const calls = [];
+  const responses = [
+    { data: { message_id: "om-card-reply" } },
+    { data: { message_id: "om-direct-reply" } },
+    { data: { message_id: "om-group-card" } },
+    { data: { reaction_id: "reaction-typing" } },
+    { data: { reaction_id: "reaction-typing" } },
+  ];
+  const adapter = new LarkCliBridgeAdapter({
+    profile: "bot",
+    runner: async (args) => {
+      calls.push(args);
+      return responses.shift();
+    },
+  });
+  const card = buildFeishuReplyCard(
+    "answer <at id=\"ou-surprise\"></at>",
+    "feature/card-title",
+  );
+
+  assert.equal((await adapter.replyCard("om-root", card, "tw-card-one", "topic")).messageId, "om-card-reply");
+  assert.equal((await adapter.replyCard("om-root", card, "tw-card-direct", "direct")).messageId, "om-direct-reply");
+  assert.equal((await adapter.sendCard("oc-one", card, "tw-card-two")).messageId, "om-group-card");
+  assert.equal((await adapter.addReaction("om-root", "Typing")).reactionId, "reaction-typing");
+  await adapter.deleteReaction("om-root", "reaction-typing");
+
+  assert.deepEqual(calls[0], [
+    "--profile", "bot", "im", "+messages-reply",
+    "--message-id", "om-root",
+    "--msg-type", "interactive",
+    "--content", JSON.stringify(card),
+    "--reply-in-thread",
+    "--idempotency-key", "tw-card-one",
+    "--as", "bot",
+    "--json",
+  ]);
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.config.streaming_mode, false);
+  assert.equal(card.header.title.content, "tw agent on feature/card-title");
+  assert.equal(card.body.elements[0].content.includes("<at"), false, "card output must not create a real mention");
+  assert.equal(
+    buildFeishuReplyCard("status", `  ${"x".repeat(60)}\nprivate  `, "status").header.title.content,
+    `tw agent on ${"x".repeat(47)}…`,
+    "card title context must be single-line and bounded",
+  );
+  assert.deepEqual(calls[1], [
+    "--profile", "bot", "im", "+messages-reply",
+    "--message-id", "om-root",
+    "--msg-type", "interactive",
+    "--content", JSON.stringify(card),
+    "--idempotency-key", "tw-card-direct",
+    "--as", "bot",
+    "--json",
+  ]);
+  assert.deepEqual(calls[2], [
+    "--profile", "bot", "im", "+messages-send",
+    "--chat-id", "oc-one",
+    "--msg-type", "interactive",
+    "--content", JSON.stringify(card),
+    "--idempotency-key", "tw-card-two",
+    "--as", "bot",
+    "--json",
+  ]);
+  assert.deepEqual(calls[3], [
+    "--profile", "bot", "im", "reactions", "create",
+    "--params", JSON.stringify({ message_id: "om-root" }),
+    "--data", JSON.stringify({ reaction_type: { emoji_type: "Typing" } }),
+    "--as", "bot", "--json",
+  ]);
+  assert.deepEqual(calls[4], [
+    "--profile", "bot", "im", "reactions", "delete",
+    "--params", JSON.stringify({ message_id: "om-root", reaction_id: "reaction-typing" }),
+    "--as", "bot", "--json",
+  ]);
+  await assert.rejects(
+    adapter.replyCard("om-root", card, "tw-card-invalid", "future"),
+    /invalid Feishu reply mode/,
+  );
+  assert.equal(calls.length, 5, "an unknown mode must fail before invoking lark-cli");
+  assert.equal(parseFeishuReactionId({ data: { reactionId: "reaction-camel" } }), "reaction-camel");
+});
+
 test("Feishu event and message detail parsers keep the verified routing fields", () => {
   assert.equal(parseFeishuInboundEvent(event()).event_id, "evt-one");
   const detail = parseFeishuMessageDetail({
@@ -822,6 +1175,539 @@ test("Feishu event and message detail parsers keep the verified routing fields",
   });
 });
 
+test("binding lifecycle cards keep dynamic session details in plain-text components", () => {
+  const card = buildFeishuBindingLifecycleCard({
+    kind: "linked",
+    sessionName: "managed-<at id='all'>",
+    sessionKind: "worktree",
+    sessionSummary: "release inspection <at id='all'>",
+    controlTargetId: "target-lifecycle-one",
+  });
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.header.template, "green");
+  assert.match(cardText(card), /release inspection <at id='all'>/);
+  const dynamicTextNodes = card.body.elements
+    .filter((element) => element.tag === "div")
+    .flatMap((element) => [element.text, ...(element.fields ?? []).map((field) => field.text)]);
+  assert.ok(dynamicTextNodes.every((text) => text.tag === "plain_text"));
+});
+
+test("local task result card contains only the structured final answer", () => {
+  const card = buildFeishuLocalTaskResultCard({
+    sessionName: "x-redis-cache",
+    sessionSummary: "Redis cache investigation",
+    text: "Final answer from the structured transcript <at id='all'>",
+    truncated: false,
+  });
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.header.template, "green");
+  assert.equal(card.header.title.content, "tw agent on Redis cache investigation");
+  assert.equal(card.config.summary.content, "TW Agent 回复");
+  assert.equal(card.body.elements[0].tag, "markdown");
+  assert.match(card.body.elements[0].content, /Final answer from the structured transcript/);
+  assert.doesNotMatch(card.body.elements[0].content, /<at\b/i);
+  assert.doesNotMatch(cardText(card), /已结束|完成时间|input footer/i);
+});
+
+test("Feishu ownership activation requires rendered snapshots and structured Agent results", async () => {
+  const create = harness();
+  try {
+    create.control.renderedSnapshotCapability = false;
+    await assert.rejects(
+      create.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      }),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED",
+    );
+    assert.equal(create.control.target.state, "FREE");
+    assert.equal(create.store.read().bindings.length, 0);
+    assert.equal(create.control.requests.some(({ type }) => type === "lease.acquire"), false);
+  } finally {
+    await create.bridge.close();
+    rmSync(create.root, { recursive: true, force: true });
+  }
+
+  const missingResult = harness();
+  try {
+    missingResult.control.agentResultCapability = false;
+    await assert.rejects(
+      missingResult.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      }),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED"
+        && /activity\.agent-result/.test(error.message),
+    );
+    assert.equal(missingResult.control.target.state, "FREE");
+  } finally {
+    await missingResult.bridge.close();
+    rmSync(missingResult.root, { recursive: true, force: true });
+  }
+
+  const resume = harness();
+  try {
+    const binding = await resume.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await resume.bridge.pauseBinding(binding.id);
+    resume.control.renderedSnapshotCapability = false;
+    const acquireCount = resume.control.requests.filter(({ type }) => type === "lease.acquire").length;
+    await assert.rejects(
+      resume.bridge.resumeBinding(binding.id),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED",
+    );
+    assert.equal(resume.control.requests.filter(({ type }) => type === "lease.acquire").length, acquireCount);
+    assert.equal(resume.control.target.state, "FREE");
+    assert.equal(resume.store.read().bindings[0].status, "paused");
+  } finally {
+    await resume.bridge.close();
+    rmSync(resume.root, { recursive: true, force: true });
+  }
+
+  const repair = harness();
+  let repairBridge;
+  try {
+    const binding = await repair.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await repair.bridge.pauseBinding(binding.id);
+    const persisted = repair.store.read();
+    persisted.bindings[0].status = "stale";
+    persisted.bindings[0].staleReason = "test requires canonical repair";
+    repair.store.write(persisted);
+    repairBridge = new FeishuBridge({
+      control: repair.control,
+      lark: repair.lark,
+      store: repair.store,
+      instanceId: "daemon-repair-capability",
+      botOpenId: "ou-bot",
+    });
+    repair.control.renderedSnapshotCapability = false;
+    const acquireCount = repair.control.requests.filter(({ type }) => type === "lease.acquire").length;
+    await assert.rejects(
+      repairBridge.repairBinding(binding.id),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED",
+    );
+    assert.equal(repair.control.requests.filter(({ type }) => type === "lease.acquire").length, acquireCount);
+    assert.equal(repair.control.target.state, "FREE");
+    assert.equal(repair.store.read().bindings[0].status, "stale");
+  } finally {
+    await repairBridge?.close();
+    await repair.bridge.close();
+    rmSync(repair.root, { recursive: true, force: true });
+  }
+
+  const returning = harness();
+  try {
+    const binding = await returning.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    const dashboardLease = await returning.bridge.takeoverBinding(
+      binding.id,
+      "dashboard:capability:return",
+    );
+    returning.control.renderedSnapshotCapability = false;
+    const handoffCount = returning.control.requests.filter(({ type }) => type === "handoff.begin").length;
+    await assert.rejects(
+      returning.bridge.returnBinding(binding.id, dashboardLease),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED",
+    );
+    assert.equal(returning.control.requests.filter(({ type }) => type === "handoff.begin").length, handoffCount);
+    assert.equal(returning.control.target.owner.kind, "dashboard");
+    assert.equal(returning.store.read().bindings[0].status, "paused");
+  } finally {
+    await returning.bridge.close();
+    rmSync(returning.root, { recursive: true, force: true });
+  }
+});
+
+test("each inbound turn rechecks rendered-snapshot support before dedup or terminal input", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    h.control.renderedSnapshotCapability = false;
+    const inbound = event({ event_id: "evt-capability-retry", message_id: "om-capability-retry" });
+    const ownershipChecks = h.control.ownershipStatusCalls;
+    await assert.rejects(
+      h.bridge.handleEvent(inbound),
+      (error) => error?.code === "FEISHU_BRIDGE_UPGRADE_REQUIRED",
+    );
+    assert.equal(h.control.inputs.length, 0);
+    assert.equal(h.control.ownershipStatusCalls, ownershipChecks);
+    assert.equal(h.store.read().eventIds.includes(inbound.event_id), false);
+    assert.equal(h.store.read().turns.length, 0);
+
+    h.control.renderedSnapshotCapability = true;
+    await h.bridge.handleEvent(inbound);
+    assert.equal(h.control.inputs.length, 1, "the same event remains retryable after controller upgrade");
+    assert.equal(h.store.read().eventIds.includes(inbound.event_id), true);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("binding creation and manual unlink announce the committed lifecycle to the group", async () => {
+  const h = harness();
+  try {
+    const observedBindingCounts = [];
+    h.lark.beforeGroupCard = ({ card }) => {
+      if (card.header.template === "green" || card.header.template === "grey") {
+        observedBindingCounts.push(h.store.read().bindings.length);
+      }
+    };
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "tmux-worktree release verification",
+      createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards[0].chatId, "oc-one");
+    assert.equal(h.lark.groupCards[0].card.header.template, "green");
+    assert.match(cardText(h.lark.groupCards[0].card), /tmux-worktree release verification/);
+    assert.match(cardText(h.lark.groupCards[0].card), /managed-one/);
+    assert.match(h.lark.groupCards[0].idempotencyKey, /^tw-[0-9a-f]{40}$/);
+
+    await h.bridge.removeBinding(binding.id);
+    await flushBestEffortEffects();
+    assert.equal(h.store.read().bindings.length, 0);
+    assert.equal(h.lark.groupCards.length, 2);
+    assert.equal(h.lark.groupCards[1].card.header.template, "grey");
+    assert.match(cardText(h.lark.groupCards[1].card), /本机管理端请求解除绑定/);
+    assert.deepEqual(observedBindingCounts, [1, 0]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a task already running at bind time posts its structured final answer after it stops", async () => {
+  let now = Date.parse("2026-07-21T12:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "existing local task",
+      createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    assert.equal(binding.activityWatch.status, "armed");
+    assert.equal(h.store.read().turns.length, 0, "an inherited task is not a synthetic Feishu turn");
+    assert.equal(h.control.inputs.length, 0, "arming the watch never writes to the Agent");
+
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 0, "running observations do not announce completion");
+    h.control.agentRunning = false;
+    now += 1_000;
+    await h.bridge.pollTurns();
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "stop-candidate");
+    assert.equal(h.lark.groupCards.length, 0, "one stopped sample is debounced");
+
+    now += 1_001;
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards[0].chatId, "oc-one");
+    assert.match(cardText(h.lark.groupCards[0].card), /The exact structured final answer\./);
+    assert.doesNotMatch(cardText(h.lark.groupCards[0].card), /已结束|完整结果请在 TW 中查看/);
+    assert.equal(h.lark.groupCards[0].card.header.title.content, "tw agent on existing local task");
+    assert.match(h.lark.groupCards[0].idempotencyKey, /^tw-[0-9a-f]{40}$/);
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sent");
+    assert.equal(h.control.inputs.length, 0);
+
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 1, "settled watches never resend");
+    await h.bridge.handleEvent(event({ event_id: "evt-after-local", message_id: "om-after-local" }));
+    assert.equal(h.control.inputs.length, 1, "new group turns resume after completion is announced");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a group message converts an inherited local task into one marker-correlated steering turn", async () => {
+  const h = harness();
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "existing local task",
+      createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    assert.equal(binding.activityWatch.status, "armed");
+
+    await h.bridge.handleEvent(event({
+      event_id: "evt-steer-local",
+      message_id: "om-steer-local",
+    }));
+    assert.equal(h.control.inputs.length, 1, "the group message must enter the running Agent");
+    assert.match(h.control.inputs[0].message, /treat this as a steering update/i);
+    assert.equal(h.store.read().bindings[0].activityWatch.status, "cancelled");
+    assert.match(
+      h.store.read().bindings[0].activityWatch.error,
+      /marker-correlated Feishu steering turn/,
+    );
+    assert.equal(currentTurn(h).status, "awaiting");
+
+    h.control.output += marked(h, "answer after inherited task steering");
+    await h.bridge.pollTurns();
+    assert.deepEqual(
+      h.lark.replies.map(({ messageId, text }) => ({ messageId, text })),
+      [{ messageId: "om-steer-local", text: "answer after inherited task steering" }],
+    );
+    assert.equal(h.lark.groupCards.length, 0, "a steered inherited task has no duplicate completion card");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an uncertain local-task completion card is never sent twice", async () => {
+  let now = Date.parse("2026-07-21T13:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    now += 1_001;
+    h.lark.failGroupCard = true;
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 2);
+    assert.match(cardText(h.lark.groupCards[0].card), /The exact structured final answer\./);
+    assert.doesNotMatch(cardText(h.lark.groupCards[1].card), /The exact structured final answer\./);
+    assert.match(cardText(h.lark.groupCards[1].card), /投递结果无法确认/);
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "uncertain");
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.groupCards.length, 2, "neither Agent content nor its recovery notice is retried blindly");
+  } finally {
+    h.lark.failGroupCard = false;
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed local-task completion card never blocks terminal lease renewal", async () => {
+  let now = Date.parse("2026-07-21T00:00:00.000Z");
+  const h = harness({ now: () => now });
+  let releaseCard = () => {};
+  const cardBarrier = new Promise((resolve) => { releaseCard = resolve; });
+  let markCardStarted = () => {};
+  const cardStarted = new Promise((resolve) => { markCardStarted = resolve; });
+  let pollPromise;
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    now += 1_001;
+    h.lark.beforeGroupCard = async () => {
+      markCardStarted();
+      await cardBarrier;
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await cardStarted;
+    await h.bridge.renewLeases();
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "lease.renew").length,
+      1,
+      "outbound Feishu I/O must not occupy the terminal mutation lane",
+    );
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sending");
+
+    releaseCard();
+    await pollPromise;
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "sent");
+  } finally {
+    releaseCard();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed turn reply never blocks lease renewal or permits concurrent unlink", async () => {
+  const h = harness();
+  let releaseReply = () => {};
+  const replyBarrier = new Promise((resolve) => { releaseReply = resolve; });
+  let markReplyStarted = () => {};
+  const replyStarted = new Promise((resolve) => { markReplyStarted = resolve; });
+  let pollPromise;
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output += marked(h, "delayed durable answer");
+    h.lark.beforeReply = async () => {
+      markReplyStarted();
+      await replyBarrier;
+    };
+
+    pollPromise = h.bridge.pollTurns();
+    await replyStarted;
+    await h.bridge.renewLeases();
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "lease.renew").length,
+      1,
+      "outbound reply I/O must not occupy the terminal mutation lane",
+    );
+    await assert.rejects(
+      h.bridge.removeBinding(h.bridge.snapshot().bindings[0].id, true),
+      /reply card is being delivered/,
+    );
+
+    releaseReply();
+    await pollPromise;
+    assert.equal(currentTurn(h).status, "completed");
+    assert.equal(h.lark.replies.length, 1);
+  } finally {
+    releaseReply();
+    await pollPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an external non-force handoff waits for inherited Agent completion", async () => {
+  const h = harness();
+  try {
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    const localOwner = { kind: "dashboard", instanceId: "dashboard:external:pty-one" };
+    const pending = await h.control.beginHandoff(binding.controlTargetId, localOwner);
+
+    await h.bridge.reconcileHandoffs();
+    assert.equal(h.control.target.state, "DRAINING");
+    assert.equal(h.control.target.owner.kind, "feishu");
+    assert.equal(h.bridge.snapshot().bindings[0].activityWatch.status, "armed");
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "handoff.commit").length,
+      0,
+      "an inherited running task is not a drained Feishu binding",
+    );
+
+    await h.control.withdrawHandoff(binding.controlTargetId, pending.ownership.handoffId, localOwner);
+    await h.bridge.reconcileHandoffs();
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("fatal first activity probe leaves committed Feishu ownership stale and visible", async () => {
+  const h = harness();
+  try {
+    const error = new Error("activity probe lost authority");
+    error.code = "PERMISSION_DENIED";
+    h.control.agentStatusErrors.push(error);
+    await assert.rejects(
+      h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      }),
+      /activity probe lost authority/,
+    );
+    const [binding] = h.bridge.snapshot().bindings;
+    assert.equal(binding.status, "stale");
+    assert.equal(binding.activityWatch.status, "recovery-required");
+    assert.match(binding.staleReason, /could not establish Agent activity continuity/);
+    assert.equal(h.control.target.owner.kind, "feishu");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("completion authority mismatch fails closed before a group Card is sent", async () => {
+  let now = Date.parse("2026-07-21T01:00:00.000Z");
+  const h = harness({ now: () => now });
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.agentRunning = false;
+    await h.bridge.pollTurns();
+    now += 1_001;
+    const originalAgentStatus = h.control.agentStatus.bind(h.control);
+    h.control.agentStatus = async (input) => {
+      const observation = await originalAgentStatus(input);
+      h.control.target.outputGeneration = "out-fenced-before-completion";
+      return observation;
+    };
+
+    await h.bridge.pollTurns();
+    const [binding] = h.bridge.snapshot().bindings;
+    assert.equal(binding.status, "stale");
+    assert.equal(binding.activityWatch.status, "recovery-required");
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.doesNotMatch(cardText(h.lark.groupCards[0].card), /The exact structured final answer\./);
+    assert.match(cardText(h.lark.groupCards[0].card), /运行连续性已经丢失/);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed lifecycle card never blocks terminal lease renewal", async () => {
+  const h = harness();
+  let releaseCard = () => {};
+  const cardBarrier = new Promise((resolve) => { releaseCard = resolve; });
+  let markCardStarted = () => {};
+  const cardStarted = new Promise((resolve) => { markCardStarted = resolve; });
+  let createPromise;
+  try {
+    h.lark.beforeGroupCard = async () => {
+      markCardStarted();
+      await cardBarrier;
+    };
+    createPromise = h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await cardStarted;
+
+    const renewPromise = h.bridge.renewLeases();
+    await flushBestEffortEffects();
+    assert.equal(
+      h.control.requests.filter((request) => request.type === "lease.renew").length,
+      1,
+      "best-effort Feishu delivery must not occupy the terminal mutation lane",
+    );
+    releaseCard();
+    await Promise.all([createPromise, renewPromise]);
+  } finally {
+    releaseCard();
+    await createPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("one authorized mentioned message owns the target, writes once, and posts only marked output", async () => {
   const h = harness();
   try {
@@ -832,6 +1718,8 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       createdBy: "ou-owner",
     });
     assert.equal(binding.status, "active");
+    assert.equal(binding.options.replyAsCard, true);
+    assert.equal(binding.options.replyMode, "topic");
     assert.equal(h.control.target.owner.kind, "feishu");
 
     await h.bridge.handleEvent(event());
@@ -843,11 +1731,16 @@ test("one authorized mentioned message owns the target, writes once, and posts o
     assert.equal(h.control.inputs[0].message.includes(markers.close), false, "prompt echo must not contain the parser token");
     assert.equal(h.control.inputs[0].submit, true, "prompt body and submit must be one canonical operation");
     assert.equal(h.lark.replies.length, 0);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
 
     h.control.output += `tool trace\n${marked(h, "safe group answer")}\nprivate tail`;
     await h.bridge.pollTurns();
     assert.equal(h.lark.replies.length, 1);
     assert.equal(h.lark.replies[0].text, "safe group answer");
+    assert.equal(h.lark.replies[0].replyMode, "topic");
+    assert.equal(h.lark.replies[0].card.schema, "2.0");
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
     assert.equal(h.bridge.snapshot().activeTurns.length, 0);
 
     const persisted = h.store.read();
@@ -857,6 +1750,160 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       assert.equal(statSync(path).mode & 0o777, 0o600);
     }
   } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("raw marker completion waits for a clean rendered snapshot before replying", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    const markers = feishuTurnMarkers(currentTurn(h).markerNonce);
+    const rawRepaint = [
+      markers.open,
+      "公开回答",
+      "\x1b[2A\x1b[2K› agent 输入框",
+      "\x1b[1B\x1b[2K100% context left",
+      markers.close,
+    ].join("");
+    h.control.output = rawRepaint;
+    h.control.renderedOutput = `${markers.open}公开回答`;
+
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.replies.length, 0, "an incomplete rendered marker must not fall back to raw PTY bytes");
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "output.rendered-snapshot").length,
+      1,
+    );
+    const rawAfterFirstPoll = h.control.output;
+    const rawCursorAfterFirstPoll = currentTurn(h).cursor;
+
+    h.control.renderedOutput = [
+      `${markers.open}公开回答${markers.close}`,
+      "› agent 输入框",
+      "100% context left",
+    ].join("\n");
+    await h.bridge.pollTurns();
+
+    assert.equal(h.control.output, rawAfterFirstPoll, "snapshot retry must not require additional raw output");
+    assert.equal(h.lark.replies.length, 1);
+    assert.equal(h.lark.replies[0].text, "公开回答");
+    assert.equal(h.lark.replies[0].text.includes("agent 输入框"), false);
+    assert.equal(h.lark.replies[0].text.includes("context left"), false);
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "output.rendered-snapshot").length,
+      2,
+      "a marker-complete raw turn must retry an incomplete rendered snapshot",
+    );
+    const secondTail = h.control.requests.filter(({ type }) => type === "output.tail").at(-1);
+    assert.equal(secondTail.fields.cursor, rawCursorAfterFirstPoll);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("binding reply mode is durable, applies to source replies, and cannot change during an active turn", async () => {
+  const h = harness();
+  try {
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+      replyMode: "direct",
+    });
+    assert.equal(binding.options.replyMode, "direct");
+    assert.equal(h.store.read().bindings[0].options.replyMode, "direct");
+
+    await h.bridge.handleEvent(event());
+    await assert.rejects(
+      h.bridge.updateBinding(binding.id, "topic"),
+      /active Feishu turn/,
+    );
+    await h.bridge.handleEvent(event({ event_id: "evt-busy", message_id: "om-busy" }));
+    assert.equal(h.control.inputs.length, 2, "the second group message must steer the active turn");
+    assert.match(h.control.inputs[1].message, /Steering update for the current in-progress task/);
+    assert.equal(h.lark.replies.length, 1);
+    assert.match(h.lark.replies[0].text, /steer 到当前 Agent/);
+    assert.equal(h.lark.replies[0].replyMode, "direct", "steering acknowledgement follows the binding mode");
+
+    h.control.output += marked(h, "direct group answer");
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.replies.length, 2);
+    assert.equal(h.lark.replies[1].text, "direct group answer");
+    assert.equal(h.lark.replies[1].replyMode, "direct", "final answer follows the binding mode");
+
+    const updated = await h.bridge.updateBinding(binding.id, "topic");
+    assert.equal(updated.options.replyMode, "topic");
+    assert.equal(h.store.read().bindings[0].options.replyMode, "topic");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("binding reply mode remains unchanged in memory when persistence fails", async () => {
+  const h = harness();
+  const write = h.store.write.bind(h.store);
+  try {
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+      replyMode: "direct",
+    });
+    h.store.write = () => {
+      throw new Error("injected reply mode persistence failure");
+    };
+
+    await assert.rejects(
+      h.bridge.updateBinding(binding.id, "topic"),
+      /injected reply mode persistence failure/,
+    );
+    assert.equal(h.bridge.snapshot().bindings[0].options.replyMode, "direct");
+    assert.equal(h.store.read().bindings[0].options.replyMode, "direct");
+  } finally {
+    h.store.write = write;
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a slow reaction API never blocks canonical lease renewal", async () => {
+  const h = harness();
+  let releaseReaction;
+  h.lark.reactionCreateBarrier = new Promise((resolve) => { releaseReaction = resolve; });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
+
+    let timer;
+    try {
+      await Promise.race([
+        h.bridge.renewLeases(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("lease renewal waited for the reaction API")), 250);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(h.control.requests.filter(({ type }) => type === "lease.renew").length, 1);
+  } finally {
+    releaseReaction?.();
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }
@@ -883,6 +1930,82 @@ test("agent-message output correlation, not a pre-input inspect cursor, starts t
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a retention-stale cursor resyncs within the same Feishu authority and completes the turn", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    const initialTurn = currentTurn(h);
+    assert.equal(initialTurn.cursor, 0);
+    const retainedCursor = installRetainedMarkedOutput(h, "answer after retained-window resync");
+
+    await h.bridge.pollTurns();
+    let state = h.store.read();
+    let turn = state.turns.at(-1);
+    assert.equal(turn.status, "awaiting");
+    assert.equal(turn.cursor, retainedCursor);
+    assert.equal(turn.output, "");
+    assert.equal(turn.outputRemainderBase64, undefined);
+    assert.equal(turn.markerSeenAt, undefined);
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.control.inputs.length, 1, "output resync must not replay terminal input");
+    assert.equal(h.lark.replies.length, 0);
+    const firstTail = h.control.requests.filter(({ type }) => type === "output.tail").at(-1);
+    assert.equal(firstTail.fields.cursor, 0);
+
+    await h.bridge.pollTurns();
+    state = h.store.read();
+    turn = state.turns.at(-1);
+    assert.equal(turn.status, "completed");
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.lark.replies.length, 1);
+    assert.equal(h.lark.replies[0].text, "answer after retained-window resync");
+    assert.equal(h.control.inputs.length, 1, "reply polling must not resend the accepted operation");
+    const successfulTail = h.control.requests.filter(({ type }) => type === "output.tail").at(-1);
+    assert.equal(successfulTail.fields.cursor, retainedCursor);
+    assert.equal(successfulTail.fields.outputGeneration, initialTurn.outputGeneration);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("retention resync still fails closed when generation or fence changes", async () => {
+  for (const scenario of [
+    {
+      name: "generation",
+      mutate: (control) => { control.target.outputGeneration = "out-after-retention-stale"; },
+    },
+    {
+      name: "fence",
+      mutate: (control) => { control.target.fence = (BigInt(control.target.fence) + 1n).toString(); },
+    },
+  ]) {
+    const h = harness();
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      await h.bridge.handleEvent(event());
+      installRetainedMarkedOutput(h, `must stay private after ${scenario.name} change`);
+      h.control.beforeRetainedStale = () => scenario.mutate(h.control);
+
+      await h.bridge.pollTurns();
+      const state = h.store.read();
+      assert.equal(state.turns.at(-1).status, "recovery-required", scenario.name);
+      assert.equal(state.turns.at(-1).cursor, 0, scenario.name);
+      assert.equal(state.bindings[0].status, "stale", scenario.name);
+      assert.equal(h.lark.replies.length, 0, scenario.name);
+      assert.equal(h.control.inputs.length, 1, `${scenario.name} staleness must not replay input`);
+    } finally {
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -935,6 +2058,32 @@ test("Dashboard binding creation atomically hands its lease to Feishu and requir
   }
 });
 
+test("Dashboard handoff arms completion watch for an already running local Agent", async () => {
+  const h = harness();
+  try {
+    h.control.target.state = "HELD";
+    h.control.target.owner = { kind: "dashboard", instanceId: "dashboard-one:pty-one" };
+    h.control.target.leaseId = "lease-dashboard";
+    h.control.target.expiresAt = new Date(Date.now() + 60_000).toISOString();
+    h.control.agentRunning = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+      dashboardLease: h.control.lease(),
+    });
+
+    assert.equal(binding.status, "active");
+    assert.equal(binding.activityWatch.status, "armed");
+    assert.equal(h.control.target.owner.kind, "feishu");
+    assert.equal(h.control.inputs.length, 0);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("an uncertain lease release leaves the binding stale instead of pretending to be paused", async () => {
   const h = harness();
   try {
@@ -973,6 +2122,255 @@ test("lease renewal carries the full canonical token and failure fences an activ
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.equal(h.lark.replies.length, 0);
   } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("lease renewal failure settles an inherited task watch as recovery-required", async () => {
+  const h = harness();
+  try {
+    h.control.agentRunning = true;
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    h.control.failRenew = true;
+
+    await h.bridge.renewLeases();
+
+    const [binding] = h.bridge.snapshot().bindings;
+    assert.equal(binding.status, "stale");
+    assert.equal(binding.activityWatch.status, "recovery-required");
+    assert.match(binding.activityWatch.error, /lease renewal failed/);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("exact target deletion removes an active binding and announces the deletion once", async () => {
+  const h = harness();
+  const ended = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.ownershipStatus = async () => {
+      const error = new Error("target lifecycle ended");
+      error.code = "TARGET_GONE";
+      throw error;
+    };
+    h.control.resolveTarget = async () => {
+      const error = new Error("managed session is absent");
+      error.code = "TARGET_NOT_FOUND";
+      throw error;
+    };
+
+    await h.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    assert.equal(h.bridge.snapshot().bindings.length, 0);
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards[0].card.header.template, "red");
+    assert.match(cardText(h.lark.groupCards[0].card), /已被删除/);
+    await h.bridge.reconcileBindingTargets();
+    assert.equal(h.lark.groupCards.length, 1, "a removed binding must not notify twice");
+
+    await ended.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    ended.lark.groupCards.length = 0;
+    ended.control.ownershipStatus = async () => {
+      const error = new Error("exact lifecycle ended");
+      error.code = "TARGET_GONE";
+      throw error;
+    };
+    ended.control.resolveTarget = async () => {
+      const error = new Error("backend lookup is temporarily unavailable");
+      error.code = "CONTROLLER_UNAVAILABLE";
+      throw error;
+    };
+    await ended.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    const endedText = cardText(ended.lark.groupCards[0].card);
+    assert.match(endedText, /精确生命周期已结束/);
+    assert.doesNotMatch(endedText, /同名会话替换/);
+  } finally {
+    await h.bridge.close();
+    await ended.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+    rmSync(ended.root, { recursive: true, force: true });
+  }
+});
+
+test("paused bindings require proof of replacement while uncertain targets stay linked", async () => {
+  const replaced = harness();
+  const uncertain = harness();
+  const reset = harness();
+  try {
+    const binding = await replaced.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    await replaced.bridge.pauseBinding(binding.id);
+    replaced.lark.groupCards.length = 0;
+    let replacementResolved = false;
+    replaced.control.ownershipStatus = async () => {
+      if (!replacementResolved) return replaced.control.ownership();
+      const error = new Error("old target was invalidated after backend identity changed");
+      error.code = "TARGET_GONE";
+      throw error;
+    };
+    replaced.control.resolveTarget = async () => {
+      replacementResolved = true;
+      return {
+        controlTargetId: "replacement-target",
+        controlEpoch: "replacement-epoch",
+        managedSession: {
+          name: "managed-one",
+          kind: "terminal",
+          createdAt: "2026-07-16T00:00:00.000Z",
+        },
+        ownership: replaced.control.ownership(),
+      };
+    };
+    await replaced.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    assert.equal(replaced.bridge.snapshot().bindings.length, 0);
+    assert.match(cardText(replaced.lark.groupCards[0].card), /同名会话替换/);
+    assert.match(cardText(replaced.lark.groupCards[0].card), /不会自动指向/);
+
+    const uncertainBinding = await uncertain.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    await uncertain.bridge.pauseBinding(uncertainBinding.id);
+    uncertain.lark.groupCards.length = 0;
+    uncertain.control.ownershipStatus = async () => {
+      const error = new Error("controller requires recovery");
+      error.code = "RECOVERY_REQUIRED";
+      throw error;
+    };
+    await uncertain.bridge.reconcileBindingTargets();
+    assert.equal(uncertain.bridge.snapshot().bindings[0].status, "paused");
+    assert.equal(uncertain.lark.groupCards.length, 0);
+
+    const resetBinding = await reset.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    await reset.bridge.pauseBinding(resetBinding.id);
+    reset.lark.groupCards.length = 0;
+    reset.control.ownershipStatus = async () => {
+      const error = new Error("controller lineage was reset");
+      error.code = "TARGET_NOT_FOUND";
+      throw error;
+    };
+    reset.control.resolveTarget = async () => ({
+      controlTargetId: "new-controller-target",
+      controlEpoch: "new-controller-epoch",
+      managedSession: {
+        name: "managed-one",
+        kind: "terminal",
+        createdAt: "2026-07-16T00:00:00.000Z",
+      },
+      ownership: reset.control.ownership(),
+    });
+    await reset.bridge.reconcileBindingTargets();
+    assert.equal(reset.bridge.snapshot().bindings[0].status, "paused");
+    assert.equal(reset.lark.groupCards.length, 0, "a new controller ID alone is not replacement proof");
+  } finally {
+    await replaced.bridge.close();
+    await uncertain.bridge.close();
+    await reset.bridge.close();
+    rmSync(replaced.root, { recursive: true, force: true });
+    rmSync(uncertain.root, { recursive: true, force: true });
+    rmSync(reset.root, { recursive: true, force: true });
+  }
+});
+
+test("a recovery-required stale binding still detects a certainly deleted session", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.failRenew = true;
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+    h.control.ownershipStatus = async () => {
+      const error = new Error("old Feishu ownership requires recovery");
+      error.code = "RECOVERY_REQUIRED";
+      throw error;
+    };
+    h.control.resolveTarget = async () => {
+      const error = new Error("managed session was deleted");
+      error.code = "TARGET_NOT_FOUND";
+      throw error;
+    };
+
+    await h.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    assert.equal(h.bridge.snapshot().bindings.length, 0);
+    assert.match(cardText(h.lark.groupCards[0].card), /已被删除/);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("restart-stale unlink keeps the binding until Feishu ownership is recovered locally", async () => {
+  const h = harness();
+  const binding = await h.bridge.createBinding({
+    chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+  });
+  await flushBestEffortEffects();
+  const restarted = new FeishuBridge({
+    control: h.control,
+    lark: h.lark,
+    store: h.store,
+    instanceId: "daemon-after-restart",
+    botOpenId: "ou-bot",
+  });
+  try {
+    restarted.initializeAfterRestart();
+    await assert.rejects(
+      restarted.removeBinding(binding.id, true),
+      /recover terminal ownership locally/,
+    );
+    assert.equal(restarted.snapshot().bindings[0].status, "stale");
+
+    h.control.recoverLocally();
+    await restarted.removeBinding(binding.id, true);
+    await flushBestEffortEffects();
+    assert.equal(restarted.snapshot().bindings.length, 0);
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /本机管理端请求解除绑定/);
+  } finally {
+    await restarted.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("group card delivery failure never rolls back binding ownership or unlink", async () => {
+  const h = harness();
+  try {
+    h.lark.failGroupCard = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+    assert.equal(h.control.target.owner.kind, "feishu");
+    await h.bridge.removeBinding(binding.id);
+    await flushBestEffortEffects();
+    assert.equal(h.bridge.snapshot().bindings.length, 0);
+    assert.equal(h.control.target.state, "FREE");
+    assert.equal(h.lark.groupCards.length, 2);
+  } finally {
+    h.lark.failGroupCard = false;
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }
@@ -1094,6 +2492,28 @@ test("agent-message response loss is operation-in-doubt and never retried", asyn
   }
 });
 
+test("steering response loss fences the active turn and is never replayed", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.failInputAfterCommit = true;
+    const steer = event({ event_id: "evt-steer-uncertain", message_id: "om-steer-uncertain" });
+    await assert.rejects(h.bridge.handleEvent(steer), /closed before replying/);
+    assert.equal(h.control.inputs.length, 2, "the possibly committed steering operation must not be replayed");
+    const state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.equal(state.bindings[0].status, "stale");
+    await h.bridge.handleEvent(steer);
+    assert.equal(h.control.inputs.length, 2);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("turn nonce rejects prompt echo and marker injection, and UTF-8 survives chunk boundaries", async () => {
   const h = harness();
   try {
@@ -1127,7 +2547,41 @@ test("turn nonce rejects prompt echo and marker injection, and UTF-8 survives ch
   }
 });
 
-test("turn timeout stops lease renewal and requires controlled recovery", async () => {
+test("active terminal output slides the turn inactivity deadline until a marked reply completes", async () => {
+  let clock = Date.now();
+  const h = harness({ now: () => clock });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    const originalDeadline = currentTurn(h).deadlineAt;
+
+    clock += 10 * 60_000 - 100;
+    h.control.output = "agent is still producing terminal output";
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "awaiting");
+    assert.equal(currentTurn(h).lastOutputAt, new Date(clock).toISOString());
+    assert.equal(currentTurn(h).deadlineAt, new Date(clock + 10 * 60_000).toISOString());
+
+    clock += 101;
+    assert.ok(clock > Date.parse(originalDeadline));
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "awaiting", "the original wall-clock deadline must not end an active run");
+    assert.equal(h.lark.replies.length, 0);
+
+    h.control.output += marked(h, "long-running answer");
+    h.control.renderedOutput = marked(h, "long-running answer");
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "completed");
+    assert.deepEqual(h.lark.replies.map(({ text }) => text), ["long-running answer"]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("turn inactivity timeout stops lease renewal and requires controlled recovery", async () => {
   let clock = Date.now();
   const h = harness({ now: () => clock });
   try {
@@ -1140,18 +2594,67 @@ test("turn timeout stops lease renewal and requires controlled recovery", async 
     const state = h.store.read();
     assert.equal(state.turns.at(-1).status, "timed-out");
     assert.equal(state.bindings[0].status, "stale");
-    assert.match(state.bindings[0].staleReason, /timed out/);
+    assert.match(state.bindings[0].staleReason, /idle for 10 minutes/);
+    assert.match(h.lark.replies[0].text, /连续 10 分钟没有新输出/);
     const renewals = h.control.requests.filter(({ type }) => type === "lease.renew").length;
     await h.bridge.renewLeases();
     assert.equal(h.control.requests.filter(({ type }) => type === "lease.renew").length, renewals);
     assert.equal(h.control.target.state, "HELD", "bridge must not release an unresolved terminal turn to FREE");
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing", "CrossMark"]);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }
 });
 
-test("sender allowlist, exact bot mention, and one in-flight turn reject competing input", async () => {
+test("a failed Typing removal never stacks a contradictory CrossMark", async () => {
+  let clock = Date.now();
+  const h = harness({ now: () => clock });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.lark.failReactionDelete = true;
+    clock += 10 * 60_000 + 1;
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "timed-out");
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+  } finally {
+    h.lark.failReactionDelete = false;
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an uncertain Typing creation never stacks a contradictory CrossMark", async () => {
+  for (const scenario of ["lost-ack", "missing-id"]) {
+    let clock = Date.now();
+    const h = harness({ now: () => clock });
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      h.lark.failReactionCreateAcknowledgement = scenario === "lost-ack";
+      h.lark.omitReactionId = scenario === "missing-id";
+      await h.bridge.handleEvent(event());
+      clock += 10 * 60_000 + 1;
+      await h.bridge.pollTurns();
+      assert.equal(currentTurn(h).status, "timed-out", scenario);
+      assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"], scenario);
+      assert.deepEqual(h.lark.reactionDeletes, [], scenario);
+    } finally {
+      h.lark.failReactionCreateAcknowledgement = false;
+      h.lark.omitReactionId = false;
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("sender allowlist and exact bot mention gate one reply turn while later messages steer it", async () => {
   const h = harness();
   try {
     await h.bridge.createBinding({
@@ -1172,9 +2675,13 @@ test("sender allowlist, exact bot mention, and one in-flight turn reject competi
 
     await h.bridge.handleEvent(event());
     await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
-    assert.equal(h.control.inputs.length, 1);
+    await h.bridge.handleEvent(event({ event_id: "evt-two", message_id: "om-two" }));
+    assert.equal(h.control.inputs.length, 2, "event dedup must keep one steering operation");
+    assert.equal(h.store.read().turns.length, 1, "steering must not create a competing reply turn");
+    assert.match(h.control.inputs[1].message, /Steering update for the current in-progress task/);
     assert.equal(h.lark.replies.length, 1);
-    assert.match(h.lark.replies[0].text, /上一条群消息/);
+    assert.equal(h.lark.replies[0].messageId, "om-two");
+    assert.match(h.lark.replies[0].text, /steer 到当前 Agent/);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -1210,12 +2717,108 @@ test("late output after a fence change and uncertain Feishu ACK fail closed", as
     uncertain.lark.failReply = true;
     await uncertain.bridge.pollTurns();
     const state = uncertain.store.read();
-    assert.equal(state.replies.at(-1).status, "uncertain");
+    assert.equal(
+      state.replies.find((reply) => reply.deliveryKind === "turn-reply")?.status,
+      "uncertain",
+    );
+    assert.equal(
+      state.replies.find((reply) => reply.deliveryKind === "recovery-notice")?.status,
+      "sent",
+    );
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.equal(state.bindings[0].status, "stale");
+    assert.deepEqual(uncertain.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
+    assert.deepEqual(uncertain.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
   } finally {
     await uncertain.bridge.close();
     rmSync(uncertain.root, { recursive: true, force: true });
+  }
+});
+
+test("an outbound authority check failure keeps Agent content private and posts a recovery Card", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output = marked(h, "must stay private");
+    h.control.failOwnershipStatusAt = h.control.ownershipStatusCalls + 2;
+
+    await h.bridge.pollTurns();
+    await new Promise((resolve) => setImmediate(resolve));
+    const state = h.store.read();
+    assert.equal(h.lark.replies.length, 0);
+    assert.equal(
+      state.replies.some((reply) => reply.deliveryKind === "turn-reply"),
+      false,
+      "authority failure happens before an Agent-content reply is prepared",
+    );
+    const recovery = state.replies.find((reply) => reply.deliveryKind === "recovery-notice");
+    assert.equal(recovery?.status, "sent");
+    assert.equal(h.lark.groupCards.at(-1).idempotencyKey, recovery.idempotencyKey);
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /没有在不确定状态下继续发送/);
+    assert.equal(cardText(h.lark.groupCards.at(-1).card).includes("must stay private"), false);
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.match(state.turns.at(-1).error, /outbound Feishu reply was not started/);
+    assert.equal(state.bindings[0].status, "stale");
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing", "CrossMark"]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a fully persisted prepared reply resumes with the same idempotency key after restart", async () => {
+  const h = harness();
+  try {
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    await flushBestEffortEffects();
+    const state = h.store.read();
+    const turn = state.turns.at(-1);
+    const text = "durable reply recovered after restart";
+    const idempotencyKey = `tw-${createHash("sha256").update(turn.outboundAttemptId).digest("hex").slice(0, 40)}`;
+    turn.status = "replying";
+    state.replies.push({
+      id: turn.outboundAttemptId,
+      turnId: turn.id,
+      sourceMessageId: turn.messageId,
+      idempotencyKey,
+      status: "prepared",
+      textDigest: createHash("sha256").update(text).digest("hex"),
+      createdAt: new Date().toISOString(),
+      deliveryKind: "turn-reply",
+      text,
+      sessionName: binding.sessionName,
+      tone: "answer",
+      replyMode: "topic",
+      finalTurnStatus: "completed",
+    });
+    h.store.write(state);
+
+    const restarted = new FeishuBridge({
+      control: h.control,
+      lark: h.lark,
+      store: h.store,
+      instanceId: "daemon-after-crash",
+      botOpenId: "ou-bot",
+    });
+    restarted.initializeAfterRestart();
+    await restarted.pollTurns();
+
+    const recovered = h.store.read();
+    assert.equal(recovered.replies.find((reply) => reply.id === turn.outboundAttemptId)?.status, "sent");
+    assert.equal(recovered.turns.find((candidate) => candidate.id === turn.id)?.status, "completed");
+    assert.equal(h.lark.replies.at(-1).text, text);
+    assert.equal(h.lark.replies.at(-1).idempotencyKey, idempotencyKey);
+    assert.equal(restarted.snapshot().bindings[0].status, "stale");
+    await restarted.close();
+  } finally {
+    rmSync(h.root, { recursive: true, force: true });
   }
 });
 
@@ -1267,6 +2870,118 @@ test("tail response fence and ownerKind are checked before marked output can rep
   }
 });
 
+test("transient rendered snapshot failures stay awaiting and a later observation can reply", async () => {
+  for (const failure of [
+    new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "rendered snapshot transport is temporarily unavailable",
+      true,
+    ),
+    new CanonicalTerminalControlError(
+      "RESOURCE_EXHAUSTED",
+      "rendered snapshot exceeded its bounded source limit",
+    ),
+    new CanonicalTerminalControlError(
+      "INTERNAL",
+      "tmux rendered snapshot capture timed out",
+    ),
+    Object.assign(new Error("rendered snapshot socket timed out"), { code: "ETIMEDOUT" }),
+  ]) {
+    const h = harness();
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      await h.bridge.handleEvent(event());
+      h.control.output = marked(h, "reply after transient snapshot failure");
+      h.control.renderedOutput = h.control.output;
+      h.control.snapshotErrors.push(failure);
+
+      await h.bridge.pollTurns();
+
+      let state = h.store.read();
+      assert.equal(h.lark.replies.length, 0, failure.code);
+      assert.equal(state.turns.at(-1).status, "awaiting", failure.code);
+      assert.equal(state.turns.at(-1).error, undefined, failure.code);
+      assert.equal(state.bindings[0].status, "active", failure.code);
+      assert.ok(state.turns.at(-1).markerSeenAt, failure.code);
+
+      await h.bridge.pollTurns();
+
+      state = h.store.read();
+      assert.equal(state.turns.at(-1).status, "completed", failure.code);
+      assert.equal(state.bindings[0].status, "active", failure.code);
+      assert.equal(h.lark.replies.length, 1, failure.code);
+      assert.equal(h.lark.replies[0].text, "reply after transient snapshot failure", failure.code);
+      assert.equal(
+        h.control.requests.filter(({ type }) => type === "output.rendered-snapshot").length,
+        2,
+        failure.code,
+      );
+    } finally {
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("rendered snapshot authority errors fail closed even if labeled retryable", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output = marked(h, "must stay private after snapshot authority failure");
+    h.control.renderedOutput = h.control.output;
+    h.control.snapshotErrors.push(new CanonicalTerminalControlError(
+      "PERMISSION_DENIED",
+      "rendered snapshot lease was fenced",
+      true,
+    ));
+
+    await h.bridge.pollTurns();
+
+    assert.equal(h.lark.replies.length, 0);
+    const state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.equal(state.bindings[0].status, "stale");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("rendered snapshot fence mismatch fails closed before a Card can be sent", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output = marked(h, "must stay private after snapshot fence change");
+    h.control.renderedOutput = h.control.output;
+    h.control.snapshotFence = (BigInt(h.control.target.fence) + 1n).toString();
+
+    await h.bridge.pollTurns();
+
+    assert.equal(
+      h.control.requests.filter(({ type }) => type === "output.rendered-snapshot").length,
+      1,
+    );
+    assert.equal(h.lark.replies.length, 0);
+    const state = h.store.read();
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.equal(state.bindings[0].status, "stale");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
 test("explicit takeover cancellation drains before normal handoff and return reverses ownership", async () => {
   const h = harness();
   try {
@@ -1289,10 +3004,12 @@ test("explicit takeover cancellation drains before normal handoff and return rev
     assert.equal(h.store.read().turns.at(-1).status, "cancelled");
     assert.equal(h.store.read().bindings[0].status, "paused");
 
+    h.control.agentRunning = true;
     await h.bridge.returnBinding(binding.id, dashboardLease);
     assert.equal(h.control.target.owner.kind, "feishu");
     assert.equal(h.control.target.fence, "3");
     assert.equal(h.store.read().bindings[0].status, "active");
+    assert.equal(h.store.read().bindings[0].activityWatch.status, "armed");
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
@@ -1354,25 +3071,95 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
     paths: h.paths,
     control: h.control,
     lark: h.lark,
+    larkProfile: "bot",
     botOpenId: "ou-bot",
   });
   try {
     await server.start();
     assert.equal(statSync(h.paths.socket).mode & 0o777, 0o600);
     const client = new FeishuBridgeClient(h.paths.socket);
+    assert.deepEqual(await client.request("bridge.info", {}), {
+      daemonVersion: packageVersion,
+      larkProfile: "bot",
+      capabilities: [
+        "binding.lifecycle-notices.v1",
+        "binding.create.session-summary.v1",
+        "binding.target-reconciliation.v1",
+        "binding.reply-mode.v1",
+        "binding.activity-completion.v1",
+        "binding.structured-agent-result.v1",
+        "binding.steering.v1",
+        "binding.remove-origin.v1",
+        "bridge.consumer-health.v1",
+        "reply.durable-payload.v1",
+      ],
+    });
+    await assert.rejects(
+      client.request("bridge.info", { extra: true }),
+      /invalid bridge.info params/,
+    );
     const snapshot = await client.request("bridge.snapshot", {});
     assert.deepEqual(snapshot.bindings, []);
+    assert.equal(snapshot.eventConsumer.state, "running");
     assert.deepEqual(await client.request("groups.list", {}), [
       { chatId: "oc-one", name: "bridge group" },
     ]);
     const binding = await client.request("binding.create", {
-      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "UDS lifecycle summary",
+      createdBy: "ou-owner",
+      replyMode: "direct",
     });
+    await flushBestEffortEffects();
     assert.equal(binding.status, "active");
+    assert.equal(binding.options.replyMode, "direct");
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /UDS lifecycle summary/);
+    const updated = await client.request("binding.update", {
+      bindingId: binding.id,
+      replyMode: "topic",
+    });
+    assert.equal(updated.options.replyMode, "topic");
+    await assert.rejects(
+      client.request("binding.update", { bindingId: binding.id, replyMode: "future" }),
+      /invalid binding.update params/,
+    );
+    await assert.rejects(
+      client.request("binding.update", { bindingId: binding.id, replyMode: "topic", unknown: true }),
+      /invalid binding.update params/,
+    );
     await assert.rejects(
       client.request("binding.pause", { bindingId: binding.id, unknown: true }),
       /invalid binding.pause params/,
     );
+  } finally {
+    await server.stop();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("Feishu bridge startup fails when the event consumer cannot spawn", async () => {
+  const h = harness();
+  h.lark.subscribe = () => {
+    const readyError = new Error("spawn lark-cli ENOENT");
+    return {
+      child: undefined,
+      ready: Promise.reject(readyError),
+      done: Promise.reject(readyError),
+      stop() {},
+    };
+  };
+  const server = await FeishuBridgeServer.create({
+    paths: h.paths,
+    control: h.control,
+    lark: h.lark,
+    larkProfile: "bot",
+    botOpenId: "ou-bot",
+  });
+  try {
+    await assert.rejects(server.start(), /spawn lark-cli ENOENT/);
+    assert.equal(existsSync(h.paths.socket), false);
   } finally {
     await server.stop();
     rmSync(h.root, { recursive: true, force: true });
@@ -1385,6 +3172,7 @@ test("Feishu bridge allows a profile restart only while it has no bindings", asy
     paths: empty.paths,
     control: empty.control,
     lark: empty.lark,
+    larkProfile: "bot",
     botOpenId: "ou-bot",
   });
   try {
@@ -1403,6 +3191,7 @@ test("Feishu bridge allows a profile restart only while it has no bindings", asy
     paths: bound.paths,
     control: bound.control,
     lark: bound.lark,
+    larkProfile: "bot",
     botOpenId: "ou-bot",
   });
   try {
@@ -1419,6 +3208,52 @@ test("Feishu bridge allows a profile restart only while it has no bindings", asy
   } finally {
     await boundServer.stop();
     rmSync(bound.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy binding reply mode defaults to topic while unknown modes remain fail closed", () => {
+  const h = harness();
+  try {
+    const legacy = {
+      version: 1,
+      bindings: [{
+        version: 1,
+        id: "bind-legacy-topic",
+        chatId: "oc-legacy",
+        chatName: "legacy group",
+        controlTargetId: "ct-legacy",
+        sessionName: "managed-legacy",
+        status: "paused",
+        options: {
+          mentionOnly: true,
+          replyAsCard: true,
+          includeQuotedContext: false,
+        },
+        allowedSenderIds: [],
+        createdAt: "2026-07-16T00:00:00.000Z",
+        createdBy: "ou-owner",
+      }],
+    };
+    assert.throws(() => h.store.write({
+      bindings: legacy.bindings,
+      eventIds: [],
+      turns: [],
+      replies: [],
+    }), /malformed Feishu bridge state/, "new writes require an explicit reply mode");
+    writeFileSync(h.paths.bindings, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+    const normalized = h.store.read();
+    assert.equal(normalized.bindings[0].options.replyMode, "topic");
+    h.store.write(normalized);
+    const persisted = JSON.parse(readFileSync(h.paths.bindings, "utf8"));
+    assert.equal(persisted.bindings[0].options.replyMode, "topic");
+
+    persisted.bindings[0].options.replyMode = "future-mode";
+    writeFileSync(h.paths.bindings, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
+    assert.throws(() => h.store.read(), /malformed Feishu bridge state/);
+    assert.match(readFileSync(h.paths.bindings, "utf8"), /future-mode/);
+  } finally {
+    rmSync(h.root, { recursive: true, force: true });
   }
 });
 

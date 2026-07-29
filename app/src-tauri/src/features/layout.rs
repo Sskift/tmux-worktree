@@ -448,6 +448,10 @@ fn valid_current_layout(record: &serde_json::Map<String, serde_json::Value>) -> 
     }
 
     optional_field(record, "sessionOrder", |value| string_array(value, false))
+        && optional_field(record, "worktreeGroupOrder", |value| {
+            string_array(value, false)
+        })
+        && optional_field(record, "terminalOrder", |value| string_array(value, false))
         && optional_field(record, "collapsedProjects", |value| {
             string_array(value, true)
         })

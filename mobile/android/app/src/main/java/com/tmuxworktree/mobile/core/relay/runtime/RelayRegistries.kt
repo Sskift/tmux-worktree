@@ -118,7 +118,6 @@ class RelayStreamRegistry {
         hostId: String,
         sessionName: String,
         pane: RelayV1Pane? = null,
-        inputReadOnly: Boolean = false,
     ): RelayStreamContext {
         generation += 1
         return RelayStreamContext(
@@ -127,7 +126,6 @@ class RelayStreamRegistry {
             sessionName = sessionName,
             pane = pane,
             generation = generation,
-            inputReadOnly = inputReadOnly,
         ).also { current = it }
     }
 

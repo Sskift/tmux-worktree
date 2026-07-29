@@ -8,9 +8,14 @@ import type {
   TerminalControlRequest,
 } from "./protocol";
 import {
+  TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT,
+  TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS,
+  TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
   TERMINAL_CONTROL_DEFAULT_LEASE_TTL_MS,
   TERMINAL_CONTROL_MAX_LEASE_TTL_MS,
+  TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
   TERMINAL_CONTROL_MAX_OUTPUT_TAIL_BYTES,
+  TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
   TerminalControlProtocolError,
 } from "./protocol";
 import { TmuxTerminalControlBackend, type TerminalControlBackend } from "./backend";
@@ -30,6 +35,8 @@ import {
 } from "./store";
 
 const MAX_COMPLETED_OPERATIONS = 128;
+const OUTPUT_CAPTURE_LIMIT_MESSAGE = "terminal output generation exceeded its bounded capture limit";
+const LEGACY_CAPTURE_ROTATION_MESSAGE = "terminal output legacy capture requires bounded rotation";
 
 export interface TerminalControlRelayV2ExactTargetInput {
   schemaVersion: 1;
@@ -173,6 +180,31 @@ function revision(target: TerminalControlTargetRecord): void {
   target.revision = nextDecimal(target.revision);
 }
 
+function plannedOutputRecoveryGeneration(target: TerminalControlTargetRecord): string {
+  if (target.lifecycle !== "RECOVERY_REQUIRED" || !target.recovery) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output recovery has no persisted recovery identity",
+    );
+  }
+  return createHash("sha256").update(JSON.stringify([
+    "terminal-output-recovery-v1",
+    target.controlTargetId,
+    target.managedSession.name,
+    target.managedSession.kind,
+    target.managedSession.createdAt,
+    target.backend.tmuxInstanceId,
+    target.outputGeneration,
+    target.ownership.fence,
+    target.revision,
+    target.recovery.reason,
+    target.recovery.since,
+    target.recovery.previousControlEpoch,
+    target.recovery.previousOwnerKind ?? null,
+    target.recovery.operationId ?? null,
+  ])).digest("hex");
+}
+
 function ownershipView(
   state: TerminalControlState,
   target: TerminalControlTargetRecord,
@@ -240,6 +272,19 @@ function isAutoRecoverableNonFeishuState(target: TerminalControlTargetRecord): b
   if (target.lifecycle !== "RECOVERY_REQUIRED" || target.inFlight || !target.recovery) return false;
   if (target.recovery.previousOwnerKind === "feishu" || target.recovery.operationId) return false;
   return !["OPERATION_IN_DOUBT", "DRAIN_UNCERTAIN"].includes(target.recovery.reason);
+}
+
+function isOutputCapacityError(error: unknown): error is TerminalControlProtocolError {
+  return error instanceof TerminalControlProtocolError
+    && error.code === "RESOURCE_EXHAUSTED"
+    && error.message === OUTPUT_CAPTURE_LIMIT_MESSAGE;
+}
+
+function isOutputRotationError(error: unknown): error is TerminalControlProtocolError {
+  return isOutputCapacityError(error)
+    || (error instanceof TerminalControlProtocolError
+      && error.code === "RESOURCE_EXHAUSTED"
+      && error.message === LEGACY_CAPTURE_ROTATION_MESSAGE);
 }
 
 function appendOperation(
@@ -1355,8 +1400,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         saveTerminalControlState(state, this.statePath);
         throw new TerminalControlProtocolError("TARGET_GONE", error.message);
       }
-      markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
-      saveTerminalControlState(state, this.statePath);
+      // A transient identity probe cannot supersede an existing durable
+      // recovery transaction. Keep it fenced and retry the exact proof later.
       return false;
     }
 
@@ -1369,8 +1414,9 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       );
       target.outputGeneration = output.generation;
     } catch {
-      markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
-      saveTerminalControlState(state, this.statePath);
+      // The target is already durably fenced. Preserve its exact recovery
+      // identity so an interrupted explicit recovery derives the same planned
+      // output generation on every retry and after controller restart.
       return false;
     }
     target.lifecycle = "ACTIVE";
@@ -1433,9 +1479,11 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       // unavailable. Feishu and every draining/in-flight state remain strict.
       if (
         target.lifecycle === "ACTIVE"
-        && target.ownership.state === "HELD"
-        && target.ownership.owner.kind !== "feishu"
         && !target.inFlight
+        && (
+          (target.ownership.state === "FREE" && isOutputRotationError(error))
+          || (target.ownership.state === "HELD" && target.ownership.owner.kind !== "feishu")
+        )
       ) {
         try {
           await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
@@ -1486,13 +1534,42 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     }
   }
 
+  private async recoverOutput(
+    target: TerminalControlTargetRecord,
+  ): Promise<{ generation: string; cursor: number }> {
+    try {
+      const output = await this.backend.recoverOutput(
+        target.controlTargetId,
+        target.managedSession.name,
+        "0",
+        target.outputGeneration,
+        plannedOutputRecoveryGeneration(target),
+      );
+      target.outputGeneration = output.generation;
+      return output;
+    } catch (error) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `terminal output continuity is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   async handle(request: TerminalControlRequest): Promise<unknown> {
     return this.relayV2ExternalOperation(() => this.handleV1(request));
   }
 
   private async handleV1(request: TerminalControlRequest): Promise<unknown> {
     if (request.type === "ping") {
-      return { protocolVersion: 1, authority: "local-terminal-control" };
+      return {
+        protocolVersion: 1,
+        authority: "local-terminal-control",
+        capabilities: [
+          TERMINAL_CONTROL_CAPABILITY_RENDERED_SNAPSHOT,
+          TERMINAL_CONTROL_CAPABILITY_AGENT_STATUS,
+          TERMINAL_CONTROL_CAPABILITY_AGENT_RESULT,
+        ],
+      };
     }
     if (request.type === "target.resolve") return this.resolveTarget(request.sessionName);
     if (request.type === "ownership.status") return this.status(request.controlTargetId);
@@ -1567,6 +1644,30 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         request.controlEpoch,
         request.outputGeneration,
         request.cursor,
+        request.maxBytes,
+      );
+    }
+    if (request.type === "output.rendered-snapshot") {
+      return this.renderedSnapshot(
+        request.lease,
+        request.outputGeneration,
+        request.pane,
+        request.maxBytes,
+      );
+    }
+    if (request.type === "activity.agent-status") {
+      return this.agentStatus(
+        request.lease,
+        request.outputGeneration,
+        request.pane,
+      );
+    }
+    if (request.type === "activity.agent-result") {
+      return this.agentResult(
+        request.lease,
+        request.outputGeneration,
+        request.pane,
+        request.source,
         request.maxBytes,
       );
     }
@@ -1770,8 +1871,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           const output = await this.prepareOutput(state, target);
           if (target.ownership.state !== "HELD") {
             throw new TerminalControlProtocolError(
-              "INTERNAL",
-              "terminal-control release no longer owns the target",
+              "RECOVERY_REQUIRED",
+              "interactive ownership disappeared while another producer remained registered",
             );
           }
           if (!sameOwner(target.ownership.owner, detached.remaining)) {
@@ -1995,8 +2096,21 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       if (target.lifecycle === "TARGET_GONE") {
         throw new TerminalControlProtocolError("TARGET_GONE", "control target backend lifecycle has ended");
       }
+      if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
+        markRecovery(state, target, "LEASE_EXPIRED", this.now);
+        // Persist the recovery identity before touching tmux. The planned
+        // output generation is derived only from this durable target record,
+        // so a retry after any later interruption computes the same value.
+        saveTerminalControlState(state, this.statePath);
+      }
+      if (target.lifecycle !== "RECOVERY_REQUIRED" || !target.recovery) {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "force recovery is only available for a durably fenced recovery target",
+        );
+      }
       const previousOwnerKind = target.ownership.state === "FREE"
-        ? target.recovery?.previousOwnerKind
+        ? target.recovery.previousOwnerKind
         : target.ownership.owner.kind;
       if (previousOwnerKind === "feishu" && proof.kind === "owner-unreachable") {
         throw new TerminalControlProtocolError(
@@ -2004,41 +2118,29 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "force takeover from Feishu requires a persisted turn cancellation or explicit in-doubt acknowledgement",
         );
       }
-      if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
-        markRecovery(state, target, "LEASE_EXPIRED", this.now);
-      }
-      if (target.lifecycle === "RECOVERY_REQUIRED" || target.inFlight) {
-        try {
-          await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
-        } catch (error) {
-          if (
-            error instanceof TerminalControlProtocolError
-            && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
-          ) {
-            invalidateTarget(target, this.now);
-            saveTerminalControlState(state, this.statePath);
-            throw new TerminalControlProtocolError(
-              "TARGET_GONE",
-              error.message,
-            );
-          }
-          if (target.lifecycle !== "RECOVERY_REQUIRED") {
-            markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
-          }
+      try {
+        await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
+      } catch (error) {
+        if (
+          error instanceof TerminalControlProtocolError
+          && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
+        ) {
+          invalidateTarget(target, this.now);
           saveTerminalControlState(state, this.statePath);
           throw new TerminalControlProtocolError(
-            "RECOVERY_REQUIRED",
-            `force recovery could not prove the exact terminal backend lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+            "TARGET_GONE",
+            error.message,
           );
         }
-        // The explicit acknowledgement accepts that the persisted in-flight
-        // operation may have taken effect. Advancing the fence is the recovery
-        // boundary; the old operation is never replayed by this authority.
-        completeInFlightAsInDoubt(target, this.now);
-      } else {
-        await this.assertTargetCurrent(state, target);
+        throw new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          `force recovery could not prove the exact terminal backend lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-      const output = await this.resetOutput(state, target);
+      // The explicit acknowledgement accepts that a persisted in-flight
+      // operation may have taken effect. It is never replayed.
+      completeInFlightAsInDoubt(target, this.now);
+      const output = await this.recoverOutput(target);
       this.resetInteractiveOwners(target.controlTargetId);
       target.lifecycle = "ACTIVE";
       target.recovery = undefined;
@@ -2075,6 +2177,16 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         await this.assertTargetCurrent(state, target);
       }
       validateLease(state, target, lease);
+      if (pane !== "0") {
+        // The managed single-pane contract exposes one logical pane regardless
+        // of the tmux pane-base-index. Reject it before preparing output or
+        // persisting an in-flight operation so backend error codes never need
+        // to imply whether a write may already have happened.
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
       this.registerInteractiveOwner(target.controlTargetId, lease.owner);
       const hash = payloadHash(kind, pane, payload);
       const completed = existingOperation(
@@ -2272,6 +2384,155 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         cursor: chunk.cursor,
         dataBase64: chunk.dataBase64,
         nextCursor: chunk.nextCursor,
+      };
+    });
+  }
+
+  private async renderedSnapshot(
+    lease: TerminalControlLease,
+    outputGeneration: string,
+    pane: string,
+    maxBytes = TERMINAL_CONTROL_MAX_RENDERED_SNAPSHOT_BYTES,
+  ): Promise<unknown> {
+    return this.locked(async (state) => {
+      const target = targetById(state, lease.controlTargetId);
+      if (lease.owner.kind !== "feishu") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "rendered terminal snapshots require the exact Feishu owner",
+        );
+      }
+      await this.assertTargetCurrent(state, target);
+      validateLease(state, target, lease, { allowDraining: true });
+      if (pane !== "0") {
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
+      if (outputGeneration !== target.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "rendered terminal snapshot was fenced by an output generation change",
+        );
+      }
+      const snapshot = await this.backend.captureRenderedSnapshot(
+        target.managedSession,
+        target.backend.tmuxInstanceId,
+        outputGeneration,
+        pane,
+        maxBytes,
+      );
+      return {
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        leaseId: lease.leaseId,
+        fence: target.ownership.fence,
+        ownerKind: "feishu",
+        outputGeneration,
+        pane,
+        dataBase64: snapshot.dataBase64,
+        truncated: snapshot.truncated,
+      };
+    });
+  }
+
+  private async agentStatus(
+    lease: TerminalControlLease,
+    outputGeneration: string,
+    pane: string,
+  ): Promise<unknown> {
+    return this.locked(async (state) => {
+      const target = targetById(state, lease.controlTargetId);
+      if (lease.owner.kind !== "feishu") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "agent status observations require the exact Feishu owner",
+        );
+      }
+      await this.assertTargetCurrent(state, target);
+      validateLease(state, target, lease, { allowDraining: true });
+      if (pane !== "0") {
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
+      if (outputGeneration !== target.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "agent status observation was fenced by an output generation change",
+        );
+      }
+      const activity = await this.backend.agentStatus(
+        target.managedSession,
+        target.backend.tmuxInstanceId,
+        outputGeneration,
+        pane,
+      );
+      return {
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        leaseId: lease.leaseId,
+        fence: target.ownership.fence,
+        ownerKind: "feishu",
+        outputGeneration,
+        pane,
+        agentRunning: activity.agentRunning,
+        ...(activity.source === undefined ? {} : { source: activity.source }),
+      };
+    });
+  }
+
+  private async agentResult(
+    lease: TerminalControlLease,
+    outputGeneration: string,
+    pane: string,
+    source: import("./protocol").TerminalControlAgentSource,
+    maxBytes = TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
+  ): Promise<unknown> {
+    return this.locked(async (state) => {
+      const target = targetById(state, lease.controlTargetId);
+      if (lease.owner.kind !== "feishu") {
+        throw new TerminalControlProtocolError(
+          "PERMISSION_DENIED",
+          "Agent final response extraction requires the exact Feishu owner",
+        );
+      }
+      await this.assertTargetCurrent(state, target);
+      validateLease(state, target, lease, { allowDraining: true });
+      if (pane !== "0") {
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
+      if (outputGeneration !== target.outputGeneration) {
+        throw new TerminalControlProtocolError(
+          "STALE_OUTPUT_CURSOR",
+          "Agent final response extraction was fenced by an output generation change",
+        );
+      }
+      const result = await this.backend.agentResult(
+        target.managedSession,
+        target.backend.tmuxInstanceId,
+        outputGeneration,
+        pane,
+        source,
+        maxBytes,
+      );
+      return {
+        controlTargetId: target.controlTargetId,
+        controlEpoch: state.controlEpoch,
+        leaseId: lease.leaseId,
+        fence: target.ownership.fence,
+        ownerKind: "feishu",
+        outputGeneration,
+        pane,
+        source: result.source,
+        completedAt: result.completedAt,
+        text: result.text,
+        truncated: result.truncated,
       };
     });
   }

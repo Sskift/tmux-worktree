@@ -54,7 +54,8 @@ export type AgentProbeId =
   | "codex"
   | "gemini"
   | "opencode"
-  | "aider";
+  | "aider"
+  | "kimi";
 
 export type AgentProbeTarget =
   | { kind: "local" }
@@ -433,6 +434,41 @@ export type MobileRelayV2RevokeClientGrantInput = {
 
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 
+export type FeishuReplyMode = "topic" | "direct";
+
+export type FeishuActivityWatchStatus =
+  | "probing"
+  | "armed"
+  | "stop-candidate"
+  | "sending"
+  | "sent"
+  | "uncertain"
+  | "cancelled"
+  | "recovery-required";
+
+export type FeishuActivityWatch = {
+  id: string;
+  status: FeishuActivityWatchStatus;
+  controlEpoch: string;
+  leaseId: string;
+  fence: string;
+  outputGeneration: string;
+  source?: {
+    provider: "claude" | "codex";
+    boundary: "after" | "inclusive" | "exact";
+    sourceId: string;
+    sessionId: string;
+    turnId: string;
+    startedAt: string;
+  };
+  createdAt: string;
+  observedRunningAt?: string;
+  stopCandidateAt?: string;
+  completedAt?: string;
+  messageId?: string;
+  error?: string;
+};
+
 export type FeishuBinding = {
   version: 1;
   id: string;
@@ -446,10 +482,13 @@ export type FeishuBinding = {
     mentionOnly: boolean;
     replyAsCard: boolean;
     includeQuotedContext: boolean;
+    replyMode?: FeishuReplyMode;
   };
   allowedSenderIds: string[];
   createdAt: string;
   createdBy: string;
+  sessionSummary?: string;
+  activityWatch?: FeishuActivityWatch;
   lastActivityAt?: string;
   staleReason?: string;
 };
@@ -459,6 +498,11 @@ export type FeishuBridgeSnapshot = {
   bindings: FeishuBinding[];
   activeTurns: Array<{ id: string; bindingId: string; status: string; deadlineAt: string }>;
   uncertainReplies: Array<{ id: string; turnId: string; status: "uncertain"; error?: string }>;
+  eventConsumer?: {
+    state: "starting" | "running" | "backoff";
+    updatedAt: string;
+    error?: string;
+  };
 };
 
 export type FeishuChat = {
@@ -501,9 +545,11 @@ export type FeishuBindingInput = {
   chatId: string;
   chatName: string;
   sessionName: string;
+  sessionSummary?: string;
   createdBy: string;
   allowedSenderIds?: string[];
   mentionOnly?: boolean;
+  replyMode: FeishuReplyMode;
   attachmentId?: string;
 };
 

@@ -5,7 +5,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import type { WorkspaceTerminalDraft } from "./dashboard/actions/workspaceActionCoordinator";
 import { keepFocusInside } from "./dashboard/Settings/focusTrap";
 import { createLatestRequestGate, requestSourceKey } from "./latestRequestGate";
@@ -37,7 +36,6 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
   const [selectedHost, setSelectedHost] = useState(LOCAL_HOST);
   const [path, setPath] = useState("");
   const [label, setLabel] = useState("");
-  const [aiCmd, setAiCmd] = useState(loadLastAiCmd);
   const [localDefaultPath, setLocalDefaultPath] = useState("");
   const [showRemotePicker, setShowRemotePicker] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -127,7 +125,6 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const p = path.trim();
-    const ai = aiCmd.trim();
     if (!p) {
       setError(isRemote ? "remote path required" : "directory required");
       return;
@@ -143,14 +140,12 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
       const accepted = await onCreated({
         label: l,
         cwd: p,
-        aiCmd: ai,
         hostId: isRemote ? selectedHost : null,
       });
       if (!accepted) {
         setBusy(false);
         return;
       }
-      if (ai) saveLastAiCmd(ai);
     } catch (err) {
       setError(String(err));
       setBusy(false);
@@ -187,7 +182,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
       >
         <div className="modal__title" id={titleId}>new terminal</div>
         <p className="modal__hint" id={descriptionId}>
-          Create a TW-managed tmux session. An AI command is optional.
+          Create a TW-managed tmux session in a login shell.
         </p>
 
         {hosts.length > 0 && (
@@ -235,22 +230,6 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
               browse
             </button>
           </div>
-        </label>
-
-        <label className="field">
-          <span className="field__label">ai command (optional)</span>
-          <input
-            className="field__input"
-            type="text"
-            value={aiCmd}
-            onChange={(e) => setAiCmd(e.target.value)}
-            placeholder="leave empty for a login shell"
-            disabled={busy}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-          />
         </label>
 
         <label className="field">

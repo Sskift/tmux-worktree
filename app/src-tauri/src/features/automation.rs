@@ -135,7 +135,10 @@ fn unix_seconds_to_rfc3339(secs: u64) -> String {
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if month <= 2 { 1 } else { 0 };
 
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    // Keep timestamps in JavaScript's canonical ISO representation. Besides
+    // being valid RFC 3339, this exact millisecond form is required by the
+    // frozen terminal-control request contract.
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z")
 }
 
 pub(crate) fn now_rfc3339() -> String {

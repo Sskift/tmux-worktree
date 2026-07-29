@@ -35,6 +35,8 @@ export type DashboardLayoutPreferences = {
   sectionSplit?: number;
   automationHeight?: number;
   sessionOrder?: string[];
+  worktreeGroupOrder?: string[];
+  terminalOrder?: string[];
   collapsedProjects?: string[];
   pinnedItems?: PinnedItem[];
   automationSectionCollapsed?: boolean;

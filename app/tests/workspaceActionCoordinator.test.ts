@@ -185,7 +185,6 @@ function createHarness(initialBackend = createFakeDashboardBackend().backend) {
 const terminalDraft: WorkspaceTerminalDraft = {
   label: "agent",
   cwd: "/repo/new",
-  aiCmd: "codex",
   hostId: null,
 };
 
@@ -367,8 +366,8 @@ test("activation replay invalidates pending work while the replayed owner can pr
     created: createdTerminal("tw-replay"),
   }]);
   assert.deepEqual(createInputs, [
-    { cwd: "/repo/new", aiCmd: "codex", hostId: null },
-    { cwd: "/repo/new", aiCmd: "codex", hostId: null },
+    { cwd: "/repo/new", aiCmd: "", hostId: null },
+    { cwd: "/repo/new", aiCmd: "", hostId: null },
   ]);
 });
 

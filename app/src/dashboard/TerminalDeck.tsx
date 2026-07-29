@@ -3,6 +3,7 @@ import {
   type FeishuBinding,
   type FeishuBridgeSnapshot,
   type FeishuChat,
+  type FeishuReplyMode,
   type HostConfig,
   type PlainTerminal,
   type Session,
@@ -11,7 +12,11 @@ import {
 import { Terminal } from "../Terminal";
 import { MenuSelect } from "../MenuSelect";
 import type { Selection } from "./model/selection";
-import { terminalRawName, terminalSessionKey } from "./model/terminalIdentity";
+import {
+  sessionDisplayName,
+  terminalRawName,
+  terminalSessionKey,
+} from "./model/terminalIdentity";
 import { buildSshAttachArgs } from "../terminal/attach";
 
 export {
@@ -69,12 +74,17 @@ export function TerminalDeck({
   const [feishuSnapshot, setFeishuSnapshot] = useState<FeishuBridgeSnapshot | null>(null);
   const [feishuError, setFeishuError] = useState<string | null>(null);
   const [feishuBusy, setFeishuBusy] = useState(false);
-  const [bindingTarget, setBindingTarget] = useState<{ sessionName: string; ptyId: string } | null>(null);
+  const [bindingTarget, setBindingTarget] = useState<{
+    sessionName: string;
+    sessionSummary: string;
+    ptyId: string;
+  } | null>(null);
   const [groups, setGroups] = useState<FeishuChat[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [groupsError, setGroupsError] = useState<string | null>(null);
   const [chatId, setChatId] = useState("");
   const [chatName, setChatName] = useState("");
+  const [replyMode, setReplyMode] = useState<FeishuReplyMode>("topic");
   const [attachmentIds, setAttachmentIds] = useState<Record<string, string>>({});
 
   const setAttachmentId = (key: string, id: string | null) => {
@@ -121,6 +131,8 @@ export function TerminalDeck({
 
   const bindingFor = (sessionName: string): FeishuBinding | undefined =>
     feishuSnapshot?.bindings.find((binding) => binding.sessionName === sessionName);
+  const feishuConsumerUnavailable = feishuSnapshot?.eventConsumer
+    && feishuSnapshot.eventConsumer.state !== "running";
 
   const runFeishuAction = async (operation: () => Promise<unknown>) => {
     setFeishuBusy(true);
@@ -135,10 +147,20 @@ export function TerminalDeck({
     }
   };
 
-  const openBinding = (sessionName: string, ptyId: string) => {
-    setBindingTarget({ sessionName, ptyId });
+  const confirmUnlink = async (binding: FeishuBinding) => {
+    const confirmed = await dashboardBackend.dialog.confirm({
+      title: "Unlink Feishu group?",
+      message: `Unlink ${binding.chatName} from ${binding.sessionName}? The group will stop steering this terminal, and an unresolved reply will be cancelled.`,
+    });
+    if (!confirmed) return;
+    await runFeishuAction(() => dashboardBackend.feishu.remove(binding.id, true));
+  };
+
+  const openBinding = (sessionName: string, ptyId: string, sessionSummary: string) => {
+    setBindingTarget({ sessionName, ptyId, sessionSummary: sessionSummary.slice(0, 256) });
     setChatId("");
     setChatName("");
+    setReplyMode("topic");
     setFeishuError(null);
     setGroups([]);
     setGroupsError(null);
@@ -156,18 +178,27 @@ export function TerminalDeck({
     sessionName: string,
     managed: boolean,
     ptyId?: string,
+    sessionSummary = sessionName,
   ) => {
     if (!managed) return null;
     const binding = bindingFor(sessionName);
     const activeTurn = binding
       ? feishuSnapshot?.activeTurns.some((turn) => turn.bindingId === binding.id)
       : false;
+    const activeActivityWatch = binding
+      ? ["probing", "armed", "stop-candidate", "sending"].includes(
+        binding.activityWatch?.status ?? "",
+      )
+      : false;
+    const activeAgentWork = activeTurn || activeActivityWatch;
     if (!binding) {
       return (
         <div className="terminal-feishu-bar" data-state="unbound">
           <span>
             {feishuSnapshot
-              ? "Feishu not linked"
+              ? feishuConsumerUnavailable
+                ? "Feishu event consumer is reconnecting"
+                : "Feishu not linked"
               : feishuError?.includes("FEISHU_PROFILE_NOT_CONFIGURED")
                 ? "Feishu bot not configured · Settings › Integrations"
                 : feishuError
@@ -177,8 +208,8 @@ export function TerminalDeck({
           {feishuSnapshot && (
             <button
               type="button"
-              disabled={feishuBusy || !ptyId}
-              onClick={() => ptyId && openBinding(sessionName, ptyId)}
+              disabled={feishuBusy || !ptyId || !!feishuConsumerUnavailable}
+              onClick={() => ptyId && openBinding(sessionName, ptyId, sessionSummary)}
             >
               Link group
             </button>
@@ -190,14 +221,19 @@ export function TerminalDeck({
       <div className="terminal-feishu-bar" data-state={binding.status} role="status">
         <span>
           {binding.status === "active"
-            ? `Input locked by Feishu group “${binding.chatName}”${activeTurn ? " (turn in progress)" : ""}`
-            : binding.status === "paused"
-              ? `Feishu group “${binding.chatName}” is paused; local input is active`
-              : binding.status === "pausing"
-                ? `Safely handing off from Feishu group “${binding.chatName}”…`
-                : `Feishu link needs recovery: ${binding.staleReason ?? binding.chatName}`}
+            ? `Input locked by Feishu group “${binding.chatName}”${activeTurn
+              ? " (turn in progress)"
+              : activeActivityWatch
+                ? " (local Agent task in progress; final response will be posted)"
+                : ""}`
+              : binding.status === "paused"
+                ? `Feishu group “${binding.chatName}” is paused; local input is active`
+                : binding.status === "pausing"
+                  ? `Safely handing off from Feishu group “${binding.chatName}”…`
+                  : `Feishu link needs recovery: ${binding.staleReason ?? binding.chatName}`}
+          {feishuConsumerUnavailable ? " · event consumer reconnecting" : ""}
         </span>
-        {binding.status === "active" && !activeTurn && (
+        {binding.status === "active" && !activeAgentWork && (
           <button
             type="button"
             disabled={feishuBusy || !ptyId}
@@ -216,6 +252,16 @@ export function TerminalDeck({
             Cancel turn and take over
           </button>
         )}
+        {binding.status === "active" && !activeTurn && activeActivityWatch && (
+          <button
+            type="button"
+            className="danger"
+            disabled={feishuBusy || !ptyId || binding.activityWatch?.status === "sending"}
+            onClick={() => ptyId && void runFeishuAction(() => dashboardBackend.feishu.takeover(binding.id, ptyId, true))}
+          >
+            Cancel result delivery and take over
+          </button>
+        )}
         {binding.status === "paused" && (
           <button
             type="button"
@@ -229,7 +275,7 @@ export function TerminalDeck({
           <button
             type="button"
             disabled={feishuBusy}
-            onClick={() => void runFeishuAction(() => dashboardBackend.feishu.remove(binding.id, true))}
+            onClick={() => void confirmUnlink(binding)}
           >
             Unlink
           </button>
@@ -310,7 +356,14 @@ export function TerminalDeck({
                 initialHistory={tmuxPreviews[name]}
                 onOpenFile={onOpenFile}
               />
-              {!isRemote && lockOverlay(rawName, controlled, ptyId)}
+              {!isRemote && lockOverlay(
+                rawName,
+                controlled,
+                ptyId,
+                session.project
+                  ? `${session.project} · ${sessionDisplayName(session)}`
+                  : sessionDisplayName(session),
+              )}
             </div>
           );
         })}
@@ -363,7 +416,7 @@ export function TerminalDeck({
                 initialHistory={tmuxPreviews[sessionKey]}
                 onOpenFile={onOpenFile}
               />
-              {!terminal.hostId && lockOverlay(rawName, controlled, ptyId)}
+              {!terminal.hostId && lockOverlay(rawName, controlled, ptyId, terminal.label)}
             </div>
           );
         })}
@@ -423,22 +476,57 @@ export function TerminalDeck({
                 Group name
                 <input value={chatName} onChange={(event) => setChatName(event.target.value)} />
               </label>
+              <label>
+                Session summary shown to the group
+                <input
+                  value={bindingTarget.sessionSummary}
+                  maxLength={256}
+                  onChange={(event) => setBindingTarget((current) => current
+                    ? { ...current, sessionSummary: event.target.value }
+                    : current)}
+                />
+              </label>
+              <label>
+                Reply placement
+                <MenuSelect
+                  ariaLabel="Reply placement"
+                  value={replyMode}
+                  options={[
+                    {
+                      value: "topic",
+                      label: "Topic reply",
+                      detail: "Keep each answer inside the question's topic",
+                    },
+                    {
+                      value: "direct",
+                      label: "Direct reply",
+                      detail: "Post each answer in the group's main timeline",
+                    },
+                  ]}
+                  onChange={(value) => setReplyMode(value === "direct" ? "direct" : "topic")}
+                />
+              </label>
               {feishuError && <p className="terminal-feishu-dialog__error">{feishuError}</p>}
               <div className="terminal-feishu-dialog__actions">
                 <button type="button" disabled={feishuBusy} onClick={() => setBindingTarget(null)}>Cancel</button>
                 <button
                   type="button"
-                  disabled={feishuBusy || !chatId.trim() || !chatName.trim()}
+                  disabled={feishuBusy
+                    || !chatId.trim()
+                    || !chatName.trim()
+                    || !bindingTarget.sessionSummary.trim()}
                   onClick={() => void runFeishuAction(async () => {
                     const groupOwner = groups.find((group) => group.chatId === chatId.trim())?.ownerId?.trim();
                     await dashboardBackend.feishu.create({
                       chatId: chatId.trim(),
                       chatName: chatName.trim(),
                       sessionName: bindingTarget.sessionName,
+                      sessionSummary: bindingTarget.sessionSummary.trim(),
                       attachmentId: bindingTarget.ptyId,
                       createdBy: groupOwner || "local-dashboard",
                       allowedSenderIds: [],
                       mentionOnly: true,
+                      replyMode,
                     });
                     setBindingTarget(null);
                   })}

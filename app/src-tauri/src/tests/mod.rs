@@ -1,10 +1,10 @@
 use super::{
-    acquire_dashboard_config_file_lock, add_host_with_state, agent_running_from_pane_title,
-    append_automation_run, atomic_write_file_with, automation_command_with_instruction,
-    build_local_worktree_rpc_args, build_terminal_rpc_args, classify_dashboard_layout,
-    cleanup_pending_worktrees, config_worktree_base, config_worktree_base_with_home,
-    create_local_terminal_via_runtime, create_local_worktree_via_runtime,
-    create_remote_terminal_via_tw_rpc, create_remote_worktree,
+    acquire_dashboard_config_file_lock, add_host_with_state, agent_running_from_pane,
+    agent_running_from_pane_title, append_automation_run, atomic_write_file_with,
+    automation_command_with_instruction, build_local_worktree_rpc_args, build_terminal_rpc_args,
+    classify_dashboard_layout, cleanup_pending_worktrees, config_worktree_base,
+    config_worktree_base_with_home, create_local_terminal_via_runtime,
+    create_local_worktree_via_runtime, create_remote_terminal_via_tw_rpc, create_remote_worktree,
     dashboard_layout_window_is_restorable, default_worktree_base, delete_automation_from_list,
     delete_worktree_blocking, derive_session_name, ensure_terminal_session,
     fetchable_project_paths, find_host, finish_git_fetch_target, git_fetch_args, git_graph_for,
@@ -28,14 +28,14 @@ use super::{
     ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
     trigger_automation_with_creator, try_cleanup_remote_worktree, try_cleanup_worktree,
     tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
-    validate_ssh_host_fields, worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs,
-    AgentProbeResult, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
-    AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
-    DashboardConfigLockOwner, DashboardLayoutClassification, DeleteWorktreeArgs,
-    EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery, GitGraphRefKind,
-    HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree, Project,
-    RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS,
-    AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+    user_bin_search_paths, validate_ssh_host_fields, worktree_has_uncommitted_changes,
+    worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
+    AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
+    CreateTerminalArgs, DashboardConfigLockOwner, DashboardLayoutClassification,
+    DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
+    GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
+    Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
+    AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -84,11 +84,17 @@ fn restore_env(name: &str, value: Option<String>) {
 }
 
 #[test]
-fn agent_probe_uses_only_the_fixed_allowlist_and_checks_executable_bits() {
+fn agent_probe_uses_managed_session_paths_and_only_the_fixed_executable_allowlist() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let codex_path = temp.path().join("codex");
-    let custom_path = temp.path().join("custom-agent --unsafe");
+    let user_bin = temp.path().join(".local/bin");
+    let kimi_bin = temp.path().join(".kimi-code/bin");
+    fs::create_dir_all(&user_bin).expect("user bin");
+    fs::create_dir_all(&kimi_bin).expect("kimi bin");
+    let codex_path = user_bin.join("codex");
+    let kimi_path = kimi_bin.join("kimi");
+    let custom_path = user_bin.join("custom-agent --unsafe");
     fs::write(&codex_path, "#!/bin/sh\nexit 0\n").expect("write codex");
+    fs::write(&kimi_path, "#!/bin/sh\nexit 0\n").expect("write kimi");
     fs::write(&custom_path, "#!/bin/sh\nexit 0\n").expect("write custom agent");
 
     let mut codex_permissions = fs::metadata(&codex_path)
@@ -96,19 +102,29 @@ fn agent_probe_uses_only_the_fixed_allowlist_and_checks_executable_bits() {
         .permissions();
     codex_permissions.set_mode(0o755);
     fs::set_permissions(&codex_path, codex_permissions).expect("chmod codex");
+    let mut kimi_permissions = fs::metadata(&kimi_path)
+        .expect("kimi metadata")
+        .permissions();
+    kimi_permissions.set_mode(0o755);
+    fs::set_permissions(&kimi_path, kimi_permissions).expect("chmod kimi");
     let mut custom_permissions = fs::metadata(&custom_path)
         .expect("custom metadata")
         .permissions();
     custom_permissions.set_mode(0o755);
     fs::set_permissions(&custom_path, custom_permissions).expect("chmod custom agent");
 
-    let results = probe_local_agents_in_paths(&[temp.path().to_path_buf()]);
+    let search_paths = user_bin_search_paths(
+        Some(temp.path()),
+        Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+    );
+    assert_eq!(search_paths[0], user_bin);
+    let results = probe_local_agents_in_paths(&search_paths);
     assert_eq!(
         AGENT_PROBE_SPECS
             .iter()
             .map(|spec| spec.command)
             .collect::<Vec<_>>(),
-        vec!["claude", "codex", "gemini", "opencode", "aider"]
+        vec!["claude", "codex", "gemini", "opencode", "aider", "kimi"]
     );
     assert_eq!(results.len(), AGENT_PROBE_SPECS.len());
     assert_eq!(
@@ -119,6 +135,17 @@ fn agent_probe_uses_only_the_fixed_allowlist_and_checks_executable_bits() {
             command: "codex".into(),
             available: true,
             executable_path: Some(codex_path.to_string_lossy().to_string()),
+            error: None,
+        })
+    );
+    assert_eq!(
+        results.iter().find(|result| result.id == "kimi"),
+        Some(&AgentProbeResult {
+            id: "kimi".into(),
+            label: "Kimi Code".into(),
+            command: "kimi".into(),
+            available: true,
+            executable_path: Some(kimi_path.to_string_lossy().to_string()),
             error: None,
         })
     );
@@ -564,6 +591,38 @@ fn agent_running_from_pane_title_detects_codex_spinner_prefix() {
     assert!(agent_running_from_pane_title(" ⠇ another-worktree"));
     assert!(!agent_running_from_pane_title("x-pipeline-bf6d9"));
     assert!(!agent_running_from_pane_title("⠴not-a-status-prefix"));
+}
+
+#[test]
+fn kimi_agent_activity_uses_pane_output_changes_for_running_and_stopped() {
+    assert_eq!(
+        agent_running_from_pane(
+            "Kimi Code",
+            "kimi",
+            "sh -c 'export PATH=\"$PATH\"; kimi; exec zsh -l'",
+        ),
+        None
+    );
+    assert_eq!(
+        agent_running_from_pane(
+            "Refactor the dashboard",
+            "node",
+            "sh -c 'export PATH=\"$PATH\"; /Users/dev/.kimi-code/bin/kimi; exec zsh -l'",
+        ),
+        None
+    );
+    assert_eq!(
+        agent_running_from_pane(
+            "Implement the host codec",
+            "zsh",
+            "sh -c 'zsh -lc \"export PATH=$PATH; exec kimi --auto\"; exec zsh -l'",
+        ),
+        None
+    );
+    assert_eq!(
+        agent_running_from_pane("ordinary shell", "zsh", "exec zsh -l"),
+        Some(false)
+    );
 }
 
 #[test]
@@ -2496,7 +2555,7 @@ if [ "$#" -eq 1 ]; then
       exit 0
       ;;
     *"tmux capture-pane"*)
-      printf 'dev-session\037123:45\037 ⠇ dev-session\n'
+      printf 'dev-session\037123:45\037Kimi Code\037kimi\037kimi\n'
       exit 0
       ;;
     *"'tmux'"*"'display-message'"*"'=dev-session:'"*)
@@ -2560,7 +2619,7 @@ exit 12
         sessions[0].output_signature.as_deref(),
         Some("remote:123:45")
     );
-    assert_eq!(sessions[0].agent_running, Some(true));
+    assert_eq!(sessions[0].agent_running, None);
 
     restore_env("PATH", original_path);
     restore_env("TW_FAKE_SSH_LOG", original_log);
@@ -3360,7 +3419,7 @@ exit 12
     assert!(log.contains("'tmux' 'new-session' '-d' '-s' 'tw-term-dead1'"));
     assert!(log.contains("'tmux' 'kill-session' '-t' '=tw-term-dead1'"));
     assert!(log.contains(
-            "'export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; claude; exec \"${SHELL:-/bin/zsh}\" -l'"
+            "'export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; claude; exec \"${SHELL:-/bin/zsh}\" -l'"
         ));
 
     restore_env("PATH", original_path);
@@ -4595,6 +4654,8 @@ fn canonical_dashboard_layout(label: &str) -> serde_json::Value {
     serde_json::json!({
         "schemaVersion": 2,
         "columnOrder": ["file", "main", "scratch", "editor"],
+        "worktreeGroupOrder": ["local:dashboard", "ssh:builder:dashboard"],
+        "terminalOrder": ["builder:tw-term-one", "tw-term-two"],
         "sidebarWidth": if label == "first" { 280 } else { 320 },
         "selection": { "kind": "session", "name": label },
         "opaqueExtension": { "label": label }
@@ -4937,6 +4998,8 @@ fn invalid_layout_save_request_fails_before_lock_backup_or_write() {
         serde_json::json!({ "schemaVersion": 3, "columnOrder": ["file", "main", "scratch", "editor"] }),
         serde_json::json!({ "schemaVersion": 2, "version": 2, "columnOrder": ["file", "main", "scratch", "editor"] }),
         serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "file", "scratch", "editor"] }),
+        serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "main", "scratch", "editor"], "worktreeGroupOrder": ["valid", 42] }),
+        serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "main", "scratch", "editor"], "terminalOrder": ["valid", 42] }),
     ] {
         let error = save_layout_to_path(&path, invalid, &revision)
             .expect_err("invalid request must fail closed");

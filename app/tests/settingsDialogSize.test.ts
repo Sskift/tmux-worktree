@@ -27,6 +27,6 @@ test("settings dialog resize clamps both pointer and keyboard dimensions", () =>
   );
   assert.deepEqual(
     clampSettingsDialogSize({ width: Number.NaN, height: 600 }, { width: 1440, height: 900 }),
-    { width: 780, height: 600 },
+    { width: 1060, height: 600 },
   );
 });

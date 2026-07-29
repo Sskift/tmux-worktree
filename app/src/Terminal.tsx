@@ -21,6 +21,7 @@ import {
   type LinkMatch,
 } from "./linkDetect";
 import { isTerminalProtocolReply } from "./terminal/terminalResponses";
+import { TerminalControlBanner } from "./terminal/TerminalControlBanner";
 import { checkFileExists, openUrlInBrowser } from "./linkActions";
 import {
   ControlledTerminalOutputFilter,
@@ -312,6 +313,8 @@ export function Terminal({
   const remoteReconnectAttemptRef = useRef(0);
   const [reconnectSeq, setReconnectSeq] = useState(0);
   const [controlStatus, setControlStatus] = useState<PtyControlStatus | null>(null);
+  const [controlAction, setControlAction] = useState<"recovery" | null>(null);
+  const [controlActionError, setControlActionError] = useState<string | null>(null);
   linkCwdRef.current = linkCwd ?? cwd;
   onOpenFileRef.current = onOpenFile;
   onAttachmentIdChangeRef.current = onAttachmentIdChange;
@@ -905,44 +908,59 @@ export function Terminal({
   };
 
   const requestRecovery = async () => {
+    if (controlAction) return;
     const connection = ptyConnectionRef.current;
-    if (!connection) return;
-    const confirmed = await dashboardBackend.dialog.confirm({
-      title: "Recover local terminal input?",
-      message:
-        "The previous input lease expired or its controller restarted. Recovery advances the input fence and treats any uncertain in-flight operation as already attempted. Continue only if no other controller is still writing to this terminal.",
-    });
-    if (!confirmed || !connection.active) return;
-    connection.requestRecovery().then((nextStatus) => {
+    if (!connection) {
+      setControlActionError("The terminal connection is no longer available.");
+      return;
+    }
+    setControlActionError(null);
+    let confirmed = false;
+    try {
+      confirmed = await dashboardBackend.dialog.confirm({
+        title: "Recover local terminal input?",
+        message:
+          "The previous input lease expired or its controller restarted. Recovery advances the input fence and treats any uncertain in-flight operation as already attempted. Continue only if no other controller is still writing to this terminal.",
+      });
+    } catch (error) {
+      setControlActionError(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (!confirmed) return;
+    if (!connection.active) {
+      setControlActionError("The terminal connection closed before recovery started.");
+      return;
+    }
+    setControlAction("recovery");
+    try {
+      const nextStatus = await connection.requestRecovery();
       setControlStatus(nextStatus);
+      setControlActionError(nextStatus.message ?? null);
       const term = termRef.current;
       if (term && !nextStatus.readOnly) {
         void connection.resize(term.cols, term.rows).catch(() => {});
       }
-    }).catch(() => {
-      connection.controlStatus().then(setControlStatus).catch(() => {});
-    });
+    } catch (error) {
+      setControlActionError(error instanceof Error ? error.message : String(error));
+      try {
+        setControlStatus(await connection.controlStatus());
+      } catch {}
+    } finally {
+      setControlAction(null);
+    }
   };
 
   return (
     <div className="term-shell">
       <div ref={hostRef} className="term" />
       {controlStatus?.controlled && controlStatus.readOnly && (
-        <div className="term-control-banner" role="status" data-terminal-control-state={controlStatus.state}>
-          <span>
-            {controlStatus.state === "DRAINING"
-              ? `Waiting for ${controlStatus.ownerKind ?? "the current owner"} to finish local handoff…`
-              : controlStatus.state === "RECOVERY_REQUIRED"
-                ? "Read-only · terminal input continuity needs local recovery"
-                : `Read-only · input owned by ${controlStatus.ownerKind ?? "another controller"}`}
-          </span>
-          {controlStatus.canTakeOver && (
-            <button type="button" onClick={requestTakeover}>Take over locally</button>
-          )}
-          {controlStatus.canRecover && (
-            <button type="button" onClick={() => void requestRecovery()}>Recover local input</button>
-          )}
-        </div>
+        <TerminalControlBanner
+          status={controlStatus}
+          recoveryPending={controlAction === "recovery"}
+          actionError={controlActionError}
+          onTakeover={requestTakeover}
+          onRecover={() => void requestRecovery()}
+        />
       )}
     </div>
   );

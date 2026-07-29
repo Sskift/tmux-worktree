@@ -72,6 +72,7 @@ import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionConfig
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewParserAdapter
+import com.tmuxworktree.mobile.core.terminal.TerminalAttachmentInputPolicy
 import com.tmuxworktree.mobile.core.terminal.TerminalWebViewController
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
@@ -1178,7 +1179,7 @@ class V2ViewModel(
         relayV1IfAdmitted()?.killSession(session.hostId, session.name)
     }
 
-    fun openTerminal(session: RelaySession) {
+    fun openTerminal(session: RelaySession, attachmentId: String) {
         if (demoMode) {
             _uiState.update {
                 it.copy(
@@ -1192,15 +1193,20 @@ class V2ViewModel(
             emit(V2UiEffect.TerminalReset("Connected to ${session.title}\r\n"))
             emit(V2UiEffect.TerminalWrite("\u001b[32m${session.hostName}\u001b[0m:${session.cwd.ifBlank { "~" }}$ "))
         } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-            _uiState.update { it.copy(actionError = "Relay v2 terminal view is not attached") }
+            // The WebView-ready callback opens the composition-issued v2
+            // attachment. This attachment-scoped entry belongs only to v1.
+            return
         } else {
-            relayV1IfAdmitted()?.openTerminal(session.hostId, session.name)
+            relayV1IfAdmitted()?.openTerminal(
+                hostId = session.hostId,
+                sessionName = session.name,
+                attachmentId = attachmentId,
+            )
         }
     }
 
     fun openTerminal(session: RelaySession, controller: TerminalWebViewController) {
         if (demoMode || _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
-            openTerminal(session)
             return
         }
         val admitted = synchronized(relayV2UiFenceLock) {
@@ -1286,7 +1292,20 @@ class V2ViewModel(
         }
     }
 
-    fun closeTerminal() {
+    fun retryTerminalInput(session: RelaySession, attachmentId: String) {
+        if (demoMode) {
+            openTerminal(session, attachmentId)
+        } else if (_uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
+            relayV1IfAdmitted()?.openTerminal(
+                hostId = session.hostId,
+                sessionName = session.name,
+                resetDisplay = true,
+                attachmentId = attachmentId,
+            )
+        }
+    }
+
+    fun closeTerminal(attachmentId: String) {
         if (demoMode) return
         if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
             val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
@@ -1299,32 +1318,42 @@ class V2ViewModel(
                 }
             }
         } else {
-            relayV1IfAdmitted()?.closeTerminal()
+            relayV1IfAdmitted()?.closeTerminal(attachmentId)
         }
     }
 
-    fun sendTerminalInput(data: String) {
+    fun sendTerminalInput(data: String, attachmentId: String) {
         if (demoMode) {
             emit(V2UiEffect.TerminalWrite(data))
-        } else if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-            val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
-            viewModelScope.launch {
-                if (!current.composition.sendTerminalInput(
-                        current.attachment,
-                        data.toByteArray(Charsets.UTF_8),
-                    )
-                ) {
-                    updateCurrentTerminal(current) {
-                        it.copy(actionError = "Relay v2 terminal input was not admitted")
+            return
+        }
+        when (_uiState.value.relayStartupAdmission) {
+            RelayStartupAdmissionState.RELAY_V2 -> {
+                val admittedData =
+                    TerminalAttachmentInputPolicy.RELAY_V2_RAW_BYTES.admit(data) ?: return
+                val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
+                viewModelScope.launch {
+                    if (!current.composition.sendTerminalInput(
+                            current.attachment,
+                            admittedData.toByteArray(Charsets.UTF_8),
+                        )
+                    ) {
+                        updateCurrentTerminal(current) {
+                            it.copy(actionError = "Relay v2 terminal input was not admitted")
+                        }
                     }
                 }
             }
-        } else {
-            relayV1IfAdmitted()?.sendTerminalInput(data)
+            RelayStartupAdmissionState.RELAY_V1 -> {
+                val admittedData =
+                    TerminalAttachmentInputPolicy.RELAY_V1_CONTROLLED.admit(data) ?: return
+                relayV1IfAdmitted()?.sendTerminalInput(admittedData, attachmentId)
+            }
+            else -> Unit
         }
     }
 
-    fun resizeTerminal(cols: Int, rows: Int) {
+    fun resizeTerminal(cols: Int, rows: Int, attachmentId: String) {
         if (demoMode) return
         if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
             val current = synchronized(relayV2UiFenceLock) { relayV2Terminal } ?: return
@@ -1332,7 +1361,7 @@ class V2ViewModel(
                 current.composition.resizeTerminal(current.attachment, cols, rows)
             }
         } else {
-            relayV1IfAdmitted()?.resizeTerminal(cols, rows)
+            relayV1IfAdmitted()?.resizeTerminal(cols, rows, attachmentId)
         }
     }
 
@@ -1616,7 +1645,8 @@ class V2ViewModel(
                                         consented ->
                                         synchronized(relayV2UiFenceLock) {
                                             val exact = relayV2ExplicitRefreshReservation
-                                            if (exact === reservation &&
+                                            if (exact != null &&
+                                                exact === reservation &&
                                                 exact.expectedIdentity == consented.identity &&
                                                 consented.identity == expectedProfile.identity &&
                                                 exact.retiredComposition === composition &&

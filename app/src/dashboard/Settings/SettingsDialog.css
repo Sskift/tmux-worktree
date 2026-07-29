@@ -12,8 +12,8 @@
 
 .settings-dialog {
   position: relative;
-  width: min(780px, calc(100vw - 48px));
-  height: min(620px, calc(100vh - 72px));
+  width: min(1060px, calc(100vw - 48px));
+  height: min(740px, calc(100vh - 72px));
   min-width: min(640px, calc(100vw - 48px));
   min-height: 460px;
   max-width: calc(100vw - 48px);

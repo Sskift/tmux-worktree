@@ -36,6 +36,7 @@ class TerminalWebViewController internal constructor() {
     private var terminalWriteInFlight = false
     private var terminalOutputGeneration = 0L
     private var parserMutation: PendingParserMutation? = null
+    private val controlledOutput = ControlledTerminalOutputFilter()
     @Volatile
     var isReady: Boolean = false
         private set
@@ -70,6 +71,7 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            controlledOutput.reset()
             parserMutation.also { parserMutation = null }
         }
         settleParserMutation(parserMutation, applied = false)
@@ -110,7 +112,9 @@ class TerminalWebViewController internal constructor() {
     fun write(data: String) {
         if (data.isEmpty()) return
         val scheduled: Pair<WebView, Long>? = synchronized(lock) {
-            appendTerminalOutput(data)
+            val output = controlledOutput.push(data)
+            if (output.isEmpty()) return@synchronized null
+            appendTerminalOutput(output)
             val readyView = webView?.takeIf { isReady }
             if (readyView == null || terminalWriteInFlight) {
                 null
@@ -129,6 +133,7 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            controlledOutput.reset()
             parserMutation.also { parserMutation = null }
         }
         settleParserMutation(parserMutation, applied = false)
@@ -157,6 +162,7 @@ class TerminalWebViewController internal constructor() {
             pendingTerminalOutput.clear()
             terminalWriteInFlight = false
             terminalOutputGeneration += 1
+            controlledOutput.reset()
             val mutation = parserMutation.also { parserMutation = null }
             webView?.takeIf { isReady } to mutation
         }

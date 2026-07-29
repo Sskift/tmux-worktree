@@ -1,6 +1,7 @@
 use crate::config::find_host;
 use crate::ipc::AgentProbeResult;
 use crate::remote::{run_remote_cmd_check_strings, HostConfig};
+use crate::support::user_bin_search_paths;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,7 @@ pub(crate) struct AgentProbeSpec {
     pub(crate) command: &'static str,
 }
 
-pub(crate) const AGENT_PROBE_SPECS: [AgentProbeSpec; 5] = [
+pub(crate) const AGENT_PROBE_SPECS: [AgentProbeSpec; 6] = [
     AgentProbeSpec {
         id: "claude",
         label: "Claude Code",
@@ -36,6 +37,11 @@ pub(crate) const AGENT_PROBE_SPECS: [AgentProbeSpec; 5] = [
         id: "aider",
         label: "Aider",
         command: "aider",
+    },
+    AgentProbeSpec {
+        id: "kimi",
+        label: "Kimi Code",
+        command: "kimi",
     },
 ];
 
@@ -80,9 +86,9 @@ pub(crate) fn probe_local_agents_in_paths(search_paths: &[PathBuf]) -> Vec<Agent
 }
 
 fn probe_local_agents() -> Vec<AgentProbeResult> {
-    let search_paths = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let inherited_path = std::env::var_os("PATH");
+    let search_paths = user_bin_search_paths(home.as_deref(), inherited_path.as_deref());
     probe_local_agents_in_paths(&search_paths)
 }
 

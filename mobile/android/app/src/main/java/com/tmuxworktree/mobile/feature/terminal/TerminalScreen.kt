@@ -40,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -64,6 +65,7 @@ fun TerminalScreen(
     sessionTitle: String,
     connectionStatus: ConnectionStatus,
     isReadOnly: Boolean,
+    ownershipReadOnly: Boolean,
     keyboardVisible: Boolean,
     terminalFontSizeSp: Int,
     disconnectReason: String?,
@@ -74,6 +76,7 @@ fun TerminalScreen(
     onDecreaseFont: () -> Unit,
     onIncreaseFont: () -> Unit,
     onToggleReadOnly: () -> Unit,
+    onRetryInput: () -> Unit,
     modifier: Modifier = Modifier,
     terminalContent: @Composable BoxScope.() -> Unit,
 ) {
@@ -96,12 +99,14 @@ fun TerminalScreen(
             TerminalControls(
                 terminalOnline = terminalOnline,
                 isReadOnly = isReadOnly,
+                ownershipReadOnly = ownershipReadOnly,
                 keyboardVisible = keyboardVisible,
                 fontSizeSp = boundedFontSizeSp,
                 onToggleKeyboard = onToggleKeyboard,
                 onDecreaseFont = onDecreaseFont,
                 onIncreaseFont = onIncreaseFont,
                 onToggleReadOnly = onToggleReadOnly,
+                onRetryInput = onRetryInput,
             )
         },
     ) { innerPadding ->
@@ -123,6 +128,8 @@ fun TerminalScreen(
 
             if (isReadOnly && terminalOnline) {
                 ReadOnlyBanner(
+                    ownershipReadOnly = ownershipReadOnly,
+                    onRetryInput = onRetryInput,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(horizontal = 12.dp, vertical = 10.dp),
@@ -197,7 +204,16 @@ private fun TerminalTopBar(
 }
 
 @Composable
-private fun ReadOnlyBanner(modifier: Modifier = Modifier) {
+private fun ReadOnlyBanner(
+    ownershipReadOnly: Boolean,
+    onRetryInput: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val description = if (ownershipReadOnly) {
+        "Terminal input is temporarily unavailable. Retry input to ask the controller again."
+    } else {
+        "Terminal is read-only. Terminal input is disabled."
+    }
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -205,7 +221,7 @@ private fun ReadOnlyBanner(modifier: Modifier = Modifier) {
             .testTag("terminal_read_only_banner")
             .semantics {
                 liveRegion = LiveRegionMode.Polite
-                contentDescription = "Terminal is read-only. Terminal input is disabled."
+                contentDescription = description
             },
         color = TwSurface.copy(alpha = 0.96f),
         shape = RoundedCornerShape(12.dp),
@@ -216,17 +232,31 @@ private fun ReadOnlyBanner(modifier: Modifier = Modifier) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                imageVector = Icons.Outlined.Lock,
+                imageVector = if (ownershipReadOnly) Icons.Outlined.LinkOff else Icons.Outlined.Lock,
                 contentDescription = null,
                 tint = TwWarning,
                 modifier = Modifier.size(20.dp),
             )
             Spacer(Modifier.width(10.dp))
             Text(
-                text = "Read-only · terminal input is disabled",
+                text = if (ownershipReadOnly) {
+                    "Input unavailable · controller rejected input"
+                } else {
+                    "Read-only · terminal input is disabled"
+                },
                 color = TwTextPrimary,
                 style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
             )
+            if (ownershipReadOnly) {
+                Spacer(Modifier.width(8.dp))
+                TextButton(
+                    onClick = onRetryInput,
+                    modifier = Modifier.testTag("terminal_retry_input"),
+                ) {
+                    Text("Retry input")
+                }
+            }
         }
     }
 }
@@ -343,12 +373,14 @@ private fun BoxScope.DisconnectedOverlay(
 private fun TerminalControls(
     terminalOnline: Boolean,
     isReadOnly: Boolean,
+    ownershipReadOnly: Boolean,
     keyboardVisible: Boolean,
     fontSizeSp: Int,
     onToggleKeyboard: () -> Unit,
     onDecreaseFont: () -> Unit,
     onIncreaseFont: () -> Unit,
     onToggleReadOnly: () -> Unit,
+    onRetryInput: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -446,26 +478,34 @@ private fun TerminalControls(
             )
 
             IconButton(
-                onClick = onToggleReadOnly,
+                onClick = if (ownershipReadOnly) onRetryInput else onToggleReadOnly,
                 enabled = terminalOnline,
                 modifier = Modifier
                     .size(48.dp)
                     .testTag("terminal_read_only")
                     .semantics {
-                        contentDescription = if (isReadOnly) {
-                            "Enable terminal input"
-                        } else {
-                            "Switch terminal to read-only"
+                        contentDescription = when {
+                            ownershipReadOnly -> "Retry terminal input"
+                            isReadOnly -> "Enable terminal input"
+                            else -> "Switch terminal to read-only"
                         }
-                        stateDescription = if (isReadOnly) "Read-only enabled" else "Terminal input enabled"
+                        stateDescription = when {
+                            ownershipReadOnly -> "Input unavailable"
+                            isReadOnly -> "Read-only enabled"
+                            else -> "Terminal input enabled"
+                        }
                     },
             ) {
                 Icon(
-                    imageVector = if (isReadOnly) Icons.Outlined.Lock else Icons.Outlined.LockOpen,
+                    imageVector = when {
+                        ownershipReadOnly -> Icons.Outlined.Refresh
+                        isReadOnly -> Icons.Outlined.Lock
+                        else -> Icons.Outlined.LockOpen
+                    },
                     contentDescription = null,
                     tint = when {
                         !terminalOnline -> TwTextMuted
-                        isReadOnly -> TwWarning
+                        ownershipReadOnly || isReadOnly -> TwWarning
                         else -> TwSuccess
                     },
                     modifier = Modifier.size(24.dp),
@@ -508,6 +548,7 @@ private fun TerminalScreenPreview() {
             sessionTitle = "tmux-worktree-apk-re",
             connectionStatus = ConnectionStatus.ONLINE,
             isReadOnly = false,
+            ownershipReadOnly = false,
             keyboardVisible = false,
             terminalFontSizeSp = 14,
             disconnectReason = null,
@@ -518,6 +559,7 @@ private fun TerminalScreenPreview() {
             onDecreaseFont = {},
             onIncreaseFont = {},
             onToggleReadOnly = {},
+            onRetryInput = {},
         ) {
             Column(
                 modifier = Modifier
@@ -551,6 +593,7 @@ private fun TerminalDisconnectedPreview() {
             sessionTitle = "tmux-worktree-apk-re",
             connectionStatus = ConnectionStatus.OFFLINE,
             isReadOnly = true,
+            ownershipReadOnly = false,
             keyboardVisible = false,
             terminalFontSizeSp = 14,
             disconnectReason = null,
@@ -561,6 +604,7 @@ private fun TerminalDisconnectedPreview() {
             onDecreaseFont = {},
             onIncreaseFont = {},
             onToggleReadOnly = {},
+            onRetryInput = {},
         ) {
             Text(
                 text = "Last known terminal output",

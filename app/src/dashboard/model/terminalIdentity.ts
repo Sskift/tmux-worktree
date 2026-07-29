@@ -19,6 +19,20 @@ export function terminalSessionKey(terminal: PlainTerminal): string {
     : terminalRawName(terminal);
 }
 
+export function orderTerminalsBySessionKey(
+  terminals: readonly PlainTerminal[],
+  order: readonly string[],
+): PlainTerminal[] {
+  const orderMap = new Map<string, number>();
+  for (const key of order) {
+    if (!orderMap.has(key)) orderMap.set(key, orderMap.size);
+  }
+  return [...terminals].sort((left, right) =>
+    (orderMap.get(terminalSessionKey(left)) ?? Number.POSITIVE_INFINITY) -
+    (orderMap.get(terminalSessionKey(right)) ?? Number.POSITIVE_INFINITY),
+  );
+}
+
 export function isInternalTerminalName(value: string | null | undefined): boolean {
   return !!value && value.startsWith("tw-term-");
 }

@@ -10,6 +10,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
+import packageMetadata from "../package.json";
 import { FeishuBridge, type CreateFeishuBindingInput } from "./feishuBridge.js";
 import { FeishuBridgeStore, feishuBridgePaths, type FeishuBridgePaths } from "./feishuBridgeStorage.js";
 import { LarkCliBridgeAdapter, type FeishuEventSubscription, type FeishuLarkAdapter } from "./larkCliBridge.js";
@@ -25,12 +26,26 @@ const PROTOCOL_VERSION = 1;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const INSTANCE_LOCK_STALE_MS = 30_000;
+export const FEISHU_BRIDGE_CAPABILITIES = [
+  "binding.lifecycle-notices.v1",
+  "binding.create.session-summary.v1",
+  "binding.target-reconciliation.v1",
+  "binding.reply-mode.v1",
+  "binding.activity-completion.v1",
+  "binding.structured-agent-result.v1",
+  "binding.steering.v1",
+  "binding.remove-origin.v1",
+  "bridge.consumer-health.v1",
+  "reply.durable-payload.v1",
+] as const;
 
 type FeishuBridgeOperation =
+  | "bridge.info"
   | "bridge.snapshot"
   | "bridge.shutdown"
   | "groups.list"
   | "binding.create"
+  | "binding.update"
   | "binding.pause"
   | "binding.resume"
   | "binding.repair"
@@ -43,6 +58,12 @@ interface BridgeRequest {
   requestId: string;
   operation: FeishuBridgeOperation;
   params: Record<string, unknown>;
+}
+
+interface FeishuBridgeInfo {
+  daemonVersion: string;
+  larkProfile: string;
+  capabilities: string[];
 }
 
 type BridgeResponse =
@@ -109,7 +130,7 @@ function parseRequest(value: unknown): BridgeRequest {
   }
   text(value.requestId, "requestId");
   const operations: FeishuBridgeOperation[] = [
-    "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
+    "bridge.info", "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.update", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
     "binding.takeover", "binding.return",
   ];
   if (!operations.includes(value.operation as FeishuBridgeOperation)) throw new Error("unknown Feishu bridge operation");
@@ -120,9 +141,13 @@ async function dispatch(
   bridge: FeishuBridge,
   lark: FeishuLarkAdapter,
   request: BridgeRequest,
+  info: FeishuBridgeInfo,
 ): Promise<unknown> {
   const params = request.params;
   switch (request.operation) {
+    case "bridge.info":
+      if (!exactKeys(params, [])) throw new Error("invalid bridge.info params");
+      return structuredClone(info);
     case "bridge.snapshot":
       if (!exactKeys(params, [])) throw new Error("invalid snapshot params");
       return bridge.snapshot();
@@ -139,7 +164,7 @@ async function dispatch(
       return lark.listGroups();
     case "binding.create": {
       if (!exactKeys(params, ["chatId", "chatName", "sessionName", "createdBy"], [
-        "allowedSenderIds", "mentionOnly", "dashboardLease",
+        "sessionSummary", "allowedSenderIds", "mentionOnly", "replyMode", "dashboardLease",
       ])) throw new Error("invalid binding.create params");
       if (params.allowedSenderIds !== undefined
         && (!Array.isArray(params.allowedSenderIds)
@@ -149,6 +174,11 @@ async function dispatch(
       if (params.mentionOnly !== undefined && typeof params.mentionOnly !== "boolean") {
         throw new Error("invalid mentionOnly");
       }
+      if (params.replyMode !== undefined
+        && params.replyMode !== "topic"
+        && params.replyMode !== "direct") {
+        throw new Error("invalid replyMode");
+      }
       const dashboardLease = params.dashboardLease === undefined
         ? undefined
         : canonicalLease(params.dashboardLease, "dashboardLease");
@@ -157,13 +187,26 @@ async function dispatch(
         chatName: text(params.chatName, "chatName"),
         sessionName: text(params.sessionName, "sessionName"),
         createdBy: text(params.createdBy, "createdBy"),
+        ...(params.sessionSummary === undefined ? {} : {
+          sessionSummary: text(params.sessionSummary, "sessionSummary"),
+        }),
         ...(params.allowedSenderIds === undefined ? {} : {
           allowedSenderIds: params.allowedSenderIds.map((item) => text(item, "allowedSenderId")),
         }),
         ...(params.mentionOnly === undefined ? {} : { mentionOnly: params.mentionOnly }),
+        ...(params.replyMode === undefined ? {} : { replyMode: params.replyMode }),
         ...(dashboardLease === undefined ? {} : { dashboardLease }),
       } satisfies CreateFeishuBindingInput);
     }
+    case "binding.update":
+      if (!exactKeys(params, ["bindingId", "replyMode"])
+        || (params.replyMode !== "topic" && params.replyMode !== "direct")) {
+        throw new Error("invalid binding.update params");
+      }
+      return bridge.updateBinding(
+        text(params.bindingId, "bindingId"),
+        params.replyMode,
+      );
     case "binding.pause":
       if (!exactKeys(params, ["bindingId"], ["force"]) || (params.force !== undefined && typeof params.force !== "boolean")) {
         throw new Error("invalid binding.pause params");
@@ -176,10 +219,19 @@ async function dispatch(
       if (!exactKeys(params, ["bindingId"])) throw new Error("invalid binding.repair params");
       return bridge.repairBinding(text(params.bindingId, "bindingId"));
     case "binding.remove":
-      if (!exactKeys(params, ["bindingId"], ["force"]) || (params.force !== undefined && typeof params.force !== "boolean")) {
+      if (!exactKeys(params, ["bindingId"], ["force", "origin"])
+        || (params.force !== undefined && typeof params.force !== "boolean")
+        || (params.origin !== undefined
+          && params.origin !== "dashboard"
+          && params.origin !== "cli"
+          && params.origin !== "unknown-local-client")) {
         throw new Error("invalid binding.remove params");
       }
-      await bridge.removeBinding(text(params.bindingId, "bindingId"), params.force === true);
+      await bridge.removeBinding(
+        text(params.bindingId, "bindingId"),
+        params.force === true,
+        params.origin ?? "unknown-local-client",
+      );
       return { removed: true };
     case "binding.takeover":
       if (!exactKeys(params, ["bindingId", "dashboardOwnerInstance"], ["force"])
@@ -218,6 +270,7 @@ function responseError(requestId: string, error: unknown): BridgeResponse {
 function attachSocket(
   bridge: FeishuBridge,
   lark: FeishuLarkAdapter,
+  info: FeishuBridgeInfo,
   socket: Socket,
   onShutdown: () => void,
 ): void {
@@ -249,7 +302,7 @@ function attachSocket(
             protocolVersion: PROTOCOL_VERSION,
             requestId: request.requestId,
             ok: true,
-            result: await dispatch(bridge, lark, request),
+            result: await dispatch(bridge, lark, request, info),
           };
         } catch (error) {
           response = responseError(requestId, error);
@@ -314,11 +367,14 @@ export class FeishuBridgeServer {
   readonly paths: FeishuBridgePaths;
   readonly bridge: FeishuBridge;
   private readonly lark: FeishuLarkAdapter;
+  private readonly info: FeishuBridgeInfo;
   private readonly server: Server;
   private consumer?: FeishuEventSubscription;
   private pollTimer?: ReturnType<typeof setInterval>;
   private renewTimer?: ReturnType<typeof setInterval>;
   private restartTimer?: ReturnType<typeof setTimeout>;
+  private pollInFlight = false;
+  private renewInFlight = false;
   private stopping = false;
   readonly stopped: Promise<void>;
   private resolveStopped!: () => void;
@@ -327,16 +383,19 @@ export class FeishuBridgeServer {
     paths: FeishuBridgePaths;
     bridge: FeishuBridge;
     lark: FeishuLarkAdapter;
+    info: FeishuBridgeInfo;
   }) {
     this.paths = options.paths;
     this.bridge = options.bridge;
     this.lark = options.lark;
+    this.info = options.info;
     this.stopped = new Promise<void>((resolve) => {
       this.resolveStopped = resolve;
     });
     this.server = createServer((socket) => attachSocket(
       this.bridge,
       this.lark,
+      this.info,
       socket,
       () => { void this.stop(); },
     ));
@@ -351,8 +410,9 @@ export class FeishuBridgeServer {
   } = {}): Promise<FeishuBridgeServer> {
     const paths = options.paths ?? feishuBridgePaths();
     const control = options.control ?? new CanonicalTerminalControlSocketClient();
+    const larkProfile = options.larkProfile ?? process.env.TW_FEISHU_LARK_PROFILE ?? "";
     const lark = options.lark ?? new LarkCliBridgeAdapter({
-      profile: options.larkProfile ?? process.env.TW_FEISHU_LARK_PROFILE,
+      profile: larkProfile || undefined,
     });
     const bridge = new FeishuBridge({
       control,
@@ -361,7 +421,16 @@ export class FeishuBridgeServer {
       botOpenId: options.botOpenId ?? process.env.TW_FEISHU_BOT_OPEN_ID,
     });
     bridge.initializeAfterRestart();
-    return new FeishuBridgeServer({ paths, bridge, lark });
+    return new FeishuBridgeServer({
+      paths,
+      bridge,
+      lark,
+      info: {
+        daemonVersion: typeof packageMetadata.version === "string" ? packageMetadata.version : "unknown",
+        larkProfile,
+        capabilities: [...FEISHU_BRIDGE_CAPABILITIES],
+      },
+    });
   }
 
   async start(): Promise<void> {
@@ -375,21 +444,34 @@ export class FeishuBridgeServer {
         this.server.listen(this.paths.socket, () => resolve());
       });
       chmodSync(this.paths.socket, 0o600);
+      await this.bridge.reconcileBindingTargets();
       this.pollTimer = setInterval(() => {
-        void this.bridge.pollTurns().then(
-          () => this.bridge.reconcileHandoffs(),
-        ).catch((error) => {
-          process.stderr.write(`[feishu-bridge] output poll failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
+        if (this.pollInFlight) return;
+        this.pollInFlight = true;
+        void this.bridge.pollTurns()
+          .then(() => this.bridge.reconcileHandoffs())
+          .catch((error) => {
+            process.stderr.write(`[feishu-bridge] output poll failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          })
+          .finally(() => {
+            this.pollInFlight = false;
+          });
       }, 500);
       this.pollTimer.unref();
       this.renewTimer = setInterval(() => {
-        void this.bridge.renewLeases().catch((error) => {
-          process.stderr.write(`[feishu-bridge] lease renewal failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
+        if (this.renewInFlight) return;
+        this.renewInFlight = true;
+        void this.bridge.renewLeases()
+          .then(() => this.bridge.reconcileBindingTargets())
+          .catch((error) => {
+            process.stderr.write(`[feishu-bridge] lease renewal failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          })
+          .finally(() => {
+            this.renewInFlight = false;
+          });
       }, 20_000);
       this.renewTimer.unref();
-      this.startConsumer();
+      await this.startConsumer();
     } catch (error) {
       await this.stop();
       throw error;
@@ -416,17 +498,44 @@ export class FeishuBridgeServer {
     }
   }
 
-  private startConsumer(): void {
+  private async startConsumer(): Promise<void> {
     if (this.stopping) return;
+    this.bridge.setEventConsumerHealth("starting");
     this.consumer = this.lark.subscribe((event) => this.bridge.handleEvent(event));
-    void this.consumer.done.catch((error) => {
+    const consumer = this.consumer;
+    void consumer.done.then(
+      () => {
+        if (!this.stopping) {
+          this.bridge.setEventConsumerHealth("backoff", "Feishu event consumer exited");
+        }
+      },
+      (error) => {
+        if (this.stopping) return;
+        const message = error instanceof Error ? error.message : String(error);
+        this.bridge.setEventConsumerHealth("backoff", message);
+        process.stderr.write(`[feishu-bridge] event consumer stopped: ${message}\n`);
+      },
+    ).finally(() => {
       if (this.stopping) return;
-      process.stderr.write(`[feishu-bridge] event consumer stopped: ${error instanceof Error ? error.message : String(error)}\n`);
-    }).finally(() => {
-      if (this.stopping) return;
-      this.restartTimer = setTimeout(() => this.startConsumer(), 2_000);
+      this.restartTimer = setTimeout(() => {
+        void this.startConsumer().catch((error) => {
+          if (this.stopping) return;
+          const message = error instanceof Error ? error.message : String(error);
+          this.bridge.setEventConsumerHealth("backoff", message);
+        });
+      }, 2_000);
       this.restartTimer.unref();
     });
+    try {
+      await consumer.ready;
+      if (!this.stopping && this.consumer === consumer) {
+        this.bridge.setEventConsumerHealth("running");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.bridge.setEventConsumerHealth("backoff", message);
+      throw error;
+    }
   }
 }
 
@@ -531,6 +640,7 @@ export async function feishuBridgeCmd(args: string[]): Promise<void> {
         chatName: requiredFlag(args, "--chat-name"),
         sessionName: requiredFlag(args, "--session"),
         createdBy: requiredFlag(args, "--created-by"),
+        ...(flag(args, "--summary") ? { sessionSummary: flag(args, "--summary") } : {}),
         ...(args.includes("--no-mention-required") ? { mentionOnly: false } : {}),
         ...(flag(args, "--allow-senders") ? {
           allowedSenderIds: flag(args, "--allow-senders")!.split(",").filter(Boolean),
@@ -552,6 +662,7 @@ export async function feishuBridgeCmd(args: string[]): Promise<void> {
       process.stdout.write(`${JSON.stringify(await client.request("binding.remove", {
         bindingId: requiredFlag(args, "--binding"),
         ...(args.includes("--force") ? { force: true } : {}),
+        origin: "cli",
       }), null, 2)}\n`);
       return;
     default:

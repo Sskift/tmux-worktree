@@ -97,6 +97,8 @@ function boundedLayoutSaveErrorDetail(error: unknown): string {
 export function useDashboardLayoutState() {
   const { loadLayoutPreferences, saveLayoutPreferences } = useLayoutPreferences();
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
+  const [worktreeGroupOrder, setWorktreeGroupOrder] = useState<string[]>([]);
+  const [terminalOrder, setTerminalOrder] = useState<string[]>([]);
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>([]);
   const [pinnedItems, setPinnedItems] = useState<PinnedItem[]>([]);
   const [automationSectionCollapsed, setAutomationSectionCollapsed] = useState(true);
@@ -167,6 +169,10 @@ export function useDashboardLayoutState() {
   return {
     sessionOrder,
     setSessionOrder,
+    worktreeGroupOrder,
+    setWorktreeGroupOrder,
+    terminalOrder,
+    setTerminalOrder,
     collapsedProjects,
     setCollapsedProjects,
     pinnedItems,
@@ -345,6 +351,8 @@ export function useDashboardLayoutHydrationPhase(
     setScratchCollapsed,
     setScratchWidth,
     setSessionOrder,
+    setWorktreeGroupOrder,
+    setTerminalOrder,
     setSidebarOpen,
     setSidebarView,
     setSidebarWidth,
@@ -405,6 +413,8 @@ export function useDashboardLayoutHydrationPhase(
         if (lay.sessionOrder) {
           setSessionOrder(lay.sessionOrder.filter((name) => !name.startsWith("tw-term-")));
         }
+        if (lay.worktreeGroupOrder) setWorktreeGroupOrder(lay.worktreeGroupOrder);
+        if (lay.terminalOrder) setTerminalOrder(lay.terminalOrder);
         if (lay.collapsedProjects) {
           setCollapsedProjects(lay.collapsedProjects);
         }
@@ -552,6 +562,8 @@ export function useDashboardLayoutPersistencePhase(
     scratchCollapsed,
     scratchWidth,
     sessionOrder,
+    worktreeGroupOrder,
+    terminalOrder,
     sidebarOpen,
     sidebarOpenPreferenceRef,
     sidebarView,
@@ -576,6 +588,8 @@ export function useDashboardLayoutPersistencePhase(
             scratchWidth,
             selection,
             sessionOrder,
+            worktreeGroupOrder,
+            terminalOrder,
             sidebarOpen: sidebarOpenPreferenceRef.current,
             sidebarView,
             sidebarWidth,
@@ -603,6 +617,8 @@ export function useDashboardLayoutPersistencePhase(
     inspectorOpen,
     sidebarView,
     sessionOrder,
+    worktreeGroupOrder,
+    terminalOrder,
     collapsedProjects,
     pinnedItems,
     automationSectionCollapsed,

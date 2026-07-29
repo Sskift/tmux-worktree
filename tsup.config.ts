@@ -126,6 +126,7 @@ export default defineConfig({
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexTrustedSourceComposition.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
+    "src/feishuReplyCard.ts",
     "src/larkCliBridge.ts",
     "src/feishuBridgeStorage.ts",
     "src/feishuBridge.ts",
@@ -188,6 +189,9 @@ export default defineConfig({
     // issuer/receiver registry is never duplicated inside the root bundle.
     "./relay/v2/hostRuntimeComposition.js",
     "./relay/v2/hostCanonicalProductionComposition.js",
+    // Profile provisioning must use the canonical nested entry so its
+    // credential-authority import keeps the relay/v2 module identity.
+    "./relay/v2/hostProductionProfileStore.js",
     "./hostAgentTranscriptLifecycleAttachment.js",
     // relayServer dynamically loads the canonical activated combined owner
     // from its matching dist/relay/v2 directory so private brands stay single.

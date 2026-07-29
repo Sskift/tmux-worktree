@@ -105,6 +105,8 @@ class RelayV1ConnectionActor(
     private val requestTimeoutJobs = mutableMapOf<String, Job>()
     private var selectedHostId: String = ""
     private var desiredTerminal: DesiredTerminal? = null
+    private val desiredTerminalSizes = linkedMapOf<String, TerminalSize>()
+    private var lastSentTerminalSize: SentTerminalSize? = null
     private var pendingReopenGeneration: Long? = null
     private var rejectedSocketEpoch: Long? = null
     private val terminalOutputBuffer = StringBuilder()
@@ -274,24 +276,25 @@ class RelayV1ConnectionActor(
         sessionName: String,
         pane: RelayV1Pane? = null,
         resetDisplay: Boolean = true,
+        attachmentId: String = DEFAULT_ATTACHMENT_ID,
     ): String {
         val streamId = streamIdFactory()
         if (!isClosed.get()) {
-            enqueueAction(Action.OpenTerminal(streamId, hostId, sessionName, pane, resetDisplay))
+            enqueueAction(Action.OpenTerminal(streamId, hostId, sessionName, pane, resetDisplay, attachmentId))
         }
         return streamId
     }
 
-    fun sendTerminalInput(data: String) {
-        if (!isClosed.get()) enqueueAction(Action.TerminalInput(data))
+    fun sendTerminalInput(data: String, attachmentId: String = DEFAULT_ATTACHMENT_ID) {
+        if (!isClosed.get()) enqueueAction(Action.TerminalInput(data, attachmentId))
     }
 
-    fun resizeTerminal(cols: Int, rows: Int) {
-        if (!isClosed.get()) enqueueAction(Action.ResizeTerminal(cols, rows))
+    fun resizeTerminal(cols: Int, rows: Int, attachmentId: String = DEFAULT_ATTACHMENT_ID) {
+        if (!isClosed.get()) enqueueAction(Action.ResizeTerminal(cols, rows, attachmentId))
     }
 
-    fun closeTerminal() {
-        if (!isClosed.get()) enqueueAction(Action.CloseTerminal)
+    fun closeTerminal(attachmentId: String = DEFAULT_ATTACHMENT_ID) {
+        if (!isClosed.get()) enqueueAction(Action.CloseTerminal(attachmentId))
     }
 
     override fun close() {
@@ -379,7 +382,7 @@ class RelayV1ConnectionActor(
                         inputReadOnly = active?.inputReadOnly ?: _terminal.value.inputReadOnly,
                     )
                 } else {
-                    desiredTerminal = null
+                    if (!sameConfig) clearDesiredTerminalState()
                     _terminal.value = streams.state(ConnectionStatus.OFFLINE)
                 }
                 config = action.config
@@ -421,7 +424,7 @@ class RelayV1ConnectionActor(
                     rejectPendingRequests(
                         "Connection closed before acknowledgement; delivery is ambiguous",
                     )
-                    desiredTerminal = null
+                    clearDesiredTerminalState()
                     pendingReopenGeneration = null
                     streams.clear()
                     _snapshots.value = RelaySnapshotState()
@@ -440,14 +443,11 @@ class RelayV1ConnectionActor(
                 sessionName = action.sessionName,
                 pane = action.pane,
                 resetDisplay = action.resetDisplay,
+                attachmentId = action.attachmentId,
             )
-            is Action.TerminalInput -> terminalInputNow(action.data)
-            is Action.ResizeTerminal -> if (!_terminal.value.inputReadOnly) {
-                streams.current()?.let {
-                    sendNow(RelayV1Command.Resize(it.streamId, action.cols, action.rows))
-                }
-            }
-            Action.CloseTerminal -> closeTerminalNow()
+            is Action.TerminalInput -> terminalInputNow(action.data, action.attachmentId)
+            is Action.ResizeTerminal -> resizeTerminalNow(action.cols, action.rows, action.attachmentId)
+            is Action.CloseTerminal -> closeTerminalNow(action.attachmentId)
             is Action.SocketOpened -> socketOpened(action)
             is Action.SocketMessage -> try {
                 if (action.epoch == transport.epoch && action.epoch != rejectedSocketEpoch) {
@@ -597,7 +597,7 @@ class RelayV1ConnectionActor(
         if (transport.phase == TransportPhase.AUTH_REQUIRED) {
             flushTerminalOutput()
             cancelTerminalOpenTimeout()
-            desiredTerminal = null
+            clearDesiredTerminalState()
             streams.clear()
             _terminal.value = streams.state(ConnectionStatus.AUTH_REQUIRED)
             emit(RelayClientEvent.AuthRequired(action.message.ifBlank { "Authentication required" }))
@@ -784,6 +784,7 @@ class RelayV1ConnectionActor(
                     sessionName = desired.sessionName,
                     pane = desired.pane,
                     resetDisplay = false,
+                    attachmentId = desired.attachmentId,
                 )
             }
         }
@@ -862,7 +863,7 @@ class RelayV1ConnectionActor(
             if (desired?.hostId == hostId && desired.sessionName == sessionName) {
                 flushTerminalOutput()
                 cancelTerminalOpenTimeout()
-                desiredTerminal = null
+                clearDesiredTerminalState()
                 streams.clear()
                 _terminal.value = streams.state(ConnectionStatus.OFFLINE)
             }
@@ -911,8 +912,7 @@ class RelayV1ConnectionActor(
             return
         }
         if (!event.streamId.isNullOrEmpty() && !streams.accepts(event.streamId)) return
-        val normalized = event.message.lowercase()
-        val ownershipRejected = normalized.startsWith("[input-ownership:")
+        val ownershipRejected = isInputOwnershipError(event.message)
         if (ownershipRejected && streams.accepts(event.streamId)) {
             streams.markInputReadOnly(event.streamId!!)
             _terminal.value = streams.state(_terminal.value.status).copy(
@@ -921,9 +921,9 @@ class RelayV1ConnectionActor(
             emit(RelayClientEvent.Error(event.message, resolution?.context, event.streamId))
             return
         }
-        val recoverable = normalized.contains("terminal stream is not open") ||
-            normalized.contains("terminal stream closed") ||
-            normalized.contains("host reconnected")
+        val recoverable = event.message.contains("terminal stream is not open", ignoreCase = true) ||
+            event.message.contains("terminal stream closed", ignoreCase = true) ||
+            event.message.contains("host reconnected", ignoreCase = true)
         val active = streams.current()
         if (recoverable && active != null && streams.accepts(event.streamId)) {
             flushTerminalOutput(active.streamId)
@@ -954,6 +954,7 @@ class RelayV1ConnectionActor(
         sessionName: String,
         pane: RelayV1Pane?,
         resetDisplay: Boolean,
+        attachmentId: String,
     ) {
         flushTerminalOutput()
         cancelTerminalOpenTimeout()
@@ -961,18 +962,19 @@ class RelayV1ConnectionActor(
         if (old != null && old.streamId != streamId) {
             sendNow(RelayV1Command.CloseTerminal(old.streamId))
         }
-        desiredTerminal = DesiredTerminal(hostId, sessionName, pane)
+        val pendingSize = desiredTerminalSizes[attachmentId]
+        desiredTerminalSizes.clear()
+        if (pendingSize != null) desiredTerminalSizes[attachmentId] = pendingSize
+        if (desiredTerminal?.attachmentId != attachmentId) {
+            lastSentTerminalSize = null
+        }
+        desiredTerminal = DesiredTerminal(hostId, sessionName, pane, attachmentId)
         pendingReopenGeneration = null
-        val targetSessionId = "$hostId:$sessionName"
-        val preserveOwnershipReadOnly = !resetDisplay &&
-            _terminal.value.sessionId == targetSessionId &&
-            _terminal.value.inputReadOnly
         val stream = streams.open(
             streamId,
             hostId,
             sessionName,
             pane,
-            inputReadOnly = preserveOwnershipReadOnly,
         )
         _terminal.value = streams.state(ConnectionStatus.RECOVERING).copy(
             resetReason = if (resetDisplay) "opening" else "reopening",
@@ -990,6 +992,7 @@ class RelayV1ConnectionActor(
                 inputReadOnly = stream.inputReadOnly,
             )
         } else {
+            sendDesiredTerminalSize(stream)
             scheduleTerminalOpenTimeout(transport.epoch, stream)
         }
     }
@@ -1003,34 +1006,67 @@ class RelayV1ConnectionActor(
             desired.sessionName,
             desired.pane,
             resetDisplay = false,
+            attachmentId = desired.attachmentId,
         )
     }
 
-    private fun terminalInputNow(data: String) {
+    private fun terminalInputNow(data: String, attachmentId: String) {
+        val desired = desiredTerminal ?: return
+        if (desired.attachmentId != attachmentId) return
         if (_terminal.value.inputReadOnly) return
         var active = streams.current()
         if (active == null) {
-            val desired = desiredTerminal ?: return
             openTerminalNow(
                 streamId = streamIdFactory(),
                 hostId = desired.hostId,
                 sessionName = desired.sessionName,
                 pane = desired.pane,
                 resetDisplay = false,
+                attachmentId = desired.attachmentId,
             )
             active = streams.current()
         }
         active?.let { sendNow(RelayV1Command.TerminalInput(it.streamId, data)) }
     }
 
-    private fun closeTerminalNow() {
+    private fun resizeTerminalNow(cols: Int, rows: Int, attachmentId: String) {
+        if (cols !in MIN_TERMINAL_COLS..MAX_TERMINAL_COLS) return
+        if (rows !in MIN_TERMINAL_ROWS..MAX_TERMINAL_ROWS) return
+        desiredTerminalSizes.remove(attachmentId)
+        desiredTerminalSizes[attachmentId] = TerminalSize(cols, rows)
+        while (desiredTerminalSizes.size > MAX_PENDING_ATTACHMENT_SIZES) {
+            desiredTerminalSizes.remove(desiredTerminalSizes.keys.first())
+        }
+        val desired = desiredTerminal
+        if (desired?.attachmentId != attachmentId) return
+        streams.current()?.let(::sendDesiredTerminalSize)
+    }
+
+    private fun sendDesiredTerminalSize(stream: RelayStreamContext) {
+        val desired = desiredTerminal ?: return
+        val size = desiredTerminalSizes[desired.attachmentId] ?: return
+        val sent = lastSentTerminalSize
+        if (sent?.generation == stream.generation && sent.size == size) return
+        if (sendNow(RelayV1Command.Resize(stream.streamId, size.cols, size.rows))) {
+            lastSentTerminalSize = SentTerminalSize(stream.generation, size)
+        }
+    }
+
+    private fun closeTerminalNow(attachmentId: String) {
+        if (desiredTerminal?.attachmentId != attachmentId) return
         flushTerminalOutput()
         cancelTerminalOpenTimeout()
         streams.current()?.let { sendNow(RelayV1Command.CloseTerminal(it.streamId)) }
         streams.clear()
-        desiredTerminal = null
+        clearDesiredTerminalState()
         pendingReopenGeneration = null
         _terminal.value = streams.state(ConnectionStatus.OFFLINE)
+    }
+
+    private fun clearDesiredTerminalState() {
+        desiredTerminal = null
+        desiredTerminalSizes.clear()
+        lastSentTerminalSize = null
     }
 
     private fun scheduleRefresh(hostId: String, delayMillis: Long) {
@@ -1206,7 +1242,7 @@ class RelayV1ConnectionActor(
         )
         socket?.cancel()
         socket = null
-        desiredTerminal = null
+        clearDesiredTerminalState()
         pendingReopenGeneration = null
         streams.clear()
         _snapshots.value = RelaySnapshotState()
@@ -1265,6 +1301,14 @@ class RelayV1ConnectionActor(
         val hostId: String,
         val sessionName: String,
         val pane: RelayV1Pane?,
+        val attachmentId: String,
+    )
+
+    private data class TerminalSize(val cols: Int, val rows: Int)
+
+    private data class SentTerminalSize(
+        val generation: Long,
+        val size: TerminalSize,
     )
 
     private sealed interface Action {
@@ -1281,10 +1325,11 @@ class RelayV1ConnectionActor(
             val sessionName: String,
             val pane: RelayV1Pane?,
             val resetDisplay: Boolean,
+            val attachmentId: String,
         ) : Action
-        data class TerminalInput(val data: String) : Action
-        data class ResizeTerminal(val cols: Int, val rows: Int) : Action
-        data object CloseTerminal : Action
+        data class TerminalInput(val data: String, val attachmentId: String) : Action
+        data class ResizeTerminal(val cols: Int, val rows: Int, val attachmentId: String) : Action
+        data class CloseTerminal(val attachmentId: String) : Action
         data class SocketOpened(val epoch: Long, val socket: WebSocket) : Action
         data class SocketMessage(val epoch: Long, val raw: String) : Action
         data class SocketClosed(val epoch: Long, val code: Int, val reason: String) : Action
@@ -1319,7 +1364,7 @@ class RelayV1ConnectionActor(
         Action.PauseForNetwork,
         is Action.Disconnect,
         is Action.OpenTerminal,
-        Action.CloseTerminal,
+        is Action.CloseTerminal,
         -> true
         else -> false
     }
@@ -1334,6 +1379,22 @@ class RelayV1ConnectionActor(
         private const val MAX_PENDING_EVENTS = 32
         private const val MAX_PENDING_WIRE_MESSAGES = 32
         private const val MAX_WIRE_MESSAGE_CHARS = 512 * 1024
+        private const val MAX_PENDING_ATTACHMENT_SIZES = 8
+        private const val DEFAULT_ATTACHMENT_ID = "relay-v1-default-attachment"
+        private const val MIN_TERMINAL_COLS = 20
+        private const val MAX_TERMINAL_COLS = 300
+        private const val MIN_TERMINAL_ROWS = 5
+        private const val MAX_TERMINAL_ROWS = 200
+        private const val INPUT_OWNERSHIP_ERROR_PREFIX = "[input-ownership:"
+
+        private fun isInputOwnershipError(message: String): Boolean {
+            if (!message.startsWith(INPUT_OWNERSHIP_ERROR_PREFIX, ignoreCase = true)) return false
+            val markerEnd = message.indexOf(']')
+            if (markerEnd <= INPUT_OWNERSHIP_ERROR_PREFIX.length) return false
+            val code = message.substring(INPUT_OWNERSHIP_ERROR_PREFIX.length, markerEnd)
+            if (code.any { !it.isLetterOrDigit() && it != '_' }) return false
+            return markerEnd == message.lastIndex || message[markerEnd + 1].isWhitespace()
+        }
 
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)

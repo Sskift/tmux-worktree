@@ -15,6 +15,8 @@ test("dashboard layout snapshot builder owns every persisted field and clones in
     scratchWidth: 390,
     selection: { kind: "terminal" as const, id: "terminal-1" },
     sessionOrder: ["host:session"],
+    worktreeGroupOrder: ["host:project"],
+    terminalOrder: ["builder:tw-term-1"],
     sidebarOpen: false,
     sidebarView: "files" as const,
     sidebarWidth: 310,
@@ -30,6 +32,8 @@ test("dashboard layout snapshot builder owns every persisted field and clones in
     inspectorOpen: true,
     sidebarView: "files",
     sessionOrder: ["host:session"],
+    worktreeGroupOrder: ["host:project"],
+    terminalOrder: ["builder:tw-term-1"],
     collapsedProjects: ["host:project"],
     pinnedItems: [{ kind: "session", name: "host:session" }],
     automationSectionCollapsed: false,
@@ -49,6 +53,8 @@ test("dashboard layout snapshot builder owns every persisted field and clones in
   });
 
   input.sessionOrder.push("mutated");
+  input.worktreeGroupOrder.push("mutated");
+  input.terminalOrder.push("mutated");
   input.collapsedProjects.push("mutated");
   input.pinnedItems[0].name = "mutated";
   input.selection.id = "mutated";
@@ -56,6 +62,8 @@ test("dashboard layout snapshot builder owns every persisted field and clones in
   input.diffFile.path = "mutated";
   input.windowLayout.width = 1;
   assert.deepEqual(snapshot.sessionOrder, ["host:session"]);
+  assert.deepEqual(snapshot.worktreeGroupOrder, ["host:project"]);
+  assert.deepEqual(snapshot.terminalOrder, ["builder:tw-term-1"]);
   assert.deepEqual(snapshot.collapsedProjects, ["host:project"]);
   assert.deepEqual(snapshot.pinnedItems, [{ kind: "session", name: "host:session" }]);
   assert.deepEqual(snapshot.selection, { kind: "terminal", id: "terminal-1" });
@@ -77,6 +85,8 @@ test("dashboard layout snapshot omits unknown window state and preserves null se
     scratchWidth: 360,
     selection: null,
     sessionOrder: [],
+    worktreeGroupOrder: [],
+    terminalOrder: [],
     sidebarOpen: true,
     sidebarView: "workspaces",
     sidebarWidth: 280,

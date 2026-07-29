@@ -15,6 +15,7 @@ import { keepFocusInside } from "./dashboard/Settings/focusTrap";
 import { createLatestRequestGate, requestSourceKey } from "./latestRequestGate";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
 import {
+  type AgentProbeResult,
   type CreateWorktreeInput,
   type HostConfig,
   type OrphanedWorktree as Orphan,
@@ -47,6 +48,39 @@ export function shouldApplyWorktreeCatalogDefault(
   return draftState.source === source && !draftState.dirty;
 }
 
+export function availableWorktreeAgents(
+  results: readonly AgentProbeResult[],
+): AgentProbeResult[] {
+  return results.filter((agent) => agent.available);
+}
+
+export function resolveWorktreeAgentCommand(
+  results: readonly AgentProbeResult[],
+  preferredCommand: string,
+): string {
+  const available = availableWorktreeAgents(results);
+  const preferred = preferredCommand.trim();
+  return available.some((agent) => agent.command === preferred)
+    ? preferred
+    : available[0]?.command ?? "";
+}
+
+export type WorktreeAgentAvailability = Readonly<{
+  source: string;
+  results: readonly AgentProbeResult[];
+}>;
+
+export function isWorktreeAgentSelectionAvailable(
+  availability: WorktreeAgentAvailability,
+  source: string,
+  command: string,
+): boolean {
+  const selected = command.trim();
+  return availability.source === source && availability.results.some(
+    (agent) => agent.available && agent.command === selected,
+  );
+}
+
 export function NewWorktreeModal({
   hosts,
   onClose,
@@ -60,6 +94,11 @@ export function NewWorktreeModal({
   const remoteBrowseButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const catalogRequestGateRef = useRef(createLatestRequestGate());
+  const agentRequestGateRef = useRef(createLatestRequestGate());
+  const agentAvailabilityRef = useRef<WorktreeAgentAvailability>({
+    source: LOCAL_HOST,
+    results: [],
+  });
   const projectValidationGateRef = useRef(createLatestRequestGate());
   const busyRef = useRef(false);
   const catalogDraftStateRef = useRef<WorktreeCatalogDraftState>({
@@ -67,6 +106,7 @@ export function NewWorktreeModal({
     dirty: false,
   });
   const titleId = useId();
+  const preferredAgentRef = useRef(loadLastAiCmd());
   const [projects, setProjects] = useState<Project[]>([]);
   const [orphans, setOrphans] = useState<Orphan[]>([]);
   const [selectedHost, setSelectedHost] = useState<string>(LOCAL_HOST);
@@ -74,7 +114,10 @@ export function NewWorktreeModal({
   const [customPath, setCustomPath] = useState<string>("");
   const [customName, setCustomName] = useState<string>("");
   const [savePreset, setSavePreset] = useState(false);
-  const [aiCmd, setAiCmd] = useState<string>(loadLastAiCmd);
+  const [agentResults, setAgentResults] = useState<AgentProbeResult[]>([]);
+  const [agentLoading, setAgentLoading] = useState(true);
+  const [agentError, setAgentError] = useState<string | null>(null);
+  const [aiCmd, setAiCmd] = useState<string>("");
   const [name, setName] = useState<string>("");
   const [branch, setBranch] = useState<string>("");
   const [showRemotePicker, setShowRemotePicker] = useState(false);
@@ -93,8 +136,9 @@ export function NewWorktreeModal({
       detail: host.host,
     })),
   ];
-  const selectedHostLabel = hosts.find((host) => host.id === selectedHost)?.label
-    ?? selectedHost;
+  const selectedHostLabel = isRemote
+    ? hosts.find((host) => host.id === selectedHost)?.label ?? selectedHost
+    : "This Mac";
   const projectMenuOptions: MenuOption[] = isRemote && projectCatalogLoading
     ? [{
         value: CUSTOM,
@@ -113,6 +157,22 @@ export function NewWorktreeModal({
           detail: "choose another repository",
         },
       ];
+  const agentMenuOptions: MenuOption[] = agentLoading
+    ? [{ value: "", label: "Scanning agents…", detail: selectedHostLabel }]
+    : agentError
+      ? [{ value: "", label: "Agent scan failed", detail: selectedHostLabel }]
+      : agentResults.length === 0
+        ? [{ value: "", label: "No agents available", detail: selectedHostLabel }]
+        : agentResults.map((agent) => ({
+            value: agent.command,
+            label: agent.label,
+            detail: agent.command,
+          }));
+  const agentSelectionAvailable = isWorktreeAgentSelectionAvailable(
+    { source: selectedHost, results: agentResults },
+    selectedHost,
+    aiCmd,
+  );
 
   useEffect(() => {
     previousFocusRef.current = document.activeElement instanceof HTMLElement
@@ -198,9 +258,48 @@ export function NewWorktreeModal({
     return () => requestGate.cancel(token);
   }, [dashboardBackend, isRemote, selectedHost]);
 
+  useEffect(() => {
+    const requestGate = agentRequestGateRef.current;
+    const token = requestGate.issue(
+      requestSourceKey("new-worktree-agents", selectedHost),
+    );
+    const target = isRemote
+      ? { kind: "host" as const, hostId: selectedHost }
+      : { kind: "local" as const };
+
+    setAgentLoading(true);
+    setAgentResults([]);
+    setAgentError(null);
+    setAiCmd("");
+    agentAvailabilityRef.current = { source: selectedHost, results: [] };
+
+    void dashboardBackend.agents.probe(target).then(
+      (results) => {
+        if (!requestGate.isCurrent(token)) return;
+        const available = availableWorktreeAgents(results);
+        agentAvailabilityRef.current = { source: selectedHost, results: available };
+        setAgentResults(available);
+        setAiCmd(resolveWorktreeAgentCommand(available, preferredAgentRef.current));
+        setAgentLoading(false);
+      },
+      (reason) => {
+        if (!requestGate.isCurrent(token)) return;
+        agentAvailabilityRef.current = { source: selectedHost, results: [] };
+        setAgentError(String(reason));
+        setAgentLoading(false);
+      },
+    );
+
+    return () => requestGate.cancel(token);
+  }, [dashboardBackend, isRemote, selectedHost]);
+
   const changeHost = (hostId: string) => {
+    if (hostId === selectedHost) return;
+
     catalogRequestGateRef.current.invalidate();
+    agentRequestGateRef.current.invalidate();
     projectValidationGateRef.current.invalidate();
+    agentAvailabilityRef.current = { source: hostId, results: [] };
     catalogDraftStateRef.current = { source: hostId, dirty: false };
     setSelectedHost(hostId);
     setProjects([]);
@@ -208,6 +307,10 @@ export function NewWorktreeModal({
     setValidatingProject(false);
     setProjectCatalogLoading(true);
     setOrphans([]);
+    setAgentLoading(true);
+    setAgentResults([]);
+    setAgentError(null);
+    setAiCmd("");
     setError(null);
   };
 
@@ -280,6 +383,14 @@ export function NewWorktreeModal({
   };
 
   const restoreOrphan = async (orphan: Orphan) => {
+    if (!isWorktreeAgentSelectionAvailable(
+      agentAvailabilityRef.current,
+      selectedHost,
+      aiCmd,
+    )) {
+      setError("Select an agent detected as available on the current host.");
+      return;
+    }
     if (!beginBusy()) return;
     try {
       const accepted = await onRestoreWorktree({
@@ -315,7 +426,15 @@ export function NewWorktreeModal({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!aiCmd.trim() || !beginBusy()) return;
+    if (!isWorktreeAgentSelectionAvailable(
+      agentAvailabilityRef.current,
+      selectedHost,
+      aiCmd,
+    )) {
+      setError("Select an agent detected as available on the current host.");
+      return;
+    }
+    if (!beginBusy()) return;
     try {
       const createArgs: CreateWorktreeInput = {
         aiCmd: aiCmd.trim(),
@@ -416,7 +535,7 @@ export function NewWorktreeModal({
                   <button
                     type="button"
                     className="btn btn--ghost orphan-item"
-                    disabled={busy}
+                    disabled={busy || agentLoading || !agentSelectionAvailable}
                     onClick={() => restoreOrphan(o)}
                   >
                     <span className="orphan-item__project">{o.project}</span>
@@ -552,6 +671,7 @@ export function NewWorktreeModal({
         <label className="field">
           <span className="field__label">target branch</span>
           <input
+            ref={initialFocusRef}
             className="field__input"
             type="text"
             value={branch}
@@ -570,20 +690,30 @@ export function NewWorktreeModal({
         </label>
 
         <label className="field">
-          <span className="field__label">ai command</span>
-          <input
-            ref={initialFocusRef}
-            className="field__input"
-            type="text"
+          <span className="field__label">agent</span>
+          <MenuSelect
+            ariaLabel="Agent"
             value={aiCmd}
-            onChange={(e) => setAiCmd(e.target.value)}
-            placeholder="claude"
-            disabled={busy}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
+            options={agentMenuOptions}
+            onChange={(command) => {
+              preferredAgentRef.current = command;
+              setAiCmd(command);
+            }}
+            disabled={busy || agentLoading || !!agentError || agentResults.length === 0}
           />
+          {agentLoading ? (
+            <span className="field__hint" role="status">
+              Checking supported agents on {selectedHostLabel}…
+            </span>
+          ) : agentError ? (
+            <span className="field__hint" role="alert">
+              Could not detect agents on {selectedHostLabel}: {agentError}
+            </span>
+          ) : agentResults.length === 0 ? (
+            <span className="field__hint" role="status">
+              Install a supported agent on {selectedHostLabel} before creating or restoring a worktree.
+            </span>
+          ) : null}
         </label>
 
         <label className="field">
@@ -619,7 +749,8 @@ export function NewWorktreeModal({
             disabled={
               busy ||
               validatingProject ||
-              !aiCmd.trim() ||
+              agentLoading ||
+              !agentSelectionAvailable ||
               (isCustom &&
                 (!customPath.trim() ||
                   (!isRemote && savePreset && !customName.trim())))

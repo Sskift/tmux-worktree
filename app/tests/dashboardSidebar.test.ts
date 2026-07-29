@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  canReorderSessionsWithinGroup,
   describeSidebarActivity,
   groupSessionsByHostProject,
+  orderSidebarSessionGroups,
+  orderSessionsByName,
   summarizeSidebarConnections,
 } from "../src/dashboard/model/workspaceSelectors.ts";
+import {
+  moveSortableItem,
+  resolveSortableMove,
+} from "../src/dashboard/hooks/useSortable.ts";
 import type { HostConfig, HostStatus, Session } from "../src/platform/domainTypes.ts";
 
 const hosts: HostConfig[] = [
@@ -83,6 +90,96 @@ test("groups worktrees by host and project with collapse-compatible keys", () =>
         sessionNames: ["relay-beta-docs"],
       },
     ],
+  );
+});
+
+test("worktree sorting preserves groups, supports group blocks, and rejects cross-group rows", () => {
+  const ordered = orderSessionsByName(sessions, [
+    "build-alpha-tests",
+    "build-alpha-review",
+    "local-alpha-fix",
+  ]);
+  assert.deepEqual(ordered.map((session) => session.name), [
+    "build-alpha-tests",
+    "build-alpha-review",
+    "local-alpha-fix",
+    "relay-beta-docs",
+  ]);
+  assert.equal(canReorderSessionsWithinGroup(ordered, 0, 1), true);
+  assert.equal(canReorderSessionsWithinGroup(ordered, 1, 2), false);
+
+  const groups = groupSessionsByHostProject(ordered, hosts);
+  const movedGroups = moveSortableItem(groups, 2, 0);
+  assert.deepEqual(
+    movedGroups.flatMap((group) => group.sessions.map((session) => session.name)),
+    [
+      "relay-beta-docs",
+      "build-alpha-tests",
+      "build-alpha-review",
+      "local-alpha-fix",
+    ],
+  );
+
+  const interleaved = orderSessionsByName(sessions, [
+    "build-alpha-review",
+    "local-alpha-fix",
+    "build-alpha-tests",
+    "relay-beta-docs",
+  ]);
+  const visualSessions = groupSessionsByHostProject(interleaved, hosts)
+    .flatMap((group) => group.sessions);
+  assert.deepEqual(visualSessions.map((session) => session.name), [
+    "build-alpha-review",
+    "build-alpha-tests",
+    "local-alpha-fix",
+    "relay-beta-docs",
+  ]);
+  assert.equal(canReorderSessionsWithinGroup(visualSessions, 0, 1), true);
+  const rowMove = resolveSortableMove(
+    visualSessions,
+    "build-alpha-review",
+    "build-alpha-tests",
+    (session) => session.name,
+    (fromIndex, toIndex) =>
+      canReorderSessionsWithinGroup(visualSessions, fromIndex, toIndex),
+  );
+  assert.deepEqual(rowMove?.items.map((session) => session.name), [
+    "build-alpha-tests",
+    "build-alpha-review",
+    "local-alpha-fix",
+    "relay-beta-docs",
+  ]);
+
+  const refreshedDuringDrag = [
+    sessions[0],
+    sessions[2],
+    sessions[1],
+    sessions[3],
+  ];
+  const stableMove = resolveSortableMove(
+    refreshedDuringDrag,
+    "build-alpha-review",
+    "build-alpha-tests",
+    (session) => session.name,
+  );
+  assert.deepEqual(stableMove?.items.map((session) => session.name), [
+    "local-alpha-fix",
+    "build-alpha-review",
+    "build-alpha-tests",
+    "relay-beta-docs",
+  ]);
+
+  const groupsAfterAnchorClose = groupSessionsByHostProject(
+    sessions.filter((session) => session.name !== "build-alpha-review"),
+    hosts,
+  );
+  assert.deepEqual(
+    orderSidebarSessionGroups(groupsAfterAnchorClose, [
+      "ssh:build:alpha",
+      "local:alpha",
+      "ssh:relay:beta",
+    ]).map((group) => group.key),
+    ["ssh:build:alpha", "local:alpha", "ssh:relay:beta"],
   );
 });
 

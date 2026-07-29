@@ -402,14 +402,14 @@ function runSsh(
 }
 
 function remoteTwCommand(host: HostConfig, args: string[]): string {
-  const prefix = 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"';
+  const prefix = 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin"';
   const tw = remotePathExpression(host.twPath || "tw");
   const tmuxEnv = host.tmuxPath ? `TW_TMUX=${remotePathExpression(host.tmuxPath)} ` : "";
   return `${prefix}; ${tmuxEnv}${tw}${args.length ? ` ${args.map(shellQuote).join(" ")}` : ""}`;
 }
 
 function remoteTmuxCommand(host: HostConfig, args: string[]): string {
-  const prefix = 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"';
+  const prefix = 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin"';
   const tmux = remotePathExpression(host.tmuxPath || "tmux");
   return `${prefix}; ${tmux}${args.length ? ` ${args.map(shellQuote).join(" ")}` : ""}`;
 }

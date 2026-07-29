@@ -1220,6 +1220,16 @@ pub(crate) fn recover_pty_control(
     state: &TerminalControlState,
     control: &mut PtyControl,
 ) -> PtyControlStatus {
+    // Recovery is an operator action, but the PTY may have cached an epoch or
+    // state from before a controller restart. Refresh first so one click uses
+    // the current canonical epoch instead of silently requiring a second try.
+    let refreshed = refresh_pty_control_status(app, state, control);
+    if refreshed.state != "RECOVERY_REQUIRED" || refreshed.message.is_some() {
+        // A transport, response, or lease-validation failure is not proof of
+        // canonical recovery state. Surface it without using a cached epoch to
+        // force/fence an otherwise healthy target.
+        return refreshed;
+    }
     if control.lease.is_some() || control.last_state != "RECOVERY_REQUIRED" {
         control.last_error = Some(
             "local recovery is only available while terminal input continuity requires recovery"
@@ -1261,10 +1271,13 @@ pub(crate) fn recover_pty_control(
             Err(error) => control.last_error = Some(error.to_string()),
         },
         Err(error) => {
-            control.last_error = Some(error.to_string());
+            let message = error.to_string();
             if error.code != "RECOVERY_REQUIRED" {
                 let _ = refresh_pty_control_status(app, state, control);
             }
+            // A successful refresh must not erase the reason the operator's
+            // recovery attempt failed; the renderer surfaces this message.
+            control.last_error = Some(message);
         }
     }
     control.status()
@@ -1323,6 +1336,16 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn recovery_timestamp_matches_the_canonical_terminal_control_contract() {
+        let timestamp = now_rfc3339();
+        assert_eq!(timestamp.len(), 24);
+        assert_eq!(&timestamp[4..5], "-");
+        assert_eq!(&timestamp[7..8], "-");
+        assert_eq!(&timestamp[10..11], "T");
+        assert_eq!(&timestamp[19..], ".000Z");
+    }
 
     fn remote_host() -> HostConfig {
         HostConfig {

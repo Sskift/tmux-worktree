@@ -59,7 +59,6 @@ type TerminalMetadataController = {
     draft: Readonly<{
       label: string;
       cwd: string;
-      aiCmd: string;
       hostId?: string | null;
     }>,
     created: CreatedTerminal,
@@ -190,7 +189,6 @@ export function useTerminalMetadata(
     draft: Readonly<{
       label: string;
       cwd: string;
-      aiCmd: string;
       hostId?: string | null;
     }>,
     created: CreatedTerminal,
@@ -203,7 +201,6 @@ export function useTerminalMetadata(
       tmuxName: created.tmuxName,
       hostId: created.hostId ?? draft.hostId ?? null,
       rawName: created.rawName,
-      aiCmd: draft.aiCmd,
       managed: created.managed,
     };
     const runtimeKey = terminalSessionKey(runtime);

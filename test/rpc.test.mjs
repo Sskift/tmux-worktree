@@ -563,9 +563,21 @@ case "$1" in
     fi
     ;;
   display-message)
-    if [ "$5" = '#{session_id}' ]; then
-      printf '$0\n'
-    elif [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '1\n'; else printf '0\n'; fi
+    case "$5" in
+      '#{session_id}')
+        printf '$0\n'
+        ;;
+      *'@tw_terminal_control_output_generation_v1'*'pane_pipe'*)
+        if [ -f "$TW_TEST_TMUX_LOG.output-generation" ]; then
+          generation=$(cat "$TW_TEST_TMUX_LOG.output-generation")
+          printf '%s' "$generation"
+        fi
+        if [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '\\0371\\n'; else printf '\\0370\\n'; fi
+        ;;
+      *)
+        if [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '1\n'; else printf '0\n'; fi
+        ;;
+    esac
     ;;
   pipe-pane)
     if [ "$2" = '-O' ]; then
@@ -689,7 +701,7 @@ test("rpc worktree creation records a dashboard-managed remote session", () => {
       "app-fix-1",
       "-c",
       "/home/dev/.tmux-worktree/worktrees/app/app-fix-1-abc12",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex; exec \"${SHELL:-/bin/zsh}\" -l",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex; exec \"${SHELL:-/bin/zsh}\" -l",
     ]],
     ["setupClipboardBindings", []],
   ]);
@@ -739,7 +751,7 @@ test("rpc terminal creation uses the shared single-pane contract and records man
       "tw-term-abc12",
       "-c",
       "/home/dev/src/app",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
     ]],
     ["setupClipboardBindings", []],
   ]);
@@ -1026,7 +1038,19 @@ if [ "$1" = "list-panes" ]; then
   exit 0
 fi
 if [ "$1" = "display-message" ]; then
-  if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '1\\n'; else printf '0\\n'; fi
+  for arg in "$@"; do last="$arg"; done
+  case "$last" in
+    *'@tw_terminal_control_output_generation_v1'*'pane_pipe'*)
+      if [ -f "$TW_TEST_TMUX_OUTPUT" ]; then
+        generation=$(cat "$TW_TEST_TMUX_OUTPUT")
+        printf '%s' "$generation"
+      fi
+      if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '\\0371\\n'; else printf '\\0370\\n'; fi
+      ;;
+    *)
+      if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '1\\n'; else printf '0\\n'; fi
+      ;;
+  esac
   exit 0
 fi
 if [ "$1" = "pipe-pane" ]; then
@@ -1239,7 +1263,7 @@ test("CLI and Dashboard provenance use the same single-pane session contract", (
       "app-fix",
       "-c",
       "/repo/app",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
     ]],
     ["setupClipboardBindings", []],
   ]);

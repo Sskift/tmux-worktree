@@ -1,4 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import type { FeishuReplyMode } from "./feishuBridgeStorage.js";
+import type { FeishuReplyCard } from "./feishuReplyCard.js";
 
 const MAX_LARK_OUTPUT_BYTES = 1024 * 1024;
 const LARK_COMMAND_TIMEOUT_MS = 15_000;
@@ -29,6 +31,13 @@ export interface FeishuReplyResult {
   raw: unknown;
 }
 
+export type FeishuReactionEmoji = "Typing" | "CrossMark";
+
+export interface FeishuReactionResult {
+  reactionId?: string;
+  raw: unknown;
+}
+
 export interface FeishuBotIdentity {
   openId: string;
   mentionIds: string[];
@@ -42,6 +51,7 @@ export interface FeishuChat {
 
 export interface FeishuEventSubscription {
   child: ChildProcess;
+  ready: Promise<void>;
   done: Promise<void>;
   stop(): void;
 }
@@ -49,7 +59,15 @@ export interface FeishuEventSubscription {
 export interface FeishuLarkAdapter {
   subscribe(onEvent: (event: FeishuInboundEvent) => Promise<void>): FeishuEventSubscription;
   messageDetail(messageId: string): Promise<FeishuMessageDetail>;
-  reply(messageId: string, text: string, idempotencyKey: string): Promise<FeishuReplyResult>;
+  sendCard(chatId: string, card: FeishuReplyCard, idempotencyKey: string): Promise<FeishuReplyResult>;
+  replyCard(
+    messageId: string,
+    card: FeishuReplyCard,
+    idempotencyKey: string,
+    replyMode: FeishuReplyMode,
+  ): Promise<FeishuReplyResult>;
+  addReaction(messageId: string, emojiType: FeishuReactionEmoji): Promise<FeishuReactionResult>;
+  deleteReaction(messageId: string, reactionId: string): Promise<void>;
   listGroups(): Promise<FeishuChat[]>;
   botOpenId(): Promise<string>;
   botMentionIds?(): Promise<string[]>;
@@ -235,6 +253,24 @@ function findReplyMessageId(value: unknown): string | undefined {
   return undefined;
 }
 
+export function parseFeishuReactionId(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = parseFeishuReactionId(item);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  const own = pickString(value.reaction_id, value.reactionId);
+  if (own) return own;
+  for (const child of Object.values(value)) {
+    const found = parseFeishuReactionId(child);
+    if (found) return found;
+  }
+  return undefined;
+}
+
 export function parseFeishuChats(value: unknown): FeishuChat[] {
   const chats = new Map<string, FeishuChat>();
   const visit = (candidate: unknown): void => {
@@ -352,6 +388,10 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     child.stderr.on("data", (chunk: string) => {
       stderr = `${stderr}${chunk}`.slice(-8192);
     });
+    const ready = new Promise<void>((resolve, reject) => {
+      child.once("spawn", () => resolve());
+      child.once("error", reject);
+    });
     const done = new Promise<void>((resolve, reject) => {
       child.once("error", reject);
       child.once("exit", (code, signal) => {
@@ -363,6 +403,7 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     });
     return {
       child,
+      ready,
       done,
       stop() {
         try { child.kill("SIGTERM"); } catch {}
@@ -381,16 +422,66 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     return parseFeishuMessageDetail(raw, messageId);
   }
 
-  async reply(messageId: string, text: string, idempotencyKey: string): Promise<FeishuReplyResult> {
+  async replyCard(
+    messageId: string,
+    card: FeishuReplyCard,
+    idempotencyKey: string,
+    replyMode: FeishuReplyMode,
+  ): Promise<FeishuReplyResult> {
+    if (replyMode !== "topic" && replyMode !== "direct") {
+      throw new Error("invalid Feishu reply mode");
+    }
     const raw = await this.runner(this.commandArgs([
       "im", "+messages-reply",
       "--message-id", messageId,
-      "--text", text,
+      "--msg-type", "interactive",
+      "--content", JSON.stringify(card),
+      ...(replyMode === "topic" ? ["--reply-in-thread"] : []),
       "--idempotency-key", idempotencyKey,
       "--as", "bot",
       "--json",
     ]));
     return { messageId: findReplyMessageId(raw), raw };
+  }
+
+  async sendCard(
+    chatId: string,
+    card: FeishuReplyCard,
+    idempotencyKey: string,
+  ): Promise<FeishuReplyResult> {
+    const raw = await this.runner(this.commandArgs([
+      "im", "+messages-send",
+      "--chat-id", chatId,
+      "--msg-type", "interactive",
+      "--content", JSON.stringify(card),
+      "--idempotency-key", idempotencyKey,
+      "--as", "bot",
+      "--json",
+    ]));
+    return { messageId: findReplyMessageId(raw), raw };
+  }
+
+  async addReaction(
+    messageId: string,
+    emojiType: FeishuReactionEmoji,
+  ): Promise<FeishuReactionResult> {
+    const raw = await this.runner(this.commandArgs([
+      "im", "reactions", "create",
+      "--params", JSON.stringify({ message_id: messageId }),
+      "--data", JSON.stringify({ reaction_type: { emoji_type: emojiType } }),
+      "--as", "bot",
+      "--json",
+    ]));
+    return { reactionId: parseFeishuReactionId(raw), raw };
+  }
+
+  async deleteReaction(messageId: string, reactionId: string): Promise<void> {
+    await this.runner(this.commandArgs([
+      "im", "reactions", "delete",
+      "--params", JSON.stringify({ message_id: messageId, reaction_id: reactionId }),
+      "--as", "bot",
+      "--json",
+    ]));
   }
 
   async listGroups(): Promise<FeishuChat[]> {

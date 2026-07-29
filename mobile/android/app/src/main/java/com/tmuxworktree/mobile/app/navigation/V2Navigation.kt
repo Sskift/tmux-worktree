@@ -118,6 +118,7 @@ import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
 import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
 import com.tmuxworktree.mobile.navigation.RootDestination
+import java.util.UUID
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -882,6 +883,7 @@ private fun TerminalRoute(
     onBack: () -> Unit,
     onHealth: () -> Unit,
 ) {
+    val attachmentId = remember(session.stableId) { UUID.randomUUID().toString() }
     var userReadOnly by rememberSaveable(session.stableId) { mutableStateOf(false) }
     var keyboardVisible by rememberSaveable(session.stableId) { mutableStateOf(true) }
     var fontSize by rememberSaveable(session.stableId) { mutableIntStateOf(14) }
@@ -889,29 +891,38 @@ private fun TerminalRoute(
     val ownershipReadOnly = state.terminal.inputReadOnly
     val readOnly = userReadOnly || ownershipReadOnly
 
+    LaunchedEffect(session.stableId, attachmentId) { viewModel.openTerminal(session, attachmentId) }
     LaunchedEffect(readOnly) { controller.setReadOnly(readOnly) }
     LaunchedEffect(fontSize) { controller.setFontSize(fontSize) }
-    DisposableEffect(session.stableId) {
-        onDispose { viewModel.closeTerminal() }
+    DisposableEffect(session.stableId, attachmentId) {
+        onDispose { viewModel.closeTerminal(attachmentId) }
     }
 
     TerminalScreen(
         sessionTitle = session.title,
         connectionStatus = connectionStatus,
         isReadOnly = readOnly,
+        ownershipReadOnly = ownershipReadOnly,
         keyboardVisible = keyboardVisible,
         terminalFontSizeSp = fontSize,
         disconnectReason = state.terminal.resetReason.ifBlank { state.health.errorMessage }.ifBlank { null },
         onBack = onBack,
         onConnectionStatusClick = onHealth,
-        onReconnect = { viewModel.openTerminal(session, controller) },
+        onReconnect = {
+            if (state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+                viewModel.openTerminal(session, controller)
+            } else {
+                viewModel.openTerminal(session, attachmentId)
+            }
+        },
         onToggleKeyboard = {
             keyboardVisible = !keyboardVisible
             if (keyboardVisible) controller.focus() else controller.blur()
         },
         onDecreaseFont = { fontSize = (fontSize - 1).coerceAtLeast(10) },
         onIncreaseFont = { fontSize = (fontSize + 1).coerceAtMost(24) },
-        onToggleReadOnly = { if (!ownershipReadOnly) userReadOnly = !userReadOnly },
+        onToggleReadOnly = { userReadOnly = !userReadOnly },
+        onRetryInput = { viewModel.retryTerminalInput(session, attachmentId) },
         terminalContent = {
             TerminalWebView(
                 controller = controller,
@@ -922,8 +933,8 @@ private fun TerminalRoute(
                     viewModel.openTerminal(session, controller)
                 },
                 onFailure = viewModel::reportTerminalError,
-                onInput = { if (!readOnly) viewModel.sendTerminalInput(it) },
-                onResize = viewModel::resizeTerminal,
+                onInput = { if (!readOnly) viewModel.sendTerminalInput(it, attachmentId) },
+                onResize = { cols, rows -> viewModel.resizeTerminal(cols, rows, attachmentId) },
                 modifier = Modifier.fillMaxSize().focusRequester(remember { FocusRequester() }),
             )
         },

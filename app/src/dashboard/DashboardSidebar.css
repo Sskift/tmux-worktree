@@ -320,7 +320,14 @@
 }
 
 .tw-sidebar-group {
+  position: relative;
   min-inline-size: 0;
+}
+
+.tw-sidebar-group__header {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
 }
 
 .tw-sidebar-group__toggle {
@@ -393,6 +400,88 @@
   min-block-size: 42px;
   border-radius: var(--shell-radius-md);
   color: var(--shell-text-muted);
+}
+
+.tw-sidebar-row[data-sortable="true"] {
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+}
+
+.tw-sidebar-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  justify-content: center;
+  inline-size: 24px;
+  block-size: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--shell-radius-sm);
+  color: var(--shell-text-disabled);
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+}
+
+.tw-sidebar-drag-handle:hover,
+.tw-sidebar-drag-handle:focus-visible {
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-hover);
+}
+
+.tw-sidebar-drag-handle:active {
+  cursor: grabbing;
+}
+
+.tw-sidebar-drag-handle:disabled {
+  visibility: hidden;
+}
+
+.tw-sidebar-row[data-sortable="true"] > .tw-sidebar-row__target {
+  padding-inline-start: 4px;
+}
+
+.tw-sidebar-sort-assistive {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.tw-sidebar-group[data-dragging="true"],
+.tw-sidebar-row[data-dragging="true"] {
+  opacity: 0.42;
+}
+
+.tw-sidebar-group[data-drag-over]::before,
+.tw-sidebar-group[data-drag-over]::after,
+.tw-sidebar-row[data-drag-over]::before,
+.tw-sidebar-row[data-drag-over]::after {
+  position: absolute;
+  z-index: 2;
+  right: 6px;
+  left: 6px;
+  block-size: 2px;
+  border-radius: 999px;
+  background: var(--shell-accent);
+  pointer-events: none;
+}
+
+.tw-sidebar-group[data-drag-over="before"]::before,
+.tw-sidebar-row[data-drag-over="before"]::before {
+  top: -1px;
+  content: "";
+}
+
+.tw-sidebar-group[data-drag-over="after"]::after,
+.tw-sidebar-row[data-drag-over="after"]::after {
+  bottom: -1px;
+  content: "";
 }
 
 .tw-sidebar-row:hover {

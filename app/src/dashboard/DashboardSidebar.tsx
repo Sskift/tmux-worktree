@@ -4,6 +4,7 @@ import {
   Download,
   Files,
   FolderGit2,
+  GripVertical,
   LayoutDashboard,
   Laptop,
   LoaderCircle,
@@ -18,6 +19,7 @@ import {
 } from "lucide-react";
 import {
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -29,12 +31,18 @@ import { triggerLabel, type Automation } from "../automationTypes";
 import type { HostConfig, HostStatus, PlainTerminal, Session } from "../platform";
 import type { SessionActivityInfo } from "./model/sessionActivity";
 import type { PinnedItem, Selection } from "./model/selection";
+import { terminalSessionKey } from "./model/terminalIdentity";
 import type { SidebarView } from "./layout/types";
 import {
   describeSidebarActivity,
+  canReorderSessionsWithinGroup,
   groupSessionsByHostProject,
+  orderSidebarSessionGroups,
+  orderSessionsByName,
+  sidebarSessionGroupKey,
   summarizeSidebarConnections,
 } from "./model/workspaceSelectors";
+import { useSortable } from "./hooks/useSortable";
 import "./DashboardSidebar.css";
 
 export {
@@ -68,6 +76,8 @@ export type DashboardSidebarProps = {
   localRuntimeState?: "checking" | "ready" | "error";
   selection: Selection;
   sessionActivity: Readonly<Record<string, SessionActivityInfo | undefined>>;
+  sessionOrder: readonly string[];
+  worktreeGroupOrder: readonly string[];
   collapsedProjects: readonly string[];
   pinnedItems: readonly PinnedItem[];
   automationSectionCollapsed: boolean;
@@ -89,8 +99,11 @@ export type DashboardSidebarProps = {
   onToggleAutomationSection: () => void;
   onManageAutomations: () => void;
   onSelectSession: (sessionName: string) => void;
+  onReorderSessions: (sessions: Session[]) => void;
+  onReorderWorktreeGroups: (groupKeys: string[]) => void;
   onCloseSession: (sessionName: string) => void | Promise<void>;
   onSelectTerminal: (terminalId: string) => void;
+  onReorderTerminals: (terminals: PlainTerminal[]) => void;
   onRenameTerminal: (terminalId: string, label: string) => void | Promise<void>;
   onCloseTerminal: (terminalId: string) => void | Promise<void>;
   onSelectAutomation: (automationId: string) => void;
@@ -114,6 +127,15 @@ function terminalDescription(terminal: PlainTerminal, hostsById: ReadonlyMap<str
   if (command) return `${command} · ${location}`;
   if (terminal.cwd) return `${location} · ${terminal.cwd}`;
   return location;
+}
+
+function sortableDropPosition(
+  dragIndex: number | null,
+  overIndex: number | null,
+  index: number,
+): "before" | "after" | undefined {
+  if (dragIndex === null || overIndex !== index || dragIndex === index) return undefined;
+  return dragIndex > index ? "before" : "after";
 }
 
 type SidebarPinnedRow =
@@ -163,6 +185,8 @@ export function DashboardSidebar({
   localRuntimeState = "checking",
   selection,
   sessionActivity,
+  sessionOrder,
+  worktreeGroupOrder,
   collapsedProjects,
   pinnedItems,
   automationSectionCollapsed,
@@ -184,16 +208,87 @@ export function DashboardSidebar({
   onToggleAutomationSection,
   onManageAutomations,
   onSelectSession,
+  onReorderSessions,
+  onReorderWorktreeGroups,
   onCloseSession,
   onSelectTerminal,
+  onReorderTerminals,
   onRenameTerminal,
   onCloseTerminal,
   onSelectAutomation,
   onInstallTw,
 }: DashboardSidebarProps) {
+  const sortInstructionsId = useId();
+  const sortDragLeaseRef = useRef<object | null>(null);
+  const [sortAnnouncement, setSortAnnouncement] = useState("");
+  const orderedSessions = useMemo(
+    () => orderSessionsByName(sessions, sessionOrder),
+    [sessionOrder, sessions],
+  );
+  const unorderedGroups = useMemo(
+    () => groupSessionsByHostProject(orderedSessions, hosts),
+    [hosts, orderedSessions],
+  );
   const groups = useMemo(
-    () => groupSessionsByHostProject(sessions, hosts),
-    [hosts, sessions],
+    () => orderSidebarSessionGroups(unorderedGroups, worktreeGroupOrder),
+    [unorderedGroups, worktreeGroupOrder],
+  );
+  const sidebarSessions = useMemo(
+    () => groups.flatMap((group) => group.sessions),
+    [groups],
+  );
+  const sessionIndexByName = useMemo(
+    () => new Map(sidebarSessions.map((session, index) => [session.name, index])),
+    [sidebarSessions],
+  );
+  const groupSortable = useSortable(
+    groups,
+    (reordered) => onReorderWorktreeGroups(reordered.map((group) => group.key)),
+    {
+      dragLease: sortDragLeaseRef,
+      itemSelector: ".tw-sidebar-group[data-group-sort-item][data-sort-key]",
+      keyOf: (group) => group.key,
+      onMove: (move) => {
+        setSortAnnouncement(
+          `${move.item.hostLabel} / ${move.item.project} moved to group position ${move.toIndex + 1} of ${move.items.length}.`,
+        );
+      },
+    },
+  );
+  const sessionSortable = useSortable(
+    sidebarSessions,
+    onReorderSessions,
+    {
+      dragLease: sortDragLeaseRef,
+      itemSelector: ".tw-sidebar-row[data-session-sort-item][data-sort-key]",
+      keyOf: (session) => session.name,
+      canMove: (fromIndex, toIndex) =>
+        canReorderSessionsWithinGroup(sidebarSessions, fromIndex, toIndex),
+      onMove: (move) => {
+        const groupKey = sidebarSessionGroupKey(move.item);
+        const groupItems = move.items.filter(
+          (session) => sidebarSessionGroupKey(session) === groupKey,
+        );
+        const position = groupItems.findIndex((session) => session.name === move.item.name) + 1;
+        setSortAnnouncement(
+          `${sidebarSessionDisplayName(move.item)} moved to position ${position} of ${groupItems.length} in its worktree group.`,
+        );
+      },
+    },
+  );
+  const terminalSortable = useSortable(
+    terminals,
+    onReorderTerminals,
+    {
+      dragLease: sortDragLeaseRef,
+      itemSelector: ".tw-sidebar-row[data-terminal-sort-item][data-sort-key]",
+      keyOf: terminalSessionKey,
+      onMove: (move) => {
+        setSortAnnouncement(
+          `${move.item.label} moved to terminal position ${move.toIndex + 1} of ${move.items.length}.`,
+        );
+      },
+    },
   );
   const hostsById = useMemo(
     () => new Map(hosts.map((host) => [host.id, host])),
@@ -379,6 +474,18 @@ export function DashboardSidebar({
           </div>
 
           <div className="tw-dashboard-sidebar__scroll-region">
+        <p id={sortInstructionsId} className="tw-sidebar-sort-assistive">
+          Drag a reorder handle, or focus it and press Up or Down. A worktree row stays in its
+          current Host and Project group.
+        </p>
+        <p
+          className="tw-sidebar-sort-assistive"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {sortAnnouncement}
+        </p>
         <section className="tw-sidebar-section" aria-labelledby="tw-sidebar-pinned-heading">
           <div className="tw-sidebar-section__heading">
             <Pin aria-hidden="true" size={13} strokeWidth={1.8} />
@@ -465,38 +572,78 @@ export function DashboardSidebar({
             <p className="tw-sidebar-section__empty">No worktrees yet</p>
           )}
 
-          <nav className="tw-sidebar-list" aria-label="Worktrees">
-            {groups.map((group) => {
+          <nav
+            className="tw-sidebar-list"
+            aria-label="Worktrees"
+            ref={(node) => {
+              groupSortable.setListRef(node);
+              sessionSortable.setListRef(node);
+            }}
+          >
+            {groups.map((group, groupIndex) => {
               const isCollapsed = collapsed.has(group.key);
+              const groupDropPosition = sortableDropPosition(
+                groupSortable.dragIndex,
+                groupSortable.overIndex,
+                groupIndex,
+              );
               return (
-                <div className="tw-sidebar-group" key={group.key}>
-                  <button
-                    className="tw-sidebar-group__toggle"
-                    type="button"
-                    onClick={() => onToggleProjectCollapsed(group.key)}
-                    aria-expanded={!isCollapsed}
-                    title={`${isCollapsed ? "Expand" : "Collapse"} ${group.hostLabel} / ${group.project}`}
-                  >
-                    <ChevronRight
-                      className="tw-sidebar-group__chevron"
-                      aria-hidden="true"
-                      size={14}
-                      strokeWidth={1.8}
-                    />
-                    {group.hostId ? (
-                      <Server aria-hidden="true" size={13} strokeWidth={1.8} />
-                    ) : (
-                      <Laptop aria-hidden="true" size={13} strokeWidth={1.8} />
-                    )}
-                    <span className="tw-sidebar-group__host">{group.hostLabel}</span>
-                    <span className="tw-sidebar-group__separator" aria-hidden="true">/</span>
-                    <span className="tw-sidebar-group__project" title={group.project}>{group.project}</span>
-                    <span className="tw-sidebar-group__count">{group.sessions.length}</span>
-                  </button>
+                <div
+                  className="tw-sidebar-group"
+                  data-group-sort-item="true"
+                  data-sort-key={group.key}
+                  data-sort-index={groupIndex}
+                  data-dragging={groupSortable.dragIndex === groupIndex || undefined}
+                  data-drag-over={groupDropPosition}
+                  key={group.key}
+                >
+                  <div className="tw-sidebar-group__header">
+                    <button
+                      className="tw-sidebar-drag-handle"
+                      type="button"
+                      aria-label={`Reorder ${group.hostLabel} / ${group.project} worktrees, group ${groupIndex + 1} of ${groups.length}`}
+                      aria-describedby={sortInstructionsId}
+                      aria-keyshortcuts="ArrowUp ArrowDown"
+                      title="Drag to reorder group; press Up or Down while focused"
+                      onPointerDown={groupSortable.onPointerDown(group.key)}
+                      onKeyDown={groupSortable.onHandleKeyDown(group.key)}
+                    >
+                      <GripVertical aria-hidden="true" size={14} strokeWidth={1.7} />
+                    </button>
+                    <button
+                      className="tw-sidebar-group__toggle"
+                      type="button"
+                      onClick={() => onToggleProjectCollapsed(group.key)}
+                      aria-expanded={!isCollapsed}
+                      title={`${isCollapsed ? "Expand" : "Collapse"} ${group.hostLabel} / ${group.project}`}
+                    >
+                      <ChevronRight
+                        className="tw-sidebar-group__chevron"
+                        aria-hidden="true"
+                        size={14}
+                        strokeWidth={1.8}
+                      />
+                      {group.hostId ? (
+                        <Server aria-hidden="true" size={13} strokeWidth={1.8} />
+                      ) : (
+                        <Laptop aria-hidden="true" size={13} strokeWidth={1.8} />
+                      )}
+                      <span className="tw-sidebar-group__host">{group.hostLabel}</span>
+                      <span className="tw-sidebar-group__separator" aria-hidden="true">/</span>
+                      <span className="tw-sidebar-group__project" title={group.project}>{group.project}</span>
+                      <span className="tw-sidebar-group__count">{group.sessions.length}</span>
+                    </button>
+                  </div>
 
                   {!isCollapsed && (
                     <div className="tw-sidebar-group__items">
-                      {group.sessions.map((session) => {
+                      {group.sessions.map((session, groupSessionIndex) => {
+                        const sessionIndex = sessionIndexByName.get(session.name) ?? -1;
+                        const sessionDropPosition = sortableDropPosition(
+                          sessionSortable.dragIndex,
+                          sessionSortable.overIndex,
+                          sessionIndex,
+                        );
                         const activity = describeSidebarActivity(
                           sessionActivity[session.name],
                           session.attached,
@@ -510,8 +657,26 @@ export function DashboardSidebar({
                             data-selected={selected}
                             data-pinned={pinned}
                             data-status={activity.state}
+                            data-session-sort-item="true"
+                            data-sort-key={session.name}
+                            data-sort-index={sessionIndex}
+                            data-sortable="true"
+                            data-dragging={sessionSortable.dragIndex === sessionIndex || undefined}
+                            data-drag-over={sessionDropPosition}
                             key={session.name}
                           >
+                            <button
+                              className="tw-sidebar-drag-handle"
+                              type="button"
+                              aria-label={`Reorder worktree ${displayName}, position ${groupSessionIndex + 1} of ${group.sessions.length}`}
+                              aria-describedby={sortInstructionsId}
+                              aria-keyshortcuts="ArrowUp ArrowDown"
+                              title="Drag to reorder within this group; press Up or Down while focused"
+                              onPointerDown={sessionSortable.onPointerDown(session.name)}
+                              onKeyDown={sessionSortable.onHandleKeyDown(session.name)}
+                            >
+                              <GripVertical aria-hidden="true" size={14} strokeWidth={1.7} />
+                            </button>
                             <button
                               className="tw-sidebar-row__target"
                               type="button"
@@ -575,14 +740,48 @@ export function DashboardSidebar({
           {!terminalsError && terminals.length === 0 && (
             <p className="tw-sidebar-section__empty">No terminals yet</p>
           )}
-          <nav className="tw-sidebar-list" aria-label="Terminals">
-            {terminals.map((terminal) => {
+          <nav
+            className="tw-sidebar-list"
+            aria-label="Terminals"
+            ref={terminalSortable.setListRef}
+          >
+            {terminals.map((terminal, terminalIndex) => {
               const selected = selection?.kind === "terminal" && selection.id === terminal.id;
               const description = terminalDescription(terminal, hostsById);
               const pinned = pinnedItems.some((item) => item.kind === "terminal" && item.id === terminal.id);
               const renaming = renamingTerminalId === terminal.id && !terminal.discovered;
+              const terminalSortKey = terminalSessionKey(terminal);
+              const terminalDropPosition = sortableDropPosition(
+                terminalSortable.dragIndex,
+                terminalSortable.overIndex,
+                terminalIndex,
+              );
               return (
-                <div className="tw-sidebar-row" data-selected={selected} data-pinned={pinned} key={terminal.id}>
+                <div
+                  className="tw-sidebar-row"
+                  data-selected={selected}
+                  data-pinned={pinned}
+                  data-terminal-sort-item="true"
+                  data-sort-key={terminalSortKey}
+                  data-sort-index={terminalIndex}
+                  data-sortable="true"
+                  data-dragging={terminalSortable.dragIndex === terminalIndex || undefined}
+                  data-drag-over={terminalDropPosition}
+                  key={terminal.id}
+                >
+                  <button
+                    className="tw-sidebar-drag-handle"
+                    type="button"
+                    disabled={renaming}
+                    aria-label={`Reorder terminal ${terminal.label}, position ${terminalIndex + 1} of ${terminals.length}`}
+                    aria-describedby={sortInstructionsId}
+                    aria-keyshortcuts="ArrowUp ArrowDown"
+                    title="Drag to reorder; press Up or Down while focused"
+                    onPointerDown={terminalSortable.onPointerDown(terminalSortKey)}
+                    onKeyDown={terminalSortable.onHandleKeyDown(terminalSortKey)}
+                  >
+                    <GripVertical aria-hidden="true" size={14} strokeWidth={1.7} />
+                  </button>
                   {renaming ? (
                     <div className="tw-sidebar-row__target tw-sidebar-row__target--renaming">
                       <SquareTerminal
