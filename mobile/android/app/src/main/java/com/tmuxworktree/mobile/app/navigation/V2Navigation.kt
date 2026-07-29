@@ -360,7 +360,7 @@ private fun MainNavigation(
                     onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
                     onReplyClick = { navController.navigate(V2Routes.session(it.stableId, focusReply = true)) },
                     onBottomDestinationSelected = navigateRoot,
-                    agentStateAvailable = agentCapabilityAvailable,
+                    agentEvidenceAvailability = state.agentEvidenceAvailability,
                 )
             }
             composable(V2Routes.WORKSPACES) {

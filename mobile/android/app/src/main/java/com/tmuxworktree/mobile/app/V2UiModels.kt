@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.app
 
 import com.tmuxworktree.mobile.core.data.AppPreferences
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionHealth
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
@@ -94,6 +95,16 @@ data class V2UiState(
     val attentionCount: Int
         get() = activeSessions.count {
             it.agentState == AgentState.WAITING_FOR_USER || it.agentState == AgentState.FAILED
+        }
+
+    val agentEvidenceAvailability: AgentEvidenceAvailability
+        get() = when {
+            relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 &&
+                agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE ->
+                AgentEvidenceAvailability.AVAILABLE
+            relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 ->
+                AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
+            else -> AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED
         }
 
     val hasStoredProfile: Boolean

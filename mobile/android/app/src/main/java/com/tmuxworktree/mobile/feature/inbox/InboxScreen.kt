@@ -42,6 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
@@ -61,7 +62,7 @@ fun InboxScreen(
     onReplyClick: (RelaySession) -> Unit,
     onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
-    agentStateAvailable: Boolean = true,
+    agentEvidenceAvailability: AgentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
 ) {
     // Inbox is the agent workflow. Plain terminal sessions remain available
     // under Workspaces > Terminals and must not be presented as agents.
@@ -69,13 +70,15 @@ fun InboxScreen(
     val attentionSessions = agentSessions.filter {
         it.agentState == AgentState.WAITING_FOR_USER || it.agentState == AgentState.FAILED
     }
-    // Relay v1 cannot report the agent lifecycle for older hosts. Keep those
-    // sessions visible instead of silently dropping them from the inbox.
+    // Keep sessions visible when the current protocol/capability cut cannot
+    // provide lifecycle evidence instead of silently dropping them from the inbox.
     val runningSessions = agentSessions.filter {
         it.agentState == AgentState.RUNNING ||
             it.agentState == AgentState.UNKNOWN ||
             it.agentState == AgentState.COMPLETED
     }
+    val unavailableAgentStatus = inboxUnavailableAgentStatus(agentEvidenceAvailability)
+    val agentStateAvailable = unavailableAgentStatus == null
 
     Scaffold(
         modifier = modifier
@@ -120,11 +123,8 @@ fun InboxScreen(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = if (agentStateAvailable) {
-                        attentionSubtitle(attentionSessions.size)
-                    } else {
-                        "Relay v1 does not report reply state"
-                    },
+                    text = unavailableAgentStatus?.subtitle
+                        ?: attentionSubtitle(attentionSessions.size),
                     color = TwTextSecondary,
                     style = MaterialTheme.typography.bodyLarge,
                 )
@@ -146,11 +146,8 @@ fun InboxScreen(
                             .padding(top = 24.dp)
                             .testTag("inbox_attention_empty")
                             .semantics {
-                                contentDescription = if (agentStateAvailable) {
-                                    "No sessions need your attention"
-                                } else {
-                                    "Agent reply state is unavailable with Relay version 1"
-                                }
+                                contentDescription = unavailableAgentStatus?.emptyContentDescription
+                                    ?: "No sessions need your attention"
                             },
                     )
                 }
@@ -213,6 +210,27 @@ fun InboxScreen(
             }
         }
     }
+}
+
+internal data class InboxUnavailableAgentStatus(
+    val subtitle: String,
+    val emptyContentDescription: String,
+)
+
+internal fun inboxUnavailableAgentStatus(
+    availability: AgentEvidenceAvailability,
+): InboxUnavailableAgentStatus? = when (availability) {
+    AgentEvidenceAvailability.AVAILABLE -> null
+    AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED -> InboxUnavailableAgentStatus(
+        subtitle = "Relay v1 does not report reply state",
+        emptyContentDescription = "Agent reply state is unavailable with Relay version 1",
+    )
+    AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE -> InboxUnavailableAgentStatus(
+        subtitle = "Relay v2 Agent capability is unavailable or was not negotiated",
+        emptyContentDescription =
+            "Agent reply state is unavailable because the Relay version 2 Agent capability " +
+                "is unavailable or was not negotiated",
+    )
 }
 
 @Composable
