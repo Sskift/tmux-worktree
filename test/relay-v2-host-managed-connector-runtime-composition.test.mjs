@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +11,39 @@ const codec = await import("../dist/relay/v2/codec.js");
 const broker = await import("../dist/relay/v2/brokerCore.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const compositionModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
+const { build } = createRequire(import.meta.url)("esbuild");
+const shippingProcessLifecycleBuild = await build({
+  entryPoints: [new URL(
+    "../src/relay/v2/hostShippingProcessLifecycle.ts",
+    import.meta.url,
+  ).pathname],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  write: false,
+  plugins: [{
+    name: "managed-h1-shipping-lifecycle-fixture",
+    setup(esbuild) {
+      esbuild.onResolve({ filter: /^\.\/hostCarrier\.js$/ }, () => ({
+        path: "hostCarrier",
+        namespace: "managed-h1-shipping-lifecycle-stub",
+      }));
+      esbuild.onLoad(
+        { filter: /.*/, namespace: "managed-h1-shipping-lifecycle-stub" },
+        () => ({
+          contents: "export const RELAY_V2_HOST_SUPERSEDED_EXIT_CODE = 78;",
+          loader: "js",
+        }),
+      );
+    },
+  }],
+});
+const shippingProcessLifecycle = await import(
+  `data:text/javascript;base64,${Buffer.from(
+    shippingProcessLifecycleBuild.outputFiles[0].text,
+  ).toString("base64")}`
+);
 const credentialAuthorityModule = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const credentialExchangeModule = await import(
   "../dist/relay/v2/hostCredentialExchangeCoordinator.js"
@@ -440,12 +474,31 @@ async function createHarness(options = {}) {
     .openRecoveredAuthority({
       store,
       hostId: HOST_ID,
-      now: () => 1_783_700_000_000,
+      now: options.h1Now ?? (() => 1_783_700_000_000),
       executor: {
-        async resolve() { throw new Error("unexpected managed command resolution"); },
-        fenceResolution() { return undefined; },
-        async executeTwRpc() { throw new Error("unexpected managed TW RPC execution"); },
-        async executeTerminalControl() {
+        async resolve(request) {
+          if (options.h1ExecutorOverrides?.resolve) {
+            return options.h1ExecutorOverrides.resolve(request);
+          }
+          throw new Error("unexpected managed command resolution");
+        },
+        fenceResolution(transaction, request, fence) {
+          return options.h1ExecutorOverrides?.fenceResolution?.(
+            transaction,
+            request,
+            fence,
+          );
+        },
+        async executeTwRpc(plan) {
+          if (options.h1ExecutorOverrides?.executeTwRpc) {
+            return options.h1ExecutorOverrides.executeTwRpc(plan);
+          }
+          throw new Error("unexpected managed TW RPC execution");
+        },
+        async executeTerminalControl(plan) {
+          if (options.h1ExecutorOverrides?.executeTerminalControl) {
+            return options.h1ExecutorOverrides.executeTerminalControl(plan);
+          }
           throw new Error("unexpected managed terminal-control execution");
         },
       },
@@ -498,7 +551,8 @@ async function createHarness(options = {}) {
   };
   const carrierOptions = {
     idFactory: () => `managed-host-hello-${++helloSequence}`,
-    clock: () => 1_783_700_100_000,
+    clock: options.carrierClock ?? (() => 1_783_700_100_000),
+    schedule: options.carrierSchedule,
   };
   const managedCredentialReferences = {
     read(reference) {
@@ -1668,6 +1722,219 @@ test("offline retry, replacement, superseded, and late callbacks converge on the
     await settle();
     assert.equal(h.composition.inspect().status, "superseded");
   } finally {
+    await h.cleanup();
+  }
+});
+
+test("shipping lifecycle starts an H1 rotation successor with a fresh window", async () => {
+  let now = 1_783_700_000_000;
+  let executions = 0;
+  const scheduled = [];
+  const lifecycleWaits = [];
+  const lifecycleStop = new AbortController();
+  let lifecycleRequestSequence = 0;
+  let lifecycleRun = null;
+  const h = await createHarness({
+    h1Now: () => now,
+    carrierClock: () => now,
+    carrierSchedule(delayMs, callback) {
+      const timer = {
+        deadlineMs: now + delayMs,
+        callback,
+        cancelled: false,
+      };
+      scheduled.push(timer);
+      return () => { timer.cancelled = true; };
+    },
+    h1ExecutorOverrides: {
+      resolve(request) {
+        return {
+          kind: "executable",
+          adapterState: { resolvedTarget: request.sessionId },
+          resolutionFence: {
+            schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+            outcome: "positive",
+            authority: request.authority,
+            operation: request.operation,
+            expectedScopeId: request.scopeId,
+            expectedSessionId: request.sessionId,
+            target: { sessionId: request.sessionId },
+            evidence: { source: "managed-h1-rotation-test" },
+          },
+        };
+      },
+      executeTerminalControl(plan) {
+        executions += 1;
+        return {
+          state: "succeeded",
+          result: {
+            pane: plan.arguments.pane,
+            submit: plan.arguments.submit,
+            messageUtf8Bytes: Buffer.byteLength(plan.arguments.message, "utf8"),
+          },
+        };
+      },
+    },
+  });
+  try {
+    const lifecycleOwner =
+      new shippingProcessLifecycle.RelayV2HostShippingProcessLifecycleOwner(
+        h.composition,
+        {
+          signal: lifecycleStop.signal,
+          requestIdFactory: () =>
+            `managed-h1-lifecycle-${++lifecycleRequestSequence}`,
+          monitorIntervalMs: 2,
+          reconnectInitialDelayMs: 5,
+          reconnectMaximumDelayMs: 10,
+          wait(delayMs, signal) {
+            const gate = deferred();
+            let settled = false;
+            const release = () => {
+              if (settled) return;
+              settled = true;
+              signal.removeEventListener("abort", release);
+              gate.resolve();
+            };
+            signal.addEventListener("abort", release, { once: true });
+            if (signal.aborted) release();
+            lifecycleWaits.push({ delayMs, release });
+            return gate.promise;
+          },
+        },
+      );
+    lifecycleRun = lifecycleOwner.run();
+    await settle(12);
+    assert.equal(h.records.length, 1);
+    const first = h.records[0];
+    assert.notEqual(first.connection, null);
+    const firstCut = h.composition.inspect();
+    assert.equal(firstCut.status, "registered_incomplete");
+    assert.equal(lifecycleWaits.length, 1);
+    assert.equal(lifecycleWaits[0].delayMs, 2);
+
+    const firstRoute = openRoute(first, "h1-first");
+    const firstHello = fixture("client-hello-fresh");
+    firstHello.hostId = HOST_ID;
+    firstHello.payload.clientInstanceId =
+      firstRoute.route.payload.authContext.clientInstanceId;
+    sendClientFrame(firstRoute, firstHello);
+    await settle();
+    const firstWelcome = hostDataFrames(first).find(
+      (frame) => frame.type === "host.welcome",
+    );
+    assert.notEqual(firstWelcome, undefined);
+    const firstWindow = structuredClone(firstWelcome.payload.commandDedupeWindow);
+    acknowledgeAll(first);
+
+    const historical = fixture("command-execute-send-agent-message");
+    historical.expectedHostEpoch = h.identity.hostEpoch;
+    historical.requestId = "managed-h1-history-attempt";
+    historical.commandId = "managed-h1-history-command";
+    historical.payload.dedupeWindowId = firstWindow.windowId;
+    sendClientFrame(firstRoute, historical);
+    await settle();
+    assert.equal(
+      hostDataFrames(first).find(
+        (frame) => frame.requestId === historical.requestId,
+      )?.payload.state,
+      "succeeded",
+    );
+    assert.equal(executions, 1);
+    acknowledgeAll(first);
+
+    const rotation = scheduled.find((timer) => !timer.cancelled);
+    assert.notEqual(rotation, undefined);
+    assert.equal(rotation.deadlineMs, firstWindow.acceptUntilMs - 60_000);
+    now = rotation.deadlineMs;
+    rotation.callback();
+    await settle(8);
+
+    assert.equal(first.transport.closes.length, 1);
+    assert.deepEqual(h.composition.inspect(), {
+      status: "failed",
+      controllerGeneration: firstCut.controllerGeneration,
+      connectorId: firstCut.connectorId,
+      retryable: true,
+    });
+    assert.equal(h.records.length, 1, "shipping backoff owns successor creation");
+    lifecycleWaits.shift().release();
+    await settle(4);
+    assert.equal(lifecycleWaits.length, 1);
+    assert.equal(lifecycleWaits[0].delayMs, 5);
+    lifecycleWaits.shift().release();
+    await settle(16);
+
+    assert.equal(h.records.length, 2, "shipping owner creates the successor attempt");
+    const successor = h.records[1];
+    assert.notEqual(successor.connection, null);
+    const successorCut = h.composition.inspect();
+    assert.equal(successorCut.status, "registered_incomplete");
+    assert.notEqual(successorCut.controllerGeneration, firstCut.controllerGeneration);
+    assert.equal(h.credentialActivity().reads, 2);
+
+    const stale = fixture("command-execute-send-agent-message");
+    stale.expectedHostEpoch = h.identity.hostEpoch;
+    stale.requestId = "managed-h1-stale-route-attempt";
+    stale.commandId = "managed-h1-stale-route-command";
+    stale.payload.dedupeWindowId = firstWindow.windowId;
+    const oldSent = first.transport.sent.length;
+    sendClientFrame(firstRoute, stale);
+    await settle();
+    assert.equal(first.transport.sent.length, oldSent);
+    assert.equal(executions, 1, "the retired route cannot re-enter H1");
+
+    const secondRoute = openRoute(successor, "h1-successor");
+    const secondHello = fixture("client-hello-fresh");
+    secondHello.requestId = "managed-h1-successor-hello";
+    secondHello.hostId = HOST_ID;
+    secondHello.payload.clientInstanceId =
+      secondRoute.route.payload.authContext.clientInstanceId;
+    sendClientFrame(secondRoute, secondHello);
+    await settle();
+    const secondWindow = hostDataFrames(successor).find(
+      (frame) => frame.type === "host.welcome",
+    )?.payload.commandDedupeWindow;
+    assert.notEqual(secondWindow, undefined);
+    assert.notEqual(secondWindow.windowId, firstWindow.windowId);
+    assert.equal(BigInt(secondWindow.windowSeq), BigInt(firstWindow.windowSeq) + 1n);
+    acknowledgeAll(successor);
+
+    const fresh = fixture("command-execute-send-agent-message");
+    fresh.expectedHostEpoch = h.identity.hostEpoch;
+    fresh.requestId = "managed-h1-fresh-attempt";
+    fresh.commandId = "managed-h1-fresh-command";
+    fresh.payload.dedupeWindowId = secondWindow.windowId;
+    sendClientFrame(secondRoute, fresh);
+    await settle();
+    assert.equal(
+      hostDataFrames(successor).find(
+        (frame) => frame.requestId === fresh.requestId,
+      )?.payload.state,
+      "succeeded",
+    );
+    assert.equal(executions, 2);
+    acknowledgeAll(successor);
+
+    now = firstWindow.acceptUntilMs + 1;
+    const expired = fixture("command-execute-send-agent-message");
+    expired.expectedHostEpoch = h.identity.hostEpoch;
+    expired.requestId = "managed-h1-expired-attempt";
+    expired.commandId = "managed-h1-expired-command";
+    expired.payload.dedupeWindowId = firstWindow.windowId;
+    sendClientFrame(secondRoute, expired);
+    await settle();
+    assert.equal(
+      hostDataFrames(successor).find(
+        (frame) => frame.requestId === expired.requestId,
+      )?.error.code,
+      "COMMAND_WINDOW_EXPIRED",
+    );
+    assert.equal(executions, 2);
+  } finally {
+    lifecycleStop.abort();
+    for (const waiter of lifecycleWaits.splice(0)) waiter.release();
+    if (lifecycleRun !== null) await lifecycleRun.catch(() => undefined);
     await h.cleanup();
   }
 });
