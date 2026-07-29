@@ -289,7 +289,8 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
   TW_RELAY_SECRET=<secret> tw relay-server [--host 0.0.0.0] [--port 8787]
   tw relay-server --v2-profile <path> [--host-bootstrap-output <path>]
   tw relay-server --v2-local-dev --port <1-65535> --v2-dev-tls-key <path>
-    --v2-dev-tls-cert <path> --host-bootstrap-output <path>
+    --v2-dev-tls-cert <path> [--v2-dev-advertised-origin <https-origin>]
+    --host-bootstrap-output <path>
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -302,6 +303,8 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
   要求显式非零端口并固定监听 127.0.0.1，复用 canonical v2
   shipping/composition，绝不构成 production qualification/readiness，也不
   改变 --v2-profile 的 fail-closed。
+  --v2-dev-advertised-origin 只改变该开发 lane 下发的 HTTPS/WSS endpoint
+  identity；省略时保持 localhost。外部 TLS/TCP proxy 不由 relay-server 管理。
   TLS key/cert 必须是当前用户拥有、single-link、exact 0600 的本机文件。
   --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
   privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600

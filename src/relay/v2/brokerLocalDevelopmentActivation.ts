@@ -8,6 +8,7 @@ import {
   readSync,
   type BigIntStats,
 } from "node:fs";
+import { isIP } from "node:net";
 import { isAbsolute } from "node:path";
 
 import {
@@ -41,7 +42,16 @@ export interface RelayV2BrokerLocalDevelopmentOptions {
   readonly port: number;
   readonly tlsKeyPath: string;
   readonly tlsCertificatePath: string;
+  readonly advertisedOrigin?: string;
 }
+
+type CapturedLocalDevelopmentOptions = Readonly<{
+  port: number;
+  tlsKeyPath: string;
+  tlsCertificatePath: string;
+  issuerUrl: string;
+  relayUrl: string;
+}>;
 
 type RevisionOwner = Readonly<{
   transactionIdentity: object;
@@ -401,7 +411,75 @@ function readRestrictedTlsFile(path: string): Buffer {
   }
 }
 
-function captureOptions(value: unknown): RelayV2BrokerLocalDevelopmentOptions {
+function validAdvertisedHostname(hostname: string): boolean {
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return isIP(hostname.slice(1, -1)) === 6;
+  }
+  if (isIP(hostname) !== 0) return true;
+  const withoutFinalDot = hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+  return withoutFinalDot.length > 0
+    && withoutFinalDot.length <= 253
+    && withoutFinalDot.split(".").every((label) =>
+      label.length >= 1
+      && label.length <= 63
+      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
+}
+
+function captureAdvertisedEndpoints(
+  value: unknown,
+  listenerPort: number,
+): Readonly<{ issuerUrl: string; relayUrl: string }> {
+  if (value === undefined) {
+    return Object.freeze({
+      issuerUrl: `https://localhost:${listenerPort}/`,
+      relayUrl: `wss://localhost:${listenerPort}/client`,
+    });
+  }
+  if (typeof value !== "string"
+    || value.length === 0
+    || Buffer.byteLength(value, "utf8") > 2_048
+    || !value.startsWith("https://")
+    || !/^[\x21-\x7e]+$/.test(value)
+    || value.includes("\\")
+    || value.includes("?")
+    || value.includes("#")
+    || value.includes("%")) {
+    throw new Error(ACTIVATION_FAILED);
+  }
+  const afterScheme = value.slice("https://".length);
+  const firstSlash = afterScheme.indexOf("/");
+  const authority = firstSlash === -1 ? afterScheme : afterScheme.slice(0, firstSlash);
+  if (authority.length === 0
+    || authority.endsWith(":")
+    || authority.includes("@")
+    || (firstSlash !== -1 && firstSlash !== afterScheme.length - 1)) {
+    throw new Error(ACTIVATION_FAILED);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(ACTIVATION_FAILED);
+  }
+  const explicitPort = parsed.port === "" ? null : Number(parsed.port);
+  if (parsed.protocol !== "https:"
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.search !== ""
+    || parsed.hash !== ""
+    || parsed.pathname !== "/"
+    || !validAdvertisedHostname(parsed.hostname)
+    || (explicitPort !== null
+      && (!Number.isInteger(explicitPort) || explicitPort < 1 || explicitPort > 65_535))) {
+    throw new Error(ACTIVATION_FAILED);
+  }
+  return Object.freeze({
+    issuerUrl: `${parsed.origin}/`,
+    relayUrl: `wss://${parsed.host}/client`,
+  });
+}
+
+function captureOptions(value: unknown): CapturedLocalDevelopmentOptions {
   if (value === null || typeof value !== "object") throw new Error(ACTIVATION_FAILED);
   let descriptors: PropertyDescriptorMap;
   let keys: PropertyKey[];
@@ -411,8 +489,10 @@ function captureOptions(value: unknown): RelayV2BrokerLocalDevelopmentOptions {
   } catch {
     throw new Error(ACTIVATION_FAILED);
   }
-  if (keys.length !== 3 || keys.some((key) => typeof key !== "string"
-    || !["port", "tlsKeyPath", "tlsCertificatePath"].includes(key))) {
+  const required = ["port", "tlsKeyPath", "tlsCertificatePath"];
+  if (keys.some((key) => typeof key !== "string"
+    || ![...required, "advertisedOrigin"].includes(key))
+    || required.some((key) => !Object.hasOwn(descriptors, key))) {
     throw new Error(ACTIVATION_FAILED);
   }
   if (keys.some((key) => !Object.hasOwn(descriptors[key as string], "value"))) {
@@ -421,12 +501,21 @@ function captureOptions(value: unknown): RelayV2BrokerLocalDevelopmentOptions {
   const port = descriptors.port.value;
   const tlsKeyPath = descriptors.tlsKeyPath.value;
   const tlsCertificatePath = descriptors.tlsCertificatePath.value;
+  const advertisedOrigin = descriptors.advertisedOrigin?.value;
   if (!Number.isInteger(port) || port < 1 || port > 65_535
     || typeof tlsKeyPath !== "string" || tlsKeyPath.length === 0
-    || typeof tlsCertificatePath !== "string" || tlsCertificatePath.length === 0) {
+    || typeof tlsCertificatePath !== "string" || tlsCertificatePath.length === 0
+    || (advertisedOrigin !== undefined && typeof advertisedOrigin !== "string")) {
     throw new Error(ACTIVATION_FAILED);
   }
-  return Object.freeze({ port, tlsKeyPath, tlsCertificatePath });
+  const endpoints = captureAdvertisedEndpoints(advertisedOrigin, port);
+  return Object.freeze({
+    port,
+    tlsKeyPath,
+    tlsCertificatePath,
+    issuerUrl: endpoints.issuerUrl,
+    relayUrl: endpoints.relayUrl,
+  });
 }
 
 /**
@@ -463,8 +552,8 @@ export async function startRelayV2BrokerLocalDevelopment(
   const profile = Object.freeze({
     configVersion: 1 as const,
     listen: Object.freeze({ host: LOOPBACK_HOST, port: options.port }),
-    issuerUrl: `https://localhost:${options.port}/`,
-    relayUrl: `wss://localhost:${options.port}/client`,
+    issuerUrl: options.issuerUrl,
+    relayUrl: options.relayUrl,
     trustedHome: MEMORY_TRUSTED_HOME,
     tls: Object.freeze({
       keyReference: "local-development-tls-key",

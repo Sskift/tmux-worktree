@@ -120,6 +120,9 @@ export async function run(): Promise<void> {
       port: options.port,
       tlsKeyPath: options.v2LocalDevelopmentTlsKeyPath!,
       tlsCertificatePath: options.v2LocalDevelopmentTlsCertificatePath!,
+      ...(options.v2LocalDevelopmentAdvertisedOrigin === undefined
+        ? {}
+        : { advertisedOrigin: options.v2LocalDevelopmentAdvertisedOrigin }),
     });
     try {
       await handle.admin.createHostBootstrap({}, bootstrapSink);

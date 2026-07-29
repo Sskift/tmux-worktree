@@ -8,6 +8,7 @@ export type RelayServerOptions = {
   v2LocalDevelopment?: true;
   v2LocalDevelopmentTlsKeyPath?: string;
   v2LocalDevelopmentTlsCertificatePath?: string;
+  v2LocalDevelopmentAdvertisedOrigin?: string;
   v2HostBootstrapOutputPath?: string;
 };
 
@@ -22,6 +23,7 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let v2LocalDevelopment = false;
   let v2LocalDevelopmentTlsKeyPath: string | undefined;
   let v2LocalDevelopmentTlsCertificatePath: string | undefined;
+  let v2LocalDevelopmentAdvertisedOrigin: string | undefined;
   let v2HostBootstrapOutputPath: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
@@ -52,6 +54,11 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         throw new CliError("relay-server --v2-dev-tls-cert 只能指定一次");
       }
       v2LocalDevelopmentTlsCertificatePath = argv[++i] || "";
+    } else if (arg === "--v2-dev-advertised-origin") {
+      if (v2LocalDevelopmentAdvertisedOrigin !== undefined) {
+        throw new CliError("relay-server --v2-dev-advertised-origin 只能指定一次");
+      }
+      v2LocalDevelopmentAdvertisedOrigin = argv[++i] || "";
     } else if (arg === "--host-bootstrap-output") {
       if (v2HostBootstrapOutputPath !== undefined) {
         throw new CliError("relay-server --host-bootstrap-output 只能指定一次");
@@ -83,6 +90,9 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
       || v2LocalDevelopmentTlsCertificatePath !== undefined) {
       throw new CliError("relay-server --v2-dev-tls-key/--v2-dev-tls-cert 只适用于 --v2-local-dev");
     }
+    if (v2LocalDevelopmentAdvertisedOrigin !== undefined) {
+      throw new CliError("relay-server --v2-dev-advertised-origin 只适用于 --v2-local-dev");
+    }
     if (v2HostBootstrapOutputPath === "") {
       throw new CliError("relay-server --host-bootstrap-output 需要非空输出路径");
     }
@@ -111,6 +121,9 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     if (!v2LocalDevelopmentTlsCertificatePath) {
       throw new CliError("relay-server --v2-local-dev 需要 --v2-dev-tls-cert");
     }
+    if (v2LocalDevelopmentAdvertisedOrigin === "") {
+      throw new CliError("relay-server --v2-dev-advertised-origin 需要非空 HTTPS origin");
+    }
     if (!v2HostBootstrapOutputPath) {
       throw new CliError("relay-server --v2-local-dev 需要 --host-bootstrap-output");
     }
@@ -121,6 +134,7 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
       v2LocalDevelopment: true,
       v2LocalDevelopmentTlsKeyPath,
       v2LocalDevelopmentTlsCertificatePath,
+      v2LocalDevelopmentAdvertisedOrigin,
       v2HostBootstrapOutputPath,
     };
   }
@@ -128,6 +142,9 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   if (v2LocalDevelopmentTlsKeyPath !== undefined
     || v2LocalDevelopmentTlsCertificatePath !== undefined) {
     throw new CliError("relay-server --v2-dev-tls-key/--v2-dev-tls-cert 只适用于 --v2-local-dev");
+  }
+  if (v2LocalDevelopmentAdvertisedOrigin !== undefined) {
+    throw new CliError("relay-server --v2-dev-advertised-origin 只适用于 --v2-local-dev");
   }
   if (v2HostBootstrapOutputPath !== undefined) {
     throw new CliError("relay-server --host-bootstrap-output 只适用于 --v2-profile 或 --v2-local-dev");
@@ -155,7 +172,8 @@ function printRelayServerHelp(): void {
   TW_RELAY_SECRET=<secret> tw relay-server [--host 0.0.0.0] [--port 8787]
   tw relay-server --v2-profile <path> [--host-bootstrap-output <path>]
   tw relay-server --v2-local-dev --port <1-65535> --v2-dev-tls-key <path>
-    --v2-dev-tls-cert <path> --host-bootstrap-output <path>
+    --v2-dev-tls-cert <path> [--v2-dev-advertised-origin <https-origin>]
+    --host-bootstrap-output <path>
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -168,6 +186,8 @@ function printRelayServerHelp(): void {
   要求显式非零端口并固定监听 127.0.0.1，复用 canonical v2
   shipping/composition，绝不构成 production qualification/readiness，也不
   改变 --v2-profile 的 fail-closed。
+  --v2-dev-advertised-origin 只改变该开发 lane 下发的 HTTPS/WSS endpoint
+  identity；省略时保持 localhost。外部 TLS/TCP proxy 不由 relay-server 管理。
   TLS key/cert 必须是当前用户拥有、single-link、exact 0600 的本机文件。
   --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
   privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600
