@@ -287,7 +287,7 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-server [--host 0.0.0.0] [--port 8787]
-  tw relay-server --v2-profile <path>
+  tw relay-server --v2-profile <path> [--host-bootstrap-output <path>]
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -296,6 +296,9 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
   reference/path；TLS/issuer keyring/E0 material 只来自 trustedHome 下固定
   namespace 的 0600 私有 deployment 文件，缺失或 unsafe 时在监听前 fail
   closed，绝不回退 v1。
+  --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
+  privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600
+  文件。token 不写入 argv、URL、日志或 stdout。
 `);
 
   for (const scenario of [
