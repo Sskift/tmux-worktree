@@ -17,8 +17,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
+import { fileURLToPath } from "node:url";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
+const terminalControlCli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const {
   CanonicalTerminalControlSocketClient,
   parseCanonicalAgentResultResult,
@@ -31,13 +33,41 @@ const isolatedTmuxWrapper = join(isolatedTmuxWrapperRoot, "isolated-tmux");
 
 after(() => rmSync(isolatedTmuxWrapperRoot, { recursive: true, force: true }));
 
-function tempState() {
-  const root = mkdtempSync(join(tmpdir(), "tw-terminal-control-"));
+function tempState(prefix = "tw-terminal-control-") {
+  const root = mkdtempSync(join(tmpdir(), prefix));
   return {
     root,
     path: join(root, "terminal-control-state-v1.json"),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
+}
+
+async function stopAutoStartedTerminalControl(socketPath) {
+  const lockPath = `${socketPath}.server.lock`;
+  const ownerPath = join(lockPath, "owner.json");
+  if (!existsSync(ownerPath)) return;
+  let pid;
+  try {
+    pid = JSON.parse(readFileSync(ownerPath, "utf8")).pid;
+  } catch {
+    return;
+  }
+  if (!Number.isSafeInteger(pid) || pid < 2) return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+  const deadline = Date.now() + 2_000;
+  while (existsSync(lockPath) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (!existsSync(lockPath)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
 }
 
 function deferred() {
@@ -715,6 +745,58 @@ test("permission-protected socket serves correlated local requests and shortens 
   } finally {
     abort.abort();
     await serving;
+    temp.cleanup();
+  }
+});
+
+test("exact auto-start hands the bound socket and state paths to one terminal-control child", async () => {
+  const temp = tempState("tc-");
+  const exactSocketPath = join(temp.root, "exact.sock");
+  const exactStatePath = join(temp.root, "exact-state.json");
+  const defaultSocketPath = join(temp.root, "default.sock");
+  const defaultStatePath = join(temp.root, "default-state.json");
+  const previousSocketPath = process.env.TW_TERMINAL_CONTROL_SOCKET;
+  const previousStatePath = process.env.TW_TERMINAL_CONTROL_STATE;
+  process.env.TW_TERMINAL_CONTROL_SOCKET = defaultSocketPath;
+  process.env.TW_TERMINAL_CONTROL_STATE = defaultStatePath;
+  try {
+    assert.deepEqual(
+      await terminalControl.requestTerminalControl(
+        { type: "ping" },
+        {
+          socketPath: exactSocketPath,
+          autoStart: true,
+          autoStartCliTarget: {
+            executable: process.execPath,
+            entrypoint: terminalControlCli,
+          },
+          autoStartStatePath: exactStatePath,
+          timeoutMs: 4_000,
+        },
+      ),
+      {
+        protocolVersion: 1,
+        authority: "local-terminal-control",
+        capabilities: [
+          "output.rendered-snapshot",
+          "activity.agent-status",
+          "activity.agent-result",
+        ],
+      },
+    );
+    assert.deepEqual(
+      terminalControl.loadTerminalControlState(exactStatePath),
+      JSON.parse(readFileSync(exactStatePath, "utf8")),
+    );
+    assert.equal(existsSync(defaultSocketPath), false);
+    assert.equal(existsSync(defaultStatePath), false);
+  } finally {
+    await stopAutoStartedTerminalControl(exactSocketPath);
+    await stopAutoStartedTerminalControl(defaultSocketPath);
+    if (previousSocketPath === undefined) delete process.env.TW_TERMINAL_CONTROL_SOCKET;
+    else process.env.TW_TERMINAL_CONTROL_SOCKET = previousSocketPath;
+    if (previousStatePath === undefined) delete process.env.TW_TERMINAL_CONTROL_STATE;
+    else process.env.TW_TERMINAL_CONTROL_STATE = previousStatePath;
     temp.cleanup();
   }
 });

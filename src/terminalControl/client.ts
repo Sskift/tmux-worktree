@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createConnection } from "node:net";
+import { isAbsolute } from "node:path";
 import type { TerminalControlRequest, TerminalControlResponse } from "./protocol";
 import {
   TERMINAL_CONTROL_MAX_FRAME_BYTES,
@@ -19,6 +20,11 @@ export type TerminalControlRequestInput = DistributiveRequestInput<TerminalContr
 export interface TerminalControlAutoStartCliTarget {
   readonly executable: string;
   readonly entrypoint: string;
+}
+
+interface TerminalControlAutoStartPaths {
+  readonly socketPath: string;
+  readonly statePath: string;
 }
 
 function aborted(): Error {
@@ -50,7 +56,10 @@ function clientError(error: NodeJS.ErrnoException): boolean {
   return error.code === "ENOENT" || error.code === "ECONNREFUSED";
 }
 
-function startServer(target?: Readonly<TerminalControlAutoStartCliTarget>): void {
+function startServer(
+  target?: Readonly<TerminalControlAutoStartCliTarget>,
+  paths?: Readonly<TerminalControlAutoStartPaths>,
+): void {
   const cli = target?.entrypoint
     || process.env.TW_TERMINAL_CONTROL_CLI?.trim()
     || process.env.TW_DASHBOARD_CLI?.trim()
@@ -60,6 +69,14 @@ function startServer(target?: Readonly<TerminalControlAutoStartCliTarget>): void
     cli,
     "terminal-control",
     "serve",
+    ...(paths === undefined
+      ? []
+      : [
+          "--socket-path",
+          paths.socketPath,
+          "--state-path",
+          paths.statePath,
+        ]),
   ], {
     detached: true,
     stdio: "ignore",
@@ -131,6 +148,7 @@ export async function requestTerminalControl<T = unknown>(
     timeoutMs?: number;
     autoStart?: boolean;
     autoStartCliTarget?: Readonly<TerminalControlAutoStartCliTarget>;
+    autoStartStatePath?: string;
     signal?: AbortSignal;
   } = {},
 ): Promise<T> {
@@ -149,7 +167,27 @@ export async function requestTerminalControl<T = unknown>(
       throw error;
     }
     if (options.signal?.aborted) throw aborted();
-    startServer(options.autoStartCliTarget);
+    const autoStartPaths = options.autoStartStatePath === undefined
+      ? undefined
+      : (() => {
+          if (options.socketPath === undefined
+            || !isAbsolute(socketPath)
+            || socketPath.includes("\0")
+            || !isAbsolute(options.autoStartStatePath)
+            || options.autoStartStatePath.includes("\0")) {
+            throw new TypeError(
+              "terminal-control exact auto-start requires absolute socket and state paths",
+            );
+          }
+          return Object.freeze({
+            socketPath,
+            statePath: options.autoStartStatePath,
+          });
+        })();
+    startServer(
+      options.autoStartCliTarget,
+      autoStartPaths,
+    );
     const deadline = Date.now() + Math.min(timeoutMs, 5_000);
     while (true) {
       try {

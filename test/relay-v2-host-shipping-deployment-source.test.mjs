@@ -31,6 +31,10 @@ const virtualModules = new Map([
       globalThis.__hostDeploymentHarness.events.push(["terminal.path", home]);
       return home + "/.tmux-worktree/terminal-control-v1.sock";
     }
+    export function defaultTerminalControlStatePath(home) {
+      globalThis.__hostDeploymentHarness.events.push(["terminal.state-path", home]);
+      return home + "/.tmux-worktree/terminal-control-state-v1.json";
+    }
   `],
   ["../../terminalControl/client.js", `
     export async function requestTerminalControl(input, options) {
@@ -513,6 +517,11 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       executable: process.execPath,
       entrypoint: cli,
     });
+    assert.equal(
+      Object.hasOwn(terminalOptions, "autoStartStatePath"),
+      false,
+      "production keeps the default terminal-control child contract",
+    );
     assert.equal(first.foundationProfileHostId, first.profile.hostId);
     assert.equal(first.spoolProfileHostId, first.profile.hostId);
     assert.equal(first.welcomeProfileHostId, first.profile.hostId);
@@ -697,6 +706,12 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       localDevelopment.events.some(([name]) => name === "native.create"),
       false,
       "local development must never probe or manufacture native qualification",
+    );
+    const localTerminalReady = localDevelopment.events
+      .find(([name]) => name === "terminal.ready");
+    assert.equal(
+      localTerminalReady[2].autoStartStatePath,
+      join(home, ".tmux-worktree", "terminal-control-state-v1.json"),
     );
     assert.ok(localDevelopment.events.some(([name]) => name === "local.intake.open"));
     assert.equal(localDevelopment.localCapabilityHandoffIssueCount, 1);

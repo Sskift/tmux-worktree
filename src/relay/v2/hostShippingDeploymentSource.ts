@@ -15,7 +15,10 @@ import { basename, isAbsolute, join } from "node:path";
 import { types as nodeTypes } from "node:util";
 
 import { requestTerminalControl } from "../../terminalControl/client.js";
-import { defaultTerminalControlSocketPath } from "../../terminalControl/store.js";
+import {
+  defaultTerminalControlSocketPath,
+  defaultTerminalControlStatePath,
+} from "../../terminalControl/store.js";
 import {
   createRelayV2CanonicalHostRuntimeBundleOwnerV1,
   type RelayV2CanonicalHostRuntimeBundleOwnerV1,
@@ -420,6 +423,7 @@ async function closeOwned(
 async function openCanonicalRuntimeOwner(
   trustedHome: string,
   signal?: AbortSignal,
+  exactTerminalControlStatePath?: string,
 ): Promise<Readonly<{
   terminalControlDaemonSocketPath: string;
   runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1;
@@ -432,6 +436,9 @@ async function openCanonicalRuntimeOwner(
       socketPath: terminalControlDaemonSocketPath,
       autoStart: true,
       autoStartCliTarget: localCliTarget,
+      ...(exactTerminalControlStatePath === undefined
+        ? {}
+        : { autoStartStatePath: exactTerminalControlStatePath }),
       ...(signal === undefined ? {} : { signal }),
     },
   );
@@ -565,7 +572,11 @@ async function createLocalDevelopmentActivationOwner(
     credentialCell = createRelayV2HostLocalDevelopmentCredentialCell();
     requireStartupOpen(signal);
 
-    const openedRuntime = await openCanonicalRuntimeOwner(trustedHome, signal);
+    const openedRuntime = await openCanonicalRuntimeOwner(
+      trustedHome,
+      signal,
+      defaultTerminalControlStatePath(trustedHome),
+    );
     const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
     runtimeOwner = openedRuntime.runtimeOwner;
     requireStartupOpen(signal);

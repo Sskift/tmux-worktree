@@ -125,11 +125,15 @@ function listen(server: Server, path: string): Promise<void> {
 
 export async function runTerminalControlServer(options: {
   socketPath?: string;
+  statePath?: string;
   authority?: TerminalControlAuthority;
   signal?: AbortSignal;
   /** Explicit private sibling ingress; never advertised on terminal-control v1. */
   relayV2RemoteExactCompoundV1?: boolean;
 } = {}): Promise<void> {
+  if (options.authority !== undefined && options.statePath !== undefined) {
+    throw new TypeError("terminal-control server cannot split authority and state path");
+  }
   const socketPath = options.socketPath ?? terminalControlSocketPath();
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
   if (terminalControlOwnsSocketDirectory(socketPath)) {
@@ -144,7 +148,9 @@ export async function runTerminalControlServer(options: {
     chmodSync(dirname(socketPath), 0o700);
   }
   const serverLock = await acquireTerminalControlStoreLock(`${socketPath}.server.lock`);
-  const authority = options.authority ?? new TerminalControlAuthority();
+  const authority = options.authority ?? new TerminalControlAuthority(
+    options.statePath === undefined ? {} : { statePath: options.statePath },
+  );
   const server = createServer((socket) => handleSocket(socket, authority));
   let compoundIngress: import(
     "../relay/v2/remoteExactTerminalControlCompoundV1.js"

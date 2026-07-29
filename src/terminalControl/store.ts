@@ -133,9 +133,13 @@ export function terminalControlHome(home = homedir()): string {
   return join(home, ".tmux-worktree");
 }
 
+export function defaultTerminalControlStatePath(home = homedir()): string {
+  return join(terminalControlHome(home), "terminal-control-state-v1.json");
+}
+
 export function terminalControlStatePath(home = homedir()): string {
   return process.env.TW_TERMINAL_CONTROL_STATE?.trim()
-    || join(terminalControlHome(home), "terminal-control-state-v1.json");
+    || defaultTerminalControlStatePath(home);
 }
 
 export function defaultTerminalControlSocketPath(home = homedir()): string {
