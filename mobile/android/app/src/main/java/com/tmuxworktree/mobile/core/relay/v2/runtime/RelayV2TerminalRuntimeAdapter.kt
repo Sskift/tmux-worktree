@@ -1219,7 +1219,17 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                                             clearedCheckpoint == null ||
                                             clearedCheckpoint.pendingParserEffectActivation != null ||
                                             clearedCheckpoint.pendingParserEffectHandoff != null
+                                    // ACCEPTED means the current sink reservation is already
+                                    // retired. Only now may an output queued behind A register.
                                     if (uncertain) {
+                                        RelayV2TerminalParserCallbackPipelineResult.Invalidate(
+                                            teardownSink = false,
+                                        )
+                                    } else if (!dispatchParserWritesAfterActivation(
+                                            authority,
+                                            cleared.effects,
+                                        )
+                                    ) {
                                         RelayV2TerminalParserCallbackPipelineResult.Invalidate(
                                             teardownSink = false,
                                         )
@@ -1329,6 +1339,25 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
                 )
             }
         }
+    }
+
+    private suspend fun dispatchParserWritesAfterActivation(
+        authority: RelayV2RepositoryEffectAuthority,
+        effects: List<RelayV2TerminalEffect>,
+    ): Boolean {
+        for (effect in effects) {
+            if (effect !is RelayV2TerminalEffect.WriteParser) return false
+            val dispatched = handleParser(authority, effect)
+            val transferred = dispatched as? RelayV2TerminalRuntimeApplyResult.ParserDispatched
+                ?: return false
+            if (!transferred.transferredCallbackGate.settle(
+                    RelayV2TerminalTransferredCallbackSettlement.COMMITTED,
+                )
+            ) {
+                return false
+            }
+        }
+        return true
     }
 
     private suspend fun settleRuntimePoison(

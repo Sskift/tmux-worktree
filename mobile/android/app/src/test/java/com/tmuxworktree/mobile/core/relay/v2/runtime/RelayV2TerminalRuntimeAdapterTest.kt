@@ -130,6 +130,63 @@ class RelayV2TerminalRuntimeAdapterTest {
     }
 
     @Test
+    fun `consecutive output during parser handoff applies twice and acks twice`() = runBlocking {
+        val fixture = fixture()
+        val first = fixture.enqueueOutput("0", "first")
+        fixture.adapter.handle(fixture.authority, first)
+            as RelayV2TerminalRuntimeApplyResult.ParserDispatched
+        val firstPending = fixture.parser.writes.single()
+        var injectedSecond = false
+        var secondReduction: RelayV2TerminalReduction? = null
+        fixture.sink.beforeReserve = { batch ->
+            if (!injectedSecond && batch.callbackToken == first.callbackToken) {
+                injectedSecond = true
+                secondReduction = runBlocking {
+                    val duringHandoff = fixture.checkpoint()
+                    assertEquals(
+                        first.callbackToken,
+                        duringHandoff.pendingParserEffectHandoff,
+                    )
+                    fixture.repository.reduceTerminalUnderApplyLease(
+                        fixture.key,
+                        RelayV2TerminalAction.Output(
+                            actionFence(duringHandoff),
+                            first.callbackToken.endOffset,
+                            RelayV2TerminalBytes.utf8("-second"),
+                        ),
+                    )
+                }
+            }
+        }
+
+        firstPending.completion(true)
+
+        assertTrue(injectedSecond)
+        assertTrue(requireNotNull(secondReduction).effects.isEmpty())
+        assertEquals(2, fixture.parser.writes.size)
+        val secondPending = fixture.parser.writes[1]
+        assertEquals(first.callbackToken.endOffset, secondPending.token.startOffset)
+
+        secondPending.completion(true)
+
+        val outputAcks = fixture.sink.batches
+            .flatMap { it.effects }
+            .filterIsInstance<RelayV2TerminalEffect.OutputAck>()
+        assertEquals(
+            listOf(first.callbackToken.endOffset, secondPending.token.endOffset),
+            outputAcks.map { it.nextOffset },
+        )
+        val settled = fixture.checkpoint()
+        assertEquals(secondPending.token.endOffset, settled.parserAppliedNextOffset)
+        assertEquals(secondPending.token.endOffset, settled.networkReceivedThrough)
+        assertEquals(null, settled.parserInFlightCallbackToken)
+        assertEquals(null, settled.pendingParserDispatchClaim)
+        assertEquals(null, settled.pendingParserEffectHandoff)
+        assertEquals(null, settled.pendingParserEffectActivation)
+        assertTrue(fixture.fatalInvalidation.calls.isEmpty())
+    }
+
+    @Test
     fun `external cancellation propagates after exact authority withdrawal`() = runBlocking {
         val parserFixture = fixture()
         val parserWrite = parserFixture.enqueueOutput("0", "cancel-parser")

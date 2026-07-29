@@ -1358,7 +1358,9 @@ internal object RelayV2TerminalCheckpointReducer {
             pendingOutput = current.pendingOutput + pending,
         )
         val effects = mutableListOf<RelayV2TerminalEffect>()
-        if (candidate.parserInFlightCallbackToken == null && canDispatchParser(candidate)) {
+        if (candidate.parserInFlightCallbackToken == null &&
+            canStartParserDispatch(candidate)
+        ) {
             candidate = candidate.copy(parserInFlightCallbackToken = pending.callbackToken)
             effects += pending.writeEffect()
         }
@@ -1438,7 +1440,7 @@ internal object RelayV2TerminalCheckpointReducer {
         val effects = mutableListOf<RelayV2TerminalEffect>()
         if (candidate.parserInFlightCallbackToken == null &&
             candidate.pendingOutput.isNotEmpty() &&
-            canDispatchParser(candidate)
+            canStartParserDispatch(candidate)
         ) {
             val head = candidate.pendingOutput.first()
             candidate = candidate.copy(parserInFlightCallbackToken = head.callbackToken)
@@ -1886,10 +1888,21 @@ internal object RelayV2TerminalCheckpointReducer {
                 ),
             )
         }
+        var candidate = current.copy(pendingParserEffectActivation = null)
+        val effects = mutableListOf<RelayV2TerminalEffect>()
+        if (candidate.parserInFlightCallbackToken == null &&
+            candidate.pendingOutput.isNotEmpty() &&
+            canStartParserDispatch(candidate)
+        ) {
+            val head = candidate.pendingOutput.first()
+            candidate = candidate.copy(parserInFlightCallbackToken = head.callbackToken)
+            effects += head.writeEffect()
+        }
         return commit(
             current,
-            current.copy(pendingParserEffectActivation = null),
+            candidate,
             RelayV2TerminalOutcome.Applied,
+            effects,
         )
     }
 
@@ -3982,7 +3995,7 @@ internal object RelayV2TerminalCheckpointReducer {
         if (checkpoint.pendingOutput.isNotEmpty() &&
             checkpoint.parserInFlightCallbackToken == null &&
             checkpoint.parserResetCallbackToken == null &&
-            canDispatchParser(checkpoint)
+            canStartParserDispatch(checkpoint)
         ) {
             return CheckpointValidity.INVALID
         }
@@ -4863,6 +4876,11 @@ internal object RelayV2TerminalCheckpointReducer {
             RelayV2TerminalPhase.REPLAY_REQUESTED,
             RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
         )
+
+    private fun canStartParserDispatch(checkpoint: RelayV2TerminalCheckpoint): Boolean =
+        checkpoint.pendingParserEffectHandoff == null &&
+            checkpoint.pendingParserEffectActivation == null &&
+            canDispatchParser(checkpoint)
 
     private fun sameResetTarget(
         old: RelayV2TerminalIdentity,
