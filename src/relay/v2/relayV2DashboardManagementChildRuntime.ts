@@ -1,6 +1,7 @@
 import { types as nodeUtilTypes } from "node:util";
 
 import {
+  startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64,
   startRelayV2HostDashboardManagementFromTrustedDeployment,
 } from "./hostShippingDeploymentSource.js";
 import type {
@@ -33,11 +34,14 @@ export interface RelayV2DashboardManagementChildStdioOptions {
   readonly runtimeVersion: string;
   /** Test seam; omission selects the process stdin/stdout channel. */
   readonly io?: RelayV2DashboardManagementStdioIo;
+  /** Exact child argv after the hidden entry; omission is production. */
+  readonly selectionArguments?: readonly string[];
 }
 
 interface CapturedOptions {
   readonly runtimeVersion: string;
   readonly io: RelayV2DashboardManagementStdioIo;
+  readonly selectionArguments: readonly string[];
 }
 
 function rejectedProxy(value: unknown): boolean {
@@ -102,7 +106,7 @@ function captureIo(value: unknown): RelayV2DashboardManagementStdioIo | null {
 }
 
 function captureOptions(value: unknown): CapturedOptions | null {
-  const fields = captureRecord(value, ["runtimeVersion"], ["io"]);
+  const fields = captureRecord(value, ["runtimeVersion"], ["io", "selectionArguments"]);
   if (fields === null || typeof fields.runtimeVersion !== "string") return null;
   let io: RelayV2DashboardManagementStdioIo;
   if (fields.io === undefined) {
@@ -112,10 +116,62 @@ function captureOptions(value: unknown): CapturedOptions | null {
     if (capturedIo === null) return null;
     io = capturedIo;
   }
+  let selectionArguments: readonly string[] = Object.freeze([]);
+  if (fields.selectionArguments !== undefined) {
+    if (!Array.isArray(fields.selectionArguments)
+      || rejectedProxy(fields.selectionArguments)) return null;
+    let values: unknown[];
+    try {
+      values = Array.from(fields.selectionArguments);
+    } catch {
+      return null;
+    }
+    if (values.some((argument) => typeof argument !== "string"
+      || argument.length === 0
+      || argument.includes("\0"))) return null;
+    selectionArguments = Object.freeze(values as string[]);
+  }
   return Object.freeze({
     runtimeVersion: fields.runtimeVersion as string,
     io,
+    selectionArguments,
   });
+}
+
+interface SelfHostedDarwinArm64Selection {
+  readonly credentialHttpsCaInputPath: string;
+  readonly carrierWssCaInputPath: string;
+  readonly provisionProfileInputPath?: string;
+  readonly bootstrapSecretInputPath?: string;
+}
+
+function parseSelfHostedDarwinArm64Selection(
+  argv: readonly string[],
+): SelfHostedDarwinArm64Selection | null {
+  if (argv[0] !== "--self-hosted" || argv.length < 5 || argv.length % 2 !== 1) {
+    return null;
+  }
+  const names = new Map<string, keyof SelfHostedDarwinArm64Selection>([
+    ["--credential-https-ca-input", "credentialHttpsCaInputPath"],
+    ["--carrier-wss-ca-input", "carrierWssCaInputPath"],
+    ["--provision-profile-input", "provisionProfileInputPath"],
+    ["--bootstrap-secret-input", "bootstrapSecretInputPath"],
+  ]);
+  const values = Object.create(null) as Record<string, string>;
+  for (let index = 1; index < argv.length; index += 2) {
+    const name = names.get(argv[index]!);
+    const value = argv[index + 1];
+    if (name === undefined
+      || value === undefined
+      || value.length === 0
+      || value.includes("\0")
+      || value.startsWith("--")
+      || Object.hasOwn(values, name)) return null;
+    values[name] = value;
+  }
+  if (!Object.hasOwn(values, "credentialHttpsCaInputPath")
+    || !Object.hasOwn(values, "carrierWssCaInputPath")) return null;
+  return Object.freeze(values) as unknown as SelfHostedDarwinArm64Selection;
 }
 
 const HANDLE_ALLOWED_KEYS = Object.freeze([
@@ -294,7 +350,9 @@ export function createRelayV2DashboardManagementChildStdioRunner(
   const factory = captureFactory(openHostRoot);
   return async (options) => {
     const captured = captureOptions(options);
-    if (captured === null || factory === null) {
+    if (captured === null
+      || captured.selectionArguments.length !== 0
+      || factory === null) {
       return RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE;
     }
     const qualified = await runQualifiedSession(factory, captured);
@@ -316,7 +374,36 @@ export function createRelayV2DashboardManagementChildStdioRunner(
 export function runRelayV2DashboardManagementChildStdio(
   options: RelayV2DashboardManagementChildStdioOptions,
 ): Promise<number> {
-  return createRelayV2DashboardManagementChildStdioRunner(
-    startRelayV2HostDashboardManagementFromTrustedDeployment,
-  )(options);
+  const captured = captureOptions(options);
+  if (captured === null) {
+    return Promise.resolve(RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE);
+  }
+  let factory: RelayV2DashboardManagementChildHostFactory;
+  let explicitSelfHosted = false;
+  if (captured.selectionArguments.length === 0) {
+    factory = startRelayV2HostDashboardManagementFromTrustedDeployment;
+  } else {
+    const selection =
+      parseSelfHostedDarwinArm64Selection(captured.selectionArguments);
+    if (selection === null) {
+      return Promise.resolve(RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE);
+    }
+    explicitSelfHosted = true;
+    factory = (dashboardManagement) =>
+      startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+        selection,
+        dashboardManagement,
+      );
+  }
+  return (async () => {
+    const qualified = await runQualifiedSession(factory, captured);
+    if (qualified !== null) return qualified;
+    if (explicitSelfHosted) {
+      return RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE;
+    }
+    return createRelayV2DashboardManagementUnavailableStdioSession({
+      runtimeVersion: captured.runtimeVersion,
+      io: captured.io,
+    }).run();
+  })();
 }

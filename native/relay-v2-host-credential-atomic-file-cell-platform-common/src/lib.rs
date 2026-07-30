@@ -292,6 +292,34 @@ pub fn production_durability_qualification() -> Result<DurabilityQualification, 
     Err(CellErrorCode::CellDurabilityUnsupported)
 }
 
+/// Opaque, process-bound policy proof for the explicit non-production
+/// self-hosted Darwin arm64 lane. This is deliberately disjoint from
+/// [`DurabilityQualification`]: it cannot populate the production allowlist
+/// or authorize the production trusted factory.
+pub struct SelfHostedDarwinArm64AdmissionPolicy {
+    origin_pid: u32,
+}
+
+impl fmt::Debug for SelfHostedDarwinArm64AdmissionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SelfHostedDarwinArm64AdmissionPolicy(<opaque>)")
+    }
+}
+
+/// Issues one native half of the self-hosted policy cut on the exact frozen
+/// compile target. The Node deployment ticket remains the outer one-shot
+/// selector; this value is consumed by one admission attempt and is neither
+/// cloneable nor serializable.
+pub fn issue_self_hosted_darwin_arm64_admission_policy(
+) -> Result<SelfHostedDarwinArm64AdmissionPolicy, CellErrorCode> {
+    if !generated::SELF_HOSTED_DARWIN_ARM64_ADMISSION_ENABLED {
+        return Err(CellErrorCode::NativeInterfaceInvalid);
+    }
+    Ok(SelfHostedDarwinArm64AdmissionPolicy {
+        origin_pid: std::process::id(),
+    })
+}
+
 #[cfg(test)]
 fn durability_qualification_for_test() -> DurabilityQualification {
     DurabilityQualification { _private: () }
@@ -581,6 +609,31 @@ pub fn adopt_prebound_directory<P: DescriptorRelativePlatform>(
     platform: P,
     directory: P::Descriptor,
     _qualification: &DurabilityQualification,
+) -> Result<AdmissionOwner<P>, CellErrorCode> {
+    adopt_prebound_directory_inner(lifecycle_token, platform, directory)
+}
+
+/// Explicit non-production self-hosted Darwin arm64 admission. It consumes a
+/// process-bound policy proof, then enters the exact same sole AdmissionOwner
+/// path as the production-qualified seam would. It makes no production
+/// durability, rollback, directory-copy, power-loss, readiness, or capability
+/// claim.
+pub fn adopt_prebound_directory_for_self_hosted_darwin_arm64<P: DescriptorRelativePlatform>(
+    lifecycle_token: &ProcessLifecycleToken,
+    platform: P,
+    directory: P::Descriptor,
+    policy: SelfHostedDarwinArm64AdmissionPolicy,
+) -> Result<AdmissionOwner<P>, CellErrorCode> {
+    if policy.origin_pid != std::process::id() {
+        return Err(CellErrorCode::CellClosed);
+    }
+    adopt_prebound_directory_inner(lifecycle_token, platform, directory)
+}
+
+fn adopt_prebound_directory_inner<P: DescriptorRelativePlatform>(
+    lifecycle_token: &ProcessLifecycleToken,
+    platform: P,
+    directory: P::Descriptor,
 ) -> Result<AdmissionOwner<P>, CellErrorCode> {
     lifecycle_token.check_parent_process()?;
     let mut attempt = OpenAttempt::new(lifecycle_token, platform, directory);

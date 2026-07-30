@@ -18,6 +18,9 @@ import {
   captureRelayV2HostTlsCaTrust,
   type RelayV2HostTlsCaTrust,
 } from "./hostTlsTrustMaterial.js";
+import {
+  issueRelayV2HostSelfHostedCapabilityActivationHandoff,
+} from "./hostRuntimeComposition.js";
 
 export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   /**
@@ -236,6 +239,30 @@ function isAsynchronousResult(value: unknown): boolean {
 export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
   options: RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions,
 ): Promise<RelayV2HostPrivilegedProductionIntakeComposition> {
+  return openRelayV2HostNativeCredentialPrivilegedIntakeBridgeInternal(
+    options,
+    false,
+  );
+}
+
+/**
+ * Explicit self-hosted Darwin arm64 entry. It uses the same native-cell and
+ * privileged-intake owners, while independently issuing the one-shot base
+ * capability handoff for the exact cell. Production never calls this entry.
+ */
+export async function openRelayV2HostSelfHostedNativeCredentialPrivilegedIntakeBridge(
+  options: RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions,
+): Promise<RelayV2HostPrivilegedProductionIntakeComposition> {
+  return openRelayV2HostNativeCredentialPrivilegedIntakeBridgeInternal(
+    options,
+    true,
+  );
+}
+
+async function openRelayV2HostNativeCredentialPrivilegedIntakeBridgeInternal(
+  options: RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions,
+  activateSelfHostedBaseCapabilities: boolean,
+): Promise<RelayV2HostPrivilegedProductionIntakeComposition> {
   const captured = snapshotExactDataRecord(
     options,
     ["takeNativeModule", "canonical"],
@@ -333,6 +360,12 @@ export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(
       | undefined,
     credentialHttpsTlsTrust,
     carrierWssTlsTrust,
+    ...(activateSelfHostedBaseCapabilities
+      ? {
+          selfHostedCapabilityActivationHandoff:
+            issueRelayV2HostSelfHostedCapabilityActivationHandoff(cell),
+        }
+      : {}),
     canonical: captured.canonical as RelayV2HostPrivilegedProductionCanonicalOptions,
   });
   // A thrown intake error is already stable and redacted, and the intake has

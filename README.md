@@ -365,7 +365,21 @@ npm run build:relay-v2-host-credential-native -- --target darwin-arm64
 npm run verify:relay-v2-host-credential-native-pack -- --target darwin-arm64
 ```
 
-It reuses the same fd-owned staging and bounded ustar inspection boundaries, checks the Host fixed descriptor, binary header, tar and unpacked layout with the same per-owner exact-artifact rule (its own selected artifact plus only the same-target frozen Broker sibling), imports the unpacked Host fixed loader and holder to prove the packed artifact loads and fails closed with `CELL_DURABILITY_UNSUPPORTED`, and then runs the focused Host native-binding test. It is likewise absent from the ordinary build, npm lifecycle, Dashboard bundle, and production Relay runtime, and creates no qualification, readiness, or capability.
+It reuses the same fd-owned staging and bounded ustar inspection boundaries, checks the Host fixed descriptor, binary header, tar and unpacked layout with the same per-owner exact-artifact rule (its own selected artifact plus only the same-target frozen Broker sibling), imports the unpacked Host fixed loader and holder to prove the production factory still fails closed with `CELL_DURABILITY_UNSUPPORTED`, and then runs the focused Host native-binding test. It is absent from the ordinary root build and npm lifecycle. Packaging owners that build the Darwin arm64 Dashboard must use `npm run build:relay-v2-host-darwin-arm64-shipping` in place of the ordinary root build; it builds the canonical sibling tree and then stages the fixed artifact at `dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node`. The existing full-`dist` Dashboard resource mapping then places it at `tw-cli/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node`. Staging alone creates no production qualification, readiness, or capability.
+
+The Node hidden child exposes this exact Darwin arm64 self-hosted integration seam:
+
+```text
+__relay-v2-dashboard-management-stdio --self-hosted \
+  --credential-https-ca-input /absolute/path/credential-ca.pem \
+  --carrier-wss-ca-input /absolute/path/carrier-ca.pem \
+  [--provision-profile-input /absolute/path/profile.json] \
+  [--bootstrap-secret-input /absolute/path/bootstrap]
+```
+
+Each input file must be current-user-owned, regular, single-link, and exact mode `0600`; paths are not secret and contents are read through fd-bound sources. There is deliberately no `--trusted-home`: the lane uses the current Mac account home, production profile, terminal-control daemon, `~/.tmux-worktree.json`, and canonical TW session discovery. If supplied, `--provision-profile-input` uses the existing production profile store to create or validate its private directories and atomically write `~/.tmux-worktree/relay-v2-host/profile-v1.json`; without it, that profile must already exist.
+
+The native producer accepts no caller path and creates no directory. Before spawning the child, the Dashboard deployment owner must safely create or validate current-user-owned, non-symlink, exact-`0700` `~/.tmux-worktree` and `~/.tmux-worktree/relay-v2-host-credential-atomic-file-cell-v1`. The real account home may remain owner-controlled `0750`. The self-hosted one-shot activation binds the exact native cell to the intake-owned credential authority, so its `host.hello` advertises only the six frozen `RELAY_V2_REQUIRED_CAPABILITIES`; optional capabilities remain empty. Its persistence claim is limited to a successful CAS and clean close followed by a fresh-process reopen. It does not support snapshot rollback, directory copy/clone/migration, crash recovery, or power-loss durability. The parameterless production child retains an empty capability offer and remains fail-closed/UNAVAILABLE because production `qualifiedRecords=[]`; self-hosted parse or activation failures exit 1 without production or Relay v1 fallback. Dashboard spawn/restart/UI adoption of this argv is intentionally outside the Node seam.
 
 Run the Dashboard:
 
@@ -423,7 +437,7 @@ The release script:
 
 1. Builds the Tauri Dashboard DMG.
 2. Builds the standalone root CLI into `dist/cli.cjs` while retaining `dist/*.js` only as repository-local ESM module builds.
-3. Bundles `dist/cli.cjs` into the Dashboard app as `tw-cli/cli.cjs` for canonical local lifecycle RPC and the Mobile Relay `tw serve` / `tw relay-host` runtimes.
+3. Bundles the complete canonical `dist` tree plus root `package.json` into the Dashboard app under `tw-cli/`; a self-hosted Darwin arm64 Tauri packaging owner must replace the ordinary root build in its `beforeBuild` integration with the dedicated root shipping build described above.
 4. Copies the DMG to `app/installer/dmg/tw-dashboard-arm64.dmg`.
 5. Leaves upload and channel-specific publishing outside the repository.
 

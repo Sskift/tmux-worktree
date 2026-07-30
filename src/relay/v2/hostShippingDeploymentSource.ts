@@ -27,8 +27,13 @@ import {
 } from "./canonicalHostRuntimeBundle.js";
 import { relayV2RemoteExactCompoundSocketPathV1 } from
   "./remoteExactTerminalControlCompoundV1.js";
-import { relayV2HostCredentialNativeModuleTrustedLoader } from
-  "./hostCredentialNativeLoader.js";
+import {
+  createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64Loader,
+  relayV2HostCredentialNativeModuleTrustedLoader,
+} from "./hostCredentialNativeLoader.js";
+import {
+  issueRelayV2HostSelfHostedDarwinArm64AdmissionPolicy,
+} from "./hostSelfHostedDarwinArm64AdmissionPolicy.js";
 import {
   createRelayV2HostCredentialNativeModuleSource,
   type RelayV2HostCredentialNativeModuleSource,
@@ -83,6 +88,13 @@ export interface RelayV2HostLocalDevelopmentActivation {
   readonly [relayV2HostLocalDevelopmentActivationBrand]: void;
 }
 
+declare const relayV2HostSelfHostedDarwinArm64ActivationBrand: unique symbol;
+
+/** Fieldless ticket for the explicit non-production account-home lane. */
+export interface RelayV2HostSelfHostedDarwinArm64Activation {
+  readonly [relayV2HostSelfHostedDarwinArm64ActivationBrand]: void;
+}
+
 export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly trustedHome: string;
   readonly profileSnapshot: Readonly<RelayV2HostProductionProfile>;
@@ -95,6 +107,9 @@ export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly startupSignal?: AbortSignal;
   closeAndDrain(): Promise<void>;
 }
+
+export type RelayV2HostSelfHostedDarwinArm64ActivationRecord =
+  RelayV2HostTrustedDeploymentActivationRecord;
 
 export interface RelayV2HostLocalDevelopmentActivationRecord {
   readonly trustedHome: string;
@@ -111,6 +126,13 @@ export interface RelayV2HostLocalDevelopmentActivationRecord {
 
 export interface RelayV2HostLocalDevelopmentShippingOptions {
   readonly trustedHome: string;
+  readonly credentialHttpsCaInputPath: string;
+  readonly carrierWssCaInputPath: string;
+  readonly provisionProfileInputPath?: string;
+  readonly bootstrapSecretInputPath?: string;
+}
+
+export interface RelayV2HostSelfHostedDarwinArm64ShippingOptions {
   readonly credentialHttpsCaInputPath: string;
   readonly carrierWssCaInputPath: string;
   readonly provisionProfileInputPath?: string;
@@ -148,10 +170,17 @@ interface LocalDevelopmentActivationOwner {
   closeAndDrain(): Promise<void>;
 }
 
+interface SelfHostedDarwinArm64ActivationOwner {
+  readonly activation: RelayV2HostSelfHostedDarwinArm64Activation;
+  closeAndDrain(): Promise<void>;
+}
+
 const activationRecords =
   new WeakMap<object, RelayV2HostTrustedDeploymentActivationRecord>();
 const localDevelopmentActivationRecords =
   new WeakMap<object, RelayV2HostLocalDevelopmentActivationRecord>();
+const selfHostedDarwinArm64ActivationRecords =
+  new WeakMap<object, RelayV2HostSelfHostedDarwinArm64ActivationRecord>();
 const LOCAL_DEVELOPMENT_UNIX_SOCKET_PATH_MAX_BYTES = 100;
 
 function failure(
@@ -404,6 +433,47 @@ function captureLocalDevelopmentOptions(
   }
   return Object.freeze(result) as unknown as
     Readonly<RelayV2HostLocalDevelopmentShippingOptions>;
+}
+
+function captureSelfHostedDarwinArm64Options(
+  value: unknown,
+): Readonly<RelayV2HostSelfHostedDarwinArm64ShippingOptions> {
+  if (value === null || typeof value !== "object" || nodeTypes.isProxy(value)) {
+    throw failure("ACTIVATION_INVALID");
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw failure("ACTIVATION_INVALID");
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw failure("ACTIVATION_INVALID");
+  }
+  const required = [
+    "credentialHttpsCaInputPath",
+    "carrierWssCaInputPath",
+  ] as const;
+  const optional = ["provisionProfileInputPath", "bootstrapSecretInputPath"] as const;
+  const allowed = new Set<string>([...required, ...optional]);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string" || !allowed.has(key))
+    || required.some((key) => !Object.hasOwn(descriptors[key] ?? {}, "value"))) {
+    throw failure("ACTIVATION_INVALID");
+  }
+  const result = Object.create(null) as Record<string, string>;
+  for (const key of [...required, ...optional]) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined) continue;
+    if (!Object.hasOwn(descriptor, "value")
+      || typeof descriptor.value !== "string"
+      || descriptor.value.length === 0
+      || descriptor.value.includes("\0")) throw failure("ACTIVATION_INVALID");
+    result[key] = descriptor.value;
+  }
+  return Object.freeze(result) as unknown as
+    Readonly<RelayV2HostSelfHostedDarwinArm64ShippingOptions>;
 }
 
 async function closeOwned(
@@ -687,6 +757,111 @@ async function createLocalDevelopmentActivationOwner(
   }
 }
 
+async function createSelfHostedDarwinArm64ActivationOwner(
+  signal: AbortSignal | undefined,
+  options: Readonly<RelayV2HostSelfHostedDarwinArm64ShippingOptions>,
+): Promise<SelfHostedDarwinArm64ActivationOwner> {
+  let bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null = null;
+  let nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null = null;
+  let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
+  try {
+    requireStartupOpen(signal);
+    // Deliberately use the real account home. Unlike local-development, this
+    // lane does not require or synthesize a 0700 replacement home; canonical
+    // TW config/session discovery and terminal-control ownership stay on the
+    // current Mac account. The native producer alone derives its fixed 0700
+    // credential namespace beneath this account home.
+    const trustedHome = realpathSync.native(homedir());
+    if (options.provisionProfileInputPath !== undefined) {
+      const profile = readRelayV2HostProductionProfileProvisioningInput({
+        inputPath: options.provisionProfileInputPath,
+      });
+      loadOrCreateRelayV2HostProductionProfile({ profile, trustedHome });
+    }
+    const profileSnapshot = requireRelayV2HostProductionProfileSnapshot(
+      readRelayV2HostProductionProfile({ trustedHome }),
+    );
+    bootstrapSecretByteSource = openBootstrapSecretByteSource(
+      options.bootstrapSecretInputPath,
+    );
+    const credentialHttpsCa = readLocalDevelopmentTlsCaInput(
+      options.credentialHttpsCaInputPath,
+    );
+    const carrierWssCa = readLocalDevelopmentTlsCaInput(
+      options.carrierWssCaInputPath,
+    );
+    requireStartupOpen(signal);
+
+    const admissionPolicy =
+      issueRelayV2HostSelfHostedDarwinArm64AdmissionPolicy();
+    const loader =
+      createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64Loader(
+        admissionPolicy,
+      );
+    nativeModuleSource = createRelayV2HostCredentialNativeModuleSource({
+      platform: process.platform,
+      architecture: process.arch,
+      napiVersion: Number(process.versions.napi),
+    }, loader);
+    if (nativeModuleSource.capability().status !== "supported") {
+      throw failure("ACTIVATION_FAILED");
+    }
+    requireStartupOpen(signal);
+
+    const openedRuntime = await openCanonicalRuntimeOwner(trustedHome, signal);
+    const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
+    runtimeOwner = openedRuntime.runtimeOwner;
+    requireStartupOpen(signal);
+
+    const credentialHttpsTlsTrustCut = captureRelayV2HostTlsCaTrustCut({
+      certificateAuthorities: [credentialHttpsCa],
+    });
+    const carrierWssTlsTrustCut = captureRelayV2HostTlsCaTrustCut({
+      certificateAuthorities: [carrierWssCa],
+    });
+    const ownedBootstrapSource = bootstrapSecretByteSource;
+    const ownedRuntime = runtimeOwner;
+    const ownedSource = nativeModuleSource;
+    let closePromise: Promise<void> | null = null;
+    const closeAndDrain = (): Promise<void> => {
+      if (closePromise !== null) return closePromise;
+      closePromise = (async () => {
+        if (await closeOwned(ownedBootstrapSource, ownedRuntime, ownedSource)) {
+          throw failure("CLEANUP_FAILED");
+        }
+      })();
+      void closePromise.catch(() => undefined);
+      return closePromise;
+    };
+
+    const activation =
+      Object.freeze(Object.create(null)) as RelayV2HostSelfHostedDarwinArm64Activation;
+    const record = Object.freeze(Object.assign(Object.create(null), {
+      trustedHome,
+      profileSnapshot,
+      nativeModuleSource: ownedSource,
+      runtimeBundle: ownedRuntime.bundle,
+      terminalControlDaemonSocketPath,
+      credentialHttpsTlsTrustCut,
+      carrierWssTlsTrustCut,
+      ...(ownedBootstrapSource === null
+        ? {}
+        : { bootstrapSecretByteSource: ownedBootstrapSource }),
+      ...(signal === undefined ? {} : { startupSignal: signal }),
+      closeAndDrain,
+    })) as RelayV2HostSelfHostedDarwinArm64ActivationRecord;
+    selfHostedDarwinArm64ActivationRecords.set(activation as object, record);
+    return Object.freeze({ activation, closeAndDrain });
+  } catch {
+    const cleanupFailed = await closeOwned(
+      bootstrapSecretByteSource,
+      runtimeOwner,
+      nativeModuleSource,
+    );
+    throw failure(cleanupFailed ? "CLEANUP_FAILED" : "ACTIVATION_FAILED");
+  }
+}
+
 /**
  * Canonical root-only one-shot consumer. A copied, forged, replayed, or
  * already-consumed ticket cannot expose any deployment authority.
@@ -709,6 +884,17 @@ export function takeRelayV2HostLocalDevelopmentActivation(
   const record = localDevelopmentActivationRecords.get(value as object);
   if (record === undefined) throw failure("ACTIVATION_INVALID");
   localDevelopmentActivationRecords.delete(value as object);
+  return record;
+}
+
+/** Root-only one-shot consumer for the non-production account-home ticket. */
+export function takeRelayV2HostSelfHostedDarwinArm64Activation(
+  value: unknown,
+): RelayV2HostSelfHostedDarwinArm64ActivationRecord {
+  if (value === null || typeof value !== "object") throw failure("ACTIVATION_INVALID");
+  const record = selfHostedDarwinArm64ActivationRecords.get(value as object);
+  if (record === undefined) throw failure("ACTIVATION_INVALID");
+  selfHostedDarwinArm64ActivationRecords.delete(value as object);
   return record;
 }
 
@@ -775,6 +961,30 @@ async function openRelayV2HostShippingFromLocalDevelopment(
   }
 }
 
+async function openRelayV2HostShippingFromSelfHostedDarwinArm64(
+  signal: AbortSignal,
+  options: Readonly<RelayV2HostSelfHostedDarwinArm64ShippingOptions>,
+  dashboardManagement: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  const owner = await createSelfHostedDarwinArm64ActivationOwner(signal, options);
+  try {
+    requireStartupOpen(signal);
+    const root = await import("./hostShippingRoot.js");
+    requireStartupOpen(signal);
+    return await root.startRelayV2HostShippingRootFromSelfHostedDarwinArm64Activation(
+      owner.activation,
+      dashboardManagement,
+    );
+  } catch {
+    try {
+      await owner.closeAndDrain();
+    } catch {
+      throw failure("CLEANUP_FAILED");
+    }
+    throw failure("ACTIVATION_FAILED");
+  }
+}
+
 /**
  * Dashboard hidden-child entry for the same trusted Host deployment owner.
  * The caller supplies only its protocol-v2 channel identity; profile,
@@ -816,6 +1026,29 @@ export async function startRelayV2HostDashboardManagementFromLocalDevelopment(
   }
   const captured = captureLocalDevelopmentOptions(options);
   return openRelayV2HostShippingFromLocalDevelopment(
+    dashboardManagement.signal,
+    captured,
+    dashboardManagement,
+  );
+}
+
+/**
+ * Exact Dashboard adoption seam for the explicit non-production self-hosted
+ * Darwin arm64 lane. It uses the real account home/profile/runtime discovery,
+ * the persistent native cell selected by one policy ticket, and two distinct
+ * owner-only CA inputs. It never selects production or Relay v1 on failure.
+ */
+export async function startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+  options: unknown,
+  dashboardManagement: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  if (arguments.length !== 2
+    || dashboardManagement === null
+    || typeof dashboardManagement !== "object") {
+    throw failure("ACTIVATION_INVALID");
+  }
+  const captured = captureSelfHostedDarwinArm64Options(options);
+  return openRelayV2HostShippingFromSelfHostedDarwinArm64(
     dashboardManagement.signal,
     captured,
     dashboardManagement,

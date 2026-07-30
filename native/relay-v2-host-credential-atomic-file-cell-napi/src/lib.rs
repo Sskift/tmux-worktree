@@ -310,6 +310,7 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
     factory::pin_process_origin();
     let intrinsics = Arc::new(Intrinsics::capture(&env)?);
     let factory_intrinsics = Arc::clone(&intrinsics);
+    let self_hosted_factory_intrinsics = Arc::clone(&intrinsics);
 
     let open = env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
         "openRelayV2HostCredentialAtomicFileCellV1",
@@ -331,6 +332,15 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
             factory::run_trusted_factory_callback(context, &factory_intrinsics)
         },
     )?;
+    let self_hosted_factory = env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
+        factory::SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD,
+        move |context: FunctionCallContext<'_>| {
+            factory::run_self_hosted_darwin_arm64_factory_callback(
+                context,
+                &self_hosted_factory_intrinsics,
+            )
+        },
+    )?;
     // The frozen v1 module surface stays exactly `{ open }`: the trusted
     // factory rides only as an additive own-data entry on the raw open
     // function, and the fixed trusted loader is its only production driver.
@@ -340,6 +350,12 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
         &mut open_object,
         factory::TRUSTED_FACTORY_METHOD,
         trusted_factory,
+    )?;
+    define_own_data(
+        &env,
+        &mut open_object,
+        factory::SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD,
+        self_hosted_factory,
     )?;
     define_own_data(
         &env,

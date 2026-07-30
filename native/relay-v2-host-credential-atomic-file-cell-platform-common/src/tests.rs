@@ -744,6 +744,14 @@ fn production_qualification_is_empty_and_resources_are_host_specific() {
     ));
     let spec = platform_resource_spec();
     assert_eq!(spec.contract_revision(), 7);
+    assert_eq!(
+        generated::SELF_HOSTED_DARWIN_ARM64_ADMISSION_ENABLED,
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    );
+    assert_eq!(
+        issue_self_hosted_darwin_arm64_admission_policy().is_ok(),
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    );
     assert_eq!(spec.resource_contract_version(), 1);
     assert_eq!(generated::CREDENTIAL_MUTATION_CONTRACT_VERSION, 1);
     assert!(generated::CREDENTIAL_MUTATION_IMPLEMENTED);

@@ -23,7 +23,9 @@
 use napi::bindgen_prelude::{FunctionCallContext, Object, Unknown};
 use napi::{Env, JsValue, Result as NapiResult};
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
-    adopt_prebound_directory, CellErrorCode, DescriptorRelativePlatform, ProcessLifecycleToken,
+    adopt_prebound_directory, adopt_prebound_directory_for_self_hosted_darwin_arm64,
+    issue_self_hosted_darwin_arm64_admission_policy, CellErrorCode, DescriptorRelativePlatform,
+    ProcessLifecycleToken, SelfHostedDarwinArm64AdmissionPolicy,
 };
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +38,8 @@ use crate::{
 
 pub(crate) const TRUSTED_FACTORY_METHOD: &str =
     "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
+pub(crate) const SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD: &str =
+    "createRelayV2HostCredentialAtomicFileCellSelfHostedDarwinArm64FactoryV1";
 
 #[cfg(target_os = "macos")]
 pub(crate) mod cell_platform {
@@ -100,6 +104,17 @@ impl TrustedFactoryOnce {
 
 static TRUSTED_FACTORY_ONCE: TrustedFactoryOnce = TrustedFactoryOnce::new();
 
+enum AdmissionPolicy {
+    Production,
+    SelfHostedDarwinArm64(SelfHostedDarwinArm64AdmissionPolicy),
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionKind {
+    Production,
+    SelfHostedDarwinArm64,
+}
+
 /// Unforgeable native capability: sole ownership of the pre-bound cell
 /// directory descriptor plus its adapter, bound to the producing process. It
 /// is never exposed to JavaScript as a value and never reveals a raw
@@ -109,16 +124,21 @@ static TRUSTED_FACTORY_ONCE: TrustedFactoryOnce = TrustedFactoryOnce::new();
 pub(crate) struct TrustedCellCapability {
     platform: Option<cell_platform::Platform>,
     directory: Option<cell_platform::Descriptor>,
+    admission_policy: Option<AdmissionPolicy>,
     pid: u32,
     closed: bool,
 }
 
 impl TrustedCellCapability {
-    fn from_prebound(prebound: cell_platform::PreboundDirectory) -> Self {
+    fn from_prebound(
+        prebound: cell_platform::PreboundDirectory,
+        admission_policy: AdmissionPolicy,
+    ) -> Self {
         let (platform, directory) = prebound.into_platform_parts();
         Self {
             platform: Some(platform),
             directory: Some(directory),
+            admission_policy: Some(admission_policy),
             pid: std::process::id(),
             closed: false,
         }
@@ -133,6 +153,7 @@ impl TrustedCellCapability {
         Self {
             platform: Some(platform),
             directory: Some(directory),
+            admission_policy: Some(AdmissionPolicy::Production),
             pid,
             closed: false,
         }
@@ -150,19 +171,41 @@ impl TrustedCellCapability {
         }
     }
 
+    fn admission_kind(&self) -> AdmissionKind {
+        match self.admission_policy.as_ref() {
+            Some(AdmissionPolicy::Production) => AdmissionKind::Production,
+            Some(AdmissionPolicy::SelfHostedDarwinArm64(_)) => AdmissionKind::SelfHostedDarwinArm64,
+            None => AdmissionKind::Production,
+        }
+    }
+
     /// One-shot ownership transfer into platform-common. From this point the
     /// common adoption attempt owns descriptor cleanup on every outcome.
-    fn take_platform_parts(
+    fn take_admission_parts(
         &mut self,
-    ) -> Result<(cell_platform::Platform, cell_platform::Descriptor), CellErrorCode> {
+    ) -> Result<
+        (
+            cell_platform::Platform,
+            cell_platform::Descriptor,
+            AdmissionPolicy,
+        ),
+        CellErrorCode,
+    > {
         self.check_origin()?;
-        if self.closed || self.platform.is_none() || self.directory.is_none() {
+        if self.closed
+            || self.platform.is_none()
+            || self.directory.is_none()
+            || self.admission_policy.is_none()
+        {
             return Err(CellErrorCode::CellClosed);
         }
         self.closed = true;
         Ok((
             self.platform.take().ok_or(CellErrorCode::CellClosed)?,
             self.directory.take().ok_or(CellErrorCode::CellClosed)?,
+            self.admission_policy
+                .take()
+                .ok_or(CellErrorCode::CellClosed)?,
         ))
     }
 
@@ -187,6 +230,7 @@ impl TrustedCellCapability {
 /// permanently transfers descriptor ownership to platform-common.
 struct BoundCellOpener {
     origin_pid: u32,
+    admission_kind: AdmissionKind,
     capability: Mutex<Option<TrustedCellCapability>>,
 }
 
@@ -194,6 +238,7 @@ impl BoundCellOpener {
     fn new(capability: TrustedCellCapability) -> Self {
         Self {
             origin_pid: capability.pid,
+            admission_kind: capability.admission_kind(),
             capability: Mutex::new(Some(capability)),
         }
     }
@@ -316,6 +361,7 @@ fn outcome_error_result<'env>(env: &'env Env, code: CellErrorCode) -> NapiResult
 fn produce_capability(
     target_supported: bool,
     lifecycle_token: &std::result::Result<ProcessLifecycleToken, CellErrorCode>,
+    admission_policy: AdmissionPolicy,
 ) -> Result<TrustedCellCapability, CellErrorCode> {
     if !target_supported {
         return Err(CellErrorCode::NativeInterfaceInvalid);
@@ -324,7 +370,8 @@ fn produce_capability(
         return Err(*code);
     }
     check_origin_process()?;
-    cell_platform::produce().map(TrustedCellCapability::from_prebound)
+    cell_platform::produce()
+        .map(|prebound| TrustedCellCapability::from_prebound(prebound, admission_policy))
 }
 
 /// Callback-entry precedence shared with the focused tests. The real
@@ -361,7 +408,46 @@ pub(crate) fn run_trusted_factory_callback(
         return outcome_error_result(context.env, CellErrorCode::InvalidArgument)
             .map(|value| RawValue(value.raw()));
     }
-    match produce_capability(supported_target(), lifecycle()) {
+    match produce_capability(supported_target(), lifecycle(), AdmissionPolicy::Production) {
+        Ok(capability) => ready_factory_result(context.env, intrinsics, capability),
+        Err(code) => outcome_error_result(context.env, code),
+    }
+    .map(|value| RawValue(value.raw()))
+}
+
+/// Independent explicit non-production factory. It shares the raw factory's
+/// single process claim, fixed native directory producer, binder, final module,
+/// and sole common AdmissionOwner. Its opaque policy can only authorize the
+/// frozen Darwin arm64 self-hosted clean-restart lane; it cannot satisfy or
+/// bypass the production durability qualification.
+pub(crate) fn run_self_hosted_darwin_arm64_factory_callback(
+    context: FunctionCallContext<'_>,
+    intrinsics: &Arc<Intrinsics>,
+) -> NapiResult<RawValue> {
+    let argument_present =
+        match trusted_factory_callback_argument_present(&TRUSTED_FACTORY_ONCE, || {
+            context.get::<Unknown<'_>>(0).is_ok()
+        }) {
+            Ok(argument_present) => argument_present,
+            Err(code) => {
+                return outcome_error_result(context.env, code).map(|value| RawValue(value.raw()));
+            }
+        };
+    if argument_present {
+        return outcome_error_result(context.env, CellErrorCode::InvalidArgument)
+            .map(|value| RawValue(value.raw()));
+    }
+    let policy = match issue_self_hosted_darwin_arm64_admission_policy() {
+        Ok(policy) => policy,
+        Err(code) => {
+            return outcome_error_result(context.env, code).map(|value| RawValue(value.raw()));
+        }
+    };
+    match produce_capability(
+        supported_target(),
+        lifecycle(),
+        AdmissionPolicy::SelfHostedDarwinArm64(policy),
+    ) {
         Ok(capability) => ready_factory_result(context.env, intrinsics, capability),
         Err(code) => outcome_error_result(context.env, code),
     }
@@ -524,21 +610,41 @@ fn open_bound_cell<'env>(
             return create_open_error_result(env, CellErrorCode::NativeInterfaceInvalid)
         }
     }
-    let (lifecycle_token, qualification) =
-        match production_open_gate(supported_target(), lifecycle()) {
-            Ok(gate) => gate,
+    let (lifecycle_token, production_qualification) = match opener.admission_kind {
+        AdmissionKind::Production => match production_open_gate(supported_target(), lifecycle()) {
+            Ok((token, qualification)) => (token, Some(qualification)),
             Err(code) => return create_open_error_result(env, code),
-        };
+        },
+        AdmissionKind::SelfHostedDarwinArm64 => match lifecycle().as_ref() {
+            Ok(token) => (token, None),
+            Err(code) => return create_open_error_result(env, *code),
+        },
+    };
     let mut capability = match opener.take_capability() {
         Ok(capability) => capability,
         Err(code) => return create_open_error_result(env, code),
     };
-    let (platform, directory) = match capability.take_platform_parts() {
+    let (platform, directory, admission_policy) = match capability.take_admission_parts() {
         Ok(parts) => parts,
         Err(code) => return create_open_error_result(env, code),
     };
-    let owner = match adopt_prebound_directory(lifecycle_token, platform, directory, &qualification)
-    {
+    let owner = match admission_policy {
+        AdmissionPolicy::Production => {
+            let qualification = production_qualification
+                .as_ref()
+                .expect("production opener carries production qualification");
+            adopt_prebound_directory(lifecycle_token, platform, directory, &qualification)
+        }
+        AdmissionPolicy::SelfHostedDarwinArm64(policy) => {
+            adopt_prebound_directory_for_self_hosted_darwin_arm64(
+                lifecycle_token,
+                platform,
+                directory,
+                policy,
+            )
+        }
+    };
+    let owner = match owner {
         Ok(owner) => owner,
         Err(code) => return create_open_error_result(env, code),
     };
@@ -611,7 +717,11 @@ mod tests {
         let file = fs::File::open(&home.cell).expect("open 0700 cell directory");
         let raw_fd = file.into_raw_fd();
         let prebound = unsafe { cell_platform::prebound_directory_from_owned_raw_fd(raw_fd) };
-        (TrustedCellCapability::from_prebound(prebound), raw_fd, home)
+        (
+            TrustedCellCapability::from_prebound(prebound, AdmissionPolicy::Production),
+            raw_fd,
+            home,
+        )
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -738,9 +848,10 @@ mod tests {
             matches!(opener.take_capability(), Err(CellErrorCode::CellClosed)),
             "the final open authority cannot transfer twice"
         );
-        let (mut platform, directory) = capability
-            .take_platform_parts()
+        let (mut platform, directory, admission_policy) = capability
+            .take_admission_parts()
             .expect("capability transfers exact platform and descriptor");
+        assert!(matches!(admission_policy, AdmissionPolicy::Production));
         drop(capability);
         assert!(
             fd_is_open(raw_fd),

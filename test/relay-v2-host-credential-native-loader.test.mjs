@@ -5,6 +5,9 @@ import test from "node:test";
 
 const targetModule = await import("../dist/relay/v2/hostCredentialNativeTarget.js");
 const loaderModule = await import("../dist/relay/v2/hostCredentialNativeLoader.js");
+const selfHostedPolicyModule = await import(
+  "../dist/relay/v2/hostSelfHostedDarwinArm64AdmissionPolicy.js"
+);
 const sourceModule = await import("../dist/relay/v2/hostCredentialNativeModuleSource.js");
 
 const fixture = JSON.parse(readFileSync(
@@ -303,6 +306,8 @@ test("default fixed loader resolves the current target missing without a staged 
 });
 
 const TRUSTED_FACTORY_METHOD = "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
+const SELF_HOSTED_FACTORY_METHOD =
+  "createRelayV2HostCredentialAtomicFileCellSelfHostedDarwinArm64FactoryV1";
 
 function fakeFinalModule(openResult) {
   return Object.freeze({
@@ -484,5 +489,90 @@ test("trusted loader never falls back to the raw v1 module", () => {
   assert.throws(
     () => source.takeNativeModule(),
     (error) => error?.code === "SOURCE_INVALID",
+  );
+});
+
+test("self-hosted Darwin arm64 policy selects only its fixed native factory once", {
+  skip: process.platform !== "darwin" || process.arch !== "arm64",
+}, () => {
+  const calls = [];
+  let productionFactoryCalls = 0;
+  let selfHostedFactoryCalls = 0;
+  const finalModule = fakeFinalModule({
+    abiVersion: 1,
+    operation: "open",
+    outcome: "error",
+    error: { code: "CELL_IO" },
+  });
+  const rawOpen = () => {
+    throw new Error("raw open must not be invoked");
+  };
+  Object.defineProperty(rawOpen, TRUSTED_FACTORY_METHOD, {
+    value: () => {
+      productionFactoryCalls += 1;
+      throw new Error("production factory must not be selected");
+    },
+  });
+  Object.defineProperty(rawOpen, SELF_HOSTED_FACTORY_METHOD, {
+    value: () => {
+      selfHostedFactoryCalls += 1;
+      return Object.freeze({
+        outcome: "ready",
+        bind: () => Object.freeze({ outcome: "bound", module: finalModule }),
+      });
+    },
+  });
+  const artifact = Object.freeze({ [OPEN_METHOD]: rawOpen });
+  const policy =
+    selfHostedPolicyModule.issueRelayV2HostSelfHostedDarwinArm64AdmissionPolicy();
+  const loader =
+    loaderModule
+      .createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64LoaderForRuntime(
+        policy,
+        (specifier) => {
+          calls.push(["resolve", specifier]);
+          return "/resolved/self-hosted.node";
+        },
+        (resolved) => {
+          calls.push(["load", resolved]);
+          return artifact;
+        },
+      );
+  const result = loader(darwinArm64Descriptor());
+  assert.deepEqual(result, { status: "loaded", binding: finalModule });
+  assert.equal(selfHostedFactoryCalls, 1);
+  assert.equal(productionFactoryCalls, 0);
+  assert.deepEqual(calls, [
+    ["resolve", "./native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node"],
+    ["load", "/resolved/self-hosted.node"],
+  ]);
+  assert.throws(
+    () => loader(holderDescriptor(
+      "linux-arm64",
+      "linux",
+      "arm64",
+      "aarch64-unknown-linux-gnu",
+    )),
+    /self-hosted Darwin arm64 loader: target descriptor is invalid/,
+  );
+  assert.throws(
+    () => loaderModule
+      .createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64LoaderForRuntime(
+        policy,
+        () => "/must-not-resolve",
+        () => artifact,
+      ),
+    /admission policy is invalid/,
+    "policy replay is rejected before resolution",
+  );
+  assert.throws(
+    () => loaderModule
+      .createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64LoaderForRuntime(
+        Object.freeze({}),
+        () => "/must-not-resolve",
+        () => artifact,
+      ),
+    /admission policy is invalid/,
+    "forged policy is rejected",
   );
 });

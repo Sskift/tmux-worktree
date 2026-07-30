@@ -9,6 +9,7 @@ import {
 } from "./hostCredentialNativeModuleSource.js";
 import {
   openRelayV2HostNativeCredentialPrivilegedIntakeBridge,
+  openRelayV2HostSelfHostedNativeCredentialPrivilegedIntakeBridge,
 } from "./hostNativeCredentialPrivilegedIntakeBridge.js";
 import {
   openRelayV2HostPrivilegedProductionIntakeComposition,
@@ -59,9 +60,13 @@ import { consumeRelayV2CanonicalHostRuntimeBundleV1 } from
   "./canonicalHostRuntimeBundle.js";
 import {
   takeRelayV2HostLocalDevelopmentActivation,
+  takeRelayV2HostSelfHostedDarwinArm64Activation,
   takeRelayV2HostTrustedDeploymentActivation,
   type RelayV2HostLocalDevelopmentActivation,
+  type RelayV2HostSelfHostedDarwinArm64Activation,
+  type RelayV2HostSelfHostedDarwinArm64ActivationRecord,
   type RelayV2HostTrustedDeploymentActivation,
+  type RelayV2HostTrustedDeploymentActivationRecord,
 } from "./hostShippingDeploymentSource.js";
 
 /**
@@ -333,6 +338,10 @@ CapturedOptions,
 type CredentialIntakeActivation =
   | Readonly<{
     kind: "native";
+    source: RelayV2HostCredentialNativeModuleSource;
+  }>
+  | Readonly<{
+    kind: "native-self-hosted";
     source: RelayV2HostCredentialNativeModuleSource;
   }>
   | Readonly<{
@@ -638,10 +647,12 @@ async function startCapturedShippingRoot(
   let intake: RelayV2HostPrivilegedProductionIntakeComposition | null = null;
   try {
     requireStartupOpen(startupSignal);
-    // Production native support is checked before H0 recovery. The explicit
-    // local-development activation has no native source and therefore cannot
-    // observe, alter, or manufacture a production qualification result.
-    if (credentialIntakeActivation.kind === "native") {
+    // Native module support is checked before H0 recovery. Production and the
+    // independent self-hosted loader have disjoint factory gates; the explicit
+    // local-development activation has no native source. No branch can
+    // manufacture a production qualification result.
+    if (credentialIntakeActivation.kind === "native"
+      || credentialIntakeActivation.kind === "native-self-hosted") {
       const capability = credentialIntakeActivation.source.capability();
       if (capability.status !== "supported") throw nativeModuleFailure(capability);
     }
@@ -716,8 +727,12 @@ async function startCapturedShippingRoot(
         : { carrierWssTlsTrust: captured.carrierWssTlsTrust }),
       canonical,
     };
-    if (credentialIntakeActivation.kind === "native") {
-      intake = await openRelayV2HostNativeCredentialPrivilegedIntakeBridge({
+    if (credentialIntakeActivation.kind === "native"
+      || credentialIntakeActivation.kind === "native-self-hosted") {
+      const openNativeIntake = credentialIntakeActivation.kind === "native"
+        ? openRelayV2HostNativeCredentialPrivilegedIntakeBridge
+        : openRelayV2HostSelfHostedNativeCredentialPrivilegedIntakeBridge;
+      intake = await openNativeIntake({
         takeNativeModule: credentialIntakeActivation.source.takeNativeModule,
         ...intakeOptions,
       });
@@ -799,6 +814,21 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
   dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
 ): Promise<RelayV2HostShippingRootHandle> {
   const deployment = takeRelayV2HostTrustedDeploymentActivation(activation);
+  return startRelayV2HostShippingRootFromNativeActivationRecord(
+    deployment,
+    dashboardManagement,
+    "production",
+  );
+}
+
+async function startRelayV2HostShippingRootFromNativeActivationRecord(
+  deployment: RelayV2HostTrustedDeploymentActivationRecord
+    | RelayV2HostSelfHostedDarwinArm64ActivationRecord,
+  dashboardManagement:
+    | RelayV2HostPrivilegedProductionDashboardManagementOptions
+    | undefined,
+  lane: "production" | "self-hosted",
+): Promise<RelayV2HostShippingRootHandle> {
   const startupSignal = deployment.startupSignal;
   let capturedDashboardManagement:
     | RelayV2HostPrivilegedProductionDashboardManagementOptions
@@ -848,9 +878,31 @@ export async function startRelayV2HostShippingRootFromTrustedDeployment(
   return startCapturedShippingRoot(
     captured,
     deployment.profileSnapshot,
-    Object.freeze({ kind: "native", source: deployment.nativeModuleSource }),
+    Object.freeze({
+      kind: lane === "production" ? "native" : "native-self-hosted",
+      source: deployment.nativeModuleSource,
+    }),
     deployment.closeAndDrain,
     startupSignal,
+  );
+}
+
+/**
+ * Separate consumer for the explicit non-production self-hosted ticket. The
+ * record has the same closed native/runtime shape as production, but only its
+ * independent issuer can create it; this path never calls the production
+ * trusted activation consumer or qualification factory.
+ */
+export async function startRelayV2HostShippingRootFromSelfHostedDarwinArm64Activation(
+  activation: RelayV2HostSelfHostedDarwinArm64Activation,
+  dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions,
+): Promise<RelayV2HostShippingRootHandle> {
+  const deployment =
+    takeRelayV2HostSelfHostedDarwinArm64Activation(activation);
+  return startRelayV2HostShippingRootFromNativeActivationRecord(
+    deployment,
+    dashboardManagement,
+    "self-hosted",
   );
 }
 

@@ -1,7 +1,9 @@
 use super::*;
 use relay_v2_host_credential_atomic_file_cell_platform_common::{
-    CredentialMutationPlatform, DescriptorRelativePlatform, Lookup, ObjectKind, PlatformFailure,
-    RelativeResource, TEMPORARY_ENTROPY_BYTES, TEMPORARY_PREFIX,
+    adopt_prebound_directory_for_self_hosted_darwin_arm64, initialize_process_lifecycle,
+    issue_self_hosted_darwin_arm64_admission_policy, CredentialCompareAndSwapOutcome,
+    CredentialCurrent, CredentialMutationPlatform, DescriptorRelativePlatform, Lookup, ObjectKind,
+    PlatformFailure, RelativeResource, TEMPORARY_ENTROPY_BYTES, TEMPORARY_PREFIX,
 };
 use std::ffi::CString;
 use std::fs;
@@ -15,6 +17,8 @@ use std::time::{Duration, Instant};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const CHILD_TIMEOUT: Duration = Duration::from_secs(5);
+const SELF_HOSTED_CLEAN_RESTART_CREDENTIAL: &[u8] =
+    b"relay-v2-self-hosted-clean-restart-credential-v1";
 
 struct TestDirectory {
     path: PathBuf,
@@ -186,6 +190,45 @@ fn child_assert_descriptors_not_inherited(lines: impl Iterator<Item = String>) {
     }
 }
 
+fn child_open_self_hosted_owner(
+    path: &Path,
+) -> relay_v2_host_credential_atomic_file_cell_platform_common::AdmissionOwner<
+    DarwinDescriptorRelativePlatform,
+> {
+    let lifecycle = initialize_process_lifecycle().expect("initialize process lifecycle");
+    let policy = issue_self_hosted_darwin_arm64_admission_policy()
+        .expect("issue exact Darwin arm64 self-hosted policy");
+    let (platform, directory) = platform_for(path);
+    adopt_prebound_directory_for_self_hosted_darwin_arm64(&lifecycle, platform, directory, policy)
+        .expect("admit self-hosted cell")
+}
+
+fn child_self_hosted_write(path: &Path) {
+    let mut owner = child_open_self_hosted_owner(path);
+    let revision = match owner.read().expect("read initially absent credential") {
+        CredentialCurrent::Absent { revision } => revision,
+        CredentialCurrent::Present { .. } => panic!("writer expected an empty cell"),
+    };
+    assert!(matches!(
+        owner
+            .compare_and_swap(revision, SELF_HOSTED_CLEAN_RESTART_CREDENTIAL)
+            .expect("persist self-hosted credential"),
+        CredentialCompareAndSwapOutcome::Swapped
+    ));
+    owner.close().expect("clean writer close");
+}
+
+fn child_self_hosted_read(path: &Path) {
+    let mut owner = child_open_self_hosted_owner(path);
+    match owner.read().expect("read persisted credential after exec") {
+        CredentialCurrent::Present { bytes, .. } => {
+            assert_eq!(bytes, SELF_HOSTED_CLEAN_RESTART_CREDENTIAL)
+        }
+        CredentialCurrent::Absent { .. } => panic!("persisted credential was absent"),
+    }
+    owner.close().expect("clean reader close");
+}
+
 #[test]
 #[ignore = "subprocess/exec helper invoked by the parent tests"]
 fn subprocess_probe() {
@@ -206,8 +249,28 @@ fn subprocess_probe() {
             child_lock_probe(&path, false);
         }
         Some("NO_INHERIT") => child_assert_descriptors_not_inherited(lines),
+        Some("SELF_HOSTED_WRITE") => {
+            let path = PathBuf::from(lines.next().expect("self-hosted write path"));
+            assert!(lines.next().is_none());
+            child_self_hosted_write(&path);
+        }
+        Some("SELF_HOSTED_READ") => {
+            let path = PathBuf::from(lines.next().expect("self-hosted read path"));
+            assert!(lines.next().is_none());
+            child_self_hosted_read(&path);
+        }
         other => panic!("unknown child probe request {other:?}"),
     }
+}
+
+#[test]
+fn self_hosted_darwin_arm64_clean_process_reopen_preserves_credential() {
+    let temporary = TestDirectory::new("self-hosted-clean-restart");
+    spawn_probe(&format!(
+        "SELF_HOSTED_WRITE\n{}\n",
+        temporary.path.display()
+    ));
+    spawn_probe(&format!("SELF_HOSTED_READ\n{}\n", temporary.path.display()));
 }
 
 #[test]

@@ -9,6 +9,10 @@ import {
   type RelayV2HostCredentialNativeModuleLoad,
   type RelayV2HostCredentialNativeModuleLoader,
 } from "./hostCredentialNativeModuleSource.js";
+import {
+  takeRelayV2HostSelfHostedDarwinArm64AdmissionPolicy,
+  type RelayV2HostSelfHostedDarwinArm64AdmissionPolicy,
+} from "./hostSelfHostedDarwinArm64AdmissionPolicy.js";
 
 const DESCRIPTOR_KEYS = Object.freeze([
   "target",
@@ -19,6 +23,8 @@ const DESCRIPTOR_KEYS = Object.freeze([
 
 const TRUSTED_FACTORY_METHOD =
   "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1" as const;
+const SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD =
+  "createRelayV2HostCredentialAtomicFileCellSelfHostedDarwinArm64FactoryV1" as const;
 
 function fixedLoaderFailure(message: string): Error {
   return new Error(`Relay v2 Host credential native module fixed loader: ${message}`);
@@ -176,7 +182,11 @@ function snapshotClosedRecord(value: unknown, keys: readonly string[]): Record<s
 // function, and this fixed trusted loader is its only production driver (no
 // visibility isolation exists or is claimed). The raw open export is never
 // invoked or delivered here; only the factory is captured.
-function captureRawTrustedFactory(artifact: unknown): ((...args: never[]) => unknown) | null {
+function captureRawFactory(
+  artifact: unknown,
+  factoryMethod: typeof TRUSTED_FACTORY_METHOD
+    | typeof SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD,
+): ((...args: never[]) => unknown) | null {
   const snapshot = snapshotClosedRecord(artifact, [
     RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_OPEN_METHOD,
   ]);
@@ -185,7 +195,7 @@ function captureRawTrustedFactory(artifact: unknown): ((...args: never[]) => unk
   if (!isClosedFunction(open)) return null;
   let descriptor: PropertyDescriptor | undefined;
   try {
-    descriptor = Object.getOwnPropertyDescriptor(open, TRUSTED_FACTORY_METHOD);
+    descriptor = Object.getOwnPropertyDescriptor(open, factoryMethod);
   } catch {
     return null;
   }
@@ -213,7 +223,11 @@ function captureBoundModule(result: unknown): unknown | null {
   // The final module never carries the factory: its open function must not
   // expose the private trusted entry either.
   try {
-    if (Object.getOwnPropertyDescriptor(open, TRUSTED_FACTORY_METHOD) !== undefined) return null;
+    if (Object.getOwnPropertyDescriptor(open, TRUSTED_FACTORY_METHOD) !== undefined
+      || Object.getOwnPropertyDescriptor(
+        open,
+        SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD,
+      ) !== undefined) return null;
   } catch {
     return null;
   }
@@ -260,7 +274,7 @@ export function createRelayV2HostCredentialNativeModuleTrustedLoader(
       throw trustedLoaderFailure("module runtime returned an invalid artifact identity");
     }
     const artifact = loadResolvedArtifact(resolved);
-    const factory = captureRawTrustedFactory(artifact);
+    const factory = captureRawFactory(artifact, TRUSTED_FACTORY_METHOD);
     if (factory === null) throw trustedLoaderFailure("raw artifact surface is invalid");
     let factoryResult: unknown;
     try {
@@ -295,3 +309,86 @@ export const relayV2HostCredentialNativeModuleTrustedLoader:
     (fixedModuleSpecifier) => nativeRequire.resolve(fixedModuleSpecifier),
     (resolvedArtifact) => nativeRequire(resolvedArtifact),
   );
+
+function selfHostedLoaderFailure(message: string): Error {
+  return new Error(
+    `Relay v2 Host credential native module self-hosted Darwin arm64 loader: ${message}`,
+  );
+}
+
+/**
+ * Testable module-runtime adapter for the explicit non-production self-hosted
+ * Darwin arm64 policy. The ticket is consumed at construction, before target
+ * resolution. The returned loader still accepts only the holder-issued exact
+ * Darwin arm64 descriptor and drives only the independent native self-hosted
+ * factory. It never invokes the production factory or raw open and has no JS,
+ * v1, production, or alternate-artifact fallback.
+ */
+export function createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64LoaderForRuntime(
+  policy: RelayV2HostSelfHostedDarwinArm64AdmissionPolicy,
+  resolveArtifact: (fixedModuleSpecifier: string) => string,
+  loadResolvedArtifact: (resolvedArtifact: string) => unknown,
+): RelayV2HostCredentialNativeModuleLoader {
+  if (arguments.length !== 3) throw selfHostedLoaderFailure("module runtime is invalid");
+  takeRelayV2HostSelfHostedDarwinArm64AdmissionPolicy(policy);
+  if (typeof resolveArtifact !== "function" || typeof loadResolvedArtifact !== "function") {
+    throw selfHostedLoaderFailure("module runtime is invalid");
+  }
+  return (descriptor) => {
+    const snapshot = snapshotDescriptor(descriptor);
+    if (snapshot === null
+      || snapshot.target !== "darwin-arm64"
+      || snapshot.platform !== "darwin"
+      || snapshot.architecture !== "arm64"
+      || snapshot.cargoTargetTriple !== "aarch64-apple-darwin") {
+      throw selfHostedLoaderFailure("target descriptor is invalid");
+    }
+    const fixed = getRelayV2HostCredentialNativeTargetDescriptor("darwin-arm64");
+    if (fixed === null) throw selfHostedLoaderFailure("target is unsupported");
+    let resolved: string;
+    try {
+      resolved = resolveArtifact(fixed.loaderModuleSpecifier);
+    } catch (error) {
+      if (isModuleNotFound(error)) return Object.freeze({ status: "missing" });
+      throw error;
+    }
+    if (typeof resolved !== "string" || resolved.length === 0) {
+      throw selfHostedLoaderFailure("module runtime returned an invalid artifact identity");
+    }
+    const artifact = loadResolvedArtifact(resolved);
+    const factory = captureRawFactory(
+      artifact,
+      SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD,
+    );
+    if (factory === null) throw selfHostedLoaderFailure("raw artifact surface is invalid");
+    let factoryResult: unknown;
+    try {
+      factoryResult = Reflect.apply(factory, undefined, []);
+    } catch {
+      throw selfHostedLoaderFailure("self-hosted factory call failed");
+    }
+    const bind = captureFactoryReadyBind(factoryResult);
+    if (bind === null) throw selfHostedLoaderFailure("self-hosted factory result is invalid");
+    let bindResult: unknown;
+    try {
+      bindResult = Reflect.apply(bind, undefined, []);
+    } catch {
+      throw selfHostedLoaderFailure("self-hosted factory bind failed");
+    }
+    const module = captureBoundModule(bindResult);
+    if (module === null) throw selfHostedLoaderFailure("self-hosted factory module is invalid");
+    return Object.freeze({ status: "loaded", binding: module });
+  };
+}
+
+/** Fixed self-hosted loader over this entry's canonical module identity. */
+export function createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64Loader(
+  policy: RelayV2HostSelfHostedDarwinArm64AdmissionPolicy,
+): RelayV2HostCredentialNativeModuleLoader {
+  if (arguments.length !== 1) throw selfHostedLoaderFailure("policy is invalid");
+  return createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64LoaderForRuntime(
+    policy,
+    (fixedModuleSpecifier) => nativeRequire.resolve(fixedModuleSpecifier),
+    (resolvedArtifact) => nativeRequire(resolvedArtifact),
+  );
+}

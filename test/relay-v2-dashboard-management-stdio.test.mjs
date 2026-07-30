@@ -313,11 +313,26 @@ test("requestId canonicality is enforced without pretending to observe manager o
 });
 
 test("extra argv is a silent ordinary pre-handshake failure, not bad-frame 64 or superseded 78", () => {
-  const child = runChild(Buffer.alloc(0), { args: ["forbidden-secret-marker"] });
-  assert.notEqual(child.status, legacyCases.constants.badRequestExitCode);
-  assert.notEqual(child.status, legacyCases.constants.supersededExitCode);
-  assert.deepEqual(child.stdout, Buffer.alloc(0));
-  assert.deepEqual(child.stderr, Buffer.alloc(0));
+  for (const args of [
+    ["forbidden-secret-marker"],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/missing/credential-ca.pem",
+      "--carrier-wss-ca-input", "/missing/carrier-ca.pem",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/missing/credential-ca.pem",
+      "--carrier-wss-ca-input", "/missing/carrier-ca.pem",
+      "--trusted-home", "/Users/forbidden-isolated-home",
+    ],
+  ]) {
+    const child = runChild(Buffer.alloc(0), { args });
+    assert.notEqual(child.status, legacyCases.constants.badRequestExitCode);
+    assert.notEqual(child.status, legacyCases.constants.supersededExitCode);
+    assert.deepEqual(child.stdout, Buffer.alloc(0));
+    assert.deepEqual(child.stderr, Buffer.alloc(0));
+  }
 });
 
 test("environment material is never reflected into frames, logs, or fixed errors", () => {

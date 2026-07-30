@@ -21,6 +21,14 @@ const fixture = JSON.parse(readFileSync(
   ),
   "utf8",
 ));
+const packageMetadata = JSON.parse(readFileSync(
+  new URL("../package.json", import.meta.url),
+  "utf8",
+));
+const tauriConfig = JSON.parse(readFileSync(
+  new URL("../app/src-tauri/tauri.conf.json", import.meta.url),
+  "utf8",
+));
 
 function descriptor(target) {
   const selected = targetModule.getRelayV2HostCredentialNativeTargetDescriptor(target);
@@ -68,6 +76,23 @@ function headerBytes(header) {
   }
   return new Uint8Array([0x4d, 0x5a, ...new Uint8Array(62)]);
 }
+
+test("Darwin arm64 root shipping build stages into the existing full-dist Dashboard resource", () => {
+  assert.equal(
+    packageMetadata.scripts["build:relay-v2-host-darwin-arm64-shipping"],
+    "npm run build && npm run build:relay-v2-host-credential-native -- --target darwin-arm64",
+  );
+  assert.equal(tauriConfig.bundle.resources["../../dist/"], "tw-cli/");
+  assert.equal(
+    tauriConfig.bundle.resources["../../package.json"],
+    "tw-cli/package.json",
+  );
+  assert.equal(
+    fixture.canonicalTargets.find(({ target }) => target === "darwin-arm64")
+      .stagedRelativePath,
+    "dist/relay/v2/native/relay-v2-host-credential-atomic-file-cell-v1-darwin-arm64.node",
+  );
+});
 
 test("native binary header identity follows the frozen Mach-O/ELF rules", () => {
   for (const entry of fixture.binaryHeaderCases) {

@@ -25,6 +25,8 @@ const nativeCell = await import("../dist/relay/v2/hostCredentialAtomicFileCellNa
 
 const OPEN_METHOD = "openRelayV2HostCredentialAtomicFileCellV1";
 const FACTORY_METHOD = "createRelayV2HostCredentialAtomicFileCellTrustedFactoryV1";
+const SELF_HOSTED_FACTORY_METHOD =
+  "createRelayV2HostCredentialAtomicFileCellSelfHostedDarwinArm64FactoryV1";
 const CLOSED_CODES = new Set([
   "NATIVE_INTERFACE_INVALID",
   "CELL_BUSY",
@@ -42,6 +44,7 @@ const CLOSED_CODES = new Set([
 const POISONED_NAMES = [
   OPEN_METHOD,
   FACTORY_METHOD,
+  SELF_HOSTED_FACTORY_METHOD,
   "abiVersion",
   "operation",
   "outcome",
@@ -105,6 +108,14 @@ test("actual selected-target factory invalid-first call consumes the process cla
       outcome: "error",
       error: { code: "CELL_CLOSED" },
     });
+    const selfHostedFactory = Object.getOwnPropertyDescriptor(
+      open,
+      "createRelayV2HostCredentialAtomicFileCellSelfHostedDarwinArm64FactoryV1",
+    ).value;
+    assert.deepStrictEqual(selfHostedFactory(), {
+      outcome: "error",
+      error: { code: "CELL_CLOSED" },
+    });
   `], {
     encoding: "utf8",
     env: {
@@ -165,6 +176,15 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
     assert.equal(Object.hasOwn(factoryDescriptor, "set"), false);
     assert.equal(typeof factoryDescriptor.value, "function");
     const factory = factoryDescriptor.value;
+    const selfHostedFactoryDescriptor =
+      Object.getOwnPropertyDescriptor(binding[OPEN_METHOD], SELF_HOSTED_FACTORY_METHOD);
+    assert.notEqual(
+      selfHostedFactoryDescriptor,
+      undefined,
+      "independent self-hosted factory entry on the raw open function",
+    );
+    assert.equal(Object.hasOwn(selfHostedFactoryDescriptor, "value"), true);
+    assert.equal(typeof selfHostedFactoryDescriptor.value, "function");
 
     const beforeOpen = setterCalls;
     const openResult = binding[OPEN_METHOD](Object.freeze({
@@ -255,6 +275,14 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
         undefined,
         "final module open never carries the trusted factory entry",
       );
+      assert.equal(
+        Object.getOwnPropertyDescriptor(
+          bindResult.module[OPEN_METHOD],
+          SELF_HOSTED_FACTORY_METHOD,
+        ),
+        undefined,
+        "final module open never carries the self-hosted factory entry",
+      );
       const beforeBoundOpen = setterCalls;
       const boundOpenResult = bindResult.module[OPEN_METHOD](Object.freeze({
         abiVersion: 1,
@@ -296,6 +324,10 @@ test("actual selected-target binding is exact, prototype-safe, and closed before
       outcome: "error",
       error: { code: "CELL_CLOSED" },
     });
+    assert.deepEqual(selfHostedFactoryDescriptor.value(), {
+      outcome: "error",
+      error: { code: "CELL_CLOSED" },
+    }, "production and self-hosted factories share one selection claim");
     assert.equal(existsSync(ignoredEnvironmentHome), false);
 
     // The frozen v1 observable behavior is unchanged: the canonical wrapper

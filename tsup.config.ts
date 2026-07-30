@@ -29,6 +29,7 @@ export default defineConfig({
     "src/relay/v2/hostCredentialNativeModuleSource.ts",
     "src/relay/v2/hostCredentialNativeTarget.ts",
     "src/relay/v2/hostCredentialNativeLoader.ts",
+    "src/relay/v2/hostSelfHostedDarwinArm64AdmissionPolicy.ts",
     "src/relay/v2/hostTlsTrustMaterial.ts",
     "src/relay/v2/hostCredentialExchangeCoordinator.ts",
     "src/relay/v2/hostReauthenticationLifecycleOwner.ts",
@@ -221,6 +222,7 @@ export default defineConfig({
     // one-shot source/module claim registries are never duplicated, and
     // relayHost dynamically loads the shipping root's canonical dist entry.
     "./hostNativeCredentialPrivilegedIntakeBridge.js",
+    "./hostSelfHostedDarwinArm64AdmissionPolicy.js",
     // The trusted Host source owns the only activation-ticket registry. The
     // source and root must also share the canonical runtime-bundle and TLS-cut
     // registries instead of bundling private copies.

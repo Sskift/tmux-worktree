@@ -66,7 +66,7 @@ const PROFILE = Object.freeze(profileCases.validProfile);
 const BOOTSTRAP_SECRET = "twhostboot2.privileged-intake-secret-never-reflect";
 const REFRESH_SECRET = "twref2.privileged-intake-refresh-never-reflect";
 const relayV2Corpus = loadRelayV2FixtureCorpus();
-const LOCAL_DEVELOPMENT_BASE_CAPABILITIES = Object.freeze([
+const EXPLICIT_BASE_CAPABILITIES = Object.freeze([
   "error.structured.v1",
   "command.ledger.v1",
   "command.query.v1",
@@ -738,7 +738,7 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       const record = wss.records[0];
       assert.deepEqual(
         record.hello.payload.capabilities,
-        LOCAL_DEVELOPMENT_BASE_CAPABILITIES,
+        EXPLICIT_BASE_CAPABILITIES,
       );
       assert.deepEqual(record.hello.payload.clientDialects, ["tw-relay.v2"]);
       const registered = structuredClone(
@@ -982,6 +982,79 @@ function createPlainModuleSource(nativeModule) {
 }
 
 test("native credential privileged intake bridge transfers one-shot ownership once", async (t) => {
+  await t.test(
+    "self-hosted native bridge advertises the six base capabilities while production stays empty",
+    async () => {
+      const run = async (lane) => {
+        const home = privateHome(`tw-relay-v2-bridge-${lane}-capability-home-`);
+        const h = await makeHarness(
+          lane === "self-hosted" ? "b-s-cap" : "b-p-cap",
+          home,
+        );
+        const daemon = await startDaemon(h);
+        const events = [];
+        const fake = createFakeNativeModule(events);
+        const source = createPlainModuleSource(fake.nativeModule);
+        const byteSource = createByteSource(events);
+        const credentialHttps = createCredentialHttpsTransport(
+          events,
+          h.hostSnapshot,
+        );
+        const wss = createCapabilityWssHarness();
+        const canonical = { ...h.canonical };
+        delete canonical.dashboardManagement;
+        let facade = null;
+        try {
+          const open = lane === "self-hosted"
+            ? bridgeModule
+              .openRelayV2HostSelfHostedNativeCredentialPrivilegedIntakeBridge
+            : bridgeModule.openRelayV2HostNativeCredentialPrivilegedIntakeBridge;
+          facade = await open({
+            takeNativeModule: source.takeNativeModule,
+            trustedHome: home,
+            bootstrapSecretByteSource: byteSource.source,
+            credentialHttpsTransport: credentialHttps.transport,
+            wssTransport: wss.transport,
+            canonical,
+          });
+          const pendingStart = facade.start({
+            requestId: `bridge-${lane}-capability-start`,
+            signal: new AbortController().signal,
+          });
+          await waitFor(
+            () => wss.records[0]?.hello !== null,
+            `${lane} bridge did not send host.hello`,
+          );
+          const record = wss.records[0];
+          const capabilities = record.hello.payload.capabilities;
+          assert.deepEqual(
+            capabilities,
+            lane === "self-hosted" ? EXPLICIT_BASE_CAPABILITIES : [],
+          );
+          const registered = structuredClone(
+            relayV2Corpus.goldenByName.get("host-registered").frame,
+          );
+          registered.requestId = record.hello.requestId;
+          registered.connectorId = `bridge-${lane}-connector`;
+          record.socket.receive(registered);
+          await pendingStart;
+          return capabilities;
+        } finally {
+          await facade?.closeAndDrain().catch(() => undefined);
+          await daemon.close();
+          h.cleanup();
+          rmSync(home, { recursive: true, force: true });
+        }
+      };
+
+      assert.deepEqual(await run("production"), []);
+      assert.deepEqual(
+        await run("self-hosted"),
+        EXPLICIT_BASE_CAPABILITIES,
+      );
+    },
+  );
+
   await t.test("fake native module reaches the real wrapper and intake exactly once", async () => {
     const home = privateHome("tw-relay-v2-bridge-success-home-");
     const h = await makeHarness("bridge-success", home);

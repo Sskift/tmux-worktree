@@ -33,6 +33,15 @@ const compiled = await build({
             ) {
               return globalThis.__relayV2DashboardManagementTrustedHostFactory(options);
             }
+            export async function startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+              selection,
+              options,
+            ) {
+              return globalThis.__relayV2DashboardManagementSelfHostedHostFactory(
+                selection,
+                options,
+              );
+            }
           `,
           loader: "js",
         }),
@@ -225,6 +234,85 @@ test("qualified owner runs exactly once and drains exactly once", async () => {
   assert.deepEqual(calls, ["run", "close"]);
   // The wrapper never writes a frame of its own on the qualified path.
   assert.equal(channel.raw(), "");
+});
+
+test("explicit self-hosted argv is closed, exact, and never falls back to production", async () => {
+  const calls = [];
+  globalThis.__relayV2DashboardManagementTrustedHostFactory = async () => {
+    assert.fail("self-hosted selection must not call the production opener");
+  };
+  globalThis.__relayV2DashboardManagementSelfHostedHostFactory =
+    async (selection, options) => {
+      calls.push({ selection, options });
+      return {
+        runDashboardManagement: async () => 0,
+        closeAndDrain: async () => {},
+      };
+    };
+  const channel = makeIo();
+  assert.equal(await childRuntime.runRelayV2DashboardManagementChildStdio({
+    runtimeVersion: RUNTIME_VERSION,
+    io: channel.io,
+    selectionArguments: [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/credential-ca.pem",
+      "--carrier-wss-ca-input", "/private/carrier-ca.pem",
+      "--provision-profile-input", "/private/profile.json",
+      "--bootstrap-secret-input", "/private/bootstrap",
+    ],
+  }), 0);
+  assert.equal(channel.raw(), "");
+  assert.equal(calls.length, 1);
+  assert.deepEqual({ ...calls[0].selection }, {
+    credentialHttpsCaInputPath: "/private/credential-ca.pem",
+    carrierWssCaInputPath: "/private/carrier-ca.pem",
+    provisionProfileInputPath: "/private/profile.json",
+    bootstrapSecretInputPath: "/private/bootstrap",
+  });
+  assert.equal(calls[0].options.signal instanceof AbortSignal, true);
+
+  for (const selectionArguments of [
+    ["--self-hosted"],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+      "--trusted-home", "/Users/isolated",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--credential-https-ca-input", "/private/replay",
+      "--carrier-wss-ca-input", "/private/b",
+    ],
+    [
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+    ],
+  ]) {
+    const rejected = makeIo();
+    assert.equal(await childRuntime.runRelayV2DashboardManagementChildStdio({
+      runtimeVersion: RUNTIME_VERSION,
+      io: rejected.io,
+      selectionArguments,
+    }), 1);
+    assert.equal(rejected.raw(), "");
+  }
+
+  globalThis.__relayV2DashboardManagementSelfHostedHostFactory = async () => {
+    throw new Error("activation failed");
+  };
+  const failed = makeIo();
+  assert.equal(await childRuntime.runRelayV2DashboardManagementChildStdio({
+    runtimeVersion: RUNTIME_VERSION,
+    io: failed.io,
+    selectionArguments: [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+    ],
+  }), 1);
+  assert.equal(failed.raw(), "", "explicit failure never opens production UNAVAILABLE");
 });
 
 test("session or close uncertainty exits ordinary failure without a second session", async (t) => {

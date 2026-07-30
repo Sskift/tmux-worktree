@@ -18,6 +18,7 @@ import {
   type RelayV2HostManagedConnectorStopInput,
   type RelayV2HostManagedConnectorReauthenticationInput,
   type RelayV2HostLocalDevelopmentCapabilityActivation,
+  type RelayV2HostSelfHostedCapabilityActivation,
 } from "./hostRuntimeComposition.js";
 import { captureRelayV2HostH0ReadinessPort, type RelayV2HostStateStore } from "./hostState.js";
 import {
@@ -118,6 +119,12 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
    */
   readonly localDevelopmentCapabilityActivation?:
     RelayV2HostLocalDevelopmentCapabilityActivation;
+  /**
+   * Explicit self-hosted Darwin arm64 capability activation. It is a separate
+   * one-shot authority and does not represent production qualification.
+   */
+  readonly selfHostedCapabilityActivation?:
+    RelayV2HostSelfHostedCapabilityActivation;
   /** Default-off. The root supplies the recovered Host lineage itself. */
   readonly agentTranscriptLifecycle?: Readonly<{
     store: Omit<RelayAgentAuthorityStoreOptions, "hostId" | "hostEpoch">;
@@ -316,6 +323,25 @@ function captureLocalDevelopmentCapabilityActivation(
   return descriptor.value === undefined
     ? undefined
     : descriptor.value as RelayV2HostLocalDevelopmentCapabilityActivation;
+}
+
+function captureSelfHostedCapabilityActivation(
+  options: RelayV2HostCanonicalProductionCompositionOptions,
+): RelayV2HostSelfHostedCapabilityActivation | undefined | null {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(
+      options,
+      "selfHostedCapabilityActivation",
+    );
+  } catch {
+    return null;
+  }
+  if (descriptor === undefined) return undefined;
+  if (!Object.hasOwn(descriptor, "value")) return null;
+  return descriptor.value === undefined
+    ? undefined
+    : descriptor.value as RelayV2HostSelfHostedCapabilityActivation;
 }
 
 type CapturedReauthenticationOptions = NonNullable<
@@ -614,8 +640,8 @@ async function settleAll(steps: readonly (() => void | Promise<void>)[]): Promis
 
 /**
  * Default-off production owner. Construction recovers existing durable owners
- * but never starts the connector or opens WSS. With no explicit owner-bound
- * local-development activation, the managed carrier advertises no capability.
+ * but never starts the connector or opens WSS. With no recognized explicit
+ * owner-bound activation, the managed carrier advertises no capability.
  */
 export async function openRelayV2HostCanonicalProductionComposition(
   profile: RelayV2HostCanonicalProductionProfile,
@@ -627,6 +653,11 @@ export async function openRelayV2HostCanonicalProductionComposition(
   const localDevelopmentCapabilityActivation =
     captureLocalDevelopmentCapabilityActivation(options);
   if (localDevelopmentCapabilityActivation === null) return null;
+  const selfHostedCapabilityActivation =
+    captureSelfHostedCapabilityActivation(options);
+  if (selfHostedCapabilityActivation === null
+    || localDevelopmentCapabilityActivation !== undefined
+      && selfHostedCapabilityActivation !== undefined) return null;
   const reauthentication = captureReauthenticationOptions(options);
   if (reauthentication === null) return null;
   const wssTransport = captureWssTransportOptions(options);
@@ -851,7 +882,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
         }]),
       }]),
     }]),
-      localDevelopmentCapabilityActivation,
+      localDevelopmentCapabilityActivation ?? selfHostedCapabilityActivation,
     );
     if (await managed.readiness.h0.activate() !== true) {
       throw new RelayV2TerminalManagerError(

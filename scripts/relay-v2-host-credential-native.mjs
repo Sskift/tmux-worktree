@@ -259,6 +259,7 @@ async function assertLoaderBuildExists() {
     "hostCredentialNativeLoader.js",
     "hostCredentialNativeTarget.js",
     "hostCredentialNativeModuleSource.js",
+    "hostSelfHostedDarwinArm64AdmissionPolicy.js",
   ]) {
     await assertRegularFileNoFollow(
       join(DIST_LOADER_DIRECTORY, name),
@@ -520,12 +521,16 @@ async function verifyUnpackedPackage(
   const holderModule = extractedFiles.get(
     "package/dist/relay/v2/hostCredentialNativeModuleSource.js",
   );
+  const selfHostedPolicyModule = extractedFiles.get(
+    "package/dist/relay/v2/hostSelfHostedDarwinArm64AdmissionPolicy.js",
+  );
   const artifact = extractedFiles.get(expectedTarArtifact);
   if (
     packageJsonPath === undefined
     || targetModule === undefined
     || loaderModule === undefined
     || holderModule === undefined
+    || selfHostedPolicyModule === undefined
     || artifact === undefined
   ) {
     fail("npm pack tarball is missing required packed modules");
@@ -563,7 +568,13 @@ async function verifyUnpackedPackage(
     (bytes) => assertNativeBinaryMatchesDescriptor(bytes, descriptor),
     { requireSingleLink: true },
   );
-  return Object.freeze({ artifact, targetModule, loaderModule, holderModule });
+  return Object.freeze({
+    artifact,
+    targetModule,
+    loaderModule,
+    holderModule,
+    selfHostedPolicyModule,
+  });
 }
 
 function parsePackOutput(stdout, packDirectory) {
@@ -829,6 +840,7 @@ async function verifyPack(target) {
         "package/dist/relay/v2/hostCredentialNativeTarget.js",
         "package/dist/relay/v2/hostCredentialNativeLoader.js",
         "package/dist/relay/v2/hostCredentialNativeModuleSource.js",
+        "package/dist/relay/v2/hostSelfHostedDarwinArm64AdmissionPolicy.js",
         expectedArtifact,
       ];
       inspection = await inspectAndExtractNpmPackTar({

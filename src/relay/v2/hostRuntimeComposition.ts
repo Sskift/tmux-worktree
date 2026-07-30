@@ -129,7 +129,7 @@ const runtimePreCarrierOfferIssuers = new WeakMap<object, Readonly<{
   issue(input: Readonly<RelayV2HostPreCarrierOfferIssueInput>):
   RelayV2HostPreCarrierOfferClaim | null;
 }>>();
-const LOCAL_DEVELOPMENT_BASE_CAPABILITIES = Object.freeze([
+const EXPLICIT_BASE_CAPABILITIES = Object.freeze([
   ...RELAY_V2_REQUIRED_CAPABILITIES,
 ]);
 
@@ -138,6 +138,8 @@ declare const relayV2HostDashboardManagementPortBrand: unique symbol;
 declare const relayV2HostDashboardManagementBindingBrand: unique symbol;
 declare const relayV2HostLocalDevelopmentCapabilityActivationBrand: unique symbol;
 declare const relayV2HostLocalDevelopmentCapabilityActivationHandoffBrand: unique symbol;
+declare const relayV2HostSelfHostedCapabilityActivationBrand: unique symbol;
+declare const relayV2HostSelfHostedCapabilityActivationHandoffBrand: unique symbol;
 
 /** Process-local, owner-bound, one-shot opt-in for the local-development lane. */
 export interface RelayV2HostLocalDevelopmentCapabilityActivation {
@@ -172,6 +174,43 @@ const localDevelopmentCapabilityActivationHandoffs = new WeakMap<
   object,
   RelayV2HostLocalDevelopmentCapabilityActivationHandoffRecord
 >();
+
+/**
+ * Independent process-local, owner-bound, one-shot opt-in for the explicit
+ * self-hosted Darwin arm64 lane. It is not a production qualification.
+ */
+export interface RelayV2HostSelfHostedCapabilityActivation {
+  readonly [relayV2HostSelfHostedCapabilityActivationBrand]: true;
+}
+
+/** One-shot self-hosted opt-in bound to one exact native credential cell. */
+export interface RelayV2HostSelfHostedCapabilityActivationHandoff {
+  readonly [relayV2HostSelfHostedCapabilityActivationHandoffBrand]: true;
+}
+
+interface RelayV2HostSelfHostedCapabilityActivationRecord {
+  readonly credentialOwner: object;
+  consumed: boolean;
+}
+
+const selfHostedCapabilityActivations = new WeakMap<
+  object,
+  RelayV2HostSelfHostedCapabilityActivationRecord
+>();
+
+interface RelayV2HostSelfHostedCapabilityActivationHandoffRecord {
+  readonly credentialCell: object;
+  consumed: boolean;
+}
+
+const selfHostedCapabilityActivationHandoffs = new WeakMap<
+  object,
+  RelayV2HostSelfHostedCapabilityActivationHandoffRecord
+>();
+
+export type RelayV2HostExplicitBaseCapabilityActivation =
+  | RelayV2HostLocalDevelopmentCapabilityActivation
+  | RelayV2HostSelfHostedCapabilityActivation;
 
 /** Opaque, owner-bound claim token emitted by one managed Host composition. */
 export interface RelayV2HostDashboardManagementPort {
@@ -1395,6 +1434,75 @@ function consumeRelayV2HostLocalDevelopmentCapabilityActivation(
   return true;
 }
 
+export function issueRelayV2HostSelfHostedCapabilityActivationHandoff(
+  credentialCell: object,
+): RelayV2HostSelfHostedCapabilityActivationHandoff {
+  if ((typeof credentialCell !== "object" && typeof credentialCell !== "function")
+    || credentialCell === null
+    || nodeTypes.isProxy(credentialCell)) throw managedCompositionFailure();
+  const handoff = Object.freeze(Object.create(null)) as
+    RelayV2HostSelfHostedCapabilityActivationHandoff;
+  selfHostedCapabilityActivationHandoffs.set(handoff, {
+    credentialCell,
+    consumed: false,
+  });
+  return handoff;
+}
+
+export function matchesRelayV2HostSelfHostedCapabilityActivationHandoff(
+  handoff: unknown,
+  credentialCell: object,
+): handoff is RelayV2HostSelfHostedCapabilityActivationHandoff {
+  if ((typeof handoff !== "object" && typeof handoff !== "function")
+    || handoff === null
+    || nodeTypes.isProxy(handoff)) return false;
+  const record = selfHostedCapabilityActivationHandoffs.get(handoff);
+  return record !== undefined
+    && !record.consumed
+    && record.credentialCell === credentialCell;
+}
+
+export function transferRelayV2HostSelfHostedCapabilityActivationHandoff(
+  handoff: RelayV2HostSelfHostedCapabilityActivationHandoff,
+  credentialCell: object,
+  credentialOwner: object,
+): RelayV2HostSelfHostedCapabilityActivation {
+  if (!matchesRelayV2HostSelfHostedCapabilityActivationHandoff(handoff, credentialCell)
+    || (typeof credentialOwner !== "object" && typeof credentialOwner !== "function")
+    || credentialOwner === null
+    || nodeTypes.isProxy(credentialOwner)) throw managedCompositionFailure();
+  const record = selfHostedCapabilityActivationHandoffs.get(handoff as object)!;
+  record.consumed = true;
+  const activation = Object.freeze(Object.create(null)) as
+    RelayV2HostSelfHostedCapabilityActivation;
+  selfHostedCapabilityActivations.set(activation, {
+    credentialOwner,
+    consumed: false,
+  });
+  return activation;
+}
+
+function consumeRelayV2HostExplicitBaseCapabilityActivation(
+  activation: RelayV2HostExplicitBaseCapabilityActivation | undefined,
+  credentialOwner: object,
+): boolean {
+  if (activation === undefined) return false;
+  if ((typeof activation !== "object" && typeof activation !== "function")
+    || activation === null
+    || nodeTypes.isProxy(activation)) throw managedCompositionFailure();
+  if (localDevelopmentCapabilityActivations.has(activation)) {
+    return consumeRelayV2HostLocalDevelopmentCapabilityActivation(
+      activation as RelayV2HostLocalDevelopmentCapabilityActivation,
+      credentialOwner,
+    );
+  }
+  const record = selfHostedCapabilityActivations.get(activation);
+  if (record === undefined || record.consumed
+    || record.credentialOwner !== credentialOwner) throw managedCompositionFailure();
+  record.consumed = true;
+  return true;
+}
+
 const MANAGED_DATA_NODE_IS_PROXY = nodeTypes.isProxy;
 const MANAGED_DATA_OBJECT_CREATE = Object.create;
 const MANAGED_DATA_OBJECT_GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
@@ -1995,22 +2103,22 @@ function projectManagedConnectorCut(
  */
 export async function openRelayV2HostManagedConnectorRuntimeComposition(
   options: RelayV2HostManagedConnectorRuntimeCompositionOptions,
-  localDevelopmentActivation?: RelayV2HostLocalDevelopmentCapabilityActivation,
+  explicitBaseCapabilityActivation?: RelayV2HostExplicitBaseCapabilityActivation,
 ): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
   const credentialOwner = options.connector.carrier.credentialReferences;
-  const localDevelopmentCapabilities = consumeRelayV2HostLocalDevelopmentCapabilityActivation(
-    localDevelopmentActivation,
+  const explicitBaseCapabilities = consumeRelayV2HostExplicitBaseCapabilityActivation(
+    explicitBaseCapabilityActivation,
     credentialOwner,
   );
   return openRelayV2HostManagedConnectorRuntimeCompositionInternal(
     options,
-    localDevelopmentCapabilities,
+    explicitBaseCapabilities,
   );
 }
 
 async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
   options: RelayV2HostManagedConnectorRuntimeCompositionOptions,
-  localDevelopmentCapabilities: boolean,
+  explicitBaseCapabilities: boolean,
 ): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
   const runtimeOptions = captureRelayV2HostCarrierRuntimeOptions(options.runtime);
   const connectorOptions = options.connector;
@@ -2150,7 +2258,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
       },
     });
     const attemptAdapter = new RelayV2HostConnectorCarrierAttemptAdapter(
-      localDevelopmentCapabilities
+      explicitBaseCapabilities
         ? {
             factory: carrierAttemptFactory,
             preCarrierOfferIssuer: Object.freeze({
@@ -2273,7 +2381,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
               || latestStatus.connectorId !== connectorId
               || attemptRuntimeBindings.get(input.controllerGeneration)
                 !== runtimeBinding) return Object.freeze([]);
-            return LOCAL_DEVELOPMENT_BASE_CAPABILITIES;
+            return EXPLICIT_BASE_CAPABILITIES;
           },
           fenceReauthentication(): void {
             reauthenticationFenced = true;
@@ -2681,11 +2789,12 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
  * over one canonical credential authority/reference. It does not open a
  * socket, resolve credential material, start a process/timer/retry, or provide
  * a Relay v1 fallback. Capabilities remain empty unless the exact credential
- * owner supplies its explicit one-shot local-development activation.
+ * owner supplies a recognized one-shot local-development or explicit
+ * self-hosted activation.
  */
 export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
   rawOptions: RelayV2HostManagedWssConnectorRuntimeCompositionOptions,
-  localDevelopmentActivation?: RelayV2HostLocalDevelopmentCapabilityActivation,
+  explicitBaseCapabilityActivation?: RelayV2HostExplicitBaseCapabilityActivation,
 ): Promise<RelayV2HostManagedConnectorRuntimeComposition> {
   let fields: Record<string, unknown>;
   let connectorFields: Record<string, unknown>;
@@ -2714,8 +2823,8 @@ export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
 
   const credentialAuthority = connectorFields.credentialAuthority as
     RelayV2HostCredentialAuthority;
-  const localDevelopmentCapabilities = consumeRelayV2HostLocalDevelopmentCapabilityActivation(
-    localDevelopmentActivation,
+  const explicitBaseCapabilities = consumeRelayV2HostExplicitBaseCapabilityActivation(
+    explicitBaseCapabilityActivation,
     credentialAuthority,
   );
   let transportLifecycleFactory: RelayV2HostWssTransportLifecycleFactory;
@@ -2738,5 +2847,5 @@ export async function openRelayV2HostManagedWssConnectorRuntimeComposition(
       }),
       transportLifecycleFactory,
     }),
-  }), localDevelopmentCapabilities);
+  }), explicitBaseCapabilities);
 }

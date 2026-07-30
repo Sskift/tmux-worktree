@@ -21,19 +21,23 @@ function readVersion(): string {
  * child entry is obtained it is awaited outside the try; the entry never
  * rejects, and no second session is ever started on the same channel.
  */
-async function runRelayV2DashboardManagementHiddenChild(version: string): Promise<number> {
+async function runRelayV2DashboardManagementHiddenChild(
+  version: string,
+  selectionArguments: readonly string[],
+): Promise<number> {
   let runChildStdio;
   try {
     const entry = await import("./relay/v2/relayV2DashboardManagementChildRuntime.js");
     runChildStdio = entry.runRelayV2DashboardManagementChildStdio;
     if (typeof runChildStdio !== "function") throw new Error("missing child entry");
   } catch {
+    if (selectionArguments.length !== 0) return 1;
     const {
       runRelayV2DashboardManagementStdio,
     } = await import("./relay/v2/relayV2DashboardManagementStdio.js");
     return runRelayV2DashboardManagementStdio(version);
   }
-  return runChildStdio({ runtimeVersion: version });
+  return runChildStdio({ runtimeVersion: version, selectionArguments });
 }
 
 function printHelp(): void {
@@ -165,11 +169,10 @@ async function main() {
       return;
     }
     case "__relay-v2-dashboard-management-stdio": {
-      if (process.argv.length !== 3) {
-        process.exitCode = 1;
-        return;
-      }
-      process.exitCode = await runRelayV2DashboardManagementHiddenChild(readVersion());
+      process.exitCode = await runRelayV2DashboardManagementHiddenChild(
+        readVersion(),
+        process.argv.slice(3),
+      );
       return;
     }
     case "terminal-control": {

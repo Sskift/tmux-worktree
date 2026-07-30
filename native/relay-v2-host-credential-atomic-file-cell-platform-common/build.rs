@@ -56,8 +56,12 @@ fn no_broker_namespace<'a>(value: &'a Value, label: &str) -> &'a str {
 
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let build_target = env::var("TARGET").expect("TARGET");
     let contract_dir =
         format!("{crate_dir}/../../contracts/relay/v2/host-credential-atomic-file-cell-v1");
+    let self_hosted_manifest_path = format!(
+        "{crate_dir}/../../contracts/relay/v2/host-credential-self-hosted-darwin-arm64-v1/manifest.json"
+    );
     let manifest_path = format!("{contract_dir}/manifest.json");
     let journal_path = format!("{contract_dir}/claim-journal-v1.json");
     let mutation_path = format!("{contract_dir}/credential-mutation-cases-v1.json");
@@ -66,6 +70,7 @@ fn main() {
     println!("cargo:rerun-if-changed={journal_path}");
     println!("cargo:rerun-if-changed={mutation_path}");
     println!("cargo:rerun-if-changed={artifact_path}");
+    println!("cargo:rerun-if-changed={self_hosted_manifest_path}");
 
     let manifest: Value = serde_json::from_slice(
         &fs::read(&manifest_path).expect("read host credential cell manifest"),
@@ -737,11 +742,154 @@ fn main() {
         );
     }
 
+    let self_hosted_manifest: Value = serde_json::from_slice(
+        &fs::read(&self_hosted_manifest_path).expect("read self-hosted admission manifest"),
+    )
+    .expect("parse self-hosted admission manifest");
+    assert_eq!(
+        member(&self_hosted_manifest, "contract"),
+        "tmux-worktree-relay-v2-host-credential-self-hosted-darwin-arm64-admission"
+    );
+    assert_eq!(
+        unsigned(
+            member(&self_hosted_manifest, "contractVersion"),
+            "self-hosted contractVersion"
+        ),
+        1
+    );
+    assert_eq!(
+        member(&self_hosted_manifest, "status"),
+        "frozen-explicit-non-production"
+    );
+    let self_hosted_target = member(&self_hosted_manifest, "target");
+    assert_eq!(member(self_hosted_target, "name"), "darwin-arm64");
+    assert_eq!(member(self_hosted_target, "platform"), "darwin");
+    assert_eq!(member(self_hosted_target, "architecture"), "arm64");
+    assert_eq!(
+        member(self_hosted_target, "cargoTargetTriple"),
+        "aarch64-apple-darwin"
+    );
+    let self_hosted_production = member(&self_hosted_manifest, "production");
+    assert_eq!(member(self_hosted_production, "wired"), false);
+    assert_eq!(
+        member(self_hosted_production, "qualificationEffect"),
+        "none"
+    );
+    assert_eq!(
+        member(
+            self_hosted_production,
+            "hostCredentialQualifiedRecordsMustRemainEmpty"
+        ),
+        true
+    );
+    assert_eq!(
+        member(self_hosted_production, "trustedFactorySelectionAllowed"),
+        false
+    );
+    assert_eq!(
+        member(self_hosted_production, "readinessOrCapabilityEffect"),
+        "none"
+    );
+    let self_hosted_admission = member(&self_hosted_manifest, "admission");
+    assert_eq!(
+        member(self_hosted_admission, "owner"),
+        "existing-platform-common-AdmissionOwner"
+    );
+    assert_eq!(
+        member(self_hosted_admission, "credentialMutation"),
+        "existing-platform-common-read-cas-owner"
+    );
+    assert_eq!(
+        member(self_hosted_admission, "newJavascriptCredentialStoreAllowed"),
+        false
+    );
+    assert_eq!(
+        member(self_hosted_admission, "newNativeMutationOwnerAllowed"),
+        false
+    );
+    assert_eq!(
+        member(
+            self_hosted_admission,
+            "productionDurabilityQualificationUsed"
+        ),
+        false
+    );
+    let self_hosted_persistence = member(&self_hosted_manifest, "persistence");
+    assert_eq!(
+        member(self_hosted_persistence, "claim"),
+        "single-process-clean-restart-only"
+    );
+    assert_eq!(
+        member(self_hosted_persistence, "snapshotRollbackAllowed"),
+        false
+    );
+    assert_eq!(
+        member(
+            self_hosted_persistence,
+            "directoryCopyCloneOrMigrationAllowed"
+        ),
+        false
+    );
+    assert_eq!(
+        member(self_hosted_persistence, "powerLossDurabilityClaimed"),
+        false
+    );
+    let self_hosted_capabilities = member(&self_hosted_manifest, "baseCapabilities");
+    exact_string_array(
+        member(self_hosted_capabilities, "hostHelloCapabilities"),
+        "self-hosted hostHelloCapabilities",
+        &[
+            "error.structured.v1",
+            "command.ledger.v1",
+            "command.query.v1",
+            "snapshot.revision.v1",
+            "event.sequence.v1",
+            "terminal.stream.resume.v1",
+        ],
+    );
+    exact_string_array(
+        member(self_hosted_capabilities, "optionalCapabilities"),
+        "self-hosted optionalCapabilities",
+        &[],
+    );
+    assert_eq!(
+        member(
+            self_hosted_capabilities,
+            "productionActivationOrQualificationUsed"
+        ),
+        false
+    );
+    let self_hosted_shipping = member(&self_hosted_manifest, "shipping");
+    let deployment_precondition = member(self_hosted_shipping, "deploymentOwnerPrecondition");
+    assert_eq!(
+        member(deployment_precondition, "nodeOrNativeCreatesDirectories"),
+        false
+    );
+    exact_string_array(
+        member(deployment_precondition, "fixedDirectories"),
+        "self-hosted fixedDirectories",
+        &[
+            "~/.tmux-worktree",
+            "~/.tmux-worktree/relay-v2-host-credential-atomic-file-cell-v1",
+        ],
+    );
+    assert_eq!(member(deployment_precondition, "exactModeOctal"), "0700");
+    let self_hosted_enabled = build_target
+        == string(
+            member(self_hosted_target, "cargoTargetTriple"),
+            "self-hosted cargoTargetTriple",
+        );
+
     let mut generated = String::new();
     writeln!(generated, "pub(super) const CONTRACT_REVISION: u32 = 7;").unwrap();
     writeln!(
         generated,
         "pub(super) const RESOURCE_CONTRACT_VERSION: u32 = 1;"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(super) const SELF_HOSTED_DARWIN_ARM64_ADMISSION_ENABLED: bool = {self_hosted_enabled};"
     )
     .unwrap();
     writeln!(

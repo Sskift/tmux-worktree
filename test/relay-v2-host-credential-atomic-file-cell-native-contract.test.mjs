@@ -10,6 +10,10 @@ const contractRoot = new URL(
   import.meta.url,
 );
 const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot), "utf8"));
+const selfHostedManifest = JSON.parse(readFileSync(new URL(
+  "../host-credential-self-hosted-darwin-arm64-v1/manifest.json",
+  contractRoot,
+), "utf8"));
 const fixture = JSON.parse(
   readFileSync(new URL("native-interface-cases.json", contractRoot), "utf8"),
 );
@@ -31,6 +35,77 @@ const nativeTargetModule = await import(
 
 const ABI_VERSION = nativeCell.RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_ABI_VERSION;
 const OPEN_METHOD = nativeCell.RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_OPEN_METHOD;
+
+test("Darwin arm64 self-hosted admission is independent and cannot qualify production", () => {
+  assert.equal(manifest.productionWired, false);
+  assert.deepEqual(
+    manifest.platformResources.durabilityQualification.qualifiedRecords,
+    [],
+  );
+  assert.equal(
+    manifest.nativeModuleAuthority.pathOrDescriptorArgumentInAbi,
+    false,
+  );
+  assert.equal(
+    manifest.nativeModuleAuthority.homePathEnvironmentOrGlobalLookupAllowed,
+    false,
+  );
+  assert.equal(selfHostedManifest.status, "frozen-explicit-non-production");
+  assert.deepEqual(selfHostedManifest.target, {
+    name: "darwin-arm64",
+    platform: "darwin",
+    architecture: "arm64",
+    cargoTargetTriple: "aarch64-apple-darwin",
+  });
+  assert.deepEqual(selfHostedManifest.production, {
+    wired: false,
+    qualificationEffect: "none",
+    hostCredentialQualifiedRecordsMustRemainEmpty: true,
+    trustedFactorySelectionAllowed: false,
+    readinessOrCapabilityEffect: "none",
+  });
+  assert.equal(
+    selfHostedManifest.persistence.claim,
+    "single-process-clean-restart-only",
+  );
+  assert.equal(selfHostedManifest.persistence.snapshotRollbackAllowed, false);
+  assert.equal(
+    selfHostedManifest.persistence.directoryCopyCloneOrMigrationAllowed,
+    false,
+  );
+  assert.equal(selfHostedManifest.persistence.powerLossDurabilityClaimed, false);
+  assert.deepEqual(selfHostedManifest.baseCapabilities.hostHelloCapabilities, [
+    "error.structured.v1",
+    "command.ledger.v1",
+    "command.query.v1",
+    "snapshot.revision.v1",
+    "event.sequence.v1",
+    "terminal.stream.resume.v1",
+  ]);
+  assert.deepEqual(selfHostedManifest.baseCapabilities.optionalCapabilities, []);
+  assert.equal(
+    selfHostedManifest.baseCapabilities.productionActivationOrQualificationUsed,
+    false,
+  );
+  assert.equal(selfHostedManifest.shipping.defaultSelected, false);
+  assert.equal(selfHostedManifest.shipping.relayV1FallbackAllowed, false);
+  assert.equal(
+    selfHostedManifest.shipping.productionTrustedFactoryFallbackAllowed,
+    false,
+  );
+  assert.deepEqual(
+    selfHostedManifest.shipping.deploymentOwnerPrecondition.fixedDirectories,
+    [
+      "~/.tmux-worktree",
+      "~/.tmux-worktree/relay-v2-host-credential-atomic-file-cell-v1",
+    ],
+  );
+  assert.equal(
+    selfHostedManifest.shipping.deploymentOwnerPrecondition
+      .nodeOrNativeCreatesDirectories,
+    false,
+  );
+});
 
 function errorCode(code) {
   return (error) => error?.code === code;

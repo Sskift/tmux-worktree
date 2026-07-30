@@ -80,12 +80,30 @@ const virtualModules = new Map([
   ["./hostCredentialNativeLoader.js", `
     export const relayV2HostCredentialNativeModuleTrustedLoader =
       globalThis.__hostDeploymentTrustedLoader;
+    export function createRelayV2HostCredentialNativeModuleSelfHostedDarwinArm64Loader(policy) {
+      const h = globalThis.__hostDeploymentHarness;
+      h.events.push(["self-hosted.loader", policy]);
+      return h.selfHostedLoader;
+    }
+  `],
+  ["./hostSelfHostedDarwinArm64AdmissionPolicy.js", `
+    export function issueRelayV2HostSelfHostedDarwinArm64AdmissionPolicy() {
+      const h = globalThis.__hostDeploymentHarness;
+      const policy = Object.freeze(Object.create(null));
+      h.events.push(["self-hosted.policy", policy]);
+      return policy;
+    }
   `],
   ["./hostCredentialNativeModuleSource.js", `
     export function createRelayV2HostCredentialNativeModuleSource(target, loader) {
       const h = globalThis.__hostDeploymentHarness;
-      if (loader !== h.trustedLoader) throw new Error("trusted loader was replaced");
-      h.events.push(["native.create", target]);
+      const kind = loader === h.trustedLoader
+        ? "production"
+        : loader === h.selfHostedLoader
+          ? "self-hosted"
+          : null;
+      if (kind === null) throw new Error("fixed loader was replaced");
+      h.events.push(["native.create", target, kind]);
       const source = {
         capability() {
           h.events.push(["native.capability"]);
@@ -275,10 +293,11 @@ const virtualModules = new Map([
     }
   `],
   ["./hostNativeCredentialPrivilegedIntakeBridge.js", `
-    export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(options) {
+    async function open(options, lane) {
       const h = globalThis.__hostDeploymentHarness;
       h.events.push(["intake.open", options.profileSnapshot, options.canonical]);
       h.nativeIntakeOptions = options;
+      h.nativeIntakeLane = lane;
       if (Object.hasOwn(options, "localDevelopmentCapabilityActivationHandoff")) {
         throw new Error("production intake received local-development handoff");
       }
@@ -287,9 +306,18 @@ const virtualModules = new Map([
       if (options.canonical.welcome.hostId !== h.profile.hostId) {
         throw new Error("welcome lineage split");
       }
-      if (options.credentialHttpsTlsTrust !== undefined
+      if (h.expectNativeTls) {
+        if (options.credentialHttpsTlsTrust === undefined
+          || options.carrierWssTlsTrust === undefined) {
+          throw new Error("self-hosted TLS cuts were omitted");
+        }
+        h.nativeTlsTrust = {
+          credential: options.credentialHttpsTlsTrust,
+          carrier: options.carrierWssTlsTrust,
+        };
+      } else if (options.credentialHttpsTlsTrust !== undefined
         || options.carrierWssTlsTrust !== undefined) {
-        throw new Error("system TLS cuts were replaced");
+        throw new Error("production system TLS cuts were replaced");
       }
       h.bootstrapSecretByteSource = options.bootstrapSecretByteSource;
       if (options.bootstrapSecretByteSource !== undefined) {
@@ -325,6 +353,12 @@ const virtualModules = new Map([
       });
       if (h.abortAfterIntakeOpen) h.processSignalController.abort();
       return intake;
+    }
+    export async function openRelayV2HostNativeCredentialPrivilegedIntakeBridge(options) {
+      return open(options, "production");
+    }
+    export async function openRelayV2HostSelfHostedNativeCredentialPrivilegedIntakeBridge(options) {
+      return open(options, "self-hosted");
     }
   `],
   ["./hostPrivilegedProductionIntakeComposition.js", `
@@ -441,6 +475,8 @@ const compiled = await build({
   plugins: [plugin],
 });
 globalThis.__hostDeploymentTrustedLoader = Object.freeze(function trustedLoader() {});
+globalThis.__hostDeploymentSelfHostedLoader =
+  Object.freeze(function selfHostedLoader() {});
 const module = await import(
   `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
 );
@@ -472,6 +508,7 @@ function createHarness(home) {
     profile: canonicalProfile(),
     profileReads: 0,
     trustedLoader: globalThis.__hostDeploymentTrustedLoader,
+    selfHostedLoader: globalThis.__hostDeploymentSelfHostedLoader,
     nativeModule: Object.freeze({ openRelayV2HostCredentialAtomicFileCellV1() {} }),
     events: [],
     sources: [],
@@ -488,6 +525,8 @@ function createHarness(home) {
     localCapabilityHandoffIssueCount: 0,
     localIntakeOptions: null,
     nativeIntakeOptions: null,
+    expectNativeTls: false,
+    nativeTlsTrust: null,
     inheritedThenableErrorCode: null,
     hostileThenableErrorCode: null,
     hostileThenGetterReads: 0,
@@ -577,6 +616,7 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     assert.equal(Reflect.get(handle, "profileSnapshot"), undefined);
     assert.equal(Reflect.get(handle, "runtimeBundle"), undefined);
     assert.equal(Reflect.get(handle, "nativeModuleSource"), undefined);
+    assert.equal(first.nativeIntakeLane, "production");
     assert.equal(first.localCapabilityHandoffIssueCount, 0);
     assert.equal(
       Object.hasOwn(
@@ -732,6 +772,108 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     writeFileSync(carrierCaPath, carrierCa, { mode: 0o600 });
     chmodSync(credentialCaPath, 0o600);
     chmodSync(carrierCaPath, 0o600);
+
+    if (process.platform === "darwin" && process.arch === "arm64") {
+      const accountHome = createPrivateHome(60);
+      chmodSync(accountHome, 0o750);
+      const selfHostedProfileInputPath =
+        join(accountHome, "self-hosted-profile-input.json");
+      writeFileSync(selfHostedProfileInputPath, "profile-input", { mode: 0o600 });
+      chmodSync(selfHostedProfileInputPath, 0o600);
+      const selfHosted = createHarness(accountHome);
+      selfHosted.expectNativeTls = true;
+      globalThis.__hostDeploymentHarness = selfHosted;
+      const selfHostedAbort = new AbortController();
+      const selfHostedHandle =
+        await module.startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+        Object.freeze({
+          credentialHttpsCaInputPath: credentialCaPath,
+          carrierWssCaInputPath: carrierCaPath,
+          provisionProfileInputPath: selfHostedProfileInputPath,
+        }),
+        Object.freeze({
+          clock: dashboardClock,
+          runtimeVersion: "0.0.0-dashboard-self-hosted-test",
+          signal: selfHostedAbort.signal,
+          io: Object.freeze({
+            input: dashboardInput,
+            writeFrame: dashboardWrite,
+          }),
+        }),
+        );
+      assert.equal(typeof selfHostedHandle.runDashboardManagement, "function");
+      assert.equal(selfHosted.nativeIntakeLane, "self-hosted");
+      assert.deepEqual(
+        selfHosted.events.filter(([name]) => name.startsWith("profile.")).slice(0, 3),
+        [
+          ["profile.provisioning.read", selfHostedProfileInputPath],
+          ["profile.create", accountHome, selfHosted.profile],
+          ["profile.read", accountHome],
+        ],
+        "self-hosted provisioning writes through the existing account-home profile store",
+      );
+      assert.deepEqual(
+      selfHosted.events
+        .filter(([name]) => name === "native.create")
+        .map(([, target, kind]) => [target, kind]),
+      [[{
+        platform: process.platform,
+        architecture: process.arch,
+        napiVersion: Number(process.versions.napi),
+      }, "self-hosted"]],
+      );
+      assert.equal(
+      selfHosted.events.filter(([name]) => name === "self-hosted.policy").length,
+      1,
+      );
+      assert.equal(
+      selfHosted.events.filter(([name]) => name === "self-hosted.loader").length,
+      1,
+      );
+      const selfHostedTerminal = selfHosted.events
+        .find(([name]) => name === "terminal.ready");
+      assert.equal(
+      selfHostedTerminal[2].socketPath,
+      join(accountHome, ".tmux-worktree", "terminal-control-v1.sock"),
+      );
+      assert.equal(
+      Object.hasOwn(selfHostedTerminal[2].autoStartCliTarget, "home"),
+      false,
+      "self-hosted terminal-control keeps the real account process target",
+      );
+      const selfHostedRuntimeOptions = selfHosted.events
+        .find(([name]) => name === "runtime.create")[1];
+      assert.equal(
+      Object.hasOwn(selfHostedRuntimeOptions, "configLoader"),
+      false,
+      "self-hosted discovery keeps the production account config owner",
+      );
+      assert.equal(
+      Object.hasOwn(selfHostedRuntimeOptions.localCliTarget, "home"),
+      false,
+      "self-hosted runtime does not redirect TW discovery into an isolated home",
+      );
+      assert.equal(
+      Buffer.from(
+        selfHosted.nativeTlsTrust.credential.certificateAuthorities[0],
+      ).toString("utf8"),
+      credentialCa,
+      );
+      assert.equal(
+      Buffer.from(
+        selfHosted.nativeTlsTrust.carrier.certificateAuthorities[0],
+      ).toString("utf8"),
+      carrierCa,
+      );
+      assert.equal(await selfHostedHandle.runDashboardManagement(), 0);
+      assert.equal(
+      selfHosted.events.some(([name]) => name === "process.run"),
+      false,
+      );
+      await selfHostedHandle.closeAndDrain();
+      rmSync(accountHome, { recursive: true, force: true });
+    }
+
     const localDevelopment = createHarness(home);
     localDevelopment.profile = localDevelopmentProfile();
     localDevelopment.provisioningProfile = localDevelopment.profile;

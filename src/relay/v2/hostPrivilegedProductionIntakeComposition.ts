@@ -38,9 +38,13 @@ import {
 } from "./hostTlsTrustMaterial.js";
 import {
   matchesRelayV2HostLocalDevelopmentCapabilityActivationHandoff,
+  matchesRelayV2HostSelfHostedCapabilityActivationHandoff,
   transferRelayV2HostLocalDevelopmentCapabilityActivationHandoff,
+  transferRelayV2HostSelfHostedCapabilityActivationHandoff,
   type RelayV2HostLocalDevelopmentCapabilityActivation,
   type RelayV2HostLocalDevelopmentCapabilityActivationHandoff,
+  type RelayV2HostSelfHostedCapabilityActivation,
+  type RelayV2HostSelfHostedCapabilityActivationHandoff,
 } from "./hostRuntimeComposition.js";
 
 export interface RelayV2HostCredentialAtomicByteCellOwner
@@ -77,6 +81,7 @@ RelayV2HostCanonicalProductionCompositionOptions,
 | "dashboardManagement"
 | "carrierWssTlsTrust"
 | "localDevelopmentCapabilityActivation"
+| "selfHostedCapabilityActivation"
 > & Readonly<{
   dashboardManagement?: RelayV2HostPrivilegedProductionDashboardManagementOptions;
 }>;
@@ -112,6 +117,12 @@ export interface RelayV2HostPrivilegedProductionIntakeCompositionOptions {
    */
   readonly localDevelopmentCapabilityActivationHandoff?:
     RelayV2HostLocalDevelopmentCapabilityActivationHandoff;
+  /**
+   * Explicit self-hosted-only handoff bound to this exact native credential
+   * cell. It is mutually exclusive with the local-development handoff.
+   */
+  readonly selfHostedCapabilityActivationHandoff?:
+    RelayV2HostSelfHostedCapabilityActivationHandoff;
   readonly canonical: RelayV2HostPrivilegedProductionCanonicalOptions;
 }
 
@@ -201,6 +212,8 @@ interface CapturedOptions {
   readonly carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
   readonly localDevelopmentCapabilityActivationHandoff:
     RelayV2HostLocalDevelopmentCapabilityActivationHandoff | undefined;
+  readonly selfHostedCapabilityActivationHandoff:
+    RelayV2HostSelfHostedCapabilityActivationHandoff | undefined;
   readonly canonical: CapturedCanonicalOptions;
 }
 
@@ -606,6 +619,7 @@ function captureOptions(
     "credentialHttpsTlsTrust",
     "carrierWssTlsTrust",
     "localDevelopmentCapabilityActivationHandoff",
+    "selfHostedCapabilityActivationHandoff",
   ]);
   if (fields === null) return null;
   if (fields.trustedHome !== undefined && typeof fields.trustedHome !== "string") return null;
@@ -642,8 +656,15 @@ function captureOptions(
     || wssTransport === null
     || canonical === null
     || fields.localDevelopmentCapabilityActivationHandoff !== undefined
+      && fields.selfHostedCapabilityActivationHandoff !== undefined
+    || fields.localDevelopmentCapabilityActivationHandoff !== undefined
       && !matchesRelayV2HostLocalDevelopmentCapabilityActivationHandoff(
         fields.localDevelopmentCapabilityActivationHandoff,
+        cell.identity,
+      )
+    || fields.selfHostedCapabilityActivationHandoff !== undefined
+      && !matchesRelayV2HostSelfHostedCapabilityActivationHandoff(
+        fields.selfHostedCapabilityActivationHandoff,
         cell.identity,
       )) return null;
   return REFLECT_APPLY(OBJECT_FREEZE, undefined, [{
@@ -660,6 +681,10 @@ function captureOptions(
     localDevelopmentCapabilityActivationHandoff:
       fields.localDevelopmentCapabilityActivationHandoff as
         | RelayV2HostLocalDevelopmentCapabilityActivationHandoff
+        | undefined,
+    selfHostedCapabilityActivationHandoff:
+      fields.selfHostedCapabilityActivationHandoff as
+        | RelayV2HostSelfHostedCapabilityActivationHandoff
         | undefined,
     canonical,
   }]);
@@ -747,6 +772,8 @@ function canonicalOptions(
   coordinator: RelayV2HostCredentialExchangeCoordinator,
   localDevelopmentCapabilityActivation:
     RelayV2HostLocalDevelopmentCapabilityActivation | undefined,
+  selfHostedCapabilityActivation:
+    RelayV2HostSelfHostedCapabilityActivation | undefined,
 ): RelayV2HostCanonicalProductionCompositionOptions {
   const values = captured.canonical.values;
   const result = Object.create(null) as Record<string, unknown>;
@@ -775,6 +802,9 @@ function canonicalOptions(
   if (localDevelopmentCapabilityActivation !== undefined) {
     result.localDevelopmentCapabilityActivation =
       localDevelopmentCapabilityActivation;
+  }
+  if (selfHostedCapabilityActivation !== undefined) {
+    result.selfHostedCapabilityActivation = selfHostedCapabilityActivation;
   }
   const dashboard = values.dashboardManagement;
   if (dashboard !== undefined) {
@@ -976,6 +1006,14 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
           captured.cell.identity,
           authority,
         );
+    const selfHostedCapabilityActivation =
+      captured.selfHostedCapabilityActivationHandoff === undefined
+        ? undefined
+        : transferRelayV2HostSelfHostedCapabilityActivationHandoff(
+          captured.selfHostedCapabilityActivationHandoff,
+          captured.cell.identity,
+          authority,
+        );
     const canonical = await openRelayV2HostCanonicalProductionComposition(
       canonicalProfile(profile),
       canonicalOptions(
@@ -984,6 +1022,7 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
         authority,
         coordinator,
         localDevelopmentCapabilityActivation,
+        selfHostedCapabilityActivation,
       ),
     );
     if (canonical === null) throw failure("CANONICAL_OPEN_FAILED");
