@@ -25,7 +25,9 @@ import {
 import {
   RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS,
   type RelayV2BrokerCredentialAuthority,
+  type RelayV2BrokerCredentialAuthorityGenesis,
 } from "./brokerCredentialAuthority.js";
+import type { RelayV2LiveAuthorizationFencePort } from "./brokerCore.js";
 import type { RelayV2IssuerKeyring } from "./issuer.js";
 import type {
   RelayV2ExternalContinuityAuthorityAttemptProvider,
@@ -40,18 +42,17 @@ import type { RelayV2BrokerServerComposition } from "../broker/server.js";
 /**
  * Explicit, default-off Relay v2 broker shipping root.
  *
- * The profile carries only non-sensitive references (listen address, public
- * issuer root and exact client relay endpoint, TLS/E0 reference identifiers,
- * trustedHome). Sensitive material
- * (TLS key/cert, issuer keyring) enters the process only through the injected
- * narrow privileged resolver; E0 auth/trust material stays behind the injected
- * attempt provider. This root creates no credential/E0/backend/resolver of its
- * own, never exposes the admin seam on the public route, adds no readiness or
- * capability advertisement, and has no Relay v1 fallback: any profile,
- * deployment-input, qualification, E0, TLS, or activation failure fails closed
- * before or during listener startup. Listener success is not Relay v2
- * readiness; native `qualifiedRecords=[]` and qualified E0/TLS deployment
- * evidence still gate production availability.
+ * Production profiles carry only non-sensitive references (listen address,
+ * public issuer root and exact client relay endpoint, TLS/E0 reference
+ * identifiers, trustedHome). Sensitive TLS/keyring material enters only
+ * through the injected narrow privileged resolver; E0 auth/trust material
+ * stays behind the injected attempt provider. The one alternate profile shape
+ * is the exact non-production single-node policy below, which may inject a
+ * canonical credential-authority opener but cannot inject native/E0 inputs.
+ * This root never exposes the admin seam on the public route, adds no readiness
+ * or capability advertisement, and has no Relay v1 fallback. Listener success
+ * is not Relay v2 production readiness; native `qualifiedRecords=[]` and
+ * qualified E0/TLS deployment evidence still gate production availability.
  */
 
 export interface RelayV2BrokerShippingTlsReferences {
@@ -60,7 +61,7 @@ export interface RelayV2BrokerShippingTlsReferences {
   readonly trustReference?: string;
 }
 
-export interface RelayV2BrokerShippingProfile {
+interface RelayV2BrokerShippingProfileBase {
   readonly configVersion: 1;
   readonly listen: Readonly<{ host: string; port: number }>;
   readonly issuerUrl: string;
@@ -68,8 +69,22 @@ export interface RelayV2BrokerShippingProfile {
   readonly trustedHome: string;
   readonly tls: RelayV2BrokerShippingTlsReferences;
   readonly issuerKeyringReference: string;
-  readonly externalContinuity: RelayV2ExternalContinuityAuthorityConfig;
 }
+
+export const RELAY_V2_BROKER_SINGLE_NODE_SELF_HOSTED_POLICY =
+  "non-production-single-node-co-located-sqlite-v1" as const;
+
+export type RelayV2BrokerShippingProfile = RelayV2BrokerShippingProfileBase & (
+  | {
+      readonly externalContinuity: RelayV2ExternalContinuityAuthorityConfig;
+      readonly nonProductionCredentialPolicy?: never;
+    }
+  | {
+      readonly externalContinuity?: never;
+      readonly nonProductionCredentialPolicy:
+        typeof RELAY_V2_BROKER_SINGLE_NODE_SELF_HOSTED_POLICY;
+    }
+);
 
 export interface RelayV2BrokerShippingTlsMaterial {
   readonly key: string | Buffer | Uint8Array;
@@ -86,10 +101,8 @@ export interface RelayV2BrokerShippingPrivilegedResolver {
   resolveIssuerKeyring(reference: string): RelayV2IssuerKeyring;
 }
 
-export interface RelayV2BrokerShippingDeploymentInputs {
+interface RelayV2BrokerShippingDeploymentInputsBase {
   readonly privilegedResolver: RelayV2BrokerShippingPrivilegedResolver;
-  readonly externalContinuityAttemptProvider: RelayV2ExternalContinuityAuthorityAttemptProvider;
-  readonly nativeLoader: RelayV2BrokerCredentialStateStoreNativeLoader;
   readonly closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
   readonly createHttpsServer?: (options: Readonly<{
     key: string | Buffer | Uint8Array;
@@ -97,6 +110,29 @@ export interface RelayV2BrokerShippingDeploymentInputs {
     ca?: string | Buffer | Uint8Array | readonly (string | Buffer | Uint8Array)[];
   }>) => NodeHttpsServer;
 }
+
+export type RelayV2BrokerShippingDeploymentInputs =
+  RelayV2BrokerShippingDeploymentInputsBase & (
+    | {
+        readonly externalContinuityAttemptProvider:
+          RelayV2ExternalContinuityAuthorityAttemptProvider;
+        readonly nativeLoader: RelayV2BrokerCredentialStateStoreNativeLoader;
+        readonly nonProductionCredentialAuthorityOpener?: never;
+      }
+    | {
+        readonly externalContinuityAttemptProvider?: never;
+        readonly nativeLoader?: never;
+        readonly nonProductionCredentialAuthorityOpener:
+          RelayV2BrokerShippingNonProductionCredentialAuthorityOpener;
+      }
+  );
+
+export type RelayV2BrokerShippingNonProductionCredentialAuthorityOpener = (
+  input: Readonly<{
+    liveAuthorizationFence: RelayV2LiveAuthorizationFencePort;
+    genesis: RelayV2BrokerCredentialAuthorityGenesis;
+  }>,
+) => Promise<RelayV2BrokerCredentialAuthority>;
 
 /** Caller-owned restricted delivery target (for example a 0600 file write). */
 export type RelayV2BrokerAdminSecretSink = (secret: string) => void;
@@ -231,8 +267,17 @@ type CapturedProfile = Readonly<{
   trustedHome: string;
   tls: RelayV2BrokerShippingTlsReferences;
   issuerKeyringReference: string;
-  externalContinuity: RelayV2ExternalContinuityAuthorityConfig;
-}>;
+} & (
+  | {
+      externalContinuity: RelayV2ExternalContinuityAuthorityConfig;
+      nonProductionCredentialPolicy?: never;
+    }
+  | {
+      externalContinuity?: never;
+      nonProductionCredentialPolicy:
+        typeof RELAY_V2_BROKER_SINGLE_NODE_SELF_HOSTED_POLICY;
+    }
+)>;
 
 function captureProfile(value: unknown): CapturedProfile {
   const record = captureOwnDataRecord(value, [
@@ -243,8 +288,7 @@ function captureProfile(value: unknown): CapturedProfile {
     "trustedHome",
     "tls",
     "issuerKeyringReference",
-    "externalContinuity",
-  ]);
+  ], ["externalContinuity", "nonProductionCredentialPolicy"]);
   if (record === null || record.configVersion !== 1) throw new TypeError(PROFILE_INVALID);
   const listen = captureOwnDataRecord(record.listen, ["host", "port"]);
   const issuerUrl = captureEndpointUrl(record.issuerUrl, "https:", "/");
@@ -270,10 +314,19 @@ function captureProfile(value: unknown): CapturedProfile {
     || !record.trustedHome.startsWith("/")
     || record.trustedHome.includes("\0")
     || !boundedReference(record.issuerKeyringReference)
-    || record.externalContinuity === null
-    || typeof record.externalContinuity !== "object"
-    || rejectedProxy(record.externalContinuity)
   ) throw new TypeError(PROFILE_INVALID);
+  const productionExternalContinuity = record.externalContinuity !== undefined
+    && record.externalContinuity !== null
+    && typeof record.externalContinuity === "object"
+    && !rejectedProxy(record.externalContinuity)
+    && record.nonProductionCredentialPolicy === undefined;
+  const nonProductionSingleNode =
+    record.externalContinuity === undefined
+    && record.nonProductionCredentialPolicy
+      === RELAY_V2_BROKER_SINGLE_NODE_SELF_HOSTED_POLICY;
+  if (!productionExternalContinuity && !nonProductionSingleNode) {
+    throw new TypeError(PROFILE_INVALID);
+  }
   return Object.freeze({
     configVersion: 1,
     listen: Object.freeze({ host: listen.host, port: listen.port as number }),
@@ -291,16 +344,26 @@ function captureProfile(value: unknown): CapturedProfile {
           trustReference: tls.trustReference,
         }),
     issuerKeyringReference: record.issuerKeyringReference,
-    externalContinuity: record.externalContinuity as RelayV2ExternalContinuityAuthorityConfig,
-  });
+    ...(productionExternalContinuity
+      ? {
+          externalContinuity:
+            record.externalContinuity as RelayV2ExternalContinuityAuthorityConfig,
+        }
+      : {
+          nonProductionCredentialPolicy:
+            RELAY_V2_BROKER_SINGLE_NODE_SELF_HOSTED_POLICY,
+        }),
+  } as CapturedProfile);
 }
 
 type CapturedDeploymentInputs = Readonly<{
   resolverReceiver: object;
   resolveTlsMaterial: RelayV2BrokerShippingPrivilegedResolver["resolveTlsMaterial"];
   resolveIssuerKeyring: RelayV2BrokerShippingPrivilegedResolver["resolveIssuerKeyring"];
-  externalContinuityAttemptProvider: RelayV2ExternalContinuityAuthorityAttemptProvider;
-  nativeLoader: RelayV2BrokerCredentialStateStoreNativeLoader;
+  externalContinuityAttemptProvider?: RelayV2ExternalContinuityAuthorityAttemptProvider;
+  nativeLoader?: RelayV2BrokerCredentialStateStoreNativeLoader;
+  nonProductionCredentialAuthorityOpener?:
+    RelayV2BrokerShippingNonProductionCredentialAuthorityOpener;
   closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
   createHttpsServer: NonNullable<RelayV2BrokerShippingDeploymentInputs["createHttpsServer"]>;
 }>;
@@ -340,20 +403,35 @@ function capturePrivilegedResolver(value: unknown): Readonly<{
   });
 }
 
-function captureDeploymentInputs(value: unknown): CapturedDeploymentInputs {
+function captureDeploymentInputs(
+  value: unknown,
+  nonProduction: boolean,
+): CapturedDeploymentInputs {
   const record = captureOwnDataRecord(value, [
     "privilegedResolver",
+  ], [
     "externalContinuityAttemptProvider",
     "nativeLoader",
-  ], ["closeDeadlineScheduler", "createHttpsServer"]);
+    "nonProductionCredentialAuthorityOpener",
+    "closeDeadlineScheduler",
+    "createHttpsServer",
+  ]);
+  const productionInputs = !nonProduction
+    && record?.externalContinuityAttemptProvider !== null
+    && typeof record?.externalContinuityAttemptProvider === "object"
+    && !rejectedProxy(record.externalContinuityAttemptProvider)
+    && record.nativeLoader !== null
+    && typeof record.nativeLoader === "object"
+    && !rejectedProxy(record.nativeLoader)
+    && record.nonProductionCredentialAuthorityOpener === undefined;
+  const nonProductionInputs = nonProduction
+    && record?.externalContinuityAttemptProvider === undefined
+    && record?.nativeLoader === undefined
+    && typeof record?.nonProductionCredentialAuthorityOpener === "function"
+    && !rejectedProxy(record.nonProductionCredentialAuthorityOpener);
   if (
     record === null
-    || record.externalContinuityAttemptProvider === null
-    || typeof record.externalContinuityAttemptProvider !== "object"
-    || rejectedProxy(record.externalContinuityAttemptProvider)
-    || record.nativeLoader === null
-    || typeof record.nativeLoader !== "object"
-    || rejectedProxy(record.nativeLoader)
+    || (!productionInputs && !nonProductionInputs)
     || (record.closeDeadlineScheduler !== undefined && (record.closeDeadlineScheduler === null
       || typeof record.closeDeadlineScheduler !== "object"
       || rejectedProxy(record.closeDeadlineScheduler)))
@@ -362,7 +440,6 @@ function captureDeploymentInputs(value: unknown): CapturedDeploymentInputs {
         || rejectedProxy(record.createHttpsServer)))
   ) throw new TypeError(INPUTS_INVALID);
   const resolver = capturePrivilegedResolver(record.privilegedResolver);
-  const nativeLoader = record.nativeLoader as RelayV2BrokerCredentialStateStoreNativeLoader;
   const createHttpsServer = (record.createHttpsServer ?? ((options: Readonly<{
     key: string | Buffer | Uint8Array;
     cert: string | Buffer | Uint8Array;
@@ -372,9 +449,19 @@ function captureDeploymentInputs(value: unknown): CapturedDeploymentInputs {
     resolverReceiver: resolver.receiver,
     resolveTlsMaterial: resolver.resolveTlsMaterial,
     resolveIssuerKeyring: resolver.resolveIssuerKeyring,
-    externalContinuityAttemptProvider:
-      record.externalContinuityAttemptProvider as RelayV2ExternalContinuityAuthorityAttemptProvider,
-    nativeLoader,
+    ...(productionInputs
+      ? {
+          externalContinuityAttemptProvider:
+            record.externalContinuityAttemptProvider as
+              RelayV2ExternalContinuityAuthorityAttemptProvider,
+          nativeLoader:
+            record.nativeLoader as RelayV2BrokerCredentialStateStoreNativeLoader,
+        }
+      : {
+          nonProductionCredentialAuthorityOpener:
+            record.nonProductionCredentialAuthorityOpener as
+              RelayV2BrokerShippingNonProductionCredentialAuthorityOpener,
+        }),
     ...(record.closeDeadlineScheduler === undefined
       ? {}
       : { closeDeadlineScheduler: record.closeDeadlineScheduler as RelayV2BrokerTransportCloseDeadlineScheduler }),
@@ -528,17 +615,20 @@ function captureRotationIdInput(value: unknown): { rotationId: string } {
 
 /**
  * Start the shipping root from a reference-only profile and injected
- * deployment inputs. Durable authorities (native store, E0 continuity,
- * credential authority) fully open before the listener binds through the
- * existing public HTTPS lifecycle root; startup failure rolls back in reverse
- * order and never falls back to Relay v1.
+ * deployment inputs. The selected production native/E0 chain or the one
+ * explicit non-production authority opener fully opens before the listener
+ * binds through the existing public HTTPS lifecycle root; startup failure
+ * rolls back in reverse order and never falls back to Relay v1.
  */
 export async function startRelayV2BrokerShippingRoot(
   profileInput: unknown,
   deploymentInputs: unknown,
 ): Promise<RelayV2BrokerShippingRootHandle> {
   const profile = captureProfile(profileInput);
-  const inputs = captureDeploymentInputs(deploymentInputs);
+  const nonProduction =
+    profile.nonProductionCredentialPolicy
+      === RELAY_V2_BROKER_SINGLE_NODE_SELF_HOSTED_POLICY;
+  const inputs = captureDeploymentInputs(deploymentInputs, nonProduction);
 
   let keyring: unknown;
   try {
@@ -552,23 +642,43 @@ export async function startRelayV2BrokerShippingRoot(
     throw new Error(KEYRING_FAILED);
   }
 
-  // Pure capture: validates the frozen E0 config binding and genesis (incl.
-  // the resolved keyring) without opening the native store or any socket.
-  const composition = createRelayV2BrokerProductionComposition({
-    trustedHome: profile.trustedHome,
-    nativeLoader: inputs.nativeLoader,
-    externalContinuityConfig: profile.externalContinuity,
-    externalContinuityAttemptProvider: inputs.externalContinuityAttemptProvider,
-    genesis: {
-      issuerKeyring: keyring as RelayV2IssuerKeyring,
-      issuerUrl: profile.issuerUrl,
-      relayUrl: profile.relayUrl,
-    },
-    resolveHttpSourceKey,
-    ...(inputs.closeDeadlineScheduler === undefined
-      ? {}
-      : { closeDeadlineScheduler: inputs.closeDeadlineScheduler }),
+  const genesis = Object.freeze({
+    issuerKeyring: keyring as RelayV2IssuerKeyring,
+    issuerUrl: profile.issuerUrl,
+    relayUrl: profile.relayUrl,
   });
+  // Production stays on the frozen E0/native opener. The only alternate
+  // policy is the explicit non-production single-node lane, whose opener gets
+  // the exact resolved keyring/genesis and live-fence input but never an E0
+  // label, provider, or production qualification path.
+  const composition: RelayV2BrokerServerComposition = nonProduction
+    ? Object.freeze({
+        openCredentialAuthority: (input: Readonly<{
+          liveAuthorizationFence: RelayV2LiveAuthorizationFencePort;
+        }>) =>
+          inputs.nonProductionCredentialAuthorityOpener!(
+            Object.freeze({
+              liveAuthorizationFence: input.liveAuthorizationFence,
+              genesis,
+            }),
+          ),
+        resolveHttpSourceKey,
+        ...(inputs.closeDeadlineScheduler === undefined
+          ? {}
+          : { closeDeadlineScheduler: inputs.closeDeadlineScheduler }),
+      })
+    : createRelayV2BrokerProductionComposition({
+        trustedHome: profile.trustedHome,
+        nativeLoader: inputs.nativeLoader!,
+        externalContinuityConfig: profile.externalContinuity!,
+        externalContinuityAttemptProvider:
+          inputs.externalContinuityAttemptProvider!,
+        genesis,
+        resolveHttpSourceKey,
+        ...(inputs.closeDeadlineScheduler === undefined
+          ? {}
+          : { closeDeadlineScheduler: inputs.closeDeadlineScheduler }),
+      });
 
   let acquiredTlsMaterial: unknown;
   try {

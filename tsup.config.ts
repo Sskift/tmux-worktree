@@ -106,6 +106,7 @@ export default defineConfig({
     "src/relay/v2/brokerShippingRoot.ts",
     "src/relay/v2/brokerShippingDeploymentSource.ts",
     "src/relay/v2/brokerLocalDevelopmentActivation.ts",
+    "src/relay/v2/brokerSingleNodeSelfHostedActivation.ts",
     "src/relay/v2/hostShippingRoot.ts",
     "src/relay/v2/hostShippingDeploymentSource.ts",
     "src/relay/v2/relayV2DashboardManagementChildRuntime.ts",
@@ -139,6 +140,10 @@ export default defineConfig({
   clean: true,
   splitting: false,
   external: [
+    // Node 22.16+ self-hosted Broker lane loads this built-in dynamically.
+    // Keep the node: identity intact even though the general bundle target is
+    // Node 20, where this opt-in lane is rejected before import.
+    "node:sqlite",
     "./codexAppServerNotificationSource.js",
     "./codexAppServerProcessControllerAuthority.js",
     // The Host attachment lives in relay/v2, so keep its extension owner on
@@ -205,6 +210,7 @@ export default defineConfig({
     "./relay/v2/brokerPublicHttpsServer.js",
     "./relay/v2/brokerShippingRoot.js",
     "./relay/v2/brokerLocalDevelopmentActivation.js",
+    "./relay/v2/brokerSingleNodeSelfHostedActivation.js",
     // The trusted deployment source and the relayServer facade must consume the
     // canonical shipping-root owner entry and the one fixed native loader
     // instance instead of bundling second copies.

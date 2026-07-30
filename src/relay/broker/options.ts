@@ -6,9 +6,11 @@ export type RelayServerOptions = {
   secret: string;
   v2ProfilePath?: string;
   v2LocalDevelopment?: true;
+  v2SingleNodeSelfHosted?: true;
   v2LocalDevelopmentTlsKeyPath?: string;
   v2LocalDevelopmentTlsCertificatePath?: string;
   v2LocalDevelopmentAdvertisedOrigin?: string;
+  v2SingleNodeSelfHostedStateDirectory?: string;
   v2HostBootstrapOutputPath?: string;
 };
 
@@ -21,9 +23,11 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let portFlag = false;
   let v2ProfilePath: string | undefined;
   let v2LocalDevelopment = false;
+  let v2SingleNodeSelfHosted = false;
   let v2LocalDevelopmentTlsKeyPath: string | undefined;
   let v2LocalDevelopmentTlsCertificatePath: string | undefined;
   let v2LocalDevelopmentAdvertisedOrigin: string | undefined;
+  let v2SingleNodeSelfHostedStateDirectory: string | undefined;
   let v2HostBootstrapOutputPath: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
@@ -44,6 +48,13 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         throw new CliError("relay-server --v2-local-dev 只能指定一次");
       }
       v2LocalDevelopment = true;
+    } else if (arg === "--v2-single-node-self-hosted") {
+      if (v2SingleNodeSelfHosted) {
+        throw new CliError(
+          "relay-server --v2-single-node-self-hosted 只能指定一次",
+        );
+      }
+      v2SingleNodeSelfHosted = true;
     } else if (arg === "--v2-dev-tls-key") {
       if (v2LocalDevelopmentTlsKeyPath !== undefined) {
         throw new CliError("relay-server --v2-dev-tls-key 只能指定一次");
@@ -59,6 +70,13 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         throw new CliError("relay-server --v2-dev-advertised-origin 只能指定一次");
       }
       v2LocalDevelopmentAdvertisedOrigin = argv[++i] || "";
+    } else if (arg === "--v2-self-hosted-state-dir") {
+      if (v2SingleNodeSelfHostedStateDirectory !== undefined) {
+        throw new CliError(
+          "relay-server --v2-self-hosted-state-dir 只能指定一次",
+        );
+      }
+      v2SingleNodeSelfHostedStateDirectory = argv[++i] || "";
     } else if (arg === "--host-bootstrap-output") {
       if (v2HostBootstrapOutputPath !== undefined) {
         throw new CliError("relay-server --host-bootstrap-output 只能指定一次");
@@ -72,8 +90,14 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     }
   }
 
-  if (v2ProfilePath !== undefined && v2LocalDevelopment) {
-    throw new CliError("relay-server --v2-profile 不能与 --v2-local-dev 同时使用");
+  const explicitV2LaneCount = Number(v2ProfilePath !== undefined)
+    + Number(v2LocalDevelopment)
+    + Number(v2SingleNodeSelfHosted);
+  if (explicitV2LaneCount > 1) {
+    throw new CliError(
+      "relay-server --v2-profile、--v2-local-dev 与 "
+        + "--v2-single-node-self-hosted 不能同时使用",
+    );
   }
 
   if (v2ProfilePath !== undefined) {
@@ -88,10 +112,21 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     }
     if (v2LocalDevelopmentTlsKeyPath !== undefined
       || v2LocalDevelopmentTlsCertificatePath !== undefined) {
-      throw new CliError("relay-server --v2-dev-tls-key/--v2-dev-tls-cert 只适用于 --v2-local-dev");
+      throw new CliError(
+        "relay-server --v2-dev-tls-key/--v2-dev-tls-cert "
+          + "只适用于显式 v2 开发 lane",
+      );
     }
     if (v2LocalDevelopmentAdvertisedOrigin !== undefined) {
-      throw new CliError("relay-server --v2-dev-advertised-origin 只适用于 --v2-local-dev");
+      throw new CliError(
+        "relay-server --v2-dev-advertised-origin 只适用于显式 v2 开发 lane",
+      );
+    }
+    if (v2SingleNodeSelfHostedStateDirectory !== undefined) {
+      throw new CliError(
+        "relay-server --v2-self-hosted-state-dir "
+          + "只适用于 --v2-single-node-self-hosted",
+      );
     }
     if (v2HostBootstrapOutputPath === "") {
       throw new CliError("relay-server --host-bootstrap-output 需要非空输出路径");
@@ -139,15 +174,87 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     };
   }
 
+  if (v2SingleNodeSelfHosted) {
+    if (secretFlag) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted 不能与 --secret 同时使用",
+      );
+    }
+    if (!hostFlag || !host) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted 需要显式 --host",
+      );
+    }
+    if (!portFlag) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted 需要显式 --port",
+      );
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw new CliError(`无效端口: ${port}`);
+    }
+    if (!v2LocalDevelopmentTlsKeyPath) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted 需要 --v2-dev-tls-key",
+      );
+    }
+    if (!v2LocalDevelopmentTlsCertificatePath) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted 需要 --v2-dev-tls-cert",
+      );
+    }
+    if (!v2LocalDevelopmentAdvertisedOrigin) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted "
+          + "需要 --v2-dev-advertised-origin",
+      );
+    }
+    if (!v2SingleNodeSelfHostedStateDirectory) {
+      throw new CliError(
+        "relay-server --v2-single-node-self-hosted "
+          + "需要 --v2-self-hosted-state-dir",
+      );
+    }
+    if (v2HostBootstrapOutputPath === "") {
+      throw new CliError(
+        "relay-server --host-bootstrap-output 需要非空输出路径",
+      );
+    }
+    return {
+      host,
+      port,
+      secret: "",
+      v2SingleNodeSelfHosted: true,
+      v2LocalDevelopmentTlsKeyPath,
+      v2LocalDevelopmentTlsCertificatePath,
+      v2LocalDevelopmentAdvertisedOrigin,
+      v2SingleNodeSelfHostedStateDirectory,
+      v2HostBootstrapOutputPath,
+    };
+  }
+
   if (v2LocalDevelopmentTlsKeyPath !== undefined
     || v2LocalDevelopmentTlsCertificatePath !== undefined) {
-    throw new CliError("relay-server --v2-dev-tls-key/--v2-dev-tls-cert 只适用于 --v2-local-dev");
+    throw new CliError(
+      "relay-server --v2-dev-tls-key/--v2-dev-tls-cert "
+        + "只适用于显式 v2 开发 lane",
+    );
   }
   if (v2LocalDevelopmentAdvertisedOrigin !== undefined) {
-    throw new CliError("relay-server --v2-dev-advertised-origin 只适用于 --v2-local-dev");
+    throw new CliError(
+      "relay-server --v2-dev-advertised-origin 只适用于显式 v2 开发 lane",
+    );
+  }
+  if (v2SingleNodeSelfHostedStateDirectory !== undefined) {
+    throw new CliError(
+      "relay-server --v2-self-hosted-state-dir "
+        + "只适用于 --v2-single-node-self-hosted",
+    );
   }
   if (v2HostBootstrapOutputPath !== undefined) {
-    throw new CliError("relay-server --host-bootstrap-output 只适用于 --v2-profile 或 --v2-local-dev");
+    throw new CliError(
+      "relay-server --host-bootstrap-output 只适用于显式 v2 lane",
+    );
   }
 
   // 仅 v1 分支读取 env：--secret 优先，缺省回落 TW_RELAY_SECRET。
@@ -174,6 +281,10 @@ function printRelayServerHelp(): void {
   tw relay-server --v2-local-dev --port <1-65535> --v2-dev-tls-key <path>
     --v2-dev-tls-cert <path> [--v2-dev-advertised-origin <https-origin>]
     --host-bootstrap-output <path>
+  tw relay-server --v2-single-node-self-hosted --host <listen-host>
+    --port <1-65535> --v2-dev-advertised-origin <https-origin>
+    --v2-dev-tls-key <path> --v2-dev-tls-cert <path>
+    --v2-self-hosted-state-dir <path> [--host-bootstrap-output <path>]
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -186,8 +297,17 @@ function printRelayServerHelp(): void {
   要求显式非零端口并固定监听 127.0.0.1，复用 canonical v2
   shipping/composition，绝不构成 production qualification/readiness，也不
   改变 --v2-profile 的 fail-closed。
-  --v2-dev-advertised-origin 只改变该开发 lane 下发的 HTTPS/WSS endpoint
-  identity；省略时保持 localhost。外部 TLS/TCP proxy 不由 relay-server 管理。
+  --v2-single-node-self-hosted 是明确非 production、仅 Linux x64 Node
+  >=22.16 的单进程持久自托管 lane。它要求显式 listen host/port 与独立
+  advertised HTTPS origin；唯一 0600 SQLite owner 持久化 credential、
+  co-located continuity 与稳定 issuer keyring。该 continuity 不是 E0，
+  不产生 production qualification/readiness，且绝不回退 v1。
+  self-hosted state dir 必须是现存 canonical、当前用户拥有的 exact 0700
+  dedicated 目录；绑定 machine-id 与目录 identity，禁止复制目录、恢复旧
+  快照、并行启动或修改 DB，且不提供 override/import/recovery。
+  --v2-dev-advertised-origin 改变显式开发 lane 下发的 HTTPS/WSS endpoint
+  identity；local-dev 省略时保持 localhost，self-hosted 必须显式提供。
+  外部 TLS/TCP proxy 不由 relay-server 管理。
   TLS key/cert 必须是当前用户拥有、single-link、exact 0600 的本机文件。
   --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
   privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600

@@ -109,6 +109,123 @@ export async function startRelayV2BrokerLocalDevelopment(
     .startRelayV2BrokerLocalDevelopment(options);
 }
 
+/**
+ * Explicit non-production Linux x64 single-node root. It keeps the canonical
+ * Broker shipping/credential/HTTPS/WSS owners and injects one co-located
+ * SQLite storage/continuity/keyring owner. The co-located continuity is not E0
+ * and this entry never changes production qualification or falls back to v1.
+ */
+export async function startRelayV2BrokerSingleNodeSelfHosted(
+  options: import("./relay/v2/brokerSingleNodeSelfHostedActivation.js").RelayV2BrokerSingleNodeSelfHostedOptions,
+  signal?: AbortSignal,
+): Promise<import("./relay/v2/brokerShippingRoot.js").RelayV2BrokerShippingRootHandle> {
+  return (await import("./relay/v2/brokerSingleNodeSelfHostedActivation.js"))
+    .startRelayV2BrokerSingleNodeSelfHosted(options, signal);
+}
+
+class RelayV2BrokerCliSignalLatch {
+  readonly #controller = new AbortController();
+  readonly #stopped: Promise<void>;
+  #resolveStopped!: () => void;
+  #closed = false;
+
+  readonly #stop = (): void => {
+    if (this.#controller.signal.aborted) return;
+    this.#controller.abort();
+    this.#resolveStopped();
+  };
+
+  constructor() {
+    this.#stopped = new Promise((resolve) => {
+      this.#resolveStopped = resolve;
+    });
+    process.once("SIGINT", this.#stop);
+    process.once("SIGTERM", this.#stop);
+    process.once("SIGHUP", this.#stop);
+  }
+
+  get signal(): AbortSignal {
+    return this.#controller.signal;
+  }
+
+  wait(): Promise<void> {
+    return this.#stopped;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    process.off("SIGINT", this.#stop);
+    process.off("SIGTERM", this.#stop);
+    process.off("SIGHUP", this.#stop);
+  }
+}
+
+async function runRelayV2BrokerSingleNodeSelfHostedCli(
+  options: RelayServerOptions,
+): Promise<void> {
+  // This owner exists before any TLS/state/SQLite/listener activation. A
+  // signal permanently fences bootstrap publication; any non-interruptible
+  // activation/admin await is followed by the same one-shot root drain.
+  const signalLatch = new RelayV2BrokerCliSignalLatch();
+  let handle:
+    import("./relay/v2/brokerShippingRoot.js").RelayV2BrokerShippingRootHandle
+    | null = null;
+  let shutdownPromise: Promise<void> | null = null;
+  const shutdown = (): Promise<void> => {
+    if (handle === null) return Promise.resolve();
+    if (shutdownPromise === null) shutdownPromise = handle.shutdown();
+    return shutdownPromise;
+  };
+  try {
+    try {
+      handle = await startRelayV2BrokerSingleNodeSelfHosted({
+        host: options.host,
+        port: options.port,
+        advertisedOrigin: options.v2LocalDevelopmentAdvertisedOrigin!,
+        tlsKeyPath: options.v2LocalDevelopmentTlsKeyPath!,
+        tlsCertificatePath: options.v2LocalDevelopmentTlsCertificatePath!,
+        stateDirectory: options.v2SingleNodeSelfHostedStateDirectory!,
+      }, signalLatch.signal);
+    } catch (error) {
+      if (signalLatch.signal.aborted) return;
+      throw error;
+    }
+    if (signalLatch.signal.aborted) {
+      await shutdown();
+      return;
+    }
+
+    if (options.v2HostBootstrapOutputPath !== undefined) {
+      const bootstrapSink = createRelayV2HostBootstrapOutputSink(
+        options.v2HostBootstrapOutputPath,
+      );
+      try {
+        await handle.admin.createHostBootstrap({}, (secret) => {
+          if (signalLatch.signal.aborted) {
+            throw new Error("Relay v2 Broker startup stopped");
+          }
+          bootstrapSink(secret);
+        });
+      } catch (error) {
+        await shutdown();
+        if (signalLatch.signal.aborted) return;
+        throw error;
+      }
+    }
+    if (signalLatch.signal.aborted) {
+      await shutdown();
+      return;
+    }
+
+    await signalLatch.wait();
+    await shutdown();
+  } finally {
+    signalLatch.close();
+    if (handle !== null) await shutdown();
+  }
+}
+
 /** Stable CLI/tsup facade for the Relay v1 broker implementation. */
 export async function run(): Promise<void> {
   const options = parseRelayServerOptions(process.argv.slice(3));
@@ -130,6 +247,10 @@ export async function run(): Promise<void> {
       await handle.shutdown();
       throw error;
     }
+    return;
+  }
+  if (options.v2SingleNodeSelfHosted === true) {
+    await runRelayV2BrokerSingleNodeSelfHostedCli(options);
     return;
   }
   if (options.v2ProfilePath !== undefined) {

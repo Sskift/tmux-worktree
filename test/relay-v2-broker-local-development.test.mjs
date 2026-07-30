@@ -315,7 +315,7 @@ test("local development CLI refuses a non-loopback host before reading TLS", () 
   });
   assert.equal(outsideLocalDevelopment.status, 1);
   assert.equal(outsideLocalDevelopment.stdout, "");
-  assert.match(outsideLocalDevelopment.stderr, /只适用于 --v2-local-dev/);
+  assert.match(outsideLocalDevelopment.stderr, /只适用于显式 v2 开发 lane/);
   assert.equal(outsideLocalDevelopment.stderr.includes("option-test-secret"), false);
 
   const emptyAdvertisedOrigin = spawnSync(process.execPath, [

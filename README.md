@@ -592,8 +592,8 @@ native state-store loader into that activated composition and public
 lifecycle root, and adds a local in-process admin seam for issuer/replay
 rotation and host bootstrap issuance; the bootstrap secret is delivered only
 to a caller-provided restricted sink, never to stdout, logs, or the public
-route. The `relay-server` CLI selects it only through an explicit
-`--v2-profile <path>`, and only via the single default-off trusted deployment
+route. The `relay-server` CLI selects the production shape only through an
+explicit `--v2-profile <path>`, and only via the single default-off trusted deployment
 activation/source owner (`src/relay/v2/brokerShippingDeploymentSource.ts`):
 the profile still carries non-sensitive identifiers/references only, while
 TLS key/cert, issuer keyring, and E0 credential/trust material come solely
@@ -643,8 +643,9 @@ current-user-owned, regular, single-link files with exact mode `0600`; the
 certificate chain and hostname used at each test TLS boundary must remain
 trusted and valid.
 The command uses the canonical Broker shipping composition and HTTPS/WSS
-lifecycle, but its credential store, issuer keyring, and E0 continuity backend
-exist only in memory. It atomically writes the bootstrap secret as an exact
+lifecycle, but its credential store, issuer keyring, and process-local
+continuity test backend exist only in memory; that backend is not E0. It
+atomically writes the bootstrap secret as an exact
 `0600` file and never prints it. Stopping the process loses all issued
 credential and continuity state, so this lane has no restart, recovery, HA, or
 production value. It neither reads nor mutates the production deployment
@@ -652,6 +653,59 @@ namespace or `qualifiedRecords`; default Relay v1 and `--v2-profile` production
 fail-closed behavior are unchanged. Advertising a public development origin
 and placing a proxy in front adds no production TLS, qualification, device,
 signing, release, readiness, capability, or GO evidence.
+
+For a persistent, single-Broker self-hosted development deployment, there is a
+separate explicit non-production lane:
+
+```bash
+install -d -m 700 "$HOME/.local/state/tw-relay-v2-broker"
+install -d -m 700 "$HOME/.config/tw-relay-v2"
+chmod 600 \
+  "$HOME/.config/tw-relay-v2/relay.key.pem" \
+  "$HOME/.config/tw-relay-v2/relay.cert.pem"
+tw relay-server \
+  --v2-single-node-self-hosted \
+  --host 0.0.0.0 \
+  --port 9443 \
+  --v2-dev-advertised-origin "https://tw-relay.duckdns.org:9443/" \
+  --v2-dev-tls-key "$HOME/.config/tw-relay-v2/relay.key.pem" \
+  --v2-dev-tls-cert "$HOME/.config/tw-relay-v2/relay.cert.pem" \
+  --v2-self-hosted-state-dir "$HOME/.local/state/tw-relay-v2-broker" \
+  --host-bootstrap-output "$HOME/.config/tw-relay-v2/new-host.twhostboot2"
+```
+
+This lane requires Linux x86_64, Node.js 22.16 or newer, and an ext-family
+filesystem. Unlike local development, both listen host and port are mandatory;
+binding `0.0.0.0` is therefore possible only after the explicit self-hosted
+opt-in. The advertised HTTPS root is independent from the listen address, is
+also mandatory, and determines both the issued HTTPS identity and the WSS
+`/client` identity. The certificate must validate for that advertised
+hostname; an omitted port means 443, while a high port such as 9443 remains
+part of the credential endpoint identity.
+
+The state directory must already exist at its canonical absolute path, be
+owned by the current user, have exact mode `0700`, and contain no unrelated
+files. One exact-mode `0600` SQLite database is the sole persistent owner for
+credential bytes, a directly co-located monotonic continuity row, and the
+stable issuer keyring/kid. It uses `synchronous=FULL`, exclusive SQLite
+locking, and strict successor validation. A second Broker process fails closed.
+The stored machine-id digest plus directory device/inode bind the database to
+that one directory, so copying the state directory or moving it to another
+machine is rejected. SIGINT/SIGTERM/SIGHUP fence startup/bootstrap and drain the
+published HTTPS/WSS root before the CLI exits.
+
+After a clean process restart with the exact same directory, advertised
+origin, and TLS identity, already-issued Host and Android credentials remain
+valid. `--host-bootstrap-output` is normally used only for the first Host and
+may be omitted on later starts. This policy deliberately has no snapshot
+restore, state-directory copy/import, backup restore, failover, HA, or disaster
+recovery path; replacing the database with an old snapshot, even inside the
+same directory, is forbidden. The co-located continuity row is explicitly not
+E0 and does not provide rollback-independent evidence. The lane does not read
+or modify production `qualifiedRecords`, does not manufacture E0 evidence,
+does not change the frozen six required capabilities, and never falls back to
+Relay v1. It is useful for a single devbox deployment, not production
+qualification, readiness, capability, release, or GO evidence.
 
 For the first Host only, the Broker and Host commands form one explicit
 restricted-file handoff. On the Broker:

@@ -291,6 +291,10 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
   tw relay-server --v2-local-dev --port <1-65535> --v2-dev-tls-key <path>
     --v2-dev-tls-cert <path> [--v2-dev-advertised-origin <https-origin>]
     --host-bootstrap-output <path>
+  tw relay-server --v2-single-node-self-hosted --host <listen-host>
+    --port <1-65535> --v2-dev-advertised-origin <https-origin>
+    --v2-dev-tls-key <path> --v2-dev-tls-cert <path>
+    --v2-self-hosted-state-dir <path> [--host-bootstrap-output <path>]
 
 说明:
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
@@ -303,8 +307,17 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
   要求显式非零端口并固定监听 127.0.0.1，复用 canonical v2
   shipping/composition，绝不构成 production qualification/readiness，也不
   改变 --v2-profile 的 fail-closed。
-  --v2-dev-advertised-origin 只改变该开发 lane 下发的 HTTPS/WSS endpoint
-  identity；省略时保持 localhost。外部 TLS/TCP proxy 不由 relay-server 管理。
+  --v2-single-node-self-hosted 是明确非 production、仅 Linux x64 Node
+  >=22.16 的单进程持久自托管 lane。它要求显式 listen host/port 与独立
+  advertised HTTPS origin；唯一 0600 SQLite owner 持久化 credential、
+  co-located continuity 与稳定 issuer keyring。该 continuity 不是 E0，
+  不产生 production qualification/readiness，且绝不回退 v1。
+  self-hosted state dir 必须是现存 canonical、当前用户拥有的 exact 0700
+  dedicated 目录；绑定 machine-id 与目录 identity，禁止复制目录、恢复旧
+  快照、并行启动或修改 DB，且不提供 override/import/recovery。
+  --v2-dev-advertised-origin 改变显式开发 lane 下发的 HTTPS/WSS endpoint
+  identity；local-dev 省略时保持 localhost，self-hosted 必须显式提供。
+  外部 TLS/TCP proxy 不由 relay-server 管理。
   TLS key/cert 必须是当前用户拥有、single-link、exact 0600 的本机文件。
   --host-bootstrap-output 仅适用于显式 v2 lane；shipping root 启动后通过本进程
   privileged admin authority 创建一次 Host bootstrap，并只原子写入指定的 0600

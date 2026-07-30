@@ -364,7 +364,7 @@ function assertRestrictedTlsFile(information: BigIntStats, euid: bigint): void {
   }
 }
 
-function readRestrictedTlsFile(path: string): Buffer {
+export function readRelayV2BrokerDevelopmentTlsFile(path: string): Buffer {
   if ((process.platform !== "darwin" && process.platform !== "linux")
     || typeof process.geteuid !== "function"
     || typeof fsConstants.O_NOFOLLOW !== "number"
@@ -425,7 +425,7 @@ function validAdvertisedHostname(hostname: string): boolean {
       && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
 }
 
-function captureAdvertisedEndpoints(
+export function captureRelayV2BrokerDevelopmentAdvertisedEndpoints(
   value: unknown,
   listenerPort: number,
 ): Readonly<{ issuerUrl: string; relayUrl: string }> {
@@ -508,7 +508,10 @@ function captureOptions(value: unknown): CapturedLocalDevelopmentOptions {
     || (advertisedOrigin !== undefined && typeof advertisedOrigin !== "string")) {
     throw new Error(ACTIVATION_FAILED);
   }
-  const endpoints = captureAdvertisedEndpoints(advertisedOrigin, port);
+  const endpoints = captureRelayV2BrokerDevelopmentAdvertisedEndpoints(
+    advertisedOrigin,
+    port,
+  );
   return Object.freeze({
     port,
     tlsKeyPath,
@@ -521,17 +524,18 @@ function captureOptions(value: unknown): CapturedLocalDevelopmentOptions {
 /**
  * Explicit loopback-only developer activation. It reuses the canonical
  * shipping/composition/public lifecycle and substitutes only process-local
- * credential persistence, issuer keys, and external continuity. Nothing here
- * qualifies or changes either production deployment source.
+ * credential persistence, issuer keys, and a continuity test backend which is
+ * not E0. Nothing here qualifies or changes either production deployment
+ * source.
  */
 export async function startRelayV2BrokerLocalDevelopment(
   optionsInput: unknown,
 ): Promise<RelayV2BrokerShippingRootHandle> {
   const options = captureOptions(optionsInput);
-  const key = readRestrictedTlsFile(options.tlsKeyPath);
+  const key = readRelayV2BrokerDevelopmentTlsFile(options.tlsKeyPath);
   let certificate: Buffer;
   try {
-    certificate = readRestrictedTlsFile(options.tlsCertificatePath);
+    certificate = readRelayV2BrokerDevelopmentTlsFile(options.tlsCertificatePath);
   } catch (error) {
     key.fill(0);
     throw error;
