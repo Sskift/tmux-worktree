@@ -692,7 +692,8 @@ tw relay-server \
   --v2-dev-tls-key "$HOME/.config/tw-relay-v2/relay.key.pem" \
   --v2-dev-tls-cert "$HOME/.config/tw-relay-v2/relay.cert.pem" \
   --v2-self-hosted-state-dir "$HOME/.local/state/tw-relay-v2-broker" \
-  --host-bootstrap-output "$HOME/.config/tw-relay-v2/new-host.twhostboot2"
+  --host-bootstrap-output "$HOME/.config/tw-relay-v2/new-host.twhostboot2" \
+  --v2-self-hosted-bootstrap-correlation "first-host-setup-2026-07-30"
 ```
 
 This lane requires Linux x86_64, Node.js 22.16 or newer, and an ext-family
@@ -718,7 +719,23 @@ published HTTPS/WSS root before the CLI exits.
 After a clean process restart with the exact same directory, advertised
 origin, and TLS identity, already-issued Host and Android credentials remain
 valid. `--host-bootstrap-output` is normally used only for the first Host and
-may be omitted on later starts. This policy deliberately has no snapshot
+may be omitted on later starts. A Dashboard/operator that can retry first-Host
+setup must generate one non-secret Relay identifier (1–128 UTF-8 bytes, trimmed,
+with no NUL/CR/LF), persist it with the pending output path, and pass that exact
+value through the self-hosted-only hidden
+`--v2-self-hosted-bootstrap-correlation <attempt-id>` argument every time it
+passes `--host-bootstrap-output`. The Broker atomically commits the bootstrap
+verifier and an encrypted, correlation/profile/selector-bound recovery response,
+replays that exact bootstrap after a process crash, and durably acknowledges it
+only after the synchronous 0600 output sink returns. A correlation/TTL/profile
+mismatch fails closed; an acknowledged retry does not rewrite the file or mint
+another token. Recovery/tombstone state is bounded to the bootstrap expiry plus
+the existing ten-minute credential replay retention. The attempt identifier
+must never contain a secret and must not be reused after that retention window.
+If this hidden correlation is omitted, the existing one-shot mint-and-publish
+behavior is unchanged.
+
+This policy deliberately has no snapshot
 restore, state-directory copy/import, backup restore, failover, HA, or disaster
 recovery path; replacing the database with an old snapshot, even inside the
 same directory, is forbidden. The co-located continuity row is explicitly not

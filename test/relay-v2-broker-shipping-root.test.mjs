@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
+  linkSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
@@ -22,6 +26,11 @@ const issuer = await import("../dist/relay/v2/issuer.js");
 const ENDPOINT = "https://continuity.example.test/external/continuity/v1";
 const TRUSTED_HOME = "/test/account-home";
 const TEST_SECRET = Buffer.alloc(32, 17).toString("base64url");
+const TEST_BOOTSTRAP_TOKEN = [
+  "twhostboot2",
+  Buffer.alloc(16, 23).toString("base64url"),
+  Buffer.alloc(32, 29).toString("base64url"),
+].join(".");
 
 // Test-only throwaway self-signed pair for loopback TLS; it protects nothing
 // and is committed deliberately so no certificate generation runs in tests.
@@ -450,27 +459,128 @@ async function runCli(argv) {
   }
 }
 
-test("host bootstrap output sink atomically publishes only a 0600 file", () => {
+test("host bootstrap output sink creates 0600 once and accepts exact existing bytes without rewrite", () => {
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "tw-v2-host-bootstrap-output-"));
   const outputPath = path.join(tempDir, "new-host.bootstrap");
-  const token = "twhostboot2.test-only-bootstrap-token";
   try {
     const sink = hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(outputPath);
-    sink(token);
+    sink(TEST_BOOTSTRAP_TOKEN);
 
-    assert.equal(readFileSync(outputPath, "utf8"), `${token}\n`);
-    assert.equal(lstatSync(outputPath).mode & 0o777, 0o600);
+    assert.equal(readFileSync(outputPath, "utf8"), `${TEST_BOOTSTRAP_TOKEN}\n`);
+    const before = lstatSync(outputPath, { bigint: true });
+    assert.equal(before.mode & 0o7777n, 0o600n);
+    assert.equal(before.nlink, 1n);
+    assert.deepEqual(readdirSync(tempDir), ["new-host.bootstrap"]);
+
+    sink(TEST_BOOTSTRAP_TOKEN);
+    const after = lstatSync(outputPath, { bigint: true });
+    assert.deepEqual(
+      {
+        dev: after.dev,
+        ino: after.ino,
+        mode: after.mode,
+        nlink: after.nlink,
+        size: after.size,
+        mtimeNs: after.mtimeNs,
+        ctimeNs: after.ctimeNs,
+      },
+      {
+        dev: before.dev,
+        ino: before.ino,
+        mode: before.mode,
+        nlink: before.nlink,
+        size: before.size,
+        mtimeNs: before.mtimeNs,
+        ctimeNs: before.ctimeNs,
+      },
+    );
     assert.deepEqual(readdirSync(tempDir), ["new-host.bootstrap"]);
 
     const missingParentPath = path.join(tempDir, "missing", "bootstrap");
     assert.throws(
-      () => hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(missingParentPath)(token),
+      () => hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(
+        missingParentPath,
+      )(TEST_BOOTSTRAP_TOKEN),
       (error) => {
         assert.equal(error?.message, "Relay v2 host bootstrap output failed");
-        assert.equal(String(error).includes(token), false);
+        assert.equal(String(error).includes(TEST_BOOTSTRAP_TOKEN), false);
         return true;
       },
     );
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("host bootstrap output sink rejects different and unsafe existing targets without overwrite", () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "tw-v2-host-bootstrap-unsafe-"));
+  const assertRejected = (outputPath) => {
+    assert.throws(
+      () => hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(
+        outputPath,
+      )(TEST_BOOTSTRAP_TOKEN),
+      (error) => {
+        assert.equal(error?.message, "Relay v2 host bootstrap output failed");
+        assert.equal(String(error).includes(TEST_BOOTSTRAP_TOKEN), false);
+        assert.equal(String(error).includes(outputPath), false);
+        return true;
+      },
+    );
+  };
+  try {
+    const different = path.join(tempDir, "different.bootstrap");
+    writeFileSync(different, "foreign-bootstrap\n", { mode: 0o600 });
+    chmodSync(different, 0o600);
+    const differentBefore = lstatSync(different, { bigint: true });
+    assertRejected(different);
+    assert.equal(readFileSync(different, "utf8"), "foreign-bootstrap\n");
+    const differentAfter = lstatSync(different, { bigint: true });
+    assert.equal(differentAfter.ino, differentBefore.ino);
+    assert.equal(differentAfter.mtimeNs, differentBefore.mtimeNs);
+
+    const wrongMode = path.join(tempDir, "wrong-mode.bootstrap");
+    writeFileSync(wrongMode, `${TEST_BOOTSTRAP_TOKEN}\n`, { mode: 0o600 });
+    chmodSync(wrongMode, 0o640);
+    assertRejected(wrongMode);
+    assert.equal(readFileSync(wrongMode, "utf8"), `${TEST_BOOTSTRAP_TOKEN}\n`);
+    assert.equal(lstatSync(wrongMode).mode & 0o777, 0o640);
+
+    const specialMode = path.join(tempDir, "special-mode.bootstrap");
+    writeFileSync(specialMode, `${TEST_BOOTSTRAP_TOKEN}\n`, { mode: 0o600 });
+    chmodSync(specialMode, 0o4600);
+    assert.equal(lstatSync(specialMode).mode & 0o7777, 0o4600);
+    assertRejected(specialMode);
+    assert.equal(readFileSync(specialMode, "utf8"), `${TEST_BOOTSTRAP_TOKEN}\n`);
+    assert.equal(lstatSync(specialMode).mode & 0o7777, 0o4600);
+
+    const oversized = path.join(tempDir, "oversized.bootstrap");
+    const oversizedBytes = Buffer.alloc(8_194, 47);
+    writeFileSync(oversized, oversizedBytes, { mode: 0o600 });
+    chmodSync(oversized, 0o600);
+    assertRejected(oversized);
+    assert.deepEqual(readFileSync(oversized), oversizedBytes);
+
+    const symlinkVictim = path.join(tempDir, "symlink-victim");
+    const symlinkOutput = path.join(tempDir, "symlink.bootstrap");
+    writeFileSync(symlinkVictim, "victim-must-not-change\n", { mode: 0o600 });
+    symlinkSync(symlinkVictim, symlinkOutput);
+    assertRejected(symlinkOutput);
+    assert.equal(lstatSync(symlinkOutput).isSymbolicLink(), true);
+    assert.equal(readFileSync(symlinkVictim, "utf8"), "victim-must-not-change\n");
+
+    const hardlinkSource = path.join(tempDir, "hardlink-source");
+    const hardlinkOutput = path.join(tempDir, "hardlink.bootstrap");
+    writeFileSync(hardlinkSource, `${TEST_BOOTSTRAP_TOKEN}\n`, { mode: 0o600 });
+    chmodSync(hardlinkSource, 0o600);
+    linkSync(hardlinkSource, hardlinkOutput);
+    assertRejected(hardlinkOutput);
+    assert.equal(readFileSync(hardlinkSource, "utf8"), `${TEST_BOOTSTRAP_TOKEN}\n`);
+    assert.equal(lstatSync(hardlinkOutput).nlink, 2);
+
+    const special = path.join(tempDir, "special.bootstrap");
+    mkdirSync(special, { mode: 0o700 });
+    assertRejected(special);
+    assert.equal(lstatSync(special).isDirectory(), true);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -633,6 +743,103 @@ test("privileged admin seam delivers bootstrap secret only to the sink and reuse
     );
   } finally {
     await handle.shutdown();
+  }
+});
+
+test("privileged publication seam resumes one correlated sink attempt and acknowledges without remint", async () => {
+  const shipping = startableShipping();
+  const handle = await shipping.start();
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "tw-v2-bootstrap-publication-"));
+  try {
+    const input = {
+      correlation: "dashboard-first-host-publication",
+      expiresInMs: 60_000,
+    };
+    const outputPath = path.join(tempDir, "first-host.bootstrap");
+    const outputSink = hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(outputPath);
+    const failedSinkTokens = [];
+    await assert.rejects(
+      handle.admin.publishHostBootstrap(input, (secret) => {
+        failedSinkTokens.push(secret);
+        outputSink(secret);
+        throw new Error("injected crash before durable acknowledgement");
+      }),
+      /admin secret sink failed/,
+    );
+    assert.equal(failedSinkTokens.length, 1);
+    const beforeResume = lstatSync(outputPath, { bigint: true });
+
+    await assert.rejects(
+      handle.admin.publishHostBootstrap({
+        ...input,
+        expiresInMs: 60_001,
+      }, () => {}),
+      /conflicts with a prior request/,
+    );
+
+    const published = await handle.admin.publishHostBootstrap(
+      input,
+      outputSink,
+    );
+    assert.deepEqual(published, {
+      expiresAtMs: published.expiresAtMs,
+      alreadyAcknowledged: false,
+    });
+    const afterResume = lstatSync(outputPath, { bigint: true });
+    assert.equal(afterResume.ino, beforeResume.ino);
+    assert.equal(afterResume.mtimeNs, beforeResume.mtimeNs);
+    assert.equal(afterResume.ctimeNs, beforeResume.ctimeNs);
+    assert.equal(readFileSync(outputPath, "utf8"), `${failedSinkTokens[0]}\n`);
+
+    let acknowledgedSinkCalls = 0;
+    const acknowledged = await handle.admin.publishHostBootstrap(
+      input,
+      () => { acknowledgedSinkCalls += 1; },
+    );
+    assert.deepEqual(acknowledged, {
+      expiresAtMs: published.expiresAtMs,
+      alreadyAcknowledged: true,
+    });
+    assert.equal(acknowledgedSinkCalls, 0);
+
+    const differentInput = {
+      correlation: "dashboard-foreign-output-publication",
+      expiresInMs: 60_000,
+    };
+    const differentPath = path.join(tempDir, "foreign.bootstrap");
+    writeFileSync(differentPath, "foreign-bootstrap\n", { mode: 0o600 });
+    chmodSync(differentPath, 0o600);
+    const differentBefore = lstatSync(differentPath, { bigint: true });
+    const attemptedTokens = [];
+    const differentSink = hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(differentPath);
+    await assert.rejects(
+      handle.admin.publishHostBootstrap(differentInput, (secret) => {
+        attemptedTokens.push(secret);
+        differentSink(secret);
+      }),
+      /admin secret sink failed/,
+    );
+    assert.equal(readFileSync(differentPath, "utf8"), "foreign-bootstrap\n");
+    const differentAfter = lstatSync(differentPath, { bigint: true });
+    assert.equal(differentAfter.ino, differentBefore.ino);
+    assert.equal(differentAfter.mtimeNs, differentBefore.mtimeNs);
+
+    const recoveredPath = path.join(tempDir, "foreign-recovery.bootstrap");
+    const recoveredSink = hostBootstrapOutput.createRelayV2HostBootstrapOutputSink(recoveredPath);
+    const recoveredTokens = [];
+    const recovered = await handle.admin.publishHostBootstrap(
+      differentInput,
+      (secret) => {
+        recoveredTokens.push(secret);
+        recoveredSink(secret);
+      },
+    );
+    assert.equal(recovered.alreadyAcknowledged, false);
+    assert.deepEqual(recoveredTokens, attemptedTokens);
+    assert.equal(readFileSync(recoveredPath, "utf8"), `${attemptedTokens[0]}\n`);
+  } finally {
+    await handle.shutdown();
+    rmSync(tempDir, { recursive: true, force: true });
   }
 });
 

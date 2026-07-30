@@ -225,6 +225,29 @@ export interface RelayV2BrokerCredentialHostBootstrapCreated {
   expiresAtMs: number;
 }
 
+declare const relayV2HostBootstrapPublicationReceiptBrand: unique symbol;
+
+/**
+ * Process-local acknowledgement capability for one durable bootstrap
+ * publication claim. It has no serializable representation and only the
+ * authority instance that issued it can consume it.
+ */
+export interface RelayV2BrokerCredentialHostBootstrapPublicationReceipt {
+  readonly [relayV2HostBootstrapPublicationReceiptBrand]: true;
+}
+
+export type RelayV2BrokerCredentialHostBootstrapPublicationClaim =
+  | Readonly<{
+      status: "pending";
+      bootstrapToken: string;
+      expiresAtMs: number;
+      receipt: RelayV2BrokerCredentialHostBootstrapPublicationReceipt;
+    }>
+  | Readonly<{
+      status: "acknowledged";
+      expiresAtMs: number;
+    }>;
+
 export interface RelayV2BrokerCredentialGrantResponseBody {
   principalId: string;
   grantId: string;
@@ -310,6 +333,7 @@ type ReplayOperation =
   | "enrollment.create"
   | "enrollment.redeem"
   | "host.bootstrap"
+  | "host.bootstrap.publish"
   | "grant.refresh"
   | "host.reauthenticate"
   | "grant.revoke";
@@ -374,6 +398,13 @@ interface CredentialAuthorityEnvelope {
   grants: GrantRecord[];
   replays: ReplayRecord[];
   rateLimits: RateLimitRecord[];
+}
+
+function hostBootstrapRetentionExpiresAt(
+  bootstrap: HostBootstrapRecord,
+): number {
+  return (bootstrap.terminalAtMs ?? bootstrap.expiresAtMs)
+    + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS;
 }
 
 type TransitionResult<Result> =
@@ -768,6 +799,7 @@ function parseReplay(
       "enrollment.create",
       "enrollment.redeem",
       "host.bootstrap",
+      "host.bootstrap.publish",
       "grant.refresh",
       "host.reauthenticate",
       "grant.revoke",
@@ -1054,16 +1086,29 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
   ))) invalidState();
   const hostBootstrapReplayAttempts = new Set<string>();
   const hostBootstrapReplaysBySelector = new Map<string, ReplayRecord>();
+  const hostBootstrapPublicationAttempts = new Set<string>();
+  const hostBootstrapPublicationsBySelector = new Map<string, ReplayRecord>();
   for (const replay of replays) {
-    if (replay.operation !== "host.bootstrap") continue;
-    exactBase64UrlBytes(replay.subjectId, 16);
-    if (
-      replay.expiresAtMs <= value.lastObservedAtMs
-      || hostBootstrapReplayAttempts.has(replay.attemptId)
-      || hostBootstrapReplaysBySelector.has(replay.subjectId)
-    ) invalidState();
-    hostBootstrapReplayAttempts.add(replay.attemptId);
-    hostBootstrapReplaysBySelector.set(replay.subjectId, replay);
+    if (replay.operation === "host.bootstrap") {
+      exactBase64UrlBytes(replay.subjectId, 16);
+      if (
+        replay.expiresAtMs <= value.lastObservedAtMs
+        || hostBootstrapReplayAttempts.has(replay.attemptId)
+        || hostBootstrapReplaysBySelector.has(replay.subjectId)
+      ) invalidState();
+      hostBootstrapReplayAttempts.add(replay.attemptId);
+      hostBootstrapReplaysBySelector.set(replay.subjectId, replay);
+    } else if (replay.operation === "host.bootstrap.publish") {
+      exactBase64UrlBytes(replay.subjectId, 16);
+      if (
+        !isCurrentEnvelope
+        || replay.expiresAtMs <= value.lastObservedAtMs
+        || hostBootstrapPublicationAttempts.has(replay.attemptId)
+        || hostBootstrapPublicationsBySelector.has(replay.subjectId)
+      ) invalidState();
+      hostBootstrapPublicationAttempts.add(replay.attemptId);
+      hostBootstrapPublicationsBySelector.set(replay.subjectId, replay);
+    }
   }
   for (const bootstrap of hostBootstraps) {
     const replay = hostBootstrapReplaysBySelector.get(bootstrap.selector);
@@ -1078,8 +1123,18 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     } else if (replay) {
       invalidState();
     }
+    const publication = hostBootstrapPublicationsBySelector.get(bootstrap.selector);
+    if (publication) {
+      if (
+        publication.expiresAtMs !== hostBootstrapRetentionExpiresAt(bootstrap)
+      ) invalidState();
+      hostBootstrapPublicationsBySelector.delete(bootstrap.selector);
+    }
   }
-  if (hostBootstrapReplaysBySelector.size !== 0) invalidState();
+  if (
+    hostBootstrapReplaysBySelector.size !== 0
+    || hostBootstrapPublicationsBySelector.size !== 0
+  ) invalidState();
   if (
     !strictlySortedUnique(enrollments, (item) => item.enrollmentId)
     || !strictlySortedUnique(hostBootstraps, (item) => item.selector)
@@ -1321,6 +1376,25 @@ function openReplayResponse(
       case "host.bootstrap":
         if (value.bootstrapAttemptId !== record.attemptId) invalidState();
         break;
+      case "host.bootstrap.publish":
+        if (
+          value.publicationVersion !== 1
+          || (value.status !== "pending" && value.status !== "acknowledged")
+          || !Number.isSafeInteger(value.expiresAtMs)
+          || (value.status === "pending"
+            ? !hasExactKeys(value, [
+                "publicationVersion",
+                "status",
+                "bootstrapToken",
+                "expiresAtMs",
+              ]) || typeof value.bootstrapToken !== "string"
+            : !hasExactKeys(value, [
+                "publicationVersion",
+                "status",
+                "expiresAtMs",
+              ]))
+        ) invalidState();
+        break;
       case "grant.refresh":
         if (
           value.refreshAttemptId !== record.attemptId
@@ -1378,6 +1452,7 @@ function addReplay(
   response: RelayV2JsonObject,
   now: number,
   random: (length: number) => Uint8Array,
+  explicitExpiresAtMs?: number,
 ): void {
   if (state.replays.length >= MAX_REPLAYS) {
     throw authorityError("STATE_CAPACITY_EXHAUSTED");
@@ -1387,9 +1462,10 @@ function addReplay(
     replayKeyId: state.replayKeyring.activeKey.replayKeyId,
     aadVersion: 2,
     ciphertextBase64url: "",
-    expiresAtMs: now + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS,
+    expiresAtMs: explicitExpiresAtMs
+      ?? now + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS,
   };
-  if (!Number.isSafeInteger(next.expiresAtMs)) {
+  if (!Number.isSafeInteger(next.expiresAtMs) || next.expiresAtMs <= now) {
     throw authorityError("STATE_CAPACITY_EXHAUSTED");
   }
   next.ciphertextBase64url = sealReplayResponse(state, next, response, random);
@@ -1468,8 +1544,7 @@ function pruneExpiredAuthorityState(state: CredentialAuthorityEnvelope, now: num
     changed = true;
   }
   const hostBootstraps = state.hostBootstraps.filter((record) => {
-    const terminalAt = record.terminalAtMs ?? record.expiresAtMs;
-    return terminalAt + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS > now;
+    return hostBootstrapRetentionExpiresAt(record) > now;
   });
   if (hostBootstraps.length !== state.hostBootstraps.length) {
     state.hostBootstraps = hostBootstraps;
@@ -1547,6 +1622,75 @@ function hostBootstrapCredentialInput(value: unknown): {
     || secretBytes.toString("base64url") !== secret
   ) throw authorityError("AUTH_INVALID");
   return { selector, tokenHash: sha256Hex(value) };
+}
+
+function hostBootstrapPublicationFingerprint(
+  state: CredentialAuthorityEnvelope,
+  selector: string,
+  expiresInMs: number,
+): string {
+  return fixedFieldFingerprint({
+    anchorId: state.anchorId,
+    issuerUrl: state.issuerUrl,
+    relayUrl: state.relayUrl,
+    selector,
+    expiresInMs,
+  }, [
+    "anchorId",
+    "issuerUrl",
+    "relayUrl",
+    "selector",
+    "expiresInMs",
+  ]);
+}
+
+function alignHostBootstrapPublicationRetention(
+  state: CredentialAuthorityEnvelope,
+  bootstrap: HostBootstrapRecord,
+): void {
+  const publication = state.replays.find((replay) => (
+    replay.operation === "host.bootstrap.publish"
+    && replay.subjectId === bootstrap.selector
+  ));
+  if (publication) {
+    publication.expiresAtMs = hostBootstrapRetentionExpiresAt(bootstrap);
+  }
+}
+
+function openHostBootstrapPublicationReplay(
+  state: CredentialAuthorityEnvelope,
+  replay: ReplayRecord,
+): Readonly<{
+  status: "pending" | "acknowledged";
+  bootstrapToken?: string;
+  expiresAtMs: number;
+}> {
+  if (replay.operation !== "host.bootstrap.publish") invalidState();
+  const value = openReplayResponse(state, replay);
+  const bootstrap = state.hostBootstraps.find((record) => (
+    record.selector === replay.subjectId
+  ));
+  if (
+    !bootstrap
+    || value.expiresAtMs !== bootstrap.expiresAtMs
+    || replay.expiresAtMs !== hostBootstrapRetentionExpiresAt(bootstrap)
+  ) invalidState();
+  if (value.status === "pending") {
+    const parsed = hostBootstrapCredentialInput(value.bootstrapToken);
+    if (
+      parsed.selector !== bootstrap.selector
+      || parsed.tokenHash !== bootstrap.tokenHash
+    ) invalidState();
+    return Object.freeze({
+      status: "pending",
+      bootstrapToken: value.bootstrapToken as string,
+      expiresAtMs: bootstrap.expiresAtMs,
+    });
+  }
+  return Object.freeze({
+    status: "acknowledged",
+    expiresAtMs: bootstrap.expiresAtMs,
+  });
 }
 
 function accessTokenInput(value: unknown): string {
@@ -2033,6 +2177,14 @@ implements RelayV2BrokerAuthControlAuthority {
   private readonly random: (length: number) => Uint8Array;
   private readonly liveAuthorizationFence: RelayV2LiveAuthorizationFencePort | undefined;
   private readonly sourceAdmissions = new Map<object, SourceAdmissionRecord>();
+  private readonly hostBootstrapPublicationReceipts = new WeakMap<
+    object,
+    Readonly<{
+      selector: string;
+      correlation: string;
+      fingerprint: string;
+    }>
+  >();
   private authorityContinuityReadinessValue:
     RelayV2BrokerCredentialAuthorityContinuityReadiness = { status: "opening" };
   private currentCheckpoint: RelayV2ContinuityCheckpoint | null = null;
@@ -2706,6 +2858,169 @@ implements RelayV2BrokerAuthControlAuthority {
     });
   }
 
+  /**
+   * Begins or resumes one correlation-bound Host bootstrap publication.
+   *
+   * The bootstrap verifier and its encrypted response-loss recovery record
+   * publish in the same durable credential-authority commit. The correlation
+   * is non-secret; the Broker-generated selector and immutable authority
+   * profile are part of the fingerprint, so callers cannot choose a target or
+   * inject authority state. The plaintext is retained only inside the bounded
+   * encrypted replay record until acknowledgement/retention expiry.
+   */
+  async adminClaimHostBootstrapPublication(input: {
+    correlation: string;
+    expiresInMs?: number;
+  }): Promise<RelayV2BrokerCredentialHostBootstrapPublicationClaim> {
+    if (!isRecord(input) || !hasExactKeys(input, [
+      "correlation",
+      ...(Object.hasOwn(input, "expiresInMs") ? ["expiresInMs"] : []),
+    ])) throw authorityError("INVALID_ARGUMENT");
+    const correlation = ensureIdentifier(input.correlation);
+    const expiresInMs = input.expiresInMs
+      ?? RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS;
+    if (
+      !Number.isSafeInteger(expiresInMs)
+      || expiresInMs <= 0
+      || expiresInMs > RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS
+    ) throw authorityError("INVALID_ARGUMENT");
+
+    return this.mutate((state, now) => {
+      const prior = replayForAttempt(
+        state,
+        "host.bootstrap.publish",
+        correlation,
+      );
+      if (prior) {
+        const fingerprint = hostBootstrapPublicationFingerprint(
+          state,
+          prior.subjectId,
+          expiresInMs,
+        );
+        if (prior.fingerprint !== fingerprint) {
+          return rejectTransition("IDEMPOTENCY_CONFLICT", false);
+        }
+        const opened = openHostBootstrapPublicationReplay(state, prior);
+        if (opened.status === "acknowledged") {
+          return returnTransition(Object.freeze({
+            status: "acknowledged" as const,
+            expiresAtMs: opened.expiresAtMs,
+          }), false);
+        }
+        if (opened.expiresAtMs <= now) {
+          return rejectTransition("AUTH_INVALID", false);
+        }
+        const receipt =
+          Object.freeze({}) as RelayV2BrokerCredentialHostBootstrapPublicationReceipt;
+        this.hostBootstrapPublicationReceipts.set(receipt, Object.freeze({
+          selector: prior.subjectId,
+          correlation,
+          fingerprint,
+        }));
+        return returnTransition(Object.freeze({
+          status: "pending" as const,
+          bootstrapToken: opened.bootstrapToken!,
+          expiresAtMs: opened.expiresAtMs,
+          receipt,
+        }), false);
+      }
+
+      if (
+        state.hostBootstraps.length >= MAX_HOST_BOOTSTRAPS
+        || state.replays.length >= MAX_REPLAYS
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      const expiresAtMs = now + expiresInMs;
+      const recoveryExpiresAtMs = expiresAtMs
+        + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS;
+      if (
+        !Number.isSafeInteger(expiresAtMs)
+        || !Number.isSafeInteger(recoveryExpiresAtMs)
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      const bootstrapToken = generatedHostBootstrapToken(
+        this.randomExact(16),
+        this.randomExact(32),
+      );
+      const parsed = hostBootstrapCredentialInput(bootstrapToken);
+      if (
+        state.hostBootstraps.some((record) => (
+          record.selector === parsed.selector || record.tokenHash === parsed.tokenHash
+        ))
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      state.hostBootstraps.push({
+        selector: parsed.selector,
+        tokenHash: parsed.tokenHash,
+        createdAtMs: now,
+        expiresAtMs,
+        failedAttempts: 0,
+        terminalAtMs: null,
+        terminalReason: null,
+      });
+      state.hostBootstraps.sort((left, right) => compareUtf8(left.selector, right.selector));
+      const fingerprint = hostBootstrapPublicationFingerprint(
+        state,
+        parsed.selector,
+        expiresInMs,
+      );
+      addReplay(state, {
+        operation: "host.bootstrap.publish",
+        subjectId: parsed.selector,
+        attemptId: correlation,
+        fingerprint,
+      }, {
+        publicationVersion: 1,
+        status: "pending",
+        bootstrapToken,
+        expiresAtMs,
+      }, now, (length) => this.randomExact(length), recoveryExpiresAtMs);
+      const receipt =
+        Object.freeze({}) as RelayV2BrokerCredentialHostBootstrapPublicationReceipt;
+      this.hostBootstrapPublicationReceipts.set(receipt, Object.freeze({
+        selector: parsed.selector,
+        correlation,
+        fingerprint,
+      }));
+      return returnTransition(Object.freeze({
+        status: "pending" as const,
+        bootstrapToken,
+        expiresAtMs,
+        receipt,
+      }), true);
+    });
+  }
+
+  async adminAcknowledgeHostBootstrapPublication(
+    receipt: RelayV2BrokerCredentialHostBootstrapPublicationReceipt,
+  ): Promise<Readonly<{ expiresAtMs: number }>> {
+    if (
+      (typeof receipt !== "object" && typeof receipt !== "function")
+      || receipt === null
+    ) throw authorityError("INVALID_ARGUMENT");
+    const binding = this.hostBootstrapPublicationReceipts.get(receipt);
+    if (!binding) throw authorityError("INVALID_ARGUMENT");
+    this.hostBootstrapPublicationReceipts.delete(receipt);
+    return this.mutate((state) => {
+      const replay = replayFor(
+        state,
+        "host.bootstrap.publish",
+        binding.selector,
+        binding.correlation,
+      );
+      if (!replay || replay.fingerprint !== binding.fingerprint) {
+        throw authorityError("STATE_INVALID");
+      }
+      const opened = openHostBootstrapPublicationReplay(state, replay);
+      if (opened.status !== "pending") throw authorityError("STATE_INVALID");
+      replay.ciphertextBase64url = sealReplayResponse(state, replay, {
+        publicationVersion: 1,
+        status: "acknowledged",
+        expiresAtMs: opened.expiresAtMs,
+      }, (length) => this.randomExact(length));
+      return returnTransition(Object.freeze({
+        expiresAtMs: opened.expiresAtMs,
+      }), true);
+    });
+  }
+
   async authorizeAccessToken(
     token: string,
     expectedRole: RelayV2AccessRole,
@@ -3294,6 +3609,7 @@ implements RelayV2BrokerAuthControlAuthority {
         ) {
           bootstrap.terminalAtMs = now;
           bootstrap.terminalReason = "failures_exhausted";
+          alignHostBootstrapPublicationRetention(state, bootstrap);
         }
         return rejectTransition("AUTH_INVALID", true);
       }
@@ -3343,6 +3659,7 @@ implements RelayV2BrokerAuthControlAuthority {
       state.grants.sort((left, right) => compareUtf8(left.grantId, right.grantId));
       bootstrap.terminalAtMs = now;
       bootstrap.terminalReason = "consumed";
+      alignHostBootstrapPublicationRetention(state, bootstrap);
       const response: RelayV2JsonObject = {
         bootstrapAttemptId,
         principalId,

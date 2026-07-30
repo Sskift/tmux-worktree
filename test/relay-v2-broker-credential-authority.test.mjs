@@ -813,6 +813,149 @@ test("fresh host bootstrap issues the frozen host credential once and exactly re
   await authority.close();
 });
 
+test("correlation-bound bootstrap publication survives commit-before-output restart and never remints after acknowledgement", async () => {
+  let clock = NOW_MS;
+  const external = new MemoryContinuityAuthority();
+  const firstStore = new InMemoryRelayV2BrokerCredentialStateStore();
+  const first = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(firstStore, external, {
+      idPrefix: "bootstrap-publication-first",
+      now: () => clock,
+    }),
+  );
+  const input = {
+    correlation: "dashboard-first-host-attempt",
+    expiresInMs: 60_000,
+  };
+
+  // This is the crash cut: the verifier and recoverable encrypted response
+  // have committed, but no output sink or acknowledgement has run.
+  const committed = await first.adminClaimHostBootstrapPublication(input);
+  assert.equal(committed.status, "pending");
+  assert.match(committed.bootstrapToken, /^twhostboot2\./);
+  const committedStateText = Buffer.from(firstStore.snapshotBytes()).toString("utf8");
+  const committedState = JSON.parse(committedStateText);
+  assert.equal(committedState.hostBootstraps.length, 1);
+  assert.equal(
+    committedState.replays.filter((record) => (
+      record.operation === "host.bootstrap.publish"
+    )).length,
+    1,
+  );
+  assert.equal(committedStateText.includes(committed.bootstrapToken), false);
+  assert.equal(
+    committedStateText.includes(committed.bootstrapToken.split(".")[2]),
+    false,
+  );
+  const committedBytes = firstStore.snapshotBytes();
+  await first.close();
+
+  const restartStore = new InMemoryRelayV2BrokerCredentialStateStore({
+    initialBytes: committedBytes,
+  });
+  const restarted = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(restartStore, external, {
+      idPrefix: "bootstrap-publication-restarted",
+      now: () => clock,
+    }),
+  );
+  const beforeResumePublishes = restartStore.compareAndPublishCalls;
+  const resumed = await restarted.adminClaimHostBootstrapPublication(input);
+  assert.equal(resumed.status, "pending");
+  assert.equal(resumed.bootstrapToken, committed.bootstrapToken);
+  assert.equal(restartStore.compareAndPublishCalls, beforeResumePublishes);
+  assert.equal(decodeState(restartStore.snapshotBytes()).hostBootstraps.length, 1);
+
+  const beforeMismatchBytes = restartStore.snapshotBytes();
+  await assert.rejects(
+    restarted.adminClaimHostBootstrapPublication({
+      ...input,
+      expiresInMs: 60_001,
+    }),
+    errorCode("IDEMPOTENCY_CONFLICT"),
+  );
+  assert.deepEqual(restartStore.snapshotBytes(), beforeMismatchBytes);
+  await assert.rejects(
+    restarted.adminAcknowledgeHostBootstrapPublication(Object.freeze({})),
+    errorCode("INVALID_ARGUMENT"),
+  );
+
+  const acknowledged =
+    await restarted.adminAcknowledgeHostBootstrapPublication(resumed.receipt);
+  assert.deepEqual(acknowledged, { expiresAtMs: resumed.expiresAtMs });
+  await assert.rejects(
+    restarted.adminAcknowledgeHostBootstrapPublication(resumed.receipt),
+    errorCode("INVALID_ARGUMENT"),
+  );
+  const acknowledgedBytes = restartStore.snapshotBytes();
+  assert.equal(
+    Buffer.from(acknowledgedBytes).toString("utf8").includes(resumed.bootstrapToken),
+    false,
+  );
+  await restarted.close();
+
+  const acknowledgedRestartStore =
+    new InMemoryRelayV2BrokerCredentialStateStore({
+      initialBytes: acknowledgedBytes,
+    });
+  const acknowledgedRestart =
+    await credential.RelayV2BrokerCredentialAuthority.open(
+      authorityOptions(acknowledgedRestartStore, external, {
+        idPrefix: "bootstrap-publication-acknowledged-restart",
+        now: () => clock,
+      }),
+    );
+  const beforeAcknowledgedQuery =
+    acknowledgedRestartStore.compareAndPublishCalls;
+  const alreadyAcknowledged =
+    await acknowledgedRestart.adminClaimHostBootstrapPublication(input);
+  assert.deepEqual(alreadyAcknowledged, {
+    status: "acknowledged",
+    expiresAtMs: committed.expiresAtMs,
+  });
+  assert.equal(
+    acknowledgedRestartStore.compareAndPublishCalls,
+    beforeAcknowledgedQuery,
+  );
+  assert.equal(
+    decodeState(acknowledgedRestartStore.snapshotBytes()).hostBootstraps.length,
+    1,
+  );
+  const bootstrapAdmission = await admitHostBootstrap(
+    acknowledgedRestart,
+    "bootstrap-publication-redeem-source",
+  );
+  await acknowledgedRestart.bootstrapHost(
+    bootstrapAdmission,
+    "bootstrap-publication-redeem-source",
+    hostBootstrapInput(committed.bootstrapToken, {
+      bootstrapAttemptId: "bootstrap-publication-redeem",
+    }),
+  );
+  const consumedState = decodeState(
+    acknowledgedRestartStore.snapshotBytes(),
+  );
+  assert.equal(
+    consumedState.replays.find((record) => (
+      record.operation === "host.bootstrap.publish"
+    )).expiresAtMs,
+    clock + credential.RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS,
+  );
+  clock += credential.RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS;
+  await acknowledgedRestart.adminRotateIssuerKey({
+    kid: "bootstrap-publication-retention-prune",
+  });
+  const pruned = decodeState(acknowledgedRestartStore.snapshotBytes());
+  assert.equal(pruned.hostBootstraps.length, 0);
+  assert.equal(
+    pruned.replays.some((record) => (
+      record.operation === "host.bootstrap.publish"
+    )),
+    false,
+  );
+  await acknowledgedRestart.close();
+});
+
 test("host bootstrap selector attribution counts only known-selector failures and atomically exhausts at five", async () => {
   const store = new InMemoryRelayV2BrokerCredentialStateStore();
   const authority = await credential.RelayV2BrokerCredentialAuthority.open(

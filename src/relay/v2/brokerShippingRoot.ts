@@ -33,6 +33,7 @@ import type {
   RelayV2ExternalContinuityAuthorityAttemptProvider,
   RelayV2ExternalContinuityAuthorityConfig,
 } from "./externalContinuityAuthorityConfig.js";
+import { isRelayV2AuthIdentifier } from "./token.js";
 import {
   type RelayV2BrokerCredentialStateStoreNativeLoader,
 } from "./brokerCredentialStateStoreLoader.js";
@@ -142,6 +143,13 @@ export interface RelayV2BrokerLocalAdminPort {
     input: Readonly<{ expiresInMs?: number }>,
     sink: RelayV2BrokerAdminSecretSink,
   ): Promise<Readonly<{ expiresAtMs: number }>>;
+  publishHostBootstrap(
+    input: Readonly<{ correlation: string; expiresInMs?: number }>,
+    sink: RelayV2BrokerAdminSecretSink,
+  ): Promise<Readonly<{
+    expiresAtMs: number;
+    alreadyAcknowledged: boolean;
+  }>>;
   rotateIssuerKey(
     input: Readonly<{ kid: string; secretBase64url?: string }>,
   ): Promise<Readonly<{ kid: string }>>;
@@ -551,6 +559,8 @@ function hasAdminSurface(authority: unknown): authority is RelayV2BrokerCredenti
   const candidate = authority as Record<string, unknown>;
   return [
     "adminCreateHostBootstrap",
+    "adminClaimHostBootstrapPublication",
+    "adminAcknowledgeHostBootstrapPublication",
     "adminRotateIssuerKey",
     "adminRemoveIssuerKey",
     "adminRotateReplayKey",
@@ -569,6 +579,27 @@ function captureBootstrapInput(value: unknown): { expiresInMs?: number } {
   return Object.freeze(record.expiresInMs === undefined
     ? {}
     : { expiresInMs: record.expiresInMs as number });
+}
+
+function captureBootstrapPublicationInput(
+  value: unknown,
+): { correlation: string; expiresInMs?: number } {
+  const record = captureOwnDataRecord(value, ["correlation"], ["expiresInMs"]);
+  if (
+    record === null
+    || !isRelayV2AuthIdentifier(record.correlation)
+    || (record.expiresInMs !== undefined
+      && (!Number.isSafeInteger(record.expiresInMs)
+        || (record.expiresInMs as number) <= 0
+        || (record.expiresInMs as number)
+          > RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS))
+  ) throw new TypeError(ADMIN_INPUT_INVALID);
+  return Object.freeze({
+    correlation: record.correlation,
+    ...(record.expiresInMs === undefined
+      ? {}
+      : { expiresInMs: record.expiresInMs as number }),
+  });
 }
 
 function captureSecretSink(value: unknown): RelayV2BrokerAdminSecretSink {
@@ -804,6 +835,54 @@ export async function startRelayV2BrokerShippingRoot(
         throw new Error(ADMIN_SINK_FAILED);
       }
       return Object.freeze({ expiresAtMs: expiresAtMs as number });
+    },
+    async publishHostBootstrap(input, sink) {
+      const capturedInput = captureBootstrapPublicationInput(input);
+      const capturedSink = captureSecretSink(sink);
+      return runAdmin(async (authority) => {
+        const claim = await authority.adminClaimHostBootstrapPublication(
+          capturedInput,
+        );
+        if (
+          claim?.status === "acknowledged"
+          && Number.isSafeInteger(claim.expiresAtMs)
+        ) {
+          return Object.freeze({
+            expiresAtMs: claim.expiresAtMs,
+            alreadyAcknowledged: true,
+          });
+        }
+        if (
+          claim?.status !== "pending"
+          || typeof claim.bootstrapToken !== "string"
+          || !Number.isSafeInteger(claim.expiresAtMs)
+          || claim.receipt === null
+          || typeof claim.receipt !== "object"
+        ) throw new Error(ADMIN_UNAVAILABLE);
+        try {
+          const delivered: unknown = Reflect.apply(
+            capturedSink,
+            undefined,
+            [claim.bootstrapToken],
+          );
+          if (isThenable(delivered)) {
+            throw new Error("sink must deliver synchronously");
+          }
+        } catch {
+          throw new Error(ADMIN_SINK_FAILED);
+        }
+        const acknowledged =
+          await authority.adminAcknowledgeHostBootstrapPublication(
+            claim.receipt,
+          );
+        if (acknowledged?.expiresAtMs !== claim.expiresAtMs) {
+          throw new Error(ADMIN_UNAVAILABLE);
+        }
+        return Object.freeze({
+          expiresAtMs: claim.expiresAtMs,
+          alreadyAcknowledged: false,
+        });
+      });
     },
     rotateIssuerKey: (input) => runAdmin((authority) => authority.adminRotateIssuerKey(
       captureRotateIssuerKeyInput(input),

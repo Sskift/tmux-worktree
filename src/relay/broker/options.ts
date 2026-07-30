@@ -1,4 +1,5 @@
 import { CliError } from "../../tmux.js";
+import { isRelayV2AuthIdentifier } from "../v2/token.js";
 
 export type RelayServerOptions = {
   host: string;
@@ -12,6 +13,7 @@ export type RelayServerOptions = {
   v2LocalDevelopmentAdvertisedOrigin?: string;
   v2SingleNodeSelfHostedStateDirectory?: string;
   v2HostBootstrapOutputPath?: string;
+  v2SingleNodeSelfHostedBootstrapCorrelation?: string;
 };
 
 export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
@@ -29,6 +31,7 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let v2LocalDevelopmentAdvertisedOrigin: string | undefined;
   let v2SingleNodeSelfHostedStateDirectory: string | undefined;
   let v2HostBootstrapOutputPath: string | undefined;
+  let v2SingleNodeSelfHostedBootstrapCorrelation: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -82,6 +85,13 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         throw new CliError("relay-server --host-bootstrap-output 只能指定一次");
       }
       v2HostBootstrapOutputPath = argv[++i] || "";
+    } else if (arg === "--v2-self-hosted-bootstrap-correlation") {
+      if (v2SingleNodeSelfHostedBootstrapCorrelation !== undefined) {
+        throw new CliError(
+          "relay-server --v2-self-hosted-bootstrap-correlation 只能指定一次",
+        );
+      }
+      v2SingleNodeSelfHostedBootstrapCorrelation = argv[++i] || "";
     } else if (arg === "-h" || arg === "--help") {
       printRelayServerHelp();
       process.exit(0);
@@ -128,6 +138,12 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
           + "只适用于 --v2-single-node-self-hosted",
       );
     }
+    if (v2SingleNodeSelfHostedBootstrapCorrelation !== undefined) {
+      throw new CliError(
+        "relay-server --v2-self-hosted-bootstrap-correlation "
+          + "只适用于 --v2-single-node-self-hosted",
+      );
+    }
     if (v2HostBootstrapOutputPath === "") {
       throw new CliError("relay-server --host-bootstrap-output 需要非空输出路径");
     }
@@ -161,6 +177,12 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     }
     if (!v2HostBootstrapOutputPath) {
       throw new CliError("relay-server --v2-local-dev 需要 --host-bootstrap-output");
+    }
+    if (v2SingleNodeSelfHostedBootstrapCorrelation !== undefined) {
+      throw new CliError(
+        "relay-server --v2-self-hosted-bootstrap-correlation "
+          + "只适用于 --v2-single-node-self-hosted",
+      );
     }
     return {
       host: "127.0.0.1",
@@ -220,6 +242,24 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         "relay-server --host-bootstrap-output 需要非空输出路径",
       );
     }
+    if (
+      v2SingleNodeSelfHostedBootstrapCorrelation !== undefined
+      && !isRelayV2AuthIdentifier(v2SingleNodeSelfHostedBootstrapCorrelation)
+    ) {
+      throw new CliError(
+        "relay-server --v2-self-hosted-bootstrap-correlation "
+          + "需要有效的非敏感 attempt identifier",
+      );
+    }
+    if (
+      v2SingleNodeSelfHostedBootstrapCorrelation !== undefined
+      && v2HostBootstrapOutputPath === undefined
+    ) {
+      throw new CliError(
+        "relay-server --v2-self-hosted-bootstrap-correlation "
+          + "必须与 --host-bootstrap-output 同时使用",
+      );
+    }
     return {
       host,
       port,
@@ -230,6 +270,7 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
       v2LocalDevelopmentAdvertisedOrigin,
       v2SingleNodeSelfHostedStateDirectory,
       v2HostBootstrapOutputPath,
+      v2SingleNodeSelfHostedBootstrapCorrelation,
     };
   }
 
@@ -254,6 +295,12 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   if (v2HostBootstrapOutputPath !== undefined) {
     throw new CliError(
       "relay-server --host-bootstrap-output 只适用于显式 v2 lane",
+    );
+  }
+  if (v2SingleNodeSelfHostedBootstrapCorrelation !== undefined) {
+    throw new CliError(
+      "relay-server --v2-self-hosted-bootstrap-correlation "
+        + "只适用于 --v2-single-node-self-hosted",
     );
   }
 

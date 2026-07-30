@@ -212,6 +212,64 @@ test("self-hosted CLI is explicit and never consumes a v1 secret", () => {
   );
 });
 
+test("self-hosted bootstrap correlation is a strict output-paired hidden seam", () => {
+  const base = [
+    "--v2-single-node-self-hosted",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "9443",
+    "--v2-dev-advertised-origin",
+    "https://relay.example.test",
+    "--v2-dev-tls-key",
+    "/private/relay.key",
+    "--v2-dev-tls-cert",
+    "/private/relay.cert",
+    "--v2-self-hosted-state-dir",
+    "/private/relay-state",
+  ];
+  const missingOutput = spawnSync(process.execPath, [
+    path.resolve("dist/cli.cjs"),
+    "relay-server",
+    ...base,
+    "--v2-self-hosted-bootstrap-correlation",
+    "dashboard-attempt-one",
+  ], { encoding: "utf8" });
+  assert.equal(missingOutput.status, 1);
+  assert.match(
+    missingOutput.stderr,
+    /必须与 --host-bootstrap-output 同时使用/,
+  );
+
+  const invalidCorrelation = spawnSync(process.execPath, [
+    path.resolve("dist/cli.cjs"),
+    "relay-server",
+    ...base,
+    "--host-bootstrap-output",
+    "/private/bootstrap-output",
+    "--v2-self-hosted-bootstrap-correlation",
+    " invalid-correlation ",
+  ], { encoding: "utf8" });
+  assert.equal(invalidCorrelation.status, 1);
+  assert.match(
+    invalidCorrelation.stderr,
+    /有效的非敏感 attempt identifier/,
+  );
+
+  const v1Correlation = spawnSync(process.execPath, [
+    path.resolve("dist/cli.cjs"),
+    "relay-server",
+    "--v2-self-hosted-bootstrap-correlation",
+    "not-a-v1-secret",
+  ], { encoding: "utf8" });
+  assert.equal(v1Correlation.status, 1);
+  assert.match(
+    v1Correlation.stderr,
+    /只适用于 --v2-single-node-self-hosted/,
+  );
+  assert.equal(v1Correlation.stderr.includes("not-a-v1-secret"), false);
+});
+
 test("single-node SQLite owner preserves Host and Android credentials across restart", {
   skip: linuxNode2216OrNewer()
     ? false
@@ -224,6 +282,8 @@ test("single-node SQLite owner preserves Host and Android credentials across res
   const copiedStateDirectory = path.join(tempDirectory, "copied-state");
   const keyPath = path.join(tempDirectory, "loopback.key.pem");
   const certificatePath = path.join(tempDirectory, "loopback.cert.pem");
+  const correlatedBootstrapOutputPath =
+    path.join(tempDirectory, "correlated-host.bootstrap");
   mkdirSync(stateDirectory, { mode: 0o700 });
   chmodSync(stateDirectory, 0o700);
   writeFileSync(keyPath, TEST_LOOPBACK_KEY_PEM, { mode: 0o600 });
@@ -427,6 +487,10 @@ test("single-node SQLite owner preserves Host and Android credentials across res
       certificatePath,
       "--v2-self-hosted-state-dir",
       stateDirectory,
+      "--host-bootstrap-output",
+      correlatedBootstrapOutputPath,
+      "--v2-self-hosted-bootstrap-correlation",
+      "dashboard-cli-first-host-attempt",
     ], {
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -434,6 +498,18 @@ test("single-node SQLite owner preserves Host and Android credentials across res
     cliChild.stderr.on("data", (chunk) => cliOutput.push(chunk));
     const output = () => Buffer.concat(cliOutput).toString("utf8");
     await waitForCliListener(port, cliChild, output);
+    let correlatedBootstrapToken = "";
+    const bootstrapDeadline = Date.now() + 5_000;
+    while (correlatedBootstrapToken === "" && Date.now() < bootstrapDeadline) {
+      try {
+        correlatedBootstrapToken =
+          readFileSync(correlatedBootstrapOutputPath, "utf8").trim();
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    assert.match(correlatedBootstrapToken, /^twhostboot2\./);
+    assert.equal(lstatSync(correlatedBootstrapOutputPath).mode & 0o777, 0o600);
     assert.equal(cliChild.kill("SIGHUP"), true);
     const [exitCode, signalCode] = await waitForChildExit(cliChild);
     assert.equal(exitCode, 0, output());
@@ -460,6 +536,10 @@ test("single-node SQLite owner preserves Host and Android credentials across res
 
     const persistedBytes = readFileSync(databasePath);
     assert.equal(persistedBytes.includes(Buffer.from(bootstrapToken)), false);
+    assert.equal(
+      persistedBytes.includes(Buffer.from(correlatedBootstrapToken)),
+      false,
+    );
   } finally {
     for (const socket of sockets) {
       try { socket.terminate(); } catch {}

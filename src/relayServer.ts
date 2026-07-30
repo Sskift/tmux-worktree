@@ -201,12 +201,22 @@ async function runRelayV2BrokerSingleNodeSelfHostedCli(
         options.v2HostBootstrapOutputPath,
       );
       try {
-        await handle.admin.createHostBootstrap({}, (secret) => {
+        const guardedSink = (secret: string): void => {
           if (signalLatch.signal.aborted) {
             throw new Error("Relay v2 Broker startup stopped");
           }
           bootstrapSink(secret);
-        });
+        };
+        if (
+          options.v2SingleNodeSelfHostedBootstrapCorrelation === undefined
+        ) {
+          await handle.admin.createHostBootstrap({}, guardedSink);
+        } else {
+          await handle.admin.publishHostBootstrap({
+            correlation:
+              options.v2SingleNodeSelfHostedBootstrapCorrelation,
+          }, guardedSink);
+        }
       } catch (error) {
         await shutdown();
         if (signalLatch.signal.aborted) return;
