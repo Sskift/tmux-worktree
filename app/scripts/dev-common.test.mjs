@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,8 +12,24 @@ import {
   prepareIsolatedDevApp,
 } from "./dev-common.mjs";
 
-test("isolated Dashboard launchers use one private tmux namespace", () => {
+function listenUnix(socketPath) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      server.off("error", reject);
+      resolve(server);
+    });
+  });
+}
+
+test("isolated Dashboard launchers use one short private socket namespace", async () => {
   const sourceHome = fs.mkdtempSync(path.join(os.tmpdir(), "twd-source-"));
+  const hostileTmpDir = path.join(
+    sourceHome,
+    "var-folders-style-tmpdir-that-is-deliberately-too-long-for-unix-sockets",
+  );
+  fs.mkdirSync(hostileTmpDir);
   fs.writeFileSync(
     path.join(sourceHome, ".tw-dashboard-layout.json"),
     '{"layout":"copied"}\n',
@@ -22,15 +39,32 @@ test("isolated Dashboard launchers use one private tmux namespace", () => {
     '{"terminals":[{"aiCmd":"hostile-command"}]}\n',
   );
   const originalHome = process.env.HOME;
+  const originalTmpDir = process.env.TMPDIR;
   let isolated;
+  let secondIsolated;
   try {
     process.env.HOME = sourceHome;
+    process.env.TMPDIR = hostileTmpDir;
     isolated = prepareIsolatedDevApp("tw-dashboard-test");
+    secondIsolated = prepareIsolatedDevApp("tw-dashboard-test");
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
+    if (originalTmpDir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpDir;
   }
   try {
+    const canonicalSystemTmp = fs.realpathSync.native("/tmp");
+    assert.equal(path.dirname(isolated.tempRoot), canonicalSystemTmp);
+    if (process.platform === "darwin") {
+      assert.equal(canonicalSystemTmp, "/private/tmp");
+    }
+    assert.equal(fs.realpathSync.native(isolated.tempRoot), isolated.tempRoot);
+    assert.notEqual(secondIsolated.tempRoot, isolated.tempRoot);
+    assert.notEqual(
+      secondIsolated.socketPaths.relayV2ExactCompound,
+      isolated.socketPaths.relayV2ExactCompound,
+    );
     assert.equal(
       fs.readFileSync(path.join(isolated.tempHome, ".tw-dashboard-layout.json"), "utf8"),
       '{"layout":"copied"}\n',
@@ -46,11 +80,40 @@ test("isolated Dashboard launchers use one private tmux namespace", () => {
     if (typeof process.getuid === "function") {
       assert.equal(metadata.uid, process.getuid());
     }
-    const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
-    const tmuxSocketPath = path.join(isolated.tmuxTmpDir, `tmux-${uid}`, "default");
-    assert.ok(
-      Buffer.byteLength(tmuxSocketPath, "utf8") <= 100,
-      `tmux socket path exceeds 100 UTF-8 bytes: ${tmuxSocketPath}`,
+    assert.equal(
+      isolated.socketPaths.terminalControl,
+      path.join(
+        isolated.tempHome,
+        ".tmux-worktree",
+        "terminal-control-v1.sock",
+      ),
+    );
+    assert.equal(
+      path.dirname(isolated.socketPaths.relayV2ExactCompound),
+      path.dirname(isolated.socketPaths.terminalControl),
+    );
+    assert.match(
+      path.basename(isolated.socketPaths.relayV2ExactCompound),
+      /^\.relay-v2-exact-[0-9a-f]{16}\.sock$/,
+    );
+    for (const [label, socketPath] of Object.entries(isolated.socketPaths)) {
+      assert.ok(
+        Buffer.byteLength(socketPath, "utf8") <= 100,
+        `${label} socket path exceeds 100 UTF-8 bytes: ${socketPath}`,
+      );
+    }
+
+    fs.mkdirSync(path.dirname(isolated.socketPaths.tmux), { recursive: true });
+    fs.mkdirSync(path.dirname(isolated.socketPaths.terminalControl), {
+      recursive: true,
+    });
+    const listeners = await Promise.all(
+      Object.values(isolated.socketPaths).map(listenUnix),
+    );
+    await Promise.all(
+      listeners.map((server) => new Promise((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      })),
     );
 
     const runtimeEnv = isolatedRuntimeEnv(isolated, {
@@ -108,6 +171,9 @@ test("isolated Dashboard launchers use one private tmux namespace", () => {
   } finally {
     if (isolated) {
       fs.rmSync(isolated.tempRoot, { recursive: true, force: true });
+    }
+    if (secondIsolated) {
+      fs.rmSync(secondIsolated.tempRoot, { recursive: true, force: true });
     }
     fs.rmSync(sourceHome, { recursive: true, force: true });
   }

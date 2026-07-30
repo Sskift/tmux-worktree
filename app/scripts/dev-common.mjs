@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,35 +17,89 @@ export const stateFiles = [
   ".tw-serve-token",
 ];
 
+const UNIX_SOCKET_PATH_MAX_BYTES = 100;
+
+function isolatedDevSocketPaths(tempHome, tmuxTmpDir) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
+  const tmux = path.join(tmuxTmpDir, `tmux-${uid}`, "default");
+  const terminalControl = path.join(
+    tempHome,
+    ".tmux-worktree",
+    "terminal-control-v1.sock",
+  );
+  // Validation-only projection of the shipping identity; it never selects or binds the socket.
+  const exactDigest = createHash("sha256")
+    .update(terminalControl, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  const relayV2ExactCompound = path.join(
+    path.dirname(terminalControl),
+    `.relay-v2-exact-${exactDigest}.sock`,
+  );
+  return Object.freeze({ tmux, terminalControl, relayV2ExactCompound });
+}
+
+function requireIsolatedDevSocketPathsFit(socketPaths) {
+  for (const [label, socketPath] of Object.entries(socketPaths)) {
+    const bytes = Buffer.byteLength(socketPath, "utf8");
+    if (bytes > UNIX_SOCKET_PATH_MAX_BYTES) {
+      throw new Error(
+        `isolated ${label} socket path is ${bytes} UTF-8 bytes `
+          + `(maximum ${UNIX_SOCKET_PATH_MAX_BYTES}): ${socketPath}`,
+      );
+    }
+  }
+}
+
 export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
   const suffix = randomBytes(3).toString("hex");
   const productName = `${prefix}-${suffix}`;
   const identifier = `dev.warpdash.tw.dev.${suffix}`;
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "twd-"));
-  const tempHome = path.join(tempRoot, "home");
-  const tmuxTmpDir = tempRoot;
-  fs.chmodSync(tmuxTmpDir, 0o700);
-  fs.mkdirSync(tempHome, { recursive: true });
-
-  const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
-  const tmuxSocketPath = path.join(tmuxTmpDir, `tmux-${uid}`, "default");
-  const tmuxSocketBytes = Buffer.byteLength(tmuxSocketPath, "utf8");
-  if (tmuxSocketBytes > 100) {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
-    throw new Error(
-      `isolated tmux socket path is ${tmuxSocketBytes} UTF-8 bytes (maximum 100): ${tmuxSocketPath}`,
-    );
-  }
-
-  for (const name of stateFiles) {
-    const src = path.join(os.homedir(), name);
-    const dst = path.join(tempHome, name);
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, dst);
+  const tempParent = fs.realpathSync.native("/tmp");
+  const tempRoot = fs.mkdtempSync(path.join(tempParent, "twd-"));
+  try {
+    fs.chmodSync(tempRoot, 0o700);
+    const metadata = fs.lstatSync(tempRoot);
+    if (
+      fs.realpathSync.native(tempRoot) !== tempRoot
+      || !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || (metadata.mode & 0o777) !== 0o700
+      || (
+        typeof process.getuid === "function"
+        && metadata.uid !== process.getuid()
+      )
+    ) {
+      throw new Error(`isolated temp root is not canonical owner-only storage: ${tempRoot}`);
     }
-  }
 
-  return { suffix, productName, identifier, tempRoot, tempHome, tmuxTmpDir };
+    const tempHome = path.join(tempRoot, "home");
+    const tmuxTmpDir = tempRoot;
+    fs.mkdirSync(tempHome, { mode: 0o700 });
+    const socketPaths = isolatedDevSocketPaths(tempHome, tmuxTmpDir);
+    requireIsolatedDevSocketPathsFit(socketPaths);
+
+    for (const name of stateFiles) {
+      const src = path.join(os.homedir(), name);
+      const dst = path.join(tempHome, name);
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, dst);
+      }
+    }
+
+    return {
+      suffix,
+      productName,
+      identifier,
+      tempRoot,
+      tempHome,
+      tmuxTmpDir,
+      socketPaths,
+    };
+  } catch (error) {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export function isolatedRuntimeEnv(isolated, baseEnv = process.env) {
