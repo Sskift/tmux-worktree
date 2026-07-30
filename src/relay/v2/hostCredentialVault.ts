@@ -206,6 +206,32 @@ function emptyEnvelope(): VaultEnvelope {
   return { credentialState: null, bootstrapSecret: null, refreshSecret: null };
 }
 
+function isPendingBootstrapEnvelope(envelope: VaultEnvelope): boolean {
+  const state = envelope.credentialState;
+  return state !== null
+    && state.credentialVersion === "0"
+    && state.pendingCredentialAttempt?.kind === "bootstrap"
+    && state.pendingCredentialAttempt.oldCredentialVersion === "0"
+    && envelope.bootstrapSecret !== null
+    && envelope.refreshSecret === null;
+}
+
+function isBootstrapOnlyEnvelope(envelope: VaultEnvelope): boolean {
+  return envelope.credentialState === null
+    && envelope.bootstrapSecret !== null
+    && envelope.refreshSecret === null;
+}
+
+function isIdempotentBootstrapEnvelope(envelope: VaultEnvelope): boolean {
+  return isBootstrapOnlyEnvelope(envelope) || isPendingBootstrapEnvelope(envelope);
+}
+
+function sameSecret(left: string, right: string): boolean {
+  const leftDigest = createHash("sha256").update(left, "utf8").digest();
+  const rightDigest = createHash("sha256").update(right, "utf8").digest();
+  return timingSafeEqual(leftDigest, rightDigest);
+}
+
 function validateEnvelopeInvariants(envelope: VaultEnvelope): VaultEnvelope {
   const state = envelope.credentialState;
   if (state === null) {
@@ -369,6 +395,7 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
   readonly #cell: RelayV2HostCredentialAtomicByteCell;
   readonly #bootstrapSecretHandoff: RelayV2HostBootstrapSecretHandoff;
   #lifecycle: "open" | "closing" | "closed" = "open";
+  #commitUncertain = false;
   #admitted = 0;
   #drainPromise: Promise<void> | null = null;
   #resolveDrain: (() => void) | null = null;
@@ -404,6 +431,13 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
     return this.#admit(() => this.#withCell((transaction) => {
       let read = this.#cellRead(transaction);
       let current = decodeEnvelope(read.bytes, this.#binding);
+      if (isIdempotentBootstrapEnvelope(current)) {
+        return this.#runWithBootstrapCandidate(candidate, (bootstrapSecret) => {
+          if (!sameSecret(current.bootstrapSecret!, bootstrapSecret)) {
+            return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
+          }
+        });
+      }
       if (current.credentialState !== null
         || current.bootstrapSecret !== null
         || current.refreshSecret !== null) {
@@ -427,6 +461,12 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
           }
           read = validateCellRead(result.current);
           current = decodeEnvelope(read.bytes, this.#binding);
+          if (isIdempotentBootstrapEnvelope(current)) {
+            if (!sameSecret(current.bootstrapSecret!, bootstrapSecret)) {
+              return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
+            }
+            return;
+          }
           if (current.credentialState !== null
             || current.bootstrapSecret !== null
             || current.refreshSecret !== null) {
@@ -566,7 +606,10 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
         return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BACKEND_UNAVAILABLE");
       }
       if ((result.status === "swapped" || result.status === "uncertain")
-        && exactKeys(result, ["status"])) return { status: result.status };
+        && exactKeys(result, ["status"])) {
+        if (result.status === "uncertain") this.#commitUncertain = true;
+        return { status: result.status };
+      }
       if (result.status === "conflict"
         && exactKeys(result, ["status", "current"])) {
         return { status: "conflict", current: validateCellRead(result.current) };
@@ -663,6 +706,9 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
   #admit<T>(operation: () => T): T {
     if (this.#lifecycle !== "open") {
       return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_CLOSED");
+    }
+    if (this.#commitUncertain) {
+      return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN");
     }
     this.#admitted += 1;
     try {

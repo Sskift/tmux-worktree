@@ -863,6 +863,7 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
 
     const recovering = await makeHarness("pending-recovery", home);
     const daemon = await startDaemon(recovering);
+    const recoverySource = createByteSource(backend.events);
     const recoveredHttps = createCredentialHttpsTransport(
       backend.events,
       recovering.hostSnapshot,
@@ -871,10 +872,13 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       const facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
         trustedHome: home,
         credentialCell: new FakeCellOwner(backend),
+        bootstrapSecretByteSource: recoverySource.source,
         credentialHttpsTransport: recoveredHttps.transport,
         canonical: recovering.canonical,
       });
       assert.notEqual(facade, null);
+      assert.equal(recoverySource.stats.iterators, 1);
+      assert.equal(recoverySource.stats.cancels, 1);
       assert.equal(recoveredHttps.stats.calls, 1);
       assert.equal(
         recoveredHttps.stats.attemptIds[0],

@@ -273,12 +273,46 @@ test("provision, pending response-loss retry, bootstrap commit, and refresh rota
   assertInspectableSurfaceDoesNotExposeBootstrapSecret(candidate);
   assert.equal(cell.operations, 0, "privileged intake is inert against the byte cell");
   opened.vault.provisionBootstrap(candidate);
+  const bootstrapOnlyBytes = cell.snapshotBytes();
+  const comparesBeforeBootstrapOnlyReplay = cell.compares;
+  opened.vault.provisionBootstrap(
+    handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET),
+  );
+  assert.equal(cell.compares, comparesBeforeBootstrapOnlyReplay);
+  assert.equal(digest(cell.snapshotBytes()), digest(bootstrapOnlyBytes));
+  assert.throws(
+    () => opened.vault.provisionBootstrap(
+      handoffAuthority.privilegedIntake.accept(
+        "twhostboot2.bootstrap-only-different.different-secret",
+      ),
+    ),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED"),
+  );
+  assert.equal(cell.compares, comparesBeforeBootstrapOnlyReplay);
+  assert.equal(digest(cell.snapshotBytes()), digest(bootstrapOnlyBytes));
   const authority = openAuthority(opened.vault);
   const prepared = authority.prepareBootstrap(bootstrapPreparation());
   assert.equal(prepared.fence.oldCredentialVersion, "0");
   assert.equal(digest(prepared.credential.bootstrapToken), digest(BOOTSTRAP_SECRET));
 
   const reopenedVault = openVault(cell, handoffAuthority).vault;
+  const pendingBytes = cell.snapshotBytes();
+  const comparesBeforeIdempotentProvision = cell.compares;
+  reopenedVault.provisionBootstrap(
+    handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET),
+  );
+  assert.equal(cell.compares, comparesBeforeIdempotentProvision);
+  assert.equal(digest(cell.snapshotBytes()), digest(pendingBytes));
+  assert.throws(
+    () => reopenedVault.provisionBootstrap(
+      handoffAuthority.privilegedIntake.accept(
+        "twhostboot2.different-selector.different-secret",
+      ),
+    ),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED"),
+  );
+  assert.equal(cell.compares, comparesBeforeIdempotentProvision);
+  assert.equal(digest(cell.snapshotBytes()), digest(pendingBytes));
   const reopenedAuthority = openAuthority(reopenedVault);
   const responseLossRetry = reopenedAuthority.prepareBootstrap(bootstrapPreparation({
     attemptId: "must-reuse-durable-bootstrap-attempt",
@@ -663,7 +697,7 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
         label: "occupied",
         cell: new FakeAtomicByteCell(occupiedBytes),
         errorCode: "RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED",
-        preflight: true,
+        candidateSecret: "twhostboot2.occupied-different.different-secret",
       },
       {
         label: "corrupt",
@@ -704,7 +738,9 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
     let replay;
     for (const entry of cases) {
       const handoffAuthority = createBootstrapHandoff();
-      const candidate = handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET);
+      const candidate = handoffAuthority.privilegedIntake.accept(
+        entry.candidateSecret ?? BOOTSTRAP_SECRET,
+      );
       const candidateForFailure = entry.preflight
         ? Object.freeze(Object.create(null))
         : candidate;
@@ -750,7 +786,7 @@ test("foreign, replayed, invalid, uncertain, and closed inputs fail closed witho
     assert.notEqual(uncertainAfterBytes, null);
     assert.throws(
       () => uncertainAfterVault.provisionBootstrap(uncertainAfterCandidate),
-      assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED"),
+      assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN"),
     );
     assert.equal(
       optionalDigest(uncertainAfterCell.snapshotBytes()),
