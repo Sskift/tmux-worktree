@@ -34,7 +34,11 @@ export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   readonly profileSnapshot?: Readonly<RelayV2HostProductionProfile>;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
-  /** Explicit operator repair for the existing version-zero pending envelope. */
+  /**
+   * Explicit operator repair for a version-zero pending envelope, or
+   * active-cell recovery that discards the stale candidate and resumes the
+   * exact existing credential.
+   */
   readonly replacePendingBootstrap?: true;
   /** Exact outer startup signal forwarded unchanged to the intake owner. */
   readonly startupSignal?: AbortSignal;

@@ -758,7 +758,7 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
     }
   });
 
-  await t.test("canonical failure preserves ready credential and recovery does not rebootstrap", async () => {
+  await t.test("ReplacePending resumes an active credential and disposes the stale source without bootstrap", async () => {
     const home = privateHome("tw-relay-v2-intake-recovery-home-");
     const backend = new FakeCellBackend();
     const source = createByteSource(backend.events);
@@ -810,17 +810,34 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       recovering.hostSnapshot,
       { fail: true },
     );
+    const recoveryCell = new FakeCellOwner(backend);
+    const staleSource = createByteSource(
+      backend.events,
+      "twhostboot2.stale-dashboard-candidate.must-be-discarded",
+    );
+    const selfHostedHandoff = runtimeCompositionModule
+      .issueRelayV2HostSelfHostedCapabilityActivationHandoff(recoveryCell);
     try {
       const swapsBefore = backend.swaps;
       const facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
         trustedHome: home,
-        credentialCell: new FakeCellOwner(backend),
+        credentialCell: recoveryCell,
+        bootstrapSecretByteSource: staleSource.source,
+        replacePendingBootstrap: true,
+        selfHostedCapabilityActivationHandoff: selfHostedHandoff,
         credentialHttpsTransport: recoveryHttps.transport,
         canonical: recovering.canonical,
       });
       assert.notEqual(facade, null);
       assert.deepEqual(facade.inspect(), { status: "stopped", controllerGeneration: "0" });
-      assert.equal(backend.swaps, swapsBefore, "recovery without a source must remain read-only");
+      assert.equal(staleSource.stats.iterators, 1);
+      assert.equal(staleSource.stats.nextCalls, 2);
+      assert.equal(staleSource.stats.cancels, 1);
+      assert.equal(
+        backend.swaps,
+        swapsBefore,
+        "active-cell recovery must not CAS the stale candidate",
+      );
       assert.equal(recoveryHttps.stats.calls, 0, "ready credential must not bootstrap again");
       assert.deepEqual(recovering.effects, {
         welcome: 0, create: 0, process: 0, terminal: 0, remote: 0,
@@ -957,6 +974,9 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
         credentialHttpsTransport: recoveredHttps.transport,
         canonical: recovering.canonical,
       });
+      assert.equal(replacementSource.stats.iterators, 1);
+      assert.equal(replacementSource.stats.cancels, 1);
+      assert.equal(recoveredHttps.stats.calls, 1);
       assert.equal(
         recoveredHttps.stats.attemptIds[0],
         failedHttps.stats.attemptIds[0],

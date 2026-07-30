@@ -958,16 +958,20 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
       storage: vault,
       secretResolver: vault,
     });
-    // A read-only recovery pass validates the complete existing envelope even
-    // when no privileged source was supplied.
-    const recoveredCredential = authority.inspect(profile.credentialReference);
-    let bootstrapRequired = recoveredCredential?.credentialVersion === "0";
-    if (captured.sourceOwner.current === null && recoveredCredential === null) {
-      // The Vault is the only envelope decoder. A successful resolve proves
-      // the permitted durable bootstrap-only intermediate state; discard the
-      // returned secret immediately and never retain it in this composition.
-      void vault.resolve(profile.bootstrapSecretReference);
-      bootstrapRequired = true;
+    let bootstrapRequired = false;
+    if (!captured.replacePendingBootstrap) {
+      // A read-only recovery pass validates the complete existing envelope
+      // when the dedicated ReplacePending cell-authoritative operation is not
+      // selected.
+      const recoveredCredential = authority.inspect(profile.credentialReference);
+      bootstrapRequired = recoveredCredential?.credentialVersion === "0";
+      if (captured.sourceOwner.current === null && recoveredCredential === null) {
+        // The Vault is the only envelope decoder. A successful resolve proves
+        // the permitted durable bootstrap-only intermediate state; discard
+        // the returned secret immediately and never retain it here.
+        void vault.resolve(profile.bootstrapSecretReference);
+        bootstrapRequired = true;
+      }
     }
     const httpsAdapter = new RelayV2HostCredentialHttpsAdapter({
       issuerUrl: profile.credentialIssuerUrl,
@@ -989,11 +993,12 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
       owned.sourceHandle = sourceHandle;
       const candidate = await sourceHandle.readCandidate();
       if (captured.replacePendingBootstrap) {
-        vault.replacePendingBootstrap(candidate);
+        bootstrapRequired =
+          vault.replacePendingBootstrap(candidate) === "bootstrap-required";
       } else {
         vault.provisionBootstrap(candidate);
+        bootstrapRequired = true;
       }
-      bootstrapRequired = true;
     }
 
     if (bootstrapRequired) {

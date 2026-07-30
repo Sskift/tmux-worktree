@@ -81,6 +81,10 @@ export interface RelayV2HostCredentialVaultOptions {
   readonly bootstrapSecretHandoff: RelayV2HostBootstrapSecretHandoff;
 }
 
+export type RelayV2HostReplacePendingBootstrapDisposition =
+  | "bootstrap-required"
+  | "active-credential";
+
 export type RelayV2HostCredentialVaultErrorCode =
   | "RELAY_V2_HOST_CREDENTIAL_VAULT_INVALID_OPTIONS"
   | "RELAY_V2_HOST_CREDENTIAL_VAULT_FOREIGN_REFERENCE"
@@ -263,7 +267,11 @@ function validateEnvelopeInvariants(
   }
   if (envelope.bootstrapSecret !== null
     || typeof state.refreshToken !== "string"
-    || envelope.refreshSecret !== state.refreshToken) {
+    || envelope.refreshSecret !== state.refreshToken
+    || (state.pendingCredentialAttempt !== null
+      && (state.pendingCredentialAttempt.kind !== "refresh"
+        || state.pendingCredentialAttempt.oldSecretReference
+          !== binding.refreshSecretReference))) {
     return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_STATE_INVALID");
   }
   return envelope;
@@ -491,27 +499,42 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
     }));
   }
 
-  replacePendingBootstrap(candidate: RelayV2HostBootstrapSecretHandoffCandidate): void {
+  replacePendingBootstrap(
+    candidate: RelayV2HostBootstrapSecretHandoffCandidate,
+  ): RelayV2HostReplacePendingBootstrapDisposition {
     return this.#admit(() => this.#withCell((transaction) => {
       const read = this.#cellRead(transaction);
       const current = decodeEnvelope(read.bytes, this.#binding);
-      if (!isPendingBootstrapEnvelope(current, this.#binding)) {
-        return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
+      if (isPendingBootstrapEnvelope(current, this.#binding)) {
+        this.#runWithBootstrapCandidate(candidate, (bootstrapSecret) => {
+          if (sameSecret(current.bootstrapSecret!, bootstrapSecret)) return;
+          const replacement = encodeEnvelope({
+            credentialState: current.credentialState,
+            bootstrapSecret,
+            refreshSecret: null,
+          }, this.#binding);
+          const result = this.#cellCompareAndSwap(transaction, read.revision, replacement);
+          if (result.status === "swapped") return;
+          if (result.status === "uncertain") {
+            return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN");
+          }
+          return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_CAS_CONFLICT");
+        });
+        return "bootstrap-required";
       }
-      return this.#runWithBootstrapCandidate(candidate, (bootstrapSecret) => {
-        if (sameSecret(current.bootstrapSecret!, bootstrapSecret)) return;
-        const replacement = encodeEnvelope({
-          credentialState: current.credentialState,
-          bootstrapSecret,
-          refreshSecret: null,
-        }, this.#binding);
-        const result = this.#cellCompareAndSwap(transaction, read.revision, replacement);
-        if (result.status === "swapped") return;
-        if (result.status === "uncertain") {
-          return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN");
-        }
-        return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_CAS_CONFLICT");
-      });
+      if (current.credentialState !== null
+        && current.credentialState.credentialVersion !== "0") {
+        // The decoded envelope and its exact binding are authoritative. The
+        // stale operator candidate is consumed only so its source-owned secret
+        // is destroyed; it is never compared with, written over, or otherwise
+        // promoted into the already-active credential.
+        this.#runWithBootstrapCandidate(
+          candidate,
+          () => undefined,
+        );
+        return "active-credential";
+      }
+      return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
     }));
   }
 

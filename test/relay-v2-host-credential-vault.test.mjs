@@ -385,21 +385,31 @@ test("provision, pending response-loss retry, bootstrap commit, and refresh rota
   await handoffAuthority.closeAndDrain();
 });
 
-test("explicit pending bootstrap replacement preserves the durable attempt and fails closed elsewhere", async () => {
+test("explicit replacement repairs pending state or resumes the exact active credential", async () => {
   const cell = new FakeAtomicByteCell();
   const handoffAuthority = createBootstrapHandoff();
   const vault = openVault(cell, handoffAuthority).vault;
   vault.provisionBootstrap(
     handoffAuthority.privilegedIntake.accept(BOOTSTRAP_SECRET),
   );
+  const bootstrapOnlyBytes = cell.snapshotBytes();
+  assert.throws(
+    () => vault.replacePendingBootstrap(
+      handoffAuthority.privilegedIntake.accept(
+        "twhostboot2.bootstrap-only-candidate.rejected",
+      ),
+    ),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED"),
+  );
+  assert.equal(digest(cell.snapshotBytes()), digest(bootstrapOnlyBytes));
   const authority = openAuthority(vault);
   const prepared = authority.prepareBootstrap(bootstrapPreparation());
   const pendingBefore = authority.inspect(CREDENTIAL_REFERENCE).pendingCredentialAttempt;
   const replacementSecret = "twhostboot2.rotated-selector.rotated-secret";
 
-  vault.replacePendingBootstrap(
+  assert.equal(vault.replacePendingBootstrap(
     handoffAuthority.privilegedIntake.accept(replacementSecret),
-  );
+  ), "bootstrap-required");
   assert.deepEqual(
     authority.inspect(CREDENTIAL_REFERENCE).pendingCredentialAttempt,
     pendingBefore,
@@ -411,9 +421,9 @@ test("explicit pending bootstrap replacement preserves the durable attempt and f
   assert.equal(digest(recovered.credential.bootstrapToken), digest(replacementSecret));
 
   const comparesBeforeReplay = cell.compares;
-  vault.replacePendingBootstrap(
+  assert.equal(vault.replacePendingBootstrap(
     handoffAuthority.privilegedIntake.accept(replacementSecret),
-  );
+  ), "bootstrap-required");
   assert.equal(cell.compares, comparesBeforeReplay);
 
   const readyAccess = tokenIssuer()();
@@ -425,15 +435,75 @@ test("explicit pending bootstrap replacement preserves the durable attempt and f
     { status: "applied", credentialVersion: "1" },
   );
   const readyBytes = cell.snapshotBytes();
+  const foreignRefreshPendingBytes = rewriteEnvelope(readyBytes, (payload) => {
+    payload.credentialState.pendingCredentialAttempt = {
+      kind: "refresh",
+      attemptId: "foreign-refresh-pending-attempt",
+      oldCredentialVersion: "1",
+      oldSecretReference: BOOTSTRAP_SECRET_REFERENCE,
+    };
+  });
+  const foreignRefreshPendingCell = new FakeAtomicByteCell(
+    foreignRefreshPendingBytes,
+  );
+  const foreignRefreshPendingHandoff = createBootstrapHandoff();
+  const foreignRefreshPendingVault = openVault(
+    foreignRefreshPendingCell,
+    foreignRefreshPendingHandoff,
+  ).vault;
+  const foreignRefreshPendingCandidate =
+    foreignRefreshPendingHandoff.privilegedIntake.accept(
+      "twhostboot2.foreign-refresh-pending.rejected-candidate",
+    );
+  assert.throws(
+    () => foreignRefreshPendingVault.replacePendingBootstrap(
+      foreignRefreshPendingCandidate,
+    ),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_STATE_INVALID"),
+  );
+  assert.equal(foreignRefreshPendingCell.compares, 0);
+  assert.equal(
+    digest(foreignRefreshPendingCell.snapshotBytes()),
+    digest(foreignRefreshPendingBytes),
+  );
+  const candidateConsumptionProofCell = new FakeAtomicByteCell();
+  openVault(candidateConsumptionProofCell, foreignRefreshPendingHandoff)
+    .vault.provisionBootstrap(foreignRefreshPendingCandidate);
+  assert.notEqual(candidateConsumptionProofCell.snapshotBytes(), null);
+  await foreignRefreshPendingHandoff.closeAndDrain();
+
+  const staleCandidate = handoffAuthority.privilegedIntake.accept(
+    "twhostboot2.late-selector.late-secret",
+  );
+  const comparesBeforeActiveResume = cell.compares;
+  assert.equal(
+    vault.replacePendingBootstrap(staleCandidate),
+    "active-credential",
+  );
+  assert.equal(cell.compares, comparesBeforeActiveResume);
+  assert.equal(digest(cell.snapshotBytes()), digest(readyBytes));
+  assert.equal(
+    digest(vault.resolve(REFRESH_SECRET_REFERENCE)),
+    digest(REFRESH_SECRET_1),
+  );
+  assert.throws(
+    () => openVault(new FakeAtomicByteCell(), handoffAuthority)
+      .vault.provisionBootstrap(
+        staleCandidate,
+      ),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_HANDOFF_INVALID"),
+  );
+  const corruptActiveBytes = Uint8Array.from(readyBytes);
+  corruptActiveBytes[0] ^= 0xff;
+  cell.installConcurrentBytes(corruptActiveBytes);
   assert.throws(
     () => vault.replacePendingBootstrap(
       handoffAuthority.privilegedIntake.accept(
-        "twhostboot2.late-selector.late-secret",
+        "twhostboot2.active-malformed-state-candidate.rejected",
       ),
     ),
-    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED"),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_STATE_INVALID"),
   );
-  assert.equal(digest(cell.snapshotBytes()), digest(readyBytes));
   await handoffAuthority.closeAndDrain();
 });
 
@@ -467,6 +537,23 @@ test("pending bootstrap replacement performs only one CAS and preserves a concur
   );
   assert.equal(cell.compares - comparesBefore, 1);
   assert.equal(digest(cell.snapshotBytes()), digest(concurrentBytes));
+
+  const uncertainCell = new FakeAtomicByteCell(concurrentBytes);
+  const uncertainHandoff = createBootstrapHandoff();
+  const uncertainVault = openVault(uncertainCell, uncertainHandoff).vault;
+  const uncertainBefore = uncertainCell.snapshotBytes();
+  uncertainCell.uncertainNext = "before";
+  assert.throws(
+    () => uncertainVault.replacePendingBootstrap(
+      uncertainHandoff.privilegedIntake.accept(
+        "twhostboot2.uncertain-candidate.operator-secret",
+      ),
+    ),
+    assertVaultError("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN"),
+  );
+  assert.equal(uncertainCell.compares, 1);
+  assert.equal(digest(uncertainCell.snapshotBytes()), digest(uncertainBefore));
+  await uncertainHandoff.closeAndDrain();
   await concurrentHandoff.closeAndDrain();
   await handoffAuthority.closeAndDrain();
 });
