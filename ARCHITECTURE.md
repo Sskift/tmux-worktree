@@ -477,7 +477,14 @@ may notify the same spool lifecycle to capture and activate the exact current
 same-lineage cut with a strictly larger H2 generation; the notification itself
 carries no authority. Exact activation identity prevents an old late close from
 withdrawing the successor, while a synchronous source-activation release error
-permanently poisons pending and future fresh activation. H3 accepts only the durable
+permanently poisons pending and future fresh activation. Across distinct spool
+roots, the foundation owns one strictly increasing current-spool claim. Claim
+replacement invalidates prior candidates and activations before publishing the
+new claim in the same HostState serialized section. Fresh and recovered issue,
+process-authority capture, composition activation, receipt final publication,
+successor recovery, and runtime/spool facade access all require that exact
+claim; stale close and late callbacks release compare-exact and cannot clear
+the successor. H3 accepts only the durable
 lineage/manager/host recovery candidate. Runtime receives private gated facades;
 public H1 and H2 each expose only `close()`, while H3 has no readiness `apply`
 path. Spool/fatal close, snapshot-owner takeover, source/sink close, outer H2

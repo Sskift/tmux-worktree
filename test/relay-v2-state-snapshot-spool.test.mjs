@@ -488,6 +488,147 @@ test("recovered H2 candidates are exact, deterministic, empty, and canonical-ent
   }
 });
 
+test("bound H2 claim replaces sequential roots across fresh and recovered authority", async () => {
+  const h = await realHarness({ bound: true });
+  let second;
+  let publisher;
+  let recovered;
+  let successor;
+  try {
+    second = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: join(h.home, "snapshot-spool-second"),
+      ownerInstanceId: h.store.hostInstanceId,
+    });
+    assert.equal(await h.spool.issueFreshInstallHostH2Candidate(), null);
+    assert.equal(await h.spool.issueRecoveredHostH2Candidate(), null);
+
+    h.discovery.push({ coverage: "complete", scopes: [scope()] });
+    const staleFreshCandidate = await second.issueFreshInstallHostH2Candidate();
+    assert.notEqual(staleFreshCandidate, null);
+    publisher = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: join(h.home, "snapshot-spool-recovered"),
+      ownerInstanceId: h.store.hostInstanceId,
+    });
+    const compositionOptions = (candidate) => ({
+      hostId: "mac-admin",
+      hostEpoch: h.seeded.snapshot.hostEpoch,
+      hostInstanceId: h.store.hostInstanceId,
+      authorities: { h2RecoveryCandidate: candidate },
+    });
+    assert.equal(
+      snapshotSpool.captureRelayV2RecoveredHostH2ProcessAuthority(
+        staleFreshCandidate,
+        h.store,
+      ),
+      null,
+    );
+    assert.equal(
+      await snapshotSpool.openRelayV2RecoveredHostRuntimeComposition(
+        compositionOptions(staleFreshCandidate),
+      ),
+      null,
+    );
+
+    await publisher.get(firstRequest(
+      h.seeded.snapshot.hostEpoch,
+      "sequential-root-recovered-cut",
+    ));
+    await publisher.close();
+    publisher = undefined;
+    recovered = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: join(h.home, "snapshot-spool-recovered"),
+      ownerInstanceId: h.store.hostInstanceId,
+    });
+    const staleRecoveredCandidate = await recovered.issueRecoveredHostH2Candidate();
+    assert.notEqual(staleRecoveredCandidate, null);
+
+    successor = await h.foundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root: join(h.home, "snapshot-spool-successor"),
+      ownerInstanceId: h.store.hostInstanceId,
+    });
+    assert.equal(await recovered.issueRecoveredHostH2Candidate(), null);
+    assert.equal(
+      snapshotSpool.captureRelayV2RecoveredHostH2ProcessAuthority(
+        staleRecoveredCandidate,
+        h.store,
+      ),
+      null,
+    );
+    assert.equal(
+      await snapshotSpool.openRelayV2RecoveredHostRuntimeComposition(
+        compositionOptions(staleRecoveredCandidate),
+      ),
+      null,
+    );
+
+    await h.spool.close();
+    await second.close();
+    await recovered.close();
+    h.discovery.push({ coverage: "complete", scopes: [scope()] });
+    assert.notEqual(await successor.issueFreshInstallHostH2Candidate(), null);
+  } finally {
+    await successor?.close().catch(() => undefined);
+    await recovered?.close().catch(() => undefined);
+    await publisher?.close().catch(() => undefined);
+    await second?.close().catch(() => undefined);
+    await h.spool.close().catch(() => undefined);
+    h.store.close();
+    h.cleanup();
+  }
+});
+
+test("concurrent bound spool opens leave exactly one current H2 claim", async () => {
+  const h = await realHarness({ bound: true });
+  let first;
+  let second;
+  try {
+    await h.spool.close();
+    [first, second] = await Promise.all([
+      h.foundation.openStateSnapshotSpool({
+        hostId: "mac-admin",
+        root: join(h.home, "snapshot-spool-concurrent-a"),
+        ownerInstanceId: h.store.hostInstanceId,
+      }),
+      h.foundation.openStateSnapshotSpool({
+        hostId: "mac-admin",
+        root: join(h.home, "snapshot-spool-concurrent-b"),
+        ownerInstanceId: h.store.hostInstanceId,
+      }),
+    ]);
+    h.discovery.push({ coverage: "complete", scopes: [scope()] });
+    const candidates = await Promise.all([
+      first.issueFreshInstallHostH2Candidate(),
+      second.issueFreshInstallHostH2Candidate(),
+    ]);
+    assert.equal(candidates.filter((candidate) => candidate !== null).length, 1);
+    const currentIndex = candidates[0] === null ? 1 : 0;
+    const current = currentIndex === 0 ? first : second;
+    const stale = currentIndex === 0 ? second : first;
+    const candidate = candidates[currentIndex];
+
+    await stale.close();
+    assert.notEqual(
+      snapshotSpool.captureRelayV2RecoveredHostH2ProcessAuthority(
+        candidate,
+        h.store,
+      ),
+      null,
+    );
+    assert.equal(await stale.issueFreshInstallHostH2Candidate(), null);
+    assert.equal(await stale.issueRecoveredHostH2Candidate(), null);
+    await current.close();
+  } finally {
+    await second?.close().catch(() => undefined);
+    await first?.close().catch(() => undefined);
+    h.store.close();
+    h.cleanup();
+  }
+});
+
 test("bound spool instance does not expose materialized or readiness authorities", async () => {
   const h = await realHarness({
     bound: true,

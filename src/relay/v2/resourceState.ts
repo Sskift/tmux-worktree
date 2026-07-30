@@ -499,6 +499,8 @@ export interface RelayV2MaterializedStateProcessAuthorityPorts {
   readonly hostStateOwner: object;
   readonly resourceResolver: RelayV2CanonicalResourceResolverPort;
   readonly resourceMutationOwner: RelayV2CommandResourceMutationOwner;
+  isCurrentBoundSnapshotSpoolClaim(spool: object, claim: unknown): boolean;
+  releaseBoundSnapshotSpoolClaim(spool: object, claim: unknown): void;
   captureProcessTargets(
     expectedHostEpoch: string,
   ): Promise<readonly RelayV2ResourceResolverProcessTarget[]>;
@@ -2908,6 +2910,15 @@ function ensureConvenienceFrame(frame: RelayV2JsonObject): void {
   }
 }
 
+interface BoundSnapshotSpoolClaimRecord {
+  readonly spool: object;
+  readonly claim: object;
+  readonly generation: bigint;
+  observer: (() => Promise<void>) | null;
+}
+
+const MAX_BOUND_SNAPSHOT_SPOOL_GENERATION = 18_446_744_073_709_551_615n;
+
 export class RelayV2MaterializedStateFoundation {
   readonly hostId: string;
   readonly capacity: MaterializedCapacity;
@@ -2932,7 +2943,8 @@ export class RelayV2MaterializedStateFoundation {
   private snapshotCutCandidateRetainedBytes = 0;
   private publishedCanonicalResolver: PublishedCanonicalResolver | null = null;
   private reconcileInFlight: Promise<RelayV2MaterializedReconcileResult> | null = null;
-  private authoritativeReconcileObserver: (() => Promise<void>) | null = null;
+  private boundSnapshotSpoolGeneration = 0n;
+  private currentBoundSnapshotSpoolClaim: BoundSnapshotSpoolClaimRecord | null = null;
   private observedHostEpoch: string | null = null;
   private continuityFenceReason: ContinuityFenceReason | null = null;
 
@@ -3120,6 +3132,12 @@ export class RelayV2MaterializedStateFoundation {
       hostStateOwner: this.store as object,
       resourceResolver: this.canonicalTargetResolver,
       resourceMutationOwner: this.commandResourceMutationOwner,
+      isCurrentBoundSnapshotSpoolClaim: (spool: object, claim: unknown) => (
+        this.isCurrentBoundSnapshotSpoolClaim(spool, claim)
+      ),
+      releaseBoundSnapshotSpoolClaim: (spool: object, claim: unknown) => {
+        this.releaseBoundSnapshotSpoolClaim(spool, claim);
+      },
       captureProcessTargets: (expectedHostEpoch: string) => (
         this.captureCanonicalProcessTargets(expectedHostEpoch)
       ),
@@ -3145,19 +3163,74 @@ export class RelayV2MaterializedStateFoundation {
       ...options,
       materializedStateOwner: this.#snapshotSpoolOwner,
     });
+    let claim: object | null = null;
     try {
-      canonicalSpool.registerRelayV2FreshInstallH2BootstrapReconcile(
+      claim = await this.issueBoundSnapshotSpoolClaim(spool);
+      canonicalSpool.registerRelayV2BoundHostH2Spool(
         spool,
         () => this.reconcile(),
+        claim,
       );
-      this.authoritativeReconcileObserver = () => (
-        canonicalSpool.notifyRelayV2FreshInstallH2AuthoritativeReconcile(spool)
-      );
+      this.installBoundSnapshotSpoolObserver(spool, claim, () => (
+        canonicalSpool.notifyRelayV2FreshInstallH2AuthoritativeReconcile(
+          spool,
+          claim,
+        )
+      ));
     } catch (error) {
+      if (claim !== null) this.releaseBoundSnapshotSpoolClaim(spool, claim);
       try { await spool.close(); } catch {}
       throw error;
     }
     return spool;
+  }
+
+  private issueBoundSnapshotSpoolClaim(spool: object): Promise<object> {
+    return this.store.serialize(() => {
+      if (this.boundSnapshotSpoolGeneration >= MAX_BOUND_SNAPSHOT_SPOOL_GENERATION) {
+        throw new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "bound snapshot spool generation is exhausted",
+        );
+      }
+      this.invalidateSnapshotCutCandidates();
+      this.invalidateSnapshotCutActivations(new RelayV2MaterializedStateError(
+        "CAPABILITY_UNAVAILABLE",
+        "snapshot spool owner changed",
+      ));
+      this.boundSnapshotSpoolGeneration += 1n;
+      const claim = Object.freeze(Object.create(null)) as object;
+      this.currentBoundSnapshotSpoolClaim = {
+        spool,
+        claim,
+        generation: this.boundSnapshotSpoolGeneration,
+        observer: null,
+      };
+      return claim;
+    });
+  }
+
+  private isCurrentBoundSnapshotSpoolClaim(spool: object, claim: unknown): boolean {
+    const current = this.currentBoundSnapshotSpoolClaim;
+    return current !== null
+      && current.spool === spool
+      && current.claim === claim
+      && current.generation === this.boundSnapshotSpoolGeneration;
+  }
+
+  private installBoundSnapshotSpoolObserver(
+    spool: object,
+    claim: object,
+    observer: () => Promise<void>,
+  ): void {
+    const current = this.currentBoundSnapshotSpoolClaim;
+    if (current === null || current.spool !== spool || current.claim !== claim) return;
+    current.observer = observer;
+  }
+
+  private releaseBoundSnapshotSpoolClaim(spool: object, claim: unknown): void {
+    if (!this.isCurrentBoundSnapshotSpoolClaim(spool, claim)) return;
+    this.currentBoundSnapshotSpoolClaim = null;
   }
 
   private reserveCommandResource(
@@ -4019,7 +4092,12 @@ export class RelayV2MaterializedStateFoundation {
       });
       if (attempt.kind === "applied") {
         if (attempt.notifyAuthoritativeReconcile) {
-          await this.authoritativeReconcileObserver?.();
+          const observedClaim = this.currentBoundSnapshotSpoolClaim;
+          await observedClaim?.observer?.();
+          if (observedClaim !== null
+            && this.currentBoundSnapshotSpoolClaim !== observedClaim) {
+            return attempt.value;
+          }
         }
         return attempt.value;
       }

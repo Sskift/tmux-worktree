@@ -298,6 +298,8 @@ interface RelayV2HostH2RecoveryCandidateRecord {
   readonly hostInstanceId: string;
   readonly ownerFence: string;
   readonly spoolGeneration: string;
+  readonly boundSpool: RelayV2StateSnapshotSpool;
+  readonly boundSpoolClaim: object;
   readonly snapshotId: string;
   readonly materializedCutIdentity: string;
   readonly readinessIssue: RelayV2StateSnapshotReadinessReceiptIssue;
@@ -330,6 +332,8 @@ interface RelayV2FreshInstallHostH2CandidateRecord {
   readonly hostInstanceId: string;
   readonly ownerFence: string;
   readonly spoolGeneration: string;
+  readonly boundSpool: RelayV2StateSnapshotSpool;
+  readonly boundSpoolClaim: object;
   readonly materializedCutIdentity: string;
   readonly compositionPair: object;
   readonly processAuthority: RelayV2MaterializedStateProcessAuthorityPorts;
@@ -378,26 +382,75 @@ const recoveredHostH2SpoolProcessAuthorities = new WeakMap<
  * opened this spool through `openStateSnapshotSpool()` may register it, so the
  * same opaque bootstrap owner holds both `reconcile` and the opened spool.
  */
-const freshInstallBootstrapReconcilers = new WeakMap<
+interface BoundHostH2SpoolBinding {
+  readonly reconcile: () => Promise<unknown>;
+  readonly claim: object;
+}
+
+const boundHostH2SpoolBindings = new WeakMap<
   RelayV2StateSnapshotSpool,
-  () => Promise<unknown>
+  BoundHostH2SpoolBinding
 >();
 const freshInstallH2AuthoritativeReconcileObservers = new WeakMap<
   RelayV2StateSnapshotSpool,
   () => Promise<void>
 >();
 
-export function registerRelayV2FreshInstallH2BootstrapReconcile(
+export function registerRelayV2BoundHostH2Spool(
   spool: RelayV2StateSnapshotSpool,
   reconcile: () => Promise<unknown>,
+  claim: object,
 ): void {
-  if (!(spool instanceof RelayV2StateSnapshotSpool) || typeof reconcile !== "function") {
+  if (!(spool instanceof RelayV2StateSnapshotSpool)
+    || typeof reconcile !== "function"
+    || typeof claim !== "object"
+    || claim === null) {
     throw new RelayV2StateSnapshotSpoolError(
       "INVALID_ARGUMENT",
       "fresh-install H2 bootstrap reconcile binding is invalid",
     );
   }
-  freshInstallBootstrapReconcilers.set(spool, reconcile);
+  boundHostH2SpoolBindings.set(spool, Object.freeze({ reconcile, claim }));
+}
+
+function currentBoundH2SpoolBinding(
+  spool: RelayV2StateSnapshotSpool,
+  expectedClaim?: object,
+): BoundHostH2SpoolBinding | null {
+  const binding = boundHostH2SpoolBindings.get(spool);
+  const processAuthority = recoveredHostH2SpoolProcessAuthorities.get(spool);
+  if (binding === undefined
+    || processAuthority === undefined
+    || (expectedClaim !== undefined && binding.claim !== expectedClaim)) return null;
+  try {
+    return processAuthority.isCurrentBoundSnapshotSpoolClaim(spool, binding.claim)
+      ? binding
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function releaseBoundH2SpoolBinding(
+  spool: RelayV2StateSnapshotSpool,
+): void {
+  const binding = boundHostH2SpoolBindings.get(spool);
+  const processAuthority = recoveredHostH2SpoolProcessAuthorities.get(spool);
+  boundHostH2SpoolBindings.delete(spool);
+  freshInstallH2AuthoritativeReconcileObservers.delete(spool);
+  if (binding === undefined || processAuthority === undefined) return;
+  try {
+    processAuthority.releaseBoundSnapshotSpoolClaim(spool, binding.claim);
+  } catch {}
+}
+
+function isCurrentHostH2CandidateRecord(
+  record: Readonly<RelayV2HostH2CandidateRecord>,
+): boolean {
+  return currentBoundH2SpoolBinding(
+    record.boundSpool,
+    record.boundSpoolClaim,
+  ) !== null;
 }
 
 /**
@@ -408,9 +461,13 @@ export function registerRelayV2FreshInstallH2BootstrapReconcile(
  */
 export async function notifyRelayV2FreshInstallH2AuthoritativeReconcile(
   spool: RelayV2StateSnapshotSpool,
+  claim: object,
 ): Promise<void> {
   if (!(spool instanceof RelayV2StateSnapshotSpool)) return;
+  const binding = currentBoundH2SpoolBinding(spool, claim);
+  if (binding === null) return;
   await freshInstallH2AuthoritativeReconcileObservers.get(spool)?.();
+  if (currentBoundH2SpoolBinding(spool, claim) !== binding) return;
 }
 
 export interface RelayV2RecoveredHostH2ProcessAuthority {
@@ -432,7 +489,9 @@ export function captureRelayV2RecoveredHostH2ProcessAuthority(
   if ((typeof candidate !== "object" || candidate === null)
     || (typeof expectedHostStateOwner !== "object" || expectedHostStateOwner === null)) return null;
   const record = recoveredHostH2Candidates.get(candidate as object);
-  if (!record || record.processAuthority.hostStateOwner !== expectedHostStateOwner) return null;
+  if (!record
+    || record.processAuthority.hostStateOwner !== expectedHostStateOwner
+    || !isCurrentHostH2CandidateRecord(record)) return null;
   return Object.freeze({
     hostId: record.hostId,
     hostEpoch: record.hostEpoch,
@@ -440,7 +499,24 @@ export function captureRelayV2RecoveredHostH2ProcessAuthority(
     h2RecoveryCandidate: candidate as RelayV2HostH2RecoveryCandidate,
     resourceResolver: record.processAuthority.resourceResolver,
     resourceMutationOwner: record.processAuthority.resourceMutationOwner,
-    captureProcessTargets: record.processAuthority.captureProcessTargets,
+    captureProcessTargets: async (expectedHostEpoch: string) => {
+      if (!isCurrentHostH2CandidateRecord(record)) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "CAPABILITY_UNAVAILABLE",
+          "bound snapshot spool H2 claim is no longer current",
+        );
+      }
+      const targets = await record.processAuthority.captureProcessTargets(
+        expectedHostEpoch,
+      );
+      if (!isCurrentHostH2CandidateRecord(record)) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "CAPABILITY_UNAVAILABLE",
+          "bound snapshot spool H2 claim changed during target capture",
+        );
+      }
+      return targets;
+    },
   });
 }
 let recoveredHostH2ActivationGeneration = 0n;
@@ -537,19 +613,32 @@ export async function openRelayV2RecoveredHostRuntimeComposition(
   if (captured === null) return null;
   const { candidate } = captured;
   const record = recoveredHostH2Candidates.get(candidate as object);
-  if (record === undefined) return null;
+  if (record === undefined || !isCurrentHostH2CandidateRecord(record)) return null;
   if (captured.hostId !== record.hostId
     || captured.hostEpoch !== record.hostEpoch
     || captured.hostInstanceId !== record.hostInstanceId) return null;
   const entryUrl = new URL("./hostRuntimeComposition.js", import.meta.url).href;
   const entry = await import(entryUrl) as Record<PropertyKey, unknown>;
   const complete = entry.completeRelayV2HostRuntimeCompositionFromRecoveredH2;
-  if (typeof complete !== "function") return null;
+  if (typeof complete !== "function"
+    || recoveredHostH2Candidates.get(candidate as object) !== record
+    || !isCurrentHostH2CandidateRecord(record)) return null;
   const result = await Reflect.apply(complete, entry, [
     record.compositionPair,
     candidate,
     options,
   ]);
+  if (!isCurrentHostH2CandidateRecord(record)) {
+    if ((typeof result === "object" || typeof result === "function") && result !== null) {
+      const dispose = exactDataDescriptor(result as object, "dispose");
+      if (dispose !== null && typeof dispose.value === "function") {
+        try {
+          await Reflect.apply(dispose.value, result, []);
+        } catch {}
+      }
+    }
+    return null;
+  }
   return result === null || (typeof result !== "object" && typeof result !== "function")
     ? null
     : result;
@@ -563,7 +652,8 @@ export function matchesRelayV2RecoveredHostH2CompositionPair(
   if (typeof pair !== "object" || pair === null
     || typeof candidate !== "object" || candidate === null) return false;
   const record = recoveredHostH2Candidates.get(candidate);
-  return record?.compositionPair === pair;
+  return record?.compositionPair === pair
+    && isCurrentHostH2CandidateRecord(record);
 }
 
 /**
@@ -578,7 +668,7 @@ export async function activateRelayV2RecoveredHostH2CompositionReceiver(
   if (typeof candidate !== "object" || candidate === null
     || typeof receiverIdentity !== "function") return null;
   const record = recoveredHostH2Candidates.get(candidate);
-  if (record === undefined) return null;
+  if (record === undefined || !isCurrentHostH2CandidateRecord(record)) return null;
   const entryUrl = new URL("./hostRuntimeComposition.js", import.meta.url).href;
   const entry = await import(entryUrl) as Record<PropertyKey, unknown>;
   const matchesReceiver = entry.matchesRelayV2RecoveredHostH2CompositionReceiver;
@@ -587,11 +677,14 @@ export async function activateRelayV2RecoveredHostH2CompositionReceiver(
       record.compositionPair,
       receiverIdentity,
     ]) !== true
-    || recoveredHostH2Candidates.get(candidate) !== record) return null;
+    || recoveredHostH2Candidates.get(candidate) !== record
+    || !isCurrentHostH2CandidateRecord(record)) return null;
   recoveredHostH2Candidates.delete(candidate);
   try {
     const consumeReadinessSink = Object.freeze(async (readinessSink: unknown) => {
-      if (typeof readinessSink !== "object" || readinessSink === null) return null;
+      if (typeof readinessSink !== "object"
+        || readinessSink === null
+        || !isCurrentHostH2CandidateRecord(record)) return null;
       return record.claimReadiness(
         readinessSink as RelayV2RecoveredHostH2ReadinessSink,
       );
@@ -599,7 +692,11 @@ export async function activateRelayV2RecoveredHostH2CompositionReceiver(
     const activation = await Reflect.apply(receiverIdentity, receiverIdentity, [
       consumeReadinessSink,
     ]) as RelayV2RecoveredHostH2Activation | null;
-    if (activation === null) record.release();
+    if (activation === null || !isCurrentHostH2CandidateRecord(record)) {
+      try { activation?.dispose(); } catch {}
+      record.release();
+      return null;
+    }
     return activation;
   } catch {
     record.release();
@@ -770,6 +867,7 @@ interface ReadinessReceiptRecord extends RelayV2StateSnapshotReadinessReceiptBin
   processIncarnation: string;
   spoolIdentity: object;
   spoolGeneration: string;
+  boundSpoolClaim: object;
   source: RelayV2MaterializedStateCutSource;
   materializedSourceGeneration: string;
   materializedGeneration: string;
@@ -2247,6 +2345,8 @@ export class RelayV2StateSnapshotSpool {
     if (this.#runtimeH2 === null) return null;
     const processAuthority = recoveredHostH2SpoolProcessAuthorities.get(this);
     if (processAuthority === undefined || processAuthority.hostId !== this.hostId) return null;
+    const binding = currentBoundH2SpoolBinding(this);
+    if (binding === null) return null;
     const compositionPair = await issueCanonicalHostRuntimeCompositionPair();
     let provisional: RelayV2MaterializedStateCutCandidateLease | null = null;
     let transferredCut: ActiveCut | null = null;
@@ -2255,7 +2355,8 @@ export class RelayV2StateSnapshotSpool {
       return await this.serializeMetadata(async () => {
         if (this.fatalUnavailable
           || this.recoveredQuotaExceeded
-          || this.recoveryIncomplete) return null;
+          || this.recoveryIncomplete
+          || currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
         const hostEpoch = await this.readCurrentHostEpoch();
         try {
           provisional = await this.#cutSource.captureCandidate(hostEpoch);
@@ -2271,7 +2372,8 @@ export class RelayV2StateSnapshotSpool {
           this.pruneExpiredReadinessReceipts(freshNow);
           if (this.fatalUnavailable
             || this.recoveredQuotaExceeded
-            || this.recoveryIncomplete) return null;
+            || this.recoveryIncomplete
+            || currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
           if (this.ownerInstanceId !== materialized.hostInstanceId
             || materialized.hostId !== this.hostId
             || materialized.hostEpoch !== hostEpoch) return null;
@@ -2305,6 +2407,7 @@ export class RelayV2StateSnapshotSpool {
             candidateLease,
             materialized,
             freshNow,
+            binding.claim,
           );
           cut.recoveryCandidateIssued = true;
           const token = Object.freeze(Object.create(null)) as
@@ -2317,6 +2420,8 @@ export class RelayV2StateSnapshotSpool {
             hostInstanceId: materialized.hostInstanceId,
             ownerFence: this.#ownerFence,
             spoolGeneration: this.#spoolGeneration,
+            boundSpool: this,
+            boundSpoolClaim: binding.claim,
             snapshotId: cut.manifest.snapshotId,
             materializedCutIdentity: materialized.materializedCutIdentity,
             readinessIssue: issue,
@@ -2337,10 +2442,18 @@ export class RelayV2StateSnapshotSpool {
           issued = token;
           this.testHooks?.beforeReadinessReceiptOwnerRecheck?.(issue);
           this.assertCurrentOwner();
+          if (currentBoundH2SpoolBinding(this, binding.claim) !== binding) {
+            recoveredHostH2Candidates.delete(token as object);
+            record.release();
+            issued = null;
+            transferredCut = null;
+            provisional = null;
+            return null;
+          }
           return token;
         });
         if (candidate === null) {
-          this.#cutSource.releaseCandidate(candidateLease);
+          if (provisional !== null) this.#cutSource.releaseCandidate(candidateLease);
           provisional = null;
           return null;
         }
@@ -2351,6 +2464,7 @@ export class RelayV2StateSnapshotSpool {
           || this.#activeById.get(transferredCut.manifest.snapshotId) !== transferredCut
           || transferredCut.readinessCandidate !== candidateLease
           || transferredCut.readinessReceipt === null
+          || currentBoundH2SpoolBinding(this, binding.claim) !== binding
           || finalNow >= transferredCut.lease.snapshotLeaseExpiresAtMs
           || finalNow >= transferredCut.manifest.snapshotAbsoluteExpiresAtMs) {
           recoveredHostH2Candidates.delete(candidate as object);
@@ -2390,8 +2504,8 @@ export class RelayV2StateSnapshotSpool {
     if (this.#runtimeH2 === null) return null;
     const processAuthority = recoveredHostH2SpoolProcessAuthorities.get(this);
     if (processAuthority === undefined || processAuthority.hostId !== this.hostId) return null;
-    const reconcile = freshInstallBootstrapReconcilers.get(this);
-    if (reconcile === undefined
+    const binding = currentBoundH2SpoolBinding(this);
+    if (binding === null
       || this.closed
       || this.fatalUnavailable
       || this.recoveredQuotaExceeded
@@ -2402,10 +2516,11 @@ export class RelayV2StateSnapshotSpool {
       || this.tombstonesById.size !== 0
       || this.buildsByLogicalKey.size !== 0) return null;
     try {
-      await reconcile();
+      await binding.reconcile();
     } catch (error) {
       throw mapSourceError(error);
     }
+    if (currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
     const compositionPair = await issueCanonicalHostRuntimeCompositionPair();
     let provisional: RelayV2MaterializedStateCutCandidateLease | null = null;
     let issued: RelayV2HostH2RecoveryCandidate | null = null;
@@ -2419,7 +2534,8 @@ export class RelayV2StateSnapshotSpool {
           || this.#activeById.size !== 0
           || this.reservationsById.size !== 0
           || this.tombstonesById.size !== 0
-          || this.buildsByLogicalKey.size !== 0) return null;
+          || this.buildsByLogicalKey.size !== 0
+          || currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
         const hostEpoch = await this.readCurrentHostEpoch();
         try {
           provisional = await this.#cutSource.captureCandidate(hostEpoch);
@@ -2432,7 +2548,8 @@ export class RelayV2StateSnapshotSpool {
           if (this.freshInstallBootstrapCandidateIssued
             || this.ownerInstanceId !== materialized.hostInstanceId
             || materialized.hostId !== this.hostId
-            || materialized.hostEpoch !== hostEpoch) return null;
+            || materialized.hostEpoch !== hostEpoch
+            || currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
           const token = Object.freeze(Object.create(null)) as
             RelayV2HostH2RecoveryCandidate;
           let cancelled = false;
@@ -2447,6 +2564,8 @@ export class RelayV2StateSnapshotSpool {
             hostInstanceId: materialized.hostInstanceId,
             ownerFence: this.#ownerFence,
             spoolGeneration: this.#spoolGeneration,
+            boundSpool: this,
+            boundSpoolClaim: binding.claim,
             materializedCutIdentity: materialized.materializedCutIdentity,
             compositionPair,
             processAuthority,
@@ -2475,10 +2594,16 @@ export class RelayV2StateSnapshotSpool {
           this.freshInstallBootstrap = { record, closeActivation: null };
           issued = token;
           this.assertCurrentOwner();
+          if (currentBoundH2SpoolBinding(this, binding.claim) !== binding) {
+            recoveredHostH2Candidates.delete(token as object);
+            record.release();
+            issued = null;
+            return null;
+          }
           return token;
         });
         if (candidate === null) {
-          this.#cutSource.releaseCandidate(candidateLease);
+          if (provisional !== null) this.#cutSource.releaseCandidate(candidateLease);
           provisional = null;
           return null;
         }
@@ -2516,6 +2641,8 @@ export class RelayV2StateSnapshotSpool {
       || typeof closeDescriptor.value !== "function"
       || record.ownerFence !== this.#ownerFence
       || record.spoolGeneration !== this.#spoolGeneration
+      || record.boundSpool !== this
+      || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null
       || this.freshInstallBootstrap?.record !== record) {
       record.release();
       return null;
@@ -2543,6 +2670,11 @@ export class RelayV2StateSnapshotSpool {
       record.release();
       return null;
     }
+    if (currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
+      this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+      record.release();
+      return null;
+    }
     bootstrapState.attached = true;
     bootstrapState.activation = lifecycle.current.sourceActivation;
 
@@ -2551,7 +2683,8 @@ export class RelayV2StateSnapshotSpool {
       if (lifecycle.permanentlyClosed
         || current === null
         || current.closed
-        || !current.readinessPublished) {
+        || !current.readinessPublished
+        || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
         throw new RelayV2StateSnapshotSpoolError(
           "CAPABILITY_UNAVAILABLE",
           "fresh-install H2 activation is closed",
@@ -2586,13 +2719,18 @@ export class RelayV2StateSnapshotSpool {
         return this.release(request);
       },
     });
-    if (this.freshInstallBootstrap?.record === record) {
+    if (this.freshInstallBootstrap?.record === record
+      && currentBoundH2SpoolBinding(this, record.boundSpoolClaim) !== null) {
       this.freshInstallBootstrap.closeActivation = () => {
         this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
       };
       freshInstallH2AuthoritativeReconcileObservers.set(this, () => (
         this.#recoverFreshInstallH2AfterAuthoritativeReconcile(lifecycle)
       ));
+    } else {
+      this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+      record.release();
+      return null;
     }
     return Object.freeze({
       runtimeH2: gatedRuntimeH2,
@@ -2618,6 +2756,10 @@ export class RelayV2StateSnapshotSpool {
       || lifecycle.pending !== null
       || this.closed
       || this.fatalUnavailable
+      || currentBoundH2SpoolBinding(
+        this,
+        lifecycle.candidate.boundSpoolClaim,
+      ) === null
       || this.freshInstallBootstrap?.record !== lifecycle.candidate) return false;
     const source: RelayV2FreshInstallH2SourceActivationRecord = {
       sourceActivation: null,
@@ -2664,6 +2806,10 @@ export class RelayV2StateSnapshotSpool {
         || candidate.hostInstanceId !== lifecycle.candidate.hostInstanceId
         || (requiredCutIdentity !== null
           && candidate.materializedCutIdentity !== requiredCutIdentity)
+        || currentBoundH2SpoolBinding(
+          this,
+          lifecycle.candidate.boundSpoolClaim,
+        ) === null
         || this.freshInstallBootstrap?.record !== lifecycle.candidate) {
         throw new RelayV2StateSnapshotSpoolError(
           "CAPABILITY_UNAVAILABLE",
@@ -2690,6 +2836,10 @@ export class RelayV2StateSnapshotSpool {
         || lifecycle.pending !== source
         || lifecycle.current !== null
         || source.closed
+        || currentBoundH2SpoolBinding(
+          this,
+          lifecycle.candidate.boundSpoolClaim,
+        ) === null
         || recoveredHostH2ActivationGeneration
           >= MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION) {
         release();
@@ -2714,7 +2864,11 @@ export class RelayV2StateSnapshotSpool {
         || lifecycle.permanentlyClosed
         || lifecycle.current !== source
         || source.closed
-        || !source.readinessPublished) {
+        || !source.readinessPublished
+        || currentBoundH2SpoolBinding(
+          this,
+          lifecycle.candidate.boundSpoolClaim,
+        ) === null) {
         if (lifecycle.current === source) lifecycle.current = null;
         withdraw();
         release();
@@ -2765,7 +2919,11 @@ export class RelayV2StateSnapshotSpool {
   ): Promise<void> {
     if (lifecycle.permanentlyClosed
       || lifecycle.current !== null
-      || lifecycle.pending !== null) return;
+      || lifecycle.pending !== null
+      || currentBoundH2SpoolBinding(
+        this,
+        lifecycle.candidate.boundSpoolClaim,
+      ) === null) return;
     if (lifecycle.recoveryInFlight !== null) {
       await lifecycle.recoveryInFlight;
       return;
@@ -2790,9 +2948,17 @@ export class RelayV2StateSnapshotSpool {
           || lifecycle.pending !== null
           || this.closed
           || this.fatalUnavailable
+          || currentBoundH2SpoolBinding(
+            this,
+            lifecycle.candidate.boundSpoolClaim,
+          ) === null
           || this.freshInstallBootstrap?.record !== lifecycle.candidate) return;
         const hostEpoch = await this.readCurrentHostEpoch();
-        if (hostEpoch !== lifecycle.candidate.hostEpoch) {
+        if (hostEpoch !== lifecycle.candidate.hostEpoch
+          || currentBoundH2SpoolBinding(
+            this,
+            lifecycle.candidate.boundSpoolClaim,
+          ) === null) {
           this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
           return;
         }
@@ -2801,6 +2967,10 @@ export class RelayV2StateSnapshotSpool {
         } catch (error) {
           throw mapSourceError(error);
         }
+        if (currentBoundH2SpoolBinding(
+          this,
+          lifecycle.candidate.boundSpoolClaim,
+        ) === null) return;
         await this.#installFreshInstallH2SourceActivation(
           lifecycle,
           candidateLease,
@@ -2839,6 +3009,8 @@ export class RelayV2StateSnapshotSpool {
       || typeof closeDescriptor.value !== "function"
       || record.ownerFence !== this.#ownerFence
       || record.spoolGeneration !== this.#spoolGeneration
+      || record.boundSpool !== this
+      || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null
       || issue.binding.hostId !== record.hostId
       || issue.binding.hostEpoch !== record.hostEpoch
       || issue.binding.hostInstanceId !== record.hostInstanceId
@@ -2902,7 +3074,12 @@ export class RelayV2StateSnapshotSpool {
       releaseActivation();
     };
     try {
-      if (await this.#verifyReadinessReceipt(issue.receipt, issue.binding) !== true) {
+      if (await this.#verifyReadinessReceipt(
+        issue.receipt,
+        issue.binding,
+        record.boundSpoolClaim,
+      ) !== true
+        || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
         record.release();
         return null;
       }
@@ -2910,8 +3087,13 @@ export class RelayV2StateSnapshotSpool {
         enqueue: () => accepting,
         close: closeFromSource,
       });
-      activation = await this.#activateReadinessReceipt(issue.receipt, sourceSink);
+      activation = await this.#activateReadinessReceipt(
+        issue.receipt,
+        sourceSink,
+        record.boundSpoolClaim,
+      );
       if (!accepting || activation === null
+        || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null
         || ((typeof activation !== "object" || activation === null)
           && typeof activation !== "function")) {
         close();
@@ -2920,6 +3102,11 @@ export class RelayV2StateSnapshotSpool {
       }
       if (recoveredHostH2ActivationGeneration
         >= MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION) {
+        close();
+        record.release();
+        return null;
+      }
+      if (currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
         close();
         record.release();
         return null;
@@ -2934,7 +3121,10 @@ export class RelayV2StateSnapshotSpool {
           ready: true,
         })]) === true;
       } catch {}
-      if (!applied || !accepting || !readinessPublished) {
+      if (!applied
+        || !accepting
+        || !readinessPublished
+        || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
         close();
         record.release();
         return null;
@@ -2946,7 +3136,10 @@ export class RelayV2StateSnapshotSpool {
     }
 
     const assertAccepting = (): void => {
-      if (!accepting) {
+      if (!accepting
+        || currentBoundH2SpoolBinding(this, record.boundSpoolClaim) === null) {
+        accepting = false;
+        withdrawReadiness();
         throw new RelayV2StateSnapshotSpoolError(
           "CAPABILITY_UNAVAILABLE",
           "recovered H2 activation is closed",
@@ -2996,6 +3189,7 @@ export class RelayV2StateSnapshotSpool {
   async #verifyReadinessReceipt(
     receipt: unknown,
     expected: unknown,
+    boundSpoolClaim: object,
   ): Promise<boolean> {
     try {
       this.testHooks?.beforeReadinessReceiptVerify?.(receipt, expected);
@@ -3009,6 +3203,8 @@ export class RelayV2StateSnapshotSpool {
     }
     const record = this.#readinessReceipts.get(receipt as object);
     if (record === undefined
+      || record.boundSpoolClaim !== boundSpoolClaim
+      || currentBoundH2SpoolBinding(this, boundSpoolClaim) === null
       || record.hostId !== binding.hostId
       || record.hostEpoch !== binding.hostEpoch
       || record.hostInstanceId !== binding.hostInstanceId
@@ -3018,20 +3214,23 @@ export class RelayV2StateSnapshotSpool {
         const now = this.readNow();
         this.cleanupExpiredAt(now);
         this.pruneExpiredReadinessReceipts(now);
-        if (this.#readinessReceipts.get(receipt as object) !== record) return false;
+        if (this.#readinessReceipts.get(receipt as object) !== record
+          || currentBoundH2SpoolBinding(this, boundSpoolClaim) === null) return false;
         await this.testHooks?.beforeReadinessReceiptCandidateFence?.();
         const verified = await this.withCandidateFence(record.candidate, (candidate) => {
           this.assertCurrentOwner();
           const freshNow = this.readNow();
           this.cleanupExpiredAt(freshNow);
           this.pruneExpiredReadinessReceipts(freshNow);
-          return this.readinessReceiptRecordMatches(record, candidate, record.cut, freshNow);
+          return currentBoundH2SpoolBinding(this, boundSpoolClaim) !== null
+            && this.readinessReceiptRecordMatches(record, candidate, record.cut, freshNow);
         });
         const finalNow = this.readNow();
         this.cleanupExpiredAt(finalNow);
         this.pruneExpiredReadinessReceipts(finalNow);
         return verified
           && this.#readinessReceipts.get(receipt as object) === record
+          && currentBoundH2SpoolBinding(this, boundSpoolClaim) !== null
           && finalNow < record.expiresAtMs
           && finalNow < record.cut.lease.snapshotLeaseExpiresAtMs
           && finalNow < record.cut.manifest.snapshotAbsoluteExpiresAtMs;
@@ -3047,6 +3246,7 @@ export class RelayV2StateSnapshotSpool {
   async #activateReadinessReceipt(
     receipt: unknown,
     sink: RelayV2StateEventSink<RelayV2JsonObject>,
+    boundSpoolClaim: object,
   ): Promise<RelayV2StateSnapshotActivationLease> {
     if (((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)
       || ((typeof sink !== "object" && typeof sink !== "function") || sink === null)) {
@@ -3098,11 +3298,18 @@ export class RelayV2StateSnapshotSpool {
         },
       });
       return await this.serializeMetadata(async () => {
+        if (currentBoundH2SpoolBinding(this, boundSpoolClaim) === null) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot spool H2 claim is no longer current",
+          );
+        }
         const now = this.readNow();
         this.cleanupExpiredAt(now);
         this.pruneExpiredReadinessReceipts(now);
         receiptRecord = this.#readinessReceipts.get(receipt as object);
         if (receiptRecord === undefined
+          || receiptRecord.boundSpoolClaim !== boundSpoolClaim
           || receiptRecord.cut.readinessActivation !== null) {
           throw new RelayV2StateSnapshotSpoolError(
             "CAPABILITY_UNAVAILABLE",
@@ -3114,7 +3321,13 @@ export class RelayV2StateSnapshotSpool {
           candidate: RelayV2MaterializedStateCutCandidate,
         ): true => {
           this.assertCurrentOwner();
-          if (!this.readinessReceiptRecordMatches(record, candidate, record.cut, this.readNow())) {
+          if (currentBoundH2SpoolBinding(this, boundSpoolClaim) === null
+            || !this.readinessReceiptRecordMatches(
+              record,
+              candidate,
+              record.cut,
+              this.readNow(),
+            )) {
             throw new RelayV2StateSnapshotSpoolError(
               "CAPABILITY_UNAVAILABLE",
               "snapshot readiness receipt lost its same-cut owner fence",
@@ -3155,6 +3368,8 @@ export class RelayV2StateSnapshotSpool {
           || record.processIncarnation !== this.#processIncarnation
           || record.spoolIdentity !== this.#spoolIdentity
           || record.spoolGeneration !== this.#spoolGeneration
+          || record.boundSpoolClaim !== boundSpoolClaim
+          || currentBoundH2SpoolBinding(this, boundSpoolClaim) === null
           || record.source !== this.#cutSource
           || finalNow >= record.expiresAtMs
           || finalNow >= record.cut.lease.snapshotLeaseExpiresAtMs
@@ -3233,6 +3448,7 @@ export class RelayV2StateSnapshotSpool {
   close(): Promise<void> {
     if (this.closeBarrier !== null) return this.closeBarrier;
     this.closed = true;
+    releaseBoundH2SpoolBinding(this);
     recoveredHostH2SpoolProcessAuthorities.delete(this);
     this.invalidateAllReadinessAuthority();
     this.closeBarrier = this.serializeMetadata(() => {
@@ -4907,10 +5123,12 @@ export class RelayV2StateSnapshotSpool {
     candidateLease: RelayV2MaterializedStateCutCandidateLease,
     candidate: RelayV2MaterializedStateCutCandidate,
     now: number,
+    boundSpoolClaim: object,
   ): Readonly<{ record: ReadinessReceiptRecord; installed: boolean }> {
     if (this.#activeById.get(snapshotId) !== cut
       || cut.readinessCandidate !== candidateLease
       || this.ownerInstanceId !== candidate.hostInstanceId
+      || currentBoundH2SpoolBinding(this, boundSpoolClaim) === null
       || !candidateMatchesManifest(candidate, cut.manifest, this.hostId)) {
       throw new RelayV2StateSnapshotSpoolError(
         "CAPABILITY_UNAVAILABLE",
@@ -4983,6 +5201,7 @@ export class RelayV2StateSnapshotSpool {
       processIncarnation: this.#processIncarnation,
       spoolIdentity: this.#spoolIdentity,
       spoolGeneration: this.#spoolGeneration,
+      boundSpoolClaim,
       source: this.#cutSource,
       materializedSourceGeneration: candidate.materializedSourceGeneration,
       materializedGeneration: candidate.materializedGeneration,
@@ -5023,6 +5242,7 @@ export class RelayV2StateSnapshotSpool {
       && record.processIncarnation === this.#processIncarnation
       && record.spoolIdentity === this.#spoolIdentity
       && record.spoolGeneration === this.#spoolGeneration
+      && currentBoundH2SpoolBinding(this, record.boundSpoolClaim) !== null
       && record.source === this.#cutSource
       && record.nonce.length === 43
       && now >= record.issuedAtMs
