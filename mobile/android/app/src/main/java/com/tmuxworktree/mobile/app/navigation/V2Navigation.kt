@@ -900,12 +900,20 @@ private fun TerminalRoute(
     val connectionStatus = state.terminal.status
     val ownershipReadOnly = state.terminal.inputReadOnly
     val readOnly = userReadOnly || ownershipReadOnly
+    val currentRelayAdmission = rememberUpdatedState(state.relayStartupAdmission)
 
     LaunchedEffect(session.stableId, attachmentId) { viewModel.openTerminal(session, attachmentId) }
     LaunchedEffect(readOnly) { controller.setReadOnly(readOnly) }
     LaunchedEffect(fontSize) { controller.setFontSize(fontSize) }
     DisposableEffect(session.stableId, attachmentId) {
-        onDispose { viewModel.closeTerminal(attachmentId) }
+        onDispose {
+            // Relay v2 WebView disposal owns the exact parser-generation fence and detach receipt.
+            // Calling the route close owner in parallel could steal that attachment before its
+            // held parser false is allowed to settle. Relay v1 keeps its existing close path.
+            if (currentRelayAdmission.value != RelayStartupAdmissionState.RELAY_V2) {
+                viewModel.closeTerminal(attachmentId)
+            }
+        }
     }
 
     TerminalScreen(
@@ -920,7 +928,9 @@ private fun TerminalRoute(
         onConnectionStatusClick = onHealth,
         onReconnect = {
             if (state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-                viewModel.openTerminal(session, attachmentId, controller)
+                controller.currentParserBinding()?.let {
+                    viewModel.openTerminal(session, attachmentId, it)
+                }
             } else {
                 viewModel.openTerminal(session, attachmentId)
             }
@@ -936,11 +946,14 @@ private fun TerminalRoute(
         terminalContent = {
             TerminalWebView(
                 controller = controller,
-                onReady = {
+                onReady = { rendererBinding ->
                     controller.setReadOnly(readOnly)
                     controller.setFontSize(fontSize)
                     controller.fit()
-                    viewModel.openTerminal(session, attachmentId, controller)
+                    viewModel.openTerminal(session, attachmentId, rendererBinding)
+                },
+                onViewLoss = {
+                    viewModel.recoverTerminalRendererLoss(attachmentId, it)
                 },
                 onFailure = viewModel::reportTerminalError,
                 onInput = { if (!readOnly) viewModel.sendTerminalInput(it, attachmentId) },

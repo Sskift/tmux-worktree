@@ -74,6 +74,65 @@ class RelayV2TerminalWebViewParserAdapterTest {
     }
 
     @Test
+    fun `detached parser attachment fences a late false callback without converting it to success`() =
+        runBlocking {
+            val completion = CompletableDeferred<Boolean>()
+            lateinit var platformCompletion: (Boolean) -> Unit
+            val adapter = RelayV2TerminalWebViewParserAdapter(
+                callbackScope = CoroutineScope(coroutineContext),
+                writePort = RelayV2TerminalWebViewWritePort { _, _, callback ->
+                    platformCompletion = callback
+                    true
+                },
+                resetPort = RelayV2TerminalWebViewResetPort { _, _ -> false },
+                newCallbackNonce = { "renderer-loss" },
+            )
+
+            assertTrue(adapter.write(token(), byteArrayOf(1)) { completion.complete(it) })
+            val barrier = adapter.fenceAttachment()
+            platformCompletion(false)
+            barrier.awaitDrained()
+
+            assertFalse(completion.isCompleted)
+        }
+
+    @Test
+    fun `attachment fence rejects new callbacks and drains an admitted completion`() = runBlocking {
+        val completionEntered = CompletableDeferred<Unit>()
+        val releaseCompletion = CompletableDeferred<Unit>()
+        val completionSettled = CompletableDeferred<Boolean>()
+        lateinit var platformCompletion: (Boolean) -> Unit
+        val adapter = RelayV2TerminalWebViewParserAdapter(
+            callbackScope = CoroutineScope(coroutineContext),
+            writePort = RelayV2TerminalWebViewWritePort { _, _, callback ->
+                platformCompletion = callback
+                true
+            },
+            resetPort = RelayV2TerminalWebViewResetPort { _, _ -> false },
+            newCallbackNonce = { "drain" },
+        )
+
+        assertTrue(
+            adapter.write(token(), byteArrayOf(1)) {
+                completionEntered.complete(Unit)
+                releaseCompletion.await()
+                completionSettled.complete(it)
+            },
+        )
+        platformCompletion(false)
+        completionEntered.await()
+
+        val barrier = adapter.fenceAttachment()
+        assertFalse(barrier.isDrained)
+        assertFalse(adapter.write(token(), byteArrayOf(2)) { Unit })
+
+        releaseCompletion.complete(Unit)
+        barrier.awaitDrained()
+        assertTrue(barrier.isDrained)
+        assertFalse(completionSettled.await())
+    }
+
+    @Test
     fun `rejected registration never settles a violating callback`() = runBlocking {
         val completion = CompletableDeferred<Boolean>()
         val adapter = RelayV2TerminalWebViewParserAdapter(

@@ -71,9 +71,11 @@ import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionActor
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionConfig
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
+import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalParserCallbackBarrier
 import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewParserAdapter
 import com.tmuxworktree.mobile.core.terminal.TerminalAttachmentInputPolicy
-import com.tmuxworktree.mobile.core.terminal.TerminalWebViewController
+import com.tmuxworktree.mobile.core.terminal.TerminalWebViewParserBinding
+import com.tmuxworktree.mobile.core.terminal.TerminalWebViewRendererLoss
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -153,7 +155,10 @@ class V2ViewModel(
     private data class RelayV2UiTerminalAttachment(
         val composition: RelayV2BaseRuntimeComposition,
         val fence: RelayV2TerminalUiAttachmentFence,
-        val attachment: RelayV2TerminalAttachment,
+        val parser: RelayV2TerminalWebViewParserAdapter,
+        val rendererBinding: TerminalWebViewParserBinding,
+        val lifecycle: RelayV2TerminalUiAttachmentLifecycle<RelayV2TerminalAttachment> =
+            RelayV2TerminalUiAttachmentLifecycle(),
     )
 
     private val repository = container.repository
@@ -1229,10 +1234,10 @@ class V2ViewModel(
         }
     }
 
-    fun openTerminal(
+    internal fun openTerminal(
         session: RelaySession,
         attachmentId: String,
-        controller: TerminalWebViewController,
+        rendererBinding: TerminalWebViewParserBinding,
     ) {
         if (demoMode || _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
             return
@@ -1243,12 +1248,28 @@ class V2ViewModel(
             val fence = cut?.let {
                 RelayV2TerminalUiAttachmentFence(session.stableId, attachmentId, it)
             }
-            if (composition == null || fence == null ||
+            if (composition == null || fence == null || !rendererBinding.isCurrent() ||
                 !fence.isCurrent(attachmentId, relayV2SessionReplyCuts.value)
             ) {
                 null
             } else {
-                Triple(composition, fence, relayV2Terminal)
+                val parser = RelayV2TerminalWebViewParserAdapter(
+                    rendererBinding,
+                    viewModelScope,
+                )
+                val issued = RelayV2UiTerminalAttachment(
+                    composition = composition,
+                    fence = fence,
+                    parser = parser,
+                    rendererBinding = rendererBinding,
+                )
+                val previous = relayV2Terminal
+                val previousDetach = previous?.let {
+                    val callbacks = it.parser.fenceAttachment()
+                    Triple(it, it.lifecycle.requestDetach(), callbacks)
+                }
+                relayV2Terminal = issued
+                issued to previousDetach
             }
         }
         if (admitted == null) {
@@ -1256,10 +1277,9 @@ class V2ViewModel(
             return
         }
         viewModelScope.launch {
-            val (composition, fence, previous) = admitted
-            previous?.let { stale -> stale.composition.detachTerminal(stale.attachment) }
-            val parser = RelayV2TerminalWebViewParserAdapter(controller, viewModelScope)
-            lateinit var issued: RelayV2UiTerminalAttachment
+            val (issued, previousDetach) = admitted
+            val composition = issued.composition
+            val fence = issued.fence
             val observer = object : RelayV2TerminalAttachmentObserver {
                 override fun opened(streamId: String) {
                     updateCurrentTerminal(issued) {
@@ -1298,50 +1318,221 @@ class V2ViewModel(
                     }
                 }
             }
-            val attachment = composition.attachTerminal(fence.sessionCut, parser, observer)
-            if (attachment == null) {
-                _uiState.update { it.copy(actionError = "Relay v2 terminal attachment is stale") }
-                return@launch
-            }
-            issued = RelayV2UiTerminalAttachment(
-                composition,
-                fence,
-                attachment,
-            )
-            val current = synchronized(relayV2UiFenceLock) {
-                val stillCurrent = relayV2Composition === composition &&
-                    issued.fence.ownsRoute(attachmentId)
-                if (stillCurrent) relayV2Terminal = issued
-                stillCurrent
-            }
-            val openingCurrent = current && updateCurrentTerminal(issued) {
-                it.copy(
-                    terminal = TerminalStreamState(
-                        sessionId = session.stableId,
-                        status = ConnectionStatus.CONNECTING,
-                    ),
-                )
-            }
-            if (!openingCurrent ||
-                !composition.openTerminal(attachment, DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
-            ) {
-                composition.detachTerminal(attachment)
-                synchronized(relayV2UiFenceLock) {
-                    val stillCurrent = relayV2Terminal === issued &&
-                        relayV2Composition === composition &&
-                        issued.fence.ownsRoute(attachmentId)
-                    if (stillCurrent) {
-                        relayV2Terminal = null
-                        _uiState.value = _uiState.value.copy(
-                            terminal = TerminalStreamState(
-                                sessionId = session.stableId,
-                                status = ConnectionStatus.OFFLINE,
-                            ),
-                            actionError = "Relay v2 terminal could not be opened",
+            try {
+                previousDetach?.let { (previous, detach, callbacks) ->
+                    detachRelayV2TerminalAttachment(previous, detach, callbacks)
+                }
+                if (issued.lifecycle.detachRequested() || !rendererBinding.isCurrent()) {
+                    issued.lifecycle.abandonOpening()
+                    return@launch
+                }
+                val attachment = composition.attachTerminal(fence.sessionCut, issued.parser, observer)
+                if (attachment == null) {
+                    issued.parser.fenceAttachment()
+                    issued.lifecycle.abandonOpening()
+                    clearFailedRelayV2Terminal(
+                        issued,
+                        session.stableId,
+                        "Relay v2 terminal attachment is stale",
+                    )
+                    return@launch
+                }
+                when (issued.lifecycle.install(attachment)) {
+                    RelayV2TerminalAttachmentInstall.Current -> Unit
+                    is RelayV2TerminalAttachmentInstall.Detach -> {
+                        detachRelayV2TerminalAttachment(
+                            issued,
+                            RelayV2TerminalAttachmentDetach.Detach(attachment),
                         )
+                        return@launch
                     }
                 }
+                val current = synchronized(relayV2UiFenceLock) {
+                    relayV2Terminal === issued &&
+                        relayV2Composition === composition &&
+                        issued.fence.ownsRoute(attachmentId) &&
+                        rendererBinding.isCurrent()
+                }
+                val openingCurrent = current && updateCurrentTerminal(issued) {
+                    it.copy(
+                        terminal = TerminalStreamState(
+                            sessionId = session.stableId,
+                            status = ConnectionStatus.CONNECTING,
+                        ),
+                    )
+                }
+                if (!openingCurrent ||
+                    !composition.openTerminal(
+                        attachment,
+                        DEFAULT_TERMINAL_COLS,
+                        DEFAULT_TERMINAL_ROWS,
+                    )
+                ) {
+                    issued.parser.fenceAttachment()
+                    detachRelayV2TerminalAttachment(issued)
+                    clearFailedRelayV2Terminal(
+                        issued,
+                        session.stableId,
+                        "Relay v2 terminal could not be opened",
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                issued.parser.fenceAttachment()
+                if (!issued.lifecycle.abandonOpening()) {
+                    try {
+                        detachRelayV2TerminalAttachment(issued)
+                    } catch (detachFailure: Throwable) {
+                        if (detachFailure !== cancelled) {
+                            cancelled.addSuppressed(detachFailure)
+                        }
+                    }
+                }
+                throw cancelled
+            } catch (_: Exception) {
+                issued.parser.fenceAttachment()
+                if (!issued.lifecycle.abandonOpening()) {
+                    try {
+                        detachRelayV2TerminalAttachment(issued)
+                    } catch (_: Exception) {
+                        // Keep the lifecycle failed and any held parser false unsettled.
+                    }
+                }
+                clearFailedRelayV2Terminal(
+                    issued,
+                    session.stableId,
+                    "Relay v2 terminal could not be opened",
+                )
             }
+        }
+    }
+
+    private suspend fun detachRelayV2TerminalAttachment(
+        issued: RelayV2UiTerminalAttachment,
+        claimed: RelayV2TerminalAttachmentDetach<RelayV2TerminalAttachment> =
+            issued.lifecycle.requestDetach(),
+        callbackBarrier: RelayV2TerminalParserCallbackBarrier =
+            issued.parser.fenceAttachment(),
+    ) {
+        // Loss/replacement admission synchronously owns this exact fence. Drain every callback
+        // admitted before that cut before runtime attachment ownership is withdrawn.
+        callbackBarrier.awaitDrained()
+        when (val detach = claimed) {
+            is RelayV2TerminalAttachmentDetach.Detach -> {
+                try {
+                    issued.composition.detachTerminal(detach.attachment)
+                } catch (failure: Throwable) {
+                    issued.lifecycle.failDetach(detach.attachment, failure)
+                    throw failure
+                }
+                issued.lifecycle.completeDetach(detach.attachment)
+            }
+            RelayV2TerminalAttachmentDetach.Await -> issued.lifecycle.awaitDetached()
+            RelayV2TerminalAttachmentDetach.Detached -> Unit
+        }
+    }
+
+    private fun clearFailedRelayV2Terminal(
+        issued: RelayV2UiTerminalAttachment,
+        sessionId: String,
+        message: String,
+    ) {
+        synchronized(relayV2UiFenceLock) {
+            if (relayV2Terminal !== issued || relayV2Composition !== issued.composition) return
+            relayV2Terminal = null
+            _uiState.value = _uiState.value.copy(
+                terminal = TerminalStreamState(
+                    sessionId = sessionId,
+                    status = ConnectionStatus.OFFLINE,
+                ),
+                actionError = message,
+            )
+        }
+    }
+
+    internal fun recoverTerminalRendererLoss(
+        attachmentId: String,
+        rendererLoss: TerminalWebViewRendererLoss,
+    ) {
+        if (demoMode ||
+            _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+        ) {
+            rendererLoss.completeAfterAttachmentDetach()
+            if (rendererLoss.isRendererLoss) {
+                val reason = if (rendererLoss.didCrash) {
+                    "renderer_crashed"
+                } else {
+                    "renderer_gone"
+                }
+                _uiState.update {
+                    it.copy(
+                        terminal = TerminalStreamState(
+                            sessionId = it.terminal.sessionId,
+                            status = ConnectionStatus.OFFLINE,
+                            resetReason = reason,
+                        ),
+                        actionError = "Terminal renderer is unavailable",
+                    )
+                }
+            }
+            return
+        }
+        val current = synchronized(relayV2UiFenceLock) {
+            relayV2Terminal?.takeIf {
+                it.fence.ownsRoute(attachmentId) &&
+                    rendererLoss.fences(it.rendererBinding)
+            }?.let {
+                val callbacks = it.parser.fenceAttachment()
+                relayV2Terminal = null
+                Triple(it, it.lifecycle.requestDetach(), callbacks)
+            }
+        }
+        if (current == null) {
+            // No matching parser attachment was published for this exact view generation.
+            val rebuilt = rendererLoss.completeAfterAttachmentDetach()
+            if (!rebuilt && rendererLoss.isRendererLoss) {
+                publishTerminalRendererRecoveryPaused(sessionId = null)
+            }
+            return
+        }
+        viewModelScope.launch {
+            val (issued, detach, callbacks) = current
+            try {
+                detachRelayV2TerminalAttachment(issued, detach, callbacks)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                emit(V2UiEffect.Notice("Terminal renderer recovery could not fully detach"))
+                _uiState.update {
+                    it.copy(
+                        terminal = TerminalStreamState(
+                            sessionId = issued.fence.sessionStableId,
+                            status = ConnectionStatus.OFFLINE,
+                            resetReason = "terminal_view_detach_failed",
+                        ),
+                        actionError = "Terminal view recovery could not detach safely",
+                    )
+                }
+                return@launch
+            }
+            // This settles the controller's held platform false only after the adapter has fenced
+            // and drained every pre-cut callback and the production attachment is withdrawn.
+            val rebuilt = rendererLoss.completeAfterAttachmentDetach()
+            if (!rebuilt && rendererLoss.isRendererLoss) {
+                publishTerminalRendererRecoveryPaused(issued.fence.sessionStableId)
+            }
+        }
+    }
+
+    private fun publishTerminalRendererRecoveryPaused(sessionId: String?) {
+        _uiState.update {
+            it.copy(
+                terminal = TerminalStreamState(
+                    sessionId = sessionId ?: it.terminal.sessionId,
+                    status = ConnectionStatus.OFFLINE,
+                    resetReason = "renderer_recovery_exhausted",
+                ),
+                actionError = "Terminal renderer recovery is paused",
+            )
         }
     }
 
@@ -1365,9 +1556,15 @@ class V2ViewModel(
                 relayV2Terminal?.takeIf { it.fence.ownsRoute(attachmentId) }
                     .also { if (it != null) relayV2Terminal = null }
             } ?: return
+            val attachment = current.lifecycle.attached()
+            if (attachment == null) {
+                current.parser.fenceAttachment()
+                viewModelScope.launch { detachRelayV2TerminalAttachment(current) }
+                return
+            }
             viewModelScope.launch {
-                if (!current.composition.closeTerminal(current.attachment)) {
-                    current.composition.detachTerminal(current.attachment)
+                if (!current.composition.closeTerminal(attachment)) {
+                    current.composition.detachTerminal(attachment)
                 }
             }
         } else {
@@ -1389,9 +1586,10 @@ class V2ViewModel(
                         it.fence.ownsRoute(attachmentId)
                     }
                 } ?: return
+                val attachment = current.lifecycle.attached() ?: return
                 viewModelScope.launch {
                     if (!current.composition.sendTerminalInput(
-                            current.attachment,
+                            attachment,
                             admittedData.toByteArray(Charsets.UTF_8),
                         )
                     ) {
@@ -1418,8 +1616,9 @@ class V2ViewModel(
                     it.fence.ownsRoute(attachmentId)
                 }
             } ?: return
+            val attachment = current.lifecycle.attached() ?: return
             viewModelScope.launch {
-                current.composition.resizeTerminal(current.attachment, cols, rows)
+                current.composition.resizeTerminal(attachment, cols, rows)
             }
         } else {
             relayV1IfAdmitted()?.resizeTerminal(cols, rows, attachmentId)
