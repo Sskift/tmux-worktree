@@ -178,10 +178,11 @@ class RelayV2TerminalProductionCompositionTest {
     }
 
     @Test
-    fun `generic public errors resolve only their exact durable terminal owner`() = runBlocking {
+    fun `handled reset stays applied with exact terminal ownership`() = runBlocking {
         val codec = RelayV2Codec()
         val terminal = BlockingTerminalAuthority()
         terminal.releaseClaim.complete(Unit)
+        var observedReset: RelayV2TerminalResetReason? = null
         var nextId = 0
         val composition = RelayV2TerminalProductionComposition(
             applyLease = CurrentApplyLease,
@@ -212,7 +213,19 @@ class RelayV2TerminalProductionCompositionTest {
             "host-a",
             "epoch-a",
         )
-        val attachment = composition.attach(target, RejectingParser)
+        val attachment = composition.attach(
+            target,
+            RejectingParser,
+            object : RelayV2TerminalAttachmentObserver {
+                override fun opened(streamId: String) = Unit
+
+                override fun reset(reason: RelayV2TerminalResetReason) {
+                    observedReset = reason
+                }
+
+                override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+            },
+        )
         assertTrue(composition.open(attachment, authority, 120, 36))
         val key = terminal.beginOpenKeys.single()
         val preOpen = (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.PreOpen).checkpoint
@@ -431,6 +444,32 @@ class RelayV2TerminalProductionCompositionTest {
             )
             assertEquals(case.name, case.stored, terminal.stored(key))
         }
+
+        terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(present))
+        val resetRequired = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            codec.encodeWebSocketFrame(
+                RelayV2WebSocketChannel.PUBLIC,
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "event",
+                    "type" to "terminal.reset_required",
+                    "streamId" to identity.streamId,
+                    "payload" to linkedMapOf(
+                        "generation" to identity.generation,
+                        "reason" to "stream_lost",
+                        "requestedOffset" to null,
+                        "bufferStartOffset" to null,
+                        "tailOffset" to null,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalFrameResult.Applied,
+            composition.handlePublicFrame(authority, resetRequired),
+        )
+        assertEquals(RelayV2TerminalResetReason.STREAM_LOST, observedReset)
 
         terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(present))
         val output = codec.decodeWebSocketFrame(

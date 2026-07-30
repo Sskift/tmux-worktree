@@ -571,7 +571,7 @@ internal class RelayV2TerminalProductionComposition(
                 }
                 is RelayV2TerminalEffect.ResetRequired -> {
                     state.attachment.observer.reset(effect.reason)
-                    false
+                    true
                 }
                 is RelayV2TerminalEffect.FinalizeClosed -> {
                     credentials.clear(
