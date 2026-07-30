@@ -540,20 +540,24 @@ async function closeOwned(
   return failed;
 }
 
-const loadLocalDevelopmentHostConfig = (): Pick<Config, "hosts"> => ({
+const loadLocalOnlyHostConfig = (): Pick<Config, "hosts"> => ({
   hosts: [],
 });
 
 async function openCanonicalRuntimeOwner(
   trustedHome: string,
   signal?: AbortSignal,
-  localDevelopmentIsolation?: Readonly<{
-    terminalControlStatePath: string;
-  }>,
+  lane: Readonly<{
+    localDevelopmentIsolation?: Readonly<{
+      terminalControlStatePath: string;
+    }>;
+    configLoader?: () => Pick<Config, "hosts"> | null;
+  }> = {},
 ): Promise<Readonly<{
   terminalControlDaemonSocketPath: string;
   runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1;
 }>> {
+  const localDevelopmentIsolation = lane.localDevelopmentIsolation;
   const terminalControlDaemonSocketPath = localDevelopmentIsolation === undefined
     ? defaultTerminalControlSocketPath(trustedHome)
     : localDevelopmentTerminalControlSocketPath(trustedHome);
@@ -589,9 +593,9 @@ async function openCanonicalRuntimeOwner(
     terminalControlDaemonSocketPath,
     knownHostsFile: join(trustedHome, ".ssh", "known_hosts"),
     sshExecutable: "/usr/bin/ssh",
-    ...(localDevelopmentIsolation === undefined
+    ...(lane.configLoader === undefined
       ? {}
-      : { configLoader: loadLocalDevelopmentHostConfig }),
+      : { configLoader: lane.configLoader }),
   });
   return Object.freeze({ terminalControlDaemonSocketPath, runtimeOwner });
 }
@@ -720,7 +724,10 @@ async function createLocalDevelopmentActivationOwner(
       trustedHome,
       signal,
       Object.freeze({
-        terminalControlStatePath: defaultTerminalControlStatePath(trustedHome),
+        localDevelopmentIsolation: Object.freeze({
+          terminalControlStatePath: defaultTerminalControlStatePath(trustedHome),
+        }),
+        configLoader: loadLocalOnlyHostConfig,
       }),
     );
     const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
@@ -794,9 +801,11 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     requireStartupOpen(signal);
     // Deliberately use the real account home. Unlike local-development, this
     // lane does not require or synthesize a 0700 replacement home; canonical
-    // TW config/session discovery and terminal-control ownership stay on the
-    // current Mac account. The native producer alone derives its fixed 0700
-    // credential namespace beneath this account home.
+    // Local TW session discovery and terminal-control ownership stay on the
+    // current Mac account. This non-production lane injects a static empty
+    // Host config below, so legacy remote aliases cannot enter activation.
+    // The native producer alone derives its fixed 0700 credential namespace
+    // beneath this account home.
     const trustedHome = requireSelfHostedDarwinArm64AccountHome();
     if (options.provisionProfileInputPath !== undefined) {
       const profile = readRelayV2HostProductionProfileProvisioningInput({
@@ -834,7 +843,11 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     }
     requireStartupOpen(signal);
 
-    const openedRuntime = await openCanonicalRuntimeOwner(trustedHome, signal);
+    const openedRuntime = await openCanonicalRuntimeOwner(
+      trustedHome,
+      signal,
+      Object.freeze({ configLoader: loadLocalOnlyHostConfig }),
+    );
     const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
     runtimeOwner = openedRuntime.runtimeOwner;
     requireStartupOpen(signal);
@@ -1060,9 +1073,10 @@ export async function startRelayV2HostDashboardManagementFromLocalDevelopment(
 
 /**
  * Exact Dashboard adoption seam for the explicit non-production self-hosted
- * Darwin arm64 lane. It uses the real account home/profile/runtime discovery,
- * the persistent native cell selected by one policy ticket, and two distinct
- * owner-only CA inputs. It never selects production or Relay v1 on failure.
+ * Darwin arm64 lane. It uses the real account home/profile, canonical local
+ * runtime discovery with an explicit empty Host config, the persistent native
+ * cell selected by one policy ticket, and two distinct owner-only CA inputs.
+ * It never selects production or Relay v1 on failure.
  */
 export async function startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
   options: unknown,

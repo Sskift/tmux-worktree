@@ -151,6 +151,66 @@ function noEffectTerminalControlBackend() {
   };
 }
 
+test("canonical Host runtime fails closed when the incumbent daemon lacks its exact sibling", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-relay-v2-incumbent-only-"));
+  const socketPath = join(
+    tmpdir(),
+    `twv2-incumbent-${process.pid}-${root.slice(-6)}.sock`,
+  );
+  const compoundSocketPath = exactCompound.relayV2RemoteExactCompoundSocketPathV1(
+    socketPath,
+  );
+  const daemonAbort = new AbortController();
+  const daemonAuthority = new terminalControl.TerminalControlAuthority({
+    statePath: join(root, "terminal-control-state-v1.json"),
+    backend: noEffectTerminalControlBackend(),
+  });
+  const daemon = terminalControl.runTerminalControlServer({
+    socketPath,
+    authority: daemonAuthority,
+    signal: daemonAbort.signal,
+  });
+
+  try {
+    await waitForPath(socketPath);
+    assert.equal(existsSync(compoundSocketPath), false);
+    await terminalControl.requestTerminalControl(
+      { type: "ping" },
+      { socketPath, autoStart: false },
+    );
+
+    await assert.rejects(
+      bundleModule.createRelayV2CanonicalHostRuntimeBundleOwnerV1({
+        localCliTarget: {
+          executable: "/opt/tw-node/bin/node",
+          entrypoint: "/opt/tw-dashboard/tw-cli/cli.cjs",
+          home: root,
+        },
+        terminalControlDaemonSocketPath: socketPath,
+        knownHostsFile: "/configured/ssh/known_hosts",
+        sshExecutable: "/usr/bin/ssh",
+        configLoader: () => ({ hosts: [] }),
+      }),
+      /Relay v2 exact daemon ingress is unavailable/,
+    );
+
+    assert.equal(
+      existsSync(compoundSocketPath),
+      false,
+      "Host preflight must not create a sibling or a second authority",
+    );
+    await terminalControl.requestTerminalControl(
+      { type: "ping" },
+      { socketPath, autoStart: false },
+    );
+  } finally {
+    daemonAbort.abort();
+    await daemon.catch(() => undefined);
+    rmSync(socketPath, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("canonical Host runtime bundle keeps one target generation and fences every old spawn", async () => {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-v2-canonical-host-bundle-"));
   const socketPath = join(
