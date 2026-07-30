@@ -26,6 +26,7 @@ export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SCOPES = Math.floor(
   RELAY_V2_MATERIALIZED_CAPACITY.maxSnapshotRecords
     / RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_FIXED_RECORDS_PER_SCOPE,
 );
+/** Per-response input hard limit; independent of the remaining H2 record budget. */
 export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE =
   RELAY_V2_MATERIALIZED_CAPACITY.maxSnapshotRecords;
 export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS = 5_000;
@@ -133,6 +134,9 @@ export function projectRelayV2CanonicalTwRpcDiscoveredSession(
   input: RelayV2CanonicalTwRpcDiscoveryInput,
 ): RelayV2DiscoveredSession {
   const { session } = input;
+  if (session.lifecycleMarked !== true) {
+    throw new TypeError("canonical TW RPC Session lacks lifecycle authority");
+  }
   const displayName = persistedDisplayLabel(session);
   const times = sessionTimes(session);
   if (session.kind === "worktree") {
@@ -301,7 +305,7 @@ function parseSession(value: unknown): RpcV2Session {
   if ((value.kind !== "worktree" && value.kind !== "terminal")
     || (value.profile !== "cli" && value.profile !== "dashboard")
     || typeof value.attached !== "boolean"
-    || value.lifecycleMarked !== true) {
+    || typeof value.lifecycleMarked !== "boolean") {
     throw new TypeError("invalid canonical TW RPC v2 Session response fields");
   }
   const createdAt = boundedString(value.createdAt, "createdAt", 64);
@@ -330,25 +334,26 @@ function parseSession(value: unknown): RpcV2Session {
     created: nonNegativeSafeInteger(value.created, "created"),
     activity: nonNegativeSafeInteger(value.activity, "activity"),
     incarnation,
-    lifecycleMarked: true,
+    lifecycleMarked: value.lifecycleMarked,
     reservationCorrelation: value.reservationCorrelation === null
       ? null
       : normalizeManagedSessionReservationCorrelation(value.reservationCorrelation),
   };
 }
 
-function parseListResponse(value: unknown, maxSessions: number): RpcV2ListResponse {
+function parseListResponse(value: unknown): RpcV2ListResponse {
   if (!isRecord(value)
     || !hasExactKeys(value, ["protocolVersion", "sessions"])
     || value.protocolVersion !== 2
     || !Array.isArray(value.sessions)
-    || value.sessions.length > maxSessions
     || value.sessions.length > RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE) {
     throw new TypeError("invalid canonical TW RPC v2 list response");
   }
   return {
     protocolVersion: 2,
-    sessions: value.sessions.map(parseSession),
+    // Array.from visits sparse slots as undefined, so every claimed row is
+    // parsed and malformed input cannot disappear before the authority cut.
+    sessions: Array.from(value.sessions, parseSession),
   };
 }
 
@@ -692,8 +697,19 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
       };
     }
     try {
-      const response = parseListResponse(listResult.value, maxSessions);
-      const sessions = response.sessions.map((session) => (
+      const response = parseListResponse(listResult.value);
+      // rpc-v2 list deliberately preserves readable legacy records without a
+      // synthesized lifecycle marker. The canonical H2 projection is the
+      // authority boundary that excludes them: every row is still parsed
+      // strictly above, but only lifecycle-marked Sessions may receive Relay
+      // identity, exact mutation targets, or terminal authority.
+      const authoritativeSessions = response.sessions.filter(
+        (session) => session.lifecycleMarked,
+      );
+      if (authoritativeSessions.length > maxSessions) {
+        throw new TypeError("canonical TW RPC v2 authoritative Session budget exceeded");
+      }
+      const sessions = authoritativeSessions.map((session) => (
         projectRelayV2CanonicalTwRpcDiscoveredSession({
           processTarget: scope.processTarget,
           session,
@@ -726,7 +742,7 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
           processTarget: { ...scope.processTarget },
           capabilities: [...capabilities.capabilities],
         },
-        sessionTargets: response.sessions.map((session) => ({
+        sessionTargets: authoritativeSessions.map((session) => ({
           scopeBackendIdentity: scope.backendIdentity,
           sessionBackendIdentity: issueRelayV2CanonicalBackendInstanceKey({
             processTarget: scope.processTarget,

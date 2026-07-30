@@ -11,7 +11,9 @@ import {
 } from "../dist/relay/v2/hostState.js";
 import {
   RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SCOPES,
+  RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE,
   RelayV2CanonicalTwRpcDiscoveryAdapter,
+  projectRelayV2CanonicalTwRpcDiscoveredSession,
 } from "../dist/relay/v2/canonicalTwRpcDiscovery.js";
 import {
   RelayV2CanonicalTwRpcQueryTransportAdapter,
@@ -186,6 +188,46 @@ test("canonical TW RPC v2 discovery scans only configured scopes and projects de
   }
 });
 
+test("canonical discovery authoritatively excludes unmarked legacy Sessions", async () => {
+  assert.throws(
+    () => projectRelayV2CanonicalTwRpcDiscoveredSession({
+      processTarget: { kind: "local", targetId: "local" },
+      session: terminalSession({ lifecycleMarked: false }),
+    }),
+    /lacks lifecycle authority/,
+  );
+  const port = queryPort(({ command }) => command === "capabilities"
+    ? capabilities()
+    : {
+        protocolVersion: 2,
+        sessions: [
+          terminalSession({ lifecycleMarked: false }),
+          worktreeSession({ lifecycleMarked: false }),
+        ],
+      });
+  const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
+    scopes: [scope("local", "local")],
+    queryPort: port,
+  });
+
+  const scan = await discovery.scan();
+  const cut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
+
+  assert.equal(scan.coverage, "complete");
+  assert.equal(scan.scopes[0].reachability, "online");
+  assert.equal(scan.scopes[0].sessionsCompleteness, "complete");
+  assert.deepEqual(scan.scopes[0].sessions, []);
+  assert.equal(scan.scopes[0].error, null);
+  assert.equal(scan.scopes[0].reservationCorrelationCompleteness, "complete");
+  assert.equal(cut.scopeTargets.length, 1);
+  assert.deepEqual(cut.sessionTargets, []);
+  assert.equal(
+    JSON.stringify(scan).includes("raw.tmux"),
+    false,
+    "legacy raw targets must not enter the public Relay projection",
+  );
+});
+
 test("canonical discovery swaps explicit config generations atomically and keeps raw targets process-local", async () => {
   const portA = queryPort(({ command }) => (
     command === "capabilities"
@@ -279,6 +321,57 @@ test("a canonical scope with more than 256 valid Sessions remains complete", asy
   assert.equal(scan.scopes[0].sessions.length, 257);
 });
 
+test("unmarked legacy rows do not consume the remaining H2 Session budget", async () => {
+  const legacy = terminalSession({ lifecycleMarked: false });
+  const port = queryPort((request) => request.command === "capabilities"
+    ? capabilities()
+    : {
+        protocolVersion: 2,
+        sessions: new Array(request.maxSessions + 1).fill(legacy),
+      });
+  const scan = await new RelayV2CanonicalTwRpcDiscoveryAdapter({
+    scopes: [scope("local", "local")],
+    queryPort: port,
+  }).scan();
+  const cut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
+  const listCall = port.calls.find((call) => call.command === "list");
+
+  assert.equal(
+    listCall.maxSessions,
+    RELAY_V2_MATERIALIZED_CAPACITY.maxSnapshotRecords - 2,
+  );
+  assert.ok(
+    listCall.maxSessions + 1
+      <= RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE,
+  );
+  assert.equal(scan.coverage, "complete");
+  assert.equal(scan.scopes[0].sessionsCompleteness, "complete");
+  assert.deepEqual(scan.scopes[0].sessions, []);
+  assert.equal(scan.scopes[0].error, null);
+  assert.equal(cut.scopeTargets.length, 1);
+  assert.deepEqual(cut.sessionTargets, []);
+});
+
+test("the independent input hard limit still rejects oversized unmarked responses", async () => {
+  const port = queryPort(({ command }) => command === "capabilities"
+    ? capabilities()
+    : {
+        protocolVersion: 2,
+        sessions: new Array(
+          RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE + 1,
+        ),
+      });
+  const scan = await new RelayV2CanonicalTwRpcDiscoveryAdapter({
+    scopes: [scope("local", "local")],
+    queryPort: port,
+  }).scan();
+
+  assert.equal(scan.coverage, "partial");
+  assert.equal(scan.scopes[0].sessionsCompleteness, "partial");
+  assert.deepEqual(scan.scopes[0].sessions, []);
+  assert.equal(scan.scopes[0].error.code, "INTERNAL");
+});
+
 test("multiple scopes share the deterministic H2 full-cut record budget without truncation", async () => {
   const port = queryPort((request) => {
     if (request.command === "capabilities") return capabilities();
@@ -287,7 +380,7 @@ test("multiple scopes share the deterministic H2 full-cut record budget without 
     }
     return {
       protocolVersion: 2,
-      sessions: new Array(request.maxSessions + 1),
+      sessions: new Array(request.maxSessions + 1).fill(terminalSession()),
     };
   });
   const scan = await new RelayV2CanonicalTwRpcDiscoveryAdapter({
@@ -382,6 +475,23 @@ test("timeout, transport, capability, and malformed-session failures remain part
         : {
           protocolVersion: 2,
           sessions: [terminalSession(), worktreeSession({ incarnation: "invalid" })],
+        },
+      expectedCode: "INTERNAL",
+      expectedReachability: "online",
+      expectedCommands: ["capabilities", "list"],
+    },
+    {
+      name: "malformed unmarked legacy session is not hidden by exclusion",
+      handler: ({ command }) => command === "capabilities"
+        ? capabilities()
+        : {
+          protocolVersion: 2,
+          sessions: [
+            terminalSession({
+              lifecycleMarked: false,
+              incarnation: "invalid",
+            }),
+          ],
         },
       expectedCode: "INTERNAL",
       expectedReachability: "online",
