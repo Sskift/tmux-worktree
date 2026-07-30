@@ -1,8 +1,8 @@
 use super::{
-    local_session_active_cwd, managed_worktree_root_for_session, pane_output_signature,
-    project_from_worktree_path, remote_git_root, remote_session_active_cwd,
-    remote_session_activity_samples, remote_tmux_session_is_worktree, session_agent_running,
-    tmux_list_sessions_fmt,
+    local_session_active_cwd, local_tmux_catalog_failure_is_empty,
+    managed_worktree_root_for_session, pane_output_signature, project_from_worktree_path,
+    remote_git_root, remote_session_active_cwd, remote_session_activity_samples,
+    remote_tmux_session_is_worktree, session_agent_running, tmux_list_sessions_fmt,
 };
 use crate::config::{config_worktree_base, load_hosts, trimmed_non_empty_string};
 use crate::ipc::{DashboardCatalogSnapshot, Session, TmuxTerminal, TwRpcListResponse};
@@ -140,7 +140,7 @@ pub(crate) fn list_local_sessions() -> Result<Vec<Session>, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("no server running") || stderr.contains("no current server") {
+        if local_tmux_catalog_failure_is_empty(&output.stdout, &stderr) {
             return Ok(vec![]);
         }
         return Err(format!("tmux exited {}: {}", output.status, stderr.trim()));
@@ -353,7 +353,7 @@ fn list_local_tmux_terminals() -> Result<Vec<TmuxTerminal>, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("no server running") || stderr.contains("no current server") {
+        if local_tmux_catalog_failure_is_empty(&output.stdout, &stderr) {
             return Ok(vec![]);
         }
         return Err(format!("tmux exited {}: {}", output.status, stderr.trim()));
@@ -452,4 +452,48 @@ fn list_remote_tmux_terminals_via_tmux(host: &HostConfig) -> Result<Vec<TmuxTerm
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_private_tmux_namespace_has_an_empty_local_catalog() {
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
+        let original_home = std::env::var_os("TW_DASHBOARD_HOME");
+        let original_tmux_tmpdir = std::env::var_os("TMUX_TMPDIR");
+        let original_tmux = std::env::var_os("TMUX");
+        let original_tmux_pane = std::env::var_os("TMUX_PANE");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let tmux_tmpdir = temp.path().join("tmux");
+        std::fs::create_dir(&home).expect("home");
+        std::fs::create_dir(&tmux_tmpdir).expect("tmux tmpdir");
+
+        unsafe {
+            std::env::set_var("TW_DASHBOARD_HOME", &home);
+            std::env::set_var("TMUX_TMPDIR", &tmux_tmpdir);
+            std::env::remove_var("TMUX");
+            std::env::remove_var("TMUX_PANE");
+        }
+        let result = list_local_dashboard_catalog_blocking();
+        for (name, value) in [
+            ("TW_DASHBOARD_HOME", original_home),
+            ("TMUX_TMPDIR", original_tmux_tmpdir),
+            ("TMUX", original_tmux),
+            ("TMUX_PANE", original_tmux_pane),
+        ] {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let catalog = result.expect("fresh local catalog");
+        assert!(catalog.sessions.is_empty());
+        assert!(catalog.terminals.is_empty());
+    }
 }
