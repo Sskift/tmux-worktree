@@ -149,6 +149,7 @@ pub fn run() {
             mobile_relay_v2_self_hosted_save_config,
             mobile_relay_v2_self_hosted_deploy,
             mobile_relay_v2_self_hosted_start_center,
+            mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap,
             mobile_relay_v2_self_hosted_stop_center,
         ])
         .build(tauri::generate_context!())

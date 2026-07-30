@@ -1,4 +1,13 @@
-import { Check, FolderOpen, LoaderCircle, Play, Save, Server, Square } from "lucide-react";
+import {
+  Check,
+  FolderOpen,
+  LoaderCircle,
+  Play,
+  RotateCcw,
+  Save,
+  Server,
+  Square,
+} from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { MenuSelect, type MenuOption } from "../../MenuSelect";
 import type {
@@ -8,6 +17,7 @@ import type {
 import { useDashboardBackend } from "../../platform";
 import {
   createRelayV2SelfHostedDraft,
+  relayV2ExpiredBootstrapRotationAvailable,
   relayV2SelfHostedDraftMatchesStatus,
   relayV2SelfHostedStatusLabel,
   selfHostedStatusToDraft,
@@ -16,7 +26,7 @@ import {
   type RelayV2SelfHostedDraftErrors,
 } from "./relayV2SelfHostedModel";
 
-type Operation = "save" | "deploy" | "start" | "stop" | null;
+type Operation = "save" | "deploy" | "start" | "stop" | "rotate" | null;
 
 export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[] }) {
   const backend = useDashboardBackend();
@@ -67,6 +77,8 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
       let next: MobileRelayV2SelfHostedStatus;
       if (kind === "stop") {
         next = await backend.relay.v2Deployment.stopCenter();
+      } else if (kind === "rotate") {
+        next = await backend.relay.v2Deployment.rotateExpiredHostBootstrap();
       } else {
         const validation = validateRelayV2SelfHostedDraft(draft);
         setErrors(validation.errors);
@@ -88,6 +100,8 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           ? "Canonical tw bundle, TLS files, and deployment profile published."
           : kind === "start"
             ? "Relay v2 Center started on the selected devbox."
+            : kind === "rotate"
+              ? "Expired version-zero Host bootstrap rotated with the same persisted correlation."
             : "Relay v2 Center stopped; persisted broker state was preserved.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
@@ -112,6 +126,7 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
   const locked = operation !== null;
   const running = status?.centerStatus === "running";
   const draftMatchesSaved = relayV2SelfHostedDraftMatchesStatus(draft, status);
+  const rotationAvailable = relayV2ExpiredBootstrapRotationAvailable(status);
   return (
     <section
       className="connections-relay-v2-deployment"
@@ -208,7 +223,17 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           <span>Bundle · {status.bundleStatus}</span>
           <span>TLS/profile · {status.tlsStatus}</span>
           <span>Center · {status.centerStatus}</span>
-          <span>Host bootstrap · {status.hostBootstrapAvailable ? "0600 file ready" : "not created"}</span>
+          <span>
+            Host bootstrap · {status.hostCredentialProvisioned
+              ? "credential provisioned"
+              : status.bootstrapRotationPending
+                ? "rotation pending"
+                : status.hostBootstrapAvailable
+                  ? "0600 file ready"
+                  : status.hostBootstrapPending
+                    ? "local input missing"
+                    : "not created"}
+          </span>
         </div>
       )}
       <p className="connections-relay-v2-deployment__hint">
@@ -217,6 +242,15 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
         TLS key, leaf certificate, and CA certificate must be current-user-owned,
         single-link, exact 0600 files. Deployment publishes separate 0600 copies and
         keeps the Broker SQLite state directory 0700.
+      </p>
+      <p className="connections-relay-v2-deployment__hint">
+        Manual recovery only: rotate only when the Host native credential cell is
+        still version 0 pending and its bootstrap has expired. Dashboard never
+        guesses expiry. Rotation preserves the Broker SQLite state, Host cell, and
+        bootstrap correlation.
+        {status?.bootstrapRotationPending
+          ? " A rotation is pending; retry continues the same correlation."
+          : ""}
       </p>
       {(notice || status?.error) && (
         <div className="connections-notice connections-notice--pending" role="status">
@@ -241,6 +275,17 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
         >
           {operation === "deploy" ? <LoaderCircle className="connections-spin" size={14} /> : <Server size={14} />}
           Deploy / update bundle
+        </button>
+        <button
+          type="button"
+          className="connections-button"
+          disabled={locked || !draftMatchesSaved || !rotationAvailable}
+          onClick={() => void run("rotate")}
+        >
+          {operation === "rotate"
+            ? <LoaderCircle className="connections-spin" size={14} />
+            : <RotateCcw size={14} />}
+          Rotate expired Host bootstrap
         </button>
         {running ? (
           <button

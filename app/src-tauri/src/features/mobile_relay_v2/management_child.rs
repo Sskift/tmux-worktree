@@ -72,6 +72,19 @@ impl ManagementPreparedFileMarker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagementBootstrapSecretMode {
+    ReplacePending,
+}
+
+impl ManagementBootstrapSecretMode {
+    fn as_argument(&self) -> &'static str {
+        match self {
+            Self::ReplacePending => "replace-pending",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagementChildSelection {
     DefaultProduction,
     SelfHostedDarwinArm64 {
@@ -83,6 +96,7 @@ pub(crate) enum ManagementChildSelection {
         profile_lineage: String,
         provision_profile_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
         bootstrap_secret_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
+        bootstrap_secret_mode: Option<ManagementBootstrapSecretMode>,
     },
 }
 
@@ -98,6 +112,7 @@ pub(crate) enum ManagementLaunchKey {
         profile_lineage: String,
         provision_profile_input: Option<ManagementPreparedFileMarker>,
         bootstrap_secret_input: Option<ManagementPreparedFileMarker>,
+        bootstrap_secret_mode: Option<ManagementBootstrapSecretMode>,
     },
 }
 
@@ -111,6 +126,7 @@ impl ManagementChildSelection {
         profile_lineage: String,
         provision_profile_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
         bootstrap_secret_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
+        bootstrap_secret_mode: Option<ManagementBootstrapSecretMode>,
     ) -> Result<Self, ManagementStartError> {
         if !account_home.is_absolute()
             || !credential_https_ca_input.is_absolute()
@@ -137,6 +153,7 @@ impl ManagementChildSelection {
                         || identity.links != 1
                         || identity.length == 0
                 })
+            || (bootstrap_secret_mode.is_some() && bootstrap_secret_input.is_none())
             || profile_lineage.len() != 32
             || !profile_lineage.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -151,6 +168,7 @@ impl ManagementChildSelection {
             profile_lineage,
             provision_profile_input,
             bootstrap_secret_input,
+            bootstrap_secret_mode,
         })
     }
 
@@ -166,6 +184,7 @@ impl ManagementChildSelection {
                 profile_lineage,
                 provision_profile_input,
                 bootstrap_secret_input,
+                bootstrap_secret_mode,
             } => ManagementLaunchKey::SelfHostedDarwinArm64 {
                 account_home: account_home.clone(),
                 credential_https_ca_input: credential_https_ca_input.clone(),
@@ -179,6 +198,7 @@ impl ManagementChildSelection {
                 bootstrap_secret_input: bootstrap_secret_input.as_ref().map(|(path, identity)| {
                     ManagementPreparedFileMarker::from_prepared(path, identity)
                 }),
+                bootstrap_secret_mode: bootstrap_secret_mode.clone(),
             },
         }
     }
@@ -202,6 +222,7 @@ impl ManagementChildSelection {
                 profile_lineage,
                 provision_profile_input: None,
                 bootstrap_secret_input: None,
+                bootstrap_secret_mode: None,
             },
             ManagementLaunchKey::DefaultProduction => ManagementLaunchKey::DefaultProduction,
         }
@@ -215,6 +236,7 @@ impl ManagementChildSelection {
                 carrier_wss_ca_input,
                 provision_profile_input,
                 bootstrap_secret_input,
+                bootstrap_secret_mode,
                 ..
             } => {
                 command
@@ -228,6 +250,11 @@ impl ManagementChildSelection {
                 }
                 if let Some((path, _)) = bootstrap_secret_input {
                     command.arg("--bootstrap-secret-input").arg(path);
+                }
+                if let Some(mode) = bootstrap_secret_mode {
+                    command
+                        .arg("--bootstrap-secret-mode")
+                        .arg(mode.as_argument());
                 }
             }
         }
@@ -2818,7 +2845,7 @@ mod tests {
 
     #[test]
     fn pending_one_shot_inputs_force_admission_then_converge_to_one_steady_key() {
-        let selection = |provision, bootstrap| {
+        let selection = |provision, bootstrap, mode| {
             ManagementChildSelection::self_hosted_darwin_arm64(
                 PathBuf::from("/Users/fixture"),
                 PathBuf::from("/Users/fixture/credential-ca.pem"),
@@ -2828,15 +2855,17 @@ mod tests {
                 "00112233445566778899aabbccddeeff".to_string(),
                 provision,
                 bootstrap,
+                mode,
             )
             .unwrap()
         };
-        let steady = selection(None, None);
+        let steady = selection(None, None, None);
         let provision = selection(
             Some((
                 PathBuf::from("/Users/fixture/profile.json"),
                 prepared_identity(3),
             )),
+            None,
             None,
         );
         let bootstrap = selection(
@@ -2845,14 +2874,62 @@ mod tests {
                 PathBuf::from("/Users/fixture/bootstrap.twhostboot2"),
                 prepared_identity(4),
             )),
+            None,
+        );
+        let rotated_bootstrap = selection(
+            None,
+            Some((
+                PathBuf::from("/Users/fixture/bootstrap.twhostboot2"),
+                prepared_identity(4),
+            )),
+            Some(ManagementBootstrapSecretMode::ReplacePending),
         );
 
         assert_eq!(steady.launch_key(), steady.steady_launch_key());
         assert_ne!(provision.launch_key(), provision.steady_launch_key());
         assert_ne!(bootstrap.launch_key(), bootstrap.steady_launch_key());
+        assert_ne!(
+            rotated_bootstrap.launch_key(),
+            rotated_bootstrap.steady_launch_key()
+        );
         assert_ne!(provision.launch_key(), bootstrap.launch_key());
+        assert_ne!(bootstrap.launch_key(), rotated_bootstrap.launch_key());
         assert_eq!(provision.steady_launch_key(), steady.launch_key());
         assert_eq!(bootstrap.steady_launch_key(), steady.launch_key());
+        assert_eq!(rotated_bootstrap.steady_launch_key(), steady.launch_key());
+    }
+
+    #[test]
+    fn rotated_bootstrap_launch_uses_exact_non_secret_replace_pending_mode() {
+        let artifact = artifact();
+        let selection = ManagementChildSelection::self_hosted_darwin_arm64(
+            PathBuf::from("/Users/fixture"),
+            PathBuf::from("/Users/fixture/credential-ca.pem"),
+            PathBuf::from("/Users/fixture/carrier-ca.pem"),
+            prepared_identity(1),
+            prepared_identity(2),
+            "00112233445566778899aabbccddeeff".to_string(),
+            None,
+            Some((
+                PathBuf::from("/Users/fixture/bootstrap.twhostboot2"),
+                prepared_identity(4),
+            )),
+            Some(ManagementBootstrapSecretMode::ReplacePending),
+        )
+        .unwrap();
+        let command = production_command_with_environment(
+            Path::new("/fixed/node"),
+            &artifact,
+            &selection,
+            std::iter::empty::<(OsString, OsString)>(),
+        );
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                std::ffi::OsStr::new("--bootstrap-secret-mode"),
+                std::ffi::OsStr::new("replace-pending"),
+            ]
+        }));
     }
 
     #[test]

@@ -458,6 +458,9 @@ export type MobileRelayV2SelfHostedStatus = {
   tlsStatus: MobileRelayV2SelfHostedProbeStatus;
   centerStatus: MobileRelayV2SelfHostedProbeStatus;
   hostBootstrapAvailable: boolean;
+  hostBootstrapPending: boolean;
+  hostCredentialProvisioned: boolean;
+  bootstrapRotationPending: boolean;
   remoteTlsKeyPath: string;
   remoteTlsCertificatePath: string;
   remoteTlsCaPath: string;

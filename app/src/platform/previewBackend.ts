@@ -299,6 +299,9 @@ const relayV2DeploymentStatus = {
   tlsStatus: "missing",
   centerStatus: "stopped",
   hostBootstrapAvailable: false,
+  hostBootstrapPending: false,
+  hostCredentialProvisioned: false,
+  bootstrapRotationPending: false,
   remoteTlsKeyPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.key",
   remoteTlsCertificatePath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.crt",
   remoteTlsCaPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/ca.pem",
@@ -443,6 +446,10 @@ transport.handlers.set("mobile_relay_v2_self_hosted_status", value(relayV2Deploy
 transport.handlers.set("mobile_relay_v2_self_hosted_save_config", value(relayV2DeploymentStatus));
 transport.handlers.set("mobile_relay_v2_self_hosted_deploy", value(relayV2DeploymentStatus));
 transport.handlers.set("mobile_relay_v2_self_hosted_start_center", value(relayV2DeploymentStatus));
+transport.handlers.set(
+  "mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap",
+  value(relayV2DeploymentStatus),
+);
 transport.handlers.set("mobile_relay_v2_self_hosted_stop_center", value(relayV2DeploymentStatus));
 const feishuIntegrationStatus = {
   selectedProfile: "preview-bot",

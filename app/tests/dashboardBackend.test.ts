@@ -626,6 +626,12 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.relay.v2Deployment.startCenter(relayV2DeploymentArgs),
   },
   {
+    label: "relay.v2Deployment.rotateExpiredHostBootstrap",
+    command: "mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap",
+    args: undefined,
+    call: (backend) => backend.relay.v2Deployment.rotateExpiredHostBootstrap(),
+  },
+  {
     label: "relay.v2Deployment.stopCenter",
     command: "mobile_relay_v2_self_hosted_stop_center",
     args: undefined,

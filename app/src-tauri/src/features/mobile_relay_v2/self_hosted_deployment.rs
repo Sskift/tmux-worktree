@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
 use super::management_child::{
-    ManagementChildSelection, ManagementPreparedFileIdentity, ManagementStartError,
+    ManagementBootstrapSecretMode, ManagementChildSelection, ManagementPreparedFileIdentity,
+    ManagementStartError,
 };
 use super::MobileRelayV2ManagementCommandState;
 use crate::config::find_host;
@@ -19,8 +20,11 @@ use crate::remote::{
 use crate::support::{app_home_dir, atomic_write_file, shell_quote};
 
 const CONFIG_CONTRACT: &str = "tmux-worktree-dashboard-relay-v2-self-hosted";
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+const CONFIG_SCHEMA_VERSION: u32 = 5;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
+const HOST_PROFILE_CONFIG_SCHEMA_VERSION: u32 = 2;
+const ROTATION_PENDING_CONFIG_SCHEMA_VERSION: u32 = 3;
+const ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION: u32 = 4;
 const REMOTE_PROFILE_SCHEMA_VERSION: u32 = 1;
 const FEATURE_KIND: &str = "explicit_self_hosted";
 const CENTER_SESSION: &str = "tw-relay-v2-center";
@@ -38,6 +42,7 @@ const LOCAL_HOST_CA_INPUT: &str = "host-tls-ca-input.pem";
 const LOCAL_READY_COMMIT_JOURNAL: &str = "management-ready-commit-journal-v1.json";
 const READY_COMMIT_JOURNAL_CONTRACT: &str =
     "tmux-worktree-dashboard-relay-v2-management-ready-commit";
+const READY_COMMIT_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 const REMOTE_SECURITY_FUNCTIONS: &str = r#"LC_ALL=C
 export LC_ALL
@@ -246,6 +251,7 @@ const ADVERTISED_ORIGIN_FLAG: &str = "--v2-dev-advertised-origin";
 const TLS_KEY_FLAG: &str = "--v2-dev-tls-key";
 const TLS_CERTIFICATE_FLAG: &str = "--v2-dev-tls-cert";
 const STATE_DIRECTORY_FLAG: &str = "--v2-self-hosted-state-dir";
+const BOOTSTRAP_CORRELATION_FLAG: &str = "--v2-self-hosted-bootstrap-correlation";
 
 #[derive(Default)]
 pub(crate) struct MobileRelayV2SelfHostedDeploymentState {
@@ -286,7 +292,41 @@ struct PersistedSelfHostedConfig {
     host_credential_provisioned: bool,
     #[serde(default)]
     management_recovery_required: bool,
+    #[serde(default)]
+    bootstrap_rotation_pending: bool,
+    #[serde(default)]
+    bootstrap_rotation_request_phase: Option<BootstrapRotationRequestPhase>,
+    #[serde(default)]
+    bootstrap_rotation_transfer_receipt: Option<BootstrapRotationTransferReceipt>,
     bootstrap_file_name: Option<String>,
+    #[serde(default)]
+    bootstrap_publication_correlation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BootstrapRotationTransferReceipt {
+    profile_lineage: String,
+    bootstrap_file_name: String,
+    #[serde(default)]
+    bootstrap_publication_correlation: String,
+    local_identity: LocalPrivateFileIdentity,
+    phase: BootstrapRotationTransferPhase,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BootstrapRotationTransferPhase {
+    RemoteCleanupPending,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BootstrapRotationRequestPhase {
+    UnverifiedLegacy,
+    Requested,
+    CenterStopped,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -322,6 +362,9 @@ pub(crate) struct MobileRelayV2SelfHostedStatus {
     tls_status: DeploymentProbeStatus,
     center_status: DeploymentProbeStatus,
     host_bootstrap_available: bool,
+    host_bootstrap_pending: bool,
+    host_credential_provisioned: bool,
+    bootstrap_rotation_pending: bool,
     remote_tls_key_path: String,
     remote_tls_certificate_path: String,
     remote_tls_ca_path: String,
@@ -359,6 +402,8 @@ struct ReadyCommitJournal {
     schema_version: u32,
     profile_lineage: String,
     bootstrap_file_name: Option<String>,
+    #[serde(default)]
+    bootstrap_publication_correlation: Option<String>,
     bootstrap_identity: Option<LocalPrivateFileIdentity>,
     provision_profile_identity: Option<LocalPrivateFileIdentity>,
 }
@@ -392,9 +437,13 @@ impl PreparedSelfHostedManagementLaunch {
     pub(crate) fn commit_ready(mut self) -> Result<(), String> {
         let journal = ReadyCommitJournal {
             contract: READY_COMMIT_JOURNAL_CONTRACT.to_string(),
-            schema_version: 1,
+            schema_version: READY_COMMIT_JOURNAL_SCHEMA_VERSION,
             profile_lineage: self.config.host_profile_identity.clone(),
             bootstrap_file_name: self.config.bootstrap_file_name.clone(),
+            bootstrap_publication_correlation: self
+                .config
+                .bootstrap_publication_correlation
+                .clone(),
             bootstrap_identity: self.bootstrap_identity.clone(),
             provision_profile_identity: self.provision_profile_identity.clone(),
         };
@@ -415,8 +464,11 @@ impl PreparedSelfHostedManagementLaunch {
                 MAX_BOOTSTRAP_RAW_BYTES as u64,
                 "Relay v2 Host bootstrap input",
             )?;
-            self.config.bootstrap_file_name = None;
-            self.config.host_credential_provisioned = true;
+            commit_bootstrap_ready_state(
+                &mut self.config,
+                &journal.bootstrap_file_name,
+                &journal.bootstrap_publication_correlation,
+            )?;
         }
         if let Some(expected) = self.provision_profile_identity.take() {
             consume_local_private_file(
@@ -891,6 +943,7 @@ fn validate_local_tls_file(value: &str, label: &str) -> Result<String, String> {
 fn validated_config(
     input: MobileRelayV2SelfHostedConfigInput,
     bootstrap_file_name: Option<String>,
+    bootstrap_publication_correlation: Option<String>,
     inspect_tls: bool,
 ) -> Result<PersistedSelfHostedConfig, String> {
     if !input.enabled {
@@ -953,7 +1006,11 @@ fn validated_config(
         profile_provisioned: false,
         host_credential_provisioned: false,
         management_recovery_required: false,
+        bootstrap_rotation_pending: false,
+        bootstrap_rotation_request_phase: None,
+        bootstrap_rotation_transfer_receipt: None,
         bootstrap_file_name,
+        bootstrap_publication_correlation,
     })
 }
 
@@ -962,7 +1019,7 @@ fn validated_config_with_persisted_state(
     inspect_tls: bool,
 ) -> Result<PersistedSelfHostedConfig, String> {
     let current = load_config()?;
-    let mut config = validated_config(input, None, inspect_tls)?;
+    let mut config = validated_config(input, None, None, inspect_tls)?;
     if let Some(mut current) = current {
         ensure_host_profile_identity(&mut current)?;
         let same_host_lineage = current.broker_host_id == config.broker_host_id
@@ -983,11 +1040,112 @@ fn validated_config_with_persisted_state(
         config.profile_provisioned = current.profile_provisioned;
         config.host_credential_provisioned = current.host_credential_provisioned;
         config.management_recovery_required = current.management_recovery_required;
+        config.bootstrap_rotation_pending = current.bootstrap_rotation_pending;
+        config.bootstrap_rotation_request_phase = current.bootstrap_rotation_request_phase;
+        config.bootstrap_rotation_transfer_receipt = current.bootstrap_rotation_transfer_receipt;
         config.bootstrap_file_name = current.bootstrap_file_name;
+        config.bootstrap_publication_correlation = current.bootstrap_publication_correlation;
     } else {
         config.host_profile_identity = fresh_host_profile_identity()?;
     }
     Ok(config)
+}
+
+fn valid_bootstrap_rotation_transfer_receipt(config: &PersistedSelfHostedConfig) -> bool {
+    match &config.bootstrap_rotation_transfer_receipt {
+        None => true,
+        Some(receipt) => {
+            config.bootstrap_rotation_pending
+                && !config.host_credential_provisioned
+                && receipt.profile_lineage == config.host_profile_identity
+                && config.bootstrap_file_name.as_deref()
+                    == Some(receipt.bootstrap_file_name.as_str())
+                && config.bootstrap_publication_correlation.as_deref()
+                    == Some(receipt.bootstrap_publication_correlation.as_str())
+                && receipt.local_identity.mode == 0o600
+                && receipt.local_identity.links == 1
+                && receipt.local_identity.length > 0
+                && receipt.local_identity.length <= MAX_BOOTSTRAP_RAW_BYTES as u64
+        }
+    }
+}
+
+fn valid_bootstrap_publication_correlation(correlation: &str) -> bool {
+    !correlation.is_empty()
+        && correlation.len() <= 128
+        && correlation.trim() == correlation
+        && !correlation
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+}
+
+fn valid_bootstrap_publication_attempt(
+    config: &PersistedSelfHostedConfig,
+    allow_legacy_missing_correlation: bool,
+) -> bool {
+    match (
+        config.bootstrap_file_name.as_deref(),
+        config.bootstrap_publication_correlation.as_deref(),
+    ) {
+        (None, None) => true,
+        (Some(_), Some(correlation)) => valid_bootstrap_publication_correlation(correlation),
+        (Some(_), None) => {
+            allow_legacy_missing_correlation && config.schema_version < CONFIG_SCHEMA_VERSION
+        }
+        (None, Some(_)) => false,
+    }
+}
+
+fn valid_bootstrap_rotation_state(config: &PersistedSelfHostedConfig) -> bool {
+    if !config.bootstrap_rotation_pending {
+        return config.bootstrap_rotation_request_phase.is_none()
+            && config.bootstrap_rotation_transfer_receipt.is_none();
+    }
+    match (
+        config.bootstrap_rotation_request_phase,
+        config.bootstrap_rotation_transfer_receipt.as_ref(),
+    ) {
+        (Some(_), None) => true,
+        (None, Some(_)) => valid_bootstrap_rotation_transfer_receipt(config),
+        (None, None) => config.schema_version < CONFIG_SCHEMA_VERSION,
+        (Some(_), Some(_)) => false,
+    }
+}
+
+fn ready_rotation_transfer_identity(
+    config: &PersistedSelfHostedConfig,
+) -> Result<Option<&LocalPrivateFileIdentity>, String> {
+    if !config.bootstrap_rotation_pending {
+        return Ok(None);
+    }
+    if !valid_bootstrap_rotation_transfer_receipt(config) {
+        return Err("Relay v2 Host bootstrap transfer receipt does not match config".to_string());
+    }
+    let receipt = config
+        .bootstrap_rotation_transfer_receipt
+        .as_ref()
+        .filter(|receipt| receipt.phase == BootstrapRotationTransferPhase::Ready)
+        .ok_or(
+            "Relay v2 Host bootstrap rotation has not completed its verified transfer".to_string(),
+        )?;
+    Ok(Some(&receipt.local_identity))
+}
+
+fn verify_rotation_transfer_identity(
+    config: &PersistedSelfHostedConfig,
+    actual: &LocalPrivateFileIdentity,
+) -> Result<(), String> {
+    if !valid_bootstrap_rotation_transfer_receipt(config)
+        || config
+            .bootstrap_rotation_transfer_receipt
+            .as_ref()
+            .is_none_or(|receipt| &receipt.local_identity != actual)
+    {
+        return Err(
+            "Relay v2 Host bootstrap replacement does not match its transfer receipt".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
@@ -1008,7 +1166,11 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
     if config.contract != CONFIG_CONTRACT
         || !matches!(
             config.schema_version,
-            LEGACY_CONFIG_SCHEMA_VERSION | CONFIG_SCHEMA_VERSION
+            LEGACY_CONFIG_SCHEMA_VERSION
+                | HOST_PROFILE_CONFIG_SCHEMA_VERSION
+                | ROTATION_PENDING_CONFIG_SCHEMA_VERSION
+                | ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION
+                | CONFIG_SCHEMA_VERSION
         )
         || !config.enabled
         || config.broker_host_id.trim() != config.broker_host_id
@@ -1022,10 +1184,19 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
         || !Path::new(&config.tls_key_path).is_absolute()
         || !Path::new(&config.tls_certificate_path).is_absolute()
         || !Path::new(&config.tls_ca_path).is_absolute()
-        || (config.schema_version == CONFIG_SCHEMA_VERSION
+        || (config.schema_version != LEGACY_CONFIG_SCHEMA_VERSION
             && !valid_host_profile_identity(&config.host_profile_identity))
         || config.host_credential_provisioned && !config.profile_provisioned
-        || config.host_credential_provisioned && config.bootstrap_file_name.is_some()
+        || config.host_credential_provisioned
+            && (config.bootstrap_file_name.is_some()
+                || config.bootstrap_publication_correlation.is_some())
+        || config.bootstrap_rotation_pending && config.host_credential_provisioned
+        || config.bootstrap_rotation_pending && config.bootstrap_file_name.is_none()
+        || config.bootstrap_rotation_pending
+            && config.schema_version == CONFIG_SCHEMA_VERSION
+            && config.bootstrap_publication_correlation.is_none()
+        || !valid_bootstrap_publication_attempt(&config, true)
+        || !valid_bootstrap_rotation_state(&config)
         || config.bootstrap_file_name.as_deref().is_some_and(|name| {
             !name.starts_with("host-bootstrap-")
                 || !name.ends_with(".twhostboot2")
@@ -1042,6 +1213,15 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
 fn save_config(config: &PersistedSelfHostedConfig) -> Result<(), String> {
     if config.schema_version != CONFIG_SCHEMA_VERSION
         || !valid_host_profile_identity(&config.host_profile_identity)
+        || config.host_credential_provisioned && !config.profile_provisioned
+        || config.host_credential_provisioned
+            && (config.bootstrap_file_name.is_some()
+                || config.bootstrap_publication_correlation.is_some())
+        || config.bootstrap_rotation_pending && config.host_credential_provisioned
+        || config.bootstrap_rotation_pending && config.bootstrap_file_name.is_none()
+        || config.bootstrap_rotation_pending && config.bootstrap_publication_correlation.is_none()
+        || !valid_bootstrap_publication_attempt(config, false)
+        || !valid_bootstrap_rotation_state(config)
     {
         return Err("Relay v2 self-hosted configuration is invalid".to_string());
     }
@@ -1098,15 +1278,60 @@ fn fresh_host_profile_identity() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn fresh_bootstrap_publication_correlation() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| {
+        "generate Relay v2 Host bootstrap publication correlation failed".to_string()
+    })?;
+    Ok(format!(
+        "dashboard-bootstrap-publication-{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
 fn ensure_host_profile_identity(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
     if config.schema_version == LEGACY_CONFIG_SCHEMA_VERSION
         && config.host_profile_identity.is_empty()
     {
         config.host_profile_identity = fresh_host_profile_identity()?;
-        config.schema_version = CONFIG_SCHEMA_VERSION;
     }
     if !valid_host_profile_identity(&config.host_profile_identity) {
         return Err("Relay v2 Host profile identity is invalid".to_string());
+    }
+    if config.schema_version < CONFIG_SCHEMA_VERSION
+        && config.bootstrap_file_name.is_some()
+        && config.bootstrap_publication_correlation.is_none()
+    {
+        return Err(
+            "Pending Relay v2 Host bootstrap predates publication correlations and cannot be resumed"
+                .to_string(),
+        );
+    }
+    if !valid_bootstrap_publication_attempt(config, false) {
+        return Err("Relay v2 Host bootstrap publication attempt is invalid".to_string());
+    }
+    if config.schema_version < CONFIG_SCHEMA_VERSION
+        && config.bootstrap_rotation_pending
+        && config.bootstrap_rotation_request_phase.is_none()
+        && config.bootstrap_rotation_transfer_receipt.is_none()
+    {
+        // Schema 3 did not distinguish an old expired local input from a
+        // replacement whose remote copy was already removed. Never infer
+        // either state or remint during migration.
+        config.bootstrap_rotation_request_phase =
+            Some(BootstrapRotationRequestPhase::UnverifiedLegacy);
+    }
+    if matches!(
+        config.schema_version,
+        LEGACY_CONFIG_SCHEMA_VERSION
+            | HOST_PROFILE_CONFIG_SCHEMA_VERSION
+            | ROTATION_PENDING_CONFIG_SCHEMA_VERSION
+            | ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION
+    ) {
+        config.schema_version = CONFIG_SCHEMA_VERSION;
     }
     Ok(())
 }
@@ -1256,8 +1481,20 @@ fn load_ready_commit_journal_at(
     let journal: ReadyCommitJournal = serde_json::from_slice(&file.bytes)
         .map_err(|_| "Relay v2 management ready commit journal is invalid".to_string())?;
     if journal.contract != READY_COMMIT_JOURNAL_CONTRACT
-        || journal.schema_version != 1
+        || !matches!(
+            journal.schema_version,
+            1 | READY_COMMIT_JOURNAL_SCHEMA_VERSION
+        )
         || !valid_host_profile_identity(&journal.profile_lineage)
+        || journal.schema_version == READY_COMMIT_JOURNAL_SCHEMA_VERSION
+            && (journal.bootstrap_file_name.is_some()
+                != journal.bootstrap_publication_correlation.is_some()
+                || journal.bootstrap_identity.is_some()
+                    != journal.bootstrap_publication_correlation.is_some())
+        || journal
+            .bootstrap_publication_correlation
+            .as_deref()
+            .is_some_and(|correlation| !valid_bootstrap_publication_correlation(correlation))
     {
         return Err("Relay v2 management ready commit journal is invalid".to_string());
     }
@@ -1292,6 +1529,37 @@ fn finish_consuming_if_present(
     }
 }
 
+fn commit_bootstrap_ready_state(
+    config: &mut PersistedSelfHostedConfig,
+    journal_file_name: &Option<String>,
+    journal_correlation: &Option<String>,
+) -> Result<(), String> {
+    if config.bootstrap_file_name == *journal_file_name
+        && config.bootstrap_publication_correlation == *journal_correlation
+        && journal_file_name.is_some()
+        && journal_correlation.is_some()
+    {
+        config.bootstrap_file_name = None;
+        config.bootstrap_publication_correlation = None;
+        config.host_credential_provisioned = true;
+        config.bootstrap_rotation_pending = false;
+        config.bootstrap_rotation_request_phase = None;
+        config.bootstrap_rotation_transfer_receipt = None;
+    } else if config.bootstrap_file_name.is_some()
+        || config.bootstrap_publication_correlation.is_some()
+        || !config.host_credential_provisioned
+    {
+        return Err("Relay v2 management ready commit journal does not match config".to_string());
+    } else {
+        // The config commit may have completed before the journal tombstone was
+        // finalized. Replaying the same ready record is idempotent.
+        config.bootstrap_rotation_pending = false;
+        config.bootstrap_rotation_request_phase = None;
+        config.bootstrap_rotation_transfer_receipt = None;
+    }
+    Ok(())
+}
+
 fn recover_ready_commit(
     config: &mut PersistedSelfHostedConfig,
     journal: ReadyCommitJournal,
@@ -1299,24 +1567,27 @@ fn recover_ready_commit(
 ) -> Result<(), String> {
     if journal.profile_lineage != config.host_profile_identity
         || journal.bootstrap_identity.is_some() != journal.bootstrap_file_name.is_some()
+        || journal.bootstrap_identity.is_some()
+            != journal.bootstrap_publication_correlation.is_some()
     {
         return Err("Relay v2 management ready commit journal does not match config".to_string());
     }
     if let Some(expected) = &journal.bootstrap_identity {
-        if config.bootstrap_file_name == journal.bootstrap_file_name {
+        if config.bootstrap_file_name == journal.bootstrap_file_name
+            && config.bootstrap_publication_correlation == journal.bootstrap_publication_correlation
+        {
             finish_consuming_if_present(
                 &local_bootstrap_path(config)?,
                 expected,
                 MAX_BOOTSTRAP_RAW_BYTES as u64,
                 "Relay v2 Host bootstrap input",
             )?;
-            config.bootstrap_file_name = None;
-            config.host_credential_provisioned = true;
-        } else if config.bootstrap_file_name.is_some() || !config.host_credential_provisioned {
-            return Err(
-                "Relay v2 management ready commit journal does not match config".to_string(),
-            );
         }
+        commit_bootstrap_ready_state(
+            config,
+            &journal.bootstrap_file_name,
+            &journal.bootstrap_publication_correlation,
+        )?;
     }
     if let Some(expected) = &journal.provision_profile_identity {
         if !config.profile_provisioned {
@@ -1349,6 +1620,7 @@ fn prepare_local_host_prerequisites_for(
     ),
     String,
 > {
+    let expected_rotation_identity = ready_rotation_transfer_identity(config)?;
     ensure_local_host_private_tree()?;
     ensure_local_native_credential_directory()?;
 
@@ -1426,6 +1698,19 @@ fn prepare_local_host_prerequisites_for(
     } else {
         None
     };
+    if let Some(expected) = expected_rotation_identity {
+        let actual = bootstrap
+            .as_ref()
+            .map(|file| &file.identity)
+            .ok_or("Relay v2 Host bootstrap replacement is unavailable".to_string())?;
+        verify_rotation_transfer_identity(config, actual)?;
+        if actual != expected {
+            return Err(
+                "Relay v2 Host bootstrap replacement does not match its transfer receipt"
+                    .to_string(),
+            );
+        }
+    }
     Ok((ca, profile, bootstrap))
 }
 
@@ -1459,6 +1744,11 @@ pub(crate) fn prepare_relay_v2_self_hosted_management_prerequisites(
         bootstrap
             .as_ref()
             .map(|file| (file.path.clone(), file.identity.clone().into())),
+        config
+            .bootstrap_rotation_transfer_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.phase == BootstrapRotationTransferPhase::Ready)
+            .then_some(ManagementBootstrapSecretMode::ReplacePending),
     )
     .map_err(|_| "Relay v2 self-hosted Host launch inputs are invalid".to_string())?;
     Ok(Some(PreparedSelfHostedManagementLaunch {
@@ -1493,6 +1783,12 @@ fn base_status(
             DeploymentProbeStatus::Stopped
         },
         host_bootstrap_available: false,
+        host_bootstrap_pending: config.is_some_and(|config| {
+            !config.host_credential_provisioned && config.bootstrap_file_name.is_some()
+        }),
+        host_credential_provisioned: config
+            .is_some_and(|config| config.host_credential_provisioned),
+        bootstrap_rotation_pending: config.is_some_and(|config| config.bootstrap_rotation_pending),
         remote_tls_key_path: format!("~/{REMOTE_TLS_KEY}"),
         remote_tls_certificate_path: format!("~/{REMOTE_TLS_CERTIFICATE}"),
         remote_tls_ca_path: format!("~/{REMOTE_TLS_CA}"),
@@ -1802,9 +2098,35 @@ test ! -L "$HOME/{remote_stage}"
     publish_remote_profile(&host, config)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootstrapPublicationAttempt {
+    file_name: String,
+    correlation: String,
+}
+
+fn bootstrap_publication_attempt(
+    config: &PersistedSelfHostedConfig,
+) -> Result<Option<BootstrapPublicationAttempt>, String> {
+    match (
+        config.bootstrap_file_name.as_deref(),
+        config.bootstrap_publication_correlation.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(file_name), Some(correlation))
+            if valid_bootstrap_publication_correlation(correlation) =>
+        {
+            Ok(Some(BootstrapPublicationAttempt {
+                file_name: file_name.to_string(),
+                correlation: correlation.to_string(),
+            }))
+        }
+        _ => Err("Relay v2 Host bootstrap publication attempt is invalid".to_string()),
+    }
+}
+
 fn build_remote_relay_v2_center_command(
     config: &PersistedSelfHostedConfig,
-    bootstrap_file_name: Option<&str>,
+    bootstrap_attempt: Option<&BootstrapPublicationAttempt>,
 ) -> String {
     let mut arguments = vec![
         "/usr/bin/env".to_string(),
@@ -1825,11 +2147,14 @@ fn build_remote_relay_v2_center_command(
         STATE_DIRECTORY_FLAG.to_string(),
         "\"$relay_v2_state_directory\"".to_string(),
     ];
-    if let Some(bootstrap_file_name) = bootstrap_file_name {
+    if let Some(bootstrap_attempt) = bootstrap_attempt {
         arguments.push("--host-bootstrap-output".to_string());
         arguments.push(format!(
-            "\"$HOME/{REMOTE_ROOT}/bootstrap/{bootstrap_file_name}\""
+            "\"$HOME/{REMOTE_ROOT}/bootstrap/{}\"",
+            bootstrap_attempt.file_name
         ));
+        arguments.push(BOOTSTRAP_CORRELATION_FLAG.to_string());
+        arguments.push(shell_quote(&bootstrap_attempt.correlation));
     }
     arguments.join(" ")
 }
@@ -1892,6 +2217,36 @@ fn transfer_remote_bootstrap(
     host: &HostConfig,
     config: &PersistedSelfHostedConfig,
 ) -> Result<(), String> {
+    let local_file = write_remote_bootstrap_to_local(host, config)?;
+    if cleanup_remote_bootstrap(host, config).is_err() {
+        let _ = std::fs::remove_file(&local_file.path);
+        return Err("Relay v2 Host bootstrap remote cleanup failed".to_string());
+    }
+    Ok(())
+}
+
+fn write_remote_bootstrap_to_local(
+    host: &HostConfig,
+    config: &PersistedSelfHostedConfig,
+) -> Result<LocalPrivateFile, String> {
+    let output = read_remote_bootstrap_bytes(host, config)?;
+    ensure_local_host_private_tree()?;
+    let local_file = local_bootstrap_path(config)?;
+    atomic_write_file(&local_file, &output)?;
+    if !secure_bootstrap_file(&local_file) {
+        return Err("Relay v2 Host bootstrap local file is unsafe".to_string());
+    }
+    read_local_private_file(
+        &local_file.to_string_lossy(),
+        "Relay v2 Host bootstrap input",
+        MAX_BOOTSTRAP_RAW_BYTES as u64,
+    )
+}
+
+fn read_remote_bootstrap_bytes(
+    host: &HostConfig,
+    config: &PersistedSelfHostedConfig,
+) -> Result<Vec<u8>, String> {
     let file_name = config
         .bootstrap_file_name
         .as_deref()
@@ -1903,13 +2258,19 @@ fn transfer_remote_bootstrap(
         return Err("Relay v2 Host bootstrap transfer is not available".to_string());
     }
     validate_bootstrap_bytes(&output.stdout)?;
-    ensure_local_host_private_tree()?;
-    let local_file = local_bootstrap_path(config)?;
-    atomic_write_file(&local_file, &output.stdout)?;
-    if !secure_bootstrap_file(&local_file) {
-        return Err("Relay v2 Host bootstrap local file is unsafe".to_string());
-    }
-    let cleanup = run_remote_cmd_check_strings(
+    Ok(output.stdout)
+}
+
+fn cleanup_remote_bootstrap(
+    host: &HostConfig,
+    config: &PersistedSelfHostedConfig,
+) -> Result<(), String> {
+    let file_name = config
+        .bootstrap_file_name
+        .as_deref()
+        .ok_or("Relay v2 Host bootstrap has not been requested")?;
+    let remote_file = format!("$HOME/{REMOTE_ROOT}/bootstrap/{file_name}");
+    run_remote_cmd_check_strings(
         host,
         &[
             "sh".into(),
@@ -1923,12 +2284,42 @@ rm -f -- "{remote_file}"
 "#
             ),
         ],
-    );
-    if cleanup.is_err() {
-        let _ = std::fs::remove_file(&local_file);
-        return Err("Relay v2 Host bootstrap remote cleanup failed".to_string());
-    }
-    Ok(())
+    )
+    .map(|_| ())
+}
+
+fn transfer_rotated_remote_bootstrap(
+    host: &HostConfig,
+    config: &mut PersistedSelfHostedConfig,
+) -> Result<(), String> {
+    let local_file = write_remote_bootstrap_to_local(host, config)?;
+    let file_name = config
+        .bootstrap_file_name
+        .clone()
+        .ok_or("Relay v2 Host bootstrap has not been requested")?;
+    let publication_correlation = config
+        .bootstrap_publication_correlation
+        .clone()
+        .ok_or("Relay v2 Host bootstrap publication correlation is missing")?;
+    config.bootstrap_rotation_transfer_receipt = Some(BootstrapRotationTransferReceipt {
+        profile_lineage: config.host_profile_identity.clone(),
+        bootstrap_file_name: file_name,
+        bootstrap_publication_correlation: publication_correlation,
+        local_identity: local_file.identity,
+        phase: BootstrapRotationTransferPhase::RemoteCleanupPending,
+    });
+    config.bootstrap_rotation_request_phase = None;
+    // The receipt is durable before the remote copy is removed. A crash on
+    // either side of cleanup can therefore reuse this exact local identity.
+    save_config(config)?;
+    cleanup_remote_bootstrap(host, config)
+        .map_err(|_| "Relay v2 Host bootstrap remote cleanup failed".to_string())?;
+    let receipt = config
+        .bootstrap_rotation_transfer_receipt
+        .as_mut()
+        .ok_or("Relay v2 Host bootstrap transfer receipt disappeared")?;
+    receipt.phase = BootstrapRotationTransferPhase::Ready;
+    save_config(config)
 }
 
 fn build_remote_bootstrap_read_script(remote_file: &str) -> String {
@@ -1949,45 +2340,114 @@ TW_RELAY_V2_BOOTSTRAP_FD_READER
     )
 }
 
-fn start_center(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
+fn cleanup_matching_republished_bootstrap(
+    host: &HostConfig,
+    config: &PersistedSelfHostedConfig,
+) -> Result<(), String> {
+    if !remote_bootstrap_is_available(host, config)? {
+        return Ok(());
+    }
+    cleanup_matching_remote_bootstrap(host, config, None)
+}
+
+fn cleanup_matching_remote_bootstrap(
+    host: &HostConfig,
+    config: &PersistedSelfHostedConfig,
+    expected_local_identity: Option<&LocalPrivateFileIdentity>,
+) -> Result<(), String> {
+    let local = read_local_private_file(
+        &local_bootstrap_path(config)?.to_string_lossy(),
+        "Relay v2 Host bootstrap input",
+        MAX_BOOTSTRAP_RAW_BYTES as u64,
+    )?;
+    if expected_local_identity.is_some_and(|expected| expected != &local.identity) {
+        return Err(
+            "Relay v2 Host bootstrap replacement does not match its transfer receipt".to_string(),
+        );
+    }
+    let remote = read_remote_bootstrap_bytes(host, config)?;
+    if !bootstrap_bytes_match_local_identity(&remote, &local.identity) {
+        return Err(
+            "Relay v2 Host bootstrap output does not match its persisted publication attempt"
+                .to_string(),
+        );
+    }
+    cleanup_remote_bootstrap(host, config)
+        .map_err(|_| "Relay v2 Host bootstrap remote cleanup failed".to_string())
+}
+
+fn bootstrap_bytes_match_local_identity(
+    remote: &[u8],
+    local_identity: &LocalPrivateFileIdentity,
+) -> bool {
+    remote.len() as u64 == local_identity.length
+        && <[u8; 32]>::from(Sha256::digest(remote)) == local_identity.sha256
+}
+
+fn start_center_with_pending_rotation_output(
+    config: &mut PersistedSelfHostedConfig,
+    require_replacement_output: bool,
+) -> Result<(), String> {
+    bootstrap_publication_attempt(config)?;
     let host = find_host(&config.broker_host_id)?;
     if center_is_running(&host)? {
-        if !config.host_credential_provisioned
-            && config.bootstrap_file_name.is_some()
-            && !local_bootstrap_path(config).is_ok_and(|path| secure_bootstrap_file(&path))
-        {
-            transfer_remote_bootstrap(&host, config)?;
+        if !config.host_credential_provisioned && config.bootstrap_file_name.is_some() {
+            if !local_bootstrap_path(config).is_ok_and(|path| secure_bootstrap_file(&path)) {
+                if config.bootstrap_rotation_pending {
+                    transfer_rotated_remote_bootstrap(&host, config)?;
+                } else {
+                    transfer_remote_bootstrap(&host, config)?;
+                }
+            } else {
+                cleanup_matching_republished_bootstrap(&host, config)?;
+            }
         }
         return Ok(());
     }
 
-    let bootstrap_output = if config.host_credential_provisioned {
-        None
+    let mut transfer_after_start = require_replacement_output;
+    if config.host_credential_provisioned {
+        transfer_after_start = false;
     } else if config.bootstrap_file_name.is_none() {
+        if config.bootstrap_rotation_pending {
+            return Err("Relay v2 Host bootstrap rotation attempt is missing".to_string());
+        }
         let name = format!(
             "host-bootstrap-{}.twhostboot2",
             uuid::Uuid::new_v4().simple()
         );
-        config.bootstrap_file_name = Some(name.clone());
-        // Persist the non-secret correlation before launch so a failed local
-        // transfer can repair from the same remote output without minting a
-        // second bootstrap.
+        let correlation = fresh_bootstrap_publication_correlation()?;
+        config.bootstrap_file_name = Some(name);
+        config.bootstrap_publication_correlation = Some(correlation);
+        // The output path and independent non-secret publication correlation
+        // are durable before any remote action.
         save_config(config)?;
-        Some(name)
+        transfer_after_start = true;
     } else if !local_bootstrap_path(config).is_ok_and(|path| secure_bootstrap_file(&path)) {
         if remote_bootstrap_is_available(&host, config)? {
-            transfer_remote_bootstrap(&host, config)?;
-            None
+            if config.bootstrap_rotation_pending {
+                transfer_rotated_remote_bootstrap(&host, config)?;
+            } else {
+                transfer_remote_bootstrap(&host, config)?;
+            }
+            transfer_after_start = false;
         } else {
-            // This is still the same pending first-Host bootstrap. Reuse its
-            // persisted output path so repair never mints a second
-            // correlation; the Broker remains the credential authority.
-            config.bootstrap_file_name.clone()
+            // Reinvoke the exact attempt. If the Broker already acknowledged
+            // it but the output was lost, the transfer below fails closed;
+            // this owner never substitutes a new correlation.
+            transfer_after_start = true;
         }
-    } else {
-        None
-    };
-    let command = build_remote_relay_v2_center_command(config, bootstrap_output.as_deref());
+    } else if !transfer_after_start {
+        // A prior invocation can leave both the durable local input and its
+        // remote publication after crashing before cleanup/ack. Remove only
+        // an exact byte match before the launcher's no-output-file guard.
+        cleanup_matching_republished_bootstrap(&host, config)?;
+    }
+    let bootstrap_attempt = bootstrap_publication_attempt(config)?;
+    if transfer_after_start && bootstrap_attempt.is_none() {
+        return Err("Relay v2 Host bootstrap publication attempt is missing".to_string());
+    }
+    let command = build_remote_relay_v2_center_command(config, bootstrap_attempt.as_ref());
     let fingerprint = deployment_fingerprint(config);
     let launcher = format!("$HOME/{REMOTE_ROOT}/relay-v2-center.sh");
     let launcher_stage = format!(
@@ -2035,21 +2495,46 @@ sleep 1
 {tmux} has-session -t {CENTER_SESSION}
 "#,
         launcher_security_functions = REMOTE_SECURITY_FUNCTIONS,
-        bootstrap_output_guard = bootstrap_output
-            .as_deref()
-            .map(|name| {
+        bootstrap_output_guard = bootstrap_attempt
+            .as_ref()
+            .map(|attempt| {
                 format!(
-                    "test ! -e \"$root/bootstrap/{name}\"\ntest ! -L \"$root/bootstrap/{name}\""
+                    "test ! -e \"$root/bootstrap/{name}\"\ntest ! -L \"$root/bootstrap/{name}\"",
+                    name = attempt.file_name
                 )
             })
             .unwrap_or_else(|| ":".to_string()),
     );
     run_remote_cmd_check_strings(&host, &["sh".into(), "-lc".into(), script])?;
-    if bootstrap_output.is_some() {
-        transfer_remote_bootstrap(&host, config)?;
+    if transfer_after_start {
+        if config.bootstrap_rotation_pending {
+            transfer_rotated_remote_bootstrap(&host, config)?;
+        } else {
+            transfer_remote_bootstrap(&host, config)?;
+        }
+    } else if bootstrap_attempt.is_some() {
+        // A crash after the Broker's durable output but before its
+        // acknowledgement can republish the same correlation. Preserve the
+        // exact local identity and only remove a byte-identical duplicate.
+        cleanup_matching_republished_bootstrap(&host, config)?;
     }
     save_config(config)?;
     Ok(())
+}
+
+fn ensure_ordinary_center_start_allowed(config: &PersistedSelfHostedConfig) -> Result<(), String> {
+    if config.bootstrap_rotation_pending {
+        return Err(
+            "Relay v2 Host bootstrap rotation must be completed with the explicit rotate action"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn start_center(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
+    ensure_ordinary_center_start_allowed(config)?;
+    start_center_with_pending_rotation_output(config, false)
 }
 
 fn stop_center(config: &PersistedSelfHostedConfig) -> Result<(), String> {
@@ -2071,6 +2556,207 @@ require_relay_layout
         ],
     )
     .map(|_| ())
+}
+
+fn validate_expired_bootstrap_rotation_candidate(
+    config: &PersistedSelfHostedConfig,
+) -> Result<(), String> {
+    if config.host_credential_provisioned
+        || config.bootstrap_file_name.is_none()
+        || config.bootstrap_publication_correlation.is_none()
+    {
+        return Err(
+            "Host bootstrap rotation is only available for an expired version-zero pending bootstrap"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn record_expired_bootstrap_rotation_intent(
+    config: &mut PersistedSelfHostedConfig,
+    replacement_correlation_after_previous_cleanup: Option<String>,
+) -> Result<bool, String> {
+    validate_expired_bootstrap_rotation_candidate(config)?;
+    let retry = config.bootstrap_rotation_pending;
+    if !retry {
+        let replacement_correlation = replacement_correlation_after_previous_cleanup.ok_or(
+            "Relay v2 Host bootstrap previous publication cleanup is not confirmed".to_string(),
+        )?;
+        if !valid_bootstrap_publication_correlation(&replacement_correlation)
+            || config.bootstrap_publication_correlation.as_deref()
+                == Some(replacement_correlation.as_str())
+        {
+            return Err(
+                "Relay v2 Host bootstrap replacement publication correlation is invalid"
+                    .to_string(),
+            );
+        }
+        // Explicit operator intent begins one new publication attempt for the
+        // replacement. All later retries retain this independently generated
+        // correlation and the existing output filename.
+        config.bootstrap_publication_correlation = Some(replacement_correlation);
+        config.bootstrap_rotation_request_phase = Some(BootstrapRotationRequestPhase::Requested);
+        config.bootstrap_rotation_transfer_receipt = None;
+    } else if replacement_correlation_after_previous_cleanup.is_some() {
+        return Err(
+            "Relay v2 Host bootstrap replacement publication attempt is already durable"
+                .to_string(),
+        );
+    }
+    config.bootstrap_rotation_pending = true;
+    Ok(retry)
+}
+
+fn begin_expired_bootstrap_rotation(
+    config: &mut PersistedSelfHostedConfig,
+) -> Result<bool, String> {
+    validate_expired_bootstrap_rotation_candidate(config)?;
+    let replacement_correlation_after_previous_cleanup = if config.bootstrap_rotation_pending {
+        None
+    } else {
+        let host = find_host(&config.broker_host_id)?;
+        let previous_local = read_local_private_file(
+            &local_bootstrap_path(config)?.to_string_lossy(),
+            "Relay v2 Host bootstrap input",
+            MAX_BOOTSTRAP_RAW_BYTES as u64,
+        )?;
+        if remote_bootstrap_is_available(&host, config)? {
+            cleanup_matching_remote_bootstrap(&host, config, Some(&previous_local.identity))?;
+        }
+        if remote_bootstrap_is_available(&host, config)? {
+            return Err(
+                "Relay v2 Host bootstrap previous publication cleanup is uncertain".to_string(),
+            );
+        }
+        // The Broker sink writes synchronously before acknowledgement, and an
+        // acknowledged correlation never invokes the sink again. Until the
+        // atomic config save below, A remains the only durable attempt, so a
+        // crash can only retry this same exact cleanup.
+        Some(fresh_bootstrap_publication_correlation()?)
+    };
+    let retry = record_expired_bootstrap_rotation_intent(
+        config,
+        replacement_correlation_after_previous_cleanup,
+    )?;
+    save_config(config)?;
+    Ok(retry)
+}
+
+fn verify_rotation_transfer_receipt_local(
+    config: &PersistedSelfHostedConfig,
+) -> Result<(), String> {
+    verify_rotation_transfer_receipt_local_at(config, &local_bootstrap_path(config)?)
+}
+
+fn verify_rotation_transfer_receipt_local_at(
+    config: &PersistedSelfHostedConfig,
+    path: &Path,
+) -> Result<(), String> {
+    if config.bootstrap_rotation_transfer_receipt.is_none() {
+        return Err("Relay v2 Host bootstrap transfer receipt is missing".to_string());
+    }
+    let local = read_local_private_file(
+        &path.to_string_lossy(),
+        "Relay v2 Host bootstrap replacement",
+        MAX_BOOTSTRAP_RAW_BYTES as u64,
+    )
+    .map_err(|_| {
+        "Relay v2 Host bootstrap replacement does not match its transfer receipt".to_string()
+    })?;
+    verify_rotation_transfer_identity(config, &local.identity)
+}
+
+fn finish_rotation_remote_cleanup(
+    host: &HostConfig,
+    config: &mut PersistedSelfHostedConfig,
+    remote_available: bool,
+) -> Result<(), String> {
+    verify_rotation_transfer_receipt_local(config)?;
+    let receipt_identity = config
+        .bootstrap_rotation_transfer_receipt
+        .as_ref()
+        .map(|receipt| receipt.local_identity.clone())
+        .ok_or("Relay v2 Host bootstrap transfer receipt disappeared")?;
+    if remote_available {
+        // RemoteCleanupPending can be replayed only when the still-published
+        // bytes match the receipt-bound local replacement exactly.
+        cleanup_matching_remote_bootstrap(host, config, Some(&receipt_identity))?;
+    }
+    let receipt = config
+        .bootstrap_rotation_transfer_receipt
+        .as_mut()
+        .ok_or("Relay v2 Host bootstrap transfer receipt disappeared")?;
+    if receipt.phase != BootstrapRotationTransferPhase::Ready {
+        receipt.phase = BootstrapRotationTransferPhase::Ready;
+        save_config(config)?;
+    }
+    Ok(())
+}
+
+fn rotate_expired_host_bootstrap(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
+    let retry = begin_expired_bootstrap_rotation(config)?;
+    let host = find_host(&config.broker_host_id)?;
+
+    if retry {
+        if config.bootstrap_rotation_transfer_receipt.is_some() {
+            verify_rotation_transfer_receipt_local(config)?;
+            let remote_available = remote_bootstrap_is_available(&host, config)?;
+            finish_rotation_remote_cleanup(&host, config, remote_available)?;
+            if !center_is_running(&host)? {
+                start_center_with_pending_rotation_output(config, false)?;
+            }
+            return Ok(());
+        }
+        let remote_available = remote_bootstrap_is_available(&host, config)?;
+        // A crash before the receipt commit leaves the same replacement on
+        // the remote output path. Re-read that token, persist its exact local
+        // identity, and never mint a successor.
+        if remote_available {
+            transfer_rotated_remote_bootstrap(&host, config)?;
+            if !center_is_running(&host)? {
+                start_center_with_pending_rotation_output(config, false)?;
+            }
+            return Ok(());
+        }
+    }
+
+    match config.bootstrap_rotation_request_phase {
+        Some(BootstrapRotationRequestPhase::UnverifiedLegacy) => {
+            return Err(
+                "Relay v2 Host bootstrap rotation predates verified transfer receipts".to_string(),
+            );
+        }
+        Some(BootstrapRotationRequestPhase::Requested) => {
+            // This is the only process stopped by rotation. The dedicated
+            // SQLite state directory, native Host cell, and correlation stay.
+            stop_center(config)?;
+            if center_is_running(&host)? {
+                return Err(
+                    "Relay v2 Center could not be stopped for Host bootstrap rotation".to_string(),
+                );
+            }
+            config.bootstrap_rotation_request_phase =
+                Some(BootstrapRotationRequestPhase::CenterStopped);
+            save_config(config)?;
+        }
+        Some(BootstrapRotationRequestPhase::CenterStopped) => {
+            if center_is_running(&host)? {
+                // The prior launch may still be publishing its exact output.
+                // Never stop it and mint a successor while transfer is absent.
+                return Err(
+                    "Relay v2 Host bootstrap replacement has not reached verified transfer"
+                        .to_string(),
+                );
+            }
+        }
+        None => {
+            return Err(
+                "Relay v2 Host bootstrap rotation transfer state is inconsistent".to_string(),
+            );
+        }
+    }
+    start_center_with_pending_rotation_output(config, true)
 }
 
 #[tauri::command]
@@ -2147,13 +2833,20 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
         let saved =
             load_config()?.ok_or("Save and deploy the Relay v2 self-hosted configuration first")?;
-        let requested = validated_config(args, saved.bootstrap_file_name.clone(), false)?;
+        let requested = validated_config(
+            args,
+            saved.bootstrap_file_name.clone(),
+            saved.bootstrap_publication_correlation.clone(),
+            false,
+        )?;
         if !same_deployment_config(&saved, &requested) {
             return Err(
                 "Save and deploy the current Relay v2 configuration before starting".to_string(),
             );
         }
         let mut config = saved;
+        ensure_host_profile_identity(&mut config)?;
+        ensure_ordinary_center_start_allowed(&config)?;
         prepare_local_host_prerequisites_for(&config)?;
         start_center(&mut config)?;
         let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
@@ -2178,6 +2871,44 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
 }
 
 #[tauri::command]
+pub(crate) async fn mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<MobileRelayV2SelfHostedDeploymentState>>,
+    management: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
+) -> Result<MobileRelayV2SelfHostedStatus, String> {
+    let state = Arc::clone(state.inner());
+    let management = Arc::clone(management.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .operation
+            .lock()
+            .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
+        let mut config =
+            load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
+        ensure_host_profile_identity(&mut config)?;
+        rotate_expired_host_bootstrap(&mut config)?;
+        let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
+            .ok_or("Relay v2 self-hosted management configuration disappeared")?;
+        let selection = prepared.selection();
+        management
+            .replace_self_hosted(&app, selection, move || prepared.commit_ready())
+            .map_err(|error| match error {
+                ManagementStartError::RecoveryRequired => {
+                    "Relay v2 Host cleanup is uncertain; operator recovery is required".to_string()
+                }
+                ManagementStartError::Unavailable | ManagementStartError::ChannelClosed => {
+                    "Rotated Relay v2 self-hosted Host could not become ready".to_string()
+                }
+            })?;
+        let committed =
+            load_config()?.ok_or("Relay v2 self-hosted management configuration disappeared")?;
+        Ok(probe_status(&committed))
+    })
+    .await
+    .map_err(|error| format!("Relay v2 Host bootstrap rotation task failed: {error}"))?
+}
+
+#[tauri::command]
 pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
     state: State<'_, Arc<MobileRelayV2SelfHostedDeploymentState>>,
 ) -> Result<MobileRelayV2SelfHostedStatus, String> {
@@ -2198,13 +2929,23 @@ pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
 #[cfg(test)]
 mod tests {
     use super::{
+        bootstrap_bytes_match_local_identity, bootstrap_publication_attempt,
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
         build_remote_bundle_stage_validation_script, build_remote_relay_v2_center_command,
-        build_remote_state_directory_launcher_preflight, consumed_local_private_file_path,
-        finish_consuming_if_present, load_ready_commit_journal_at, normalize_issuer_url,
-        read_local_private_file, relay_url_from_issuer, validate_bootstrap_bytes,
-        validate_listen_host, PersistedSelfHostedConfig, ReadyCommitJournal, CONFIG_CONTRACT,
-        CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT, REMOTE_BOOTSTRAP_FD_READER,
+        build_remote_state_directory_launcher_preflight, commit_bootstrap_ready_state,
+        consumed_local_private_file_path, ensure_host_profile_identity,
+        ensure_ordinary_center_start_allowed, finish_consuming_if_present,
+        fresh_bootstrap_publication_correlation, load_ready_commit_journal_at,
+        normalize_issuer_url, read_local_private_file, ready_rotation_transfer_identity,
+        record_expired_bootstrap_rotation_intent, relay_url_from_issuer,
+        valid_bootstrap_publication_correlation, validate_bootstrap_bytes, validate_listen_host,
+        verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
+        BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
+        BootstrapRotationTransferReceipt, LocalPrivateFileIdentity, PersistedSelfHostedConfig,
+        ReadyCommitJournal, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
+        HOST_PROFILE_CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT,
+        READY_COMMIT_JOURNAL_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
+        ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
 
     fn config() -> PersistedSelfHostedConfig {
@@ -2223,7 +2964,23 @@ mod tests {
             profile_provisioned: false,
             host_credential_provisioned: false,
             management_recovery_required: false,
+            bootstrap_rotation_pending: false,
+            bootstrap_rotation_request_phase: None,
+            bootstrap_rotation_transfer_receipt: None,
             bootstrap_file_name: None,
+            bootstrap_publication_correlation: None,
+        }
+    }
+
+    fn local_identity(inode: u64) -> LocalPrivateFileIdentity {
+        LocalPrivateFileIdentity {
+            device: 7,
+            inode,
+            length: 32,
+            mode: 0o600,
+            uid: 501,
+            links: 1,
+            sha256: [9; 32],
         }
     }
 
@@ -2267,10 +3024,12 @@ mod tests {
 
     #[test]
     fn one_builder_owns_the_canonical_self_hosted_cli_seam_without_secret_values() {
-        let command = build_remote_relay_v2_center_command(
-            &config(),
-            Some("host-bootstrap-correlation.twhostboot2"),
-        );
+        let mut pending = config();
+        pending.bootstrap_file_name = Some("host-bootstrap-output-path.twhostboot2".to_string());
+        pending.bootstrap_publication_correlation =
+            Some("dashboard-bootstrap-publication-attempt".to_string());
+        let attempt = bootstrap_publication_attempt(&pending).unwrap().unwrap();
+        let command = build_remote_relay_v2_center_command(&pending, Some(&attempt));
         assert!(command.contains("--v2-single-node-self-hosted"));
         assert!(command.contains("--host '0.0.0.0' --port 443"));
         assert!(command.contains("--v2-dev-advertised-origin 'https://relay.company.test/'"));
@@ -2281,7 +3040,9 @@ mod tests {
         assert!(!command.contains(
             "--v2-self-hosted-state-dir \"$HOME/.tmux-worktree/relay-v2-self-hosted/state\""
         ));
-        assert!(command.contains("--host-bootstrap-output"));
+        assert!(command.contains(
+            "--host-bootstrap-output \"$HOME/.tmux-worktree/relay-v2-self-hosted/bootstrap/host-bootstrap-output-path.twhostboot2\" --v2-self-hosted-bootstrap-correlation 'dashboard-bootstrap-publication-attempt'"
+        ));
         for forbidden in [
             "twcap2.",
             "twref2.",
@@ -2296,7 +3057,244 @@ mod tests {
 
         let restart = build_remote_relay_v2_center_command(&config(), None);
         assert!(!restart.contains("--host-bootstrap-output"));
+        assert!(!restart.contains("--v2-self-hosted-bootstrap-correlation"));
         assert!(!restart.contains("host-bootstrap-"));
+    }
+
+    #[test]
+    fn publication_correlation_is_opaque_bounded_and_independent_of_the_filename() {
+        let correlation = fresh_bootstrap_publication_correlation().unwrap();
+        assert!(valid_bootstrap_publication_correlation(&correlation));
+        assert!(correlation.len() <= 128);
+        assert!(!correlation.contains("twhostboot2"));
+        for invalid in [
+            "",
+            " leading",
+            "trailing ",
+            "line\nbreak",
+            "carriage\rreturn",
+            "nul\0byte",
+        ] {
+            assert!(
+                !valid_bootstrap_publication_correlation(invalid),
+                "{invalid:?}"
+            );
+        }
+        assert!(!valid_bootstrap_publication_correlation(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn explicit_rotation_creates_one_replacement_attempt_then_reuses_it_on_retry() {
+        let mut pending = config();
+        pending.bootstrap_file_name = Some("host-bootstrap-stable-output.twhostboot2".to_string());
+        pending.bootstrap_publication_correlation =
+            Some("dashboard-bootstrap-publication-expired".to_string());
+        let original_correlation = pending.bootstrap_publication_correlation.clone();
+        let original_file_name = pending.bootstrap_file_name.clone();
+
+        let mut before_previous_cleanup = pending.clone();
+        assert!(
+            record_expired_bootstrap_rotation_intent(&mut before_previous_cleanup, None).is_err()
+        );
+        assert_eq!(before_previous_cleanup, pending);
+
+        assert!(!record_expired_bootstrap_rotation_intent(
+            &mut pending,
+            Some("dashboard-bootstrap-publication-replacement".to_string())
+        )
+        .unwrap());
+        let replacement_correlation = pending.bootstrap_publication_correlation.clone();
+        assert_ne!(replacement_correlation, original_correlation);
+        assert_eq!(pending.bootstrap_file_name, original_file_name);
+        assert_eq!(
+            pending.bootstrap_rotation_request_phase,
+            Some(BootstrapRotationRequestPhase::Requested)
+        );
+
+        assert!(record_expired_bootstrap_rotation_intent(&mut pending, None).unwrap());
+        assert_eq!(
+            pending.bootstrap_publication_correlation,
+            replacement_correlation
+        );
+        assert_eq!(pending.bootstrap_file_name, original_file_name);
+    }
+
+    #[test]
+    fn old_pending_schema_without_publication_correlation_fails_closed() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value["schemaVersion"] = serde_json::json!(HOST_PROFILE_CONFIG_SCHEMA_VERSION);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bootstrapRotationPending");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bootstrapRotationRequestPhase");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bootstrapRotationTransferReceipt");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bootstrapPublicationCorrelation");
+        let mut migrated: PersistedSelfHostedConfig = serde_json::from_value(value).unwrap();
+        assert!(!migrated.bootstrap_rotation_pending);
+        assert!(migrated.bootstrap_rotation_request_phase.is_none());
+        assert!(migrated.bootstrap_rotation_transfer_receipt.is_none());
+        ensure_host_profile_identity(&mut migrated).unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+
+        migrated.schema_version = ROTATION_PENDING_CONFIG_SCHEMA_VERSION;
+        migrated.bootstrap_rotation_pending = true;
+        migrated.bootstrap_file_name =
+            Some("host-bootstrap-migrated-correlation.twhostboot2".to_string());
+        assert!(ensure_host_profile_identity(&mut migrated).is_err());
+        assert_eq!(
+            migrated.schema_version,
+            ROTATION_PENDING_CONFIG_SCHEMA_VERSION
+        );
+
+        migrated.schema_version = ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION;
+        assert!(ensure_host_profile_identity(&mut migrated).is_err());
+    }
+
+    #[test]
+    fn pending_rotation_reuses_filename_and_ready_recovery_clears_intent() {
+        let mut pending = config();
+        assert!(ensure_ordinary_center_start_allowed(&pending).is_ok());
+        pending.profile_provisioned = true;
+        pending.bootstrap_file_name = Some("host-bootstrap-same-output.twhostboot2".to_string());
+        pending.bootstrap_publication_correlation =
+            Some("dashboard-bootstrap-publication-replacement".to_string());
+        pending.bootstrap_rotation_pending = true;
+        pending.bootstrap_rotation_request_phase = Some(BootstrapRotationRequestPhase::Requested);
+        let file_name = pending.bootstrap_file_name.clone();
+        let publication_correlation = pending.bootstrap_publication_correlation.clone();
+
+        // Startup and ordinary Start must not feed the old local input to a
+        // Host child before a verified replacement receipt exists.
+        assert!(ensure_ordinary_center_start_allowed(&pending).is_err());
+        assert!(ready_rotation_transfer_identity(&pending).is_err());
+        assert_ne!(
+            pending.bootstrap_file_name,
+            pending.bootstrap_publication_correlation
+        );
+        let attempt = bootstrap_publication_attempt(&pending).unwrap().unwrap();
+        let first_restart = build_remote_relay_v2_center_command(&pending, Some(&attempt));
+        let crash_retry = build_remote_relay_v2_center_command(&pending, Some(&attempt));
+        assert_eq!(crash_retry, first_restart);
+        assert!(crash_retry.contains("host-bootstrap-same-output.twhostboot2"));
+        assert!(crash_retry.contains(
+            "--v2-self-hosted-bootstrap-correlation 'dashboard-bootstrap-publication-replacement'"
+        ));
+
+        let replacement_identity = local_identity(11);
+        pending.bootstrap_rotation_request_phase = None;
+        pending.bootstrap_rotation_transfer_receipt = Some(BootstrapRotationTransferReceipt {
+            profile_lineage: pending.host_profile_identity.clone(),
+            bootstrap_file_name: file_name.clone().unwrap(),
+            bootstrap_publication_correlation: publication_correlation.clone().unwrap(),
+            local_identity: replacement_identity.clone(),
+            phase: BootstrapRotationTransferPhase::RemoteCleanupPending,
+        });
+        assert!(ready_rotation_transfer_identity(&pending).is_err());
+        pending
+            .bootstrap_rotation_transfer_receipt
+            .as_mut()
+            .unwrap()
+            .phase = BootstrapRotationTransferPhase::Ready;
+        assert_eq!(
+            ready_rotation_transfer_identity(&pending).unwrap(),
+            Some(&replacement_identity)
+        );
+        assert!(ensure_ordinary_center_start_allowed(&pending).is_err());
+        assert!(verify_rotation_transfer_identity(&pending, &replacement_identity).is_ok());
+        assert!(verify_rotation_transfer_identity(&pending, &local_identity(12)).is_err());
+        let mut wrong_lineage = pending.clone();
+        wrong_lineage
+            .bootstrap_rotation_transfer_receipt
+            .as_mut()
+            .unwrap()
+            .profile_lineage = "ffeeddccbbaa99887766554433221100".to_string();
+        assert!(ready_rotation_transfer_identity(&wrong_lineage).is_err());
+        let mut wrong_correlation = pending.clone();
+        wrong_correlation
+            .bootstrap_rotation_transfer_receipt
+            .as_mut()
+            .unwrap()
+            .bootstrap_publication_correlation =
+            "dashboard-bootstrap-publication-other".to_string();
+        assert!(ready_rotation_transfer_identity(&wrong_correlation).is_err());
+
+        let wrong_ready_correlation = Some("dashboard-bootstrap-publication-other".to_string());
+        assert!(commit_bootstrap_ready_state(
+            &mut pending.clone(),
+            &file_name,
+            &wrong_ready_correlation
+        )
+        .is_err());
+        commit_bootstrap_ready_state(&mut pending, &file_name, &publication_correlation).unwrap();
+        assert!(pending.host_credential_provisioned);
+        assert!(!pending.bootstrap_rotation_pending);
+        assert!(pending.bootstrap_rotation_request_phase.is_none());
+        assert!(pending.bootstrap_rotation_transfer_receipt.is_none());
+        assert!(pending.bootstrap_file_name.is_none());
+        assert!(pending.bootstrap_publication_correlation.is_none());
+
+        // Replaying the ready journal after a crash between config commit and
+        // journal cleanup is idempotent.
+        commit_bootstrap_ready_state(&mut pending, &file_name, &publication_correlation).unwrap();
+        assert!(pending.host_credential_provisioned);
+        assert!(!pending.bootstrap_rotation_pending);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_receipt_requires_the_exact_fd_bound_local_replacement_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("host-bootstrap-replacement.twhostboot2");
+        std::fs::write(&path, b"twhostboot2.replacement-one\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = read_local_private_file(
+            &path.to_string_lossy(),
+            "Relay v2 Host bootstrap replacement",
+            8_193,
+        )
+        .unwrap();
+        assert!(bootstrap_bytes_match_local_identity(
+            b"twhostboot2.replacement-one\n",
+            &replacement.identity
+        ));
+        assert!(!bootstrap_bytes_match_local_identity(
+            b"twhostboot2.replacement-other\n",
+            &replacement.identity
+        ));
+        let mut pending = config();
+        pending.bootstrap_rotation_pending = true;
+        pending.bootstrap_file_name = Some("host-bootstrap-replacement.twhostboot2".to_string());
+        pending.bootstrap_publication_correlation =
+            Some("dashboard-bootstrap-publication-replacement".to_string());
+        pending.bootstrap_rotation_transfer_receipt = Some(BootstrapRotationTransferReceipt {
+            profile_lineage: pending.host_profile_identity.clone(),
+            bootstrap_file_name: pending.bootstrap_file_name.clone().unwrap(),
+            bootstrap_publication_correlation: pending
+                .bootstrap_publication_correlation
+                .clone()
+                .unwrap(),
+            local_identity: replacement.identity,
+            phase: BootstrapRotationTransferPhase::RemoteCleanupPending,
+        });
+
+        assert!(ready_rotation_transfer_identity(&pending).is_err());
+        verify_rotation_transfer_receipt_local_at(&pending, &path).unwrap();
+        std::fs::write(&path, b"twhostboot2.replacement-two\n").unwrap();
+        assert!(verify_rotation_transfer_receipt_local_at(&pending, &path).is_err());
     }
 
     #[test]
@@ -2366,9 +3364,10 @@ mod tests {
         .unwrap();
         let journal = ReadyCommitJournal {
             contract: READY_COMMIT_JOURNAL_CONTRACT.to_string(),
-            schema_version: 1,
+            schema_version: READY_COMMIT_JOURNAL_SCHEMA_VERSION,
             profile_lineage: "00112233445566778899aabbccddeeff".to_string(),
             bootstrap_file_name: None,
+            bootstrap_publication_correlation: None,
             bootstrap_identity: None,
             provision_profile_identity: None,
         };

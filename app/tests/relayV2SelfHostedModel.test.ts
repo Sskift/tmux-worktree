@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createRelayV2SelfHostedDraft,
+  relayV2ExpiredBootstrapRotationAvailable,
   relayV2SelfHostedStatusLabel,
   relayV2SelfHostedDraftMatchesStatus,
   selfHostedStatusToDraft,
@@ -26,6 +27,9 @@ const configuredStatus: MobileRelayV2SelfHostedStatus = {
   tlsStatus: "ready",
   centerStatus: "stopped",
   hostBootstrapAvailable: false,
+  hostBootstrapPending: false,
+  hostCredentialProvisioned: false,
+  bootstrapRotationPending: false,
   remoteTlsKeyPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.key",
   remoteTlsCertificatePath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.crt",
   remoteTlsCaPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/ca.pem",
@@ -59,6 +63,25 @@ test("self-hosted Relay v2 draft is explicit and normalizes a root HTTPS origin"
       tlsCaPath: "/private/ca.pem",
     },
   });
+});
+
+test("expired Host bootstrap rotation is limited to version-zero pending state", () => {
+  const pending = {
+    ...configuredStatus,
+    centerStatus: "running" as const,
+    hostBootstrapAvailable: true,
+    hostBootstrapPending: true,
+    hostCredentialProvisioned: false,
+  };
+  assert.equal(relayV2ExpiredBootstrapRotationAvailable(pending), true);
+  assert.equal(
+    relayV2ExpiredBootstrapRotationAvailable({
+      ...pending,
+      hostBootstrapPending: false,
+      hostCredentialProvisioned: true,
+    }),
+    false,
+  );
 });
 
 test("self-hosted Relay v2 rejects implicit activation and secret-bearing URLs", () => {

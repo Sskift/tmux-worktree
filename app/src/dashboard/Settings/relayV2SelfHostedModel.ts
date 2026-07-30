@@ -182,3 +182,11 @@ export function relayV2SelfHostedStatusLabel(
   if (status.configured) return "Configured · bundle pending";
   return "Not configured";
 }
+
+export function relayV2ExpiredBootstrapRotationAvailable(
+  status: MobileRelayV2SelfHostedStatus | null,
+): boolean {
+  return status?.configured === true
+    && status.hostBootstrapPending
+    && !status.hostCredentialProvisioned;
+}

@@ -111,6 +111,7 @@ export interface MobileRelayV2SelfHostedDeploymentPort {
   saveConfig(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
   deploy(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
   startCenter(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
+  rotateExpiredHostBootstrap(): Promise<MobileRelayV2SelfHostedStatus>;
   stopCenter(): Promise<MobileRelayV2SelfHostedStatus>;
 }
 
@@ -666,6 +667,10 @@ export function createDashboardBackend(
           transport.invoke<MobileRelayV2SelfHostedStatus>(
             "mobile_relay_v2_self_hosted_start_center",
             { args },
+          ),
+        rotateExpiredHostBootstrap: () =>
+          transport.invoke<MobileRelayV2SelfHostedStatus>(
+            "mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap",
           ),
         stopCenter: () =>
           transport.invoke<MobileRelayV2SelfHostedStatus>(
