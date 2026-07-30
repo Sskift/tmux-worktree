@@ -964,11 +964,11 @@ export async function openRelayV2HostCanonicalProductionComposition(
       // its lock remain externally owned throughout.
       closingExactTargets.fenceNewPreparations();
       closeBarrier = settleAll([
+        // Fence new reauthentication signals and drain the in-flight job
+        // before Dashboard or connector drain can re-enter its authority.
+        ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
         ...(dashboardManagementSession === null
           ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
-        // Fence new reauthentication signals and drain the in-flight job
-        // before the connector drains.
-        ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
         () => closingManaged.closeAndDrain(),
         ...(closingObservedBytePlane === null
           ? [] : [() => closingObservedBytePlane.close()]),
@@ -1010,9 +1010,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
     if (!claimedOwners) throw error;
     exactTargets?.fenceNewPreparations();
     const rollback = [
+      ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
       ...(dashboardManagementSession === null
         ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
-      ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
       ...(managed !== null
         ? [() => managed!.closeAndDrain()]
         : terminalManager === null ? [] : [() => terminalManager!.shutdown()]),

@@ -316,7 +316,7 @@ test("canonical production root is inert, singular, and closes idempotently", as
   }
 });
 
-test("canonical production root owns one exact Dashboard management session and closes it first", async () => {
+test("canonical production root owns one exact Dashboard session and closes it before durable owners", async () => {
   const malformed = await makeHarness("dashboard-management-malformed");
   const beforeMalformed = await malformed.store.read();
   const readMalformed = malformed.store.read.bind(malformed.store);
