@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
 use super::management_child::{
-    ManagementBootstrapSecretMode, ManagementChildSelection, ManagementPreparedFileIdentity,
-    ManagementStartError,
+    ManagementBootstrapSecretMode, ManagementChildSelection, ManagementError, ManagementLaunchKey,
+    ManagementOutcome, ManagementPreparedFileIdentity, ManagementStartError,
 };
-use super::MobileRelayV2ManagementCommandState;
+use super::{MobileRelayV2ManagementCommandState, MobileRelayV2ManagementOperation};
 use crate::config::find_host;
 use crate::features::control_plane::{scp_cli_to_host, scp_directory_to_host};
 use crate::remote::{
@@ -20,11 +20,12 @@ use crate::remote::{
 use crate::support::{app_home_dir, atomic_write_file, shell_quote};
 
 const CONFIG_CONTRACT: &str = "tmux-worktree-dashboard-relay-v2-self-hosted";
-const CONFIG_SCHEMA_VERSION: u32 = 5;
+const CONFIG_SCHEMA_VERSION: u32 = 6;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 const HOST_PROFILE_CONFIG_SCHEMA_VERSION: u32 = 2;
 const ROTATION_PENDING_CONFIG_SCHEMA_VERSION: u32 = 3;
 const ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION: u32 = 4;
+const BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION: u32 = 5;
 const REMOTE_PROFILE_SCHEMA_VERSION: u32 = 1;
 const FEATURE_KIND: &str = "explicit_self_hosted";
 const CENTER_SESSION: &str = "tw-relay-v2-center";
@@ -253,9 +254,22 @@ const TLS_CERTIFICATE_FLAG: &str = "--v2-dev-tls-cert";
 const STATE_DIRECTORY_FLAG: &str = "--v2-self-hosted-state-dir";
 const BOOTSTRAP_CORRELATION_FLAG: &str = "--v2-self-hosted-bootstrap-correlation";
 
-#[derive(Default)]
 pub(crate) struct MobileRelayV2SelfHostedDeploymentState {
-    operation: Mutex<()>,
+    operation: Mutex<SelfHostedDeploymentOperationOwner>,
+}
+
+#[derive(Default)]
+struct SelfHostedDeploymentOperationOwner {
+    active_management: Option<SelfHostedManagementBinding>,
+    startup_restore_error: Option<String>,
+}
+
+impl Default for MobileRelayV2SelfHostedDeploymentState {
+    fn default() -> Self {
+        Self {
+            operation: Mutex::new(SelfHostedDeploymentOperationOwner::default()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -290,6 +304,8 @@ struct PersistedSelfHostedConfig {
     profile_provisioned: bool,
     #[serde(default)]
     host_credential_provisioned: bool,
+    #[serde(default)]
+    connector_desired_running: bool,
     #[serde(default)]
     management_recovery_required: bool,
     #[serde(default)]
@@ -429,9 +445,37 @@ pub(crate) struct PreparedSelfHostedManagementLaunch {
     provision_profile_identity: Option<LocalPrivateFileIdentity>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelfHostedManagementBinding {
+    persisted_config_identity: [u8; 32],
+    steady_launch_key: ManagementLaunchKey,
+}
+
 impl PreparedSelfHostedManagementLaunch {
     pub(crate) fn selection(&self) -> ManagementChildSelection {
         self.selection.clone()
+    }
+
+    pub(crate) fn management_binding(&self) -> Result<SelfHostedManagementBinding, String> {
+        let mut expected = self.config.clone();
+        if self.bootstrap_identity.is_some() {
+            let bootstrap_file_name = expected.bootstrap_file_name.clone();
+            let bootstrap_publication_correlation =
+                expected.bootstrap_publication_correlation.clone();
+            commit_bootstrap_ready_state(
+                &mut expected,
+                &bootstrap_file_name,
+                &bootstrap_publication_correlation,
+            )?;
+        }
+        if self.provision_profile_identity.is_some() {
+            expected.profile_provisioned = true;
+        }
+        expected.management_recovery_required = false;
+        Ok(SelfHostedManagementBinding {
+            persisted_config_identity: persisted_management_config_identity(&expected)?,
+            steady_launch_key: self.selection.steady_launch_key(),
+        })
     }
 
     pub(crate) fn commit_ready(mut self) -> Result<(), String> {
@@ -487,6 +531,44 @@ impl PreparedSelfHostedManagementLaunch {
             16 * 1024,
             "Relay v2 management ready commit journal",
         )?;
+        Ok(())
+    }
+}
+
+impl SelfHostedManagementBinding {
+    fn matches_config(&self, config: &PersistedSelfHostedConfig) -> bool {
+        persisted_management_config_identity(config)
+            .is_ok_and(|identity| identity == self.persisted_config_identity)
+    }
+}
+
+fn revalidate_current_management_binding(
+    expected: &SelfHostedManagementBinding,
+) -> Result<PersistedSelfHostedConfig, String> {
+    let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
+        .ok_or("Relay v2 self-hosted management configuration disappeared")?;
+    if prepared.management_binding()? != *expected {
+        return Err("Relay v2 self-hosted management binding changed".to_string());
+    }
+    let config =
+        load_config()?.ok_or("Relay v2 self-hosted management configuration disappeared")?;
+    if !expected.matches_config(&config) {
+        return Err("Relay v2 self-hosted management binding changed".to_string());
+    }
+    Ok(config)
+}
+
+impl MobileRelayV2SelfHostedDeploymentState {
+    pub(crate) fn publish_self_hosted_management_binding(
+        &self,
+        binding: SelfHostedManagementBinding,
+    ) -> Result<(), String> {
+        let mut owner = self
+            .operation
+            .lock()
+            .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
+        owner.active_management = Some(binding);
+        owner.startup_restore_error = None;
         Ok(())
     }
 }
@@ -1005,6 +1087,7 @@ fn validated_config(
         host_profile_identity: String::new(),
         profile_provisioned: false,
         host_credential_provisioned: false,
+        connector_desired_running: false,
         management_recovery_required: false,
         bootstrap_rotation_pending: false,
         bootstrap_rotation_request_phase: None,
@@ -1017,38 +1100,42 @@ fn validated_config(
 fn validated_config_with_persisted_state(
     input: MobileRelayV2SelfHostedConfigInput,
     inspect_tls: bool,
-) -> Result<PersistedSelfHostedConfig, String> {
-    let current = load_config()?;
+) -> Result<(Option<PersistedSelfHostedConfig>, PersistedSelfHostedConfig), String> {
+    let mut current = load_config()?;
     let mut config = validated_config(input, None, None, inspect_tls)?;
-    if let Some(mut current) = current {
-        ensure_host_profile_identity(&mut current)?;
-        let same_host_lineage = current.broker_host_id == config.broker_host_id
-            && current.issuer_url == config.issuer_url;
-        if current.bootstrap_file_name.is_some() && !same_host_lineage {
+    if let Some(persisted) = current.as_mut() {
+        ensure_host_profile_identity(persisted)?;
+        let same_host_lineage = persisted.broker_host_id == config.broker_host_id
+            && persisted.issuer_url == config.issuer_url;
+        if persisted.bootstrap_file_name.is_some() && !same_host_lineage {
             return Err(
                 "Finish the pending Relay v2 Host bootstrap before changing its devbox or URL"
                     .to_string(),
             );
         }
-        if current.profile_provisioned && current.issuer_url != config.issuer_url {
+        if persisted.profile_provisioned && persisted.issuer_url != config.issuer_url {
             return Err(
                 "The persisted Relay v2 Host profile cannot be changed to another Relay URL"
                     .to_string(),
             );
         }
-        config.host_profile_identity = current.host_profile_identity;
-        config.profile_provisioned = current.profile_provisioned;
-        config.host_credential_provisioned = current.host_credential_provisioned;
-        config.management_recovery_required = current.management_recovery_required;
-        config.bootstrap_rotation_pending = current.bootstrap_rotation_pending;
-        config.bootstrap_rotation_request_phase = current.bootstrap_rotation_request_phase;
-        config.bootstrap_rotation_transfer_receipt = current.bootstrap_rotation_transfer_receipt;
-        config.bootstrap_file_name = current.bootstrap_file_name;
-        config.bootstrap_publication_correlation = current.bootstrap_publication_correlation;
+        config.host_profile_identity = persisted.host_profile_identity.clone();
+        config.profile_provisioned = persisted.profile_provisioned;
+        config.host_credential_provisioned = persisted.host_credential_provisioned;
+        config.connector_desired_running = persisted.connector_desired_running;
+        config.management_recovery_required = persisted.management_recovery_required;
+        config.bootstrap_rotation_pending = persisted.bootstrap_rotation_pending;
+        config.bootstrap_rotation_request_phase =
+            persisted.bootstrap_rotation_request_phase.clone();
+        config.bootstrap_rotation_transfer_receipt =
+            persisted.bootstrap_rotation_transfer_receipt.clone();
+        config.bootstrap_file_name = persisted.bootstrap_file_name.clone();
+        config.bootstrap_publication_correlation =
+            persisted.bootstrap_publication_correlation.clone();
     } else {
         config.host_profile_identity = fresh_host_profile_identity()?;
     }
-    Ok(config)
+    Ok((current, config))
 }
 
 fn valid_bootstrap_rotation_transfer_receipt(config: &PersistedSelfHostedConfig) -> bool {
@@ -1090,7 +1177,8 @@ fn valid_bootstrap_publication_attempt(
         (None, None) => true,
         (Some(_), Some(correlation)) => valid_bootstrap_publication_correlation(correlation),
         (Some(_), None) => {
-            allow_legacy_missing_correlation && config.schema_version < CONFIG_SCHEMA_VERSION
+            allow_legacy_missing_correlation
+                && config.schema_version < BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
         }
         (None, Some(_)) => false,
     }
@@ -1107,7 +1195,7 @@ fn valid_bootstrap_rotation_state(config: &PersistedSelfHostedConfig) -> bool {
     ) {
         (Some(_), None) => true,
         (None, Some(_)) => valid_bootstrap_rotation_transfer_receipt(config),
-        (None, None) => config.schema_version < CONFIG_SCHEMA_VERSION,
+        (None, None) => config.schema_version < BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION,
         (Some(_), Some(_)) => false,
     }
 }
@@ -1148,6 +1236,12 @@ fn verify_rotation_transfer_identity(
     Ok(())
 }
 
+fn normalize_legacy_connector_desired_state(config: &mut PersistedSelfHostedConfig) {
+    if config.schema_version < CONFIG_SCHEMA_VERSION {
+        config.connector_desired_running = false;
+    }
+}
+
 fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
     let path = config_path()?;
     match std::fs::symlink_metadata(&path) {
@@ -1161,8 +1255,9 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
         "Relay v2 self-hosted configuration",
         16 * 1024,
     )?;
-    let config: PersistedSelfHostedConfig = serde_json::from_slice(&contents.bytes)
+    let mut config: PersistedSelfHostedConfig = serde_json::from_slice(&contents.bytes)
         .map_err(|_| "Relay v2 self-hosted configuration is invalid".to_string())?;
+    normalize_legacy_connector_desired_state(&mut config);
     if config.contract != CONFIG_CONTRACT
         || !matches!(
             config.schema_version,
@@ -1170,6 +1265,7 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
                 | HOST_PROFILE_CONFIG_SCHEMA_VERSION
                 | ROTATION_PENDING_CONFIG_SCHEMA_VERSION
                 | ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION
+                | BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
                 | CONFIG_SCHEMA_VERSION
         )
         || !config.enabled
@@ -1193,7 +1289,7 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
         || config.bootstrap_rotation_pending && config.host_credential_provisioned
         || config.bootstrap_rotation_pending && config.bootstrap_file_name.is_none()
         || config.bootstrap_rotation_pending
-            && config.schema_version == CONFIG_SCHEMA_VERSION
+            && config.schema_version >= BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
             && config.bootstrap_publication_correlation.is_none()
         || !valid_bootstrap_publication_attempt(&config, true)
         || !valid_bootstrap_rotation_state(&config)
@@ -1260,6 +1356,138 @@ fn deployment_fingerprint(config: &PersistedSelfHostedConfig) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn persisted_management_config_identity(
+    config: &PersistedSelfHostedConfig,
+) -> Result<[u8; 32], String> {
+    let mut identity_config = config.clone();
+    identity_config.connector_desired_running = false;
+    let bytes = serde_json::to_vec(&identity_config)
+        .map_err(|_| "Relay v2 self-hosted configuration identity failed".to_string())?;
+    let digest = Sha256::digest(bytes);
+    let mut identity = [0_u8; 32];
+    identity.copy_from_slice(&digest);
+    Ok(identity)
+}
+
+fn management_config_identity_changed(
+    previous: Option<&PersistedSelfHostedConfig>,
+    next: &PersistedSelfHostedConfig,
+) -> Result<bool, String> {
+    let Some(previous) = previous else {
+        return Ok(false);
+    };
+    Ok(persisted_management_config_identity(previous)?
+        != persisted_management_config_identity(next)?)
+}
+
+fn prepared_management_ca_would_change(
+    config: &PersistedSelfHostedConfig,
+    binding: &SelfHostedManagementBinding,
+) -> Result<bool, String> {
+    let source = read_local_private_file(
+        &config.tls_ca_path,
+        "TLS CA certificate",
+        MAX_TLS_FILE_BYTES,
+    )?;
+    let prepared_path = local_host_ca_input_path()?;
+    match std::fs::symlink_metadata(&prepared_path) {
+        Ok(_) => {
+            let prepared = read_local_private_file(
+                &prepared_path.to_string_lossy(),
+                "prepared TLS CA certificate",
+                MAX_TLS_FILE_BYTES,
+            )?;
+            if prepared.bytes != source.bytes {
+                return Ok(true);
+            }
+            let identity: ManagementPreparedFileIdentity = prepared.identity.into();
+            Ok(!matches!(
+                &binding.steady_launch_key,
+                ManagementLaunchKey::SelfHostedDarwinArm64 {
+                    credential_https_ca_input,
+                    carrier_wss_ca_input,
+                    credential_https_ca_identity,
+                    carrier_wss_ca_identity,
+                    ..
+                } if credential_https_ca_input == &prepared_path
+                    && carrier_wss_ca_input == &prepared_path
+                    && credential_https_ca_identity == &identity
+                    && carrier_wss_ca_identity == &identity
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err("inspect prepared TLS CA certificate failed".to_string()),
+    }
+}
+
+fn commit_config_replacement_with_barrier<Drain, Persist>(
+    owner: &mut SelfHostedDeploymentOperationOwner,
+    previous: Option<PersistedSelfHostedConfig>,
+    mut next: PersistedSelfHostedConfig,
+    steady_launch_identity_changed: bool,
+    mut drain: Drain,
+    mut persist: Persist,
+) -> Result<PersistedSelfHostedConfig, String>
+where
+    Drain: FnMut(&ManagementLaunchKey) -> Result<(), String>,
+    Persist: FnMut(&PersistedSelfHostedConfig) -> Result<(), String>,
+{
+    let config_identity_changed = management_config_identity_changed(previous.as_ref(), &next)?;
+    if !config_identity_changed && !steady_launch_identity_changed {
+        persist(&next)?;
+        return Ok(next);
+    }
+
+    let mut stopped =
+        previous.ok_or("Relay v2 self-hosted configuration replacement lost its current state")?;
+    stopped.connector_desired_running = false;
+    persist(&stopped)?;
+    next.connector_desired_running = false;
+
+    if let Some(binding) = owner.active_management.clone() {
+        drain(&binding.steady_launch_key)?;
+        owner.active_management = None;
+    }
+
+    persist(&next)?;
+    owner.startup_restore_error = None;
+    Ok(next)
+}
+
+fn save_config_replacement_after_management_barrier(
+    owner: &mut SelfHostedDeploymentOperationOwner,
+    management: &MobileRelayV2ManagementCommandState,
+    previous: Option<PersistedSelfHostedConfig>,
+    next: PersistedSelfHostedConfig,
+) -> Result<PersistedSelfHostedConfig, String> {
+    let config_identity_changed = management_config_identity_changed(previous.as_ref(), &next)?;
+    let steady_launch_identity_changed = match owner.active_management.as_ref() {
+        Some(binding) if config_identity_changed || !binding.matches_config(&next) => true,
+        Some(binding) => prepared_management_ca_would_change(&next, binding)?,
+        None => false,
+    };
+    commit_config_replacement_with_barrier(
+        owner,
+        previous,
+        next,
+        steady_launch_identity_changed,
+        |launch_key| {
+            if management
+                .stop_self_hosted_connector_for_launch_key(Some(launch_key))
+                .is_ok()
+            {
+                return Ok(());
+            }
+            let _ = management.dispose();
+            Err(
+                "Relay v2 self-hosted Host could not be stopped before replacing configuration"
+                    .to_string(),
+            )
+        },
+        save_config,
+    )
+}
+
 fn same_deployment_config(
     left: &PersistedSelfHostedConfig,
     right: &PersistedSelfHostedConfig,
@@ -1293,6 +1521,7 @@ fn fresh_bootstrap_publication_correlation() -> Result<String, String> {
 }
 
 fn ensure_host_profile_identity(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
+    normalize_legacy_connector_desired_state(config);
     if config.schema_version == LEGACY_CONFIG_SCHEMA_VERSION
         && config.host_profile_identity.is_empty()
     {
@@ -1301,7 +1530,7 @@ fn ensure_host_profile_identity(config: &mut PersistedSelfHostedConfig) -> Resul
     if !valid_host_profile_identity(&config.host_profile_identity) {
         return Err("Relay v2 Host profile identity is invalid".to_string());
     }
-    if config.schema_version < CONFIG_SCHEMA_VERSION
+    if config.schema_version < BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
         && config.bootstrap_file_name.is_some()
         && config.bootstrap_publication_correlation.is_none()
     {
@@ -1313,7 +1542,7 @@ fn ensure_host_profile_identity(config: &mut PersistedSelfHostedConfig) -> Resul
     if !valid_bootstrap_publication_attempt(config, false) {
         return Err("Relay v2 Host bootstrap publication attempt is invalid".to_string());
     }
-    if config.schema_version < CONFIG_SCHEMA_VERSION
+    if config.schema_version < BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
         && config.bootstrap_rotation_pending
         && config.bootstrap_rotation_request_phase.is_none()
         && config.bootstrap_rotation_transfer_receipt.is_none()
@@ -1330,6 +1559,7 @@ fn ensure_host_profile_identity(config: &mut PersistedSelfHostedConfig) -> Resul
             | HOST_PROFILE_CONFIG_SCHEMA_VERSION
             | ROTATION_PENDING_CONFIG_SCHEMA_VERSION
             | ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION
+            | BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
     ) {
         config.schema_version = CONFIG_SCHEMA_VERSION;
     }
@@ -1864,6 +2094,154 @@ if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n
         Err(error) => status.error = Some(error),
     }
     status
+}
+
+fn self_hosted_connector_prerequisites_are_complete(config: &PersistedSelfHostedConfig) -> bool {
+    config.schema_version == CONFIG_SCHEMA_VERSION
+        && config.enabled
+        && config.profile_provisioned
+        && config.host_credential_provisioned
+        && !config.management_recovery_required
+        && !config.bootstrap_rotation_pending
+        && config.bootstrap_rotation_request_phase.is_none()
+        && config.bootstrap_rotation_transfer_receipt.is_none()
+        && config.bootstrap_file_name.is_none()
+        && config.bootstrap_publication_correlation.is_none()
+}
+
+fn self_hosted_connector_should_be_running(
+    config: &PersistedSelfHostedConfig,
+    status: &MobileRelayV2SelfHostedStatus,
+) -> bool {
+    self_hosted_connector_prerequisites_are_complete(config)
+        && config.connector_desired_running
+        && status.error.is_none()
+        && status.configured
+        && status.bundle_status == DeploymentProbeStatus::Ready
+        && status.tls_status == DeploymentProbeStatus::Ready
+        && status.center_status == DeploymentProbeStatus::Running
+}
+
+pub(crate) fn restore_relay_v2_self_hosted_connector_desired_state(
+    state: &MobileRelayV2SelfHostedDeploymentState,
+    management: &MobileRelayV2ManagementCommandState,
+    expected_binding: &SelfHostedManagementBinding,
+) -> Result<(), String> {
+    let mut owner = state
+        .operation
+        .lock()
+        .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
+    let result = (|| {
+        if owner.active_management.as_ref() != Some(expected_binding) {
+            return Err("Relay v2 self-hosted management binding changed".to_string());
+        }
+        let Some(config) = load_config()? else {
+            return Err("Relay v2 self-hosted configuration disappeared".to_string());
+        };
+        if !config.connector_desired_running {
+            return Ok(());
+        }
+        let config = revalidate_current_management_binding(expected_binding)?;
+        if !self_hosted_connector_prerequisites_are_complete(&config) {
+            return Err("Relay v2 self-hosted management prerequisites changed".to_string());
+        }
+        let status = probe_status(&config);
+        if !self_hosted_connector_should_be_running(&config, &status) {
+            return Err("Relay v2 self-hosted restore prerequisites are not ready".to_string());
+        }
+        management
+            .restore_self_hosted_connector_desired_state(&expected_binding.steady_launch_key)
+            .map_err(|_| {
+                "Relay v2 self-hosted Host desired state could not be restored".to_string()
+            })
+    })();
+    owner.startup_restore_error = result
+        .as_ref()
+        .err()
+        .map(|_| "Relay v2 self-hosted Host startup restore failed".to_string());
+    result
+}
+
+fn management_operation_failed_error() -> ManagementError {
+    ManagementError {
+        code: "OPERATION_FAILED".to_string(),
+        message: "Relay v2 management operation failed".to_string(),
+        retryable: false,
+    }
+}
+
+fn persist_connector_desired_running(
+    config: &mut PersistedSelfHostedConfig,
+    desired_running: bool,
+) -> Result<(), String> {
+    if config.connector_desired_running == desired_running {
+        return Ok(());
+    }
+    config.connector_desired_running = desired_running;
+    save_config(config)
+}
+
+pub(crate) fn call_relay_v2_self_hosted_connector_operation(
+    state: &MobileRelayV2SelfHostedDeploymentState,
+    management: &MobileRelayV2ManagementCommandState,
+    operation: MobileRelayV2ManagementOperation,
+) -> Option<Result<ManagementOutcome, ManagementError>> {
+    if !matches!(
+        operation,
+        MobileRelayV2ManagementOperation::StartConnector
+            | MobileRelayV2ManagementOperation::StopConnector
+    ) {
+        return None;
+    }
+    let mut owner = match state.operation.lock() {
+        Ok(owner) => owner,
+        Err(_) => return Some(Err(management_operation_failed_error())),
+    };
+    let mut config = match load_config() {
+        Ok(Some(config)) => config,
+        Ok(None) => return None,
+        Err(_) => return Some(Err(management_operation_failed_error())),
+    };
+    let result = match operation {
+        MobileRelayV2ManagementOperation::StartConnector => {
+            let Some(binding) = owner.active_management.clone() else {
+                return Some(Err(management_operation_failed_error()));
+            };
+            config = match revalidate_current_management_binding(&binding) {
+                Ok(config) => config,
+                Err(_) => return Some(Err(management_operation_failed_error())),
+            };
+            if !self_hosted_connector_prerequisites_are_complete(&config) {
+                return Some(Err(management_operation_failed_error()));
+            }
+            let outcome = match management.start_self_hosted_connector(&binding.steady_launch_key) {
+                Ok(outcome) => outcome,
+                Err(error) => return Some(Err(error)),
+            };
+            if persist_connector_desired_running(&mut config, true).is_err() {
+                let _ = management
+                    .stop_self_hosted_connector_for_launch_key(Some(&binding.steady_launch_key));
+                return Some(Err(management_operation_failed_error()));
+            }
+            Ok(outcome)
+        }
+        MobileRelayV2ManagementOperation::StopConnector => {
+            if persist_connector_desired_running(&mut config, false).is_err() {
+                return Some(Err(management_operation_failed_error()));
+            }
+            owner.startup_restore_error = None;
+            let launch_key = owner
+                .active_management
+                .as_ref()
+                .map(|binding| binding.steady_launch_key.clone());
+            management.stop_self_hosted_connector_for_launch_key(launch_key.as_ref())
+        }
+        _ => unreachable!("connector operation was closed above"),
+    };
+    if result.is_ok() {
+        owner.startup_restore_error = None;
+    }
+    Some(result)
 }
 
 fn current_status() -> MobileRelayV2SelfHostedStatus {
@@ -2537,25 +2915,35 @@ fn start_center(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
     start_center_with_pending_rotation_output(config, false)
 }
 
+fn build_remote_center_stop_script(tmux: &str) -> String {
+    format!(
+        r#"{REMOTE_SECURITY_FUNCTIONS}
+set -eu
+require_relay_layout
+{tmux} kill-session -t {CENTER_SESSION} 2>/dev/null || true
+if {tmux} has-session -t {CENTER_SESSION} 2>/dev/null; then
+  exit 1
+else
+  center_has_session_status=$?
+fi
+test "$center_has_session_status" -eq 1
+"#,
+    )
+}
+
 fn stop_center(config: &PersistedSelfHostedConfig) -> Result<(), String> {
-    let host = find_host(&config.broker_host_id)?;
+    let host = find_host(&config.broker_host_id)
+        .map_err(|_| "Relay v2 Center did not reach the stopped state".to_string())?;
     run_remote_cmd_check_strings(
         &host,
         &[
             "sh".into(),
             "-lc".into(),
-            format!(
-                r#"{REMOTE_SECURITY_FUNCTIONS}
-set -eu
-require_relay_layout
-{} kill-session -t {} 2>/dev/null || true
-"#,
-                remote_tmux_cmd(&host),
-                CENTER_SESSION
-            ),
+            build_remote_center_stop_script(&remote_tmux_cmd(&host)),
         ],
     )
     .map(|_| ())
+    .map_err(|_| "Relay v2 Center did not reach the stopped state".to_string())
 }
 
 fn validate_expired_bootstrap_rotation_candidate(
@@ -2765,11 +3153,15 @@ pub(crate) async fn mobile_relay_v2_self_hosted_status(
 ) -> Result<MobileRelayV2SelfHostedStatus, String> {
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
+        let owner = state
             .operation
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
-        Ok(current_status())
+        let mut status = current_status();
+        if status.error.is_none() {
+            status.error = owner.startup_restore_error.clone();
+        }
+        Ok(status)
     })
     .await
     .map_err(|error| format!("Relay v2 status task failed: {error}"))?
@@ -2779,15 +3171,23 @@ pub(crate) async fn mobile_relay_v2_self_hosted_status(
 pub(crate) async fn mobile_relay_v2_self_hosted_save_config(
     args: MobileRelayV2SelfHostedConfigInput,
     state: State<'_, Arc<MobileRelayV2SelfHostedDeploymentState>>,
+    management: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
 ) -> Result<MobileRelayV2SelfHostedStatus, String> {
     let state = Arc::clone(state.inner());
+    let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
+        let mut owner = state
             .operation
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
-        let config = validated_config_with_persisted_state(args, false)?;
-        save_config(&config)?;
+        let (previous, config) = validated_config_with_persisted_state(args, false)?;
+        let config = save_config_replacement_after_management_barrier(
+            &mut owner,
+            management.as_ref(),
+            previous,
+            config,
+        )?;
+        owner.startup_restore_error = None;
         prepare_local_host_prerequisites_for(&config)?;
         Ok(probe_status(&config))
     })
@@ -2800,15 +3200,23 @@ pub(crate) async fn mobile_relay_v2_self_hosted_deploy(
     app: tauri::AppHandle,
     args: MobileRelayV2SelfHostedConfigInput,
     state: State<'_, Arc<MobileRelayV2SelfHostedDeploymentState>>,
+    management: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
 ) -> Result<MobileRelayV2SelfHostedStatus, String> {
     let state = Arc::clone(state.inner());
+    let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
+        let mut owner = state
             .operation
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
-        let config = validated_config_with_persisted_state(args, true)?;
-        save_config(&config)?;
+        let (previous, config) = validated_config_with_persisted_state(args, true)?;
+        let config = save_config_replacement_after_management_barrier(
+            &mut owner,
+            management.as_ref(),
+            previous,
+            config,
+        )?;
+        owner.startup_restore_error = None;
         prepare_local_host_prerequisites_for(&config)?;
         deploy_bundle(&app, &config)?;
         Ok(probe_status(&config))
@@ -2827,7 +3235,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
     let state = Arc::clone(state.inner());
     let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
+        let mut owner = state
             .operation
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
@@ -2844,14 +3252,22 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
                 "Save and deploy the current Relay v2 configuration before starting".to_string(),
             );
         }
-        let mut config = saved;
-        ensure_host_profile_identity(&mut config)?;
+        let mut previous = saved;
+        ensure_host_profile_identity(&mut previous)?;
+        let config = previous.clone();
         ensure_ordinary_center_start_allowed(&config)?;
+        let mut config = save_config_replacement_after_management_barrier(
+            &mut owner,
+            management.as_ref(),
+            Some(previous),
+            config,
+        )?;
         prepare_local_host_prerequisites_for(&config)?;
         start_center(&mut config)?;
         let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
             .ok_or("Relay v2 self-hosted management configuration disappeared")?;
         let selection = prepared.selection();
+        let binding = prepared.management_binding()?;
         management
             .replace_self_hosted(&app, selection, move || prepared.commit_ready())
             .map_err(|error| match error {
@@ -2862,19 +3278,26 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
                     "Relay v2 self-hosted Host could not become ready".to_string()
                 }
             })?;
-        // The protocol-v2 StartConnector operation waits on the canonical
-        // Host connector controller through its host.registered cut. The
-        // Broker process and its durable state may predate this invocation,
-        // so a Host failure is left to that controller and reported without
-        // stopping the Center, reminting bootstrap material, or falling back.
+        owner.active_management = Some(binding.clone());
+        let mut committed = revalidate_current_management_binding(&binding)?;
+        let readiness = management
+            .ensure_self_hosted_connector_start_accepted(&binding.steady_launch_key)
+            .map_err(|_| "Relay v2 self-hosted Host start was not accepted".to_string())?;
+        if persist_connector_desired_running(&mut committed, true).is_err() {
+            let _ = management
+                .stop_self_hosted_connector_for_launch_key(Some(&binding.steady_launch_key));
+            return Err("Relay v2 self-hosted Host desired state was not saved".to_string());
+        }
+        owner.startup_restore_error = None;
+        // Network registration remains controller-owned. Once the accepted
+        // desired state is durable, a bounded readiness wait may fail without
+        // disarming the composition-owned retry policy.
         management
-            .start_connector_and_require_base_readiness()
+            .wait_for_self_hosted_connector_base_readiness(&binding.steady_launch_key, readiness)
             .map_err(|_| {
                 "Relay v2 self-hosted Host did not register with all six required capabilities"
                     .to_string()
             })?;
-        let committed =
-            load_config()?.ok_or("Relay v2 self-hosted management configuration disappeared")?;
         Ok(probe_status(&committed))
     })
     .await
@@ -2890,7 +3313,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap(
     let state = Arc::clone(state.inner());
     let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
+        let mut owner = state
             .operation
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
@@ -2901,6 +3324,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap(
         let prepared = prepare_relay_v2_self_hosted_management_prerequisites()?
             .ok_or("Relay v2 self-hosted management configuration disappeared")?;
         let selection = prepared.selection();
+        let binding = prepared.management_binding()?;
         management
             .replace_self_hosted(&app, selection, move || prepared.commit_ready())
             .map_err(|error| match error {
@@ -2911,8 +3335,20 @@ pub(crate) async fn mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap(
                     "Rotated Relay v2 self-hosted Host could not become ready".to_string()
                 }
             })?;
-        let committed =
-            load_config()?.ok_or("Relay v2 self-hosted management configuration disappeared")?;
+        let committed = revalidate_current_management_binding(&binding)?;
+        owner.active_management = Some(binding.clone());
+        if committed.connector_desired_running {
+            let status = probe_status(&committed);
+            if !self_hosted_connector_should_be_running(&committed, &status) {
+                return Err("Relay v2 self-hosted restore prerequisites are not ready".to_string());
+            }
+            management
+                .restore_self_hosted_connector_desired_state(&binding.steady_launch_key)
+                .map_err(|_| {
+                    "Relay v2 self-hosted Host desired state could not be restored".to_string()
+                })?;
+        }
+        owner.startup_restore_error = None;
         Ok(probe_status(&committed))
     })
     .await
@@ -2922,15 +3358,29 @@ pub(crate) async fn mobile_relay_v2_self_hosted_rotate_expired_host_bootstrap(
 #[tauri::command]
 pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
     state: State<'_, Arc<MobileRelayV2SelfHostedDeploymentState>>,
+    management: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
 ) -> Result<MobileRelayV2SelfHostedStatus, String> {
     let state = Arc::clone(state.inner());
+    let management = Arc::clone(management.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = state
+        let mut owner = state
             .operation
             .lock()
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
-        let config = load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
-        stop_center(&config)?;
+        let mut config =
+            load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
+        persist_connector_desired_running(&mut config, false)?;
+        owner.startup_restore_error = None;
+        let center_stop = stop_center(&config);
+        let launch_key = owner
+            .active_management
+            .as_ref()
+            .map(|binding| binding.steady_launch_key.clone());
+        let connector_stop =
+            management.stop_self_hosted_connector_for_launch_key(launch_key.as_ref());
+        center_stop?;
+        connector_stop
+            .map_err(|_| "Relay v2 self-hosted Host could not be stopped cleanly".to_string())?;
         Ok(probe_status(&config))
     })
     .await
@@ -2939,22 +3389,26 @@ pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
 
 #[cfg(test)]
 mod tests {
+    use super::super::management_child::ManagementLaunchKey;
     use super::{
-        bootstrap_bytes_match_local_identity, bootstrap_publication_attempt,
+        base_status, bootstrap_bytes_match_local_identity, bootstrap_publication_attempt,
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
-        build_remote_bundle_stage_validation_script, build_remote_relay_v2_center_command,
-        build_remote_state_directory_launcher_preflight, commit_bootstrap_ready_state,
+        build_remote_bundle_stage_validation_script, build_remote_center_stop_script,
+        build_remote_relay_v2_center_command, build_remote_state_directory_launcher_preflight,
+        commit_bootstrap_ready_state, commit_config_replacement_with_barrier,
         consumed_local_private_file_path, ensure_host_profile_identity,
         ensure_ordinary_center_start_allowed, finish_consuming_if_present,
         fresh_bootstrap_publication_correlation, load_ready_commit_journal_at,
-        normalize_issuer_url, read_local_private_file, ready_rotation_transfer_identity,
-        record_expired_bootstrap_rotation_intent, relay_url_from_issuer,
+        normalize_issuer_url, persisted_management_config_identity, read_local_private_file,
+        ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
+        relay_url_from_issuer, self_hosted_connector_should_be_running,
         valid_bootstrap_publication_correlation, validate_bootstrap_bytes, validate_listen_host,
         verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
         BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
-        BootstrapRotationTransferReceipt, LocalPrivateFileIdentity, PersistedSelfHostedConfig,
-        ReadyCommitJournal, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
-        HOST_PROFILE_CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT,
+        BootstrapRotationTransferReceipt, DeploymentProbeStatus, LocalPrivateFileIdentity,
+        PersistedSelfHostedConfig, ReadyCommitJournal, SelfHostedDeploymentOperationOwner,
+        SelfHostedManagementBinding, BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT,
+        CONFIG_SCHEMA_VERSION, HOST_PROFILE_CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT,
         READY_COMMIT_JOURNAL_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
         ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
@@ -2974,6 +3428,7 @@ mod tests {
             host_profile_identity: "00112233445566778899aabbccddeeff".to_string(),
             profile_provisioned: false,
             host_credential_provisioned: false,
+            connector_desired_running: false,
             management_recovery_required: false,
             bootstrap_rotation_pending: false,
             bootstrap_rotation_request_phase: None,
@@ -3031,6 +3486,224 @@ mod tests {
         ] {
             assert!(validate_listen_host(rejected).is_err(), "{rejected}");
         }
+    }
+
+    #[test]
+    fn restart_restore_requires_complete_prerequisites_and_a_running_exact_deployment() {
+        let mut ready = config();
+        ready.profile_provisioned = true;
+        ready.host_credential_provisioned = true;
+        let mut status = base_status(Some(&ready), None);
+        status.bundle_status = DeploymentProbeStatus::Ready;
+        status.tls_status = DeploymentProbeStatus::Ready;
+        status.center_status = DeploymentProbeStatus::Running;
+
+        assert!(!self_hosted_connector_should_be_running(&ready, &status));
+        ready.connector_desired_running = true;
+        assert!(self_hosted_connector_should_be_running(&ready, &status));
+
+        let mut stopped = status.clone();
+        stopped.center_status = DeploymentProbeStatus::Stopped;
+        assert!(!self_hosted_connector_should_be_running(&ready, &stopped));
+
+        let mut incomplete = ready.clone();
+        incomplete.host_credential_provisioned = false;
+        assert!(!self_hosted_connector_should_be_running(
+            &incomplete,
+            &status
+        ));
+        incomplete = ready.clone();
+        incomplete.profile_provisioned = false;
+        assert!(!self_hosted_connector_should_be_running(
+            &incomplete,
+            &status
+        ));
+        incomplete = ready.clone();
+        incomplete.management_recovery_required = true;
+        assert!(!self_hosted_connector_should_be_running(
+            &incomplete,
+            &status
+        ));
+
+        let mut mismatched = status.clone();
+        mismatched.tls_status = DeploymentProbeStatus::Missing;
+        assert!(!self_hosted_connector_should_be_running(
+            &ready,
+            &mismatched
+        ));
+        mismatched = status;
+        mismatched.error = Some("redacted probe failure".to_string());
+        assert!(!self_hosted_connector_should_be_running(
+            &ready,
+            &mismatched
+        ));
+    }
+
+    #[test]
+    fn schema_five_migrates_connector_desired_state_to_conservative_stopped() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value["schemaVersion"] = serde_json::json!(BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("connectorDesiredRunning");
+
+        let mut migrated: PersistedSelfHostedConfig = serde_json::from_value(value).unwrap();
+        assert!(!migrated.connector_desired_running);
+        ensure_host_profile_identity(&mut migrated).unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(!migrated.connector_desired_running);
+    }
+
+    #[test]
+    fn old_schema_explicit_running_is_unconditionally_migrated_to_stopped() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value["schemaVersion"] = serde_json::json!(BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION);
+        value["connectorDesiredRunning"] = serde_json::json!(true);
+
+        let mut migrated: PersistedSelfHostedConfig = serde_json::from_value(value).unwrap();
+        assert!(migrated.connector_desired_running);
+        ensure_host_profile_identity(&mut migrated).unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(!migrated.connector_desired_running);
+    }
+
+    #[test]
+    fn management_binding_requires_the_exact_persisted_config_except_desired_state() {
+        let original = config();
+        let binding = SelfHostedManagementBinding {
+            persisted_config_identity: persisted_management_config_identity(&original).unwrap(),
+            steady_launch_key: ManagementLaunchKey::DefaultProduction,
+        };
+        assert!(binding.matches_config(&original));
+
+        let mut desired_running = original.clone();
+        desired_running.connector_desired_running = true;
+        assert!(binding.matches_config(&desired_running));
+
+        let mut different_origin = original.clone();
+        different_origin.issuer_url = "https://rotated.company.test/".to_string();
+        assert!(!binding.matches_config(&different_origin));
+
+        let mut rotation_started = original;
+        rotation_started.bootstrap_rotation_pending = true;
+        rotation_started.bootstrap_rotation_request_phase =
+            Some(BootstrapRotationRequestPhase::Requested);
+        rotation_started.bootstrap_file_name =
+            Some("host-bootstrap-rotation.twhostboot2".to_string());
+        rotation_started.bootstrap_publication_correlation =
+            Some("dashboard-bootstrap-publication-rotation".to_string());
+        assert!(!binding.matches_config(&rotation_started));
+    }
+
+    #[test]
+    fn config_replacement_persists_stopped_then_drains_before_new_commit() {
+        use std::cell::RefCell;
+
+        let mut previous = config();
+        previous.connector_desired_running = true;
+        let mut next = previous.clone();
+        next.listen_port = 444;
+        let binding = SelfHostedManagementBinding {
+            persisted_config_identity: persisted_management_config_identity(&previous).unwrap(),
+            steady_launch_key: ManagementLaunchKey::DefaultProduction,
+        };
+        let mut owner = SelfHostedDeploymentOperationOwner {
+            active_management: Some(binding),
+            startup_restore_error: Some("old restore error".to_string()),
+        };
+        let events = RefCell::new(Vec::new());
+
+        let committed = commit_config_replacement_with_barrier(
+            &mut owner,
+            Some(previous),
+            next,
+            false,
+            |launch_key| {
+                assert_eq!(launch_key, &ManagementLaunchKey::DefaultProduction);
+                events.borrow_mut().push("drain".to_string());
+                Ok(())
+            },
+            |config| {
+                events.borrow_mut().push(format!(
+                    "persist:{}:{}",
+                    config.listen_port, config.connector_desired_running
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!committed.connector_desired_running);
+        assert!(owner.active_management.is_none());
+        assert_eq!(
+            events.into_inner(),
+            [
+                "persist:443:false".to_string(),
+                "drain".to_string(),
+                "persist:444:false".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_replacement_drain_failure_keeps_old_stopped_and_blocks_new_commit() {
+        use std::cell::RefCell;
+
+        let mut previous = config();
+        previous.connector_desired_running = true;
+        let mut next = previous.clone();
+        next.listen_port = 444;
+        let binding = SelfHostedManagementBinding {
+            persisted_config_identity: persisted_management_config_identity(&previous).unwrap(),
+            steady_launch_key: ManagementLaunchKey::DefaultProduction,
+        };
+        let mut owner = SelfHostedDeploymentOperationOwner {
+            active_management: Some(binding),
+            startup_restore_error: None,
+        };
+        let events = RefCell::new(Vec::new());
+
+        assert!(commit_config_replacement_with_barrier(
+            &mut owner,
+            Some(previous),
+            next,
+            false,
+            |_| {
+                events.borrow_mut().push("drain".to_string());
+                Err("redacted drain failure".to_string())
+            },
+            |config| {
+                events.borrow_mut().push(format!(
+                    "persist:{}:{}",
+                    config.listen_port, config.connector_desired_running
+                ));
+                Ok(())
+            },
+        )
+        .is_err());
+
+        assert!(owner.active_management.is_some());
+        assert_eq!(
+            events.into_inner(),
+            ["persist:443:false".to_string(), "drain".to_string()]
+        );
+    }
+
+    #[test]
+    fn center_stop_requires_the_exact_absent_session_postcondition() {
+        let script = build_remote_center_stop_script("/usr/bin/tmux");
+        let kill = script
+            .find("/usr/bin/tmux kill-session -t tw-relay-v2-center")
+            .unwrap();
+        let postcondition = script
+            .find("if /usr/bin/tmux has-session -t tw-relay-v2-center")
+            .unwrap();
+
+        assert!(kill < postcondition);
+        assert!(script[postcondition..].contains("center_has_session_status=$?"));
+        assert!(script[postcondition..].contains("test \"$center_has_session_status\" -eq 1"));
+        assert!(!script[postcondition..].contains("|| true"));
     }
 
     #[test]

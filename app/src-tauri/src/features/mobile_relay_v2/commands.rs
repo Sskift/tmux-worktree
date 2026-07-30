@@ -216,6 +216,15 @@ impl MobileRelayV2ManagementCommandState {
         operation: MobileRelayV2ManagementOperation,
         input: ManagementInput,
     ) -> Result<ManagementOutcome, ManagementError> {
+        self.call_with_input_for_launch_key(operation, input, None)
+    }
+
+    fn call_with_input_for_launch_key(
+        &self,
+        operation: MobileRelayV2ManagementOperation,
+        input: ManagementInput,
+        expected_launch_key: Option<&ManagementLaunchKey>,
+    ) -> Result<ManagementOutcome, ManagementError> {
         if self.disposed.load(Ordering::Acquire) {
             return Err(channel_closed_error());
         }
@@ -224,7 +233,13 @@ impl MobileRelayV2ManagementCommandState {
         }
         let owner = self.owner.lock().unwrap();
         match &*owner {
-            ManagementCommandOwner::Ready { manager, .. } => {
+            ManagementCommandOwner::Ready {
+                launch_key,
+                manager,
+            } => {
+                if expected_launch_key.is_some_and(|expected| expected != launch_key) {
+                    return Err(not_ready_error());
+                }
                 let mut outcome = match manager.request_with_input(operation.into(), input) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -260,41 +275,127 @@ impl MobileRelayV2ManagementCommandState {
         }
     }
 
-    pub(crate) fn start_connector_and_require_base_readiness(&self) -> Result<(), ManagementError> {
-        self.start_connector_and_require_base_readiness_with_bounds(
-            CONNECTOR_READINESS_TIMEOUT,
-            CONNECTOR_READINESS_POLL_INTERVAL,
-        )
-    }
-
-    fn start_connector_and_require_base_readiness_with_bounds(
+    pub(crate) fn restore_self_hosted_connector_desired_state(
         &self,
-        timeout: Duration,
-        poll_interval: Duration,
+        expected_launch_key: &ManagementLaunchKey,
     ) -> Result<(), ManagementError> {
         use super::management_protocol_v2::BaseConnectorReadiness;
 
-        let deadline = Instant::now() + timeout;
-        let status = self.call_with_input(
+        let status = successful_v2_result(self.call_with_input_for_launch_key(
             MobileRelayV2ManagementOperation::Status,
             ManagementInput::None,
+            Some(expected_launch_key),
+        )?)?;
+        match super::management_protocol_v2::projection_base_connector_readiness(&status) {
+            BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => return Ok(()),
+            BaseConnectorReadiness::NotReady
+                if connector_projection_status(&status) == Some("stopped") => {}
+            BaseConnectorReadiness::NotReady => return Err(not_ready_error()),
+        }
+        match base_connector_readiness(self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::StartConnector,
+            ManagementInput::None,
+            Some(expected_launch_key),
+        )?)? {
+            BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => Ok(()),
+            BaseConnectorReadiness::NotReady => Err(not_ready_error()),
+        }
+    }
+
+    pub(crate) fn start_self_hosted_connector(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+    ) -> Result<ManagementOutcome, ManagementError> {
+        use super::management_protocol_v2::BaseConnectorReadiness;
+
+        let outcome = self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::StartConnector,
+            ManagementInput::None,
+            Some(expected_launch_key),
+        )?;
+        match base_connector_readiness(outcome.clone())? {
+            BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => Ok(outcome),
+            BaseConnectorReadiness::NotReady => Err(not_ready_error()),
+        }
+    }
+
+    pub(crate) fn stop_self_hosted_connector_for_launch_key(
+        &self,
+        expected_launch_key: Option<&ManagementLaunchKey>,
+    ) -> Result<ManagementOutcome, ManagementError> {
+        let outcome = self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::StopConnector,
+            ManagementInput::None,
+            expected_launch_key,
+        )?;
+        let result = successful_v2_result(outcome.clone())?;
+        if connector_projection_status(&result) == Some("stopped") {
+            Ok(outcome)
+        } else {
+            Err(not_ready_error())
+        }
+    }
+
+    pub(crate) fn ensure_self_hosted_connector_start_accepted(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+    ) -> Result<super::management_protocol_v2::BaseConnectorReadiness, ManagementError> {
+        use super::management_protocol_v2::BaseConnectorReadiness;
+
+        let status = self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::Status,
+            ManagementInput::None,
+            Some(expected_launch_key),
         )?;
         let mut readiness = base_connector_readiness(status)?;
         if readiness == BaseConnectorReadiness::Ready {
-            return Ok(());
+            return Ok(readiness);
         }
         if readiness == BaseConnectorReadiness::NotReady {
-            readiness = base_connector_readiness(self.call_with_input(
+            readiness = base_connector_readiness(self.call_with_input_for_launch_key(
                 MobileRelayV2ManagementOperation::StartConnector,
                 ManagementInput::None,
+                Some(expected_launch_key),
             )?)?;
             if readiness == BaseConnectorReadiness::Ready {
-                return Ok(());
+                return Ok(readiness);
             }
             if readiness != BaseConnectorReadiness::Starting {
                 return Err(not_ready_error());
             }
         }
+        Ok(readiness)
+    }
+
+    pub(crate) fn wait_for_self_hosted_connector_base_readiness(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+        readiness: super::management_protocol_v2::BaseConnectorReadiness,
+    ) -> Result<(), ManagementError> {
+        self.wait_for_self_hosted_connector_base_readiness_with_bounds(
+            expected_launch_key,
+            readiness,
+            CONNECTOR_READINESS_TIMEOUT,
+            CONNECTOR_READINESS_POLL_INTERVAL,
+        )
+    }
+
+    fn wait_for_self_hosted_connector_base_readiness_with_bounds(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+        mut readiness: super::management_protocol_v2::BaseConnectorReadiness,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<(), ManagementError> {
+        use super::management_protocol_v2::BaseConnectorReadiness;
+
+        if readiness == BaseConnectorReadiness::Ready {
+            return Ok(());
+        }
+        if readiness != BaseConnectorReadiness::Starting {
+            return Err(not_ready_error());
+        }
+        let deadline = Instant::now() + timeout;
 
         loop {
             let now = Instant::now();
@@ -302,9 +403,10 @@ impl MobileRelayV2ManagementCommandState {
                 return Err(not_ready_error());
             }
             thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
-            readiness = base_connector_readiness(self.call_with_input(
+            readiness = base_connector_readiness(self.call_with_input_for_launch_key(
                 MobileRelayV2ManagementOperation::Status,
                 ManagementInput::None,
+                Some(expected_launch_key),
             )?)?;
             match readiness {
                 BaseConnectorReadiness::Ready => return Ok(()),
@@ -492,12 +594,23 @@ pub(crate) async fn mobile_relay_v2_management_call(
     operation: MobileRelayV2ManagementOperation,
     input: serde_json::Value,
     state: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
+    deployment: State<'_, Arc<super::MobileRelayV2SelfHostedDeploymentState>>,
 ) -> Result<ManagementOutcome, ManagementError> {
     let input = decode_command_input(operation, input)?;
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.call_with_input(operation, input))
-        .await
-        .map_err(|_| channel_closed_error())?
+    let deployment = Arc::clone(deployment.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(outcome) = super::call_relay_v2_self_hosted_connector_operation(
+            deployment.as_ref(),
+            state.as_ref(),
+            operation,
+        ) {
+            return outcome;
+        }
+        state.call_with_input(operation, input)
+    })
+    .await
+    .map_err(|_| channel_closed_error())?
 }
 
 #[tauri::command]
@@ -726,6 +839,11 @@ fn not_ready_error() -> ManagementError {
 fn base_connector_readiness(
     outcome: ManagementOutcome,
 ) -> Result<super::management_protocol_v2::BaseConnectorReadiness, ManagementError> {
+    let result = successful_v2_result(outcome)?;
+    Ok(super::management_protocol_v2::projection_base_connector_readiness(&result))
+}
+
+fn successful_v2_result(outcome: ManagementOutcome) -> Result<serde_json::Value, ManagementError> {
     if !outcome.ok {
         return Err(outcome.error.unwrap_or_else(channel_closed_error));
     }
@@ -734,11 +852,15 @@ fn base_connector_readiness(
     {
         return Err(not_ready_error());
     }
-    Ok(outcome
-        .result
-        .as_ref()
-        .map(super::management_protocol_v2::projection_base_connector_readiness)
-        .unwrap_or(super::management_protocol_v2::BaseConnectorReadiness::NotReady))
+    outcome.result.ok_or_else(not_ready_error)
+}
+
+fn connector_projection_status(result: &serde_json::Value) -> Option<&str> {
+    result
+        .get("connector")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|connector| connector.get("status"))
+        .and_then(serde_json::Value::as_str)
 }
 
 fn map_start_error(error: ManagementStartError) -> ManagementError {
@@ -974,7 +1096,201 @@ mod tests {
         .unwrap();
         let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
 
-        assert_eq!(state.start_connector_and_require_base_readiness(), Ok(()));
+        assert_eq!(
+            state.ensure_self_hosted_connector_start_accepted(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Ok(super::super::management_protocol_v2::BaseConnectorReadiness::Ready)
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_restore_arms_one_controller_owned_attempt_without_polling() {
+        let ids = [[13; 16], [14; 16], [15; 16]];
+        let stopped = command_regression_projection_response(
+            ids[0],
+            serde_json::json!({"status": "stopped"}),
+        );
+        let starting_connector = serde_json::json!({"status": "starting", "hostId": "mac-admin"});
+        let starting = command_regression_projection_response(ids[1], starting_connector.clone());
+        let after = command_regression_projection_response(ids[2], starting_connector);
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) case \"$request\" in *'\"operation\":\"status\"'*) printf '%s\\n' '{}' ;; *) exit 77 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"start_connector\"'*) printf '%s\\n' '{}' ;; *) exit 78 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"status\"'*) printf '%s\\n' '{}' ;; *) exit 79 ;; esac ;; *) exit 80 ;; esac; done",
+            request_ids[0],
+            stopped,
+            request_ids[1],
+            starting,
+            request_ids[2],
+            after,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(
+            state.restore_self_hosted_connector_desired_state(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Ok(())
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_restore_reuses_an_already_armed_starting_cut() {
+        let ids = [[16; 16], [17; 16]];
+        let starting_connector = serde_json::json!({"status": "starting", "hostId": "mac-admin"});
+        let first = command_regression_projection_response(ids[0], starting_connector.clone());
+        let after = command_regression_projection_response(ids[1], starting_connector);
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'\"operation\":\"start_connector\"'*) exit 81 ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 82 ;; esac; done",
+            request_ids[0],
+            first,
+            request_ids[1],
+            after,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(
+            state.restore_self_hosted_connector_desired_state(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Ok(())
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_restore_does_not_override_a_nonretryable_failed_cut() {
+        let ids = [[20; 16], [21; 16]];
+        let failed_connector = serde_json::json!({"status": "failed", "retryable": false});
+        let first = command_regression_projection_response(ids[0], failed_connector.clone());
+        let after = command_regression_projection_response(ids[1], failed_connector);
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'\"operation\":\"start_connector\"'*) exit 85 ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 86 ;; esac; done",
+            request_ids[0],
+            first,
+            request_ids[1],
+            after,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(
+            state.restore_self_hosted_connector_desired_state(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Err(not_ready_error())
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_restore_rejects_a_different_published_launch_identity_before_request() {
+        let script = "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; while IFS= read -r request; do exit 87; done".to_string();
+        let manager =
+            ManagementChildManager::start_v2_command_regression_script(script, [26; 16]).unwrap();
+        let identity = super::super::management_child::ManagementPreparedFileIdentity {
+            device: 1,
+            inode: 2,
+            length: 3,
+            mode: 0o600,
+            uid: 501,
+            links: 1,
+            sha256: [4; 32],
+        };
+        let published_key = ManagementLaunchKey::SelfHostedDarwinArm64 {
+            account_home: std::path::PathBuf::from("/Users/test"),
+            credential_https_ca_input: std::path::PathBuf::from("/Users/test/issuer-ca.pem"),
+            carrier_wss_ca_input: std::path::PathBuf::from("/Users/test/carrier-ca.pem"),
+            credential_https_ca_identity: identity.clone(),
+            carrier_wss_ca_identity: identity,
+            profile_lineage: "00112233445566778899aabbccddeeff".to_string(),
+            provision_profile_input: None,
+            bootstrap_secret_input: None,
+            bootstrap_secret_mode: None,
+        };
+        let state = MobileRelayV2ManagementCommandState::from_start_with_artifacts(
+            Ok(manager),
+            published_key,
+            EnrollmentArtifactRegistry::disabled(),
+        );
+
+        assert_eq!(
+            state.restore_self_hosted_connector_desired_state(
+                &ManagementLaunchKey::DefaultProduction
+            ),
+            Err(not_ready_error())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_stop_uses_the_management_owner_and_requires_exact_stopped() {
+        let ids = [[18; 16], [19; 16]];
+        let stopped_connector = serde_json::json!({"status": "stopped"});
+        let stopped = command_regression_projection_response(ids[0], stopped_connector.clone());
+        let after = command_regression_projection_response(ids[1], stopped_connector);
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) case \"$request\" in *'\"operation\":\"stop_connector\"'*) printf '%s\\n' '{}' ;; *) exit 83 ;; esac ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 84 ;; esac; done",
+            request_ids[0],
+            stopped,
+            request_ids[1],
+            after,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert!(state
+            .stop_self_hosted_connector_for_launch_key(Some(
+                &ManagementLaunchKey::DefaultProduction,
+            ))
+            .is_ok());
         assert!(
             state
                 .call(MobileRelayV2ManagementOperation::Status)
@@ -1025,8 +1341,13 @@ mod tests {
         .unwrap();
         let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
 
+        let readiness = state
+            .ensure_self_hosted_connector_start_accepted(&ManagementLaunchKey::DefaultProduction)
+            .unwrap();
         assert_eq!(
-            state.start_connector_and_require_base_readiness_with_bounds(
+            state.wait_for_self_hosted_connector_base_readiness_with_bounds(
+                &ManagementLaunchKey::DefaultProduction,
+                readiness,
                 Duration::from_secs(1),
                 Duration::from_millis(1),
             ),
@@ -1074,8 +1395,13 @@ mod tests {
         .unwrap();
         let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
 
+        let readiness = state
+            .ensure_self_hosted_connector_start_accepted(&ManagementLaunchKey::DefaultProduction)
+            .unwrap();
         assert_eq!(
-            state.start_connector_and_require_base_readiness_with_bounds(
+            state.wait_for_self_hosted_connector_base_readiness_with_bounds(
+                &ManagementLaunchKey::DefaultProduction,
+                readiness,
                 Duration::from_millis(1),
                 Duration::from_millis(1),
             ),

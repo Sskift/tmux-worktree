@@ -31,21 +31,47 @@ pub fn run() {
             app.manage(Arc::new(FeishuBridgeRuntimeState::default()));
             app.manage(Arc::new(MobileRelayState::default()));
             let relay_v2_deployment = Arc::new(MobileRelayV2SelfHostedDeploymentState::default());
-            let relay_v2_management = match prepare_relay_v2_self_hosted_management_prerequisites()
-            {
-                Ok(None) => MobileRelayV2ManagementCommandState::start(&app.handle()),
-                Ok(Some(prepared)) => {
-                    let selection = prepared.selection();
-                    MobileRelayV2ManagementCommandState::start_self_hosted(
-                        &app.handle(),
-                        selection,
-                        move || prepared.commit_ready(),
-                    )
+            let (relay_v2_management, restore_self_hosted_connector) =
+                match prepare_relay_v2_self_hosted_management_prerequisites() {
+                    Ok(None) => (
+                        MobileRelayV2ManagementCommandState::start(&app.handle()),
+                        None,
+                    ),
+                    Ok(Some(prepared)) => {
+                        let selection = prepared.selection();
+                        match prepared.management_binding() {
+                            Ok(binding) => (
+                                MobileRelayV2ManagementCommandState::start_self_hosted(
+                                    &app.handle(),
+                                    selection,
+                                    move || prepared.commit_ready(),
+                                ),
+                                Some(binding),
+                            ),
+                            Err(_) => (MobileRelayV2ManagementCommandState::unavailable(), None),
+                        }
+                    }
+                    Err(_) => (MobileRelayV2ManagementCommandState::unavailable(), None),
+                };
+            let relay_v2_management = Arc::new(relay_v2_management);
+            app.manage(Arc::clone(&relay_v2_management));
+            app.manage(Arc::clone(&relay_v2_deployment));
+            if let Some(binding) = restore_self_hosted_connector {
+                let deployment = Arc::clone(&relay_v2_deployment);
+                let management = Arc::clone(&relay_v2_management);
+                if deployment
+                    .publish_self_hosted_management_binding(binding.clone())
+                    .is_ok()
+                {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let _ = restore_relay_v2_self_hosted_connector_desired_state(
+                            deployment.as_ref(),
+                            management.as_ref(),
+                            &binding,
+                        );
+                    });
                 }
-                Err(_) => MobileRelayV2ManagementCommandState::unavailable(),
-            };
-            app.manage(Arc::new(relay_v2_management));
-            app.manage(relay_v2_deployment);
+            }
             app.manage(Arc::new(GitFetchState::default()));
             app.manage(Arc::new(HostState::default()));
             setup_clipboard_bindings();

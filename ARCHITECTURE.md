@@ -327,7 +327,7 @@ broker、WSS ingress 与 connector 在后端仍是可诊断的独立生命周期
 
 Dashboard 的 Relay v2 self-hosted 路径是与上述 v1 owner 分离的显式 deployment port。renderer 只提交非敏感配置与本机 TLS 文件路径；bind address默认空且只接受显式输入的RFC1918 IPv4，`0.0.0.0`仅作为用户明确选择的全网卡例外。Tauri 串行拥有配置持久化、既有 SSH transport、完整 canonical `tw-cli/` directory staging、明确限定的 Linux x86_64 / Node.js >=22.16 / ext-family filesystem versioned bundle 发布、远端 tmux Center lifecycle 与状态探测；远端 preflight 在创建 self-hosted layout 或启动 Center 前拒绝旧 Node，且不改变通用 CLI/Dashboard 的 Node.js 20+ 要求。远端 root/tls/state/bundles/bootstrap 的每个既存对象都必须通过 no-symlink、real directory/file、current remote uid、exact mode 检查；scp staging 再递归拒绝 symlink/special/hard-link/foreign-owner，之后 dirs=0700、files=0600收敛并复核关键文件。`current` 只由 `ln -s` 后的 GNU `mv -Tf` 原子替换，避免跟随已有 directory symlink。TLS key、leaf certificate、独立 CA 先由 Tauri 以 `O_NOFOLLOW|O_CLOEXEC` fd打开，在lstat/fstat/read/fstat identity保持一致后只把descriptor bytes经SSH stdin发布；deployment profile固定0600，SQLite credential/continuity/keyring directory固定0700。CLI 参数只由单一 builder 组装：`--v2-single-node-self-hosted` 配合 `--host`、`--port`、独立 HTTPS advertised origin、TLS key/cert 和 state-directory path；没有 v1 shared secret 或 credential value。保存后的参数 fingerprint 必须与远端 profile 一致才允许启动。
 
-Center start 对 live tmux session 是幂等 no-op，stop/restart 保留 state directory，并且正常 restart 省略 `--host-bootstrap-output`。首次尚无 Host bootstrap correlation 时，owner 必须创建并持久化一个新的非敏感 attempt identifier和一个远端 output path，并在同一次 Center invocation 同时传入 `--host-bootstrap-output <same-path>` 与 `--v2-self-hosted-bootstrap-correlation <same-attempt-id>`；若该首次启动在产出或ack前失败，repair只复用这对pending correlation/path，绝不创建第二个filename，credential是否仍需首次bootstrap继续由Broker durable publication authority决定。Tauri 通过复用同一 `~/.tmux-worktree/ssh/%C` ControlMaster 的非交互 SSH stdout cut读取该 owner-only 0600 file，限制为一个最多 8193-byte 的 `twhostboot2` record，原子写入本机 private 0600 file，确认后删除远端副本；renderer 永远只获得 availability。若启动时已有 self-hosted config，deployment owner先检查/创建本机 `~/.tmux-worktree` 与native contract固定的 `relay-v2-host-credential-atomic-file-cell-v1` exact 0700 directory，并在自身private 0700 namespace准备0600 CA copy、严格Host production profile input及存在时的bootstrap input；native fixed directory path不进入Node argv/options/authority。deployment owner 向 Host 分支只提供 issuer/WSS root、本机profile/CA path 与可选 bootstrap input path的窄 handoff，不解析 token、不签发 credential，也不复制 Host、worktree 或 tmux 业务。Start Center 在 exact self-hosted management child ready并提交本地input消费后，先通过同一 `MobileRelayV2ManagementCommandState` 读取 exact current projection；若 Host credential 为 `ready`、authority 为无 reason 的 `node`、connector 有 exact `host.registered` acknowledgement 且六项 base capability 全部存在，则直接成功并且不发送新的 `start_connector`。否则只发送一次 protocol-v2 `start_connector`；Host adapter 在 canonical controller 同步发布 exact `starting` cut 后返回 typed acceptance，DNS/TCP/TLS/Upgrade/`host.registered` 仍由同一 controller attempt 持有。Tauri 把每次本地 stdio exchange 的 5 秒 corruption deadline 与网络注册等待分开，在最多 60 秒内轮询 exact status，且仍只在同一严格 ready cut 成立时返回成功；terminal/incomplete cut 或 readiness timeout 返回 `NOT_READY`，不 kill、不 poison management child。失败不停止可能早已存在的Center、不remint credential/bootstrap，也不fallback；accepted attempt和session close时的drain仍由canonical controller持有，incomplete registered cut保持enrollment不可用并作为失败返回。因此这条一键编排只建立Host注册前置条件，不能解释为Android在线、production readiness或整体GO。
+Center start 对 live tmux session 是幂等 no-op，stop/restart 保留 state directory，并且正常 restart 省略 `--host-bootstrap-output`。首次尚无 Host bootstrap correlation 时，owner 必须创建并持久化一个新的非敏感 attempt identifier和一个远端 output path，并在同一次 Center invocation 同时传入 `--host-bootstrap-output <same-path>` 与 `--v2-self-hosted-bootstrap-correlation <same-attempt-id>`；若该首次启动在产出或ack前失败，repair只复用这对pending correlation/path，绝不创建第二个filename，credential是否仍需首次bootstrap继续由Broker durable publication authority决定。Tauri 通过复用同一 `~/.tmux-worktree/ssh/%C` ControlMaster 的非交互 SSH stdout cut读取该 owner-only 0600 file，限制为一个最多 8193-byte 的 `twhostboot2` record，原子写入本机 private 0600 file，确认后删除远端副本；renderer 永远只获得 availability。若启动时已有 self-hosted config，deployment owner先检查/创建本机 `~/.tmux-worktree` 与native contract固定的 `relay-v2-host-credential-atomic-file-cell-v1` exact 0700 directory，并在自身private 0700 namespace准备0600 CA copy、严格Host production profile input及存在时的bootstrap input；native fixed directory path不进入Node argv/options/authority。deployment owner 向 Host 分支只提供 issuer/WSS root、本机profile/CA path 与可选 bootstrap input path的窄 handoff，不解析 token、不签发 credential，也不复制 Host、worktree 或 tmux 业务。Start Center 在 exact self-hosted management child ready并提交本地input消费后，先通过同一 `MobileRelayV2ManagementCommandState` 读取 exact current projection；若 Host credential 为 `ready`、authority 为无 reason 的 `node`、connector 有 exact `host.registered` acknowledgement 且六项 base capability 全部存在，则直接成功并且不发送新的 `start_connector`。否则只发送一次 protocol-v2 `start_connector`；Host adapter 在 canonical controller 同步发布 exact `starting` cut 后返回 typed acceptance，DNS/TCP/TLS/Upgrade/`host.registered` 仍由同一 controller attempt 持有。Tauri 把每次本地 stdio exchange 的 5 秒 corruption deadline 与网络注册等待分开，在最多 60 秒内轮询 exact status，且仍只在同一严格 ready cut 成立时返回成功；terminal/incomplete cut 或 readiness timeout 返回 `NOT_READY`，不 kill、不 poison management child。失败不停止可能早已存在的Center、不remint credential/bootstrap，也不fallback；accepted attempt和session close时的drain仍由canonical controller持有，incomplete registered cut保持enrollment不可用并作为失败返回。self-hosted deployment owner在私有config schema 6中唯一持久化独立`connectorDesiredRunning`；Settings的Start Host与Start Center只在exact child接受后置为true，Stop Host与Stop Center先置为false再进入同一management drain。旧schema默认迁移为false；deployment enabled和远端tmux Center running都只属于prerequisite，不能作为connector意图。Dashboard启动准备的exact持久config identity与steady launch key组成binding；startup restore在与显式Start/Stop共用的operation mutex内重验current，只有binding仍一致、desired=true、profile/credential及pending状态完整且exact bundle/TLS/Center probe ready时才执行一次status→必要时start。Tauri不轮询或重试，错误仅保存脱敏进程内status outcome；后续retry仍只进入composition-owned backoff。Stop Center还必须复核exact tmux session已经消失；复核失败返回脱敏错误但不回滚desired=false。以上一键编排与恢复只建立Host注册前置条件，不能解释为Android在线、production readiness或整体GO。
 
 self-hosted Host activation继续使用真实Mac account home、真实本地TW managed state/session，以及canonical默认 `terminal-control-v1.sock`/state；它只在既有configLoader seam注入完整静态 `{hosts: []}`，因此不读取、筛选或补全account config中的remote Host。当前对外Scope严格只有Mac本地scope，Linux devbox只承担Broker Center。trusted production不注入该loader，继续严格解析完整account Host config；`--local-development`仍使用隔离trusted home、socket与state。
 
@@ -361,7 +361,7 @@ Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 
 | git repositories/worktrees | 各目标主机的 git | `tw` managed create；Dashboard orphan cleanup | 工作区内容和 dirty 状态由 git 决定 |
 | `~/.tmux-worktree/state.json` | 目标主机上的 `tw` | `tw` session/RPC lifecycle | managed worktree/terminal registry；mutation 使用跨进程锁和原子替换，损坏或未知 schema 时 fail closed |
 | `~/.tmux-worktree.json` | 用户配置 | CLI 和 Dashboard | projects、hosts、worktree base、mobile relay，以及非敏感的 `feishuBridge.larkProfile`；跨进程写入必须持锁并保留未知字段，Lark credential 不写入这里 |
-| `~/.tmux-worktree/relay-v2-self-hosted/dashboard-config-v1.json` | Dashboard Relay v2 deployment owner | 显式 self-hosted opt-in、SSH Host、用户输入的 HTTPS origin、bind host/port、本机 TLS key/leaf/CA path 与非敏感 bootstrap filename；不含 token/credential |
+| `~/.tmux-worktree/relay-v2-self-hosted/dashboard-config-v1.json` | Dashboard Relay v2 deployment owner | schema 6显式self-hosted opt-in、SSH Host、HTTPS origin、bind host/port、本机TLS path、非敏感bootstrap filename与独立`connectorDesiredRunning`；任何旧schema即使夹带true也无条件迁移为stopped，不含token/credential |
 | `~/.tmux-worktree/relay-v2-self-hosted/private/host-bootstrap-*.twhostboot2` | Dashboard Tauri → canonical Host trusted source | 首次 Host 的有界 owner-only 0600 bootstrap input；不进入 renderer，Host credential 已持久化后的 restart 不再请求新 token |
 | `~/.tmux-worktree/relay-v2-self-hosted/private/{host-production-profile-input-v1.json,host-tls-ca-input.pem}` | Dashboard deployment owner → canonical Host trusted source | fd-bound选中CA的0600私有copy与冻结0600非敏感Host profile input；不含native目录path |
 | `~/.tmux-worktree/relay-v2-host-credential-atomic-file-cell-v1/` | Host native trusted factory fixed namespace | Dashboard只在self-hosted child前创建/校验current-user-owned exact0700目录；Node不接收path，native factory仍按account database home与contract固定components自行打开 |
@@ -477,9 +477,34 @@ advertise Relay v2 capabilities.
 ## Relay v2 Dashboard-owned Host desired state
 
 Dashboard hidden child仍不采用headless `relay-host --profile v2`的auto-start
-process lifecycle，也不会在冷启动时自行连接。只有用户的`start_connector`
-经同一个management composition和canonical controller成功后，该闭包才arm
-same-lineage desired state；随后只对exact
+process lifecycle，也不会在冷启动时自行连接。self-hosted deployment owner
+以私有配置schema 6的`connectorDesiredRunning`作为唯一持久connector意图；
+deployment enabled与远端Center tmux session只属于prerequisite，不能推断该
+意图，任何旧schema即使显式夹带true也必须在校验与状态复制前归一为stopped。
+Settings的Start Host/Start Center在exact
+management child接受后才持久化running；Stop Host/Stop Center先原子持久化
+stopped再调用同一management owner的drain。Stop Center必须在远端复核exact
+session不存在；无法证明时返回脱敏错误，但不能回滚stopped意图。
+
+Save/Deploy配置替换也进入同一个operation owner。persisted config identity、
+已发布binding或prepared CA identity任一改变时，owner先把旧config原子持久化为
+stopped，再按旧steady launch key等待exact `stop_connector`/drain barrier；
+只有barrier clean才把新config以stopped提交并丢弃旧binding。barrier失败不提交
+新config且保留旧binding，同时同步dispose并等待同一management child关闭以永久
+fence其retry，当前进程随后保持fail closed并要求Dashboard restart；新config写失败时旧child已经完成
+drain且旧持久状态仍为stopped。因此在stopped落盘、drain和新commit之间的任一
+Dashboard crash cut都不会让旧composition继续跨进程复活或把running意图带到
+新配置。
+
+Dashboard startup以prepared config的完整持久identity（排除可合法切换的desired
+bit）与steady management launch key组成exact binding。只有binding仍匹配current、
+desired=true且profile/credential/pending状态、bundle、TLS与Center probe全部就绪，
+才重放一次`start_connector`。restore的status→start、Settings显式Start/Stop和
+Center Start/Stop共用deployment operation mutex，并在mutex内重验current，因此
+Stop返回后旧restore不能再Start；binding或rotation/config切换一律fail closed。
+Tauri不轮询、不创建retry timer，只把restore失败以脱敏进程内outcome投影到既有
+status error。经同一个management composition和canonical controller成功后，
+该闭包才arm same-lineage desired state；随后只对exact
 `{ status: "failed", retryable: true }`按共享的1秒到15秒capped backoff调用
 同一controller的`start`，观察到`host.registered`后重置backoff。retry前会重读
 exact cut，因此nonretryable、superseded、stopped或已closed状态都不能触发
@@ -488,5 +513,6 @@ successor。
 `stop_connector`在进入既有controller stop/drain前同步disarm并fence等待中的
 timer；composition close还永久fence late arm，等待已接纳request和retry task
 收敛后再沿既有stop/drain关闭。该policy不在React observer、Tauri supervisor
-或第二套Host lifecycle中实现，也不改变default-off、空production
+或第二套Host lifecycle中实现；Tauri的startup reconcile只负责条件化的单次
+意图重放，不拥有timer或successor。该边界也不改变default-off、空production
 qualification/capability与默认Relay v1边界。
