@@ -316,6 +316,7 @@ interface CapturedOptions {
   readonly nativeModuleLoader: RelayV2HostCredentialNativeModuleLoader;
   readonly createTargetExecutionPair: RelayV2CanonicalCreateTargetExecutionPairV1;
   readonly bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | undefined;
+  readonly replacePendingBootstrap: boolean;
   readonly reauthentication: RelayV2HostShippingReauthenticationOptions | undefined;
   readonly wssTransport: RelayV2HostShippingWssTransport | undefined;
   readonly credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
@@ -482,6 +483,7 @@ function captureOptions(value: unknown): CapturedOptions {
     bootstrapSecretByteSource: deployment.bootstrapSecretByteSource as
       | RelayV2HostBootstrapSecretByteSource
       | undefined,
+    replacePendingBootstrap: false,
     reauthentication: deployment.reauthentication as
       | RelayV2HostShippingReauthenticationOptions
       | undefined,
@@ -714,6 +716,9 @@ async function startCapturedShippingRoot(
       ...(captured.bootstrapSecretByteSource === undefined
         ? {}
         : { bootstrapSecretByteSource: captured.bootstrapSecretByteSource }),
+      ...(captured.replacePendingBootstrap
+        ? { replacePendingBootstrap: true as const }
+        : {}),
       ...(startupSignal === undefined ? {} : { startupSignal }),
       ...(captured.reauthentication === undefined
         ? {}
@@ -859,6 +864,9 @@ async function startRelayV2HostShippingRootFromNativeActivationRecord(
     trustedHome: deployment.trustedHome,
     createTargetExecutionPair: openedRuntime.createTargetExecutionPair,
     bootstrapSecretByteSource: deployment.bootstrapSecretByteSource,
+    replacePendingBootstrap: lane === "self-hosted"
+      && "replacePendingBootstrap" in deployment
+      && deployment.replacePendingBootstrap === true,
     reauthentication: undefined,
     wssTransport: undefined,
     credentialHttpsTlsTrust: readRelayV2HostTlsCaTrustCut(
@@ -960,6 +968,7 @@ export async function startRelayV2HostShippingRootFromLocalDevelopmentActivation
     trustedHome: deployment.trustedHome,
     createTargetExecutionPair: openedRuntime.createTargetExecutionPair,
     bootstrapSecretByteSource: deployment.bootstrapSecretByteSource,
+    replacePendingBootstrap: false,
     reauthentication: undefined,
     wssTransport: undefined,
     credentialHttpsTlsTrust,

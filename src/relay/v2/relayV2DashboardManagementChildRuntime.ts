@@ -144,6 +144,7 @@ interface SelfHostedDarwinArm64Selection {
   readonly carrierWssCaInputPath: string;
   readonly provisionProfileInputPath?: string;
   readonly bootstrapSecretInputPath?: string;
+  readonly replacePendingBootstrap?: true;
 }
 
 function parseSelfHostedDarwinArm64Selection(
@@ -157,8 +158,9 @@ function parseSelfHostedDarwinArm64Selection(
     ["--carrier-wss-ca-input", "carrierWssCaInputPath"],
     ["--provision-profile-input", "provisionProfileInputPath"],
     ["--bootstrap-secret-input", "bootstrapSecretInputPath"],
+    ["--bootstrap-secret-mode", "replacePendingBootstrap"],
   ]);
-  const values = Object.create(null) as Record<string, string>;
+  const values = Object.create(null) as Record<string, string | true>;
   for (let index = 1; index < argv.length; index += 2) {
     const name = names.get(argv[index]!);
     const value = argv[index + 1];
@@ -167,12 +169,19 @@ function parseSelfHostedDarwinArm64Selection(
       || value.length === 0
       || value.includes("\0")
       || value.startsWith("--")
-      || !isAbsolute(value)
       || Object.hasOwn(values, name)) return null;
-    values[name] = value;
+    if (name === "replacePendingBootstrap") {
+      if (value !== "replace-pending") return null;
+      values[name] = true;
+    } else {
+      if (!isAbsolute(value)) return null;
+      values[name] = value;
+    }
   }
   if (!Object.hasOwn(values, "credentialHttpsCaInputPath")
-    || !Object.hasOwn(values, "carrierWssCaInputPath")) return null;
+    || !Object.hasOwn(values, "carrierWssCaInputPath")
+    || Object.hasOwn(values, "replacePendingBootstrap")
+      && !Object.hasOwn(values, "bootstrapSecretInputPath")) return null;
   return Object.freeze(values) as unknown as SelfHostedDarwinArm64Selection;
 }
 

@@ -109,7 +109,9 @@ export interface RelayV2HostTrustedDeploymentActivationRecord {
 }
 
 export type RelayV2HostSelfHostedDarwinArm64ActivationRecord =
-  RelayV2HostTrustedDeploymentActivationRecord;
+  RelayV2HostTrustedDeploymentActivationRecord & Readonly<{
+    replacePendingBootstrap?: true;
+  }>;
 
 export interface RelayV2HostLocalDevelopmentActivationRecord {
   readonly trustedHome: string;
@@ -137,6 +139,7 @@ export interface RelayV2HostSelfHostedDarwinArm64ShippingOptions {
   readonly carrierWssCaInputPath: string;
   readonly provisionProfileInputPath?: string;
   readonly bootstrapSecretInputPath?: string;
+  readonly replacePendingBootstrap?: true;
 }
 
 export type RelayV2HostShippingDeploymentSourceErrorCode =
@@ -480,15 +483,15 @@ function captureSelfHostedDarwinArm64Options(
     "credentialHttpsCaInputPath",
     "carrierWssCaInputPath",
   ] as const;
-  const optional = ["provisionProfileInputPath", "bootstrapSecretInputPath"] as const;
-  const allowed = new Set<string>([...required, ...optional]);
+  const optionalPaths = ["provisionProfileInputPath", "bootstrapSecretInputPath"] as const;
+  const allowed = new Set<string>([...required, ...optionalPaths, "replacePendingBootstrap"]);
   const keys = Reflect.ownKeys(descriptors);
   if (keys.some((key) => typeof key !== "string" || !allowed.has(key))
     || required.some((key) => !Object.hasOwn(descriptors[key] ?? {}, "value"))) {
     throw failure("ACTIVATION_INVALID");
   }
-  const result = Object.create(null) as Record<string, string>;
-  for (const key of [...required, ...optional]) {
+  const result = Object.create(null) as Record<string, string | true>;
+  for (const key of [...required, ...optionalPaths]) {
     const descriptor = descriptors[key];
     if (descriptor === undefined) continue;
     if (!Object.hasOwn(descriptor, "value")
@@ -497,6 +500,15 @@ function captureSelfHostedDarwinArm64Options(
       || descriptor.value.includes("\0")
       || !isAbsolute(descriptor.value)) throw failure("ACTIVATION_INVALID");
     result[key] = descriptor.value;
+  }
+  const replaceDescriptor = descriptors.replacePendingBootstrap;
+  if (replaceDescriptor !== undefined) {
+    if (!Object.hasOwn(replaceDescriptor, "value")
+      || replaceDescriptor.value !== true
+      || !Object.hasOwn(result, "bootstrapSecretInputPath")) {
+      throw failure("ACTIVATION_INVALID");
+    }
+    result.replacePendingBootstrap = true;
   }
   return Object.freeze(result) as unknown as
     Readonly<RelayV2HostSelfHostedDarwinArm64ShippingOptions>;
@@ -886,6 +898,9 @@ async function createSelfHostedDarwinArm64ActivationOwner(
       ...(ownedBootstrapSource === null
         ? {}
         : { bootstrapSecretByteSource: ownedBootstrapSource }),
+      ...(options.replacePendingBootstrap === true
+        ? { replacePendingBootstrap: true as const }
+        : {}),
       ...(signal === undefined ? {} : { startupSignal: signal }),
       closeAndDrain,
     })) as RelayV2HostSelfHostedDarwinArm64ActivationRecord;

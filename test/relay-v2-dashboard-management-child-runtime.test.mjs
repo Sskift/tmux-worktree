@@ -259,6 +259,7 @@ test("explicit self-hosted argv is closed, exact, and never falls back to produc
       "--carrier-wss-ca-input", "/private/carrier-ca.pem",
       "--provision-profile-input", "/private/profile.json",
       "--bootstrap-secret-input", "/private/bootstrap",
+      "--bootstrap-secret-mode", "replace-pending",
     ],
   }), 0);
   assert.equal(channel.raw(), "");
@@ -268,6 +269,7 @@ test("explicit self-hosted argv is closed, exact, and never falls back to produc
     carrierWssCaInputPath: "/private/carrier-ca.pem",
     provisionProfileInputPath: "/private/profile.json",
     bootstrapSecretInputPath: "/private/bootstrap",
+    replacePendingBootstrap: true,
   });
   assert.equal(calls[0].options.signal instanceof AbortSignal, true);
 
@@ -310,6 +312,27 @@ test("explicit self-hosted argv is closed, exact, and never falls back to produc
       "--credential-https-ca-input", "/private/a",
       "--carrier-wss-ca-input", "/private/b",
       "--bootstrap-secret-input", "relative/bootstrap",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+      "--bootstrap-secret-mode", "replace-pending",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+      "--bootstrap-secret-input", "/private/bootstrap",
+      "--bootstrap-secret-mode", "replace",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+      "--bootstrap-secret-input", "/private/bootstrap",
+      "--bootstrap-secret-mode", "replace-pending",
+      "--bootstrap-secret-mode", "replace-pending",
     ],
   ]) {
     const rejected = makeIo();

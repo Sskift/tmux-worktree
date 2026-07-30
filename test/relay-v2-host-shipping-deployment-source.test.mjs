@@ -778,14 +778,43 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     chmodSync(credentialCaPath, 0o600);
     chmodSync(carrierCaPath, 0o600);
 
+    await assert.rejects(
+      module.startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+        Object.freeze({
+          credentialHttpsCaInputPath: credentialCaPath,
+          carrierWssCaInputPath: carrierCaPath,
+          replacePendingBootstrap: true,
+        }),
+        Object.freeze({
+          clock: dashboardClock,
+          runtimeVersion: "0.0.0-dashboard-self-hosted-invalid-mode",
+          signal: new AbortController().signal,
+          io: Object.freeze({
+            input: dashboardInput,
+            writeFrame: dashboardWrite,
+          }),
+        }),
+      ),
+      (error) => error?.code === "ACTIVATION_INVALID",
+      "replace-pending mode cannot exist without an exact bootstrap source",
+    );
+
     if (process.platform === "darwin" && process.arch === "arm64") {
       const accountHome = createPrivateHome(60);
       const alternateHome = createPrivateHome(61);
       chmodSync(accountHome, 0o750);
       const selfHostedProfileInputPath =
         join(accountHome, "self-hosted-profile-input.json");
+      const selfHostedBootstrapInputPath =
+        join(accountHome, "self-hosted-bootstrap-input.twhostboot2");
       writeFileSync(selfHostedProfileInputPath, "profile-input", { mode: 0o600 });
+      writeFileSync(
+        selfHostedBootstrapInputPath,
+        "twhostboot2.self-hosted-rotate.rotated-secret\n",
+        { mode: 0o600 },
+      );
       chmodSync(selfHostedProfileInputPath, 0o600);
+      chmodSync(selfHostedBootstrapInputPath, 0o600);
       const selfHosted = createHarness(accountHome);
       selfHosted.expectNativeTls = true;
       globalThis.__hostDeploymentHarness = selfHosted;
@@ -794,6 +823,8 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
         credentialHttpsCaInputPath: credentialCaPath,
         carrierWssCaInputPath: carrierCaPath,
         provisionProfileInputPath: selfHostedProfileInputPath,
+        bootstrapSecretInputPath: selfHostedBootstrapInputPath,
+        replacePendingBootstrap: true,
       });
       const selfHostedManagementOptions = Object.freeze({
         clock: dashboardClock,
@@ -827,6 +858,8 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
           credentialHttpsCaInputPath: credentialCaPath,
           carrierWssCaInputPath: carrierCaPath,
           provisionProfileInputPath: selfHostedProfileInputPath,
+          bootstrapSecretInputPath: selfHostedBootstrapInputPath,
+          replacePendingBootstrap: true,
         }),
         Object.freeze({
           clock: dashboardClock,
@@ -840,6 +873,11 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
         );
       assert.equal(typeof selfHostedHandle.runDashboardManagement, "function");
       assert.equal(selfHosted.nativeIntakeLane, "self-hosted");
+      assert.equal(selfHosted.nativeIntakeOptions.replacePendingBootstrap, true);
+      assert.equal(
+        selfHosted.bootstrapSecretRaw,
+        "twhostboot2.self-hosted-rotate.rotated-secret\n",
+      );
       assert.deepEqual(
         selfHosted.events.filter(([name]) => name.startsWith("profile.")).slice(0, 3),
         [

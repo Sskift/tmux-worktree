@@ -188,7 +188,7 @@ function noEffectTerminalControlBackend() {
   };
 }
 
-function createByteSource(events) {
+function createByteSource(events, secret = BOOTSTRAP_SECRET) {
   const stats = { iterators: 0, nextCalls: 0, cancels: 0 };
   let cancelPromise = null;
   const source = Object.freeze({
@@ -201,7 +201,7 @@ function createByteSource(events) {
           if (index++ === 0) {
             return Promise.resolve({
               done: false,
-              value: Uint8Array.from(Buffer.from(`${BOOTSTRAP_SECRET}\n`, "utf8")),
+              value: Uint8Array.from(Buffer.from(`${secret}\n`, "utf8")),
             });
           }
           return Promise.resolve({ done: true, value: undefined });
@@ -886,6 +886,82 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
         "authority must retain and reuse the pending bootstrap attempt",
       );
       assert.equal(backend.swaps, 3, "recovery commits the ready credential once");
+      await facade.closeAndDrain();
+    } finally {
+      await daemon.close();
+      recovering.cleanup();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("explicit pending replacement changes only the secret and reuses the durable attempt", async () => {
+    const home = privateHome("tw-relay-v2-intake-pending-replace-home-");
+    const backend = new FakeCellBackend();
+    const first = await makeHarness("pending-replace-first", home);
+    const source = createByteSource(backend.events);
+    const failedHttps = createCredentialHttpsTransport(
+      backend.events,
+      first.hostSnapshot,
+      { fail: true },
+    );
+    try {
+      await assert.rejects(
+        intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+          trustedHome: home,
+          credentialCell: new FakeCellOwner(backend),
+          bootstrapSecretByteSource: source.source,
+          credentialHttpsTransport: failedHttps.transport,
+          canonical: first.canonical,
+        }),
+        (error) => assertRedacted(error, "BOOTSTRAP_PROVISION_FAILED"),
+      );
+      assert.equal(backend.swaps, 2);
+    } finally {
+      first.cleanup();
+    }
+
+    const recovering = await makeHarness("pending-replace-recovery", home);
+    const daemon = await startDaemon(recovering);
+    const replacementSource = createByteSource(
+      backend.events,
+      "twhostboot2.explicit-replacement.rotated-secret",
+    );
+    const recoveredHttps = createCredentialHttpsTransport(
+      backend.events,
+      recovering.hostSnapshot,
+    );
+    const replacementCell = new FakeCellOwner(backend);
+    try {
+      assert.equal(
+        await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+          trustedHome: home,
+          credentialCell: replacementCell,
+          bootstrapSecretByteSource: replacementSource.source,
+          replacePendingBootstrap: true,
+          credentialHttpsTransport: recoveredHttps.transport,
+          canonical: recovering.canonical,
+        }),
+        null,
+        "direct replacement without the exact self-hosted handoff must fail admission",
+      );
+      assert.equal(replacementSource.stats.iterators, 0);
+      assert.equal(backend.swaps, 2);
+      const selfHostedHandoff = runtimeCompositionModule
+        .issueRelayV2HostSelfHostedCapabilityActivationHandoff(replacementCell);
+      const facade = await intakeModule.openRelayV2HostPrivilegedProductionIntakeComposition({
+        trustedHome: home,
+        credentialCell: replacementCell,
+        bootstrapSecretByteSource: replacementSource.source,
+        replacePendingBootstrap: true,
+        selfHostedCapabilityActivationHandoff: selfHostedHandoff,
+        credentialHttpsTransport: recoveredHttps.transport,
+        canonical: recovering.canonical,
+      });
+      assert.equal(
+        recoveredHttps.stats.attemptIds[0],
+        failedHttps.stats.attemptIds[0],
+      );
+      assert.equal(backend.swaps, 4, "one replacement CAS precedes the ready commit");
       await facade.closeAndDrain();
     } finally {
       await daemon.close();

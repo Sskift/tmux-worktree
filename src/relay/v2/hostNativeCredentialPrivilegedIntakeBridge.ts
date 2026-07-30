@@ -34,6 +34,8 @@ export interface RelayV2HostNativeCredentialPrivilegedIntakeBridgeOptions {
   readonly profileSnapshot?: Readonly<RelayV2HostProductionProfile>;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  /** Explicit operator repair for the existing version-zero pending envelope. */
+  readonly replacePendingBootstrap?: true;
   /** Exact outer startup signal forwarded unchanged to the intake owner. */
   readonly startupSignal?: AbortSignal;
   /** Deterministic reauthentication overrides forwarded to the intake. */
@@ -270,6 +272,7 @@ async function openRelayV2HostNativeCredentialPrivilegedIntakeBridgeInternal(
       "trustedHome",
       "profileSnapshot",
       "bootstrapSecretByteSource",
+      "replacePendingBootstrap",
       "startupSignal",
       "reauthentication",
       "credentialHttpsTransport",
@@ -281,7 +284,12 @@ async function openRelayV2HostNativeCredentialPrivilegedIntakeBridgeInternal(
   const take = captured?.takeNativeModule;
   if (captured === null
     || typeof take !== "function"
-    || isAsyncFunction(take)) throw failure("SOURCE_INVALID");
+    || isAsyncFunction(take)
+    || captured.replacePendingBootstrap !== undefined
+      && captured.replacePendingBootstrap !== true
+    || captured.replacePendingBootstrap === true
+      && (!activateSelfHostedBaseCapabilities
+        || captured.bootstrapSecretByteSource === undefined)) throw failure("SOURCE_INVALID");
   let credentialHttpsTlsTrust: RelayV2HostTlsCaTrust | undefined;
   let carrierWssTlsTrust: RelayV2HostTlsCaTrust | undefined;
   try {
@@ -348,6 +356,9 @@ async function openRelayV2HostNativeCredentialPrivilegedIntakeBridgeInternal(
     bootstrapSecretByteSource: captured.bootstrapSecretByteSource as
       | RelayV2HostBootstrapSecretByteSource
       | undefined,
+    ...(captured.replacePendingBootstrap === true
+      ? { replacePendingBootstrap: true as const }
+      : {}),
     startupSignal: captured.startupSignal as AbortSignal | undefined,
     reauthentication: captured.reauthentication as
       | RelayV2HostPrivilegedProductionReauthenticationOptions

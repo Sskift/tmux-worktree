@@ -98,6 +98,11 @@ export interface RelayV2HostPrivilegedProductionIntakeCompositionOptions {
   readonly credentialCell: RelayV2HostCredentialAtomicByteCellOwner;
   /** An already-owned privileged channel. No source is selected by this owner. */
   readonly bootstrapSecretByteSource?: RelayV2HostBootstrapSecretByteSource;
+  /**
+   * Explicit self-hosted operator repair. It additionally requires the exact
+   * cell-bound selfHostedCapabilityActivationHandoff below.
+   */
+  readonly replacePendingBootstrap?: true;
   /** Exact outer startup signal; shipping forwards its existing process-owned signal. */
   readonly startupSignal?: AbortSignal;
   /** Deterministic reauthentication overrides; omission keeps the production defaults. */
@@ -203,6 +208,7 @@ interface CapturedOptions {
   readonly profileSnapshot: Readonly<RelayV2HostProductionProfile> | undefined;
   readonly cell: CapturedCell;
   readonly sourceOwner: { current: CapturedByteSource | null };
+  readonly replacePendingBootstrap: boolean;
   readonly startupSignal: AbortSignal | undefined;
   readonly reauthentication: RelayV2HostPrivilegedProductionReauthenticationOptions | undefined;
   readonly credentialHttpsTransport:
@@ -612,6 +618,7 @@ function captureOptions(
     "trustedHome",
     "profileSnapshot",
     "bootstrapSecretByteSource",
+    "replacePendingBootstrap",
     "startupSignal",
     "reauthentication",
     "credentialHttpsTransport",
@@ -650,6 +657,11 @@ function captureOptions(
     return null;
   }
   if (cell === null || source === null && fields.bootstrapSecretByteSource !== undefined
+    || fields.replacePendingBootstrap !== undefined
+      && fields.replacePendingBootstrap !== true
+    || fields.replacePendingBootstrap === true && source === null
+    || fields.replacePendingBootstrap === true
+      && fields.selfHostedCapabilityActivationHandoff === undefined
     || startupSignal === null
     || reauthentication === null
     || credentialHttpsTransport === null
@@ -672,6 +684,7 @@ function captureOptions(
     profileSnapshot,
     cell,
     sourceOwner: { current: source },
+    replacePendingBootstrap: fields.replacePendingBootstrap === true,
     startupSignal,
     reauthentication,
     credentialHttpsTransport,
@@ -975,7 +988,11 @@ export async function openRelayV2HostPrivilegedProductionIntakeComposition(
       const sourceHandle = transferSourceOwner(captured, handoff);
       owned.sourceHandle = sourceHandle;
       const candidate = await sourceHandle.readCandidate();
-      vault.provisionBootstrap(candidate);
+      if (captured.replacePendingBootstrap) {
+        vault.replacePendingBootstrap(candidate);
+      } else {
+        vault.provisionBootstrap(candidate);
+      }
       bootstrapRequired = true;
     }
 

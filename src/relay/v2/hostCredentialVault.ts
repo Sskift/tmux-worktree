@@ -206,12 +206,17 @@ function emptyEnvelope(): VaultEnvelope {
   return { credentialState: null, bootstrapSecret: null, refreshSecret: null };
 }
 
-function isPendingBootstrapEnvelope(envelope: VaultEnvelope): boolean {
+function isPendingBootstrapEnvelope(
+  envelope: VaultEnvelope,
+  binding: VaultBinding,
+): boolean {
   const state = envelope.credentialState;
   return state !== null
     && state.credentialVersion === "0"
     && state.pendingCredentialAttempt?.kind === "bootstrap"
     && state.pendingCredentialAttempt.oldCredentialVersion === "0"
+    && state.pendingCredentialAttempt.oldSecretReference
+      === binding.bootstrapSecretReference
     && envelope.bootstrapSecret !== null
     && envelope.refreshSecret === null;
 }
@@ -222,8 +227,12 @@ function isBootstrapOnlyEnvelope(envelope: VaultEnvelope): boolean {
     && envelope.refreshSecret === null;
 }
 
-function isIdempotentBootstrapEnvelope(envelope: VaultEnvelope): boolean {
-  return isBootstrapOnlyEnvelope(envelope) || isPendingBootstrapEnvelope(envelope);
+function isIdempotentBootstrapEnvelope(
+  envelope: VaultEnvelope,
+  binding: VaultBinding,
+): boolean {
+  return isBootstrapOnlyEnvelope(envelope)
+    || isPendingBootstrapEnvelope(envelope, binding);
 }
 
 function sameSecret(left: string, right: string): boolean {
@@ -232,7 +241,10 @@ function sameSecret(left: string, right: string): boolean {
   return timingSafeEqual(leftDigest, rightDigest);
 }
 
-function validateEnvelopeInvariants(envelope: VaultEnvelope): VaultEnvelope {
+function validateEnvelopeInvariants(
+  envelope: VaultEnvelope,
+  binding: VaultBinding,
+): VaultEnvelope {
   const state = envelope.credentialState;
   if (state === null) {
     if (envelope.refreshSecret !== null) {
@@ -243,7 +255,8 @@ function validateEnvelopeInvariants(envelope: VaultEnvelope): VaultEnvelope {
   if (state.credentialVersion === "0") {
     if (envelope.bootstrapSecret === null
       || envelope.refreshSecret !== null
-      || state.refreshToken !== null) {
+      || state.refreshToken !== null
+      || !isPendingBootstrapEnvelope(envelope, binding)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_STATE_INVALID");
     }
     return envelope;
@@ -257,7 +270,7 @@ function validateEnvelopeInvariants(envelope: VaultEnvelope): VaultEnvelope {
 }
 
 function encodeEnvelope(envelope: VaultEnvelope, binding: VaultBinding): Uint8Array {
-  const validated = validateEnvelopeInvariants(envelope);
+  const validated = validateEnvelopeInvariants(envelope, binding);
   let payload: Buffer;
   try {
     payload = Buffer.from(JSON.stringify({
@@ -347,7 +360,7 @@ function decodeEnvelope(raw: Uint8Array | null, binding: VaultBinding): VaultEnv
     credentialState: decodeCredentialState(parsed.credentialState, binding),
     bootstrapSecret,
     refreshSecret,
-  });
+  }, binding);
 }
 
 function validateCellRead(value: unknown): RelayV2HostCredentialAtomicByteCellRead {
@@ -381,7 +394,7 @@ function replacementEnvelope(
     credentialState: state,
     bootstrapSecret: state.credentialVersion === "0" ? current.bootstrapSecret : null,
     refreshSecret: state.credentialVersion === "0" ? null : state.refreshToken,
-  });
+  }, binding);
 }
 
 /**
@@ -431,7 +444,7 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
     return this.#admit(() => this.#withCell((transaction) => {
       let read = this.#cellRead(transaction);
       let current = decodeEnvelope(read.bytes, this.#binding);
-      if (isIdempotentBootstrapEnvelope(current)) {
+      if (isIdempotentBootstrapEnvelope(current, this.#binding)) {
         return this.#runWithBootstrapCandidate(candidate, (bootstrapSecret) => {
           if (!sameSecret(current.bootstrapSecret!, bootstrapSecret)) {
             return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
@@ -461,7 +474,7 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
           }
           read = validateCellRead(result.current);
           current = decodeEnvelope(read.bytes, this.#binding);
-          if (isIdempotentBootstrapEnvelope(current)) {
+          if (isIdempotentBootstrapEnvelope(current, this.#binding)) {
             if (!sameSecret(current.bootstrapSecret!, bootstrapSecret)) {
               return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
             }
@@ -472,6 +485,30 @@ implements RelayV2HostCredentialStorage, RelayV2HostCredentialSecretResolver {
             || current.refreshSecret !== null) {
             return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
           }
+        }
+        return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_CAS_CONFLICT");
+      });
+    }));
+  }
+
+  replacePendingBootstrap(candidate: RelayV2HostBootstrapSecretHandoffCandidate): void {
+    return this.#admit(() => this.#withCell((transaction) => {
+      const read = this.#cellRead(transaction);
+      const current = decodeEnvelope(read.bytes, this.#binding);
+      if (!isPendingBootstrapEnvelope(current, this.#binding)) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_BOOTSTRAP_ALREADY_PROVISIONED");
+      }
+      return this.#runWithBootstrapCandidate(candidate, (bootstrapSecret) => {
+        if (sameSecret(current.bootstrapSecret!, bootstrapSecret)) return;
+        const replacement = encodeEnvelope({
+          credentialState: current.credentialState,
+          bootstrapSecret,
+          refreshSecret: null,
+        }, this.#binding);
+        const result = this.#cellCompareAndSwap(transaction, read.revision, replacement);
+        if (result.status === "swapped") return;
+        if (result.status === "uncertain") {
+          return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_COMMIT_UNCERTAIN");
         }
         return fail("RELAY_V2_HOST_CREDENTIAL_VAULT_CAS_CONFLICT");
       });
