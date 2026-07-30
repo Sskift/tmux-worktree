@@ -323,6 +323,10 @@ Dashboard 的 Rust mobile-relay feature 负责保存 Relay center 与 connector 
 
 broker、WSS ingress 与 connector 在后端仍是可诊断的独立生命周期，但 Dashboard 的 **Set up Relay** 会按顺序编排它们：取得可信 WSS、部署/重启远端 broker 并轮换 Relay v1 shared secret、原子保存配置，再启动 Mac connector。固定 WSS 和单独 Save/Start 仍作为高级运维与恢复入口；`Stop connector` 只管理 Mac connector 与其本地 loopback `tw serve`。Dashboard 的 `connected` 只证明 Mac connector 已连接 broker，不证明 Android 在线；broker 部署成功也只是一轮命令结果，不伪装成持续健康状态。
 
+Dashboard 的 Relay v2 self-hosted 路径是与上述 v1 owner 分离的显式 deployment port。renderer 只提交非敏感配置与本机 TLS 文件路径；Tauri 串行拥有配置持久化、既有 SSH transport、完整 canonical `tw-cli/` directory staging、明确限定的 Linux x86_64 versioned bundle 发布、远端 tmux Center lifecycle 与状态探测。远端 root/tls/state/bundles/bootstrap 的每个既存对象都必须通过 no-symlink、real directory/file、current remote uid、exact mode 检查；scp staging 再递归拒绝 symlink/special/hard-link/foreign-owner，之后 dirs=0700、files=0600收敛并复核关键文件。`current` 只由 `ln -s` 后的 GNU `mv -Tf` 原子替换，避免跟随已有 directory symlink。TLS key、leaf certificate、独立 CA 先由 Tauri 以 `O_NOFOLLOW|O_CLOEXEC` fd打开，在lstat/fstat/read/fstat identity保持一致后只把descriptor bytes经SSH stdin发布；deployment profile固定0600，SQLite credential/continuity/keyring directory固定0700。CLI 参数只由单一 builder 组装：`--v2-single-node-self-hosted` 配合 `--host`、`--port`、独立 HTTPS advertised origin、TLS key/cert 和 state-directory path；没有 v1 shared secret 或 credential value。保存后的参数 fingerprint 必须与远端 profile 一致才允许启动。
+
+Center start 对 live tmux session 是幂等 no-op，stop/restart 保留 state directory，并且正常 restart 省略 `--host-bootstrap-output`。首次尚无 Host bootstrap correlation 时，owner 创建一个新的远端 output path；若该首次启动在产出前失败，repair只复用同一个pending correlation/path，绝不创建第二个filename，credential是否仍需首次bootstrap继续由Broker state authority决定。Tauri 通过复用同一 `~/.tmux-worktree/ssh/%C` ControlMaster 的非交互 SSH stdout cut读取该 owner-only 0600 file，限制为一个最多 8193-byte 的 `twhostboot2` record，原子写入本机 private 0600 file，确认后删除远端副本；renderer 永远只获得 availability。若启动时已有 self-hosted config，deployment owner先检查/创建本机 `~/.tmux-worktree` 与native contract固定的 `relay-v2-host-credential-atomic-file-cell-v1` exact 0700 directory，并在自身private 0700 namespace准备0600 CA copy、严格Host production profile input及存在时的bootstrap input；native fixed directory path不进入Node argv/options/authority。deployment owner 向 Host 分支只提供 issuer/WSS root、本机profile/CA path 与可选 bootstrap input path的窄 handoff，不解析 token、不签发 credential，也不复制 Host、worktree 或 tmux 业务。现有 canonical management child 仍需 Host 分支消费该 handoff并拥有 credential-aware restart，所以 deployment success 不能解释为 Host/Android ready、capability 或整体 GO。
+
 Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent message 以及 terminal input/output，但没有：
 
 - Agent 入站历史或完整双向 Timeline；
@@ -351,6 +355,11 @@ Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 
 | git repositories/worktrees | 各目标主机的 git | `tw` managed create；Dashboard orphan cleanup | 工作区内容和 dirty 状态由 git 决定 |
 | `~/.tmux-worktree/state.json` | 目标主机上的 `tw` | `tw` session/RPC lifecycle | managed worktree/terminal registry；mutation 使用跨进程锁和原子替换，损坏或未知 schema 时 fail closed |
 | `~/.tmux-worktree.json` | 用户配置 | CLI 和 Dashboard | projects、hosts、worktree base、mobile relay，以及非敏感的 `feishuBridge.larkProfile`；跨进程写入必须持锁并保留未知字段，Lark credential 不写入这里 |
+| `~/.tmux-worktree/relay-v2-self-hosted/dashboard-config-v1.json` | Dashboard Relay v2 deployment owner | 显式 self-hosted opt-in、SSH Host、用户输入的 HTTPS origin、bind host/port、本机 TLS key/leaf/CA path 与非敏感 bootstrap filename；不含 token/credential |
+| `~/.tmux-worktree/relay-v2-self-hosted/private/host-bootstrap-*.twhostboot2` | Dashboard Tauri → canonical Host trusted source | 首次 Host 的有界 owner-only 0600 bootstrap input；不进入 renderer，Host credential 已持久化后的 restart 不再请求新 token |
+| `~/.tmux-worktree/relay-v2-self-hosted/private/{host-production-profile-input-v1.json,host-tls-ca-input.pem}` | Dashboard deployment owner → canonical Host trusted source | fd-bound选中CA的0600私有copy与冻结0600非敏感Host profile input；不含native目录path |
+| `~/.tmux-worktree/relay-v2-host-credential-atomic-file-cell-v1/` | Host native trusted factory fixed namespace | Dashboard只在self-hosted child前创建/校验current-user-owned exact0700目录；Node不接收path，native factory仍按account database home与contract固定components自行打开 |
+| remote `~/.tmux-worktree/relay-v2-self-hosted/` | Dashboard deployment owner / canonical Broker CLI | versioned完整 `tw-cli` bundle、0600 TLS/profile、0700 bootstrap staging 与 dedicated SQLite state；stop/update 不删除 credential/continuity/keyring state |
 | `~/.tmux-worktree/relay-v2-host/profile-v1.json` | Relay v2 Host production profile store | `loadOrCreateRelayV2HostProductionProfile` | reference-only、create-once 的固定 contract；operator 只能经显式 v2-only 0600 input 导入，exact existing 幂等，different/corrupt/unsafe 不覆盖；不含 credential/bootstrap/refresh secret |
 | `~/.tw-dashboard-terminals.json` | Dashboard metadata | Dashboard Rust 与 relay-host | label、cwd、host/raw name、managed marker；不是 tmux 或 managed state 的替代品 |
 | `~/.tw-dashboard-layout.json` | Dashboard | Dashboard Rust | canonical schema、revision/CAS、窗口与工作区展示状态，包括 worktree/terminal 侧栏顺序 |
@@ -408,7 +417,7 @@ Host credential N-API artifact 有一条同构但完全独立命名空间的 opt
 
 ### macOS Dashboard
 
-Tauri `beforeBuildCommand` 先构建 React，再构建根 CLI；`tauri.conf.json` 把 `dist/cli.cjs` 放入 `.app/Contents/Resources/tw-cli/cli.cjs`。这形成源码级分层、产物级组合：Dashboard 自己不实现 managed creator，但随包携带精确版本的 control plane。
+Tauri `beforeBuildCommand` 先构建 React，再构建根 CLI；`tauri.conf.json` 把完整 `dist/` sibling tree 和根 `package.json` 放入 `.app/Contents/Resources/tw-cli/`。这形成源码级分层、产物级组合：Dashboard 自己不实现 managed creator，但随包携带精确版本且保持 ESM/import identity 的 canonical control plane。
 
 `app/scripts/release.sh` 当前负责 macOS bundle/DMG 构建、签名完整性校验和把 DMG 复制到 installer 目录；上传、notarization 和发布渠道在脚本外处理。脚本不发布 APK，也不把 Node.js 嵌入 `.app`。
 

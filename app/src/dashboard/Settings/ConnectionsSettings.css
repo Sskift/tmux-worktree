@@ -577,6 +577,50 @@
   margin-top: 13px;
 }
 
+.connections-relay-v2-deployment {
+  display: grid;
+  gap: 10px;
+  margin-top: 13px;
+  padding: 12px;
+  background: var(--shell-surface-2);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--shell-radius-sm);
+}
+
+.connections-relay-v2-deployment__status {
+  color: var(--shell-text-secondary);
+  font-size: 11px;
+  font-weight: 580;
+  white-space: nowrap;
+}
+
+.connections-relay-v2-deployment__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--shell-text-secondary);
+  font-size: 11px;
+}
+
+.connections-fields--relay-v2-deployment {
+  padding: 0;
+}
+
+.connections-relay-v2-deployment__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--shell-text-muted);
+  font-size: 10px;
+}
+
+.connections-relay-v2-deployment__hint {
+  margin: 0;
+  color: var(--shell-text-muted);
+  font-size: 10px;
+  line-height: 14px;
+}
+
 .connections-relay-pairing--v2 {
   margin-top: 0;
   flex-wrap: wrap;

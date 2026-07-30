@@ -37,6 +37,10 @@ export type DirectoryDialogOptions = {
   title: string;
 };
 
+export type FileDialogOptions = {
+  title: string;
+};
+
 export type ConfirmDialogOptions = {
   message: string;
   title?: string;
@@ -47,6 +51,7 @@ export interface DashboardTransport {
   listen<T>(event: string, handler: BackendEventHandler<T>): Promise<BackendUnlisten>;
   assetUrl(path: string): string;
   selectDirectory(options: DirectoryDialogOptions): Promise<string | null>;
+  selectFile(options: FileDialogOptions): Promise<string | null>;
   confirm(options: ConfirmDialogOptions): Promise<boolean>;
   currentWindow(): DashboardWindow;
   closeLifecycle?: DashboardWindowCloseLifecycle;

@@ -56,6 +56,7 @@ import {
   type RelayDraftErrors,
 } from "./connectionsModel";
 import { RelayV2EnrollmentPanel } from "./RelayV2EnrollmentPreviewPanel";
+import { RelayV2SelfHostedPanel } from "./RelayV2SelfHostedPanel";
 
 type HostEditorMode = "view" | "add" | "edit";
 type ConnectionTab = "hosts" | "relay";
@@ -1095,6 +1096,8 @@ export function ConnectionsSettings({
                 <MobileRelayV1ProfileQrCode payload={relay.v1PairingPayload} />
               )}
             </div>
+
+            <RelayV2SelfHostedPanel hosts={hosts} />
 
             <RelayV2EnrollmentPanel
               v1SharedSecretConfigured={relay.tokenConfigured}

@@ -117,6 +117,20 @@ ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" tw rpc list'
 
 `tw host attach <id> <session>` first proves that the selected remote `tw` has a working terminal-control authority, then invokes its controlled attach. Old or unavailable controllers fail closed without a direct-tmux fallback. Add `--take-over` for a graceful Feishu-to-local handoff. `--privileged-bypass` is the explicit, warned break-glass path and is never selected automatically.
 
+## Deploy an Explicit Self-hosted Relay v2 Center
+
+This is a default-off integration surface and is separate from the Relay v1 **Set up Relay** flow.
+
+1. Add and test the Linux x86_64 devbox under `Settings → Connections`.
+2. Prepare three distinct local files: the TLS private key, the server leaf certificate, and the CA certificate that the Mac Host and Android trust. Each must be an absolute, current-user-owned, single-link, exact 0600 file.
+3. Under **Relay v2 · self-hosted**, enable the explicit feature, choose the devbox, enter the root `https://` Relay URL, and set the bind host/port. The URL must not contain credentials, a path, query, or fragment; Dashboard persists exactly this user configuration and does not substitute a domain.
+4. Choose **Save v2 settings**, then **Deploy / update bundle**. Deployment publishes the complete bundled `tw-cli` directory and `package.json`, separate remote 0600 TLS/profile files, and a dedicated 0700 Broker state directory. It uses the configured SSH Host and the Dashboard ControlMaster at `~/.tmux-worktree/ssh/%C`. Existing remote root/TLS/state/bundle paths must already be owner-safe real directories/files; symlinks, special files, foreign ownership, or wrong modes fail closed. Staged bundle directories are normalized to 0700 and files to 0600 before the Linux `current` symlink is atomically replaced with GNU `mv -Tf`.
+5. Choose **Start v2 Relay Center**. The first start may request one Host bootstrap output. Its value moves directly from the remote 0600 file to a Tauri-owned local 0600 file; it is never returned to React, printed, placed in a URL, or passed as an argv value. Starting an already-running Center is a no-op. Stop and later start preserve the Broker SQLite credential/continuity/keyring state and do not request another bootstrap.
+6. Restarting a persisted self-hosted setup preflights the local Host before its management child: `~/.tmux-worktree` and the contract-fixed `relay-v2-host-credential-atomic-file-cell-v1` directory must be real current-user-owned exact 0700 directories. Tauri prepares private 0600 CA and frozen Host profile inputs, plus the bootstrap input only when one exists. The fixed native directory is never supplied to Node as a path.
+7. In the adjacent Relay v2 management card, bootstrap/start the local Host, create the reviewed one-time Android enrollment, and inspect or revoke the resulting grant. Those controls require the matching canonical Broker and Host-management branches; if the child reports `UNAVAILABLE`, update to a bundle that exposes both interfaces rather than falling back to Relay v1.
+
+The remote command is the canonical `tw relay-server --v2-single-node-self-hosted` lane with explicit bind address/port, advertised HTTPS origin, TLS paths, and state directory. TLS bytes are read through an `O_NOFOLLOW` descriptor with identity rechecks and published over SSH stdin, rather than validated and later reopened by path. Dashboard neither generates credentials nor reuses the Relay v1 shared secret. A successful deploy or running tmux session is operational state only, not Relay v2 capability/readiness evidence.
+
 ## Remote AI Commands
 
 The AI command runs on the remote host inside the `tw`-owned tmux session. Install the command on the remote host and verify `--version`.

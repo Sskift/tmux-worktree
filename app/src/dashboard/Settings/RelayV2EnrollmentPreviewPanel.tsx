@@ -84,7 +84,9 @@ export function RelayV2EnrollmentPreviewPanel({
               className="connections-button"
               onClick={view.hostCredentialAction === "bootstrap" ? onBootstrapHost : onRefreshHost}
             >
-              {view.hostCredentialAction === "bootstrap" ? "Bootstrap v2 host" : "Refresh v2 host"}
+              {view.hostCredentialAction === "bootstrap"
+                ? "Bootstrap local v2 Host"
+                : "Refresh local v2 Host"}
             </button>
           )}
           {view.connectorAction && (
@@ -94,10 +96,10 @@ export function RelayV2EnrollmentPreviewPanel({
               onClick={view.connectorAction === "stop" ? onStopConnector : onStartConnector}
             >
               {view.connectorAction === "restart"
-                ? "Restart v2 connector"
+                ? "Restart local v2 Host"
                 : view.connectorAction === "start"
-                  ? "Start v2 connector"
-                  : "Stop v2 connector"}
+                  ? "Start local v2 Host"
+                  : "Stop local v2 Host"}
             </button>
           )}
         </div>
@@ -134,14 +136,21 @@ export function RelayV2EnrollmentPreviewPanel({
         {(state.knownClientGrant.status === "active"
           || state.knownClientGrant.status === "failed"
           || state.knownClientGrant.status === "revoking") && (
-          <button
-            type="button"
-            className="connections-button connections-button--danger"
-            disabled={view.grantRevokeDisabled}
-            onClick={onRevokeKnownGrant}
-          >
-            {view.grantRevokeLabel}
-          </button>
+          <div className="connections-relay-v2-preview__review">
+            <div>
+              <strong>Known Android grant</strong>
+              <span>{state.knownClientGrant.grantId}</span>
+              <span>Status · {state.knownClientGrant.status}</span>
+            </div>
+            <button
+              type="button"
+              className="connections-button connections-button--danger"
+              disabled={view.grantRevokeDisabled}
+              onClick={onRevokeKnownGrant}
+            >
+              {view.grantRevokeLabel}
+            </button>
+          </div>
         )}
       </div>
       {view.error && (

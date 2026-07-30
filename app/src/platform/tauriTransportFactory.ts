@@ -35,6 +35,7 @@ export interface TauriTransportDependencies {
   ): Promise<BackendUnlisten>;
   assetUrl(path: string): string;
   selectDirectory(title: string): Promise<string | string[] | null>;
+  selectFile(title: string): Promise<string | string[] | null>;
   confirm(message: string, title?: string): Promise<boolean>;
   currentWindow(): RawDashboardWindow;
   setLogicalSize(width: number, height: number): Promise<void>;
@@ -91,6 +92,10 @@ export function createTauriTransport(
     assetUrl: (path) => dependencies.assetUrl(path),
     selectDirectory: async ({ title }) => {
       const result = await dependencies.selectDirectory(title);
+      return typeof result === "string" ? result : null;
+    },
+    selectFile: async ({ title }) => {
+      const result = await dependencies.selectFile(title);
       return typeof result === "string" ? result : null;
     },
     confirm: ({ message, title }) => dependencies.confirm(message, title),

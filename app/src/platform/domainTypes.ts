@@ -432,6 +432,40 @@ export type MobileRelayV2RevokeClientGrantInput = {
   reason: "user_revoked";
 };
 
+export type MobileRelayV2SelfHostedConfigInput = {
+  enabled: true;
+  brokerHostId: string;
+  issuerUrl: string;
+  listenHost: string;
+  listenPort: number;
+  tlsKeyPath: string;
+  tlsCertificatePath: string;
+  tlsCaPath: string;
+};
+
+export type MobileRelayV2SelfHostedProbeStatus =
+  | "missing"
+  | "ready"
+  | "running"
+  | "stopped"
+  | "unknown";
+
+export type MobileRelayV2SelfHostedStatus = {
+  feature: "explicit_self_hosted";
+  configured: boolean;
+  config: MobileRelayV2SelfHostedConfigInput | null;
+  bundleStatus: MobileRelayV2SelfHostedProbeStatus;
+  tlsStatus: MobileRelayV2SelfHostedProbeStatus;
+  centerStatus: MobileRelayV2SelfHostedProbeStatus;
+  hostBootstrapAvailable: boolean;
+  remoteTlsKeyPath: string;
+  remoteTlsCertificatePath: string;
+  remoteTlsCaPath: string;
+  remoteProfilePath: string;
+  remoteStateDirectory: string;
+  error: string | null;
+};
+
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 
 export type FeishuReplyMode = "topic" | "direct";

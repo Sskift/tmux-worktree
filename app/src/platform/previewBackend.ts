@@ -291,6 +291,22 @@ const relayStatus = {
   error: null,
 };
 
+const relayV2DeploymentStatus = {
+  feature: "explicit_self_hosted",
+  configured: false,
+  config: null,
+  bundleStatus: "missing",
+  tlsStatus: "missing",
+  centerStatus: "stopped",
+  hostBootstrapAvailable: false,
+  remoteTlsKeyPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.key",
+  remoteTlsCertificatePath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.crt",
+  remoteTlsCaPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/ca.pem",
+  remoteProfilePath: "~/.tmux-worktree/relay-v2-self-hosted/deployment-profile-v1.json",
+  remoteStateDirectory: "~/.tmux-worktree/relay-v2-self-hosted/state",
+  error: null,
+};
+
 const relayV2PreviewState = createFakeMobileRelayV2State(false);
 const relayV2PreviewEnrollmentExpiresAtMs = Date.now() + 5 * 60_000;
 relayV2PreviewState.hostCredential = {
@@ -423,6 +439,11 @@ transport.handlers.set("mobile_relay_start", nothing);
 transport.handlers.set("mobile_relay_stop", nothing);
 transport.handlers.set("mobile_relay_save_config", value(relayStatus));
 transport.handlers.set("mobile_relay_start_broker", value(relayStatus));
+transport.handlers.set("mobile_relay_v2_self_hosted_status", value(relayV2DeploymentStatus));
+transport.handlers.set("mobile_relay_v2_self_hosted_save_config", value(relayV2DeploymentStatus));
+transport.handlers.set("mobile_relay_v2_self_hosted_deploy", value(relayV2DeploymentStatus));
+transport.handlers.set("mobile_relay_v2_self_hosted_start_center", value(relayV2DeploymentStatus));
+transport.handlers.set("mobile_relay_v2_self_hosted_stop_center", value(relayV2DeploymentStatus));
 const feishuIntegrationStatus = {
   selectedProfile: "preview-bot",
   profileSource: "config",

@@ -9,6 +9,7 @@ import type {
   DashboardTransport,
   DashboardWindow,
   DirectoryDialogOptions,
+  FileDialogOptions,
 } from "./types";
 
 export type FakeBackendCall = {
@@ -63,6 +64,7 @@ export class FakeDashboardTransport implements DashboardTransport {
   readonly handlers = new Map<string, FakeBackendHandler>();
   readonly window = new FakeWindow();
   selectedDirectory: string | null = null;
+  selectedFile: string | null = null;
   confirmationResult = true;
   private readonly listeners = new Map<string, Set<BackendEventHandler<unknown>>>();
 
@@ -113,6 +115,10 @@ export class FakeDashboardTransport implements DashboardTransport {
 
   async selectDirectory(_options: DirectoryDialogOptions): Promise<string | null> {
     return this.selectedDirectory;
+  }
+
+  async selectFile(_options: FileDialogOptions): Promise<string | null> {
+    return this.selectedFile;
   }
 
   async confirm(_options: ConfirmDialogOptions): Promise<boolean> {

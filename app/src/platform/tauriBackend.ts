@@ -14,6 +14,7 @@ export const tauriTransport = createTauriTransport({
   listen: (event, handler) => listen(event, handler),
   assetUrl: convertFileSrc,
   selectDirectory: (title) => open({ directory: true, multiple: false, title }),
+  selectFile: (title) => open({ directory: false, multiple: false, title }),
   confirm: (message, title) => confirm(message, title ? { title } : undefined),
   currentWindow: () => ({
     isFullscreen: () => currentWindow.isFullscreen(),

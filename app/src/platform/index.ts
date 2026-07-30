@@ -5,6 +5,7 @@ export type {
   DashboardWindow,
   ConfirmDialogOptions,
   DirectoryDialogOptions,
+  FileDialogOptions,
   PtyConnection,
   PtyControlStatus,
   PtyDataEvent,

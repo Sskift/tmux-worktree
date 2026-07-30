@@ -35,6 +35,7 @@ class TauriDependenciesStub implements TauriTransportDependencies {
   envelopeHandlers = new Map<string, (message: { payload: unknown }) => void>();
   unlistened: string[] = [];
   directoryResult: string | string[] | null = null;
+  fileResult: string | string[] | null = null;
   confirmCalls: Array<{ message: string; title?: string }> = [];
   logicalSizes: Array<{ width: number; height: number }> = [];
   window = new RawWindowStub();
@@ -67,6 +68,10 @@ class TauriDependenciesStub implements TauriTransportDependencies {
 
   async selectDirectory(): Promise<string | string[] | null> {
     return this.directoryResult;
+  }
+
+  async selectFile(): Promise<string | string[] | null> {
+    return this.fileResult;
   }
 
   async confirm(message: string, title?: string): Promise<boolean> {
@@ -120,6 +125,10 @@ test("Tauri transport normalizes dialogs, assets, and physical window values", a
   );
   dependencies.directoryResult = ["/repo/one", "/repo/two"];
   assert.equal(await transport.selectDirectory({ title: "Choose one" }), null);
+  dependencies.fileResult = "/repo/tls.key";
+  assert.equal(await transport.selectFile({ title: "Choose TLS key" }), "/repo/tls.key");
+  dependencies.fileResult = ["/repo/tls.key", "/repo/tls.crt"];
+  assert.equal(await transport.selectFile({ title: "Choose one TLS file" }), null);
   assert.equal(transport.assetUrl("/tmp/icon.png"), "asset:///tmp/icon.png");
   assert.equal(
     await transport.confirm({ title: "Delete", message: "Delete host?" }),

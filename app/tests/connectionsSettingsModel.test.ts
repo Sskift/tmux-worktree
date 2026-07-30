@@ -669,7 +669,7 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
     },
   });
   assert.ok(panel);
-  const restartButton = findButtonByAccessibleName(panel, "Restart v2 connector");
+  const restartButton = findButtonByAccessibleName(panel, "Restart local v2 Host");
   assert.deepEqual([startCalls, stopCalls], [0, 0]);
   assert.equal(typeof restartButton.props.onClick, "function");
   restartButton.props.onClick?.();

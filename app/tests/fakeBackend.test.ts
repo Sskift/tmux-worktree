@@ -113,6 +113,14 @@ test("fake directory dialogs return their configured selection or cancellation",
     null,
   );
 
+  transport.selectedFile = "/repo/tls.key";
+  assert.equal(
+    await backend.dialog.selectFile({ title: "Choose TLS key" }),
+    "/repo/tls.key",
+  );
+  transport.selectedFile = null;
+  assert.equal(await backend.dialog.selectFile({ title: "Choose TLS key" }), null);
+
   transport.confirmationResult = false;
   assert.equal(
     await backend.dialog.confirm({ title: "Delete", message: "Delete this worktree?" }),

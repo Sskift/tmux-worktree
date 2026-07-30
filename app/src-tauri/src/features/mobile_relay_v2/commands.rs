@@ -56,6 +56,13 @@ pub(crate) struct MobileRelayV2ManagementCommandState {
 }
 
 impl MobileRelayV2ManagementCommandState {
+    pub(crate) fn unavailable() -> Self {
+        Self::from_start_with_artifacts(
+            Err(ManagementStartError::Unavailable),
+            EnrollmentArtifactRegistry::disabled(),
+        )
+    }
+
     pub(crate) fn start(app: &tauri::AppHandle) -> Self {
         let closer_app = app.clone();
         let artifacts = EnrollmentArtifactRegistry::new(move |label| {

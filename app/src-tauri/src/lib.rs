@@ -30,9 +30,15 @@ pub fn run() {
             app.manage(Arc::new(TerminalControlState::new()));
             app.manage(Arc::new(FeishuBridgeRuntimeState::default()));
             app.manage(Arc::new(MobileRelayState::default()));
-            app.manage(Arc::new(MobileRelayV2ManagementCommandState::start(
-                &app.handle(),
-            )));
+            let relay_v2_deployment = Arc::new(MobileRelayV2SelfHostedDeploymentState::default());
+            let relay_v2_management =
+                if prepare_relay_v2_self_hosted_management_prerequisites().is_ok() {
+                    MobileRelayV2ManagementCommandState::start(&app.handle())
+                } else {
+                    MobileRelayV2ManagementCommandState::unavailable()
+                };
+            app.manage(Arc::new(relay_v2_management));
+            app.manage(relay_v2_deployment);
             app.manage(Arc::new(GitFetchState::default()));
             app.manage(Arc::new(HostState::default()));
             setup_clipboard_bindings();
@@ -132,6 +138,11 @@ pub fn run() {
             mobile_relay_status,
             mobile_relay_v2_management_call,
             mobile_relay_v2_enrollment_artifact_show,
+            mobile_relay_v2_self_hosted_status,
+            mobile_relay_v2_self_hosted_save_config,
+            mobile_relay_v2_self_hosted_deploy,
+            mobile_relay_v2_self_hosted_start_center,
+            mobile_relay_v2_self_hosted_stop_center,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

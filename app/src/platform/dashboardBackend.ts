@@ -4,6 +4,7 @@ import type {
   DashboardWindowCloseLifecycle,
   ConfirmDialogOptions,
   DirectoryDialogOptions,
+  FileDialogOptions,
   PtyConnection,
   PtyDataEvent,
   PtyExitEvent,
@@ -50,6 +51,8 @@ import type {
   MobileRelayV2CreateEnrollmentInput,
   MobileRelayV2DashboardState,
   MobileRelayV2RevokeClientGrantInput,
+  MobileRelayV2SelfHostedConfigInput,
+  MobileRelayV2SelfHostedStatus,
   MobileRelayV2ShowEnrollmentArtifactInput,
   OrphanedWorktree,
   PlainTerminal,
@@ -101,6 +104,14 @@ export interface MobileRelayV2ProductAdapter {
   revokeClientGrant(
     input: MobileRelayV2RevokeClientGrantInput,
   ): Promise<MobileRelayV2DashboardState>;
+}
+
+export interface MobileRelayV2SelfHostedDeploymentPort {
+  status(): Promise<MobileRelayV2SelfHostedStatus>;
+  saveConfig(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
+  deploy(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
+  startCenter(input: MobileRelayV2SelfHostedConfigInput): Promise<MobileRelayV2SelfHostedStatus>;
+  stopCenter(): Promise<MobileRelayV2SelfHostedStatus>;
 }
 
 export interface DashboardBackend {
@@ -204,6 +215,7 @@ export interface DashboardBackend {
     startBroker(args: MobileRelayBrokerInput): Promise<MobileRelayStatus>;
     stop(): Promise<void>;
     v2: MobileRelayV2ProductAdapter;
+    v2Deployment: MobileRelayV2SelfHostedDeploymentPort;
   };
   feishu: FeishuProductAdapter;
   persistence: {
@@ -216,6 +228,7 @@ export interface DashboardBackend {
   };
   dialog: {
     selectDirectory(options: DirectoryDialogOptions): Promise<string | null>;
+    selectFile(options: FileDialogOptions): Promise<string | null>;
     confirm(options: ConfirmDialogOptions): Promise<boolean>;
   };
   window: {
@@ -634,6 +647,31 @@ export function createDashboardBackend(
         transport.invoke<MobileRelayStatus>("mobile_relay_start_broker", { args }),
       stop: () => transport.invoke<void>("mobile_relay_stop"),
       v2: adapters.relayV2 ?? createUnavailableMobileRelayV2Adapter(),
+      v2Deployment: {
+        status: () =>
+          transport.invoke<MobileRelayV2SelfHostedStatus>(
+            "mobile_relay_v2_self_hosted_status",
+          ),
+        saveConfig: (args) =>
+          transport.invoke<MobileRelayV2SelfHostedStatus>(
+            "mobile_relay_v2_self_hosted_save_config",
+            { args },
+          ),
+        deploy: (args) =>
+          transport.invoke<MobileRelayV2SelfHostedStatus>(
+            "mobile_relay_v2_self_hosted_deploy",
+            { args },
+          ),
+        startCenter: (args) =>
+          transport.invoke<MobileRelayV2SelfHostedStatus>(
+            "mobile_relay_v2_self_hosted_start_center",
+            { args },
+          ),
+        stopCenter: () =>
+          transport.invoke<MobileRelayV2SelfHostedStatus>(
+            "mobile_relay_v2_self_hosted_stop_center",
+          ),
+      },
     },
     feishu: {
       integrationStatus: () =>
@@ -686,6 +724,7 @@ export function createDashboardBackend(
     },
     dialog: {
       selectDirectory: (options) => transport.selectDirectory(options),
+      selectFile: (options) => transport.selectFile(options),
       confirm: (options) => transport.confirm(options),
     },
     window: {

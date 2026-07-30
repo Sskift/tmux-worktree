@@ -98,6 +98,16 @@ const relayArgs = {
   hostId: "dashboard-host",
   secret: "test-secret",
 };
+const relayV2DeploymentArgs = {
+  enabled: true as const,
+  brokerHostId: "host-1",
+  issuerUrl: "https://relay.example.test/",
+  listenHost: "0.0.0.0",
+  listenPort: 8788,
+  tlsKeyPath: "/private/tls.key",
+  tlsCertificatePath: "/private/tls.crt",
+  tlsCaPath: "/private/ca.pem",
+};
 const layout = { schemaVersion: 2, sidebar: { width: 280 } };
 const layoutRevision = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
 const feishuBindingArgs: FeishuBindingInput = {
@@ -590,6 +600,36 @@ const commandCases: CommandCase[] = [
     command: "mobile_relay_stop",
     args: undefined,
     call: (backend) => backend.relay.stop(),
+  },
+  {
+    label: "relay.v2Deployment.status",
+    command: "mobile_relay_v2_self_hosted_status",
+    args: undefined,
+    call: (backend) => backend.relay.v2Deployment.status(),
+  },
+  {
+    label: "relay.v2Deployment.saveConfig",
+    command: "mobile_relay_v2_self_hosted_save_config",
+    args: { args: relayV2DeploymentArgs },
+    call: (backend) => backend.relay.v2Deployment.saveConfig(relayV2DeploymentArgs),
+  },
+  {
+    label: "relay.v2Deployment.deploy",
+    command: "mobile_relay_v2_self_hosted_deploy",
+    args: { args: relayV2DeploymentArgs },
+    call: (backend) => backend.relay.v2Deployment.deploy(relayV2DeploymentArgs),
+  },
+  {
+    label: "relay.v2Deployment.startCenter",
+    command: "mobile_relay_v2_self_hosted_start_center",
+    args: { args: relayV2DeploymentArgs },
+    call: (backend) => backend.relay.v2Deployment.startCenter(relayV2DeploymentArgs),
+  },
+  {
+    label: "relay.v2Deployment.stopCenter",
+    command: "mobile_relay_v2_self_hosted_stop_center",
+    args: undefined,
+    call: (backend) => backend.relay.v2Deployment.stopCenter(),
   },
   {
     label: "feishu.integrationStatus",
