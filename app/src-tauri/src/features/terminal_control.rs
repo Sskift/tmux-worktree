@@ -632,9 +632,7 @@ fn server_is_ready() -> bool {
 
 fn apply_local_runtime_namespace(command: &mut Command) -> Result<(), String> {
     let home = app_home_dir().ok_or("home dir not found")?;
-    command
-        .env("HOME", &home)
-        .env("TW_DASHBOARD_HOME", &home);
+    command.env("HOME", &home).env("TW_DASHBOARD_HOME", &home);
     Ok(())
 }
 
@@ -1360,8 +1358,6 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn recovery_timestamp_matches_the_canonical_terminal_control_contract() {
         let timestamp = now_rfc3339();
@@ -1437,7 +1433,7 @@ mod tests {
 
     #[test]
     fn dashboard_home_namespaces_local_terminal_control_client_and_daemon() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
         let original_home = std::env::var_os("HOME");
         let original_dashboard_home = std::env::var_os("TW_DASHBOARD_HOME");
         let original_socket = std::env::var_os("TW_TERMINAL_CONTROL_SOCKET");
@@ -1459,13 +1455,28 @@ mod tests {
                 .join("terminal-control-v1.sock")
         );
 
+        let long_dashboard_home = PathBuf::from(format!("/tmp/twd-long-{}", "隔离".repeat(80)));
+        unsafe {
+            std::env::set_var("TW_DASHBOARD_HOME", &long_dashboard_home);
+        }
+        let digest = Sha256::digest(long_dashboard_home.to_string_lossy().as_bytes());
+        let suffix = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let expected_hashed_socket = std::env::temp_dir()
+            .join(format!("tw-terminal-control-{suffix}"))
+            .join("v1.sock");
+        assert_eq!(socket_path(), expected_hashed_socket);
+        assert!(socket_path().to_string_lossy().as_bytes().len() <= 100);
+        unsafe {
+            std::env::set_var("TW_DASHBOARD_HOME", &dashboard_home);
+        }
+
         let mut command = Command::new("/bin/sh");
         apply_local_runtime_namespace(&mut command).unwrap();
         let output = command
-            .args([
-                "-c",
-                "printf '%s\\n%s\\n' \"$HOME\" \"$TW_DASHBOARD_HOME\"",
-            ])
+            .args(["-c", "printf '%s\\n%s\\n' \"$HOME\" \"$TW_DASHBOARD_HOME\""])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -1557,7 +1568,7 @@ mod tests {
 
     #[test]
     fn terminal_control_socket_checks_correlation_and_preserves_permission_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
         let path = PathBuf::from(format!(
             "/tmp/tw-terminal-control-rust-{}.sock",
             uuid::Uuid::new_v4()

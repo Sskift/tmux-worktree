@@ -55,6 +55,7 @@ printDevAppInfo({
   productName: isolated.productName,
   identifier: isolated.identifier,
   tempHome: isolated.tempHome,
+  tmuxTmpDir: isolated.tmuxTmpDir,
   overridePath,
   installPath,
 });

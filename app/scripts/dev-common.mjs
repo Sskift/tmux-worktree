@@ -11,7 +11,6 @@ export const appDir = path.resolve(__dirname, "..");
 export const stateFiles = [
   ".tmux-worktree.json",
   ".tw-dashboard-layout.json",
-  ".tw-dashboard-terminals.json",
   ".tw-dashboard-automations.json",
   ".tw-dashboard-automation-runs.json",
   ".tw-dashboard-pending-worktree-cleanup.json",
@@ -22,12 +21,21 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
   const suffix = randomBytes(3).toString("hex");
   const productName = `${prefix}-${suffix}`;
   const identifier = `dev.warpdash.tw.dev.${suffix}`;
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${productName}-`));
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "twd-"));
   const tempHome = path.join(tempRoot, "home");
-  const tmuxTmpDir = path.join(tempRoot, "tmux");
-  fs.mkdirSync(tempHome, { recursive: true });
-  fs.mkdirSync(tmuxTmpDir, { mode: 0o700 });
+  const tmuxTmpDir = tempRoot;
   fs.chmodSync(tmuxTmpDir, 0o700);
+  fs.mkdirSync(tempHome, { recursive: true });
+
+  const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
+  const tmuxSocketPath = path.join(tmuxTmpDir, `tmux-${uid}`, "default");
+  const tmuxSocketBytes = Buffer.byteLength(tmuxSocketPath, "utf8");
+  if (tmuxSocketBytes > 100) {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+    throw new Error(
+      `isolated tmux socket path is ${tmuxSocketBytes} UTF-8 bytes (maximum 100): ${tmuxSocketPath}`,
+    );
+  }
 
   for (const name of stateFiles) {
     const src = path.join(os.homedir(), name);
@@ -47,8 +55,10 @@ export function isolatedRuntimeEnv(isolated, baseEnv = process.env) {
     TMUX_TMPDIR: isolated.tmuxTmpDir,
   };
   delete env.TMUX;
+  delete env.TMUX_PANE;
   delete env.TW_TERMINAL_CONTROL_SOCKET;
   delete env.TW_TERMINAL_CONTROL_STATE;
+  delete env.TW_TERMINAL_CONTROL_OUTPUT_DIR;
   return env;
 }
 
@@ -56,7 +66,7 @@ export function isolatedLauncherScript(isolated) {
   return `#!/bin/sh
 export TW_DASHBOARD_HOME=${JSON.stringify(isolated.tempHome)}
 export TMUX_TMPDIR=${JSON.stringify(isolated.tmuxTmpDir)}
-unset TMUX TW_TERMINAL_CONTROL_SOCKET TW_TERMINAL_CONTROL_STATE
+unset TMUX TMUX_PANE TW_TERMINAL_CONTROL_SOCKET TW_TERMINAL_CONTROL_STATE TW_TERMINAL_CONTROL_OUTPUT_DIR
 exec "$(dirname "$0")/app-real" "$@"
 `;
 }
@@ -91,10 +101,18 @@ export function ensureNodeModules() {
   }
 }
 
-export function printDevAppInfo({ productName, identifier, tempHome, overridePath, installPath }) {
+export function printDevAppInfo({
+  productName,
+  identifier,
+  tempHome,
+  tmuxTmpDir,
+  overridePath,
+  installPath,
+}) {
   console.log(`productName: ${productName}`);
   console.log(`identifier: ${identifier}`);
   console.log(`isolated HOME: ${tempHome}`);
+  console.log(`isolated TMUX_TMPDIR: ${tmuxTmpDir}`);
   console.log(`override config: ${overridePath}`);
   if (installPath) {
     console.log(`installed app: ${installPath}`);
