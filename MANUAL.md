@@ -121,7 +121,7 @@ ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" tw rpc list'
 
 This is a default-off integration surface and is separate from the Relay v1 **Set up Relay** flow.
 
-1. Add and test the Linux x86_64 devbox under `Settings → Connections`.
+1. Add and test the Linux x86_64 devbox under `Settings → Connections`. This explicit self-hosted lane additionally requires Node.js 22.16 or newer and an ext-family filesystem; the general Dashboard/CLI requirement remains Node.js 20+.
 2. Prepare three distinct local files: the TLS private key, the server leaf certificate, and the CA certificate that the Mac Host and Android trust. Each must be an absolute, current-user-owned, single-link, exact 0600 file.
 3. Under **Relay v2 · self-hosted**, enable the explicit feature, choose the devbox, enter the root `https://` Relay URL, and explicitly enter the devbox private IPv4 and port. Dashboard does not prefill the address; entering `0.0.0.0` is an explicit opt-in to every interface. The URL must not contain credentials, a path, query, or fragment; Dashboard persists exactly this user configuration and does not substitute a domain.
 4. Choose **Save v2 settings**, then **Deploy / update bundle**. Deployment publishes the complete bundled `tw-cli` directory and `package.json`, separate remote 0600 TLS/profile files, and a dedicated 0700 Broker state directory. It uses the configured SSH Host and the Dashboard ControlMaster at `~/.tmux-worktree/ssh/%C`. Existing remote root/TLS/state/bundle paths must already be owner-safe real directories/files; symlinks, special files, foreign ownership, or wrong modes fail closed. Staged bundle directories are normalized to 0700 and files to 0600 before the Linux `current` symlink is atomically replaced with GNU `mv -Tf`.

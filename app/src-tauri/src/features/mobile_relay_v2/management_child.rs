@@ -47,6 +47,31 @@ pub(crate) struct ManagementPreparedFileIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagementPreparedFileMarker {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    length: u64,
+    mode: u32,
+    uid: u32,
+    links: u64,
+}
+
+impl ManagementPreparedFileMarker {
+    fn from_prepared(path: &Path, identity: &ManagementPreparedFileIdentity) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            device: identity.device,
+            inode: identity.inode,
+            length: identity.length,
+            mode: identity.mode,
+            uid: identity.uid,
+            links: identity.links,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagementChildSelection {
     DefaultProduction,
     SelfHostedDarwinArm64 {
@@ -56,8 +81,8 @@ pub(crate) enum ManagementChildSelection {
         credential_https_ca_identity: ManagementPreparedFileIdentity,
         carrier_wss_ca_identity: ManagementPreparedFileIdentity,
         profile_lineage: String,
-        provision_profile_input: Option<PathBuf>,
-        bootstrap_secret_input: Option<PathBuf>,
+        provision_profile_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
+        bootstrap_secret_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
     },
 }
 
@@ -71,6 +96,8 @@ pub(crate) enum ManagementLaunchKey {
         credential_https_ca_identity: ManagementPreparedFileIdentity,
         carrier_wss_ca_identity: ManagementPreparedFileIdentity,
         profile_lineage: String,
+        provision_profile_input: Option<ManagementPreparedFileMarker>,
+        bootstrap_secret_input: Option<ManagementPreparedFileMarker>,
     },
 }
 
@@ -82,8 +109,8 @@ impl ManagementChildSelection {
         credential_https_ca_identity: ManagementPreparedFileIdentity,
         carrier_wss_ca_identity: ManagementPreparedFileIdentity,
         profile_lineage: String,
-        provision_profile_input: Option<PathBuf>,
-        bootstrap_secret_input: Option<PathBuf>,
+        provision_profile_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
+        bootstrap_secret_input: Option<(PathBuf, ManagementPreparedFileIdentity)>,
     ) -> Result<Self, ManagementStartError> {
         if !account_home.is_absolute()
             || !credential_https_ca_input.is_absolute()
@@ -96,10 +123,20 @@ impl ManagementChildSelection {
             || carrier_wss_ca_identity.length == 0
             || provision_profile_input
                 .as_ref()
-                .is_some_and(|path| !path.is_absolute())
+                .is_some_and(|(path, identity)| {
+                    !path.is_absolute()
+                        || identity.mode != 0o600
+                        || identity.links != 1
+                        || identity.length == 0
+                })
             || bootstrap_secret_input
                 .as_ref()
-                .is_some_and(|path| !path.is_absolute())
+                .is_some_and(|(path, identity)| {
+                    !path.is_absolute()
+                        || identity.mode != 0o600
+                        || identity.links != 1
+                        || identity.length == 0
+                })
             || profile_lineage.len() != 32
             || !profile_lineage.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -127,7 +164,8 @@ impl ManagementChildSelection {
                 credential_https_ca_identity,
                 carrier_wss_ca_identity,
                 profile_lineage,
-                ..
+                provision_profile_input,
+                bootstrap_secret_input,
             } => ManagementLaunchKey::SelfHostedDarwinArm64 {
                 account_home: account_home.clone(),
                 credential_https_ca_input: credential_https_ca_input.clone(),
@@ -135,7 +173,37 @@ impl ManagementChildSelection {
                 credential_https_ca_identity: credential_https_ca_identity.clone(),
                 carrier_wss_ca_identity: carrier_wss_ca_identity.clone(),
                 profile_lineage: profile_lineage.clone(),
+                provision_profile_input: provision_profile_input.as_ref().map(
+                    |(path, identity)| ManagementPreparedFileMarker::from_prepared(path, identity),
+                ),
+                bootstrap_secret_input: bootstrap_secret_input.as_ref().map(|(path, identity)| {
+                    ManagementPreparedFileMarker::from_prepared(path, identity)
+                }),
             },
+        }
+    }
+
+    pub(crate) fn steady_launch_key(&self) -> ManagementLaunchKey {
+        match self.launch_key() {
+            ManagementLaunchKey::SelfHostedDarwinArm64 {
+                account_home,
+                credential_https_ca_input,
+                carrier_wss_ca_input,
+                credential_https_ca_identity,
+                carrier_wss_ca_identity,
+                profile_lineage,
+                ..
+            } => ManagementLaunchKey::SelfHostedDarwinArm64 {
+                account_home,
+                credential_https_ca_input,
+                carrier_wss_ca_input,
+                credential_https_ca_identity,
+                carrier_wss_ca_identity,
+                profile_lineage,
+                provision_profile_input: None,
+                bootstrap_secret_input: None,
+            },
+            ManagementLaunchKey::DefaultProduction => ManagementLaunchKey::DefaultProduction,
         }
     }
 
@@ -155,10 +223,10 @@ impl ManagementChildSelection {
                     .arg(credential_https_ca_input)
                     .arg("--carrier-wss-ca-input")
                     .arg(carrier_wss_ca_input);
-                if let Some(path) = provision_profile_input {
+                if let Some((path, _)) = provision_profile_input {
                     command.arg("--provision-profile-input").arg(path);
                 }
-                if let Some(path) = bootstrap_secret_input {
+                if let Some((path, _)) = bootstrap_secret_input {
                     command.arg("--bootstrap-secret-input").arg(path);
                 }
             }
@@ -1469,8 +1537,18 @@ impl ManagementChildManager {
         self.inner.artifact.path()
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
-        !self.inner.supervisor_stop.load(Ordering::Acquire)
+    pub(crate) fn is_reusable_after_observation(&self) -> bool {
+        if self.inner.supervisor_stop.load(Ordering::Acquire) {
+            return false;
+        }
+        // The same observation barrier serializes every request, the
+        // supervisor, and this same-key reuse decision. Poll the exact child
+        // here instead of trusting the supervisor's next 2 ms pass.
+        let _observation = self.inner.observation.lock().unwrap();
+        if self.inner.lifecycle_kind_after_barrier() != LifecycleKind::Ready {
+            return false;
+        }
+        self.inner.observe_idle_child().is_none()
             && self.inner.lifecycle_kind_now() == LifecycleKind::Ready
     }
 
@@ -2565,6 +2643,18 @@ mod tests {
         }
     }
 
+    fn prepared_identity(marker: u8) -> ManagementPreparedFileIdentity {
+        ManagementPreparedFileIdentity {
+            device: marker as u64 + 1,
+            inode: marker as u64 + 10,
+            length: marker as u64 + 20,
+            mode: 0o600,
+            uid: 501,
+            links: 1,
+            sha256: [marker; 32],
+        }
+    }
+
     fn id_bytes(request_id: &str) -> [u8; 16] {
         let decoded = URL_SAFE_NO_PAD
             .decode(request_id.split_once('.').unwrap().1)
@@ -2658,6 +2748,45 @@ mod tests {
         assert_eq!(selected.path(), resource.join("tw-cli/cli.cjs"));
         assert!(bundled_management_artifact_in(Some(PathBuf::from("relative"))).is_err());
         assert!(bundled_management_artifact_in(Some(resource.join("missing"))).is_err());
+    }
+
+    #[test]
+    fn pending_one_shot_inputs_force_admission_then_converge_to_one_steady_key() {
+        let selection = |provision, bootstrap| {
+            ManagementChildSelection::self_hosted_darwin_arm64(
+                PathBuf::from("/Users/fixture"),
+                PathBuf::from("/Users/fixture/credential-ca.pem"),
+                PathBuf::from("/Users/fixture/carrier-ca.pem"),
+                prepared_identity(1),
+                prepared_identity(2),
+                "00112233445566778899aabbccddeeff".to_string(),
+                provision,
+                bootstrap,
+            )
+            .unwrap()
+        };
+        let steady = selection(None, None);
+        let provision = selection(
+            Some((
+                PathBuf::from("/Users/fixture/profile.json"),
+                prepared_identity(3),
+            )),
+            None,
+        );
+        let bootstrap = selection(
+            None,
+            Some((
+                PathBuf::from("/Users/fixture/bootstrap.twhostboot2"),
+                prepared_identity(4),
+            )),
+        );
+
+        assert_eq!(steady.launch_key(), steady.steady_launch_key());
+        assert_ne!(provision.launch_key(), provision.steady_launch_key());
+        assert_ne!(bootstrap.launch_key(), bootstrap.steady_launch_key());
+        assert_ne!(provision.launch_key(), bootstrap.launch_key());
+        assert_eq!(provision.steady_launch_key(), steady.launch_key());
+        assert_eq!(bootstrap.steady_launch_key(), steady.launch_key());
     }
 
     #[test]
@@ -3376,6 +3505,23 @@ mod tests {
         ]);
         let _manager = start_fake(child.clone(), vec![[11; 16]], "1.2.3");
         child.wait_until_reaped();
+        assert_eq!(
+            child.state.lock().unwrap().events,
+            ["kill-if-live", "wait-and-reap"]
+        );
+    }
+
+    #[test]
+    fn same_key_reuse_synchronously_observes_the_exact_idle_child() {
+        let child = FakeChild::ready_then("1.2.3", Vec::new());
+        let manager = start_fake(child.clone(), vec![[12; 16]], "1.2.3");
+        child.push_read(0, ChildRead::Eof);
+
+        assert!(!manager.is_reusable_after_observation());
+        assert_eq!(
+            manager.dispose(),
+            ManagementCleanupOutcome::RecoveryRequired
+        );
         assert_eq!(
             child.state.lock().unwrap().events,
             ["kill-if-live", "wait-and-reap"]

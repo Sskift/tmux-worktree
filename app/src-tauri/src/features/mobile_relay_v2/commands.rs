@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tauri::{Manager, State};
 
 use super::enrollment_artifact::{EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim};
@@ -53,11 +53,50 @@ enum ManagementCommandOwner {
         manager: ManagementChildManager,
     },
     StartFailed(ManagementStartError),
-    Replacing,
+    Replacing(Arc<ManagementDrainCompletion>),
+}
+
+struct ManagementDrainCompletion {
+    outcome: Mutex<Option<ManagementCleanupOutcome>>,
+    changed: Condvar,
+}
+
+impl ManagementDrainCompletion {
+    fn pending() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, outcome: ManagementCleanupOutcome) {
+        let mut current = self.outcome.lock().unwrap();
+        if current.is_none() {
+            *current = Some(outcome);
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self) -> ManagementCleanupOutcome {
+        let mut outcome = self.outcome.lock().unwrap();
+        loop {
+            if let Some(outcome) = *outcome {
+                return outcome;
+            }
+            outcome = self.changed.wait(outcome).unwrap();
+        }
+    }
+}
+
+enum ManagementShutdown {
+    Live,
+    Draining(Arc<ManagementDrainCompletion>),
+    Complete(ManagementCleanupOutcome),
 }
 
 pub(crate) struct MobileRelayV2ManagementCommandState {
     owner: Mutex<ManagementCommandOwner>,
+    shutdown: Mutex<ManagementShutdown>,
     artifacts: EnrollmentArtifactRegistry,
     disposed: AtomicBool,
 }
@@ -91,7 +130,7 @@ impl MobileRelayV2ManagementCommandState {
     where
         F: FnOnce() -> Result<(), String>,
     {
-        let launch_key = selection.launch_key();
+        let launch_key = selection.steady_launch_key();
         let closer_app = app.clone();
         let artifacts = EnrollmentArtifactRegistry::new(move |label| {
             if let Some(window) = closer_app.get_webview_window(label) {
@@ -154,6 +193,7 @@ impl MobileRelayV2ManagementCommandState {
                 },
                 Err(error) => ManagementCommandOwner::StartFailed(error),
             }),
+            shutdown: Mutex::new(ManagementShutdown::Live),
             artifacts,
             disposed: AtomicBool::new(false),
         }
@@ -178,7 +218,7 @@ impl MobileRelayV2ManagementCommandState {
         if operation == MobileRelayV2ManagementOperation::RefreshHost {
             self.artifacts.clear();
         }
-        let mut owner = self.owner.lock().unwrap();
+        let owner = self.owner.lock().unwrap();
         match &*owner {
             ManagementCommandOwner::Ready { manager, .. } => {
                 let mut outcome = match manager.request_with_input(operation.into(), input) {
@@ -203,19 +243,8 @@ impl MobileRelayV2ManagementCommandState {
                         Ok(result) => outcome.result = result,
                         Err(()) => {
                             self.disposed.store(true, Ordering::Release);
-                            self.artifacts.close();
-                            let previous =
-                                std::mem::replace(&mut *owner, ManagementCommandOwner::Replacing);
                             drop(owner);
-                            let cleanup = drain_command_owner(previous);
-                            let mut owner = self.owner.lock().unwrap();
-                            *owner = ManagementCommandOwner::StartFailed(
-                                if cleanup == ManagementCleanupOutcome::RecoveryRequired {
-                                    ManagementStartError::RecoveryRequired
-                                } else {
-                                    ManagementStartError::ChannelClosed
-                                },
-                            );
+                            self.shutdown_and_drain();
                             return Err(channel_closed_error());
                         }
                     }
@@ -223,7 +252,7 @@ impl MobileRelayV2ManagementCommandState {
                 Ok(outcome)
             }
             ManagementCommandOwner::StartFailed(error) => Err(map_start_error(*error)),
-            ManagementCommandOwner::Replacing => Err(channel_closed_error()),
+            ManagementCommandOwner::Replacing(_) => Err(channel_closed_error()),
         }
     }
 
@@ -240,6 +269,7 @@ impl MobileRelayV2ManagementCommandState {
             return Err(ManagementStartError::ChannelClosed);
         }
         let desired_key = selection.launch_key();
+        let published_key = selection.steady_launch_key();
         let mut owner = self.owner.lock().unwrap();
         if self.disposed.load(Ordering::Acquire) {
             return Err(ManagementStartError::ChannelClosed);
@@ -249,60 +279,107 @@ impl MobileRelayV2ManagementCommandState {
             ManagementCommandOwner::Ready {
                 launch_key,
                 manager,
-            } if launch_key == &desired_key && manager.is_ready()
+            } if launch_key == &desired_key && manager.is_reusable_after_observation()
         ) {
             return Ok(());
         }
 
         self.artifacts.clear();
-        let previous = std::mem::replace(&mut *owner, ManagementCommandOwner::Replacing);
+        let completion = Arc::new(ManagementDrainCompletion::pending());
+        let previous = std::mem::replace(
+            &mut *owner,
+            ManagementCommandOwner::Replacing(completion.clone()),
+        );
         match previous {
             ManagementCommandOwner::Ready { manager, .. } => {
                 if manager.dispose() != ManagementCleanupOutcome::Clean {
                     *owner =
                         ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                    completion.complete(ManagementCleanupOutcome::RecoveryRequired);
                     return Err(ManagementStartError::RecoveryRequired);
                 }
             }
             ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired) => {
                 *owner =
                     ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                completion.complete(ManagementCleanupOutcome::RecoveryRequired);
                 return Err(ManagementStartError::RecoveryRequired);
             }
-            ManagementCommandOwner::StartFailed(_) | ManagementCommandOwner::Replacing => {}
+            ManagementCommandOwner::StartFailed(_) => {}
+            ManagementCommandOwner::Replacing(previous) => {
+                drop(owner);
+                let cleanup = previous.wait();
+                completion.complete(cleanup);
+                return Err(if cleanup == ManagementCleanupOutcome::RecoveryRequired {
+                    ManagementStartError::RecoveryRequired
+                } else {
+                    ManagementStartError::ChannelClosed
+                });
+            }
         }
 
+        if self.disposed.load(Ordering::Acquire) {
+            *owner = ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed);
+            completion.complete(ManagementCleanupOutcome::Clean);
+            return Err(ManagementStartError::ChannelClosed);
+        }
         let candidate = ManagementChildManager::start_selected(app, selection);
         let settled = settle_candidate_start(candidate, commit_ready);
         match settled {
             Ok(manager) => {
                 *owner = ManagementCommandOwner::Ready {
-                    launch_key: desired_key,
+                    launch_key: published_key,
                     manager,
                 };
+                completion.complete(ManagementCleanupOutcome::Clean);
                 Ok(())
             }
             Err(error) => {
                 *owner = ManagementCommandOwner::StartFailed(error);
+                completion.complete(if error == ManagementStartError::RecoveryRequired {
+                    ManagementCleanupOutcome::RecoveryRequired
+                } else {
+                    ManagementCleanupOutcome::Clean
+                });
                 Err(error)
             }
         }
     }
 
     pub(crate) fn dispose(&self) -> ManagementCleanupOutcome {
-        if self.disposed.swap(true, Ordering::AcqRel) {
-            let owner = self.owner.lock().unwrap();
-            return match &*owner {
-                ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired) => {
-                    ManagementCleanupOutcome::RecoveryRequired
+        self.shutdown_and_drain()
+    }
+
+    fn shutdown_and_drain(&self) -> ManagementCleanupOutcome {
+        let (completion, leader) = {
+            let mut shutdown = self.shutdown.lock().unwrap();
+            match &*shutdown {
+                ManagementShutdown::Complete(outcome) => return *outcome,
+                ManagementShutdown::Draining(completion) => (completion.clone(), false),
+                ManagementShutdown::Live => {
+                    let completion = Arc::new(ManagementDrainCompletion::pending());
+                    *shutdown = ManagementShutdown::Draining(completion.clone());
+                    (completion, true)
                 }
-                _ => ManagementCleanupOutcome::Clean,
-            };
+            }
+        };
+        if !leader {
+            return completion.wait();
         }
+
+        // The sole completion becomes visible before the disposed fence. No
+        // concurrent Exit/dispose can observe shutdown without an exact
+        // outcome barrier to await.
+        self.disposed.store(true, Ordering::Release);
         self.artifacts.close();
         let mut owner = self.owner.lock().unwrap();
-        let previous = std::mem::replace(&mut *owner, ManagementCommandOwner::Replacing);
+        let previous = std::mem::replace(
+            &mut *owner,
+            ManagementCommandOwner::Replacing(completion.clone()),
+        );
+        drop(owner);
         let cleanup = drain_command_owner(previous);
+        let mut owner = self.owner.lock().unwrap();
         *owner = ManagementCommandOwner::StartFailed(
             if cleanup == ManagementCleanupOutcome::RecoveryRequired {
                 ManagementStartError::RecoveryRequired
@@ -310,6 +387,12 @@ impl MobileRelayV2ManagementCommandState {
                 ManagementStartError::ChannelClosed
             },
         );
+        drop(owner);
+        {
+            let mut shutdown = self.shutdown.lock().unwrap();
+            *shutdown = ManagementShutdown::Complete(cleanup);
+        }
+        completion.complete(cleanup);
         cleanup
     }
 }
@@ -320,9 +403,8 @@ fn drain_command_owner(owner: ManagementCommandOwner) -> ManagementCleanupOutcom
         ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired) => {
             ManagementCleanupOutcome::RecoveryRequired
         }
-        ManagementCommandOwner::StartFailed(_) | ManagementCommandOwner::Replacing => {
-            ManagementCleanupOutcome::Clean
-        }
+        ManagementCommandOwner::StartFailed(_) => ManagementCleanupOutcome::Clean,
+        ManagementCommandOwner::Replacing(completion) => completion.wait(),
     }
 }
 
@@ -656,6 +738,30 @@ mod tests {
         assert_eq!(
             state.call(MobileRelayV2ManagementOperation::Status),
             Err(channel_closed_error())
+        );
+    }
+
+    #[test]
+    fn concurrent_dispose_waits_for_the_single_published_drain_outcome() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let state = Arc::new(MobileRelayV2ManagementCommandState::from_start(Err(
+            ManagementStartError::ChannelClosed,
+        )));
+        let completion = Arc::new(ManagementDrainCompletion::pending());
+        *state.shutdown.lock().unwrap() = ManagementShutdown::Draining(completion.clone());
+        state.disposed.store(true, Ordering::Release);
+
+        let follower = state.clone();
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || sent.send(follower.dispose()).unwrap());
+        assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+
+        completion.complete(ManagementCleanupOutcome::RecoveryRequired);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ManagementCleanupOutcome::RecoveryRequired
         );
     }
 

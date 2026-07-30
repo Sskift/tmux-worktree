@@ -47,6 +47,16 @@ require_linux_x86_64() {
   test "$(uname -m)" = "x86_64"
   mv --version 2>/dev/null | grep -Fq "GNU coreutils"
 }
+require_self_hosted_node() {
+  /usr/bin/env node -e '
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (
+  !Number.isInteger(major) ||
+  !Number.isInteger(minor) ||
+  !(major > 22 || (major === 22 && minor >= 16))
+) process.exit(1);
+'
+}
 require_parent_dir() {
   path="$1"
   test ! -L "$path"
@@ -104,6 +114,7 @@ require_private_executable() {
 }
 ensure_relay_layout() {
   require_linux_x86_64
+  require_self_hosted_node
   ensure_parent_dir "$HOME/.tmux-worktree"
   ensure_private_dir "$HOME/.tmux-worktree/relay-v2-self-hosted"
   ensure_private_dir "$HOME/.tmux-worktree/relay-v2-self-hosted/bundles"
@@ -113,6 +124,7 @@ ensure_relay_layout() {
 }
 require_relay_layout() {
   require_linux_x86_64
+  require_self_hosted_node
   require_parent_dir "$HOME/.tmux-worktree"
   require_private_dir "$HOME/.tmux-worktree/relay-v2-self-hosted"
   require_private_dir "$HOME/.tmux-worktree/relay-v2-self-hosted/bundles"
@@ -163,8 +175,12 @@ require_current_bundle() {
 // to returned descriptors. The helper adds O_NOFOLLOW itself and performs both
 // validation passes plus the bounded read against that single descriptor.
 const REMOTE_BOOTSTRAP_FD_READER: &str = r#"const fs = require("node:fs");
-const major = Number(process.versions.node.split(".")[0]);
-if (!Number.isInteger(major) || major < 22) throw new Error("NODE_22_REQUIRED");
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (
+  !Number.isInteger(major) ||
+  !Number.isInteger(minor) ||
+  !(major > 22 || (major === 22 && minor >= 16))
+) throw new Error("NODE_22_16_REQUIRED");
 const path = process.argv[2];
 const maximum = Number(process.argv[3]);
 if (!path || !Number.isSafeInteger(maximum) || maximum < 1) throw new Error("INVALID_INPUT");
@@ -1133,6 +1149,16 @@ fn fsync_parent(path: &Path) -> Result<(), String> {
         .map_err(|_| "sync Relay v2 private directory failed".to_string())
 }
 
+fn consumed_local_private_file_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} has no private parent"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{label} has no file name"))?;
+    Ok(parent.join(format!(".{}.consumed", file_name.to_string_lossy())))
+}
+
 fn consume_local_private_file(
     path: &Path,
     expected: &LocalPrivateFileIdentity,
@@ -1143,13 +1169,7 @@ fn consume_local_private_file(
     if &current.identity != expected {
         return Err(format!("{label} identity changed before consumption"));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{label} has no private parent"))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| format!("{label} has no file name"))?;
-    let tombstone = parent.join(format!(".{}.consumed", file_name.to_string_lossy()));
+    let tombstone = consumed_local_private_file_path(path, label)?;
     if std::fs::symlink_metadata(&tombstone).is_ok() {
         return Err(format!("{label} cleanup collision"));
     }
@@ -1186,13 +1206,32 @@ fn write_ready_commit_journal(
 fn load_ready_commit_journal(
 ) -> Result<Option<(ReadyCommitJournal, LocalPrivateFileIdentity)>, String> {
     let path = local_ready_commit_journal_path()?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("inspect Relay v2 management ready commit journal failed".to_string()),
+    load_ready_commit_journal_at(&path)
+}
+
+fn load_ready_commit_journal_at(
+    path: &Path,
+) -> Result<Option<(ReadyCommitJournal, LocalPrivateFileIdentity)>, String> {
+    let tombstone =
+        consumed_local_private_file_path(path, "Relay v2 management ready commit journal")?;
+    let present = |candidate: &Path| match std::fs::symlink_metadata(candidate) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("inspect Relay v2 management ready commit journal failed".to_string()),
+    };
+    let live_present = present(path)?;
+    let consumed_present = present(&tombstone)?;
+    if live_present && consumed_present {
+        return Err("Relay v2 management ready commit journal cleanup collision".to_string());
     }
+    let selected = match (live_present, consumed_present) {
+        (true, false) => path,
+        (false, true) => tombstone.as_path(),
+        (false, false) => return Ok(None),
+        (true, true) => unreachable!(),
+    };
     let file = read_local_private_file(
-        &path.to_string_lossy(),
+        &selected.to_string_lossy(),
         "Relay v2 management ready commit journal",
         16 * 1024,
     )?;
@@ -1218,13 +1257,7 @@ fn finish_consuming_if_present(
         Ok(_) => consume_local_private_file(path, expected, maximum_bytes, label),
         Err(_) => Err(format!("inspect {label} failed")),
     }?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{label} has no private parent"))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| format!("{label} has no file name"))?;
-    let tombstone = parent.join(format!(".{}.consumed", file_name.to_string_lossy()));
+    let tombstone = consumed_local_private_file_path(path, label)?;
     match std::fs::symlink_metadata(&tombstone) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => {
@@ -1280,7 +1313,7 @@ fn recover_ready_commit(
     }
     config.management_recovery_required = false;
     save_config(config)?;
-    consume_local_private_file(
+    finish_consuming_if_present(
         &local_ready_commit_journal_path()?,
         journal_identity,
         16 * 1024,
@@ -1402,8 +1435,12 @@ pub(crate) fn prepare_relay_v2_self_hosted_management_prerequisites(
         ca.identity.clone().into(),
         ca.identity.into(),
         config.host_profile_identity.clone(),
-        profile.as_ref().map(|file| file.path.clone()),
-        bootstrap.as_ref().map(|file| file.path.clone()),
+        profile
+            .as_ref()
+            .map(|file| (file.path.clone(), file.identity.clone().into())),
+        bootstrap
+            .as_ref()
+            .map(|file| (file.path.clone(), file.identity.clone().into())),
     )
     .map_err(|_| "Relay v2 self-hosted Host launch inputs are invalid".to_string())?;
     Ok(Some(PreparedSelfHostedManagementLaunch {
@@ -2139,9 +2176,11 @@ mod tests {
     use super::{
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
         build_remote_bundle_stage_validation_script, build_remote_relay_v2_center_command,
-        normalize_issuer_url, read_local_private_file, relay_url_from_issuer,
-        validate_bootstrap_bytes, validate_listen_host, PersistedSelfHostedConfig, CONFIG_CONTRACT,
-        CONFIG_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
+        consumed_local_private_file_path, finish_consuming_if_present,
+        load_ready_commit_journal_at, normalize_issuer_url, read_local_private_file,
+        relay_url_from_issuer, validate_bootstrap_bytes, validate_listen_host,
+        PersistedSelfHostedConfig, ReadyCommitJournal, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
+        READY_COMMIT_JOURNAL_CONTRACT, REMOTE_BOOTSTRAP_FD_READER,
     };
 
     fn config() -> PersistedSelfHostedConfig {
@@ -2261,6 +2300,50 @@ mod tests {
         assert!(script.contains("-type d -exec chmod 700"));
         assert!(script.contains("-type f -exec chmod 600"));
         assert!(script.contains("-type f ! -perm 0600"));
+        assert!(script.contains("major === 22 && minor >= 16"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consumed_ready_journal_is_validated_and_finalized_on_next_prepare() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory
+            .path()
+            .join("management-ready-commit-journal-v1.json");
+        let consumed = consumed_local_private_file_path(
+            &journal_path,
+            "Relay v2 management ready commit journal",
+        )
+        .unwrap();
+        let journal = ReadyCommitJournal {
+            contract: READY_COMMIT_JOURNAL_CONTRACT.to_string(),
+            schema_version: 1,
+            profile_lineage: "00112233445566778899aabbccddeeff".to_string(),
+            bootstrap_file_name: None,
+            bootstrap_identity: None,
+            provision_profile_identity: None,
+        };
+        let mut bytes = serde_json::to_vec(&journal).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&consumed, bytes).unwrap();
+        std::fs::set_permissions(&consumed, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (_, identity) = load_ready_commit_journal_at(&journal_path)
+            .unwrap()
+            .expect("consumed journal remains a recoverable commit record");
+        finish_consuming_if_present(
+            &journal_path,
+            &identity,
+            16 * 1024,
+            "Relay v2 management ready commit journal",
+        )
+        .unwrap();
+        assert!(!consumed.exists());
+        assert!(load_ready_commit_journal_at(&journal_path)
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(unix)]
