@@ -185,9 +185,7 @@ internal class RelayV2TerminalControlCodecBridge(
         )
         when (mode) {
             RelayV2TerminalOpenMode.NEW -> check(resume == null)
-            RelayV2TerminalOpenMode.RESUME,
-            RelayV2TerminalOpenMode.RESET,
-            -> {
+            RelayV2TerminalOpenMode.RESUME -> {
                 val exactResume = requireNotNull(resume)
                 val token = credentials.readExact(
                     openFence.target,
@@ -196,15 +194,22 @@ internal class RelayV2TerminalControlCodecBridge(
                 )
                 val encoded = linkedMapOf<String, Any?>(
                     "generation" to exactResume.generation,
+                    "nextOffset" to requireNotNull(exactResume.nextOffset),
                 )
-                when (mode) {
-                    RelayV2TerminalOpenMode.RESUME ->
-                        encoded["nextOffset"] = requireNotNull(exactResume.nextOffset)
-                    RelayV2TerminalOpenMode.RESET -> check(exactResume.nextOffset == null)
-                    RelayV2TerminalOpenMode.NEW -> error("unreachable")
-                }
                 encoded["resumeToken"] = token
                 payload["resume"] = encoded
+            }
+            RelayV2TerminalOpenMode.RESET -> resume?.let { exactResume ->
+                check(exactResume.nextOffset == null)
+                val token = credentials.readExact(
+                    openFence.target,
+                    exactResume.resumeTokenCredentialReference,
+                    exactResume.resumeTokenCredentialFingerprint,
+                )
+                payload["resume"] = linkedMapOf(
+                    "generation" to exactResume.generation,
+                    "resumeToken" to token,
+                )
             }
         }
         return linkedMapOf(

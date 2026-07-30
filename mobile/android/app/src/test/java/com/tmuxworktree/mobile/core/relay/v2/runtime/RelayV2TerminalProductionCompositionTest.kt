@@ -178,6 +178,189 @@ class RelayV2TerminalProductionCompositionTest {
     }
 
     @Test
+    fun `correlated pre-open stream loss durably opens reset without resume`() = runBlocking {
+        val codec = RelayV2Codec()
+        val terminal = BlockingTerminalAuthority()
+        terminal.releaseClaim.complete(Unit)
+        val sent = mutableListOf<ByteArray>()
+        val credentials = RecordingCredentials()
+        var nextId = 0
+        val composition = RelayV2TerminalProductionComposition(
+            applyLease = CurrentApplyLease,
+            terminal = terminal,
+            journal = EmptyJournal(),
+            credentials = credentials,
+            sendPort = RelayV2TerminalExactGenerationSendPort { _, bytes ->
+                sent += bytes
+                RelayV2TerminalExactGenerationSendResult.Sent
+            },
+            fatalInvalidation = UnexpectedInvalidation,
+            newId = { "pre-open-reset-${++nextId}" },
+        )
+        val target = RelayV2TerminalAttachmentTarget(
+            "profile-a",
+            7,
+            "principal-a",
+            "client-a",
+            "host-a",
+            "scope-a",
+            "session-a",
+            pane = 3,
+        )
+        val authority = RelayV2RepositoryEffectAuthority(
+            RelayV2EffectGeneration("profile-a", 7, 1),
+            "profile-a",
+            7,
+            "principal-a",
+            "client-a",
+            "host-a",
+            "epoch-a",
+        )
+        val parser = object : RelayV2TerminalParserPort {
+            override suspend fun write(
+                callbackToken: RelayV2TerminalParserCallbackToken,
+                bytes: ByteArray,
+                completion: suspend (Boolean) -> Unit,
+            ) = false
+
+            override suspend fun reset(
+                callbackToken: RelayV2TerminalParserCallbackToken,
+                completion: suspend (Boolean) -> Unit,
+            ) = true
+        }
+        val attachment = composition.attach(target, parser)
+        assertTrue(composition.open(attachment, authority, 143, 47))
+        assertEquals(1, sent.size)
+        val firstOpen = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            sent.single(),
+        ).frame
+        val firstPayload = firstOpen["payload"] as Map<*, *>
+        val key = terminal.beginOpenKeys.single()
+        val initialPreOpen = (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.PreOpen)
+            .checkpoint
+        val initialPending = requireNotNull(initialPreOpen.pendingOpen)
+
+        val resetRequired = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            codec.encodeWebSocketFrame(
+                RelayV2WebSocketChannel.PUBLIC,
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "terminal.reset_required",
+                    "requestId" to firstOpen["requestId"],
+                    "hostId" to firstOpen["hostId"],
+                    "hostEpoch" to firstOpen["expectedHostEpoch"],
+                    "scopeId" to firstOpen["scopeId"],
+                    "sessionId" to firstOpen["sessionId"],
+                    "streamId" to firstOpen["streamId"],
+                    "payload" to linkedMapOf(
+                        "origin" to "open",
+                        "generation" to null,
+                        "reason" to "stream_lost",
+                        "requestedOffset" to null,
+                        "bufferStartOffset" to null,
+                        "tailOffset" to null,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalFrameResult.Applied,
+            composition.handlePublicFrame(authority, resetRequired),
+        )
+
+        val resetActions = terminal.reducedActions.takeLast(2)
+        assertTrue(resetActions[0] is RelayV2TerminalAction.PreOpenResetRequired)
+        val beginReset = resetActions[1] as RelayV2TerminalAction.BeginOpenAttempt
+        assertEquals(RelayV2TerminalOpenMode.RESET, beginReset.mode)
+        assertEquals(null, beginReset.resume)
+        val resetStates = terminal.committedStates.takeLast(2)
+        val durableReset = (resetStates[0] as RelayV2TerminalStoredCheckpoint.PreOpen).checkpoint
+        assertEquals(RelayV2TerminalPreOpenPhase.RESET_REQUIRED, durableReset.phase)
+        assertEquals(RelayV2TerminalResetReason.STREAM_LOST, durableReset.resetReason)
+        val pendingReset = (resetStates[1] as RelayV2TerminalStoredCheckpoint.PreOpen).checkpoint
+        assertEquals(RelayV2TerminalPreOpenPhase.PENDING_OPEN, pendingReset.phase)
+        val successorPending = requireNotNull(pendingReset.pendingOpen)
+        assertEquals(RelayV2TerminalOpenMode.RESET, successorPending.mode)
+        assertEquals(null, successorPending.resume)
+        assertEquals(initialPending.target, successorPending.target)
+        assertEquals(initialPending.deliveryToken, successorPending.deliveryToken)
+        assertEquals(initialPending.parserContinuityId, successorPending.parserContinuityId)
+        assertEquals(initialPending.cols, successorPending.cols)
+        assertEquals(initialPending.rows, successorPending.rows)
+        assertFalse(initialPending.requestId == successorPending.requestId)
+        assertFalse(initialPending.openAttempt.openId == successorPending.openAttempt.openId)
+        assertFalse(
+            initialPending.openAttempt.fingerprint == successorPending.openAttempt.fingerprint,
+        )
+
+        assertEquals(2, sent.size)
+        val successorOpen = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            sent.last(),
+        ).frame
+        val successorPayload = successorOpen["payload"] as Map<*, *>
+        assertEquals("terminal.open", successorOpen["type"])
+        assertEquals("reset", successorPayload["mode"])
+        assertFalse(successorPayload.containsKey("resume"))
+        assertEquals(firstOpen["hostId"], successorOpen["hostId"])
+        assertEquals(firstOpen["expectedHostEpoch"], successorOpen["expectedHostEpoch"])
+        assertEquals(firstOpen["scopeId"], successorOpen["scopeId"])
+        assertEquals(firstOpen["sessionId"], successorOpen["sessionId"])
+        assertEquals(firstOpen["streamId"], successorOpen["streamId"])
+        assertEquals(firstPayload["pane"], successorPayload["pane"])
+        assertEquals(firstPayload["cols"], successorPayload["cols"])
+        assertEquals(firstPayload["rows"], successorPayload["rows"])
+        assertEquals(0, credentials.readCount)
+
+        val opened = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            codec.encodeWebSocketFrame(
+                RelayV2WebSocketChannel.PUBLIC,
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "terminal.opened",
+                    "requestId" to successorOpen["requestId"],
+                    "hostId" to successorOpen["hostId"],
+                    "hostEpoch" to successorOpen["expectedHostEpoch"],
+                    "scopeId" to successorOpen["scopeId"],
+                    "sessionId" to successorOpen["sessionId"],
+                    "streamId" to successorOpen["streamId"],
+                    "hostInstanceId" to "host-instance-reset",
+                    "payload" to linkedMapOf(
+                        "openId" to successorPayload["openId"],
+                        "deduplicated" to false,
+                        "generation" to "generation-reset",
+                        "resumeToken" to "resume-token-reset",
+                        "disposition" to "reset",
+                        "replayFromOffset" to "0",
+                        "bufferStartOffset" to "0",
+                        "tailOffset" to "0",
+                        "maxUnackedBytes" to 524_288L,
+                        "resetReason" to "stream_lost",
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalFrameResult.Applied,
+            composition.handlePublicFrame(authority, opened),
+        )
+        val active = (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+        assertEquals(successorPending.openAttempt, active.openAttempt)
+        assertEquals(RelayV2TerminalOpenDisposition.RESET, active.openResult.disposition)
+        assertEquals(successorPending.target, active.identity.target())
+        assertEquals(successorPending.deliveryToken, active.deliveryToken)
+        assertEquals(successorPending.cols, active.openedCols)
+        assertEquals(successorPending.rows, active.openedRows)
+        assertEquals(0, credentials.readCount)
+        assertEquals(1, credentials.installCount)
+    }
+
+    @Test
     fun `handled reset stays applied with exact terminal ownership`() = runBlocking {
         val codec = RelayV2Codec()
         val terminal = BlockingTerminalAuthority()
@@ -702,6 +885,8 @@ class RelayV2TerminalProductionCompositionTest {
         val releaseClaim = CompletableDeferred<Unit>()
         val beginOpenDeliveries = mutableListOf<RelayV2TerminalDeliveryToken>()
         val beginOpenKeys = mutableListOf<RelayV2TerminalCheckpointKey>()
+        val reducedActions = mutableListOf<RelayV2TerminalAction>()
+        val committedStates = mutableListOf<RelayV2TerminalStoredCheckpoint>()
         private val checkpoints = mutableMapOf<RelayV2TerminalCheckpointKey, RelayV2TerminalStoredCheckpoint>()
 
         override suspend fun claimResumableTerminalUnderApplyLease(
@@ -745,6 +930,8 @@ class RelayV2TerminalProductionCompositionTest {
             reduced.checkpoint?.let {
                 checkpoints[key] = RelayV2TerminalStoredCheckpoint.Present(it)
             }
+            reducedActions += action
+            checkpoints[key]?.let(committedStates::add)
             return reduced
         }
 
@@ -762,6 +949,46 @@ class RelayV2TerminalProductionCompositionTest {
         ) {
             checkpoints[key] = checkpoint
         }
+    }
+
+    private class RecordingCredentials : RelayV2TerminalResumeCredentialStore {
+        private val values = mutableMapOf<String, String>()
+        var readCount = 0
+            private set
+        var installCount = 0
+            private set
+
+        override fun installExact(
+            owner: RelayV2TerminalResumeCredentialOwner,
+            reference: String,
+            resumeToken: String,
+        ): RelayV2TerminalResumeCredentialInstall? {
+            val existing = values[reference]
+            if (existing != null && existing != resumeToken) return null
+            values[reference] = resumeToken
+            installCount += 1
+            return RelayV2TerminalResumeCredentialInstall(
+                fingerprint(resumeToken),
+                existing == null,
+            )
+        }
+
+        override fun read(
+            owner: RelayV2TerminalResumeCredentialOwner,
+            reference: String,
+        ): String? {
+            readCount += 1
+            return values[reference]
+        }
+
+        override fun clear(
+            owner: RelayV2TerminalResumeCredentialOwner,
+            reference: String,
+        ) {
+            values.remove(reference)
+        }
+
+        override fun clearProfile(profileId: String, throughActivationGeneration: Long) = Unit
     }
 
     private class EmptyCredentials : RelayV2TerminalResumeCredentialStore {

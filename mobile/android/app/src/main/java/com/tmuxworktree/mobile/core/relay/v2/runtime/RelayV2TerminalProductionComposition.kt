@@ -339,13 +339,7 @@ internal class RelayV2TerminalProductionComposition(
             if (stored is RelayV2TerminalStoredCheckpoint.PreOpen &&
                 type == "terminal.reset_required" && frame["kind"] == "response"
             ) {
-                return dispatchFrameReduction(
-                    state,
-                    terminal.reduceTerminalUnderApplyLease(
-                        state.key,
-                        preOpenResetAction(stored.checkpoint, frame),
-                    ),
-                )
+                return handlePreOpenReset(state, stored.checkpoint, frame)
             }
             val present = stored as? RelayV2TerminalStoredCheckpoint.Present
                 ?: return RelayV2TerminalFrameResult.NotOwned
@@ -359,6 +353,73 @@ internal class RelayV2TerminalProductionComposition(
             )
         }
         return dispatchFrameReduction(state, reduction)
+    }
+
+    private suspend fun handlePreOpenReset(
+        state: Active,
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+        frame: Map<String, Any?>,
+    ): RelayV2TerminalFrameResult {
+        val action = preOpenResetAction(checkpoint, frame)
+        val resetReduction = terminal.reduceTerminalUnderApplyLease(state.key, action)
+        val resetResult = dispatchFrameReduction(state, resetReduction)
+        if (resetResult != RelayV2TerminalFrameResult.Applied ||
+            action.reason != RelayV2TerminalResetReason.STREAM_LOST
+        ) {
+            return resetResult
+        }
+        val resetCheckpoint = resetReduction.preOpenCheckpoint
+            ?.takeIf {
+                it.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED &&
+                    it.resetReason == RelayV2TerminalResetReason.STREAM_LOST
+            } ?: return RelayV2TerminalFrameResult.ProtocolViolation
+        val resetFence = resetCheckpoint.resetFence
+            ?: return RelayV2TerminalFrameResult.ProtocolViolation
+        val successorRequestId = newId()
+        val successorAttempt = RelayV2TerminalOpenAttempt(newId(), newId())
+        val successorReduction = terminal.reduceTerminalUnderApplyLease(
+            state.key,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = resetFence.deliveryToken,
+                requestId = successorRequestId,
+                openAttempt = successorAttempt,
+                mode = RelayV2TerminalOpenMode.RESET,
+                cols = resetFence.cols,
+                rows = resetFence.rows,
+                target = resetFence.target,
+                parserContinuityId = resetFence.parserContinuityId,
+                resume = null,
+            ),
+        )
+        val successorCheckpoint = successorReduction.preOpenCheckpoint
+            ?.takeIf { it.phase == RelayV2TerminalPreOpenPhase.PENDING_OPEN }
+            ?: return RelayV2TerminalFrameResult.ProtocolViolation
+        val openEffect = successorReduction.effects
+            .filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+            .singleOrNull() ?: return RelayV2TerminalFrameResult.ProtocolViolation
+        if (openEffect.openFence.target != resetFence.target ||
+            openEffect.openFence.deliveryToken != resetFence.deliveryToken ||
+            openEffect.openFence.parserContinuityId != resetFence.parserContinuityId ||
+            openEffect.cols != resetFence.cols || openEffect.rows != resetFence.rows ||
+            openEffect.mode != RelayV2TerminalOpenMode.RESET ||
+            openEffect.resume != null ||
+            successorCheckpoint.pendingOpen?.openAttempt != successorAttempt
+        ) {
+            return RelayV2TerminalFrameResult.ProtocolViolation
+        }
+        val successor = state.copy(
+            delivery = openEffect.openFence.deliveryToken,
+            openAttempt = openEffect.openFence.openAttempt,
+            requestId = openEffect.requestId,
+            parserContinuityId = openEffect.openFence.parserContinuityId,
+            cols = openEffect.cols,
+            rows = openEffect.rows,
+        )
+        synchronized(lock) {
+            if (active !== state) return RelayV2TerminalFrameResult.NotOwned
+            active = successor
+        }
+        return dispatchFrameReduction(successor, successorReduction)
     }
 
     private suspend fun dispatchFrameReduction(
@@ -380,6 +441,7 @@ internal class RelayV2TerminalProductionComposition(
     ): RelayV2TerminalAction.PreOpenResetRequired {
         val pending = requireNotNull(checkpoint.pendingOpen)
         val payload = frame.objectValue("payload")
+        check(payload.string("origin") == "open")
         return RelayV2TerminalAction.PreOpenResetRequired(
             fence = RelayV2TerminalOpenFence(
                 pending.target,

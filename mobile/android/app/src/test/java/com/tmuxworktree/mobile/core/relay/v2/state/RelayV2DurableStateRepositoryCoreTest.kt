@@ -683,6 +683,143 @@ class RelayV2DurableStateRepositoryCoreTest {
     }
 
     @Test
+    fun `pre-open stream-loss crash claim durably begins exact reset without resume`() =
+        runBlocking {
+            val store = MemoryStore()
+            val initialRepository = RelayV2DurableStateRepositoryCore(store)
+            val target = terminalIdentity().target()
+            val key = RelayV2TerminalCheckpointKey.from(target)
+            val initialDelivery = terminalDelivery()
+            val initialAttempt = RelayV2TerminalOpenAttempt(
+                "open-before-pre-open-crash",
+                "open-before-pre-open-crash-fingerprint",
+            )
+            val begun = initialRepository.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.BeginOpenAttempt(
+                    deliveryToken = initialDelivery,
+                    requestId = "open-before-pre-open-crash-request",
+                    openAttempt = initialAttempt,
+                    mode = RelayV2TerminalOpenMode.NEW,
+                    cols = 143,
+                    rows = 47,
+                    target = target,
+                    parserContinuityId = PARSER_CONTINUITY,
+                    resume = null,
+                ),
+            )
+            val pending = requireNotNull(begun.preOpenCheckpoint?.pendingOpen)
+            val initialFence = RelayV2TerminalOpenFence(
+                pending.target,
+                pending.deliveryToken,
+                pending.openAttempt,
+                pending.parserContinuityId,
+                pending.mode,
+                pending.cols,
+                pending.rows,
+                pending.resume,
+            )
+            initialRepository.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.PreOpenResetRequired(
+                    fence = initialFence,
+                    requestId = pending.requestId,
+                    reason = RelayV2TerminalResetReason.STREAM_LOST,
+                    requestedOffset = null,
+                    bufferStartOffset = null,
+                    tailOffset = null,
+                ),
+            )
+            val crashed = (store.lastCommittedTerminal(key)
+                as RelayV2TerminalStoredCheckpoint.PreOpen).checkpoint
+            assertEquals(RelayV2TerminalPreOpenPhase.RESET_REQUIRED, crashed.phase)
+            assertEquals(initialFence, crashed.resetFence)
+
+            val authority = RelayV2RepositoryEffectAuthority(
+                RelayV2EffectGeneration("profile-v2", 7, 2),
+                "profile-v2",
+                7,
+                "principal-v2",
+                "android-install-v2",
+                "host-a",
+                "epoch-a",
+            )
+            val successorAttempt = RelayV2TerminalOpenAttempt(
+                "open-after-pre-open-crash",
+                "open-after-pre-open-crash-fingerprint",
+            )
+            val restarted = RelayV2DurableStateRepositoryCore(store)
+            val claim = requireNotNull(
+                restarted.claimResumableTerminalUnderApplyLease(
+                    selector = RelayV2TerminalResumeSessionSelector(
+                        "profile-v2",
+                        7,
+                        "principal-v2",
+                        "android-install-v2",
+                        "host-a",
+                        "scope-a",
+                        "session-a",
+                        0,
+                    ),
+                    authority = authority,
+                    requestId = "open-after-pre-open-crash-request",
+                    openAttempt = successorAttempt,
+                    cols = 80,
+                    rows = 24,
+                ),
+            )
+            val send = claim.reduction.effects
+                .filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+                .single()
+            assertEquals(RelayV2TerminalOpenMode.RESET, send.mode)
+            assertEquals(null, send.resume)
+            assertEquals(target, send.openFence.target)
+            assertEquals(successorAttempt, send.openFence.openAttempt)
+            assertEquals(authority.generation, send.openFence.deliveryToken.actorGeneration)
+            assertEquals(PARSER_CONTINUITY, send.openFence.parserContinuityId)
+            assertEquals(143, send.cols)
+            assertEquals(47, send.rows)
+
+            val durablePending = (store.lastCommittedTerminal(key)
+                as RelayV2TerminalStoredCheckpoint.PreOpen).checkpoint
+            assertEquals(RelayV2TerminalPreOpenPhase.PENDING_OPEN, durablePending.phase)
+            assertEquals(RelayV2TerminalResetReason.STREAM_LOST, durablePending.resetReason)
+            assertEquals(
+                send.openFence.deliveryToken,
+                durablePending.resetFence?.deliveryToken,
+            )
+            assertEquals(null, durablePending.pendingOpen?.resume)
+
+            val successorIdentity = terminalIdentity().copy(
+                hostInstanceId = "host-process-after-pre-open-crash",
+                generation = "generation-after-pre-open-crash",
+                resumeTokenCredentialReference = "resume-reference-after-pre-open-crash",
+                resumeTokenCredentialFingerprint = "resume-fingerprint-after-pre-open-crash",
+            )
+            val opened = restarted.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.Opened(
+                    identity = successorIdentity,
+                    requestId = send.requestId,
+                    openAttempt = successorAttempt,
+                    deliveryToken = send.openFence.deliveryToken,
+                    parserContinuityId = send.openFence.parserContinuityId,
+                    disposition = RelayV2TerminalOpenDisposition.RESET,
+                    cols = send.cols,
+                    rows = send.rows,
+                    replayFromOffset = "0",
+                    tailOffset = "0",
+                ),
+            )
+            assertEquals(RelayV2TerminalOutcome.Applied, opened.outcome)
+            val active = requireNotNull(opened.checkpoint)
+            assertEquals(successorAttempt, active.openAttempt)
+            assertEquals(RelayV2TerminalOpenDisposition.RESET, active.openResult.disposition)
+            assertEquals(null, active.openRequestResume)
+            assertEquals(PARSER_CONTINUITY, active.parserContinuityId)
+        }
+
+    @Test
     fun `reset-required Session claim emits exact RESET and fences stale open`() = runBlocking {
         val store = MemoryStore()
         val initialRepository = RelayV2DurableStateRepositoryCore(store)

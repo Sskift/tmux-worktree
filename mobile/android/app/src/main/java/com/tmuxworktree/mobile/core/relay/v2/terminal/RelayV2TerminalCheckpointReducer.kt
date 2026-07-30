@@ -247,6 +247,9 @@ internal object RelayV2TerminalCheckpointReducer {
                                 val rebound = checkpoint.copy(
                                     deliveryToken = currentDeliveryToken,
                                     pendingOpen = reboundPending,
+                                    resetFence = checkpoint.resetFence?.copy(
+                                        deliveryToken = currentDeliveryToken,
+                                    ),
                                 )
                                 preOpenReduction(
                                     rebound,
@@ -599,7 +602,9 @@ internal object RelayV2TerminalCheckpointReducer {
             return missingReset(null, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
         }
         if (current == null) {
-            if (action.mode == RelayV2TerminalOpenMode.RESUME) {
+            if (action.mode == RelayV2TerminalOpenMode.RESUME ||
+                (action.mode == RelayV2TerminalOpenMode.RESET && action.resume == null)
+            ) {
                 return missingReset(null, RelayV2TerminalResetReason.MISSING_CHECKPOINT)
             }
             val pending = action.pendingOpen()
@@ -616,6 +621,31 @@ internal object RelayV2TerminalCheckpointReducer {
                 RelayV2TerminalOutcome.Applied,
                 listOf(pending.sendOpen(checkpoint)),
             )
+        }
+        if (action.mode == RelayV2TerminalOpenMode.RESET && action.resume == null) {
+            val ownsExactResetSuccessor = when (current.phase) {
+                RelayV2TerminalPreOpenPhase.RESET_REQUIRED -> current.resetFence?.let { fence ->
+                    current.resetReason == RelayV2TerminalResetReason.STREAM_LOST &&
+                        action.deliveryToken == fence.deliveryToken &&
+                        action.target == fence.target &&
+                        action.parserContinuityId == fence.parserContinuityId &&
+                        action.cols == fence.cols && action.rows == fence.rows &&
+                        action.openAttempt.openId != fence.openAttempt.openId &&
+                        action.openAttempt.fingerprint != fence.openAttempt.fingerprint
+                } == true
+                RelayV2TerminalPreOpenPhase.PENDING_OPEN -> current.pendingOpen?.let { pending ->
+                    nullResetPredecessorMatches(current, pending) &&
+                        action.deliveryToken == pending.deliveryToken &&
+                        pending.sameLogicalAttempt(action)
+                } == true
+            }
+            if (!ownsExactResetSuccessor) {
+                return preOpenReset(
+                    current,
+                    RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+                    current.resetFence,
+                )
+            }
         }
         if (current.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED &&
             action.mode != RelayV2TerminalOpenMode.RESET
@@ -686,8 +716,12 @@ internal object RelayV2TerminalCheckpointReducer {
                 ),
             phase = RelayV2TerminalPreOpenPhase.PENDING_OPEN,
             pendingOpen = pending,
-            resetFence = null,
-            resetReason = null,
+            resetFence = current.resetFence.takeIf {
+                action.mode == RelayV2TerminalOpenMode.RESET && action.resume == null
+            },
+            resetReason = current.resetReason.takeIf {
+                action.mode == RelayV2TerminalOpenMode.RESET && action.resume == null
+            },
         )
         return preOpenReduction(
             candidate,
@@ -727,7 +761,9 @@ internal object RelayV2TerminalCheckpointReducer {
         }
         val replayFrom = parseCounter(action.replayFromOffset)
         val tail = parseCounter(action.tailOffset)
-        if (!resetResultAdvancesAuthority(pending, action.identity)) {
+        if (!resetResultAdvancesAuthority(pending, action.identity) &&
+            !nullResetPredecessorMatches(current, pending)
+        ) {
             return preOpenReset(current, RelayV2TerminalResetReason.GENERATION_STALE)
         }
         if (action.identity.target() != current.target ||
@@ -3710,10 +3746,18 @@ internal object RelayV2TerminalCheckpointReducer {
             return false
         }
         return when (checkpoint.phase) {
-            RelayV2TerminalPreOpenPhase.PENDING_OPEN -> checkpoint.resetReason == null &&
-                checkpoint.resetFence == null &&
+            RelayV2TerminalPreOpenPhase.PENDING_OPEN ->
                 checkpoint.pendingOpen?.let { pending ->
-                    validOperationId(pending.requestId) &&
+                    val resetPredecessorValid = if (
+                        pending.mode == RelayV2TerminalOpenMode.RESET &&
+                        pending.resume == null
+                    ) {
+                        nullResetPredecessorMatches(checkpoint, pending)
+                    } else {
+                        checkpoint.resetReason == null && checkpoint.resetFence == null
+                    }
+                    resetPredecessorValid &&
+                        validOperationId(pending.requestId) &&
                         validRequestIdHistory(
                             pending.issuedRequestIds,
                             pending.requestId,
@@ -3783,7 +3827,7 @@ internal object RelayV2TerminalCheckpointReducer {
                 !resetResultAdvancesAuthority(
                     checkpoint.openRequestResume,
                     checkpoint.identity,
-                ))
+                ) && !checkpoint.hasConsumedNullResetPredecessor())
         ) {
             return CheckpointValidity.INVALID
         }
@@ -4452,7 +4496,7 @@ internal object RelayV2TerminalCheckpointReducer {
         RelayV2TerminalOpenMode.NEW -> resume == null
         RelayV2TerminalOpenMode.RESUME -> resume != null &&
             parseCounter(resume.nextOffset ?: "") != null
-        RelayV2TerminalOpenMode.RESET -> resume != null && resume.nextOffset == null
+        RelayV2TerminalOpenMode.RESET -> resume?.nextOffset == null
     }
 
     private fun RelayV2TerminalCheckpoint.openResume(
@@ -4521,6 +4565,34 @@ internal object RelayV2TerminalCheckpointReducer {
         identity: RelayV2TerminalIdentity,
     ): Boolean = resume != null && identity.generation != resume.generation &&
         identity.resumeTokenCredentialFingerprint != resume.resumeTokenCredentialFingerprint
+
+    private fun nullResetPredecessorMatches(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+        pending: RelayV2TerminalPendingOpen,
+    ): Boolean {
+        val predecessor = checkpoint.resetFence ?: return false
+        return checkpoint.resetReason == RelayV2TerminalResetReason.STREAM_LOST &&
+            pending.mode == RelayV2TerminalOpenMode.RESET && pending.resume == null &&
+            predecessor.target == checkpoint.target &&
+            predecessor.deliveryToken == checkpoint.deliveryToken &&
+            predecessor.parserContinuityId == checkpoint.parserContinuityId &&
+            pending.target == predecessor.target &&
+            pending.deliveryToken == predecessor.deliveryToken &&
+            pending.parserContinuityId == predecessor.parserContinuityId &&
+            pending.cols == predecessor.cols && pending.rows == predecessor.rows &&
+            pending.openAttempt.openId != predecessor.openAttempt.openId &&
+            pending.openAttempt.fingerprint != predecessor.openAttempt.fingerprint &&
+            checkpoint.openRequestIds.size > pending.issuedRequestIds.size &&
+            checkpoint.openRequestIds.takeLast(
+                pending.issuedRequestIds.size,
+            ) == pending.issuedRequestIds
+    }
+
+    private fun RelayV2TerminalCheckpoint.hasConsumedNullResetPredecessor(): Boolean =
+        openMode == RelayV2TerminalOpenMode.RESET &&
+            openRequestResume == null &&
+            openResult.disposition == RelayV2TerminalOpenDisposition.RESET &&
+            openRequestIds.size >= 2
 
     private fun appendRequestId(
         issued: List<String>,

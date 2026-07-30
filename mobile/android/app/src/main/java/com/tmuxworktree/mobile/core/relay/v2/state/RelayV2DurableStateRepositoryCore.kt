@@ -25,7 +25,9 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenResume
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOutcome
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserRestoreProof
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPhase
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPreOpenPhase
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalRestoreInvalidity
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 import java.util.concurrent.ConcurrentHashMap
@@ -619,6 +621,29 @@ internal class RelayV2DurableStateRepositoryCore(
                                 target = pending.target,
                                 parserContinuityId = pending.parserContinuityId,
                                 resume = pending.resume,
+                            ),
+                        )
+                    } else if (
+                        restored.outcome ==
+                        RelayV2TerminalOutcome.ResetRequired(
+                            RelayV2TerminalResetReason.STREAM_LOST,
+                        )
+                    ) {
+                        val current = requireNotNull(restored.preOpenCheckpoint)
+                        check(current.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED)
+                        val predecessor = requireNotNull(current.resetFence)
+                        RelayV2TerminalCheckpointReducer.reduce(
+                            current,
+                            RelayV2TerminalAction.BeginOpenAttempt(
+                                deliveryToken = predecessor.deliveryToken,
+                                requestId = requestId,
+                                openAttempt = openAttempt,
+                                mode = RelayV2TerminalOpenMode.RESET,
+                                cols = predecessor.cols,
+                                rows = predecessor.rows,
+                                target = predecessor.target,
+                                parserContinuityId = predecessor.parserContinuityId,
+                                resume = null,
                             ),
                         )
                     } else {
