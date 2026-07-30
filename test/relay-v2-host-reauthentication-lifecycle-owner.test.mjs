@@ -59,12 +59,14 @@ class InMemoryDurableCredentialStorage {
   slots = new Map();
   revisions = new WeakMap();
   operations = 0;
+  compareAttempts = 0;
 
   runExclusive(reference, operation) {
     this.operations += 1;
     const transaction = {
       read: () => this.readCut(reference),
       compareAndSwap: (expected, replacement) => {
+        this.compareAttempts += 1;
         const identity = this.revisions.get(expected);
         const slot = this.slot(reference);
         if (!identity || identity.reference !== reference || identity.revision !== slot.revision) {
@@ -265,6 +267,7 @@ class ManualScheduler {
  */
 class ManagedConnectorShim {
   forceAdmissionFalseOnce = false;
+  beforeRequestReauthentication = null;
   sendCalls = [];
 
   constructor(parts) {
@@ -292,6 +295,8 @@ class ManagedConnectorShim {
       const requestId = input.requestId;
       const controllerGeneration = input.controllerGeneration;
       const connectorId = input.connectorId;
+      const expectedCredential = input.expectedCredential;
+      const expectedPendingReauthentication = input.expectedPendingReauthentication;
       if (typeof requestId !== "string"
         || typeof controllerGeneration !== "string"
         || typeof connectorId !== "string") return false;
@@ -301,18 +306,31 @@ class ManagedConnectorShim {
         || status.connectorId !== connectorId) return false;
       const forced = this.forceAdmissionFalseOnce;
       this.forceAdmissionFalseOnce = false;
-      this.sendCalls.push({ requestId, controllerGeneration, connectorId });
-      return Reflect.apply(this.parts.actor.requestReauthentication, this.parts.actor, [
+      this.sendCalls.push({
         requestId,
-        CREDENTIAL_REFERENCE,
-        () => {
-          const current = this.parts.state.latestStatus;
-          return !forced
-            && current?.phase === "registered"
-            && String(current.generation) === controllerGeneration
-            && current.connectorId === connectorId;
-        },
-      ]);
+        controllerGeneration,
+        connectorId,
+        expectedCredential: structuredClone(expectedCredential),
+        expectedPendingReauthentication: structuredClone(expectedPendingReauthentication),
+      });
+      this.beforeRequestReauthentication?.();
+      try {
+        return Reflect.apply(this.parts.actor.requestReauthentication, this.parts.actor, [
+          requestId,
+          CREDENTIAL_REFERENCE,
+          () => {
+            const current = this.parts.state.latestStatus;
+            return !forced
+              && current?.phase === "registered"
+              && String(current.generation) === controllerGeneration
+              && current.connectorId === connectorId;
+          },
+          expectedCredential,
+          expectedPendingReauthentication,
+        ]);
+      } catch {
+        return false;
+      }
     };
   }
 }
@@ -525,6 +543,61 @@ test("a durable recovered attempt is reused across bounded retries and persists 
     sendObservations[0].requestId,
   );
   assert.equal(h.scheduler.size, 1, "the bounded ACK-loss replay chain is armed");
+  assert.equal(
+    h.shim.sendCalls[0].expectedPendingReauthentication,
+    null,
+    "a fresh post-refresh request carries the exact no-pending expectation",
+  );
+});
+
+test("a synchronous explicit refresh fences an inspected pending resend", async () => {
+  const h = createHarness();
+  const bootstrapAccess = installBootstrap(h);
+  const { connection, transport, connectorId } = connectRegistered(h);
+  const current = h.authority.read(CREDENTIAL_REFERENCE);
+  const oldPending = h.authority.prepareReauthentication({
+    credentialReference: CREDENTIAL_REFERENCE,
+    requestId: "pending-before-explicit-refresh",
+    expectedCredential: {
+      reference: current.reference,
+      version: current.version,
+      grantId: current.grantId,
+      accessJti: current.accessJti,
+    },
+    expectedPendingReauthentication: null,
+  });
+  let comparesAfterRefresh = 0;
+  h.shim.beforeRequestReauthentication = () => {
+    h.shim.beforeRequestReauthentication = null;
+    const prepared = h.authority.prepareRefresh({
+      credentialReference: CREDENTIAL_REFERENCE,
+      attemptId: "reentrant-explicit-refresh",
+      oldSecretReference: REFRESH_SECRET_REFERENCE,
+    });
+    const access = h.issueAccess();
+    assert.deepEqual(h.authority.applyRefreshResponse(prepared.fence, {
+      refreshAttemptId: prepared.fence.attemptId,
+      principalId: PRINCIPAL_ID,
+      grantId: GRANT_ID,
+      hostId: HOST_ID,
+      accessToken: access.token,
+      accessExpiresAtMs: access.expiresAtMs,
+      refreshToken: "twref2.host-refresh-token-reentrant",
+      refreshExpiresAtMs: REFRESH_EXP + 1,
+    }), { status: "applied", credentialVersion: "2" });
+    comparesAfterRefresh = h.storage.compareAttempts;
+  };
+
+  const warning = warn(h, connection, connectorId, bootstrapAccess.expiresAtMs);
+  await tick();
+  assert.equal(h.storage.compareAttempts, comparesAfterRefresh);
+  assert.equal(h.authority.inspect(CREDENTIAL_REFERENCE).pendingReauthentication, null);
+  assert.equal(h.authority.acknowledgeReauthentication(oldPending.fence), false);
+  assert.equal(reauthenticateFrames(transport).length, 0);
+  assert.equal(h.scheduler.size, 1);
+  h.scheduler.fireNext();
+  assert.deepEqual(await warning, { status: "already_current" });
+  assert.equal(reauthenticateFrames(transport).length, 0);
 });
 
 test("concurrent warnings share one bounded in-flight exchange", async () => {
@@ -563,8 +636,14 @@ test("ACK loss replays only the exact persisted request identity and a landed AC
   const pending = h.authority.inspect(CREDENTIAL_REFERENCE).pendingReauthentication;
   assert.equal(pending.requestId, initial[0].requestId);
 
+  const comparesBeforeReplay = h.storage.compareAttempts;
   h.scheduler.fireNext();
   h.scheduler.fireNext();
+  assert.equal(
+    h.storage.compareAttempts,
+    comparesBeforeReplay,
+    "exact durable replay returns the existing winner without CAS",
+  );
   const replayed = reauthenticateFrames(transport);
   assert.equal(replayed.length, 3);
   assert.equal(replayed[1].requestId, initial[0].requestId, "replay reuses the persisted identity");

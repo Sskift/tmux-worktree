@@ -221,6 +221,21 @@ function installBootstrap(harness, issueToken) {
   return { prepared, access };
 }
 
+function reauthenticationPreparation(harness, requestId, expectedPendingReauthentication = null) {
+  const current = harness.authority.read(REFERENCE);
+  return {
+    credentialReference: REFERENCE,
+    requestId,
+    expectedCredential: {
+      reference: current.reference,
+      version: current.version,
+      grantId: current.grantId,
+      accessJti: current.accessJti,
+    },
+    expectedPendingReauthentication,
+  };
+}
+
 function assertAuthorityError(code) {
   return (error) => error?.code === code
     && !error.message.includes("twcap2.")
@@ -399,7 +414,80 @@ test("owner-bound one-shot cuts reject foreign value collisions and admit one ex
   first.authority.releaseExchangeLease(reused.lease);
 });
 
-test("reauthentication retries reuse requestId/token/jti and five-field ACK fences newer credentials", () => {
+test("a strictly newer refresh commit supersedes the old connector reauthentication", () => {
+  const h = authority();
+  const issueToken = tokenIssuer();
+  installBootstrap(h, issueToken);
+
+  const oldPending = h.authority.prepareReauthentication(
+    reauthenticationPreparation(h, "host-reauth-request-before-refresh"),
+  );
+  assert.equal(
+    h.authority.inspect(REFERENCE).pendingReauthentication.credentialVersion,
+    "1",
+  );
+
+  const refresh2 = h.authority.prepareRefresh(refreshPreparation(2));
+  const access2 = issueToken();
+  const committed = h.authority.applyRefreshResponse(
+    refresh2.fence,
+    refreshResponse(2, access2),
+  );
+  assert.deepEqual(committed, { status: "applied", credentialVersion: "2" });
+  const inspection = h.authority.inspect(REFERENCE);
+  assert.equal(inspection.credentialVersion, "2");
+  assert.equal(inspection.accessJti, access2.jti);
+  assert.equal(inspection.pendingReauthentication, null);
+  assert.equal(h.authority.acknowledgeReauthentication(oldPending.fence), false);
+});
+
+test("registered connection reconciliation clears only the exact-current same-version orphan", () => {
+  const h = authority();
+  const issueToken = tokenIssuer();
+  installBootstrap(h, issueToken);
+  const pending = h.authority.prepareReauthentication(
+    reauthenticationPreparation(h, "host-reauth-connector-orphan"),
+  );
+  const current = h.authority.read(REFERENCE);
+  const exactCurrent = {
+    reference: current.reference,
+    version: current.version,
+    grantId: current.grantId,
+    accessJti: current.accessJti,
+  };
+  const comparesBeforeMismatches = h.storage.compareAttempts;
+
+  for (const mismatch of [
+    { ...exactCurrent, reference: SECOND_REFERENCE },
+    { ...exactCurrent, version: "2" },
+    { ...exactCurrent, grantId: "wrong-grant" },
+    { ...exactCurrent, accessJti: "wrong-jti" },
+  ]) {
+    assert.equal(
+      credential.reconcileRelayV2HostCredentialRegisteredConnection(
+        h.authority,
+        mismatch,
+      ),
+      false,
+    );
+    assert.equal(
+      h.authority.inspect(REFERENCE).pendingReauthentication.requestId,
+      pending.fence.requestId,
+    );
+  }
+  assert.equal(h.storage.compareAttempts, comparesBeforeMismatches);
+  assert.equal(
+    credential.reconcileRelayV2HostCredentialRegisteredConnection(
+      h.authority,
+      exactCurrent,
+    ),
+    true,
+  );
+  assert.equal(h.authority.inspect(REFERENCE).pendingReauthentication, null);
+  assert.equal(h.storage.compareAttempts, comparesBeforeMismatches + 1);
+});
+
+test("same-version reauthentication retries reuse requestId/token/jti and five-field ACK fences", () => {
   const h = authority();
   const issueToken = tokenIssuer();
   installBootstrap(h, issueToken);
@@ -407,54 +495,34 @@ test("reauthentication retries reuse requestId/token/jti and five-field ACK fenc
   const refresh2 = h.authority.prepareRefresh(refreshPreparation(2));
   const access2 = issueToken();
   h.authority.applyRefreshResponse(refresh2.fence, refreshResponse(2, access2));
-  const reauth2 = h.authority.prepareReauthentication({
-    credentialReference: REFERENCE,
-    requestId: "host-reauth-request-2",
-  });
-  const retried2 = h.authority.prepareReauthentication({
-    credentialReference: REFERENCE,
-    requestId: "must-not-replace-persisted-reauth-request",
-  });
+  const reauth2 = h.authority.prepareReauthentication(
+    reauthenticationPreparation(h, "host-reauth-request-2"),
+  );
+  const retried2 = h.authority.prepareReauthentication(
+    reauthenticationPreparation(
+      h,
+      reauth2.fence.requestId,
+      h.authority.inspect(REFERENCE).pendingReauthentication,
+    ),
+  );
   assert.equal(retried2.fence.requestId, reauth2.fence.requestId);
   assert.equal(retried2.fence.accessJti, reauth2.fence.accessJti);
   assert.equal(digest(retried2.accessToken), digest(reauth2.accessToken));
 
-  const refresh3 = h.authority.prepareRefresh(refreshPreparation(3));
-  const access3 = issueToken();
-  h.authority.applyRefreshResponse(refresh3.fence, refreshResponse(3, access3));
-  const beforeReusedOldRequestId = h.storage.snapshot(REFERENCE);
-  assert.throws(
-    () => h.authority.prepareReauthentication({
-      credentialReference: REFERENCE,
-      requestId: "host-reauth-request-2",
-    }),
-    assertAuthorityError("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT"),
-  );
-  assert.deepEqual(h.storage.snapshot(REFERENCE), beforeReusedOldRequestId);
-  const reauth3 = h.authority.prepareReauthentication({
-    credentialReference: REFERENCE,
-    requestId: "host-reauth-request-3",
-  });
-  assert.equal(reauth3.fence.version, "3");
-  assert.equal(reauth3.fence.accessJti, access3.jti);
-
-  assert.equal(h.authority.acknowledgeReauthentication(reauth2.fence), false);
-  assert.equal(h.authority.inspect(REFERENCE).pendingReauthentication.requestId,
-    "host-reauth-request-3");
   for (const staleFence of [
-    { ...reauth3.fence, reference: SECOND_REFERENCE },
-    { ...reauth3.fence, version: "2" },
-    { ...reauth3.fence, requestId: "wrong-request" },
-    { ...reauth3.fence, grantId: "wrong-grant" },
-    { ...reauth3.fence, accessJti: "wrong-jti" },
+    { ...reauth2.fence, reference: SECOND_REFERENCE },
+    { ...reauth2.fence, version: "1" },
+    { ...reauth2.fence, requestId: "wrong-request" },
+    { ...reauth2.fence, grantId: "wrong-grant" },
+    { ...reauth2.fence, accessJti: "wrong-jti" },
   ]) {
     assert.equal(h.authority.acknowledgeReauthentication(staleFence), false);
     assert.equal(h.authority.inspect(REFERENCE).pendingReauthentication.requestId,
-      "host-reauth-request-3");
+      "host-reauth-request-2");
   }
-  assert.equal(h.authority.acknowledgeReauthentication(reauth3.fence), true);
+  assert.equal(h.authority.acknowledgeReauthentication(reauth2.fence), true);
   assert.equal(h.authority.inspect(REFERENCE).pendingReauthentication, null);
-  assert.equal(h.authority.acknowledgeReauthentication(reauth3.fence), false);
+  assert.equal(h.authority.acknowledgeReauthentication(reauth2.fence), false);
 });
 
 test("uncertain CAS fails closed before or after linearization and bounded conflicts never guess", () => {

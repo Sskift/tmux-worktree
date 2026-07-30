@@ -12,6 +12,7 @@ import {
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
   consumeRelayV2HostCredentialConnectionAdmissionForCarrier,
+  reconcileRelayV2HostCredentialRegisteredConnection,
   type RelayV2HostCredentialConnectionAdmission,
   type RelayV2HostCredentialConnectionMetadata,
 } from "./hostCredentialAuthority.js";
@@ -142,6 +143,19 @@ export interface RelayV2HostCarrierCredentialReferences {
   prepareReauthentication(input: {
     credentialReference: string;
     requestId: string;
+    expectedCredential: Readonly<{
+      reference: string;
+      version: string;
+      grantId: string;
+      accessJti: string;
+    }>;
+    expectedPendingReauthentication: Readonly<{
+      credentialReference: string;
+      credentialVersion: string;
+      requestId: string;
+      grantId: string;
+      accessJti: string;
+    }> | null;
   }): {
     fence: RelayV2HostCredentialAckFence;
     accessToken: string;
@@ -1544,7 +1558,44 @@ export class RelayV2HostCarrierActor {
   requestReauthentication(
     requestId: string,
     credentialReference: string,
-    postPreparationAdmission?: () => boolean,
+  ): boolean;
+
+  requestReauthentication(
+    requestId: string,
+    credentialReference: string,
+    postPreparationAdmission: (() => boolean) | undefined,
+    expectedCredential: Readonly<{
+      reference: string;
+      version: string;
+      grantId: string;
+      accessJti: string;
+    }>,
+    expectedPendingReauthentication: Readonly<{
+      credentialReference: string;
+      credentialVersion: string;
+      requestId: string;
+      grantId: string;
+      accessJti: string;
+    }> | null,
+  ): boolean;
+
+  requestReauthentication(
+    requestId: string,
+    credentialReference: string,
+    postPreparationAdmission: (() => boolean) | undefined,
+    expectedCredential: Readonly<{
+      reference: string;
+      version: string;
+      grantId: string;
+      accessJti: string;
+    }> | undefined,
+    expectedPendingReauthentication: Readonly<{
+      credentialReference: string;
+      credentialVersion: string;
+      requestId: string;
+      grantId: string;
+      accessJti: string;
+    }> | null | undefined,
   ): boolean {
     if (this.disposed) return false;
     const activePreparation = this.reauthenticationPreparation;
@@ -1565,12 +1616,23 @@ export class RelayV2HostCarrierActor {
     };
     this.reauthenticationPreparation = preparation;
     try {
+      if ((expectedCredential === undefined)
+        !== (expectedPendingReauthentication === undefined)) {
+        throw new Error("Relay v2 host reauthentication expectation is incomplete");
+      }
+      const exactExpectedCredential = expectedCredential ?? connector.credential;
+      const exactExpectedPending = expectedCredential === undefined
+        ? null
+        : expectedPendingReauthentication!;
+      const prepared = this.options.credentialReferences.prepareReauthentication({
+        credentialReference,
+        requestId,
+        expectedCredential: exactExpectedCredential,
+        expectedPendingReauthentication: exactExpectedPending,
+      });
       const winner = snapshotPreparedReauthentication(
         credentialReference,
-        this.options.credentialReferences.prepareReauthentication({
-          credentialReference,
-          requestId,
-        }),
+        prepared,
       );
       // Preparation and descriptor capture are both untrusted synchronous
       // calls. Re-establish exact ownership before touching volatile pending
@@ -1822,6 +1884,40 @@ export class RelayV2HostCarrierActor {
       return;
     }
     connector.connectorId = stringField(frame, "connectorId");
+    const registeredGeneration = connector.generation;
+    const registeredConnectorId = connector.connectorId;
+    const registeredTransport = connector.transport;
+    const registeredHelloRequestId = connector.helloRequestId;
+    const registeredHelloSent = connector.helloSent;
+    if (this.options.credentialConnectionAdmission !== undefined) {
+      let reconciled = false;
+      try {
+        reconciled = reconcileRelayV2HostCredentialRegisteredConnection(
+          this.options.credentialReferences,
+          connector.credential,
+        );
+      } catch {
+        // Registration cannot publish a credential cut whose durable
+        // reconciliation is uncertain or unavailable.
+      }
+      if (!reconciled) {
+        this.failConnector(
+          connector,
+          1013,
+          "credential_registration_reconcile_failed",
+        );
+        return;
+      }
+    }
+    if (this.disposed
+      || this.current !== connector
+      || connector.phase !== "hello"
+      || connector.generation !== registeredGeneration
+      || connector.connectorId !== registeredConnectorId
+      || connector.transport !== registeredTransport
+      || connector.helloRequestId !== registeredHelloRequestId
+      || connector.helloSent !== registeredHelloSent
+      || !connector.helloSent) return;
     connector.phase = "registered";
     this.publishStatus({
       phase: "registered",

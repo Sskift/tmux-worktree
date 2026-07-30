@@ -187,6 +187,8 @@ export interface RelayV2HostRefreshResponse {
 export interface RelayV2HostReauthenticationPreparation {
   credentialReference: string;
   requestId: string;
+  expectedCredential: RelayV2HostCredentialConnectionMetadata;
+  expectedPendingReauthentication: RelayV2HostPendingReauthentication | null;
 }
 
 export interface RelayV2HostPreparedReauthentication {
@@ -931,6 +933,26 @@ function validateConnectionCarrierBinding(
   });
 }
 
+function validateConnectionMetadata(
+  value: unknown,
+): RelayV2HostCredentialConnectionMetadata {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ["reference", "version", "grantId", "accessJti"])
+    || !isRelayV2HostCredentialReference(value.reference)
+    || !isCanonicalCounter(value.version)
+    || value.version === "0"
+    || !isRelayV2AuthIdentifier(value.grantId)
+    || !isRelayV2AuthIdentifier(value.accessJti)) {
+    return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+  }
+  return OBJECT_FREEZE({
+    reference: value.reference,
+    version: value.version,
+    grantId: value.grantId,
+    accessJti: value.accessJti,
+  });
+}
+
 function connectionCutFromState(
   reference: string,
   state: RelayV2HostCredentialState | null,
@@ -1068,6 +1090,20 @@ export function releaseRelayV2HostCredentialConnectionAdmission(
     transportOwner,
     admission,
   );
+}
+
+/**
+ * Registration-only reconciliation for the credential-exact managed WSS
+ * lane. A newly registered connector may retire a durable reauthentication
+ * request only when its frozen Authorization cut is still the authority's
+ * exact current `{ reference, version, grantId, accessJti }` cut.
+ */
+export function reconcileRelayV2HostCredentialRegisteredConnection(
+  authority: RelayV2HostCarrierCredentialReferences,
+  credential: RelayV2HostCredentialConnectionMetadata,
+): boolean {
+  if (!isRelayV2HostCredentialAuthority(authority)) return false;
+  return authority.reconcileRegisteredConnection(credential);
 }
 
 /**
@@ -1725,7 +1761,38 @@ implements RelayV2HostCarrierCredentialReferences {
           refreshExpiresAtMs: response.refreshExpiresAtMs,
           accessJti: claims.jti,
           pendingCredentialAttempt: null,
+          // A successful refresh strictly advances credentialVersion. Any
+          // older connector-scoped reauthentication request is therefore
+          // superseded and must never survive into a successor connector.
+          pendingReauthentication: null,
         },
+      };
+    });
+  }
+
+  reconcileRegisteredConnection(
+    rawCredential: RelayV2HostCredentialConnectionMetadata,
+  ): boolean {
+    const credential = validateConnectionMetadata(rawCredential);
+    return this.transition(credential.reference, (current) => {
+      if (!current
+        || current.credentialVersion !== credential.version
+        || current.grantId !== credential.grantId
+        || current.accessJti !== credential.accessJti) {
+        return { kind: "unchanged", value: false };
+      }
+      const pending = current.pendingReauthentication;
+      if (pending === null) return { kind: "unchanged", value: true };
+      if (pending.credentialReference !== credential.reference
+        || pending.credentialVersion !== credential.version
+        || pending.grantId !== credential.grantId
+        || pending.accessJti !== credential.accessJti) {
+        return { kind: "unchanged", value: false };
+      }
+      return {
+        kind: "replace",
+        value: true,
+        replacement: { ...current, pendingReauthentication: null },
       };
     });
   }
@@ -1738,6 +1805,16 @@ implements RelayV2HostCarrierCredentialReferences {
       || !isRelayV2AuthIdentifier(input.requestId)) {
       return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
     }
+    const expectedCredential = validateConnectionMetadata(input.expectedCredential);
+    let expected: RelayV2HostPendingReauthentication | null;
+    if (input.expectedPendingReauthentication === null) {
+      expected = null;
+    } else {
+      expected = parsePendingReauthentication(input.expectedPendingReauthentication);
+      if (expected === null) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
+    }
     return this.transition(input.credentialReference, (current) => {
       if (!current
         || current.credentialVersion === "0"
@@ -1747,6 +1824,25 @@ implements RelayV2HostCarrierCredentialReferences {
         return fail("RELAY_V2_HOST_CREDENTIAL_NOT_READY");
       }
       const existing = current.pendingReauthentication;
+      if (expectedCredential.reference !== input.credentialReference
+          || expectedCredential.version !== current.credentialVersion
+          || expectedCredential.grantId !== current.grantId
+          || expectedCredential.accessJti !== current.accessJti
+          || (expected === null
+            ? existing !== null
+            : existing === null
+              || input.requestId !== expected.requestId
+              || expected.credentialReference !== expectedCredential.reference
+              || expected.credentialVersion !== expectedCredential.version
+              || expected.grantId !== expectedCredential.grantId
+              || expected.accessJti !== expectedCredential.accessJti
+              || existing.credentialReference !== expected.credentialReference
+              || existing.credentialVersion !== expected.credentialVersion
+              || existing.requestId !== expected.requestId
+              || existing.grantId !== expected.grantId
+              || existing.accessJti !== expected.accessJti)) {
+        return fail("RELAY_V2_HOST_CREDENTIAL_ATTEMPT_CONFLICT");
+      }
       if (existing
         && existing.credentialReference === input.credentialReference
         && existing.credentialVersion === current.credentialVersion

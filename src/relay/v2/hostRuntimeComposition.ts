@@ -84,6 +84,8 @@ import type {
 import type {
   RelayV2HostCredentialAuthority,
   RelayV2HostCredentialConnectionAdmission,
+  RelayV2HostCredentialConnectionMetadata,
+  RelayV2HostPendingReauthentication,
 } from "./hostCredentialAuthority.js";
 import {
   isRelayV2HostCredentialAuthority,
@@ -244,7 +246,7 @@ export interface RelayV2HostAutomaticReauthenticationClaim {
 export interface RelayV2HostAutomaticReauthenticationClosedPort {
   inspect(): RelayV2HostManagedConnectorInspection;
   requestReauthentication(
-    input: Readonly<RelayV2HostManagedConnectorReauthenticationInput>,
+    input: Readonly<RelayV2HostAutomaticReauthenticationInput>,
   ): boolean;
 }
 
@@ -507,6 +509,14 @@ export interface RelayV2HostManagedConnectorReauthenticationInput {
   readonly requestId: string;
   readonly controllerGeneration: string;
   readonly connectorId: string;
+}
+
+export interface RelayV2HostAutomaticReauthenticationInput
+extends RelayV2HostManagedConnectorReauthenticationInput {
+  readonly expectedCredential: Readonly<RelayV2HostCredentialConnectionMetadata>;
+  readonly expectedPendingReauthentication: Readonly<
+  RelayV2HostPendingReauthentication
+  > | null;
 }
 
 export interface RelayV2HostManagedConnectorStopInput {
@@ -2049,6 +2059,82 @@ function captureManagedStartInput(value: unknown): RelayV2HostManagedConnectorSt
   });
 }
 
+function captureAutomaticReauthenticationInput(
+  value: unknown,
+): RelayV2HostAutomaticReauthenticationInput {
+  const fields = exactManagedDataObject(value, [
+    "requestId", "controllerGeneration", "connectorId",
+    "expectedCredential", "expectedPendingReauthentication",
+  ]);
+  const credential = exactManagedDataObject(fields.expectedCredential, [
+    "reference", "version", "grantId", "accessJti",
+  ]);
+  if (typeof credential.reference !== "string"
+    || !credential.reference.startsWith(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE)
+    || typeof credential.version !== "string"
+    || !/^[1-9][0-9]*$/.test(credential.version)
+    || !isRelayV2AuthIdentifier(credential.grantId)
+    || !isRelayV2AuthIdentifier(credential.accessJti)) {
+    throw managedCompositionFailure();
+  }
+  const expectedCredential = Object.freeze({
+    reference: credential.reference,
+    version: credential.version,
+    grantId: credential.grantId,
+    accessJti: credential.accessJti,
+  }) as RelayV2HostCredentialConnectionMetadata;
+  const expected = fields.expectedPendingReauthentication;
+  let expectedPendingReauthentication: RelayV2HostPendingReauthentication | null;
+  if (expected === null) {
+    expectedPendingReauthentication = null;
+  } else {
+    const pending = exactManagedDataObject(expected, [
+      "credentialReference", "credentialVersion", "requestId", "grantId", "accessJti",
+    ]);
+    if (typeof pending.credentialReference !== "string"
+      || !pending.credentialReference.startsWith(
+        RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE,
+      )
+      || typeof pending.credentialVersion !== "string"
+      || !/^[1-9][0-9]*$/.test(pending.credentialVersion)
+      || !isRelayV2AuthIdentifier(pending.requestId)
+      || !isRelayV2AuthIdentifier(pending.grantId)
+      || !isRelayV2AuthIdentifier(pending.accessJti)) {
+      throw managedCompositionFailure();
+    }
+    expectedPendingReauthentication = Object.freeze({
+      credentialReference: pending.credentialReference,
+      credentialVersion: pending.credentialVersion,
+      requestId: pending.requestId,
+      grantId: pending.grantId,
+      accessJti: pending.accessJti,
+    }) as RelayV2HostPendingReauthentication;
+  }
+  if (!isRelayV2AuthIdentifier(fields.requestId)
+    || /(?:twcap2|twref2|twenroll2|twhostboot2)\./i.test(fields.requestId)
+    || typeof fields.controllerGeneration !== "string"
+    || !/^[1-9][0-9]*$/.test(fields.controllerGeneration)
+    || !isRelayV2AuthIdentifier(fields.connectorId)
+    || /(?:twcap2|twref2|twenroll2|twhostboot2)\./i.test(fields.connectorId)) {
+    throw managedCompositionFailure();
+  }
+  try {
+    if (BigInt(fields.controllerGeneration) > MAX_CARRIER_READINESS_GENERATION) {
+      throw managedCompositionFailure();
+    }
+  } catch (error) {
+    if (error instanceof RelayV2HostConnectorControllerError) throw error;
+    throw managedCompositionFailure();
+  }
+  return Object.freeze({
+    requestId: fields.requestId,
+    controllerGeneration: fields.controllerGeneration,
+    connectorId: fields.connectorId,
+    expectedCredential,
+    expectedPendingReauthentication,
+  });
+}
+
 function captureManagedReauthenticationInput(
   value: unknown,
 ): RelayV2HostManagedConnectorReauthenticationInput {
@@ -2183,7 +2269,14 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
     managementCarrierControl(
       connectorId: string,
     ): RelayV2DashboardManagementCarrierControlPort | null;
-    requestReauthentication(requestId: string, connectorId: string): boolean;
+    requestReauthentication(
+      requestId: string,
+      connectorId: string,
+      expectedCredential: Readonly<RelayV2HostCredentialConnectionMetadata>,
+      expectedPendingReauthentication: Readonly<
+      RelayV2HostPendingReauthentication
+      > | null,
+    ): boolean;
     negotiatedCapabilityIntersection(
       connectorId: string,
     ): readonly RelayV2RequiredCapability[];
@@ -2392,7 +2485,14 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
               return null;
             }
           },
-          requestReauthentication(requestId: string, connectorId: string): boolean {
+          requestReauthentication(
+            requestId: string,
+            connectorId: string,
+            expectedCredential: Readonly<RelayV2HostCredentialConnectionMetadata>,
+            expectedPendingReauthentication: Readonly<
+            RelayV2HostPendingReauthentication
+            > | null,
+          ): boolean {
             if (rejected || reauthenticationFenced || reauthenticationInFlight
               || !controllerAdmitted || actor === null) return false;
             const requestActor = actor;
@@ -2411,6 +2511,8 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
                     && cut.controllerGeneration === input.controllerGeneration
                     && cut.connectorId === connectorId;
                 },
+                expectedCredential,
+                expectedPendingReauthentication,
               );
             } catch {
               return false;
@@ -2531,8 +2633,18 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
     authority?: unknown,
   ): boolean => {
     let input: RelayV2HostManagedConnectorReauthenticationInput;
+    let expectedCredential: RelayV2HostCredentialConnectionMetadata | null = null;
+    let expectedPendingReauthentication: RelayV2HostPendingReauthentication | null = null;
+    const automatic = authority === automaticReauthenticationAuthority;
     try {
-      input = captureManagedReauthenticationInput(rawInput);
+      if (automatic) {
+        const captured = captureAutomaticReauthenticationInput(rawInput);
+        input = captured;
+        expectedCredential = captured.expectedCredential;
+        expectedPendingReauthentication = captured.expectedPendingReauthentication;
+      } else {
+        input = captureManagedReauthenticationInput(rawInput);
+      }
     } catch {
       return false;
     }
@@ -2544,10 +2656,26 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
       if (cut.status !== "registered"
         || cut.controllerGeneration !== input.controllerGeneration
         || cut.connectorId !== input.connectorId) return false;
+      if (!automatic) {
+        const current = carrierOptions.credentialReferences.read(credentialReference);
+        if (current.reference !== credentialReference
+          || !/^[1-9][0-9]*$/.test(current.version)
+          || !isRelayV2AuthIdentifier(current.grantId)
+          || !isRelayV2AuthIdentifier(current.accessJti)) return false;
+        expectedCredential = Object.freeze({
+          reference: current.reference,
+          version: current.version,
+          grantId: current.grantId,
+          accessJti: current.accessJti,
+        });
+      }
+      if (expectedCredential === null) return false;
       const runtimeBinding = attemptRuntimeBindings.get(input.controllerGeneration);
       return runtimeBinding?.requestReauthentication(
         input.requestId,
         input.connectorId,
+        expectedCredential,
+        expectedPendingReauthentication,
       ) ?? false;
     } catch {
       return false;
@@ -2595,7 +2723,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
           return projectManagedConnectorCut(controller.inspectCut());
         },
         requestReauthentication(
-          input: Readonly<RelayV2HostManagedConnectorReauthenticationInput>,
+          input: Readonly<RelayV2HostAutomaticReauthenticationInput>,
         ): boolean {
           return requestManagedReauthentication(
             input,

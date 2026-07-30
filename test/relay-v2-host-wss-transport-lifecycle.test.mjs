@@ -55,6 +55,7 @@ class InMemoryCredentialStorage {
   slots = new Map();
   exclusiveDepth = 0;
   operationErrors = [];
+  beforeCompareAndSwap = null;
 
   runExclusive(reference, operation) {
     if (this.exclusiveDepth !== 0) {
@@ -69,6 +70,7 @@ class InMemoryCredentialStorage {
           revision: Object.freeze({ revision: slot.revision }),
         }),
         compareAndSwap: (_expected, replacement) => {
+          this.beforeCompareAndSwap?.();
           slot.state = replacement === null ? null : structuredClone(replacement);
           slot.revision += 1;
           return { status: "swapped" };
@@ -610,6 +612,46 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
   assert.equal(lifecycle.transport.bufferedAmount(), 0);
   assert.equal(observations.receives, 2);
 
+  await closeLifecycle(lifecycle, socket);
+});
+
+test("registered reconciliation cannot publish after a synchronous connector retirement", async () => {
+  const h = credentialHarness();
+  const current = h.authority.read(REFERENCE);
+  h.authority.prepareReauthentication({
+    credentialReference: REFERENCE,
+    requestId: "registration-reconcile-orphan",
+    expectedCredential: {
+      reference: current.reference,
+      version: current.version,
+      grantId: current.grantId,
+      accessJti: current.accessJti,
+    },
+    expectedPendingReauthentication: null,
+  });
+  const sockets = fakeWebSockets(h.expectedAuthorizationDigest);
+  const scheduler = deadlineScheduler();
+  const factory = createFactory(h, sockets, scheduler);
+  const input = attempt();
+  const admission = prepare(factory, h.authority, input);
+  const lifecycle = factory.createTransportLifecycle(input);
+  const statuses = [];
+  const carrier = actor(h.authority, admission, statuses);
+  const connection = carrier.connect(lifecycle.transport, REFERENCE);
+  lifecycle.bindConnection(connection);
+  const socket = sockets.sockets[0];
+  socket.emitOpen();
+  const hello = decodeCarrier(socket.writes[0].bytes);
+
+  h.storage.beforeCompareAndSwap = () => {
+    h.storage.beforeCompareAndSwap = null;
+    connection.closed(1006);
+  };
+  socket.emitMessage(Buffer.from(registeredFrame(hello)), false);
+
+  assert.equal(h.authority.inspect(REFERENCE).pendingReauthentication, null);
+  assert.equal(statuses.at(-1).phase, "offline");
+  assert.equal(statuses.some((status) => status.phase === "registered"), false);
   await closeLifecycle(lifecycle, socket);
 });
 

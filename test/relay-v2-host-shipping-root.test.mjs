@@ -183,9 +183,17 @@ async function mintCredentialBytes() {
     refreshExpiresAtMs: ACCESS_EXPIRES_AT_MS + 86_400_000,
   });
   assert.equal(applied.status, "applied");
+  const current = authority.read(PROFILE.credentialReference);
   const reauth = authority.prepareReauthentication({
     credentialReference: PROFILE.credentialReference,
     requestId: MINT_REAUTH_REQUEST_ID,
+    expectedCredential: {
+      reference: current.reference,
+      version: current.version,
+      grantId: current.grantId,
+      accessJti: current.accessJti,
+    },
+    expectedPendingReauthentication: null,
   });
   assert.equal(reauth.accessToken, accessToken);
   await vault.closeAndDrain();
@@ -353,13 +361,6 @@ function registeredFrame(record) {
   registered.payload.supersededHostInstanceId = null;
   record.registeredConnectorId = registered.connectorId;
   return carrierWire(registered);
-}
-
-function authExpiringFrame(record) {
-  const frame = fixture("host-auth-expiring");
-  frame.connectorId = record.registeredConnectorId;
-  frame.payload.grantId = MINT_GRANT_ID;
-  return carrierWire(frame);
 }
 
 /** A real one-shot execution pair whose components stay inert in these tests. */
@@ -613,28 +614,17 @@ test("inputs, profile, and native source all fail closed before any socket", asy
   });
 });
 
-test("full chain assembles once: reconcile lifecycle, exact lineage start/stop, reauth cut, close fence", async () => {
+test("full chain reconciles registered credential orphan without replaying it to a successor", async () => {
   const home = privateHome("tw-relay-v2-ship-full-");
   seedProfile(home);
   const minted = await mintCredentialBytes();
   const h = await makeHarness("full", home, { initialBytes: minted.bytes });
   await h.openDaemon();
-  const scheduleLog = [];
   const previousSecret = process.env.TW_RELAY_SECRET;
   process.env.TW_RELAY_SECRET = V1_SECRET;
   try {
     const handle = await shippingRoot.startRelayV2HostShippingRoot(h.options({
       scanIntervalMs: 30,
-      reauthentication: {
-        idFactory: () => "mint-reauth-id",
-        schedule: (delayMs, callback) => {
-          const entry = { delayMs, callback, cancelled: false };
-          scheduleLog.push(entry);
-          return () => {
-            entry.cancelled = true;
-          };
-        },
-      },
     }));
     assert.equal(Object.getPrototypeOf(handle), null);
     assert.deepEqual(Reflect.ownKeys(handle).sort(), [
@@ -673,14 +663,13 @@ test("full chain assembles once: reconcile lifecycle, exact lineage start/stop, 
     assert.equal(inspection.status, "registered_incomplete");
     assert.deepEqual(inspection.negotiatedCapabilityIntersection, []);
 
-    // auth.expiring 进入同 lineage 的真实 reauth owner：只重放 exact durable pending request。
+    // registered 的 frozen WSS credential cut 与 durable current cut 完全一致，
+    // 因而只清理这个 connector-scoped orphan，不向当前 connector 重放旧 request。
     const beforeFirst = first.record.sent.length;
-    first.record.socket.receive(authExpiringFrame(first.record));
     await settle();
     const firstReauth = reauthenticateFrames(first.record, beforeFirst);
-    assert.equal(firstReauth.length, 1);
-    assert.equal(firstReauth[0].requestId, MINT_REAUTH_REQUEST_ID);
-    assert.equal(firstReauth[0].connectorId, first.record.registeredConnectorId);
+    assert.equal(firstReauth.length, 0);
+    assert.equal(h.native.state.generation, 1);
 
     const stopped = await handle.stopAndDrain({
       requestId: "ship.full.stop.1",
@@ -690,17 +679,15 @@ test("full chain assembles once: reconcile lifecycle, exact lineage start/stop, 
     });
     assert.equal(stopped.status, "stopped_and_drained");
 
-    // 新 connector 绑新 exact cut；stale socket 静默，durable request identity 不重新铸造。
+    // successor 继续绑定 exact current cut；已清理的旧 request 不跨 generation 重放。
     const second = await startOnce(handle, h, "ship.full.start.2");
     assert.notEqual(second.started.controllerGeneration, first.started.controllerGeneration);
     const staleSent = first.record.sent.length;
     const beforeSecond = second.record.sent.length;
-    second.record.socket.receive(authExpiringFrame(second.record));
     await settle();
     const secondReauth = reauthenticateFrames(second.record, beforeSecond);
-    assert.equal(secondReauth.length, 1);
-    assert.equal(secondReauth[0].requestId, MINT_REAUTH_REQUEST_ID);
-    assert.equal(secondReauth[0].connectorId, second.record.registeredConnectorId);
+    assert.equal(secondReauth.length, 0);
+    assert.equal(h.native.state.generation, 1);
     assert.equal(first.record.sent.length, staleSent);
 
     // v1 shared secret 与 bootstrap secret 都不上 wire、不进 header。
@@ -711,7 +698,7 @@ test("full chain assembles once: reconcile lifecycle, exact lineage start/stop, 
     assert.equal(wire.includes(BOOTSTRAP_SECRET), false);
     assert.equal(JSON.stringify(first.record.headers).includes(V1_SECRET), false);
 
-    // close fence：先拒新工作，drain 后幂等；replay timer 取消且 late fire 零帧；lifecycle 停摆。
+    // close fence：先拒新工作，drain 后幂等；lifecycle 停摆。
     const closing = handle.closeAndDrain();
     assert.equal(handle.closeAndDrain(), closing);
     assert.throws(
@@ -722,11 +709,6 @@ test("full chain assembles once: reconcile lifecycle, exact lineage start/stop, 
     await closing;
     assert.equal(h.native.state.closeCalls, 1);
     assert.ok(second.record.closes.length > 0, "managed drain closed the connector socket");
-    assert.ok(scheduleLog.length > 0 && scheduleLog.some((entry) => entry.cancelled));
-    const secondSent = second.record.sent.length;
-    for (const entry of scheduleLog) entry.callback();
-    await settle();
-    assert.equal(second.record.sent.length, secondSent);
     const callsAfterClose = h.discovery.state.calls;
     await new Promise((resolve) => setTimeout(resolve, 90));
     assert.equal(h.discovery.state.calls, callsAfterClose);

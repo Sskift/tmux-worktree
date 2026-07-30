@@ -808,6 +808,22 @@ function reauthenticationInput(cut, requestId = "managed.reauthenticate") {
   };
 }
 
+function automaticReauthenticationInput(harness, cut, requestId) {
+  const inspection = harness.managedWssCredential.authority.inspect(
+    CREDENTIAL_REFERENCE,
+  );
+  return {
+    ...reauthenticationInput(cut, requestId),
+    expectedCredential: {
+      reference: CREDENTIAL_REFERENCE,
+      version: inspection.credentialVersion,
+      grantId: inspection.grantId,
+      accessJti: inspection.accessJti,
+    },
+    expectedPendingReauthentication: inspection.pendingReauthentication,
+  };
+}
+
 function assertReauthenticationRejectedWithoutTouch(harness, input) {
   const activity = harness.credentialActivity();
   const sentCounts = harness.records.map((record) => record.transport.sent.length);
@@ -959,6 +975,51 @@ test("managed WSS composition keeps construction inert and binds one credential 
       await h.cleanup();
     }
   });
+
+  await t.test("successor registration retires its exact-current connector orphan", async () => {
+    const h = await createHarness({ managedWss: true });
+    try {
+      const first = await startManagedWssRegistered(
+        h,
+        "managed.wss.orphan.start.first",
+      );
+      const firstCut = h.composition.inspect();
+      assert.equal(h.composition.requestReauthentication(
+        reauthenticationInput(firstCut, "managed.wss.orphan.request"),
+      ), true);
+      assert.equal(
+        h.managedWssCredential.authority.inspect(CREDENTIAL_REFERENCE)
+          .pendingReauthentication.requestId,
+        "managed.wss.orphan.request",
+      );
+      await h.composition.stopAndDrain(
+        stopInput(firstCut, "managed.wss.orphan.stop.first"),
+      );
+
+      const second = await startManagedWssRegistered(
+        h,
+        "managed.wss.orphan.start.successor",
+      );
+      assert.notEqual(
+        second.result.controllerGeneration,
+        first.result.controllerGeneration,
+      );
+      assert.equal(
+        h.managedWssCredential.authority.inspect(CREDENTIAL_REFERENCE)
+          .pendingReauthentication,
+        null,
+      );
+      assert.equal(h.managedWssCredential.activity.writes, 2);
+      assert.equal(
+        second.record.sent
+          .map(({ bytes }) => decodeCarrier(bytes))
+          .some((frame) => frame.type === "host.reauthenticate"),
+        false,
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 test("local-development activation is opaque, exact-owner-bound, and one-shot", async () => {
@@ -1081,7 +1142,8 @@ test("Dashboard-owned connector enrolls while automatic reauth uses its exact cl
       await settle(1);
     }
     assert.equal(registeredCut.status, "registered_incomplete");
-    const reauthentication = reauthenticationInput(
+    const reauthentication = automaticReauthenticationInput(
+      h,
       registeredCut,
       "managed.dashboard.automatic-reauth",
     );
@@ -1091,6 +1153,18 @@ test("Dashboard-owned connector enrolls while automatic reauth uses its exact cl
       "the public facade remains gated after Dashboard claims connector lifecycle",
     );
     assert.deepEqual(automaticReauthentication.inspect(), registeredCut);
+    const effectsBeforeIncompleteAutomaticInput = dashboardManagementEffects(h, owner);
+    assert.equal(
+      automaticReauthentication.requestReauthentication(
+        reauthenticationInput(registeredCut, "managed.dashboard.incomplete-automatic-reauth"),
+      ),
+      false,
+      "the closed automatic port has no legacy three-field fallback",
+    );
+    assert.deepEqual(
+      dashboardManagementEffects(h, owner),
+      effectsBeforeIncompleteAutomaticInput,
+    );
     assert.equal(
       automaticReauthentication.requestReauthentication(reauthentication),
       true,
@@ -1896,6 +1970,13 @@ test("managed reauthentication delegates one exact registered cut and closes hos
     assert.deepEqual(h.reauthenticationPreparations, [{
       credentialReference: CREDENTIAL_REFERENCE,
       requestId: "managed.reauth.caller",
+      expectedCredential: {
+        reference: CREDENTIAL_REFERENCE,
+        version: "1",
+        grantId: "managed-host-grant",
+        accessJti: "managed-host-access-jti",
+      },
+      expectedPendingReauthentication: null,
     }]);
     const reauthenticationFrames = record.transport.sent
       .map(decodeCarrier)
@@ -2042,7 +2123,7 @@ test("managed reauthentication redacts synchronous credential authority failures
     assert.equal(result, false);
     assert.equal(String(result).includes(secret), false);
     assert.deepEqual(h.credentialActivity(), {
-      reads: 1,
+      reads: 2,
       preparations: 1,
       acknowledgements: 0,
     });

@@ -142,6 +142,13 @@ interface PendingReauthenticationSnapshot {
   readonly accessJti: string;
 }
 
+interface ExpectedCredentialSnapshot {
+  readonly reference: string;
+  readonly version: string;
+  readonly grantId: string;
+  readonly accessJti: string;
+}
+
 interface CredentialInspectionSnapshot {
   readonly credentialVersion: string;
   readonly hostId: string;
@@ -782,6 +789,15 @@ export class RelayV2HostReauthenticationLifecycleOwner {
     if (inspection.grantId !== signal.grantId || inspection.hostId !== this.hostId) {
       return terminalRound(this.seal("authority_mismatch"));
     }
+    if (inspection.accessJti === null) {
+      return terminalRound(this.seal("authority_mismatch"));
+    }
+    const expectedCredential = Object.freeze({
+      reference: this.credentialReference,
+      version: inspection.credentialVersion,
+      grantId: inspection.grantId,
+      accessJti: inspection.accessJti,
+    });
     if (inspection.pendingReauthentication !== null) {
       // ACK/transport loss, a refused admission after the durable persist, or
       // a reentered warning: resend only the exact persisted pending request
@@ -789,6 +805,8 @@ export class RelayV2HostReauthenticationLifecycleOwner {
       return this.sendExactPendingRequest(
         job,
         inspection.pendingReauthentication.requestId,
+        expectedCredential,
+        inspection.pendingReauthentication,
         OUTCOME_RESENT,
       );
     }
@@ -814,6 +832,9 @@ export class RelayV2HostReauthenticationLifecycleOwner {
     if (after.grantId !== signal.grantId || after.hostId !== this.hostId) {
       return terminalRound(this.seal("authority_mismatch"));
     }
+    if (after.accessJti === null) {
+      return terminalRound(this.seal("authority_mismatch"));
+    }
     if (BigInt(after.credentialVersion) <= BigInt(inspection.credentialVersion)) {
       // The durable commit (or an authority-proven winner) must have advanced
       // the credential before the new token may go on the wire.
@@ -821,7 +842,18 @@ export class RelayV2HostReauthenticationLifecycleOwner {
     }
     const requestId = this.nextIdentifier();
     if (requestId === null) return terminalRound(FAILED_OUTCOMES[this.sealCode]);
-    return this.sendExactPendingRequest(job, requestId, OUTCOME_REQUESTED);
+    return this.sendExactPendingRequest(
+      job,
+      requestId,
+      Object.freeze({
+        reference: this.credentialReference,
+        version: after.credentialVersion,
+        grantId: after.grantId,
+        accessJti: after.accessJti,
+      }),
+      null,
+      OUTCOME_REQUESTED,
+    );
   }
 
   /**
@@ -832,6 +864,8 @@ export class RelayV2HostReauthenticationLifecycleOwner {
   private sendExactPendingRequest(
     job: JobState,
     requestId: string,
+    expectedCredential: ExpectedCredentialSnapshot,
+    expectedPendingReauthentication: PendingReauthenticationSnapshot | null,
     outcome: RelayV2HostReauthenticationLifecycleOutcome,
   ): RoundResult {
     const bound = job.boundCut;
@@ -852,6 +886,8 @@ export class RelayV2HostReauthenticationLifecycleOwner {
           requestId,
           controllerGeneration: bound.controllerGeneration,
           connectorId: bound.connectorId,
+          expectedCredential,
+          expectedPendingReauthentication,
         })],
       );
     } catch {
@@ -1117,7 +1153,8 @@ export class RelayV2HostReauthenticationLifecycleOwner {
     const pending = inspection.pendingReauthentication;
     // The ACK landed durably: the chain stops. Anything else resends only the
     // exact persisted pending request identity through the same bound cut.
-    if (pending === null || chain.remaining <= 0) return;
+    if (pending === null || inspection.grantId === null
+      || inspection.accessJti === null || chain.remaining <= 0) return;
     let admitted: unknown;
     try {
       admitted = Reflect.apply(
@@ -1127,6 +1164,13 @@ export class RelayV2HostReauthenticationLifecycleOwner {
           requestId: pending.requestId,
           controllerGeneration: chain.cut.controllerGeneration,
           connectorId: chain.cut.connectorId,
+          expectedCredential: Object.freeze({
+            reference: this.credentialReference,
+            version: inspection.credentialVersion,
+            grantId: inspection.grantId,
+            accessJti: inspection.accessJti,
+          }),
+          expectedPendingReauthentication: pending,
         })],
       );
     } catch {
