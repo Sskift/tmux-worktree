@@ -315,6 +315,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val beforeNonOnlineProjectionClear: () -> Unit = {},
     private val beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
     private val afterRetryableFailureAdmissionDetached: () -> Unit = {},
+    private val afterCredentialRolloverTransportLossClaimed: () -> Unit = {},
     private val afterActorConnectAdmissionHandoff: () -> Unit = {},
 ) : RelayV2SessionReplyCommandPort,
     RelayV2SessionKillCommandPort,
@@ -1017,7 +1018,8 @@ internal class RelayV2BaseRuntimeComposition(
         if (!terminalRecoveryReady || !canConnectLocked(fence)) return null
         if (connectionAttemptJob != null ||
             pendingOutboxAdmission != null ||
-            boundOutboxAdmission != null
+            boundOutboxAdmission != null ||
+            credentialRolloverAdmission != null
         ) {
             return null
         }
@@ -2303,6 +2305,7 @@ internal class RelayV2BaseRuntimeComposition(
         ) return@synchronized false
         detachConnectionAttemptLocked(admission.connectionAttempt, admission.generation)
         admission.transportLost = true
+        afterCredentialRolloverTransportLossClaimed()
         true
     }
 

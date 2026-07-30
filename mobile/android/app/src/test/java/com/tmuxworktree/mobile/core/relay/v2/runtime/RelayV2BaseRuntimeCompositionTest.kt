@@ -1527,6 +1527,51 @@ class RelayV2BaseRuntimeCompositionTest {
         }
 
     @Test
+    fun `retry now cannot steal transport loss admission from credential rollover`() = runBlocking {
+        val rolloverEntered = CompletableDeferred<RelayV2Profile>()
+        val rolloverResult = CompletableDeferred<RelayV2CredentialRolloverResult>()
+        val transportLossClaimed = CompletableDeferred<Unit>()
+        val harness = Harness(
+            autoConnect = true,
+            credentialRollover = RelayV2CredentialRolloverPort { expected ->
+                rolloverEntered.complete(expected)
+                rolloverResult.await()
+            },
+            afterCredentialRolloverTransportLossClaimed = {
+                transportLossClaimed.complete(Unit)
+            },
+        )
+        try {
+            harness.connectOnline()
+            val original = harness.transport()
+            original.sendFixture("auth-expiring")
+            val expected = withTimeout(TIMEOUT_MS) { rolloverEntered.await() }
+            original.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+            withTimeout(TIMEOUT_MS) { transportLossClaimed.await() }
+
+            assertEquals(
+                RelayV2RetryNowResult.AlreadyInProgress,
+                harness.composition.retryNow(harness.profile.copy(autoConnect = true)),
+            )
+            delay(50)
+            assertEquals(1, harness.factory.requests.size)
+
+            harness.advanceCredentialVersion(2)
+            rolloverResult.complete(
+                RelayV2CredentialRolloverResult.Refreshed(
+                    expected.copy(credentialVersion = 2),
+                ),
+            )
+            harness.awaitTransport(1)
+            assertEquals(2, harness.factory.requests.size)
+            assertEquals("twcap2.test-access-v2", harness.factory.requests[1].accessToken)
+        } finally {
+            rolloverResult.complete(RelayV2CredentialRolloverResult.Unavailable)
+            harness.close()
+        }
+    }
+
+    @Test
     fun `query commits before send and empty status effects finish recovery`() = runBlocking {
         val harness = Harness(
             autoConnect = true,
@@ -2868,6 +2913,7 @@ class RelayV2BaseRuntimeCompositionTest {
         beforeNonOnlineProjectionClear: () -> Unit = {},
         beforeOnlineResyncReceiptSubmit: suspend () -> Unit = {},
         afterRetryableFailureAdmissionDetached: () -> Unit = {},
+        afterCredentialRolloverTransportLossClaimed: () -> Unit = {},
         beforeOutboxRead: suspend (Int) -> Unit = {},
         includeMaterializedSession: Boolean = true,
         transportOpenFailure: Throwable? = null,
@@ -2951,6 +2997,8 @@ class RelayV2BaseRuntimeCompositionTest {
                 beforeOnlineResyncReceiptSubmit = beforeOnlineResyncReceiptSubmit,
                 afterRetryableFailureAdmissionDetached =
                     afterRetryableFailureAdmissionDetached,
+                afterCredentialRolloverTransportLossClaimed =
+                    afterCredentialRolloverTransportLossClaimed,
                 afterActorConnectAdmissionHandoff = afterActorConnectAdmissionHandoff,
             )
         }
