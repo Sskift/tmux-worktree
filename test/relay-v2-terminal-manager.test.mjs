@@ -2195,7 +2195,7 @@ test("HostState pending exact retry durably replays stream_lost without resolver
   }
 });
 
-test("restart-like reset retires only an exact durable binding before admitting a replacement", async () => {
+test("restart-like reset rejects invalid tuples and fails closed without local lost proof", async () => {
   const lineage = new FakeDurableLineage();
   const first = harness({ lineage, hostInstanceId: "restart-retire-host-one" });
   const request = goldenOpen({
@@ -2213,7 +2213,6 @@ test("restart-like reset retires only an exact durable binding before admitting 
   });
   const exactResume = {
     generation: source.payload.generation,
-    nextOffset: "0",
     resumeToken: source.payload.resumeToken,
   };
   const wrongResumeSecret = "private-capability-not-used-by-any-request-identity";
@@ -2289,22 +2288,268 @@ test("restart-like reset retires only an exact durable binding before admitting 
   )?.frame;
   assert.equal(reset.type, "terminal.reset_required");
   assert.equal(reset.payload.reason, "stream_lost");
-  assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, {
-    kind: "retire_previous",
-    generation: source.payload.generation,
-  });
-  assert.equal(lineage.streams.get(streamKey).status, "released");
+  assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, { kind: "preserve" });
+  assert.equal(lineage.streams.get(streamKey).status, "live");
+  assert.equal(lineage.streams.get(streamKey).generation, source.payload.generation);
   assert.equal(restarted.resolver.calls.length, 0);
   assert.equal(restarted.backend.opens.length, 0);
+});
 
-  const replacement = goldenOpen({
-    requestId: "restart-retire-new-after-exact",
-    streamId: request.streamId,
-    openId: "restart-retire-new-after-exact-open-id",
+test("quarantined active backend blocks repeated exact reset replacement", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({ lineage, limits: { maxStreams: 2 } });
+  const request = goldenOpen({
+    requestId: "quarantined-reset-source",
+    streamId: "quarantined-reset-stream",
+    openId: "quarantined-reset-source-open-id",
   });
-  await restarted.manager.open(replacement);
-  assert.ok(opened(restarted.sent, replacement.requestId));
-  assert.equal(restarted.backend.opens.length, 1);
+  await h.manager.open(request);
+  const source = opened(h.sent, request.requestId);
+  const streamKey = lineage.claimOpenCalls[0].streamKey;
+  const stream = [...h.manager.streams.values()][0];
+  swapStreamEffectTarget(stream, "quarantined-reset");
+
+  await h.manager.open({ ...request, requestId: "quarantined-reset-replay" });
+  assert.equal(h.sent.at(-1).frame.type, "terminal.reset_required");
+  assert.equal(h.manager.stats().retainedStreams, 0);
+  assert.equal(h.backend.opens.length, 1);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 0);
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const resetRequest = goldenOpen({
+      requestId: `quarantined-reset-attempt-${attempt}`,
+      streamId: request.streamId,
+      openId: `quarantined-reset-attempt-${attempt}-open-id`,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+    await h.manager.open(resetRequest);
+    const reset = h.sent.find(
+      ({ frame }) => frame.requestId === resetRequest.requestId,
+    )?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.reason, "stream_lost");
+    assert.equal(opened(h.sent, resetRequest.requestId), undefined);
+    assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, { kind: "preserve" });
+    assert.equal(lineage.streams.get(streamKey).status, "live");
+    assert.equal(lineage.streams.get(streamKey).generation, source.payload.generation);
+    assert.equal(h.backend.opens.length, 1);
+    assert.equal(h.backend.opens[0].handle.closeCalls, 0);
+    assert.equal(h.resolver.calls.length, 1);
+  }
+});
+
+test("uncertain lost-local release blocks repeated exact reset replacement", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({
+    lineage,
+    limits: {
+      maxStreams: 2,
+      streamRingBytes: 8,
+      hostRingBytes: 16,
+      maxUnackedBytes: 4,
+      maxFrameBytes: 4,
+    },
+  });
+  const request = goldenOpen({
+    requestId: "uncertain-reset-source",
+    streamId: "uncertain-reset-stream",
+    openId: "uncertain-reset-source-open-id",
+  });
+  await h.manager.open(request);
+  const source = opened(h.sent, request.requestId);
+  await h.manager.input({
+    ...streamContext(source),
+    inputSeq: "1",
+    data: Buffer.from([1]),
+  });
+  const exactLease = clone(h.authority.inputCalls[0].lease);
+  h.authority.releaseResults.push(new Error("uncertain reset release settlement"));
+  await h.backend.opens[0].handle.emit(Buffer.alloc(5));
+
+  const lost = [...h.manager.streams.values()][0];
+  assert.equal(lost.status, "lost");
+  assert.equal(lost.backend, undefined);
+  assert.deepEqual(lost.retiringLease, exactLease);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const resetRequest = goldenOpen({
+      requestId: `uncertain-reset-attempt-${attempt}`,
+      streamId: request.streamId,
+      openId: `uncertain-reset-attempt-${attempt}-open-id`,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+    await h.manager.open(resetRequest);
+    const reset = h.sent.find(
+      ({ frame }) => frame.requestId === resetRequest.requestId,
+    )?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.reason, "stream_lost");
+    assert.equal(opened(h.sent, resetRequest.requestId), undefined);
+    assert.equal(h.backend.opens.length, 1);
+    assert.equal(h.manager.stats().retainedStreams, 1);
+    assert.deepEqual([...h.manager.streams.values()][0].retiringLease, exactLease);
+    assert.equal(h.resolver.calls.length, 1);
+  }
+});
+
+test("HostState exact lost-local reset atomically replaces and preserves on backend failure", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-lost-reset-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
+    const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store,
+      admissionFence: new FakeResolver(),
+      now: () => 1_000_000,
+    });
+    const markStreamClosed = lineage.markStreamClosed.bind(lineage);
+    let failNaturalCloseOnce = false;
+    lineage.markStreamClosed = async (input) => {
+      if (failNaturalCloseOnce) {
+        failNaturalCloseOnce = false;
+        throw new Error("injected natural close persistence failure");
+      }
+      return markStreamClosed(input);
+    };
+    const h = harness({
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+      limits: {
+        streamRingBytes: 8,
+        hostRingBytes: 16,
+        maxUnackedBytes: 4,
+        maxFrameBytes: 4,
+      },
+    });
+    const request = goldenOpen({
+      requestId: "lost-reset-source-open",
+      streamId: "lost-reset-stream",
+      openId: "lost-reset-source-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+    });
+    await h.manager.open(request);
+    const source = opened(h.sent, request.requestId);
+    const oversized = new Proxy({}, {
+      get(_target, property) {
+        if (property === "byteLength") return 5;
+        throw new Error(`oversize callback was inspected through ${String(property)}`);
+      },
+    });
+    await h.backend.opens[0].handle.emitRaw(oversized);
+    assert.equal(h.sent.at(-1).frame.type, "terminal.reset_required");
+    assert.equal(h.sent.at(-1).frame.kind, "event");
+
+    const firstReset = goldenOpen({
+      requestId: "lost-reset-first-attempt",
+      streamId: request.streamId,
+      openId: "lost-reset-first-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+    await h.manager.open(firstReset);
+    const replacement = opened(h.sent, firstReset.requestId);
+    assert.ok(replacement);
+    assert.equal(replacement.payload.disposition, "reset");
+    assert.notEqual(replacement.payload.generation, source.payload.generation);
+    assert.equal(h.backend.opens.length, 2);
+    assert.equal(h.sent.some(({ frame }) => (
+      frame.requestId === firstReset.requestId && frame.type === "terminal.reset_required"
+    )), false);
+
+    const replayReset = {
+      ...firstReset,
+      requestId: "lost-reset-first-attempt-replay",
+    };
+    await h.manager.open(replayReset);
+    const replayed = opened(h.sent, replayReset.requestId);
+    assert.ok(replayed);
+    assert.equal(replayed.payload.disposition, "reset");
+    assert.equal(replayed.payload.generation, replacement.payload.generation);
+    assert.equal(replayed.payload.deduplicated, true);
+    assert.equal(h.backend.opens.length, 2);
+    assert.equal(h.backend.opens[1].handle.closeCalls, 0);
+
+    let snapshot = await store.read();
+    let durableState = Object.values(snapshot.materialized).find((value) => (
+      value?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    assert.equal(durableState.streamAuthorities.length, 1);
+    assert.equal(durableState.streamAuthorities[0].generation, replacement.payload.generation);
+    assert.equal(
+      durableState.streamAuthorities[0].resumeTokenHash,
+      resumeTokenHash(replacement.payload.resumeToken),
+    );
+    assert.deepEqual(durableState.streamAuthorities[0].canonicalBinding, CANONICAL_BINDING);
+    assert.equal(durableState.streamAuthorities[0].closeSlotReserved, true);
+    assert.equal(JSON.stringify(durableState).includes(replacement.payload.resumeToken), false);
+
+    failNaturalCloseOnce = true;
+    const sentBeforeSilentLoss = h.sent.length;
+    await assert.rejects(
+      h.backend.opens[1].handle.exit("backend_exit", 0),
+      managerError("INTERNAL"),
+    );
+    assert.equal(h.sent.length, sentBeforeSilentLoss);
+    h.backend.openResults.push(new Error("injected lost-local replacement failure"));
+    const failedReset = goldenOpen({
+      requestId: "lost-reset-backend-failure",
+      streamId: request.streamId,
+      openId: "lost-reset-backend-failure-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+      resume: {
+        generation: replacement.payload.generation,
+        resumeToken: replacement.payload.resumeToken,
+      },
+    });
+    await h.manager.open(failedReset);
+    assert.equal(
+      h.sent.find(({ frame }) => frame.requestId === failedReset.requestId)?.frame.type,
+      "terminal.reset_required",
+    );
+    assert.equal(h.backend.openResults.length, 0);
+    assert.equal(h.manager.stats().retainedStreams, 1);
+    assert.equal(h.manager.stats().reservedCloseRecords, 1);
+    snapshot = await store.read();
+    durableState = Object.values(snapshot.materialized).find((value) => (
+      value?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    assert.equal(durableState.streamAuthorities.length, 1);
+    assert.equal(durableState.streamAuthorities[0].generation, replacement.payload.generation);
+    assert.equal(
+      durableState.streamAuthorities[0].resumeTokenHash,
+      resumeTokenHash(replacement.payload.resumeToken),
+    );
+
+    const retry = goldenOpen({
+      ...failedReset,
+      requestId: "lost-reset-retry-after-backend-failure",
+      openId: "lost-reset-retry-after-backend-failure-open-id",
+    });
+    await h.manager.open(retry);
+    const recovered = opened(h.sent, retry.requestId);
+    assert.ok(recovered);
+    assert.equal(recovered.payload.disposition, "reset");
+    assert.notEqual(recovered.payload.generation, replacement.payload.generation);
+    assert.equal(h.backend.opens.length, 3);
+    assert.equal(h.manager.stats().reservedCloseRecords, 1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("durable open claims every mode and retains fingerprints and reset outcomes across restart", async () => {

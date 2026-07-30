@@ -2198,7 +2198,40 @@ export class RelayV2TerminalManager {
       authority: claimAuthority.streamAuthority,
       ...(retained ? { record: retained } : {}),
     });
-    if (reconciliation.status === "divergent" || retained) {
+    const exactLostLocalReset = reconciliation.status === "divergent"
+      && retained === undefined
+      && request.mode === "reset"
+      && request.resume !== undefined
+      && reconciliation.stream.status === "lost"
+      && reconciliation.stream.backend === undefined
+      && reconciliation.stream.producerLease === undefined
+      && reconciliation.stream.retiringLease === undefined
+      && reconciliation.stream.ringRetained === false
+      && reconciliation.stream.ring.length === 0
+      && reconciliation.localFenceAuthorized
+      && reconciliation.effectTargetProven
+      && claimAuthority.streamAuthority.status === "live"
+      && reconciliation.stream.generation === claimAuthority.streamAuthority.generation
+      && request.resume.generation === claimAuthority.streamAuthority.generation
+      && sameTarget(claimAuthority.streamAuthority.target, request.target)
+      && claimAuthority.streamAuthority.pane === request.pane
+      && requestResumeTokenHash !== null
+      && safeHashEqual(
+        reconciliation.stream.resumeTokenHash,
+        claimAuthority.streamAuthority.resumeTokenHash,
+      )
+      && safeHashEqual(
+        claimAuthority.streamAuthority.resumeTokenHash,
+        requestResumeTokenHash,
+      )
+      && this.validResumeToken(reconciliation.stream, request.resume.resumeToken);
+    const alreadyLostPrevious = exactLostLocalReset
+      ? reconciliation.stream
+      : undefined;
+    if (
+      (reconciliation.status === "divergent" && !exactLostLocalReset)
+      || retained
+    ) {
       const settled = await this.failOpenRecord(
         request,
         key,
@@ -2248,8 +2281,10 @@ export class RelayV2TerminalManager {
       return;
     }
     try {
+      const reservesCloseSlot = request.mode === "new"
+        || (request.mode === "reset" && !existing && !alreadyLostPrevious);
       this.requireControlSlots(
-        request.mode === "new" || (request.mode === "reset" && !existing) ? 2 : 1,
+        reservesCloseSlot ? 2 : 1,
       );
       if (
         (request.mode === "new" || (request.mode === "reset" && !existing))
@@ -2306,8 +2341,8 @@ export class RelayV2TerminalManager {
       recordKey,
       requestFingerprint,
       claimAuthority,
-      !existing || existing.status === "lost",
       requestResumeTokenHash,
+      alreadyLostPrevious,
     );
   }
 
@@ -2516,7 +2551,9 @@ export class RelayV2TerminalManager {
   }
 
   private async cleanupDivergentLocalStream(stream: TerminalStream): Promise<void> {
+    stream.binding = undefined;
     await this.loseStream(stream, "stream_lost", false);
+    if (stream.retiringLease) return;
     stream.reservedCloseRecord = false;
     if (this.streams.get(stream.key) === stream) this.streams.delete(stream.key);
   }
@@ -2962,7 +2999,36 @@ export class RelayV2TerminalManager {
     disposition: "new" | "reset",
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
     previous?: TerminalStream,
+    alreadyLostPrevious?: TerminalStream,
   ): Promise<void> {
+    const source = claimAuthority.streamAuthority;
+    const lostResume = request.mode === "reset" ? request.resume : undefined;
+    if (alreadyLostPrevious && (
+      previous !== undefined
+      || disposition !== "reset"
+      || lostResume === undefined
+      || this.streams.get(key) !== alreadyLostPrevious
+      || alreadyLostPrevious.status !== "lost"
+      || alreadyLostPrevious.backend !== undefined
+      || alreadyLostPrevious.producerLease !== undefined
+      || alreadyLostPrevious.retiringLease !== undefined
+      || alreadyLostPrevious.ringRetained
+      || alreadyLostPrevious.ring.length !== 0
+      || source.status !== "live"
+      || alreadyLostPrevious.generation !== source.generation
+      || lostResume.generation !== source.generation
+      || !sameTarget(source.target, request.target)
+      || source.pane !== request.pane
+      || !safeHashEqual(alreadyLostPrevious.resumeTokenHash, source.resumeTokenHash)
+      || !safeHashEqual(source.resumeTokenHash, tokenHash(lostResume.resumeToken))
+      || !this.validResumeToken(alreadyLostPrevious, lostResume.resumeToken)
+      || !exactEffectTargetMatches(alreadyLostPrevious, source.canonicalBinding)
+    )) {
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "terminal lost-generation replacement lacks exact local proof",
+      );
+    }
     let generation: string | null = null;
     generation = claimAuthority.issuedGeneration;
     if (!isOpaqueId(generation)) {
@@ -2981,6 +3047,7 @@ export class RelayV2TerminalManager {
     if (generation === null) {
       throw new RelayV2TerminalManagerError("INTERNAL", "terminal generation was not initialized");
     }
+    if (alreadyLostPrevious) alreadyLostPrevious.binding = undefined;
 
     let failureStreamEffect: RelayV2TerminalOpenFailureStreamEffect = { kind: "preserve" };
     if (previous) {
@@ -3094,6 +3161,7 @@ export class RelayV2TerminalManager {
       return;
     }
     this.streams.set(key, stream);
+    if (alreadyLostPrevious) alreadyLostPrevious.reservedCloseRecord = false;
     this.cacheOpenRecord({
       key: recordKey,
       streamKey: key,
@@ -3271,8 +3339,8 @@ export class RelayV2TerminalManager {
     recordKey: string,
     requestFingerprint: string,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
-    localWasMissingOrLost: boolean,
     requestResumeTokenHash: string | null,
+    alreadyLostPrevious?: TerminalStream,
   ): Promise<void> {
     const source = claimAuthority.streamAuthority;
     const resume = request.resume;
@@ -3289,47 +3357,17 @@ export class RelayV2TerminalManager {
       && requestResumeTokenHash !== null
       && safeHashEqual(source.resumeTokenHash, requestResumeTokenHash)
       && this.validResumeToken(existing, resume.resumeToken);
-    const restartLikeExactPrevious = localWasMissingOrLost
-      && !existing
-      && source.status === "live"
-      && resume !== undefined
-      && source.generation === resume.generation
-      && sameTarget(source.target, request.target)
-      && source.pane === request.pane
-      && requestResumeTokenHash !== null
-      && safeHashEqual(source.resumeTokenHash, requestResumeTokenHash);
-    if (restartLikeExactPrevious) {
-      const outcome: Extract<OpenRecordOutcome, { kind: "reset" }> = {
-        kind: "reset",
-        generation: source.generation,
-        reason: "stream_lost",
-        requestedOffset: null,
-        bufferStartOffset: null,
-        tailOffset: null,
-      };
-      const completed = await this.failOpenRecord(
+    if (alreadyLostPrevious) {
+      await this.createGeneration(
         request,
         key,
         recordKey,
         requestFingerprint,
-        outcome,
+        "reset",
         claimAuthority,
-        { kind: "retire_previous", generation: source.generation },
+        undefined,
+        alreadyLostPrevious,
       );
-      if (
-        completed.kind !== "reset"
-        || completed.generation !== outcome.generation
-        || completed.reason !== outcome.reason
-        || completed.requestedOffset !== null
-        || completed.bufferStartOffset !== null
-        || completed.tailOffset !== null
-      ) {
-        throw new RelayV2TerminalManagerError(
-          "INTERNAL",
-          "durable terminal restart retirement changed the stream_lost winner",
-        );
-      }
-      await this.sendResetResponse(request, completed, "open");
       return;
     }
     if (!(sourceIsAbsent && !existing) && !validExisting) {
