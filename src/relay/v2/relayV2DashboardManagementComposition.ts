@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto";
+
 import {
   RelayV2DashboardManagementAuthority,
+  type RelayV2DashboardManagementConnectorPort,
 } from "./relayV2DashboardManagementAuthority.js";
 import {
   RelayV2DashboardManagementHostCredentialAdapter,
@@ -26,6 +29,13 @@ import {
   consumeRelayV2HostDashboardManagementBinding,
   type RelayV2HostDashboardManagementBinding,
 } from "./hostRuntimeComposition.js";
+import {
+  RELAY_V2_HOST_CONNECTOR_MONITOR_INTERVAL_MS,
+  RELAY_V2_HOST_RECONNECT_INITIAL_DELAY_MS,
+  RELAY_V2_HOST_RECONNECT_MAXIMUM_DELAY_MS,
+  nextRelayV2HostReconnectDelayMs,
+  waitForRelayV2HostReconnectDelay,
+} from "./hostReconnectBackoff.js";
 
 type DataRecord = Record<string, unknown>;
 
@@ -72,6 +82,7 @@ const hostManagementBindingActivations = new WeakMap<object, ActivationRecord>()
 const COORDINATOR_CREATE_OWNER =
   RelayV2HostCredentialExchangeCoordinator.prototype.createOwnerBoundPort;
 const COMPOSITION_CLOSE_REQUEST_ID = "dashboard-management-composition.close";
+const COMPOSITION_RETRY_REQUEST_ID_PREFIX = "dashboard-management-retry.";
 
 function closed(): never {
   throw new RelayV2DashboardManagementCompositionClosedError();
@@ -176,7 +187,9 @@ function validateOwners(signature: ActivationSignature): void {
 /**
  * Default-off, unwired composition for one exact Dashboard management owner.
  * It chooses no protocol and owns no process, socket, transport, credential,
- * enrollment, capability, or fallback lifecycle.
+ * enrollment, capability, or fallback lifecycle. Its private desired-state
+ * loop is armed only by a successful user start and drives successor attempts
+ * through the same canonical connector owner.
  */
 function activateComposition(
   signature: ActivationSignature,
@@ -212,13 +225,103 @@ function activateComposition(
       signature.credentialAuthority,
     );
     if (hostPorts === null) return closed();
-    const connector = new RelayV2DashboardManagementHostConnectorAdapter({
+    const connectorAdapter = new RelayV2DashboardManagementHostConnectorAdapter({
       controller: hostPorts.connectorLifecycle,
       hostId: signature.hostId,
       hostEpoch: signature.hostEpoch,
       hostInstanceId: signature.hostInstanceId,
       credentialReference: signature.credentialReference,
       signal: signature.signal,
+    });
+    let retryPermanentlyFenced = false;
+    let retryDesired = false;
+    let retryAbort: AbortController | null = null;
+    let retryTask: Promise<void> | null = null;
+
+    const retryIsCurrent = (abort: AbortController): boolean =>
+      retryDesired && retryAbort === abort && !abort.signal.aborted;
+
+    const disarmRetry = (): Promise<void> | null => {
+      retryDesired = false;
+      const task = retryTask;
+      retryAbort?.abort();
+      retryAbort = null;
+      return task;
+    };
+
+    const runRetry = async (abort: AbortController): Promise<void> => {
+      let reconnectDelayMs = RELAY_V2_HOST_RECONNECT_INITIAL_DELAY_MS;
+      while (retryIsCurrent(abort)) {
+        const cut = await connectorAdapter.inspectCut();
+        if (!retryIsCurrent(abort)) return;
+        if (cut.status === "registered") {
+          reconnectDelayMs = RELAY_V2_HOST_RECONNECT_INITIAL_DELAY_MS;
+          await waitForRelayV2HostReconnectDelay(
+            RELAY_V2_HOST_CONNECTOR_MONITOR_INTERVAL_MS,
+            abort.signal,
+          );
+          continue;
+        }
+        if (cut.status === "starting") {
+          await waitForRelayV2HostReconnectDelay(
+            RELAY_V2_HOST_CONNECTOR_MONITOR_INTERVAL_MS,
+            abort.signal,
+          );
+          continue;
+        }
+        if (cut.status !== "failed" || cut.retryable !== true) return;
+        await waitForRelayV2HostReconnectDelay(reconnectDelayMs, abort.signal);
+        if (!retryIsCurrent(abort)) return;
+        const retryCut = await connectorAdapter.inspectCut();
+        if (!retryIsCurrent(abort)) return;
+        if (retryCut.status === "registered") {
+          reconnectDelayMs = RELAY_V2_HOST_RECONNECT_INITIAL_DELAY_MS;
+          continue;
+        }
+        if (retryCut.status === "starting") continue;
+        if (retryCut.status !== "failed" || retryCut.retryable !== true) return;
+        reconnectDelayMs = nextRelayV2HostReconnectDelayMs(
+          reconnectDelayMs,
+          RELAY_V2_HOST_RECONNECT_MAXIMUM_DELAY_MS,
+        );
+        try {
+          await connectorAdapter.start(Object.freeze({
+            requestId: `${COMPOSITION_RETRY_REQUEST_ID_PREFIX}${randomUUID()}`,
+          }));
+        } catch {
+          if (!retryIsCurrent(abort)) return;
+        }
+      }
+    };
+
+    const armRetry = (): void => {
+      if (retryPermanentlyFenced || retryDesired) return;
+      retryDesired = true;
+      const abort = new AbortController();
+      retryAbort = abort;
+      const task = runRetry(abort).finally(() => {
+        if (retryTask !== task) return;
+        retryTask = null;
+        if (retryAbort === abort) {
+          retryDesired = false;
+          retryAbort = null;
+        }
+      });
+      retryTask = task;
+      void task.catch(() => undefined);
+    };
+
+    const connector: RelayV2DashboardManagementConnectorPort = Object.freeze({
+      inspectCut: () => connectorAdapter.inspectCut(),
+      async start(input) {
+        await connectorAdapter.start(input);
+        armRetry();
+      },
+      async stop(input) {
+        const retry = disarmRetry();
+        if (retry !== null) await retry;
+        await connectorAdapter.stop(input);
+      },
     });
     const authority = new RelayV2DashboardManagementAuthority({
       credential,
@@ -247,12 +350,15 @@ function activateComposition(
     const closeAndDrain = (): Promise<void> => {
       if (closePromise !== null) return closePromise;
       accepting = false;
+      retryPermanentlyFenced = true;
+      const retry = disarmRetry();
       closePromise = (async () => {
         await Promise.allSettled([...pending]);
-        const cut = await connector.inspectCut();
+        if (retry !== null) await retry;
+        const cut = await connectorAdapter.inspectCut();
         if (cut.status !== "stopped") {
-          await connector.stop({ requestId: COMPOSITION_CLOSE_REQUEST_ID });
-          const drained = await connector.inspectCut();
+          await connectorAdapter.stop({ requestId: COMPOSITION_CLOSE_REQUEST_ID });
+          const drained = await connectorAdapter.inspectCut();
           if (drained.status !== "stopped") return closed();
         }
       })().catch(() => {

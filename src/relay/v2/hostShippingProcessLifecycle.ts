@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 
 import { RELAY_V2_HOST_SUPERSEDED_EXIT_CODE } from "./hostCarrier.js";
+import {
+  RELAY_V2_HOST_CONNECTOR_MONITOR_INTERVAL_MS,
+  RELAY_V2_HOST_RECONNECT_INITIAL_DELAY_MS,
+  RELAY_V2_HOST_RECONNECT_MAXIMUM_DELAY_MS,
+  nextRelayV2HostReconnectDelayMs,
+  waitForRelayV2HostReconnectDelay,
+} from "./hostReconnectBackoff.js";
 import type { RelayV2HostManagedConnectorInspection } from "./hostRuntimeComposition.js";
 import type { RelayV2HostShippingRootHandle } from "./hostShippingRoot.js";
-
-const DEFAULT_MONITOR_INTERVAL_MS = 250;
-const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 1_000;
-const DEFAULT_RECONNECT_MAXIMUM_DELAY_MS = 15_000;
 
 export interface RelayV2HostShippingProcessLifecycleOptions {
   readonly signal?: AbortSignal;
@@ -76,20 +79,6 @@ function positiveDelay(value: number | undefined, fallback: number): number {
   return value;
 }
 
-function defaultWait(delayMs: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const finish = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", finish);
-      resolve();
-    };
-    const timer = setTimeout(finish, delayMs);
-    signal.addEventListener("abort", finish, { once: true });
-    if (signal.aborted) finish();
-  });
-}
-
 function connectorId(
   inspection: RelayV2HostManagedConnectorInspection,
 ): string | null {
@@ -137,18 +126,18 @@ export class RelayV2HostShippingProcessLifecycleOwner {
     this.#handle = handle;
     this.#externalSignal = options.signal;
     this.#requestIdFactory = options.requestIdFactory ?? randomUUID;
-    this.#wait = options.wait ?? defaultWait;
+    this.#wait = options.wait ?? waitForRelayV2HostReconnectDelay;
     this.#monitorIntervalMs = positiveDelay(
       options.monitorIntervalMs,
-      DEFAULT_MONITOR_INTERVAL_MS,
+      RELAY_V2_HOST_CONNECTOR_MONITOR_INTERVAL_MS,
     );
     this.#reconnectInitialDelayMs = positiveDelay(
       options.reconnectInitialDelayMs,
-      DEFAULT_RECONNECT_INITIAL_DELAY_MS,
+      RELAY_V2_HOST_RECONNECT_INITIAL_DELAY_MS,
     );
     this.#reconnectMaximumDelayMs = positiveDelay(
       options.reconnectMaximumDelayMs,
-      DEFAULT_RECONNECT_MAXIMUM_DELAY_MS,
+      RELAY_V2_HOST_RECONNECT_MAXIMUM_DELAY_MS,
     );
     if (this.#reconnectInitialDelayMs > this.#reconnectMaximumDelayMs) {
       throw new RelayV2HostShippingProcessLifecycleError("LIFECYCLE_FAILED");
@@ -271,8 +260,8 @@ export class RelayV2HostShippingProcessLifecycleOwner {
       }
       if (signal.aborted) break;
       await this.#wait(reconnectDelayMs, signal);
-      reconnectDelayMs = Math.min(
-        reconnectDelayMs * 2,
+      reconnectDelayMs = nextRelayV2HostReconnectDelayMs(
+        reconnectDelayMs,
         this.#reconnectMaximumDelayMs,
       );
     }

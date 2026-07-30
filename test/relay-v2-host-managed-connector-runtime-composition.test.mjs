@@ -66,6 +66,9 @@ const dashboardManagementContract = JSON.parse(readFileSync(new URL(
 const dashboardManagementStartFrame = dashboardManagementContract.goldenExchanges.find(
   ({ operation }) => operation === "start_connector",
 ).requestFrame;
+const dashboardManagementStopFrame = dashboardManagementContract.goldenExchanges.find(
+  ({ operation }) => operation === "stop_connector",
+).requestFrame;
 const dashboardManagementStatusFrame = dashboardManagementContract.goldenExchanges.find(
   ({ operation }) => operation === "status",
 ).requestFrame;
@@ -95,6 +98,18 @@ function settle(turns = 8) {
     (tail) => tail.then(() => new Promise((resolve) => setImmediate(resolve))),
     Promise.resolve(),
   );
+}
+
+function delay(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function waitForRecordCount(harness, count, message) {
+  const deadline = Date.now() + 3_000;
+  while (harness.records.length < count && Date.now() < deadline) {
+    await delay(25);
+  }
+  assert.equal(harness.records.length, count, message);
 }
 
 function deferred() {
@@ -1146,6 +1161,97 @@ test("Dashboard-owned connector enrolls while automatic reauth uses its exact cl
     assert.equal(await session.run(), 1);
   } finally {
     await h.cleanup();
+  }
+});
+
+test("Dashboard-owned desired state retries registered retryable failure on the canonical controller", async () => {
+  const h = await createHarness({ managedWss: true });
+  try {
+    const owner = createDashboardManagementOwner(h);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    await settle();
+    assert.equal(h.records.length, 0, "cold construction cannot start the connector");
+
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    const first = await registerPendingManagedWss(h);
+    await settle();
+    assert.equal(h.composition.inspect().status, "registered_incomplete");
+
+    first.socket.terminate();
+    await settle();
+    assert.deepEqual(h.composition.inspect(), {
+      status: "failed",
+      controllerGeneration: "1",
+      connectorId: "managed-connector-1",
+      retryable: true,
+    });
+
+    await waitForRecordCount(
+      h,
+      2,
+      "the Dashboard owner did not create the successor after capped backoff",
+    );
+    const successor = await registerPendingManagedWss(h);
+    assert.equal(successor.sequence, 2);
+    await settle();
+    assert.deepEqual(h.composition.inspect(), {
+      status: "registered_incomplete",
+      controllerGeneration: "2",
+      connectorId: "managed-connector-2",
+      acknowledgement: "host.registered",
+      negotiatedCapabilityIntersection: [],
+    });
+
+    owner.input.end();
+    assert.equal(await run, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("Dashboard stop and composition close fence a pending desired-state retry", async (t) => {
+  for (const operation of ["stop", "close"]) {
+    await t.test(operation, async () => {
+      const h = await createHarness({ managedWss: true });
+      try {
+        const owner = createDashboardManagementOwner(h);
+        const session = dashboardManagementSessionModule
+          .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+        owner.input.push(Buffer.from(dashboardManagementStartFrame));
+        const run = session.run();
+        const first = await registerPendingManagedWss(h);
+        await settle();
+        first.socket.terminate();
+        await settle();
+        assert.equal(h.composition.inspect().status, "failed");
+
+        await delay(300);
+        assert.equal(h.records.length, 1, "retry must still be inside its initial backoff");
+        if (operation === "stop") {
+          owner.input.push(Buffer.from(dashboardManagementStopFrame));
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            if (h.composition.inspect().status === "stopped") break;
+            await settle(1);
+          }
+          assert.equal(h.composition.inspect().status, "stopped");
+        } else {
+          await session.closeAndDrain();
+        }
+
+        await delay(1_100);
+        assert.equal(h.records.length, 1, `${operation} did not fence the retry timer`);
+        if (operation === "stop") {
+          owner.input.end();
+          assert.equal(await run, 0);
+        } else {
+          assert.equal(await run, 1);
+        }
+      } finally {
+        await h.cleanup();
+      }
+    });
   }
 });
 

@@ -473,3 +473,20 @@ remains outside `relay-host` CLI/public production activation; the actor's stati
 advertised capability set is only the fail-closed input that forbids bypassing
 the readiness-to-pre-carrier-claim chain, and the codec producer alone does not
 advertise Relay v2 capabilities.
+
+## Relay v2 Dashboard-owned Host desired state
+
+Dashboard hidden child仍不采用headless `relay-host --profile v2`的auto-start
+process lifecycle，也不会在冷启动时自行连接。只有用户的`start_connector`
+经同一个management composition和canonical controller成功后，该闭包才arm
+same-lineage desired state；随后只对exact
+`{ status: "failed", retryable: true }`按共享的1秒到15秒capped backoff调用
+同一controller的`start`，观察到`host.registered`后重置backoff。retry前会重读
+exact cut，因此nonretryable、superseded、stopped或已closed状态都不能触发
+successor。
+
+`stop_connector`在进入既有controller stop/drain前同步disarm并fence等待中的
+timer；composition close还永久fence late arm，等待已接纳request和retry task
+收敛后再沿既有stop/drain关闭。该policy不在React observer、Tauri supervisor
+或第二套Host lifecycle中实现，也不改变default-off、空production
+qualification/capability与默认Relay v1边界。
