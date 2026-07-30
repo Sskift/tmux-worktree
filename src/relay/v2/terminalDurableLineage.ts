@@ -1125,7 +1125,7 @@ function parseState(
           && record.requestedOffset === null)
         || (record.resumeTokenHash !== null
           && record.previousGeneration !== null
-          && record.requestedOffset !== null)
+          && record.requestedOffset === null)
       ))) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
@@ -1199,7 +1199,6 @@ function parseState(
         || record.resumeTokenHash !== record.streamAuthority.resumeTokenHash
         || !sameTarget(record.target, record.streamAuthority.target)
         || record.pane !== record.streamAuthority.pane
-        || record.requestedOffset === null
         || record.requestedOffset !== record.streamAuthority.requestedOffset
       )) {
         return lineageError(
@@ -1224,7 +1223,6 @@ function parseState(
           || record.resumeTokenHash !== record.streamAuthority.resumeTokenHash
           || !sameTarget(record.target, record.streamAuthority.target)
           || record.pane !== record.streamAuthority.pane
-          || record.requestedOffset === null
           || record.requestedOffset !== record.streamAuthority.requestedOffset
         ))
         || (record.mode === "resume" && (
@@ -2302,7 +2300,6 @@ export class RelayV2TerminalDurableLineageAuthority
       || record.resumeTokenHash !== record.streamAuthority.resumeTokenHash
       || !sameTarget(record.target, record.streamAuthority.target)
       || record.pane !== record.streamAuthority.pane
-      || record.requestedOffset === null
       || record.requestedOffset !== record.streamAuthority.requestedOffset
       || !sameCanonicalBinding(
         record.preparedBinding,
@@ -2794,7 +2791,7 @@ export class RelayV2TerminalDurableLineageAuthority
           && value.requestedOffset === null)
         || (value.resumeTokenHash !== null
           && value.previousGeneration !== null
-          && value.requestedOffset !== null)
+          && value.requestedOffset === null)
       ))) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",

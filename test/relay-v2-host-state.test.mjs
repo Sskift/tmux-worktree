@@ -499,6 +499,63 @@ test("commit faults expose either the previous cut or the complete associated cu
   });
 });
 
+test("terminal durable lineage admits exact reset resume identity without a requested offset", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store);
+    const original = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const opened = await commitTerminalOpen(authority, original);
+    const reset = terminalOpenClaim({
+      key: "terminal-open:exact-reset-without-offset",
+      fingerprint: "2".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      requestedOffset: null,
+    });
+
+    const winner = await authority.claimOpen(reset);
+    assert.equal(winner.status, "claimed");
+    assert.equal(winner.streamAuthority.status, "live");
+    assert.equal(winner.streamAuthority.generation, opened.generation);
+    assert.equal((await authority.prepareOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    })).status, "prepared");
+    const outcome = {
+      kind: "opened",
+      generation: winner.issuedGeneration,
+      resumeTokenHash: TOKEN_HASH_TWO,
+      disposition: "reset",
+      replayFromOffset: "0",
+    };
+    assert.deepEqual(await authority.completeOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      outcome,
+    }), { status: "committed", outcome });
+
+    const record = terminalState(await store.read()).openRecords.find(
+      ({ key }) => key === reset.key,
+    );
+    assert.equal(record.resumeTokenHash, TOKEN_HASH_ONE);
+    assert.equal(Object.hasOwn(record, "resumeToken"), false);
+    assert.equal(record.requestedOffset, null);
+    assert.equal(record.streamAuthority.requestedOffset, null);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("HostState terminal lineage persists exact binding, monotonic issuance, and restart loss", async () => {
   const h = harness();
   let issued = 0;
@@ -1093,7 +1150,7 @@ test("host restart atomically retires executable terminal lineage and requires e
       hostInstanceId: secondStore.hostInstanceId,
       mode: "reset",
       previousGeneration: opened.generation,
-      requestedOffset: "0",
+      requestedOffset: null,
       resumeTokenHash: TOKEN_HASH_ONE,
     });
     const resetWinner = await secondAuthority.claimOpen(reset);
@@ -1177,6 +1234,17 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
       mode: "reset",
       previousGeneration: opened.generation,
       requestedOffset: null,
+      resumeTokenHash: null,
+    })), (error) => (
+      error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT"
+    ));
+    await assert.rejects(secondAuthority.claimOpen(terminalOpenClaim({
+      key: "terminal-open:offset-reset-after-restart",
+      fingerprint: "0".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
       resumeTokenHash: TOKEN_HASH_ONE,
     })), (error) => (
       error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT"
@@ -1188,7 +1256,7 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
       hostInstanceId: secondStore.hostInstanceId,
       mode: "reset",
       previousGeneration: opened.generation,
-      requestedOffset: "0",
+      requestedOffset: null,
       resumeTokenHash: TOKEN_HASH_TWO,
     });
     assert.deepEqual(await secondAuthority.claimOpen(wrongOldTuple), {
@@ -1400,7 +1468,7 @@ test("HostState terminal lineage admits one stream mutation, enforces quotas, an
         hostInstanceId: store.hostInstanceId,
         mode: "reset",
         previousGeneration: closed.generation,
-        requestedOffset: "0",
+        requestedOffset: null,
         resumeTokenHash: TOKEN_HASH_ONE,
       });
       assert.deepEqual(await authority.claimOpen(resetClosed), {
@@ -1432,7 +1500,7 @@ test("HostState terminal lineage admits one stream mutation, enforces quotas, an
         resumeTokenHash: TOKEN_HASH_ONE,
         mode: "reset",
         previousGeneration: opened.generation,
-        requestedOffset: "0",
+        requestedOffset: null,
       });
       assert.deepEqual(await authority.claimOpen(mismatched), {
         status: "conflict",
@@ -2025,7 +2093,7 @@ test("open admission reconciliation reuses exact post-retirement quota math", as
         hostInstanceId: store.hostInstanceId,
         mode: "reset",
         previousGeneration: closed.generation,
-        requestedOffset: "0",
+        requestedOffset: null,
         resumeTokenHash: TOKEN_HASH_ONE,
       });
       failWitnessRename = true;
@@ -2058,7 +2126,7 @@ test("reset completion and parsing preserve the full captured recovery tuple", a
       hostInstanceId: store.hostInstanceId,
       mode: "reset",
       previousGeneration: opened.generation,
-      requestedOffset: "0",
+      requestedOffset: null,
       resumeTokenHash: TOKEN_HASH_ONE,
     });
     const winner = await authority.claimOpen(reset);
