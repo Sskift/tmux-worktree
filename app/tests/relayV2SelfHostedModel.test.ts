@@ -40,6 +40,7 @@ test("self-hosted Relay v2 draft is explicit and normalizes a root HTTPS origin"
     enabled: true,
     brokerHostId: "devbox",
     issuerUrl: "https://relay.company.test",
+    listenHost: "10.20.30.40",
     tlsKeyPath: "/private/tls.key",
     tlsCertificatePath: "/private/tls.crt",
     tlsCaPath: "/private/ca.pem",
@@ -51,7 +52,7 @@ test("self-hosted Relay v2 draft is explicit and normalizes a root HTTPS origin"
       enabled: true,
       brokerHostId: "devbox",
       issuerUrl: "https://relay.company.test/",
-      listenHost: "0.0.0.0",
+      listenHost: "10.20.30.40",
       listenPort: 8788,
       tlsKeyPath: "/private/tls.key",
       tlsCertificatePath: "/private/tls.crt",
@@ -78,6 +79,43 @@ test("self-hosted Relay v2 rejects implicit activation and secret-bearing URLs",
     assert.equal(validation.valid, false, issuerUrl);
     assert.ok(validation.errors.enabled, issuerUrl);
     assert.ok(validation.errors.issuerUrl, issuerUrl);
+  }
+});
+
+test("self-hosted Relay v2 requires an explicit private IPv4 bind address", () => {
+  assert.equal(createRelayV2SelfHostedDraft().listenHost, "");
+  for (const listenHost of [
+    "",
+    "relay.internal",
+    "203.0.113.8",
+    "2001:db8::1",
+  ]) {
+    const validation = validateRelayV2SelfHostedDraft({
+      ...createRelayV2SelfHostedDraft(),
+      enabled: true,
+      brokerHostId: "devbox",
+      issuerUrl: "https://relay.company.test/",
+      listenHost,
+      tlsKeyPath: "/private/tls.key",
+      tlsCertificatePath: "/private/tls.crt",
+      tlsCaPath: "/private/ca.pem",
+    });
+    assert.equal(validation.valid, false, listenHost);
+    assert.match(validation.errors.listenHost ?? "", /private IPv4/);
+  }
+
+  for (const listenHost of ["10.2.3.4", "172.16.5.6", "192.168.1.8", "0.0.0.0"]) {
+    const validation = validateRelayV2SelfHostedDraft({
+      ...createRelayV2SelfHostedDraft(),
+      enabled: true,
+      brokerHostId: "devbox",
+      issuerUrl: "https://relay.company.test/",
+      listenHost,
+      tlsKeyPath: "/private/tls.key",
+      tlsCertificatePath: "/private/tls.crt",
+      tlsCaPath: "/private/ca.pem",
+    });
+    assert.equal(validation.valid, true, listenHost);
   }
 });
 

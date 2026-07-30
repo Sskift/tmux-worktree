@@ -164,9 +164,9 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           onChange={(value) => update("issuerUrl", value)}
         />
         <DeploymentField
-          label="Bind host"
+          label="Devbox private IPv4"
           value={draft.listenHost}
-          placeholder="0.0.0.0"
+          placeholder="10.x.x.x"
           error={errors.listenHost}
           disabled={locked || running || !draft.enabled}
           onChange={(value) => update("listenHost", value)}
@@ -211,6 +211,8 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
         </div>
       )}
       <p className="connections-relay-v2-deployment__hint">
+        Enter the devbox&apos;s private IPv4 explicitly. Using 0.0.0.0 is an
+        explicit opt-in to listen on every interface.{" "}
         TLS key, leaf certificate, and CA certificate must be current-user-owned,
         single-link, exact 0600 files. Deployment publishes separate 0600 copies and
         keeps the Broker SQLite state directory 0700.

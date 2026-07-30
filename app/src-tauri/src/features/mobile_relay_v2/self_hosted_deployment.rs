@@ -482,16 +482,17 @@ fn relay_url_from_issuer(issuer_url: &str) -> Result<String, String> {
 
 fn validate_listen_host(value: &str) -> Result<String, String> {
     let value = value.trim();
-    if value.is_empty()
-        || value.len() > 255
-        || value.starts_with('-')
-        || value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return Err("Relay v2 listen host is invalid".to_string());
+    let address = value.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        "Enter the devbox private IPv4 address; 0.0.0.0 requires explicit input".to_string()
+    })?;
+    let octets = address.octets();
+    let private = octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168);
+    if !private && !address.is_unspecified() {
+        return Err("Relay v2 bind address must be a private IPv4 or explicit 0.0.0.0".to_string());
     }
-    Ok(value.to_string())
+    Ok(address.to_string())
 }
 
 fn read_local_private_file(
@@ -1539,8 +1540,8 @@ mod tests {
     use super::{
         build_remote_bundle_publish_script, build_remote_bundle_stage_validation_script,
         build_remote_relay_v2_center_command, normalize_issuer_url, read_local_private_file,
-        relay_url_from_issuer, validate_bootstrap_bytes, PersistedSelfHostedConfig,
-        CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
+        relay_url_from_issuer, validate_bootstrap_bytes, validate_listen_host,
+        PersistedSelfHostedConfig, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
     };
 
     fn config() -> PersistedSelfHostedConfig {
@@ -1579,6 +1580,22 @@ mod tests {
             relay_url_from_issuer("https://relay.company.test/"),
             Ok("wss://relay.company.test/".to_string())
         );
+    }
+
+    #[test]
+    fn listen_host_requires_an_explicit_private_ipv4_or_wildcard() {
+        for accepted in ["10.2.3.4", "172.31.9.8", "192.168.1.7", "0.0.0.0"] {
+            assert_eq!(validate_listen_host(accepted), Ok(accepted.to_string()));
+        }
+        for rejected in [
+            "",
+            "relay.internal",
+            "172.32.1.1",
+            "203.0.113.8",
+            "2001:db8::1",
+        ] {
+            assert!(validate_listen_host(rejected).is_err(), "{rejected}");
+        }
     }
 
     #[test]

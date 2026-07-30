@@ -35,7 +35,7 @@ export function createRelayV2SelfHostedDraft(): RelayV2SelfHostedDraft {
     enabled: false,
     brokerHostId: "",
     issuerUrl: "",
-    listenHost: "0.0.0.0",
+    listenHost: "",
     listenPort: "8788",
     tlsKeyPath: "",
     tlsCertificatePath: "",
@@ -95,13 +95,19 @@ export function validateRelayV2SelfHostedDraft(
   }
 
   const listenHost = draft.listenHost.trim();
-  if (
-    !listenHost
-    || listenHost.startsWith("-")
-    || /\s/.test(listenHost)
-    || listenHost.length > 255
-  ) {
-    errors.listenHost = "Enter a valid bind host, for example 0.0.0.0.";
+  const octets = listenHost.split(".");
+  const validIpv4 = octets.length === 4 && octets.every((octet) => (
+    /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255
+  ));
+  const values = validIpv4 ? octets.map(Number) : [];
+  const privateIpv4 = validIpv4 && (
+    values[0] === 10
+    || (values[0] === 172 && values[1] >= 16 && values[1] <= 31)
+    || (values[0] === 192 && values[1] === 168)
+  );
+  if (!privateIpv4 && listenHost !== "0.0.0.0") {
+    errors.listenHost =
+      "Enter the devbox private IPv4 address; use 0.0.0.0 only as an explicit all-interface opt-in.";
   }
   const listenPort = Number(draft.listenPort);
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65_535) {
