@@ -392,6 +392,56 @@ pub(crate) fn project_for_renderer(
     .map_err(|_| ())
 }
 
+pub(crate) fn projection_has_base_connector_readiness(value: &serde_json::Value) -> bool {
+    let Ok(projection) = exact_object(
+        value,
+        &[
+            "authority",
+            "hostCredential",
+            "connector",
+            "enrollment",
+            "knownClientGrant",
+        ],
+    ) else {
+        return false;
+    };
+    let Ok(authority) =
+        serde_json::from_value::<ProjectionAuthority>(projection["authority"].clone())
+    else {
+        return false;
+    };
+    let Ok(host_credential) =
+        serde_json::from_value::<HostCredentialProjection>(projection["hostCredential"].clone())
+    else {
+        return false;
+    };
+    let Ok(connector) =
+        serde_json::from_value::<ConnectorProjection>(projection["connector"].clone())
+    else {
+        return false;
+    };
+    let ConnectorProjection::Registered {
+        acknowledgement,
+        host_id,
+        connector_id,
+        negotiated_capability_intersection,
+    } = &connector
+    else {
+        return false;
+    };
+    matches!(host_credential, HostCredentialProjection::Ready { .. })
+        && authority.kind == "node"
+        && authority.reason.is_none()
+        && validate_registered_connector(
+            acknowledgement,
+            host_id,
+            connector_id,
+            negotiated_capability_intersection,
+            true,
+        )
+        .is_ok()
+}
+
 fn renderer_enrollment_review(
     review: EnrollmentReview,
     connector_id: String,

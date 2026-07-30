@@ -256,6 +256,27 @@ impl MobileRelayV2ManagementCommandState {
         }
     }
 
+    pub(crate) fn start_connector_and_require_base_readiness(&self) -> Result<(), ManagementError> {
+        let outcome = self.call_with_input(
+            MobileRelayV2ManagementOperation::StartConnector,
+            ManagementInput::None,
+        )?;
+        if !outcome.ok {
+            return Err(outcome.error.unwrap_or_else(channel_closed_error));
+        }
+        if outcome.protocol_version == super::management_protocol_v2::PROTOCOL_VERSION
+            && outcome.error.is_none()
+            && outcome
+                .result
+                .as_ref()
+                .is_some_and(super::management_protocol_v2::projection_has_base_connector_readiness)
+        {
+            Ok(())
+        } else {
+            Err(not_ready_error())
+        }
+    }
+
     pub(crate) fn replace_self_hosted<F>(
         &self,
         app: &tauri::AppHandle,
@@ -836,6 +857,56 @@ mod tests {
                 .unwrap_err(),
             channel_closed_error()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_hosted_connector_start_requires_the_exact_base_readiness_projection() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../contracts/dashboard-relay-v2-management/v2/cases.json"
+        ))
+        .unwrap();
+        let start = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "start_connector")
+            .unwrap();
+        let request_id = start["normalizedRequest"]["requestId"].as_str().unwrap();
+        let request_bytes: [u8; 16] = URL_SAFE_NO_PAD
+            .decode(request_id.split_once('.').unwrap().1)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut response = fixture["projectionCases"]["registeredIncomplete"].clone();
+        response["requestId"] = serde_json::Value::String(request_id.to_string());
+        let cases = [
+            (
+                start["responseFrame"]
+                    .as_str()
+                    .unwrap()
+                    .trim_end()
+                    .to_string(),
+                Ok(()),
+            ),
+            (
+                serde_json::to_string(&response).unwrap(),
+                Err(not_ready_error()),
+            ),
+        ];
+        for (response, expected) in cases {
+            assert!(!response.contains('\''));
+            let script = format!(
+                "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; IFS= read -r request; case \"$request\" in *'\"operation\":\"start_connector\"'*) printf '%s\\n' '{response}' ;; *) exit 1 ;; esac; while IFS= read -r request; do :; done"
+            );
+            let manager =
+                ManagementChildManager::start_v2_command_regression_script(script, request_bytes)
+                    .unwrap();
+            let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+            assert_eq!(state.start_connector_and_require_base_readiness(), expected);
+        }
     }
 
     #[test]

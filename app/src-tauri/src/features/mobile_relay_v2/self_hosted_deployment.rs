@@ -2862,6 +2862,17 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
                     "Relay v2 self-hosted Host could not become ready".to_string()
                 }
             })?;
+        // The protocol-v2 StartConnector operation waits on the canonical
+        // Host connector controller through its host.registered cut. The
+        // Broker process and its durable state may predate this invocation,
+        // so a Host failure is left to that controller and reported without
+        // stopping the Center, reminting bootstrap material, or falling back.
+        management
+            .start_connector_and_require_base_readiness()
+            .map_err(|_| {
+                "Relay v2 self-hosted Host did not register with all six required capabilities"
+                    .to_string()
+            })?;
         let committed =
             load_config()?.ok_or("Relay v2 self-hosted management configuration disappeared")?;
         Ok(probe_status(&committed))
