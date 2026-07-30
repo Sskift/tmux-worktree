@@ -311,6 +311,7 @@ trait ManagementChildProcess: ChildLifecycle {
     fn write_stdin_once(&self, frame: &[u8], deadline: Instant) -> ChildWrite;
     fn read_stdout(&self, deadline: Instant) -> ChildRead;
     fn poll_stdout(&self) -> ChildPoll;
+    fn poll_health(&self, deadline: Instant) -> ChildPoll;
     fn poll_after_response(&self, deadline: Instant) -> ChildPoll;
 }
 
@@ -593,6 +594,44 @@ impl BoundedObservationQueue {
                     return ChildPoll::Pending;
                 }
                 None => {}
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return ChildPoll::Failed;
+            };
+            let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timeout.timed_out() {
+                return ChildPoll::Failed;
+            }
+        }
+    }
+
+    fn poll_health(&self, deadline: Instant) -> ChildPoll {
+        let mut state = self.state.lock().unwrap();
+        let Some(required_generation) = state.drain_started_generation.checked_add(1) else {
+            return ChildPoll::Failed;
+        };
+        state.requested_drain_generation =
+            state.requested_drain_generation.max(required_generation);
+        self.changed.notify_all();
+        loop {
+            if state.discarded {
+                return ChildPoll::Failed;
+            }
+            if state.partial {
+                return ChildPoll::Output;
+            }
+            if let Some(event) = state.events.pop_front() {
+                self.changed.notify_all();
+                return match event {
+                    StdoutEvent::Frame(_) | StdoutEvent::Violation => ChildPoll::Output,
+                    StdoutEvent::Eof => ChildPoll::Eof,
+                    StdoutEvent::Exited(exit) => ChildPoll::Exited(exit),
+                    StdoutEvent::Failed => ChildPoll::Failed,
+                };
+            }
+            if state.drain_ack_generation >= required_generation {
+                return ChildPoll::Pending;
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return ChildPoll::Failed;
@@ -1005,6 +1044,10 @@ impl ManagementChildProcess for ProductionProcess {
 
     fn poll_stdout(&self) -> ChildPoll {
         self.observations.poll_idle()
+    }
+
+    fn poll_health(&self, deadline: Instant) -> ChildPoll {
+        self.observations.poll_health(deadline)
     }
 
     fn poll_after_response(&self, deadline: Instant) -> ChildPoll {
@@ -1548,7 +1591,13 @@ impl ManagementChildManager {
         if self.inner.lifecycle_kind_after_barrier() != LifecycleKind::Ready {
             return false;
         }
-        self.inner.observe_idle_child().is_none()
+        if self.inner.observe_idle_child().is_some() {
+            return false;
+        }
+        let deadline = Instant::now() + self.inner.operation_timeout;
+        self.inner
+            .observe_child_poll(self.inner.child.poll_health(deadline))
+            .is_none()
             && self.inner.lifecycle_kind_now() == LifecycleKind::Ready
     }
 
@@ -1700,7 +1749,11 @@ impl ManagerInner {
     }
 
     fn observe_idle_child(&self) -> Option<LifecycleKind> {
-        match self.child.poll_stdout() {
+        self.observe_child_poll(self.child.poll_stdout())
+    }
+
+    fn observe_child_poll(&self, poll: ChildPoll) -> Option<LifecycleKind> {
+        match poll {
             ChildPoll::Pending => None,
             ChildPoll::Exited(exit) => Some(self.classify_post_handshake_exit(exit)),
             ChildPoll::Output | ChildPoll::Eof | ChildPoll::Failed => {
@@ -2214,6 +2267,7 @@ mod tests {
         killed: bool,
         stdin_closed: bool,
         reaped: bool,
+        health_poll: ChildPoll,
         events: Vec<&'static str>,
     }
 
@@ -2241,6 +2295,7 @@ mod tests {
                     killed: false,
                     stdin_closed: false,
                     reaped: false,
+                    health_poll: ChildPoll::Pending,
                     events: Vec::new(),
                 }),
                 changed: Condvar::new(),
@@ -2257,6 +2312,10 @@ mod tests {
 
         fn set_write_action(&self, action: WriteAction) {
             self.state.lock().unwrap().write_actions = VecDeque::from([action]);
+        }
+
+        fn set_health_poll(&self, poll: ChildPoll) {
+            self.state.lock().unwrap().health_poll = poll;
         }
 
         fn push_read(&self, after_writes: usize, read: ChildRead) {
@@ -2399,6 +2458,13 @@ mod tests {
             };
             state.reads.pop_front();
             poll
+        }
+
+        fn poll_health(&self, _deadline: Instant) -> ChildPoll {
+            match self.poll_stdout() {
+                ChildPoll::Pending => self.state.lock().unwrap().health_poll,
+                observed => observed,
+            }
         }
 
         fn poll_after_response(&self, _deadline: Instant) -> ChildPoll {
@@ -3325,6 +3391,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn production_health_cut_requests_a_drain_for_an_exit_in_the_idle_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("child-exited");
+        let process = production_script_process(&format!(
+            "IFS= read -r signal; : > '{}'; exit 0",
+            marker.display()
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert!(process
+            .observations
+            .pause_unsolicited_drains_after_current_ack(deadline));
+        assert_eq!(
+            process.write_stdin_once(b"exit\n", deadline),
+            ChildWrite::Written(5)
+        );
+        while !marker.is_file() {
+            assert!(Instant::now() < deadline, "child did not reach exit");
+            thread::sleep(Duration::from_millis(1));
+        }
+        loop {
+            match process.authority.try_exit() {
+                Ok(Some(exit)) => {
+                    assert_eq!(exit.code, Some(0));
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => panic!("exact child did not exit"),
+            }
+        }
+
+        assert_eq!(process.poll_stdout(), ChildPoll::Pending);
+        assert_eq!(
+            process.poll_health(deadline),
+            ChildPoll::Exited(ChildExit { code: Some(0) })
+        );
+        assert_eq!(process.wait_and_reap().code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn production_stdout_owner_latches_payload_overflow() {
         let process = script_process(
             "i=0; while [ \"$i\" -lt 16385 ]; do printf x; i=$((i + 1)); done; printf '\\n'",
@@ -3512,20 +3620,17 @@ mod tests {
     }
 
     #[test]
-    fn same_key_reuse_synchronously_observes_the_exact_idle_child() {
+    fn same_key_health_cut_rejects_exit_between_stdout_drains() {
         let child = FakeChild::ready_then("1.2.3", Vec::new());
         let manager = start_fake(child.clone(), vec![[12; 16]], "1.2.3");
-        child.push_read(0, ChildRead::Eof);
+        // The observation queue is empty, matching the production gap after
+        // one acknowledged would-block drain and before the stdout owner has
+        // published the exact process exit on its next pass.
+        child.set_health_poll(ChildPoll::Exited(ChildExit { code: Some(0) }));
 
         assert!(!manager.is_reusable_after_observation());
-        assert_eq!(
-            manager.dispose(),
-            ManagementCleanupOutcome::RecoveryRequired
-        );
-        assert_eq!(
-            child.state.lock().unwrap().events,
-            ["kill-if-live", "wait-and-reap"]
-        );
+        assert_eq!(manager.dispose(), ManagementCleanupOutcome::Clean);
+        assert_eq!(child.state.lock().unwrap().events, ["wait-and-reap"]);
     }
 
     #[test]
