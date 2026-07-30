@@ -25,6 +25,24 @@ function listenUnix(socketPath) {
 
 test("isolated Dashboard launchers use one short private socket namespace", async () => {
   const sourceHome = fs.mkdtempSync(path.join(os.tmpdir(), "twd-source-"));
+  const sensitiveServiceMarker = "must-not-reach-isolated-dashboard";
+  const expectedHosts = [
+    {
+      id: "devbox",
+      host: "devbox.example",
+      futureHostField: { keep: true },
+    },
+  ];
+  const expectedProjects = {
+    dashboard: {
+      path: "/repo/dashboard",
+      futureProjectField: "keep",
+    },
+  };
+  const expectedUnknownExtension = {
+    contract: "future-dashboard-extension",
+    nested: { keep: true },
+  };
   const hostileTmpDir = path.join(
     sourceHome,
     "var-folders-style-tmpdir-that-is-deliberately-too-long-for-unix-sockets",
@@ -38,6 +56,29 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
     path.join(sourceHome, ".tw-dashboard-terminals.json"),
     '{"terminals":[{"aiCmd":"hostile-command"}]}\n',
   );
+  const sourceConfigPath = path.join(sourceHome, ".tmux-worktree.json");
+  fs.writeFileSync(
+    sourceConfigPath,
+    `${JSON.stringify({
+      hosts: expectedHosts,
+      projects: expectedProjects,
+      worktreeBase: "/private/tmp/worktrees",
+      feishuBridge: { marker: sensitiveServiceMarker },
+      mobileRelay: { marker: sensitiveServiceMarker },
+      futureDashboardExtension: expectedUnknownExtension,
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const selfHostedConfigPath = path.join(
+    sourceHome,
+    ".tmux-worktree",
+    "relay-v2-self-hosted",
+    "dashboard-config-v1.json",
+  );
+  fs.mkdirSync(path.dirname(selfHostedConfigPath), { recursive: true });
+  fs.writeFileSync(selfHostedConfigPath, '{"marker":"account-owned"}\n', {
+    mode: 0o600,
+  });
   const originalHome = process.env.HOME;
   const originalTmpDir = process.env.TMPDIR;
   let isolated;
@@ -71,6 +112,41 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
     );
     assert.equal(
       fs.existsSync(path.join(isolated.tempHome, ".tw-dashboard-terminals.json")),
+      false,
+    );
+    const isolatedConfigPath = path.join(
+      isolated.tempHome,
+      ".tmux-worktree.json",
+    );
+    const isolatedConfigText = fs.readFileSync(isolatedConfigPath, "utf8");
+    assert.equal(isolatedConfigText.includes(sensitiveServiceMarker), false);
+    const isolatedConfig = JSON.parse(isolatedConfigText);
+    assert.equal(Object.hasOwn(isolatedConfig, "feishuBridge"), false);
+    assert.equal(Object.hasOwn(isolatedConfig, "mobileRelay"), false);
+    assert.deepEqual(isolatedConfig.hosts, expectedHosts);
+    assert.deepEqual(isolatedConfig.projects, expectedProjects);
+    assert.equal(isolatedConfig.worktreeBase, "/private/tmp/worktrees");
+    assert.deepEqual(
+      isolatedConfig.futureDashboardExtension,
+      expectedUnknownExtension,
+    );
+    assert.equal(fs.lstatSync(isolatedConfigPath).mode & 0o777, 0o600);
+
+    const sourceConfigAfter = JSON.parse(
+      fs.readFileSync(sourceConfigPath, "utf8"),
+    );
+    assert.equal(Object.hasOwn(sourceConfigAfter, "feishuBridge"), true);
+    assert.equal(Object.hasOwn(sourceConfigAfter, "mobileRelay"), true);
+    assert.equal(fs.existsSync(selfHostedConfigPath), true);
+    assert.equal(
+      fs.existsSync(
+        path.join(
+          isolated.tempHome,
+          ".tmux-worktree",
+          "relay-v2-self-hosted",
+          "dashboard-config-v1.json",
+        ),
+      ),
       false,
     );
     const metadata = fs.lstatSync(isolated.tmuxTmpDir);
@@ -176,5 +252,39 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
       fs.rmSync(secondIsolated.tempRoot, { recursive: true, force: true });
     }
     fs.rmSync(sourceHome, { recursive: true, force: true });
+  }
+});
+
+test("isolated Dashboard config copy fails closed and cleans its temp root", () => {
+  for (const invalidConfig of ["{", "[]"]) {
+    const sourceHome = fs.mkdtempSync(path.join(os.tmpdir(), "twd-invalid-source-"));
+    const sourceConfigPath = path.join(sourceHome, ".tmux-worktree.json");
+    fs.writeFileSync(sourceConfigPath, invalidConfig, { mode: 0o600 });
+
+    const originalHome = process.env.HOME;
+    const originalMkdtempSync = fs.mkdtempSync;
+    let isolatedTempRoot;
+    try {
+      fs.mkdtempSync = (...args) => {
+        isolatedTempRoot = Reflect.apply(originalMkdtempSync, fs, args);
+        return isolatedTempRoot;
+      };
+      process.env.HOME = sourceHome;
+      assert.throws(
+        () => prepareIsolatedDevApp("tw-dashboard-invalid-config-test"),
+        /isolated Dashboard config must be a valid top-level JSON object/,
+      );
+      assert.equal(typeof isolatedTempRoot, "string");
+      assert.equal(fs.existsSync(isolatedTempRoot), false);
+      assert.equal(fs.existsSync(sourceConfigPath), true);
+    } finally {
+      fs.mkdtempSync = originalMkdtempSync;
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (isolatedTempRoot) {
+        fs.rmSync(isolatedTempRoot, { recursive: true, force: true });
+      }
+      fs.rmSync(sourceHome, { recursive: true, force: true });
+    }
   }
 });

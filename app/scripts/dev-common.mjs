@@ -18,6 +18,7 @@ export const stateFiles = [
 ];
 
 const UNIX_SOCKET_PATH_MAX_BYTES = 100;
+const DASHBOARD_CONFIG_FILE = ".tmux-worktree.json";
 
 function isolatedDevSocketPaths(tempHome, tmuxTmpDir) {
   const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
@@ -49,6 +50,37 @@ function requireIsolatedDevSocketPathsFit(socketPaths) {
       );
     }
   }
+}
+
+function copyIsolatedStateFile(name, src, dst) {
+  if (name !== DASHBOARD_CONFIG_FILE) {
+    fs.copyFileSync(src, dst);
+    return;
+  }
+
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(src, "utf8"));
+  } catch {
+    throw new Error("isolated Dashboard config must be a valid top-level JSON object");
+  }
+  if (
+    config === null
+    || typeof config !== "object"
+    || Array.isArray(config)
+    || Object.getPrototypeOf(config) !== Object.prototype
+  ) {
+    throw new Error("isolated Dashboard config must be a valid top-level JSON object");
+  }
+
+  delete config.feishuBridge;
+  delete config.mobileRelay;
+  fs.writeFileSync(dst, `${JSON.stringify(config, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  fs.chmodSync(dst, 0o600);
 }
 
 export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
@@ -83,7 +115,7 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
       const src = path.join(os.homedir(), name);
       const dst = path.join(tempHome, name);
       if (fs.existsSync(src)) {
-        fs.copyFileSync(src, dst);
+        copyIsolatedStateFile(name, src, dst);
       }
     }
 
