@@ -262,6 +262,7 @@ async function realCompositionHarness({
   assert.notEqual(h1RecoveryCandidate, null);
   await beforeCompositionOpen?.({
     candidate: h2RecoveryCandidate,
+    foundation,
     hostEpoch: seeded.snapshot.hostEpoch,
     hostInstanceId: store.hostInstanceId,
   });
@@ -741,6 +742,58 @@ test("recovered H2 internal receipt rejects a fence wait crossing cut expiry", a
   }
 });
 
+test("recovered H2 promotion rejects cut expiry after source attachment", async () => {
+  let now = 2_000;
+  let activationReleases = 0;
+  const h = await realCompositionHarness({
+    now: () => now,
+    spoolLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
+    expectCompositionFailure: true,
+    spoolHooks: {
+      afterReadinessActivationAttached() { now += 10; },
+      afterReadinessActivationRelease(_activation, released) {
+        if (released) activationReleases += 1;
+      },
+    },
+  });
+  try {
+    assert.equal(h.composition, null);
+    assert.match(
+      String(h.constructionError),
+      /invalid Relay v2 recovered H2 composition receiver/,
+    );
+    assert.equal(activationReleases, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("recovered H2 promotion rejects source takeover after attachment", async () => {
+  let withdrawSnapshotOwnerAuthority;
+  const h = await realCompositionHarness({
+    expectCompositionFailure: true,
+    beforeCompositionOpen({ foundation }) {
+      withdrawSnapshotOwnerAuthority = () => (
+        foundation.snapshotCutSource.withdrawSnapshotOwnerAuthority()
+      );
+    },
+    spoolHooks: {
+      async afterReadinessActivationAttached() {
+        await withdrawSnapshotOwnerAuthority();
+      },
+    },
+  });
+  try {
+    assert.equal(h.composition, null);
+    assert.match(
+      String(h.constructionError),
+      /invalid Relay v2 recovered H2 composition receiver/,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("composition derives the dedupe window only from the H1 owner fixed lifetime", async () => {
   // The composition plane clock is fixed at 1_783_700_000_000; the H1 owner
   // alone issues acceptUntilMs = now + 15min and queryUntilMs covering 7d.
@@ -874,7 +927,7 @@ test("fatal recovered H1 withdrawal fences an active route with 4406", async () 
   }
 });
 
-test("active H2 receipt authority is withdrawn by every owning lease boundary", async (t) => {
+test("promoted live H2 outlives its client cut but remains owner-withdrawable", async (t) => {
   await t.test("explicit composition close permanently fences the recovered generation", async () => {
     const h = await realCompositionHarness();
     try {
@@ -888,7 +941,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
     }
   });
 
-  await t.test("snapshot release closes the activation sink and withdraws H2", async () => {
+  await t.test("snapshot release retires the old cut without withdrawing promoted H2", async () => {
     const h = await realCompositionHarness();
     try {
       activateRemainingReadinessSources(h.composition);
@@ -896,13 +949,13 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
         h.recoveredChunk,
         h.recoveredPrincipalId,
       ));
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
+      assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
     } finally {
       await h.cleanup();
     }
   });
 
-  await t.test("snapshot cleanup observes expiry and withdraws H2", async () => {
+  await t.test("snapshot cleanup expiry retires the old cut without withdrawing promoted H2", async () => {
     let now = 1_000;
     const h = await realCompositionHarness({
       now: () => now,
@@ -912,7 +965,7 @@ test("active H2 receipt authority is withdrawn by every owning lease boundary", 
       activateRemainingReadinessSources(h.composition);
       now += 10;
       await h.spool.cleanupExpired();
-      assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
+      assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
     } finally {
       await h.cleanup();
     }

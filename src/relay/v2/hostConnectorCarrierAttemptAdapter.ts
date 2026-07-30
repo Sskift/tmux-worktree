@@ -7,14 +7,15 @@ import {
   type RelayV2HostCarrierStatus,
   type RelayV2HostCarrierTransport,
 } from "./hostCarrier.js";
-import type {
-  RelayV2HostConnectorAttemptDrainEvidence,
-  RelayV2HostConnectorAttemptDrainInput,
-  RelayV2HostConnectorAttemptFactoryPort,
-  RelayV2HostConnectorAttemptPort,
-  RelayV2HostConnectorAttemptCapabilityFence,
-  RelayV2HostConnectorAttemptPreparedBinding,
-  RelayV2HostConnectorAttemptStartInput,
+import {
+  RelayV2HostConnectorControllerError,
+  type RelayV2HostConnectorAttemptDrainEvidence,
+  type RelayV2HostConnectorAttemptDrainInput,
+  type RelayV2HostConnectorAttemptFactoryPort,
+  type RelayV2HostConnectorAttemptPort,
+  type RelayV2HostConnectorAttemptCapabilityFence,
+  type RelayV2HostConnectorAttemptPreparedBinding,
+  type RelayV2HostConnectorAttemptStartInput,
 } from "./hostConnectorController.js";
 import type {
   RelayV2HostPreCarrierOfferBinding,
@@ -700,8 +701,9 @@ implements RelayV2HostConnectorAttemptFactoryPort {
     }
     let preCarrierOfferClaim: RelayV2HostPreCarrierOfferClaim | null = null;
     if (this.#preCarrierOfferIssuer !== null) {
+      let candidate: unknown;
       try {
-        const candidate = Reflect.apply(
+        candidate = Reflect.apply(
           this.#preCarrierOfferIssuer.issuePreCarrierOffer,
           this.#preCarrierOfferIssuer.receiver,
           [Object.freeze({ ...preparedBinding, fence: preCarrierOfferFence })],
@@ -710,11 +712,15 @@ implements RelayV2HostConnectorAttemptFactoryPort {
           && !matchesRelayV2HostPreCarrierOfferClaim(candidate, preparedBinding)) {
           throw failure();
         }
-        preCarrierOfferClaim = candidate;
       } catch {
         fenceAttachedAttempt();
         throw failure();
       }
+      if (candidate === null) {
+        fenceAttachedAttempt();
+        throw new RelayV2HostConnectorControllerError("UNAVAILABLE");
+      }
+      preCarrierOfferClaim = candidate as RelayV2HostPreCarrierOfferClaim;
     }
     const factoryInput = Object.freeze({
       requestId,

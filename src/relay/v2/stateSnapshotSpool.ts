@@ -158,7 +158,7 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
   /** Runs after H0 attached the sink but before the spool commits activation. */
   afterReadinessActivationAttached?: (
     receipt: RelayV2StateSnapshotReadinessReceipt,
-  ) => void;
+  ) => void | Promise<void>;
   /** Runs after the exact spool activation has been synchronously revoked. */
   afterReadinessActivationRelease?: (activation: unknown, released: boolean) => unknown;
 }
@@ -751,11 +751,10 @@ interface ReadinessReceiptRecord extends RelayV2StateSnapshotReadinessReceiptBin
   retainedBytes: number;
 }
 
-interface ReadinessActivationRecord {
+interface ReadinessActivationRecordBase {
   activation: RelayV2StateSnapshotActivationLease;
   sourceActivation: RelayV2MaterializedStateCutActivationLease;
   source: RelayV2MaterializedStateCutSource;
-  cut: ActiveCut;
   snapshotId: string;
   ownerFence: string;
   ownerInstanceId: string;
@@ -766,6 +765,22 @@ interface ReadinessActivationRecord {
   activationNonce: string;
   sinkIdentity: object;
 }
+
+interface RecoveredCutReadinessActivationRecord
+extends ReadinessActivationRecordBase {
+  owner: "recovered_cut";
+  cut: ActiveCut;
+}
+
+interface LiveH2ReadinessActivationRecord
+extends ReadinessActivationRecordBase {
+  owner: "live_h2";
+  liveOwner: object;
+}
+
+type ReadinessActivationRecord =
+  | RecoveredCutReadinessActivationRecord
+  | LiveH2ReadinessActivationRecord;
 
 interface SnapshotTombstone {
   path: string;
@@ -1923,6 +1938,8 @@ export class RelayV2StateSnapshotSpool {
   private readonly buildsByLogicalKey = new Map<string, BuildEntry>();
   readonly #readinessReceipts = new Map<object, ReadinessReceiptRecord>();
   readonly #readinessActivations = new Map<object, ReadinessActivationRecord>();
+  readonly #liveH2ActivationOwner = Object.freeze(Object.create(null)) as object;
+  private liveH2Activation: LiveH2ReadinessActivationRecord | null = null;
   private readinessReceiptRetainedBytes = 0;
   private metadataTail: Promise<void> = Promise.resolve();
   private closeBarrier: Promise<void> | null = null;
@@ -2851,16 +2868,40 @@ export class RelayV2StateSnapshotSpool {
     let receiptRecord: ReadinessReceiptRecord | undefined;
     let sourceAttempted = false;
     let sourceSink = sink;
+    let sourceClosed = false;
     try {
       this.testHooks?.beforeReadinessReceiptActivation?.(receipt);
-      sourceSink = this.testHooks?.wrapReadinessActivationSink?.(sink) ?? sink;
-      if (((typeof sourceSink !== "object" && typeof sourceSink !== "function")
-        || sourceSink === null)) {
+      const selectedSourceSink = this.testHooks?.wrapReadinessActivationSink?.(sink) ?? sink;
+      if (((typeof selectedSourceSink !== "object"
+        && typeof selectedSourceSink !== "function")
+        || selectedSourceSink === null)) {
         throw new RelayV2StateSnapshotSpoolError(
           "INVALID_ARGUMENT",
           "snapshot readiness activation sink adapter is invalid",
         );
       }
+      const sourceEnqueue = selectedSourceSink.enqueue;
+      const sourceClose = selectedSourceSink.close;
+      if (typeof sourceEnqueue !== "function"
+        || (sourceClose !== undefined && typeof sourceClose !== "function")) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "INVALID_ARGUMENT",
+          "snapshot readiness activation sink adapter is invalid",
+        );
+      }
+      sourceSink = Object.freeze({
+        enqueue(item: RelayV2JsonObject): boolean {
+          if (sourceClosed) return false;
+          return Reflect.apply(sourceEnqueue, selectedSourceSink, [item]) as boolean;
+        },
+        close(error: RelayV2MaterializedStateError): void {
+          if (sourceClosed) return;
+          sourceClosed = true;
+          if (sourceClose !== undefined) {
+            Reflect.apply(sourceClose, selectedSourceSink, [error]);
+          }
+        },
+      });
       return await this.serializeMetadata(async () => {
         const now = this.readNow();
         this.cleanupExpiredAt(now);
@@ -2902,7 +2943,7 @@ export class RelayV2StateSnapshotSpool {
           throw mapSourceError(error);
         }
 
-        this.testHooks?.afterReadinessActivationAttached?.(record.receipt);
+        await this.testHooks?.afterReadinessActivationAttached?.(record.receipt);
         this.assertCurrentOwner();
         const finalNow = this.readNow();
         this.cleanupExpiredAt(finalNow);
@@ -2912,6 +2953,8 @@ export class RelayV2StateSnapshotSpool {
           || record.cut.readinessReceipt !== record.receipt
           || record.cut.readinessCandidate !== record.candidate
           || record.cut.readinessActivation !== null
+          || this.liveH2Activation !== null
+          || sourceClosed
           || record.ownerFence !== this.#ownerFence
           || record.ownerInstanceId !== this.ownerInstanceId
           || record.processIncarnation !== this.#processIncarnation
@@ -2928,11 +2971,10 @@ export class RelayV2StateSnapshotSpool {
         }
         const activation = Object.freeze(() => undefined) as unknown as
           RelayV2StateSnapshotActivationLease;
-        installed = {
+        const activationRecord: ReadinessActivationRecordBase = {
           activation,
           sourceActivation: sourceActivation!,
           source: this.#cutSource,
-          cut: record.cut,
           snapshotId: record.snapshotId,
           ownerFence: this.#ownerFence,
           ownerInstanceId: this.ownerInstanceId,
@@ -2943,8 +2985,22 @@ export class RelayV2StateSnapshotSpool {
           activationNonce: randomBytes(32).toString("base64url"),
           sinkIdentity: sourceSink as object,
         };
-        this.#readinessActivations.set(activation as object, installed);
+        const recoveredCutRecord: RecoveredCutReadinessActivationRecord = {
+          ...activationRecord,
+          owner: "recovered_cut",
+          cut: record.cut,
+        };
+        this.#readinessActivations.set(activation as object, recoveredCutRecord);
         record.cut.readinessActivation = activation;
+        const liveRecord: LiveH2ReadinessActivationRecord = {
+          ...activationRecord,
+          owner: "live_h2",
+          liveOwner: this.#liveH2ActivationOwner,
+        };
+        record.cut.readinessActivation = null;
+        this.#readinessActivations.set(activation as object, liveRecord);
+        this.liveH2Activation = liveRecord;
+        installed = liveRecord;
         this.consumeReadinessReceiptForActivation(record);
         return activation;
       });
@@ -4852,8 +4908,13 @@ export class RelayV2StateSnapshotSpool {
   private revokeReadinessActivation(record: ReadinessActivationRecord): void {
     if (this.#readinessActivations.get(record.activation as object) !== record) return;
     this.#readinessActivations.delete(record.activation as object);
-    if (record.cut.readinessActivation === record.activation) {
+    if (record.owner === "recovered_cut"
+      && record.cut.readinessActivation === record.activation) {
       record.cut.readinessActivation = null;
+    } else if (record.owner === "live_h2"
+      && record.liveOwner === this.#liveH2ActivationOwner
+      && this.liveH2Activation === record) {
+      this.liveH2Activation = null;
     }
     record.source.releaseCandidateActivation(record.sourceActivation);
   }
@@ -4889,6 +4950,7 @@ export class RelayV2StateSnapshotSpool {
       this.revokeReadinessActivation(activation);
     }
     this.#readinessActivations.clear();
+    this.liveH2Activation = null;
     this.#readinessReceipts.clear();
     this.readinessReceiptRetainedBytes = 0;
   }

@@ -428,6 +428,9 @@ function createManagedWssConstructor(records, effects) {
 }
 
 async function createHarness(options = {}) {
+  const spoolNow = options.spoolNow ?? Date.now;
+  const spoolLimits = options.spoolLimits;
+  const spoolHooks = options.spoolHooks;
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-managed-runtime-"));
   const store = await hostState.RelayV2HostStateStore.open({
     paths: hostState.relayV2HostStatePaths(home),
@@ -446,6 +449,9 @@ async function createHarness(options = {}) {
     hostId: HOST_ID,
     root: spoolRoot,
     ownerInstanceId: store.hostInstanceId,
+    now: spoolNow,
+    testLimits: spoolLimits,
+    testHooks: spoolHooks,
   });
   await publisherSpool.get({
     principalId: "managed-runtime-readiness-principal",
@@ -461,6 +467,9 @@ async function createHarness(options = {}) {
     hostId: HOST_ID,
     root: spoolRoot,
     ownerInstanceId: store.hostInstanceId,
+    now: spoolNow,
+    testLimits: spoolLimits,
+    testHooks: spoolHooks,
   });
   const h2RecoveryCandidate = await spool.issueRecoveredHostH2Candidate();
   assert.notEqual(h2RecoveryCandidate, null);
@@ -1164,20 +1173,45 @@ test("Dashboard-owned connector enrolls while automatic reauth uses its exact cl
   }
 });
 
-test("Dashboard-owned desired state retries registered retryable failure on the canonical controller", async () => {
-  const h = await createHarness({ managedWss: true });
+test("Dashboard-owned full-cap retry outlives its promoted H2 client lease and gates H0 loss", async () => {
+  let spoolNow = 1_000;
+  const h2Evidence = { reservations: 0, verifications: 0, activations: 0 };
+  const h = await createHarness({
+    managedWss: true,
+    spoolNow: () => spoolNow,
+    spoolLimits: { idleLeaseMs: 10, absoluteLeaseMs: 20 },
+    spoolHooks: {
+      afterReservationPersisted() { h2Evidence.reservations += 1; },
+      beforeReadinessReceiptVerify() { h2Evidence.verifications += 1; },
+      beforeReadinessReceiptActivation() { h2Evidence.activations += 1; },
+    },
+  });
   try {
     const owner = createDashboardManagementOwner(h);
     const session = dashboardManagementSessionModule
       .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
     await settle();
+    assert.deepEqual(h2Evidence, { reservations: 1, verifications: 1, activations: 1 });
     assert.equal(h.records.length, 0, "cold construction cannot start the connector");
 
     owner.input.push(Buffer.from(dashboardManagementStartFrame));
     const run = session.run();
     const first = await registerPendingManagedWss(h);
     await settle();
+    assert.deepEqual(
+      first.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
     assert.equal(h.composition.inspect().status, "registered_incomplete");
+
+    spoolNow += 10;
+    await h.spool.cleanupExpired();
+    await settle();
+    assert.deepEqual(first.closes, []);
+    assert.equal(readinessReady(h.composition.readiness.current()), true);
+    assert.deepEqual(h2Evidence, { reservations: 1, verifications: 1, activations: 1 });
+    assert.equal(h.composition.inspect().status, "registered_incomplete");
+    assert.deepEqual(owner.exchanges, { bootstrap: 0, refresh: 0 });
 
     first.socket.terminate();
     await settle();
@@ -1191,11 +1225,15 @@ test("Dashboard-owned desired state retries registered retryable failure on the 
     await waitForRecordCount(
       h,
       2,
-      "the Dashboard owner did not create the successor after capped backoff",
+      "the Dashboard owner did not create the post-expiry successor",
     );
     const successor = await registerPendingManagedWss(h);
     assert.equal(successor.sequence, 2);
     await settle();
+    assert.deepEqual(
+      successor.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
     assert.deepEqual(h.composition.inspect(), {
       status: "registered_incomplete",
       controllerGeneration: "2",
@@ -1203,6 +1241,83 @@ test("Dashboard-owned desired state retries registered retryable failure on the 
       acknowledgement: "host.registered",
       negotiatedCapabilityIntersection: [],
     });
+    assert.equal(readinessReady(h.composition.readiness.current()), true);
+
+    h.composition.readiness.h0.close();
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
+    assert.deepEqual(successor.closes, [{ code: 1000, reason: "host_shutdown" }]);
+    await delay(1_250);
+    assert.equal(
+      h.records.length,
+      2,
+      "a missing full pre-carrier offer must fail before creating a socket",
+    );
+    assert.equal(await h.composition.readiness.h0.activate(), true);
+    await waitForRecordCount(
+      h,
+      3,
+      "the Dashboard owner did not retry after canonical H0 recovery",
+    );
+    const nextSuccessor = await registerPendingManagedWss(h);
+    assert.equal(nextSuccessor.sequence, 3);
+    await settle();
+    assert.deepEqual(
+      nextSuccessor.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
+    assert.deepEqual(h.composition.inspect(), {
+      status: "registered_incomplete",
+      controllerGeneration: "3",
+      connectorId: "managed-connector-3",
+      acknowledgement: "host.registered",
+      negotiatedCapabilityIntersection: [],
+    });
+
+    owner.input.push(Buffer.from(dashboardManagementStatusFrame));
+    owner.input.end();
+    assert.equal(await run, 0);
+    const statusRequestId = JSON.parse(dashboardManagementStatusFrame).requestId;
+    const statusResponse = owner.writes
+      .map((frame) => JSON.parse(frame))
+      .find((candidate) => candidate.requestId === statusRequestId);
+    assert.equal(statusResponse.ok, true);
+    assert.deepEqual(statusResponse.result.connector, {
+      status: "registered",
+      acknowledgement: "host.registered",
+      hostId: HOST_ID,
+      connectorId: "managed-connector-3",
+      negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    });
+    assert.deepEqual(owner.exchanges, { bootstrap: 0, refresh: 0 });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("Dashboard retry stays socket-free after promoted H2 owner withdrawal", async () => {
+  const h = await createHarness({ managedWss: true });
+  try {
+    const owner = createDashboardManagementOwner(h);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    const first = await registerPendingManagedWss(h);
+    await settle();
+    assert.deepEqual(
+      first.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
+
+    h.composition.readiness.h2.close();
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
+    assert.deepEqual(first.closes, [{ code: 1000, reason: "host_shutdown" }]);
+    await delay(1_250);
+    assert.equal(
+      h.records.length,
+      1,
+      "a withdrawn live H2 owner must not permit an empty-cap retry socket",
+    );
 
     owner.input.end();
     assert.equal(await run, 0);

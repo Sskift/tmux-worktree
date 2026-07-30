@@ -412,6 +412,60 @@ test("withdrawal synchronously fences the exact full-offer attempt before one dr
   assert.deepEqual(h.records[1].hello.payload.capabilities, [...RELAY_V2_REQUIRED_CAPABILITIES]);
 });
 
+test("an issuer-owned null offer fails unavailable before the transport factory", async () => {
+  const offerOwner = Object.freeze({
+    issuePreCarrierOffer() { return null; },
+  });
+  const h = harness({ offerOwner });
+  await assert.rejects(
+    h.controller.start(startInput("adapter.full-offer-unavailable")),
+    (error) => isControllerFailure(error, "UNAVAILABLE"),
+  );
+  assert.equal(h.records.length, 0);
+  assert.deepEqual(h.controller.inspectCut(), {
+    status: "failed",
+    retryable: true,
+    controllerGeneration: "1",
+    connectorId: null,
+    ...IDENTITY,
+  });
+
+  const direct = harness({ offerOwner });
+  let prepared = 0;
+  let capabilityFenced = 0;
+  await assert.rejects(
+    direct.attempts.startAttempt(Object.freeze({
+      ...startInput("adapter.full-offer-unavailable-direct"),
+      controllerGeneration: "1",
+      onCarrierStatus() {},
+      onCarrierAttemptPrepared() { prepared += 1; },
+      onCarrierAttemptFenced() { capabilityFenced += 1; },
+    })),
+    (error) => isControllerFailure(error, "UNAVAILABLE"),
+  );
+  assert.equal(prepared, 1);
+  assert.equal(capabilityFenced, 0);
+  assert.equal(direct.records.length, 0);
+});
+
+test("issuer throw and foreign offer remain operation failures before the factory", async (t) => {
+  for (const [name, issuePreCarrierOffer] of [
+    ["throw", () => { throw new Error("issuer failed"); }],
+    ["foreign", () => Object.freeze({})],
+  ]) {
+    await t.test(name, async () => {
+      const h = harness({
+        offerOwner: Object.freeze({ issuePreCarrierOffer }),
+      });
+      await assert.rejects(
+        h.controller.start(startInput(`adapter.full-offer-${name}`)),
+        (error) => isControllerFailure(error, "OPERATION_FAILED"),
+      );
+      assert.equal(h.records.length, 0);
+    });
+  }
+});
+
 test("malformed factory products and uncertain drain proofs fail closed with redacted errors", async (t) => {
   const secret = "twref2.secret-must-not-reflect";
 
