@@ -23,6 +23,12 @@ function listenUnix(socketPath) {
   });
 }
 
+function closeUnix(server) {
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+}
+
 test("isolated Dashboard launchers use one short private socket namespace", async () => {
   const sourceHome = fs.mkdtempSync(path.join(os.tmpdir(), "twd-source-"));
   const sensitiveServiceMarker = "must-not-reach-isolated-dashboard";
@@ -183,14 +189,19 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
     fs.mkdirSync(path.dirname(isolated.socketPaths.terminalControl), {
       recursive: true,
     });
-    const listeners = await Promise.all(
-      Object.values(isolated.socketPaths).map(listenUnix),
+    const listeners = [];
+    const listenAttempts = Object.values(isolated.socketPaths).map(
+      async (socketPath) => {
+        const listener = await listenUnix(socketPath);
+        listeners.push(listener);
+      },
     );
-    await Promise.all(
-      listeners.map((server) => new Promise((resolve, reject) => {
-        server.close((error) => error ? reject(error) : resolve());
-      })),
-    );
+    try {
+      await Promise.all(listenAttempts);
+    } finally {
+      await Promise.allSettled(listenAttempts);
+      await Promise.allSettled(listeners.map(closeUnix));
+    }
 
     const runtimeEnv = isolatedRuntimeEnv(isolated, {
       PATH: process.env.PATH,
