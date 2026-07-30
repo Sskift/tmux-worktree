@@ -33,7 +33,7 @@ pub(crate) fn inherit_shell_env() {
             for entry in stdout.split('\0') {
                 if let Some((key, value)) = entry.split_once('=') {
                     if matches!(key, "PWD" | "OLDPWD" | "_" | "SHLVL")
-                        || is_protected_login_shell_env(key)
+                        || (sealed_namespace.is_some() && is_protected_login_shell_env(key))
                     {
                         continue;
                     }
@@ -173,6 +173,77 @@ mod tests {
         assert_eq!(
             std::env::var_os("TW_LOGIN_SHELL_TEST"),
             Some(OsString::from("imported"))
+        );
+
+        for (name, value) in original {
+            restore_env(name, value);
+        }
+    }
+
+    #[test]
+    fn login_shell_imports_dashboard_namespace_when_launch_is_not_sealed() {
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shell = temp.path().join("login-shell");
+        std::fs::write(
+            &shell,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'TW_DASHBOARD_HOME=/login/home\\0",
+                "TMUX_TMPDIR=/login/tmux\\0",
+                "TW_TERMINAL_CONTROL_SOCKET=/login/control.sock\\0",
+                "TW_TERMINAL_CONTROL_STATE=/login/control.json\\0",
+                "TW_TERMINAL_CONTROL_OUTPUT_DIR=/login/output\\0'\n",
+            ),
+        )
+        .expect("write login shell");
+        let mut permissions = std::fs::metadata(&shell)
+            .expect("login shell metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&shell, permissions).expect("chmod login shell");
+
+        let variables = [
+            "SHELL",
+            "TW_DASHBOARD_HOME",
+            "TMUX_TMPDIR",
+            "TW_TERMINAL_CONTROL_SOCKET",
+            "TW_TERMINAL_CONTROL_STATE",
+            "TW_TERMINAL_CONTROL_OUTPUT_DIR",
+        ];
+        let original = variables
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+
+        unsafe {
+            std::env::set_var("SHELL", &shell);
+            for key in &variables[1..] {
+                std::env::remove_var(key);
+            }
+        }
+
+        inherit_shell_env();
+
+        assert_eq!(
+            std::env::var_os("TW_DASHBOARD_HOME"),
+            Some(OsString::from("/login/home"))
+        );
+        assert_eq!(
+            std::env::var_os("TMUX_TMPDIR"),
+            Some(OsString::from("/login/tmux"))
+        );
+        assert_eq!(
+            std::env::var_os("TW_TERMINAL_CONTROL_SOCKET"),
+            Some(OsString::from("/login/control.sock"))
+        );
+        assert_eq!(
+            std::env::var_os("TW_TERMINAL_CONTROL_STATE"),
+            Some(OsString::from("/login/control.json"))
+        );
+        assert_eq!(
+            std::env::var_os("TW_TERMINAL_CONTROL_OUTPUT_DIR"),
+            Some(OsString::from("/login/output"))
         );
 
         for (name, value) in original {
