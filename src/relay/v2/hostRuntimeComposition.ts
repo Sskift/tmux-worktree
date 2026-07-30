@@ -136,6 +136,7 @@ const EXPLICIT_BASE_CAPABILITIES = Object.freeze([
 declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
 declare const relayV2HostDashboardManagementPortBrand: unique symbol;
 declare const relayV2HostDashboardManagementBindingBrand: unique symbol;
+declare const relayV2HostAutomaticReauthenticationClaimBrand: unique symbol;
 declare const relayV2HostLocalDevelopmentCapabilityActivationBrand: unique symbol;
 declare const relayV2HostLocalDevelopmentCapabilityActivationHandoffBrand: unique symbol;
 declare const relayV2HostSelfHostedCapabilityActivationBrand: unique symbol;
@@ -234,6 +235,19 @@ export interface RelayV2HostDashboardManagementClosedPorts {
   readonly carrierControl: RelayV2DashboardManagementCarrierControlPort;
 }
 
+/** Opaque one-shot claim for the canonical automatic reauthentication owner. */
+export interface RelayV2HostAutomaticReauthenticationClaim {
+  readonly [relayV2HostAutomaticReauthenticationClaimBrand]: true;
+}
+
+/** Exact-lineage closed port consumed only by the reauthentication lifecycle owner. */
+export interface RelayV2HostAutomaticReauthenticationClosedPort {
+  inspect(): RelayV2HostManagedConnectorInspection;
+  requestReauthentication(
+    input: Readonly<RelayV2HostManagedConnectorReauthenticationInput>,
+  ): boolean;
+}
+
 type RelayV2HostDashboardManagementPortCapability =
   RelayV2HostDashboardManagementPort & ((
     candidate: unknown,
@@ -250,6 +264,12 @@ type RelayV2HostDashboardManagementBindingCapability =
     expectedIdentity: RelayV2HostDashboardManagementIdentity,
     expectedCredentialOwner: object,
   ) => RelayV2HostDashboardManagementBindingOperationResult);
+type RelayV2HostAutomaticReauthenticationClaimCapability =
+  RelayV2HostAutomaticReauthenticationClaim & ((
+    candidate: unknown,
+    expectedIdentity: RelayV2HostDashboardManagementIdentity,
+    expectedCredentialOwner: object,
+  ) => RelayV2HostAutomaticReauthenticationClosedPort | null);
 
 /** Opaque issuer half; its receiver identity never leaves this module. */
 export interface RelayV2RecoveredHostH2CompositionPair {
@@ -527,6 +547,7 @@ export type RelayV2HostManagedConnectorInspection =
 
 export interface RelayV2HostManagedConnectorRuntimeComposition {
   readonly dashboardManagementPort: RelayV2HostDashboardManagementPort;
+  readonly automaticReauthenticationClaim: RelayV2HostAutomaticReauthenticationClaim;
   inspect(): RelayV2HostManagedConnectorInspection;
   start(
     input: Readonly<RelayV2HostManagedConnectorStartInput>,
@@ -1992,6 +2013,31 @@ export function abortRelayV2HostDashboardManagementBinding(
   ) === true;
 }
 
+/**
+ * One-shot exact-lineage claim used by the canonical Host reauthentication
+ * owner. The returned facade cannot acquire Dashboard start/stop authority.
+ */
+export function claimRelayV2HostAutomaticReauthenticationPort(
+  claim: unknown,
+  expectedIdentity: unknown,
+  expectedCredentialOwner: unknown,
+): RelayV2HostAutomaticReauthenticationClosedPort | null {
+  if (typeof claim !== "function" || nodeTypes.isProxy(claim)
+    || typeof expectedCredentialOwner !== "object" || expectedCredentialOwner === null
+    || nodeTypes.isProxy(expectedCredentialOwner)) return null;
+  const identity = captureDashboardManagementIdentity(expectedIdentity);
+  if (identity === null) return null;
+  try {
+    return Reflect.apply(
+      claim as RelayV2HostAutomaticReauthenticationClaimCapability,
+      undefined,
+      [claim, identity, expectedCredentialOwner],
+    );
+  } catch {
+    return null;
+  }
+}
+
 function captureManagedStartInput(value: unknown): RelayV2HostManagedConnectorStartInput {
   const fields = exactManagedDataObject(value, ["requestId", "signal"]);
   if (typeof fields.requestId !== "string" || !(fields.signal instanceof AbortSignal)) {
@@ -2443,6 +2489,11 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
     hostInstanceId: runtimeOptions.hostInstanceId,
     credentialReference,
   });
+  let automaticReauthenticationClaim!:
+    RelayV2HostAutomaticReauthenticationClaimCapability;
+  const automaticReauthenticationAuthority = Object.freeze({});
+  let automaticReauthenticationClaimed = false;
+  let automaticReauthenticationClaimFenced = false;
   let dashboardManagementPort!: RelayV2HostDashboardManagementPortCapability;
   const dashboardManagementIssuedGeneration = controller.inspectCut().controllerGeneration;
   const dashboardManagementAuthority = Object.freeze({});
@@ -2486,7 +2537,9 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
       return false;
     }
     try {
-      if (closing || !hasDashboardManagementAuthority(authority)) return false;
+      if (closing
+        || (!hasDashboardManagementAuthority(authority)
+          && authority !== automaticReauthenticationAuthority)) return false;
       const cut = controller.inspectCut();
       if (cut.status !== "registered"
         || cut.controllerGeneration !== input.controllerGeneration
@@ -2520,6 +2573,38 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
     }
     return controller.stopAndDrain(Object.freeze({ ...identity, ...input }));
   };
+
+  automaticReauthenticationClaim = Object.freeze(
+    function claimAutomaticReauthentication(
+      candidate: unknown,
+      claimedIdentity: RelayV2HostDashboardManagementIdentity,
+      claimedCredentialOwner: object,
+    ): RelayV2HostAutomaticReauthenticationClosedPort | null {
+      const requestedIdentity = captureDashboardManagementIdentity(claimedIdentity);
+      if (candidate !== automaticReauthenticationClaim
+        || requestedIdentity === null
+        || !sameDashboardManagementIdentity(identity, requestedIdentity)
+        || claimedCredentialOwner !== carrierOptions.credentialReferences
+        || automaticReauthenticationClaimed
+        || automaticReauthenticationClaimFenced
+        || closing) return null;
+      automaticReauthenticationClaimed = true;
+      return Object.freeze({
+        inspect(): RelayV2HostManagedConnectorInspection {
+          if (closing) throw managedCompositionFailure();
+          return projectManagedConnectorCut(controller.inspectCut());
+        },
+        requestReauthentication(
+          input: Readonly<RelayV2HostManagedConnectorReauthenticationInput>,
+        ): boolean {
+          return requestManagedReauthentication(
+            input,
+            automaticReauthenticationAuthority,
+          );
+        },
+      });
+    },
+  ) as RelayV2HostAutomaticReauthenticationClaimCapability;
 
   dashboardManagementPort = Object.freeze(function claimDashboardManagementPort(
     candidate: unknown,
@@ -2726,6 +2811,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
 
   return Object.freeze({
     dashboardManagementPort,
+    automaticReauthenticationClaim,
     inspect: () => projectManagedConnectorCut(controller.inspectCut()),
     start: (rawInput) => startManagedConnector(rawInput),
     requestReauthentication: (rawInput) => requestManagedReauthentication(rawInput),
@@ -2741,6 +2827,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
       const published = createDeferredBarrier();
       closeBarrier = published.promise;
       closing = true;
+      automaticReauthenticationClaimFenced = true;
       dashboardManagementPortFenced = true;
       const closingCut = controller.inspectCut();
       if (closingCut.status !== "stopped") {

@@ -976,11 +976,43 @@ test("local-development activation is opaque, exact-owner-bound, and one-shot", 
   }
 });
 
-test("local-development activation lets the same Dashboard session start and enroll", async () => {
+test("Dashboard-owned connector enrolls while automatic reauth uses its exact closed port", async () => {
   const h = await createHarness({ managedWss: true });
   try {
     const owner = createDashboardManagementOwner(h);
     const beforeConstruction = dashboardManagementEffects(h, owner);
+    assert.equal(
+      compositionModule.claimRelayV2HostAutomaticReauthenticationPort(
+        h.composition.automaticReauthenticationClaim,
+        { ...dashboardManagementIdentity(h), hostId: "foreign-host" },
+        h.managedWssCredential.authority,
+      ),
+      null,
+    );
+    assert.equal(
+      compositionModule.claimRelayV2HostAutomaticReauthenticationPort(
+        h.composition.automaticReauthenticationClaim,
+        dashboardManagementIdentity(h),
+        Object.freeze({}),
+      ),
+      null,
+    );
+    const automaticReauthentication =
+      compositionModule.claimRelayV2HostAutomaticReauthenticationPort(
+        h.composition.automaticReauthenticationClaim,
+        dashboardManagementIdentity(h),
+        h.managedWssCredential.authority,
+      );
+    assert.notEqual(automaticReauthentication, null);
+    assert.equal(
+      compositionModule.claimRelayV2HostAutomaticReauthenticationPort(
+        h.composition.automaticReauthenticationClaim,
+        dashboardManagementIdentity(h),
+        h.managedWssCredential.authority,
+      ),
+      null,
+      "the exact automatic reauthentication claim is one-shot",
+    );
     const session = dashboardManagementSessionModule
       .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
 
@@ -1006,11 +1038,48 @@ test("local-development activation lets the same Dashboard session start and enr
     }
 
     owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    const record = await registerPendingManagedWss(h);
+    let registeredCut;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      registeredCut = h.composition.inspect();
+      if (registeredCut.status === "registered_incomplete") break;
+      await settle(1);
+    }
+    assert.equal(registeredCut.status, "registered_incomplete");
+    const reauthentication = reauthenticationInput(
+      registeredCut,
+      "managed.dashboard.automatic-reauth",
+    );
+    assert.equal(
+      h.composition.requestReauthentication(reauthentication),
+      false,
+      "the public facade remains gated after Dashboard claims connector lifecycle",
+    );
+    assert.deepEqual(automaticReauthentication.inspect(), registeredCut);
+    assert.equal(
+      automaticReauthentication.requestReauthentication(reauthentication),
+      true,
+    );
+    const reauthenticationFrames = record.sent
+      .map(({ bytes }) => decodeCarrier(bytes))
+      .filter(({ type }) => type === "host.reauthenticate");
+    assert.equal(reauthenticationFrames.length, 1);
+    assert.equal(
+      reauthenticationFrames[0].connectorId,
+      `managed-connector-${record.sequence}`,
+    );
+    const reauthenticated = fixture("host-reauthenticated");
+    reauthenticated.requestId = reauthenticationFrames[0].requestId;
+    reauthenticated.connectorId = `managed-connector-${record.sequence}`;
+    reauthenticated.payload.grantId = "managed-wss-grant";
+    reauthenticated.payload.jti = "managed-wss-access-jti";
+    record.socket.receive(carrierWire(reauthenticated));
+    await settle();
+
     owner.input.push(Buffer.from(dashboardManagementCreateEnrollmentFrame));
     owner.input.push(Buffer.from(dashboardManagementStatusFrame));
     owner.input.end();
-    const run = session.run();
-    const record = await registerPendingManagedWss(h);
     let enrollmentCreate;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       enrollmentCreate = record.sent
@@ -1046,15 +1115,17 @@ test("local-development activation lets the same Dashboard session start and enr
     assert.equal(startResponse.ok, true);
     assert.equal(createResponse.ok, true);
     assert.equal(statusResponse.ok, true);
-    for (const response of [startResponse, statusResponse]) {
-      assert.deepEqual(response.result.connector, {
-        status: "registered",
-        acknowledgement: "host.registered",
-        hostId: HOST_ID,
-        connectorId: `managed-connector-${record.sequence}`,
-        negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
-      });
-    }
+    assert.deepEqual(startResponse.result.connector, {
+      status: "starting",
+      hostId: HOST_ID,
+    });
+    assert.deepEqual(statusResponse.result.connector, {
+      status: "registered",
+      acknowledgement: "host.registered",
+      hostId: HOST_ID,
+      connectorId: `managed-connector-${record.sequence}`,
+      negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    });
     assert.equal(createResponse.result.enrollment.status, "active");
     assert.equal(
       createResponse.result.enrollment.review.enrollment.enrollmentCode,
@@ -1064,12 +1135,8 @@ test("local-development activation lets the same Dashboard session start and enr
       record.hello.payload.capabilities,
       [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
     );
-    assert.equal(
-      record.sent.some(({ bytes }) => decodeCarrier(bytes).type === "host.reauthenticate"),
-      false,
-    );
     assert.deepEqual(owner.exchanges, { bootstrap: 0, refresh: 0 });
-    assert.equal(h.managedWssCredential.activity.writes, 0);
+    assert.equal(h.managedWssCredential.activity.writes, 2);
     assert.equal(h.managedWssCredential.activity.secretResolutions, 0);
     assert.deepEqual(h.composition.inspect(), {
       status: "stopped",

@@ -11,6 +11,7 @@ import {
 } from "./canonicalCreateTargetAdmissionAdapter.js";
 import { RelayV2CanonicalTerminalTargetResolverAdapter } from "./canonicalTerminalTargetResolverAdapter.js";
 import {
+  claimRelayV2HostAutomaticReauthenticationPort,
   openRelayV2HostManagedWssConnectorRuntimeComposition,
   type RelayV2HostManagedConnectorInspection,
   type RelayV2HostManagedConnectorRuntimeComposition,
@@ -897,6 +898,22 @@ export async function openRelayV2HostCanonicalProductionComposition(
       );
     }
     if (reauthentication !== undefined) {
+      const automaticReauthentication = claimRelayV2HostAutomaticReauthenticationPort(
+        managed.automaticReauthenticationClaim,
+        Object.freeze({
+          hostId: profile.hostId,
+          hostEpoch: snapshot.hostEpoch,
+          hostInstanceId: options.hostState.hostInstanceId,
+          credentialReference: profile.credentialReference,
+        }),
+        options.credentialAuthority,
+      );
+      if (automaticReauthentication === null) {
+        throw new RelayV2TerminalManagerError(
+          "CAPABILITY_UNAVAILABLE",
+          "Host reauthentication authority could not be claimed",
+        );
+      }
       // The existing owner binds the real authority/coordinator to the exact
       // managed connector cut. Carrier signals can only arrive after the
       // facade is published and started, so this synchronous late binding
@@ -908,7 +925,7 @@ export async function openRelayV2HostCanonicalProductionComposition(
         refreshSecretReference: reauthentication.refreshSecretReference,
         credentialAuthority: options.credentialAuthority,
         credentialExchangeCoordinator: reauthentication.credentialExchangeCoordinator,
-        managedConnector: managed,
+        managedConnector: automaticReauthentication,
         idFactory: reauthentication.idFactory ?? (() => randomUUID()),
         schedule: reauthentication.schedule ?? defaultReauthenticationSchedule,
       }));
