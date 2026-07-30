@@ -107,6 +107,8 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
       assert.equal(canonicalSystemTmp, "/private/tmp");
     }
     assert.equal(fs.realpathSync.native(isolated.tempRoot), isolated.tempRoot);
+    assert.match(path.basename(isolated.tempRoot), /^w-.{6}$/);
+    assert.equal(isolated.tempHome, path.join(isolated.tempRoot, "h"));
     assert.notEqual(secondIsolated.tempRoot, isolated.tempRoot);
     assert.notEqual(
       secondIsolated.socketPaths.relayV2ExactCompound,
@@ -155,12 +157,22 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
       ),
       false,
     );
-    const metadata = fs.lstatSync(isolated.tmuxTmpDir);
-    assert.equal(metadata.isDirectory(), true);
-    assert.equal(metadata.isSymbolicLink(), false);
-    assert.equal(metadata.mode & 0o777, 0o700);
-    if (typeof process.getuid === "function") {
-      assert.equal(metadata.uid, process.getuid());
+    for (const privateDirectory of [
+      isolated.tempRoot,
+      isolated.tempHome,
+      path.join(isolated.tempHome, ".tmux-worktree"),
+    ]) {
+      const metadata = fs.lstatSync(privateDirectory);
+      assert.equal(metadata.isDirectory(), true);
+      assert.equal(metadata.isSymbolicLink(), false);
+      assert.equal(metadata.mode & 0o777, 0o700);
+      if (
+        typeof process.getuid === "function"
+        && typeof process.getgid === "function"
+      ) {
+        assert.equal(metadata.uid, process.getuid());
+        assert.equal(metadata.gid, process.getgid());
+      }
     }
     assert.equal(
       isolated.socketPaths.terminalControl,
@@ -184,18 +196,38 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
         `${label} socket path exceeds 100 UTF-8 bytes: ${socketPath}`,
       );
     }
+    assert.equal(
+      isolated.sshControlPaths.template,
+      path.join(isolated.tempHome, ".tmux-worktree", "ssh", "%C"),
+    );
+    assert.equal(
+      isolated.sshControlPaths.temporaryBind,
+      `${
+        isolated.sshControlPaths.template.replace("%C", "c".repeat(40))
+      }.${"r".repeat(16)}`,
+    );
+    assert.ok(
+      Buffer.byteLength(isolated.sshControlPaths.temporaryBind, "utf8") <= 103,
+      "ordinary SSH temporary ControlPath bind exceeds 103 UTF-8 bytes",
+    );
 
     fs.mkdirSync(path.dirname(isolated.socketPaths.tmux), { recursive: true });
     fs.mkdirSync(path.dirname(isolated.socketPaths.terminalControl), {
       recursive: true,
     });
+    fs.mkdirSync(path.dirname(isolated.sshControlPaths.temporaryBind), {
+      recursive: true,
+      mode: 0o700,
+    });
     const listeners = [];
-    const listenAttempts = Object.values(isolated.socketPaths).map(
-      async (socketPath) => {
-        const listener = await listenUnix(socketPath);
-        listeners.push(listener);
-      },
-    );
+    const bindPaths = [
+      ...Object.values(isolated.socketPaths),
+      isolated.sshControlPaths.temporaryBind,
+    ];
+    const listenAttempts = bindPaths.map(async (socketPath) => {
+      const listener = await listenUnix(socketPath);
+      listeners.push(listener);
+    });
     try {
       await Promise.all(listenAttempts);
     } finally {

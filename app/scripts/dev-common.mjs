@@ -19,6 +19,25 @@ export const stateFiles = [
 
 const UNIX_SOCKET_PATH_MAX_BYTES = 100;
 const DASHBOARD_CONFIG_FILE = ".tmux-worktree.json";
+const OPENSSH_CONTROL_HASH_PROBE = "c".repeat(40);
+const OPENSSH_TEMP_SUFFIX_PROBE = "r".repeat(16);
+
+function currentUnixIdentity() {
+  if (
+    typeof process.getuid !== "function"
+    || typeof process.getgid !== "function"
+  ) {
+    return null;
+  }
+  return Object.freeze({ uid: process.getuid(), gid: process.getgid() });
+}
+
+function secureIsolatedDirectory(directoryPath, unixIdentity) {
+  if (unixIdentity !== null) {
+    fs.chownSync(directoryPath, unixIdentity.uid, unixIdentity.gid);
+  }
+  fs.chmodSync(directoryPath, 0o700);
+}
 
 function isolatedDevSocketPaths(tempHome, tmuxTmpDir) {
   const uid = typeof process.getuid === "function" ? process.getuid() : os.userInfo().uid;
@@ -38,6 +57,16 @@ function isolatedDevSocketPaths(tempHome, tmuxTmpDir) {
     `.relay-v2-exact-${exactDigest}.sock`,
   );
   return Object.freeze({ tmux, terminalControl, relayV2ExactCompound });
+}
+
+function isolatedDevSshControlPaths(tempHome) {
+  // Preserve the shipping ~/.tmux-worktree/ssh/%C identity while projecting
+  // OpenSSH's expanded hash and first-bind random suffix into the dev preflight.
+  const template = path.join(tempHome, ".tmux-worktree", "ssh", "%C");
+  const temporaryBind = `${
+    template.replace("%C", OPENSSH_CONTROL_HASH_PROBE)
+  }.${OPENSSH_TEMP_SUFFIX_PROBE}`;
+  return Object.freeze({ template, temporaryBind });
 }
 
 function requireIsolatedDevSocketPathsFit(socketPaths) {
@@ -88,9 +117,10 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
   const productName = `${prefix}-${suffix}`;
   const identifier = `dev.warpdash.tw.dev.${suffix}`;
   const tempParent = fs.realpathSync.native("/tmp");
-  const tempRoot = fs.mkdtempSync(path.join(tempParent, "twd-"));
+  const tempRoot = fs.mkdtempSync(path.join(tempParent, "w-"));
   try {
-    fs.chmodSync(tempRoot, 0o700);
+    const unixIdentity = currentUnixIdentity();
+    secureIsolatedDirectory(tempRoot, unixIdentity);
     const metadata = fs.lstatSync(tempRoot);
     if (
       fs.realpathSync.native(tempRoot) !== tempRoot
@@ -98,18 +128,29 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
       || metadata.isSymbolicLink()
       || (metadata.mode & 0o777) !== 0o700
       || (
-        typeof process.getuid === "function"
-        && metadata.uid !== process.getuid()
+        unixIdentity !== null
+        && (
+          metadata.uid !== unixIdentity.uid
+          || metadata.gid !== unixIdentity.gid
+        )
       )
     ) {
       throw new Error(`isolated temp root is not canonical owner-only storage: ${tempRoot}`);
     }
 
-    const tempHome = path.join(tempRoot, "home");
+    const tempHome = path.join(tempRoot, "h");
     const tmuxTmpDir = tempRoot;
     fs.mkdirSync(tempHome, { mode: 0o700 });
+    secureIsolatedDirectory(tempHome, unixIdentity);
+    const privateHome = path.join(tempHome, ".tmux-worktree");
+    fs.mkdirSync(privateHome, { mode: 0o700 });
+    secureIsolatedDirectory(privateHome, unixIdentity);
     const socketPaths = isolatedDevSocketPaths(tempHome, tmuxTmpDir);
-    requireIsolatedDevSocketPathsFit(socketPaths);
+    const sshControlPaths = isolatedDevSshControlPaths(tempHome);
+    requireIsolatedDevSocketPathsFit({
+      ...socketPaths,
+      sshControlTemporaryBind: sshControlPaths.temporaryBind,
+    });
 
     for (const name of stateFiles) {
       const src = path.join(os.homedir(), name);
@@ -127,6 +168,7 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
       tempHome,
       tmuxTmpDir,
       socketPaths,
+      sshControlPaths,
     };
   } catch (error) {
     fs.rmSync(tempRoot, { recursive: true, force: true });
