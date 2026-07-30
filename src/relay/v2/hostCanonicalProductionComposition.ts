@@ -639,6 +639,23 @@ async function settleAll(steps: readonly (() => void | Promise<void>)[]): Promis
   if (firstFailure !== null) throw firstFailure;
 }
 
+function captureCloseBarrier(
+  step: (() => void | Promise<void>) | null,
+): Promise<void> | null {
+  if (step === null) return null;
+  let barrier: Promise<void>;
+  try {
+    barrier = Promise.resolve(step());
+  } catch (error) {
+    barrier = Promise.reject(error);
+  }
+  // A later barrier may reject while settleAll is still awaiting the earlier
+  // one. Observe it immediately without consuming the rejection from the
+  // captured promise that settleAll will eventually await.
+  void barrier.catch(() => {});
+  return barrier;
+}
+
 /**
  * Default-off production owner. Construction recovers existing durable owners
  * but never starts the connector or opens WSS. With no recognized explicit
@@ -963,12 +980,20 @@ export async function openRelayV2HostCanonicalProductionComposition(
       // the Host-owned compound channels are closed. The daemon authority and
       // its lock remain externally owned throughout.
       closingExactTargets.fenceNewPreparations();
+      // Invoke both independent fences synchronously at shutdown entry. Their
+      // drains remain sequential so reauthentication still settles before
+      // Dashboard, without leaving Dashboard live behind a stalled first await.
+      const reauthenticationCloseBarrier = captureCloseBarrier(
+        reauthOwner === null ? null : () => reauthOwner!.close(),
+      );
+      const dashboardCloseBarrier = captureCloseBarrier(
+        dashboardManagementSession === null
+          ? null : () => dashboardManagementSession!.closeAndDrain(),
+      );
       closeBarrier = settleAll([
-        // Fence new reauthentication signals and drain the in-flight job
-        // before Dashboard or connector drain can re-enter its authority.
-        ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
-        ...(dashboardManagementSession === null
-          ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
+        ...(reauthenticationCloseBarrier === null
+          ? [] : [() => reauthenticationCloseBarrier]),
+        ...(dashboardCloseBarrier === null ? [] : [() => dashboardCloseBarrier]),
         () => closingManaged.closeAndDrain(),
         ...(closingObservedBytePlane === null
           ? [] : [() => closingObservedBytePlane.close()]),
@@ -1009,10 +1034,17 @@ export async function openRelayV2HostCanonicalProductionComposition(
     // there is nothing local to roll back and those owners must stay open.
     if (!claimedOwners) throw error;
     exactTargets?.fenceNewPreparations();
+    const reauthenticationRollbackBarrier = captureCloseBarrier(
+      reauthOwner === null ? null : () => reauthOwner!.close(),
+    );
+    const dashboardRollbackBarrier = captureCloseBarrier(
+      dashboardManagementSession === null
+        ? null : () => dashboardManagementSession!.closeAndDrain(),
+    );
     const rollback = [
-      ...(reauthOwner === null ? [] : [() => reauthOwner!.close()]),
-      ...(dashboardManagementSession === null
-        ? [] : [() => dashboardManagementSession!.closeAndDrain()]),
+      ...(reauthenticationRollbackBarrier === null
+        ? [] : [() => reauthenticationRollbackBarrier]),
+      ...(dashboardRollbackBarrier === null ? [] : [() => dashboardRollbackBarrier]),
       ...(managed !== null
         ? [() => managed!.closeAndDrain()]
         : terminalManager === null ? [] : [() => terminalManager!.shutdown()]),
