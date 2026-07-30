@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import { types as nodeUtilTypes } from "node:util";
 
 import {
@@ -166,6 +167,7 @@ function parseSelfHostedDarwinArm64Selection(
       || value.length === 0
       || value.includes("\0")
       || value.startsWith("--")
+      || !isAbsolute(value)
       || Object.hasOwn(values, name)) return null;
     values[name] = value;
   }

@@ -289,6 +289,28 @@ test("explicit self-hosted argv is closed, exact, and never falls back to produc
       "--credential-https-ca-input", "/private/a",
       "--carrier-wss-ca-input", "/private/b",
     ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "relative/credential-ca.pem",
+      "--carrier-wss-ca-input", "/private/b",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "relative/carrier-ca.pem",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+      "--provision-profile-input", "relative/profile.json",
+    ],
+    [
+      "--self-hosted",
+      "--credential-https-ca-input", "/private/a",
+      "--carrier-wss-ca-input", "/private/b",
+      "--bootstrap-secret-input", "relative/bootstrap",
+    ],
   ]) {
     const rejected = makeIo();
     assert.equal(await childRuntime.runRelayV2DashboardManagementChildStdio({
@@ -298,6 +320,7 @@ test("explicit self-hosted argv is closed, exact, and never falls back to produc
     }), 1);
     assert.equal(rejected.raw(), "");
   }
+  assert.equal(calls.length, 1, "invalid paths are rejected before opening a Host");
 
   globalThis.__relayV2DashboardManagementSelfHostedHostFactory = async () => {
     throw new Error("activation failed");

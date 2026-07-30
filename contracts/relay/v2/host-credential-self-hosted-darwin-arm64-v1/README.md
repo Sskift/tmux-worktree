@@ -18,11 +18,16 @@ Node hidden child 只接受：
 
 ```text
 __relay-v2-dashboard-management-stdio --self-hosted \
-  --credential-https-ca-input <0600-path> \
-  --carrier-wss-ca-input <0600-path> \
-  [--provision-profile-input <0600-path>] \
-  [--bootstrap-secret-input <0600-path>]
+  --credential-https-ca-input <absolute-0600-path> \
+  --carrier-wss-ca-input <absolute-0600-path> \
+  [--provision-profile-input <absolute-0600-path>] \
+  [--bootstrap-secret-input <absolute-0600-path>]
 ```
+
+四类 input path 均必须是绝对路径。self-hosted owner 从
+`node:os userInfo().homedir` 取得 account database home 并经 `realpath`
+固定 namespace；若继承的 `HOME` 存在，其 `realpath` 必须与该 canonical
+account home 相同，否则 activation fail closed。
 
 该 lane 另签发一个绑定 exact native credential cell、随后再绑定 intake-owned
 credential authority 的 one-shot base-capability handoff。只有它的 `host.hello`

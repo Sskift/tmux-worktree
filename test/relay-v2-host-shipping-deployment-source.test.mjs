@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -27,6 +28,9 @@ const rootPath = new URL("../src/relay/v2/hostShippingRoot.ts", import.meta.url)
 const virtualModules = new Map([
   ["node:os", `
     export function homedir() { return globalThis.__hostDeploymentHarness.home; }
+    export function userInfo() {
+      return { homedir: globalThis.__hostDeploymentHarness.home };
+    }
   `],
   ["../../terminalControl/store.js", `
     import { createHash } from "node:crypto";
@@ -560,6 +564,7 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
   const cli = join(home, "cli.cjs");
   writeFileSync(cli, "/* fixture */\n");
   const savedArgv = process.argv;
+  const savedHome = process.env.HOME;
   try {
     process.argv = [process.execPath, cli];
     const first = createHarness(home);
@@ -775,6 +780,7 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
 
     if (process.platform === "darwin" && process.arch === "arm64") {
       const accountHome = createPrivateHome(60);
+      const alternateHome = createPrivateHome(61);
       chmodSync(accountHome, 0o750);
       const selfHostedProfileInputPath =
         join(accountHome, "self-hosted-profile-input.json");
@@ -784,6 +790,37 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       selfHosted.expectNativeTls = true;
       globalThis.__hostDeploymentHarness = selfHosted;
       const selfHostedAbort = new AbortController();
+      const selfHostedOptions = Object.freeze({
+        credentialHttpsCaInputPath: credentialCaPath,
+        carrierWssCaInputPath: carrierCaPath,
+        provisionProfileInputPath: selfHostedProfileInputPath,
+      });
+      const selfHostedManagementOptions = Object.freeze({
+        clock: dashboardClock,
+        runtimeVersion: "0.0.0-dashboard-self-hosted-test",
+        signal: selfHostedAbort.signal,
+        io: Object.freeze({
+          input: dashboardInput,
+          writeFrame: dashboardWrite,
+        }),
+      });
+
+      process.env.HOME = alternateHome;
+      await assert.rejects(
+        module.startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+          selfHostedOptions,
+          selfHostedManagementOptions,
+        ),
+        (error) => error?.code === "ACTIVATION_FAILED",
+      );
+      assert.equal(
+        existsSync(join(alternateHome, ".tmux-worktree")),
+        false,
+        "a forged inherited HOME cannot receive self-hosted profile or runtime state",
+      );
+      assert.deepEqual(selfHosted.events, []);
+
+      process.env.HOME = accountHome;
       const selfHostedHandle =
         await module.startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
         Object.freeze({
@@ -810,7 +847,7 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
           ["profile.create", accountHome, selfHosted.profile],
           ["profile.read", accountHome],
         ],
-        "self-hosted provisioning writes through the existing account-home profile store",
+        "self-hosted provisioning writes through the account-database home",
       );
       assert.deepEqual(
       selfHosted.events
@@ -871,6 +908,9 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       false,
       );
       await selfHostedHandle.closeAndDrain();
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      rmSync(alternateHome, { recursive: true, force: true });
       rmSync(accountHome, { recursive: true, force: true });
     }
 
@@ -1241,6 +1281,8 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     ]);
   } finally {
     process.argv = savedArgv;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
     delete globalThis.__hostDeploymentHarness;
     delete globalThis.__hostDeploymentTrustedLoader;
     rmSync(tooLongHome, { recursive: true, force: true });

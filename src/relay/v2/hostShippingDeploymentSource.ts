@@ -10,7 +10,7 @@ import {
   statSync,
 } from "node:fs";
 import { isIP } from "node:net";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { types as nodeTypes } from "node:util";
 
@@ -191,6 +191,31 @@ function failure(
 
 function requireStartupOpen(signal?: AbortSignal): void {
   if (signal?.aborted) throw failure("ACTIVATION_FAILED");
+}
+
+function requireSelfHostedDarwinArm64AccountHome(): string {
+  try {
+    const accountHome = userInfo().homedir;
+    if (typeof accountHome !== "string"
+      || accountHome.length === 0
+      || accountHome.includes("\0")
+      || !isAbsolute(accountHome)) {
+      throw failure("ACTIVATION_FAILED");
+    }
+    const canonicalAccountHome = realpathSync.native(accountHome);
+    const inheritedHome = process.env.HOME;
+    if (inheritedHome !== undefined) {
+      if (inheritedHome.length === 0
+        || inheritedHome.includes("\0")
+        || !isAbsolute(inheritedHome)
+        || realpathSync.native(inheritedHome) !== canonicalAccountHome) {
+        throw failure("ACTIVATION_FAILED");
+      }
+    }
+    return canonicalAccountHome;
+  } catch {
+    throw failure("ACTIVATION_FAILED");
+  }
 }
 
 function requireLocalDevelopmentTrustedHome(value: string): string {
@@ -469,7 +494,8 @@ function captureSelfHostedDarwinArm64Options(
     if (!Object.hasOwn(descriptor, "value")
       || typeof descriptor.value !== "string"
       || descriptor.value.length === 0
-      || descriptor.value.includes("\0")) throw failure("ACTIVATION_INVALID");
+      || descriptor.value.includes("\0")
+      || !isAbsolute(descriptor.value)) throw failure("ACTIVATION_INVALID");
     result[key] = descriptor.value;
   }
   return Object.freeze(result) as unknown as
@@ -771,7 +797,7 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     // TW config/session discovery and terminal-control ownership stay on the
     // current Mac account. The native producer alone derives its fixed 0700
     // credential namespace beneath this account home.
-    const trustedHome = realpathSync.native(homedir());
+    const trustedHome = requireSelfHostedDarwinArm64AccountHome();
     if (options.provisionProfileInputPath !== undefined) {
       const profile = readRelayV2HostProductionProfileProvisioningInput({
         inputPath: options.provisionProfileInputPath,
