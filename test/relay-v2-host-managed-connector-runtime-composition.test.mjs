@@ -441,28 +441,34 @@ async function createHarness(options = {}) {
     discovery,
     store,
     readinessSink: { apply: () => true },
+    testHooks: options.resourceHooks,
   });
   discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
+  if (options.freshH2) {
+    discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
+  }
   const seeded = await foundation.reconcile();
   const spoolRoot = join(home, "snapshot-spool");
-  const publisherSpool = await foundation.openStateSnapshotSpool({
-    hostId: HOST_ID,
-    root: spoolRoot,
-    ownerInstanceId: store.hostInstanceId,
-    now: spoolNow,
-    testLimits: spoolLimits,
-    testHooks: spoolHooks,
-  });
-  await publisherSpool.get({
-    principalId: "managed-runtime-readiness-principal",
-    clientInstanceId: "managed-composition-client",
-    expectedHostEpoch: seeded.snapshot.hostEpoch,
-    snapshotRequestId: "managed-runtime-readiness",
-    snapshotId: null,
-    cursor: null,
-    nextChunkIndex: 0,
-  });
-  await publisherSpool.close();
+  if (!options.freshH2) {
+    const publisherSpool = await foundation.openStateSnapshotSpool({
+      hostId: HOST_ID,
+      root: spoolRoot,
+      ownerInstanceId: store.hostInstanceId,
+      now: spoolNow,
+      testLimits: spoolLimits,
+      testHooks: spoolHooks,
+    });
+    await publisherSpool.get({
+      principalId: "managed-runtime-readiness-principal",
+      clientInstanceId: "managed-composition-client",
+      expectedHostEpoch: seeded.snapshot.hostEpoch,
+      snapshotRequestId: "managed-runtime-readiness",
+      snapshotId: null,
+      cursor: null,
+      nextChunkIndex: 0,
+    });
+    await publisherSpool.close();
+  }
   const spool = await foundation.openStateSnapshotSpool({
     hostId: HOST_ID,
     root: spoolRoot,
@@ -471,7 +477,9 @@ async function createHarness(options = {}) {
     testLimits: spoolLimits,
     testHooks: spoolHooks,
   });
-  const h2RecoveryCandidate = await spool.issueRecoveredHostH2Candidate();
+  const h2RecoveryCandidate = options.freshH2
+    ? await spool.issueFreshInstallHostH2Candidate()
+    : await spool.issueRecoveredHostH2Candidate();
   assert.notEqual(h2RecoveryCandidate, null);
 
   const identity = {
@@ -650,6 +658,8 @@ async function createHarness(options = {}) {
 
   return {
     home,
+    discovery,
+    foundation,
     spool,
     store,
     composition,
@@ -1289,6 +1299,94 @@ test("Dashboard-owned full-cap retry outlives its promoted H2 client lease and g
       negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
     });
     assert.deepEqual(owner.exchanges, { bootstrap: 0, refresh: 0 });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("Dashboard-owned fresh H2 recovers its full offer after a post-open materialized withdrawal", async () => {
+  const h = await createHarness({ managedWss: true, freshH2: true });
+  try {
+    const owner = createDashboardManagementOwner(h);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    owner.input.push(Buffer.from(dashboardManagementStatusFrame));
+    const run = session.run();
+    await settle();
+    const initialStatusRequestId = JSON.parse(dashboardManagementStatusFrame).requestId;
+    const initialStatus = owner.writes
+      .map((frame) => JSON.parse(frame))
+      .find(({ requestId }) => requestId === initialStatusRequestId);
+    assert.deepEqual(initialStatus.result.connector, {
+      status: "stopped",
+    });
+    assert.equal(h.records.length, 0);
+
+    const beforeReplacement = await h.store.read();
+    h.discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
+    const replacement = await h.foundation.reconcile();
+    assert.equal(replacement.snapshot.eventSeq, beforeReplacement.eventSeq);
+    assert.deepEqual(replacement.events, []);
+
+    h.discovery.scans.push({ coverage: "partial", scopes: [] });
+    const withdrawn = await h.foundation.reconcile();
+    assert.equal(withdrawn.readiness.snapshotMaterializationReady, false);
+
+    h.discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
+    const recovered = await h.foundation.reconcile();
+    assert.equal(recovered.readiness.snapshotMaterializationReady, true);
+
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const record = await registerPendingManagedWss(h);
+    assert.deepEqual(
+      record.hello.payload.capabilities,
+      [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    );
+    owner.input.push(Buffer.from(dashboardManagementStatusFrame));
+    owner.input.end();
+    assert.equal(await run, 0);
+    const statuses = owner.writes
+      .map((frame) => JSON.parse(frame))
+      .filter(({ requestId }) => requestId === initialStatusRequestId);
+    assert.deepEqual(statuses.at(-1).result.connector, {
+      status: "registered",
+      acknowledgement: "host.registered",
+      hostId: HOST_ID,
+      connectorId: `managed-connector-${record.sequence}`,
+      negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("fresh H2 release failure permanently fences authoritative successors", async () => {
+  let failRelease = false;
+  const h = await createHarness({
+    managedWss: true,
+    freshH2: true,
+    resourceHooks: {
+      beforeSnapshotActivationRelease() {
+        if (failRelease) throw new Error("injected fresh H2 release failure");
+      },
+    },
+  });
+  try {
+    failRelease = true;
+    h.discovery.scans.push({ coverage: "partial", scopes: [] });
+    const withdrawn = await h.foundation.reconcile();
+    assert.equal(withdrawn.readiness.snapshotMaterializationReady, false);
+
+    h.discovery.scans.push({ coverage: "complete", scopes: [completeScope()] });
+    const recovered = await h.foundation.reconcile();
+    assert.equal(recovered.readiness.snapshotMaterializationReady, true);
+    await assert.rejects(
+      h.composition.start(startInput("managed.fresh-h2.release-failed")),
+      (error) => error?.name === "RelayV2HostConnectorControllerError"
+        && error.code === "UNAVAILABLE",
+    );
+    assert.equal(h.records.length, 0,
+      "a poisoned fresh H2 lifecycle must not create a successor socket");
   } finally {
     await h.cleanup();
   }

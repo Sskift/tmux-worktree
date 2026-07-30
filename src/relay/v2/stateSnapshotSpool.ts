@@ -343,6 +343,27 @@ type RelayV2HostH2CandidateRecord =
   | RelayV2HostH2RecoveryCandidateRecord
   | RelayV2FreshInstallHostH2CandidateRecord;
 
+interface RelayV2FreshInstallH2SourceActivationRecord {
+  sourceActivation: RelayV2MaterializedStateCutActivationLease | null;
+  closed: boolean;
+  releaseAttempted: boolean;
+  readinessPublished: boolean;
+}
+
+interface RelayV2FreshInstallH2LifecycleRecord {
+  readonly candidate: RelayV2FreshInstallHostH2CandidateRecord;
+  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
+  readonly readinessSink: RelayV2RecoveredHostH2ReadinessSink;
+  readonly applyReadiness: (
+    snapshot: Readonly<{ source: "h2"; generation: string; ready: boolean }>,
+  ) => boolean;
+  readonly closeReadiness: () => void;
+  current: RelayV2FreshInstallH2SourceActivationRecord | null;
+  pending: RelayV2FreshInstallH2SourceActivationRecord | null;
+  recoveryInFlight: Promise<void> | null;
+  permanentlyClosed: boolean;
+}
+
 const recoveredHostH2Candidates = new WeakMap<
   object,
   Readonly<RelayV2HostH2CandidateRecord>
@@ -361,6 +382,10 @@ const freshInstallBootstrapReconcilers = new WeakMap<
   RelayV2StateSnapshotSpool,
   () => Promise<unknown>
 >();
+const freshInstallH2AuthoritativeReconcileObservers = new WeakMap<
+  RelayV2StateSnapshotSpool,
+  () => Promise<void>
+>();
 
 export function registerRelayV2FreshInstallH2BootstrapReconcile(
   spool: RelayV2StateSnapshotSpool,
@@ -373,6 +398,19 @@ export function registerRelayV2FreshInstallH2BootstrapReconcile(
     );
   }
   freshInstallBootstrapReconcilers.set(spool, reconcile);
+}
+
+/**
+ * Delivers only the successful-authoritative reconcile edge from the exact
+ * materialized foundation that opened this spool. The installed fresh H2
+ * lifecycle independently recaptures and activates the current source cut;
+ * the edge itself carries no readiness authority.
+ */
+export async function notifyRelayV2FreshInstallH2AuthoritativeReconcile(
+  spool: RelayV2StateSnapshotSpool,
+): Promise<void> {
+  if (!(spool instanceof RelayV2StateSnapshotSpool)) return;
+  await freshInstallH2AuthoritativeReconcileObservers.get(spool)?.();
 }
 
 export interface RelayV2RecoveredHostH2ProcessAuthority {
@@ -2482,104 +2520,38 @@ export class RelayV2StateSnapshotSpool {
       record.release();
       return null;
     }
-    const applyReadiness = applyDescriptor.value as (
-      snapshot: Readonly<{ source: "h2"; generation: string; ready: boolean }>,
-    ) => boolean;
-    const closeReadiness = closeDescriptor.value as () => void;
-    let accepting = true;
-    let readinessPublished = false;
-    let activationReleaseStarted = false;
-    const withdrawReadiness = (): void => {
-      if (!readinessPublished) return;
-      readinessPublished = false;
-      try { Reflect.apply(closeReadiness, readinessSink, []); } catch {}
+    const lifecycle: RelayV2FreshInstallH2LifecycleRecord = {
+      candidate: record,
+      runtimeH2,
+      readinessSink,
+      applyReadiness: applyDescriptor.value as RelayV2FreshInstallH2LifecycleRecord[
+        "applyReadiness"
+      ],
+      closeReadiness: closeDescriptor.value as () => void,
+      current: null,
+      pending: null,
+      recoveryInFlight: null,
+      permanentlyClosed: false,
     };
-    const closeFromSource = (): void => {
-      accepting = false;
-      withdrawReadiness();
-    };
-    const releaseActivation = (): void => {
-      if (bootstrapState.activation === null || activationReleaseStarted) return;
-      activationReleaseStarted = true;
-      try {
-        this.#cutSource.releaseCandidateActivation(bootstrapState.activation);
-      } catch {
-        accepting = false;
-        withdrawReadiness();
-      }
-    };
-    const close = (): void => {
-      if (!accepting && activationReleaseStarted) return;
-      accepting = false;
-      withdrawReadiness();
-      releaseActivation();
-    };
-    try {
-      const assertFreshInstallFence = (
-        candidate: RelayV2MaterializedStateCutCandidate,
-      ): true => {
-        this.assertCurrentOwner();
-        if (candidate.hostId !== record.hostId
-          || candidate.hostEpoch !== record.hostEpoch
-          || candidate.hostInstanceId !== record.hostInstanceId
-          || candidate.materializedCutIdentity !== record.materializedCutIdentity
-          || this.freshInstallBootstrap?.record !== record) {
-          throw new RelayV2StateSnapshotSpoolError(
-            "CAPABILITY_UNAVAILABLE",
-            "fresh-install H2 bootstrap lost its same-cut owner fence",
-          );
-        }
-        return true;
-      };
-      const sourceSink: RelayV2StateEventSink<RelayV2JsonObject> = Object.freeze({
-        enqueue: () => accepting,
-        close: closeFromSource,
-      });
-      const sourceActivation = await this.#cutSource.activateCandidate(
-        candidateLease,
-        sourceSink,
-        assertFreshInstallFence,
-        (candidate, activation) => {
-          bootstrapState.activation = activation;
-          return assertFreshInstallFence(candidate);
-        },
-      );
-      bootstrapState.attached = true;
-      bootstrapState.activation = sourceActivation;
-      if (!accepting) {
-        close();
-        record.release();
-        return null;
-      }
-      if (recoveredHostH2ActivationGeneration
-        >= MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION) {
-        close();
-        record.release();
-        return null;
-      }
-      recoveredHostH2ActivationGeneration += 1n;
-      readinessPublished = true;
-      let applied = false;
-      try {
-        applied = Reflect.apply(applyReadiness, readinessSink, [Object.freeze({
-          source: "h2",
-          generation: recoveredHostH2ActivationGeneration.toString(10),
-          ready: true,
-        })]) === true;
-      } catch {}
-      if (!applied || !accepting || !readinessPublished) {
-        close();
-        record.release();
-        return null;
-      }
-    } catch {
-      close();
+    const installed = await this.#installFreshInstallH2SourceActivation(
+      lifecycle,
+      candidateLease,
+      record.materializedCutIdentity,
+    );
+    if (!installed || lifecycle.current === null) {
+      this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
       record.release();
       return null;
     }
+    bootstrapState.attached = true;
+    bootstrapState.activation = lifecycle.current.sourceActivation;
 
     const assertAccepting = (): void => {
-      if (!accepting) {
+      const current = lifecycle.current;
+      if (lifecycle.permanentlyClosed
+        || current === null
+        || current.closed
+        || !current.readinessPublished) {
         throw new RelayV2StateSnapshotSpoolError(
           "CAPABILITY_UNAVAILABLE",
           "fresh-install H2 activation is closed",
@@ -2615,18 +2587,241 @@ export class RelayV2StateSnapshotSpool {
       },
     });
     if (this.freshInstallBootstrap?.record === record) {
-      this.freshInstallBootstrap.closeActivation = close;
+      this.freshInstallBootstrap.closeActivation = () => {
+        this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+      };
+      freshInstallH2AuthoritativeReconcileObservers.set(this, () => (
+        this.#recoverFreshInstallH2AfterAuthoritativeReconcile(lifecycle)
+      ));
     }
     return Object.freeze({
       runtimeH2: gatedRuntimeH2,
       snapshotSpool,
-      lifecycle: Object.freeze({ close }),
+      lifecycle: Object.freeze({
+        close: () => this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle),
+      }),
       cancelConstruction: () => {
-        close();
+        this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
         record.release();
       },
-      dispose: close,
+      dispose: () => this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle),
     });
+  }
+
+  async #installFreshInstallH2SourceActivation(
+    lifecycle: RelayV2FreshInstallH2LifecycleRecord,
+    candidateLease: RelayV2MaterializedStateCutCandidateLease,
+    requiredCutIdentity: string | null,
+  ): Promise<boolean> {
+    if (lifecycle.permanentlyClosed
+      || lifecycle.current !== null
+      || lifecycle.pending !== null
+      || this.closed
+      || this.fatalUnavailable
+      || this.freshInstallBootstrap?.record !== lifecycle.candidate) return false;
+    const source: RelayV2FreshInstallH2SourceActivationRecord = {
+      sourceActivation: null,
+      closed: false,
+      releaseAttempted: false,
+      readinessPublished: false,
+    };
+    lifecycle.pending = source;
+    const withdraw = (): void => {
+      if (!source.readinessPublished) return;
+      source.readinessPublished = false;
+      try {
+        Reflect.apply(lifecycle.closeReadiness, lifecycle.readinessSink, []);
+      } catch {}
+    };
+    const release = (): void => {
+      if (source.sourceActivation === null || source.releaseAttempted) return;
+      source.releaseAttempted = true;
+      try {
+        this.#cutSource.releaseCandidateActivation(source.sourceActivation);
+      } catch {
+        source.closed = true;
+        if (lifecycle.current === source) lifecycle.current = null;
+        withdraw();
+        this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+      }
+    };
+    const closeFromSource = (): void => {
+      source.closed = true;
+      if (lifecycle.current === source) {
+        lifecycle.current = null;
+        withdraw();
+      }
+      release();
+    };
+    const assertFreshInstallFence = (
+      candidate: RelayV2MaterializedStateCutCandidate,
+    ): true => {
+      this.assertCurrentOwner();
+      if (lifecycle.permanentlyClosed
+        || lifecycle.pending !== source
+        || candidate.hostId !== lifecycle.candidate.hostId
+        || candidate.hostEpoch !== lifecycle.candidate.hostEpoch
+        || candidate.hostInstanceId !== lifecycle.candidate.hostInstanceId
+        || (requiredCutIdentity !== null
+          && candidate.materializedCutIdentity !== requiredCutIdentity)
+        || this.freshInstallBootstrap?.record !== lifecycle.candidate) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "CAPABILITY_UNAVAILABLE",
+          "fresh-install H2 activation lost its exact current-cut owner fence",
+        );
+      }
+      return true;
+    };
+    try {
+      const sourceSink: RelayV2StateEventSink<RelayV2JsonObject> = Object.freeze({
+        enqueue: () => !lifecycle.permanentlyClosed && !source.closed,
+        close: closeFromSource,
+      });
+      source.sourceActivation = await this.#cutSource.activateCandidate(
+        candidateLease,
+        sourceSink,
+        assertFreshInstallFence,
+        (candidate, activation) => {
+          source.sourceActivation = activation;
+          return assertFreshInstallFence(candidate);
+        },
+      );
+      if (lifecycle.permanentlyClosed
+        || lifecycle.pending !== source
+        || lifecycle.current !== null
+        || source.closed
+        || recoveredHostH2ActivationGeneration
+          >= MAX_RECOVERED_HOST_H2_ACTIVATION_GENERATION) {
+        release();
+        return false;
+      }
+      recoveredHostH2ActivationGeneration += 1n;
+      lifecycle.current = source;
+      source.readinessPublished = true;
+      let applied = false;
+      try {
+        applied = Reflect.apply(
+          lifecycle.applyReadiness,
+          lifecycle.readinessSink,
+          [Object.freeze({
+            source: "h2",
+            generation: recoveredHostH2ActivationGeneration.toString(10),
+            ready: true,
+          })],
+        ) === true;
+      } catch {}
+      if (!applied
+        || lifecycle.permanentlyClosed
+        || lifecycle.current !== source
+        || source.closed
+        || !source.readinessPublished) {
+        if (lifecycle.current === source) lifecycle.current = null;
+        withdraw();
+        release();
+        return false;
+      }
+      return true;
+    } catch {
+      if (lifecycle.current === source) lifecycle.current = null;
+      withdraw();
+      release();
+      return false;
+    } finally {
+      if (lifecycle.pending === source) lifecycle.pending = null;
+    }
+  }
+
+  #permanentlyCloseFreshInstallH2Lifecycle(
+    lifecycle: RelayV2FreshInstallH2LifecycleRecord,
+  ): void {
+    if (lifecycle.permanentlyClosed) return;
+    lifecycle.permanentlyClosed = true;
+    freshInstallH2AuthoritativeReconcileObservers.delete(this);
+    const sources = [lifecycle.current, lifecycle.pending]
+      .filter((source): source is RelayV2FreshInstallH2SourceActivationRecord => (
+        source !== null
+      ));
+    lifecycle.current = null;
+    lifecycle.pending = null;
+    for (const source of sources) {
+      source.closed = true;
+      if (source.readinessPublished) {
+        source.readinessPublished = false;
+        try {
+          Reflect.apply(lifecycle.closeReadiness, lifecycle.readinessSink, []);
+        } catch {}
+      }
+      if (source.sourceActivation !== null && !source.releaseAttempted) {
+        source.releaseAttempted = true;
+        try {
+          this.#cutSource.releaseCandidateActivation(source.sourceActivation);
+        } catch {}
+      }
+    }
+  }
+
+  async #recoverFreshInstallH2AfterAuthoritativeReconcile(
+    lifecycle: RelayV2FreshInstallH2LifecycleRecord,
+  ): Promise<void> {
+    if (lifecycle.permanentlyClosed
+      || lifecycle.current !== null
+      || lifecycle.pending !== null) return;
+    if (lifecycle.recoveryInFlight !== null) {
+      await lifecycle.recoveryInFlight;
+      return;
+    }
+    const recovery = this.#runFreshInstallH2AuthoritativeRecovery(lifecycle);
+    lifecycle.recoveryInFlight = recovery;
+    try {
+      await recovery;
+    } finally {
+      if (lifecycle.recoveryInFlight === recovery) lifecycle.recoveryInFlight = null;
+    }
+  }
+
+  async #runFreshInstallH2AuthoritativeRecovery(
+    lifecycle: RelayV2FreshInstallH2LifecycleRecord,
+  ): Promise<void> {
+    let candidateLease: RelayV2MaterializedStateCutCandidateLease | null = null;
+    try {
+      await this.serializeMetadata(async () => {
+        if (lifecycle.permanentlyClosed
+          || lifecycle.current !== null
+          || lifecycle.pending !== null
+          || this.closed
+          || this.fatalUnavailable
+          || this.freshInstallBootstrap?.record !== lifecycle.candidate) return;
+        const hostEpoch = await this.readCurrentHostEpoch();
+        if (hostEpoch !== lifecycle.candidate.hostEpoch) {
+          this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+          return;
+        }
+        try {
+          candidateLease = await this.#cutSource.captureCandidate(hostEpoch);
+        } catch (error) {
+          throw mapSourceError(error);
+        }
+        await this.#installFreshInstallH2SourceActivation(
+          lifecycle,
+          candidateLease,
+          null,
+        );
+      });
+    } catch {
+      if (this.closed || this.fatalUnavailable) {
+        this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+      } else {
+        try {
+          this.assertCurrentOwner();
+        } catch {
+          this.#permanentlyCloseFreshInstallH2Lifecycle(lifecycle);
+        }
+      }
+    } finally {
+      if (candidateLease !== null) {
+        try { this.#cutSource.releaseCandidate(candidateLease); } catch {}
+      }
+    }
   }
 
   async #activateRecoveredHostH2Candidate(

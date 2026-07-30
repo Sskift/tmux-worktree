@@ -666,6 +666,7 @@ type MaterializedCutCandidateLimits = typeof RELAY_V2_MATERIALIZED_CUT_CANDIDATE
 
 export interface RelayV2MaterializedStateTestHooks {
   afterSnapshotCandidateSubscriptionInstall?: () => void;
+  beforeSnapshotActivationRelease?: () => void;
 }
 
 interface PendingChange {
@@ -2931,6 +2932,7 @@ export class RelayV2MaterializedStateFoundation {
   private snapshotCutCandidateRetainedBytes = 0;
   private publishedCanonicalResolver: PublishedCanonicalResolver | null = null;
   private reconcileInFlight: Promise<RelayV2MaterializedReconcileResult> | null = null;
+  private authoritativeReconcileObserver: (() => Promise<void>) | null = null;
   private observedHostEpoch: string | null = null;
   private continuityFenceReason: ContinuityFenceReason | null = null;
 
@@ -3147,6 +3149,9 @@ export class RelayV2MaterializedStateFoundation {
       canonicalSpool.registerRelayV2FreshInstallH2BootstrapReconcile(
         spool,
         () => this.reconcile(),
+      );
+      this.authoritativeReconcileObserver = () => (
+        canonicalSpool.notifyRelayV2FreshInstallH2AuthoritativeReconcile(spool)
       );
     } catch (error) {
       try { await spool.close(); } catch {}
@@ -4002,6 +4007,9 @@ export class RelayV2MaterializedStateFoundation {
         }
         return {
           kind: "applied" as const,
+          notifyAuthoritativeReconcile: publication.accepted
+            && publication.readiness.snapshotMaterializationReady
+            && !publication.readiness.closeV2Routes,
           value: {
             events: clone(commit.value.events),
             snapshot: commit.snapshot,
@@ -4009,7 +4017,12 @@ export class RelayV2MaterializedStateFoundation {
           },
         };
       });
-      if (attempt.kind === "applied") return attempt.value;
+      if (attempt.kind === "applied") {
+        if (attempt.notifyAuthoritativeReconcile) {
+          await this.authoritativeReconcileObserver?.();
+        }
+        return attempt.value;
+      }
       if (attempt.kind === "exhausted") {
         throw new RelayV2MaterializedStateError(
           "CAPABILITY_UNAVAILABLE",
@@ -4440,6 +4453,7 @@ export class RelayV2MaterializedStateFoundation {
   ): void {
     if ((typeof activation !== "object" && typeof activation !== "function")
       || activation === null) return;
+    this.testHooks?.beforeSnapshotActivationRelease?.();
     const record = this.snapshotCutActivations.get(activation as object);
     if (record === undefined
       || record.sourceIdentity !== this.snapshotCutSourceIdentity

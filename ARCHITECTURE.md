@@ -469,12 +469,21 @@ activation within that metadata commit to a spool-wide live H2 record and
 consumes the receipt; later release or observed expiry of the original client
 cut retires only that cut and does not withdraw H2. When no recovered pinned cut
 exists, the spool's one-shot fresh-install bootstrap candidate feeds the same
-private activation pair instead. H3 accepts only the durable
+private activation pair instead. A transient materialized-readiness withdrawal
+closes that fresh source activation and gates its runtime/spool facade. Only a
+later successful authoritative reconcile from the exact foundation that opened
+the spool, with `snapshotMaterializationReady=true` and `closeV2Routes=false`,
+may notify the same spool lifecycle to capture and activate the exact current
+same-lineage cut with a strictly larger H2 generation; the notification itself
+carries no authority. Exact activation identity prevents an old late close from
+withdrawing the successor, while a synchronous source-activation release error
+permanently poisons pending and future fresh activation. H3 accepts only the durable
 lineage/manager/host recovery candidate. Runtime receives private gated facades;
 public H1 and H2 each expose only `close()`, while H3 has no readiness `apply`
 path. Spool/fatal close, snapshot-owner takeover, source/sink close, outer H2
 close/disposal, or fatal authority failure synchronously withdraws live H2
-readiness and applies the existing 4406 route fence. This foundation
+readiness and applies the existing 4406 route fence; takeover and owner/outer
+close permanently fence the fresh successor path. This foundation
 remains outside `relay-host` CLI/public production activation; the actor's static empty
 advertised capability set is only the fail-closed input that forbids bypassing
 the readiness-to-pre-carrier-claim chain, and the codec producer alone does not
