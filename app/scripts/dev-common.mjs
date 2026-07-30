@@ -24,7 +24,10 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
   const identifier = `dev.warpdash.tw.dev.${suffix}`;
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${productName}-`));
   const tempHome = path.join(tempRoot, "home");
+  const tmuxTmpDir = path.join(tempRoot, "tmux");
   fs.mkdirSync(tempHome, { recursive: true });
+  fs.mkdirSync(tmuxTmpDir, { mode: 0o700 });
+  fs.chmodSync(tmuxTmpDir, 0o700);
 
   for (const name of stateFiles) {
     const src = path.join(os.homedir(), name);
@@ -34,7 +37,28 @@ export function prepareIsolatedDevApp(prefix = "tw-dashboard-dev") {
     }
   }
 
-  return { suffix, productName, identifier, tempRoot, tempHome };
+  return { suffix, productName, identifier, tempRoot, tempHome, tmuxTmpDir };
+}
+
+export function isolatedRuntimeEnv(isolated, baseEnv = process.env) {
+  const env = {
+    ...baseEnv,
+    TW_DASHBOARD_HOME: isolated.tempHome,
+    TMUX_TMPDIR: isolated.tmuxTmpDir,
+  };
+  delete env.TMUX;
+  delete env.TW_TERMINAL_CONTROL_SOCKET;
+  delete env.TW_TERMINAL_CONTROL_STATE;
+  return env;
+}
+
+export function isolatedLauncherScript(isolated) {
+  return `#!/bin/sh
+export TW_DASHBOARD_HOME=${JSON.stringify(isolated.tempHome)}
+export TMUX_TMPDIR=${JSON.stringify(isolated.tmuxTmpDir)}
+unset TMUX TW_TERMINAL_CONTROL_SOCKET TW_TERMINAL_CONTROL_STATE
+exec "$(dirname "$0")/app-real" "$@"
+`;
 }
 
 export function writeOverrideConfig(tempRoot, productName, identifier) {

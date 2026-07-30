@@ -5,6 +5,7 @@ use crate::remote::{
     remote_tmux_cmd, remote_tw_cmd, spawn_remote_terminal_control_proxy, HostConfig,
     RemoteTerminalControlProxy,
 };
+use crate::support::app_home_dir;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -338,7 +339,7 @@ fn socket_path() -> PathBuf {
     {
         return PathBuf::from(path);
     }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = app_home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let preferred = home.join(".tmux-worktree").join("terminal-control-v1.sock");
     if preferred.to_string_lossy().as_bytes().len() <= 100 {
         return preferred;
@@ -629,12 +630,28 @@ fn server_is_ready() -> bool {
     send_once(&request("ping", json!({}))).is_ok()
 }
 
+fn apply_local_runtime_namespace(command: &mut Command) -> Result<(), String> {
+    let home = app_home_dir().ok_or("home dir not found")?;
+    command
+        .env("HOME", &home)
+        .env("TW_DASHBOARD_HOME", &home);
+    Ok(())
+}
+
 fn spawn_server(app: &tauri::AppHandle) -> Result<Child, String> {
     let mut failures = Vec::new();
     if let Some(cli) = bundled_cli_path(app) {
         if let Some(node) = node_bin() {
             let cli_arg = cli.to_string_lossy().to_string();
-            match Command::new(&node)
+            let mut command = Command::new(&node);
+            if let Err(error) = apply_local_runtime_namespace(&mut command) {
+                failures.push(format!("configure bundled terminal-control: {error}"));
+                return Err(format!(
+                    "failed to start terminal-control authority: {}",
+                    failures.join("; ")
+                ));
+            }
+            match command
                 .args([cli_arg.as_str(), "terminal-control", "serve"])
                 .env("TW_TERMINAL_CONTROL_CLI", &cli_arg)
                 .process_group(0)
@@ -653,7 +670,15 @@ fn spawn_server(app: &tauri::AppHandle) -> Result<Child, String> {
         failures.push("bundled CLI resource not found".to_string());
     }
     if let Some(tw) = installed_tw_command() {
-        match Command::new(&tw)
+        let mut command = Command::new(&tw);
+        if let Err(error) = apply_local_runtime_namespace(&mut command) {
+            failures.push(format!("configure installed terminal-control: {error}"));
+            return Err(format!(
+                "failed to start terminal-control authority: {}",
+                failures.join("; ")
+            ));
+        }
+        match command
             .args(["terminal-control", "serve"])
             .process_group(0)
             .stdin(Stdio::null())
@@ -1408,6 +1433,65 @@ mod tests {
             RemoteTerminalControlFingerprint::from(&presentation_only),
             expected
         );
+    }
+
+    #[test]
+    fn dashboard_home_namespaces_local_terminal_control_client_and_daemon() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_dashboard_home = std::env::var_os("TW_DASHBOARD_HOME");
+        let original_socket = std::env::var_os("TW_TERMINAL_CONTROL_SOCKET");
+        let dashboard_home = PathBuf::from(format!(
+            "/tmp/twd-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+
+        unsafe {
+            std::env::set_var("HOME", "/tmp/real-dashboard-account-home");
+            std::env::set_var("TW_DASHBOARD_HOME", &dashboard_home);
+            std::env::remove_var("TW_TERMINAL_CONTROL_SOCKET");
+        }
+
+        assert_eq!(
+            socket_path(),
+            dashboard_home
+                .join(".tmux-worktree")
+                .join("terminal-control-v1.sock")
+        );
+
+        let mut command = Command::new("/bin/sh");
+        apply_local_runtime_namespace(&mut command).unwrap();
+        let output = command
+            .args([
+                "-c",
+                "printf '%s\\n%s\\n' \"$HOME\" \"$TW_DASHBOARD_HOME\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}\n{}\n",
+                dashboard_home.display(),
+                dashboard_home.display()
+            )
+        );
+
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_dashboard_home {
+                Some(value) => std::env::set_var("TW_DASHBOARD_HOME", value),
+                None => std::env::remove_var("TW_DASHBOARD_HOME"),
+            }
+            match original_socket {
+                Some(value) => std::env::set_var("TW_TERMINAL_CONTROL_SOCKET", value),
+                None => std::env::remove_var("TW_TERMINAL_CONTROL_SOCKET"),
+            }
+        }
     }
 
     #[test]

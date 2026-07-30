@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   appDir,
   ensureNodeModules,
+  isolatedRuntimeEnv,
   prepareIsolatedDevApp,
   printDevAppInfo,
   writeOverrideConfig,
@@ -19,6 +20,7 @@ function usage() {
 
 Starts a Tauri dev app with:
 - isolated dashboard state under a temporary TW_DASHBOARD_HOME
+- a private TMUX_TMPDIR so it cannot see normal tmux sessions
 - unique productName / identifier so it won't conflict with installed tw-dashboard
 
 Extra args after -- are passed through to tauri dev.`);
@@ -64,9 +66,8 @@ const child = spawn(
     cwd: appDir,
     stdio: "inherit",
     env: {
-      ...process.env,
+      ...isolatedRuntimeEnv(isolated),
       SHELL: wrapperPath,
-      TW_DASHBOARD_HOME: isolated.tempHome,
     },
   },
 );

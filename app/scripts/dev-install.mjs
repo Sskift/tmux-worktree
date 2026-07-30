@@ -7,6 +7,8 @@ import path from "node:path";
 import {
   appDir,
   ensureNodeModules,
+  isolatedLauncherScript,
+  isolatedRuntimeEnv,
   prepareIsolatedDevApp,
   printDevAppInfo,
   writeOverrideConfig,
@@ -17,6 +19,7 @@ function usage() {
 
 Builds and installs a uniquely named debug app bundle with:
 - isolated dashboard state under a temporary TW_DASHBOARD_HOME
+- a private TMUX_TMPDIR so it cannot see normal tmux sessions
 - unique productName / identifier so it won't conflict with installed tw-dashboard
 - a launcher wrapper inside the bundle so Finder/open keeps using the isolated state
 
@@ -62,10 +65,7 @@ const build = spawnSync(
   {
     cwd: appDir,
     stdio: "inherit",
-    env: {
-      ...process.env,
-      TW_DASHBOARD_HOME: isolated.tempHome,
-    },
+    env: isolatedRuntimeEnv(isolated),
   },
 );
 
@@ -87,10 +87,7 @@ const realBinaryPath = path.join(macosDir, "app-real");
 fs.renameSync(launcherPath, realBinaryPath);
 fs.writeFileSync(
   launcherPath,
-  `#!/bin/sh
-export TW_DASHBOARD_HOME=${JSON.stringify(isolated.tempHome)}
-exec "$(dirname "$0")/app-real" "$@"
-`,
+  isolatedLauncherScript(isolated),
   { mode: 0o755 },
 );
 
