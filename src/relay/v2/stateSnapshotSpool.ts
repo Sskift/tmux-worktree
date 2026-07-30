@@ -161,6 +161,10 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
   ) => void | Promise<void>;
   /** Runs after the exact spool activation has been synchronously revoked. */
   afterReadinessActivationRelease?: (activation: unknown, released: boolean) => unknown;
+  /** Pauses only H2-facade snapshot work before its first mutation cut. */
+  beforeBoundH2SnapshotOperation?: (
+    operation: "get" | "release",
+  ) => void | Promise<void>;
 }
 
 export interface RelayV2StateSnapshotSpoolOptions {
@@ -283,6 +287,8 @@ export type RelayV2RecoveredHostH2SnapshotSpoolPort = Pick<
   RelayV2StateSnapshotHostSpoolPort,
   "get" | "release"
 >;
+
+type RelayV2BoundH2SnapshotOperationFence = (() => void) | null;
 
 interface RelayV2RecoveredHostH2Activation {
   readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
@@ -735,6 +741,16 @@ export class RelayV2StateSnapshotSpoolError extends Error {
   ) {
     super(message);
     this.name = "RelayV2StateSnapshotSpoolError";
+  }
+}
+
+class RelayV2BoundH2SnapshotOperationFencedError
+extends RelayV2StateSnapshotSpoolError {
+  constructor() {
+    super(
+      "CAPABILITY_UNAVAILABLE",
+      "bound snapshot spool H2 claim changed during an admitted operation",
+    );
   }
 }
 
@@ -2196,10 +2212,22 @@ export class RelayV2StateSnapshotSpool {
   }
 
   async get(request: RelayV2StateSnapshotGet): Promise<RelayV2StateSnapshotChunk> {
+    return this.getWithOperationFence(request, null);
+  }
+
+  private async getWithOperationFence(
+    request: RelayV2StateSnapshotGet,
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): Promise<RelayV2StateSnapshotChunk> {
     validateGet(request);
+    await this.beforeBoundH2SnapshotOperation("get", operationFence);
     const currentHostEpoch = await this.readCurrentHostEpoch();
+    this.assertSnapshotOperationFence(operationFence);
     if (request.expectedHostEpoch !== currentHostEpoch) {
-      await this.serializeMetadata(() => this.dropOtherLineages(currentHostEpoch));
+      await this.serializeSnapshotOperationMetadata(
+        operationFence,
+        () => this.dropOtherLineages(currentHostEpoch),
+      );
       throw new RelayV2StateSnapshotSpoolError(
         "HOST_EPOCH_MISMATCH",
         "Relay v2 host lineage does not match",
@@ -2209,26 +2237,31 @@ export class RelayV2StateSnapshotSpool {
         },
       );
     }
-    await this.serializeMetadata(() => {
+    await this.serializeSnapshotOperationMetadata(operationFence, () => {
       this.dropOtherLineages(currentHostEpoch);
       this.cleanupExpiredAt(this.readNow());
     });
 
     if (request.snapshotId !== null) {
-      return this.serveExisting(request, request.snapshotId);
+      return this.serveExisting(request, request.snapshotId, operationFence);
     }
 
     const binding = bindingFor(request);
     const key = logicalKey(binding);
-    let decision = await this.serializeMetadata(() => this.existingFirst(key));
+    let decision = await this.serializeSnapshotOperationMetadata(
+      operationFence,
+      () => this.existingFirst(key),
+    );
     if (decision === null) {
       const estimate = await this.readAdmissionEstimate(binding.hostEpoch);
-      decision = await this.serializeMetadata(() => (
-        this.beginFirst(binding, key, estimate)
-      ));
+      this.assertSnapshotOperationFence(operationFence);
+      decision = await this.serializeSnapshotOperationMetadata(
+        operationFence,
+        () => this.beginFirst(binding, key, estimate),
+      );
     }
     if (decision.kind === "build") {
-      void this.buildAndPublish(decision.reservation).then(
+      void this.buildAndPublish(decision.reservation, operationFence).then(
         () => decision.build.resolve(),
         (error) => decision.build.reject(error),
       );
@@ -2244,20 +2277,35 @@ export class RelayV2StateSnapshotSpool {
         });
       }
     }
+    this.assertSnapshotOperationFence(operationFence);
     const active = decision.kind === "active"
       ? decision.cut
-      : await this.serializeMetadata(() => this.#activeByLogicalKey.get(key));
+      : await this.serializeSnapshotOperationMetadata(
+        operationFence,
+        () => this.#activeByLogicalKey.get(key),
+      );
     if (!active) throw expiredError();
-    return this.serveExisting(request, active.manifest.snapshotId);
+    return this.serveExisting(request, active.manifest.snapshotId, operationFence);
   }
 
   async release(
     request: RelayV2StateSnapshotRelease,
   ): Promise<RelayV2StateSnapshotReleased> {
+    return this.releaseWithOperationFence(request, null);
+  }
+
+  private async releaseWithOperationFence(
+    request: RelayV2StateSnapshotRelease,
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): Promise<RelayV2StateSnapshotReleased> {
     validateRelease(request);
-    return this.serializeMetadata(() => this.withLineageFence(
+    await this.beforeBoundH2SnapshotOperation("release", operationFence);
+    const released = await this.serializeSnapshotOperationMetadata(
+      operationFence,
+      () => this.withLineageFence(
       request.expectedHostEpoch,
       () => {
+      this.assertSnapshotOperationFence(operationFence);
       const now = this.readNow();
       this.cleanupExpiredAt(now);
       const binding = bindingFor(request);
@@ -2266,7 +2314,7 @@ export class RelayV2StateSnapshotSpool {
         if (!sameBinding(existingTombstone.record.binding, binding)
           || existingTombstone.record.disposition !== "released") throw expiredError();
         this.removeCutIfPresent(request.snapshotId);
-        return {
+        const response = {
           hostEpoch: request.expectedHostEpoch,
           snapshotRequestId: request.snapshotRequestId,
           snapshotId: request.snapshotId,
@@ -2274,6 +2322,8 @@ export class RelayV2StateSnapshotSpool {
           alreadyReleased: true,
           releasedAtMs: existingTombstone.record.recordedAtMs,
         };
+        this.assertSnapshotOperationFence(operationFence);
+        return response;
       }
       if (this.recoveryIncomplete) {
         throw new RelayV2StateSnapshotSpoolError(
@@ -2314,7 +2364,7 @@ export class RelayV2StateSnapshotSpool {
       this.installTombstone(tombstone);
       this.removeActiveCut(active);
       this.enforceRecoveredQuota();
-      return {
+      const response = {
         hostEpoch: request.expectedHostEpoch,
         snapshotRequestId: request.snapshotRequestId,
         snapshotId: request.snapshotId,
@@ -2322,8 +2372,12 @@ export class RelayV2StateSnapshotSpool {
         alreadyReleased: false,
         releasedAtMs: now,
       };
+      this.assertSnapshotOperationFence(operationFence);
+      return response;
       },
     ));
+    this.assertSnapshotOperationFence(operationFence);
+    return released;
   }
 
   async cleanupExpired(): Promise<void> {
@@ -2709,16 +2763,7 @@ export class RelayV2StateSnapshotSpool {
         return runtimeH2.unsubscribe(subscriberId);
       },
     });
-    const snapshotSpool: RelayV2RecoveredHostH2SnapshotSpoolPort = Object.freeze({
-      get: (request) => {
-        assertAccepting();
-        return this.get(request);
-      },
-      release: (request) => {
-        assertAccepting();
-        return this.release(request);
-      },
-    });
+    const snapshotSpool = this.createBoundH2SnapshotSpoolPort(assertAccepting);
     if (this.freshInstallBootstrap?.record === record
       && currentBoundH2SpoolBinding(this, record.boundSpoolClaim) !== null) {
       this.freshInstallBootstrap.closeActivation = () => {
@@ -3164,16 +3209,7 @@ export class RelayV2StateSnapshotSpool {
         return runtimeH2.unsubscribe(subscriberId);
       },
     });
-    const snapshotSpool: RelayV2RecoveredHostH2SnapshotSpoolPort = Object.freeze({
-      get: (request) => {
-        assertAccepting();
-        return this.get(request);
-      },
-      release: (request) => {
-        assertAccepting();
-        return this.release(request);
-      },
-    });
+    const snapshotSpool = this.createBoundH2SnapshotSpoolPort(assertAccepting);
     return Object.freeze({
       runtimeH2: gatedRuntimeH2,
       snapshotSpool,
@@ -3183,6 +3219,22 @@ export class RelayV2StateSnapshotSpool {
         record.release();
       },
       dispose: close,
+    });
+  }
+
+  private createBoundH2SnapshotSpoolPort(
+    assertAccepting: () => void,
+  ): RelayV2RecoveredHostH2SnapshotSpoolPort {
+    const operationFence = (): void => {
+      try {
+        assertAccepting();
+      } catch {
+        throw new RelayV2BoundH2SnapshotOperationFencedError();
+      }
+    };
+    return Object.freeze({
+      get: (request) => this.getWithOperationFence(request, operationFence),
+      release: (request) => this.releaseWithOperationFence(request, operationFence),
     });
   }
 
@@ -3600,6 +3652,62 @@ export class RelayV2StateSnapshotSpool {
       );
     }
     return clone(estimate);
+  }
+
+  private assertSnapshotOperationFence(
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): void {
+    operationFence?.();
+  }
+
+  private snapshotOperationFenceFailure(
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): RelayV2BoundH2SnapshotOperationFencedError | null {
+    if (operationFence === null) return null;
+    try {
+      operationFence();
+      return null;
+    } catch {
+      return new RelayV2BoundH2SnapshotOperationFencedError();
+    }
+  }
+
+  private async beforeBoundH2SnapshotOperation(
+    operation: "get" | "release",
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): Promise<void> {
+    if (operationFence === null) return;
+    operationFence();
+    await this.testHooks?.beforeBoundH2SnapshotOperation?.(operation);
+    operationFence();
+  }
+
+  private serializeSnapshotOperationMetadata<T>(
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+    operation: () => T | Promise<T>,
+  ): Promise<T> {
+    return this.serializeMetadata(async () => {
+      this.assertSnapshotOperationFence(operationFence);
+      const result = await operation();
+      this.assertSnapshotOperationFence(operationFence);
+      return result;
+    });
+  }
+
+  private retireFailedBuildReservation(
+    reservation: PersistedReservation,
+    failure: RelayV2StateSnapshotSpoolError,
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): Promise<void> {
+    return this.serializeMetadata(() => {
+      if (this.reservationsById.get(reservation.reservationId) !== reservation) return;
+      if (failure instanceof RelayV2BoundH2SnapshotOperationFencedError
+        || this.snapshotOperationFenceFailure(operationFence) !== null) {
+        this.cancelBoundH2BuildReservation(reservation, failure);
+      } else {
+        this.expireReservation(reservation, failure);
+      }
+    });
   }
 
   private async serializeMetadata<T>(
@@ -4589,19 +4697,25 @@ export class RelayV2StateSnapshotSpool {
       ));
   }
 
-  private async buildAndPublish(reservation: PersistedReservation): Promise<void> {
+  private async buildAndPublish(
+    reservation: PersistedReservation,
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
+  ): Promise<void> {
     let candidateLease: RelayV2MaterializedStateCutCandidateLease | undefined;
     let candidate: RelayV2MaterializedStateCutCandidate;
     let cut: RelayV2MaterializedStateCut;
     try {
+      this.assertSnapshotOperationFence(operationFence);
       candidateLease = await this.#cutSource.captureCandidate(reservation.binding.hostEpoch);
+      this.assertSnapshotOperationFence(operationFence);
       candidate = this.#cutSource.inspectCandidate(candidateLease);
       cut = candidate.cut;
     } catch (error) {
       if (candidateLease !== undefined) this.#cutSource.releaseCandidate(candidateLease);
-      const sourceError = mapSourceError(error);
-      await this.serializeMetadata(() => this.expireReservation(reservation, sourceError));
-      throw sourceError;
+      const failure = this.snapshotOperationFenceFailure(operationFence)
+        ?? mapSourceError(error);
+      await this.retireFailedBuildReservation(reservation, failure, operationFence);
+      throw failure;
     }
     try {
       if (cut.hostEpoch !== reservation.binding.hostEpoch) {
@@ -4640,14 +4754,15 @@ export class RelayV2StateSnapshotSpool {
       }
     } catch (error) {
       this.#cutSource.releaseCandidate(candidateLease!);
-      const failure = structuredSpoolError(error);
-      await this.serializeMetadata(() => this.expireReservation(reservation, failure));
+      const failure = this.snapshotOperationFenceFailure(operationFence)
+        ?? structuredSpoolError(error);
+      await this.retireFailedBuildReservation(reservation, failure, operationFence);
       throw failure;
     }
 
     let candidateTransferred = false;
     try {
-      await this.serializeMetadata(async () => {
+      await this.serializeSnapshotOperationMetadata(operationFence, async () => {
         let stagingDirectory: string | undefined;
         let finalDirectory: string | undefined;
         let publication: "precommit" | "renamed" | "published" = "precommit";
@@ -4666,6 +4781,7 @@ export class RelayV2StateSnapshotSpool {
           reservationRemoved = true;
         };
         try {
+        this.assertSnapshotOperationFence(operationFence);
         const activeReservation = this.reservationsById.get(reservation.reservationId);
         if (!activeReservation
           || activeReservation.ownerFence !== this.#ownerFence
@@ -4698,6 +4814,7 @@ export class RelayV2StateSnapshotSpool {
           );
         }
         await this.withLineageFence(reservation.binding.hostEpoch, () => {
+          this.assertSnapshotOperationFence(operationFence);
           const stillReserved = this.reservationsById.get(reservation.reservationId);
           if (!stillReserved || stillReserved.ownerFence !== this.#ownerFence
             || this.readNow() >= reservation.snapshotAbsoluteExpiresAtMs) {
@@ -4724,12 +4841,21 @@ export class RelayV2StateSnapshotSpool {
           this.#activeByLogicalKey.set(logicalKey(reservation.binding), cutRecord);
           candidateTransferred = true;
           removePublishedReservation();
+          this.assertSnapshotOperationFence(operationFence);
         });
         } catch (error) {
-          const failure = structuredSpoolError(error);
+          const failure = this.snapshotOperationFenceFailure(operationFence)
+            ?? structuredSpoolError(error);
           try {
           if (publicationState() !== "published") {
-            expireBuildingReservation(failure);
+            if (failure instanceof RelayV2BoundH2SnapshotOperationFencedError) {
+              if (!reservationRemoved) {
+                this.cancelBoundH2BuildReservation(reservation, failure);
+                reservationRemoved = true;
+              }
+            } else {
+              expireBuildingReservation(failure);
+            }
           }
           if (publicationState() === "renamed" && finalDirectory !== undefined) {
             rmSync(finalDirectory, { recursive: true, force: true });
@@ -4900,8 +5026,9 @@ export class RelayV2StateSnapshotSpool {
   private async serveExisting(
     request: RelayV2StateSnapshotGet,
     snapshotId: string,
+    operationFence: RelayV2BoundH2SnapshotOperationFence,
   ): Promise<RelayV2StateSnapshotChunk> {
-    return this.serializeMetadata(async () => {
+    return this.serializeSnapshotOperationMetadata(operationFence, async () => {
       if (this.recoveredQuotaExceeded || this.recoveryIncomplete) {
         throw new RelayV2StateSnapshotSpoolError(
           "INTERNAL",
@@ -4983,7 +5110,10 @@ export class RelayV2StateSnapshotSpool {
         cutDigest: cut.manifest.cutDigest,
         records: clone(records),
       };
-      return this.withLineageFence(request.expectedHostEpoch, () => response);
+      return this.withLineageFence(request.expectedHostEpoch, () => {
+        this.assertSnapshotOperationFence(operationFence);
+        return response;
+      });
     });
   }
 
@@ -5409,6 +5539,19 @@ export class RelayV2StateSnapshotSpool {
       this.readNow(),
       recovery,
     );
+    const key = logicalKey(reservation.binding);
+    const build = this.buildsByLogicalKey.get(key);
+    if (build) {
+      build.reject(failure);
+      this.buildsByLogicalKey.delete(key);
+    }
+    this.removeReservationFile(reservation);
+  }
+
+  private cancelBoundH2BuildReservation(
+    reservation: PersistedReservation,
+    failure: RelayV2StateSnapshotSpoolError,
+  ): void {
     const key = logicalKey(reservation.binding);
     const build = this.buildsByLogicalKey.get(key);
     if (build) {

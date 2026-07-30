@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -181,6 +181,33 @@ async function settle(turns = 4) {
   for (let index = 0; index < turns; index += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
+}
+
+function snapshotSpoolArtifactInventory(paths) {
+  return {
+    cuts: readdirSync(paths.cuts).sort(),
+    reservations: readdirSync(paths.reservations).sort(),
+    tombstones: readdirSync(paths.tombstones).sort(),
+    staging: readdirSync(paths.staging).sort(),
+  };
+}
+
+function snapshotOperationBarrier(expectedOperation) {
+  let enter;
+  let resume;
+  let used = false;
+  const entered = new Promise((resolve) => { enter = resolve; });
+  const resumed = new Promise((resolve) => { resume = resolve; });
+  return {
+    entered,
+    resume: () => resume(),
+    hook(operation) {
+      if (used || operation !== expectedOperation) return undefined;
+      used = true;
+      enter();
+      return resumed;
+    },
+  };
 }
 
 async function realCompositionHarness({
@@ -432,6 +459,105 @@ test("async host composition returns only after exact recovered H2 activation", 
     assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);
   } finally {
     await h.cleanup();
+  }
+});
+
+test("bound H2 snapshot operations cannot cross a successor spool claim", async (t) => {
+  for (const operation of ["get", "release"]) {
+    await t.test(operation, async () => {
+      const barrier = snapshotOperationBarrier(operation);
+      const outboundFrames = [];
+      const h = await realCompositionHarness({
+        spoolHooks: {
+          beforeBoundH2SnapshotOperation: (observed) => barrier.hook(observed),
+        },
+        compositionOverrides: {
+          welcome: {
+            build(input) {
+              const welcome = fixture("host-welcome-snapshot-required");
+              welcome.requestId = input.hello.requestId;
+              welcome.hostId = HOST_ID;
+              welcome.hostEpoch = input.cut.hostEpoch;
+              welcome.hostInstanceId = input.cut.hostInstanceId;
+              welcome.payload.eventSeq = input.cut.eventSeq;
+              welcome.payload.capabilities = [...input.capabilities];
+              welcome.payload.commandDedupeWindow = structuredClone(
+                input.commandDedupeWindow,
+              );
+              return welcome;
+            },
+          },
+          outbound: {
+            trySend(_route, payload, receipt) {
+              outboundFrames.push(
+                codec.decodeRelayV2WebSocketFrame("public", payload).frame,
+              );
+              receipt.settle(true);
+              return true;
+            },
+            close() {},
+          },
+        },
+      });
+      let successor;
+      try {
+        activateRemainingReadinessSources(h.composition);
+        const principalId = operation === "release"
+          ? h.recoveredPrincipalId
+          : "composition-principal";
+        const route = binding({ authContext: { principalId } });
+        assert.equal(h.composition.routeSink.onRouteBound(route), undefined);
+        const hello = fixture("client-hello-fresh");
+        hello.hostId = HOST_ID;
+        hello.payload.clientInstanceId = route.authContext.clientInstanceId;
+        h.composition.routeSink.onClientFrame(
+          route,
+          codec.encodeRelayV2WebSocketFrame("public", hello),
+        );
+        await settle();
+
+        const before = snapshotSpoolArtifactInventory(h.spool.paths);
+        const request = fixture(
+          operation === "get" ? "state-snapshot-get-first" : "state-snapshot-release",
+        );
+        request.hostId = HOST_ID;
+        request.expectedHostEpoch = h.seeded.snapshot.hostEpoch;
+        if (operation === "get") {
+          request.payload.snapshotRequestId = "claim-barrier-snapshot";
+        } else {
+          request.payload.snapshotRequestId = h.recoveredChunk.snapshotRequestId;
+          request.payload.snapshotId = h.recoveredChunk.snapshotId;
+        }
+        h.composition.routeSink.onClientFrame(
+          route,
+          codec.encodeRelayV2WebSocketFrame("public", request),
+        );
+        await barrier.entered;
+
+        successor = await h.foundation.openStateSnapshotSpool({
+          hostId: HOST_ID,
+          root: join(h.home, `snapshot-spool-${operation}-successor`),
+          ownerInstanceId: h.store.hostInstanceId,
+        });
+        barrier.resume();
+        await settle(8);
+
+        assert.deepEqual(snapshotSpoolArtifactInventory(h.spool.paths), before);
+        const successType = operation === "get"
+          ? "state.snapshot.chunk"
+          : "state.snapshot.released";
+        assert.equal(
+          outboundFrames.some((frame) => (
+            frame.type === successType && frame.requestId === request.requestId
+          )),
+          false,
+        );
+      } finally {
+        barrier.resume();
+        await successor?.close().catch(() => undefined);
+        await h.cleanup();
+      }
+    });
   }
 });
 
