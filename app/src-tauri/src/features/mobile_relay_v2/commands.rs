@@ -1,11 +1,12 @@
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
 use super::enrollment_artifact::{EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim};
 use super::management_child::{
-    ManagementCallError, ManagementChildManager, ManagementError, ManagementInput,
+    ManagementCallError, ManagementChildManager, ManagementChildSelection,
+    ManagementCleanupOutcome, ManagementError, ManagementInput, ManagementLaunchKey,
     ManagementOperation, ManagementOutcome, ManagementStartError,
 };
 
@@ -17,6 +18,8 @@ const SUPERSEDED_CODE: &str = "SUPERSEDED";
 const SUPERSEDED_MESSAGE: &str = "Relay v2 management owner was superseded";
 const INVALID_ARGUMENT_CODE: &str = "INVALID_ARGUMENT";
 const INVALID_ARGUMENT_MESSAGE: &str = "Relay v2 management input is invalid";
+const RECOVERY_REQUIRED_CODE: &str = "CELL_RECOVERY_REQUIRED";
+const RECOVERY_REQUIRED_MESSAGE: &str = "Relay v2 Host credential cell requires operator recovery";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -45,12 +48,16 @@ impl From<MobileRelayV2ManagementOperation> for ManagementOperation {
 }
 
 enum ManagementCommandOwner {
-    Ready(ManagementChildManager),
+    Ready {
+        launch_key: ManagementLaunchKey,
+        manager: ManagementChildManager,
+    },
     StartFailed(ManagementStartError),
+    Replacing,
 }
 
 pub(crate) struct MobileRelayV2ManagementCommandState {
-    owner: ManagementCommandOwner,
+    owner: Mutex<ManagementCommandOwner>,
     artifacts: EnrollmentArtifactRegistry,
     disposed: AtomicBool,
 }
@@ -59,6 +66,7 @@ impl MobileRelayV2ManagementCommandState {
     pub(crate) fn unavailable() -> Self {
         Self::from_start_with_artifacts(
             Err(ManagementStartError::Unavailable),
+            ManagementLaunchKey::DefaultProduction,
             EnrollmentArtifactRegistry::disabled(),
         )
     }
@@ -70,20 +78,55 @@ impl MobileRelayV2ManagementCommandState {
                 let _ = window.destroy();
             }
         });
-        Self::from_artifact_start(artifacts, || ManagementChildManager::start(app))
+        Self::from_artifact_start(artifacts, ManagementLaunchKey::DefaultProduction, || {
+            ManagementChildManager::start(app)
+        })
+    }
+
+    pub(crate) fn start_self_hosted<F>(
+        app: &tauri::AppHandle,
+        selection: ManagementChildSelection,
+        commit_ready: F,
+    ) -> Self
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let launch_key = selection.launch_key();
+        let closer_app = app.clone();
+        let artifacts = EnrollmentArtifactRegistry::new(move |label| {
+            if let Some(window) = closer_app.get_webview_window(label) {
+                let _ = window.destroy();
+            }
+        });
+        match artifacts {
+            Ok(artifacts) => {
+                let start = ManagementChildManager::start_selected(app, selection);
+                let settled = settle_candidate_start(start, commit_ready);
+                Self::from_start_with_artifacts(settled, launch_key, artifacts)
+            }
+            Err(()) => Self::from_start_with_artifacts(
+                Err(ManagementStartError::Unavailable),
+                launch_key,
+                EnrollmentArtifactRegistry::disabled(),
+            ),
+        }
     }
 
     fn from_artifact_start<F>(
         artifacts: Result<EnrollmentArtifactRegistry, ()>,
+        launch_key: ManagementLaunchKey,
         start_manager: F,
     ) -> Self
     where
         F: FnOnce() -> Result<ManagementChildManager, ManagementStartError>,
     {
         match artifacts {
-            Ok(artifacts) => Self::from_start_with_artifacts(start_manager(), artifacts),
+            Ok(artifacts) => {
+                Self::from_start_with_artifacts(start_manager(), launch_key, artifacts)
+            }
             Err(()) => Self::from_start_with_artifacts(
                 Err(ManagementStartError::Unavailable),
+                launch_key,
                 EnrollmentArtifactRegistry::disabled(),
             ),
         }
@@ -91,18 +134,26 @@ impl MobileRelayV2ManagementCommandState {
 
     #[cfg(test)]
     fn from_start(start: Result<ManagementChildManager, ManagementStartError>) -> Self {
-        Self::from_start_with_artifacts(start, EnrollmentArtifactRegistry::disabled())
+        Self::from_start_with_artifacts(
+            start,
+            ManagementLaunchKey::DefaultProduction,
+            EnrollmentArtifactRegistry::disabled(),
+        )
     }
 
     fn from_start_with_artifacts(
         start: Result<ManagementChildManager, ManagementStartError>,
+        launch_key: ManagementLaunchKey,
         artifacts: EnrollmentArtifactRegistry,
     ) -> Self {
         Self {
-            owner: match start {
-                Ok(manager) => ManagementCommandOwner::Ready(manager),
+            owner: Mutex::new(match start {
+                Ok(manager) => ManagementCommandOwner::Ready {
+                    launch_key,
+                    manager,
+                },
                 Err(error) => ManagementCommandOwner::StartFailed(error),
-            },
+            }),
             artifacts,
             disposed: AtomicBool::new(false),
         }
@@ -127,8 +178,9 @@ impl MobileRelayV2ManagementCommandState {
         if operation == MobileRelayV2ManagementOperation::RefreshHost {
             self.artifacts.clear();
         }
-        match &self.owner {
-            ManagementCommandOwner::Ready(manager) => {
+        let mut owner = self.owner.lock().unwrap();
+        match &*owner {
+            ManagementCommandOwner::Ready { manager, .. } => {
                 let mut outcome = match manager.request_with_input(operation.into(), input) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -150,7 +202,20 @@ impl MobileRelayV2ManagementCommandState {
                     match projected {
                         Ok(result) => outcome.result = result,
                         Err(()) => {
-                            self.dispose();
+                            self.disposed.store(true, Ordering::Release);
+                            self.artifacts.close();
+                            let previous =
+                                std::mem::replace(&mut *owner, ManagementCommandOwner::Replacing);
+                            drop(owner);
+                            let cleanup = drain_command_owner(previous);
+                            let mut owner = self.owner.lock().unwrap();
+                            *owner = ManagementCommandOwner::StartFailed(
+                                if cleanup == ManagementCleanupOutcome::RecoveryRequired {
+                                    ManagementStartError::RecoveryRequired
+                                } else {
+                                    ManagementStartError::ChannelClosed
+                                },
+                            );
                             return Err(channel_closed_error());
                         }
                     }
@@ -158,18 +223,122 @@ impl MobileRelayV2ManagementCommandState {
                 Ok(outcome)
             }
             ManagementCommandOwner::StartFailed(error) => Err(map_start_error(*error)),
+            ManagementCommandOwner::Replacing => Err(channel_closed_error()),
         }
     }
 
-    pub(crate) fn dispose(&self) {
-        if self.disposed.swap(true, Ordering::AcqRel) {
-            return;
+    pub(crate) fn replace_self_hosted<F>(
+        &self,
+        app: &tauri::AppHandle,
+        selection: ManagementChildSelection,
+        commit_ready: F,
+    ) -> Result<(), ManagementStartError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if self.disposed.load(Ordering::Acquire) {
+            return Err(ManagementStartError::ChannelClosed);
         }
-        self.artifacts.close();
-        if let ManagementCommandOwner::Ready(manager) = &self.owner {
-            manager.dispose();
+        let desired_key = selection.launch_key();
+        let mut owner = self.owner.lock().unwrap();
+        if self.disposed.load(Ordering::Acquire) {
+            return Err(ManagementStartError::ChannelClosed);
+        }
+        if matches!(
+            &*owner,
+            ManagementCommandOwner::Ready {
+                launch_key,
+                manager,
+            } if launch_key == &desired_key && manager.is_ready()
+        ) {
+            return Ok(());
+        }
+
+        self.artifacts.clear();
+        let previous = std::mem::replace(&mut *owner, ManagementCommandOwner::Replacing);
+        match previous {
+            ManagementCommandOwner::Ready { manager, .. } => {
+                if manager.dispose() != ManagementCleanupOutcome::Clean {
+                    *owner =
+                        ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                    return Err(ManagementStartError::RecoveryRequired);
+                }
+            }
+            ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired) => {
+                *owner =
+                    ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired);
+                return Err(ManagementStartError::RecoveryRequired);
+            }
+            ManagementCommandOwner::StartFailed(_) | ManagementCommandOwner::Replacing => {}
+        }
+
+        let candidate = ManagementChildManager::start_selected(app, selection);
+        let settled = settle_candidate_start(candidate, commit_ready);
+        match settled {
+            Ok(manager) => {
+                *owner = ManagementCommandOwner::Ready {
+                    launch_key: desired_key,
+                    manager,
+                };
+                Ok(())
+            }
+            Err(error) => {
+                *owner = ManagementCommandOwner::StartFailed(error);
+                Err(error)
+            }
         }
     }
+
+    pub(crate) fn dispose(&self) -> ManagementCleanupOutcome {
+        if self.disposed.swap(true, Ordering::AcqRel) {
+            let owner = self.owner.lock().unwrap();
+            return match &*owner {
+                ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired) => {
+                    ManagementCleanupOutcome::RecoveryRequired
+                }
+                _ => ManagementCleanupOutcome::Clean,
+            };
+        }
+        self.artifacts.close();
+        let mut owner = self.owner.lock().unwrap();
+        let previous = std::mem::replace(&mut *owner, ManagementCommandOwner::Replacing);
+        let cleanup = drain_command_owner(previous);
+        *owner = ManagementCommandOwner::StartFailed(
+            if cleanup == ManagementCleanupOutcome::RecoveryRequired {
+                ManagementStartError::RecoveryRequired
+            } else {
+                ManagementStartError::ChannelClosed
+            },
+        );
+        cleanup
+    }
+}
+
+fn drain_command_owner(owner: ManagementCommandOwner) -> ManagementCleanupOutcome {
+    match owner {
+        ManagementCommandOwner::Ready { manager, .. } => manager.dispose(),
+        ManagementCommandOwner::StartFailed(ManagementStartError::RecoveryRequired) => {
+            ManagementCleanupOutcome::RecoveryRequired
+        }
+        ManagementCommandOwner::StartFailed(_) | ManagementCommandOwner::Replacing => {
+            ManagementCleanupOutcome::Clean
+        }
+    }
+}
+
+fn settle_candidate_start<F>(
+    start: Result<ManagementChildManager, ManagementStartError>,
+    commit_ready: F,
+) -> Result<ManagementChildManager, ManagementStartError>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let manager = start?;
+    if commit_ready().is_ok() {
+        return Ok(manager);
+    }
+    let _ = manager.dispose();
+    Err(ManagementStartError::RecoveryRequired)
 }
 
 impl Drop for MobileRelayV2ManagementCommandState {
@@ -418,6 +587,9 @@ fn map_start_error(error: ManagementStartError) -> ManagementError {
     match error {
         ManagementStartError::Unavailable => unavailable_error(),
         ManagementStartError::ChannelClosed => channel_closed_error(),
+        ManagementStartError::RecoveryRequired => {
+            fixed_error(RECOVERY_REQUIRED_CODE, RECOVERY_REQUIRED_MESSAGE)
+        }
     }
 }
 
@@ -433,6 +605,59 @@ fn map_call_error(error: ManagementCallError) -> ManagementError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_failure_fences_then_drains_without_recursively_locking_owner() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../contracts/dashboard-relay-v2-management/v2/cases.json"
+        ))
+        .unwrap();
+        let exchange = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "create_enrollment")
+            .unwrap();
+        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+        let request_id: [u8; 16] = URL_SAFE_NO_PAD
+            .decode(request_id.split_once('.').unwrap().1)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let response = exchange["responseFrame"].as_str().unwrap().trim_end();
+        assert!(!response.contains('\''));
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; IFS= read -r request; printf '%s\\n' '{response}'; while IFS= read -r request; do :; done"
+        );
+        let manager =
+            ManagementChildManager::start_v2_command_regression_script(script, request_id).unwrap();
+        let state = Arc::new(MobileRelayV2ManagementCommandState::from_start(Ok(manager)));
+        let called = state.clone();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sent.send(called.call_with_input(
+                MobileRelayV2ManagementOperation::CreateEnrollment,
+                ManagementInput::CreateEnrollment {
+                    device_label: Some("Pixel".to_string()),
+                },
+            ))
+            .unwrap();
+        });
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(channel_closed_error())
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            state.call(MobileRelayV2ManagementOperation::Status),
+            Err(channel_closed_error())
+        );
+    }
 
     #[test]
     fn command_operation_is_a_closed_enum() {
@@ -509,9 +734,11 @@ mod tests {
 
     #[test]
     fn artifact_owner_start_failure_is_permanently_unavailable_without_starting_the_child() {
-        let unavailable = MobileRelayV2ManagementCommandState::from_artifact_start(Err(()), || {
-            panic!("artifact failure must fence child startup")
-        });
+        let unavailable = MobileRelayV2ManagementCommandState::from_artifact_start(
+            Err(()),
+            ManagementLaunchKey::DefaultProduction,
+            || panic!("artifact failure must fence child startup"),
+        );
         assert_eq!(
             unavailable
                 .call(MobileRelayV2ManagementOperation::Status)

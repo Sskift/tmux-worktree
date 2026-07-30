@@ -31,12 +31,19 @@ pub fn run() {
             app.manage(Arc::new(FeishuBridgeRuntimeState::default()));
             app.manage(Arc::new(MobileRelayState::default()));
             let relay_v2_deployment = Arc::new(MobileRelayV2SelfHostedDeploymentState::default());
-            let relay_v2_management =
-                if prepare_relay_v2_self_hosted_management_prerequisites().is_ok() {
-                    MobileRelayV2ManagementCommandState::start(&app.handle())
-                } else {
-                    MobileRelayV2ManagementCommandState::unavailable()
-                };
+            let relay_v2_management = match prepare_relay_v2_self_hosted_management_prerequisites()
+            {
+                Ok(None) => MobileRelayV2ManagementCommandState::start(&app.handle()),
+                Ok(Some(prepared)) => {
+                    let selection = prepared.selection();
+                    MobileRelayV2ManagementCommandState::start_self_hosted(
+                        &app.handle(),
+                        selection,
+                        move || prepared.commit_ready(),
+                    )
+                }
+                Err(_) => MobileRelayV2ManagementCommandState::unavailable(),
+            };
             app.manage(Arc::new(relay_v2_management));
             app.manage(relay_v2_deployment);
             app.manage(Arc::new(GitFetchState::default()));

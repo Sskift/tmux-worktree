@@ -20,6 +20,7 @@ const PROTOCOL_VERSION_V1: u32 = 1;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_ID_PREFIX_V1: &str = "dmgmt1.";
 const SUPERSEDED_EXIT_CODE: i32 = 78;
 const HIDDEN_MANAGEMENT_ENTRY: &str = "__relay-v2-dashboard-management-stdio";
@@ -32,6 +33,144 @@ const MANAGEMENT_CHILD_ENVIRONMENT_ALLOWLIST: [&str; 6] =
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BundledManagementArtifact {
     path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagementPreparedFileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) length: u64,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) links: u64,
+    pub(crate) sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagementChildSelection {
+    DefaultProduction,
+    SelfHostedDarwinArm64 {
+        account_home: PathBuf,
+        credential_https_ca_input: PathBuf,
+        carrier_wss_ca_input: PathBuf,
+        credential_https_ca_identity: ManagementPreparedFileIdentity,
+        carrier_wss_ca_identity: ManagementPreparedFileIdentity,
+        profile_lineage: String,
+        provision_profile_input: Option<PathBuf>,
+        bootstrap_secret_input: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagementLaunchKey {
+    DefaultProduction,
+    SelfHostedDarwinArm64 {
+        account_home: PathBuf,
+        credential_https_ca_input: PathBuf,
+        carrier_wss_ca_input: PathBuf,
+        credential_https_ca_identity: ManagementPreparedFileIdentity,
+        carrier_wss_ca_identity: ManagementPreparedFileIdentity,
+        profile_lineage: String,
+    },
+}
+
+impl ManagementChildSelection {
+    pub(crate) fn self_hosted_darwin_arm64(
+        account_home: PathBuf,
+        credential_https_ca_input: PathBuf,
+        carrier_wss_ca_input: PathBuf,
+        credential_https_ca_identity: ManagementPreparedFileIdentity,
+        carrier_wss_ca_identity: ManagementPreparedFileIdentity,
+        profile_lineage: String,
+        provision_profile_input: Option<PathBuf>,
+        bootstrap_secret_input: Option<PathBuf>,
+    ) -> Result<Self, ManagementStartError> {
+        if !account_home.is_absolute()
+            || !credential_https_ca_input.is_absolute()
+            || !carrier_wss_ca_input.is_absolute()
+            || credential_https_ca_identity.mode != 0o600
+            || carrier_wss_ca_identity.mode != 0o600
+            || credential_https_ca_identity.links != 1
+            || carrier_wss_ca_identity.links != 1
+            || credential_https_ca_identity.length == 0
+            || carrier_wss_ca_identity.length == 0
+            || provision_profile_input
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            || bootstrap_secret_input
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            || profile_lineage.len() != 32
+            || !profile_lineage.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ManagementStartError::Unavailable);
+        }
+        Ok(Self::SelfHostedDarwinArm64 {
+            account_home,
+            credential_https_ca_input,
+            carrier_wss_ca_input,
+            credential_https_ca_identity,
+            carrier_wss_ca_identity,
+            profile_lineage,
+            provision_profile_input,
+            bootstrap_secret_input,
+        })
+    }
+
+    pub(crate) fn launch_key(&self) -> ManagementLaunchKey {
+        match self {
+            Self::DefaultProduction => ManagementLaunchKey::DefaultProduction,
+            Self::SelfHostedDarwinArm64 {
+                account_home,
+                credential_https_ca_input,
+                carrier_wss_ca_input,
+                credential_https_ca_identity,
+                carrier_wss_ca_identity,
+                profile_lineage,
+                ..
+            } => ManagementLaunchKey::SelfHostedDarwinArm64 {
+                account_home: account_home.clone(),
+                credential_https_ca_input: credential_https_ca_input.clone(),
+                carrier_wss_ca_input: carrier_wss_ca_input.clone(),
+                credential_https_ca_identity: credential_https_ca_identity.clone(),
+                carrier_wss_ca_identity: carrier_wss_ca_identity.clone(),
+                profile_lineage: profile_lineage.clone(),
+            },
+        }
+    }
+
+    fn append_fixed_arguments(&self, command: &mut Command) {
+        match self {
+            Self::DefaultProduction => {}
+            Self::SelfHostedDarwinArm64 {
+                credential_https_ca_input,
+                carrier_wss_ca_input,
+                provision_profile_input,
+                bootstrap_secret_input,
+                ..
+            } => {
+                command
+                    .arg("--self-hosted")
+                    .arg("--credential-https-ca-input")
+                    .arg(credential_https_ca_input)
+                    .arg("--carrier-wss-ca-input")
+                    .arg(carrier_wss_ca_input);
+                if let Some(path) = provision_profile_input {
+                    command.arg("--provision-profile-input").arg(path);
+                }
+                if let Some(path) = bootstrap_secret_input {
+                    command.arg("--bootstrap-secret-input").arg(path);
+                }
+            }
+        }
+    }
+
+    fn account_home_override(&self) -> Option<&Path> {
+        match self {
+            Self::DefaultProduction => None,
+            Self::SelfHostedDarwinArm64 { account_home, .. } => Some(account_home),
+        }
+    }
 }
 
 impl BundledManagementArtifact {
@@ -96,9 +235,11 @@ enum ChildWrite {
 trait ChildLifecycle: Send + Sync {
     fn kill_if_live(&self);
     fn wait_and_reap(&self) -> ChildExit;
+    fn wait_until(&self, deadline: Instant) -> Option<ChildExit>;
 }
 
 trait ManagementChildProcess: ChildLifecycle {
+    fn close_stdin(&self);
     fn write_stdin_once(&self, frame: &[u8], deadline: Instant) -> ChildWrite;
     fn read_stdout(&self, deadline: Instant) -> ChildRead;
     fn poll_stdout(&self) -> ChildPoll;
@@ -182,6 +323,18 @@ impl ChildLifecycle for ExactChildAuthority {
         };
         state.exit = Some(exit);
         exit
+    }
+
+    fn wait_until(&self, deadline: Instant) -> Option<ChildExit> {
+        loop {
+            match self.try_exit() {
+                Ok(Some(exit)) => return Some(exit),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(SUPERVISOR_POLL_INTERVAL);
+                }
+                Ok(None) | Err(()) => return None,
+            }
+        }
     }
 }
 
@@ -361,12 +514,16 @@ impl BoundedObservationQueue {
                 Some(StdoutEvent::Frame(_) | StdoutEvent::Violation | StdoutEvent::Failed) => {
                     return ChildPoll::Output;
                 }
-                Some(StdoutEvent::Eof | StdoutEvent::Exited(_)) | None
-                    if state.drain_ack_generation >= required_generation =>
-                {
+                // A terminal observation was produced only after the stdout
+                // owner drained the exact pipe to EOF (and, for Exited,
+                // reaped the exact child). It is itself stronger evidence
+                // than a later empty-drain acknowledgement.
+                Some(StdoutEvent::Eof | StdoutEvent::Exited(_)) => {
                     return ChildPoll::Pending;
                 }
-                Some(StdoutEvent::Eof | StdoutEvent::Exited(_)) => {}
+                None if state.drain_ack_generation >= required_generation => {
+                    return ChildPoll::Pending;
+                }
                 None => {}
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -745,9 +902,18 @@ impl ChildLifecycle for ProductionProcess {
         self.finish_io();
         exit
     }
+
+    fn wait_until(&self, deadline: Instant) -> Option<ChildExit> {
+        self.authority.wait_until(deadline)
+    }
 }
 
 impl ManagementChildProcess for ProductionProcess {
+    fn close_stdin(&self) {
+        self.write_workers.close_and_join();
+        self.stdin.lock().unwrap().take();
+    }
+
     fn write_stdin_once(&self, frame: &[u8], deadline: Instant) -> ChildWrite {
         let Some(stdin) = self.stdin.lock().unwrap().take() else {
             return ChildWrite::Failed;
@@ -788,11 +954,12 @@ impl Drop for ProductionProcess {
 
 struct ProductionFactory {
     node: PathBuf,
+    selection: ManagementChildSelection,
 }
 
 impl ChildFactory for ProductionFactory {
     fn spawn(&self, artifact: &BundledManagementArtifact) -> SpawnAttempt {
-        let child = match production_command(&self.node, artifact)
+        let child = match production_command(&self.node, artifact, &self.selection)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -813,18 +980,27 @@ impl ChildFactory for ProductionFactory {
     }
 }
 
-fn production_command(node: &Path, artifact: &BundledManagementArtifact) -> Command {
-    production_command_with_environment(node, artifact, std::env::vars_os())
+fn production_command(
+    node: &Path,
+    artifact: &BundledManagementArtifact,
+    selection: &ManagementChildSelection,
+) -> Command {
+    production_command_with_environment(node, artifact, selection, std::env::vars_os())
 }
 
 fn production_command_with_environment(
     node: &Path,
     artifact: &BundledManagementArtifact,
+    selection: &ManagementChildSelection,
     inherited_environment: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Command {
     let mut command = Command::new(node);
     configure_management_child_environment(&mut command, inherited_environment);
     command.arg(artifact.path()).arg(HIDDEN_MANAGEMENT_ENTRY);
+    selection.append_fixed_arguments(&mut command);
+    if let Some(account_home) = selection.account_home_override() {
+        command.env("HOME", account_home);
+    }
     command
 }
 
@@ -886,6 +1062,48 @@ struct OsRequestIdGenerator;
 impl RequestIdGenerator for OsRequestIdGenerator {
     fn fill(&self, bytes: &mut [u8; 16]) -> Result<(), ()> {
         getrandom::fill(bytes).map_err(|_| ())
+    }
+}
+
+#[cfg(all(test, unix))]
+struct CommandRegressionScriptFactory {
+    script: String,
+}
+
+#[cfg(all(test, unix))]
+impl ChildFactory for CommandRegressionScriptFactory {
+    fn spawn(&self, _artifact: &BundledManagementArtifact) -> SpawnAttempt {
+        let child = match Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&self.script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return SpawnAttempt::FailedBeforeChild,
+        };
+        let authority = Arc::new(ExactChildAuthority::new(child));
+        let (stdin, stdout) = authority.take_stdio();
+        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+            return SpawnAttempt::FailedAfterChild(authority);
+        };
+        match ProductionProcess::new(authority.clone(), stdin, stdout) {
+            Ok(process) => SpawnAttempt::Ready(Arc::new(process)),
+            Err(authority) => SpawnAttempt::FailedAfterChild(authority),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+struct CommandRegressionRequestId(Mutex<Option<[u8; 16]>>);
+
+#[cfg(all(test, unix))]
+impl RequestIdGenerator for CommandRegressionRequestId {
+    fn fill(&self, bytes: &mut [u8; 16]) -> Result<(), ()> {
+        *bytes = self.0.lock().unwrap().take().ok_or(())?;
+        Ok(())
     }
 }
 
@@ -1072,6 +1290,7 @@ impl<'de> Deserialize<'de> for ManagementOutcomeWire {
 pub(crate) enum ManagementStartError {
     Unavailable,
     ChannelClosed,
+    RecoveryRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1089,10 +1308,17 @@ enum LifecycleKind {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagementCleanupOutcome {
+    Clean,
+    RecoveryRequired,
+}
+
 struct LifecycleState {
     kind: LifecycleKind,
     reaping: bool,
     reaped: bool,
+    cleanup: Option<ManagementCleanupOutcome>,
 }
 
 struct LifecycleBarrier {
@@ -1107,6 +1333,7 @@ impl LifecycleBarrier {
                 kind: LifecycleKind::Ready,
                 reaping: false,
                 reaped: false,
+                cleanup: None,
             }),
             changed: Condvar::new(),
         }
@@ -1140,18 +1367,43 @@ impl Drop for InFlightGuard<'_> {
 
 impl ManagementChildManager {
     pub(crate) fn start(app: &tauri::AppHandle) -> Result<Self, ManagementStartError> {
+        Self::start_selected(app, ManagementChildSelection::DefaultProduction)
+    }
+
+    pub(crate) fn start_selected(
+        app: &tauri::AppHandle,
+        selection: ManagementChildSelection,
+    ) -> Result<Self, ManagementStartError> {
         let artifact = resolve_bundled_management_artifact(app)?;
         let node = node_bin()
             .map(PathBuf::from)
             .ok_or(ManagementStartError::Unavailable)?;
         Self::start_with_factory(
             artifact,
-            Arc::new(ProductionFactory { node }),
+            Arc::new(ProductionFactory { node, selection }),
             Arc::new(OsRequestIdGenerator),
             PRODUCTION_EXPECTED_PROTOCOL,
             env!("CARGO_PKG_VERSION"),
             STARTUP_TIMEOUT,
             OPERATION_TIMEOUT,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn start_v2_command_regression_script(
+        script: String,
+        request_id: [u8; 16],
+    ) -> Result<Self, ManagementStartError> {
+        Self::start_with_factory(
+            BundledManagementArtifact {
+                path: PathBuf::from("/test/tw-cli/cli.cjs"),
+            },
+            Arc::new(CommandRegressionScriptFactory { script }),
+            Arc::new(CommandRegressionRequestId(Mutex::new(Some(request_id)))),
+            ManagementProtocol::V2,
+            "1.2.3",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
         )
     }
 
@@ -1215,6 +1467,11 @@ impl ManagementChildManager {
 
     pub(crate) fn artifact_path(&self) -> &Path {
         self.inner.artifact.path()
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        !self.inner.supervisor_stop.load(Ordering::Acquire)
+            && self.inner.lifecycle_kind_now() == LifecycleKind::Ready
     }
 
     pub(crate) fn request(
@@ -1329,12 +1586,13 @@ impl ManagementChildManager {
         }
     }
 
-    pub(crate) fn dispose(&self) {
+    pub(crate) fn dispose(&self) -> ManagementCleanupOutcome {
         self.inner.supervisor_stop.store(true, Ordering::Release);
-        self.inner.terminalize(LifecycleKind::Closed, true);
+        let cleanup = self.inner.close_and_drain(CLEAN_CLOSE_TIMEOUT);
         if let Some(supervisor) = self.supervisor.lock().unwrap().take() {
             let _ = supervisor.join();
         }
+        cleanup
     }
 }
 
@@ -1355,7 +1613,12 @@ impl ManagerInner {
         } else {
             LifecycleKind::Poisoned
         };
-        self.terminalize(kind, false)
+        let cleanup = if matches!(exit.code, Some(0) | Some(SUPERSEDED_EXIT_CODE)) {
+            ManagementCleanupOutcome::Clean
+        } else {
+            ManagementCleanupOutcome::RecoveryRequired
+        };
+        self.terminalize_with_cleanup(kind, false, cleanup)
     }
 
     fn observe_idle_child(&self) -> Option<LifecycleKind> {
@@ -1369,6 +1632,23 @@ impl ManagerInner {
     }
 
     fn terminalize(&self, requested: LifecycleKind, kill: bool) -> LifecycleKind {
+        self.terminalize_with_cleanup(
+            requested,
+            kill,
+            if kill {
+                ManagementCleanupOutcome::RecoveryRequired
+            } else {
+                ManagementCleanupOutcome::Clean
+            },
+        )
+    }
+
+    fn terminalize_with_cleanup(
+        &self,
+        requested: LifecycleKind,
+        kill: bool,
+        cleanup: ManagementCleanupOutcome,
+    ) -> LifecycleKind {
         let leader;
         {
             let mut state = self.lifecycle.state.lock().unwrap();
@@ -1395,12 +1675,70 @@ impl ManagerInner {
             let mut state = self.lifecycle.state.lock().unwrap();
             state.reaping = false;
             state.reaped = true;
+            state.cleanup = Some(cleanup);
             let kind = state.kind;
             self.lifecycle.changed.notify_all();
             kind
         } else {
             unreachable!()
         }
+    }
+
+    fn close_and_drain(&self, timeout: Duration) -> ManagementCleanupOutcome {
+        {
+            let mut state = self.lifecycle.state.lock().unwrap();
+            state.kind = LifecycleKind::Closed;
+            if state.reaped {
+                return state
+                    .cleanup
+                    .unwrap_or(ManagementCleanupOutcome::RecoveryRequired);
+            }
+            self.lifecycle.changed.notify_all();
+        }
+
+        // Every request and the supervisor observe stdout only while holding
+        // this same barrier. Once acquired, no admitted request can still own
+        // child stdin and every later request sees the Closed fence.
+        let _request_barrier = self.observation.lock().unwrap();
+        {
+            let mut state = self.lifecycle.state.lock().unwrap();
+            while state.reaping && !state.reaped {
+                state = self.lifecycle.changed.wait(state).unwrap();
+            }
+            if state.reaped {
+                return state
+                    .cleanup
+                    .unwrap_or(ManagementCleanupOutcome::RecoveryRequired);
+            }
+            state.reaping = true;
+        }
+
+        self.child.close_stdin();
+        let deadline = Instant::now() + timeout;
+        let (exit, cleanup) = match self.child.wait_until(deadline) {
+            Some(exit) => {
+                let cleanup = if matches!(exit.code, Some(0) | Some(SUPERSEDED_EXIT_CODE)) {
+                    ManagementCleanupOutcome::Clean
+                } else {
+                    ManagementCleanupOutcome::RecoveryRequired
+                };
+                (self.child.wait_and_reap(), cleanup)
+            }
+            None => {
+                self.child.kill_if_live();
+                (
+                    self.child.wait_and_reap(),
+                    ManagementCleanupOutcome::RecoveryRequired,
+                )
+            }
+        };
+        let _ = exit;
+        let mut state = self.lifecycle.state.lock().unwrap();
+        state.reaping = false;
+        state.reaped = true;
+        state.cleanup = Some(cleanup);
+        self.lifecycle.changed.notify_all();
+        cleanup
     }
 
     fn lifecycle_kind_after_barrier(&self) -> LifecycleKind {
@@ -1796,6 +2134,7 @@ mod tests {
         write_actions: VecDeque<WriteAction>,
         blocked: bool,
         killed: bool,
+        stdin_closed: bool,
         reaped: bool,
         events: Vec<&'static str>,
     }
@@ -1822,6 +2161,7 @@ mod tests {
                     write_actions: VecDeque::from([WriteAction::Full]),
                     blocked: false,
                     killed: false,
+                    stdin_closed: false,
                     reaped: false,
                     events: Vec::new(),
                 }),
@@ -1887,9 +2227,31 @@ mod tests {
             self.changed.notify_all();
             ChildExit { code: Some(0) }
         }
+
+        fn wait_until(&self, deadline: Instant) -> Option<ChildExit> {
+            let mut state = self.state.lock().unwrap();
+            loop {
+                if state.stdin_closed || state.killed || state.reaped {
+                    return Some(ChildExit { code: Some(0) });
+                }
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if timeout.timed_out() {
+                    return None;
+                }
+            }
+        }
     }
 
     impl ManagementChildProcess for FakeChild {
+        fn close_stdin(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("close-stdin");
+            state.stdin_closed = true;
+            self.changed.notify_all();
+        }
+
         fn write_stdin_once(&self, frame: &[u8], deadline: Instant) -> ChildWrite {
             let mut state = self.state.lock().unwrap();
             state.events.push("write");
@@ -2304,6 +2666,7 @@ mod tests {
         let command = production_command_with_environment(
             Path::new("/fixed/node"),
             &artifact,
+            &ManagementChildSelection::DefaultProduction,
             [
                 (OsString::from("HOME"), OsString::from("/Users/fixture")),
                 (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),

@@ -7,7 +7,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build && cd .. && npm run build",
+    "beforeBuildCommand": "npm run build && cd .. && npm run build:relay-v2-host-darwin-arm64-shipping",
     "frontendDist": "../dist"
   },
   "app": {
