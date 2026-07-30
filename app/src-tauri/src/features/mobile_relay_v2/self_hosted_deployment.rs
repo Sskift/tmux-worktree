@@ -46,6 +46,8 @@ require_linux_x86_64() {
   test "$(uname -s)" = "Linux"
   test "$(uname -m)" = "x86_64"
   mv --version 2>/dev/null | grep -Fq "GNU coreutils"
+  test -x /usr/bin/realpath
+  /usr/bin/realpath --version 2>/dev/null | grep -Fq "GNU coreutils"
 }
 require_self_hosted_node() {
   /usr/bin/env node -e '
@@ -170,6 +172,22 @@ require_current_bundle() {
   require_private_file "$root/$target/package.json"
 }
 "#;
+
+fn build_remote_state_directory_launcher_preflight() -> String {
+    format!(
+        r#"relay_v2_state_alias="$HOME/{REMOTE_STATE_DIRECTORY}"
+require_private_dir "$relay_v2_state_alias"
+relay_v2_state_directory="$(/usr/bin/realpath -e -- "$relay_v2_state_alias")"
+case "$relay_v2_state_directory" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+test "$(/usr/bin/realpath -e -- "$relay_v2_state_directory")" = "$relay_v2_state_directory"
+require_private_dir "$relay_v2_state_directory"
+test "$(stat -c %d:%i -- "$relay_v2_state_alias")" = "$(stat -c %d:%i -- "$relay_v2_state_directory")"
+"#
+    )
+}
 
 // Node >=22 delegates fs.openSync to libuv, which always applies close-on-exec
 // to returned descriptors. The helper adds O_NOFOLLOW itself and performs both
@@ -1805,7 +1823,7 @@ fn build_remote_relay_v2_center_command(
         TLS_CERTIFICATE_FLAG.to_string(),
         format!("\"$HOME/{REMOTE_TLS_CERTIFICATE}\""),
         STATE_DIRECTORY_FLAG.to_string(),
-        format!("\"$HOME/{REMOTE_STATE_DIRECTORY}\""),
+        "\"$relay_v2_state_directory\"".to_string(),
     ];
     if let Some(bootstrap_file_name) = bootstrap_file_name {
         arguments.push("--host-bootstrap-output".to_string());
@@ -1977,10 +1995,12 @@ fn start_center(config: &mut PersistedSelfHostedConfig) -> Result<(), String> {
         uuid::Uuid::new_v4().simple()
     );
     let tmux = remote_tmux_cmd(&host);
+    let state_directory_preflight = build_remote_state_directory_launcher_preflight();
     let script = format!(
         r#"{REMOTE_SECURITY_FUNCTIONS}
 set -eu
 require_relay_layout
+{state_directory_preflight}
 require_current_bundle
 root="$HOME/{REMOTE_ROOT}"
 require_private_file "$HOME/{REMOTE_TLS_KEY}"
@@ -1998,6 +2018,9 @@ cat > "{launcher_stage}" <<'EOF'
 #!/bin/sh
 set -eu
 umask 077
+{launcher_security_functions}
+require_relay_layout
+{state_directory_preflight}
 exec {command}
 EOF
 set +C
@@ -2011,6 +2034,7 @@ if {tmux} has-session -t {CENTER_SESSION} 2>/dev/null; then exit 0; fi
 sleep 1
 {tmux} has-session -t {CENTER_SESSION}
 "#,
+        launcher_security_functions = REMOTE_SECURITY_FUNCTIONS,
         bootstrap_output_guard = bootstrap_output
             .as_deref()
             .map(|name| {
@@ -2176,11 +2200,11 @@ mod tests {
     use super::{
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
         build_remote_bundle_stage_validation_script, build_remote_relay_v2_center_command,
-        consumed_local_private_file_path, finish_consuming_if_present,
-        load_ready_commit_journal_at, normalize_issuer_url, read_local_private_file,
-        relay_url_from_issuer, validate_bootstrap_bytes, validate_listen_host,
-        PersistedSelfHostedConfig, ReadyCommitJournal, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
-        READY_COMMIT_JOURNAL_CONTRACT, REMOTE_BOOTSTRAP_FD_READER,
+        build_remote_state_directory_launcher_preflight, consumed_local_private_file_path,
+        finish_consuming_if_present, load_ready_commit_journal_at, normalize_issuer_url,
+        read_local_private_file, relay_url_from_issuer, validate_bootstrap_bytes,
+        validate_listen_host, PersistedSelfHostedConfig, ReadyCommitJournal, CONFIG_CONTRACT,
+        CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT, REMOTE_BOOTSTRAP_FD_READER,
     };
 
     fn config() -> PersistedSelfHostedConfig {
@@ -2253,6 +2277,10 @@ mod tests {
         assert!(command.contains("--v2-dev-tls-key"));
         assert!(command.contains("--v2-dev-tls-cert"));
         assert!(command.contains("--v2-self-hosted-state-dir"));
+        assert!(command.contains("--v2-self-hosted-state-dir \"$relay_v2_state_directory\""));
+        assert!(!command.contains(
+            "--v2-self-hosted-state-dir \"$HOME/.tmux-worktree/relay-v2-self-hosted/state\""
+        ));
         assert!(command.contains("--host-bootstrap-output"));
         for forbidden in [
             "twcap2.",
@@ -2269,6 +2297,25 @@ mod tests {
         let restart = build_remote_relay_v2_center_command(&config(), None);
         assert!(!restart.contains("--host-bootstrap-output"));
         assert!(!restart.contains("host-bootstrap-"));
+    }
+
+    #[test]
+    fn launcher_resolves_home_alias_to_one_revalidated_canonical_state_argument() {
+        let preflight = build_remote_state_directory_launcher_preflight();
+        assert!(preflight
+            .contains("relay_v2_state_alias=\"$HOME/.tmux-worktree/relay-v2-self-hosted/state\""));
+        assert!(preflight.contains(
+            "relay_v2_state_directory=\"$(/usr/bin/realpath -e -- \"$relay_v2_state_alias\")\""
+        ));
+        assert!(preflight.contains("case \"$relay_v2_state_directory\" in"));
+        assert!(preflight.contains(
+            "test \"$(/usr/bin/realpath -e -- \"$relay_v2_state_directory\")\" = \"$relay_v2_state_directory\""
+        ));
+        assert!(preflight.contains("require_private_dir \"$relay_v2_state_alias\""));
+        assert!(preflight.contains("require_private_dir \"$relay_v2_state_directory\""));
+        assert!(preflight.contains("stat -c %d:%i -- \"$relay_v2_state_alias\""));
+        assert!(preflight.contains("stat -c %d:%i -- \"$relay_v2_state_directory\""));
+        assert!(!preflight.contains("eval"));
     }
 
     #[test]
