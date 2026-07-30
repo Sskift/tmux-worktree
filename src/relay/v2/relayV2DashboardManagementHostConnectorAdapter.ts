@@ -330,8 +330,9 @@ function mappedProtocolCode(
 /**
  * Unwired NDM3 adapter. The injected controller remains the only connector
  * lifecycle owner. This adapter retains only fixed bindings, a monotonic
- * observation fence, and one pending start promise; it never owns a child,
- * process, socket, capability producer, retry, or deadline.
+ * observation fence, and one pending controller attempt with a shared
+ * acceptance promise; it never owns a child, process, socket, capability
+ * producer, retry, or deadline.
  */
 export class RelayV2DashboardManagementHostConnectorAdapter
 implements RelayV2DashboardManagementConnectorPort {
@@ -428,6 +429,17 @@ implements RelayV2DashboardManagementConnectorPort {
     });
     const attempt = Object.freeze({ requestId: requestedId, promise });
     this.pendingStart = attempt;
+    let acceptanceSettled = false;
+    const resolveAcceptance = () => {
+      if (acceptanceSettled) return;
+      acceptanceSettled = true;
+      resolveAttempt();
+    };
+    const rejectAcceptance = (error: unknown) => {
+      if (acceptanceSettled) return;
+      acceptanceSettled = true;
+      rejectAttempt(error);
+    };
 
     void (async () => {
       try {
@@ -442,11 +454,27 @@ implements RelayV2DashboardManagementConnectorPort {
         this.validateBinding(result);
         if (result.requestId !== requestedId) return closed();
         this.observeResult(result.controllerGeneration, result.connectorId);
-        resolveAttempt();
+        resolveAcceptance();
       } catch (error) {
-        rejectAttempt(this.translate(error));
+        rejectAcceptance(this.translate(error));
       } finally {
         if (this.pendingStart === attempt) this.pendingStart = null;
+      }
+    })();
+    void (async () => {
+      await Promise.resolve();
+      if (acceptanceSettled) return;
+      try {
+        const cut = parseControllerCut(await this.inspectControllerCut());
+        this.observe(cut);
+        if (cut.status !== "starting" && cut.status !== "registered") {
+          throw new RelayV2DashboardManagementAuthorityFailure(
+            cut.status === "superseded" ? "NOT_READY" : "OPERATION_FAILED",
+          );
+        }
+        resolveAcceptance();
+      } catch (error) {
+        rejectAcceptance(this.translate(error));
       }
     })();
     return promise;
@@ -456,9 +484,6 @@ implements RelayV2DashboardManagementConnectorPort {
     this.ensureOpen();
     try {
       const requestedId = parseRequestId(input);
-      if (this.pendingStart !== null) {
-        throw new RelayV2DashboardManagementAuthorityFailure("BUSY");
-      }
       const captured = parseControllerCut(await this.inspectControllerCut());
       this.observe(captured);
       if (captured.status === "stopped") return;

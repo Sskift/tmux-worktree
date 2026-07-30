@@ -1235,12 +1235,12 @@ impl ChildFactory for CommandRegressionScriptFactory {
 }
 
 #[cfg(all(test, unix))]
-struct CommandRegressionRequestId(Mutex<Option<[u8; 16]>>);
+struct CommandRegressionRequestId(Mutex<VecDeque<[u8; 16]>>);
 
 #[cfg(all(test, unix))]
 impl RequestIdGenerator for CommandRegressionRequestId {
     fn fill(&self, bytes: &mut [u8; 16]) -> Result<(), ()> {
-        *bytes = self.0.lock().unwrap().take().ok_or(())?;
+        *bytes = self.0.lock().unwrap().pop_front().ok_or(())?;
         Ok(())
     }
 }
@@ -1532,12 +1532,20 @@ impl ManagementChildManager {
         script: String,
         request_id: [u8; 16],
     ) -> Result<Self, ManagementStartError> {
+        Self::start_v2_command_regression_script_with_request_ids(script, vec![request_id])
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn start_v2_command_regression_script_with_request_ids(
+        script: String,
+        request_ids: Vec<[u8; 16]>,
+    ) -> Result<Self, ManagementStartError> {
         Self::start_with_factory(
             BundledManagementArtifact {
                 path: PathBuf::from("/test/tw-cli/cli.cjs"),
             },
             Arc::new(CommandRegressionScriptFactory { script }),
-            Arc::new(CommandRegressionRequestId(Mutex::new(Some(request_id)))),
+            Arc::new(CommandRegressionRequestId(Mutex::new(request_ids.into()))),
             ManagementProtocol::V2,
             "1.2.3",
             Duration::from_secs(2),

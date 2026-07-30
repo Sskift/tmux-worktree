@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 
 use super::enrollment_artifact::{EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim};
@@ -20,6 +22,8 @@ const INVALID_ARGUMENT_CODE: &str = "INVALID_ARGUMENT";
 const INVALID_ARGUMENT_MESSAGE: &str = "Relay v2 management input is invalid";
 const RECOVERY_REQUIRED_CODE: &str = "CELL_RECOVERY_REQUIRED";
 const RECOVERY_REQUIRED_MESSAGE: &str = "Relay v2 Host credential cell requires operator recovery";
+const CONNECTOR_READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECTOR_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -257,23 +261,56 @@ impl MobileRelayV2ManagementCommandState {
     }
 
     pub(crate) fn start_connector_and_require_base_readiness(&self) -> Result<(), ManagementError> {
-        let outcome = self.call_with_input(
-            MobileRelayV2ManagementOperation::StartConnector,
+        self.start_connector_and_require_base_readiness_with_bounds(
+            CONNECTOR_READINESS_TIMEOUT,
+            CONNECTOR_READINESS_POLL_INTERVAL,
+        )
+    }
+
+    fn start_connector_and_require_base_readiness_with_bounds(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<(), ManagementError> {
+        use super::management_protocol_v2::BaseConnectorReadiness;
+
+        let deadline = Instant::now() + timeout;
+        let status = self.call_with_input(
+            MobileRelayV2ManagementOperation::Status,
             ManagementInput::None,
         )?;
-        if !outcome.ok {
-            return Err(outcome.error.unwrap_or_else(channel_closed_error));
+        let mut readiness = base_connector_readiness(status)?;
+        if readiness == BaseConnectorReadiness::Ready {
+            return Ok(());
         }
-        if outcome.protocol_version == super::management_protocol_v2::PROTOCOL_VERSION
-            && outcome.error.is_none()
-            && outcome
-                .result
-                .as_ref()
-                .is_some_and(super::management_protocol_v2::projection_has_base_connector_readiness)
-        {
-            Ok(())
-        } else {
-            Err(not_ready_error())
+        if readiness == BaseConnectorReadiness::NotReady {
+            readiness = base_connector_readiness(self.call_with_input(
+                MobileRelayV2ManagementOperation::StartConnector,
+                ManagementInput::None,
+            )?)?;
+            if readiness == BaseConnectorReadiness::Ready {
+                return Ok(());
+            }
+            if readiness != BaseConnectorReadiness::Starting {
+                return Err(not_ready_error());
+            }
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(not_ready_error());
+            }
+            thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+            readiness = base_connector_readiness(self.call_with_input(
+                MobileRelayV2ManagementOperation::Status,
+                ManagementInput::None,
+            )?)?;
+            match readiness {
+                BaseConnectorReadiness::Ready => return Ok(()),
+                BaseConnectorReadiness::Starting => {}
+                BaseConnectorReadiness::NotReady => return Err(not_ready_error()),
+            }
         }
     }
 
@@ -686,6 +723,24 @@ fn not_ready_error() -> ManagementError {
     fixed_error("NOT_READY", "Relay v2 management is not ready")
 }
 
+fn base_connector_readiness(
+    outcome: ManagementOutcome,
+) -> Result<super::management_protocol_v2::BaseConnectorReadiness, ManagementError> {
+    if !outcome.ok {
+        return Err(outcome.error.unwrap_or_else(channel_closed_error));
+    }
+    if outcome.protocol_version != super::management_protocol_v2::PROTOCOL_VERSION
+        || outcome.error.is_some()
+    {
+        return Err(not_ready_error());
+    }
+    Ok(outcome
+        .result
+        .as_ref()
+        .map(super::management_protocol_v2::projection_base_connector_readiness)
+        .unwrap_or(super::management_protocol_v2::BaseConnectorReadiness::NotReady))
+}
+
 fn map_start_error(error: ManagementStartError) -> ManagementError {
     match error {
         ManagementStartError::Unavailable => unavailable_error(),
@@ -860,53 +915,178 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn self_hosted_connector_start_requires_the_exact_base_readiness_projection() {
+    fn command_regression_request_id(bytes: [u8; 16]) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
+        format!("dmgmt2.{}", URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    #[cfg(unix)]
+    fn command_regression_projection_response(
+        request_bytes: [u8; 16],
+        connector: serde_json::Value,
+    ) -> String {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../contracts/dashboard-relay-v2-management/v2/cases.json"
         ))
         .unwrap();
-        let start = fixture["goldenExchanges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|exchange| exchange["operation"] == "start_connector")
-            .unwrap();
-        let request_id = start["normalizedRequest"]["requestId"].as_str().unwrap();
-        let request_bytes: [u8; 16] = URL_SAFE_NO_PAD
-            .decode(request_id.split_once('.').unwrap().1)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let mut response = fixture["projectionCases"]["registeredIncomplete"].clone();
-        response["requestId"] = serde_json::Value::String(request_id.to_string());
-        let cases = [
-            (
-                start["responseFrame"]
-                    .as_str()
-                    .unwrap()
-                    .trim_end()
-                    .to_string(),
-                Ok(()),
+        let mut response: serde_json::Value = serde_json::from_str(
+            fixture["goldenExchanges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|exchange| exchange["operation"] == "start_connector")
+                .unwrap()["responseFrame"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        response["requestId"] =
+            serde_json::Value::String(command_regression_request_id(request_bytes));
+        response["result"]["connector"] = connector;
+        serde_json::to_string(&response).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_hosted_connector_reuses_exact_ready_projection_without_a_new_start() {
+        let first = [11; 16];
+        let second = [12; 16];
+        let ready_connector = serde_json::json!({
+            "status": "registered",
+            "acknowledgement": "host.registered",
+            "hostId": "mac-admin",
+            "connectorId": "connector-one",
+            "negotiatedCapabilityIntersection":
+                super::super::management_protocol_v2::REQUIRED_CAPABILITIES,
+        });
+        let first_response = command_regression_projection_response(first, ready_connector.clone());
+        let second_response = command_regression_projection_response(second, ready_connector);
+        let first_id = command_regression_request_id(first);
+        let second_id = command_regression_request_id(second);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'\"operation\":\"start_connector\"'*) exit 73 ;; *'{first_id}'*) printf '%s\\n' '{first_response}' ;; *'{second_id}'*) printf '%s\\n' '{second_response}' ;; *) exit 74 ;; esac; done"
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            vec![first, second],
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(state.start_connector_and_require_base_readiness(), Ok(()));
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_connector_start_polls_the_exact_ready_cut_without_poisoning_the_child() {
+        let ids = [[21; 16], [22; 16], [23; 16], [24; 16], [25; 16]];
+        let stopped = command_regression_projection_response(
+            ids[0],
+            serde_json::json!({"status": "stopped"}),
+        );
+        let starting = serde_json::json!({"status": "starting", "hostId": "mac-admin"});
+        let accepted = command_regression_projection_response(ids[1], starting.clone());
+        let pending = command_regression_projection_response(ids[2], starting);
+        let ready_connector = serde_json::json!({
+            "status": "registered",
+            "acknowledgement": "host.registered",
+            "hostId": "mac-admin",
+            "connectorId": "connector-one",
+            "negotiatedCapabilityIntersection":
+                super::super::management_protocol_v2::REQUIRED_CAPABILITIES,
+        });
+        let ready = command_regression_projection_response(ids[3], ready_connector.clone());
+        let after = command_regression_projection_response(ids[4], ready_connector);
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 75 ;; esac; done",
+            request_ids[0],
+            stopped,
+            request_ids[1],
+            accepted,
+            request_ids[2],
+            pending,
+            request_ids[3],
+            ready,
+            request_ids[4],
+            after,
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(
+            state.start_connector_and_require_base_readiness_with_bounds(
+                Duration::from_secs(1),
+                Duration::from_millis(1),
             ),
-            (
-                serde_json::to_string(&response).unwrap(),
-                Err(not_ready_error()),
-            ),
+            Ok(())
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connector_readiness_timeout_does_not_poison_the_management_child() {
+        let ids = [[31; 16], [32; 16], [33; 16], [34; 16]];
+        let stopped = command_regression_projection_response(
+            ids[0],
+            serde_json::json!({"status": "stopped"}),
+        );
+        let starting = serde_json::json!({"status": "starting", "hostId": "mac-admin"});
+        let responses = [
+            stopped,
+            command_regression_projection_response(ids[1], starting.clone()),
+            command_regression_projection_response(ids[2], starting.clone()),
+            command_regression_projection_response(ids[3], starting),
         ];
-        for (response, expected) in cases {
-            assert!(!response.contains('\''));
-            let script = format!(
-                "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; IFS= read -r request; case \"$request\" in *'\"operation\":\"start_connector\"'*) printf '%s\\n' '{response}' ;; *) exit 1 ;; esac; while IFS= read -r request; do :; done"
-            );
-            let manager =
-                ManagementChildManager::start_v2_command_regression_script(script, request_bytes)
-                    .unwrap();
-            let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
-            assert_eq!(state.start_connector_and_require_base_readiness(), expected);
-        }
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *'{}'*) printf '%s\\n' '{}' ;; *) exit 76 ;; esac; done",
+            request_ids[0],
+            responses[0],
+            request_ids[1],
+            responses[1],
+            request_ids[2],
+            responses[2],
+            request_ids[3],
+            responses[3],
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(
+            state.start_connector_and_require_base_readiness_with_bounds(
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ),
+            Err(not_ready_error())
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
     }
 
     #[test]

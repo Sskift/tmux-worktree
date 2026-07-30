@@ -16,7 +16,7 @@ const MAX_DEVICE_LABEL_BYTES: usize = 128;
 const MAX_URL_BYTES: usize = 2_048;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-const REQUIRED_CAPABILITIES: [&str; 6] = [
+pub(crate) const REQUIRED_CAPABILITIES: [&str; 6] = [
     "error.structured.v1",
     "command.ledger.v1",
     "command.query.v1",
@@ -392,7 +392,16 @@ pub(crate) fn project_for_renderer(
     .map_err(|_| ())
 }
 
-pub(crate) fn projection_has_base_connector_readiness(value: &serde_json::Value) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BaseConnectorReadiness {
+    Ready,
+    Starting,
+    NotReady,
+}
+
+pub(crate) fn projection_base_connector_readiness(
+    value: &serde_json::Value,
+) -> BaseConnectorReadiness {
     let Ok(projection) = exact_object(
         value,
         &[
@@ -403,43 +412,49 @@ pub(crate) fn projection_has_base_connector_readiness(value: &serde_json::Value)
             "knownClientGrant",
         ],
     ) else {
-        return false;
+        return BaseConnectorReadiness::NotReady;
     };
     let Ok(authority) =
         serde_json::from_value::<ProjectionAuthority>(projection["authority"].clone())
     else {
-        return false;
+        return BaseConnectorReadiness::NotReady;
     };
     let Ok(host_credential) =
         serde_json::from_value::<HostCredentialProjection>(projection["hostCredential"].clone())
     else {
-        return false;
+        return BaseConnectorReadiness::NotReady;
     };
     let Ok(connector) =
         serde_json::from_value::<ConnectorProjection>(projection["connector"].clone())
     else {
-        return false;
+        return BaseConnectorReadiness::NotReady;
     };
-    let ConnectorProjection::Registered {
-        acknowledgement,
-        host_id,
-        connector_id,
-        negotiated_capability_intersection,
-    } = &connector
-    else {
-        return false;
-    };
-    matches!(host_credential, HostCredentialProjection::Ready { .. })
-        && authority.kind == "node"
-        && authority.reason.is_none()
-        && validate_registered_connector(
+    if !matches!(host_credential, HostCredentialProjection::Ready { .. })
+        || authority.kind != "node"
+        || authority.reason.is_some()
+    {
+        return BaseConnectorReadiness::NotReady;
+    }
+    match &connector {
+        ConnectorProjection::Starting { host_id: Some(_) } => BaseConnectorReadiness::Starting,
+        ConnectorProjection::Registered {
+            acknowledgement,
+            host_id,
+            connector_id,
+            negotiated_capability_intersection,
+        } if validate_registered_connector(
             acknowledgement,
             host_id,
             connector_id,
             negotiated_capability_intersection,
             true,
         )
-        .is_ok()
+        .is_ok() =>
+        {
+            BaseConnectorReadiness::Ready
+        }
+        _ => BaseConnectorReadiness::NotReady,
+    }
 }
 
 fn renderer_enrollment_review(

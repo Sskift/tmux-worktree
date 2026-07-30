@@ -254,9 +254,9 @@ test("only exact host.registered evidence can produce a registered cut", async (
   }
 });
 
-test("one pending start request shares its exact promise and controller attempt", async () => {
+test("one pending controller attempt shares an accepted-start promise without waiting for registration", async () => {
   const gate = deferred();
-  const h = harness({ start: () => gate.promise });
+  const h = harness({ cut: startingCut("1"), start: () => gate.promise });
 
   const first = h.adapter.start(START_ONE);
   const duplicate = h.adapter.start(START_ONE);
@@ -278,11 +278,45 @@ test("one pending start request shares its exact promise and controller attempt"
   let settled = false;
   first.finally(() => { settled = true; }).catch(() => {});
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(settled, false, "the adapter adds no timeout to the owner attempt");
-  gate.resolve(startResult());
+  assert.equal(settled, true, "the exact starting cut accepts the management request");
   await Promise.all([first, duplicate]);
-  assert.equal(settled, true);
+  await assert.rejects(
+    h.adapter.start(START_TWO),
+    (error) => isAuthorityFailure(error, "BUSY"),
+    "the controller attempt remains exclusively pending until its owner settles",
+  );
+  gate.resolve(startResult());
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.calls.start.length, 1);
+});
+
+test("stop drains an accepted controller attempt while registration remains pending", async () => {
+  const gate = deferred();
+  const h = harness({
+    cut: startingCut("1"),
+    start: () => gate.promise,
+    stop: (input) => stopResult(
+      input.requestId,
+      input.controllerGeneration,
+      input.connectorId,
+    ),
+  });
+
+  await h.adapter.start(START_ONE);
+  await h.adapter.stop(STOP_ONE);
+  assert.equal(h.calls.start.length, 1);
+  assert.deepEqual(
+    { ...h.calls.stop[0], signal: undefined },
+    {
+      requestId: STOP_ONE.requestId,
+      controllerGeneration: "1",
+      connectorId: null,
+      ...BINDING,
+      signal: undefined,
+    },
+  );
+  gate.reject(new RelayV2HostConnectorControllerError("ABORTED"));
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 test("stop uses the captured generation and connector and waits exact drain", async (t) => {
