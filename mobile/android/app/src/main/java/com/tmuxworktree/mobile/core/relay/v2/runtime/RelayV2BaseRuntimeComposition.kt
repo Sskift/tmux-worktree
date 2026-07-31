@@ -27,6 +27,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
@@ -1641,29 +1642,68 @@ internal class RelayV2BaseRuntimeComposition(
         issuance: RelayV2OutboxDispatchIssuance,
     ): Boolean {
         val queryLineage = requireNotNull(effect.queryLineage)
-        val executeEffects = commit.effects.mapNotNull { it as? RelayV2OutboxEffect.ExecuteCommand }
-        if (executeEffects.size != commit.effects.size) return false
+        val authority = effect.repositoryAuthority
+        val receipt = commit.receipt
+        val receiptCommands = receipt.appliedCommands
+        if (receipt.binding.generation != effect.generation ||
+            receipt.hostId != authority.hostId ||
+            receipt.hostEpoch != authority.hostEpoch ||
+            receiptCommands.map { it.commandId }.toSet().size != receiptCommands.size ||
+            commit.effects.size > receiptCommands.size
+        ) return false
+        val executeCount = commit.effects.count {
+            it is RelayV2OutboxEffect.ExecuteCommand
+        }
         val capabilities = when (issuance) {
             RelayV2OutboxDispatchIssuance.NoDispatch -> {
-                if (commit.effects.isNotEmpty()) return false
+                if (executeCount != 0) return false
                 emptyList()
             }
             is RelayV2OutboxDispatchIssuance.Issued -> {
-                if (issuance.capabilities.size != executeEffects.size) return false
+                if (issuance.capabilities.size != executeCount) return false
                 issuance.capabilities
             }
             RelayV2OutboxDispatchIssuance.Disabled,
             is RelayV2OutboxDispatchIssuance.Rejected,
             -> return false
         }
-        capabilities.forEachIndexed { index, capability ->
-            val execute = executeEffects[index]
-            if (capability.identity.generation != effect.generation ||
-                capability.identity.commandId != execute.command.entryId.commandId ||
-                capability.identity.requestId != execute.attempt.requestId
-            ) return false
+        val receiptByCommand = receiptCommands.associateBy { it.commandId }
+        val claimedReceiptCommands = HashSet<String>()
+        val replacementEntries = HashSet<RelayV2OutboxEntryId>()
+        var capabilityIndex = 0
+        commit.effects.forEach { recovered ->
+            when (recovered) {
+                is RelayV2OutboxEffect.ExecuteCommand -> {
+                    val entryId = recovered.command.entryId
+                    val capability = capabilities.getOrNull(capabilityIndex++) ?: return false
+                    if (!entryId.belongsTo(authority) ||
+                        receiptByCommand[entryId.commandId] != RelayV2PendingCommand(
+                            entryId.commandId,
+                            recovered.command.dedupeWindowId,
+                        ) ||
+                        !claimedReceiptCommands.add(entryId.commandId) ||
+                        capability.identity.generation != effect.generation ||
+                        capability.identity.commandId != entryId.commandId ||
+                        capability.identity.requestId != recovered.attempt.requestId
+                    ) return false
+                }
+                is RelayV2OutboxEffect.ReissueCreated -> {
+                    val original = recovered.originalEntryId
+                    val replacement = recovered.replacementEntryId
+                    if (!original.belongsTo(authority) ||
+                        !replacement.belongsTo(authority) ||
+                        original == replacement ||
+                        receiptByCommand[original.commandId] == null ||
+                        receiptByCommand.containsKey(replacement.commandId) ||
+                        !claimedReceiptCommands.add(original.commandId) ||
+                        !replacementEntries.add(replacement)
+                    ) return false
+                }
+                else -> return false
+            }
         }
-        val lineage = RecoveredDispatchLineage(queryLineage, effect.repositoryAuthority)
+        if (capabilityIndex != capabilities.size) return false
+        val lineage = RecoveredDispatchLineage(queryLineage, authority)
         return synchronized(recoveredDispatchLock) {
             if (closed.get() || terminalFailure.get() != null) return@synchronized false
             val current = recoveredDispatch
@@ -2721,3 +2761,10 @@ private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
         principalId = principalId,
         clientInstanceId = clientInstanceId,
     )
+
+private fun RelayV2OutboxEntryId.belongsTo(
+    authority: RelayV2RepositoryEffectAuthority,
+): Boolean = profileId == authority.profileId &&
+    principalId == authority.principalId &&
+    hostId == authority.hostId &&
+    expectedHostEpoch == authority.hostEpoch

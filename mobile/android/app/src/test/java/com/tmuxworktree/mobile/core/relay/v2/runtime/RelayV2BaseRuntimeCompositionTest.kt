@@ -1640,6 +1640,52 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `recovered mixed retry and reissue preserve order before fresh replacement dispatch`() =
+        runBlocking {
+            val harness = Harness(
+                autoConnect = true,
+                outbox = sendingOutbox("retry-command", "reissue-command"),
+            )
+            try {
+                val query = harness.connectToCommandQuery()
+                assertEquals(
+                    listOf("retry-command", "reissue-command"),
+                    query.payloadReadOnly().objectList("items").map {
+                        it.stringValue("commandId")
+                    },
+                )
+                harness.transport().sendCommandStatuses(
+                    query,
+                    listOf(StatusMode.RETRY_IMMEDIATE, StatusMode.REISSUE_REQUIRED),
+                )
+
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.transport().framesOfType("command.execute").size != 2) delay(1)
+                }
+                val durable = harness.authority.outboxState()
+                val original = durable.entries.single {
+                    it.commandId == "reissue-command"
+                }
+                val replacement = durable.entries.single {
+                    it.reissuedFromCommandId == original.commandId
+                }
+                assertEquals(RelayV2OutboxStateTag.REISSUED, original.state)
+                assertEquals(RelayV2OutboxStateTag.SENDING, replacement.state)
+                assertEquals(
+                    listOf("retry-command", replacement.commandId),
+                    harness.transport().framesOfType("command.execute").map {
+                        it.stringValue("commandId")
+                    },
+                )
+                assertEquals(listOf(1), harness.authority.freshBatchSizes)
+                assertEquals(1, harness.authority.statusCommits.get())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
     fun `empty recovery dispatches fresh queued commands in creation order without query`() =
         runBlocking {
             val harness = Harness(
@@ -4299,8 +4345,17 @@ class RelayV2BaseRuntimeCompositionTest {
         fun sendCommandStatuses(
             query: Map<String, Any?>,
             mode: StatusMode,
+        ) = sendCommandStatuses(
+            query,
+            List(query.payloadReadOnly().objectList("items").size) { mode },
+        )
+
+        fun sendCommandStatuses(
+            query: Map<String, Any?>,
+            modes: List<StatusMode>,
         ) {
             val items = query.payloadReadOnly().objectList("items")
+            require(modes.size == items.size)
             sendFrame(
                 linkedMapOf(
                     "protocolVersion" to 2L,
@@ -4315,7 +4370,9 @@ class RelayV2BaseRuntimeCompositionTest {
                             "newestIssuedWindowSeq" to "42",
                             "observedAtMs" to NOW_MS,
                         ),
-                        "items" to items.map { item -> statusItem(item, mode) },
+                        "items" to items.mapIndexed { index, item ->
+                            statusItem(item, modes[index])
+                        },
                     ),
                 ),
             )
@@ -4355,23 +4412,34 @@ class RelayV2BaseRuntimeCompositionTest {
             mode: StatusMode,
         ): Map<String, Any?> {
             val retry = mode == StatusMode.RETRY_IMMEDIATE
+            val reissue = mode == StatusMode.REISSUE_REQUIRED
             return linkedMapOf(
                 "commandId" to pending.stringValue("commandId"),
                 "dedupeWindowId" to pending.stringValue("dedupeWindowId"),
-                "state" to if (retry) "not_accepted" else "accepted",
+                "state" to if (retry || reissue) "not_accepted" else "accepted",
                 "updatedAtMs" to NOW_MS,
                 "dedupeUntilMs" to null,
                 "retryable" to retry,
                 "retryAfterMs" to if (retry) 0L else null,
-                "reissueRequired" to false,
+                "reissueRequired" to reissue,
                 "result" to null,
-                "error" to if (retry) linkedMapOf(
-                    "code" to "COMMAND_NOT_ACCEPTED",
-                    "message" to "retryable status",
-                    "retryable" to true,
-                    "commandDisposition" to "not_accepted",
-                    "details" to null,
-                ) else null,
+                "error" to when {
+                    retry -> linkedMapOf(
+                        "code" to "COMMAND_NOT_ACCEPTED",
+                        "message" to "retryable status",
+                        "retryable" to true,
+                        "commandDisposition" to "not_accepted",
+                        "details" to null,
+                    )
+                    reissue -> linkedMapOf(
+                        "code" to "COMMAND_WINDOW_EXPIRED",
+                        "message" to "reissue required",
+                        "retryable" to false,
+                        "commandDisposition" to "not_accepted",
+                        "details" to linkedMapOf("reissueRequired" to true),
+                    )
+                    else -> null
+                },
             )
         }
     }
@@ -4749,6 +4817,7 @@ class RelayV2BaseRuntimeCompositionTest {
     private enum class StatusMode {
         ACCEPTED,
         RETRY_IMMEDIATE,
+        REISSUE_REQUIRED,
     }
 
     private companion object {
