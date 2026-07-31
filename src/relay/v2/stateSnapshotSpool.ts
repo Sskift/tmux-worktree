@@ -327,9 +327,11 @@ interface RelayV2RecoveredHostH2ReadinessSink {
 }
 
 /**
- * Fresh-install counterpart of the recovered record. It never touches an
- * ActiveCut, manifest, receipt, tombstone, or the recovered/client quota; its
- * whole lifecycle reuses only the cut-source candidate/activation leases.
+ * Materialized-bootstrap counterpart of the recovered record. It never uses
+ * an ActiveCut, manifest, receipt, tombstone, or the recovered/client quota as
+ * readiness authority; its whole lifecycle reuses only the cut-source
+ * candidate/activation leases. Durable tombstones remain independent request
+ * replay fences and may coexist with this record.
  */
 interface RelayV2FreshInstallHostH2CandidateRecord {
   readonly freshInstall: true;
@@ -2546,13 +2548,15 @@ export class RelayV2StateSnapshotSpool {
   }
 
   /**
-   * Independent one-shot fresh-install H2 bootstrap port. It is available only
-   * when this bound spool holds no recovered or published cut at all: the same
-   * opaque owner runs its foundation reconcile, captures a fresh cut-source
-   * candidate, and lets the canonical pair receiver activate that exact
-   * candidate. The first real client snapshot still goes through the existing
-   * reservation/buildAndPublish path; release reuses only the cut-source
-   * candidate/activation and never touches recovered or client quota.
+   * Independent one-shot materialized H2 bootstrap port. It is available only
+   * when this bound spool holds no recovered or published cut, reservation, or
+   * in-flight build. Durable release/expiry tombstones do not authorize H2 and
+   * therefore do not block the same opaque owner from running its foundation
+   * reconcile, capturing a fresh cut-source candidate, and activating that
+   * exact candidate through the canonical pair receiver. The first real client
+   * snapshot still goes through the existing reservation/buildAndPublish path;
+   * release reuses only the cut-source candidate/activation and never touches
+   * recovered/client quota or tombstones.
    */
   async issueFreshInstallHostH2Candidate(): Promise<RelayV2HostH2RecoveryCandidate | null> {
     if (this.#runtimeH2 === null) return null;
@@ -2567,7 +2571,6 @@ export class RelayV2StateSnapshotSpool {
       || this.freshInstallBootstrapCandidateIssued
       || this.#activeById.size !== 0
       || this.reservationsById.size !== 0
-      || this.tombstonesById.size !== 0
       || this.buildsByLogicalKey.size !== 0) return null;
     try {
       await binding.reconcile();
@@ -2587,7 +2590,6 @@ export class RelayV2StateSnapshotSpool {
           || this.freshInstallBootstrapCandidateIssued
           || this.#activeById.size !== 0
           || this.reservationsById.size !== 0
-          || this.tombstonesById.size !== 0
           || this.buildsByLogicalKey.size !== 0
           || currentBoundH2SpoolBinding(this, binding.claim) !== binding) return null;
         const hostEpoch = await this.readCurrentHostEpoch();

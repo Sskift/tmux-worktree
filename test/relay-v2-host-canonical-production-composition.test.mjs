@@ -159,14 +159,14 @@ function makeCredentialAuthority() {
   });
 }
 
-async function makeHarness(label, { fresh = false } = {}) {
+async function makeHarness(label, { fresh = false, released = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), `tw-relay-v2-host-root-${label}-`));
   const store = await hostState.RelayV2HostStateStore.open({
     paths: hostState.relayV2HostStatePaths(root),
   });
   const foundation = new resourceState.RelayV2MaterializedStateFoundation({
     hostId: HOST_ID,
-    discovery: new OneScanDiscovery({ repeatable: fresh }),
+    discovery: new OneScanDiscovery({ repeatable: fresh || released }),
     store,
     readinessSink: { apply: () => true },
   });
@@ -178,7 +178,7 @@ async function makeHarness(label, { fresh = false } = {}) {
       root: spoolRoot,
       ownerInstanceId: store.hostInstanceId,
     });
-    await publisher.get({
+    const cut = await publisher.get({
       principalId: "canonical-production-principal",
       clientInstanceId: "canonical-production-client",
       expectedHostEpoch: seeded.snapshot.hostEpoch,
@@ -187,6 +187,16 @@ async function makeHarness(label, { fresh = false } = {}) {
       cursor: null,
       nextChunkIndex: 0,
     });
+    if (released) {
+      assert.equal((await publisher.release({
+        principalId: "canonical-production-principal",
+        clientInstanceId: "canonical-production-client",
+        expectedHostEpoch: seeded.snapshot.hostEpoch,
+        snapshotRequestId: "canonical-production-snapshot",
+        snapshotId: cut.snapshotId,
+        reason: "completed",
+      })).released, true);
+    }
     await publisher.close();
   }
   const spool = await foundation.openStateSnapshotSpool({
@@ -534,6 +544,41 @@ test("canonical production root opens from a fresh-install H2 bootstrap", async 
     });
     assert.equal(released.released, true);
 
+    await composition.closeAndDrain();
+  } finally {
+    abort.abort();
+    await daemon.catch(() => undefined);
+    h.cleanup();
+  }
+});
+
+test("canonical production root rebuilds H2 after the durable snapshot cut was released", async () => {
+  const h = await makeHarness("released-cut-recovery", { released: true });
+  const abort = new AbortController();
+  const daemonAuthority = new terminalControl.TerminalControlAuthority({
+    statePath: h.statePath,
+    backend: h.terminalBackend,
+  });
+  const daemon = terminalControl.runTerminalControlServer({
+    socketPath: h.socketPath,
+    authority: daemonAuthority,
+    signal: abort.signal,
+    relayV2RemoteExactCompoundV1: true,
+  });
+  try {
+    await waitForPath(h.socketPath);
+    await waitForPath(exactCompound.relayV2RemoteExactCompoundSocketPathV1(h.socketPath));
+    const before = await h.store.read();
+    assert.equal(before.materializedReadinessFence, null);
+    const composition = await relayHost.openRelayV2HostCanonicalProductionComposition(
+      h.profile,
+      h.options,
+    );
+    assert.notEqual(composition, null);
+    assert.deepEqual(composition.inspect(), {
+      status: "stopped",
+      controllerGeneration: "0",
+    });
     await composition.closeAndDrain();
   } finally {
     abort.abort();

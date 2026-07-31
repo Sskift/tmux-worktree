@@ -488,6 +488,88 @@ test("recovered H2 candidates are exact, deterministic, empty, and canonical-ent
   }
 });
 
+test("released durable cut rebuilds H2 only through authoritative materialized recovery after restart", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-h2-restart-"));
+  const paths = hostState.relayV2HostStatePaths(home);
+  let firstStore;
+  let publisher;
+  let restartedStore;
+  let restarted;
+  try {
+    firstStore = await hostState.RelayV2HostStateStore.open({ paths });
+    const firstDiscovery = new QueueDiscovery();
+    const firstFoundation = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery: firstDiscovery,
+      store: firstStore,
+      readinessSink: { apply: () => true },
+    });
+    firstDiscovery.push({
+      coverage: "complete",
+      scopes: [scope([terminal("pane:restart", "restart")])],
+    });
+    const seeded = await firstFoundation.reconcile();
+    const root = join(home, "snapshot-spool");
+    publisher = await firstFoundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root,
+      ownerInstanceId: firstStore.hostInstanceId,
+    });
+    const cut = await publisher.get(firstRequest(
+      seeded.snapshot.hostEpoch,
+      "released-before-h2-restart",
+    ));
+    assert.equal((await publisher.release(releaseRequest(cut))).released, true);
+    assert.equal(readdirSync(publisher.paths.cuts).length, 0);
+    assert.equal(readdirSync(publisher.paths.tombstones).length, 1);
+    await publisher.close();
+    publisher = undefined;
+    await firstStore.close();
+    firstStore = undefined;
+
+    restartedStore = await hostState.RelayV2HostStateStore.open({ paths });
+    const restartedDiscovery = new QueueDiscovery();
+    const restartedFoundation = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery: restartedDiscovery,
+      store: restartedStore,
+      readinessSink: { apply: () => true },
+    });
+    restartedDiscovery.push({
+      coverage: "complete",
+      scopes: [scope([terminal("pane:restart", "restart")])],
+    });
+    restarted = await restartedFoundation.openStateSnapshotSpool({
+      hostId: "mac-admin",
+      root,
+      ownerInstanceId: restartedStore.hostInstanceId,
+    });
+    const candidate = await restarted.issueFreshInstallHostH2Candidate();
+    assert.notEqual(candidate, null);
+    const recoveredAuthority =
+      snapshotSpool.captureRelayV2RecoveredHostH2ProcessAuthority(
+        candidate,
+        restartedStore,
+      );
+    assert.notEqual(recoveredAuthority, null);
+    assert.equal(recoveredAuthority.hostEpoch, seeded.snapshot.hostEpoch);
+    assert.equal(
+      recoveredAuthority.hostInstanceId,
+      restartedStore.hostInstanceId,
+      "the rebuilt H2 cut must belong to the restarted HostState owner",
+    );
+    assert.equal((await restartedStore.read()).materializedReadinessFence, null);
+    assert.equal(readdirSync(restarted.paths.tombstones).length, 1,
+      "the released request replay fence remains durable and is not readiness authority");
+  } finally {
+    await restarted?.close().catch(() => undefined);
+    try { await restartedStore?.close(); } catch {}
+    await publisher?.close().catch(() => undefined);
+    try { await firstStore?.close(); } catch {}
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("bound H2 claim replaces sequential roots across fresh and recovered authority", async () => {
   const h = await realHarness({ bound: true });
   let second;

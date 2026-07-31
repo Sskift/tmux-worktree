@@ -161,7 +161,7 @@ H2 使用现有 local/SSH discovery 作为查询 adapter，但以 H0 materialize
 
 - scope/session materialization、完整与 partial reconciliation、per-dimension revision 和 host eventSeq。
 - hello barrier、`scopes/sessions.snapshot` convenience API、pinned `state.snapshot` spool、cursor/digest/quota/release。
-- H2 spool 已有 one-shot fresh-install bootstrap port：零 recovered pinned cut 时由同一 materialized owner 的 reconcile 捕获 fresh cut-source candidate 并复用同一 private canonical pair 完成 activation；任何 active cut/reservation/tombstone/in-flight build 或已签发过时返回 null，与 recovered-candidate 路径结构性互斥。仍属 default-off composition，不产生 capability。
+- H2 spool 已有 one-shot materialized bootstrap port：零 recovered pinned cut 时由同一 materialized owner 的 authoritative reconcile 捕获 fresh cut-source candidate 并复用同一 private canonical pair 完成 activation；任何 active cut/reservation/in-flight build 或已签发过时返回 null，与 recovered-candidate 路径结构性互斥。release/expiry tombstone 只保留 snapshot request replay fence，不作为 readiness authority，也不阻断 clean process restart 从当前 exact materialized cut 重建 H2。仍属 default-off composition，不产生 capability。
 
 验收：
 
