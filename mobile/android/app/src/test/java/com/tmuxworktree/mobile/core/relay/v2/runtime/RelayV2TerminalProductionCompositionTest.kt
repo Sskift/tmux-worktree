@@ -628,6 +628,45 @@ class RelayV2TerminalProductionCompositionTest {
             assertEquals(case.name, case.stored, terminal.stored(key))
         }
 
+        terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(pendingOpen))
+        val openResetRequired = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            codec.encodeWebSocketFrame(
+                RelayV2WebSocketChannel.PUBLIC,
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "terminal.reset_required",
+                    "requestId" to requireNotNull(pendingOpen.pendingOpen).requestId,
+                    "hostId" to identity.hostId,
+                    "hostEpoch" to identity.hostEpoch,
+                    "scopeId" to identity.scopeId,
+                    "sessionId" to identity.sessionId,
+                    "streamId" to identity.streamId,
+                    "payload" to linkedMapOf(
+                        "origin" to "open",
+                        "generation" to null,
+                        "reason" to "stream_lost",
+                        "requestedOffset" to null,
+                        "bufferStartOffset" to null,
+                        "tailOffset" to null,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalFrameResult.Applied,
+            composition.handlePublicFrame(authority, openResetRequired),
+        )
+        val openResetCheckpoint =
+            (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+        assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, openResetCheckpoint.phase)
+        assertEquals(
+            RelayV2TerminalResetReason.STREAM_LOST,
+            openResetCheckpoint.resetReason,
+        )
+        assertEquals(RelayV2TerminalResetReason.STREAM_LOST, observedReset)
+
         terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(present))
         val resetRequired = codec.decodeWebSocketFrame(
             RelayV2WebSocketChannel.PUBLIC,

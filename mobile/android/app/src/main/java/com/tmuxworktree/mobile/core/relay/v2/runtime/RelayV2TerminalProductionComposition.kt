@@ -789,14 +789,20 @@ internal class RelayV2TerminalProductionComposition(
                 payload.string("tailOffsetAtStart"),
             )
             "terminal.reset_required" -> if (frame["kind"] == "response") {
+                val origin = when (payload.string("origin")) {
+                    "open" -> RelayV2TerminalResetOrigin.OPEN
+                    "replay" -> RelayV2TerminalResetOrigin.REPLAY
+                    else -> error("Invalid reset origin")
+                }
                 RelayV2TerminalAction.CorrelatedResetRequired(
                     fence,
-                    when (payload.string("origin")) {
-                        "open" -> RelayV2TerminalResetOrigin.OPEN
-                        "replay" -> RelayV2TerminalResetOrigin.REPLAY
-                        else -> error("Invalid reset origin")
-                    },
+                    origin,
                     frame.string("requestId"),
+                    openAttempt = if (origin == RelayV2TerminalResetOrigin.OPEN) {
+                        checkpoint.pendingOpen?.openAttempt
+                    } else {
+                        null
+                    },
                     reason = payload.resetReason(),
                     requestedOffset = payload.nullableString("requestedOffset"),
                     bufferStartOffset = payload.nullableString("bufferStartOffset"),
