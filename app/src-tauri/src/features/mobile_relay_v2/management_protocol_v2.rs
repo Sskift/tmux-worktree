@@ -399,6 +399,28 @@ pub(crate) enum BaseConnectorReadiness {
     NotReady,
 }
 
+pub(crate) fn projection_ready_host_credential_expires_at_ms(
+    value: &serde_json::Value,
+) -> Option<u64> {
+    let projection = exact_object(
+        value,
+        &[
+            "authority",
+            "hostCredential",
+            "connector",
+            "enrollment",
+            "knownClientGrant",
+        ],
+    )
+    .ok()?;
+    match serde_json::from_value::<HostCredentialProjection>(projection["hostCredential"].clone())
+        .ok()?
+    {
+        HostCredentialProjection::Ready { expires_at_ms, .. } => Some(expires_at_ms),
+        HostCredentialProjection::Missing | HostCredentialProjection::Failed { .. } => None,
+    }
+}
+
 pub(crate) fn projection_base_connector_readiness(
     value: &serde_json::Value,
 ) -> BaseConnectorReadiness {

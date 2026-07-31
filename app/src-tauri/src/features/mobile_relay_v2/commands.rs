@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 
 use super::enrollment_artifact::{EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim};
@@ -279,24 +279,24 @@ impl MobileRelayV2ManagementCommandState {
         &self,
         expected_launch_key: &ManagementLaunchKey,
     ) -> Result<(), ManagementError> {
+        self.restore_self_hosted_connector_desired_state_with_now(
+            expected_launch_key,
+            management_now_ms()?,
+        )
+    }
+
+    fn restore_self_hosted_connector_desired_state_with_now(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+        now_ms: u64,
+    ) -> Result<(), ManagementError> {
         use super::management_protocol_v2::BaseConnectorReadiness;
 
-        let status = successful_v2_result(self.call_with_input_for_launch_key(
-            MobileRelayV2ManagementOperation::Status,
-            ManagementInput::None,
-            Some(expected_launch_key),
-        )?)?;
-        match super::management_protocol_v2::projection_base_connector_readiness(&status) {
-            BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => return Ok(()),
-            BaseConnectorReadiness::NotReady
-                if connector_projection_status(&status) == Some("stopped") => {}
-            BaseConnectorReadiness::NotReady => return Err(not_ready_error()),
-        }
-        match base_connector_readiness(self.call_with_input_for_launch_key(
-            MobileRelayV2ManagementOperation::StartConnector,
-            ManagementInput::None,
-            Some(expected_launch_key),
-        )?)? {
+        match self.ensure_self_hosted_connector_start_accepted_with_now(
+            expected_launch_key,
+            now_ms,
+            true,
+        )? {
             BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => Ok(()),
             BaseConnectorReadiness::NotReady => Err(not_ready_error()),
         }
@@ -306,13 +306,18 @@ impl MobileRelayV2ManagementCommandState {
         &self,
         expected_launch_key: &ManagementLaunchKey,
     ) -> Result<ManagementOutcome, ManagementError> {
+        self.start_self_hosted_connector_with_now(expected_launch_key, management_now_ms()?)
+    }
+
+    fn start_self_hosted_connector_with_now(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+        now_ms: u64,
+    ) -> Result<ManagementOutcome, ManagementError> {
         use super::management_protocol_v2::BaseConnectorReadiness;
 
-        let outcome = self.call_with_input_for_launch_key(
-            MobileRelayV2ManagementOperation::StartConnector,
-            ManagementInput::None,
-            Some(expected_launch_key),
-        )?;
+        self.preflight_self_hosted_connector_credential(expected_launch_key, now_ms)?;
+        let outcome = self.request_self_hosted_connector_start(expected_launch_key)?;
         match base_connector_readiness(outcome.clone())? {
             BaseConnectorReadiness::Ready | BaseConnectorReadiness::Starting => Ok(outcome),
             BaseConnectorReadiness::NotReady => Err(not_ready_error()),
@@ -340,31 +345,89 @@ impl MobileRelayV2ManagementCommandState {
         &self,
         expected_launch_key: &ManagementLaunchKey,
     ) -> Result<super::management_protocol_v2::BaseConnectorReadiness, ManagementError> {
+        self.ensure_self_hosted_connector_start_accepted_with_now(
+            expected_launch_key,
+            management_now_ms()?,
+            false,
+        )
+    }
+
+    fn ensure_self_hosted_connector_start_accepted_with_now(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+        now_ms: u64,
+        strict_stopped: bool,
+    ) -> Result<super::management_protocol_v2::BaseConnectorReadiness, ManagementError> {
         use super::management_protocol_v2::BaseConnectorReadiness;
 
-        let status = self.call_with_input_for_launch_key(
+        let (status, refreshed) =
+            self.preflight_self_hosted_connector_credential(expected_launch_key, now_ms)?;
+        let mut readiness =
+            super::management_protocol_v2::projection_base_connector_readiness(&status);
+        if !refreshed && readiness == BaseConnectorReadiness::Ready {
+            return Ok(readiness);
+        }
+        if !refreshed && readiness == BaseConnectorReadiness::Starting {
+            return Ok(readiness);
+        }
+        if strict_stopped
+            && !refreshed
+            && readiness == BaseConnectorReadiness::NotReady
+            && connector_projection_status(&status) != Some("stopped")
+        {
+            return Err(not_ready_error());
+        }
+        readiness = base_connector_readiness(
+            self.request_self_hosted_connector_start(expected_launch_key)?,
+        )?;
+        if readiness == BaseConnectorReadiness::NotReady {
+            return Err(not_ready_error());
+        }
+        Ok(readiness)
+    }
+
+    fn preflight_self_hosted_connector_credential(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+        now_ms: u64,
+    ) -> Result<(serde_json::Value, bool), ManagementError> {
+        let status = successful_v2_result(self.call_with_input_for_launch_key(
             MobileRelayV2ManagementOperation::Status,
             ManagementInput::None,
             Some(expected_launch_key),
-        )?;
-        let mut readiness = base_connector_readiness(status)?;
-        if readiness == BaseConnectorReadiness::Ready {
-            return Ok(readiness);
+        )?)?;
+        let expires_at_ms =
+            super::management_protocol_v2::projection_ready_host_credential_expires_at_ms(&status)
+                .ok_or_else(not_ready_error)?;
+        if expires_at_ms > now_ms {
+            return Ok((status, false));
         }
-        if readiness == BaseConnectorReadiness::NotReady {
-            readiness = base_connector_readiness(self.call_with_input_for_launch_key(
-                MobileRelayV2ManagementOperation::StartConnector,
-                ManagementInput::None,
-                Some(expected_launch_key),
-            )?)?;
-            if readiness == BaseConnectorReadiness::Ready {
-                return Ok(readiness);
-            }
-            if readiness != BaseConnectorReadiness::Starting {
-                return Err(not_ready_error());
-            }
+
+        let refreshed = successful_v2_result(self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::RefreshHost,
+            ManagementInput::None,
+            Some(expected_launch_key),
+        )?)?;
+        let refreshed_expires_at_ms =
+            super::management_protocol_v2::projection_ready_host_credential_expires_at_ms(
+                &refreshed,
+            )
+            .ok_or_else(not_ready_error)?;
+        if refreshed_expires_at_ms <= now_ms {
+            return Err(not_ready_error());
         }
-        Ok(readiness)
+        Ok((refreshed, true))
+    }
+
+    fn request_self_hosted_connector_start(
+        &self,
+        expected_launch_key: &ManagementLaunchKey,
+    ) -> Result<ManagementOutcome, ManagementError> {
+        self.call_with_input_for_launch_key(
+            MobileRelayV2ManagementOperation::StartConnector,
+            ManagementInput::None,
+            Some(expected_launch_key),
+        )
     }
 
     pub(crate) fn wait_for_self_hosted_connector_base_readiness(
@@ -836,6 +899,13 @@ fn not_ready_error() -> ManagementError {
     fixed_error("NOT_READY", "Relay v2 management is not ready")
 }
 
+fn management_now_ms() -> Result<u64, ManagementError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| not_ready_error())?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| not_ready_error())
+}
+
 fn base_connector_readiness(
     outcome: ManagementOutcome,
 ) -> Result<super::management_protocol_v2::BaseConnectorReadiness, ManagementError> {
@@ -1065,6 +1135,8 @@ mod tests {
         .unwrap();
         response["requestId"] =
             serde_json::Value::String(command_regression_request_id(request_bytes));
+        response["result"]["hostCredential"]["expiresAtMs"] =
+            serde_json::json!(8_000_000_000_000_u64);
         response["result"]["connector"] = connector;
         serde_json::to_string(&response).unwrap()
     }
@@ -1143,6 +1215,81 @@ mod tests {
                 &ManagementLaunchKey::DefaultProduction
             ),
             Ok(())
+        );
+        assert!(
+            state
+                .call(MobileRelayV2ManagementOperation::Status)
+                .unwrap()
+                .ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_start_and_restore_refresh_before_connector_admission() {
+        const NOW_MS: u64 = 1_900_000_000_000;
+        let ids = [
+            [41; 16], [42; 16], [43; 16], [44; 16], [45; 16], [46; 16], [47; 16],
+        ];
+        let stopped_connector = serde_json::json!({"status": "stopped"});
+        let starting_connector = serde_json::json!({"status": "starting", "hostId": "mac-admin"});
+        let response = |request_id, connector: serde_json::Value, expires_at_ms| {
+            let mut value: serde_json::Value = serde_json::from_str(
+                &command_regression_projection_response(request_id, connector),
+            )
+            .unwrap();
+            value["result"]["hostCredential"]["expiresAtMs"] = serde_json::json!(expires_at_ms);
+            serde_json::to_string(&value).unwrap()
+        };
+        let responses = [
+            response(ids[0], stopped_connector.clone(), NOW_MS),
+            response(ids[1], stopped_connector.clone(), NOW_MS + 3_600_000),
+            response(ids[2], starting_connector.clone(), NOW_MS + 3_600_000),
+            response(ids[3], stopped_connector.clone(), NOW_MS - 1),
+            response(ids[4], stopped_connector, NOW_MS + 7_200_000),
+            response(ids[5], starting_connector.clone(), NOW_MS + 7_200_000),
+            response(ids[6], starting_connector, NOW_MS + 7_200_000),
+        ];
+        let request_ids = ids.map(command_regression_request_id);
+        let script = format!(
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; while IFS= read -r request; do case \"$request\" in *'{}'*) case \"$request\" in *'\"operation\":\"status\"'*) printf '%s\\n' '{}' ;; *) exit 91 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"refresh_host\"'*) printf '%s\\n' '{}' ;; *) exit 92 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"start_connector\"'*) printf '%s\\n' '{}' ;; *) exit 93 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"status\"'*) printf '%s\\n' '{}' ;; *) exit 94 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"refresh_host\"'*) printf '%s\\n' '{}' ;; *) exit 95 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"start_connector\"'*) printf '%s\\n' '{}' ;; *) exit 96 ;; esac ;; *'{}'*) case \"$request\" in *'\"operation\":\"status\"'*) printf '%s\\n' '{}' ;; *) exit 97 ;; esac ;; *) exit 98 ;; esac; done",
+            request_ids[0],
+            responses[0],
+            request_ids[1],
+            responses[1],
+            request_ids[2],
+            responses[2],
+            request_ids[3],
+            responses[3],
+            request_ids[4],
+            responses[4],
+            request_ids[5],
+            responses[5],
+            request_ids[6],
+            responses[6],
+        );
+        let manager = ManagementChildManager::start_v2_command_regression_script_with_request_ids(
+            script,
+            ids.to_vec(),
+        )
+        .unwrap();
+        let state = MobileRelayV2ManagementCommandState::from_start(Ok(manager));
+
+        assert_eq!(
+            state.restore_self_hosted_connector_desired_state_with_now(
+                &ManagementLaunchKey::DefaultProduction,
+                NOW_MS,
+            ),
+            Ok(()),
+        );
+        assert!(
+            state
+                .start_self_hosted_connector_with_now(
+                    &ManagementLaunchKey::DefaultProduction,
+                    NOW_MS,
+                )
+                .unwrap()
+                .ok
         );
         assert!(
             state
