@@ -11,6 +11,7 @@ const canonicalBackendIdentity = await import("../dist/relay/v2/canonicalBackend
 const hostState = await import("../dist/relay/v2/hostState.js");
 const terminalDurable = await import("../dist/relay/v2/terminalDurableLineage.js");
 const terminal = await import("../dist/relay/v2/terminalManager.js");
+const terminalControl = await import("../dist/terminalControl/index.js");
 const fixtures = loadRelayV2FixtureCorpus();
 
 const HOST_ID = "mac-admin";
@@ -288,12 +289,15 @@ class FakeResolver {
 
   calls = [];
   fenceCalls = [];
+  resolveResults = [];
   resolved = clone(CANONICAL_RESOLUTION);
 
   async resolve(input) {
     this.trace.push("resolver.resolve");
     this.calls.push(clone(input));
-    return clone(this.resolved);
+    const result = this.resolveResults.shift();
+    if (result instanceof Error) throw result;
+    return clone(result ?? this.resolved);
   }
 
   fenceSessionForAdmission(transaction, resolution) {
@@ -1538,6 +1542,70 @@ test("exact preparation failure has zero global backend or control effects", asy
     release: h.authority.releaseCalls.length,
   }, baseline);
   assert.equal(lineage.opens.get(lineage.claimOpenCalls.at(-1).key).preparedBinding, undefined);
+});
+
+test("retryable exact-target pressure releases RESET claim for same-openId recovery", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-reset-pressure-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
+    const resolver = new FakeResolver();
+    const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store,
+      admissionFence: resolver,
+      now: () => 1_000_000,
+    });
+    const h = harness({
+      resolver,
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+    });
+    const fatalErrors = [];
+    const recovery = terminal.captureRelayV2TerminalManagerRecoveryBinding(h.manager, lineage);
+    assert.equal(recovery.installFatalSink((error) => fatalErrors.push(error)), true);
+
+    const sourceRequest = goldenOpen({
+      requestId: "reset-pressure-source",
+      streamId: "reset-pressure-stream",
+      openId: "reset-pressure-source-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+    });
+    await h.manager.open(sourceRequest);
+    const source = opened(h.sent, sourceRequest.requestId);
+    await h.backend.opens[0].handle.emitRaw({
+      byteLength: h.manager.limits.maxFrameBytes + 1,
+    });
+    assert.equal(h.sent.at(-1).frame.payload.reason, "stream_lost");
+
+    resolver.resolveResults.push(new terminalControl.TerminalControlProtocolError(
+      "RESOURCE_EXHAUSTED",
+      "terminal-control is busy",
+      true,
+    ));
+    const reset = goldenOpen({
+      requestId: "reset-pressure-first",
+      streamId: sourceRequest.streamId,
+      openId: "reset-pressure-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+    await assert.rejects(h.manager.open(reset), managerError("BUSY"));
+    assert.equal(fatalErrors.length, 0);
+
+    await h.manager.open({ ...reset, requestId: "reset-pressure-retry" });
+    const recovered = opened(h.sent, "reset-pressure-retry");
+    assert.equal(recovered.payload.disposition, "reset");
+    assert.notEqual(recovered.payload.generation, source.payload.generation);
+    assert.equal(h.backend.opens.length, 2);
+    assert.equal(fatalErrors.length, 0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("divergent local cleanup waits for durable failure settlement", async () => {

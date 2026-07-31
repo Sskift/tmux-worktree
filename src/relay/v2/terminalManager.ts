@@ -546,6 +546,10 @@ export type RelayV2TerminalDurableOpenPrepareResult =
     }
   | RelayV2TerminalDurableOpenReplayResult;
 
+export type RelayV2TerminalDurableOpenReleaseResult =
+  | { status: "released" }
+  | RelayV2TerminalDurableOpenReplayResult;
+
 export type RelayV2TerminalDurableStreamReleaseResult =
   | { status: "released" }
   | { status: "already_released" }
@@ -638,6 +642,17 @@ export interface RelayV2TerminalDurableLineage {
       | { kind: "current"; resolution: RelayV2TerminalCanonicalResolution }
       | { kind: "retained"; binding: RelayV2TerminalCanonicalTargetBindingV1 };
   }): Promise<RelayV2TerminalDurableOpenPrepareResult>;
+  /**
+   * Atomically removes only this exact still-pending, unprepared claim. This is
+   * the sole retry seam before an exact target binding or backend effect exists.
+   */
+  releaseUnpreparedOpenClaim(input: {
+    key: string;
+    fingerprint: string;
+    hostInstanceId: string;
+    claimToken: string;
+    fence: string;
+  }): Promise<RelayV2TerminalDurableOpenReleaseResult>;
   completeOpen(input: {
     key: string;
     fingerprint: string;
@@ -3536,8 +3551,10 @@ export class RelayV2TerminalManager {
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
   ): Promise<RelayV2TerminalCanonicalResolution | null> {
     let resolution: RelayV2TerminalCanonicalResolution;
+    let resolvingExactTarget = true;
     try {
       resolution = await this.resolveTarget(request);
+      resolvingExactTarget = false;
       const prepared = await this.lineage.prepareOpen({
         key: recordKey,
         fingerprint: requestFingerprint,
@@ -3578,6 +3595,47 @@ export class RelayV2TerminalManager {
       }
       return resolution;
     } catch (error) {
+      const targetError = error && typeof error === "object"
+        ? error as Record<string, unknown>
+        : null;
+      if (resolvingExactTarget
+        && targetError?.code === "RESOURCE_EXHAUSTED"
+        && targetError.retryable === true) {
+        const released = await this.lineage.releaseUnpreparedOpenClaim({
+          key: recordKey,
+          fingerprint: requestFingerprint,
+          hostInstanceId: this.hostInstanceId,
+          claimToken: claimAuthority.claimToken,
+          fence: claimAuthority.fence,
+        });
+        if (!released || typeof released !== "object" || typeof released.status !== "string") {
+          throw new RelayV2TerminalManagerError(
+            "INTERNAL",
+            "durable terminal unprepared claim release is invalid",
+          );
+        }
+        if (released.status === "replay") {
+          await this.reconcileAndReplayDurableOpen(
+            request,
+            key,
+            recordKey,
+            requestFingerprint,
+            released,
+          );
+          return null;
+        }
+        if (released.status !== "released"
+          || !hasExactOwnKeys(released, ["status"])) {
+          throw new RelayV2TerminalManagerError(
+            "INTERNAL",
+            "durable terminal unprepared claim release is invalid",
+          );
+        }
+        throw new RelayV2TerminalManagerError(
+          "BUSY",
+          "exact terminal target preparation is busy",
+        );
+      }
       const message = error instanceof RelayV2TerminalManagerError
         && error.code === "CAPABILITY_UNAVAILABLE"
         ? error.message

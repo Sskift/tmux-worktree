@@ -21,6 +21,7 @@ import {
   type RelayV2TerminalDurableOpenCommitResult,
   type RelayV2TerminalDurableOpenOutcome,
   type RelayV2TerminalDurableOpenPrepareResult,
+  type RelayV2TerminalDurableOpenReleaseResult,
   type RelayV2TerminalDurableOpenReplayResult,
   type RelayV2TerminalDurableStreamAuthority,
   type RelayV2TerminalDurableStreamClosedResult,
@@ -1909,6 +1910,85 @@ export class RelayV2TerminalDurableLineageAuthority
     return this.settleOpen(input, undefined);
   }
 
+  async releaseUnpreparedOpenClaim(rawInput: {
+    key: string;
+    fingerprint: string;
+    hostInstanceId: string;
+    claimToken: string;
+    fence: string;
+  }): Promise<RelayV2TerminalDurableOpenReleaseResult> {
+    const input = this.validateOpenClaimAuthority(rawInput);
+    const result = await this.store.serialize((section) => {
+      const authorityExpiresAtMs = this.authorityRetentionExpiresAtMs();
+      const mutate = (transaction: RelayV2HostStateTransaction) => {
+        const state = this.stateForTransaction(transaction);
+        this.cleanup(state);
+        this.prepareOwner(state, authorityExpiresAtMs);
+        const index = state.openRecords.findIndex((candidate) => candidate.key === input.key);
+        if (index < 0) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal unprepared open claim is missing",
+          );
+        }
+        const record = state.openRecords[index]!;
+        if (record.fingerprint !== input.fingerprint
+          || record.ownerHostInstanceId !== input.hostInstanceId
+          || record.claimToken !== input.claimToken
+          || record.fence !== input.fence) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal unprepared open claim owner is mismatched",
+          );
+        }
+        if (record.status === "final") {
+          return { result: replayOpenResult(record), state };
+        }
+        if (record.preparedBinding !== null) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal prepared open claim cannot be released for retry",
+          );
+        }
+        state.openRecords.splice(index, 1);
+        return { result: { status: "released" } as const, state };
+      };
+      return this.commitAndReconcile<RelayV2TerminalDurableOpenReleaseResult>(
+        section,
+        mutate,
+        (snapshot) => {
+          const state = this.stateFromSnapshot(snapshot);
+          if (state.activeHostInstanceId !== this.hostInstanceId) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal unprepared open claim release lost process authority",
+            );
+          }
+          const record = state.openRecords.find(
+            (candidate) => candidate.key === input.key,
+          );
+          if (!record) return { status: "released" };
+          if (record.fingerprint !== input.fingerprint
+            || record.ownerHostInstanceId !== input.hostInstanceId
+            || record.claimToken !== input.claimToken
+            || record.fence !== input.fence) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal unprepared open claim release crossed authority",
+            );
+          }
+          if (record.status === "final") return replayOpenResult(record);
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal unprepared open claim release remained pending",
+          );
+        },
+      );
+    });
+    this.activated = true;
+    return result;
+  }
+
   async failOpen(input: {
     key: string;
     fingerprint: string;
@@ -2932,6 +3012,29 @@ export class RelayV2TerminalDurableLineageAuthority
       );
     }
     return { ...value, outcome };
+  }
+
+  private validateOpenClaimAuthority(value: {
+    key: string;
+    fingerprint: string;
+    hostInstanceId: string;
+    claimToken: string;
+    fence: string;
+  }): typeof value {
+    if (!isRecord(value)
+      || !exactKeys(value, ["key", "fingerprint", "hostInstanceId", "claimToken", "fence"])
+      || !isDurableKey(value.key)
+      || !isFingerprint(value.fingerprint)
+      || !isOpaque(value.hostInstanceId)
+      || value.hostInstanceId !== this.hostInstanceId
+      || !isOpaque(value.claimToken)
+      || !isOpaque(value.fence)) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",
+        "Relay v2 terminal open claim authority input is invalid",
+      );
+    }
+    return value;
   }
 
   private validateStreamEffect(
