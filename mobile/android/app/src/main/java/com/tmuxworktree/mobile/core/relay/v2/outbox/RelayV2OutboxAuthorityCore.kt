@@ -1308,10 +1308,10 @@ internal class RelayV2OutboxAuthorityCore(
                 } else {
                     RelayV2OutboxStateTag.CONFIRMING
                 }
-                val updated = entry.appendAttempt(
+                val updated = entry.appendRecoveryQueryAttempt(
                     requestId,
-                    RelayV2OutboxAttemptKind.QUERY,
                     queryState,
+                    capacity.maxAttemptsPerEntry,
                 )
                 mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
                 RelayV2OutboxQueryItem(updated.id, updated.dedupeWindowId)
@@ -1544,10 +1544,9 @@ internal class RelayV2OutboxAuthorityCore(
             if (state.hasAttemptRequestId(retry.attemptRequestId)) {
                 return state.reject(RelayV2OutboxRejection.DUPLICATE_ATTEMPT_REQUEST_ID)
             }
-            val updated = entry.appendAttempt(
+            val updated = entry.appendRetryExecuteAttempt(
                 retry.attemptRequestId,
-                RelayV2OutboxAttemptKind.EXECUTE,
-                RelayV2OutboxStateTag.SENDING,
+                capacity.maxAttemptsPerEntry,
             )
             val attempt = updated.attempts.last()
             return apply(
@@ -1916,6 +1915,49 @@ private fun RelayV2OutboxEntry.appendAttempt(
     attempts = attempts + RelayV2OutboxAttempt(requestId, kind, attempts.size + 1),
     state = nextState,
 )
+
+private fun RelayV2OutboxEntry.appendRecoveryQueryAttempt(
+    requestId: String,
+    nextState: RelayV2OutboxStateTag,
+    maxAttempts: Int,
+): RelayV2OutboxEntry {
+    val retained = if (attempts.size < maxAttempts) {
+        attempts
+    } else {
+        // This action is committed under the exact current recovery-generation lease. The new
+        // query supersedes prior query windows, while the newest execute remains potentially
+        // unresolved until this query returns authoritative evidence.
+        attempts.lastOrNull {
+            it.kind == RelayV2OutboxAttemptKind.EXECUTE
+        }?.let { listOf(it.copy(ordinal = 1)) }.orEmpty()
+    }
+    return copy(
+        attempts = retained + RelayV2OutboxAttempt(
+            requestId,
+            RelayV2OutboxAttemptKind.QUERY,
+            retained.size + 1,
+        ),
+        state = nextState,
+    )
+}
+
+private fun RelayV2OutboxEntry.appendRetryExecuteAttempt(
+    requestId: String,
+    maxAttempts: Int,
+): RelayV2OutboxEntry {
+    // The caller reaches this append only after exact authoritative not_accepted evidence. At
+    // saturation that evidence settles every prior attempt; replacing them and publishing the
+    // authorized successor execute therefore forms one atomic durable cut.
+    val retained = attempts.takeIf { it.size < maxAttempts }.orEmpty()
+    return copy(
+        attempts = retained + RelayV2OutboxAttempt(
+            requestId,
+            RelayV2OutboxAttemptKind.EXECUTE,
+            retained.size + 1,
+        ),
+        state = RelayV2OutboxStateTag.SENDING,
+    )
+}
 
 private fun RelayV2OutboxEntry.reissueTargetSnapshot(): RelayV2ReissueTargetSnapshot =
     RelayV2ReissueTargetSnapshot(

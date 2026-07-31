@@ -1700,6 +1700,127 @@ class RelayV2OutboxAuthorityCoreTest {
     }
 
     @Test
+    fun `saturated recovery compacts mixed attempts for query and authoritative retry`() {
+        var state = enqueue(
+            RelayV2OutboxState.empty(),
+            draft(
+                commandId = "saturated-create-terminal",
+                sessionId = null,
+                arguments = RelayV2OutboxArguments.createTerminal("/tmp"),
+            ),
+            createdAtMillis = 0,
+        ).state
+        var entry = state.entries.single()
+        state = dispatch(state, mapOf(entry.id to "execute-1")).state
+        var sixtyThreeExecutes: RelayV2OutboxState? = null
+        for (ordinal in 2..RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY) {
+            entry = state.entries.single()
+            state = applied(
+                core.reduce(
+                    state,
+                    RelayV2OutboxAction.ReconcileStatus(
+                        retryableNotAccepted(entry),
+                        RelayV2OutboxRecovery.RetrySameCommand("execute-$ordinal"),
+                    ),
+                ),
+            ).state
+            if (ordinal == RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY - 1) {
+                sixtyThreeExecutes = state
+            }
+        }
+        entry = state.entries.single()
+        assertEquals(
+            RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY,
+            entry.attempts.size,
+        )
+        assertTrue(entry.attempts.all { it.kind == RelayV2OutboxAttemptKind.EXECUTE })
+        assertEquals("execute-64", entry.attempts.last().requestId)
+
+        val queried = applied(
+            core.reduce(
+                state,
+                RelayV2OutboxAction.BeginQueries(
+                    entryIds = listOf(entry.id),
+                    attemptRequestIds = listOf("recovered-query"),
+                ),
+            ),
+        )
+        val recovered = queried.state.entries.single()
+        assertEquals(RelayV2OutboxStateTag.CONFIRMING, recovered.state)
+        assertEquals(
+            listOf("execute-64", "recovered-query"),
+            recovered.attempts.map { it.requestId },
+        )
+        assertEquals(
+            listOf(RelayV2OutboxAttemptKind.EXECUTE, RelayV2OutboxAttemptKind.QUERY),
+            recovered.attempts.map { it.kind },
+        )
+        assertEquals(listOf(1, 2), recovered.attempts.map { it.ordinal })
+        val effect = queried.effects.single() as RelayV2OutboxEffect.QueryCommands
+        assertEquals("recovered-query", effect.attemptRequestId)
+        assertEquals(listOf(entry.id), effect.items.map { it.entryId })
+
+        val beforeMixedSaturation = requireNotNull(sixtyThreeExecutes)
+        val beforeMixedEntry = beforeMixedSaturation.entries.single()
+        val saturatedMixed = applied(
+            core.reduce(
+                beforeMixedSaturation,
+                RelayV2OutboxAction.BeginQueries(
+                    entryIds = listOf(beforeMixedEntry.id),
+                    attemptRequestIds = listOf("saturating-query"),
+                ),
+            ),
+        ).state
+        val saturatedMixedEntry = saturatedMixed.entries.single()
+        assertEquals(
+            RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY,
+            saturatedMixedEntry.attempts.size,
+        )
+        assertEquals(RelayV2OutboxAttemptKind.QUERY, saturatedMixedEntry.attempts.last().kind)
+
+        val mixedQueried = applied(
+            core.reduce(
+                saturatedMixed,
+                RelayV2OutboxAction.BeginQueries(
+                    entryIds = listOf(saturatedMixedEntry.id),
+                    attemptRequestIds = listOf("replacement-query"),
+                ),
+            ),
+        ).state.entries.single()
+        assertEquals(
+            listOf("execute-63", "replacement-query"),
+            mixedQueried.attempts.map { it.requestId },
+        )
+        assertEquals(
+            listOf(RelayV2OutboxAttemptKind.EXECUTE, RelayV2OutboxAttemptKind.QUERY),
+            mixedQueried.attempts.map { it.kind },
+        )
+
+        val saturatedRetry = applied(
+            core.reduce(
+                saturatedMixed,
+                RelayV2OutboxAction.ReconcileStatus(
+                    retryableNotAccepted(saturatedMixedEntry),
+                    RelayV2OutboxRecovery.RetrySameCommand("execute-after-saturation"),
+                ),
+            ),
+        )
+        val retried = saturatedRetry.state.entries.single()
+        assertEquals(RelayV2OutboxStateTag.SENDING, retried.state)
+        assertEquals(
+            listOf("execute-after-saturation"),
+            retried.attempts.map { it.requestId },
+        )
+        assertEquals(
+            listOf(RelayV2OutboxAttemptKind.EXECUTE),
+            retried.attempts.map { it.kind },
+        )
+        assertEquals(listOf(1), retried.attempts.map { it.ordinal })
+        val retryEffect = saturatedRetry.effects.single() as RelayV2OutboxEffect.ExecuteCommand
+        assertEquals("execute-after-saturation", retryEffect.attempt.requestId)
+    }
+
+    @Test
     fun `action collection bounds reject overflow and snapshot boundary inputs`() {
         val mutableEntryIds = MutableList(RelayV2OutboxLimits.MAX_ENTRIES) { index ->
             RelayV2OutboxEntryId(
@@ -2234,7 +2355,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val oneAttemptCore = RelayV2OutboxAuthorityCore(
             RelayV2OutboxCapacity(maxAttemptsPerEntry = 1),
         )
-        val retryRejected = rejected(
+        val compactedRetry = applied(
             oneAttemptCore.reduce(
                 sent,
                 RelayV2OutboxAction.ReconcileStatus(
@@ -2243,8 +2364,10 @@ class RelayV2OutboxAuthorityCoreTest {
                 ),
             ),
         )
-        assertEquals(RelayV2OutboxRejection.CAPACITY_EXCEEDED, retryRejected.reason)
-        assertEquals(listOf("first-attempt"), retryRejected.state.entries.single().attempts.map { it.requestId })
+        assertEquals(
+            listOf("second-attempt"),
+            compactedRetry.state.entries.single().attempts.map { it.requestId },
+        )
 
         val tinyCanonicalCore = RelayV2OutboxAuthorityCore(
             RelayV2OutboxCapacity(
