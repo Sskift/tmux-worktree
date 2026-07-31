@@ -1615,6 +1615,90 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `online final evidence continues same generation FIFO dispatch`() = runBlocking {
+        val core = RelayV2OutboxAuthorityCore()
+        var outbox = RelayV2OutboxState.empty()
+        listOf("fifo-head", "fifo-next", "fifo-tail").forEachIndexed { index, commandId ->
+            outbox = applied(
+                core.reduce(
+                    outbox,
+                    RelayV2OutboxAction.Enqueue(
+                        RelayV2OutboxDraft(
+                            profileId = PROFILE_ID,
+                            principalId = PRINCIPAL_ID,
+                            hostId = HOST_ID,
+                            expectedHostEpoch = HOST_EPOCH,
+                            dedupeWindowId = "window-$commandId",
+                            commandId = commandId,
+                            scopeId = "scope-fifo",
+                            sessionId = "session-fifo",
+                            arguments = RelayV2OutboxArguments.killSession(),
+                        ),
+                        createdAtMillis = index.toLong() + 1,
+                    ),
+                ),
+            ).state
+        }
+        val head = outbox.entries.first()
+        outbox = applied(
+            core.reduce(
+                outbox,
+                RelayV2OutboxAction.DispatchEligible(
+                    mapOf(head.id to "initial-fifo-head"),
+                    effectBudget = 1,
+                ),
+            ),
+        ).state
+        val harness = Harness(autoConnect = true, outbox = outbox)
+        try {
+            val query = harness.connectToCommandQuery()
+            assertEquals(
+                listOf("fifo-head"),
+                query.payloadReadOnly().objectList("items").map {
+                    it.stringValue("commandId")
+                },
+            )
+            harness.transport().sendCommandStatuses(query, StatusMode.ACCEPTED)
+            harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+            assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
+
+            harness.transport().sendCommandResult(
+                "fifo-head",
+                scopeId = "scope-fifo",
+                sessionId = "session-fifo",
+            )
+            val next = harness.transport().awaitSentType("command.execute")
+            assertEquals("fifo-next", next.stringValue("commandId"))
+            assertEquals(
+                listOf(
+                    RelayV2OutboxStateTag.SUCCEEDED,
+                    RelayV2OutboxStateTag.SENDING,
+                    RelayV2OutboxStateTag.QUEUED,
+                ),
+                harness.authority.outboxState().entries.map { it.state },
+            )
+
+            harness.transport().sendCommandResult(
+                "fifo-next",
+                scopeId = "scope-fifo",
+                sessionId = "session-fifo",
+            )
+            val tail = harness.transport().awaitSentType("command.execute", index = 1)
+            assertEquals("fifo-tail", tail.stringValue("commandId"))
+            assertEquals(
+                listOf("fifo-next", "fifo-tail"),
+                harness.transport().framesOfType("command.execute").map {
+                    it.stringValue("commandId")
+                },
+            )
+            assertEquals(1, harness.factory.requests.size)
+            assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
     fun `recovered retry dispatches only after actor publishes online ready`() = runBlocking {
         val harness = Harness(
             autoConnect = true,
@@ -4378,7 +4462,11 @@ class RelayV2BaseRuntimeCompositionTest {
             )
         }
 
-        fun sendCommandResult(commandId: String) {
+        fun sendCommandResult(
+            commandId: String,
+            scopeId: String = "scope-$commandId",
+            sessionId: String = "session-$commandId",
+        ) {
             sendFrame(
                 linkedMapOf(
                     "protocolVersion" to 2L,
@@ -4387,14 +4475,14 @@ class RelayV2BaseRuntimeCompositionTest {
                     "commandId" to commandId,
                     "hostId" to HOST_ID,
                     "hostEpoch" to HOST_EPOCH,
-                    "scopeId" to "scope-$commandId",
-                    "sessionId" to "session-$commandId",
+                    "scopeId" to scopeId,
+                    "sessionId" to sessionId,
                     "payload" to linkedMapOf(
                         "dedupeWindowId" to "window-$commandId",
                         "state" to "succeeded",
                         "updatedAtMs" to NOW_MS,
                         "result" to linkedMapOf(
-                            "sessionId" to "session-$commandId",
+                            "sessionId" to sessionId,
                             "terminated" to true,
                         ),
                     ),

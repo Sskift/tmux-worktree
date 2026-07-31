@@ -23,6 +23,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
@@ -1577,10 +1578,18 @@ internal class RelayV2BaseRuntimeComposition(
         }
         val onlyEffect = evidence.effects.singleOrNull()
         when (onlyEffect) {
-            null -> if (evidence.effects.isNotEmpty() ||
-                issuance != RelayV2OutboxDispatchIssuance.NoDispatch
-            ) {
-                failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+            null -> {
+                if (evidence.effects.isNotEmpty() ||
+                    issuance != RelayV2OutboxDispatchIssuance.NoDispatch
+                ) {
+                    failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+                    return
+                }
+                if (evidence.receipt.state == RelayV2CommandStatusState.SUCCEEDED ||
+                    evidence.receipt.state == RelayV2CommandStatusState.FAILED
+                ) {
+                    dispatchFresh(delivered.repositoryAuthority)
+                }
             }
             is RelayV2OutboxEffect.ExecuteCommand -> {
                 val issued = issuance as? RelayV2OutboxDispatchIssuance.Issued
