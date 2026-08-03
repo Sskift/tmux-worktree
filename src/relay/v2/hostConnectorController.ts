@@ -822,6 +822,11 @@ implements RelayV2HostConnectorControllerPort {
     })();
     void record.drainPromise.catch(() => {
       record.drainFailed = true;
+      // A failed drain permanently poisons this process-local controller: the
+      // predecessor is no longer proven closed, so a successor attempt is not
+      // safe. Keep the published cut consistent with start(), which will now
+      // fail OPERATION_FAILED rather than accepting a retry.
+      record.retryable = false;
       this.#drainPoisoned = true;
     });
     return record.drainPromise;

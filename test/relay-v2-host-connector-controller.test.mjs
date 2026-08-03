@@ -287,6 +287,35 @@ test("an exact synchronous capability fence retires the attempt before drain", a
   assert.equal((await retry).controllerGeneration, "2");
 });
 
+test("a failed drain withdraws the retryable cut before rejecting successors", async () => {
+  const h = harness();
+  const registered = await registeredAttempt(h);
+  registered.record.drainGate = deferred();
+
+  registered.record.fenceAttempt({
+    reason: "capability_withdrawn",
+    controllerGeneration: registered.cut.controllerGeneration,
+    carrierAttemptGeneration: registered.record.carrierAttemptGeneration,
+    offerGeneration: "4",
+  });
+  assert.equal(h.controller.inspectCut().retryable, true);
+
+  registered.record.drainGate.reject(new Error("injected drain failure"));
+  await nextTurn();
+  assert.deepEqual(h.controller.inspectCut(), {
+    status: "failed",
+    retryable: false,
+    controllerGeneration: "1",
+    connectorId: "broker-connector-one",
+    ...IDENTITY,
+  });
+  await assert.rejects(
+    h.controller.start(startInput("controller.after-failed-drain")),
+    (error) => isControllerFailure(error, "OPERATION_FAILED"),
+  );
+  assert.equal(h.records.length, 1, "an undrained predecessor forbids a successor attempt");
+});
+
 test("old stop and callbacks cannot affect a replacement generation", async () => {
   const h = harness();
   const loser = await registeredAttempt(h, "controller.start-loser", "loser", 3);
