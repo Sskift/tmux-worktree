@@ -2743,6 +2743,48 @@ test("carrier takeover and transport teardown never invent command or terminal f
   assert.equal(JSON.stringify(unbind.frame).includes("terminal.closed"), false);
 });
 
+test("client unbind drains an already-emitted Host frame without dropping the carrier", async () => {
+  const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(core, "host-unbind-inflight");
+  const route = await openRoute(
+    core,
+    "host-unbind-inflight",
+    "client-unbind-inflight",
+  );
+
+  assert.equal(core.unbindClient(route.connectionId, "client_closed").accepted, true);
+  const [unbind] = core.drainHostCarrier("host-unbind-inflight", { maxFrames: 1 });
+  assert.equal(unbind.frame.type, "route.unbind");
+  core.acknowledgeHostDelivery("host-unbind-inflight", unbind.deliveryId);
+
+  const lateFrame = await core.receiveHostFrame(
+    "host-unbind-inflight",
+    carrierBytes(hostRouteDataBytes(
+      route.routeOpen,
+      "1",
+      publicBytes(hostTerminalAck()),
+    )),
+  );
+  assert.equal(lateFrame.accepted, true);
+  assert.equal(lateFrame.actions.some((action) => action.kind === "close_host"), false);
+  assert.equal(core.drainClient(route.connectionId).length, 0);
+
+  const completed = await core.receiveHostFrame("host-unbind-inflight", carrierBytes({
+    carrierVersion: 1,
+    type: "route.unbound",
+    connectorId: unbind.frame.connectorId,
+    routeId: unbind.frame.routeId,
+    routeFence: unbind.frame.routeFence,
+    payload: {
+      reason: unbind.frame.payload.reason,
+      lastClientToHostSeq: unbind.frame.payload.lastClientToHostSeq,
+      lastHostToClientSeq: "1",
+    },
+  }));
+  assert.equal(completed.accepted, true);
+  assert.equal(core.inspectHost(HOST_ID).state, "online");
+});
+
 test("frame-count pressure resumes only below the 64-frame low water and closes after five seconds", async () => {
   let now = NOW_MS;
   const core = new broker.RelayV2BrokerCore({ now: () => now });

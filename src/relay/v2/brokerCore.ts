@@ -2824,11 +2824,15 @@ export class RelayV2BrokerCore {
 
   private routeDataFromHost(carrier: CarrierState, frame: RelayV2JsonObject): RelayV2BrokerResult {
     const route = this.currentRouteForFrame(carrier, frame);
-    if (!route || route.status !== "opened" || frame.direction !== "host_to_client") {
+    if (!route
+      || (route.status !== "opened" && route.status !== "closing")
+      || frame.direction !== "host_to_client") {
       return this.protocolViolation(carrier, "stale_route_data");
     }
+    const closing = route.status === "closing";
     const clientAuthorization = this.clients.get(route.connectionId);
-    if (!clientAuthorization || !this.isClientAuthorizationActive(clientAuthorization)) {
+    if (!closing
+      && (!clientAuthorization || !this.isClientAuthorizationActive(clientAuthorization))) {
       return this.failure("AUTH_INVALID", "Client authorization is fenced");
     }
     const seq = BigInt(frame.seq as string);
@@ -2852,14 +2856,30 @@ export class RelayV2BrokerCore {
     ) {
       return this.protocolViolation(carrier, "forged_public_identity");
     }
-    const client = this.clients.get(route.connectionId);
-    if (!client) return this.protocolViolation(carrier, "route_client_missing");
     const responseRequestId = publicFrame.kind === "response"
       ? publicFrame.requestId as string
       : null;
     if (responseRequestId !== null && !route.inFlightRequestIds.has(responseRequestId)) {
       return this.protocolViolation(carrier, "uncorrelated_public_response");
     }
+    if (closing) {
+      if (decodedPublicFrame.lane === "agent_extension"
+        && !this.agentExtensionNegotiatedForRoute(route)
+        && route.agentExtensionDisposition !== "withdrawn") {
+        return this.protocolViolation(carrier, "unnegotiated_agent_extension");
+      }
+      // route.unbind and already-emitted Host data cross in opposite transport
+      // directions. The Host's route.unbound watermark proves which contiguous
+      // frames were emitted before it observed the fence. Validate and consume
+      // those frames without forwarding them to the closed client; rejecting
+      // one here would turn an ordinary client disconnect into a carrier-wide
+      // protocol failure.
+      route.expectedHostToClientSeq += 1n;
+      if (responseRequestId !== null) route.inFlightRequestIds.delete(responseRequestId);
+      return { accepted: true, actions: [] };
+    }
+    const client = this.clients.get(route.connectionId);
+    if (!client) return this.protocolViolation(carrier, "route_client_missing");
     let outboundBytes = bytes;
     if (publicFrame.type === "host.welcome") {
       const welcomePayload = publicFrame.payload as RelayV2JsonObject;
