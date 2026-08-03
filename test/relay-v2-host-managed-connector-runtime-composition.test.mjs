@@ -58,6 +58,7 @@ const terminal = await import("../dist/relay/v2/terminalManager.js");
 
 const HOST_ID = "mac-admin";
 const CREDENTIAL_REFERENCE = "relay-v2-host-credential-ref:managed-primary";
+const AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY = "agent.transcript-lifecycle.v1";
 const corpus = loadRelayV2FixtureCorpus();
 const dashboardManagementContract = JSON.parse(readFileSync(new URL(
   "../contracts/dashboard-relay-v2-management/v2/cases.json",
@@ -161,6 +162,30 @@ class ControlledInput {
 
 function readinessReady(snapshot) {
   return Object.values(snapshot.capabilities).every((ready) => ready === true);
+}
+
+function readyAgentTranscriptLifecycleAttachment() {
+  return Object.freeze({
+    capability: AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+    subscribe(sink) {
+      sink.apply(true);
+      return Object.freeze({ unsubscribe() {} });
+    },
+    inspectRequest() {
+      throw new Error("unexpected Agent extension request inspection");
+    },
+    async authorize() {
+      return false;
+    },
+    async handleRequest() {
+      throw new Error("unexpected Agent extension request handling");
+    },
+    handleUnavailableRequest() {
+      throw new Error("unexpected Agent extension unavailable response");
+    },
+    isolateFailure() {},
+    async closeAndDrain() {},
+  });
 }
 
 class QueueDiscovery {
@@ -581,6 +606,9 @@ async function createHarness(options = {}) {
       },
     },
   };
+  if (options.optionalExtension !== undefined) {
+    runtimeOptions.optionalExtension = options.optionalExtension;
+  }
   const carrierOptions = {
     idFactory: () => `managed-host-hello-${++helloSequence}`,
     clock: options.carrierClock ?? (() => 1_783_700_100_000),
@@ -1923,6 +1951,31 @@ test("local-development activation advertises the atomic full offer and becomes 
     assert.equal(frames[1].requestId, query.requestId);
   } finally {
     await h.cleanup();
+  }
+});
+
+test("managed Host hello snapshots only the runtime-ready Agent capability", async () => {
+  const ready = await createHarness({
+    optionalExtension: readyAgentTranscriptLifecycleAttachment(),
+  });
+  try {
+    const { record } = await startRegistered(ready, "managed.agent-capability.ready");
+    assert.deepEqual(record.hello.payload.capabilities, [
+      ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
+      AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+    ]);
+  } finally {
+    await ready.cleanup();
+  }
+
+  const absent = await createHarness();
+  try {
+    const { record } = await startRegistered(absent, "managed.agent-capability.absent");
+    assert.deepEqual(record.hello.payload.capabilities, [
+      ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
+    ]);
+  } finally {
+    await absent.cleanup();
   }
 });
 
