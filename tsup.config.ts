@@ -13,6 +13,7 @@ export default defineConfig({
     "src/state.ts",
     "src/relayHost.ts",
     "src/relayServer.ts",
+    "src/relay/broker/options.ts",
     "src/relay/broker/hostBootstrapOutput.ts",
     "src/relay/v2/hostCarrier.ts",
     "src/relay/v2/hostConnectorController.ts",
