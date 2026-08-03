@@ -494,16 +494,14 @@ class TerminalWebViewController internal constructor() {
             val readyView = (ownership.view(binding) as? WebView)?.takeIf { isReady }
                 ?: return false
             if (parserMutation != null) return false
-            val timeout = Runnable {
-                completeParserMutation(binding, callbackId, applied = false)
-            }
+            val timeout = Runnable { failParserMutation(callbackId) }
             parserMutation = PendingParserMutation(callbackId, completion, timeout)
             readyView
         }
         val timeout = synchronized(lock) {
             parserMutation?.takeIf { it.callbackId == callbackId }?.timeout
         } ?: return false
-        if (!parserCallbackHandler.postDelayed(timeout, PARSER_CALLBACK_TIMEOUT_MILLIS)) {
+        if (!parserCallbackHandler.postDelayed(timeout, PARSER_SUBMISSION_TIMEOUT_MILLIS)) {
             synchronized(lock) {
                 if (parserMutation?.callbackId == callbackId) parserMutation = null
             }
@@ -515,7 +513,23 @@ class TerminalWebViewController internal constructor() {
                     isReady &&
                     parserMutation?.callbackId == callbackId
             }
-            if (!current) return@postToView
+            if (!current) {
+                failParserMutation(callbackId)
+                return@postToView
+            }
+            // This deadline bounds xterm's parser mutation, not time spent waiting for an
+            // unattached Android View queue. Terminal assets can finish loading from the local
+            // asset loader before Compose attaches the WebView; starting the clock at registration
+            // would then let the timeout win before this runnable submitted any JavaScript.
+            parserCallbackHandler.removeCallbacks(timeout)
+            if (!parserCallbackHandler.postDelayed(
+                    timeout,
+                    PARSER_CALLBACK_TIMEOUT_MILLIS,
+                )
+            ) {
+                failParserMutation(callbackId)
+                return@postToView
+            }
             // evaluateJavascript submission failure is not itself a parser settlement. Keep the
             // exact mutation pending until TwBridge ACK, the existing bounded timeout, or a view
             // loss cut that takes and holds its false.
@@ -526,23 +540,18 @@ class TerminalWebViewController internal constructor() {
             }
         }
         if (posted) return true
-        // The main-handler timeout remains the bounded fail-closed owner. A renderer-loss callback
-        // already queued by Chromium can therefore publish its synchronous cut before ordinary
-        // false settlement, independent of main-queue callback ordering.
+        // The longer submission deadline remains the bounded fail-closed owner. A renderer-loss
+        // callback already queued by Chromium can still claim and hold its false until the exact
+        // attachment detach barrier completes.
         return true
     }
 
-    private fun completeParserMutation(
-        binding: TerminalWebViewParserBinding,
-        callbackId: String,
-        applied: Boolean,
-    ) {
+    private fun failParserMutation(callbackId: String) {
         val mutation = synchronized(lock) {
-            if (!ownership.owns(binding)) return
             parserMutation?.takeIf { it.callbackId == callbackId }
                 .also { if (it != null) parserMutation = null }
         }
-        settleParserMutation(mutation, applied)
+        settleParserMutation(mutation, applied = false)
     }
 
     private fun settleParserMutation(
@@ -668,6 +677,7 @@ class TerminalWebViewController internal constructor() {
         const val MAX_ACKED_PARSER_BYTES = 65_536
         const val MAX_CALLBACK_ID_CHARS = 256
         const val MAX_ACKED_PARSER_SCRIPT_CHARS = 96 * 1024
+        const val PARSER_SUBMISSION_TIMEOUT_MILLIS = 15_000L
         const val PARSER_CALLBACK_TIMEOUT_MILLIS = 5_000L
         const val TERMINAL_TRUNCATION_MARKER =
             "\r\n[Terminal output truncated: client buffer limit reached]\r\n"
