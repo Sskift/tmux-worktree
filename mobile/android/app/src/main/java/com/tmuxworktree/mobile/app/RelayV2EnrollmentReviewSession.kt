@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.app
 
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ConfirmedEnrollment
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EndpointValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentReviewDraft
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentReviewParser
@@ -118,6 +119,40 @@ internal class RelayV2EnrollmentReviewSession(
     suspend fun offer(rawPayload: String?): RelayV2EnrollmentOfferResult {
         val parsed = RelayV2EnrollmentReviewParser.parse(rawPayload)
             ?: return RelayV2EnrollmentOfferResult.REJECTED
+        return offerParsed(parsed)
+    }
+
+    /**
+     * Settings-only manual ingress for the same canonical enrollment token accepted by QR/Intent.
+     *
+     * The separately entered issuer is an exact review fence: it is never used to rewrite the
+     * token, and a mismatch is rejected before the private draft is installed. The token remains
+     * private to this in-memory owner and reaches no persisted UI state.
+     */
+    suspend fun offerManual(
+        issuerUrl: String?,
+        oneTimeEnrollmentToken: String?,
+    ): RelayV2EnrollmentOfferResult {
+        val expectedIssuerUrl = issuerUrl?.trim().orEmpty()
+        if (!RelayV2EndpointValidator.isIssuerUrl(expectedIssuerUrl)) {
+            return RelayV2EnrollmentOfferResult.REJECTED
+        }
+        val exactToken = oneTimeEnrollmentToken
+            ?: return RelayV2EnrollmentOfferResult.REJECTED
+        if (exactToken != exactToken.trim()) {
+            return RelayV2EnrollmentOfferResult.REJECTED
+        }
+        val parsed = RelayV2EnrollmentReviewParser.parse(exactToken)
+            ?: return RelayV2EnrollmentOfferResult.REJECTED
+        if (parsed.issuerUrl != expectedIssuerUrl) {
+            return RelayV2EnrollmentOfferResult.REJECTED
+        }
+        return offerParsed(parsed)
+    }
+
+    private suspend fun offerParsed(
+        parsed: RelayV2EnrollmentReviewDraft,
+    ): RelayV2EnrollmentOfferResult {
         return mutex.withLock {
             if (currentState != RelayV2EnrollmentReviewState.Idle) {
                 return@withLock RelayV2EnrollmentOfferResult.REVIEW_ALREADY_PRESENT

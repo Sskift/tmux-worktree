@@ -14,6 +14,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
+import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
@@ -30,6 +32,7 @@ import com.tmuxworktree.mobile.feature.inbox.InboxScreen
 import com.tmuxworktree.mobile.feature.pairing.PairingScreen
 import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
+import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
 import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
 import com.tmuxworktree.mobile.navigation.RootDestination
@@ -525,5 +528,54 @@ class CoreScreensInstrumentedTest {
         composeRule.onNodeWithText("Pixel 9 Pro").assertIsDisplayed()
         composeRule.onNodeWithTag("relay_v2_enrollment_confirm").performClick()
         composeRule.runOnIdle { assertEquals(1, confirmCount) }
+    }
+
+    @Test
+    fun settingsManualRelayV2EnrollmentPassesTheExactEnteredTokenForReview() {
+        var submittedIssuer: String? = null
+        var submittedToken: String? = null
+        val token = "tmuxworktree://enroll?v=2" +
+            "&issuerUrl=https%3A%2F%2Frelay.example.com" +
+            "&relayUrl=wss%3A%2F%2Frelay.example.com%2Fclient" +
+            "&hostId=mac-admin&enrollmentId=enrollment-1" +
+            "&enrollmentCode=twenroll2.one-time-code"
+        val enteredToken = " $token "
+        composeRule.setContent {
+            TwTheme {
+                SettingsScreen(
+                    connectionStatus = ConnectionStatus.ONLINE,
+                    preferences = AppPreferences(),
+                    pairedDeviceName = "Mac",
+                    attentionCount = 0,
+                    versionName = "test",
+                    onHealthClick = {},
+                    onPairedDeviceClick = {},
+                    onManualRelayV2Enrollment = { issuer, oneTimeToken ->
+                        submittedIssuer = issuer
+                        submittedToken = oneTimeToken
+                    },
+                    onNotificationChanged = { _, _ -> },
+                    onDarkThemeChanged = {},
+                    onCopyDiagnostics = {},
+                    onBottomDestinationSelected = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("settings_relay_v2_enrollment")
+            .performScrollTo()
+            .performClick()
+        composeRule.onNodeWithTag("relay_v2_manual_continue").assertIsNotEnabled()
+        composeRule.onNodeWithTag("relay_v2_manual_issuer")
+            .performTextInput("  https://relay.example.com  ")
+        composeRule.onNodeWithTag("relay_v2_manual_token").performTextInput(enteredToken)
+        composeRule.onNodeWithTag("relay_v2_manual_continue")
+            .assertIsEnabled()
+            .performClick()
+
+        composeRule.runOnIdle {
+            assertEquals("https://relay.example.com", submittedIssuer)
+            assertEquals(enteredToken, submittedToken)
+        }
     }
 }

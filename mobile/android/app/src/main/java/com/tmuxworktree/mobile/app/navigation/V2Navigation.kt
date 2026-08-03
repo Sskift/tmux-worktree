@@ -440,6 +440,7 @@ private fun MainNavigation(
                     versionName = BuildConfig.VERSION_NAME,
                     onHealthClick = { navController.navigate(V2Routes.HEALTH) },
                     onPairedDeviceClick = viewModel::showPairing,
+                    onManualRelayV2Enrollment = viewModel::offerManualRelayV2Enrollment,
                     onNotificationChanged = viewModel::setNotificationPreference,
                     onDarkThemeChanged = viewModel::setDarkThemeEnabled,
                     onCopyDiagnostics = {

@@ -63,6 +63,40 @@ class RelayV2EnrollmentReviewSessionTest {
     }
 
     @Test
+    fun `manual offer requires the exact issuer and remains review only`() = runBlocking {
+        val calls = AtomicInteger()
+        val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
+            calls.incrementAndGet()
+            error("confirmation must not run during manual offer")
+        }
+
+        assertEquals(
+            RelayV2EnrollmentOfferResult.REJECTED,
+            session.offerManual(ISSUER_URL, " ${enrollmentPayload()} "),
+        )
+        assertEquals(RelayV2EnrollmentReviewState.Idle, session.state)
+        assertEquals(0, calls.get())
+
+        assertEquals(
+            RelayV2EnrollmentOfferResult.REJECTED,
+            session.offerManual("https://other.example.com", enrollmentPayload()),
+        )
+        assertEquals(RelayV2EnrollmentReviewState.Idle, session.state)
+        assertEquals(0, calls.get())
+
+        assertEquals(
+            RelayV2EnrollmentOfferResult.ACCEPTED,
+            session.offerManual(ISSUER_URL, enrollmentPayload()),
+        )
+        val review = session.state as RelayV2EnrollmentReviewState.Review
+        assertEquals(ISSUER_URL, review.facts.issuerUrl)
+        assertEquals(RELAY_URL, review.facts.relayUrl)
+        assertEquals(HOST_ID, review.facts.hostId)
+        assertFalse(session.toString().contains(ENROLLMENT_CODE))
+        assertEquals(0, calls.get())
+    }
+
+    @Test
     fun `two concurrent confirmations invoke the port once and reject the second as busy`() =
         runBlocking {
             val calls = AtomicInteger()

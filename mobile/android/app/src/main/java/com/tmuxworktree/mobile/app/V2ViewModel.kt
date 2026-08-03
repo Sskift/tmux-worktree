@@ -319,13 +319,38 @@ class V2ViewModel(
 
     fun offerRelayV2Enrollment(rawPayload: String) {
         viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
-            when (relayV2EnrollmentReviewSession.offer(rawPayload)) {
-                RelayV2EnrollmentOfferResult.ACCEPTED -> publishRelayV2EnrollmentReviewState()
-                RelayV2EnrollmentOfferResult.REJECTED ->
-                    emit(V2UiEffect.Notice("This Relay v2 enrollment payload is invalid"))
-                RelayV2EnrollmentOfferResult.REVIEW_ALREADY_PRESENT ->
-                    emit(V2UiEffect.Notice("Finish or cancel the current enrollment review first"))
-            }
+            handleRelayV2EnrollmentOffer(
+                result = relayV2EnrollmentReviewSession.offer(rawPayload),
+                invalidMessage = "This Relay v2 enrollment payload is invalid",
+            )
+        }
+    }
+
+    fun offerManualRelayV2Enrollment(
+        issuerUrl: String,
+        oneTimeEnrollmentToken: String,
+    ) {
+        viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            handleRelayV2EnrollmentOffer(
+                result = relayV2EnrollmentReviewSession.offerManual(
+                    issuerUrl = issuerUrl,
+                    oneTimeEnrollmentToken = oneTimeEnrollmentToken,
+                ),
+                invalidMessage = "This Relay v2 enrollment token or issuer is invalid",
+            )
+        }
+    }
+
+    private suspend fun handleRelayV2EnrollmentOffer(
+        result: RelayV2EnrollmentOfferResult,
+        invalidMessage: String,
+    ) {
+        when (result) {
+            RelayV2EnrollmentOfferResult.ACCEPTED -> publishRelayV2EnrollmentReviewState()
+            RelayV2EnrollmentOfferResult.REJECTED ->
+                emit(V2UiEffect.Notice(invalidMessage))
+            RelayV2EnrollmentOfferResult.REVIEW_ALREADY_PRESENT ->
+                emit(V2UiEffect.Notice("Finish or cancel the current enrollment review first"))
         }
     }
 
