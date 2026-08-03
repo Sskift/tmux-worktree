@@ -125,6 +125,8 @@
         allowTransparency: false,
         // Keep Android IME composition on xterm's insertText path. In screen-reader
         // mode Gboard's composing textarea replacements are emitted as cumulative data.
+        // xterm.js also carries the upstream IME finalization fix from xtermjs/xterm.js#5024
+        // (commit 52e8a75), bounding the prior edit at the next composition start.
         screenReaderMode: false,
         theme: {
           background: '#020509',
