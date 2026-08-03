@@ -10,8 +10,10 @@ import type {
 import {
   CODEX_APP_SERVER_V2_PROVIDER,
   CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+  CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0,
   CODEX_APP_SERVER_V2_SCHEMA_VERSION,
   CodexAppServerV2EventProducer,
+  type CodexAppServerV2ProviderVersion,
 } from "./codexAppServerProducer.js";
 import {
   RelayAgentTranscriptLifecycleRuntime,
@@ -87,7 +89,7 @@ export interface CodexControlledSourceLeaseDescriptor {
   backendInstanceKey: string;
   managedIncarnation: string;
   provider: typeof CODEX_APP_SERVER_V2_PROVIDER;
-  providerVersion: typeof CODEX_APP_SERVER_V2_PROVIDER_VERSION;
+  providerVersion: CodexAppServerV2ProviderVersion;
   schemaVersion: typeof CODEX_APP_SERVER_V2_SCHEMA_VERSION;
   attach(eventSink: CodexControlledSourceEventSink): CodexControlledSourceSubscription;
 }
@@ -125,7 +127,7 @@ interface NormalizedSourceLease {
   backendInstanceKey: string;
   managedIncarnation: string;
   provider: typeof CODEX_APP_SERVER_V2_PROVIDER;
-  providerVersion: typeof CODEX_APP_SERVER_V2_PROVIDER_VERSION;
+  providerVersion: CodexAppServerV2ProviderVersion;
   schemaVersion: typeof CODEX_APP_SERVER_V2_SCHEMA_VERSION;
   attach(eventSink: CodexControlledSourceEventSink): unknown;
 }
@@ -355,7 +357,8 @@ function normalizeSourceLease(
   record.consumed = true;
   const lease = record.descriptor;
   if (lease.provider !== CODEX_APP_SERVER_V2_PROVIDER
-    || lease.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION
+    || (lease.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION
+      && lease.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0)
     || lease.schemaVersion !== CODEX_APP_SERVER_V2_SCHEMA_VERSION
     || typeof lease.attach !== "function"
     || nodeTypes.isProxy(lease.attach)) {
@@ -376,7 +379,7 @@ function normalizeSourceLease(
     ),
     managedIncarnation: opaque(lease.managedIncarnation),
     provider: CODEX_APP_SERVER_V2_PROVIDER,
-    providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+    providerVersion: lease.providerVersion as CodexAppServerV2ProviderVersion,
     schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
     attach: (eventSink: CodexControlledSourceEventSink) => attach.call(
       record.attachThis,
@@ -634,7 +637,8 @@ export class CodexTrustedSourceComposition {
         || target.backendInstanceKey !== lease.backendInstanceKey
         || target.managedTarget.incarnation !== lease.managedIncarnation
         || lease.provider !== CODEX_APP_SERVER_V2_PROVIDER
-        || lease.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION
+        || (lease.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION
+          && lease.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0)
         || lease.schemaVersion !== CODEX_APP_SERVER_V2_SCHEMA_VERSION) {
         throw compositionError("SOURCE_BINDING_MISMATCH");
       }
@@ -648,7 +652,7 @@ export class CodexTrustedSourceComposition {
         source: Object.freeze({ sourceEpoch }),
         version: Object.freeze({
           provider: CODEX_APP_SERVER_V2_PROVIDER,
-          providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+          providerVersion: lease.providerVersion,
           schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
         }),
         limits: CODEX_TRUSTED_SOURCE_PRODUCER_LIMITS,

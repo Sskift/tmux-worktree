@@ -8,7 +8,9 @@ import {
 import {
   CODEX_APP_SERVER_V2_PROVIDER,
   CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+  CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0,
   CODEX_APP_SERVER_V2_SCHEMA_VERSION,
+  type CodexAppServerProducerVersion,
 } from "./codexAppServerProducer.js";
 import {
   type CodexControlledSourceLeaseIssuer,
@@ -88,6 +90,8 @@ export interface CodexAppServerControlledProcessBinding {
 export interface CodexAppServerControlledProcess {
   binding: Readonly<CodexAppServerControlledProcessBinding>;
   notificationSource: CodexAppServerNotificationByteSource;
+  /** Omission preserves the original frozen 0.144.5 controller lane. */
+  version?: Readonly<CodexAppServerProducerVersion>;
 }
 
 /**
@@ -119,6 +123,7 @@ interface NormalizedLeaseIssuer {
 interface CapturedControllerResult {
   binding: unknown;
   notificationSource: unknown;
+  version: unknown | undefined;
 }
 
 interface Deferred<T> {
@@ -201,10 +206,56 @@ function exactFrozenDataObject(
 }
 
 function captureControllerResult(value: unknown): Readonly<CapturedControllerResult> {
-  const result = exactFrozenDataObject(value, ["binding", "notificationSource"]);
+  let descriptors: PropertyDescriptorMap;
+  try {
+    if (typeof value !== "object"
+      || value === null
+      || Array.isArray(value)
+      || nodeTypes.isProxy(value)
+      || !isPlainObject(value)
+      || !Object.isFrozen(value)) throw authorityError("INVALID_CONTROLLER_RESULT");
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw authorityError("INVALID_CONTROLLER_RESULT");
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  const expected = keys.length === 2
+    ? ["binding", "notificationSource"]
+    : ["binding", "notificationSource", "version"];
+  const result = exactFrozenDataObject(value, expected);
   return Object.freeze({
     binding: result.binding,
     notificationSource: result.notificationSource,
+    version: result.version,
+  });
+}
+
+function normalizeVersion(value: unknown): Readonly<CodexAppServerProducerVersion> {
+  if (value === undefined) {
+    return Object.freeze({
+      provider: CODEX_APP_SERVER_V2_PROVIDER,
+      providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+      schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
+    });
+  }
+  let version: Readonly<Record<string, unknown>>;
+  try {
+    version = exactFrozenDataObject(
+      value,
+      ["provider", "providerVersion", "schemaVersion"],
+    );
+  } catch {
+    throw authorityError("INVALID_CONTROLLER_RESULT");
+  }
+  if (version.provider !== CODEX_APP_SERVER_V2_PROVIDER
+    || version.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0
+    || version.schemaVersion !== CODEX_APP_SERVER_V2_SCHEMA_VERSION) {
+    throw authorityError("INVALID_CONTROLLER_RESULT");
+  }
+  return Object.freeze({
+    provider: CODEX_APP_SERVER_V2_PROVIDER,
+    providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0,
+    schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
   });
 }
 
@@ -465,8 +516,10 @@ export class CodexAppServerProcessControllerAuthority {
     }
 
     let binding: Readonly<CodexAppServerControlledProcessBinding>;
+    let version: Readonly<CodexAppServerProducerVersion>;
     try {
       binding = normalizeBinding(captured.binding);
+      version = normalizeVersion(captured.version);
     } catch {
       await this.#seal("SOURCE_BINDING_MISMATCH");
       throw authorityError("SOURCE_BINDING_MISMATCH");
@@ -474,9 +527,9 @@ export class CodexAppServerProcessControllerAuthority {
 
     const descriptor: CodexControlledSourceLeaseDescriptor = Object.freeze({
       ...binding,
-      provider: CODEX_APP_SERVER_V2_PROVIDER,
-      providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION,
-      schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
+      provider: version.provider,
+      providerVersion: version.providerVersion,
+      schemaVersion: version.schemaVersion,
       attach: (eventSink: CodexControlledSourceEventSink): CodexControlledSourceSubscription => (
         this.#attachOwnedSource(source, eventSink)
       ),

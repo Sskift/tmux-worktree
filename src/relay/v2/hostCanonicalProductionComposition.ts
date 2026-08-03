@@ -73,6 +73,8 @@ import type { RelayV2DashboardManagementStdioIo } from
   "./relayV2DashboardManagementStdio.js";
 import type { CodexAppServerProcessControllerPort } from
   "../extensions/agentTranscriptLifecycle/v1/codexAppServerProcessControllerAuthority.js";
+import type { RelayV2HostCodexAppServerStructuredNotificationProcessOptions } from
+  "./hostCodexAppServerStructuredNotificationProcessController.js";
 import {
   RelayAgentAuthorityStore,
   type RelayAgentAuthorityStoreOptions,
@@ -129,8 +131,17 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
   /** Default-off. The root supplies the recovered Host lineage itself. */
   readonly agentTranscriptLifecycle?: Readonly<{
     store: Omit<RelayAgentAuthorityStoreOptions, "hostId" | "hostEpoch">;
-    controller: CodexAppServerProcessControllerPort;
-  }>;
+  } & (
+    | {
+      controller: CodexAppServerProcessControllerPort;
+      structuredNotificationProcess?: never;
+    }
+    | {
+      controller?: never;
+      structuredNotificationProcess:
+        RelayV2HostCodexAppServerStructuredNotificationProcessOptions;
+    }
+  )>;
   /**
    * Default-off. When present, the composition constructs the existing
    * reauthentication lifecycle owner over the same credential authority and
@@ -566,7 +577,9 @@ function captureCarrierWssTlsTrust(
 
 type RelayV2HostAgentAttachmentOpener = (options: Readonly<{
   store: RelayAgentAuthorityStore;
-  controller: CodexAppServerProcessControllerPort;
+  controller?: CodexAppServerProcessControllerPort;
+  structuredNotificationProcess?:
+    RelayV2HostCodexAppServerStructuredNotificationProcessOptions;
   canonicalResourceResolver: RelayV2CanonicalResourceResolverPort;
 }>) => Promise<RelayV2HostOptionalExtensionAttachment>;
 
@@ -622,9 +635,11 @@ function validateOptions(
     && (options.agentTranscriptLifecycle === undefined
       || (isRecord(options.agentTranscriptLifecycle)
         && isRecord(options.agentTranscriptLifecycle.store)
-        && validPort(options.agentTranscriptLifecycle.controller, [
+        && ((validPort(options.agentTranscriptLifecycle.controller, [
           "claimControlledProcess",
-        ])));
+        ]) && options.agentTranscriptLifecycle.structuredNotificationProcess === undefined)
+          || (options.agentTranscriptLifecycle.controller === undefined
+            && isRecord(options.agentTranscriptLifecycle.structuredNotificationProcess)))));
 }
 
 async function settleAll(steps: readonly (() => void | Promise<void>)[]): Promise<void> {
@@ -846,7 +861,12 @@ export async function openRelayV2HostCanonicalProductionComposition(
         });
         optionalExtension = await openAttachment({
           store,
-          controller: options.agentTranscriptLifecycle.controller,
+          ...(options.agentTranscriptLifecycle.controller === undefined
+            ? {
+                structuredNotificationProcess:
+                  options.agentTranscriptLifecycle.structuredNotificationProcess,
+              }
+            : { controller: options.agentTranscriptLifecycle.controller }),
           canonicalResourceResolver: h2.resourceResolver,
         });
       } catch {

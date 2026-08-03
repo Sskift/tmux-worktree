@@ -2,6 +2,10 @@ import type { RelayV2FrameMetadata } from "./codec.js";
 import type { RelayV2CanonicalResourceResolverPort } from "./resourceState.js";
 import type { CodexAppServerProcessControllerPort } from
   "../extensions/agentTranscriptLifecycle/v1/codexAppServerProcessControllerAuthority.js";
+import {
+  RelayV2HostCodexAppServerStructuredNotificationProcessController,
+  type RelayV2HostCodexAppServerStructuredNotificationProcessOptions,
+} from "./hostCodexAppServerStructuredNotificationProcessController.js";
 import { CodexAppServerTrustedSourceActivation } from
   "../extensions/agentTranscriptLifecycle/v1/codexAppServerTrustedSourceActivation.js";
 import {
@@ -26,7 +30,9 @@ import type {
 
 export interface RelayV2HostAgentTranscriptLifecycleAttachmentOptions {
   readonly store: RelayAgentAuthorityStore;
-  readonly controller: CodexAppServerProcessControllerPort;
+  readonly controller?: CodexAppServerProcessControllerPort;
+  readonly structuredNotificationProcess?:
+    RelayV2HostCodexAppServerStructuredNotificationProcessOptions;
   readonly canonicalResourceResolver: RelayV2CanonicalResourceResolverPort;
 }
 
@@ -51,8 +57,19 @@ RelayAgentTranscriptLifecycleRuntimePublicationPort {
 
   constructor(options: RelayV2HostAgentTranscriptLifecycleAttachmentOptions) {
     this.#runtime = new RelayAgentTranscriptLifecycleRuntime(options.store, this);
+    if ((options.controller === undefined)
+      === (options.structuredNotificationProcess === undefined)) {
+      throw new TypeError("Relay Agent attachment requires one process controller owner");
+    }
+    const controller = options.controller
+      ?? new RelayV2HostCodexAppServerStructuredNotificationProcessController(
+        options.store.owner.hostId,
+        options.store.owner.hostEpoch,
+        options.canonicalResourceResolver,
+        options.structuredNotificationProcess!,
+      );
     this.#activation = new CodexAppServerTrustedSourceActivation({
-      controller: options.controller,
+      controller,
       runtime: this.#runtime,
       canonicalResourceResolver: options.canonicalResourceResolver,
       onUnavailable: (error: unknown) => this.withdraw(error),

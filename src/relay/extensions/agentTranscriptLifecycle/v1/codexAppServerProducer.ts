@@ -18,7 +18,12 @@ import {
 
 export const CODEX_APP_SERVER_V2_PROVIDER = "codex-app-server" as const;
 export const CODEX_APP_SERVER_V2_PROVIDER_VERSION = "0.144.5" as const;
+export const CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0 = "0.146.0" as const;
 export const CODEX_APP_SERVER_V2_SCHEMA_VERSION = 2 as const;
+
+export type CodexAppServerV2ProviderVersion =
+  | typeof CODEX_APP_SERVER_V2_PROVIDER_VERSION
+  | typeof CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0;
 
 const MAX_OPAQUE_ID_BYTES = 128;
 const MAX_TEXT_BYTES = 65_536;
@@ -77,7 +82,7 @@ export interface CodexAppServerProducerLimits {
 
 export interface CodexAppServerProducerVersion {
   provider: typeof CODEX_APP_SERVER_V2_PROVIDER;
-  providerVersion: typeof CODEX_APP_SERVER_V2_PROVIDER_VERSION;
+  providerVersion: CodexAppServerV2ProviderVersion;
   schemaVersion: typeof CODEX_APP_SERVER_V2_SCHEMA_VERSION;
 }
 
@@ -87,7 +92,7 @@ export interface CodexAppServerProducerSource {
 
 export interface CodexUserMessageCorrelation {
   provider: typeof CODEX_APP_SERVER_V2_PROVIDER;
-  providerVersion: typeof CODEX_APP_SERVER_V2_PROVIDER_VERSION;
+  providerVersion: CodexAppServerV2ProviderVersion;
   schemaVersion: typeof CODEX_APP_SERVER_V2_SCHEMA_VERSION;
   sourceEpoch: string;
   threadId: string;
@@ -308,7 +313,8 @@ function normalizeConfig(value: unknown): Readonly<NormalizedConfig> {
 
   if (
     versionInput.provider !== CODEX_APP_SERVER_V2_PROVIDER
-    || versionInput.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION
+    || (versionInput.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION
+      && versionInput.providerVersion !== CODEX_APP_SERVER_V2_PROVIDER_VERSION_0_146_0)
     || versionInput.schemaVersion !== CODEX_APP_SERVER_V2_SCHEMA_VERSION
   ) {
     throw producerError("INVALID_CONFIG");
@@ -341,7 +347,7 @@ function normalizeConfig(value: unknown): Readonly<NormalizedConfig> {
     }),
     version: Object.freeze({
       provider: CODEX_APP_SERVER_V2_PROVIDER,
-      providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+      providerVersion: versionInput.providerVersion,
       schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
     }),
     limits: Object.freeze({
@@ -538,7 +544,7 @@ function parseTurn(value: RelayV2JsonValue): DecodedTurn {
   });
 }
 
-function decodeNotification(bytes: Uint8Array): DecodedNotification {
+function decodeNotificationExact(bytes: Uint8Array): DecodedNotification {
   const root = parseRelayV2JsonObject(decodeRelayV2StrictUtf8(bytes), JSON_LIMITS);
   const envelope = closedJsonObject(root, ["method", "params"]);
   const method = envelope.method;
@@ -588,6 +594,29 @@ function decodeNotification(bytes: Uint8Array): DecodedNotification {
   });
 }
 
+function decodeNotification01445(bytes: Uint8Array): DecodedNotification {
+  return decodeNotificationExact(bytes);
+}
+
+/**
+ * Exact Codex 0.146.0 schema-2 lane. Generated 0.146.0 schemas retain the
+ * closed turn/started, message-only item/completed, and turn/completed subset
+ * consumed above. Keeping a separate selector prevents a version bump from
+ * silently widening the frozen 0.144.5 lane.
+ */
+function decodeNotification01460(bytes: Uint8Array): DecodedNotification {
+  return decodeNotificationExact(bytes);
+}
+
+function decodeNotification(
+  version: CodexAppServerV2ProviderVersion,
+  bytes: Uint8Array,
+): DecodedNotification {
+  return version === CODEX_APP_SERVER_V2_PROVIDER_VERSION
+    ? decodeNotification01445(bytes)
+    : decodeNotification01460(bytes);
+}
+
 function sourceMutationEvent(
   sourceEpoch: string,
   sourceSeq: bigint,
@@ -613,7 +642,7 @@ function immutableCorrelation(
 ): Readonly<CodexUserMessageCorrelation> {
   return Object.freeze({
     provider: CODEX_APP_SERVER_V2_PROVIDER,
-    providerVersion: CODEX_APP_SERVER_V2_PROVIDER_VERSION,
+    providerVersion: config.version.providerVersion,
     schemaVersion: CODEX_APP_SERVER_V2_SCHEMA_VERSION,
     sourceEpoch: config.source.sourceEpoch,
     threadId: notification.threadId,
@@ -725,7 +754,10 @@ export class CodexAppServerV2EventProducer {
       ) {
         throw producerError("INVALID_EVENT");
       }
-      const notification = decodeNotification(new Uint8Array(bytesInput));
+      const notification = decodeNotification(
+        config.version.providerVersion,
+        new Uint8Array(bytesInput),
+      );
       const retained = this.#dedupe.get(notification.upstreamEventId);
       if (retained !== undefined) {
         if (retained.fingerprint !== notification.fingerprint) {

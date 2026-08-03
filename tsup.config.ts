@@ -41,6 +41,7 @@ export default defineConfig({
     "src/relay/v2/hostWelcomeSerializer.ts",
     "src/relay/v2/hostRuntimeComposition.ts",
     "src/relay/v2/hostAgentTranscriptLifecycleAttachment.ts",
+    "src/relay/v2/hostCodexAppServerStructuredNotificationProcessController.ts",
     "src/relay/v2/hostCanonicalProductionComposition.ts",
     "src/relay/v2/hostH3ReadinessActivation.ts",
     "src/relay/v2/hostState.ts",
@@ -200,6 +201,9 @@ export default defineConfig({
     // credential-authority import keeps the relay/v2 module identity.
     "./relay/v2/hostProductionProfileStore.js",
     "./hostAgentTranscriptLifecycleAttachment.js",
+    // Privileged executable artifacts carry a module-private identity. The
+    // Host attachment and future selector must consume the canonical entry.
+    "./hostCodexAppServerStructuredNotificationProcessController.js",
     // relayServer dynamically loads the canonical activated combined owner
     // from its matching dist/relay/v2 directory so private brands stay single.
     "../v2/brokerServerRuntime.js",
