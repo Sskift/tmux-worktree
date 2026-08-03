@@ -1544,6 +1544,39 @@ test("exact preparation failure has zero global backend or control effects", asy
   assert.equal(lineage.opens.get(lineage.claimOpenCalls.at(-1).key).preparedBinding, undefined);
 });
 
+test("durable exact-target failure and replay do not retire recovered H3 authority", async () => {
+  const h = harness();
+  const fatalErrors = [];
+  const recovery = terminal.captureRelayV2TerminalManagerRecoveryBinding(
+    h.manager,
+    h.lineage,
+  );
+  assert.ok(recovery);
+  assert.equal(recovery.installFatalSink((error) => fatalErrors.push(error)), true);
+  h.resolver.resolveResults.push(new terminalControl.TerminalControlProtocolError(
+    "TARGET_NOT_FOUND",
+    "exact target disappeared before preparation",
+  ));
+  const request = goldenOpen({
+    requestId: "exact-target-unavailable-first",
+    streamId: "exact-target-unavailable-stream",
+    openId: "exact-target-unavailable-open-id",
+  });
+
+  await assert.rejects(h.manager.open(request), managerError("CAPABILITY_UNAVAILABLE"));
+  assert.equal(fatalErrors.length, 0);
+  assert.equal(h.resolver.calls.length, 1);
+  assert.equal(h.backend.opens.length, 0);
+
+  await assert.rejects(h.manager.open({
+    ...request,
+    requestId: "exact-target-unavailable-replay",
+  }), managerError("CAPABILITY_UNAVAILABLE"));
+  assert.equal(fatalErrors.length, 0);
+  assert.equal(h.resolver.calls.length, 1, "durable failure replay must not re-resolve");
+  assert.equal(h.backend.opens.length, 0);
+});
+
 test("retryable exact-target pressure releases RESET claim for same-openId recovery", async () => {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-reset-pressure-"));
   try {

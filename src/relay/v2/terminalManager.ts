@@ -91,6 +91,12 @@ export class RelayV2TerminalManagerError extends Error {
   }
 }
 
+// A durable terminal.open winner is scoped to that exact request identity.
+// In particular, replaying a retained CAPABILITY_UNAVAILABLE must remain a
+// correlated terminal response; it is not evidence that the recovered H3
+// manager/lineage authority itself was lost.
+const relayV2TerminalRequestScopedErrors = new WeakSet<RelayV2TerminalManagerError>();
+
 export function isRelayV2TerminalManagerError(
   error: unknown,
 ): error is RelayV2TerminalManagerError {
@@ -2003,7 +2009,8 @@ export class RelayV2TerminalManager {
 
   private isFatalAuthorityFailure(error: unknown): boolean {
     return !isRelayV2TerminalManagerError(error)
-      || error.code === "CAPABILITY_UNAVAILABLE"
+      || (error.code === "CAPABILITY_UNAVAILABLE"
+        && !relayV2TerminalRequestScopedErrors.has(error))
       || error.code === "INTERNAL";
   }
 
@@ -2940,7 +2947,9 @@ export class RelayV2TerminalManager {
     outcome: OpenRecordOutcome,
   ): asserts outcome is Exclude<OpenRecordOutcome, { kind: "error" }> {
     if (outcome.kind === "error") {
-      throw new RelayV2TerminalManagerError(outcome.code, outcome.message);
+      const error = new RelayV2TerminalManagerError(outcome.code, outcome.message);
+      relayV2TerminalRequestScopedErrors.add(error);
+      throw error;
     }
   }
 

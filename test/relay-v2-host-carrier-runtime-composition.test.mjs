@@ -101,6 +101,7 @@ async function createHarness({
   throwStatusObserver = false,
   reenterDisposeOnOffline = false,
   terminalManagerOverrides,
+  terminalLineageOverrides,
   h1ExecutorOverrides = {},
   h1Now = () => 1_783_700_000_000,
   carrierClock = () => 1_783_700_100_000,
@@ -151,6 +152,7 @@ async function createHarness({
   let composition = null;
   let reentrantDispose = null;
   const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({ store });
+  Object.assign(lineage, terminalLineageOverrides);
   const terminalManager = new terminal.RelayV2TerminalManager({
     hostId: HOST_ID,
     hostEpoch: identity.hostEpoch,
@@ -768,8 +770,46 @@ test("combined dispose publishes one barrier and waits for H1 drain plus H3 shut
   }
 });
 
-test("fatal H3 authority failure withdraws readiness and fences the route with 4406 first", async () => {
+test("request-scoped terminal target failure stays correlated without dropping the Host carrier", async () => {
   const h = await createHarness();
+  try {
+    const route = await openRoute(h);
+    const hello = fixture("client-hello-fresh");
+    hello.hostId = HOST_ID;
+    hello.payload.clientInstanceId = route.route.payload.authContext.clientInstanceId;
+    sendClientFrame(route, hello);
+    await settle();
+    route.connection.acknowledge(route.transport.confirmNext());
+
+    const terminalOpen = fixture("terminal-open-new");
+    terminalOpen.expectedHostEpoch = h.identity.hostEpoch;
+    sendClientFrame(route, terminalOpen);
+    await settle();
+
+    const response = publicFramesFor(route).find((frame) => (
+      frame.requestId === terminalOpen.requestId
+    ));
+    assert.equal(response.type, "error");
+    assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+    const close = route.transport.sent.map(decodeCarrier).findLast((frame) => (
+      frame.type === "route.close"
+    ));
+    assert.equal(close, undefined);
+    assert.equal(readinessReady(h.composition.readiness.current()), true);
+    assert.equal(h.composition.carrier.status().phase, "registered");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("fatal H3 authority failure withdraws readiness and fences the route with 4406 first", async () => {
+  const h = await createHarness({
+    terminalLineageOverrides: {
+      async claimOpen() {
+        throw new Error("injected fatal H3 lineage failure");
+      },
+    },
+  });
   try {
     const route = await openRoute(h);
     const hello = fixture("client-hello-fresh");
