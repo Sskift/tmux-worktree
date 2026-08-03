@@ -78,6 +78,11 @@ function findButtonByAccessibleName(node: ReactNode, name: string): ButtonElemen
   const matches: ButtonElement[] = [];
   const visit = (candidate: ReactNode) => {
     if (!isValidElement<ButtonElement["props"]>(candidate)) return;
+    if (typeof candidate.type === "function") {
+      const render = candidate.type as (props: ButtonElement["props"]) => ReactNode;
+      visit(render(candidate.props));
+      return;
+    }
     const accessibleName = candidate.props["aria-label"]
       ?? accessibleText(candidate.props.children).replace(/\s+/g, " ").trim();
     if (candidate.type === "button" && accessibleName === name) {
