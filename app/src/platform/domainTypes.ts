@@ -390,6 +390,16 @@ export type MobileRelayV2ShowEnrollmentArtifactInput = {
   handle: string;
 };
 
+export type MobileRelayV2EnrollmentArtifactCopyField =
+  | "issuer_url"
+  | "relay_url"
+  | "enrollment_link";
+
+export type MobileRelayV2CopyEnrollmentArtifactInput = {
+  handle: string;
+  field: MobileRelayV2EnrollmentArtifactCopyField;
+};
+
 export type MobileRelayV2Enrollment =
   | { status: "idle" }
   | { status: "creating"; intent: "create" | "retry" | "rebuild" }

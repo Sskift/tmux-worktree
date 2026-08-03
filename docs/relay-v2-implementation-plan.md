@@ -198,13 +198,13 @@ Dashboard 与 B/H 并行开发 domain state、fake backend和 UI；只有真实 
 
 - 明确区分 v1 shared-secret profile 与 v2 host/client credential状态，不原地升级或共用字段。
 - host bootstrap/refresh 状态、connector registration/capability，以及 client enrollment create和已知 grant revoke；基础契约没有设备枚举 API，不从本地记录伪造设备列表。
-- v2 QR review信息、过期/撤销/重建流程，以及 SUPERSEDED 退出码 78 的进程编排。
+- v2 enrollment review信息、原生QR/一次性链接显式转交流程、过期/撤销/重建流程，以及 SUPERSEDED 退出码 78 的进程编排。
 - broker issuer/bootstrap、host credential、enrollment attempt和grant状态由 Node 本地管理接口持有；Tauri只编排，不能另建issuer、keyring或credential owner。Node protocol-v2 authority/session与same-lineage Host credential/connector adapters已由可选canonical Host composition闭合；renderer/model仍使用fake；bundled child已通过唯一trusted opener接到同一Host root，但当前qualification为空，仍只返回`UNAVAILABLE`。
 
 验收：
 
 - connector 未 `host.registered` 或基础能力不完整时，不生成 v2 enrollment、不显示可用二维码。
-- QR 只含一次性 enrollment code，不含 access/refresh token；敏感值不进日志、clipboard telemetry或普通持久状态。
+- QR/一次性链接只含一次性 enrollment code，不含 access/refresh token；renderer仅持有opaque artifact handle，显式native copy不回传值，敏感值不进日志、clipboard telemetry或普通持久状态。
 - host bootstrap secret不经过命令参数、环境变量或renderer IPC，只能使用Node接口定义的stdin/0600 handoff；Dashboard持久层只保存非敏感endpoint、credential kind和credential reference。
 - v1 配对继续走原 shared-secret路径；v2 失败只给可执行错误，不降级、覆盖或旋转 v1 profile。
 - Tauri、fake/preview backend、domain types和 platform boundary 同步；进程替换、重启和 revoke由可观察行为测试覆盖。

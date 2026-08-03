@@ -2,6 +2,7 @@ import type { MobileRelayV2ProductAdapter } from "./dashboardBackend";
 import {
   MOBILE_RELAY_V2_KNOWN_CAPABILITIES,
   MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
+  type MobileRelayV2CopyEnrollmentArtifactInput,
   type MobileRelayV2CreateEnrollmentInput,
   type MobileRelayV2DashboardState,
   type MobileRelayV2RevokeClientGrantInput,
@@ -13,7 +14,8 @@ import {
 } from "./relayV2Domain";
 
 const COMMAND = "mobile_relay_v2_management_call";
-const ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
+const SHOW_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
+const COPY_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_copy";
 const DEFAULT_OFF_REASON = "Relay v2 management is unavailable (default off).";
 const REQUEST_ID_PATTERNS = {
   1: /^dmgmt1\.[A-Za-z0-9_-]{21}[AQgw]$/,
@@ -633,6 +635,14 @@ function artifactInput(input: MobileRelayV2ShowEnrollmentArtifactInput): unknown
   return { handle: input.handle };
 }
 
+function artifactCopyInput(input: MobileRelayV2CopyEnrollmentArtifactInput): unknown {
+  if (
+    !NATIVE_QR_HANDLE_PATTERN.test(input.handle)
+    || !["issuer_url", "relay_url", "enrollment_link"].includes(input.field)
+  ) throw invalidInputError();
+  return { handle: input.handle, field: input.field };
+}
+
 export function createRelayV2ManagementAdapter(
   invoke: ManagementInvoke,
 ): MobileRelayV2ProductAdapter {
@@ -672,7 +682,15 @@ export function createRelayV2ManagementAdapter(
     stopConnector: () => enqueue("stop_connector", null),
     showEnrollmentArtifact: async (input) => {
       try {
-        await invoke(ARTIFACT_COMMAND, artifactInput(input));
+        await invoke(SHOW_ARTIFACT_COMMAND, artifactInput(input));
+      } catch (error) {
+        const code = parseManagementError(error);
+        throw code ? operationError(code) : invalidOutcomeError();
+      }
+    },
+    copyEnrollmentArtifact: async (input) => {
+      try {
+        await invoke(COPY_ARTIFACT_COMMAND, artifactCopyInput(input));
       } catch (error) {
         const code = parseManagementError(error);
         throw code ? operationError(code) : invalidOutcomeError();

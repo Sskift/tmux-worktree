@@ -47,6 +47,7 @@ import type {
   HostStatus,
   MobileRelayBrokerInput,
   MobileRelayConfigInput,
+  MobileRelayV2CopyEnrollmentArtifactInput,
   MobileRelayStatus,
   MobileRelayV2CreateEnrollmentInput,
   MobileRelayV2DashboardState,
@@ -98,6 +99,7 @@ export interface MobileRelayV2ProductAdapter {
   startConnector(): Promise<MobileRelayV2DashboardState>;
   stopConnector(): Promise<MobileRelayV2DashboardState>;
   showEnrollmentArtifact(input: MobileRelayV2ShowEnrollmentArtifactInput): Promise<void>;
+  copyEnrollmentArtifact(input: MobileRelayV2CopyEnrollmentArtifactInput): Promise<void>;
   createEnrollment(
     input: MobileRelayV2CreateEnrollmentInput,
   ): Promise<MobileRelayV2DashboardState>;
@@ -287,6 +289,13 @@ export function createUnavailableMobileRelayV2Adapter(
     startConnector: unavailable,
     stopConnector: unavailable,
     showEnrollmentArtifact: async () => {
+      throw new MobileRelayV2BackendOperationError({
+        code: "relay_v2_adapter_unavailable",
+        message: reason,
+        retryable: false,
+      });
+    },
+    copyEnrollmentArtifact: async () => {
       throw new MobileRelayV2BackendOperationError({
         code: "relay_v2_adapter_unavailable",
         message: reason,

@@ -769,14 +769,26 @@ test("Relay v2 renderer state exposes only a native opaque artifact handle", () 
   ]) assert.equal(serializedState.includes(forbidden), false, forbidden);
 
   let shownHandle: string | null = null;
+  const copied: Array<[string, string]> = [];
   const panel = RelayV2EnrollmentPreviewPanel({
     state: activeState,
     v1SharedSecretConfigured: true,
     onShowEnrollmentArtifact: (handle) => {
       shownHandle = handle;
     },
+    onCopyEnrollmentArtifact: (handle, field) => {
+      copied.push([handle, field]);
+    },
   });
   assert.ok(panel);
+  findButtonByAccessibleName(panel, "Copy Issuer URL").props.onClick?.();
+  findButtonByAccessibleName(panel, "Copy Relay URL").props.onClick?.();
+  findButtonByAccessibleName(panel, "Copy one-time link").props.onClick?.();
   findButtonByAccessibleName(panel, "Show QR code").props.onClick?.();
   assert.equal(shownHandle, relayV2Review.renderArtifact.handle);
+  assert.deepEqual(copied, [
+    [relayV2Review.renderArtifact.handle, "issuer_url"],
+    [relayV2Review.renderArtifact.handle, "relay_url"],
+    [relayV2Review.renderArtifact.handle, "enrollment_link"],
+  ]);
 });

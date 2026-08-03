@@ -645,6 +645,32 @@
   max-width: 230px;
 }
 
+.connections-relay-v2-preview__review > .connections-relay-v2-preview__facts {
+  min-width: 0;
+  max-width: 320px;
+}
+
+.connections-relay-v2-preview__fact {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 5px;
+}
+
+.connections-relay-v2-preview__fact .connections-icon-button {
+  width: 24px;
+  height: 24px;
+}
+
+.connections-relay-v2-preview__review > .connections-relay-v2-preview__artifact-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: none;
+  gap: 7px;
+}
+
 .connections-relay-v2-preview__review strong,
 .connections-relay-v2-preview__review span {
   overflow: hidden;

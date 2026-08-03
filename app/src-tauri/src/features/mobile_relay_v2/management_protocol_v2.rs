@@ -2,7 +2,8 @@ use qrcode::{types::Color, EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 
 use super::enrollment_artifact::{
-    EnrollmentArtifactLineage, EnrollmentArtifactRegistry, RendererEnrollmentArtifact,
+    EnrollmentArtifactLineage, EnrollmentArtifactRegistry, RenderedEnrollmentArtifact,
+    RendererEnrollmentArtifact,
 };
 use super::management_child::{ManagementInput, ManagementOperation};
 
@@ -499,7 +500,8 @@ fn renderer_enrollment_review(
         connector_id,
         expires_at_ms: review.enrollment.expires_at_ms,
     };
-    let render_artifact = artifacts.get_or_create(lineage, || render_enrollment_qr(&review))?;
+    let render_artifact =
+        artifacts.get_or_create(lineage, || render_enrollment_artifact(&review))?;
     Ok(RendererEnrollmentReview {
         enrollment: RendererEnrollmentFacts {
             enrollment_id: review.enrollment.enrollment_id,
@@ -510,7 +512,7 @@ fn renderer_enrollment_review(
     })
 }
 
-fn render_enrollment_qr(review: &EnrollmentReview) -> Result<Vec<u8>, ()> {
+fn render_enrollment_artifact(review: &EnrollmentReview) -> Result<RenderedEnrollmentArtifact, ()> {
     let mut payload = tauri::Url::parse("tmuxworktree://enroll").map_err(|_| ())?;
     {
         let mut query = payload.query_pairs_mut();
@@ -521,8 +523,18 @@ fn render_enrollment_qr(review: &EnrollmentReview) -> Result<Vec<u8>, ()> {
         query.append_pair("enrollmentId", &review.enrollment.enrollment_id);
         query.append_pair("enrollmentCode", &review.enrollment.enrollment_code);
     }
-    let code = QrCode::with_error_correction_level(payload.as_str().as_bytes(), EcLevel::M)
-        .map_err(|_| ())?;
+    let png = render_enrollment_qr(payload.as_str())?;
+    Ok(RenderedEnrollmentArtifact {
+        issuer_url: review.display.issuer_url.clone(),
+        relay_url: review.display.relay_url.clone(),
+        enrollment_link: payload.to_string(),
+        png,
+    })
+}
+
+fn render_enrollment_qr(payload: &str) -> Result<Vec<u8>, ()> {
+    let code =
+        QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M).map_err(|_| ())?;
     let width = code.width();
     const QUIET_ZONE_MODULES: usize = 4;
     const MODULE_PIXELS: usize = 6;
@@ -1081,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_projection_replaces_the_secret_with_a_bounded_native_handle() {
+    fn renderer_projection_keeps_copyable_values_in_the_bounded_native_artifact() {
         let fixture: Value = serde_json::from_str(CASES).unwrap();
         let exchange = fixture["goldenExchanges"]
             .as_array()
@@ -1132,6 +1144,39 @@ mod tests {
         assert_eq!(
             renderer["enrollment"]["review"]["renderArtifact"]["expiresAtMs"],
             expires_at_ms
+        );
+        assert_eq!(
+            registry
+                .claim_copy_value(
+                    handle,
+                    super::super::enrollment_artifact::EnrollmentArtifactCopyField::IssuerUrl,
+                )
+                .unwrap()
+                .as_ref(),
+            "https://relay.example.com"
+        );
+        let enrollment_link = registry
+            .claim_copy_value(
+                handle,
+                super::super::enrollment_artifact::EnrollmentArtifactCopyField::EnrollmentLink,
+            )
+            .unwrap();
+        let parsed_link = tauri::Url::parse(&enrollment_link).unwrap();
+        assert_eq!(parsed_link.scheme(), "tmuxworktree");
+        let link_fields = parsed_link
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            link_fields.get("issuerUrl").unwrap(),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            link_fields.get("relayUrl").unwrap(),
+            "wss://relay.example.com/client"
+        );
+        assert_eq!(
+            link_fields.get("enrollmentCode").unwrap(),
+            "twenroll2.one-time-code"
         );
         registry.close();
     }

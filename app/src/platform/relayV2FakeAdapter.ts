@@ -240,6 +240,18 @@ export function createFakeMobileRelayV2Adapter(
         );
       }
     },
+    copyEnrollmentArtifact: async ({ handle }) => {
+      expireEnrollment();
+      if (
+        state.enrollment.status !== "active"
+        || state.enrollment.review.renderArtifact.handle !== handle
+      ) {
+        fail(
+          "relay_v2_enrollment_artifact_unavailable",
+          "The Relay v2 enrollment artifact is unavailable.",
+        );
+      }
+    },
     createEnrollment: async (input: MobileRelayV2CreateEnrollmentInput) => {
       requireAuthority();
       expireEnrollment();

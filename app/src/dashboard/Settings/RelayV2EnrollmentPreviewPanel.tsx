@@ -1,4 +1,5 @@
-import { AlertCircle, QrCode } from "lucide-react";
+import { AlertCircle, Clipboard, QrCode } from "lucide-react";
+import type { MobileRelayV2EnrollmentArtifactCopyField } from "../../platform";
 import {
   deriveRelayV2EnrollmentView,
   type RelayV2EnrollmentState,
@@ -22,6 +23,8 @@ export function RelayV2EnrollmentPanel({
       onStopConnector={controller.stopConnector}
       onCreateEnrollment={controller.createEnrollment}
       onShowEnrollmentArtifact={controller.showEnrollmentArtifact}
+      onCopyEnrollmentArtifact={controller.copyEnrollmentArtifact}
+      artifactNotice={controller.artifactNotice}
       onRevokeKnownGrant={controller.revokeKnownGrant}
     />
   );
@@ -36,6 +39,8 @@ export function RelayV2EnrollmentPreviewPanel({
   onStopConnector,
   onCreateEnrollment,
   onShowEnrollmentArtifact,
+  onCopyEnrollmentArtifact,
+  artifactNotice,
   onRevokeKnownGrant,
 }: {
   state?: RelayV2EnrollmentState;
@@ -46,6 +51,11 @@ export function RelayV2EnrollmentPreviewPanel({
   onStopConnector?: () => void;
   onCreateEnrollment?: (intent: "create" | "retry" | "rebuild") => void;
   onShowEnrollmentArtifact?: (handle: string) => void;
+  onCopyEnrollmentArtifact?: (
+    handle: string,
+    field: MobileRelayV2EnrollmentArtifactCopyField,
+  ) => void;
+  artifactNotice?: string | null;
   onRevokeKnownGrant?: () => void;
 }) {
   if (!state) return null;
@@ -105,21 +115,52 @@ export function RelayV2EnrollmentPreviewPanel({
         </div>
         {view.qrArtifact && view.review ? (
           <div className="connections-relay-v2-preview__review">
-            <div>
+            <div className="connections-relay-v2-preview__facts">
               <strong>One-time enrollment review</strong>
-              <span>{view.review.display.issuerUrl}</span>
-              <span>{view.review.display.relayUrl}</span>
+              <EnrollmentCopyFact
+                label="Issuer URL"
+                value={view.review.display.issuerUrl}
+                disabled={view.previewOnly}
+                onCopy={() => onCopyEnrollmentArtifact?.(
+                  view.qrArtifact!.handle,
+                  "issuer_url",
+                )}
+              />
+              <EnrollmentCopyFact
+                label="Relay URL"
+                value={view.review.display.relayUrl}
+                disabled={view.previewOnly}
+                onCopy={() => onCopyEnrollmentArtifact?.(
+                  view.qrArtifact!.handle,
+                  "relay_url",
+                )}
+              />
               <span>Host · {view.review.display.hostId}</span>
               <span>Expires · {new Date(view.review.enrollment.expiresAtMs).toLocaleString()}</span>
             </div>
-            <button
-              type="button"
-              className="connections-button"
-              disabled={view.previewOnly}
-              onClick={() => onShowEnrollmentArtifact?.(view.qrArtifact!.handle)}
-            >
-              {view.previewOnly ? "Native QR unavailable in browser preview" : "Show QR code"}
-            </button>
+            <div className="connections-relay-v2-preview__artifact-actions">
+              <button
+                type="button"
+                className="connections-button"
+                disabled={view.previewOnly}
+                onClick={() => onCopyEnrollmentArtifact?.(
+                  view.qrArtifact!.handle,
+                  "enrollment_link",
+                )}
+              >
+                {view.previewOnly
+                  ? "Native copy unavailable in browser preview"
+                  : "Copy one-time link"}
+              </button>
+              <button
+                type="button"
+                className="connections-button"
+                disabled={view.previewOnly}
+                onClick={() => onShowEnrollmentArtifact?.(view.qrArtifact!.handle)}
+              >
+                {view.previewOnly ? "Native QR unavailable in browser preview" : "Show QR code"}
+              </button>
+            </div>
           </div>
         ) : (
           <button
@@ -132,6 +173,11 @@ export function RelayV2EnrollmentPreviewPanel({
           >
             {view.enrollmentActionLabel}
           </button>
+        )}
+        {artifactNotice && (
+          <div className="connections-notice connections-notice--pending" role="status">
+            <span>{artifactNotice}</span>
+          </div>
         )}
         {(state.knownClientGrant.status === "active"
           || state.knownClientGrant.status === "failed"
@@ -159,6 +205,33 @@ export function RelayV2EnrollmentPreviewPanel({
           <span>{view.error}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+function EnrollmentCopyFact({
+  label,
+  value,
+  disabled,
+  onCopy,
+}: {
+  label: string;
+  value: string;
+  disabled: boolean;
+  onCopy: () => void;
+}) {
+  return (
+    <div className="connections-relay-v2-preview__fact">
+      <span title={value}>{label} · {value}</span>
+      <button
+        type="button"
+        className="connections-icon-button"
+        aria-label={`Copy ${label}`}
+        disabled={disabled}
+        onClick={onCopy}
+      >
+        <Clipboard aria-hidden="true" size={14} />
+      </button>
     </div>
   );
 }

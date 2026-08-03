@@ -171,6 +171,7 @@ pub fn run() {
             mobile_relay_status,
             mobile_relay_v2_management_call,
             mobile_relay_v2_enrollment_artifact_show,
+            mobile_relay_v2_enrollment_artifact_copy,
             mobile_relay_v2_self_hosted_status,
             mobile_relay_v2_self_hosted_save_config,
             mobile_relay_v2_self_hosted_deploy,

@@ -16,7 +16,7 @@
   "ownership": {
     "node": "sole-authority-for-host-credential-enrollment-grant-and-connector-facts",
     "rust": "startup-negotiation-framing-request-id-single-in-flight-timeout-exact-child-lifecycle-and-bounded-enrollment-artifact-registry",
-    "tauri": "closed-operation-and-non-sensitive-input-forwarding-plus-secret-to-native-image-boundary",
+    "tauri": "closed-operation-and-non-sensitive-input-forwarding-plus-secret-to-bounded-native-artifact-boundary",
     "renderer": "closed-non-sensitive-projection-and-opaque-native-artifact-handle-only",
     "rustOrRendererPersistenceAllowed": false
   },
@@ -122,6 +122,10 @@
     "handlePattern": "^dqart1\\.[A-Za-z0-9_-]{32}$",
     "handleOwner": "tauri-bounded-in-memory-artifact-registry",
     "nativeRendering": "macos-appkit-image-window-with-no-artifact-bytes-in-main-webview",
+    "nativeCopyFields": ["issuer_url", "relay_url", "enrollment_link"],
+    "nativeCopyInput": "current-opaque-handle-and-closed-field-only",
+    "nativeCopyReturnsValueToRenderer": false,
+    "nativeCopySink": "explicit-user-action-to-macos-system-clipboard-with-no-telemetry",
     "sameLineageMayReuseHandle": true,
     "lineage": ["enrollmentId", "hostId", "connectorId", "expiresAtMs"],
     "revocation": ["host-refresh", "lineage-change", "non-active-projection", "native-window-close", "expiry", "dashboard-dispose"],
@@ -140,7 +144,10 @@
       "bearerCredential"
     ],
     "allowedSensitiveRendererField": null,
-    "enrollmentCodeBoundary": "node-child-stdout-to-tauri-strict-decoder-and-native-qr-renderer-only",
+    "enrollmentCodeBoundary": "node-child-stdout-to-tauri-strict-decoder-and-bounded-native-artifact-only",
+    "explicitEnrollmentLinkClipboardTransferAllowed": true,
+    "clipboardTransferRequiresCurrentUnexpiredHandle": true,
+    "clipboardTransferChangesOneTimeExpiry": false,
     "rendererForbiddenFields": ["enrollmentCode", "qrPayload", "dataUrl", "imageBytes"],
     "enrollmentCodeMustStartWith": "twenroll2.",
     "credentialReferenceIsOpaqueNonSensitiveReference": true,

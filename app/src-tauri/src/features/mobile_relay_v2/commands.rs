@@ -5,7 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 
-use super::enrollment_artifact::{EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim};
+use super::enrollment_artifact::{
+    EnrollmentArtifactCopyField, EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim,
+};
 use super::management_child::{
     ManagementCallError, ManagementChildManager, ManagementChildSelection,
     ManagementCleanupOutcome, ManagementError, ManagementInput, ManagementLaunchKey,
@@ -686,6 +688,64 @@ pub(crate) async fn mobile_relay_v2_enrollment_artifact_show(
         return Err(invalid_argument_error());
     }
     show_enrollment_artifact(&app, state.inner().as_ref(), &handle).map_err(|_| not_ready_error())
+}
+
+#[tauri::command]
+pub(crate) async fn mobile_relay_v2_enrollment_artifact_copy(
+    handle: String,
+    field: EnrollmentArtifactCopyField,
+    state: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
+) -> Result<(), ManagementError> {
+    if !valid_artifact_handle(&handle) {
+        return Err(invalid_argument_error());
+    }
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        copy_enrollment_artifact(state.as_ref(), &handle, field)
+    })
+    .await
+    .map_err(|_| not_ready_error())?
+    .map_err(|_| not_ready_error())
+}
+
+fn copy_enrollment_artifact(
+    state: &MobileRelayV2ManagementCommandState,
+    handle: &str,
+    field: EnrollmentArtifactCopyField,
+) -> Result<(), ()> {
+    if state.disposed.load(Ordering::Acquire) {
+        return Err(());
+    }
+    let value = state.artifacts.claim_copy_value(handle, field)?;
+    write_native_clipboard(&value)
+}
+
+#[cfg(target_os = "macos")]
+fn write_native_clipboard(value: &str) -> Result<(), ()> {
+    use std::io::Write as _;
+
+    let mut child = std::process::Command::new("/usr/bin/pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| ())?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or(())
+        .and_then(|mut stdin| stdin.write_all(value.as_bytes()).map_err(|_| ()));
+    let status = child.wait().map_err(|_| ())?;
+    if write_result.is_ok() && status.success() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_native_clipboard(_value: &str) -> Result<(), ()> {
+    Err(())
 }
 
 fn show_enrollment_artifact(

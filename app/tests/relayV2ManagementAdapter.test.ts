@@ -519,7 +519,7 @@ test("renderer input and returned projection contain no credential or v1 secret 
   assert.match(serializedState, /dqart1\.[A-Za-z0-9_-]{32}/);
 });
 
-test("renderer can ask Tauri to show only an opaque current artifact handle", async () => {
+test("renderer can ask Tauri to show or copy only through an opaque current artifact handle", async () => {
   const calls: Array<{ command: string; args?: unknown }> = [];
   const adapter = createRelayV2ManagementAdapter(async (command, args) => {
     calls.push({ command, args });
@@ -529,14 +529,36 @@ test("renderer can ask Tauri to show only an opaque current artifact handle", as
   const handle = `dqart1.${"B".repeat(32)}`;
 
   await adapter.showEnrollmentArtifact({ handle });
-  assert.deepEqual(calls, [{
-    command: "mobile_relay_v2_enrollment_artifact_show",
-    args: { handle },
-  }]);
+  await adapter.copyEnrollmentArtifact({ handle, field: "issuer_url" });
+  await adapter.copyEnrollmentArtifact({ handle, field: "relay_url" });
+  await adapter.copyEnrollmentArtifact({ handle, field: "enrollment_link" });
+  assert.deepEqual(calls, [
+    {
+      command: "mobile_relay_v2_enrollment_artifact_show",
+      args: { handle },
+    },
+    {
+      command: "mobile_relay_v2_enrollment_artifact_copy",
+      args: { handle, field: "issuer_url" },
+    },
+    {
+      command: "mobile_relay_v2_enrollment_artifact_copy",
+      args: { handle, field: "relay_url" },
+    },
+    {
+      command: "mobile_relay_v2_enrollment_artifact_copy",
+      args: { handle, field: "enrollment_link" },
+    },
+  ]);
   assert.equal(JSON.stringify(calls).includes("enrollmentCode"), false);
   assert.equal(JSON.stringify(calls).includes("tmuxworktree://enroll"), false);
   await assert.rejects(
     adapter.showEnrollmentArtifact({ handle: "tmuxworktree://enroll?secret=forbidden" }),
+    (error: unknown) => error instanceof MobileRelayV2BackendOperationError
+      && error.code === "INVALID_ARGUMENT",
+  );
+  await assert.rejects(
+    adapter.copyEnrollmentArtifact({ handle, field: "enrollment_code" as "enrollment_link" }),
     (error: unknown) => error instanceof MobileRelayV2BackendOperationError
       && error.code === "INVALID_ARGUMENT",
   );

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useDashboardBackend } from "../../platform";
 import type {
   MobileRelayV2DashboardState,
+  MobileRelayV2EnrollmentArtifactCopyField,
   MobileRelayV2OperationFailure,
 } from "../../platform/domainTypes";
 import {
@@ -55,6 +56,8 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     createRelayV2EnrollmentState,
   );
   const [loaded, setLoaded] = useState(false);
+  const [artifactNotice, setArtifactNotice] = useState<string | null>(null);
+  const activeArtifactHandleRef = useRef<string | null>(null);
   const operationRef = useRef<ActiveRelayV2Operation | null>(null);
   const requestEpochRef = useRef(0);
   const observerRef = useRef<RelayV2StatusObserver | null>(null);
@@ -103,6 +106,14 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
   useEffect(() => {
     dispatch({ type: "v1ProfileObserved", sharedSecretConfigured });
   }, [sharedSecretConfigured]);
+
+  const activeArtifactHandle = state.enrollment.status === "active"
+    ? state.enrollment.review.renderArtifact.handle
+    : null;
+  useEffect(() => {
+    activeArtifactHandleRef.current = activeArtifactHandle;
+    setArtifactNotice(null);
+  }, [activeArtifactHandle]);
 
   const run = useCallback(async (
     operation: RelayV2Operation,
@@ -215,6 +226,32 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     });
   }, [backend]);
 
+  const copyEnrollmentArtifact = useCallback((
+    handle: string,
+    field: MobileRelayV2EnrollmentArtifactCopyField,
+  ) => {
+    setArtifactNotice(null);
+    const requestEpoch = requestEpochRef.current;
+    void backend.relay.v2.copyEnrollmentArtifact({ handle, field }).then(() => {
+      if (
+        requestEpoch !== requestEpochRef.current
+        || activeArtifactHandleRef.current !== handle
+      ) return;
+      setArtifactNotice(field === "enrollment_link"
+        ? "One-time enrollment link copied. Paste it into Android pairing before it expires."
+        : field === "issuer_url"
+          ? "Issuer URL copied."
+          : "Relay URL copied.");
+    }).catch(() => {
+      if (
+        requestEpoch !== requestEpochRef.current
+        || activeArtifactHandleRef.current !== handle
+      ) return;
+      setArtifactNotice("The current enrollment value could not be copied. Create a fresh enrollment and try again.");
+      observerRef.current?.refresh();
+    });
+  }, [backend]);
+
   return {
     state,
     loaded,
@@ -225,6 +262,8 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     stopConnector,
     createEnrollment,
     showEnrollmentArtifact,
+    copyEnrollmentArtifact,
+    artifactNotice,
     revokeKnownGrant,
   };
 }
