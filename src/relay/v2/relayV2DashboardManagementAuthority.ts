@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import {
   RELAY_V2_DASHBOARD_MANAGEMENT_PROTOCOL_V2_VERSION,
+  RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES,
   RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
   createRelayV2DashboardManagementProtocolV2FailureResponse,
   type RelayV2DashboardManagementConnectorProjection,
@@ -273,18 +274,18 @@ function inspectConnectorCut(value: unknown): RelayV2DashboardManagementConnecto
 
 function canonicalCapabilities(value: unknown): readonly string[] {
   if (!Array.isArray(value)
-    || value.length > RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.length) {
+    || value.length > RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES.length) {
     return closed();
   }
   const seen = new Set<string>();
   for (const candidate of value as unknown[]) {
     if (typeof candidate !== "string"
-      || !(RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES as readonly string[])
+      || !(RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES as readonly string[])
         .includes(candidate)
       || seen.has(candidate)) return closed();
     seen.add(candidate);
   }
-  return Object.freeze(RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.filter(
+  return Object.freeze(RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES.filter(
     (capability) => seen.has(capability),
   ));
 }
@@ -345,8 +346,9 @@ function revocationReceipt(
 
 function completeCapabilities(connector: RelayV2DashboardManagementConnectorCut): boolean {
   return connector.status === "registered"
-    && connector.negotiatedCapabilityIntersection.length
-      === RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.length;
+    && RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.every(
+      (capability) => connector.negotiatedCapabilityIntersection.includes(capability),
+    );
 }
 
 function activeGate(cut: PostOperationCut): ReadyGate | null {

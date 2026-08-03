@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { deriveRelayV2EnrollmentView } from "../src/dashboard/Settings/relayV2EnrollmentModel.ts";
-import { MOBILE_RELAY_V2_REQUIRED_CAPABILITIES } from "../src/platform/domainTypes.ts";
+import {
+  MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES,
+  MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
+} from "../src/platform/domainTypes.ts";
 import { MobileRelayV2BackendOperationError } from "../src/platform/relayV2Domain.ts";
 import { createRelayV2ManagementAdapter } from "../src/platform/relayV2ManagementAdapter.ts";
 
@@ -36,9 +39,14 @@ function readyCredential() {
   };
 }
 
-function registeredConnector(capabilities = [...MOBILE_RELAY_V2_REQUIRED_CAPABILITIES]) {
+function registeredConnector(
+  capabilities: readonly string[] = [...MOBILE_RELAY_V2_REQUIRED_CAPABILITIES],
+) {
+  const complete = MOBILE_RELAY_V2_REQUIRED_CAPABILITIES.every(
+    (capability) => capabilities.includes(capability),
+  );
   return {
-    status: capabilities.length === MOBILE_RELAY_V2_REQUIRED_CAPABILITIES.length
+    status: complete
       ? "registered"
       : "registered_incomplete",
     acknowledgement: "host.registered",
@@ -259,6 +267,22 @@ test("incomplete registration or any missing required capability cannot expose e
   assert.equal(view.qrArtifact?.handle, `dqart1.${"A".repeat(32)}`);
   assert.equal(JSON.stringify(state).includes("enrollmentCode"), false);
   assert.equal(JSON.stringify(state).includes("tmuxworktree://enroll"), false);
+});
+
+test("management projection preserves the negotiated Agent optional capability", async () => {
+  const capabilities = [
+    ...MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
+    ...MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES,
+  ];
+  const result = {
+    ...defaultProjection(),
+    hostCredential: readyCredential(),
+    connector: registeredConnector([...capabilities].reverse()),
+  };
+  const adapter = createRelayV2ManagementAdapter(async () => successOutcome("status", result));
+  const state = await adapter.status();
+  assert.equal(state.connector.status, "registered");
+  assert.deepEqual(state.connector.negotiatedCapabilityIntersection, capabilities);
 });
 
 test("closed v2 outcomes reject malformed, unknown, credential, and contradictory state", async () => {

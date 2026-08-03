@@ -273,6 +273,13 @@ export const MOBILE_RELAY_V2_REQUIRED_CAPABILITIES = [
   "event.sequence.v1",
   "terminal.stream.resume.v1",
 ] as const;
+export const MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES = [
+  "agent.transcript-lifecycle.v1",
+] as const;
+export const MOBILE_RELAY_V2_KNOWN_CAPABILITIES = [
+  ...MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
+  ...MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES,
+] as const;
 
 export type MobileRelayV2RequiredCapability =
   (typeof MOBILE_RELAY_V2_REQUIRED_CAPABILITIES)[number];

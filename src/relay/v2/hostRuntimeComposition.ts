@@ -1,6 +1,5 @@
 import { types as nodeTypes } from "node:util";
 import type { RelayV2JsonObject } from "./codecSchema.js";
-import { RELAY_V2_REQUIRED_CAPABILITIES } from "./brokerCore.js";
 import {
   RelayV2HostCarrierActor,
   RelayV2HostCapabilityReadiness,
@@ -61,7 +60,6 @@ import type {
   RelayV2HostRuntimeOutboundPort,
   RelayV2HostRuntimeWelcomeSerializer,
   RelayV2HostOptionalExtensionAttachment,
-  RelayV2RequiredCapability,
 } from "./hostRuntime.js";
 import { createRelayV2HostH0ReadinessActivation } from "./hostH0ReadinessActivation.js";
 import type {
@@ -131,10 +129,6 @@ const runtimePreCarrierOfferIssuers = new WeakMap<object, Readonly<{
   issue(input: Readonly<RelayV2HostPreCarrierOfferIssueInput>):
   RelayV2HostPreCarrierOfferClaim | null;
 }>>();
-const EXPLICIT_BASE_CAPABILITIES = Object.freeze([
-  ...RELAY_V2_REQUIRED_CAPABILITIES,
-]);
-
 declare const relayV2RecoveredHostH2CompositionPairBrand: unique symbol;
 declare const relayV2HostDashboardManagementPortBrand: unique symbol;
 declare const relayV2HostDashboardManagementBindingBrand: unique symbol;
@@ -2279,7 +2273,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
     ): boolean;
     negotiatedCapabilityIntersection(
       connectorId: string,
-    ): readonly RelayV2RequiredCapability[];
+    ): readonly string[];
     fenceReauthentication(): void;
     observe(status: Readonly<RelayV2HostCarrierStatus>): void;
     reject(): void;
@@ -2470,6 +2464,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
             connectorId: string,
           ): RelayV2DashboardManagementCarrierControlPort | null {
             if (rejected || !controllerAdmitted || actor === null
+              || carrierAttemptGeneration === null
               || !consumedFullOffer()
               || latestStatus?.phase !== "registered"
               || latestStatus.connectorId !== connectorId
@@ -2522,14 +2517,20 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
           },
           negotiatedCapabilityIntersection(
             connectorId: string,
-          ): readonly RelayV2RequiredCapability[] {
+          ): readonly string[] {
             if (rejected || !controllerAdmitted || actor === null
               || !consumedFullOffer()
               || latestStatus?.phase !== "registered"
               || latestStatus.connectorId !== connectorId
               || attemptRuntimeBindings.get(input.controllerGeneration)
                 !== runtimeBinding) return Object.freeze([]);
-            return EXPLICIT_BASE_CAPABILITIES;
+            return RelayV2HostCarrierActor.consumedCanonicalPreCarrierOfferCapabilities(
+              actor,
+              {
+                controllerGeneration: input.controllerGeneration,
+                carrierAttemptGeneration,
+              },
+            ) ?? Object.freeze([]);
           },
           fenceReauthentication(): void {
             reauthenticationFenced = true;

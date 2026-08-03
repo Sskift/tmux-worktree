@@ -9,11 +9,19 @@ import {
   RelayV2HostConnectorControllerError,
 } from "../dist/relay/v2/hostConnectorController.js";
 import {
+  RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES,
+  RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES,
   RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2.js";
 
 const REQUIRED = Object.freeze([
   ...RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
+]);
+const OPTIONAL = Object.freeze([
+  ...RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES,
+]);
+const KNOWN = Object.freeze([
+  ...RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES,
 ]);
 const BINDING = Object.freeze({
   hostId: "mac-admin",
@@ -127,7 +135,7 @@ function isAuthorityFailure(error, code) {
 }
 
 test("inspectCut consumes one atomic controller cut and canonicalizes only the frozen subset", async () => {
-  const cut = registeredCut("7", "connector-seven", [...REQUIRED].reverse());
+  const cut = registeredCut("7", "connector-seven", [...KNOWN].reverse());
   const gate = deferred();
   let firstInspection = true;
   const h = harness({
@@ -154,7 +162,7 @@ test("inspectCut consumes one atomic controller cut and canonicalizes only the f
     acknowledgement: "host.registered",
     hostId: BINDING.hostId,
     connectorId: "connector-seven",
-    negotiatedCapabilityIntersection: REQUIRED,
+    negotiatedCapabilityIntersection: KNOWN,
   });
   assert.equal(JSON.stringify(projection).includes("twcap2."), false);
   assert.equal(JSON.stringify(projection).includes("twref2."), false);
@@ -168,6 +176,7 @@ test("inspectCut consumes one atomic controller cut and canonicalizes only the f
     negotiatedCapabilityIntersection: REQUIRED.slice(0, 5),
   });
   assert.equal(h.calls.inspect, 2, "each projection consumes exactly one atomic cut");
+  assert.deepEqual(OPTIONAL, ["agent.transcript-lifecycle.v1"]);
 });
 
 test("the adapter captures one controller and rejects foreign lineage, generation, and connector cuts", async (t) => {

@@ -61,6 +61,19 @@
     }
   ],
   "projectionCases": {
+    "registeredWithAgentCapability": {
+      "protocolVersion": 2,
+      "requestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+      "ok": true,
+      "result": {
+        "authority": { "kind": "node", "reason": null },
+        "hostCredential": { "status": "ready", "credentialReference": "host-credential-ref-2", "expiresAtMs": 1783707200000 },
+        "connector": { "status": "registered", "acknowledgement": "host.registered", "hostId": "mac-admin", "connectorId": "connector-1", "negotiatedCapabilityIntersection": ["error.structured.v1", "command.ledger.v1", "command.query.v1", "snapshot.revision.v1", "event.sequence.v1", "terminal.stream.resume.v1", "agent.transcript-lifecycle.v1"] },
+        "enrollment": { "status": "idle" },
+        "knownClientGrant": { "status": "unknown" }
+      },
+      "error": null
+    },
     "registeredIncomplete": {
       "protocolVersion": 2,
       "requestId": "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",

@@ -1956,14 +1956,37 @@ test("local-development activation advertises the atomic full offer and becomes 
 
 test("managed Host hello snapshots only the runtime-ready Agent capability", async () => {
   const ready = await createHarness({
+    managedWss: true,
     optionalExtension: readyAgentTranscriptLifecycleAttachment(),
   });
   try {
-    const { record } = await startRegistered(ready, "managed.agent-capability.ready");
+    const owner = createDashboardManagementOwner(ready);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    const record = await registerPendingManagedWss(ready);
     assert.deepEqual(record.hello.payload.capabilities, [
       ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
       AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
     ]);
+    owner.input.push(Buffer.from(dashboardManagementStatusFrame));
+    owner.input.end();
+    assert.equal(await run, 0);
+    const statusRequestId = JSON.parse(dashboardManagementStatusFrame).requestId;
+    const statusResponse = owner.writes
+      .map((frame) => JSON.parse(frame))
+      .find((candidate) => candidate.requestId === statusRequestId);
+    assert.deepEqual(statusResponse.result.connector, {
+      status: "registered",
+      acknowledgement: "host.registered",
+      hostId: HOST_ID,
+      connectorId: `managed-connector-${record.sequence}`,
+      negotiatedCapabilityIntersection: [
+        ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
+        AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      ],
+    });
   } finally {
     await ready.cleanup();
   }

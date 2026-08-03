@@ -500,6 +500,8 @@ advertise Relay v2 capabilities.
 
 ## Relay v2 Dashboard-owned Host desired state
 
+严格non-production self-hosted Host root会在首次connector attempt前打开native Agent continuity/store和dynamic rollout attachment；attachment同步ready时，exact pre-carrier offer与Dashboard management projection追加`agent.transcript-lifecycle.v1`，而base registered/enrollment gate仍只检查六项required capability。HostCarrier投影的是本attempt实际消费的不可变offer，不读取之后可能变化的readiness。默认/trusted production Host与Android optional advertisement仍为空；这条Host侧projection不代替client/broker/Host三方route negotiation，也不产生G4或production readiness。
+
 Dashboard hidden child仍不采用headless `relay-host --profile v2`的auto-start
 process lifecycle，也不会在冷启动时自行连接。self-hosted deployment owner
 以私有配置schema 6的`connectorDesiredRunning`作为唯一持久connector意图；

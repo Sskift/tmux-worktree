@@ -24,6 +24,15 @@ pub(crate) const REQUIRED_CAPABILITIES: [&str; 6] = [
     "event.sequence.v1",
     "terminal.stream.resume.v1",
 ];
+const KNOWN_CAPABILITIES: [&str; 7] = [
+    "error.structured.v1",
+    "command.ledger.v1",
+    "command.query.v1",
+    "snapshot.revision.v1",
+    "event.sequence.v1",
+    "terminal.stream.resume.v1",
+    "agent.transcript-lifecycle.v1",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -838,12 +847,12 @@ fn validate_registered_connector(
     }
     valid_identifier(host_id)?;
     valid_identifier(connector_id)?;
-    if capabilities.len() > REQUIRED_CAPABILITIES.len() {
+    if capabilities.len() > KNOWN_CAPABILITIES.len() {
         return Err(());
     }
-    let mut seen = [false; REQUIRED_CAPABILITIES.len()];
+    let mut seen = [false; KNOWN_CAPABILITIES.len()];
     for capability in capabilities {
-        let Some(index) = REQUIRED_CAPABILITIES
+        let Some(index) = KNOWN_CAPABILITIES
             .iter()
             .position(|known| capability == known)
         else {
@@ -854,7 +863,10 @@ fn validate_registered_connector(
         }
         seen[index] = true;
     }
-    if seen.iter().all(|present| *present) == must_be_complete {
+    let has_all_required = REQUIRED_CAPABILITIES
+        .iter()
+        .all(|required| capabilities.iter().any(|capability| capability == required));
+    if has_all_required == must_be_complete {
         Ok(())
     } else {
         Err(())
@@ -1011,6 +1023,27 @@ mod tests {
     #[test]
     fn dashboard_management_v2_incomplete_registration_cannot_expose_enrollment() {
         let fixture: Value = serde_json::from_str(CASES).unwrap();
+        let optional = &fixture["projectionCases"]["registeredWithAgentCapability"];
+        let optional_payload = serde_json::to_vec(optional).unwrap();
+        let decoded = decode_response(
+            &optional_payload,
+            "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
+            ManagementOperation::Status,
+        )
+        .unwrap();
+        assert_eq!(
+            projection_base_connector_readiness(&optional["result"]),
+            BaseConnectorReadiness::Ready
+        );
+        let capabilities = match decoded.result.unwrap().connector {
+            ConnectorProjection::Registered {
+                negotiated_capability_intersection,
+                ..
+            } => negotiated_capability_intersection,
+            _ => panic!("optional capability projection was not registered"),
+        };
+        assert_eq!(capabilities, KNOWN_CAPABILITIES);
+
         let valid = &fixture["projectionCases"]["registeredIncomplete"];
         let valid_payload = serde_json::to_vec(valid).unwrap();
         decode_response(

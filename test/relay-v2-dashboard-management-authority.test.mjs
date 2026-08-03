@@ -23,6 +23,7 @@ const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot),
 const cases = JSON.parse(readFileSync(new URL("cases.json", contractRoot), "utf8"));
 
 const REQUIRED = Object.freeze([...manifest.dashboardProjection.requiredCapabilities]);
+const OPTIONAL = Object.freeze([...manifest.dashboardProjection.optionalCapabilities]);
 const IDS = Object.freeze({
   status: "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
   bootstrap: "dmgmt2.wkHofchV36_U1sOtXF-hvA",
@@ -382,6 +383,24 @@ test("enrollment control is gated by the exact registered six-capability credent
       assert.equal(h.calls.some(([name]) => name === "createEnrollment"), false);
     });
   }
+});
+
+test("registered projection preserves the known Agent optional without widening the base gate", async () => {
+  const capabilities = [...REQUIRED, ...OPTIONAL];
+  const h = harness({
+    credential: readyCredential(),
+    connector: registeredConnector(capabilities),
+  });
+  const status = await h.authority.handle(request("status"));
+  assert.equal(status.result.connector.status, "registered");
+  assert.deepEqual(status.result.connector.negotiatedCapabilityIntersection, capabilities);
+  assert.deepEqual(
+    JSON.parse(encodeRelayV2DashboardManagementProtocolV2ResponseFrame(
+      status,
+      request("status"),
+    )),
+    status,
+  );
 });
 
 test("expiry and gate loss synchronously clear the only retained enrollment code", async () => {

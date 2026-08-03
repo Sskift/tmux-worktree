@@ -104,7 +104,11 @@
       "event.sequence.v1",
       "terminal.stream.resume.v1"
     ],
+    "optionalCapabilities": [
+      "agent.transcript-lifecycle.v1"
+    ],
     "registeredRequiresAllSix": true,
+    "registeredAllowsKnownOptionalCapabilities": true,
     "registeredIncompleteRequiresMissingCapability": true,
     "activeEnrollmentRequiresRegisteredAndAllSix": true,
     "knownGrantIsSingleClosedProjectionNotDeviceList": true,

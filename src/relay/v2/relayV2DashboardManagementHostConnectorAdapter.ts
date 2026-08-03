@@ -6,6 +6,7 @@ import {
 import type { RelayV2DashboardManagementProtocolV2ErrorCode } from
   "./relayV2DashboardManagementProtocolV2.js";
 import {
+  RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES,
   RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
 } from "./relayV2DashboardManagementProtocolV2.js";
 import {
@@ -162,18 +163,18 @@ function booleanValue(value: unknown): boolean {
 
 function canonicalCapabilities(value: unknown): readonly string[] {
   if (!Array.isArray(value)
-    || value.length > RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.length) {
+    || value.length > RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES.length) {
     return closed();
   }
   const seen = new Set<string>();
   for (const capability of value as unknown[]) {
     if (typeof capability !== "string"
-      || !(RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES as readonly string[])
+      || !(RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES as readonly string[])
         .includes(capability)
       || seen.has(capability)) return closed();
     seen.add(capability);
   }
-  return Object.freeze(RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.filter(
+  return Object.freeze(RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES.filter(
     (capability) => seen.has(capability),
   ));
 }

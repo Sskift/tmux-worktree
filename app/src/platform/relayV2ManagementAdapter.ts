@@ -1,5 +1,6 @@
 import type { MobileRelayV2ProductAdapter } from "./dashboardBackend";
 import {
+  MOBILE_RELAY_V2_KNOWN_CAPABILITIES,
   MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
   type MobileRelayV2CreateEnrollmentInput,
   type MobileRelayV2DashboardState,
@@ -259,10 +260,10 @@ function parseHostCredential(value: unknown): MobileRelayV2DashboardState["hostC
 }
 
 function parseCapabilities(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length > MOBILE_RELAY_V2_REQUIRED_CAPABILITIES.length) {
+  if (!Array.isArray(value) || value.length > MOBILE_RELAY_V2_KNOWN_CAPABILITIES.length) {
     return null;
   }
-  const allowed = new Set<string>(MOBILE_RELAY_V2_REQUIRED_CAPABILITIES);
+  const allowed = new Set<string>(MOBILE_RELAY_V2_KNOWN_CAPABILITIES);
   const seen = new Set<string>();
   for (const candidate of value) {
     if (typeof candidate !== "string" || !allowed.has(candidate) || seen.has(candidate)) {
@@ -270,7 +271,7 @@ function parseCapabilities(value: unknown): string[] | null {
     }
     seen.add(candidate);
   }
-  return [...seen];
+  return MOBILE_RELAY_V2_KNOWN_CAPABILITIES.filter((capability) => seen.has(capability));
 }
 
 function parseConnector(value: unknown): MobileRelayV2DashboardState["connector"] | null {
@@ -315,7 +316,10 @@ function parseConnector(value: unknown): MobileRelayV2DashboardState["connector"
     const hostId = projectionOpaque(input.hostId);
     const connectorId = projectionOpaque(input.connectorId);
     const capabilities = parseCapabilities(input.negotiatedCapabilityIntersection);
-    const complete = capabilities?.length === MOBILE_RELAY_V2_REQUIRED_CAPABILITIES.length;
+    const complete = capabilities !== null
+      && MOBILE_RELAY_V2_REQUIRED_CAPABILITIES.every(
+        (capability) => capabilities.includes(capability),
+      );
     if (
       input.acknowledgement !== "host.registered"
       || !hostId

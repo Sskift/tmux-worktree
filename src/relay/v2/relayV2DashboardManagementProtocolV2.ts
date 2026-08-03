@@ -5,6 +5,9 @@ import {
   RelayV2JsonError,
   type RelayV2JsonValue,
 } from "./strictJson.js";
+import {
+  RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+} from "../extensions/agentTranscriptLifecycle/v1/codec.js";
 
 export const RELAY_V2_DASHBOARD_MANAGEMENT_PROTOCOL_V2_CONTRACT =
   "tmux-worktree-dashboard-relay-v2-management-ipc";
@@ -18,6 +21,13 @@ export const RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES = Object.freeze
   "snapshot.revision.v1",
   "event.sequence.v1",
   "terminal.stream.resume.v1",
+] as const);
+export const RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES = Object.freeze([
+  RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+] as const);
+export const RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES = Object.freeze([
+  ...RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
+  ...RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES,
 ] as const);
 
 const REQUEST_ID_PREFIX = "dmgmt2.";
@@ -389,14 +399,14 @@ function validateHostCredential(value: unknown): value is RelayV2DashboardManage
 
 function validateCapabilities(value: unknown, complete: boolean): value is readonly string[] {
   if (!Array.isArray(value)
-    || value.length > RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.length) {
+    || value.length > RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES.length) {
     return false;
   }
   const values = value as unknown[];
   const seen = new Set<string>();
   for (const capability of values) {
     if (typeof capability !== "string"
-      || !(RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES as readonly string[])
+      || !(RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES as readonly string[])
         .includes(capability)
       || seen.has(capability)) {
       return false;
