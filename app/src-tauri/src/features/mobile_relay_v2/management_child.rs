@@ -18,7 +18,7 @@ use crate::features::control_plane::node_bin;
 const CONTRACT: &str = "tmux-worktree-dashboard-relay-v2-management-ipc";
 const PROTOCOL_VERSION_V1: u32 = 1;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_ID_PREFIX_V1: &str = "dmgmt1.";
@@ -1172,6 +1172,31 @@ fn cleanup_spawn_attempt(attempt: SpawnAttempt) {
     }
 }
 
+fn cleanup_timed_out_start(child: &dyn ManagementChildProcess) -> ManagementStartError {
+    // The self-hosted child may already own its crash-intolerant native
+    // credential claim before it can publish the ready frame. Closing stdin
+    // lets that exact child finish startup, observe EOF, and drain the claim;
+    // only a child that cannot settle within the independent close budget is
+    // killed and classified as requiring operator recovery.
+    child.close_stdin();
+    let deadline = Instant::now() + CLEAN_CLOSE_TIMEOUT;
+    match child.wait_until(deadline) {
+        Some(_) => {
+            let exit = child.wait_and_reap();
+            if exit.code == Some(0) {
+                ManagementStartError::ChannelClosed
+            } else {
+                ManagementStartError::RecoveryRequired
+            }
+        }
+        None => {
+            child.kill_if_live();
+            child.wait_and_reap();
+            ManagementStartError::RecoveryRequired
+        }
+    }
+}
+
 fn spawn_before_deadline(
     factory: Arc<dyn ChildFactory>,
     artifact: BundledManagementArtifact,
@@ -1179,8 +1204,13 @@ fn spawn_before_deadline(
 ) -> Result<Arc<dyn ManagementChildProcess>, ManagementStartError> {
     let attempt = factory.spawn(&artifact);
     if Instant::now() >= deadline {
-        cleanup_spawn_attempt(attempt);
-        return Err(ManagementStartError::ChannelClosed);
+        return Err(match attempt {
+            SpawnAttempt::Ready(child) => cleanup_timed_out_start(child.as_ref()),
+            failed => {
+                cleanup_spawn_attempt(failed);
+                ManagementStartError::ChannelClosed
+            }
+        });
     }
     match attempt {
         SpawnAttempt::Ready(child) => Ok(child),
@@ -1564,24 +1594,27 @@ impl ManagementChildManager {
     ) -> Result<Self, ManagementStartError> {
         let deadline = Instant::now() + startup_timeout;
         let child = spawn_before_deadline(factory, artifact.clone(), deadline)?;
-        let ready_matches = if Instant::now() < deadline {
+        let ready = if Instant::now() < deadline {
             read_frame(child.as_ref(), deadline)
-                .ok()
-                .is_some_and(|payload| {
-                    decode_startup_ready(&payload, expected_version, expected_protocol).is_ok()
-                })
         } else {
-            false
+            Err(FrameFailure::TimedOut)
         };
-        if !ready_matches {
-            child.kill_if_live();
-            child.wait_and_reap();
-            return Err(ManagementStartError::ChannelClosed);
-        }
-        if Instant::now() >= deadline {
-            child.kill_if_live();
-            child.wait_and_reap();
-            return Err(ManagementStartError::ChannelClosed);
+        match ready {
+            Ok(payload)
+                if decode_startup_ready(&payload, expected_version, expected_protocol).is_ok() =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(cleanup_timed_out_start(child.as_ref()));
+                }
+            }
+            Err(FrameFailure::TimedOut) => {
+                return Err(cleanup_timed_out_start(child.as_ref()));
+            }
+            Ok(_) | Err(FrameFailure::Invalid | FrameFailure::Exited(_)) => {
+                child.kill_if_live();
+                child.wait_and_reap();
+                return Err(ManagementStartError::ChannelClosed);
+            }
         }
         let inner = Arc::new(ManagerInner {
             artifact,
@@ -1954,6 +1987,7 @@ impl Drop for ManagementChildManager {
 enum FrameFailure {
     Invalid,
     Exited(ChildExit),
+    TimedOut,
 }
 
 fn read_frame(
@@ -1963,7 +1997,7 @@ fn read_frame(
     let mut payload = Vec::new();
     loop {
         if Instant::now() >= deadline {
-            return Err(FrameFailure::Invalid);
+            return Err(FrameFailure::TimedOut);
         }
         match child.read_stdout(deadline) {
             ChildRead::Bytes(bytes) if !bytes.is_empty() => {
@@ -1989,7 +2023,8 @@ fn read_frame(
                 return Err(FrameFailure::Exited(exit));
             }
             ChildRead::Exited(_) => return Err(FrameFailure::Invalid),
-            ChildRead::Bytes(_) | ChildRead::Eof | ChildRead::TimedOut | ChildRead::Failed => {
+            ChildRead::TimedOut => return Err(FrameFailure::TimedOut),
+            ChildRead::Bytes(_) | ChildRead::Eof | ChildRead::Failed => {
                 return Err(FrameFailure::Invalid)
             }
         }
@@ -2301,6 +2336,7 @@ mod tests {
         blocked: bool,
         killed: bool,
         stdin_closed: bool,
+        exit_after_stdin_close: bool,
         reaped: bool,
         health_poll: ChildPoll,
         events: Vec<&'static str>,
@@ -2329,6 +2365,7 @@ mod tests {
                     blocked: false,
                     killed: false,
                     stdin_closed: false,
+                    exit_after_stdin_close: true,
                     reaped: false,
                     health_poll: ChildPoll::Pending,
                     events: Vec::new(),
@@ -2351,6 +2388,10 @@ mod tests {
 
         fn set_health_poll(&self, poll: ChildPoll) {
             self.state.lock().unwrap().health_poll = poll;
+        }
+
+        fn set_exit_after_stdin_close(&self, exit_after_stdin_close: bool) {
+            self.state.lock().unwrap().exit_after_stdin_close = exit_after_stdin_close;
         }
 
         fn push_read(&self, after_writes: usize, read: ChildRead) {
@@ -2403,8 +2444,13 @@ mod tests {
         fn wait_until(&self, deadline: Instant) -> Option<ChildExit> {
             let mut state = self.state.lock().unwrap();
             loop {
-                if state.stdin_closed || state.killed || state.reaped {
+                if state.killed || state.reaped {
                     return Some(ChildExit { code: Some(0) });
+                }
+                if state.stdin_closed {
+                    return state
+                        .exit_after_stdin_close
+                        .then_some(ChildExit { code: Some(0) });
                 }
                 let remaining = deadline.checked_duration_since(Instant::now())?;
                 let (next, timeout) = self.changed.wait_timeout(state, remaining).unwrap();
@@ -3343,7 +3389,7 @@ mod tests {
     }
 
     #[test]
-    fn every_rejected_startup_fixture_kills_and_reaps_before_returning() {
+    fn startup_timeout_drains_but_bad_ready_fixtures_kill_before_returning() {
         let fixture = fixture();
         let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
         for case in fixture["startupHandshakeCases"]
@@ -3384,11 +3430,37 @@ mod tests {
             );
             assert_eq!(
                 child.state.lock().unwrap().events,
-                ["kill-if-live", "wait-and-reap"],
+                if case["name"] == "startup-handshake-timeout-covers-spawn-through-validated-ready"
+                {
+                    vec!["close-stdin", "wait-and-reap"]
+                } else {
+                    vec!["kill-if-live", "wait-and-reap"]
+                },
                 "{}",
                 case["name"]
             );
         }
+    }
+
+    #[test]
+    fn startup_timeout_kills_only_after_graceful_drain_does_not_settle() {
+        let child = FakeChild::sequenced(vec![(0, ChildRead::TimedOut)]);
+        child.set_exit_after_stdin_close(false);
+        let result = ManagementChildManager::start_with_factory(
+            artifact(),
+            FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
+            Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
+            ManagementProtocol::V1,
+            "1.2.3",
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(result.err(), Some(ManagementStartError::RecoveryRequired));
+        assert_eq!(
+            child.state.lock().unwrap().events,
+            ["close-stdin", "kill-if-live", "wait-and-reap"]
+        );
     }
 
     #[test]
@@ -3419,7 +3491,7 @@ mod tests {
         start.join().unwrap();
         let state = child.state.lock().unwrap();
         assert!(state.reaped);
-        assert_eq!(state.events, ["kill-if-live", "wait-and-reap"]);
+        assert_eq!(state.events, ["close-stdin", "wait-and-reap"]);
     }
 
     #[test]
