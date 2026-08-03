@@ -123,7 +123,9 @@
         cursorStyle: 'bar',
         scrollback: 5000,
         allowTransparency: false,
-        screenReaderMode: true,
+        // Keep Android IME composition on xterm's insertText path. In screen-reader
+        // mode Gboard's composing textarea replacements are emitted as cumulative data.
+        screenReaderMode: false,
         theme: {
           background: '#020509',
           foreground: '#d5dae2',
