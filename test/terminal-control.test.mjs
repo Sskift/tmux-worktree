@@ -3462,6 +3462,83 @@ test("production tmux backend captures bounded correlated output on an isolated 
   }
 });
 
+test("exact claims survive ping and foreign status while same-target status still fences", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"A".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-poll-fence",
+    scopeId: "scope-poll-fence",
+    sessionId: "session-poll-fence",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-poll-fence",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:poll-fence" },
+  };
+  try {
+    const target = await resolved(authority);
+    const foreignTarget = await resolved(authority, "foreign-terminal");
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+
+    const ping = await authority.handle({
+      protocolVersion: 1,
+      requestId: "exact-poll-ping",
+      type: "ping",
+    });
+    assert.equal(ping.authority, "local-terminal-control");
+    const foreignStatus = await authority.handle({
+      protocolVersion: 1,
+      requestId: "exact-poll-foreign-status",
+      type: "ownership.status",
+      controlTargetId: foreignTarget.controlTargetId,
+    });
+    assert.equal(foreignStatus.state, "FREE");
+
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    const opened = await authority.consumeRelayV2ExactObservation(
+      preparation.claim,
+      exactInput,
+      preparation.identity,
+    );
+    await authority.closeRelayV2ExactObservation(opened.observation);
+
+    const fenced = await authority.prepareRelayV2ExactTarget(exactInput);
+    const sameTargetStatus = await authority.handle({
+      protocolVersion: 1,
+      requestId: "exact-poll-same-status",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    });
+    assert.equal(sameTargetStatus.state, "FREE");
+    assert.throws(
+      () => authority.fenceRelayV2ExactTarget(fenced.claim, exactInput),
+      (error) => error.code === "PERMISSION_DENIED",
+    );
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
 test("exact read observation consumes the admitted claim without input ownership or generation reset", async () => {
   const temp = tempState();
   const backend = new FakeBackend();

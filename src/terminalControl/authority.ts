@@ -164,8 +164,14 @@ interface RelayV2ExactClaimRecord {
   readonly identity: TerminalControlRelayV2ExactTargetIdentity;
   readonly lease: TerminalControlLease;
   readonly externalEpoch: number;
+  readonly targetExternalEpoch: number;
   state: RelayV2ExactClaimState;
   timer: NodeJS.Timeout | null;
+}
+
+interface RelayV2TargetExternalState {
+  epoch: number;
+  operations: number;
 }
 
 interface RelayV2ExactObservationRecord {
@@ -629,6 +635,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   private readonly relayV2ExactObservations = new WeakMap<object, RelayV2ExactObservationRecord>();
   private readonly relayV2ExactLiveObservations = new Set<TerminalControlRelayV2ExactObservation>();
   private readonly relayV2ExactObserversByTarget = new Map<string, Set<TerminalControlRelayV2ExactObservation>>();
+  private readonly relayV2TargetExternalStates = new Map<string, RelayV2TargetExternalState>();
   private relayV2ExternalEpoch = 0;
   private relayV2ExternalOperations = 0;
   private relayV2ExactClosed = false;
@@ -699,9 +706,12 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   }
 
   private relayV2ExactClaimCurrent(record: RelayV2ExactClaimRecord): boolean {
+    const targetExternal = this.relayV2TargetExternalStates.get(record.identity.controlTargetId);
     return !this.relayV2ExactClosed
       && this.relayV2ExternalOperations === 0
       && this.relayV2ExternalEpoch === record.externalEpoch
+      && (targetExternal?.operations ?? 0) === 0
+      && (targetExternal?.epoch ?? 0) === record.targetExternalEpoch
       && Date.parse(record.lease.expiresAt) > this.now().getTime();
   }
 
@@ -752,6 +762,25 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     if (failed?.status === "rejected") throw failed.reason;
   }
 
+  private async relayV2WithdrawExactClaimsForTarget(controlTargetId: string): Promise<void> {
+    const records: RelayV2ExactClaimRecord[] = [];
+    for (const claim of [...this.relayV2ExactLiveClaims]) {
+      const record = this.relayV2ExactClaims.get(claim as object);
+      if (record?.identity.controlTargetId !== controlTargetId) continue;
+      this.relayV2ExactLiveClaims.delete(claim);
+      this.relayV2ExactClaims.delete(claim as object);
+      if (record.state !== "consumed" && record.state !== "revoked") {
+        record.state = "revoked";
+        records.push(record);
+      }
+    }
+    const settled = await Promise.allSettled(records.map((record) => (
+      this.relayV2RollbackRecord(record)
+    )));
+    const failed = settled.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  }
+
   private async relayV2ExternalOperation<T>(operation: () => Promise<T>): Promise<T> {
     this.relayV2ExternalOperations += 1;
     this.relayV2ExternalEpoch += 1;
@@ -761,6 +790,26 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     } finally {
       this.relayV2ExternalOperations -= 1;
       this.relayV2ExternalEpoch += 1;
+    }
+  }
+
+  private async relayV2TargetExternalOperation<T>(
+    controlTargetId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const state = this.relayV2TargetExternalStates.get(controlTargetId) ?? {
+      epoch: 0,
+      operations: 0,
+    };
+    state.operations += 1;
+    state.epoch += 1;
+    this.relayV2TargetExternalStates.set(controlTargetId, state);
+    try {
+      await this.relayV2WithdrawExactClaimsForTarget(controlTargetId);
+      return await operation();
+    } finally {
+      state.operations -= 1;
+      state.epoch += 1;
     }
   }
 
@@ -958,6 +1007,19 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         await this.prepareOutput(state, target);
       }
       ensureOperable(target);
+      // ownership.status is serialized by this same canonical lock, but it
+      // publishes its target-scoped fence before waiting for the lock. Read
+      // that fence only after the exact persisted target is known and after
+      // the final backend await, immediately before publishing HELD.
+      const targetExternal = this.relayV2TargetExternalStates.get(target.controlTargetId);
+      const targetExternalEpoch = targetExternal?.epoch ?? 0;
+      if ((targetExternal?.operations ?? 0) !== 0) {
+        throw new TerminalControlProtocolError(
+          "RESOURCE_EXHAUSTED",
+          "terminal-control target is busy",
+          true,
+        );
+      }
       if (target.ownership.state !== "FREE") {
         throw new TerminalControlProtocolError(
           "PERMISSION_DENIED",
@@ -990,6 +1052,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       return {
         identity,
         lease: leaseForOwner(state, target, input.owner),
+        targetExternalEpoch,
       };
     });
     const claim = Object.freeze(Object.create(null)) as TerminalControlRelayV2ExactTargetClaim;
@@ -1000,6 +1063,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       identity: Object.freeze({ ...prepared.identity }),
       lease: Object.freeze({ ...prepared.lease, owner: Object.freeze({ ...prepared.lease.owner }) }),
       externalEpoch,
+      targetExternalEpoch: prepared.targetExternalEpoch,
       state: "prepared",
       timer: null,
     };
@@ -1179,9 +1243,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "Relay v2 exact observation target record is fenced",
         );
       }
-      if (this.relayV2ExactClosed
-        || this.relayV2ExternalOperations !== 0
-        || this.relayV2ExternalEpoch !== record.externalEpoch) {
+      const rejectFencedReservation = (): never => {
         // The reservation is still ours; free it before fencing this consume.
         this.resetInteractiveOwners(target.controlTargetId);
         target.ownership = {
@@ -1195,6 +1257,9 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "PERMISSION_DENIED",
           "Relay v2 exact terminal target claim cannot be consumed for observation",
         );
+      };
+      if (!this.relayV2ExactClaimCurrent(record)) {
+        rejectFencedReservation();
       }
       ensureOperable(target);
       let inspected;
@@ -1247,6 +1312,13 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "managed target changed before Relay v2 exact observation",
         );
       }
+      const output = await this.prepareOutput(state, target);
+      // inspectExactTarget/prepareOutput may yield while a same-target status
+      // poll publishes its fence and waits on this lock. Recheck after the
+      // final await, before releasing HELD or publishing the observation.
+      if (!this.relayV2ExactClaimCurrent(record)) {
+        rejectFencedReservation();
+      }
       this.resetInteractiveOwners(target.controlTargetId);
       target.ownership = {
         state: "FREE",
@@ -1254,7 +1326,6 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       };
       revision(target);
       target.updatedAt = isoNow(this.now);
-      const output = await this.prepareOutput(state, target);
       const observationRecord: RelayV2ExactObservationRecord = {
         controlTargetId: record.identity.controlTargetId,
         controlEpoch: record.identity.controlEpoch,
@@ -1672,6 +1743,13 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   }
 
   async handle(request: TerminalControlRequest): Promise<unknown> {
+    if (request.type === "ping") return this.handleV1(request);
+    if (request.type === "ownership.status") {
+      return this.relayV2TargetExternalOperation(
+        request.controlTargetId,
+        () => this.handleV1(request),
+      );
+    }
     return this.relayV2ExternalOperation(() => this.handleV1(request));
   }
 
