@@ -110,6 +110,53 @@ internal fun shouldPersistRelaySelectedHost(
     selectedHostId != preferredHostId &&
     preferredHostId !in availableHostIds
 
+internal fun V2UiState.beginCreationSubmission(target: CreationTarget): V2UiState? =
+    when (target) {
+        CreationTarget.WORKTREE -> if (creatingWorktree) null else copy(
+            creatingWorktree = true,
+            actionError = null,
+        )
+        CreationTarget.TERMINAL -> if (creatingTerminal) null else copy(
+            creatingTerminal = true,
+            actionError = null,
+        )
+    }
+
+internal data class RelayV2CreationUiTransition(
+    val state: V2UiState,
+    val effect: V2UiEffect,
+)
+
+internal fun V2UiState.afterRelayV2Creation(
+    target: CreationTarget,
+    result: RelayV2ScopeCreateResult,
+    rejectionMessage: String,
+): RelayV2CreationUiTransition {
+    val settledState = when (target) {
+        CreationTarget.WORKTREE -> copy(
+            creatingWorktree = false,
+            actionError = rejectionMessage.takeIf { result is RelayV2ScopeCreateResult.Rejected },
+        )
+        CreationTarget.TERMINAL -> copy(
+            creatingTerminal = false,
+            actionError = rejectionMessage.takeIf { result is RelayV2ScopeCreateResult.Rejected },
+        )
+    }
+    val label = when (target) {
+        CreationTarget.WORKTREE -> "Worktree"
+        CreationTarget.TERMINAL -> "Terminal"
+    }
+    val effect = when (result) {
+        is RelayV2ScopeCreateResult.Queued -> V2UiEffect.CreationQueued(
+            target = target,
+            message = "$label creation queued",
+        )
+        is RelayV2ScopeCreateResult.Rejected ->
+            V2UiEffect.Notice("$label creation was not queued")
+    }
+    return RelayV2CreationUiTransition(settledState, effect)
+}
+
 /** Owns one exact selected-Session cut from status admission through its revision collector. */
 internal suspend fun collectRelayV2SelectedSessionCut(
     requestAgentStatus: suspend () -> Unit,
@@ -971,6 +1018,7 @@ class V2ViewModel(
                 }
                 return
             }
+            var submissionAlreadyInFlight = false
             val admittedCreate = synchronized(relayV2UiFenceLock) {
                 val composition = relayV2Composition
                 val scopeCut = relayV2ScopeCreateCuts.value[hostId to request.scopeId]
@@ -980,14 +1028,20 @@ class V2ViewModel(
                 ) {
                     null
                 } else {
-                    _uiState.value = _uiState.value.copy(
-                        creatingWorktree = true,
-                        actionError = null,
+                    val reservedState = _uiState.value.beginCreationSubmission(
+                        CreationTarget.WORKTREE,
                     )
-                    composition to scopeCut
+                    if (reservedState == null) {
+                        submissionAlreadyInFlight = true
+                        null
+                    } else {
+                        _uiState.value = reservedState
+                        composition to scopeCut
+                    }
                 }
             }
             if (admittedCreate == null) {
+                if (submissionAlreadyInFlight) return
                 _uiState.update {
                     it.copy(actionError = "The Relay v2 Scope is no longer current")
                 }
@@ -1005,37 +1059,26 @@ class V2ViewModel(
                         aiCommand = request.aiCommand,
                     ),
                 )
-                val current = synchronized(relayV2UiFenceLock) {
+                val transition = synchronized(relayV2UiFenceLock) {
                     if (relayV2Composition !== composition ||
                         _uiState.value.relayStartupAdmission !=
                         RelayStartupAdmissionState.RELAY_V2
                     ) {
-                        false
+                        null
                     } else {
-                        _uiState.value = when (result) {
-                            is RelayV2ScopeCreateResult.Queued -> _uiState.value.copy(
-                                creatingWorktree = false,
-                                actionError = null,
-                            )
-                            is RelayV2ScopeCreateResult.Rejected -> _uiState.value.copy(
-                                creatingWorktree = false,
-                                actionError = result.failure.createWorktreeUserMessage(),
-                            )
-                        }
-                        true
+                        val transition = _uiState.value.afterRelayV2Creation(
+                            target = CreationTarget.WORKTREE,
+                            result = result,
+                            rejectionMessage = (result as? RelayV2ScopeCreateResult.Rejected)
+                                ?.failure
+                                ?.createWorktreeUserMessage()
+                                .orEmpty(),
+                        )
+                        _uiState.value = transition.state
+                        transition
                     }
                 }
-                if (current) {
-                    emit(
-                        V2UiEffect.Notice(
-                            when (result) {
-                                is RelayV2ScopeCreateResult.Queued -> "Worktree creation queued"
-                                is RelayV2ScopeCreateResult.Rejected ->
-                                    "Worktree creation was not queued"
-                            },
-                        ),
-                    )
-                }
+                transition?.let { emit(it.effect) }
             }
             return
         }
@@ -1098,6 +1141,7 @@ class V2ViewModel(
                 }
                 return
             }
+            var submissionAlreadyInFlight = false
             val admittedCreate = synchronized(relayV2UiFenceLock) {
                 val composition = relayV2Composition
                 val scopeCut = relayV2ScopeCreateCuts.value[selectedHost to scopeId]
@@ -1107,14 +1151,20 @@ class V2ViewModel(
                 ) {
                     null
                 } else {
-                    _uiState.value = _uiState.value.copy(
-                        creatingTerminal = true,
-                        actionError = null,
+                    val reservedState = _uiState.value.beginCreationSubmission(
+                        CreationTarget.TERMINAL,
                     )
-                    composition to scopeCut
+                    if (reservedState == null) {
+                        submissionAlreadyInFlight = true
+                        null
+                    } else {
+                        _uiState.value = reservedState
+                        composition to scopeCut
+                    }
                 }
             }
             if (admittedCreate == null) {
+                if (submissionAlreadyInFlight) return
                 _uiState.update {
                     it.copy(actionError = "The Relay v2 Scope is no longer current")
                 }
@@ -1129,38 +1179,26 @@ class V2ViewModel(
                         label = label.trim().takeIf(String::isNotEmpty),
                     ),
                 )
-                val current = synchronized(relayV2UiFenceLock) {
+                val transition = synchronized(relayV2UiFenceLock) {
                     if (relayV2Composition !== composition ||
                         _uiState.value.relayStartupAdmission !=
                         RelayStartupAdmissionState.RELAY_V2
                     ) {
-                        false
+                        null
                     } else {
-                        _uiState.value = when (result) {
-                            is RelayV2ScopeCreateResult.Queued -> _uiState.value.copy(
-                                creatingTerminal = false,
-                                actionError = null,
-                            )
-                            is RelayV2ScopeCreateResult.Rejected -> _uiState.value.copy(
-                                creatingTerminal = false,
-                                actionError = result.failure.createTerminalUserMessage(),
-                            )
-                        }
-                        true
+                        val transition = _uiState.value.afterRelayV2Creation(
+                            target = CreationTarget.TERMINAL,
+                            result = result,
+                            rejectionMessage = (result as? RelayV2ScopeCreateResult.Rejected)
+                                ?.failure
+                                ?.createTerminalUserMessage()
+                                .orEmpty(),
+                        )
+                        _uiState.value = transition.state
+                        transition
                     }
                 }
-                if (current) {
-                    emit(
-                        V2UiEffect.Notice(
-                            when (result) {
-                                is RelayV2ScopeCreateResult.Queued ->
-                                    "Terminal creation queued"
-                                is RelayV2ScopeCreateResult.Rejected ->
-                                    "Terminal creation was not queued"
-                            },
-                        ),
-                    )
-                }
+                transition?.let { emit(it.effect) }
             }
             return
         }
@@ -3366,6 +3404,7 @@ class V2ViewModel(
     private fun V2UiEffect.isCritical(): Boolean = when (this) {
         is V2UiEffect.NavigateToSession,
         is V2UiEffect.NavigateToTerminal,
+        is V2UiEffect.CreationQueued,
         is V2UiEffect.TerminalReset,
         V2UiEffect.ProfileCleared,
         -> true

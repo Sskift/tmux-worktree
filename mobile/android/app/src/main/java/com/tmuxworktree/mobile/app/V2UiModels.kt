@@ -265,9 +265,18 @@ data class NewWorktreeRequest(
     val aiCommand: String,
 )
 
+enum class CreationTarget {
+    WORKTREE,
+    TERMINAL,
+}
+
 sealed interface V2UiEffect {
     data class NavigateToSession(val sessionId: String) : V2UiEffect
     data class NavigateToTerminal(val sessionId: String) : V2UiEffect
+    data class CreationQueued(
+        val target: CreationTarget,
+        val message: String,
+    ) : V2UiEffect
     data class TerminalReset(val message: String = "") : V2UiEffect
     data class TerminalWrite(val data: String) : V2UiEffect
     data object ProfileCleared : V2UiEffect

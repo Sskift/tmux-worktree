@@ -82,6 +82,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.tmuxworktree.mobile.BuildConfig
 import com.tmuxworktree.mobile.app.AgentCapabilityAvailability
+import com.tmuxworktree.mobile.app.CreationTarget
 import com.tmuxworktree.mobile.app.NewWorktreeRequest
 import com.tmuxworktree.mobile.app.RelayV2EnrollmentReviewState
 import com.tmuxworktree.mobile.app.RelayStartupAdmissionState
@@ -219,6 +220,16 @@ internal fun V2Navigation(
                     destinationRoute = V2Routes.terminal(effect.sessionId),
                     formRoute = V2Routes.NEW_TERMINAL,
                 )
+                is V2UiEffect.CreationQueued -> {
+                    val formRoute = when (effect.target) {
+                        CreationTarget.WORKTREE -> V2Routes.NEW_WORKTREE
+                        CreationTarget.TERMINAL -> V2Routes.NEW_TERMINAL
+                    }
+                    if (navController.currentDestination?.route == formRoute) {
+                        navController.popBackStack()
+                    }
+                    launch { snackbarHostState.showSnackbar(effect.message) }
+                }
                 is V2UiEffect.TerminalReset -> terminalController.reset(effect.message)
                 is V2UiEffect.TerminalWrite -> terminalController.write(effect.data)
                 V2UiEffect.ProfileCleared -> terminalController.clear()

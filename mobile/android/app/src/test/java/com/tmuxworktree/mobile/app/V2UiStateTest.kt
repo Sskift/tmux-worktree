@@ -10,9 +10,12 @@ import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -113,6 +116,40 @@ class V2UiStateTest {
         assertEquals(
             "first reply plus more",
             edited.afterCommittedReply("session-a", submitted).drafts["session-a"],
+        )
+    }
+
+    @Test
+    fun relayV2CreateSubmissionIsFencedUntilQueuedResultLeavesTheForm() {
+        val initial = V2UiState(relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2)
+
+        val submitting = requireNotNull(
+            initial.beginCreationSubmission(CreationTarget.TERMINAL),
+        )
+        assertTrue(submitting.creatingTerminal)
+        assertNull(submitting.beginCreationSubmission(CreationTarget.TERMINAL))
+
+        val queued = submitting.afterRelayV2Creation(
+            target = CreationTarget.TERMINAL,
+            result = RelayV2ScopeCreateResult.Queued(
+                receipt = RelayV2OutboxEnqueueReceipt(
+                    hostId = "host-a",
+                    expectedHostEpoch = "11111111-1111-4111-8111-111111111111",
+                    commandId = "22222222-2222-4222-8222-222222222222",
+                    createdOrder = 1,
+                ),
+            ),
+            rejectionMessage = "",
+        )
+
+        assertFalse(queued.state.creatingTerminal)
+        assertNull(queued.state.actionError)
+        assertEquals(
+            V2UiEffect.CreationQueued(
+                target = CreationTarget.TERMINAL,
+                message = "Terminal creation queued",
+            ),
+            queued.effect,
         )
     }
 
