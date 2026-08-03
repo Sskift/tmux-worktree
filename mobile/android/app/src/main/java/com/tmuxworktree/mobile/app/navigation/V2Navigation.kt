@@ -990,6 +990,7 @@ private fun TerminalRoute(
                     controller.setReadOnly(readOnly)
                     controller.setFontSize(fontSize)
                     controller.fit()
+                    if (keyboardVisible) controller.focus()
                     viewModel.openTerminal(session, attachmentId, rendererBinding)
                 },
                 onViewLoss = {

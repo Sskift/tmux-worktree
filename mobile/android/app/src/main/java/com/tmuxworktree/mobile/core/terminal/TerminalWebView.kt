@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
@@ -399,9 +400,41 @@ class TerminalWebViewController internal constructor() {
 
     fun fit() = evaluate("window.twFit&&window.twFit();")
 
-    fun focus() = evaluate("window.twFocus&&window.twFocus();")
+    fun focus() {
+        val target = currentReadyWebView() ?: return
+        postToView(target.view) {
+            if (!ownsReadyView(target.view, target.binding)) return@postToView
+            if (!target.view.requestFocus() && !target.view.hasFocus()) return@postToView
+            runCatching {
+                target.view.evaluateJavascript("window.twFocus&&window.twFocus();") {
+                    postToView(target.view) restart@{
+                        if (!ownsReadyView(target.view, target.binding)) return@restart
+                        val inputMethodManager = target.view.context
+                            .getSystemService(InputMethodManager::class.java)
+                            ?: return@restart
+                        inputMethodManager.restartInput(target.view)
+                        inputMethodManager.showSoftInput(
+                            target.view,
+                            InputMethodManager.SHOW_IMPLICIT,
+                        )
+                    }
+                }
+            }
+        }
+    }
 
-    fun blur() = evaluate("window.twBlur&&window.twBlur();")
+    fun blur() {
+        val target = currentReadyWebView() ?: return
+        postToView(target.view) {
+            if (!ownsReadyView(target.view, target.binding)) return@postToView
+            runCatching {
+                target.view.evaluateJavascript("window.twBlur&&window.twBlur();", null)
+            }
+            target.view.context.getSystemService(InputMethodManager::class.java)
+                ?.hideSoftInputFromWindow(target.view.windowToken, 0)
+            target.view.clearFocus()
+        }
+    }
 
     fun clear() {
         val (readyView, parserMutation) = synchronized(lock) {
@@ -563,6 +596,13 @@ class TerminalWebViewController internal constructor() {
         binding: TerminalWebViewParserBinding,
     ): Boolean = synchronized(lock) {
         isReady && ownership.view(binding) === view
+    }
+
+    private fun currentReadyWebView(): BoundWebView? = synchronized(lock) {
+        val view = (ownership.currentView() as? WebView)?.takeIf { isReady }
+            ?: return@synchronized null
+        val binding = ownership.currentBinding(this) ?: return@synchronized null
+        BoundWebView(view, binding)
     }
 
     private fun postTerminalDrain(target: TerminalDrainTarget) {
