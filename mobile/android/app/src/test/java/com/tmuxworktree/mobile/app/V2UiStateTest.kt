@@ -6,6 +6,7 @@ import com.tmuxworktree.mobile.core.model.ConnectionHealth
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelayHost
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
@@ -214,6 +215,58 @@ class V2UiStateTest {
         assertFalse(stale.ownsRoute("route-new"))
         assertTrue(fresh.isCurrent("route-new", mapOf("session-a" to freshCut)))
         assertFalse(fresh.ownsRoute("route-old"))
+    }
+
+    @Test
+    fun relayV2TerminalAttachmentRetainsOnlyAnActiveOpenForTheExactRoute() {
+        val cut = object : RelayV2SessionReplyCut {}
+        val fence = RelayV2TerminalUiAttachmentFence("session-a", "route-a", cut)
+
+        assertTrue(
+            fence.retainsActiveRoute(
+                "route-a",
+                TerminalStreamState(
+                    sessionId = "session-a",
+                    status = ConnectionStatus.CONNECTING,
+                ),
+            ),
+        )
+        assertTrue(
+            fence.retainsActiveRoute(
+                "route-a",
+                TerminalStreamState(
+                    sessionId = "session-a",
+                    status = ConnectionStatus.ONLINE,
+                ),
+            ),
+        )
+        assertFalse(
+            fence.retainsActiveRoute(
+                "route-a",
+                TerminalStreamState(
+                    sessionId = "session-a",
+                    status = ConnectionStatus.OFFLINE,
+                ),
+            ),
+        )
+        assertFalse(
+            fence.retainsActiveRoute(
+                "route-b",
+                TerminalStreamState(
+                    sessionId = "session-a",
+                    status = ConnectionStatus.CONNECTING,
+                ),
+            ),
+        )
+        assertFalse(
+            fence.retainsActiveRoute(
+                "route-a",
+                TerminalStreamState(
+                    sessionId = "session-b",
+                    status = ConnectionStatus.CONNECTING,
+                ),
+            ),
+        )
     }
 
     @Test

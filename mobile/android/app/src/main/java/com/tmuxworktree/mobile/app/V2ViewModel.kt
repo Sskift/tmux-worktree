@@ -192,6 +192,14 @@ internal class RelayV2TerminalUiAttachmentFence(
 
     fun isCurrent(currentCuts: Map<String, RelayV2SessionReplyCut>): Boolean =
         currentCuts[sessionStableId] === sessionCut
+
+    fun retainsActiveRoute(
+        expectedAttachmentId: String,
+        terminal: TerminalStreamState,
+    ): Boolean =
+        ownsRoute(expectedAttachmentId) &&
+            terminal.sessionId == sessionStableId &&
+            terminal.status in setOf(ConnectionStatus.CONNECTING, ConnectionStatus.ONLINE)
 }
 
 class V2ViewModel(
@@ -207,6 +215,19 @@ class V2ViewModel(
         val lifecycle: RelayV2TerminalUiAttachmentLifecycle<RelayV2TerminalAttachment> =
             RelayV2TerminalUiAttachmentLifecycle(),
     )
+
+    private sealed interface RelayV2TerminalUiOpenAdmission {
+        data object RetainedCurrent : RelayV2TerminalUiOpenAdmission
+
+        data class Open(
+            val issued: RelayV2UiTerminalAttachment,
+            val previousDetach: Triple<
+                RelayV2UiTerminalAttachment,
+                RelayV2TerminalAttachmentDetach<RelayV2TerminalAttachment>,
+                RelayV2TerminalParserCallbackBarrier,
+            >?,
+        ) : RelayV2TerminalUiOpenAdmission
+    }
 
     private val repository = container.repository
     private val preferencesStore = container.preferences
@@ -1318,6 +1339,14 @@ class V2ViewModel(
             ) {
                 null
             } else {
+                val previous = relayV2Terminal
+                if (previous != null &&
+                    previous.fence.retainsActiveRoute(attachmentId, _uiState.value.terminal) &&
+                    previous.rendererBinding.isCurrent() &&
+                    rendererBinding.isCurrent()
+                ) {
+                    return@synchronized RelayV2TerminalUiOpenAdmission.RetainedCurrent
+                }
                 val parser = RelayV2TerminalWebViewParserAdapter(
                     rendererBinding,
                     viewModelScope,
@@ -1328,19 +1357,27 @@ class V2ViewModel(
                     parser = parser,
                     rendererBinding = rendererBinding,
                 )
-                val previous = relayV2Terminal
                 val previousDetach = previous?.let {
                     val callbacks = it.parser.fenceAttachment()
                     Triple(it, it.lifecycle.requestDetach(), callbacks)
                 }
                 relayV2Terminal = issued
-                issued to previousDetach
+                _uiState.value = _uiState.value.copy(
+                    terminal = TerminalStreamState(
+                        sessionId = session.stableId,
+                        status = ConnectionStatus.CONNECTING,
+                    ),
+                    actionError = null,
+                )
+                RelayV2TerminalUiOpenAdmission.Open(issued, previousDetach)
             }
         }
+        if (admitted === RelayV2TerminalUiOpenAdmission.RetainedCurrent) return
         if (admitted == null) {
             _uiState.update { it.copy(actionError = "Relay v2 Session is no longer current") }
             return
         }
+        check(admitted is RelayV2TerminalUiOpenAdmission.Open)
         viewModelScope.launch {
             val (issued, previousDetach) = admitted
             val composition = issued.composition
