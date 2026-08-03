@@ -368,6 +368,97 @@ function startableShipping({ backendOptions = {}, profileOverrides = {}, makeRes
   };
 }
 
+function agentReadiness(events) {
+  const subscribers = new Set();
+  let cancelCalls = 0;
+  let receipt;
+  receipt = Object.freeze({
+    status: "ready",
+    subscribeLoss(onLoss) {
+      assert.strictEqual(this, receipt);
+      assert.equal(typeof onLoss, "function");
+      events.push("agent.subscribe");
+      subscribers.add(onLoss);
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        cancelCalls += 1;
+        events.push("agent.cancel");
+        subscribers.delete(onLoss);
+      };
+    },
+  });
+  return Object.freeze({
+    receipt,
+    lose() {
+      events.push("agent.loss");
+      for (const subscriber of [...subscribers]) subscriber();
+    },
+    subscriptionCount() { return subscribers.size; },
+    cancelCalls() { return cancelCalls; },
+  });
+}
+
+function startableSingleNodeShipping(
+  agentTranscriptLifecycleReadiness,
+  events = [],
+) {
+  const { resolver } = privilegedResolver(events);
+  const authorityState = { closed: false };
+  const unavailable = async () => { throw new Error("unused fake authority operation"); };
+  const authority = Object.freeze({
+    authorityContinuityReadiness: Object.freeze({ status: "ready" }),
+    handle: unavailable,
+    admitHttpSource: unavailable,
+    releaseHttpSourceAdmission() {},
+    authorizeAccessToken: unavailable,
+    bootstrapHost: unavailable,
+    redeemEnrollment: unavailable,
+    refreshClientGrantFromHttp: unavailable,
+    refreshHostGrantFromHttp: unavailable,
+    selfRevokeGrantFromHttp: unavailable,
+    async close() {
+      authorityState.closed = true;
+      events.push("authority.close");
+    },
+    async adminCreateHostBootstrap() {
+      return Object.freeze({
+        bootstrapToken: TEST_BOOTSTRAP_TOKEN,
+        expiresAtMs: Date.now() + 60_000,
+      });
+    },
+    adminClaimHostBootstrapPublication: unavailable,
+    adminAcknowledgeHostBootstrapPublication: unavailable,
+    adminRotateIssuerKey: unavailable,
+    adminRemoveIssuerKey: unavailable,
+    adminRotateReplayKey: unavailable,
+  });
+  const profile = shippingProfile();
+  delete profile.externalContinuity;
+  profile.nonProductionCredentialPolicy =
+    "non-production-single-node-co-located-sqlite-v1";
+  const inputs = {
+    privilegedResolver: resolver,
+    nonProductionCredentialAuthorityOpener: async () => {
+      events.push("authority.open");
+      return authority;
+    },
+    createHttpsServer: trackingCreateHttpsServer(events),
+    ...(agentTranscriptLifecycleReadiness === undefined
+      ? {}
+      : { agentTranscriptLifecycleReadiness }),
+  };
+  return Object.freeze({
+    events,
+    authorityState,
+    inputs,
+    async start() {
+      return relayServer.startRelayV2BrokerShippingRoot(profile, inputs);
+    },
+  });
+}
+
 function postJson(port, requestPath, body, { method = "POST" } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === null ? null : Buffer.from(JSON.stringify(body), "utf8");
@@ -665,6 +756,47 @@ test("durable authorities open before listen and only the frozen public surface 
     handle.admin.createHostBootstrap({}, () => {}),
     /admin is unavailable/,
   );
+});
+
+test("shipping deployment preserves optional Agent readiness and isolates its loss from base v2", async () => {
+  const disabled = startableSingleNodeShipping();
+  assert.equal(
+    Object.hasOwn(disabled.inputs, "agentTranscriptLifecycleReadiness"),
+    false,
+  );
+  const disabledHandle = await disabled.start();
+  assert.equal(disabled.events.some((event) => event.startsWith("agent.")), false);
+  await disabledHandle.shutdown();
+  assert.equal(disabled.authorityState.closed, true);
+
+  const events = [];
+  const readiness = agentReadiness(events);
+  const shipping = startableSingleNodeShipping(readiness.receipt, events);
+  const handle = await shipping.start();
+  try {
+    assert.equal(readiness.subscriptionCount(), 1);
+    assert.ok(
+      shipping.events.indexOf("agent.subscribe")
+        < shipping.events.indexOf("https.listening"),
+      "the optional receipt must bind before the public listener starts",
+    );
+
+    readiness.lose();
+    assert.equal(readiness.subscriptionCount(), 1);
+    assert.equal(shipping.authorityState.closed, false);
+    assert.equal(await connectRefused(handle.port), false);
+
+    const baseSecrets = [];
+    await handle.admin.createHostBootstrap({}, (secret) => baseSecrets.push(secret));
+    assert.equal(baseSecrets.length, 1);
+    assert.match(baseSecrets[0], /^twhostboot2\./);
+    assert.equal(shipping.authorityState.closed, false);
+  } finally {
+    await handle.shutdown();
+  }
+  assert.equal(readiness.subscriptionCount(), 0);
+  assert.equal(readiness.cancelCalls(), 1);
+  assert.equal(shipping.authorityState.closed, true);
 });
 
 test("privileged admin seam delivers bootstrap secret only to the sink and reuses authority semantics", async () => {

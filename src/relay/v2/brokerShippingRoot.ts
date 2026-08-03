@@ -38,7 +38,10 @@ import {
   type RelayV2BrokerCredentialStateStoreNativeLoader,
 } from "./brokerCredentialStateStoreLoader.js";
 import type { RelayV2BrokerTransportCloseDeadlineScheduler } from "./brokerTransportCloseCoordinator.js";
-import type { RelayV2BrokerServerComposition } from "../broker/server.js";
+import type {
+  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+  RelayV2BrokerServerComposition,
+} from "../broker/server.js";
 
 /**
  * Explicit, default-off Relay v2 broker shipping root.
@@ -50,10 +53,12 @@ import type { RelayV2BrokerServerComposition } from "../broker/server.js";
  * stays behind the injected attempt provider. The one alternate profile shape
  * is the exact non-production single-node policy below, which may inject a
  * canonical credential-authority opener but cannot inject native/E0 inputs.
- * This root never exposes the admin seam on the public route, adds no readiness
- * or capability advertisement, and has no Relay v1 fallback. Listener success
- * is not Relay v2 production readiness; native `qualifiedRecords=[]` and
- * qualified E0/TLS deployment evidence still gate production availability.
+ * This root never exposes the admin seam on the public route and has no Relay
+ * v1 fallback. Omission of the narrow optional Agent readiness receipt remains
+ * default-off; when explicitly injected, the receipt can affect only that
+ * extension and cannot complete base-v2 readiness. Listener success is not
+ * Relay v2 production readiness; native `qualifiedRecords=[]` and qualified
+ * E0/TLS deployment evidence still gate production availability.
  */
 
 export interface RelayV2BrokerShippingTlsReferences {
@@ -104,6 +109,9 @@ export interface RelayV2BrokerShippingPrivilegedResolver {
 
 interface RelayV2BrokerShippingDeploymentInputsBase {
   readonly privilegedResolver: RelayV2BrokerShippingPrivilegedResolver;
+  /** Omission keeps agent.transcript-lifecycle.v1 default-off. */
+  readonly agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   readonly closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
   readonly createHttpsServer?: (options: Readonly<{
     key: string | Buffer | Uint8Array;
@@ -370,6 +378,8 @@ type CapturedDeploymentInputs = Readonly<{
   resolveIssuerKeyring: RelayV2BrokerShippingPrivilegedResolver["resolveIssuerKeyring"];
   externalContinuityAttemptProvider?: RelayV2ExternalContinuityAuthorityAttemptProvider;
   nativeLoader?: RelayV2BrokerCredentialStateStoreNativeLoader;
+  agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   nonProductionCredentialAuthorityOpener?:
     RelayV2BrokerShippingNonProductionCredentialAuthorityOpener;
   closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
@@ -411,6 +421,31 @@ function capturePrivilegedResolver(value: unknown): Readonly<{
   });
 }
 
+/**
+ * Snapshots the exact two-field receipt before any listener can start while
+ * retaining the deployment owner's receiver for its one-way loss subscription.
+ * The canonical Broker runtime remains the only consumer and capability owner.
+ */
+function captureAgentTranscriptLifecycleReadiness(
+  value: unknown,
+): RelayV2BrokerServerAgentCapabilityReadinessReceipt {
+  const record = captureOwnDataRecord(value, ["status", "subscribeLoss"]);
+  if (
+    record === null
+    || record.status !== "ready"
+    || typeof record.subscribeLoss !== "function"
+    || rejectedProxy(record.subscribeLoss)
+  ) throw new TypeError(INPUTS_INVALID);
+  const receiver = value as object;
+  const subscribeLoss = record.subscribeLoss;
+  return Object.freeze({
+    status: "ready" as const,
+    subscribeLoss(onLoss: () => void): () => void {
+      return Reflect.apply(subscribeLoss, receiver, [onLoss]) as () => void;
+    },
+  });
+}
+
 function captureDeploymentInputs(
   value: unknown,
   nonProduction: boolean,
@@ -421,6 +456,7 @@ function captureDeploymentInputs(
     "externalContinuityAttemptProvider",
     "nativeLoader",
     "nonProductionCredentialAuthorityOpener",
+    "agentTranscriptLifecycleReadiness",
     "closeDeadlineScheduler",
     "createHttpsServer",
   ]);
@@ -448,6 +484,12 @@ function captureDeploymentInputs(
         || rejectedProxy(record.createHttpsServer)))
   ) throw new TypeError(INPUTS_INVALID);
   const resolver = capturePrivilegedResolver(record.privilegedResolver);
+  const agentTranscriptLifecycleReadiness =
+    record.agentTranscriptLifecycleReadiness === undefined
+      ? undefined
+      : captureAgentTranscriptLifecycleReadiness(
+          record.agentTranscriptLifecycleReadiness,
+        );
   const createHttpsServer = (record.createHttpsServer ?? ((options: Readonly<{
     key: string | Buffer | Uint8Array;
     cert: string | Buffer | Uint8Array;
@@ -473,6 +515,9 @@ function captureDeploymentInputs(
     ...(record.closeDeadlineScheduler === undefined
       ? {}
       : { closeDeadlineScheduler: record.closeDeadlineScheduler as RelayV2BrokerTransportCloseDeadlineScheduler }),
+    ...(agentTranscriptLifecycleReadiness === undefined
+      ? {}
+      : { agentTranscriptLifecycleReadiness }),
     createHttpsServer,
   });
 }
@@ -697,6 +742,12 @@ export async function startRelayV2BrokerShippingRoot(
         ...(inputs.closeDeadlineScheduler === undefined
           ? {}
           : { closeDeadlineScheduler: inputs.closeDeadlineScheduler }),
+        ...(inputs.agentTranscriptLifecycleReadiness === undefined
+          ? {}
+          : {
+              agentTranscriptLifecycleReadiness:
+                inputs.agentTranscriptLifecycleReadiness,
+            }),
       })
     : createRelayV2BrokerProductionComposition({
         trustedHome: profile.trustedHome,
@@ -709,6 +760,12 @@ export async function startRelayV2BrokerShippingRoot(
         ...(inputs.closeDeadlineScheduler === undefined
           ? {}
           : { closeDeadlineScheduler: inputs.closeDeadlineScheduler }),
+        ...(inputs.agentTranscriptLifecycleReadiness === undefined
+          ? {}
+          : {
+              agentTranscriptLifecycleReadiness:
+                inputs.agentTranscriptLifecycleReadiness,
+            }),
       });
 
   let acquiredTlsMaterial: unknown;
@@ -783,6 +840,12 @@ export async function startRelayV2BrokerShippingRoot(
     ...(composition.closeDeadlineScheduler === undefined
       ? {}
       : { closeDeadlineScheduler: composition.closeDeadlineScheduler }),
+    ...(composition.agentTranscriptLifecycleReadiness === undefined
+      ? {}
+      : {
+          agentTranscriptLifecycleReadiness:
+            composition.agentTranscriptLifecycleReadiness,
+        }),
   });
 
   let serverHandle: RelayV2BrokerPublicHttpsServerHandle;

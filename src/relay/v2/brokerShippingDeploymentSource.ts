@@ -35,6 +35,9 @@ import {
   parseRelayV2IssuerKeyring,
   type RelayV2IssuerKeyring,
 } from "./issuer.js";
+import type {
+  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+} from "../broker/server.js";
 
 /**
  * The single default-off trusted deployment activation/source owner for the
@@ -61,9 +64,11 @@ import {
  * immediately; the privileged resolvers re-read freshly on every call and zero
  * their buffers on dispose. This owner reuses the existing fixed native
  * loader and the Node E0 attempt provider over the system Node stack, creates
- * no second authority/E0/native owner, never falls back to Relay v1, and
- * advertises no readiness or capability; native `qualifiedRecords=[]` and the
- * overall NO-GO are unchanged.
+ * no second authority/E0/native owner and never falls back to Relay v1. It
+ * invents no optional readiness fact: only an explicitly injected process-local
+ * Agent receipt is forwarded, while omission remains default-off. That receipt
+ * cannot affect native qualification or base-v2 readiness; native
+ * `qualifiedRecords=[]` and the overall NO-GO are unchanged.
  */
 
 export type RelayV2BrokerShippingDeploymentSourceErrorCode =
@@ -630,11 +635,13 @@ export function createRelayV2BrokerDeploymentFileResolvers(
  * real Node E0 attempt provider (system Node stack) over the file-backed
  * frozen resolver, and the file-backed frozen privileged resolver. The eager
  * validation pass fails closed before anything here can open, mutate, or
- * listen. There is no caller-supplied seam: qualification cannot be faked
- * through this boundary.
+ * listen. The sole caller-supplied value is the independent optional Agent
+ * readiness receipt; it cannot replace or qualify a production dependency.
  */
 export function createRelayV2BrokerShippingDeploymentInputs(
   profile: RelayV2BrokerShippingProfile,
+  agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt,
 ): RelayV2BrokerShippingDeploymentInputs {
   const { privilegedResolver, externalContinuityMaterialResolver } =
     createRelayV2BrokerDeploymentFileResolvers(profile);
@@ -645,20 +652,29 @@ export function createRelayV2BrokerShippingDeploymentInputs(
         resolver: externalContinuityMaterialResolver,
       }),
     nativeLoader: relayV2BrokerCredentialStateStoreNativeLoader,
+    ...(agentTranscriptLifecycleReadiness === undefined
+      ? {}
+      : { agentTranscriptLifecycleReadiness }),
   });
 }
 
 /**
  * CLI-facing trusted activation: reads the reference-only profile through the
  * shipping root's own reader, derives the deployment inputs from the fixed
- * trustedHome namespace, and hands both to the existing shipping root. Any
+ * trustedHome namespace, and hands both to the existing shipping root. The
+ * CLI omits the independent optional Agent receipt, keeping it default-off. Any
  * profile, identifier, ownership, material, E0, or native failure fails closed
  * before any listener — never falling back to Relay v1.
  */
 export async function startRelayV2BrokerShippingFromTrustedDeployment(
   profilePath: string,
+  agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt,
 ): Promise<RelayV2BrokerShippingRootHandle> {
   const profile = readRelayV2BrokerShippingProfile(profilePath);
-  const inputs = createRelayV2BrokerShippingDeploymentInputs(profile);
+  const inputs = createRelayV2BrokerShippingDeploymentInputs(
+    profile,
+    agentTranscriptLifecycleReadiness,
+  );
   return startRelayV2BrokerShippingRoot(profile, inputs);
 }

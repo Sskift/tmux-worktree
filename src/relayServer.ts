@@ -15,6 +15,7 @@ import { createRelayV2HostBootstrapOutputSink } from "./relay/broker/hostBootstr
 
 export type {
   RelayBrokerServerHandle,
+  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
   RelayV2BrokerServerComposition,
   RelayV2BrokerServerCredentialAuthority,
 } from "./relay/broker/server.js";
@@ -92,9 +93,14 @@ export async function startRelayV2BrokerShippingFromProfileFile(
  */
 export async function startRelayV2BrokerShippingFromTrustedDeployment(
   profilePath: string,
+  agentTranscriptLifecycleReadiness?:
+    import("./relay/broker/server.js").RelayV2BrokerServerAgentCapabilityReadinessReceipt,
 ): Promise<import("./relay/v2/brokerShippingRoot.js").RelayV2BrokerShippingRootHandle> {
   return (await import("./relay/v2/brokerShippingDeploymentSource.js"))
-    .startRelayV2BrokerShippingFromTrustedDeployment(profilePath);
+    .startRelayV2BrokerShippingFromTrustedDeployment(
+      profilePath,
+      agentTranscriptLifecycleReadiness,
+    );
 }
 
 /**
@@ -112,8 +118,10 @@ export async function startRelayV2BrokerLocalDevelopment(
 /**
  * Explicit non-production Linux x64 single-node root. It keeps the canonical
  * Broker shipping/credential/HTTPS/WSS owners and injects one co-located
- * SQLite storage/continuity/keyring owner. The co-located continuity is not E0
- * and this entry never changes production qualification or falls back to v1.
+ * SQLite storage/continuity/keyring owner. Callers may explicitly supply the
+ * independent optional Agent routing receipt in `options`; the CLI omits it.
+ * The co-located continuity is not E0 and this entry never changes production
+ * qualification or falls back to v1.
  */
 export async function startRelayV2BrokerSingleNodeSelfHosted(
   options: import("./relay/v2/brokerSingleNodeSelfHostedActivation.js").RelayV2BrokerSingleNodeSelfHostedOptions,

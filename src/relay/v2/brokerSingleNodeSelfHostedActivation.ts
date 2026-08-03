@@ -50,6 +50,9 @@ import {
   type RelayV2BrokerCredentialAuthorityGenesis,
 } from "./brokerCredentialAuthority.js";
 import type { RelayV2LiveAuthorizationFencePort } from "./brokerCore.js";
+import type {
+  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+} from "../broker/server.js";
 
 const ACTIVATION_FAILED =
   "Relay v2 single-node self-hosted Broker activation failed";
@@ -74,6 +77,9 @@ export interface RelayV2BrokerSingleNodeSelfHostedOptions {
   readonly tlsKeyPath: string;
   readonly tlsCertificatePath: string;
   readonly stateDirectory: string;
+  /** Explicit optional routing receipt; omission remains default-off. */
+  readonly agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
 type CapturedOptions = Readonly<{
@@ -84,6 +90,8 @@ type CapturedOptions = Readonly<{
   tlsKeyPath: string;
   tlsCertificatePath: string;
   stateDirectory: string;
+  agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }>;
 
 interface SqliteStatement {
@@ -154,7 +162,7 @@ function captureOwnDataOptions(value: unknown): Record<string, unknown> | null {
   } catch {
     return null;
   }
-  const expected = [
+  const required = [
     "host",
     "port",
     "advertisedOrigin",
@@ -162,14 +170,15 @@ function captureOwnDataOptions(value: unknown): Record<string, unknown> | null {
     "tlsCertificatePath",
     "stateDirectory",
   ];
+  const optional = ["agentTranscriptLifecycleReadiness"];
+  const allowed = [...required, ...optional];
   const keys = Reflect.ownKeys(descriptors);
   if (
-    keys.length !== expected.length
-    || keys.some((key) => typeof key !== "string" || !expected.includes(key))
-    || expected.some((key) => !Object.hasOwn(descriptors, key))
+    keys.some((key) => typeof key !== "string" || !allowed.includes(key))
+    || required.some((key) => !Object.hasOwn(descriptors, key))
   ) return null;
   const captured: Record<string, unknown> = {};
-  for (const key of expected) {
+  for (const key of keys as string[]) {
     const descriptor = descriptors[key];
     if (!Object.hasOwn(descriptor, "value")) return null;
     captured[key] = descriptor.value;
@@ -263,6 +272,13 @@ function captureOptions(value: unknown): CapturedOptions {
     tlsKeyPath: captured.tlsKeyPath,
     tlsCertificatePath: captured.tlsCertificatePath,
     stateDirectory: captured.stateDirectory,
+    ...(captured.agentTranscriptLifecycleReadiness === undefined
+      ? {}
+      : {
+          agentTranscriptLifecycleReadiness:
+            captured.agentTranscriptLifecycleReadiness as
+              RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+        }),
   });
 }
 
@@ -1122,8 +1138,9 @@ function wrappedHandle(
 /**
  * Explicit non-production Linux x64 single-node lane. The SQLite owner is
  * intentionally co-located and therefore is not E0 or production
- * qualification. It injects only the existing storage/continuity/keyring
- * ports into the canonical Broker shipping root.
+ * qualification. It injects the existing storage/continuity/keyring ports
+ * into the canonical Broker shipping root and may forward one explicitly
+ * supplied optional Agent routing receipt; omission remains default-off.
  */
 export async function startRelayV2BrokerSingleNodeSelfHosted(
   optionsInput: unknown,
@@ -1201,6 +1218,12 @@ export async function startRelayV2BrokerSingleNodeSelfHosted(
         privilegedResolver,
         nonProductionCredentialAuthorityOpener:
           credentialAuthorityOpener(owner),
+        ...(options.agentTranscriptLifecycleReadiness === undefined
+          ? {}
+          : {
+              agentTranscriptLifecycleReadiness:
+                options.agentTranscriptLifecycleReadiness,
+            }),
       }),
     );
     if (signal.aborted) {
