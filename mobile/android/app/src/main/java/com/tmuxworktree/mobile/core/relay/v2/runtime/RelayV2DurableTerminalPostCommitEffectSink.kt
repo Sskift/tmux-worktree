@@ -36,6 +36,7 @@ internal enum class RelayV2TerminalResetDisposition {
 internal data class RelayV2TerminalPostCommitRecoveryReceipt(
     val recoveredLineages: List<RelayV2TerminalPostCommitRecoveredLineage>,
     val globallyClosed: Boolean,
+    val connectionGenerationFloor: Long,
 )
 
 /**
@@ -93,6 +94,7 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         mutableListOf<RelayV2TerminalTransferredCallbackGate>()
     private var recovered = false
     private var globallyClosed = false
+    private var connectionGenerationFloor = 0L
     private val recoveredLineages = mutableListOf<RelayV2TerminalPostCommitRecoveredLineage>()
 
     init {
@@ -108,6 +110,7 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
             RelayV2TerminalPostCommitRecoveryReceipt(
                 recoveredLineages = recoveredLineages.toList(),
                 globallyClosed = globallyClosed,
+                connectionGenerationFloor = connectionGenerationFloor,
             )
         }
     } finally {
@@ -580,12 +583,20 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         if (recovered) return
         val receipt = journal.transaction {
             if (globallyClosed()) {
-                return@transaction RelayV2TerminalPostCommitRecoveryReceipt(emptyList(), true)
+                return@transaction RelayV2TerminalPostCommitRecoveryReceipt(
+                    emptyList(),
+                    true,
+                    0,
+                )
             }
             val rows = unsettledBatches()
             if (rows.size > reservationCapacity) {
                 closeGloballyLocked()
-                return@transaction RelayV2TerminalPostCommitRecoveryReceipt(emptyList(), true)
+                return@transaction RelayV2TerminalPostCommitRecoveryReceipt(
+                    emptyList(),
+                    true,
+                    0,
+                )
             }
             val recoveredRows = mutableListOf<RelayV2TerminalPostCommitRecoveredLineage>()
             for (row in rows) {
@@ -596,6 +607,7 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                     return@transaction RelayV2TerminalPostCommitRecoveryReceipt(
                         recoveredRows,
                         true,
+                        0,
                     )
                 }
                 fenceExactOrClose(
@@ -606,10 +618,26 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
                 markAuthorityUnknown(lineage.authorityFingerprint)
                 recoveredRows += lineage
             }
-            RelayV2TerminalPostCommitRecoveryReceipt(recoveredRows, globallyClosed())
+            val maximumFencedGeneration = maximumFencedConnectionGeneration()
+            if (maximumFencedGeneration != null &&
+                maximumFencedGeneration !in 1 until Long.MAX_VALUE
+            ) {
+                closeGloballyLocked()
+                return@transaction RelayV2TerminalPostCommitRecoveryReceipt(
+                    recoveredRows,
+                    true,
+                    0,
+                )
+            }
+            RelayV2TerminalPostCommitRecoveryReceipt(
+                recoveredRows,
+                globallyClosed(),
+                maximumFencedGeneration ?: 0,
+            )
         }
         recoveredLineages += receipt.recoveredLineages
         globallyClosed = receipt.globallyClosed
+        connectionGenerationFloor = receipt.connectionGenerationFloor
         recovered = true
     }
 

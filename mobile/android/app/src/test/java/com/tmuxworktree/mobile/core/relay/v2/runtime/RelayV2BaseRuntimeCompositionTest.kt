@@ -155,6 +155,27 @@ class RelayV2BaseRuntimeCompositionTest {
     private val fixtures = RelayV2ContractFixtures()
 
     @Test
+    fun `cold start installs durable terminal fence floor before first connection`() = runBlocking {
+        val journal = MemoryTerminalJournal().also { it.installFence(connectionGeneration = 4) }
+        val probe = PostReadyRecoveryProbe()
+        val harness = Harness(
+            autoConnect = true,
+            terminalPostCommitJournal = journal,
+            agentRuntimeFactory = { probe.runtime },
+        )
+        try {
+            harness.connectOnline()
+            withTimeout(TIMEOUT_MS) { probe.started.await() }
+
+            assertEquals(5L, probe.authorities.single().generation.connectionGeneration)
+        } finally {
+            probe.release.complete(Unit)
+            withTimeout(TIMEOUT_MS) { probe.finished.await() }
+            harness.close()
+        }
+    }
+
+    @Test
     fun `admitted auto-connect profile offers only v2 and applies base state before online`() =
         runBlocking {
             val harness = Harness(autoConnect = true)
@@ -3055,6 +3076,8 @@ class RelayV2BaseRuntimeCompositionTest {
         credentialRollover: RelayV2CredentialRolloverPort =
             RelayV2CredentialRolloverPort { RelayV2CredentialRolloverResult.Unavailable },
         terminalRuntimeAuthority: RelayV2TerminalRecoveryAuthority? = null,
+        terminalPostCommitJournal: RelayV2TerminalPostCommitJournalStore =
+            MemoryTerminalJournal(),
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -3106,7 +3129,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 credentialRollover = credentialRollover,
                 stateSyncAuthority = authority,
                 terminalRuntimeAuthority = terminalRuntimeAuthority ?: authority,
-                terminalPostCommitJournal = MemoryTerminalJournal(),
+                terminalPostCommitJournal = terminalPostCommitJournal,
                 terminalResumeCredentials = MemoryTerminalCredentials(),
                 materializedSessions = authority,
                 activationOutbox = RelayV2ActivationOutboxReadPort(authority::readOutbox),
@@ -4259,6 +4282,25 @@ class RelayV2BaseRuntimeCompositionTest {
         private var nextOrder = 1L
         private var closed = false
 
+        fun installFence(connectionGeneration: Long) {
+            require(connectionGeneration > 0)
+            val fingerprint = "durable-floor-$connectionGeneration"
+            fences[fingerprint] = RelayV2TerminalPostCommitFenceEntity(
+                authorityFingerprint = fingerprint,
+                profileId = PROFILE_ID,
+                profileActivationGeneration = 1,
+                connectionGeneration = connectionGeneration,
+                principalId = PRINCIPAL_ID,
+                clientInstanceId = CLIENT_INSTANCE_ID,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+                scopeId = "scope-a",
+                sessionId = "session-a",
+                streamId = "stream-a",
+                pane = 0,
+            )
+        }
+
         override suspend fun <T> transaction(
             block: RelayV2TerminalPostCommitJournalTransaction.() -> T,
         ): T = synchronized(this) { block(this) }
@@ -4290,6 +4332,8 @@ class RelayV2BaseRuntimeCompositionTest {
         override fun deleteBatch(reservationId: String) = batches.remove(reservationId) != null
         override fun fence(authorityFingerprint: String) = fences[authorityFingerprint]
         override fun fenceCount() = fences.size
+        override fun maximumFencedConnectionGeneration() =
+            fences.values.maxOfOrNull { it.connectionGeneration }
         override fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity) {
             check(fence.authorityFingerprint !in fences)
             fences[fence.authorityFingerprint] = fence

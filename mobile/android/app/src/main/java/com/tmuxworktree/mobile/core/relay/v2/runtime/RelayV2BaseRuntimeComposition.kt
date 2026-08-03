@@ -483,14 +483,18 @@ internal class RelayV2BaseRuntimeComposition(
         }
         pumpScope.launch {
             beforeTerminalRecoveryAdmission()
-            val recovered = try {
+            val recoveryAdmission = try {
                 terminalRuntime.recoverBeforeAdmission()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                false
+                null
             }
-            if (!recovered) {
+            if (recoveryAdmission == null ||
+                !actor.installConnectionGenerationFloorBeforeAdmission(
+                    recoveryAdmission.connectionGenerationFloor,
+                )
+            ) {
                 failRuntimeIncomplete("TERMINAL_POST_COMMIT_RECOVERY_FAILED")
             } else {
                 // Recovery completion and explicit connect share the same single-attempt claim

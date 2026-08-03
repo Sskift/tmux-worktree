@@ -1280,6 +1280,8 @@ class RelayV2TerminalProductionCompositionTest {
         override fun deleteBatch(reservationId: String) = false
         override fun fence(authorityFingerprint: String) = fences[authorityFingerprint]
         override fun fenceCount() = fences.size
+        override fun maximumFencedConnectionGeneration() =
+            fences.values.maxOfOrNull { it.connectionGeneration }
         override fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity) {
             fences[fence.authorityFingerprint] = fence
         }

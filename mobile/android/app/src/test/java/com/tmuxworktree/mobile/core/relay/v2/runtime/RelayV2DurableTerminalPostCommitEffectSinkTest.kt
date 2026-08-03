@@ -532,6 +532,8 @@ class RelayV2DurableTerminalPostCommitEffectSinkTest {
         override fun deleteBatch(reservationId: String) = rows.remove(reservationId) != null
         override fun fence(authorityFingerprint: String) = fences[authorityFingerprint]
         override fun fenceCount() = fences.size
+        override fun maximumFencedConnectionGeneration() =
+            fences.values.maxOfOrNull { it.connectionGeneration }
 
         override fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity) {
             check(fence.authorityFingerprint !in fences)

@@ -157,6 +157,9 @@ internal interface RelayV2TerminalPostCommitJournalDao {
     @Query("SELECT COUNT(*) FROM relay_v2_terminal_post_commit_fences")
     fun fenceCount(): Int
 
+    @Query("SELECT MAX(connectionGeneration) FROM relay_v2_terminal_post_commit_fences")
+    fun maximumFencedConnectionGeneration(): Long?
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity)
 
@@ -203,6 +206,7 @@ internal interface RelayV2TerminalPostCommitJournalTransaction {
     fun deleteBatch(reservationId: String): Boolean
     fun fence(authorityFingerprint: String): RelayV2TerminalPostCommitFenceEntity?
     fun fenceCount(): Int
+    fun maximumFencedConnectionGeneration(): Long?
     fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity)
     fun batchesForAuthority(authorityFingerprint: String): List<RelayV2TerminalPostCommitBatchEntity>
     fun deleteBatchesForAuthority(authorityFingerprint: String)
@@ -251,6 +255,7 @@ private class RoomRelayV2TerminalPostCommitJournalTransaction(
 
     override fun fence(authorityFingerprint: String) = dao.fence(authorityFingerprint)
     override fun fenceCount() = dao.fenceCount()
+    override fun maximumFencedConnectionGeneration() = dao.maximumFencedConnectionGeneration()
     override fun insertFence(fence: RelayV2TerminalPostCommitFenceEntity) = dao.insertFence(fence)
     override fun batchesForAuthority(authorityFingerprint: String) =
         dao.batchesForAuthority(authorityFingerprint)

@@ -208,6 +208,26 @@ internal class RelayV2ConnectionActor(
     val effects: Flow<RelayV2RuntimeEffect> = multiplexedEffectFlow()
 
     /**
+     * Installs the durable lower bound left by permanent terminal post-commit fences. The actor
+     * remains the sole generation owner: its first admitted connect increments from this floor.
+     */
+    internal fun installConnectionGenerationFloorBeforeAdmission(floor: Long): Boolean =
+        synchronized(lifecycleLock) {
+            if (floor !in 0 until Long.MAX_VALUE ||
+                lifecycleState != LifecycleState.OPEN ||
+                connectionGenerationFloorInstalled ||
+                activeConnectToken != null || activeProfile != null ||
+                provisionalCallbackOwner != null || committedCallbackOwner != null ||
+                connectionGeneration != 0L
+            ) {
+                return@synchronized false
+            }
+            connectionGeneration = floor
+            connectionGenerationFloorInstalled = true
+            true
+        }
+
+    /**
      * Runs a repository/Room commit while holding the actor-owned generation lease.
      *
      * Pulling an effect from [effects] or observing [state] never authorizes a mutation. The
@@ -530,6 +550,7 @@ internal class RelayV2ConnectionActor(
 
     // Actor state is serialized below; callback source binding/fences are guarded by lifecycleLock.
     private var connectionGeneration = 0L
+    private var connectionGenerationFloorInstalled = false
     private var activeTransport: RelayV2Transport? = null
     private val transportFences: MutableSet<RelayV2Transport> =
         Collections.newSetFromMap(IdentityHashMap())
@@ -614,7 +635,7 @@ internal class RelayV2ConnectionActor(
                 invalidateConnectionOwnershipAndDrain()
                 val source = activeTransport
                 activeTransport = null
-                connectionGeneration += 1
+                advanceConnectionGeneration()
                 source?.let {
                     beginRetirement(listOf(it), closeCode = null, forceCancel = true)
                 }
@@ -1156,13 +1177,17 @@ internal class RelayV2ConnectionActor(
                 return
             }
 
+            var generationExhausted = false
             val preparation = synchronized(lifecycleLock) {
                 if (!isConnectTokenCurrentLocked(token)) return@synchronized null
+                if (!advanceConnectionGeneration()) {
+                    generationExhausted = true
+                    return@synchronized null
+                }
                 val applyDrain = withdrawPublishedRepositoryAuthorityAndDrainLocked()
                 revokeCallbackOwnersLocked()
                 val previous = activeTransport
                 activeTransport = null
-                connectionGeneration += 1
                 lastTerminationGeneration.set(null)
                 pendingTerminalIntent = null
                 clearRecoveryAttempt()
@@ -1178,7 +1203,22 @@ internal class RelayV2ConnectionActor(
                     connectionGeneration = connectionGeneration,
                     applyDrain = applyDrain,
                 )
-            } ?: return
+            }
+            if (preparation == null) {
+                if (generationExhausted) {
+                    failConnectAttempt(
+                        token,
+                        profile,
+                        RelayV2ConnectionFailure(
+                            RelayV2FailureKind.CONFIGURATION,
+                            "CONNECTION_GENERATION_EXHAUSTED",
+                            retryable = false,
+                        ),
+                        closeCode = null,
+                    )
+                }
+                return
+            }
             cancelHandshakeWatchdogs()
             preparation.previousTransport?.let { previous ->
                 beginRetirement(listOf(previous), reason = "v2 reconnect")
@@ -4983,7 +5023,7 @@ internal class RelayV2ConnectionActor(
             revokeCallbackOwnersLocked()
             val source = activeTransport
             activeTransport = null
-            connectionGeneration += 1
+            advanceConnectionGeneration()
             clearRecoveryAttempt()
             clearPendingAgentExtensionRequests()
             updateState(_state.value.phase, current, _state.value.failure)
@@ -5651,7 +5691,7 @@ internal class RelayV2ConnectionActor(
         val applyDrain = invalidateConnectionOwnershipAndDrain()
         val source = activeTransport
         activeTransport = null
-        connectionGeneration += 1
+        advanceConnectionGeneration()
         clearRecoveryAttempt()
         clearPendingAgentExtensionRequests()
         clearPendingHostsSnapshot()
@@ -5689,6 +5729,13 @@ internal class RelayV2ConnectionActor(
         }
         completion.shutdownDrain.complete(Unit)
         completion.barriers.forEach { (barrier, receipt) -> barrier.complete(receipt) }
+    }
+
+    /** Returns false without wrapping once the actor-local positive generation space is spent. */
+    private fun advanceConnectionGeneration(): Boolean = synchronized(lifecycleLock) {
+        if (connectionGeneration == Long.MAX_VALUE) return@synchronized false
+        connectionGeneration += 1
+        true
     }
 
     private fun finishResources() {

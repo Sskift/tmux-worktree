@@ -57,6 +57,10 @@ internal class RelayV2TerminalProductionComposition(
     private val fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
     private val newId: () -> String = { UUID.randomUUID().toString() },
 ) {
+    internal data class RecoveryAdmission(
+        val connectionGenerationFloor: Long,
+    )
+
     private class Attachment(
         val origin: RelayV2TerminalProductionComposition,
         val target: RelayV2TerminalAttachmentTarget,
@@ -108,13 +112,15 @@ internal class RelayV2TerminalProductionComposition(
         fatalInvalidation = fatalInvalidation,
     )
 
-    suspend fun recoverBeforeAdmission(): Boolean = lifecycleMutex.withLock {
+    suspend fun recoverBeforeAdmission(): RecoveryAdmission? = lifecycleMutex.withLock {
         val recovered = sink.recover()
-        if (recovered.globallyClosed) return false
-        return recovered.recoveredLineages.all { lineage ->
+        if (recovered.globallyClosed) return null
+        val lineagesRecovered = recovered.recoveredLineages.all { lineage ->
             lineage.disposition == RelayV2TerminalResetDisposition.STREAM_LOST &&
                 terminal.recoverPostCommitUnknown(lineage.authority, lineage.key) != null
         }
+        if (!lineagesRecovered) return null
+        RecoveryAdmission(recovered.connectionGenerationFloor)
     }
 
     suspend fun attach(
