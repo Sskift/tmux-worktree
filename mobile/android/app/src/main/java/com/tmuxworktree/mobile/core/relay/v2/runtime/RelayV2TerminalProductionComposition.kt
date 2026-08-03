@@ -62,6 +62,7 @@ internal class RelayV2TerminalProductionComposition(
         val target: RelayV2TerminalAttachmentTarget,
         val parser: RelayV2TerminalParserPort,
         val observer: RelayV2TerminalAttachmentObserver,
+        var parserContinuityId: String? = null,
     ) : RelayV2TerminalAttachment
 
     private data class Active(
@@ -148,6 +149,9 @@ internal class RelayV2TerminalProductionComposition(
             newId(),
             newId(),
         )
+        val attachmentParserContinuityId = handle.parserContinuityId ?: newId().also {
+            handle.parserContinuityId = it
+        }
         val claimed = terminal.claimResumableTerminalUnderApplyLease(
             selector = RelayV2TerminalResumeSessionSelector(
                 profileId = handle.target.profileId,
@@ -165,9 +169,9 @@ internal class RelayV2TerminalProductionComposition(
             cols = cols,
             rows = rows,
         )
-        val reduction: RelayV2TerminalReduction
+        var reduction: RelayV2TerminalReduction
         val key: RelayV2TerminalCheckpointKey
-        val openEffect: RelayV2TerminalEffect.SendOpen
+        var openEffect: RelayV2TerminalEffect.SendOpen
         if (claimed != null) {
             reduction = claimed.reduction
             key = claimed.key
@@ -188,7 +192,6 @@ internal class RelayV2TerminalProductionComposition(
                 pane = handle.target.pane,
             )
             key = RelayV2TerminalCheckpointKey.from(target)
-            val parserContinuityId = newId()
             reduction = terminal.reduceTerminalUnderApplyLease(
                 key,
                 RelayV2TerminalAction.BeginOpenAttempt(
@@ -199,12 +202,56 @@ internal class RelayV2TerminalProductionComposition(
                     cols = cols,
                     rows = rows,
                     target = target,
-                    parserContinuityId = parserContinuityId,
+                    parserContinuityId = attachmentParserContinuityId,
                     resume = null,
                 ),
             )
             openEffect = reduction.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>()
                 .single()
+        }
+        if (openEffect.mode == RelayV2TerminalOpenMode.RESUME &&
+            openEffect.openFence.parserContinuityId != attachmentParserContinuityId
+        ) {
+            val resumed = reduction.checkpoint ?: return false
+            val continuityLost = terminal.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.VerifyContinuity(
+                    identity = resumed.identity,
+                    deliveryToken = resumed.deliveryToken,
+                    parserContinuityId = attachmentParserContinuityId,
+                ),
+            )
+            val reset = continuityLost.checkpoint?.takeIf {
+                it.phase == RelayV2TerminalPhase.RESET_REQUIRED &&
+                    it.resetReason == RelayV2TerminalResetReason.PARSER_CONTINUITY_LOST
+            } ?: return false
+            reduction = terminal.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.BeginOpenAttempt(
+                    deliveryToken = reset.deliveryToken,
+                    requestId = newId(),
+                    openAttempt = attempt,
+                    mode = RelayV2TerminalOpenMode.RESET,
+                    cols = openEffect.cols,
+                    rows = openEffect.rows,
+                    target = reset.identity.target(),
+                    parserContinuityId = attachmentParserContinuityId,
+                    resume = RelayV2TerminalOpenResume(
+                        generation = reset.identity.generation,
+                        nextOffset = null,
+                        resumeTokenCredentialReference =
+                            reset.identity.resumeTokenCredentialReference,
+                        resumeTokenCredentialFingerprint =
+                            reset.identity.resumeTokenCredentialFingerprint,
+                    ),
+                ),
+            )
+            openEffect = reduction.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+                .singleOrNull() ?: return false
+        } else if (openEffect.mode != RelayV2TerminalOpenMode.RESUME) {
+            // NEW has not populated a renderer yet; RESET explicitly initializes it. In both
+            // cases this exact attachment can safely adopt the durable open lineage.
+            handle.parserContinuityId = openEffect.openFence.parserContinuityId
         }
         val state = Active(
             handle,

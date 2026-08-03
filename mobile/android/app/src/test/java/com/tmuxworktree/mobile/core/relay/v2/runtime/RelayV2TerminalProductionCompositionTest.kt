@@ -17,6 +17,171 @@ import org.junit.Test
 
 class RelayV2TerminalProductionCompositionTest {
     @Test
+    fun `renderer reattach resets acknowledged parser continuity before resume`() = runBlocking {
+        val terminal = BlockingTerminalAuthority(resumeExisting = true).also {
+            it.releaseClaim.complete(Unit)
+        }
+        val sent = mutableListOf<ByteArray>()
+        val credentials = RecordingCredentials()
+        var nextId = 0
+        val composition = RelayV2TerminalProductionComposition(
+            applyLease = CurrentApplyLease,
+            terminal = terminal,
+            journal = EmptyJournal(),
+            credentials = credentials,
+            sendPort = RelayV2TerminalExactGenerationSendPort { _, bytes ->
+                sent += bytes
+                RelayV2TerminalExactGenerationSendResult.Sent
+            },
+            fatalInvalidation = UnexpectedInvalidation,
+            newId = { "renderer-operation-${++nextId}" },
+        )
+        val target = RelayV2TerminalAttachmentTarget(
+            "profile-a",
+            7,
+            "principal-a",
+            "client-a",
+            "host-a",
+            "scope-a",
+            "session-a",
+        )
+        val authority = RelayV2RepositoryEffectAuthority(
+            RelayV2EffectGeneration("profile-a", 7, 1),
+            "profile-a",
+            7,
+            "principal-a",
+            "client-a",
+            "host-a",
+            "epoch-a",
+        )
+        val attachment = composition.attach(target, RejectingParser)
+        assertTrue(composition.open(attachment, authority, 120, 36))
+
+        val key = terminal.beginOpenKeys.single()
+        val preOpen = (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.PreOpen).checkpoint
+        val pendingOpen = requireNotNull(preOpen.pendingOpen)
+        val resumeToken = "renderer-resume-token"
+        val resumeReference = "renderer-resume-reference"
+        credentials.installExact(
+            RelayV2TerminalResumeCredentialOwner("profile-a", 7),
+            resumeReference,
+            resumeToken,
+        )
+        val identity = RelayV2TerminalIdentity(
+            profileId = preOpen.target.profileId,
+            profileActivationGeneration = preOpen.target.profileActivationGeneration,
+            principalId = preOpen.target.principalId,
+            clientInstanceId = preOpen.target.clientInstanceId,
+            hostId = preOpen.target.hostId,
+            hostEpoch = preOpen.target.hostEpoch,
+            hostInstanceId = "host-instance-a",
+            scopeId = preOpen.target.scopeId,
+            sessionId = preOpen.target.sessionId,
+            streamId = preOpen.target.streamId,
+            generation = "generation-a",
+            resumeTokenCredentialReference = resumeReference,
+            resumeTokenCredentialFingerprint = fingerprint(resumeToken),
+            pane = preOpen.target.pane,
+        )
+        var checkpoint = requireNotNull(
+            RelayV2TerminalCheckpointReducer.reduce(
+                preOpen,
+                RelayV2TerminalAction.Opened(
+                    identity = identity,
+                    requestId = pendingOpen.requestId,
+                    openAttempt = pendingOpen.openAttempt,
+                    deliveryToken = pendingOpen.deliveryToken,
+                    parserContinuityId = pendingOpen.parserContinuityId,
+                    disposition = RelayV2TerminalOpenDisposition.NEW,
+                    cols = pendingOpen.cols,
+                    rows = pendingOpen.rows,
+                    replayFromOffset = "0",
+                    tailOffset = "0",
+                ),
+            ).checkpoint,
+        )
+        val acknowledgedBytes = RelayV2TerminalBytes.utf8("old-screen")
+        val queued = RelayV2TerminalCheckpointReducer.reduce(
+            checkpoint,
+            RelayV2TerminalAction.Output(
+                RelayV2TerminalActionFence(
+                    checkpoint.identity.binding(),
+                    checkpoint.deliveryToken,
+                    checkpoint.openAttempt.openId,
+                ),
+                "0",
+                acknowledgedBytes,
+            ),
+        )
+        checkpoint = requireNotNull(queued.checkpoint)
+        val write = queued.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        val claimed = RelayV2TerminalCheckpointReducer.reduce(
+            checkpoint,
+            RelayV2TerminalAction.ClaimParserDispatch(write),
+        )
+        val parserClaim =
+            (claimed.outcome as RelayV2TerminalOutcome.ParserDispatchClaimed).claim as
+                RelayV2TerminalParserDispatchClaim.Write
+        val applied = RelayV2TerminalCheckpointReducer.reduce(
+            requireNotNull(claimed.checkpoint),
+            RelayV2TerminalAction.ParserApplied(parserClaim),
+        )
+        val acknowledgedOffset = acknowledgedBytes.size.toString()
+        assertEquals(
+            acknowledgedOffset,
+            applied.effects.filterIsInstance<RelayV2TerminalEffect.OutputAck>().single().nextOffset,
+        )
+        checkpoint = requireNotNull(applied.checkpoint)
+        val activation = RelayV2TerminalParserEffectActivation(
+            callbackToken = write.callbackToken,
+            reservationId = "renderer-recreation-reservation",
+            batchFingerprint = "renderer-recreation-batch",
+        )
+        checkpoint = requireNotNull(
+            RelayV2TerminalCheckpointReducer.reduce(
+                checkpoint,
+                RelayV2TerminalAction.ParserEffectsReserved(activation),
+            ).checkpoint,
+        )
+        checkpoint = requireNotNull(
+            RelayV2TerminalCheckpointReducer.reduce(
+                checkpoint,
+                RelayV2TerminalAction.ParserEffectsActivated(activation),
+            ).checkpoint,
+        )
+        assertEquals(RelayV2TerminalPhase.LIVE, checkpoint.phase)
+        assertEquals(acknowledgedOffset, checkpoint.parserAppliedNextOffset)
+        terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(checkpoint))
+        val sentBeforeDetach = sent.size
+
+        composition.detach(attachment)
+
+        assertEquals(sentBeforeDetach, sent.size)
+        val replacement = composition.attach(target, RejectingParser)
+        assertTrue(composition.open(replacement, authority, 120, 36))
+
+        assertEquals(sentBeforeDetach + 1, sent.size)
+        val resetOpen = RelayV2Codec().decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            sent.last(),
+        ).frame
+        val resetPayload = resetOpen["payload"] as Map<*, *>
+        assertEquals("reset", resetPayload["mode"])
+        assertFalse((resetPayload["resume"] as Map<*, *>).containsKey("nextOffset"))
+        val resetPending =
+            (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+        assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, resetPending.phase)
+        assertEquals(
+            RelayV2TerminalResetReason.PARSER_CONTINUITY_LOST,
+            resetPending.resetReason,
+        )
+        assertEquals(RelayV2TerminalOpenMode.RESET, resetPending.pendingOpen?.mode)
+        assertEquals(null, resetPending.pendingOpen?.resume?.nextOffset)
+        assertEquals(acknowledgedOffset, resetPending.parserAppliedNextOffset)
+        assertTrue(resetPending.pendingOutput.isEmpty())
+    }
+
+    @Test
     fun `detach waits for durable open claim and new stream owns a distinct checkpoint`() = runBlocking {
         val terminal = BlockingTerminalAuthority()
         val sent = mutableListOf<ByteArray>()
@@ -919,7 +1084,9 @@ class RelayV2TerminalProductionCompositionTest {
         override fun clearProfile(profileId: String, throughActivationGeneration: Long) = Unit
     }
 
-    private class BlockingTerminalAuthority : RelayV2TerminalRecoveryAuthority {
+    private class BlockingTerminalAuthority(
+        private val resumeExisting: Boolean = false,
+    ) : RelayV2TerminalRecoveryAuthority {
         val claimEntered = CompletableDeferred<Unit>()
         val releaseClaim = CompletableDeferred<Unit>()
         val beginOpenDeliveries = mutableListOf<RelayV2TerminalDeliveryToken>()
@@ -938,7 +1105,60 @@ class RelayV2TerminalProductionCompositionTest {
         ): RelayV2TerminalResumeClaim? {
             claimEntered.complete(Unit)
             releaseClaim.await()
-            return null
+            if (!resumeExisting) return null
+            val candidate = checkpoints.entries.singleOrNull { (key, stored) ->
+                stored is RelayV2TerminalStoredCheckpoint.Present &&
+                    key.profileId == selector.profileId &&
+                    key.profileActivationGeneration == selector.profileActivationGeneration &&
+                    key.principalId == selector.principalId &&
+                    key.clientInstanceId == selector.clientInstanceId &&
+                    key.hostId == selector.hostId &&
+                    key.hostEpoch == authority.hostEpoch &&
+                    key.scopeId == selector.scopeId &&
+                    key.sessionId == selector.sessionId &&
+                    key.pane == selector.pane
+            } ?: return null
+            val key = candidate.key
+            val checkpoint =
+                (candidate.value as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+            val delivery = RelayV2TerminalDeliveryToken(
+                authority.generation,
+                checkpoint.deliveryToken.authorityGeneration + 1,
+                1,
+            )
+            val restored = RelayV2TerminalCheckpointReducer.restore(
+                RelayV2TerminalStoredCheckpoint.Present(checkpoint),
+                checkpoint.identity,
+                checkpoint.openAttempt,
+                delivery,
+                checkpoint.parserContinuityId,
+            )
+            val current = requireNotNull(restored.checkpoint)
+            val resume = RelayV2TerminalOpenResume(
+                generation = current.identity.generation,
+                nextOffset = current.parserAppliedNextOffset,
+                resumeTokenCredentialReference = current.identity.resumeTokenCredentialReference,
+                resumeTokenCredentialFingerprint =
+                    current.identity.resumeTokenCredentialFingerprint,
+            )
+            val action = RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = delivery,
+                requestId = requestId,
+                openAttempt = openAttempt,
+                mode = RelayV2TerminalOpenMode.RESUME,
+                cols = cols,
+                rows = rows,
+                target = current.identity.target(),
+                parserContinuityId = current.parserContinuityId,
+                resume = resume,
+            )
+            val reduced = RelayV2TerminalCheckpointReducer.reduce(current, action)
+            checkpoints[key] = RelayV2TerminalStoredCheckpoint.Present(
+                requireNotNull(reduced.checkpoint),
+            )
+            reducedActions += action
+            committedStates += checkpoints.getValue(key)
+            return RelayV2TerminalResumeClaim(key, reduced)
         }
 
         override suspend fun loadTerminalUnderApplyLease(
