@@ -194,6 +194,8 @@ class V2ViewModel(
     private var relayV2NotificationProfileActive = false
     private var notificationPermissionGranted = false
     private var notificationPermissionRequestPending = false
+    private var relayV2NotificationPreferencesLoaded = false
+    private var notificationPermissionRequestClaim: Any? = null
     private val agentNotificationConfigMutex = Mutex()
     private val notificationPermissionRequestChannel = Channel<Unit>(capacity = 1)
     internal val notificationPermissionRequests: Flow<Unit> =
@@ -1647,8 +1649,8 @@ class V2ViewModel(
                 state.copy(preferences = preferences)
             }
         } else {
-            if (enabled) requestNotificationPermissionFromExplicitToggle()
             viewModelScope.launch {
+                if (enabled) requestNotificationPermissionFromExplicitToggle()
                 preferencesStore.setNotificationPreference(kind, enabled)
                 val preferences = preferencesStore.values.first()
                 val composition = synchronized(relayV2UiFenceLock) {
@@ -1670,6 +1672,7 @@ class V2ViewModel(
         val composition = synchronized(relayV2UiFenceLock) {
             notificationPermissionGranted = granted
             notificationPermissionRequestPending = false
+            notificationPermissionRequestClaim = null
             relayV2Composition
         }
         composition?.let { current ->
@@ -1677,23 +1680,77 @@ class V2ViewModel(
         }
     }
 
-    private fun requestNotificationPermissionFromExplicitToggle() {
-        val shouldRequest = synchronized(relayV2UiFenceLock) {
-            if (notificationPermissionGranted || notificationPermissionRequestPending ||
-                relayV2Composition == null ||
-                _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2 ||
-                _uiState.value.agentCapabilityAvailability !=
-                AgentCapabilityAvailability.AVAILABLE
+    private suspend fun requestNotificationPermissionFromExplicitToggle() {
+        val composition = synchronized(relayV2UiFenceLock) { relayV2Composition } ?: return
+        requestNotificationPermission(composition, automatic = false)
+    }
+
+    private suspend fun requestNotificationPermissionForNegotiatedPreferences(
+        expectedComposition: RelayV2BaseRuntimeComposition,
+    ) = requestNotificationPermission(expectedComposition, automatic = true)
+
+    private suspend fun requestNotificationPermission(
+        expectedComposition: RelayV2BaseRuntimeComposition,
+        automatic: Boolean,
+    ) {
+        val requestClaim = synchronized(relayV2UiFenceLock) {
+            if (notificationPermissionRequestPending ||
+                !notificationPermissionRequestEligibleLocked(expectedComposition, automatic)
             ) {
-                false
+                null
             } else {
+                val claim = Any()
+                notificationPermissionRequestClaim = claim
                 notificationPermissionRequestPending = true
-                true
+                claim
             }
+        } ?: return
+        val durableClaimed = try {
+            preferencesStore.claimAutomaticAgentNotificationPermissionOffer()
+        } catch (cancelled: CancellationException) {
+            clearNotificationPermissionRequestClaim(requestClaim)
+            throw cancelled
+        } catch (_: Throwable) {
+            null
         }
-        if (!shouldRequest) return
+        // Automatic activation owns only a fresh durable claim. An explicit toggle may retry
+        // after denial, but still requires the already-offered marker to be durably readable.
+        if (durableClaimed == null || (automatic && durableClaimed == false)) {
+            clearNotificationPermissionRequestClaim(requestClaim)
+            return
+        }
+        val stillCurrent = synchronized(relayV2UiFenceLock) {
+            notificationPermissionRequestClaim === requestClaim &&
+                notificationPermissionRequestPending &&
+                notificationPermissionRequestEligibleLocked(expectedComposition, automatic)
+        }
+        if (!stillCurrent) {
+            clearNotificationPermissionRequestClaim(requestClaim)
+            return
+        }
         if (notificationPermissionRequestChannel.trySend(Unit).isFailure) {
-            synchronized(relayV2UiFenceLock) {
+            clearNotificationPermissionRequestClaim(requestClaim)
+        }
+    }
+
+    private fun notificationPermissionRequestEligibleLocked(
+        expectedComposition: RelayV2BaseRuntimeComposition,
+        automatic: Boolean,
+    ): Boolean {
+        val state = _uiState.value
+        return !notificationPermissionGranted &&
+            relayV2Composition === expectedComposition &&
+            state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 &&
+            state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE &&
+            (!automatic || relayV2NotificationPreferencesLoaded && with(state.preferences) {
+                waitingNotifications || failedNotifications || completedNotifications
+            })
+    }
+
+    private fun clearNotificationPermissionRequestClaim(requestClaim: Any) {
+        synchronized(relayV2UiFenceLock) {
+            if (notificationPermissionRequestClaim === requestClaim) {
+                notificationPermissionRequestClaim = null
                 notificationPermissionRequestPending = false
             }
         }
@@ -2543,6 +2600,7 @@ class V2ViewModel(
         synchronized(relayV2UiFenceLock) {
             relayV2Composition = composition
             relayV2NotificationProfileActive = true
+            relayV2NotificationPreferencesLoaded = false
             relayV2SessionReplyCuts.value = emptyMap()
             relayV2ScopeCreateCuts.value = emptyMap()
             val state = _uiState.value
@@ -2613,7 +2671,10 @@ class V2ViewModel(
                     )
                     true
                 }
-                if (current) syncAgentNotificationConfig(composition)
+                if (current) {
+                    requestNotificationPermissionForNegotiatedPreferences(composition)
+                    syncAgentNotificationConfig(composition)
+                }
             }
         }
         viewModelScope.launch {
@@ -2623,9 +2684,13 @@ class V2ViewModel(
                         _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
                     ) return@synchronized false
                     _uiState.value = _uiState.value.copy(preferences = preferences)
+                    relayV2NotificationPreferencesLoaded = true
                     true
                 }
-                if (current) syncAgentNotificationConfig(composition)
+                if (current) {
+                    requestNotificationPermissionForNegotiatedPreferences(composition)
+                    syncAgentNotificationConfig(composition)
+                }
             }
         }
         viewModelScope.launch {

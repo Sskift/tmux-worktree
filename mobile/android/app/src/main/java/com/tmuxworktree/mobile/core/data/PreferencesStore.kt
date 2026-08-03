@@ -53,6 +53,9 @@ private object Keys {
     val waitingNotifications = booleanPreferencesKey("notify_waiting")
     val failedNotifications = booleanPreferencesKey("notify_failed")
     val completedNotifications = booleanPreferencesKey("notify_completed")
+    val automaticAgentNotificationPermissionOffered = booleanPreferencesKey(
+        "automatic_agent_notification_permission_offered",
+    )
     val darkThemeEnabled = booleanPreferencesKey("dark_theme_enabled")
     val activeProfileDialect = stringPreferencesKey("relay_active_profile_dialect")
     val activeCredentialKind = stringPreferencesKey("relay_active_credential_kind")
@@ -1047,6 +1050,24 @@ class PreferencesStore internal constructor(
             NotificationKind.COMPLETED -> Keys.completedNotifications
         }
         store.edit { it[key] = enabled }
+    }
+
+    /**
+     * Atomically claims the installation-wide automatic permission offer.
+     *
+     * This marker is intentionally independent from profile state and is never cleared by a
+     * reconnect or profile replacement. A caller may emit the Android permission request only
+     * after this transaction returns true.
+     */
+    internal suspend fun claimAutomaticAgentNotificationPermissionOffer(): Boolean {
+        var claimed = false
+        store.edit { preferences ->
+            if (preferences[Keys.automaticAgentNotificationPermissionOffered] != true) {
+                preferences[Keys.automaticAgentNotificationPermissionOffered] = true
+                claimed = true
+            }
+        }
+        return claimed
     }
 
     suspend fun setDarkThemeEnabled(enabled: Boolean) {
