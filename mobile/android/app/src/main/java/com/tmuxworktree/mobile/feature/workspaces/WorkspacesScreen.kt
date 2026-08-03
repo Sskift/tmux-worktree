@@ -79,6 +79,7 @@ fun WorkspacesScreen(
     modifier: Modifier = Modifier,
     onNewTerminalClick: () -> Unit = {},
     activeHostId: String = "",
+    showBottomNavigation: Boolean = true,
 ) {
     val hostSessions = if (activeHostId.isBlank()) sessions else sessions.filter { it.hostId == activeHostId }
     val visibleScopes = if (activeHostId.isBlank()) scopes else scopes.filter { it.hostId == activeHostId }
@@ -102,11 +103,13 @@ fun WorkspacesScreen(
             )
         },
         bottomBar = {
-            TwRootBottomBar(
-                selectedDestination = RootDestination.WORKSPACES,
-                attentionCount = attentionCount,
-                onDestinationSelected = onBottomDestinationSelected,
-            )
+            if (showBottomNavigation) {
+                TwRootBottomBar(
+                    selectedDestination = RootDestination.WORKSPACES,
+                    attentionCount = attentionCount,
+                    onDestinationSelected = onBottomDestinationSelected,
+                )
+            }
         },
     ) { innerPadding ->
         LazyColumn(

@@ -78,6 +78,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.tmuxworktree.mobile.BuildConfig
@@ -420,6 +421,7 @@ private fun MainNavigation(
                     onReplyClick = { navController.navigate(V2Routes.session(it.stableId, focusReply = true)) },
                     onBottomDestinationSelected = navigateRoot,
                     agentEvidenceAvailability = routeState.agentEvidenceAvailability,
+                    showBottomNavigation = navController.isCurrentDestination(V2Routes.INBOX),
                 )
             }
             composable(V2Routes.WORKSPACES) {
@@ -438,6 +440,7 @@ private fun MainNavigation(
                     onNewTerminalClick = { navController.navigate(V2Routes.NEW_TERMINAL) },
                     onBottomDestinationSelected = navigateRoot,
                     activeHostId = routeState.activeHostId,
+                    showBottomNavigation = navController.isCurrentDestination(V2Routes.WORKSPACES),
                 )
             }
             composable(V2Routes.SETTINGS) {
@@ -461,6 +464,7 @@ private fun MainNavigation(
                     onBottomDestinationSelected = navigateRoot,
                     notificationsAvailable = routeState.agentCapabilityAvailability ==
                         AgentCapabilityAvailability.AVAILABLE,
+                    showBottomNavigation = navController.isCurrentDestination(V2Routes.SETTINGS),
                 )
             }
             composable(V2Routes.HEALTH) {
@@ -522,6 +526,12 @@ private fun MainNavigation(
             )
         }
     }
+}
+
+@Composable
+private fun NavHostController.isCurrentDestination(route: String): Boolean {
+    val currentEntry by currentBackStackEntryAsState()
+    return currentEntry?.destination?.route == route
 }
 
 @Composable

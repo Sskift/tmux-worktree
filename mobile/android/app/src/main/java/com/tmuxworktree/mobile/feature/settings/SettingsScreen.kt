@@ -73,6 +73,7 @@ fun SettingsScreen(
     onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
     notificationsAvailable: Boolean = true,
+    showBottomNavigation: Boolean = true,
 ) {
     var showManualRelayV2Enrollment by remember { mutableStateOf(false) }
 
@@ -88,11 +89,13 @@ fun SettingsScreen(
             )
         },
         bottomBar = {
-            TwRootBottomBar(
-                selectedDestination = RootDestination.SETTINGS,
-                attentionCount = attentionCount,
-                onDestinationSelected = onBottomDestinationSelected,
-            )
+            if (showBottomNavigation) {
+                TwRootBottomBar(
+                    selectedDestination = RootDestination.SETTINGS,
+                    attentionCount = attentionCount,
+                    onDestinationSelected = onBottomDestinationSelected,
+                )
+            }
         },
     ) { innerPadding ->
         LazyColumn(

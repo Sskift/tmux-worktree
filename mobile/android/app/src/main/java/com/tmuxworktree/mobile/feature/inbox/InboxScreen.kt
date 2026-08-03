@@ -63,6 +63,7 @@ fun InboxScreen(
     onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
     agentEvidenceAvailability: AgentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
+    showBottomNavigation: Boolean = true,
 ) {
     // Inbox is the agent workflow. Plain terminal sessions remain available
     // under Workspaces > Terminals and must not be presented as agents.
@@ -94,11 +95,13 @@ fun InboxScreen(
             )
         },
         bottomBar = {
-            TwRootBottomBar(
-                selectedDestination = RootDestination.INBOX,
-                attentionCount = attentionSessions.size,
-                onDestinationSelected = onBottomDestinationSelected,
-            )
+            if (showBottomNavigation) {
+                TwRootBottomBar(
+                    selectedDestination = RootDestination.INBOX,
+                    attentionCount = attentionSessions.size,
+                    onDestinationSelected = onBottomDestinationSelected,
+                )
+            }
         },
     ) { innerPadding ->
         LazyColumn(

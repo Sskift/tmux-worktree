@@ -1,11 +1,13 @@
 package com.tmuxworktree.mobile.feature
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelayHost
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.designsystem.TwTheme
@@ -16,6 +18,7 @@ import com.tmuxworktree.mobile.feature.createworktree.NewWorktreeForm
 import com.tmuxworktree.mobile.feature.createworktree.NewWorktreeScreen
 import com.tmuxworktree.mobile.feature.createworktree.NewWorktreeStep
 import com.tmuxworktree.mobile.feature.createworktree.NewWorktreeValidationErrors
+import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -89,6 +92,60 @@ class CreationScreensInstrumentedTest {
         composeRule.onNodeWithText("Relay unavailable").assertIsDisplayed()
         composeRule.onNodeWithTag("new_terminal_retry_targets").performClick()
         composeRule.runOnIdle { assertEquals(1, retries) }
+    }
+
+    @Test
+    fun outgoingWorkspacesBottomBarWithdrawsBeforeTerminalCreateFooterIsShown() {
+        val host = RelayHost("host")
+        val scope = RelayScope("host", "local")
+        var creates = 0
+        composeRule.setContent {
+            TwTheme {
+                Box {
+                    WorkspacesScreen(
+                        sessions = emptyList(),
+                        scopes = listOf(scope),
+                        connectionStatus = ConnectionStatus.ONLINE,
+                        selectedScopeId = null,
+                        attentionCount = 0,
+                        onConnectionStatusClick = {},
+                        onScopeSelected = {},
+                        onSessionClick = {},
+                        onTerminalClick = {},
+                        onNewWorktreeClick = {},
+                        onBottomDestinationSelected = {},
+                        activeHostId = host.hostId,
+                        showBottomNavigation = false,
+                    )
+                    NewTerminalScreen(
+                        form = NewTerminalForm(
+                            hostId = host.hostId,
+                            scopeId = scope.scopeId,
+                            workingDirectory = "/tmp",
+                            label = "shell",
+                        ),
+                        hosts = listOf(host),
+                        scopes = listOf(scope),
+                        isLoadingTargets = false,
+                        isCreating = false,
+                        validationErrors = NewTerminalValidationErrors(),
+                        targetLoadError = null,
+                        creationError = null,
+                        onBack = {},
+                        onHostSelected = {},
+                        onScopeSelected = {},
+                        onWorkingDirectoryChange = {},
+                        onLabelChange = {},
+                        onRetryLoadTargets = {},
+                        onCreate = { creates++ },
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithTag("bottom_nav").assertDoesNotExist()
+        composeRule.onNodeWithTag("new_terminal_create").assertIsDisplayed().performClick()
+        composeRule.runOnIdle { assertEquals(1, creates) }
     }
 
     @Test
