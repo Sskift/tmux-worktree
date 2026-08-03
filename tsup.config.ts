@@ -125,6 +125,7 @@ export default defineConfig({
     "src/relay/extensions/agentTranscriptLifecycle/v1/store.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/runtime.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerProducer.ts",
+    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerThreadAcquisitionAuthority.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerNotificationSource.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerProcessControllerAuthority.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerTrustedSourceActivation.ts",
