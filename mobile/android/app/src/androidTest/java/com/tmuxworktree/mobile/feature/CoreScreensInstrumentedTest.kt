@@ -455,6 +455,7 @@ class CoreScreensInstrumentedTest {
                     onTokenChange = {},
                     onScanQr = {},
                     onConnect = {},
+                    onManualRelayV2Enrollment = { _, _ -> },
                     onForgetPairing = { forgetCount++ },
                 )
             }
@@ -491,6 +492,7 @@ class CoreScreensInstrumentedTest {
                     onTokenChange = {},
                     onScanQr = {},
                     onConnect = {},
+                    onManualRelayV2Enrollment = { _, _ -> },
                 )
             }
         }
@@ -576,6 +578,46 @@ class CoreScreensInstrumentedTest {
         composeRule.runOnIdle {
             assertEquals("https://relay.example.com", submittedIssuer)
             assertEquals(enteredToken, submittedToken)
+        }
+    }
+
+    @Test
+    fun freshPairingManualRelayV2EnrollmentRoutesToCallback() {
+        var submittedIssuer: String? = null
+        var submittedToken: String? = null
+        val issuer = "https://relay.example.com"
+        val token = "tmuxworktree://enroll?v=2"
+        composeRule.setContent {
+            TwTheme {
+                PairingScreen(
+                    relayUrl = "",
+                    token = "",
+                    isConnecting = false,
+                    relayUrlError = null,
+                    error = null,
+                    onRelayUrlChange = {},
+                    onTokenChange = {},
+                    onScanQr = {},
+                    onConnect = {},
+                    onManualRelayV2Enrollment = { enteredIssuer, enteredToken ->
+                        submittedIssuer = enteredIssuer
+                        submittedToken = enteredToken
+                    },
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("pairing_relay_v2_enrollment")
+            .performScrollTo()
+            .performClick()
+        composeRule.onNodeWithText("Manual Relay v2 enrollment").assertIsDisplayed()
+        composeRule.onNodeWithTag("relay_v2_manual_issuer").performTextInput(issuer)
+        composeRule.onNodeWithTag("relay_v2_manual_token").performTextInput(token)
+        composeRule.onNodeWithTag("relay_v2_manual_continue").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(issuer, submittedIssuer)
+            assertEquals(token, submittedToken)
         }
     }
 }

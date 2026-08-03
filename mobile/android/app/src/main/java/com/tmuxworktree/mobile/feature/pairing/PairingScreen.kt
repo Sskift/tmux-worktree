@@ -18,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.VpnKey
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -33,6 +34,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -196,11 +198,13 @@ fun PairingScreen(
     onTokenChange: (String) -> Unit,
     onScanQr: () -> Unit,
     onConnect: () -> Unit,
+    onManualRelayV2Enrollment: (issuerUrl: String, oneTimeEnrollmentToken: String) -> Unit,
     modifier: Modifier = Modifier,
     onBack: (() -> Unit)? = null,
     onForgetPairing: (() -> Unit)? = null,
 ) {
     var confirmForgetPairing by rememberSaveable { mutableStateOf(false) }
+    var showManualRelayV2Enrollment by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -254,6 +258,20 @@ fun PairingScreen(
             Icon(Icons.Outlined.QrCodeScanner, contentDescription = null)
             Spacer(Modifier.width(12.dp))
             Text("Scan QR code")
+        }
+
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = { showManualRelayV2Enrollment = true },
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp)
+                .testTag("pairing_relay_v2_enrollment"),
+        ) {
+            Icon(Icons.Outlined.VpnKey, contentDescription = null)
+            Spacer(Modifier.width(12.dp))
+            Text("Enroll Relay v2")
         }
 
         Spacer(Modifier.height(28.dp))
@@ -372,6 +390,16 @@ fun PairingScreen(
                 ) {
                     Text("Keep pairing", color = TwAccent)
                 }
+            },
+        )
+    }
+
+    if (showManualRelayV2Enrollment) {
+        ManualRelayV2EnrollmentDialog(
+            onDismiss = { showManualRelayV2Enrollment = false },
+            onContinue = { issuerUrl, oneTimeEnrollmentToken ->
+                showManualRelayV2Enrollment = false
+                onManualRelayV2Enrollment(issuerUrl, oneTimeEnrollmentToken)
             },
         )
     }

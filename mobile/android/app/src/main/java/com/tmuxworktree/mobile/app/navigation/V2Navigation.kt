@@ -322,6 +322,7 @@ private fun PairingGate(
         onTokenChange = viewModel::setPairingToken,
         onScanQr = onScanQr,
         onConnect = viewModel::connectPairing,
+        onManualRelayV2Enrollment = viewModel::offerManualRelayV2Enrollment,
         onBack = if (canReturn) ({ viewModel.dismissPairing() }) else null,
         onForgetPairing = if (state.paired) viewModel::forgetPairing else null,
     )
