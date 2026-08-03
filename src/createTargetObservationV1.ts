@@ -6,6 +6,10 @@ import {
   parseCanonicalWorktreePlacement,
 } from "./canonicalWorktreePlacement";
 import {
+  CanonicalTerminalControlSocketClient,
+  type CanonicalTargetResolution,
+} from "./canonicalTerminalControlClient";
+import {
   expandHomePath,
   loadConfigFile,
   resolveWorktreeBase,
@@ -168,6 +172,10 @@ export interface CreateTargetObservationV1Deps {
 export interface CreateTargetAdmissionV1Deps extends CreateTargetObservationV1Deps {
   runResolvedWorktree?: (request: RpcV2CreateResolvedWorktreeRequest) => RpcV2CreateResponse;
   runTerminal?: (request: RpcV2CreateTerminalRequest) => RpcV2CreateResponse;
+}
+
+export interface CreateTargetAdmissionCommandV1Deps extends CreateTargetAdmissionV1Deps {
+  resolveTerminalTarget?: (sessionName: string) => Promise<CanonicalTargetResolution>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -739,6 +747,52 @@ export function executeCreateTargetAdmissionV1(
 }
 
 /**
+ * Production command owner for the admitted create lane. A successful
+ * create_terminal is not externally complete until the target host's
+ * terminal-control owner has registered the exact committed managed
+ * lifecycle. Relay v2 terminal.open remains a closed read/verify operation
+ * and never creates this target itself.
+ */
+export async function executeCreateTargetAdmissionCommandV1(
+  rawRequest: unknown,
+  deps: CreateTargetAdmissionCommandV1Deps = {},
+): Promise<CreateTargetObservationV1AdmitResponse> {
+  const admitted = executeCreateTargetAdmissionV1(rawRequest, deps);
+  if (admitted.state !== "executed"
+    || admitted.response.operation !== "create-terminal"
+    || admitted.response.state !== "succeeded") return admitted;
+
+  const session = admitted.response.session;
+  try {
+    const resolution = await (deps.resolveTerminalTarget
+      ?? ((sessionName: string) => new CanonicalTerminalControlSocketClient().resolveTarget(
+        sessionName,
+      )))(session.name);
+    if (resolution.managedSession.name !== session.name
+      || resolution.managedSession.kind !== session.kind
+      || resolution.managedSession.createdAt !== session.createdAt) {
+      throw new Error("terminal-control registered a different managed lifecycle");
+    }
+    return admitted;
+  } catch {
+    return {
+      schemaVersion: 1,
+      mode: "admit",
+      state: "executed",
+      response: {
+        protocolVersion: 2,
+        operation: "create-terminal",
+        state: "in_doubt",
+        error: {
+          code: "IN_DOUBT",
+          message: "created terminal committed but terminal-control target registration is uncertain",
+        },
+      },
+    };
+  }
+}
+
+/**
  * Bounded strict parse of the raw `--request-json` payload: exact UTF-8 byte
  * cap plus depth/key/node limits and duplicate-key rejection, the same
  * discipline the relay v2 strict JSON parser enforces on wire frames.
@@ -757,7 +811,7 @@ export async function createTargetObservationV1Cmd(args: string[]): Promise<void
   }
   const raw = parseCreateTargetObservationV1RequestJson(args[1]);
   if (isRecord(raw) && raw.mode === "admit") {
-    console.log(JSON.stringify(executeCreateTargetAdmissionV1(raw)));
+    console.log(JSON.stringify(await executeCreateTargetAdmissionCommandV1(raw)));
     return;
   }
   console.log(JSON.stringify(buildCreateTargetObservationV1(raw)));

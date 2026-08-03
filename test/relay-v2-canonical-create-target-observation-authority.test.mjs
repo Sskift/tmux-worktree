@@ -29,6 +29,7 @@ const {
 } = admissionModule;
 const {
   buildCreateTargetObservationV1,
+  executeCreateTargetAdmissionCommandV1,
   executeCreateTargetAdmissionV1,
   parseCreateTargetObservationV1Request,
   parseCreateTargetObservationV1RequestJson,
@@ -417,6 +418,93 @@ test("observe→admit base-ref OID or git identity drift is stale with zero muta
   });
   assert.equal(executed.state, "executed");
   assert.equal(mutations.length, 1);
+});
+
+test("create_terminal admission registers the committed exact terminal target before success", async () => {
+  const request = {
+    schemaVersion: 1,
+    operation: "create_terminal",
+    arguments: { cwd: "/repo/demo", label: "demo" },
+  };
+  const observed = buildCreateTargetObservationV1(request, fixtureDeps());
+  const reservationCorrelation = probeCorrelation();
+  const admit = {
+    schemaVersion: 1,
+    mode: "admit",
+    operation: "create_terminal",
+    arguments: structuredClone(request.arguments),
+    observation: {
+      catalogRevision: observed.catalogRevision,
+      execution: structuredClone(observed.observation.execution),
+    },
+    reservationCorrelation,
+  };
+  const session = {
+    name: "tw-term-created",
+    kind: "terminal",
+    profile: "dashboard",
+    project: null,
+    label: "demo",
+    repoPath: null,
+    worktreePath: null,
+    branch: null,
+    baseBranch: null,
+    cwd: "/repo/demo",
+    createdAt: "2026-08-04T01:00:00.000Z",
+    attached: false,
+    windows: 1,
+    created: 1_785_779_200,
+    activity: 1_785_779_200,
+    incarnation: `twinc2.${"a".repeat(43)}`,
+    lifecycleMarked: true,
+    reservationCorrelation,
+  };
+  const registrations = [];
+  const succeeded = await executeCreateTargetAdmissionCommandV1(admit, {
+    ...fixtureDeps(),
+    runTerminal: () => ({
+      protocolVersion: 2,
+      operation: "create-terminal",
+      state: "succeeded",
+      session,
+    }),
+    async resolveTerminalTarget(sessionName) {
+      registrations.push(sessionName);
+      return {
+        controlTargetId: "control-target-created",
+        controlEpoch: "control-epoch-created",
+        managedSession: {
+          name: session.name,
+          kind: session.kind,
+          createdAt: session.createdAt,
+        },
+        ownership: {},
+      };
+    },
+  });
+  assert.equal(succeeded.response.state, "succeeded");
+  assert.deepEqual(registrations, [session.name]);
+
+  for (const [name, resolveTerminalTarget] of [
+    ["registration rejection", async () => { throw new Error("controller unavailable"); }],
+    ["identity mismatch", async () => ({
+      managedSession: { ...session, createdAt: "2026-08-04T01:00:01.000Z" },
+    })],
+  ]) {
+    const uncertain = await executeCreateTargetAdmissionCommandV1(admit, {
+      ...fixtureDeps(),
+      runTerminal: () => ({
+        protocolVersion: 2,
+        operation: "create-terminal",
+        state: "succeeded",
+        session,
+      }),
+      resolveTerminalTarget,
+    });
+    assert.equal(uncertain.response.state, "in_doubt", name);
+    assert.equal(uncertain.response.error.code, "IN_DOUBT", name);
+    assert.match(uncertain.response.error.message, /committed.*registration is uncertain/, name);
+  }
 });
 
 test("issuance rejects accessor-mixing options before any bundle, lookup, or spawn", () => {
