@@ -15,6 +15,7 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.ConnectException
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketAddress
@@ -973,6 +974,39 @@ class BoundedRelayV2TransportFactoryTest {
         }
     }
 
+    @Test
+    fun unreachableFirstAddressDoesNotHideReachableAddressForExactHostname() {
+        RawTlsWebSocketServer().use { server ->
+            server.start { socket ->
+                val request = server.readRequest(socket)
+                server.writeValidUpgrade(socket, request)
+                socket.inputStream.read()
+            }
+            val socketCount = AtomicInteger()
+            val firstSocket = RejectingConnectSocket()
+            val resolver = ImmediateAddressResolver(
+                listOf(
+                    InetAddress.getByAddress(byteArrayOf(192.toByte(), 0, 2, 1)),
+                    InetAddress.getLoopbackAddress(),
+                ),
+            )
+            val listener = RecordingListener()
+            val transport = server.factory(
+                addressResolver = resolver,
+                rawSocketFactory = {
+                    if (socketCount.getAndIncrement() == 0) firstSocket else Socket()
+                },
+            ).open(openRequest(server.url()), listener)
+
+            assertTrue(listener.opened.await(3, TimeUnit.SECONDS))
+            assertEquals(RelayV2Profile.RELAY_V2_SUBPROTOCOL, listener.openedSubprotocol)
+            assertEquals(2, socketCount.get())
+            assertTrue(firstSocket.closed.get())
+            assertTrue(server.awaitRequestCount(1))
+            transport.cancel()
+        }
+    }
+
     private fun openRequest(url: String, token: String = TOKEN) = RelayV2TransportOpenRequest(
         relayUrl = url,
         offeredSubprotocols = listOf(RelayV2Profile.RELAY_V2_SUBPROTOCOL),
@@ -1070,14 +1104,29 @@ private class ReadOnlyCredentialStore(
 }
 
 private class ImmediateAddressResolver(
-    private val address: InetAddress,
+    private val addresses: List<InetAddress>,
 ) : RelayV2AddressResolver {
+    constructor(address: InetAddress) : this(listOf(address))
+
     override fun resolve(host: String): RelayV2AddressResolution =
         object : RelayV2AddressResolution {
-            override fun await(timeoutMs: Int): List<InetAddress> = listOf(address)
+            override fun await(timeoutMs: Int): List<InetAddress> = addresses
 
             override fun cancel() = Unit
         }
+}
+
+private class RejectingConnectSocket : Socket() {
+    val closed = AtomicBoolean(false)
+
+    override fun connect(endpoint: SocketAddress, timeout: Int) {
+        throw ConnectException("test address is unreachable")
+    }
+
+    override fun close() {
+        closed.set(true)
+        super.close()
+    }
 }
 
 private class BlockingConnectSocket : Socket() {

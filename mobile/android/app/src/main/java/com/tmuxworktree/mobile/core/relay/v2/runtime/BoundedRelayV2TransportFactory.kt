@@ -30,9 +30,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 /**
  * Unwired, bounded RFC6455 transport foundation for the existing Relay v2 actor seam.
  *
- * This adapter owns only one bounded/cancellable address resolution, one TLS socket, one HTTP/1.1
- * Upgrade, RFC6455 framing, and its bounded write queues. It never retries, redirects,
- * authenticates a challenge, reconnects, decodes Relay JSON, or owns an actor generation/phase.
+ * This adapter owns only one bounded/cancellable address resolution, one bounded raw-address
+ * connect attempt, one TLS socket, one HTTP/1.1 Upgrade, RFC6455 framing, and its bounded write
+ * queues. It retries only raw address candidates before TLS; it never retries TLS or Upgrade,
+ * redirects, authenticates a challenge, reconnects, decodes Relay JSON, or owns an actor
+ * generation/phase.
  */
 internal class BoundedRelayV2TransportFactory(
     private val sslSocketFactory: SSLSocketFactory = systemTrustSocketFactory(),
@@ -174,11 +176,9 @@ private class BoundedRelayV2Transport(
     private fun connectAndRead() {
         var raw: Socket? = null
         try {
-            val address = resolveAddress() ?: return
+            val addresses = resolveAddresses() ?: return
             if (terminal.get()) return
-            raw = rawSocketFactory()
-            if (!registerSocket(raw)) return
-            raw.connect(InetSocketAddress(address, endpoint.port), connectTimeoutMs)
+            raw = connectRaw(addresses) ?: return
             if (terminal.get()) return
 
             val tls = sslSocketFactory.createSocket(
@@ -278,15 +278,50 @@ private class BoundedRelayV2Transport(
         }
     }
 
-    private fun resolveAddress(): InetAddress? {
+    private fun resolveAddresses(): List<InetAddress>? {
         val pending = addressResolver.resolve(endpoint.host)
         if (!registerResolution(pending)) return null
         return try {
-            pending.await(resolveTimeoutMs).firstOrNull()
-                ?: throw IOException("Relay v2 address resolution returned no address")
+            pending.await(resolveTimeoutMs)
+                .asSequence()
+                .distinct()
+                .take(MAX_RESOLVED_ADDRESSES)
+                .toList()
+                .ifEmpty { throw IOException("Relay v2 address resolution returned no address") }
         } finally {
             resolution.compareAndSet(pending, null)
         }
+    }
+
+    /**
+     * Tries only raw TCP candidates for the same exact WSS hostname. All candidates share one
+     * connect deadline, and TLS continues to use [endpoint.host] as the identity authority.
+     */
+    private fun connectRaw(addresses: List<InetAddress>): Socket? {
+        val deadlineNanos = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(connectTimeoutMs.toLong())
+        addresses.forEachIndexed { index, address ->
+            if (terminal.get()) return null
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) throw SocketTimeoutException()
+            val remainingCandidates = addresses.size - index
+            val candidateTimeoutMs = TimeUnit.NANOSECONDS.toMillis(
+                remainingNanos / remainingCandidates,
+            ).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+            val candidate = rawSocketFactory()
+            if (!registerSocket(candidate)) return null
+            try {
+                candidate.connect(
+                    InetSocketAddress(address, endpoint.port),
+                    candidateTimeoutMs,
+                )
+                return candidate
+            } catch (_: IOException) {
+                unregisterSocket(candidate)
+                if (terminal.get()) return null
+            }
+        }
+        throw IOException("Relay v2 address candidates are unreachable")
     }
 
     private fun registerResolution(candidate: RelayV2AddressResolution): Boolean {
@@ -330,6 +365,12 @@ private class BoundedRelayV2Transport(
             return false
         }
         return true
+    }
+
+    private fun unregisterSocket(candidate: Socket) {
+        socket.compareAndSet(candidate, null)
+        wireSocket.compareAndSet(candidate, null)
+        candidate.closeQuietly()
     }
 
     private fun completeFailure(kind: RelayV2TransportFailureKind, status: Int? = null) {
@@ -408,6 +449,7 @@ private class BoundedRelayV2Transport(
     }
 
     private companion object {
+        const val MAX_RESOLVED_ADDRESSES = 16
         const val CLOSE_REPLY_TIMEOUT_MS = 1_000L
         const val PROTOCOL_CLOSE_TIMEOUT_MS = 1_000L
         const val TERMINATION_FENCE_TIMEOUT_MS = 2_000L
