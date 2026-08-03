@@ -20,7 +20,11 @@ const PROTOCOL_VERSION_V1: u32 = 1;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const CLEAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+// The Node Host owns a bounded five-second WSS drain before it can close the
+// native credential cell and remove its exact admission claim. Keep the
+// supervisor deadline strictly outside that owner deadline so ordinary
+// Dashboard shutdown cannot turn a clean close into a SIGKILL/crash cut.
+const CLEAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_ID_PREFIX_V1: &str = "dmgmt1.";
 const SUPERSEDED_EXIT_CODE: i32 = 78;
 const HIDDEN_MANAGEMENT_ENTRY: &str = "__relay-v2-dashboard-management-stdio";
