@@ -24,6 +24,7 @@ import {
 } from "./support/relayV2LoopbackTls.mjs";
 
 const relayServer = await import("../dist/relayServer.js");
+const relayServerOptions = await import("../dist/relay/broker/options.js");
 const brokerCore = await import("../dist/relay/v2/brokerCore.js");
 
 function reserveFreePort() {
@@ -210,6 +211,36 @@ test("self-hosted CLI is explicit and never consumes a v1 secret", () => {
     accidentalStateDirectory.stderr,
     /只适用于 --v2-single-node-self-hosted/,
   );
+});
+
+test("Agent routing CLI opt-in is exact and self-hosted-only", () => {
+  const base = [
+    "--v2-single-node-self-hosted",
+    "--host", "0.0.0.0",
+    "--port", "9443",
+    "--v2-dev-advertised-origin", "https://relay.example.test",
+    "--v2-dev-tls-key", "/private/relay.key",
+    "--v2-dev-tls-cert", "/private/relay.cert",
+    "--v2-self-hosted-state-dir", "/private/relay-state",
+  ];
+  const disabled = relayServerOptions.parseRelayServerOptions(base);
+  assert.equal(Object.hasOwn(disabled, "v2AgentTranscriptLifecycleV1"), false);
+  const enabled = relayServerOptions.parseRelayServerOptions([
+    ...base,
+    "--v2-agent-transcript-lifecycle-v1",
+  ]);
+  assert.equal(enabled.v2AgentTranscriptLifecycleV1, true);
+
+  for (const invalid of [
+    ["--secret", "v1-secret", "--v2-agent-transcript-lifecycle-v1"],
+    ["--v2-profile", "/not/read", "--v2-agent-transcript-lifecycle-v1"],
+    ["--v2-local-dev", "--v2-agent-transcript-lifecycle-v1"],
+  ]) {
+    assert.throws(
+      () => relayServerOptions.parseRelayServerOptions(invalid),
+      /只适用于 --v2-single-node-self-hosted/,
+    );
+  }
 });
 
 test("self-hosted bootstrap correlation is a strict output-paired hidden seam", () => {

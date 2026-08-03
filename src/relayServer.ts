@@ -131,6 +131,13 @@ export async function startRelayV2BrokerSingleNodeSelfHosted(
     .startRelayV2BrokerSingleNodeSelfHosted(options, signal);
 }
 
+function createSelfHostedAgentTranscriptLifecycleReadiness():
+  import("./relay/broker/server.js").RelayV2BrokerServerAgentCapabilityReadinessReceipt {
+  const cancel = Object.freeze((): void => {});
+  const subscribeLoss = Object.freeze((_onLoss: () => void): (() => void) => cancel);
+  return Object.freeze({ status: "ready" as const, subscribeLoss });
+}
+
 class RelayV2BrokerCliSignalLatch {
   readonly #controller = new AbortController();
   readonly #stopped: Promise<void>;
@@ -194,6 +201,12 @@ async function runRelayV2BrokerSingleNodeSelfHostedCli(
         tlsKeyPath: options.v2LocalDevelopmentTlsKeyPath!,
         tlsCertificatePath: options.v2LocalDevelopmentTlsCertificatePath!,
         stateDirectory: options.v2SingleNodeSelfHostedStateDirectory!,
+        ...(options.v2AgentTranscriptLifecycleV1 === true
+          ? {
+              agentTranscriptLifecycleReadiness:
+                createSelfHostedAgentTranscriptLifecycleReadiness(),
+            }
+          : {}),
       }, signalLatch.signal);
     } catch (error) {
       if (signalLatch.signal.aborted) return;
