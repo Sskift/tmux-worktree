@@ -267,6 +267,38 @@ export interface RelayV2CanonicalResourceResolverPort {
   ): void;
 }
 
+type RelayV2CanonicalSessionWorkingDirectoryPort = (
+  token: RelayV2CanonicalResourceResolverToken,
+  scopeId: string,
+  sessionId: string,
+) => Promise<string | null>;
+
+const canonicalSessionWorkingDirectoryPorts = new WeakMap<
+object,
+RelayV2CanonicalSessionWorkingDirectoryPort
+>();
+
+/**
+ * Private same-owner projection for adapters which must re-bind an H2 Session
+ * to a live local process. It deliberately does not widen the public resolver
+ * result consumed by command and terminal authorities.
+ */
+export function resolveRelayV2CanonicalSessionWorkingDirectory(
+  resolver: RelayV2CanonicalResourceResolverPort,
+  token: RelayV2CanonicalResourceResolverToken,
+  scopeId: string,
+  sessionId: string,
+): Promise<string | null> {
+  const port = canonicalSessionWorkingDirectoryPorts.get(resolver as object);
+  if (port === undefined) {
+    return Promise.reject(new RelayV2MaterializedStateError(
+      "CAPABILITY_UNAVAILABLE",
+      "canonical Session working-directory authority is unavailable",
+    ));
+  }
+  return port(token, scopeId, sessionId);
+}
+
 export interface RelayV2FencedNegativeCandidate {
   reservationId: string;
   hostEpoch: string;
@@ -632,6 +664,7 @@ interface PublishedCanonicalResolver {
   discoveryCut: RelayV2ResourceResolverDiscoveryCut;
   scopes: ReadonlyMap<string, RelayV2CanonicalResolvedScopeTarget>;
   sessions: ReadonlyMap<string, RelayV2CanonicalResolvedSessionTarget>;
+  sessionWorkingDirectories: ReadonlyMap<string, string | null>;
 }
 
 interface MaterializedPublicationOutcome {
@@ -3127,6 +3160,14 @@ export class RelayV2MaterializedStateFoundation {
         fence,
       ),
     });
+    canonicalSessionWorkingDirectoryPorts.set(
+      this.canonicalTargetResolver as object,
+      (token, scopeId, sessionId) => this.resolveCanonicalSessionWorkingDirectory(
+        token,
+        scopeId,
+        sessionId,
+      ),
+    );
     materializedStateProcessAuthorityPorts.set(snapshotSpoolOwner as object, Object.freeze({
       hostId: this.hostId,
       hostStateOwner: this.store as object,
@@ -3775,6 +3816,40 @@ export class RelayV2MaterializedStateFoundation {
     });
   }
 
+  private async resolveCanonicalSessionWorkingDirectory(
+    rawToken: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+    sessionId: string,
+  ): Promise<string | null> {
+    const token = normalizeCanonicalResolverToken(rawToken);
+    validateOpaqueInput(scopeId, "scopeId");
+    validateOpaqueInput(sessionId, "sessionId");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(token.hostEpoch, snapshot.hostEpoch);
+      const publication = this.requireCanonicalResolver(
+        snapshot,
+        parseMaterializedState(snapshot),
+        token,
+      );
+      if (!publication.scopes.has(scopeId)) {
+        throw new RelayV2MaterializedStateError(
+          "SCOPE_NOT_FOUND",
+          "Scope is absent from the complete canonical resolver cut",
+        );
+      }
+      const key = `${scopeId}\0${sessionId}`;
+      if (!publication.sessions.has(key)) {
+        throw new RelayV2MaterializedStateError(
+          "SESSION_NOT_FOUND",
+          "Session is absent from the complete canonical resolver cut",
+        );
+      }
+      return publication.sessionWorkingDirectories.get(key) ?? null;
+    });
+  }
+
   private async resolveCanonicalScopeForAdmission(
     token: RelayV2CanonicalResourceResolverToken,
     scopeId: string,
@@ -3927,6 +4002,7 @@ export class RelayV2MaterializedStateFoundation {
       ), 0)) return;
     const scopes = new Map<string, RelayV2CanonicalResolvedScopeTarget>();
     const sessions = new Map<string, RelayV2CanonicalResolvedSessionTarget>();
+    const sessionWorkingDirectories = new Map<string, string | null>();
     for (const scope of state.scopes) {
       const evidence = scopeEvidence.get(scope.backendIdentity);
       if (evidence === undefined || evidence.processTarget.kind !== scope.item.kind) return;
@@ -3949,12 +4025,14 @@ export class RelayV2MaterializedStateFoundation {
           || !sameJson(sessionTarget.processTarget, evidence.processTarget)
           || !sameJson(sessionTarget.capabilities, evidence.capabilities)
           || sessionTarget.managedTarget.kind !== session.item.kind) return;
-        sessions.set(`${scope.item.scopeId}\0${session.item.sessionId}`, {
+        const sessionKey = `${scope.item.scopeId}\0${session.item.sessionId}`;
+        sessions.set(sessionKey, {
           ...clone(resolvedScope),
           sessionId: session.item.sessionId,
           backendInstanceKey: session.backendIdentity,
           managedTarget: clone(sessionTarget.managedTarget),
         });
+        sessionWorkingDirectories.set(sessionKey, session.item.cwd);
       }
     }
     const token: RelayV2CanonicalResourceResolverToken = {
@@ -3963,7 +4041,13 @@ export class RelayV2MaterializedStateFoundation {
       resourceMappingDigest: canonicalResolverResourceMappingDigest(snapshot.hostEpoch, state),
       discoveryGeneration: discoveryCut.generation,
     };
-    this.publishedCanonicalResolver = { token, discoveryCut, scopes, sessions };
+    this.publishedCanonicalResolver = {
+      token,
+      discoveryCut,
+      scopes,
+      sessions,
+      sessionWorkingDirectories,
+    };
   }
 
   reconcile(): Promise<RelayV2MaterializedReconcileResult> {

@@ -167,10 +167,16 @@ export interface DarwinCodexRolloutInspectionAdapterInput {
   readonly trustedCodexExecutableSha256: string;
 }
 
+export interface DarwinCodexRolloutTofuInspectionAdapterInput {
+  readonly tmuxExecutablePath: string;
+  readonly selection: Readonly<CodexRolloutManagedSessionSelection>;
+}
+
 interface TrustedExecutableRecord {
   readonly path: string;
   readonly device: bigint;
   readonly inode: bigint;
+  readonly sha256: string;
 }
 
 interface NormalizedPorts {
@@ -738,7 +744,10 @@ function exactSha256(value: unknown): string {
   return value;
 }
 
-async function captureTrustedExecutable(path: string, expectedSha256: string): Promise<TrustedExecutableRecord> {
+async function captureTrustedExecutable(
+  path: string,
+  expectedSha256?: string,
+): Promise<TrustedExecutableRecord> {
   let handle: FileHandle | null = null;
   try {
     const canonical = await fsPromises.realpath(path);
@@ -759,12 +768,15 @@ async function captureTrustedExecutable(path: string, expectedSha256: string): P
       hash.update(buffer.subarray(0, read.bytesRead));
       offset += read.bytesRead;
     }
-    const actual = Buffer.from(hash.digest("hex"), "hex");
-    const expected = Buffer.from(expectedSha256, "hex");
-    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
-      throw sourceError("INVALID_OPTIONS");
+    const sha256 = hash.digest("hex");
+    if (expectedSha256 !== undefined) {
+      const actual = Buffer.from(sha256, "hex");
+      const expected = Buffer.from(expectedSha256, "hex");
+      if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+        throw sourceError("INVALID_OPTIONS");
+      }
     }
-    return Object.freeze({ path, device: stat.dev, inode: stat.ino });
+    return Object.freeze({ path, device: stat.dev, inode: stat.ino, sha256 });
   } catch (error) {
     if (error instanceof CodexRolloutFileSourceError) throw error;
     throw sourceError("INVALID_OPTIONS");
@@ -968,5 +980,46 @@ export async function createDarwinCodexRolloutInspectionAdapter(
   const tmuxPath = absolutePath(fields.tmuxExecutablePath, "INVALID_OPTIONS");
   const trustedPath = absolutePath(fields.trustedCodexExecutablePath, "INVALID_OPTIONS");
   const trusted = await captureTrustedExecutable(trustedPath, exactSha256(fields.trustedCodexExecutableSha256));
+  return new DarwinCodexRolloutInspectionAdapter(DARWIN_ADAPTER_TOKEN, tmuxPath, trusted);
+}
+
+/**
+ * Explicit self-hosted-only TOFU capture. The live foreground Codex vnode is
+ * selected from the exact managed pane, hashed once, and retained by the
+ * returned adapter for every pre/post-open process and lsof recheck. The
+ * rollout authority still proves the exact 0.146.0 tuple from session_meta.
+ */
+export async function createDarwinCodexRolloutTofuInspectionAdapter(
+  input: Readonly<DarwinCodexRolloutTofuInspectionAdapterInput>,
+): Promise<DarwinCodexRolloutInspectionAdapter> {
+  if (process.platform !== "darwin") throw sourceError("INVALID_OPTIONS");
+  const fields = exactObject(
+    input,
+    ["tmuxExecutablePath", "selection"],
+    "INVALID_OPTIONS",
+  );
+  const tmuxPath = absolutePath(fields.tmuxExecutablePath, "INVALID_OPTIONS");
+  const selection = normalizeSelection(fields.selection);
+  const probe = new DarwinCodexRolloutInspectionAdapter(
+    DARWIN_ADAPTER_TOKEN,
+    tmuxPath,
+    Object.freeze({ path: "/dev/null", device: 0n, inode: 0n, sha256: "0".repeat(64) }),
+  );
+  const pane = await probe.inspectSinglePane(selection);
+  const records = await probe.inspectPaneDescendants(pane);
+  const paneTty = basename(pane.paneTty);
+  const candidates = records.filter((record) => {
+    if (record.tty !== paneTty
+      || record.processGroupId !== record.foregroundProcessGroupId
+      || !isAbsolute(record.executablePath)) return false;
+    const name = basename(record.executablePath);
+    return name === "codex" || /^codex-[A-Za-z0-9._-]+$/u.test(name);
+  });
+  if (candidates.length !== 1) throw sourceError("PROCESS_MISMATCH");
+  const trustedPath = absolutePath(candidates[0].executablePath, "INVALID_OPTIONS");
+  const trusted = await captureTrustedExecutable(trustedPath);
+  // Capture of both digest and vnode is intentionally retained inside the
+  // adapter; neither value becomes a caller-controlled artifact selector.
+  if (!/^[0-9a-f]{64}$/u.test(trusted.sha256)) throw sourceError("INVALID_OPTIONS");
   return new DarwinCodexRolloutInspectionAdapter(DARWIN_ADAPTER_TOKEN, tmuxPath, trusted);
 }

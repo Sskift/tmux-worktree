@@ -983,7 +983,13 @@ export class CodexAppServerV2EventProducer {
         try {
           for (const event of job.events) {
             const result: RelayAgentTrustedIngestResult = await this.#ingestTrustedSource(event);
-            if (result.reduction.disposition !== "applied") {
+            // A fresh trusted-source process may replay the same stable source
+            // prefix after Host restart. The durable authority's exact
+            // source-event fingerprint is the idempotency boundary; accepting
+            // only its `duplicate` result avoids either appending a second
+            // timeline or sealing an otherwise valid re-acquisition.
+            if (result.reduction.disposition !== "applied"
+              && result.reduction.disposition !== "duplicate") {
               throw producerError("DURABLE_REJECTED");
             }
           }

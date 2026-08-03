@@ -9,6 +9,7 @@ const MAX_JSON_NODES = 4_096;
 const MAX_JSON_KEYS = 2_048;
 const MAX_ID_LENGTH = 128;
 const MAX_TEXT_LENGTH = 65_536;
+const MAX_ABORT_REASON_BYTES = 1_024;
 
 export const CODEX_ROLLOUT_JSONL_SOURCE_BUDGETS = Object.freeze({
   maxAppendBytes: MAX_APPEND_BYTES,
@@ -424,6 +425,57 @@ export class CodexRolloutJsonlNotificationByteSource
             itemsView: "full",
             status: "completed",
             error: null,
+            startedAt: active.startedAtSeconds,
+            completedAt: completedAtSeconds,
+            durationMs,
+          },
+        },
+      });
+    }
+
+    if (payload.type === "turn_aborted") {
+      if (
+        !exactKeys(payload, [
+          "type", "turn_id", "reason", "started_at", "completed_at", "duration_ms",
+        ])
+        || !boundedIdentity(payload.turn_id)
+        || typeof payload.reason !== "string"
+        || payload.reason.length < 1
+        || /\0/u.test(payload.reason)
+        || Buffer.byteLength(payload.reason, "utf8") > MAX_ABORT_REASON_BYTES
+      ) {
+        fail("RECORD_INVALID");
+      }
+      if (this.#activeTurn === null || payload.turn_id !== this.#activeTurn.id) {
+        fail("TURN_ORDER_INVALID");
+      }
+      timestampMs(parsed.timestamp);
+      const startedAtSeconds = epochSeconds(payload.started_at);
+      const completedAtSeconds = epochSeconds(payload.completed_at);
+      const durationMs = milliseconds(payload.duration_ms);
+      if (
+        startedAtSeconds !== this.#activeTurn.startedAtSeconds
+        || completedAtSeconds < startedAtSeconds
+        || Math.abs(durationMs - (completedAtSeconds - startedAtSeconds) * 1_000) >= 1_000
+      ) {
+        fail("TURN_ORDER_INVALID");
+      }
+      const active = this.#activeTurn;
+      this.#activeTurn = null;
+      return encodeNotification({
+        method: "turn/completed",
+        params: {
+          threadId: this.#binding.threadId,
+          turn: {
+            id: active.id,
+            items: [],
+            itemsView: "full",
+            status: "failed",
+            error: {
+              message: "Codex rollout turn aborted",
+              codexErrorInfo: null,
+              additionalDetails: null,
+            },
             startedAt: active.startedAtSeconds,
             completedAt: completedAtSeconds,
             durationMs,
