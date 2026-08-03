@@ -643,6 +643,65 @@ test("native framing, one-callback FIFO, and transport backpressure fail closed"
     await pendingWrite.closeAndDrain();
   });
 
+  await t.test("same-route data stays ahead of its unbound watermark behind blocked control", async () => {
+    let releaseAuth;
+    const blockedAuth = new Promise((_, reject) => { releaseAuth = reject; });
+    const shared = createShared({
+      authControlAuthority: {
+        handle() { return blockedAuth; },
+      },
+    });
+    const socket = new FakeUpgradedSocket({ synchronousSend: true });
+    const { handle } = prepareAndAttach(shared, socket, "ordered-unbind-host");
+    socket.emit("message", carrierFrame(hostHello("ordered-unbind-host")), false);
+    await settle();
+    const registered = socket.frame(0);
+    const route = await openClientRoute(
+      shared,
+      socket,
+      handle,
+      "ordered-unbind-host",
+      1,
+      true,
+    );
+
+    socket.emit("message", carrierFrame({
+      carrierVersion: 1,
+      type: "host.reauthenticate",
+      requestId: randomUUID(),
+      connectorId: registered.connectorId,
+      payload: { accessToken: "twcap2.blocked.signature" },
+    }), false);
+    await settle();
+    route.socket.emit("close", 1000);
+    await settle();
+    const unbind = [...socket.sends]
+      .map((_, index) => socket.frame(index))
+      .findLast((frame) => frame.type === "route.unbind");
+    assert.ok(unbind);
+
+    socket.emit("message", routeData(route, 1), false);
+    socket.emit("message", carrierFrame({
+      carrierVersion: 1,
+      type: "route.unbound",
+      connectorId: unbind.connectorId,
+      routeId: unbind.routeId,
+      routeFence: unbind.routeFence,
+      payload: {
+        reason: unbind.payload.reason,
+        lastClientToHostSeq: unbind.payload.lastClientToHostSeq,
+        lastHostToClientSeq: "1",
+      },
+    }), false);
+    releaseAuth(new Error("release ordered unbind ingress"));
+    await settle(24);
+
+    assert.equal(socket.closes.length, 0);
+    socket.emit("close", 1000);
+    await Promise.all([handle.drained, route.connection.drained]);
+    await shared.closeAndDrain();
+  });
+
   await t.test("route pause stays route-scoped while aggregate watermarks pause/resume the socket", async () => {
     let releaseAuth;
     const blockedAuth = new Promise((_, reject) => { releaseAuth = reject; });

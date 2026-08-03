@@ -580,9 +580,18 @@ class HostWssConnection {
   }
 
   private selectIngress(): IngressEntry | undefined {
-    const control = this.ingressEntries.find((entry) => (
-      entry.state === "pending" && entry.identity.control
-    ));
+    const earlierPendingRoutes = new Set<string>();
+    let control: IngressEntry | undefined;
+    for (const entry of this.ingressEntries) {
+      if (entry.state !== "pending") continue;
+      const routeId = entry.identity.routeId;
+      if (entry.identity.control
+        && (routeId === null || !earlierPendingRoutes.has(routeId))) {
+        control = entry;
+        break;
+      }
+      if (routeId !== null) earlierPendingRoutes.add(routeId);
+    }
     if (control) return control;
     const routeIds: string[] = [];
     for (const entry of this.ingressEntries) {
