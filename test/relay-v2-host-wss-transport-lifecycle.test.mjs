@@ -1536,6 +1536,55 @@ test("close cleanup failures cannot skip exact drain settlement", async () => {
   assert.equal(observations.closes.length, 1);
 });
 
+test("the default bounded close deadline keeps a clean one-shot process alive", async () => {
+  const h = credentialHarness();
+  const sockets = fakeWebSockets(h.expectedAuthorizationDigest);
+  const factory = new wss.RelayV2HostWssTransportLifecycleFactory({
+    relayUrl: "wss://relay.example.test/",
+    credentialAuthority: h.authority,
+    webSocketConstructor: sockets.FakeWebSocket,
+    closeDrainDeadlineMs: 321,
+  });
+  const input = attempt();
+  const admission = prepare(factory, h.authority, input);
+  const lifecycle = factory.createTransportLifecycle(input);
+  const observations = {
+    acks: [],
+    closes: [],
+    receives: 0,
+    writables: [],
+    bufferedAmount: () => lifecycle.transport.bufferedAmount(),
+  };
+  const connection = actor(h.authority, admission).connect(
+    lifecycle.transport,
+    REFERENCE,
+  );
+  lifecycle.bindConnection(observedConnection(connection, observations));
+  const socket = sockets.sockets[0];
+  socket.emitOpen();
+
+  const nativeSetTimeout = globalThis.setTimeout;
+  let closeDeadline = null;
+  globalThis.setTimeout = function captureCloseDeadline(callback, delay, ...args) {
+    const timer = Reflect.apply(nativeSetTimeout, globalThis, [callback, delay, ...args]);
+    if (delay === 321) closeDeadline = timer;
+    return timer;
+  };
+  try {
+    lifecycle.transport.close(1000, "host_shutdown");
+  } finally {
+    globalThis.setTimeout = nativeSetTimeout;
+  }
+
+  assert.notEqual(closeDeadline, null);
+  assert.equal(closeDeadline.hasRef(), true,
+    "the bounded close owner must pin Node until drain reaches later native owners");
+  const proof = Object.freeze(Object.create(null));
+  const drain = lifecycle.awaitDrained(proof);
+  socket.emitClose(1000);
+  assert.equal(await drain, proof);
+});
+
 test("close is idempotent and drain fences callbacks through forced termination", async () => {
   const h = credentialHarness();
   const sockets = fakeWebSockets(h.expectedAuthorizationDigest);

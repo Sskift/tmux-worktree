@@ -506,7 +506,12 @@ function strictUtf8Text(value: Uint8Array): string | null {
 
 function defaultCloseDrainScheduler(delayMs: number, callback: () => void): () => void {
   const timer = setTimeout(callback, delayMs);
-  timer.unref();
+  // This is the transport's bounded clean-close barrier. Keep it referenced:
+  // the hidden one-shot Dashboard child may have no other active libuv handle
+  // after its stdio reaches EOF, and an unresolved Promise alone cannot keep
+  // Node alive long enough to force-close the socket and release the native
+  // credential cell admission claim. The deadline remains bounded by the
+  // factory limit and is cancelled as soon as the socket closes normally.
   return () => clearTimeout(timer);
 }
 
