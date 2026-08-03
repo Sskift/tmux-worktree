@@ -2948,6 +2948,24 @@ fn stop_center(config: &PersistedSelfHostedConfig) -> Result<(), String> {
     .map_err(|_| "Relay v2 Center did not reach the stopped state".to_string())
 }
 
+fn stop_center_and_active_connector<StopCenter, StopConnector>(
+    active_management: Option<&SelfHostedManagementBinding>,
+    mut stop_center: StopCenter,
+    mut stop_connector: StopConnector,
+) -> Result<(), String>
+where
+    StopCenter: FnMut() -> Result<(), String>,
+    StopConnector: FnMut(&ManagementLaunchKey) -> Result<(), String>,
+{
+    let center_stop = stop_center();
+    let connector_stop = match active_management {
+        Some(binding) => stop_connector(&binding.steady_launch_key),
+        None => Ok(()),
+    };
+    center_stop?;
+    connector_stop
+}
+
 fn validate_expired_bootstrap_rotation_candidate(
     config: &PersistedSelfHostedConfig,
 ) -> Result<(), String> {
@@ -3373,16 +3391,18 @@ pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
             load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
         persist_connector_desired_running(&mut config, false)?;
         owner.startup_restore_error = None;
-        let center_stop = stop_center(&config);
-        let launch_key = owner
-            .active_management
-            .as_ref()
-            .map(|binding| binding.steady_launch_key.clone());
-        let connector_stop =
-            management.stop_self_hosted_connector_for_launch_key(launch_key.as_ref());
-        center_stop?;
-        connector_stop
-            .map_err(|_| "Relay v2 self-hosted Host could not be stopped cleanly".to_string())?;
+        stop_center_and_active_connector(
+            owner.active_management.as_ref(),
+            || stop_center(&config),
+            |launch_key| {
+                management
+                    .stop_self_hosted_connector_for_launch_key(Some(launch_key))
+                    .map(|_| ())
+                    .map_err(|_| {
+                        "Relay v2 self-hosted Host could not be stopped cleanly".to_string()
+                    })
+            },
+        )?;
         Ok(probe_status(&config))
     })
     .await
@@ -3404,6 +3424,7 @@ mod tests {
         normalize_issuer_url, persisted_management_config_identity, read_local_private_file,
         ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
         relay_url_from_issuer, self_hosted_connector_should_be_running,
+        stop_center_and_active_connector,
         valid_bootstrap_publication_correlation, validate_bootstrap_bytes, validate_listen_host,
         verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
         BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
@@ -3706,6 +3727,27 @@ mod tests {
         assert!(script[postcondition..].contains("center_has_session_status=$?"));
         assert!(script[postcondition..].contains("test \"$center_has_session_status\" -eq 1"));
         assert!(!script[postcondition..].contains("|| true"));
+    }
+
+    #[test]
+    fn center_stop_without_an_active_management_child_still_runs_the_remote_barrier() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        stop_center_and_active_connector(
+            None,
+            || {
+                events.borrow_mut().push("remote_absence_barrier");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("connector_drain");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.into_inner(), ["remote_absence_barrier"]);
     }
 
     #[test]
