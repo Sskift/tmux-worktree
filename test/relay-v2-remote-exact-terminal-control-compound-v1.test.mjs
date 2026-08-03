@@ -771,33 +771,41 @@ test("running daemon owns remote compound claims and drains them on target retir
   }
 });
 
-test("one canonical child carries observation and the full lease lifecycle without a generation reset", async () => {
+test("a fresh exact target is established before one child carries observation and the full lease lifecycle", async () => {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-v2-remote-observe-"));
   const statePath = join(root, "terminal-control-state-v1.json");
-  const calls = { ownerOpen: 0, inspect: 0, send: 0, reset: 0 };
+  const calls = { ownerOpen: 0, establish: 0, inspect: 0, send: 0, reset: 0 };
   const protocolFrames = [];
   const invocations = [];
   let output = Buffer.alloc(0);
   terminalControl.saveTerminalControlState({
     version: 1,
     controlEpoch: "pre-observe-epoch",
-    targets: [{
-      controlTargetId: "control-target-observe",
-      lifecycle: "ACTIVE",
-      managedSession: {
-        name: "managed-observe",
-        kind: "worktree",
-        createdAt: "2026-07-22T00:00:00.000Z",
-      },
-      backend: { kind: "tmux", tmuxInstanceId: "tmux-instance-observe" },
-      outputGeneration: "output-generation-one",
-      ownership: { state: "FREE", fence: "0" },
-      revision: "1",
-      completedOperations: [],
-      updatedAt: "2026-07-22T00:00:00.000Z",
-    }],
+    targets: [],
   }, statePath);
+  const exactTarget = {
+    managedSession: {
+      name: "managed-observe",
+      kind: "worktree",
+      profile: "cli",
+      cwd: "/repo",
+      createdAt: "2026-07-22T00:00:00.000Z",
+    },
+    managedIncarnation: INCARNATION,
+    tmuxInstanceId: "tmux-instance-observe",
+    paneIdentity: "%3",
+  };
   const backend = {
+    async establishExactTarget(input) {
+      calls.establish += 1;
+      assert.deepEqual(input, {
+        managedName: "managed-observe",
+        managedKind: "worktree",
+        managedIncarnation: INCARNATION,
+        pane: 0,
+      });
+      return structuredClone(exactTarget);
+    },
     async inspectExactTarget(input) {
       calls.inspect += 1;
       assert.deepEqual(input, {
@@ -806,18 +814,7 @@ test("one canonical child carries observation and the full lease lifecycle witho
         managedIncarnation: INCARNATION,
         pane: 0,
       });
-      return {
-        managedSession: {
-          name: "managed-observe",
-          kind: "worktree",
-          profile: "cli",
-          cwd: "/repo",
-          createdAt: "2026-07-22T00:00:00.000Z",
-        },
-        managedIncarnation: INCARNATION,
-        tmuxInstanceId: "tmux-instance-observe",
-        paneIdentity: "%3",
-      };
+      return structuredClone(exactTarget);
     },
     async resolveManagedSession() {
       throw new Error("name-only resolution must not run");
@@ -928,6 +925,14 @@ test("one canonical child carries observation and the full lease lifecycle witho
   };
   try {
     const evidence = await remote.resolveExactTarget(input);
+    const provisioned = terminalControl.loadTerminalControlState(statePath).targets;
+    assert.equal(provisioned.length, 1);
+    assert.deepEqual(provisioned[0].managedSession, {
+      name: "managed-observe",
+      kind: "worktree",
+      createdAt: "2026-07-22T00:00:00.000Z",
+    });
+    assert.equal(provisioned[0].backend.tmuxInstanceId, "tmux-instance-observe");
     remote.fenceExactTargetForAdmission(input, evidence);
     const binding = {
       ...input,
@@ -1000,10 +1005,11 @@ test("one canonical child carries observation and the full lease lifecycle witho
     );
 
     assert.equal(calls.ownerOpen, 1);
+    assert.equal(calls.establish, 1, "the empty target state is provisioned only by the exact seam");
     assert.equal(
       calls.inspect,
-      3,
-      "prepare, the live re-inspection at observation consume, and the later lease each inspect exactly once",
+      2,
+      "observation consume and the later lease each re-inspect the newly established target once",
     );
     assert.equal(invocations.length, 1, "observation and lease share one canonical child");
     assert.deepEqual(protocolFrames.map((frame) => [frame.type, frame.request?.type]), [
