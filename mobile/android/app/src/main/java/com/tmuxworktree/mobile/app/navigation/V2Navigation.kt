@@ -73,6 +73,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavGraphBuilder
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -121,6 +122,7 @@ import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
 import com.tmuxworktree.mobile.navigation.RootDestination
 import java.util.UUID
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 internal object V2Routes {
@@ -148,6 +150,50 @@ internal fun NavHostController.navigateAfterCreation(
             popUpTo(formRoute) { inclusive = true }
         }
         launchSingleTop = true
+    }
+}
+
+internal fun NavGraphBuilder.relaySessionDestinations(
+    uiState: StateFlow<V2UiState>,
+    missingContent: @Composable () -> Unit,
+    sessionContent: @Composable (RelaySession, V2UiState, Boolean) -> Unit,
+    terminalContent: @Composable (RelaySession, V2UiState) -> Unit,
+) {
+    composable(
+        route = V2Routes.SESSION,
+        arguments = listOf(
+            navArgument("sessionKey") { type = NavType.StringType },
+            navArgument("focusReply") {
+                type = NavType.BoolType
+                defaultValue = false
+            },
+        ),
+    ) { entry ->
+        val routeState by uiState.collectAsStateWithLifecycle()
+        val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
+        val session = routeState.session(sessionId)
+        if (session == null) {
+            missingContent()
+        } else {
+            sessionContent(
+                session,
+                routeState,
+                entry.arguments?.getBoolean("focusReply") ?: false,
+            )
+        }
+    }
+    composable(
+        route = V2Routes.TERMINAL,
+        arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
+    ) { entry ->
+        val routeState by uiState.collectAsStateWithLifecycle()
+        val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
+        val session = routeState.session(sessionId)
+        if (session == null) {
+            missingContent()
+        } else {
+            terminalContent(session, routeState)
+        }
     }
 }
 
@@ -432,44 +478,25 @@ private fun MainNavigation(
                     onBack = { navController.popBackStack() },
                 )
             }
-            composable(
-                route = V2Routes.SESSION,
-                arguments = listOf(
-                    navArgument("sessionKey") { type = NavType.StringType },
-                    navArgument("focusReply") {
-                        type = NavType.BoolType
-                        defaultValue = false
-                    },
-                ),
-            ) { entry ->
-                val routeState = latestState
-                val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
-                val focusReply = entry.arguments?.getBoolean("focusReply") ?: false
-                val session = routeState.session(sessionId)
-                if (session == null) {
+            relaySessionDestinations(
+                uiState = viewModel.uiState,
+                missingContent = {
                     MissingSession(onBack = { navController.popBackStack() })
-                } else {
+                },
+                sessionContent = { session, routeState, focusReply ->
                     SessionRoute(
                         session = session,
                         state = routeState,
                         viewModel = viewModel,
                         onBack = { navController.popBackStack() },
                         onHealth = { navController.navigate(V2Routes.HEALTH) },
-                        onTerminal = { navController.navigate(V2Routes.terminal(session.stableId)) },
+                        onTerminal = {
+                            navController.navigate(V2Routes.terminal(session.stableId))
+                        },
                         autoFocusReply = focusReply,
                     )
-                }
-            }
-            composable(
-                route = V2Routes.TERMINAL,
-                arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
-            ) { entry ->
-                val routeState = latestState
-                val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
-                val session = routeState.session(sessionId)
-                if (session == null) {
-                    MissingSession(onBack = { navController.popBackStack() })
-                } else {
+                },
+                terminalContent = { session, routeState ->
                     TerminalRoute(
                         session = session,
                         state = routeState,
@@ -478,8 +505,8 @@ private fun MainNavigation(
                         onBack = { navController.popBackStack() },
                         onHealth = { navController.navigate(V2Routes.HEALTH) },
                     )
-                }
-            }
+                },
+            )
         }
     }
 }
