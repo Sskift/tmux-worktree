@@ -22,6 +22,7 @@ import {
   TmuxTerminalControlBackend,
   type TerminalControlBackend,
   type TerminalControlExactTargetObservation,
+  type TerminalControlOutputPosition,
 } from "./backend";
 import {
   acquireTerminalControlStoreLock,
@@ -1273,7 +1274,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       saveTerminalControlState(state, this.statePath);
       return {
         outputGeneration: target.outputGeneration,
-        outputCursor: output.cursor,
+        outputCursor: output.retainedStartCursor ?? output.cursor,
         controlEpoch: record.identity.controlEpoch,
         controlTargetId: record.identity.controlTargetId,
         targetIncarnationProof: record.identity.targetIncarnationProof,
@@ -1577,7 +1578,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   private async prepareOutput(
     state: TerminalControlState,
     target: TerminalControlTargetRecord,
-  ): Promise<{ generation: string; cursor: number }> {
+  ): Promise<TerminalControlOutputPosition> {
     try {
       const output = await this.backend.prepareOutput(
         target.controlTargetId,
@@ -1629,7 +1630,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   private async resetOutput(
     state: TerminalControlState,
     target: TerminalControlTargetRecord,
-  ): Promise<{ generation: string; cursor: number }> {
+  ): Promise<TerminalControlOutputPosition> {
     try {
       const output = await this.backend.resetOutput(
         target.controlTargetId,
@@ -1651,7 +1652,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
 
   private async recoverOutput(
     target: TerminalControlTargetRecord,
-  ): Promise<{ generation: string; cursor: number }> {
+  ): Promise<TerminalControlOutputPosition> {
     try {
       const output = await this.backend.recoverOutput(
         target.controlTargetId,

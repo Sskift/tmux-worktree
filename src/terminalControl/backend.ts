@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -136,6 +137,8 @@ function sgrMouseWheelPayload(
 export interface TerminalControlOutputPosition {
   generation: string;
   cursor: number;
+  /** Earliest byte cursor retained for a fresh read observation, when known. */
+  retainedStartCursor?: number;
 }
 
 export interface TerminalControlOutputChunk extends TerminalControlOutputPosition {
@@ -911,7 +914,11 @@ function createInitialOutputSegment(paths: OutputCapturePaths): OutputSegment[] 
   const path = segmentPath(paths, 0);
   const fd = openSync(path, "wx", 0o600);
   closeSync(fd);
-  return [{ path, start: 0, size: 0 }];
+  // A fresh xterm generation starts blank. Seed it at the top-left before
+  // appending tmux's rendered pane so the first observation can reconstruct
+  // the already-visible screen instead of waiting for future PTY output.
+  appendFileSync(path, Buffer.from("\u001b[2J\u001b[H", "ascii"));
+  return [{ path, start: 0, size: statSync(path).size }];
 }
 
 function outputPositionFromSegments(
@@ -932,7 +939,11 @@ function outputPositionFromSegments(
       "terminal output cursor exceeded the supported range",
     );
   }
-  return { generation, cursor };
+  return {
+    generation,
+    cursor,
+    retainedStartCursor: segments[0].start,
+  };
 }
 
 function pruneObsoleteOutputFiles(paths: OutputCapturePaths): void {
@@ -1083,7 +1094,34 @@ async function establishSegmentedOutputCapture(
     );
   }
   const current = createInitialOutputSegment(paths)[0];
-  return replaceSegmentedOutputCapture(sessionId, paneTarget, paths, generation, current);
+  const snapshotBuffer = `tw-terminal-snapshot-${process.pid}-${randomUUID()}`;
+  try {
+    // These commands share one tmux command queue: capture the exact current
+    // pane into the initial generation segment, then install the live pipe
+    // before later pane output can pass that boundary.
+    await runTmux([
+      "capture-pane", "-e", "-b", snapshotBuffer, "-t", paneTarget,
+      ";", "save-buffer", "-a", "-b", snapshotBuffer, current.path,
+      ";", "delete-buffer", "-b", snapshotBuffer,
+      ";", "set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, generation,
+      ";", "pipe-pane", "-O", "-t", paneTarget, outputCaptureCommand(paths, current),
+    ]);
+  } catch (error) {
+    await runTmux(
+      ["delete-buffer", "-b", snapshotBuffer],
+      { allowFailure: true },
+    ).catch(() => undefined);
+    throw error;
+  }
+  const confirmed = await outputCaptureBackendState(paneTarget);
+  if (confirmed.generation !== generation || !confirmed.pipeActive) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output capture generation or pipe could not be established",
+    );
+  }
+  pruneObsoleteOutputFiles(paths);
+  return outputPositionFromSegments(generation, currentOutputSegments(paths));
 }
 
 async function resumeSegmentedOutputCapture(

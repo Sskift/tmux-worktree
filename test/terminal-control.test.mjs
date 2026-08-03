@@ -2407,6 +2407,95 @@ test("production backend fails closed when managed state has duplicate session i
   }
 });
 
+test("production backend seeds an existing pane before live Relay v2 input", async (t) => {
+  const harness = isolatedManagedTmux(t, "relay-v2-initial-pane");
+  if (!harness) return;
+  const existingMarker = "__relay_v2_existing_prompt__";
+  const inputMarker = "__relay_v2_input_reached_tmux__";
+  try {
+    const sendExisting = spawnSync(
+      harness.wrapper,
+      [
+        "send-keys",
+        "-t",
+        harness.sessionName,
+        `printf '${existingMarker}\\n'`,
+        "C-m",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(sendExisting.status, 0, sendExisting.stderr);
+    const visibleDeadline = Date.now() + 2_000;
+    let visible = "";
+    while (!visible.includes(existingMarker) && Date.now() < visibleDeadline) {
+      const captured = spawnSync(
+        harness.wrapper,
+        ["capture-pane", "-p", "-t", harness.sessionName],
+        { encoding: "utf8" },
+      );
+      assert.equal(captured.status, 0, captured.stderr);
+      visible = captured.stdout;
+      if (!visible.includes(existingMarker)) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    assert.match(visible, new RegExp(existingMarker));
+
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    const resolvedBackend = await backend.resolveManagedSession(harness.sessionName);
+    const controlTargetId = randomUUID();
+    const generation = randomUUID();
+    const opened = await backend.prepareOutput(
+      controlTargetId,
+      harness.sessionName,
+      "0",
+      generation,
+    );
+    assert.equal(opened.generation, generation);
+    assert.equal(opened.retainedStartCursor, 0);
+    assert.ok(opened.cursor > 0, "the initial generation must contain the rendered pane");
+    const initial = await backend.tailOutput(
+      controlTargetId,
+      harness.sessionName,
+      "0",
+      generation,
+      opened.retainedStartCursor,
+      64 * 1024,
+    );
+    assert.match(
+      Buffer.from(initial.dataBase64, "base64").toString("utf8"),
+      new RegExp(existingMarker),
+    );
+
+    await backend.writeRawFenced(
+      resolvedBackend.managedSession,
+      resolvedBackend.tmuxInstanceId,
+      generation,
+      "0",
+      Buffer.from(`printf '${inputMarker}\\n'\r`, "utf8"),
+    );
+    let cursor = opened.cursor;
+    let live = "";
+    const inputDeadline = Date.now() + 2_000;
+    while (!live.includes(inputMarker) && Date.now() < inputDeadline) {
+      const chunk = await backend.tailOutput(
+        controlTargetId,
+        harness.sessionName,
+        "0",
+        generation,
+        cursor,
+        64 * 1024,
+      );
+      cursor = chunk.nextCursor;
+      live += Buffer.from(chunk.dataBase64, "base64").toString("utf8");
+      if (!chunk.dataBase64) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.match(live, new RegExp(inputMarker));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("production backend resumes a full legacy capture without explicit recovery", async (t) => {
   const harness = isolatedManagedTmux(t, "legacy-capture");
   if (!harness) return;
@@ -3376,6 +3465,11 @@ test("production tmux backend captures bounded correlated output on an isolated 
 test("exact read observation consumes the admitted claim without input ownership or generation reset", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
+  const prepareOutput = backend.prepareOutput.bind(backend);
+  backend.prepareOutput = async (...args) => ({
+    ...await prepareOutput(...args),
+    retainedStartCursor: 0,
+  });
   const incarnation = `twinc2.${"A".repeat(43)}`;
   backend.inspectExactTarget = async (input) => {
     assert.deepEqual(input, {
@@ -3434,7 +3528,11 @@ test("exact read observation consumes the admitted claim without input ownership
     assert.equal(opened.binding.controlTargetId, target.controlTargetId);
     assert.equal(opened.binding.controlEpoch, target.controlEpoch);
     assert.equal(opened.binding.targetIncarnationProof, preparation.identity.targetIncarnationProof);
-    assert.equal(opened.binding.outputCursor, Buffer.byteLength("hello\n"));
+    assert.equal(
+      opened.binding.outputCursor,
+      0,
+      "a fresh Relay v2 observation starts at the retained screen seed",
+    );
     // Observation consumed the reservation: the target is FREE again and the
     // observer holds no lease and no input ownership.
     const free = terminalControl.loadTerminalControlState(temp.path).targets[0];
@@ -3463,7 +3561,7 @@ test("exact read observation consumes the admitted claim without input ownership
     assert.equal(backend.resetCalls, 0, "release must not reset output generation while observed");
     const continued = await authority.tailRelayV2ExactObservation(
       opened.observation,
-      opened.binding.outputCursor,
+      firstTail.nextCursor,
     );
     assert.equal(Buffer.from(continued.dataBase64, "base64").toString("utf8"), "world\n");
 
