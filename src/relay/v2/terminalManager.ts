@@ -3058,6 +3058,21 @@ export class RelayV2TerminalManager {
     if (!isOpaqueId(generation)) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage omitted its issued generation");
     }
+    if (previous && (previous.producerLease || previous.retiringLease)) {
+      // The exact target registry is single-writer. A RESET replacing this
+      // stream must yield its own input lease before asking the resolver to
+      // reserve the same target again. The read observation remains pinned,
+      // so a later preparation failure can still preserve the old generation
+      // and lazily reacquire control on its next input.
+      const released = await this.releaseProducerLease(previous);
+      if (released.status === "uncertain") {
+        previous.controlInDoubt = released.error;
+        throw new RelayV2TerminalManagerError(
+          "INTERNAL",
+          "terminal reset could not confirm previous producer release",
+        );
+      }
+    }
     const resolution = await this.prepareCanonicalTarget(
       request,
       key,
@@ -3078,7 +3093,6 @@ export class RelayV2TerminalManager {
       previous.binding = undefined;
       previous.status = "lost";
       previous.detachedUntil = undefined;
-      await this.releaseProducerLease(previous);
       this.clearControlWindows(previous);
       this.removeRing(previous, false);
       await this.disposeBackend(previous);

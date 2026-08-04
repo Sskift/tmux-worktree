@@ -1641,6 +1641,69 @@ test("retryable exact-target pressure releases RESET claim for same-openId recov
   }
 });
 
+test("RESET yields its own producer lease before exact target replacement", async () => {
+  let producerLeaseHeld = false;
+  const authority = new FakeTerminalControl(() => 1_000_000);
+  const acquire = authority.acquire.bind(authority);
+  authority.acquire = async (input) => {
+    const result = await acquire(input);
+    if (result.status === "accepted") producerLeaseHeld = true;
+    return result;
+  };
+  const release = authority.release.bind(authority);
+  authority.release = async (input) => {
+    await release(input);
+    producerLeaseHeld = false;
+  };
+  const resolver = new FakeResolver();
+  const resolve = resolver.resolve.bind(resolver);
+  resolver.resolve = async (input) => {
+    const result = await resolve(input);
+    if (resolver.calls.length > 1 && producerLeaseHeld) {
+      throw new terminalControl.TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "exact terminal-control target already has an input owner",
+      );
+    }
+    return result;
+  };
+  const h = harness({ authority, resolver });
+  const sourceRequest = goldenOpen({
+    requestId: "reset-own-lease-source",
+    streamId: "reset-own-lease-stream",
+    openId: "reset-own-lease-source-open-id",
+  });
+  await h.manager.open(sourceRequest);
+  const source = opened(h.sent, sourceRequest.requestId);
+  await h.manager.input({
+    ...streamContext(source),
+    inputSeq: "1",
+    data: Buffer.from("establish-producer-lease-before-reset"),
+  });
+  assert.equal(producerLeaseHeld, true);
+
+  const resetRequest = goldenOpen({
+    requestId: "reset-own-lease-replacement",
+    streamId: sourceRequest.streamId,
+    openId: "reset-own-lease-replacement-open-id",
+    mode: "reset",
+    resume: {
+      generation: source.payload.generation,
+      resumeToken: source.payload.resumeToken,
+    },
+  });
+  await h.manager.open(resetRequest);
+
+  const replacement = opened(h.sent, resetRequest.requestId);
+  assert.equal(replacement.payload.disposition, "reset");
+  assert.notEqual(replacement.payload.generation, source.payload.generation);
+  assert.equal(authority.releaseCalls.length, 1);
+  assert.equal(producerLeaseHeld, false);
+  assert.equal(resolver.calls.length, 2);
+  assert.equal(h.backend.opens.length, 2);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+});
+
 test("divergent local cleanup waits for durable failure settlement", async () => {
   const lineage = new FakeDurableLineage();
   const h = harness({ lineage });
@@ -1805,7 +1868,6 @@ test("an invalid reset preserves the exact live generation so it can still be cl
     mode: "reset",
     resume: {
       generation: first.payload.generation,
-      nextOffset: "0",
       resumeToken: "invalid-reset-token",
     },
   }));
@@ -1839,7 +1901,6 @@ test("a reset backend failure retires only the already-fenced previous generatio
     mode: "reset",
     resume: {
       generation: first.payload.generation,
-      nextOffset: "0",
       resumeToken: first.payload.resumeToken,
     },
   }));
@@ -1865,7 +1926,6 @@ test("a historical opened replay cannot fence the replacement generation", async
     mode: "reset",
     resume: {
       generation: first.payload.generation,
-      nextOffset: "0",
       resumeToken: first.payload.resumeToken,
     },
   }));
@@ -2676,7 +2736,6 @@ test("durable open claims every mode and retains fingerprints and reset outcomes
     mode: "reset",
     resume: {
       generation: resumed.payload.generation,
-      nextOffset: "0",
       resumeToken: resumed.payload.resumeToken,
     },
   }));
@@ -3243,7 +3302,7 @@ test("provisional generation loses every replayed CAS winner without publishing 
   }
 });
 
-test("pending resume and reset claims recover their generation and requested offset after restart", async () => {
+test("pending resume and reset claims recover generation with mode-exact offset after restart", async () => {
   const resumeLineage = new FakeDurableLineage();
   resumeLineage.failFailOpenOnce = true;
   const resumeFirst = harness({ lineage: resumeLineage, hostInstanceId: "pending-resume-host-one" });
@@ -3284,7 +3343,6 @@ test("pending resume and reset claims recover their generation and requested off
     mode: "reset",
     resume: {
       generation: "pending-reset-generation",
-      nextOffset: "23",
       resumeToken: "pending-reset-secret",
     },
   });
@@ -3303,7 +3361,7 @@ test("pending resume and reset claims recover their generation and requested off
   assert.equal(resetRequired.type, "terminal.reset_required");
   assert.equal(resetRequired.payload.reason, "stream_lost");
   assert.equal(resetRequired.payload.generation, "pending-reset-generation");
-  assert.equal(resetRequired.payload.requestedOffset, "23");
+  assert.equal(resetRequired.payload.requestedOffset, null);
   assert.equal(resetRestarted.backend.opens.length, 0);
   assert.equal(resetLineage.serializedSnapshot().includes("pending-reset-secret"), false);
 });
@@ -3445,7 +3503,6 @@ test("an uncertain input remains generation-bound and is never applied to a rese
     mode: "reset",
     resume: {
       generation: firstOpened.payload.generation,
-      nextOffset: "0",
       resumeToken: firstOpened.payload.resumeToken,
     },
   });
@@ -4092,7 +4149,6 @@ test("control admission reserves close tombstones before opening or resetting a 
     mode: "reset",
     resume: {
       generation: current.payload.generation,
-      nextOffset: "0",
       resumeToken: current.payload.resumeToken,
     },
   });
@@ -4114,7 +4170,6 @@ test("control admission reserves close tombstones before opening or resetting a 
       mode: "reset",
       resume: {
         generation: current.payload.generation,
-        nextOffset: "0",
         resumeToken: current.payload.resumeToken,
       },
     })),
