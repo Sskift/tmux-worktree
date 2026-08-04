@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 const { build } = createRequire(import.meta.url)("esbuild");
@@ -48,6 +53,18 @@ const compiled = await build({
       );
     },
   }],
+});
+const nativeCellSourcePath = new URL(
+  "../src/relay/v2/hostCredentialAtomicFileCellNative.ts",
+  import.meta.url,
+).pathname;
+const compiledNativeCell = await build({
+  entryPoints: [nativeCellSourcePath],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  write: false,
 });
 const childRuntime = await import(
   `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
@@ -234,6 +251,123 @@ test("qualified owner runs exactly once and drains exactly once", async () => {
   assert.deepEqual(calls, ["run", "close"]);
   // The wrapper never writes a frame of its own on the qualified path.
   assert.equal(channel.raw(), "");
+});
+
+test("clean hidden-child close keeps the full root alive through same-cell reopen", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-claim-close-"));
+  try {
+    const runtimePath = join(temporaryDirectory, "dashboard-management-child-runtime.mjs");
+    const nativeCellPath = join(temporaryDirectory, "host-credential-native-cell.mjs");
+    const claimPath = join(
+      temporaryDirectory,
+      ".relay-v2-host-credential.cell.admission-claim-v1",
+    );
+    writeFileSync(runtimePath, compiled.outputFiles[0].text, { mode: 0o600 });
+    writeFileSync(nativeCellPath, compiledNativeCell.outputFiles[0].text, { mode: 0o600 });
+
+    const childProgram = String.raw`
+      import { unlinkSync, writeFileSync } from "node:fs";
+
+      const runtime = await import(process.env.RUNTIME_MODULE_URL);
+      const nativeCell = await import(process.env.NATIVE_CELL_MODULE_URL);
+      const abiVersion = nativeCell
+        .RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_ABI_VERSION;
+      const openMethod = nativeCell
+        .RELAY_V2_HOST_CREDENTIAL_ATOMIC_FILE_CELL_NATIVE_OPEN_METHOD;
+      const result = (operation, outcome, fields = {}) => ({
+        abiVersion,
+        operation,
+        outcome,
+        ...fields,
+      });
+      const openCell = () => {
+        const handle = Object.freeze({
+          read() {
+            return result("read", "ok", {
+              current: { state: "empty", revision: Object.freeze(Object.create(null)) },
+            });
+          },
+          compareAndSwap() {
+            return result("compare_and_swap", "swapped");
+          },
+          close() {
+            unlinkSync(process.env.CLAIM_PATH);
+            return result("close", "closed");
+          },
+        });
+        const nativeModule = Object.freeze({
+          [openMethod]() {
+            try {
+              writeFileSync(process.env.CLAIM_PATH, Buffer.alloc(192), {
+                flag: "wx",
+                mode: 0o600,
+              });
+            } catch (error) {
+              if (error?.code !== "EEXIST") throw error;
+              return result("open", "error", { error: "CELL_RECOVERY_REQUIRED" });
+            }
+            return result("open", "opened", { handle });
+          },
+        });
+        return nativeCell.openRelayV2HostCredentialAtomicFileCellNative({ nativeModule });
+      };
+
+      const main = async () => {
+        const cell = openCell();
+        if (process.env.PHASE === "reopen") {
+          await cell.closeAndDrain();
+          return 0;
+        }
+        const runner = runtime.createRelayV2DashboardManagementChildStdioRunner(
+          async () => ({
+            runDashboardManagement: async () => 0,
+            closeAndDrain: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 25));
+              await new Promise((resolve) => {
+                const timer = setTimeout(resolve, 25);
+                timer.unref();
+              });
+              await cell.closeAndDrain();
+            },
+          }),
+        );
+        return runner({
+          runtimeVersion: "0.0.0-clean-close-reopen-test",
+          io: Object.freeze({
+            input: Object.freeze({
+              async *[Symbol.asyncIterator]() {},
+            }),
+            writeFrame: async () => {},
+          }),
+        });
+      };
+      void main().then(
+        (exitCode) => { process.exitCode = exitCode; },
+        () => { process.exitCode = 1; },
+      );
+    `;
+    const common = {
+      CLAIM_PATH: claimPath,
+      RUNTIME_MODULE_URL: pathToFileURL(runtimePath).href,
+      NATIVE_CELL_MODULE_URL: pathToFileURL(nativeCellPath).href,
+    };
+    const first = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", childProgram],
+      { env: { ...common, PHASE: "close" }, stdio: "ignore", timeout: 5_000 },
+    );
+    assert.equal(first.status, 0, "the first hidden child must finish its clean session");
+
+    const reopened = spawnSync(
+      process.execPath,
+      ["--input-type=module", "--eval", childProgram],
+      { env: { ...common, PHASE: "reopen" }, stdio: "ignore", timeout: 5_000 },
+    );
+    assert.equal(reopened.status, 0,
+      "a clean child exit must release the exact native claim before same-cell reopen");
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
 });
 
 test("explicit self-hosted argv is closed, exact, and never falls back to production", async () => {

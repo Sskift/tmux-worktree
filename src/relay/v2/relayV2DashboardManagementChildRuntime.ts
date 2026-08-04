@@ -1,4 +1,8 @@
 import { isAbsolute } from "node:path";
+import {
+  clearInterval as nodeClearInterval,
+  setInterval as nodeSetInterval,
+} from "node:timers";
 import { types as nodeUtilTypes } from "node:util";
 
 import {
@@ -192,6 +196,8 @@ const HANDLE_ALLOWED_KEYS = Object.freeze([
   "runDashboardManagement",
   "closeAndDrain",
 ] as const);
+const CLOSE_LIVENESS_INTERVAL_MS = 2_147_483_647;
+const keepAliveTick = (): void => {};
 
 interface CapturedHandle {
   readonly runDashboardManagement: (() => Promise<number>) | null;
@@ -338,7 +344,21 @@ async function runQualifiedSession(
   } catch {
     // The native controller never throws here; keep the close path total.
   }
-  if (!(await closeVerified(handle.closeAndDrain, rawHandle as object))) {
+  // The hidden child is the process lifecycle owner of this published root.
+  // Once clean stdin EOF removes the last stdio handle, a Promise alone does
+  // not keep Node alive. Pin the process across the *entire* root drain: the
+  // native AdmissionOwner that unlinks the exact credential claim is reached
+  // only after reconcile, canonical connector/runtime, Vault, and cell close.
+  // A transport-local deadline cannot cover those later owners because it is
+  // cancelled as soon as its socket closes normally.
+  const closeLiveness = nodeSetInterval(keepAliveTick, CLOSE_LIVENESS_INTERVAL_MS);
+  let cleanClose = false;
+  try {
+    cleanClose = await closeVerified(handle.closeAndDrain, rawHandle as object);
+  } finally {
+    nodeClearInterval(closeLiveness);
+  }
+  if (!cleanClose) {
     return RELAY_V2_DASHBOARD_MANAGEMENT_ORDINARY_FAILURE_EXIT_CODE;
   }
   return hasManagement ? result : null;
