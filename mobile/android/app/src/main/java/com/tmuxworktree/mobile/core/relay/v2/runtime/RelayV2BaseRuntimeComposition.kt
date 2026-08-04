@@ -310,6 +310,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val newCommandId: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = System::currentTimeMillis,
     private val retryDelay: suspend (Long) -> Unit = { delay(it) },
+    private val commandRetryDelay: suspend (Long) -> Unit = { delay(it) },
     private val actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
     private val beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
     private val beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
@@ -1601,11 +1602,12 @@ internal class RelayV2BaseRuntimeComposition(
                 if (capability == null ||
                     capability.identity.generation != delivered.generation ||
                     capability.identity.commandId != onlyEffect.command.entryId.commandId ||
-                    capability.identity.requestId != onlyEffect.attempt.requestId ||
-                    outboxDispatcher.dispatch(capability) !is RelayV2OutboxDispatchOutcome.Submitted
+                    capability.identity.requestId != onlyEffect.attempt.requestId
                 ) {
                     failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+                    return
                 }
+                scheduleCommandRetry(capability, onlyEffect)
             }
             is RelayV2OutboxEffect.ReissueCreated -> {
                 if (issuance != RelayV2OutboxDispatchIssuance.NoDispatch ||
@@ -1815,6 +1817,38 @@ internal class RelayV2BaseRuntimeComposition(
                 }
             }
         }
+    }
+
+    private fun scheduleCommandRetry(
+        capability: RelayV2OutboxDispatchCapability,
+        effect: RelayV2OutboxEffect.ExecuteCommand,
+    ) {
+        val delayMs = commandRetryDelayMillis(effect)
+        pumpScope.launch {
+            try {
+                commandRetryDelay(delayMs)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                failRuntimeIncomplete("COMMAND_OUTBOX_RETRY_BACKOFF_FAILED")
+                return@launch
+            }
+            if (closed.get() || terminalFailure.get() != null) return@launch
+            when (outboxDispatcher.dispatch(capability)) {
+                is RelayV2OutboxDispatchOutcome.Submitted,
+                is RelayV2OutboxDispatchOutcome.Stale,
+                -> Unit
+                else -> failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+            }
+        }
+    }
+
+    private fun commandRetryDelayMillis(
+        effect: RelayV2OutboxEffect.ExecuteCommand,
+    ): Long {
+        val retryOrdinal = maxOf(0, effect.attempt.ordinal - 2)
+        val localBackoff = retryDelayMillis(retryOrdinal)
+        return maxOf(localBackoff, effect.retryAfterMs ?: 0L)
     }
 
     private suspend fun enqueueSessionCommandUnderLease(

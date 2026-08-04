@@ -1777,11 +1777,18 @@ class RelayV2BaseRuntimeCompositionTest {
                 }
                 assertEquals(RelayV2OutboxStateTag.REISSUED, original.state)
                 assertEquals(RelayV2OutboxStateTag.SENDING, replacement.state)
+                assertFalse(original.dedupeWindowId == replacement.dedupeWindowId)
+                assertEquals("dedupe-window-uuid", replacement.dedupeWindowId)
                 assertEquals(
                     listOf("retry-command", replacement.commandId),
                     harness.transport().framesOfType("command.execute").map {
                         it.stringValue("commandId")
                     },
+                )
+                assertEquals(
+                    "dedupe-window-uuid",
+                    harness.transport().framesOfType("command.execute")[1]
+                        .payloadReadOnly().stringValue("dedupeWindowId"),
                 )
                 assertEquals(listOf(1), harness.authority.freshBatchSizes)
                 assertEquals(1, harness.authority.statusCommits.get())
@@ -2423,6 +2430,87 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     @Test
+    fun `retryable command error is backoff scheduled instead of tight looped`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(
+            autoConnect = true,
+            outbox = queuedOutbox("bounded-command-retry"),
+            commandRetryDelayBlock = retry::awaitDelay,
+        )
+        try {
+            harness.connectOnline()
+            val first = harness.transport().awaitSentType("command.execute")
+            harness.transport().sendFrame(
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "error",
+                    "requestId" to first.stringValue("requestId"),
+                    "commandId" to first.stringValue("commandId"),
+                    "hostId" to HOST_ID,
+                    "hostEpoch" to HOST_EPOCH,
+                    "scopeId" to first.stringValue("scopeId"),
+                    "sessionId" to first.stringValue("sessionId"),
+                    "payload" to null,
+                    "error" to linkedMapOf(
+                        "code" to "INTERNAL",
+                        "message" to "pre-ledger target observation is temporarily unavailable",
+                        "retryable" to true,
+                        "retryAfterMs" to 0L,
+                        "commandDisposition" to "not_accepted",
+                        "details" to null,
+                    ),
+                ),
+            )
+
+            assertTrue(retry.awaitCount(1))
+            delay(50)
+            assertEquals(1, harness.transport().framesOfType("command.execute").size)
+            assertEquals(listOf(1_000L), retry.delays)
+            assertEquals(
+                RelayV2OutboxAcceptanceEvidence.NONE,
+                harness.authority.outboxState().entries.single().acceptanceEvidence,
+            )
+
+            retry.release(0)
+            val second = harness.transport().awaitSentType("command.execute", index = 1)
+            assertEquals(first.stringValue("commandId"), second.stringValue("commandId"))
+            assertFalse(first.stringValue("requestId") == second.stringValue("requestId"))
+            assertEquals(2, harness.authority.outboxState().entries.single().attempts.size)
+
+            harness.transport().sendFrame(
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "error",
+                    "requestId" to second.stringValue("requestId"),
+                    "commandId" to second.stringValue("commandId"),
+                    "hostId" to HOST_ID,
+                    "hostEpoch" to HOST_EPOCH,
+                    "scopeId" to second.stringValue("scopeId"),
+                    "sessionId" to second.stringValue("sessionId"),
+                    "payload" to null,
+                    "error" to linkedMapOf(
+                        "code" to "INTERNAL",
+                        "message" to "host recovery is not ready yet",
+                        "retryable" to true,
+                        "retryAfterMs" to 60_000L,
+                        "commandDisposition" to "not_accepted",
+                        "details" to null,
+                    ),
+                ),
+            )
+            assertTrue(retry.awaitCount(2))
+            delay(50)
+            assertEquals(listOf(1_000L, 60_000L), retry.delays)
+            assertEquals(2, harness.transport().framesOfType("command.execute").size)
+        } finally {
+            retry.delays.indices.forEach(retry::release)
+            harness.close()
+        }
+    }
+
+    @Test
     fun `two recovered batches wait for final online ready then dispatch once in commit order`() =
         runBlocking {
             val commandIds = (1..33).map { "command-${it.toString().padStart(2, '0')}" }
@@ -3057,6 +3145,7 @@ class RelayV2BaseRuntimeCompositionTest {
         outboxReadFailure: Throwable? = null,
         newCommandId: () -> String = { "reply-${System.nanoTime()}" },
         retryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
+        commandRetryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
         actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { millis -> delay(millis) },
         beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
         beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
@@ -3142,6 +3231,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 newCommandId = newCommandId,
                 clock = { NOW_MS },
                 retryDelay = retryDelayBlock,
+                commandRetryDelay = commandRetryDelayBlock,
                 actorRecoveryWatchdogDelay = actorRecoveryWatchdogDelay,
                 beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
                 beforeTerminalRecoveryAdmission = beforeTerminalRecoveryAdmission,
