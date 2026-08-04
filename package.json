@@ -1,0 +1,38 @@
+{
+  "name": "tmux-worktree",
+  "version": "1.0.8",
+  "type": "module",
+  "description": "AI + tmux + git worktree workspace manager with a macOS Dashboard, local sessions, automations, and SSH remote TW-managed worktrees",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sskift/tmux-worktree.git"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "app/installer/installer.mjs",
+    "app/installer/dmg/"
+  ],
+  "bin": {
+    "tmux-worktree": "dist/cli.cjs",
+    "tw": "dist/cli.cjs",
+    "tw-dashboard-install": "app/installer/installer.mjs"
+  },
+  "scripts": {
+    "build": "tsup && tsup --config tsup.standalone.config.ts",
+    "test:cli": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
+    "test:docs": "node scripts/check-docs.mjs",
+    "verify": "sh scripts/verify.sh core",
+    "verify:android": "sh scripts/verify.sh android",
+    "verify:all": "sh scripts/verify.sh all",
+    "verify:device": "sh scripts/verify.sh device"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "valid": {
+    "input": {
+      "version": 1,
+      "rootExtension": "preserved-only-by-raw-writers",
+      "sessions": [
+        {
+          "name": "demo-fix",
+          "kind": "worktree",
+          "profile": "cli",
+          "project": "demo",
+          "repoPath": "/repo/demo",
+          "worktreePath": "/worktrees/demo/demo-fix-a1b2c",
+          "branch": "demo-fix-a1b2c",
+          "baseBranch": "main",
+          "cwd": "/worktrees/demo/demo-fix-a1b2c",
+          "createdAt": "2026-07-12T00:00:00.000Z",
+          "sessionExtension": { "owner": "fixture" }
+        },
+        {
+          "name": "tw-term-b2c3d",
+          "kind": "terminal",
+          "profile": "dashboard",
+          "cwd": "/repo/demo",
+          "createdAt": "2026-07-12T00:00:01.000Z"
+        }
+      ]
+    },
+    "normalized": {
+      "version": 1,
+      "sessions": [
+        {
+          "name": "demo-fix",
+          "kind": "worktree",
+          "profile": "cli",
+          "project": "demo",
+          "repoPath": "/repo/demo",
+          "worktreePath": "/worktrees/demo/demo-fix-a1b2c",
+          "branch": "demo-fix-a1b2c",
+          "baseBranch": "main",
+          "cwd": "/worktrees/demo/demo-fix-a1b2c",
+          "createdAt": "2026-07-12T00:00:00.000Z",
+          "sessionExtension": { "owner": "fixture" }
+        },
+        {
+          "name": "tw-term-b2c3d",
+          "kind": "terminal",
+          "profile": "dashboard",
+          "cwd": "/repo/demo",
+          "createdAt": "2026-07-12T00:00:01.000Z"
+        }
+      ]
+    }
+  },
+  "serialization": {
+    "state": {
+      "version": 1,
+      "sessions": [
+        {
+          "name": "tw-term-a1b2c",
+          "kind": "terminal",
+          "profile": "dashboard",
+          "cwd": "/repo/demo",
+          "createdAt": "2026-07-12T00:00:00.000Z"
+        }
+      ]
+    },
+    "text": "{\n  \"version\": 1,\n  \"sessions\": [\n    {\n      \"name\": \"tw-term-a1b2c\",\n      \"kind\": \"terminal\",\n      \"profile\": \"dashboard\",\n      \"cwd\": \"/repo/demo\",\n      \"createdAt\": \"2026-07-12T00:00:00.000Z\"\n    }\n  ]\n}\n"
+  },
+  "mutationFailures": [
+    {
+      "id": "invalid-json",
+      "contents": "{\"version\":1,\"sessions\":[\n",
+      "errorIncludes": "refusing to mutate invalid managed state"
+    },
+    {
+      "id": "unsupported-version",
+      "contents": "{\"version\":2,\"sessions\":[]}\n",
+      "errorIncludes": "unsupported version 2"
+    },
+    {
+      "id": "malformed-session",
+      "contents": "{\"version\":1,\"sessions\":[{\"name\":\"broken\"}]}\n",
+      "errorIncludes": "sessions[0] is malformed"
+    }
+  ]
+}

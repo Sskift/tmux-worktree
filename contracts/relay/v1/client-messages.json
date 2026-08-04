@@ -1,0 +1,86 @@
+[
+  {
+    "name": "list-hosts-with-request",
+    "type": "list_hosts",
+    "wire": "{\"type\":\"list_hosts\",\"requestId\":\"hosts-1\"}",
+    "normalized": { "type": "list_hosts", "requestId": "hosts-1" }
+  },
+  {
+    "name": "list-hosts-without-request",
+    "type": "list_hosts",
+    "wire": "{\"type\":\"list_hosts\"}",
+    "normalized": { "type": "list_hosts", "requestId": null }
+  },
+  {
+    "name": "list-sessions",
+    "type": "list_sessions",
+    "wire": "{\"type\":\"list_sessions\",\"hostId\":\"mac-admin\",\"requestId\":\"sessions-1\"}",
+    "normalized": { "type": "list_sessions", "hostId": "mac-admin", "requestId": "sessions-1" }
+  },
+  {
+    "name": "list-scope-statuses",
+    "type": "list_scope_statuses",
+    "wire": "{\"type\":\"list_scope_statuses\",\"hostId\":\"mac-admin\",\"requestId\":\"scopes-1\"}",
+    "normalized": { "type": "list_scope_statuses", "hostId": "mac-admin", "requestId": "scopes-1" }
+  },
+  {
+    "name": "create-worktree-all-fields",
+    "type": "create_worktree",
+    "wire": "{\"type\":\"create_worktree\",\"hostId\":\"mac-admin\",\"requestId\":\"create-wt-1\",\"scopeId\":\"local\",\"project\":\"demo\",\"path\":\"/repo/demo\",\"name\":\"fix\",\"branch\":\"main\",\"aiCommand\":\"codex\",\"aiCmd\":\"codex --resume\"}",
+    "normalized": { "type": "create_worktree", "hostId": "mac-admin", "requestId": "create-wt-1", "scopeId": "local", "project": "demo", "path": "/repo/demo", "name": "fix", "branch": "main", "aiCommand": "codex", "aiCmd": "codex --resume" }
+  },
+  {
+    "name": "create-terminal-android-v1",
+    "type": "create_terminal",
+    "wire": "{\"type\":\"create_terminal\",\"hostId\":\"mac-admin\",\"requestId\":\"create-term-1\",\"scopeId\":\"remote-a\",\"cwd\":\"/repo/demo\",\"label\":\"Demo\"}",
+    "normalized": { "type": "create_terminal", "hostId": "mac-admin", "requestId": "create-term-1", "scopeId": "remote-a", "cwd": "/repo/demo", "label": "Demo", "aiCommand": null, "aiCmd": null }
+  },
+  {
+    "name": "open-terminal-number-pane",
+    "type": "open_terminal",
+    "wire": "{\"type\":\"open_terminal\",\"hostId\":\"mac-admin\",\"streamId\":\"stream-number\",\"session\":\"local:demo\",\"pane\":2}",
+    "normalized": { "type": "open_terminal", "hostId": "mac-admin", "streamId": "stream-number", "session": "local:demo", "pane": { "kind": "number", "value": 2 } }
+  },
+  {
+    "name": "open-terminal-text-pane",
+    "type": "open_terminal",
+    "wire": "{\"type\":\"open_terminal\",\"hostId\":\"mac-admin\",\"streamId\":\"stream-text\",\"session\":\"local:demo\",\"pane\":\"%2\"}",
+    "normalized": { "type": "open_terminal", "hostId": "mac-admin", "streamId": "stream-text", "session": "local:demo", "pane": { "kind": "text", "value": "%2" } }
+  },
+  {
+    "name": "send-agent-message-text-pane",
+    "type": "send_agent_message",
+    "wire": "{\"type\":\"send_agent_message\",\"hostId\":\"mac-admin\",\"requestId\":\"agent-1\",\"session\":\"local:demo\",\"pane\":\"1\",\"message\":\"run\\nnow\",\"submit\":true}",
+    "normalized": { "type": "send_agent_message", "hostId": "mac-admin", "requestId": "agent-1", "session": "local:demo", "pane": { "kind": "text", "value": "1" }, "message": "run\nnow", "submit": true }
+  },
+  {
+    "name": "send-agent-message-number-pane-without-request",
+    "type": "send_agent_message",
+    "wire": "{\"type\":\"send_agent_message\",\"hostId\":\"mac-admin\",\"session\":\"local:demo\",\"pane\":1,\"message\":\"status\"}",
+    "normalized": { "type": "send_agent_message", "hostId": "mac-admin", "requestId": null, "session": "local:demo", "pane": { "kind": "number", "value": 1 }, "message": "status", "submit": null }
+  },
+  {
+    "name": "kill-session-android-v1",
+    "type": "kill_session",
+    "wire": "{\"type\":\"kill_session\",\"hostId\":\"mac-admin\",\"requestId\":\"kill-1\",\"session\":\"local:demo\"}",
+    "normalized": { "type": "kill_session", "hostId": "mac-admin", "requestId": "kill-1", "session": "local:demo", "managed": null }
+  },
+  {
+    "name": "terminal-input",
+    "type": "terminal_input",
+    "wire": "{\"type\":\"terminal_input\",\"streamId\":\"stream-1\",\"data\":\"\\u001b[A\"}",
+    "normalized": { "type": "terminal_input", "streamId": "stream-1", "data": "\u001b[A" }
+  },
+  {
+    "name": "resize",
+    "type": "resize",
+    "wire": "{\"type\":\"resize\",\"streamId\":\"stream-1\",\"cols\":120,\"rows\":40}",
+    "normalized": { "type": "resize", "streamId": "stream-1", "cols": 120, "rows": 40 }
+  },
+  {
+    "name": "close-terminal",
+    "type": "close_terminal",
+    "wire": "{\"type\":\"close_terminal\",\"streamId\":\"stream-1\"}",
+    "normalized": { "type": "close_terminal", "streamId": "stream-1" }
+  }
+]

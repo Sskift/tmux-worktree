@@ -1,0 +1,8 @@
+node_modules/
+dist/
+log/
+package-lock.json
+app/installer/dmg/*.dmg
+mobile/android/.gradle/
+mobile/android/**/build/
+mobile/android/local.properties

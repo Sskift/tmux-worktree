@@ -1,0 +1,177 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  createLatestRequestGate,
+  requestSourceKey,
+} from "../src/latestRequestGate.ts";
+import {
+  availableWorktreeAgents,
+  isWorktreeAgentSelectionAvailable,
+  resolveWorktreeAgentCommand,
+  shouldApplyWorktreeCatalogDefault,
+} from "../src/NewWorktreeModal.tsx";
+import type { AgentProbeResult } from "../src/platform/domainTypes.ts";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((fulfill, fail) => {
+    resolve = fulfill;
+    reject = fail;
+  });
+  return { promise, reject, resolve };
+}
+
+test("new worktree publishes catalogs only for the current Local/Host A/Host B source", async () => {
+  const gate = createLatestRequestGate();
+  const localProjects = deferred<string[]>();
+  const localOrphans = deferred<string[]>();
+  const hostAProjects = deferred<string[]>();
+  const hostBProjects = deferred<string[]>();
+  let projects: string[] = [];
+  let orphans: string[] = [];
+  let error: string | null = null;
+
+  const loadSource = (
+    source: string,
+    projectRequest: Promise<string[]>,
+    orphanRequest?: Promise<string[]>,
+  ) => {
+    const token = gate.issue(requestSourceKey("new-worktree-catalog", source));
+    projects = [];
+    orphans = [];
+    error = null;
+    const publications = [
+      projectRequest.then(
+        (list) => {
+          if (gate.isCurrent(token)) projects = list;
+        },
+        (reason) => {
+          if (gate.isCurrent(token)) error = String(reason);
+        },
+      ),
+    ];
+    if (orphanRequest) {
+      publications.push(orphanRequest.then((list) => {
+        if (gate.isCurrent(token)) orphans = list;
+      }));
+    }
+    return Promise.all(publications);
+  };
+
+  const localPublication = loadSource(
+    "__local__",
+    localProjects.promise,
+    localOrphans.promise,
+  );
+  const hostAPublication = loadSource("host-a", hostAProjects.promise);
+  const hostBPublication = loadSource("host-b", hostBProjects.promise);
+
+  localProjects.resolve(["local-old"]);
+  localOrphans.resolve(["orphan-old"]);
+  hostAProjects.reject(new Error("host A unavailable"));
+  hostBProjects.resolve(["host-b-current"]);
+  await Promise.all([localPublication, hostAPublication, hostBPublication]);
+
+  assert.deepEqual(projects, ["host-b-current"]);
+  assert.deepEqual(orphans, []);
+  assert.equal(error, null);
+});
+
+test("new worktree catalog defaults never replace a Custom draft edited for the current source", async () => {
+  assert.equal(
+    shouldApplyWorktreeCatalogDefault({ source: "host-a", dirty: false }, "host-a"),
+    true,
+  );
+  assert.equal(
+    shouldApplyWorktreeCatalogDefault({ source: "host-a", dirty: true }, "host-a"),
+    false,
+  );
+  assert.equal(
+    shouldApplyWorktreeCatalogDefault({ source: "host-a", dirty: false }, "host-b"),
+    false,
+  );
+
+  const delayedCatalog = deferred<string[]>();
+  let draftState = { source: "host-a", dirty: false };
+  let project = "__custom__";
+  let customPath = "";
+  const publication = delayedCatalog.promise.then((projects) => {
+    if (shouldApplyWorktreeCatalogDefault(draftState, "host-a")) {
+      project = projects[0] ?? "__custom__";
+    }
+  });
+
+  draftState = { source: "host-a", dirty: true };
+  customPath = "/srv/repos/custom-dashboard";
+  delayedCatalog.resolve(["default-dashboard"]);
+  await publication;
+
+  assert.equal(project, "__custom__");
+  assert.equal(customPath, "/srv/repos/custom-dashboard");
+});
+
+const agentResults: AgentProbeResult[] = [
+  {
+    id: "claude",
+    label: "Claude Code",
+    command: "claude",
+    available: false,
+    executablePath: null,
+    error: "not found",
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    command: "codex",
+    available: true,
+    executablePath: "/opt/homebrew/bin/codex",
+    error: null,
+  },
+  {
+    id: "gemini",
+    label: "Gemini CLI",
+    command: "gemini",
+    available: true,
+    executablePath: "/opt/homebrew/bin/gemini",
+    error: null,
+  },
+];
+
+test("new worktree agent choice is restricted to detected available commands", () => {
+  assert.deepEqual(
+    availableWorktreeAgents(agentResults).map((agent) => agent.command),
+    ["codex", "gemini"],
+  );
+  assert.equal(resolveWorktreeAgentCommand(agentResults, "gemini"), "gemini");
+  assert.equal(resolveWorktreeAgentCommand(agentResults, "codex --full-auto"), "codex");
+  assert.equal(resolveWorktreeAgentCommand(agentResults, "claude"), "codex");
+  assert.equal(
+    resolveWorktreeAgentCommand(agentResults.map((agent) => ({ ...agent, available: false })), "codex"),
+    "",
+  );
+  assert.equal(
+    isWorktreeAgentSelectionAvailable(
+      { source: "host-a", results: agentResults },
+      "host-a",
+      "codex",
+    ),
+    true,
+  );
+  assert.equal(
+    isWorktreeAgentSelectionAvailable(
+      { source: "host-a", results: agentResults },
+      "host-b",
+      "codex",
+    ),
+    false,
+  );
+  assert.equal(
+    isWorktreeAgentSelectionAvailable(
+      { source: "host-b", results: [] },
+      "host-b",
+      "codex",
+    ),
+    false,
+  );
+});

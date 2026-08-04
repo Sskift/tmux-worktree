@@ -1,0 +1,25 @@
+{
+  "contract": "tmux-worktree-terminal-registry-v1",
+  "version": 1,
+  "status": "frozen-unversioned-file",
+  "path": "~/.tw-dashboard-terminals.json",
+  "encoding": "utf-8-pretty-json-array-with-trailing-newline",
+  "fileMode": "0600",
+  "lock": {
+    "pathSuffix": ".lock",
+    "ownerFile": "owner.json",
+    "ownerFileMode": "0600"
+  },
+  "fields": [
+    "id",
+    "label",
+    "cwd",
+    "tmuxName",
+    "rawName",
+    "hostId",
+    "aiCmd",
+    "discovered",
+    "managed"
+  ],
+  "fixture": "cases.json"
+}

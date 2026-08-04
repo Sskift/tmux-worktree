@@ -1,0 +1,24 @@
+{
+  "contract": "tmux-worktree-relay-v1",
+  "version": 1,
+  "status": "legacy-frozen",
+  "encoding": "utf-8-json-text",
+  "files": [
+    {
+      "direction": "client-to-broker",
+      "path": "client-messages.json"
+    },
+    {
+      "direction": "broker-to-client",
+      "path": "server-messages.json"
+    },
+    {
+      "direction": "broker-to-host",
+      "path": "broker-to-host.json"
+    },
+    {
+      "direction": "host-to-broker",
+      "path": "host-to-broker.json"
+    }
+  ]
+}
