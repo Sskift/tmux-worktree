@@ -266,3 +266,14 @@ internal fun Map<String, Any?>.objectValue(name: String): Map<String, Any?>? {
     @Suppress("UNCHECKED_CAST")
     return this[name] as? Map<String, Any?>
 }
+
+internal fun Map<String, Any?>.stringList(name: String): List<String> {
+    val values = this[name] as? List<*> ?: return emptyList()
+    return values.mapNotNull { value ->
+        when (value) {
+            is String -> value
+            is Number, is Boolean -> value.toString()
+            else -> null
+        }
+    }
+}

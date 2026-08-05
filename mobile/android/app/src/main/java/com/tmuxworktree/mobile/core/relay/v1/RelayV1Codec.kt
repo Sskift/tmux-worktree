@@ -60,6 +60,18 @@ class RelayV1Codec {
                 payload["rows"] = command.rows
             }
             is RelayV1Command.CloseTerminal -> payload["streamId"] = command.streamId
+            is RelayV1Command.AgentChatSend -> {
+                payload.putOptional("hostId", command.hostId)
+                payload.putOptional("requestId", command.requestId)
+                payload["session"] = command.session
+                payload["message"] = command.message
+            }
+            is RelayV1Command.AgentChatHistory -> {
+                payload.putOptional("hostId", command.hostId)
+                payload.putOptional("requestId", command.requestId)
+                payload["session"] = command.session
+                payload.putOptional("limit", command.limit)
+            }
         }
         return TinyJson.stringify(payload)
     }
@@ -72,6 +84,7 @@ class RelayV1Codec {
                     RelayV1Event.Ready(
                         clientId = payload.string("clientId"),
                         hostId = payload.nullableString("hostId"),
+                        capabilities = payload.stringList("capabilities"),
                     ),
                 )
                 "hosts" -> RelayV1DecodeResult.Message(
@@ -136,6 +149,28 @@ class RelayV1Codec {
                         message = payload.string("message", "unknown error"),
                     ),
                 )
+                "agent_chat_sent" -> RelayV1DecodeResult.Message(
+                    RelayV1Event.AgentChatSent(
+                        requestId = payload.nullableString("requestId"),
+                        session = payload.string("session"),
+                        turnId = payload.string("turnId"),
+                    ),
+                )
+                "agent_chat_event" -> RelayV1DecodeResult.Message(
+                    RelayV1Event.AgentChatEvent(
+                        session = payload.string("session"),
+                        turn = decodeTurn(
+                            requireNotNull(payload.objectValue("turn")) { "turn is required" },
+                        ),
+                    ),
+                )
+                "agent_chat_history_result" -> RelayV1DecodeResult.Message(
+                    RelayV1Event.AgentChatHistoryResult(
+                        requestId = payload.nullableString("requestId"),
+                        session = payload.string("session"),
+                        turns = payload.objects("turns").map(::decodeTurn),
+                    ),
+                )
                 else -> RelayV1DecodeResult.Unknown(type = type, raw = raw)
             }
         } catch (error: Throwable) {
@@ -148,6 +183,24 @@ class RelayV1Codec {
         displayName = payload.string("displayName"),
         connectedAt = payload.long("connectedAt"),
         clients = payload.int("clients"),
+        capabilities = payload.stringList("capabilities"),
+    )
+
+    private fun decodeTurn(payload: Map<String, Any?>): AgentChatTurnView = AgentChatTurnView(
+        turnId = payload.string("turnId"),
+        session = payload.string("session"),
+        userMessage = payload.string("userMessage"),
+        status = payload.string("status"),
+        reply = payload.nullableString("reply"),
+        error = payload.nullableString("error"),
+        sentAt = payload.string("sentAt"),
+        completedAt = payload.nullableString("completedAt"),
+        steeredMessages = payload.objects("steeredMessages").map { steered ->
+            AgentChatSteeredMessage(
+                message = steered.string("message"),
+                sentAt = steered.string("sentAt"),
+            )
+        },
     )
 
     private fun decodeSession(payload: Map<String, Any?>): RelayV1Session = RelayV1Session(
