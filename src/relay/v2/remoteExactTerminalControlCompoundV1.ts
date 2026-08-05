@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, rmSync, type Stats } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, type Stats } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { TerminalControlRequestInput } from "../../terminalControl/client.js";
 import {
@@ -649,7 +650,15 @@ export function relayV2RemoteExactCompoundSocketPathV1(
   daemonSocketPath = terminalControlSocketPath(),
 ): string {
   const digest = createHash("sha256").update(daemonSocketPath, "utf8").digest("hex").slice(0, 16);
-  return join(dirname(daemonSocketPath), `.relay-v2-exact-${digest}.sock`);
+  // The compound ingress lives beside the daemon socket only when that
+  // directory keeps the path under the Unix socket length limit. Otherwise
+  // fall back to a private per-user tmpdir socket: the file itself is chmod
+  // 0600 and the ingress verifies dev/ino/uid before admitting frames.
+  const beside = join(dirname(daemonSocketPath), `.r2e-${digest}.sock`);
+  if (Buffer.byteLength(beside, "utf8") <= 103) return beside;
+  const fallbackDir = join(tmpdir(), ".tw-r2e");
+  mkdirSync(fallbackDir, { recursive: true, mode: 0o700 });
+  return join(fallbackDir, `${digest}.sock`);
 }
 
 export interface RelayV2RemoteExactCompoundDaemonIngressV1 {
