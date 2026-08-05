@@ -89,7 +89,8 @@ type MutationResponseType =
   | "worktree_created"
   | "terminal_created"
   | "agent_message_sent"
-  | "session_killed";
+  | "session_killed"
+  | "agent_chat_sent";
 
 type PendingMutation = {
   clientId: string;
@@ -135,6 +136,8 @@ const RELAY_CLIENT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   "terminal_input",
   "resize",
   "close_terminal",
+  "agent_chat_send",
+  "agent_chat_history",
 ] satisfies RelayClientMessage["type"][]);
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -237,6 +240,7 @@ function mutationResponseType(message: RelayToHostMessage): MutationResponseType
   if (message.type === "create_terminal") return "terminal_created";
   if (message.type === "send_agent_message") return "agent_message_sent";
   if (message.type === "kill_session") return "session_killed";
+  if (message.type === "agent_chat_send") return "agent_chat_sent";
   return undefined;
 }
 

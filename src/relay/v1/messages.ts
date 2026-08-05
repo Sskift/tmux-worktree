@@ -31,6 +31,18 @@ export type RelayScopeStatus = {
   error?: string;
 };
 
+export type AgentChatTurnView = {
+  turnId: string;
+  session: string;
+  userMessage: string;
+  status: "working" | "replied" | "failed" | "recovery-required";
+  reply?: string;
+  error?: string;
+  sentAt: string;
+  completedAt?: string;
+  steeredMessages?: { message: string; sentAt: string }[];
+};
+
 export type RelayClientMessage =
   | { type: "list_hosts"; requestId?: string }
   | { type: "list_sessions"; hostId?: string; requestId?: string }
@@ -42,7 +54,9 @@ export type RelayClientMessage =
   | { type: "kill_session"; hostId?: string; requestId?: string; session: string; managed?: boolean }
   | { type: "terminal_input"; streamId: string; data: string }
   | { type: "resize"; streamId: string; cols: number; rows: number }
-  | { type: "close_terminal"; streamId: string };
+  | { type: "close_terminal"; streamId: string }
+  | { type: "agent_chat_send"; hostId?: string; requestId?: string; session: string; message: string }
+  | { type: "agent_chat_history"; hostId?: string; requestId?: string; session: string; limit?: number };
 
 export type RelayToHostMessage = RelayClientMessage & {
   clientId: string;
@@ -71,6 +85,9 @@ export type RelayHostMessage =
   | { type: "session_killed"; clientId: string; requestId?: string; session: string }
   | { type: "terminal_data"; clientId: string; streamId: string; data: string }
   | { type: "terminal_exit"; clientId: string; streamId: string; code?: number }
+  | { type: "agent_chat_sent"; clientId: string; requestId?: string; session: string; turnId: string }
+  | { type: "agent_chat_event"; clientId: string; session: string; turn: AgentChatTurnView }
+  | { type: "agent_chat_history_result"; clientId: string; requestId?: string; session: string; turns: AgentChatTurnView[] }
   | { type: "error"; clientId?: string; requestId?: string; streamId?: string; message: string };
 
 export type RelayToClientMessage =
@@ -84,4 +101,7 @@ export type RelayToClientMessage =
   | { type: "session_killed"; requestId?: string; session: string }
   | { type: "terminal_data"; streamId: string; data: string }
   | { type: "terminal_exit"; streamId: string; code?: number }
+  | { type: "agent_chat_sent"; requestId?: string; session: string; turnId: string }
+  | { type: "agent_chat_event"; session: string; turn: AgentChatTurnView }
+  | { type: "agent_chat_history_result"; requestId?: string; session: string; turns: AgentChatTurnView[] }
   | { type: "error"; requestId?: string; streamId?: string; message: string };
