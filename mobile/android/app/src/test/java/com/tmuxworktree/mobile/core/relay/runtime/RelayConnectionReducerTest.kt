@@ -111,4 +111,123 @@ class RelayConnectionReducerTest {
         assertEquals("NETWORK_UNAVAILABLE", paused.state.errorCode)
         assertTrue(paused.effects.single() is RelayTransportEffect.CloseSocket)
     }
+
+    @Test
+    fun `network available while backing off reconnects immediately`() {
+        val started = reducer.reduce(RelayTransportState(), RelayTransportSignal.Start(0)).state
+        val backingOff = reducer.reduce(
+            started,
+            RelayTransportSignal.SocketFailed(started.epoch, 1, message = "offline"),
+        ).state
+        assertEquals(TransportPhase.BACKING_OFF, backingOff.phase)
+
+        val available = reducer.reduce(backingOff, RelayTransportSignal.NetworkAvailable(2))
+
+        assertTrue(available.accepted)
+        assertEquals(TransportPhase.CONNECTING, available.state.phase)
+        assertEquals(null, available.state.retryAtMillis)
+        val openSocket = available.effects.single { it is RelayTransportEffect.OpenSocket }
+            as RelayTransportEffect.OpenSocket
+        assertEquals(backingOff.epoch + 1, openSocket.epoch)
+    }
+
+    @Test
+    fun `network available while waiting for network reconnects immediately`() {
+        val started = reducer.reduce(RelayTransportState(), RelayTransportSignal.Start(0)).state
+        val waiting = reducer.reduce(started, RelayTransportSignal.PauseForNetwork(1)).state
+        assertEquals(TransportPhase.WAITING_FOR_NETWORK, waiting.phase)
+
+        val available = reducer.reduce(waiting, RelayTransportSignal.NetworkAvailable(2))
+
+        assertTrue(available.accepted)
+        assertEquals(TransportPhase.CONNECTING, available.state.phase)
+        assertTrue(available.effects.any { it is RelayTransportEffect.OpenSocket })
+    }
+
+    @Test
+    fun `network available while online is a no-op`() {
+        val started = reducer.reduce(RelayTransportState(), RelayTransportSignal.Start(0)).state
+        val opened = reducer.reduce(
+            started,
+            RelayTransportSignal.SocketOpened(started.epoch, 1),
+        ).state
+        val online = reducer.reduce(
+            opened,
+            RelayTransportSignal.Ready(opened.epoch, 2),
+        ).state
+        assertEquals(TransportPhase.ONLINE, online.phase)
+
+        val available = reducer.reduce(online, RelayTransportSignal.NetworkAvailable(3))
+
+        assertFalse(available.accepted)
+        assertEquals(online, available.state)
+        assertTrue(available.effects.isEmpty())
+    }
+
+    @Test
+    fun `network lost while online closes socket and schedules 60s backoff`() {
+        val started = reducer.reduce(RelayTransportState(), RelayTransportSignal.Start(0)).state
+        val opened = reducer.reduce(
+            started,
+            RelayTransportSignal.SocketOpened(started.epoch, 1),
+        ).state
+        val online = reducer.reduce(
+            opened,
+            RelayTransportSignal.Ready(opened.epoch, 2),
+        ).state
+
+        val lost = reducer.reduce(online, RelayTransportSignal.NetworkLost(3))
+
+        assertTrue(lost.accepted)
+        assertEquals(TransportPhase.BACKING_OFF, lost.state.phase)
+        assertEquals("NETWORK_UNAVAILABLE", lost.state.errorCode)
+        assertEquals(3 + RelayReconnectPolicy.SLOW_BACKOFF_MILLIS, lost.state.retryAtMillis)
+        assertTrue(lost.effects.any { it is RelayTransportEffect.CloseSocket })
+        val retry = lost.effects.single { it is RelayTransportEffect.ScheduleRetry }
+            as RelayTransportEffect.ScheduleRetry
+        assertEquals(RelayReconnectPolicy.SLOW_BACKOFF_MILLIS, retry.delayMillis)
+    }
+
+    @Test
+    fun `network lost while backing off reschedules to 60s`() {
+        val started = reducer.reduce(RelayTransportState(), RelayTransportSignal.Start(0)).state
+        val backingOff = reducer.reduce(
+            started,
+            RelayTransportSignal.SocketFailed(started.epoch, 1, message = "offline"),
+        ).state
+        val shortDelay = (backingOff.retryAtMillis ?: 0L) - 1
+        assertTrue(shortDelay < RelayReconnectPolicy.SLOW_BACKOFF_MILLIS)
+
+        val lost = reducer.reduce(backingOff, RelayTransportSignal.NetworkLost(2))
+
+        assertTrue(lost.accepted)
+        assertEquals(TransportPhase.BACKING_OFF, lost.state.phase)
+        assertEquals(2 + RelayReconnectPolicy.SLOW_BACKOFF_MILLIS, lost.state.retryAtMillis)
+        val retry = lost.effects.single { it is RelayTransportEffect.ScheduleRetry }
+            as RelayTransportEffect.ScheduleRetry
+        assertEquals(RelayReconnectPolicy.SLOW_BACKOFF_MILLIS, retry.delayMillis)
+    }
+
+    @Test
+    fun `network lost while waiting for network is a no-op`() {
+        val started = reducer.reduce(RelayTransportState(), RelayTransportSignal.Start(0)).state
+        val waiting = reducer.reduce(started, RelayTransportSignal.PauseForNetwork(1)).state
+
+        val lost = reducer.reduce(waiting, RelayTransportSignal.NetworkLost(2))
+
+        assertFalse(lost.accepted)
+        assertEquals(waiting, lost.state)
+        assertTrue(lost.effects.isEmpty())
+    }
+
+    @Test
+    fun `network events are ignored when shouldRun is false`() {
+        val stopped = RelayTransportState(shouldRun = false)
+
+        val available = reducer.reduce(stopped, RelayTransportSignal.NetworkAvailable(1))
+        assertFalse(available.accepted)
+
+        val lost = reducer.reduce(stopped, RelayTransportSignal.NetworkLost(1))
+        assertFalse(lost.accepted)
+    }
 }

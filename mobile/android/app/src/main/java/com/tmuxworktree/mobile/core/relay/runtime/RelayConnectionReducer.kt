@@ -16,6 +16,11 @@ class RelayReconnectPolicy(
         val factor = 0.85 + (sample * 0.30)
         return (base * factor).roundToLong().coerceIn(250, 15_000)
     }
+
+    companion object {
+        /** Slow-tier backoff used while the network is reported unavailable. */
+        const val SLOW_BACKOFF_MILLIS = 60_000L
+    }
 }
 
 data class RelayTransportState(
@@ -49,6 +54,10 @@ sealed interface RelayTransportSignal {
     data class RetryElapsed(val epoch: Long, val nowMillis: Long) : RelayTransportSignal
     data class InvalidConfiguration(val nowMillis: Long, val message: String) : RelayTransportSignal
     data class Stop(val nowMillis: Long) : RelayTransportSignal
+    /** Network became available; bypass any pending backoff and reconnect immediately. */
+    data class NetworkAvailable(val nowMillis: Long) : RelayTransportSignal
+    /** Network became unavailable; close the socket and switch to the slow (60s) backoff tier. */
+    data class NetworkLost(val nowMillis: Long) : RelayTransportSignal
 }
 
 sealed interface RelayTransportEffect {
@@ -169,6 +178,61 @@ class RelayConnectionReducer(
             ),
             effects = listOf(RelayTransportEffect.CloseSocket(reason = "user disconnect")),
         )
+        is RelayTransportSignal.NetworkAvailable -> when (state.phase) {
+            TransportPhase.BACKING_OFF -> if (!state.shouldRun) stale(state) else {
+                val epoch = state.epoch + 1
+                RelayTransportReduction(
+                    state.copy(
+                        epoch = epoch,
+                        phase = TransportPhase.CONNECTING,
+                        retryAtMillis = null,
+                        errorCode = "",
+                        errorMessage = "",
+                    ),
+                    effects = listOf(RelayTransportEffect.OpenSocket(epoch)),
+                )
+            }
+            TransportPhase.WAITING_FOR_NETWORK -> {
+                // PauseForNetwork sets shouldRun=false; network availability re-enables it.
+                val epoch = state.epoch + 1
+                RelayTransportReduction(
+                    state.copy(
+                        epoch = epoch,
+                        phase = TransportPhase.CONNECTING,
+                        shouldRun = true,
+                        retryAtMillis = null,
+                        errorCode = "",
+                        errorMessage = "",
+                    ),
+                    effects = listOf(RelayTransportEffect.OpenSocket(epoch)),
+                )
+            }
+            else -> stale(state)
+        }
+        is RelayTransportSignal.NetworkLost -> if (!state.shouldRun) stale(state) else {
+            when (state.phase) {
+                TransportPhase.WAITING_FOR_NETWORK, TransportPhase.STOPPED -> stale(state)
+                else -> {
+                    val attempt = state.attempt + 1
+                    RelayTransportReduction(
+                        state.copy(
+                            phase = TransportPhase.BACKING_OFF,
+                            attempt = attempt,
+                            retryAtMillis = signal.nowMillis + RelayReconnectPolicy.SLOW_BACKOFF_MILLIS,
+                            errorCode = "NETWORK_UNAVAILABLE",
+                            errorMessage = "Waiting for network",
+                        ),
+                        effects = listOf(
+                            RelayTransportEffect.CloseSocket(reason = "network unavailable"),
+                            RelayTransportEffect.ScheduleRetry(
+                                state.epoch,
+                                RelayReconnectPolicy.SLOW_BACKOFF_MILLIS,
+                            ),
+                        ),
+                    )
+                }
+            }
+        }
     }
 
     private fun backoff(

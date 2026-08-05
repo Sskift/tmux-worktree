@@ -67,6 +67,8 @@ import com.tmuxworktree.mobile.core.model.TimelineEvent
 import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.runtime.RelayClientEvent
+import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionRegistry
+import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionService
 import com.tmuxworktree.mobile.core.relay.runtime.RelayRequestKind
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionActor
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionConfig
@@ -234,7 +236,7 @@ class V2ViewModel(
     private val preferencesStore = container.preferences
     private val credentials = container.credentials
     private val relayOwner = lazy(LazyThreadSafetyMode.NONE) {
-        RelayV1ConnectionActor(viewModelScope)
+        RelayConnectionRegistry.actor
     }
     private val relay: RelayV1ConnectionActor
         get() = relayOwner.value
@@ -2403,7 +2405,7 @@ class V2ViewModel(
             relayV2ExplicitRefreshReservation = null
         }
         relayV2ProfileRuntime = null
-        if (relayOwner.isInitialized()) relay.close()
+        // The relay v1 actor is owned by RelayConnectionService; do not close it here.
         effectsClosed = true
         notificationPermissionRequestChannel.close()
         effectInputChannel.close()
@@ -3049,12 +3051,20 @@ class V2ViewModel(
                 refreshDecoratedHealth()
                 if (available) {
                     if ((changed || networkChanged) && _uiState.value.preferences.autoConnect) {
-                        connectedConfigKey = null
-                        connectActiveProfile(force = true)
+                        if (rawHealth.phase in setOf(
+                                TransportPhase.BACKING_OFF,
+                                TransportPhase.WAITING_FOR_NETWORK,
+                            )
+                        ) {
+                            relay.onNetworkAvailable()
+                        } else {
+                            connectedConfigKey = null
+                            connectActiveProfile(force = true)
+                        }
                     }
                 } else if (changed) {
                     connectedConfigKey = null
-                    relay.pauseForNetwork()
+                    relay.onNetworkLost()
                     markInFlightAmbiguous()
                 }
             }
@@ -3095,6 +3105,7 @@ class V2ViewModel(
         val configKey = "$relayUrl|$hostId|${token.hashCode()}"
         if (!force && configKey == connectedConfigKey && rawHealth.phase != TransportPhase.STOPPED) return
         connectedConfigKey = configKey
+        RelayConnectionService.start(container.applicationContext)
         relay.connect(RelayV1ConnectionConfig(relayUrl, token, hostId))
     }
 
@@ -3138,7 +3149,9 @@ class V2ViewModel(
             is RelayClientEvent.TerminalOpening -> if (event.resetDisplay) {
                 emitAwait(V2UiEffect.TerminalReset())
             }
-            is RelayClientEvent.TerminalData -> emitAwait(V2UiEffect.TerminalWrite(event.data))
+            is RelayClientEvent.TerminalData -> emitAwait(
+                V2UiEffect.TerminalWrite(event.data, event.droppedFrames),
+            )
             is RelayClientEvent.TerminalExit -> emit(
                 V2UiEffect.Notice("Terminal closed${event.code?.let { " (code $it)" }.orEmpty()}"),
             )

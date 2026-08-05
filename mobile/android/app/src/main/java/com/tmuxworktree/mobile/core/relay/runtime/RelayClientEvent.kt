@@ -48,7 +48,11 @@ sealed interface RelayClientEvent {
         val resetDisplay: Boolean,
     ) : RelayClientEvent
 
-    data class TerminalData(val streamId: String, val data: String) : RelayClientEvent
+    data class TerminalData(
+        val streamId: String,
+        val data: String,
+        val droppedFrames: Int = 0,
+    ) : RelayClientEvent
     data class TerminalExit(val streamId: String, val code: Int?) : RelayClientEvent
 
     data class TerminalReconnecting(

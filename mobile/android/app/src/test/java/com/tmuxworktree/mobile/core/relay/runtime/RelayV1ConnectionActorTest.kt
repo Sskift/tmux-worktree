@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -1460,6 +1461,87 @@ class RelayV1ConnectionActorTest {
     private suspend fun waitUntil(predicate: () -> Boolean) {
         withTimeout(5_000) {
             while (!predicate()) delay(10)
+        }
+    }
+
+    @Test
+    fun `terminal_data overflow merges and drops frames without resetting connection`() = runBlocking {
+        val server = MockWebServer()
+        val sender = Executors.newSingleThreadScheduledExecutor()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send("{\"type\":\"ready\",\"clientId\":\"client-1\"}")
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val payload = TinyJson.parseObject(text)
+                    when (payload.string("type")) {
+                        "list_hosts" -> webSocket.send(
+                            "{\"type\":\"hosts\",\"requestId\":\"${payload.string("requestId")}\",\"hosts\":[{\"hostId\":\"mac-admin\",\"displayName\":\"Mac\",\"clients\":1}]}",
+                        )
+                        "list_sessions" -> webSocket.send(
+                            "{\"type\":\"sessions\",\"requestId\":\"${payload.string("requestId")}\",\"sessions\":[${sessionJson("local:demo")}]}",
+                        )
+                        "list_scope_statuses" -> webSocket.send(
+                            "{\"type\":\"scope_statuses\",\"requestId\":\"${payload.string("requestId")}\",\"scopes\":[{\"scopeId\":\"local\",\"scopeLabel\":\"local\",\"kind\":\"local\",\"reachable\":true,\"sessionCount\":1}]}",
+                        )
+                        "open_terminal" -> {
+                            val streamId = payload.string("streamId")
+                            // Send many terminal_data frames spaced apart so each flush produces a
+                            // separate event, overflowing the 32-slot event channel.
+                            sender.scheduleAtFixedRate({
+                                webSocket.send(
+                                    "{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"x\"}",
+                                )
+                            }, 0, 20, TimeUnit.MILLISECONDS)
+                        }
+                    }
+                }
+            }),
+        )
+        server.start()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(scope)
+        try {
+            actor.connect(
+                RelayV1ConnectionConfig(
+                    relayUrl = server.url("/").toString().replaceFirst("http://", "ws://"),
+                    bearerToken = "secret",
+                    preferredHostId = "mac-admin",
+                ),
+            )
+            withTimeout(5_000) { actor.health.first { it.phase == TransportPhase.ONLINE } }
+
+            // Open the terminal; the server floods terminal_data frames.
+            actor.openTerminal("mac-admin", "local:demo")
+
+            // Let the flood run long enough to overflow the 32-slot event channel.
+            delay(1_000)
+
+            // The connection must NOT have been reset by terminal_data overflow.
+            assertEquals(TransportPhase.ONLINE, actor.health.value.phase)
+
+            // Drain terminal events with a timeout. The first 32 events were buffered before the
+            // overflow; the merged event that follows carries a non-zero droppedFrames count.
+            val terminalEvents = withTimeoutOrNull(5_000) {
+                actor.events
+                    .filterIsInstance<RelayClientEvent.TerminalData>()
+                    .take(35)
+                    .toList()
+            } ?: emptyList()
+
+            assertTrue("Expected at least some terminal events", terminalEvents.isNotEmpty())
+            val totalDropped = terminalEvents.sumOf { it.droppedFrames }
+            assertTrue(
+                "Expected some terminal frames to be dropped, got totalDropped=$totalDropped",
+                totalDropped > 0,
+            )
+        } finally {
+            sender.shutdownNow()
+            actor.close()
+            scope.cancel()
+            server.shutdown()
         }
     }
 }

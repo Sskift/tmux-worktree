@@ -283,7 +283,7 @@ sealed interface V2UiEffect {
         val message: String,
     ) : V2UiEffect
     data class TerminalReset(val message: String = "") : V2UiEffect
-    data class TerminalWrite(val data: String) : V2UiEffect
+    data class TerminalWrite(val data: String, val droppedFrames: Int = 0) : V2UiEffect
     data object ProfileCleared : V2UiEffect
     data class Notice(val message: String) : V2UiEffect
 }

@@ -72,6 +72,9 @@ class RelayV1ConnectionActor(
         reservedCapacity = reservedActionCapacity,
     )
     private val eventChannel = Channel<RelayClientEvent>(MAX_PENDING_EVENTS)
+    private var pendingTerminalStreamId: String? = null
+    private val pendingTerminalData = StringBuilder()
+    private var droppedTerminalFrames: Int = 0
     private val reducer = RelayConnectionReducer(reconnectPolicy)
     private val requests = RelayRequestRegistry()
     private val streams = RelayStreamRegistry()
@@ -158,6 +161,16 @@ class RelayV1ConnectionActor(
     /** Pauses reconnects without forgetting the terminal the user was viewing. */
     fun pauseForNetwork() {
         if (!isClosed.get()) enqueueAction(Action.PauseForNetwork)
+    }
+
+    /** Network became available; bypass backoff and reconnect immediately. */
+    fun onNetworkAvailable() {
+        if (!isClosed.get()) enqueueAction(Action.NetworkAvailable)
+    }
+
+    /** Network became unavailable; close the socket and switch to the slow backoff tier. */
+    fun onNetworkLost() {
+        if (!isClosed.get()) enqueueAction(Action.NetworkLost)
     }
 
     fun refreshHosts(): String {
@@ -529,6 +542,11 @@ class RelayV1ConnectionActor(
                 sendSessionsRequest(action.hostId)
                 sendScopesRequest(action.hostId)
             }
+            Action.NetworkAvailable -> transition(RelayTransportSignal.NetworkAvailable(clock()))
+            Action.NetworkLost -> {
+                retryJob?.cancel()
+                transition(RelayTransportSignal.NetworkLost(clock()))
+            }
         }
     }
 
@@ -686,6 +704,7 @@ class RelayV1ConnectionActor(
 
     private fun prepareTerminalForConnectionRecovery(reason: String) {
         flushTerminalOutput()
+        clearPendingTerminalData()
         cancelTerminalOpenTimeout()
         val active = streams.clear()
         pendingReopenGeneration = null
@@ -1206,6 +1225,7 @@ class RelayV1ConnectionActor(
         desiredTerminal = null
         desiredTerminalSizes.clear()
         lastSentTerminalSize = null
+        clearPendingTerminalData()
     }
 
     private fun scheduleRefresh(hostId: String, delayMillis: Long) {
@@ -1390,6 +1410,7 @@ class RelayV1ConnectionActor(
 
     private fun shutdownFromActor() {
         flushTerminalOutput()
+        clearPendingTerminalData()
         cancelHandshakeTimeout()
         cancelTerminalOpenTimeout()
         retryJob?.cancel()
@@ -1418,9 +1439,53 @@ class RelayV1ConnectionActor(
     }
 
     private fun emit(event: RelayClientEvent) {
-        if (eventChannel.trySend(event).isFailure && !resourcesClosed.get()) {
-            signalQueueOverload(socketEpoch, socket)
+        if (eventChannel.trySend(event).isSuccess) {
+            flushPendingTerminalData()
+            return
         }
+        if (resourcesClosed.get()) return
+        if (event is RelayClientEvent.TerminalData) {
+            // terminal_data is high-frequency and mergeable: when the UI is slow and the event
+            // channel is full, keep the latest frame by appending to a pending buffer and dropping
+            // the intermediate frame boundary. The dropped count is reported to the UI so it can
+            // surface frame skipping. Other event types still reset the connection on overflow.
+            if (pendingTerminalStreamId != null && pendingTerminalStreamId != event.streamId) {
+                flushPendingTerminalData()
+                if (eventChannel.trySend(event).isSuccess) return
+            }
+            if (pendingTerminalStreamId == null) {
+                pendingTerminalStreamId = event.streamId
+            }
+            pendingTerminalData.append(event.data)
+            droppedTerminalFrames += 1
+            return
+        }
+        signalQueueOverload(socketEpoch, socket)
+    }
+
+    private fun flushPendingTerminalData() {
+        val streamId = pendingTerminalStreamId ?: return
+        if (pendingTerminalData.isEmpty()) {
+            pendingTerminalStreamId = null
+            droppedTerminalFrames = 0
+            return
+        }
+        val event = RelayClientEvent.TerminalData(
+            streamId = streamId,
+            data = pendingTerminalData.toString(),
+            droppedFrames = droppedTerminalFrames,
+        )
+        if (eventChannel.trySend(event).isSuccess) {
+            pendingTerminalData.clear()
+            pendingTerminalStreamId = null
+            droppedTerminalFrames = 0
+        }
+    }
+
+    private fun clearPendingTerminalData() {
+        pendingTerminalData.clear()
+        pendingTerminalStreamId = null
+        droppedTerminalFrames = 0
     }
 
     private fun queueTerminalOutput(streamId: String, data: String) {
@@ -1503,6 +1568,8 @@ class RelayV1ConnectionActor(
         data object Shutdown : Action
         data class ReopenTerminal(val epoch: Long, val generation: Long) : Action
         data class DelayedRefresh(val epoch: Long, val hostId: String) : Action
+        data object NetworkAvailable : Action
+        data object NetworkLost : Action
     }
 
     private fun Action.usesReservedCapacity(): Boolean = when (this) {
@@ -1518,6 +1585,8 @@ class RelayV1ConnectionActor(
     private fun Action.isCriticalControl(): Boolean = when (this) {
         is Action.Connect,
         Action.PauseForNetwork,
+        Action.NetworkAvailable,
+        Action.NetworkLost,
         is Action.Disconnect,
         is Action.OpenTerminal,
         is Action.CloseTerminal,

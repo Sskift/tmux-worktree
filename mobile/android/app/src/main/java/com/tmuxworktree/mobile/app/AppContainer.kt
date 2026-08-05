@@ -43,6 +43,7 @@ class AppContainer internal constructor(
     )
 
     private val appContext = context.applicationContext
+    internal val applicationContext: Context get() = appContext
     internal val relayV2EnrollmentDeviceLabel: String = normalizedRelayV2EnrollmentDeviceLabel(
         relayV2EnrollmentDeviceLabelSource.readDeviceModel(),
     )
