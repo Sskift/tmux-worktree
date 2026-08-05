@@ -447,6 +447,8 @@ test("listener-free Node ingress composes the canonical client runtime without a
       return authContext("client");
     },
     runtime: harness.clientWssRuntime,
+    heartbeatIntervalMs: undefined,
+    heartbeatMissedPongLimit: undefined,
   });
   const socket = new MemoryDuplex();
   const key = Buffer.alloc(16, 12).toString("base64");

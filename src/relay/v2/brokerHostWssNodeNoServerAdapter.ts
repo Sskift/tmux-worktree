@@ -12,6 +12,14 @@ import type {
 
 const HOST_SUBPROTOCOL = "tw-relay.host.v2";
 
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+const DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT = 2;
+
+export interface RelayV2BrokerHostWssNodeNoServerAdapterOptions {
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatMissedPongLimit?: number;
+}
+
 export interface RelayV2BrokerHostWssNodeNoServerAdapter {
   readonly trustedSocketPrototype: typeof WebSocket.prototype;
   readonly nativeUpgrade: RelayV2BrokerHostNativeUpgradePort;
@@ -40,12 +48,76 @@ function equivalentBufferView(head: Uint8Array): Buffer {
     : Buffer.from(head.buffer, head.byteOffset, head.byteLength);
 }
 
+function positiveHeartbeatValue(
+  value: unknown,
+  fallback: number,
+): number {
+  const selected = value ?? fallback;
+  if (
+    !Number.isSafeInteger(selected)
+    || (selected as number) <= 0
+  ) throw failure();
+  return selected as number;
+}
+
+function attachHostSocketHeartbeat(
+  socket: WebSocket,
+  intervalMs: number,
+  missedPongLimit: number,
+): void {
+  let missedPongs = 0;
+  let stopped = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const tick = (): void => {
+    if (stopped) return;
+    missedPongs += 1;
+    if (missedPongs > missedPongLimit) {
+      stopped = true;
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+      try { socket.terminate(); } catch {}
+      return;
+    }
+    try { socket.ping(); } catch {}
+  };
+  const onPong = (): void => {
+    missedPongs = 0;
+  };
+  const cleanup = (): void => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+    try { socket.removeListener("pong", onPong); } catch {}
+    try { socket.removeListener("close", cleanup); } catch {}
+  };
+  socket.on("pong", onPong);
+  socket.once("close", cleanup);
+  tick();
+  timer = setInterval(tick, intervalMs);
+}
+
 /**
  * Default-off Node `ws` noServer adapter for the B7h native Upgrade port.
  * It creates no listener and owns neither raw-socket cleanup nor accepted sockets.
  */
-export function createRelayV2BrokerHostWssNodeNoServerAdapter():
+export function createRelayV2BrokerHostWssNodeNoServerAdapter(
+  options?: RelayV2BrokerHostWssNodeNoServerAdapterOptions,
+):
 RelayV2BrokerHostWssNodeNoServerAdapter {
+  const heartbeatIntervalMs = positiveHeartbeatValue(
+    options?.heartbeatIntervalMs,
+    DEFAULT_HEARTBEAT_INTERVAL_MS,
+  );
+  const heartbeatMissedPongLimit = positiveHeartbeatValue(
+    options?.heartbeatMissedPongLimit,
+    DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT,
+  );
+
   const handleProtocols = (protocols: Set<string>): string => {
     if (protocols.size !== 1 || !protocols.has(HOST_SUBPROTOCOL)) throw failure();
     return HOST_SUBPROTOCOL;
@@ -115,6 +187,11 @@ RelayV2BrokerHostWssNodeNoServerAdapter {
           equivalentBufferView(head),
           (webSocket, callbackRequest) => {
             if (callbackRequest !== request) throw failure();
+            attachHostSocketHeartbeat(
+              webSocket,
+              heartbeatIntervalMs,
+              heartbeatMissedPongLimit,
+            );
             Reflect.apply(callback, undefined, [webSocket, callbackRequest]);
           },
         );

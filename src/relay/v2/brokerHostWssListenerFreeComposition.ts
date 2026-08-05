@@ -516,6 +516,8 @@ function createRelayV2BrokerCombinedPrivateIngressInstaller(
       Object.freeze(Object.assign(Object.create(null), {
         verifyV2AccessToken: verifyClientV2AccessToken,
         runtime: ports.clientWssRuntime,
+        heartbeatIntervalMs: undefined,
+        heartbeatMissedPongLimit: undefined,
       })),
       (child) => {
         if (state.clientChild !== null) throw combinedFailure();

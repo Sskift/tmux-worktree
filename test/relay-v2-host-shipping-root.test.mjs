@@ -345,6 +345,8 @@ function createFakeWss(records, effects) {
       for (const listener of this.listeners.get("close") ?? []) listener(1006);
     }
 
+    ping() {}
+
     receive(frame) {
       // 本测试所有入站 carrier 帧都是 text frame；真实 ws 对 text 的回调是
       // Buffer/Uint8Array + isBinary=false，与帧的 JS 类型无关。

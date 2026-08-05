@@ -266,6 +266,8 @@ function createIngress(harness, verify = () => authorization("client")) {
   const ingress = ingressModule.createRelayV2BrokerClientWssNodeListenerFreeIngress({
     verifyV2AccessToken: verify,
     runtime: harness.ingressRuntime,
+    heartbeatIntervalMs: undefined,
+    heartbeatMissedPongLimit: undefined,
   }, (installed) => {
     child = installed;
   });

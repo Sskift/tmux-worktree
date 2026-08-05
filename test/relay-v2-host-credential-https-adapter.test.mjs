@@ -519,6 +519,8 @@ function inspectingWebSockets() {
       this.readyState = 3;
     }
 
+    ping() {}
+
     emitClose(code = 1000) {
       this.readyState = 3;
       this.listeners.get("close")?.(code);
