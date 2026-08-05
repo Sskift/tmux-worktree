@@ -115,7 +115,7 @@ function boundedUtf8Tail(value: string, maxBytes: number): string {
   return characters.slice(start).join("");
 }
 
-function sanitizeTerminalText(value: string): string {
+export function sanitizeTerminalText(value: string): string {
   return value
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, "")
