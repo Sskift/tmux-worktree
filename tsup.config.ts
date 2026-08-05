@@ -25,7 +25,6 @@ export default defineConfig({
     "src/relay/v2/hostBootstrapSecretSource.ts",
     "src/relay/v2/hostBootstrapSecretNodeReadableByteSource.ts",
     "src/relay/v2/hostCredentialVault.ts",
-    "src/relay/v2/hostCredentialAtomicFileCell.ts",
     "src/relay/v2/hostCredentialAtomicFileCellNative.ts",
     "src/relay/v2/hostCredentialNativeModuleSource.ts",
     "src/relay/v2/hostCredentialNativeTarget.ts",
@@ -41,10 +40,6 @@ export default defineConfig({
     "src/relay/v2/hostRuntime.ts",
     "src/relay/v2/hostWelcomeSerializer.ts",
     "src/relay/v2/hostRuntimeComposition.ts",
-    "src/relay/v2/hostAgentTranscriptLifecycleAttachment.ts",
-    "src/relay/v2/hostDynamicCodexRolloutAgentTranscriptLifecycleAttachment.ts",
-    "src/relay/v2/hostSelfHostedAgentContinuity.ts",
-    "src/relay/v2/hostCodexAppServerStructuredNotificationProcessController.ts",
     "src/relay/v2/hostCanonicalProductionComposition.ts",
     "src/relay/v2/hostH3ReadinessActivation.ts",
     "src/relay/v2/hostState.ts",
@@ -102,8 +97,6 @@ export default defineConfig({
     "src/relay/v2/brokerHostWssNodeNoServerAdapter.ts",
     "src/relay/v2/brokerHostWssListenerFreeComposition.ts",
     "src/relay/v2/brokerHostWssNodeUpgradeRequestAdapter.ts",
-    "src/relay/v2/brokerHostWssNodeListenerFreeIngress.ts",
-    "src/relay/v2/brokerHostWssNodeExternalContinuityActivation.ts",
     "src/relay/v2/brokerTransportCloseCoordinator.ts",
     "src/relay/v2/brokerAuthorizationExpiryDeadlineOwner.ts",
     "src/relay/v2/brokerServerRuntime.ts",
@@ -154,9 +147,6 @@ export default defineConfig({
     "node:sqlite",
     "./codexAppServerNotificationSource.js",
     "./codexAppServerProcessControllerAuthority.js",
-    // The Host attachment lives in relay/v2, so keep its extension owner on
-    // the canonical sibling dist path instead of rebasing bundled ./ imports.
-    "../extensions/agentTranscriptLifecycle/v1/codexAppServerTrustedSourceActivation.js",
     // These owner entries carry module-private WeakMap brands. Keep every
     // dist consumer on the same canonical module instances.
     "./brokerTransportCloseCoordinator.js",
@@ -206,18 +196,7 @@ export default defineConfig({
     // Profile provisioning must use the canonical nested entry so its
     // credential-authority import keeps the relay/v2 module identity.
     "./relay/v2/hostProductionProfileStore.js",
-    "./hostAgentTranscriptLifecycleAttachment.js",
-    "./hostDynamicCodexRolloutAgentTranscriptLifecycleAttachment.js",
-    "./hostSelfHostedAgentContinuity.js",
-    "../extensions/agentTranscriptLifecycle/v1/codexAppServerProducer.js",
-    "../extensions/agentTranscriptLifecycle/v1/codexRolloutFileSourceAuthority.js",
-    "../extensions/agentTranscriptLifecycle/v1/codexRolloutJsonlNotificationByteSource.js",
     "../extensions/agentTranscriptLifecycle/v1/codec.js",
-    "../extensions/agentTranscriptLifecycle/v1/runtime.js",
-    "../extensions/agentTranscriptLifecycle/v1/store.js",
-    // Privileged executable artifacts carry a module-private identity. The
-    // Host attachment and future selector must consume the canonical entry.
-    "./hostCodexAppServerStructuredNotificationProcessController.js",
     // relayServer dynamically loads the canonical activated combined owner
     // from its matching dist/relay/v2 directory so private brands stay single.
     "../v2/brokerServerRuntime.js",

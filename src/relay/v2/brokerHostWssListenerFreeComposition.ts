@@ -82,11 +82,6 @@ export type RelayV2BrokerHostWssListenerFreeSharedRuntimeOptions = Readonly<Pick
   (typeof SHARED_RUNTIME_OPTION_KEYS)[number]
 >>;
 
-export interface RelayV2BrokerHostWssListenerFreeCompositionOptions {
-  readonly verifyV2AccessToken: RelayV2BrokerHostUpgradeVerifyPort;
-  readonly sharedRuntimeOptions: RelayV2BrokerHostWssListenerFreeSharedRuntimeOptions;
-}
-
 export interface RelayV2BrokerCombinedWssNodeListenerFreeCompositionOptions {
   readonly verifyV2AccessToken:
     RelayV2BrokerHostUpgradeVerifyPort & RelayV2BrokerClientUpgradeVerifyPort;
@@ -114,28 +109,6 @@ export interface RelayV2BrokerCombinedWssNodeListenerFreeCredentialActivationOpt
     >["openCredentialAuthority"];
   readonly sharedRuntimeOptions:
     RelayV2BrokerCombinedWssNodeListenerFreeCredentialSharedRuntimeOptions;
-}
-
-export type RelayV2BrokerHostWssListenerFreeCredentialAuthority =
-  RelayV2BrokerActivatedCredentialAuthority & Readonly<{
-    authorizeAccessToken: RelayV2BrokerHostUpgradeVerifyPort;
-  }>;
-
-export type RelayV2BrokerHostWssListenerFreeCredentialSharedRuntimeOptions =
-  Readonly<Pick<
-    RelayV2BrokerSharedProducerRuntimeActivationOptions<
-      RelayV2BrokerHostWssListenerFreeCredentialAuthority
-    >,
-    (typeof SHARED_RUNTIME_OPTION_KEYS)[number]
-  >>;
-
-export interface RelayV2BrokerHostWssListenerFreeCredentialActivationOptions {
-  readonly openCredentialAuthority:
-    RelayV2BrokerSharedProducerRuntimeActivationOptions<
-      RelayV2BrokerHostWssListenerFreeCredentialAuthority
-    >["openCredentialAuthority"];
-  readonly sharedRuntimeOptions:
-    RelayV2BrokerHostWssListenerFreeCredentialSharedRuntimeOptions;
 }
 
 export interface RelayV2BrokerHostWssListenerFreeUpgradeInput {
@@ -325,19 +298,8 @@ type RelayV2BrokerHostWssListenerFreeRuntimeOpener = (
   installHostIngress: RelayV2BrokerHostPrivateIngressInstaller,
 ) => Promise<RelayV2BrokerHostWssListenerFreeOpenedRuntime>;
 
-function createAbsentClientIngressChild(): RelayV2BrokerPrivateIngressChild {
-  let child!: RelayV2BrokerPrivateIngressChild;
-  const closeAndDrain = function closeAndDrain(this: unknown): Promise<void> {
-    return this === child ? Promise.resolve() : Promise.reject(failure());
-  };
-  child = Object.freeze(Object.assign(Object.create(null), {
-    closeAndDrain,
-  })) as RelayV2BrokerPrivateIngressChild;
-  return child;
-}
-
 /**
- * File-private common owner for both raw and credential-activated entries.
+ * File-private Host ingress owner used by the combined Broker composition.
  * Receipt, socket brand, native port, dispatch, and shared runtime never cross
  * the two-method public facade.
  */
@@ -492,126 +454,6 @@ async function openRelayV2BrokerHostWssListenerFreeComposition(
     await settleCloseStep(closeHostIngress, failures);
     throw failure();
   }
-}
-
-/**
- * Default-off raw-verifier entry retained for isolated dispatch foundations.
- */
-export async function createRelayV2BrokerHostWssListenerFreeComposition(
-  options: RelayV2BrokerHostWssListenerFreeCompositionOptions,
-): Promise<RelayV2BrokerHostWssListenerFreeComposition> {
-  const capturedFactory = captureExactDataRecord(options, RAW_FACTORY_KEYS);
-  const verifyV2AccessToken = capturedFactory?.verifyV2AccessToken;
-  const sharedRuntimeOptions = captureSharedRuntimeOptions(
-    capturedFactory?.sharedRuntimeOptions,
-  );
-  if (
-    typeof verifyV2AccessToken !== "function"
-    || rejectedProxy(verifyV2AccessToken)
-    || !sharedRuntimeOptions
-  ) throw failure();
-
-  return openRelayV2BrokerHostWssListenerFreeComposition(async (
-    authority,
-    installHostIngress,
-  ) => {
-    const absentClientIngress = createAbsentClientIngressChild();
-    const installPrivateIngressChildren: RelayV2BrokerPrivateIngressInstaller = (
-      ports,
-    ) => Object.freeze(Object.assign(Object.create(null), {
-      hostIngress: installHostIngress(ports.hostWssRuntime),
-      // This Host-only foundation intentionally installs no client request path.
-      clientIngress: absentClientIngress,
-    }));
-    const sharedRuntime = createRelayV2BrokerSharedProducerRuntimeComposition({
-      ...sharedRuntimeOptions,
-      hostWssTrustedSocketPrototype: authority.trustedSocketPrototype,
-      hostWssTrustedSocketBrand: authority.trustedSocketBrand,
-      installPrivateIngressChildren,
-    });
-    return Object.freeze({
-      sharedRuntime,
-      verifyV2AccessToken: verifyV2AccessToken as RelayV2BrokerHostUpgradeVerifyPort,
-    });
-  });
-}
-
-/**
- * Default-off credential-activated entry. The opener receives only the exact
- * Core live fence; its returned authority supplies both Core auth-control and
- * the Host Upgrade verifier, and remains owned by the shared runtime close.
- */
-export async function activateRelayV2BrokerHostWssListenerFreeComposition(
-  options: RelayV2BrokerHostWssListenerFreeCredentialActivationOptions,
-): Promise<RelayV2BrokerHostWssListenerFreeComposition> {
-  const capturedFactory = captureExactDataRecord(
-    options,
-    CREDENTIAL_ACTIVATED_FACTORY_KEYS,
-  );
-  const openCredentialAuthority = capturedFactory?.openCredentialAuthority;
-  const sharedRuntimeOptions = captureSharedRuntimeOptions(
-    capturedFactory?.sharedRuntimeOptions,
-  );
-  if (
-    typeof openCredentialAuthority !== "function"
-    || rejectedProxy(openCredentialAuthority)
-    || !sharedRuntimeOptions
-  ) throw failure();
-
-  return openRelayV2BrokerHostWssListenerFreeComposition(async (
-    authority,
-    installHostIngress,
-  ) => {
-    const absentClientIngress = createAbsentClientIngressChild();
-    const installPrivateIngressChildren: RelayV2BrokerPrivateIngressInstaller = (
-      ports,
-    ) => Object.freeze(Object.assign(Object.create(null), {
-      hostIngress: installHostIngress(ports.hostWssRuntime),
-      // Credential-activated Host-only composition still has no client path.
-      clientIngress: absentClientIngress,
-    }));
-    let authorizer: CapturedDataMethod | null = null;
-    const activation = await activateRelayV2BrokerSharedProducerRuntimeComposition<
-      RelayV2BrokerHostWssListenerFreeCredentialAuthority
-    >({
-      ...(sharedRuntimeOptions as
-        RelayV2BrokerHostWssListenerFreeCredentialSharedRuntimeOptions),
-      hostWssTrustedSocketPrototype: authority.trustedSocketPrototype,
-      hostWssTrustedSocketBrand: authority.trustedSocketBrand,
-      installPrivateIngressChildren,
-      async openCredentialAuthority(input) {
-        const opened = await Reflect.apply(openCredentialAuthority, undefined, [
-          input,
-        ]) as RelayV2BrokerHostWssListenerFreeCredentialAuthority;
-        authorizer = captureDataMethod(opened, "authorizeAccessToken");
-        return opened;
-      },
-    });
-
-    if (!authorizer) {
-      try {
-        await activation.sharedRuntime.closeAndDrain();
-      } catch {
-        // The outer owner still drains B7h and the noServer adapter.
-      }
-      throw failure();
-    }
-    const capturedAuthorizer = authorizer;
-    const verifyV2AccessToken: RelayV2BrokerHostUpgradeVerifyPort = (
-      token,
-      expectedRole,
-    ) => {
-      if (expectedRole !== "host") throw failure();
-      return Reflect.apply(capturedAuthorizer.method, capturedAuthorizer.receiver, [
-        token,
-        "host",
-      ]) as ReturnType<RelayV2BrokerHostUpgradeVerifyPort>;
-    };
-    return Object.freeze({
-      sharedRuntime: activation.sharedRuntime,
-      verifyV2AccessToken,
-    });
-  });
 }
 
 type RelayV2BrokerCombinedRoleVerifiers = Readonly<{

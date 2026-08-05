@@ -54,7 +54,6 @@ import {
   type RelayV2RemoteExactCompoundChannelFactoryV1,
 } from "./remoteExactTerminalControlCompoundV1.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
-import type { RelayV2CanonicalResourceResolverPort } from "./resourceState.js";
 import {
   isRelayV2HostCredentialExchangeCoordinatorForAuthority,
   type RelayV2HostCredentialExchangeCoordinator,
@@ -71,15 +70,6 @@ import {
 } from "./relayV2DashboardManagementProtocolV2CompositionSession.js";
 import type { RelayV2DashboardManagementStdioIo } from
   "./relayV2DashboardManagementStdio.js";
-import type { CodexAppServerProcessControllerPort } from
-  "../extensions/agentTranscriptLifecycle/v1/codexAppServerProcessControllerAuthority.js";
-import type { RelayV2HostCodexAppServerStructuredNotificationProcessOptions } from
-  "./hostCodexAppServerStructuredNotificationProcessController.js";
-import {
-  RelayAgentAuthorityStore,
-  type RelayAgentAuthorityStoreOptions,
-} from "../extensions/agentTranscriptLifecycle/v1/store.js";
-import type { RelayV2HostOptionalExtensionAttachment } from "./hostRuntime.js";
 
 export interface RelayV2HostCanonicalProductionProfile {
   readonly relayUrl: string;
@@ -128,28 +118,6 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
    */
   readonly selfHostedCapabilityActivation?:
     RelayV2HostSelfHostedCapabilityActivation;
-  /** Default-off. The root supplies the recovered Host lineage itself. */
-  readonly agentTranscriptLifecycle?:
-    | Readonly<{
-      store: Omit<RelayAgentAuthorityStoreOptions, "hostId" | "hostEpoch">;
-    } & (
-      | {
-        controller: CodexAppServerProcessControllerPort;
-        structuredNotificationProcess?: never;
-      }
-      | {
-        controller?: never;
-        structuredNotificationProcess:
-          RelayV2HostCodexAppServerStructuredNotificationProcessOptions;
-      }
-    )>
-    | Readonly<{
-      selfHostedRollout: Readonly<{
-        accountHome: string;
-        accountUid: number;
-        tmuxExecutablePath: string;
-      }>;
-    }>;
   /**
    * Default-off. When present, the composition constructs the existing
    * reauthentication lifecycle owner over the same credential authority and
@@ -583,74 +551,6 @@ function captureCarrierWssTlsTrust(
   }
 }
 
-type RelayV2HostAgentAttachmentOpener = (options: Readonly<{
-  store: RelayAgentAuthorityStore;
-  controller?: CodexAppServerProcessControllerPort;
-  structuredNotificationProcess?:
-    RelayV2HostCodexAppServerStructuredNotificationProcessOptions;
-  canonicalResourceResolver: RelayV2CanonicalResourceResolverPort;
-}>) => Promise<RelayV2HostOptionalExtensionAttachment>;
-
-async function loadRelayV2HostAgentAttachmentOpener(): Promise<
-RelayV2HostAgentAttachmentOpener
-> {
-  const entryUrl = new URL("./hostAgentTranscriptLifecycleAttachment.js", import.meta.url).href;
-  const entry = await import(entryUrl) as unknown;
-  if (!isRecord(entry)
-    || typeof entry.openRelayV2HostAgentTranscriptLifecycleAttachment !== "function") {
-    throw new Error("Relay Agent Host attachment entry is unavailable");
-  }
-  const opener = entry.openRelayV2HostAgentTranscriptLifecycleAttachment;
-  return (options) => Promise.resolve(Reflect.apply(opener, entry, [options]));
-}
-
-async function openDynamicSelfHostedAgentAttachment(
-  owner: Readonly<{ hostId: string; hostEpoch: string }>,
-  rollout: Readonly<{ accountHome: string; accountUid: number; tmuxExecutablePath: string }>,
-  canonicalResourceResolver: RelayV2CanonicalResourceResolverPort,
-): Promise<RelayV2HostOptionalExtensionAttachment> {
-  const [attachmentEntry, continuityEntry] = await Promise.all([
-    import(new URL(
-      "./hostDynamicCodexRolloutAgentTranscriptLifecycleAttachment.js",
-      import.meta.url,
-    ).href),
-    import(new URL("./hostSelfHostedAgentContinuity.js", import.meta.url).href),
-  ]);
-  const continuityAnchor = continuityEntry.createRelayV2HostSelfHostedAgentContinuityAnchor(
-    rollout.accountHome,
-    owner,
-  );
-  const store = await RelayAgentAuthorityStore.open({
-    ...owner,
-    home: rollout.accountHome,
-    continuityAnchor,
-  });
-  return attachmentEntry.openRelayV2HostDynamicCodexRolloutAgentTranscriptLifecycleAttachment({
-    store,
-    canonicalResourceResolver,
-    accountHome: rollout.accountHome,
-    accountUid: rollout.accountUid,
-    tmuxExecutablePath: rollout.tmuxExecutablePath,
-  });
-}
-
-function isDynamicSelfHostedAgentOptions(value: unknown): value is Readonly<{
-  selfHostedRollout: Readonly<{
-    accountHome: string;
-    accountUid: number;
-    tmuxExecutablePath: string;
-  }>;
-}> {
-  if (!isRecord(value) || Object.keys(value).length !== 1
-    || !isRecord(value.selfHostedRollout)) return false;
-  const rollout = value.selfHostedRollout;
-  return Object.keys(rollout).length === 3
-    && typeof rollout.accountHome === "string"
-    && Number.isSafeInteger(rollout.accountUid)
-    && (rollout.accountUid as number) >= 0
-    && typeof rollout.tmuxExecutablePath === "string";
-}
-
 function terminalControlOptions(
   value: RelayV2HostCanonicalProductionCompositionOptions["terminalControl"],
 ): {
@@ -686,16 +586,7 @@ function validateOptions(
       || validPort(options.terminalBackend, ["open"]))
     && isRecord(options.localProcessTarget)
     && options.localProcessTarget.kind === "local"
-    && typeof options.localProcessTarget.targetId === "string"
-    && (options.agentTranscriptLifecycle === undefined
-      || isDynamicSelfHostedAgentOptions(options.agentTranscriptLifecycle)
-      || (isRecord(options.agentTranscriptLifecycle)
-        && isRecord(options.agentTranscriptLifecycle.store)
-        && ((validPort(options.agentTranscriptLifecycle.controller, [
-          "claimControlledProcess",
-        ]) && options.agentTranscriptLifecycle.structuredNotificationProcess === undefined)
-          || (options.agentTranscriptLifecycle.controller === undefined
-            && isRecord(options.agentTranscriptLifecycle.structuredNotificationProcess)))));
+    && typeof options.localProcessTarget.targetId === "string";
 }
 
 async function settleAll(steps: readonly (() => void | Promise<void>)[]): Promise<void> {
@@ -747,8 +638,6 @@ export async function openRelayV2HostCanonicalProductionComposition(
   if (selfHostedCapabilityActivation === null
     || localDevelopmentCapabilityActivation !== undefined
       && selfHostedCapabilityActivation !== undefined) return null;
-  if (isDynamicSelfHostedAgentOptions(options.agentTranscriptLifecycle)
-    && selfHostedCapabilityActivation === undefined) return null;
   const reauthentication = captureReauthenticationOptions(options);
   if (reauthentication === null) return null;
   const wssTransport = captureWssTransportOptions(options);
@@ -777,7 +666,6 @@ export async function openRelayV2HostCanonicalProductionComposition(
   let exactTargets: RelayV2RemoteExactTerminalControlCompoundAdapterV1 | null = null;
   let observedBytePlane: RelayV2TerminalControlObservedBytePlaneAdapterV1 | null = null;
   let terminalManager: RelayV2TerminalManager | null = null;
-  let optionalExtension: RelayV2HostOptionalExtensionAttachment | null = null;
   let managed: RelayV2HostManagedConnectorRuntimeComposition | null = null;
   let reauthOwner: RelayV2HostReauthenticationLifecycleOwner | null = null;
   let dashboardManagementSession:
@@ -909,38 +797,6 @@ export async function openRelayV2HostCanonicalProductionComposition(
       send,
     });
     const h3Candidate = await terminalLineage.recoverForHostH3(terminalManager);
-    if (options.agentTranscriptLifecycle !== undefined) {
-      try {
-        if (isDynamicSelfHostedAgentOptions(options.agentTranscriptLifecycle)) {
-          optionalExtension = await openDynamicSelfHostedAgentAttachment(
-            Object.freeze({ hostId: profile.hostId, hostEpoch: snapshot.hostEpoch }),
-            options.agentTranscriptLifecycle.selfHostedRollout,
-            h2.resourceResolver,
-          );
-        } else {
-          const openAttachment = await loadRelayV2HostAgentAttachmentOpener();
-          const store = await RelayAgentAuthorityStore.open({
-            ...options.agentTranscriptLifecycle.store,
-            hostId: profile.hostId,
-            hostEpoch: snapshot.hostEpoch,
-          });
-          optionalExtension = await openAttachment({
-            store,
-            ...(options.agentTranscriptLifecycle.controller === undefined
-              ? {
-                  structuredNotificationProcess:
-                    options.agentTranscriptLifecycle.structuredNotificationProcess,
-                }
-              : { controller: options.agentTranscriptLifecycle.controller }),
-            canonicalResourceResolver: h2.resourceResolver,
-          });
-        }
-      } catch {
-        // The optional owner is an isolation domain. Corrupt/unavailable
-        // continuity or source activation cannot withdraw H0-H3 or the route.
-        optionalExtension = null;
-      }
-    }
     managed = await openRelayV2HostManagedWssConnectorRuntimeComposition(
       OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
       runtime: Object.freeze({
@@ -954,7 +810,6 @@ export async function openRelayV2HostCanonicalProductionComposition(
           h3RecoveryCandidate: h3Candidate,
         }),
         welcome: options.welcome,
-        ...(optionalExtension === null ? {} : { optionalExtension }),
       }),
       connector: OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
         credentialAuthority: options.credentialAuthority,
@@ -1135,9 +990,6 @@ export async function openRelayV2HostCanonicalProductionComposition(
       ...(managed !== null
         ? [() => managed!.closeAndDrain()]
         : terminalManager === null ? [] : [() => terminalManager!.shutdown()]),
-      ...(managed === null && optionalExtension !== null
-        ? [() => optionalExtension!.closeAndDrain()]
-        : []),
       ...(observedBytePlane === null ? [] : [() => observedBytePlane!.close()]),
       ...(exactTargets === null ? [] : [() => exactTargets!.close()]),
       () => options.recoveredH2Spool.close(),

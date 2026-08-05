@@ -1,7 +1,5 @@
 import { types as nodeUtilTypes } from "node:util";
 
-import { tmuxBin } from "../../tmux.js";
-
 import {
   createRelayV2HostCredentialNativeModuleSource,
   type RelayV2HostCredentialNativeModuleCapability,
@@ -336,15 +334,7 @@ interface CapturedOptions {
 type CapturedShippingOptions = Omit<
 CapturedOptions,
 "nativeModuleTarget" | "nativeModuleLoader"
-> & Readonly<{
-  agentTranscriptLifecycle?: Readonly<{
-    selfHostedRollout: Readonly<{
-      accountHome: string;
-      accountUid: number;
-      tmuxExecutablePath: string;
-    }>;
-  }>;
-}>;
+>;
 
 type CredentialIntakeActivation =
   | Readonly<{
@@ -719,9 +709,6 @@ async function startCapturedShippingRoot(
       ...(captured.dashboardManagement === undefined
         ? {}
         : { dashboardManagement: captured.dashboardManagement }),
-      ...(captured.agentTranscriptLifecycle === undefined
-        ? {}
-        : { agentTranscriptLifecycle: captured.agentTranscriptLifecycle }),
     });
     const intakeOptions = {
       ...(captured.trustedHome === undefined ? {} : { trustedHome: captured.trustedHome }),
@@ -894,17 +881,6 @@ async function startRelayV2HostShippingRootFromNativeActivationRecord(
     terminalControlDaemonSocketPath: deployment.terminalControlDaemonSocketPath,
     scanIntervalMs: RELAY_V2_HOST_SHIPPING_SCAN_INTERVAL_MS,
     dashboardManagement: capturedDashboardManagement,
-    ...(lane !== "self-hosted"
-      ? {}
-      : {
-          agentTranscriptLifecycle: Object.freeze({
-            selfHostedRollout: Object.freeze({
-              accountHome: deployment.trustedHome,
-              accountUid: typeof process.getuid === "function" ? process.getuid() : -1,
-              tmuxExecutablePath: tmuxBin(),
-            }),
-          }),
-        }),
   }) as CapturedShippingOptions;
 
   return startCapturedShippingRoot(

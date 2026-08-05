@@ -241,7 +241,6 @@ const CANONICAL_OPTIONAL_KEYS = Object.freeze([
   "terminalBackend",
   "terminalControl",
   "dashboardManagement",
-  "agentTranscriptLifecycle",
 ] as const);
 const DASHBOARD_KEYS = Object.freeze([
   "clock",
@@ -252,11 +251,6 @@ const DASHBOARD_KEYS = Object.freeze([
 const DASHBOARD_IO_KEYS = Object.freeze(["input", "writeFrame"] as const);
 const TERMINAL_CONTROL_REQUIRED_KEYS = Object.freeze(["remoteCompoundChannels"] as const);
 const TERMINAL_CONTROL_OPTIONAL_KEYS = Object.freeze(["daemonSocketPath"] as const);
-const AGENT_ATTACHMENT_KEYS = Object.freeze(["store", "controller"] as const);
-const SELF_HOSTED_AGENT_KEYS = Object.freeze(["selfHostedRollout"] as const);
-const SELF_HOSTED_ROLLOUT_KEYS = Object.freeze([
-  "accountHome", "accountUid", "tmuxExecutablePath",
-] as const);
 const claimedCells = new WeakSet<object>();
 const claimedSources = new WeakSet<object>();
 const promiseThen = Promise.prototype.then;
@@ -542,33 +536,6 @@ function captureCanonicalOptions(value: unknown): CapturedCanonicalOptions | nul
       ...dashboard,
       io: freezeRecord(io),
     });
-  }
-  if (fields.agentTranscriptLifecycle !== undefined) {
-    const dynamicAgent = snapshotExactDataRecord(
-      fields.agentTranscriptLifecycle,
-      SELF_HOSTED_AGENT_KEYS,
-    );
-    if (dynamicAgent !== null) {
-      const rollout = snapshotExactDataRecord(
-        dynamicAgent.selfHostedRollout,
-        SELF_HOSTED_ROLLOUT_KEYS,
-      );
-      if (rollout === null
-        || typeof rollout.accountHome !== "string"
-        || !Number.isSafeInteger(rollout.accountUid)
-        || (rollout.accountUid as number) < 0
-        || typeof rollout.tmuxExecutablePath !== "string") return null;
-      result.agentTranscriptLifecycle = freezeRecord({
-        selfHostedRollout: freezeRecord(rollout),
-      });
-    } else {
-      const agent = snapshotExactDataRecord(
-        fields.agentTranscriptLifecycle,
-        AGENT_ATTACHMENT_KEYS,
-      );
-      if (agent === null) return null;
-      result.agentTranscriptLifecycle = freezeRecord(agent);
-    }
   }
   return Object.freeze({
     values: freezeRecord(result) as RelayV2HostPrivilegedProductionCanonicalOptions,
