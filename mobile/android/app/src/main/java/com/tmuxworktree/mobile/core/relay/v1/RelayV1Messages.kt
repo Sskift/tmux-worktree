@@ -6,6 +6,7 @@ data class RelayV1Host(
     val displayName: String = "",
     val connectedAt: Long = 0,
     val clients: Int = 0,
+    val capabilities: List<String> = emptyList(),
 )
 
 data class RelayV1Session(
@@ -128,6 +129,24 @@ sealed interface RelayV1Command {
     data class CloseTerminal(val streamId: String) : RelayV1Command {
         override val type: String = "close_terminal"
     }
+
+    data class AgentChatSend(
+        val hostId: String? = null,
+        val requestId: String? = null,
+        val session: String,
+        val message: String,
+    ) : RelayV1Command {
+        override val type: String = "agent_chat_send"
+    }
+
+    data class AgentChatHistory(
+        val hostId: String? = null,
+        val requestId: String? = null,
+        val session: String,
+        val limit: Int? = null,
+    ) : RelayV1Command {
+        override val type: String = "agent_chat_history"
+    }
 }
 
 sealed interface RelayV1Event {
@@ -136,6 +155,7 @@ sealed interface RelayV1Event {
     data class Ready(
         val clientId: String,
         val hostId: String? = null,
+        val capabilities: List<String> = emptyList(),
     ) : RelayV1Event {
         override val type: String = "ready"
     }
@@ -211,7 +231,47 @@ sealed interface RelayV1Event {
     ) : RelayV1Event {
         override val type: String = "error"
     }
+
+    data class AgentChatSent(
+        val requestId: String? = null,
+        val session: String,
+        val turnId: String,
+    ) : RelayV1Event {
+        override val type: String = "agent_chat_sent"
+    }
+
+    data class AgentChatEvent(
+        val session: String,
+        val turn: AgentChatTurnView,
+    ) : RelayV1Event {
+        override val type: String = "agent_chat_event"
+    }
+
+    data class AgentChatHistoryResult(
+        val requestId: String? = null,
+        val session: String,
+        val turns: List<AgentChatTurnView>,
+    ) : RelayV1Event {
+        override val type: String = "agent_chat_history_result"
+    }
 }
+
+data class AgentChatTurnView(
+    val turnId: String,
+    val session: String,
+    val userMessage: String,
+    val status: String,
+    val reply: String? = null,
+    val error: String? = null,
+    val sentAt: String,
+    val completedAt: String? = null,
+    val steeredMessages: List<AgentChatSteeredMessage> = emptyList(),
+)
+
+data class AgentChatSteeredMessage(
+    val message: String,
+    val sentAt: String,
+)
 
 sealed interface RelayV1DecodeResult {
     data class Message(val event: RelayV1Event) : RelayV1DecodeResult

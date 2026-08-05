@@ -8,6 +8,8 @@ data class RelayRequestTimeoutPolicy(
     val createTerminalMillis: Long = 30_000,
     val sendAgentMessageMillis: Long = 20_000,
     val killSessionMillis: Long = 15_000,
+    val agentChatSendMillis: Long = 30_000,
+    val agentChatHistoryMillis: Long = 10_000,
 ) {
     fun timeoutMillis(kind: RelayRequestKind): Long = when (kind) {
         RelayRequestKind.HOSTS -> hostsMillis
@@ -17,5 +19,7 @@ data class RelayRequestTimeoutPolicy(
         RelayRequestKind.CREATE_TERMINAL -> createTerminalMillis
         RelayRequestKind.SEND_AGENT_MESSAGE -> sendAgentMessageMillis
         RelayRequestKind.KILL_SESSION -> killSessionMillis
+        RelayRequestKind.AGENT_CHAT_SEND -> agentChatSendMillis
+        RelayRequestKind.AGENT_CHAT_HISTORY -> agentChatHistoryMillis
     }
 }

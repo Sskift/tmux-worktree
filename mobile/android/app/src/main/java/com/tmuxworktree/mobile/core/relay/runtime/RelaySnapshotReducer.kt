@@ -75,6 +75,7 @@ object RelaySnapshotReducer {
                 clients = host.clients,
                 status = ConnectionStatus.ONLINE,
                 lastSeenAtMillis = mutation.nowMillis,
+                capabilities = host.capabilities.toSet(),
             )
         }
         val selected = chooseHost(hosts.values.toList(), mutation.preferredHostId, state.selectedHostId)

@@ -118,6 +118,7 @@ import com.tmuxworktree.mobile.feature.inbox.InboxScreen
 import com.tmuxworktree.mobile.feature.pairing.PairingScreen
 import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
+import com.tmuxworktree.mobile.feature.chat.AgentChatScreen
 import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
 import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
@@ -136,10 +137,12 @@ internal object V2Routes {
     const val NEW_TERMINAL = "new-terminal"
     const val SESSION = "session/{sessionKey}?focusReply={focusReply}"
     const val TERMINAL = "terminal/{sessionKey}"
+    const val CHAT = "chat/{sessionKey}"
 
     fun session(sessionId: String, focusReply: Boolean = false): String =
         "session/${encodeRouteValue(sessionId)}?focusReply=$focusReply"
     fun terminal(sessionId: String): String = "terminal/${encodeRouteValue(sessionId)}"
+    fun chat(sessionId: String): String = "chat/${encodeRouteValue(sessionId)}"
 }
 
 internal fun NavHostController.navigateAfterCreation(
@@ -160,6 +163,7 @@ internal fun NavGraphBuilder.relaySessionDestinations(
     missingContent: @Composable () -> Unit,
     sessionContent: @Composable (RelaySession, V2UiState, Boolean) -> Unit,
     terminalContent: @Composable (RelaySession, V2UiState) -> Unit,
+    chatContent: @Composable (RelaySession, V2UiState) -> Unit,
 ) {
     composable(
         route = V2Routes.SESSION,
@@ -195,6 +199,19 @@ internal fun NavGraphBuilder.relaySessionDestinations(
             missingContent()
         } else {
             terminalContent(session, routeState)
+        }
+    }
+    composable(
+        route = V2Routes.CHAT,
+        arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
+    ) { entry ->
+        val routeState by uiState.collectAsStateWithLifecycle()
+        val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
+        val session = routeState.session(sessionId)
+        if (session == null) {
+            missingContent()
+        } else {
+            chatContent(session, routeState)
         }
     }
 }
@@ -510,6 +527,9 @@ private fun MainNavigation(
                         onTerminal = {
                             navController.navigate(V2Routes.terminal(session.stableId))
                         },
+                        onChat = {
+                            navController.navigate(V2Routes.chat(session.stableId))
+                        },
                         autoFocusReply = focusReply,
                     )
                 },
@@ -521,6 +541,14 @@ private fun MainNavigation(
                         controller = terminalController,
                         onBack = { navController.popBackStack() },
                         onHealth = { navController.navigate(V2Routes.HEALTH) },
+                    )
+                },
+                chatContent = { session, routeState ->
+                    ChatRoute(
+                        session = session,
+                        state = routeState,
+                        viewModel = viewModel,
+                        onBack = { navController.popBackStack() },
                     )
                 },
             )
@@ -609,6 +637,7 @@ private fun SessionRoute(
     onBack: () -> Unit,
     onHealth: () -> Unit,
     onTerminal: () -> Unit,
+    onChat: () -> Unit,
     autoFocusReply: Boolean,
 ) {
     val timelineFlow = remember(
@@ -655,6 +684,8 @@ private fun SessionRoute(
         agentStateAvailable =
             state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE,
         onCancelMessage = viewModel::cancelMessage,
+        agentChatAvailable = state.agentChatAvailable(session),
+        onOpenChat = onChat,
     )
 
     if (showActions) {
@@ -1012,6 +1043,35 @@ private fun TerminalRoute(
                 modifier = Modifier.fillMaxSize().focusRequester(remember { FocusRequester() }),
             )
         },
+    )
+}
+
+@Composable
+private fun ChatRoute(
+    session: RelaySession,
+    state: V2UiState,
+    viewModel: V2ViewModel,
+    onBack: () -> Unit,
+) {
+    val chatState by viewModel.agentChat.collectAsStateWithLifecycle()
+    var draft by rememberSaveable(session.stableId) { mutableStateOf("") }
+
+    LaunchedEffect(session.stableId) {
+        viewModel.fetchAgentChatHistory(session)
+    }
+
+    AgentChatScreen(
+        session = session,
+        connectionStatus = state.health.overall,
+        chatState = chatState,
+        draft = draft,
+        onDraftChange = { draft = it },
+        onBack = onBack,
+        onSend = { message ->
+            viewModel.sendAgentChatMessage(session, message)
+            draft = ""
+        },
+        onRetryFailed = { viewModel.retryFailedAgentChatMessages(session) },
     )
 }
 

@@ -35,6 +35,7 @@ data class RelayHost(
     val clients: Int = 0,
     val status: ConnectionStatus = ConnectionStatus.ONLINE,
     val lastSeenAtMillis: Long = 0,
+    val capabilities: Set<String> = emptySet(),
 )
 
 data class RelayScope(

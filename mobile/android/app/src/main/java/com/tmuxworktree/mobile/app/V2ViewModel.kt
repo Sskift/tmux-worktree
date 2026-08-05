@@ -65,6 +65,7 @@ import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
 import com.tmuxworktree.mobile.core.model.TransportPhase
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.runtime.RelayClientEvent
 import com.tmuxworktree.mobile.core.relay.runtime.RelayRequestKind
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionActor
@@ -990,6 +991,33 @@ class V2ViewModel(
                 emit(V2UiEffect.Notice("Message was not queued"))
             }
         }
+    }
+
+    val agentChat: kotlinx.coroutines.flow.StateFlow<RelayChatState>
+        get() = relay.chat
+
+    fun sendAgentChatMessage(session: RelaySession, message: String) {
+        val normalized = message.trim()
+        if (normalized.isBlank()) return
+        val relay = relayV1IfAdmitted() ?: return
+        relay.sendAgentChatMessage(
+            hostId = session.hostId,
+            sessionName = session.name,
+            message = normalized,
+        )
+    }
+
+    fun fetchAgentChatHistory(session: RelaySession) {
+        val relay = relayV1IfAdmitted() ?: return
+        relay.fetchAgentChatHistory(
+            hostId = session.hostId,
+            sessionName = session.name,
+        )
+    }
+
+    fun retryFailedAgentChatMessages(session: RelaySession) {
+        val relay = relayV1IfAdmitted() ?: return
+        relay.retryFailedChatMessages(session.hostId, session.name)
     }
 
     fun cancelMessage(event: TimelineEvent) {
@@ -3241,6 +3269,9 @@ class V2ViewModel(
                     emit(V2UiEffect.Notice("Local relay cache could not be updated"))
                 }
             }
+            is RelayClientEvent.AgentChatSent -> Unit
+            is RelayClientEvent.AgentChatTurnUpdated -> Unit
+            is RelayClientEvent.AgentChatHistoryResult -> Unit
         }
     }
 
