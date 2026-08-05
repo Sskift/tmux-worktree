@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -230,6 +229,7 @@ export interface TerminalControlBackend {
     sessionName: string,
     pane: string,
     generation?: string,
+    capturePane?: boolean,
   ): Promise<TerminalControlOutputPosition>;
   resetOutput(
     controlTargetId: string,
@@ -914,11 +914,7 @@ function createInitialOutputSegment(paths: OutputCapturePaths): OutputSegment[] 
   const path = segmentPath(paths, 0);
   const fd = openSync(path, "wx", 0o600);
   closeSync(fd);
-  // A fresh xterm generation starts blank. Seed it at the top-left before
-  // appending tmux's rendered pane so the first observation can reconstruct
-  // the already-visible screen instead of waiting for future PTY output.
-  appendFileSync(path, Buffer.from("\u001b[2J\u001b[H", "ascii"));
-  return [{ path, start: 0, size: statSync(path).size }];
+  return [{ path, start: 0, size: 0 }];
 }
 
 function outputPositionFromSegments(
@@ -1086,6 +1082,7 @@ async function establishSegmentedOutputCapture(
   paneTarget: string,
   paths: OutputCapturePaths,
   generation: string,
+  capturePane = false,
 ): Promise<TerminalControlOutputPosition> {
   if (outputCaptureKind(paths) !== "missing") {
     throw new TerminalControlProtocolError(
@@ -1094,6 +1091,9 @@ async function establishSegmentedOutputCapture(
     );
   }
   const current = createInitialOutputSegment(paths)[0];
+  if (!capturePane) {
+    return replaceSegmentedOutputCapture(sessionId, paneTarget, paths, generation, current);
+  }
   const snapshotBuffer = `tw-terminal-snapshot-${process.pid}-${randomUUID()}`;
   try {
     // These commands share one tmux command queue: capture the exact current
@@ -1703,6 +1703,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     sessionName: string,
     pane: string,
     generation?: string,
+    capturePane = true,
   ): Promise<TerminalControlOutputPosition> {
     const { sessionId, paneTarget: target } = await requirePane(sessionName, pane);
     const configured = (await runTmux(
@@ -1751,7 +1752,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         "terminal output capture data exists without an established generation",
       );
     }
-    return establishSegmentedOutputCapture(sessionId, target, paths, nextGeneration);
+    return establishSegmentedOutputCapture(sessionId, target, paths, nextGeneration, capturePane);
   }
 
   async resetOutput(
