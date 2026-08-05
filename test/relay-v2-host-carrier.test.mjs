@@ -1198,6 +1198,13 @@ test("reauthentication uses only a descriptor-safe durable winner", async (t) =>
     assert.deepEqual(h.credentials.prepareCalls, [{
       credentialReference: "credential-2",
       requestId: "caller-must-not-win",
+      expectedCredential: {
+        reference: "credential-1",
+        version: "1",
+        grantId: "host-grant-uuid",
+        accessJti: "access-jti-1",
+      },
+      expectedPendingReauthentication: null,
     }]);
     const sentReauthentication = decoded(active.transport.sent).at(-1);
     assert.equal(sentReauthentication.carrierVersion, 1);
