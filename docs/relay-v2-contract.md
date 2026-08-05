@@ -1,6 +1,8 @@
 # Relay v2 Android-first Contract
 
-状态：**Frozen contract — v2.0.0-android-first；实现尚未交付，不可宣告互操作或生产可用**
+状态：**Frozen contract — v2.0.1-android-first；实现尚未交付，不可宣告互操作或生产可用**
+
+修订说明（v2.0.1）：本次修订仅调整 §10 验收证据的部署 profile 分层（§10.19），将 external-continuity E0 生产证据按部署 profile 分层：单节点自托管 lane 豁免 E0，多租户/回滚独立生产 tier 仍需完整 E0 证据（当前 descoped）。§1–§8 wire 语义、六项 requiredCapabilities、closed schema 与错误表均未改动，规范性含义一字不变。
 
 范围：Android、relay-server、relay-host 的首个可互操作 v2 slice。
 
@@ -10,7 +12,7 @@
 
 非规范性实施拆分见 [`relay-v2-implementation-plan.md`](relay-v2-implementation-plan.md)。该计划只描述并行 owner、硬依赖和验收 Gate，不改变本文的 wire 语义，也不表示任何工作包已经完成。
 
-不在本版：Agent 入站时间线、通知、附件、跨 relay-host 进程的终端续传、host event replay log。
+不在本版：Agent 入站时间线、通知、附件、跨 relay-host 进程的终端续传、host event replay log。Agent transcript/lifecycle extension（`agent.transcript-lifecycle.v1`）的 frozen contract 与 codec 保留为独立可协商 extension，但 base-v2 交付不包含其实现：它需单独协商，当前仓库中无生产实现，G4 不在主线门槛序列内。
 
 本文中的 MUST、MUST NOT、SHOULD 按规范性词语理解。所有 UUID/ULID 示例均为不透明值，不允许客户端解析其结构。
 
@@ -2601,5 +2603,13 @@ Agent 时间线、Agent 状态、通知、附件和 event replay log 不属于�
 15. route 重绑必须 fence 旧 route；opened→replay→live→closed 不得乱序。broker/网络断开不能伪造 terminal.closed，closed 必须带 finalOffset。
 16. duplicate JSON key、错误 UTF-8、binary frame、深度/key 数超限、oversize frame、非 canonical counter/Base64 和 compression bomb 全部在有界分配前拒绝。
 17. per-stream、per-host、每方向 route、carrier、Android actor/event/UI/WebView queue 都有硬上限；压力测试不得无界增长、饿死其他 route、静默丢 command status/control event 或跳 terminal offset。
-18. 在以上测试全部通过前，当前 Android/Dashboard/relay-server/relay-host 继续只宣告和运行 Relay v1，不生成 v2 enrollment 或 capability。
-19. production v2 ready 前必须对 external continuity authority 提供独立失败域、linearizable read/CAS、已确认 CAS RPO=0、stable provisioning/ACL、旧备份拒绝 serving、failover high-water、closed internal error mapping和 broker-credential ready-loss同步 admission/active-data fence证据。ACK丢失或timeout后的CAS只允许 uncertain→linearizable read reconcile；broker credential与Agent extension anchor不能复用，reset/delete/decommission不能重置旧 history。故障注入还必须证明broker namespace fatal会全局fence，而Agent extension namespace按现有三类`AGENT_AUTHORITY_STORE_*` mapping只隔离extension；unavailable保留lineage且不reset/new epoch，独立corrupt case才允许reset/new epoch，基础credential/route/command/terminal继续。external adapter、close policy 的 production adoption/wiring 或上述证据缺一项均保持 NO-GO。
+18. §10.1–§10.17 是所有部署 profile 通用的强制验收项，任何 lane 都不得跳过。在以上测试全部通过前，当前 Android/Dashboard/relay-server/relay-host 继续只宣告和运行 Relay v1，不生成 v2 enrollment 或 capability。
+19. §10.1–§10.18 对所有部署 profile 通用；§10.19 的 external-continuity（E0）生产证据按部署 profile 分层：
+
+    (a) `non-production-single-node-co-located-sqlite-v1`（自托管单节点 lane，通过 `--v2-single-node-self-hosted` 启用）：不要求 E0/external-continuity 证据。该 lane 的耐久性边界是与 broker credential state-store、issuer keyring 同库共置的 SQLite 单调 continuity 行（`synchronous=FULL`、exclusive locking、strict successor validation、machine-id + device/inode 绑定、禁止快照恢复/目录拷贝/跨机迁移）。在 §10.1–§10.18 全部通过后，该 lane 可宣告“self-hosted GO”，但不得宣告多租户生产可用或 rollback-independent durability。
+
+    (b) 多租户 / rollback-independent 生产 tier：仍须提供以下完整 E0 证据，当前 descoped（E0 未实现，保持 NO-GO）：
+    - 对 external continuity authority 提供独立失败域、linearizable read/CAS、已确认 CAS RPO=0、stable provisioning/ACL、旧备份拒绝 serving、failover high-water、closed internal error mapping 和 broker-credential ready-loss 同步 admission/active-data fence 证据。
+    - ACK 丢失或 timeout 后的 CAS 只允许 uncertain→linearizable read reconcile；broker credential 与 Agent extension anchor 不能复用，reset/delete/decommission 不能重置旧 history。
+    - 故障注入证明 broker namespace fatal 会全局 fence，而 Agent extension namespace 按现有三类 `AGENT_AUTHORITY_STORE_*` mapping 只隔离 extension；unavailable 保留 lineage 且不 reset/new epoch，独立 corrupt case 才允许 reset/new epoch，基础 credential/route/command/terminal 继续。
+    - external adapter、close policy 的 production adoption/wiring 或上述证据缺一项均保持 NO-GO。
