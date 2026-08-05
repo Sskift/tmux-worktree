@@ -445,6 +445,8 @@ function createManagedWssConstructor(records, effects) {
       for (const listener of this.listeners.get("close") ?? []) listener(1006);
     }
 
+    ping() {}
+
     receive(bytes) {
       const text = Buffer.from(bytes).toString("utf8");
       for (const listener of this.listeners.get("message") ?? []) listener(text, false);

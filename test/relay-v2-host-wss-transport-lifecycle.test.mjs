@@ -382,6 +382,10 @@ function fakeWebSockets(expectedAuthorizationDigest, behavior = {}) {
       this.terminateCalls += 1;
       this.readyState = 3;
     }
+
+    ping() {
+      this.pingCalls = (this.pingCalls ?? 0) + 1;
+    }
   }
   return { sockets, FakeWebSocket };
 }

@@ -35,6 +35,8 @@ export const RELAY_V2_HOST_WSS_SUBPROTOCOL = "tw-relay.host.v2" as const;
 const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1_048_576;
 const DEFAULT_CLOSE_DRAIN_DEADLINE_MS = 5_000;
 const MAX_CLOSE_DRAIN_DEADLINE_MS = 30_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+const DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT = 2;
 const NODE_CHECK_SERVER_IDENTITY = checkServerIdentity;
 const NODE_IS_PROXY = nodeTypes.isProxy;
 const OBJECT_PROTOTYPE = Object.prototype;
@@ -150,6 +152,8 @@ export interface RelayV2HostWssTransportLifecycleFactoryOptions {
   readonly maxBufferedBytes?: number;
   readonly closeDrainDeadlineMs?: number;
   readonly scheduleCloseDrain?: CloseDrainScheduler;
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatMissedPongLimit?: number;
 }
 
 export interface RelayV2HostWssPreparedAttemptInput
@@ -169,6 +173,7 @@ interface CapturedSocket {
   readonly send: Function;
   readonly close: Function;
   readonly terminate: Function;
+  readonly ping: Function;
 }
 
 interface CapturedConnection {
@@ -202,6 +207,7 @@ interface SocketListeners {
   readonly error: () => void;
   readonly close: (code: unknown) => void;
   readonly unexpectedResponse: () => void;
+  readonly pong: () => void;
 }
 
 export class RelayV2HostWssTransportLifecycleError extends Error {
@@ -387,6 +393,7 @@ function captureSocket(value: unknown): CapturedSocket {
     send: captureMethod(value, "send"),
     close: captureMethod(value, "close"),
     terminate: captureMethod(value, "terminate"),
+    ping: captureMethod(value, "ping"),
   });
 }
 
@@ -526,6 +533,8 @@ function createLifecycle(input: Readonly<{
   closeDrainDeadlineMs: number;
   scheduleCloseDrain: CloseDrainScheduler;
   tlsTrust: RelayV2HostTlsCaTrust | undefined;
+  heartbeatIntervalMs: number;
+  heartbeatMissedPongLimit: number;
 }>): RelayV2HostManagedConnectorTransportLifecycle {
   const accepted: AcceptedFrame[] = [];
   const deliveryTokens = new Set<string>();
@@ -543,6 +552,23 @@ function createLifecycle(input: Readonly<{
   let drainPromise: Promise<object> | null = null;
   let resolveDrain: ((proof: object) => void) | null = null;
   let closedCleanupComplete = false;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatMissedPongs = 0;
+  let heartbeatStopped = false;
+
+  const stopHeartbeat = (): void => {
+    if (heartbeatStopped) return;
+    heartbeatStopped = true;
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+    if (socket !== null && listeners !== null) {
+      try {
+        REFLECT_APPLY(socket.removeListener, socket.receiver, ["pong", listeners.pong]);
+      } catch {}
+    }
+  };
 
   const removeListeners = (): void => {
     if (socket === null || listeners === null) return;
@@ -552,6 +578,7 @@ function createLifecycle(input: Readonly<{
       ["error", listeners.error],
       ["close", listeners.close],
       ["unexpected-response", listeners.unexpectedResponse],
+      ["pong", listeners.pong],
     ] as const) {
       try {
         REFLECT_APPLY(socket.removeListener, socket.receiver, [event, listener]);
@@ -603,6 +630,7 @@ function createLifecycle(input: Readonly<{
     if (cancel !== null) {
       try { cancel(); } catch {}
     }
+    try { stopHeartbeat(); } catch {}
     try { removeListeners(); } catch {}
     try { releaseAdmission(); } catch {}
     try { notifyClosed(); } catch {}
@@ -770,7 +798,28 @@ function createLifecycle(input: Readonly<{
       return;
     }
     phase = "open";
+    heartbeatMissedPongs = 0;
+    heartbeatStopped = false;
+    const heartbeatTick = (): void => {
+      if (heartbeatStopped || phase !== "open") return;
+      heartbeatMissedPongs += 1;
+      if (heartbeatMissedPongs > input.heartbeatMissedPongLimit) {
+        terminateAndFinish();
+        return;
+      }
+      try {
+        REFLECT_APPLY(activeSocket.ping, activeSocket.receiver, []);
+      } catch {
+        terminateAndFinish();
+      }
+    };
+    heartbeatTick();
+    heartbeatTimer = setInterval(heartbeatTick, input.heartbeatIntervalMs);
     flush();
+  };
+
+  const onPong = (): void => {
+    heartbeatMissedPongs = 0;
   };
 
   const onMessage = (data: unknown, isBinary: unknown): void => {
@@ -900,6 +949,7 @@ function createLifecycle(input: Readonly<{
         error: onError,
         close: onClose,
         unexpectedResponse: onUnexpectedResponse,
+        pong: onPong,
       });
       for (const [event, listener] of [
         ["open", listeners.open],
@@ -907,6 +957,7 @@ function createLifecycle(input: Readonly<{
         ["error", listeners.error],
         ["close", listeners.close],
         ["unexpected-response", listeners.unexpectedResponse],
+        ["pong", listeners.pong],
       ] as const) {
         REFLECT_APPLY(socket.on, socket.receiver, [event, listener]);
         if (phase !== "connecting" || socket !== capturedSocket) throw failure();
@@ -1020,12 +1071,15 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
   readonly #scheduleCloseDrain: CloseDrainScheduler;
   readonly #tlsTrust: RelayV2HostTlsCaTrust | undefined;
   readonly #transportOwner: RelayV2HostCredentialConnectionTransportOwner;
+  readonly #heartbeatIntervalMs: number;
+  readonly #heartbeatMissedPongLimit: number;
   readonly #pending = new Map<string, PreparedAttempt>();
 
   constructor(options: RelayV2HostWssTransportLifecycleFactoryOptions) {
     const fields = exactDataObject(options, ["relayUrl", "credentialAuthority"], [
       "webSocketConstructor", "maxBufferedBytes", "closeDrainDeadlineMs",
-      "scheduleCloseDrain", "tlsTrust",
+      "scheduleCloseDrain", "tlsTrust", "heartbeatIntervalMs",
+      "heartbeatMissedPongLimit",
     ]);
     if (!isRelayV2HostCredentialAuthority(fields.credentialAuthority)) throw failure();
     const webSocketConstructor = fields.webSocketConstructor ?? WebSocket;
@@ -1063,6 +1117,16 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
     );
     this.#scheduleCloseDrain = scheduleCloseDrain as CloseDrainScheduler;
     this.#tlsTrust = tlsTrust;
+    this.#heartbeatIntervalMs = positiveBound(
+      fields.heartbeatIntervalMs,
+      DEFAULT_HEARTBEAT_INTERVAL_MS,
+      Number.MAX_SAFE_INTEGER,
+    );
+    this.#heartbeatMissedPongLimit = positiveBound(
+      fields.heartbeatMissedPongLimit,
+      DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT,
+      Number.MAX_SAFE_INTEGER,
+    );
   }
 
   static prepareAttempt(
@@ -1156,6 +1220,8 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
       closeDrainDeadlineMs: this.#closeDrainDeadlineMs,
       scheduleCloseDrain: this.#scheduleCloseDrain,
       tlsTrust: this.#tlsTrust,
+      heartbeatIntervalMs: this.#heartbeatIntervalMs,
+      heartbeatMissedPongLimit: this.#heartbeatMissedPongLimit,
     });
   }
 }

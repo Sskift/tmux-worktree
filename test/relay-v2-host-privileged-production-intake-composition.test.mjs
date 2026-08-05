@@ -363,6 +363,8 @@ function createCapabilityWssHarness() {
       for (const listener of this.listeners.get("close") ?? []) listener(1006);
     }
 
+    ping() {}
+
     receive(frame) {
       const bytes = credentialCodec.encodeRelayV2WebSocketFrame("carrier", frame);
       const text = Buffer.from(bytes).toString("utf8");

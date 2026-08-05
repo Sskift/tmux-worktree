@@ -25,6 +25,8 @@ import {
 
 const CLIENT_SUBPROTOCOL = "tw-relay.v2";
 const REJECT_END_DEADLINE_MS = 1_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+const DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT = 2;
 const INPUT_KEYS = Object.freeze([
   "request",
   "socket",
@@ -33,6 +35,8 @@ const INPUT_KEYS = Object.freeze([
 const OPTION_KEYS = Object.freeze([
   "verifyV2AccessToken",
   "runtime",
+  "heartbeatIntervalMs",
+  "heartbeatMissedPongLimit",
 ] as const);
 const RUNTIME_METHODS = Object.freeze([
   "installTrustedSocketCapture",
@@ -72,6 +76,8 @@ export interface RelayV2BrokerClientWssNodeListenerFreeIngressOptions {
   readonly verifyV2AccessToken: RelayV2BrokerClientUpgradeVerifyPort;
   /** Borrowed private shared-owner port; the ingress never seals or closes it. */
   readonly runtime: RelayV2BrokerClientWssNodeIngressRuntime;
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatMissedPongLimit?: number;
 }
 
 export interface RelayV2BrokerClientWssNodeUpgradeRequestInput {
@@ -399,6 +405,59 @@ function equivalentBufferView(head: Uint8Array): Buffer {
     : Buffer.from(head.buffer, head.byteOffset, head.byteLength);
 }
 
+function positiveHeartbeatValue(
+  value: unknown,
+  fallback: number,
+): number {
+  const selected = value ?? fallback;
+  if (
+    !Number.isSafeInteger(selected)
+    || (selected as number) <= 0
+  ) throw failure();
+  return selected as number;
+}
+
+function attachClientSocketHeartbeat(
+  socket: WebSocket,
+  intervalMs: number,
+  missedPongLimit: number,
+): void {
+  let missedPongs = 0;
+  let stopped = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const tick = (): void => {
+    if (stopped) return;
+    missedPongs += 1;
+    if (missedPongs > missedPongLimit) {
+      stopped = true;
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+      try { socket.terminate(); } catch {}
+      return;
+    }
+    try { socket.ping(); } catch {}
+  };
+  const onPong = (): void => {
+    missedPongs = 0;
+  };
+  const cleanup = (): void => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+    try { socket.removeListener("pong", onPong); } catch {}
+    try { socket.removeListener("close", cleanup); } catch {}
+  };
+  socket.on("pong", onPong);
+  socket.once("close", cleanup);
+  tick();
+  timer = setInterval(tick, intervalMs);
+}
+
 function endRejectResponse(
   socket: CapturedRejectSocket,
   status: (typeof REJECT_STATUSES)[number],
@@ -465,6 +524,15 @@ export function createRelayV2BrokerClientWssNodeListenerFreeIngress(
     typeof verifyV2AccessToken !== "function"
     || rejectedProxy(verifyV2AccessToken)
   ) throw failure();
+
+  const heartbeatIntervalMs = positiveHeartbeatValue(
+    capturedOptions?.heartbeatIntervalMs,
+    DEFAULT_HEARTBEAT_INTERVAL_MS,
+  );
+  const heartbeatMissedPongLimit = positiveHeartbeatValue(
+    capturedOptions?.heartbeatMissedPongLimit,
+    DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT,
+  );
 
   const brandedSockets = new WeakSet<object>();
   const trustedSocketBrand = Object.freeze((socket: RelayV2BrokerClientWssSocket): boolean => (
@@ -693,6 +761,11 @@ export function createRelayV2BrokerClientWssNodeListenerFreeIngress(
           throw failure();
         }
         upgradedSocket = observation.socket;
+        attachClientSocketHeartbeat(
+          upgradedSocket,
+          heartbeatIntervalMs,
+          heartbeatMissedPongLimit,
+        );
 
         if (lifecycle !== "open") {
           phase = "failed";
