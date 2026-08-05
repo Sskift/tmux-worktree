@@ -51,3 +51,20 @@ JS loader（`hostCredentialNativeLoader.ts`、`brokerCredentialStateStoreLoader.
 ## 非 production deployment policy
 
 `non-production-single-node-co-located-sqlite-v1` policy（`--v2-single-node-self-hosted`）将 broker credential authority 的 state-store、continuity port 与 issuer keyring 绑定到同一 owner-only SQLite deployment owner。该 policy 不修改 public wire、closed schema、错误表或六项 required capabilities，且明确 **不是 E0**，不满足 rollback-independent production continuity 要求。
+
+## 决策记录
+
+### 2026-08-05：contract §10.19 按部署 profile 分层 E0 证据
+
+contract 版本升至 v2.0.1-android-first。§10.19 的 external-continuity（E0）生产证据按部署 profile 分层：
+
+- **`non-production-single-node-co-located-sqlite-v1`（自托管单节点 lane）**：不要求 E0 证据。耐久性边界是与 credential state-store、issuer keyring 同库共置的 SQLite 单调 continuity 行。§10.1–§10.18 全部通过后可宣告"self-hosted GO"，但不得宣告多租户生产可用或 rollback-independent durability。
+- **多租户 / rollback-independent 生产 tier**：仍须提供完整 E0 证据（独立失败域、linearizable read/CAS、CAS RPO=0、stable provisioning/ACL、旧备份拒绝 serving、failover high-water、closed internal error mapping、broker-credential ready-loss 同步 admission/active-data fence）。当前 descoped，保持 NO-GO。
+
+§1–§8 wire 语义、六项 requiredCapabilities、closed schema 与错误表未改动。§10.1–§10.17 对所有 profile 通用，任何 lane 不得跳过。
+
+### 2026-08-05：Agent extension（G4/X）移出主线门槛
+
+Agent transcript/lifecycle extension（`agent.transcript-lifecycle.v1`）的 frozen contract 与 `codec.ts` 保留，broker capability gating（`--v2-agent-transcript-lifecycle-v1`）作为 live surface 保留。Node 实现模块已于 2026-08 从仓库删除。
+
+G4 不在主线门槛序列内；G5 的 precondition 不再要求 G4。该 extension 不属于 base v2 交付，未来作为独立 proposal 单独协商。
