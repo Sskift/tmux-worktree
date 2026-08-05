@@ -115,18 +115,7 @@ export default defineConfig({
     "src/relay/v2/terminalControlExactTargetAuthorityAdapter.ts",
     "src/relay/v2/terminalControlAuthorityAdapter.ts",
     "src/relay/v2/terminalControlObservedBytePlaneAdapter.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/authority.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/store.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/runtime.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerProducer.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerThreadAcquisitionAuthority.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexRolloutFileSourceAuthority.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerNotificationSource.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexRolloutJsonlNotificationByteSource.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerProcessControllerAuthority.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexAppServerTrustedSourceActivation.ts",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codexTrustedSourceComposition.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
     "src/feishuReplyCard.ts",
@@ -145,8 +134,6 @@ export default defineConfig({
     // Keep the node: identity intact even though the general bundle target is
     // Node 20, where this opt-in lane is rejected before import.
     "node:sqlite",
-    "./codexAppServerNotificationSource.js",
-    "./codexAppServerProcessControllerAuthority.js",
     // These owner entries carry module-private WeakMap brands. Keep every
     // dist consumer on the same canonical module instances.
     "./brokerTransportCloseCoordinator.js",

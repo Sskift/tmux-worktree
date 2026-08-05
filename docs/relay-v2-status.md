@@ -40,6 +40,14 @@ JS loader（`hostCredentialNativeLoader.ts`、`brokerCredentialStateStoreLoader.
 
 `continuityAnchor.ts` 仍保留（被 `brokerCredentialAuthority.ts` 核心导入）。外部 HTTPS adapter、node attempt provider、config、opener 模块（`externalContinuityAuthorityConfig.ts`、`externalContinuityAuthorityHttpsAdapter.ts`、`externalContinuityAuthorityNodeAttemptProvider.ts`、`brokerCredentialExternalContinuityOpener.ts`）仍存在于源码中，但已 descope，不得用于 production activation。这些模块与 broker composition/shipping 层（`brokerServerRuntime.ts`、`brokerShippingRoot.ts`、`brokerShippingDeploymentSource.ts`、`brokerLocalDevelopmentActivation.ts`）深度集成（约 95 处引用），本轮未移除代码以避免破坏 composition 层构建；后续轮次在基础互操作通过后再统一清理。
 
+### Agent transcript lifecycle v1 Codex app-server 实现模块
+
+`src/relay/extensions/agentTranscriptLifecycle/v1/` 下除 `codec.ts` 外的 11 个实现模块（`authority.ts`、`store.ts`、`runtime.ts`、`codexAppServerTrustedSourceActivation.ts`、`codexAppServerProcessControllerAuthority.ts`、`codexAppServerNotificationSource.ts`、`codexAppServerProducer.ts`、`codexTrustedSourceComposition.ts`、`codexRolloutFileSourceAuthority.ts`、`codexRolloutJsonlNotificationByteSource.ts`、`codexAppServerThreadAcquisitionAuthority.ts`，共约 10,848 行）已作为死代码删除。
+
+理由：这些模块未被 `src/`、`app/src/`、`app/src-tauri/src/` 中任何代码导入（仅扩展目录内部互相引用），属于未接线的 Codex app-server 实现。
+
+`codec.ts` 保留（被 `brokerCore.ts`、`brokerServerRuntime.ts`、`relayV2DashboardManagementProtocolV2.ts` 导入）；dashboard self-hosted deployment 通过 `--v2-agent-transcript-lifecycle-v1` 启用的 capability gating 作为 live surface 保留。
+
 ## 非 production deployment policy
 
 `non-production-single-node-co-located-sqlite-v1` policy（`--v2-single-node-self-hosted`）将 broker credential authority 的 state-store、continuity port 与 issuer keyring 绑定到同一 owner-only SQLite deployment owner。该 policy 不修改 public wire、closed schema、错误表或六项 required capabilities，且明确 **不是 E0**，不满足 rollback-independent production continuity 要求。
