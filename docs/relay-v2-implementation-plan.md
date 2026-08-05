@@ -1,6 +1,6 @@
 # Relay v2 并行实施计划
 
-状态：**实施协调文档；codec conformance 基础不等于 Relay v2 runtime 已交付，也不构成 capability、兼容性或发布日期声明。**
+状态：**实施协调文档；尚未交付 Relay v2，不构成 capability、兼容性或发布日期声明。**
 
 规范语义以冻结的 [`relay-v2-contract.md`](relay-v2-contract.md) 为准。本文件只定义如何把该契约拆成可以并行交付的 owner 模块、哪些依赖必须串行，以及每个模块何时可以进入集成。当前实现事实仍以 [`ARCHITECTURE.md`](../ARCHITECTURE.md) 和源码为准；进度不得靠本文件中的阶段名称或清单推断。
 
@@ -27,18 +27,18 @@
 冻结契约已经给出跨端语义，因此各模块不必等待另一端生产实现，可以先对共享 fixture、fake transport 和 simulator 开发：
 
 ```text
- frozen Relay v2 wire + local state-store + external continuity contracts
+                         frozen Relay v2 contract
                                    │
           ┌────────────────────────┼────────────────────────┐
           │                        │                        │
-   B. broker control       H0. host state store     D/A/X domain work
-      and carrier                  │                  against fakes
-          │             ┌───────────┼───────────┐            │
-          │             │           │           │            │
-          │       H1. command  H2. resource  H3. terminal    │
-          │           plane       state        manager       │
-          │             └───────────┼───────────┘            │
-          │                         │                        │
+   C. contract/codec        B. broker control       H0. host state store
+      conformance              and carrier                  │
+          │                        │             ┌───────────┼───────────┐
+          │                        │             │           │           │
+          │                        │       H1. command  H2. resource  H3. terminal
+          │                        │           plane       state        manager
+          │                        │             └───────────┼───────────┘
+          │                        │                         │
           ├──────── D. Dashboard enrollment/process ────────┤
           ├──────── A. Android v2 client/storage/UI ─────────┤
           └──────── X. Agent extension contract/prototype ───┘
@@ -52,45 +52,25 @@
       X host/client integration and separate negotiation
 ```
 
-可立即并行的是 B、H0、Dashboard 的 fake-backed UI/domain、Android 的独立 v2 namespace/actor，以及 X 的 authority/contract 设计。H1/H2/H3 只需等待 H0 的最小事务接口，不互相等待；它们分别用 fake executor、materialized state fixture 和 fake byte backend 验收。真实跨端联调才进入后面的硬门槛；各 lane 必须持续通过已有的共享 codec conformance baseline。
+可立即并行的是 C、B、H0、Dashboard 的 fake-backed UI/domain、Android 的独立 v2 namespace/actor，以及 X 的 authority/contract 设计。H1/H2/H3 只需等待 H0 的最小事务接口，不互相等待；它们分别用 fake executor、materialized state fixture 和 fake byte backend 验收。真实跨端联调才进入后面的硬门槛。
 
 ## 工作包与验收标准
 
-### E0. external continuity authority v1 契约
+### C. Relay v2 contract 与 conformance
 
-[`contracts/relay/v2/external-continuity-authority-v1`](../contracts/relay/v2/external-continuity-authority-v1/README.md) 仍是external backend/adapter互操作与安全语义的frozen source；Node adapter/config binder/opener、per-attempt credential/trust resolver + HTTPS transport provider seam及显式default-off Broker composition已实现，但 provider seam 仍不附带 production resolver/backend，必须由 deployment 显式注入，均不等于qualified backend deployment。它保持现有 owner 链：external backend 只拥有按 `anchorId` 的 rollback-independent durable monotonic linearizable record/lifecycle；`RelayV2ContinuityAnchor`拥有 local-state-before-anchor ordering、唯一 crash-window reconcile与bounded operation timeout；T1 credential authority拥有credential state、ready withdrawal与closed mapping；broker只消费auth-control authority。machine fixture使用closed vocabulary、共享defaults与case deltas覆盖竞态CAS、ACK loss/timeout reconcile、outer/inner malformed结果、rollback/divergence、restart/旧备份/failover、closed internal errors、namespace/reset/decommission/tombstone和namespace-scoped ready-loss fence。
+所有跨端实现共同消费同一套 `contracts/relay/v2` machine fixture，但 Node、Android 和后续其他客户端各自实现 codec，不共享生产源码。
 
-E0 中的 `securityDomainId`、opaque `ownerBinding`、`broker-credential.v1`/`agent-transcript-lifecycle.v1` namespace及 external internal error taxonomy 是本 external v1 的新规范选择，不是 Relay wire字段或错误。现有Node adapter只decode outer envelope/error，backend success result必须原样使用existing continuity snapshot/CAS result shape并作为untrusted unknown交给existing decoder；adapter不能补authority字段或复制checkpoint decoder。outer HTTPS固定exact endpoint POST、no redirect、identity/no compression，请求与响应固定`Cache-Control: no-store`且请求固定JSON Accept；只有status 200与exact JSON Content-Type通过header gate后才解码closed envelope，非200或header mismatch不得读取、解析或回显proxy body。该boundary复用Relay v2 manifest的16384-byte body、depth 8、total keys 32与strict JSON规则；workload credential不得redirect转发。request fingerprint是decoded closed tuple字段级exact type/value equality，不依赖key order或canonical hash。read outer failure闭合为`ANCHOR_UNAVAILABLE`而malformed inner snapshot为`INVALID_AUTHORITY_RESPONSE`；CAS outer/inner failure都闭合为`ANCHOR_COMMIT_UNCERTAIN`。broker namespace failure再由T1撤回ready；Agent extension namespace failure复用现有`AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE|COMMIT_UNCERTAIN|CORRUPT` mapping并只隔离extension；unavailable必须保留可证明lineage并repair/reopen，不能reset/new epoch，只有corrupt允许extension reset/new epoch。即使backend声称CAS在linearization前因capacity/rate被拒绝，现有port也没有可证明的definite-rejection union，不能授权盲重试。continuity operation timeout 的 5000ms 仍只属于 continuity owner；独立未接线的 transport close coordinator 另有 5000ms credential-fence deadline 并已实现 4401/4403/1013 policy，owning production composition 在开始 adapter 前仍须显式采用、接线和验收，external adapter 不得另行选择。
+工作边界：
 
-production E0 仍是 NO-GO：尚未选择并验收 rollback-independent backend、RPO=0/DR high-water、stable anchor provisioning/ACL、frozen outer HTTPS/auth/secret/config实现、quota/rate/capacity配置、restart/旧备份/failover演练，显式default-off authority injection/composition及采用caller-supplied `node:https.Server`的public lifecycle root已存在，但没有qualified deployment、真实public TLS/network/device或ready-loss证据。由显式activated composition采用的Broker live-authorization owner已覆盖exact revoke/kid removal、trusted-time expiry与credential-authority ready-loss同步fence，但`qualifiedRecords=[]`使真实activation不可达，仍不构成shipping active-connection fence。实现顺序固定为 native store open+self-check → external authority injection → credential authority open/reconcile → synchronous admission/active-data fence → broker auth-control injection；任何缺项都不产生ready、enrollment或capability，也不允许v1/BAU fallback。broker credential与Agent extension必须使用独立anchorId/namespace/ACL/reset/decommission/tombstone，不能覆盖或复用history。
+- 覆盖公共 envelope、broker↔host carrier、HTTPS enrollment/refresh body、命令、snapshot、event、terminal 和结构化错误的合法 golden frame。
+- 覆盖 duplicate key、未知字段、null/coercion、非 canonical counter/Base64、错误 UTF-8、深度/key/node/frame 上限等拒绝向量。
+- fixture manifest 明确 contract 版本和消费端；新增 extension 使用独立 manifest，不修改基础六项能力的含义。
 
-### N0. broker credential native state-store 契约
+验收：
 
-`contracts/relay/v2/broker-credential-state-store-v1` 是 broker credential 本地持久化的唯一串行设计输入。当前顶层 contract revision 是 2；N-API interface、capability storage、binary/header、private-location derivation 与 fixture仍各自为 v1，artifact、magic、offset、length、fixture和 TypeScript ABI不变。它冻结 exact `open({trustedHome, maxStateBytes})`、TypeScript raw-store/transaction/revision/bytes closed wrapper、`RelayV2BrokerCredentialStateStore` deep port、transaction-scoped opaque revision、closed capability/open/error union，以及 single descriptor-backed binary v1。Container 的 canonical private location 只由 manifest 的 `binaryStorage.container.privateLocation` 定义；未接线的 platform-common crate由N0.2通过build script单点消费并生成shared `ContainerSpec`，并由N0.4成为shared lifecycle owner；N2/N3不能各自复制relative component literal、registry/PID/final-close状态机或直接消费N1。Container 固定 134,217,984 bytes：header0/header1 位于 absolute offset 0/128，payload0/payload1 位于 256/67,109,120，各 payload capacity 67,108,864。它不拥有 credential 业务语义。T1 已新增未接线的 `RelayV2BrokerCredentialAuthority` source foundation，通过该 port 独占 versioned issuer、enrollment、grant、replay、rate-limit、ready withdrawal 与 external continuity 业务语义；显式default-off Broker production composition与HTTP runtime现会注入该owner；默认CLI仍不注入，空qualification使真实open不可达。
-
-Capability `supported` 只表示 pre-open artifact/target/interface 完整，不表示 ready。Ready 仍依次要求 exact open、native self-check 和 T1 external continuity。Existing unknown/corrupt/unsafe/identity-uncertain/durability-unsupported store 一律 `invalid` 并保留；`unsupported` 只允许 `native_artifact_missing`、`target_unsupported`、`interface_version_unsupported`，不得把磁盘失败伪装为 missing 重建。
-
-N1、P1 与 T1 可以继续对同一 binary/interface seam 并行；platform lane 的唯一必要串行链是 `N0.3 contract revision 2 → N0.4 shared lifecycle → N2/N3 OS adapters`。N2/N3 不能跳过 N0.4或各自扩张 interface：
-
-- N1 Rust core：实现 fixed-length sparse fixture parser/selector、generation、digest/checksum、absolute-offset positional write、exclusive transaction、compare-and-publish、terminal uncertain 与 close barrier；不拥有业务 state schema。
-- N0.2 platform common foundation：独立未接线crate的build script验证contract revision 2及frozen private-location/fileLength/admission max并生成唯一immutable spec；它建立closed platform error与private N1 handoff基础，不接`trustedHome`、不构造path，也不实现syscall/filesystem/durability或N-API。N0.4在同一owner内扩展lifecycle，不建立平行crate。
-- N0.3 secure-open/durability contract：revision 2已冻结 credential snapshot、native account-home proof、exact mode/ACL、qualification-before-registry/mutation、final A/B/C descriptor proof、traditional process-owned `F_SETLK`、同进程 registry/fork/close语义及 deny-by-default durability policy。Durability v1的 `qualifiedRecords=[]`，第一条 record必须新增 contract revision；本 revision没有可实例化 item schema/template/example/wildcard，runtime probe或 syscall success不能创建 qualification。
-- N0.4 platform-common lifecycle：当前已在common内唯一实现显式eager `ProcessLifecycleToken`、registry key `(verifiedHome dev, ino, RelayV2BrokerCredentialStateStoreV1)`、`Opening/Open/Closing/CloseUncertain`、pre-fd reservation、unique token、opener-PID/descriptor fence、panic-aware permanent poison、common-owned exactly-once final close、private N1 bridge与opaque process-bound store/ticket/lease/snapshot/revision/outcome wrappers。Active collision返回`STORE_BUSY`；close uncertain和registry poison永久`STORE_CLOSED`；same-PID poison仍释放已admitted N1 ownership并attempt final close，publication `Uncertain`保持占优。Public `SoleContainer`不暴露N1 action，N2/N3/N-API不得直接依赖N1或复制lifecycle。该owner仍不做Darwin/Linux path/syscall/durability；当前N-API binding已在module init eager exactly-once捕获token。现有证据仍不包括真实OS fork、platform-adapter-qualified real open、真实kernel lock/filesystem/power-loss或device。
-- N2 Darwin adapter：当前已有未接线foundation，消费 N0.4 lifecycle与唯一 `container_spec()`，按 exact open order实现 native account-home/no-follow/mode/ACL、read-only qualification probe、registry reservation、existing `fstatat(...AT_SYMLINK_NOFOLLOW)` preflight、sole-fd exact `openat` flags/`FD_CLOEXEC`验证、traditional `F_SETLK`和 final A/B/C proof；不复制 path component/registry、不打开 preflight fd、不使用 `O_TRUNC/O_EXLOCK`或修复 existing mode。Publication payload/header各使用 `F_FULLFSYNC`；creation依次为 container full sync、parent-dir fsync、必要时 trusted-home fsync、`fsync_volume_np(...SYNC_VOLUME_FULLSYNC|SYNC_VOLUME_WAIT)`。由于本 revision allowlist为空，production real open在 registry/mutation前返回 `DURABILITY_UNSUPPORTED`；production不可达的 `cfg(test)` qualification只验证 scaffold，不是qualified real-open证据。
-- N3 Linux adapter：当前已有未接线foundation，消费与 N2 相同的 N0.4 lifecycle/spec/exact preflight+`openat` order，使用 traditional `F_SETLK`，明确禁止 `F_OFD_*`/`flock`/`O_TRUNC/O_EXLOCK`；实现同一 sole descriptor/offset/lifetime、`FD_CLOEXEC`和 final A/B/C proof与 ACL semantics，不把 `openat`/fd/inode/cleanup暴露给 Node port。Publication与 creation按 manifest的 exact `fsync` sequence；空 allowlist同样使production real open在 registry/mutation前返回 `DURABILITY_UNSUPPORTED`，production不可达的测试资格不构成qualified real-open证据。
-- N4 raw N-API binding：当前已有独立未接线foundation，以同一crate按target选择Darwin/Linux public open seam；module contract只暴露冻结capability/open，module init eager exactly-once捕获`ProcessLifecycleToken`，raw store/transaction只转换platform-common `ProcessBound*`生命周期与bytes/revision/outcome/error边界，不拥有credential schema、readiness、continuity、fallback或capability advertisement。另有显式、未接线的本机target build/stage/npm-pack verifier，共用loader的四项fixed descriptor、验证exact Cargo产物的Mach-O/ELF target header/digest与pre-commit空layout，以final hard-link作为唯一不rollback的commit point，并从自建`npm pack --ignore-scripts`临时包用有界pure-ustar inspector导入packed fixed loader、运行packed JS/native closed binding test。Node path API不足以抵抗恶意同uid最终目录换名竞态，本foundation不作该声明。当前证据仅Darwin arm64；没有Darwin x64/Linux、四target matrix、bit reproducibility、Dashboard bundle、签名/notarization、minimum-OS/glibc/SDK、provenance或production wiring，空allowlist下仍没有qualified real open或actual opened JS transaction。
-- T1 authority injection：让 `RelayV2BrokerCredentialAuthority` 只通过 port 读写 opaque bytes，并保留 external continuity/业务状态机；专项测试可继续使用 in-memory fake，但它不是 E0 production authority。显式default-off injection/composition已实现；可用的真实注入仍等待qualified E0 backend/deployment、native qualification以及真实public TLS/network/device与ready-loss验收证据；现有default-off public lifecycle root不替代这些证据。
-- P1 loader：当前已有可注入显式default-off Broker composition的target/N-API/fixed-artifact optional loader foundation，按 closed capability/open/error union 调用 N0 wrapper；只有固定目标 artifact 自身确实缺失才映射为 `unsupported/native_artifact_missing`。它精确传 caller-owned absolute `trustedHome` 与 frozen admission limit，不产生 overall ready；只有 open+self-check+T1 continuity 全部成功才允许未来 authority 宣告 ready，invalid/unsupported 都保持 v2 unavailable。
-
-E0 external contract、N1独立纯Rust binary/publication core、N0.2 spec/error foundation、N0.4 shared platform lifecycle owner、N2/N3 platform adapter foundations、N4 raw N-API binding foundation、P1 optional loader foundation与T1 credential authority source foundation已实现；显式default-off Broker production composition现会闭合loader、E0 binding/opener、credential authority、WSS/HTTP与close owner；相邻public lifecycle root接管caller-supplied `node:https.Server`的request/upgrade/listen/drain，但qualified E0 backend/deployment仍未实现。N0.3只冻结 revision 2 policy；空 durability allowlist使platform-adapter-qualified real open与actual opened JS transaction不可达，不能产生ready。显式、未接线的build/stage/npm-pack verification foundation当前只在Darwin arm64验证exact Cargo target header、fixed stage/tar/unpacked layout与closed binding；不覆盖Darwin x64、Linux targets、四target matrix、bit reproducibility、Dashboard bundle、签名/notarization、minimum-OS/glibc/SDK、provenance、真实kernel lock/filesystem/fork/power-loss或opened transaction。T1 已在现有 credential authority owner 内补齐未接线的 role=host bootstrap authority source foundation：管理侧一次性 `twhostboot2` selector+secret、per-secret失败耗尽、source admission、fresh host grant/credential与exact-response replay在authority专项层可达，并以显式envelope revision兼容读取旧合法state。Credential authority 的 enrollment create/redeem、client/host refresh、host reauthentication 与 host bootstrap API，以及 B1 ingress adapter，均可在隔离模块和专项测试中调用；B1/B4 已由上述default-off public root接到HTTP lifecycle，但默认CLI不调用且qualified E0 activation不可达，因此这些流程仍没有qualified外部生产HTTP路径，也不形成production ready/capability/enrollment或shipping声明。现由同一activated composition采用的live authorization/fence owner在credential authority owner内durably发布grant revoke与kid removal exact invalidation receipt，由BrokerCore用trusted time处理expiry、拒绝stale attach/auth-control/route/frame，并在authority首次withdraw时同步全局latch；once-only signal只携带typed symbolic reason与connection incarnation；同composition采用的transport close coordinator 已消费该 signal 并实现 4401/4403/1013 与 5000ms force-destroy policy，但默认CLI不调用public root，且qualified real public TLS/network/device/ready-loss证据仍缺失。T2 response replay-key rotation lifecycle 现由同一 credential authority 的私有 envelope v3 唯一拥有：bounded active + decrypt-only keyring、record exact key id、旧 v1/v2 单 key envelope 与 ciphertext/TTL 无损迁移、持久 rotationId 幂等、key-id non-reuse 和 fatal decode/AEAD 闭合均在专项层可达；它未接 production 管理入口/composition，不修改 public wire，也不产生 ready/capability。当前 external contract/native core/common/adapters/binding、in-memory wrapper/authority 与 loader evidence 分别证明冻结语义或各自 foundation 边界，不是跨进程 lock、filesystem、power-loss durability、真实双进程/网络/灾备或 production continuity readiness 证据；仍无Dashboard/production shipping、qualified authority activation、qualified real public-TLS/network/device wiring或continuity readiness。此前的 unsafe BAU path/JSON 设计已明确未通过 native security acceptance且未纳入当前交付源码；后续 lane 不得修补、复用或重新引入其 path rename/unlink，也不得自动迁移、删除或清理可能遗留的 prototype state/lock/temp artifact。任一 lane 单独完成都不启用 production v2、enrollment或六项 capability，也不建立到 BAU 设计或 v1 的 fallback。
-
-B4四端点credential HTTPS ingress现由显式default-off activated Broker composition采用，并复用 B1 的严格 HTTP boundary；默认CLI不注入且qualified E0/native仍不可用，因此不改变上述 production NO-GO。
-
-显式 default-off 的 Broker shipping root 与 local privileged admin seam 已实现（`src/relay/v2/brokerShippingRoot.ts`）：reference-only runtime profile 加 deployment 注入的 privileged resolver、external continuity attempt provider 与 native state-store loader 装配现有 production composition 与 public lifecycle root，profile/inputs validate 与 durable authority open 先于 listen，启动失败 reverse-order rollback，admin bootstrap secret 只同步交付调用方受限 sink，public route 无 admin 端点。`relay-server` CLI 的 production shape 仅由显式 `--v2-profile` 选择，且只经唯一 default-off trusted deployment activation/source owner（`src/relay/v2/brokerShippingDeploymentSource.ts`）：TLS/issuer keyring/E0 material 只来自 trustedHome 固定 namespace（`.tmux-worktree/relay-v2-broker-deployment/`）按严格 identifier 映射到固定 filename/schema 的 fd-bound regular-file/no-symlink、owner、exact 0600/0700、bounded 私有文件（JSON keyring/workload-header 做 closed-schema 校验，TLS PEM/CA/mTLS cert/key 只做 owner/0600/nlink=1/bounded secure-read，内容由 TLS/E0 消费边界验证），复用既有 fixed native loader 与 Node E0 attempt provider，错误 redacted；任何缺失/unsafe/malformed/unqualified（含 `qualifiedRecords=[]` 的 unqualified native）仍在监听或 native mutation 前 fail closed，无 v1 fallback。native `qualifiedRecords=[]`、默认 Relay v1 行为与整体 NO-GO 不变。
-
-Broker shipping profile 的 `issuerUrl` 现严格固定为 HTTPS root，`relayUrl` 严格固定为 WSS `/client` endpoint，确保 authority 原样签发的 enrollment/redeem 与 Android endpoint contract 对齐；Host profile 仍为 root WSS URL并在carrier边界派生`/host`。另有strictly explicit `--v2-local-dev` lane始终bind `127.0.0.1`并要求显式非零端口；缺省仍下发同authority的`https://localhost:<port>/`与`wss://localhost:<port>/client`，可选严格advertised HTTPS root origin只改变issuer/client identity，外部TLS/TCP proxy归smoke deployment。该lane只注入进程内credential store、issuer keyring和process-local continuity test backend（不是E0），TLS与bootstrap output仍经0600私有文件；它不读取production namespace或qualification allowlist，不改变上段production fail-closed，也不构成qualification或GO。
-
-另有唯一显式 `--v2-single-node-self-hosted` 非 production policy：Linux x64 / Node >=22.16 / ext-family filesystem 上，一个 exact-0700 dedicated directory 内的 exact-0600 SQLite owner 以 FULL synchronous、exclusive locking和事务同时实现 opaque credential state-store、co-located monotonic continuity port与稳定 issuer keyring/kid source；CLI 必须显式 listen host/port 和独立 HTTPS advertised origin，并在 activation 前安装 SIGINT/SIGTERM/SIGHUP signal fence。该 owner 只给 canonical Broker shipping/credential/HTTPS/WSS composition 注入窄 port；不复制 credential authority，不修改 `qualifiedRecords`，不伪造 E0，不放宽六项 capabilities，也不回退 v1。machine-id 与 directory device/inode mismatch、第二进程、schema/mode/endpoint mismatch均fail closed；目录复制、旧snapshot/DB restore或替换、import/override、backup/HA/failover/DR被policy禁止且无入口。它的restart测试只证明同目录下credential/continuity/keyring共同持久，使既有Host/Android token在进程重启后仍可验证；co-located continuity仍与credential state同rollback domain，明确不计入E0、G3 external restart/failover/ready-loss或production证据。首次 Host output repair 另只经 hidden `--v2-self-hosted-bootstrap-correlation <attempt-id>` + `--host-bootstrap-output <path>` pair进入 canonical admin publication owner：credential authority把profile、Broker-generated selector、TTL、correlation与encrypted exact response-loss record同 verifier 原子commit，sink成功后再以私有receipt durable ack；restart只resume同一个token或返回already-acknowledged，mismatch/expiry/uncertainty fail closed，record在bootstrap expiry加既有10分钟replay retention后清理。Dashboard必须持久化并在repair复用同一非敏感attempt-id/path；未提供correlation时既有one-shot mint不变。
+- Node 与 Android 的基础 v2 codec 分别消费相同 golden/invalid fixture，逐字段结果一致。
+- v1 fixture 和既有 v1 codec 不变；四种 client/host dialect 组合证明没有 silent fallback 或业务翻译。
+- 限制在分配、转发或写 ledger 前执行；测试不能只扫描源码形状。
 
 ### B. relay-server / broker
 
@@ -98,24 +78,18 @@ B 内部可以按持久认证控制面、在线目录与 carrier router 三条 l
 
 工作边界：
 
-- credential authority 的 enrollment create/redeem、client/host refresh、host reauthentication 与 host bootstrap API、严格的 B1 `POST /v2/hosts/bootstrap` ingress adapter，以及 B4 四端点 credential HTTPS ingress foundation，均已在隔离模块和专项测试中可调用。B1/B4 只做 credential admission、bounded read、closed decode/mapping并调用 authority 窄 port；它们不构造 authority/native store/server，只由显式default-off activated Broker composition采用；默认CLI不注入且qualified E0/native仍不可用，因此这些流程没有外部生产 HTTP 可达路径，不产生 ready/capability，也不能宣告已经交付。
 - issuer keyring、一次性 client enrollment、host bootstrap、refresh rotation、exact response replay、revoke 和 socket expiry。
-- credential business authority 只经 N0 port 的 T1 injection 使用 native store；broker composition 不接收 storage path，也不拥有 native cleanup。
-- broker/composition拥有`broker-credential.v1` ready-loss生产fence：T1同步撤回credential admission后，必须同步阻止新Upgrade/route/auth-control与既有连接业务frame，再由已实现的 isolated close policy 以 5000ms deadline close，并在到期时 force-destroy；production composition 必须显式采用并接线，external adapter 不选择 public close code 或 deadline。`agent-transcript-lifecycle.v1` authority failure不进入该全局fence。
 - 独立 v1/v2 Upgrade dispatch；twcap2 只形成 v2 auth context，legacy shared secret 只形成 v1 route。
 - brokerEpoch、授权 host 视图、host registration、duplicate/SUPERSEDED 仲裁和 presence。
 - routeId/routeFence、双向 carrier sequence、公平调度、route/carrier backpressure 和结构化 pre-forward error。
-- Broker Host/client WSS ingress 已在 socket 层执行冻结的 4408 handshake deadline（host.hello 5 秒、client.hello 5 秒、host.welcome 10 秒），一次性 token-scoped timer，scheduler 失败 fail closed 为 1013；Broker 侧 `host.auth_expiring`（carrier control）与 client 侧 `auth.expiring`（broker control event，不占 host eventSeq）已由同一 deadline owner 按到期前 60 秒 lead 对每个 credential 各发一次，`refreshRecommendedAtMs` 恒为 `expiresAtMs - 300_000`；wire 未变。
 
 验收：
 
 - exchange/bootstrap/refresh 的 ACK 丢失在 retention 内精确重放同一 credential；secret 只轮换一次且不进入 URL、日志或普通业务帧。
-- response replay-key rotation 的同 rotationId 重试只产生一个 active key；新 record exact 绑定 active key id，旧 key 仅在其全部 record 原 TTL 到期后移除。旧单 key state/ciphertext 不在读取时重加密或延长 TTL，unknown key、AEAD failure 和 malformed keyring 均撤回 authority 而不是 replay miss。
 - revoke、expiry、kid removal 和 role/host mismatch 在规定 commit point 后阻止新 Upgrade/帧并关闭已有连接。
 - `host.registered` 前不发布 online；同 hostInstanceId 拒绝 newcomer，不同 instance 原子 supersede loser且无中间 offline。
 - 旧 connectorId、routeFence 或 sequence 不能影响 winner；1 MiB route、16 MiB carrier和 frame-count 上限 fail closed且不饿死控制消息。
 - broker 不产生 command status/result、不保存 Session/ledger/eventSeq/ring，也不翻译 v1/v2 payload。
-
 
 ### H0. relay-host 事务状态与进程谱系
 
@@ -142,7 +116,6 @@ H1 在 H0 的事务接口上独立实现 ledger/executor；底层 mutation 继�
 - expectedHostEpoch、严格 schema、request fingerprint、dedupe window、principal-scoped ledger和 query。
 - `create_worktree`、`create_terminal`、`send_agent_message`、`kill_session` 四类固定 operation。
 - ACCEPTED/RUNNING/SUCCEEDED/FAILED/IN_DOUBT、24 小时结果和 7 天 tombstone。
-- canonical structured mutation process adapter 已实现 command executor 的 `process` port：每次 execute 经 config foundation queryPort 的 live target generation 重解析 local/SSH target authority，严格 `tw rpc-v2` argv、byte/timeout 上限与 exact outcome，retired generation fail closed；但仍无 production 构造/注入 callsite。create target 的 target-side catalog observation/revision/fence 现已交付为显式 default-off foundation：companion ABI `contracts/tw-rpc/create-target-observation-v1`（独立 version、不扩展 frozen TW RPC v2、无 fallback）定义 observe/admit 两阶段，target 侧 `tw create-target-observation-v1` entrypoint 在 admit 时同进程现场重新观察并 exact 比较 revision/arguments/闭集 execution——revision 覆盖 config project、canonical realpath、canonical git-dir/common-dir identity digest 与 exact resolved base-ref OID，观察输入闭集内的漂移（含 OID/identity 漂移）零副作用 `OBSERVATION_STALE`，已证明边界为 observe→admit 间 target 侧 reobserve exact 比较，残余仅为 reobserve→mutation 间不可约本地 TOCTOU；Relay 侧 observation authority/store 保留在独立 authority module，由 admission 模块的 pair issuer 构造唯一实例并封入 record；claim wrapper、admission adapter 与 pair registry 共置 admission 模块，两个组件是模块私有 class，无公开 constructor 或 registry opener；唯一入口 `issueRelayV2CanonicalCreateTargetExecutionPairV1({ owner, runner, inner, ... })` 对所有 options 做一次 exact own-data 捕获（accessor/Proxy/symbol/多余 key 同步 fail closed）后打开 owner 的 same-owner bundle、构造唯一 observation store，并只返回 frozen null-prototype 空 ticket；私有 wrapper 与私有 adapter 延迟到一次性 H1 factory 内构造（base non-create process 在签发时封入），组件不可取得、hybrid 不可表达。Host canonical composition 以唯一 `createTargetExecutionPair` option 接收 ticket，在 hostState.read/H2/任何 lookup 前经 `captureRelayV2CanonicalCreateTargetH1FactoryV1` 同步 exactly-once capture（foreign/复制/replay 在该处 fail closed），所得一次性 lexical closure 被调用时对 input 做一次 exact own-data 捕获、装配 command target resolver/executor 并直接 openRecoveredAuthority，只返回 opaque readiness candidate；evidence 携带 catalogRevision，fence 同步一次性消费，admitted store 以不碰撞 opaque authority token 为唯一键（token 保留 per-实例唯一 digest 输入）、按逐-evidence exact identity（operation/arguments/闭集 execution 与携带 fenced command fingerprint 的 reservationCorrelation）恰一次消费，相同 execution 的并发 evidence 各自独立成行，create_terminal 的 admitted arguments 与 executor mutation 共享同一 exact canonical 形式（canonical cwd + derived label)；未接 production composition，无 capability advertisement 与 qualified 真实设备证据。dedupe window lifetime 已收敛为 H1 command plane 独占的固定策略：accept 窗口固定 15 分钟，`queryUntilMs` 固定覆盖 accept 截止后 `commandDedupeRetentionMs`（7 天），完整 result 保留 24 小时后压缩为 tombstone 至第 7 天；调用方不能注入其他 accept/query 期限。
 
 验收：
 
@@ -155,13 +128,10 @@ H1 在 H0 的事务接口上独立实现 ledger/executor；底层 mutation 继�
 
 H2 使用现有 local/SSH discovery 作为查询 adapter，但以 H0 materialized state 为网络权威；不能在 snapshot request 中临时扫描并拼接事实。
 
-本计划只定义 H2 工作边界与验收状态，不作为当前交付事实来源；当前实现与运行边界统一引用 [`README.md`](../README.md) 和 [`ARCHITECTURE.md`](../ARCHITECTURE.md)。在 `relay-host`/wire/G2 composition 与 capability gate 完成前，本工作包的 foundation 验收不得被解释为 runtime capability 已交付。
-
 工作边界：
 
 - scope/session materialization、完整与 partial reconciliation、per-dimension revision 和 host eventSeq。
 - hello barrier、`scopes/sessions.snapshot` convenience API、pinned `state.snapshot` spool、cursor/digest/quota/release。
-- H2 spool 已有 one-shot materialized bootstrap port：零 recovered pinned cut 时由同一 materialized owner 的 authoritative reconcile 捕获 fresh cut-source candidate 并复用同一 private canonical pair 完成 activation；任何 active cut/reservation/in-flight build 或已签发过时返回 null，与 recovered-candidate 路径结构性互斥。release/expiry tombstone 只保留 snapshot request replay fence，不作为 readiness authority，也不阻断 clean process restart 从当前 exact materialized cut 重建 H2。仍属 default-off composition，不产生 capability。
 
 验收：
 
@@ -173,8 +143,6 @@ H2 使用现有 local/SSH discovery 作为查询 adapter，但以 H0 materialize
 ### H3. relay-host terminal manager
 
 H3 是 process-scoped terminal authority，复用现有 local/SSH byte transport和 terminal-control single writer，但不复用 v1 stream map、stream ID或 lease identity。
-
-existing terminal-control protocol adapter现由canonical default-off Host composition采用。它只接受显式注入的 bounded request port，把 H3 acquire/renew/release/continuity/input/resize 翻译为现有 closed request；lease、operation 和 backend side-effect 事实仍由 `src/terminalControl/authority.ts` 独占。adapter 自身不 auto-start daemon、不重发 input/resize、不保存平行状态，也没有 direct tmux fallback；显式 `--profile v2` 的 trusted deployment source 在打开 runtime bundle 前另行复用 terminal-control client 与既有 daemon lifecycle，确保 canonical daemon/exact sibling ingress ready，Host 不复制 daemon authority/single-writer。`relayHost run()` 的 CLI/public production activation 只经该显式选路进入唯一 trusted source 与 default-off shipping root，任一 prerequisite 失败均 fail closed，默认 v1 路径不变；readiness → one-shot pre-carrier claim → host.hello 的 capability advertisement 链已 default-off 闭合；canonical composition已闭合H0/H1/H2/H3与carrier owner，因此该 foundation 不改变本工作包或 G2 的未完成状态。Node terminal manager 已修正 durable mode=new open 重试在 `stream_lost` reset 中丢失 `replayFromOffset` correlation 的缺陷（`new`/`resumed` 均携带 durable offset，仅 `reset` 为 null）；terminal byte plane 仍只有注入的 byte-backend port，Relay byte-plane production atomic byte observation owner/ABI 仍未交付；local terminal-control 侧已交付 process-local exact read observation owner/ABI（`src/terminalControl/authority.ts`：claim 同步单消费，canonical lock 内重新 inspect live backend、重验 target record 与 incarnation proof、prepareOutput 并登记 observer 后返回 controlEpoch/outputGeneration/outputCursor；observer 活跃时最后 interactive release 回 FREE 但不 reset output generation，stale observer 被 retire 而不抑制后续 release 的 deferred reset，observer close 先完成 reset/持久化再注销、失败保留可重试；remote exact compound 以 `observe`/`tail`/幂等 `close-observe` 帧在同一 canonical child 贯穿观察与后续 lease lifecycle，adapter close 按 rollback-claim→close-observation 顺序 drain，不引入 generic request port，也不复制 ring/tmux）。host 侧 default-off canonical composition 另已在未注入 byte-backend 时默认装配 exact-observation byte plane（open 只把 admitted claim 原子消费为只读 observation 并从其 outputCursor tail，首个 input 经 lazy lease 在同一 compound channel 重 prepare→fence→consume，release 后回 observing 继续 tail，cleanup 经可重试 barrier、失败留存 fenced record 由 adapter.close() 重 drain 并上抛）；这只是 host-side internal 装配事实，不改变本工作包或 G2 的未完成状态。
 
 工作边界：
 
@@ -188,23 +156,21 @@ existing terminal-control protocol adapter现由canonical default-off Host compo
 - input/resize 只在 backend/controller 接受后累计 ACK；generation 改变时未 ACK input为不确定且不写入新 PTY。
 - 4 MiB/stream、64 MiB/host、512 KiB credit、120 秒 lease及 control-record 上限在压力下有界；hostInstanceId 改变必须 reset。
 
-Host侧另有reference-only production profile store与显式default-off privileged intake：intake可消费 outer owner 已读并冻结的 exact profile snapshot、外部已拥有的atomic cell与可选privileged byte source，构造同一Vault/credential authority/HTTPS coordinator并打开canonical Host composition。显式 default-off 的 Host shipping root（`src/relay/v2/hostShippingRoot.ts`）现已把该链路与已启动的 materialized reconcile lifecycle owner（startup scan 即首轮 authoritative reconcile）、单一 opaque one-shot create target execution pair、canonical H0–H3 composition 与同 lineage 的 reauthentication lifecycle owner 闭合为单一 owner。唯一 Host trusted deployment activation/source（`src/relay/v2/hostShippingDeploymentSource.ts`）单次读取并冻结 exact profile，把同一 profile/Host lineage、revision-7 trusted native loader/source、canonical runtime bundle 与 HTTPS/WSS 两条独立 TLS trust cut 纳入一个 opaque one-shot activation/rollback closure；调用方不能拆分或替换 authority，失败逆序 drain 且不回退 v1。`relay-host --profile v2` 只经该 source 打开 root，并由独立进程生命周期 owner 持有同一 shipping handle：完成初始 start，retryable offline 以 capped backoff 和同一 hostInstanceId 重连，`SUPERSEDED` 永久停止，signal/失败/superseded 均执行 exact `stopAndDrain` 后 `closeAndDrain`；默认 v1 路径不变。首次Host可加v2-only `--bootstrap-secret-input <path>`；trusted source fd-bound验证owner/regular/single-link/exact 0600/bounded文件并把唯一Readable传入既有source→handoff→Vault，所有失败/abort/close关闭fd，不自动删文件、不建立第二credential owner。成功bootstrap后同一profile/Vault持久化credential，后续无input启动及same-lineage Dashboard management复用该owner。Host `qualifiedRecords=[]`，qualification/recovery与真实 TLS/device 证据仍缺失，所以 qualified intake/socket、capability/readiness 宣称仍不可达，default-off 与整体 NO-GO 不变。
-
 ### D. macOS Dashboard
 
-Dashboard 与 B/H 并行开发 domain state、fake backend和 UI；只有真实 enrollment/credential 操作进入 Tauri/bundled `tw` adapter，React 不直接持有 secret或 WebSocket。 当前 default-off canonical Host production composition 已在 facade 发布前依次激活 H0/H3，并可选唯一拥有同 lineage 的 protocol-v2 Dashboard management session，省略配置时 facade 不变；Tauri bundled management supervisor 的 production expected protocol 已固定为 v2，v1 ready 或其他 mismatch 均 fail closed 且无 fallback。hidden Node child现固定使用exact protocol v2，并只把自身stdio IO、runtimeVersion、clock与同一个signal交给唯一Host trusted deployment opener；该opener在child进程内打开一个explicit-v2 root，把这些输入经既有`dashboardManagement` seam交给same-lineage credential/controller/carrier composition。child不接受raw deployment/runtime inputs，也不采用独立`relay-host --profile v2`的auto-start/retry process lifecycle；`start_connector`和`enrollment.create`只经同一management session进入现有owner，结束时先drain session/controller再关闭root。activation/qualification/owner/cleanup缺口仍收敛到唯一typed `UNAVAILABLE`或ordinary failure，绝不启动第二session或v1 fallback。Host `qualifiedRecords=[]`与E0/真实TLS/device证据仍缺失，因此当前Dashboard management和Relay v2整体继续NO-GO，且没有新增qualification、TLS、真实设备或签名证据。
+Dashboard 与 B/H 并行开发 domain state、fake backend和 UI；只有真实 enrollment/credential 操作进入 Tauri/bundled `tw` adapter，React 不直接持有 secret或 WebSocket。
 
 工作边界：
 
 - 明确区分 v1 shared-secret profile 与 v2 host/client credential状态，不原地升级或共用字段。
 - host bootstrap/refresh 状态、connector registration/capability，以及 client enrollment create和已知 grant revoke；基础契约没有设备枚举 API，不从本地记录伪造设备列表。
-- v2 enrollment review信息、原生QR/一次性链接显式转交流程、过期/撤销/重建流程，以及 SUPERSEDED 退出码 78 的进程编排。
-- broker issuer/bootstrap、host credential、enrollment attempt和grant状态由 Node 本地管理接口持有；Tauri只编排，不能另建issuer、keyring或credential owner。Node protocol-v2 authority/session与same-lineage Host credential/connector adapters已由可选canonical Host composition闭合；renderer/model仍使用fake；bundled child已通过唯一trusted opener接到同一Host root，但当前qualification为空，仍只返回`UNAVAILABLE`。
+- v2 QR review信息、过期/撤销/重建流程，以及 SUPERSEDED 退出码 78 的进程编排。
+- broker issuer/bootstrap、host credential、enrollment attempt和grant状态由 Node 本地管理接口持有；Tauri只编排，不能另建issuer、keyring或credential owner。真实adapter等待该接口，renderer/model使用fake并行开发。
 
 验收：
 
 - connector 未 `host.registered` 或基础能力不完整时，不生成 v2 enrollment、不显示可用二维码。
-- QR/一次性链接只含一次性 enrollment code，不含 access/refresh token；renderer仅持有opaque artifact handle，显式native copy不回传值，敏感值不进日志、clipboard telemetry或普通持久状态。
+- QR 只含一次性 enrollment code，不含 access/refresh token；敏感值不进日志、clipboard telemetry或普通持久状态。
 - host bootstrap secret不经过命令参数、环境变量或renderer IPC，只能使用Node接口定义的stdin/0600 handoff；Dashboard持久层只保存非敏感endpoint、credential kind和credential reference。
 - v1 配对继续走原 shared-secret路径；v2 失败只给可执行错误，不降级、覆盖或旋转 v1 profile。
 - Tauri、fake/preview backend、domain types和 platform boundary 同步；进程替换、重启和 revoke由可观察行为测试覆盖。
@@ -214,8 +180,6 @@ Dashboard 与 B/H 并行开发 domain state、fake backend和 UI；只有真实 
 ### A. Android v2 client
 
 Android 的 profile/credential、codec/actor、Room state、Outbox、terminal和 UI 可以按六条 lane 并行。它们使用独立 v2 interfaces和 fake actor events集成；`RelayV1ConnectionActor`、v1 codec、v1 Room identity和升级 shim保持原样。
-
-当前admitted explicit-v2 base runtime已接Room state/Outbox、bounded WSS、`host.presence`/`hosts.snapshot`恢复、durable terminal journal/parser/actor/Compose链路，以及被空optional capability关闭的Agent/notification owner。`auth.expiring` exact rollover已接入。本地 admitted-v2 用户驱动的 self-revoke quarantine/confirmed cleanup saga 已闭合但仍default-off；没有真实TLS/device/qualification/signing/release证据，因而不构成production availability或GO。这些事实不改变默认shipping v1、capability default-off、真实TLS/device/signing/release缺失与整体NO-GO。
 
 工作边界：
 
@@ -255,8 +219,14 @@ X 的 contract/authority spike 与基础 v2 并行，不阻塞 C/B/H/A。它使�
 - 手机发送状态来自 command ledger，Agent处理/回复状态来自 extension event，两者在UI和存储中不互相覆盖。
 - 不支持结构化事件的 Agent仍可使用基础 session/terminal能力，但 transcript/lifecycle明确不可用。
 - Node/Android分别消费独立 extension fixture；未协商时双方不发送未知frame，extension失败不破坏基础 v2 route。
-- external Agent namespace故障注入必须覆盖existing store mapping的三组输入与`agentAuthorityError=AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE|COMMIT_UNCERTAIN|CORRUPT`输出，并只隔离extension；unavailable case保留timeline/cache lineage且next action仅repair/reopen，独立corrupt case才允许reset/new epoch。基础credential readiness、Upgrade/route、command与terminal继续，既有基础v2 connection不因extension failure全局close。
 - 通知去重、权限拒绝、锁屏内容策略和 profile切换隔离有Android行为证据；离线 push只有完成独立安全/后台验收后才可宣告。
+
+### Descoped 工作包
+
+以下工作包已 descope，不在当前 v2 交付范围内：
+
+- **N. broker/host credential native state-store crates**：9 个原生 Rust crates（broker credential state-store 与 host credential atomic file cell 的 core/napi/platform-common/platform-darwin/platform-linux）。理由：在六项基础能力通过互操作之前过早进行 durability 工程；保持聚焦于功能交付。JS loader 在原生 artifact 缺失时返回 `"missing"` 并回退到非原生路径。
+- **E0. external continuity authority**：外部 HTTPS continuity backend/adapter、node attempt provider、config、opener。理由：同上——在基础互操作通过前不引入外部 durability 依赖。`continuityAnchor.ts` 核心保留，仅移除外部 authority。
 
 ### R. 生产与发布
 
@@ -275,13 +245,14 @@ R 可以提前准备 TLS、签名、升级矩阵和可观测性，但不能替�
 
 | Gate | 必须先完成 | Gate 通过的证据 | Gate 前禁止事项 |
 | --- | --- | --- | --- |
+| G0：contract conformance | C 的基础 fixture/invalid vectors稳定，相关 owner确认无契约歧义 | Node/Android codec golden；v1 fixture无变化 | 不因单端 parser可用宣告 v2 |
 | G1：broker↔host carrier | B 的 auth/directory/router与 H 的 carrier actor各自 simulator验收 | host register、route fencing、reauth、supersede、backpressure隔离联调 | 不接真实Android，不生成client enrollment |
 | G2：host基础集合 | G1；H0/H1/H2/H3各自验收并经同一 host route集成 | command query、gap snapshot、terminal resume和crash/pressure故障注入 | 不宣告六项requiredCapabilities中的任何子集 |
-| G3：端到端基础 v2 | G1-G2、D和A完成；E0 production choices/backend/injection/fence通过验收；共享 codec conformance baseline持续通过；single-node co-located policy 不计作 E0 | broker↔host↔Android真实WSS或等价隔离环境；五种hello、命令、snapshot、terminal、refresh/revoke、external restart/failover/ready-loss全链路 | 不默认启用v2配对，不替换v1 profile |
-| G4：Agent extension | G3；X contract、host authority/store和Android consumer完成 | transcript/lifecycle重放、断线、去重、unsupported Agent、通知及external Agent namespace failure隔离跨端验收 | 不宣告Agent reply/state/notification capability |
+| G3：端到端基础 v2 | G0-G2、D和A完成 | broker↔host↔Android真实WSS或等价隔离环境；五种hello、命令、snapshot、terminal、refresh/revoke全链路 | 不默认启用v2配对，不替换v1 profile |
+| G4：Agent extension | G3；X contract、host authority/store和Android consumer完成 | transcript/lifecycle重放、断线、去重、unsupported Agent和通知行为跨端验收 | 不宣告Agent reply/state/notification capability |
 | G5：生产发布 | G3；若发布X则还需G4；并完成R | 已签名构建、真实设备升级、受信TLS、凭证与恢复检查 | 不把build、unsigned APK或模拟器结果称为发布 |
 
-G1-G2 通过前可以继续并行开发和 simulator验证，但能力开放必须原子：基础六项只在 G2/G3 集成证明完整时一起提供。任何 auth、dialect、schema、capability或 continuity失败都不得进入 v1 fallback；共享 codec conformance baseline 在每个 gate 都是必跑回归，而不是新的串行工作包。
+G0-G2 通过前可以继续并行开发和 simulator验证，但能力开放必须原子：基础六项只在 G2/G3 集成证明完整时一起提供。任何 auth、dialect、schema、capability或 continuity失败都不得进入 v1 fallback。
 
 ## 计划维护与旧内容清理
 
