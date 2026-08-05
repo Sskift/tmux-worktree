@@ -202,11 +202,26 @@ function decodedCarrier(bytes) {
   return codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
 }
 
+function createPreCarrierOfferClaim() {
+  const owner = new carrierModule.RelayV2HostCapabilityReadiness();
+  for (const source of carrierModule.RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES) {
+    if (source === "carrier") continue;
+    owner.source(source).apply({ source, generation: "1", ready: true });
+  }
+  const fence = Object.freeze({ bind: () => true, fence() {} });
+  return owner.issuePreCarrierOffer(Object.freeze({
+    controllerGeneration: "1",
+    carrierAttemptGeneration: "1",
+    fence,
+  }));
+}
+
 function createHarness(options = {}) {
   const scheduler = options.scheduler ?? new ManualScheduler();
   const hostEpoch = options.hostEpoch ?? randomUUID();
   const broker = options.broker ?? new brokerModule.RelayV2BrokerCore({
     now: () => scheduler.now,
+    baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
     ...options.brokerOptions,
   });
   const statusObservations = [];
@@ -221,7 +236,7 @@ function createHarness(options = {}) {
     hostEpoch,
     hostInstanceId: options.hostInstanceId ?? randomUUID(),
     credentialReferences: new FakeCredentials(),
-    advertisedCapabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+    preCarrierOfferClaim: createPreCarrierOfferClaim(),
     clientDialects: ["tw-relay.v2"],
     clock: options.hostClock ?? (() => scheduler.now),
     schedule: options.hostSchedule ?? scheduler.schedule,
@@ -290,7 +305,10 @@ function createProducerHarness(options = {}) {
   let harness;
   const composition = clientTransportModule
     .createRelayV2BrokerClientSocketTransportComposition({
-      brokerOptions: { now: () => scheduler.now },
+      brokerOptions: {
+        now: () => scheduler.now,
+        baseCapabilityReadiness: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
+      },
       producerRegistry,
       resolveHostProducerBinding() {
         return harness?.pump.producerComposition?.binding;
@@ -1017,6 +1035,19 @@ async function openRoute(harness, connectionId) {
   assert.equal(harness.brokerActions.some((action) => (
     action.kind === "route_opened" && action.connectionId === connectionId
   )), true);
+  // The broker emits relay.welcome as the first client-visible frame after a
+  // route opens. Drain and acknowledge it so subsequent drainClient calls
+  // return host data and the welcome bytes don't count toward route pressure.
+  const welcome = harness.broker.drainClient(connectionId, { maxFrames: 1 });
+  if (welcome.length === 1) {
+    assert.equal(
+      codec.decodeRelayV2WebSocketFrame("public", welcome[0].bytes).frame.type,
+      "relay.welcome",
+    );
+    harness.pump.acceptBrokerResult(
+      harness.broker.acknowledgeClientDelivery(connectionId, welcome[0].deliveryId),
+    );
+  }
   return binding;
 }
 
@@ -1251,6 +1282,17 @@ test("registration commit, response retry, exact bidirectional bytes, ACKs and u
   assert.equal(h.brokerActions.some((action) => (
     action.kind === "route_opened" && action.connectionId === "client-main"
   )), true);
+
+  // Drain the broker-emitted relay.welcome so the next drainClient returns host data.
+  const welcomeDelivery = h.broker.drainClient("client-main", { maxFrames: 1 });
+  assert.equal(welcomeDelivery.length, 1);
+  assert.equal(
+    codec.decodeRelayV2WebSocketFrame("public", welcomeDelivery[0].bytes).frame.type,
+    "relay.welcome",
+  );
+  h.pump.acceptBrokerResult(
+    h.broker.acknowledgeClientDelivery("client-main", welcomeDelivery[0].deliveryId),
+  );
 
   const binding = h.bound[0];
   const clientBytes = publicClientFrame("client-to-host-exact");
