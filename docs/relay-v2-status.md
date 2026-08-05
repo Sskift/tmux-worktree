@@ -38,7 +38,7 @@ JS loader（`hostCredentialNativeLoader.ts`、`brokerCredentialStateStoreLoader.
 
 理由：同上——在基础互操作通过前不引入外部 durability 依赖。
 
-`continuityAnchor.ts` 仍保留（被 `brokerCredentialAuthority.ts` 核心导入）；仅移除外部 HTTPS adapter、node attempt provider、config、opener。
+`continuityAnchor.ts` 仍保留（被 `brokerCredentialAuthority.ts` 核心导入）。外部 HTTPS adapter、node attempt provider、config、opener 模块（`externalContinuityAuthorityConfig.ts`、`externalContinuityAuthorityHttpsAdapter.ts`、`externalContinuityAuthorityNodeAttemptProvider.ts`、`brokerCredentialExternalContinuityOpener.ts`）仍存在于源码中，但已 descope，不得用于 production activation。这些模块与 broker composition/shipping 层（`brokerServerRuntime.ts`、`brokerShippingRoot.ts`、`brokerShippingDeploymentSource.ts`、`brokerLocalDevelopmentActivation.ts`）深度集成（约 95 处引用），本轮未移除代码以避免破坏 composition 层构建；后续轮次在基础互操作通过后再统一清理。
 
 ## 非 production deployment policy
 
