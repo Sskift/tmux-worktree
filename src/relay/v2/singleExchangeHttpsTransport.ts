@@ -552,7 +552,9 @@ export function createRelayV2HostCaOnlySingleExchangeNodeHttpsTransport(
     throw new TypeError("Relay v2 Host TLS trust authority is invalid");
   }
   const captured: MutableCapturedTlsOptions = OBJECT_CREATE(null);
-  captured.ca = tlsTrust.certificateAuthorities;
+  captured.ca = tlsTrust.certificateAuthorities.map((entry) =>
+    typeof entry === "string" ? entry : BUFFER_CONSTRUCTOR.from(entry),
+  );
   return createCapturedRelayV2SingleExchangeNodeHttpsTransport(
     NODE_HTTPS_REQUEST,
     OBJECT_FREEZE(captured),

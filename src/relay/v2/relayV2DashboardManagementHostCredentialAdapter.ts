@@ -423,7 +423,8 @@ implements RelayV2DashboardManagementCredentialPort {
         return operationFailure("BUSY");
       }
       if (inspection !== null && inspection.credentialVersion !== "0") {
-        return operationFailure("NOT_READY");
+        // Already bootstrapped - idempotent success.
+        return;
       }
       const attemptId = pending?.attemptId ?? requestedAttemptId;
       const oldSecretReference = pending?.oldSecretReference
