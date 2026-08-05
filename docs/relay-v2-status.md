@@ -18,10 +18,10 @@
 ## 已通过
 
 - **G2（Node↔Node 端到端互操作）已于 2026-08-05 通过**：`scripts/relay-v2-interop.mjs` 以真实 broker + 真实 host + 真实 WSS/TLS 走完 bootstrap → enrollment → 握手协商 → command ledger/query（真实 create_terminal）→ snapshot revision → event sequence → 结构化错误表 → 断线重连 terminal resume（无字节丢失），7/7 通过。该 runner 是 G2 的可重跑证据。
+- **G3（Android↔Node 端到端互操作）已于 2026-08-06 通过**：`scripts/relay-v2-interop-g3.mjs` 起真实 broker + 真实 host（真实 WSS/TLS），写凭证交接 JSON，驱动 `./gradlew :app:testDebugUnitTest --tests …RelayV2G3InteropTest`——由**真实 Android 客户端运行时**（`RelayV2BaseRuntimeComposition` + codec + connection actor + state-sync/outbox，OkHttp/TLS 纯 JVM）连 wss 完成握手协商 → 六项能力全部真实断言 → command ledger/query（真实 create_terminal，opaque sessionId）→ snapshot revision → event sequence → terminal.stream.resume.v1（host 在真实 terminal.open 往返后签发 durable resume 凭证并被运行时安装）→ error.structured.v1（对已死 session 重复 kill，host 返回错误表内 FINAL 结构化错误，outbox 落 FAILED_FINAL），8/8 通过。该 runner 是 G3 的可重跑证据。
 
 ## 未实现 / NO-GO
 
-- G3（Android↔Node 端到端互操作）未通过。
 - production v2 仍为 NO-GO：qualified E0/native durability/public TLS/network/device/signing/release 与 shipping activation 证据缺失（单机自托管 lane 按契约 §10.19(a) 分级豁免 E0）。
 - 默认 Dashboard shipping 与 `relay-server`/`relay-host` CLI 路径仍只运行 Relay v1。
 - 任何一端都不得仅凭本文、fixture、codec 或隔离 composition 存在而发布 v2 capability、生成可用 v2 配对二维码或把 v1 credential 当作 v2 credential。

@@ -45,6 +45,27 @@ android {
             rootProject.file("../../contracts/relay").absolutePath,
         )
     }
+
+    testOptions {
+        unitTests.all { test ->
+            val handoff = (project.findProperty("g3.handoff.path") as String?)
+                ?: System.getProperty("g3.handoff.path")
+            val result = (project.findProperty("g3.result.path") as String?)
+                ?: System.getProperty("g3.result.path")
+            if (handoff != null && result != null) {
+                test.systemProperty("g3.handoff.path", handoff)
+                test.systemProperty("g3.result.path", result)
+                test.testLogging {
+                    showStandardStreams = true
+                    events("started", "passed", "failed", "skipped")
+                }
+            } else {
+                // The G3 interop test requires a live broker/host handoff file;
+                // exclude it from plain unit-test runs.
+                test.exclude("**/RelayV2G3InteropTest*")
+            }
+        }
+    }
 }
 
 kapt {
