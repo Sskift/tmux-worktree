@@ -103,6 +103,8 @@ fun SessionDetailScreen(
     autoFocusReply: Boolean = false,
     agentStateAvailable: Boolean = true,
     onCancelMessage: (TimelineEvent) -> Unit = {},
+    agentChatAvailable: Boolean = false,
+    onOpenChat: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var showAttachmentNotice by rememberSaveable { mutableStateOf(false) }
@@ -140,6 +142,8 @@ fun SessionDetailScreen(
                 session = session,
                 agentStateAvailable = agentStateAvailable,
                 onOpenTerminal = onOpenTerminal,
+                agentChatAvailable = agentChatAvailable,
+                onOpenChat = onOpenChat,
             )
             when (timelineState.agentEvidenceAvailability) {
                 AgentEvidenceAvailability.AVAILABLE -> Unit
@@ -277,6 +281,8 @@ private fun SessionSummary(
     session: RelaySession,
     agentStateAvailable: Boolean,
     onOpenTerminal: () -> Unit,
+    agentChatAvailable: Boolean,
+    onOpenChat: () -> Unit,
 ) {
     val visual = session.agentState.visual()
     val statusLabel = if (agentStateAvailable) visual.label else "Agent state unavailable"
@@ -291,7 +297,7 @@ private fun SessionSummary(
             .fillMaxWidth()
             .padding(start = 20.dp, top = 4.dp, end = 20.dp, bottom = 16.dp),
     ) {
-        Column(modifier = Modifier.padding(end = 144.dp)) {
+        Column(modifier = Modifier.padding(end = if (agentChatAvailable) 280.dp else 144.dp)) {
             Row(
                 modifier = Modifier
                     .testTag("session_semantic_status")
@@ -324,29 +330,58 @@ private fun SessionSummary(
                     .testTag("session_metadata"),
             )
         }
-        OutlinedButton(
-            onClick = onOpenTerminal,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .width(132.dp)
-                .height(48.dp)
-                .testTag("open_terminal"),
-            shape = RoundedCornerShape(12.dp),
-            border = BorderStroke(1.dp, TwAccent),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
-            contentPadding = PaddingValues(horizontal = 4.dp),
+        Row(
+            modifier = Modifier.align(Alignment.BottomEnd),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Icon(
-                imageVector = Icons.Outlined.Terminal,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = "Open terminal",
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-            )
+            if (agentChatAvailable) {
+                OutlinedButton(
+                    onClick = onOpenChat,
+                    modifier = Modifier
+                        .width(132.dp)
+                        .height(48.dp)
+                        .testTag("open_chat"),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, TwAccent),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
+                    contentPadding = PaddingValues(horizontal = 4.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.ChatBubbleOutline,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "Chat",
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                    )
+                }
+            }
+            OutlinedButton(
+                onClick = onOpenTerminal,
+                modifier = Modifier
+                    .width(132.dp)
+                    .height(48.dp)
+                    .testTag("open_terminal"),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, TwAccent),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
+                contentPadding = PaddingValues(horizontal = 4.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Terminal,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = "Open terminal",
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                )
+            }
         }
     }
 }
@@ -793,6 +828,8 @@ private fun SessionDetailScreenPreview() {
             onOpenTerminal = {},
             onOverflowClick = {},
             onSend = {},
+            agentChatAvailable = true,
+            onOpenChat = {},
         )
     }
 }

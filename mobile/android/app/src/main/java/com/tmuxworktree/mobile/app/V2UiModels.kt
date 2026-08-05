@@ -113,6 +113,11 @@ data class V2UiState(
 
     fun session(stableId: String): RelaySession? = sessions.firstOrNull { it.stableId == stableId }
 
+    fun agentChatAvailable(session: RelaySession): Boolean {
+        val host = hosts.firstOrNull { it.hostId == session.hostId }
+        return host?.capabilities?.contains("agent-chat-v1") == true
+    }
+
     // State may be captured by a crash reporter or debugger through toString().
     // Never include the in-memory review token or the unvalidated imported URL.
     override fun toString(): String =
