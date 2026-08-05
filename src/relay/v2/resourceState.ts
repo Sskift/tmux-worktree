@@ -984,6 +984,25 @@ function resolverCutIsCurrent(cut: RelayV2ResourceResolverDiscoveryCut): boolean
   }
 }
 
+function canonicalResolverUnavailable(): RelayV2MaterializedStateError {
+  return new RelayV2MaterializedStateError(
+    "CAPABILITY_UNAVAILABLE",
+    "canonical target resolver has no current complete discovery cut",
+  );
+}
+
+function canonicalResolverMiss(
+  miss: "CAPABILITY_UNAVAILABLE" | "SCOPE_NOT_FOUND" | "SESSION_NOT_FOUND",
+): RelayV2MaterializedStateError {
+  if (miss === "CAPABILITY_UNAVAILABLE") return canonicalResolverUnavailable();
+  return new RelayV2MaterializedStateError(
+    miss,
+    miss === "SCOPE_NOT_FOUND"
+      ? "Scope is absent from the complete canonical resolver cut"
+      : "Session is absent from the complete canonical resolver cut",
+  );
+}
+
 function validateScope(value: unknown): asserts value is RelayV2Scope {
   if (!isRecord(value) || !exactKeys(value, [
     "scopeId", "displayName", "kind", "reachability",
@@ -3729,26 +3748,32 @@ export class RelayV2MaterializedStateFoundation {
     expectedHostEpoch: string,
   ): Promise<RelayV2CanonicalResourceResolverToken> {
     validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
-    return this.store.serialize((section) => {
+    // Resolver unavailability is a benign transient (a discovery scan is in
+    // flight); throwing inside the store critical section would invalidate
+    // every H0 readiness proof and tear down the carrier.
+    const token = await this.store.serialize((section) => {
       const snapshot = section.read();
       this.observeLineage(snapshot);
       assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
       const state = parseMaterializedState(snapshot);
-      const publication = this.requireCanonicalResolver(snapshot, state);
-      return clone(publication.token);
+      const publication = this.currentCanonicalResolver(snapshot, state);
+      return publication === null ? null : clone(publication.token);
     });
+    if (token === null) throw canonicalResolverUnavailable();
+    return token;
   }
 
   private async captureCanonicalProcessTargets(
     expectedHostEpoch: string,
   ): Promise<readonly RelayV2ResourceResolverProcessTarget[]> {
     validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
-    return this.store.serialize((section) => {
+    const captured = await this.store.serialize((section) => {
       const snapshot = section.read();
       this.observeLineage(snapshot);
       assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
       const state = parseMaterializedState(snapshot);
-      const publication = this.requireCanonicalResolver(snapshot, state);
+      const publication = this.currentCanonicalResolver(snapshot, state);
+      if (publication === null) return null;
       const targets = new Map<string, RelayV2ResourceResolverProcessTarget>();
       for (const scope of publication.scopes.values()) {
         const target = clone(scope.processTarget);
@@ -3760,6 +3785,8 @@ export class RelayV2MaterializedStateFoundation {
         ))
         .map((target) => Object.freeze(target)));
     });
+    if (captured === null) throw canonicalResolverUnavailable();
+    return captured;
   }
 
   private async resolveCanonicalScopeTarget(
@@ -3768,21 +3795,22 @@ export class RelayV2MaterializedStateFoundation {
   ): Promise<RelayV2CanonicalResolvedScopeTarget> {
     const token = normalizeCanonicalResolverToken(rawToken);
     validateOpaqueInput(scopeId, "scopeId");
-    return this.store.serialize((section) => {
+    // Benign negative lookups must not throw inside the store critical
+    // section: the section's failure path invalidates every H0 readiness
+    // proof, which tears down the whole carrier for a mere unknown id.
+    const outcome = await this.store.serialize((section) => {
       const snapshot = section.read();
       this.observeLineage(snapshot);
       assertExpectedEpoch(token.hostEpoch, snapshot.hostEpoch);
       const state = parseMaterializedState(snapshot);
-      const publication = this.requireCanonicalResolver(snapshot, state, token);
-      const target = publication.scopes.get(scopeId);
-      if (target === undefined) {
-        throw new RelayV2MaterializedStateError(
-          "SCOPE_NOT_FOUND",
-          "Scope is absent from the complete canonical resolver cut",
-        );
-      }
-      return clone(target);
+      const publication = this.currentCanonicalResolver(snapshot, state, token);
+      if (publication === null) return { miss: "CAPABILITY_UNAVAILABLE" } as const;
+      const resolved = publication.scopes.get(scopeId);
+      if (resolved === undefined) return { miss: "SCOPE_NOT_FOUND" } as const;
+      return { target: clone(resolved) };
     });
+    if ("miss" in outcome) throw canonicalResolverMiss(outcome.miss);
+    return outcome.target;
   }
 
   private async resolveCanonicalSessionTarget(
@@ -3793,27 +3821,20 @@ export class RelayV2MaterializedStateFoundation {
     const token = normalizeCanonicalResolverToken(rawToken);
     validateOpaqueInput(scopeId, "scopeId");
     validateOpaqueInput(sessionId, "sessionId");
-    return this.store.serialize((section) => {
+    const outcome = await this.store.serialize((section) => {
       const snapshot = section.read();
       this.observeLineage(snapshot);
       assertExpectedEpoch(token.hostEpoch, snapshot.hostEpoch);
       const state = parseMaterializedState(snapshot);
-      const publication = this.requireCanonicalResolver(snapshot, state, token);
-      if (!publication.scopes.has(scopeId)) {
-        throw new RelayV2MaterializedStateError(
-          "SCOPE_NOT_FOUND",
-          "Scope is absent from the complete canonical resolver cut",
-        );
-      }
+      const publication = this.currentCanonicalResolver(snapshot, state, token);
+      if (publication === null) return { miss: "CAPABILITY_UNAVAILABLE" } as const;
+      if (!publication.scopes.has(scopeId)) return { miss: "SCOPE_NOT_FOUND" } as const;
       const target = publication.sessions.get(`${scopeId}\0${sessionId}`);
-      if (target === undefined) {
-        throw new RelayV2MaterializedStateError(
-          "SESSION_NOT_FOUND",
-          "Session is absent from the complete canonical resolver cut",
-        );
-      }
-      return clone(target);
+      if (target === undefined) return { miss: "SESSION_NOT_FOUND" } as const;
+      return { target: clone(target) };
     });
+    if ("miss" in outcome) throw canonicalResolverMiss(outcome.miss);
+    return outcome.target;
   }
 
   private async resolveCanonicalSessionWorkingDirectory(
@@ -3824,30 +3845,23 @@ export class RelayV2MaterializedStateFoundation {
     const token = normalizeCanonicalResolverToken(rawToken);
     validateOpaqueInput(scopeId, "scopeId");
     validateOpaqueInput(sessionId, "sessionId");
-    return this.store.serialize((section) => {
+    const outcome = await this.store.serialize((section) => {
       const snapshot = section.read();
       this.observeLineage(snapshot);
       assertExpectedEpoch(token.hostEpoch, snapshot.hostEpoch);
-      const publication = this.requireCanonicalResolver(
+      const publication = this.currentCanonicalResolver(
         snapshot,
         parseMaterializedState(snapshot),
         token,
       );
-      if (!publication.scopes.has(scopeId)) {
-        throw new RelayV2MaterializedStateError(
-          "SCOPE_NOT_FOUND",
-          "Scope is absent from the complete canonical resolver cut",
-        );
-      }
+      if (publication === null) return { miss: "CAPABILITY_UNAVAILABLE" } as const;
+      if (!publication.scopes.has(scopeId)) return { miss: "SCOPE_NOT_FOUND" } as const;
       const key = `${scopeId}\0${sessionId}`;
-      if (!publication.sessions.has(key)) {
-        throw new RelayV2MaterializedStateError(
-          "SESSION_NOT_FOUND",
-          "Session is absent from the complete canonical resolver cut",
-        );
-      }
-      return publication.sessionWorkingDirectories.get(key) ?? null;
+      if (!publication.sessions.has(key)) return { miss: "SESSION_NOT_FOUND" } as const;
+      return { workingDirectory: publication.sessionWorkingDirectories.get(key) ?? null };
     });
+    if ("miss" in outcome) throw canonicalResolverMiss(outcome.miss);
+    return outcome.workingDirectory;
   }
 
   private async resolveCanonicalScopeForAdmission(
@@ -3953,6 +3967,17 @@ export class RelayV2MaterializedStateFoundation {
     state: PersistedMaterializedState,
     token?: RelayV2CanonicalResourceResolverToken,
   ): PublishedCanonicalResolver {
+    const publication = this.currentCanonicalResolver(snapshot, state, token);
+    if (publication === null) throw canonicalResolverUnavailable();
+    return publication;
+  }
+
+  /** Null-returning variant safe to call inside a store critical section. */
+  private currentCanonicalResolver(
+    snapshot: RelayV2HostStateSnapshot,
+    state: PersistedMaterializedState,
+    token?: RelayV2CanonicalResourceResolverToken,
+  ): PublishedCanonicalResolver | null {
     const publication = this.publishedCanonicalResolver;
     if (publication === null
       || !resolverCutIsCurrent(publication.discoveryCut)
@@ -3960,10 +3985,7 @@ export class RelayV2MaterializedStateFoundation {
       || publication.token.resourceMappingDigest
         !== canonicalResolverResourceMappingDigest(snapshot.hostEpoch, state)
       || (token !== undefined && !sameJson(token, publication.token))) {
-      throw new RelayV2MaterializedStateError(
-        "CAPABILITY_UNAVAILABLE",
-        "canonical target resolver has no current complete discovery cut",
-      );
+      return null;
     }
     return publication;
   }

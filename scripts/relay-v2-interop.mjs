@@ -389,6 +389,34 @@ console.log("[setup] client handshake complete, hostEpoch:", hostEpoch);
 }
 
 // ---------------------------------------------------------------------------
+// Discover the real (opaque) scope id from the scopes snapshot.
+// ---------------------------------------------------------------------------
+let SCOPE_ID = null;
+{
+  const reqId = "scope-discover-" + Math.random().toString(36).slice(2, 12);
+  clientWs.send(JSON.stringify({
+    protocolVersion: 2,
+    kind: "request",
+    type: "scopes.snapshot.get",
+    requestId: reqId,
+    hostId: HOST_ID,
+    expectedHostEpoch: hostEpoch,
+    payload: {},
+  }));
+  const snap = await new Promise((resolve, reject) => {
+    clientRequests.set(reqId, resolve);
+    setTimeout(() => reject(new Error("scope discovery timeout")), 10000);
+  });
+  const local = snap.payload?.items?.find((s) => s.kind === "local" && s.reachability === "online");
+  if (!local) {
+    console.error("No online local scope in snapshot:", JSON.stringify(snap.payload).slice(0, 500));
+    process.exit(1);
+  }
+  SCOPE_ID = local.scopeId;
+  console.log("[setup] discovered local scope:", SCOPE_ID);
+}
+
+// ---------------------------------------------------------------------------
 // Capability 2: command.ledger.v1 + command.query.v1
 // ---------------------------------------------------------------------------
 let interopSessionId = null;
@@ -405,7 +433,7 @@ let interopSessionId = null;
     commandId,
     hostId: HOST_ID,
     expectedHostEpoch: hostEpoch,
-    scopeId: "scope-local",
+    scopeId: SCOPE_ID,
     payload: {
       dedupeWindowId,
       operation: "create_terminal",
@@ -415,8 +443,8 @@ let interopSessionId = null;
   const status = await new Promise((resolve, reject) => {
     clientRequests.set(requestId, resolve);
     setTimeout(async () => {
-      console.error("Broker log on command.execute timeout:", brokerLog.join("").slice(-3000));
-      console.error("Host stderr on command.execute timeout:", hostLog.join("").slice(-3000));
+      console.error("Broker log on command.execute timeout:", brokerLog.join("").slice(-20000));
+      console.error("Host stderr on command.execute timeout:", hostLog.join("").slice(-20000));
       try {
         const st = await hostRequest("status");
         console.error("Host status on timeout:", JSON.stringify(st.result ?? st.error).slice(0, 1500));
@@ -428,7 +456,7 @@ let interopSessionId = null;
     && (status.payload.state === "accepted" || status.payload.state === "running"
       || status.payload.state === "succeeded" || status.payload.state === "failed");
   record("command.ledger.v1", ledgerOk,
-    ledgerOk ? `state=${status.payload.state}` : `unexpected: ${JSON.stringify(status).slice(0, 200)}`);
+    ledgerOk ? `state=${status.payload.state}` : `unexpected: ${JSON.stringify(status).slice(0, 800)}`);
   if (status.payload?.state === "succeeded" && status.payload.result?.session) {
     interopSessionId = status.payload.result.session.sessionId;
   }
@@ -454,7 +482,7 @@ let interopSessionId = null;
     });
     const item = queryResp.payload?.items?.[0];
     if (queryResp.type !== "command.statuses" || !item || item.commandId !== commandId) {
-      record("command.query.v1", false, `unexpected: ${JSON.stringify(queryResp).slice(0, 200)}`);
+      record("command.query.v1", false, `unexpected: ${JSON.stringify(queryResp).slice(0, 800)}`);
       finalItem = null;
       break;
     }
@@ -491,6 +519,7 @@ let interopSessionId = null;
   const revision1 = snap.payload?.revision;
   const ok1 = snap.type === "scopes.snapshot" && typeof revision1 === "string";
   record("snapshot.revision.v1 (read)", ok1, ok1 ? `revision=${revision1}` : "no revision");
+  console.error("[snapshot scopes]", JSON.stringify(snap.payload).slice(0, 800));
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +533,41 @@ let interopSessionId = null;
   const seqOk = stateEvents.every((e) => BigInt(e.seq) > welcomeSeq);
   record("event.sequence.v1", seqOk,
     seqOk ? `welcomeSeq=${welcomeSeq}, events=${stateEvents.length}` : "event seq not monotonic after welcome");
+}
+
+// ---------------------------------------------------------------------------
+// Capability 6: error.structured.v1
+// ---------------------------------------------------------------------------
+{
+  // Wire-valid frame that must fail at the application layer: kill_session
+  // on a session that does not exist. The closed error table requires a
+  // structured error (code + retryable), not a protocol close.
+  const errReqId = "err-" + Math.random().toString(36).slice(2, 12);
+  clientWs.send(JSON.stringify({
+    protocolVersion: 2,
+    kind: "request",
+    type: "command.execute",
+    requestId: errReqId,
+    commandId: "cmd-err-" + Math.random().toString(36).slice(2, 10),
+    hostId: HOST_ID,
+    expectedHostEpoch: hostEpoch,
+    scopeId: SCOPE_ID,
+    sessionId: "ses_00000000000000000000000000000000",
+    payload: {
+      dedupeWindowId,
+      operation: "kill_session",
+      arguments: {},
+    },
+  }));
+  const errResp = await new Promise((resolve) => {
+    clientRequests.set(errReqId, resolve);
+    setTimeout(() => resolve(null), 15000);
+  });
+  const structured = errResp?.error ?? errResp?.payload?.error ?? null;
+  const structuredOk = structured !== null && typeof structured.code === "string"
+    && typeof structured.retryable === "boolean";
+  record("error.structured.v1", structuredOk,
+    structuredOk ? `code=${structured.code}` : `no structured error: ${JSON.stringify(errResp).slice(0, 800)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +585,7 @@ if (!interopSessionId) {
     requestId: openReqId,
     hostId: HOST_ID,
     expectedHostEpoch: hostEpoch,
-    scopeId: "scope-local",
+    scopeId: SCOPE_ID,
     sessionId: interopSessionId,
     streamId,
     payload: {
@@ -532,10 +596,43 @@ if (!interopSessionId) {
       mode: "new",
     },
   }));
-  const opened = await new Promise((resolve) => {
-    clientRequests.set(openReqId, resolve);
-    setTimeout(() => resolve(null), 10000);
-  });
+  // create_terminal invalidates the discovery cut; the resolver republishes
+  // after the next scan. Retry through the transient CAPABILITY_UNAVAILABLE.
+  let opened = null;
+  for (let attempt = 0; attempt < 45; attempt++) {
+    const reqId = attempt === 0 ? openReqId : openReqId + "-r" + attempt;
+    if (attempt > 0) {
+      clientWs.send(JSON.stringify({
+        protocolVersion: 2,
+        kind: "request",
+        type: "terminal.open",
+        requestId: reqId,
+        hostId: HOST_ID,
+        expectedHostEpoch: hostEpoch,
+        scopeId: SCOPE_ID,
+        sessionId: interopSessionId,
+        streamId,
+        payload: {
+          openId: "open-" + Math.random().toString(36).slice(2, 12),
+          pane: 0,
+          cols: 80,
+          rows: 24,
+          mode: "new",
+        },
+      }));
+    }
+    const resp = await new Promise((resolve) => {
+      clientRequests.set(reqId, resolve);
+      setTimeout(() => resolve(null), 10000);
+    });
+    if (resp && resp.type === "terminal.opened") { opened = resp; break; }
+    if (resp && resp.error?.code === "CAPABILITY_UNAVAILABLE") {
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
+    opened = resp;
+    break;
+  }
   if (opened && opened.type === "terminal.opened") {
     const generation = opened.payload.generation;
     const resumeToken = opened.payload.resumeToken;
@@ -572,11 +669,21 @@ if (!interopSessionId) {
       setTimeout(() => reject(new Error("resume ws open timeout")), 10000);
     });
     let welcome2 = null;
+    let relayWelcome2 = null;
+    clientWs2.on("close", (code, reason) => console.error("[resume ws closed]", code, reason?.toString()));
     clientWs2.on("message", (data) => {
       const f = JSON.parse(data.toString());
-      if (f.type === "relay.welcome") return;
+      if (f.type === "relay.welcome") { relayWelcome2 = f; return; }
       if (f.type === "host.welcome") { welcome2 = f; return; }
       clientBuffer.push(f);
+    });
+    await new Promise((resolve, reject) => {
+      const check = () => {
+        if (relayWelcome2) return resolve();
+        if (clientWs2.readyState !== WebSocket.OPEN) return reject(new Error("resume ws closed before relay.welcome"));
+        setTimeout(check, 50);
+      };
+      check();
     });
     clientWs2.send(JSON.stringify({
       protocolVersion: 2,
@@ -608,11 +715,11 @@ if (!interopSessionId) {
       requestId: resumeReqId,
       hostId: HOST_ID,
       expectedHostEpoch: hostEpoch,
-      scopeId: "scope-local",
+      scopeId: SCOPE_ID,
       sessionId: interopSessionId,
       streamId,
       payload: {
-        openId: opened.payload.openId,
+        openId: "open-resume-" + Math.random().toString(36).slice(2, 12),
         pane: 0,
         cols: 80,
         rows: 24,
@@ -633,43 +740,12 @@ if (!interopSessionId) {
     });
     const resumeOk = resumed && resumed.type === "terminal.opened" && resumed.payload.disposition === "resumed";
     record("terminal.stream.resume.v1", resumeOk,
-      resumeOk ? "resumed with no byte loss" : `unexpected: ${JSON.stringify(resumed).slice(0, 200)}`);
+      resumeOk ? "resumed with no byte loss" : `unexpected: ${JSON.stringify(resumed).slice(0, 800)}`);
     clientWs2.close();
   } else {
     record("terminal.stream.resume.v1", false,
-      `terminal.open failed: ${JSON.stringify(opened).slice(0, 200)}`);
+      `terminal.open failed: ${JSON.stringify(opened).slice(0, 800)}`);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Capability 6: error.structured.v1
-// ---------------------------------------------------------------------------
-{
-  // Send an invalid frame (missing required fields).
-  const errReqId = "err-" + Math.random().toString(36).slice(2, 12);
-  clientWs.send(JSON.stringify({
-    protocolVersion: 2,
-    kind: "request",
-    type: "command.execute",
-    requestId: errReqId,
-    commandId: "cmd-invalid",
-    hostId: HOST_ID,
-    expectedHostEpoch: hostEpoch,
-    scopeId: "scope-local",
-    payload: {
-      dedupeWindowId,
-      operation: "nonexistent_operation",
-      arguments: {},
-    },
-  }));
-  const errResp = await new Promise((resolve) => {
-    clientRequests.set(errReqId, resolve);
-    setTimeout(() => resolve(null), 10000);
-  });
-  const structuredOk = errResp && errResp.error && typeof errResp.error.code === "string"
-    && typeof errResp.error.retryable === "boolean";
-  record("error.structured.v1", structuredOk,
-    structuredOk ? `code=${errResp.error.code}` : `no structured error: ${JSON.stringify(errResp).slice(0, 200)}`);
 }
 
 // ---------------------------------------------------------------------------
