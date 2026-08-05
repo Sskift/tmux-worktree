@@ -218,9 +218,12 @@ class RelayV1CodecTest {
         is RelayV1Event.AgentMessageSent -> requestId
         is RelayV1Event.SessionKilled -> requestId
         is RelayV1Event.Error -> requestId
+        is RelayV1Event.AgentChatSent -> requestId
+        is RelayV1Event.AgentChatHistoryResult -> requestId
         is RelayV1Event.Ready,
         is RelayV1Event.TerminalData,
         is RelayV1Event.TerminalExit,
+        is RelayV1Event.AgentChatEvent,
         -> error("${this::class.java.simpleName} has no requestId")
     }
 
