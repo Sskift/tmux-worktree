@@ -39,6 +39,10 @@ import type {
   RelayV2HostCanonicalProductionComposition,
   RelayV2HostCanonicalProductionCompositionOptions,
 } from "./relay/v2/hostCanonicalProductionComposition.js";
+import {
+  AgentChatEngine,
+  type AgentChatControl,
+} from "./relay/agentChat.js";
 
 export type RelayHostProfile = "v1" | "v2";
 
@@ -587,7 +591,8 @@ function isSafeToAbortDuringShutdown(message: RelayToHostMessage): boolean {
   return message.type !== "create_worktree"
     && message.type !== "create_terminal"
     && message.type !== "send_agent_message"
-    && message.type !== "kill_session";
+    && message.type !== "kill_session"
+    && message.type !== "agent_chat_send";
 }
 
 function processGroupExists(pid: number): boolean {
@@ -2202,7 +2207,9 @@ function requiresCommandAdmission(message: RelayToHostMessage): boolean {
     || message.type === "create_worktree"
     || message.type === "create_terminal"
     || message.type === "send_agent_message"
-    || message.type === "kill_session";
+    || message.type === "kill_session"
+    || message.type === "agent_chat_send"
+    || message.type === "agent_chat_history";
 }
 
 function reserveStreamAdmission(
@@ -2882,6 +2889,70 @@ async function sendControlledAgentMessage(
   );
 }
 
+function createAgentChatControl(control: RelayTerminalControl): AgentChatControl {
+  const targetScopes = new Map<string, { scope: AdminScope; rawName: string }>();
+  const agentChatClientId = `agent-chat:${control.connectorId}`;
+  return {
+    async resolveTarget(sessionName) {
+      const { scope, rawName } = scopeForSession(sessionName);
+      const target = await requestScopedTerminalControl<{
+        controlTargetId: string;
+        controlEpoch: string;
+      }>(scope, { type: "target.resolve", sessionName: rawName });
+      targetScopes.set(target.controlTargetId, { scope, rawName });
+      return target;
+    },
+    async acquireLease(controlTargetId) {
+      const cached = targetScopes.get(controlTargetId);
+      if (!cached) throw new Error(`unknown control target: ${controlTargetId}`);
+      return relayControlLease(control, agentChatClientId, cached.scope, cached.rawName);
+    },
+    async sendAgentMessage(input) {
+      const cached = targetScopes.get(input.lease.controlTargetId);
+      if (!cached) throw new Error(`unknown control target: ${input.lease.controlTargetId}`);
+      return requestScopedTerminalControl(cached.scope, {
+        type: "input.agent-message",
+        lease: input.lease,
+        operationId: input.operationId,
+        pane: input.pane,
+        message: input.message,
+        submit: input.submit,
+      });
+    },
+    async tailOutput(input) {
+      const cached = targetScopes.get(input.controlTargetId);
+      if (!cached) throw new Error(`unknown control target: ${input.controlTargetId}`);
+      return requestScopedTerminalControl(cached.scope, {
+        type: "output.tail",
+        controlTargetId: input.controlTargetId,
+        controlEpoch: input.controlEpoch,
+        outputGeneration: input.outputGeneration,
+        cursor: input.cursor,
+        maxBytes: input.maxBytes,
+      });
+    },
+    async renderedSnapshot(input) {
+      const cached = targetScopes.get(input.lease.controlTargetId);
+      if (!cached) throw new Error(`unknown control target: ${input.lease.controlTargetId}`);
+      return requestScopedTerminalControl(cached.scope, {
+        type: "output.rendered-snapshot",
+        lease: input.lease,
+        outputGeneration: input.outputGeneration,
+        pane: input.pane,
+        maxBytes: input.maxBytes,
+      });
+    },
+    async ownershipStatus(controlTargetId) {
+      const cached = targetScopes.get(controlTargetId);
+      if (!cached) throw new Error(`unknown control target: ${controlTargetId}`);
+      return requestScopedTerminalControl(cached.scope, {
+        type: "ownership.status",
+        controlTargetId,
+      });
+    },
+  };
+}
+
 async function releaseRelayControlRecord(
   control: RelayTerminalControl,
   record: RelayControlLeaseRecord,
@@ -3558,6 +3629,9 @@ async function runConnection(
     TERMINAL_CONTROL_RENEW_INTERVAL_MS,
   );
   terminalControlRenewal.unref();
+
+  const agentChatControl: AgentChatControl = createAgentChatControl(terminalControl);
+  const agentChat = new AgentChatEngine(agentChatControl);
   const lease: RelayConnectionLease = { socket: relaySocket, active: true };
   const retireController = new AbortController();
   const connectionSignal = AbortSignal.any([shutdownSignal, retireController.signal]);
@@ -3649,7 +3723,7 @@ async function runConnection(
     hostId: opts.hostId,
     displayName: opts.displayName,
     version: "admin-v1",
-    capabilities: [RELAY_HOST_RETIRE_CAPABILITY],
+    capabilities: [RELAY_HOST_RETIRE_CAPABILITY, "agent-chat-v1"],
   });
 
   const beginRetirement = () => {
@@ -3816,11 +3890,49 @@ async function runConnection(
           return;
         }
 
+        if (message.type === "agent_chat_send") {
+          const { turnId } = await agentChat.startOrSteerTurn(
+            message.session,
+            message.message,
+            {
+              onEvent: (turn) => {
+                sendIfActive(lease, {
+                  type: "agent_chat_event",
+                  clientId,
+                  session: message.session,
+                  turn,
+                });
+              },
+            },
+          );
+          sendIfActive(lease, {
+            type: "agent_chat_sent",
+            clientId,
+            requestId: message.requestId,
+            session: message.session,
+            turnId,
+          });
+          return;
+        }
+
+        if (message.type === "agent_chat_history") {
+          const turns = agentChat.listTurns(message.session, message.limit);
+          sendIfActive(lease, {
+            type: "agent_chat_history_result",
+            clientId,
+            requestId: message.requestId,
+            session: message.session,
+            turns,
+          });
+          return;
+        }
+
         if (message.type === "kill_session") {
           const target = scopeForSession(message.session);
           await killControlledSession(terminalControl, clientId, message.session, message.managed);
           finalizeSessionStreams(streams, streamRoutes, message.session);
           forgetRelayControlLease(terminalControl, clientId, target.scope, target.rawName);
+          agentChat.disposeSession(message.session);
           sendIfActive(lease, {
             type: "session_killed",
             clientId,
