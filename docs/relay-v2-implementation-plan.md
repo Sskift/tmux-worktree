@@ -199,7 +199,9 @@ Android 的 profile/credential、codec/actor、Room state、Outbox、terminal和
 - xterm parser callback 后才推进 offset/credit；Activity/WebView parser continuity丢失时 reset，不把旧 checkpoint接到空 terminal。
 - queue、Room staging、WebView pending bytes和 UI effect都有硬上限；饱和触发明确 reset/query/resync而非静默丢事件。
 
-### X. Agent transcript、lifecycle 与通知 extension
+### X. Agent transcript、lifecycle 与通知 extension（已 deferred，移出主线）
+
+状态：**deferred**。frozen extension contract 与 `codec.ts` 保留（broker capability gating 作为 live surface 保留），但 Node 实现模块已于 2026-08 从仓库删除（见 `docs/relay-v2-status.md`）。G4 不在主线门槛序列内；本 extension 不阻塞基础 v2 交付，未来作为独立 proposal 单独协商。
 
 X 的 contract/authority spike 与基础 v2 并行，不阻塞 C/B/H/A。它使用独立 capability/manifest；基础六项完整实现也不能自动视为支持 X。
 
@@ -223,10 +225,11 @@ X 的 contract/authority spike 与基础 v2 并行，不阻塞 C/B/H/A。它使�
 
 ### Descoped 工作包
 
-以下工作包已 descope，不在当前 v2 交付范围内：
+以下工作包已 descope，不在当前 v2 交付范围内。完整 descope 记录以 [`docs/relay-v2-status.md`](relay-v2-status.md) 为唯一来源：
 
-- **N. broker/host credential native state-store crates**：9 个原生 Rust crates（broker credential state-store 与 host credential atomic file cell 的 core/napi/platform-common/platform-darwin/platform-linux）。理由：在六项基础能力通过互操作之前过早进行 durability 工程；保持聚焦于功能交付。JS loader 在原生 artifact 缺失时返回 `"missing"` 并回退到非原生路径。
-- **E0. external continuity authority**：外部 HTTPS continuity backend/adapter、node attempt provider、config、opener。理由：同上——在基础互操作通过前不引入外部 durability 依赖。`continuityAnchor.ts` 核心保留，仅移除外部 authority。
+- **N. broker/host credential native state-store crates**：见 `docs/relay-v2-status.md` 已 Descoped 节。
+- **E0. external continuity authority**：见 `docs/relay-v2-status.md` 已 Descoped 节。
+- **X. Agent transcript lifecycle v1 实现模块**：见 `docs/relay-v2-status.md` 已 Descoped 节。
 
 ### R. 生产与发布
 
@@ -249,8 +252,9 @@ R 可以提前准备 TLS、签名、升级矩阵和可观测性，但不能替�
 | G1：broker↔host carrier | B 的 auth/directory/router与 H 的 carrier actor各自 simulator验收 | host register、route fencing、reauth、supersede、backpressure隔离联调 | 不接真实Android，不生成client enrollment |
 | G2：host基础集合 | G1；H0/H1/H2/H3各自验收并经同一 host route集成 | command query、gap snapshot、terminal resume和crash/pressure故障注入 | 不宣告六项requiredCapabilities中的任何子集 |
 | G3：端到端基础 v2 | G0-G2、D和A完成 | broker↔host↔Android真实WSS或等价隔离环境；五种hello、命令、snapshot、terminal、refresh/revoke全链路 | 不默认启用v2配对，不替换v1 profile |
-| G4：Agent extension | G3；X contract、host authority/store和Android consumer完成 | transcript/lifecycle重放、断线、去重、unsupported Agent和通知行为跨端验收 | 不宣告Agent reply/state/notification capability |
-| G5：生产发布 | G3；若发布X则还需G4；并完成R | 已签名构建、真实设备升级、受信TLS、凭证与恢复检查 | 不把build、unsigned APK或模拟器结果称为发布 |
+| G5：生产发布 | G3；并完成R | 已签名构建、真实设备升级、受信TLS、凭证与恢复检查 | 不把build、unsigned APK或模拟器结果称为发布 |
+
+G4（Agent extension）已移出主线门槛序列，见下文 X 工作包状态。G5 的 precondition 不再要求 G4；若未来单独交付 X，则需先通过 G4 再宣告该 extension capability。
 
 G0-G2 通过前可以继续并行开发和 simulator验证，但能力开放必须原子：基础六项只在 G2/G3 集成证明完整时一起提供。任何 auth、dialect、schema、capability或 continuity失败都不得进入 v1 fallback。
 

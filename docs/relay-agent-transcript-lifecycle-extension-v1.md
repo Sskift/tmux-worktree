@@ -1,5 +1,10 @@
 # Relay Agent transcript、lifecycle 与本地通知 extension v1
 
+> **状态：frozen extension contract 保留，供未来独立 proposal 使用。**
+> - Node 实现模块已于 2026-08 从仓库删除（git 历史保留）；
+> - `codec.ts` 与 broker capability gating（`--v2-agent-transcript-lifecycle-v1`）作为唯一 live surface 保留；
+> - 不属于 base v2 交付；G4 不在主线门槛序列内。
+
 状态：**Frozen extension contract + 未接线的 Node durable host authority/public codec/replay runtime、default-off且精确版本栅栏的 Codex app-server structured-event producer、bounded LF notification source、injectable/default-off process-controller lease authority、trusted-source composition与one-shot activation foundations，以及已在隔离模块/Room owner 内部接通的 Android public codec artifact、lifecycle/notification reducer、typed durable operations/repository、row-oriented Room materialization、durable notification claim、read projection与default-off runtime composition seam；Android production base composition已接capability-fenced selected-Session单页structured transcript/lifecycle evidence projection，但默认advertisement仍为空并在actor read cut处`Unavailable`，manifest `androidUiIntegrated=false`、真实app-server process contract/implementation、Agent capability/runtime与通知启动仍未接，production default-off且 capability/G4 尚未交付，不得宣告 Agent reply、lifecycle 或 notification capability**
 
 当前 Node 交付包含 contract/machine fixtures、完整消费 accepted authority machine cases 的纯 reducer、独立 public codec、durable authority store，以及只连接这些 extension owner 的 capability-gated replay runtime foundation。store 把 reducer snapshot、source cursor/dedupe、公开 event/replay log 与 pinned cut 放入同一个 optimistic transaction candidate，再在既有跨进程锁内以 expected-current CAS原子发布；retention 使用 host commit time并只裁连续前缀，最终 serialized bytes 在 publish 前执行与读取完全相同的 strict byte/key/node inspection 和完整 restore 校验，snapshot/replay cut 也在持久化前按真实 codec wire bytes 与 JSON limits逐页冻结。因此这些 foundation artifact 与对应专项测试已经存在。
