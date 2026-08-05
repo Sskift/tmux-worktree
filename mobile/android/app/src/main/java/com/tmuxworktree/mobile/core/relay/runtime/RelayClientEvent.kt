@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.relay.v1.AgentChatTurnView
 import com.tmuxworktree.mobile.core.relay.v1.RelayV1Pane
 
 sealed interface RelayClientEvent {
@@ -68,6 +69,25 @@ sealed interface RelayClientEvent {
         val type: String,
         val reason: String,
         val request: RelayRequestContext? = null,
+    ) : RelayClientEvent
+
+    data class AgentChatSent(
+        val requestId: String?,
+        val hostId: String,
+        val sessionName: String,
+        val turnId: String,
+    ) : RelayClientEvent
+
+    data class AgentChatTurnUpdated(
+        val sessionName: String,
+        val turn: AgentChatTurnView,
+    ) : RelayClientEvent
+
+    data class AgentChatHistoryResult(
+        val requestId: String?,
+        val hostId: String,
+        val sessionName: String,
+        val turns: List<AgentChatTurnView>,
     ) : RelayClientEvent
 }
 

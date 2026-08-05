@@ -90,6 +90,9 @@ class RelayV1ConnectionActor(
     private val _terminal = MutableStateFlow(TerminalStreamState())
     val terminal: StateFlow<TerminalStreamState> = _terminal.asStateFlow()
 
+    private val _chat = MutableStateFlow(RelayChatState())
+    val chat: StateFlow<RelayChatState> = _chat.asStateFlow()
+
     /** Bounded, lossless event stream; a slow UI backpressures the dedicated relay actor. */
     val events: Flow<RelayClientEvent> = eventChannel.receiveAsFlow()
 
@@ -271,6 +274,59 @@ class RelayV1ConnectionActor(
         return requestId
     }
 
+    fun sendAgentChatMessage(
+        hostId: String,
+        sessionName: String,
+        message: String,
+    ): String {
+        val requestId = nextRequestId("agent-chat")
+        val now = clock()
+        mutateChat(RelayChatMutation.SendPending(requestId, sessionName, message, now))
+        enqueue(
+            RelayV1Command.AgentChatSend(
+                hostId = hostId,
+                requestId = requestId,
+                session = sessionName,
+                message = message,
+            ),
+            request(RelayRequestKind.AGENT_CHAT_SEND, requestId, hostId, sessionName),
+        )
+        return requestId
+    }
+
+    fun fetchAgentChatHistory(
+        hostId: String,
+        sessionName: String,
+        limit: Int? = null,
+    ): String {
+        val requestId = nextRequestId("agent-chat-history")
+        enqueue(
+            RelayV1Command.AgentChatHistory(
+                hostId = hostId,
+                requestId = requestId,
+                session = sessionName,
+                limit = limit,
+            ),
+            request(
+                RelayRequestKind.AGENT_CHAT_HISTORY,
+                requestId,
+                hostId,
+                sessionName,
+                latestKey = "agent-chat-history:$sessionName",
+            ),
+        )
+        return requestId
+    }
+
+    fun retryFailedChatMessages(hostId: String, sessionName: String) {
+        val failed = _chat.value.pending(sessionName).filter { it.failed }
+        if (failed.isEmpty()) return
+        mutateChat(RelayChatMutation.RetryFailed(sessionName))
+        failed.forEach { pending ->
+            sendAgentChatMessage(hostId, sessionName, pending.message)
+        }
+    }
+
     fun openTerminal(
         hostId: String,
         sessionName: String,
@@ -388,6 +444,9 @@ class RelayV1ConnectionActor(
                 config = action.config
                 selectedHostId = action.config.preferredHostId
                 _snapshots.value = RelaySnapshotState()
+                if (!sameConfig) {
+                    _chat.value = RelayChatState()
+                }
                 retryJob?.cancel()
                 transition(RelayTransportSignal.Start(clock()))
             }
@@ -647,6 +706,7 @@ class RelayV1ConnectionActor(
         val normalizedContext = context?.copy(epoch = transport.epoch)
         val activeSocket = socket
         if (activeSocket == null) {
+            failChatSendIfNeeded(normalizedContext, "Relay is not connected; command was not written to the socket")
             emit(
                 RelayClientEvent.CommandRejected(
                     type = command.type,
@@ -664,6 +724,7 @@ class RelayV1ConnectionActor(
         }
         if (!sent) {
             requests.remove(normalizedContext?.requestId)
+            failChatSendIfNeeded(normalizedContext, "WebSocket rejected the message before it was written")
             emit(
                 RelayClientEvent.CommandRejected(
                     type = command.type,
@@ -675,6 +736,18 @@ class RelayV1ConnectionActor(
             scheduleRequestTimeout(normalizedContext)
         }
         return sent
+    }
+
+    private fun failChatSendIfNeeded(context: RelayRequestContext?, reason: String) {
+        if (context?.kind != RelayRequestKind.AGENT_CHAT_SEND) return
+        if (context.sessionName.isBlank()) return
+        mutateChat(
+            RelayChatMutation.SendFailed(
+                requestId = context.requestId,
+                session = context.sessionName,
+                error = reason,
+            ),
+        )
     }
 
     private fun sendHostsRequest() {
@@ -718,6 +791,7 @@ class RelayV1ConnectionActor(
                 if (reduction.accepted) {
                     cancelHandshakeTimeout()
                     emit(RelayClientEvent.Ready(event.clientId, event.hostId))
+                    reconcileChatHistory()
                 }
             }
             is RelayV1Event.Hosts -> handleHosts(event)
@@ -730,6 +804,21 @@ class RelayV1ConnectionActor(
             is RelayV1Event.TerminalData -> handleTerminalData(event)
             is RelayV1Event.TerminalExit -> handleTerminalExit(event)
             is RelayV1Event.Error -> handleError(event)
+            is RelayV1Event.AgentChatSent -> handleAgentChatSent(event)
+            is RelayV1Event.AgentChatEvent -> handleAgentChatEvent(event)
+            is RelayV1Event.AgentChatHistoryResult -> handleAgentChatHistoryResult(event)
+        }
+    }
+
+    /**
+     * After reconnect, ask the host for the authoritative turn list of every session we have local
+     * state for. The host response replaces the local view (turnId dedup, host authoritative).
+     */
+    private fun reconcileChatHistory() {
+        val hostId = selectedHostId.ifBlank { config?.preferredHostId.orEmpty() }
+        if (hostId.isBlank()) return
+        _chat.value.turnsBySession.keys.forEach { session ->
+            fetchAgentChatHistory(hostId, session)
         }
     }
 
@@ -948,6 +1037,56 @@ class RelayV1ConnectionActor(
         emit(RelayClientEvent.Error(event.message, resolution?.context, event.streamId))
     }
 
+    private fun handleAgentChatSent(event: RelayV1Event.AgentChatSent) {
+        val resolution = resolveCorrelatedRequest(
+            requestId = event.requestId,
+            expectedKind = RelayRequestKind.AGENT_CHAT_SEND,
+            label = "agent chat sent acknowledgement",
+        ) ?: return
+        val hostId = resolution.context.hostId.ifBlank { selectedHostId }
+        val sessionName = event.session.ifBlank { resolution.context.sessionName }
+        mutateChat(
+            RelayChatMutation.Sent(
+                requestId = resolution.context.requestId,
+                session = sessionName,
+                turnId = event.turnId,
+                nowMillis = clock(),
+            ),
+        )
+        emit(
+            RelayClientEvent.AgentChatSent(
+                requestId = event.requestId,
+                hostId = hostId,
+                sessionName = sessionName,
+                turnId = event.turnId,
+            ),
+        )
+    }
+
+    private fun handleAgentChatEvent(event: RelayV1Event.AgentChatEvent) {
+        mutateChat(RelayChatMutation.TurnUpdated(event.session, event.turn))
+        emit(RelayClientEvent.AgentChatTurnUpdated(event.session, event.turn))
+    }
+
+    private fun handleAgentChatHistoryResult(event: RelayV1Event.AgentChatHistoryResult) {
+        val resolution = resolveCorrelatedRequest(
+            requestId = event.requestId,
+            expectedKind = RelayRequestKind.AGENT_CHAT_HISTORY,
+            fallbackLatestKey = "agent-chat-history:${event.session}",
+            label = "agent chat history",
+        ) ?: return
+        val hostId = resolution.context.hostId.ifBlank { selectedHostId }
+        mutateChat(RelayChatMutation.HistoryResult(event.session, event.turns))
+        emit(
+            RelayClientEvent.AgentChatHistoryResult(
+                requestId = event.requestId,
+                hostId = hostId,
+                sessionName = event.session,
+                turns = event.turns,
+            ),
+        )
+    }
+
     private fun openTerminalNow(
         streamId: String,
         hostId: String,
@@ -1081,6 +1220,10 @@ class RelayV1ConnectionActor(
         _snapshots.value = RelaySnapshotReducer.reduce(_snapshots.value, mutation)
     }
 
+    private fun mutateChat(mutation: RelayChatMutation) {
+        _chat.value = RelayChatReducer.reduce(_chat.value, mutation)
+    }
+
     private fun scheduleHandshakeTimeout(epoch: Long) {
         cancelHandshakeTimeout()
         handshakeTimeoutJob = scope.launch {
@@ -1169,6 +1312,10 @@ class RelayV1ConnectionActor(
     private fun requestTimedOut(action: Action.RequestTimeout) {
         if (action.epoch != transport.epoch) return
         val resolution = resolveRequest(action.requestId) ?: return
+        failChatSendIfNeeded(
+            resolution.context,
+            "Request timed out before acknowledgement; delivery is ambiguous",
+        )
         emit(
             RelayClientEvent.CommandRejected(
                 type = resolution.context.kind.commandType(),
@@ -1220,6 +1367,15 @@ class RelayV1ConnectionActor(
     private fun rejectPendingRequests(reason: String) {
         requests.drain().forEach { context ->
             requestTimeoutJobs.remove(context.requestId)?.cancel()
+            if (context.kind == RelayRequestKind.AGENT_CHAT_SEND && context.sessionName.isNotBlank()) {
+                mutateChat(
+                    RelayChatMutation.SendFailed(
+                        requestId = context.requestId,
+                        session = context.sessionName,
+                        error = reason,
+                    ),
+                )
+            }
             emit(
                 RelayClientEvent.CommandRejected(
                     type = context.kind.commandType(),
@@ -1411,4 +1567,6 @@ private fun RelayRequestKind.commandType(): String = when (this) {
     RelayRequestKind.CREATE_TERMINAL -> "create_terminal"
     RelayRequestKind.SEND_AGENT_MESSAGE -> "send_agent_message"
     RelayRequestKind.KILL_SESSION -> "kill_session"
+    RelayRequestKind.AGENT_CHAT_SEND -> "agent_chat_send"
+    RelayRequestKind.AGENT_CHAT_HISTORY -> "agent_chat_history"
 }

@@ -12,6 +12,8 @@ enum class RelayRequestKind {
     CREATE_TERMINAL,
     SEND_AGENT_MESSAGE,
     KILL_SESSION,
+    AGENT_CHAT_SEND,
+    AGENT_CHAT_HISTORY,
 }
 
 data class RelayRequestContext(
