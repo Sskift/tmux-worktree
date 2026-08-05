@@ -46,7 +46,10 @@ arch=$(uname -m)
 dmg_src="$APP_DIR/src-tauri/target/release/bundle/dmg/tw-dashboard_${tauri_version}_aarch64.dmg"
 if [[ "$skip_build" -eq 0 ]]; then
   info "running tauri build (--no-build to skip)"
-  export APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
+  # Default to the stable local signing cert so keychain/TCC grants survive
+  # rebuilds; ad-hoc ("-") signatures change every build and reset macOS
+  # authorization state. Override APPLE_SIGNING_IDENTITY to use another cert.
+  export APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-tmux-worktree Local Dashboard Signing}"
   ( cd "$APP_DIR" && npm run tauri build )
 fi
 [[ -f "$dmg_src" ]] || die "dmg not found at $dmg_src — drop --no-build, or check the build output"
