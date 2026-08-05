@@ -23,6 +23,9 @@ import {
   RelayV2HostCredentialExchangeCoordinator,
 } from "../dist/relay/v2/hostCredentialExchangeCoordinator.js";
 import {
+  claimRelayV2HostDashboardManagementPort,
+} from "../dist/relay/v2/hostRuntimeComposition.js";
+import {
   createRelayV2IssuerKeyring,
   prepareRelayV2AccessTokenIssuance,
 } from "../dist/relay/v2/issuer.js";
@@ -206,6 +209,81 @@ function bootstrapResponse(input, access) {
   };
 }
 
+function createHostManagementBinding({ controller, actor, identity, credentialAuthority }) {
+  let consumed = false;
+  let committed = false;
+  let authorizedGeneration = null;
+  try {
+    authorizedGeneration = controller.inspectCut().controllerGeneration;
+  } catch {
+    authorizedGeneration = null;
+  }
+  const binding = function hostManagementBinding(
+    candidate,
+    operation,
+    consumedIdentity,
+    consumedCredentialOwner,
+  ) {
+    if (candidate !== binding) return null;
+    if (consumedIdentity?.hostId !== identity.hostId
+      || consumedIdentity?.hostEpoch !== identity.hostEpoch
+      || consumedIdentity?.hostInstanceId !== identity.hostInstanceId
+      || consumedIdentity?.credentialReference !== identity.credentialReference
+      || consumedCredentialOwner !== credentialAuthority) return null;
+    if (operation === "consume") {
+      if (consumed) return null;
+      consumed = true;
+      return Object.freeze({
+        connectorLifecycle: controller,
+        carrierControl: actor.createDashboardManagementCarrierControlAdapter(),
+      });
+    }
+    if (operation === "commit") {
+      if (!consumed || committed) return false;
+      let currentGeneration;
+      try {
+        currentGeneration = controller.inspectCut().controllerGeneration;
+      } catch {
+        return false;
+      }
+      if (currentGeneration !== authorizedGeneration) return false;
+      committed = true;
+      return true;
+    }
+    if (operation === "abort") {
+      if (committed) return false;
+      return true;
+    }
+    return null;
+  };
+  return binding;
+}
+
+function createHostManagementPort({ controller, actor, identity, credentialAuthority }) {
+  let issuedGeneration = null;
+  try {
+    issuedGeneration = controller.inspectCut().controllerGeneration;
+  } catch {
+    issuedGeneration = null;
+  }
+  return function hostManagementPort(candidate, expectedIdentity, expectedCredentialOwner) {
+    if (candidate !== hostManagementPort) return null;
+    if (expectedIdentity?.hostId !== identity.hostId
+      || expectedIdentity?.hostEpoch !== identity.hostEpoch
+      || expectedIdentity?.hostInstanceId !== identity.hostInstanceId
+      || expectedIdentity?.credentialReference !== identity.credentialReference
+      || expectedCredentialOwner !== credentialAuthority) return null;
+    let currentGeneration;
+    try {
+      currentGeneration = controller.inspectCut().controllerGeneration;
+    } catch {
+      return null;
+    }
+    if (currentGeneration !== issuedGeneration) return null;
+    return createHostManagementBinding({ controller, actor, identity, credentialAuthority });
+  };
+}
+
 function harness(options = {}) {
   const storage = new InMemoryCredentialStorage();
   const issueToken = tokenIssuer();
@@ -256,9 +334,16 @@ function harness(options = {}) {
         statusSink = input.onCarrierStatus;
         const transport = new FakeTransport();
         const connection = hostCarrierActor.connect(transport, input.credentialReference);
+        input.onCarrierAttemptPrepared({
+          controllerGeneration: input.controllerGeneration,
+          carrierAttemptGeneration: String(connection.generation),
+        });
         const attempt = { input, transport, connection, drainCalls: [] };
         attempts.push(attempt);
         return Object.freeze({
+          fence() {
+            return true;
+          },
           async disposeAndDrain(drainInput) {
             attempt.drainCalls.push(structuredClone(drainInput));
             if (options.drainFailure) throw new Error(SECRET_MARKER);
@@ -267,6 +352,7 @@ function harness(options = {}) {
             return {
               status: "closed_and_drained",
               controllerGeneration: drainInput.controllerGeneration,
+              carrierAttemptGeneration: drainInput.carrierAttemptGeneration,
               carrierGeneration: drainInput.carrierGeneration,
               connectorId: drainInput.connectorId,
             };
@@ -288,11 +374,16 @@ function harness(options = {}) {
     },
   };
   const clock = () => NOW_MS;
+  const hostManagementPort = createHostManagementPort({
+    controller: connectorController,
+    actor: hostCarrierActor,
+    identity: IDENTITY,
+    credentialAuthority,
+  });
   const sessionOptions = {
     credentialAuthority,
     credentialExchangeCoordinator,
-    connectorController,
-    hostCarrierActor,
+    hostManagementPort,
     ...IDENTITY,
     bootstrapSecretReference: BOOTSTRAP_SECRET_REFERENCE,
     refreshSecretReference: REFRESH_SECRET_REFERENCE,
@@ -367,8 +458,24 @@ function parsedWrites(h) {
 }
 
 function compositionOptionsOf(sessionOptions) {
-  const { runtimeVersion: _runtimeVersion, io: _io, ...compositionOptions } = sessionOptions;
-  return compositionOptions;
+  const {
+    runtimeVersion: _runtimeVersion,
+    io: _io,
+    hostManagementPort,
+    ...compositionOptions
+  } = sessionOptions;
+  const hostIdentity = {
+    hostId: sessionOptions.hostId,
+    hostEpoch: sessionOptions.hostEpoch,
+    hostInstanceId: sessionOptions.hostInstanceId,
+    credentialReference: sessionOptions.credentialReference,
+  };
+  const hostManagementBinding = claimRelayV2HostDashboardManagementPort(
+    hostManagementPort,
+    hostIdentity,
+    sessionOptions.credentialAuthority,
+  );
+  return { ...compositionOptions, hostManagementBinding };
 }
 
 test("the real dist session constructs the canonical composition before v2 ready and exposes only run/close", async () => {
@@ -543,10 +650,21 @@ test("foreign/stale owners and structural composition/handler injection fail bef
     credentialReferences: h.credentialAuthority,
     routeSink: { onRouteBound() {}, onClientFrame() {}, onRouteUnbound() {} },
   });
+  const foreignPort = createHostManagementPort({
+    controller: h.connectorController,
+    actor: foreignActor,
+    identity: {
+      hostId: "foreign-host",
+      hostEpoch: IDENTITY.hostEpoch,
+      hostInstanceId: IDENTITY.hostInstanceId,
+      credentialReference: IDENTITY.credentialReference,
+    },
+    credentialAuthority: h.credentialAuthority,
+  });
   assert.throws(
     () => createRelayV2DashboardManagementProtocolV2CompositionSession({
       ...h.sessionOptions,
-      hostCarrierActor: foreignActor,
+      hostManagementPort: foreignPort,
     }),
     RelayV2DashboardManagementProtocolV2CompositionSessionClosedError,
   );
@@ -656,7 +774,9 @@ test("abort and explicit close fence new input and exactly-once drain an active 
     const secondClose = h.session.closeAndDrain();
     assert.strictEqual(secondClose, firstClose);
     await nextTurn();
-    assert.equal(attempt.drainCalls.length, 0, "admitted request must settle before drain");
+    // The start_connector operation settles once the controller admits the
+    // attempt, so the close can drain immediately after that settlement.
+    assert.equal(attempt.drainCalls.length, 1, "drain follows the settled start");
     await registerAttempt(h);
     await Promise.all([firstClose, secondClose]);
     assert.equal(await running, 1);

@@ -310,7 +310,6 @@ test("default-off config factory derives only local plus explicit Hosts and reti
     }],
   };
   const reconfigured = foundation.reconfigure();
-  const currentScanPromise = foundation.discovery.scan();
   const callsDuringRetirement = runner.calls.length;
   await assert.rejects(
     foundation.queryPort.query(query("capabilities", oldTarget)),
@@ -332,7 +331,7 @@ test("default-off config factory derives only local plus explicit Hosts and reti
     initialScan[Symbol.for("tmux-worktree.relay-v2.resource-resolver-cut")].isCurrent(),
     false,
   );
-  const currentScan = await currentScanPromise;
+  const currentScan = await foundation.discovery.scan();
   const callsBeforeOldPlan = runner.calls.length;
   await assert.rejects(
     foundation.queryPort.query(query("capabilities", oldTarget)),

@@ -187,6 +187,43 @@ function bootstrapResponse(input, access) {
   };
 }
 
+function createHostManagementBinding({ controller, actor, identity, credentialAuthority }) {
+  let consumed = false;
+  let committed = false;
+  const binding = function hostManagementBinding(
+    candidate,
+    operation,
+    consumedIdentity,
+    consumedCredentialOwner,
+  ) {
+    if (candidate !== binding) return null;
+    if (consumedIdentity?.hostId !== identity.hostId
+      || consumedIdentity?.hostEpoch !== identity.hostEpoch
+      || consumedIdentity?.hostInstanceId !== identity.hostInstanceId
+      || consumedIdentity?.credentialReference !== identity.credentialReference
+      || consumedCredentialOwner !== credentialAuthority) return null;
+    if (operation === "consume") {
+      if (consumed) return null;
+      consumed = true;
+      return Object.freeze({
+        connectorLifecycle: controller,
+        carrierControl: actor.createDashboardManagementCarrierControlAdapter(),
+      });
+    }
+    if (operation === "commit") {
+      if (!consumed || committed) return false;
+      committed = true;
+      return true;
+    }
+    if (operation === "abort") {
+      if (committed) return false;
+      return true;
+    }
+    return null;
+  };
+  return binding;
+}
+
 function harness(options = {}) {
   const storage = new InMemoryCredentialStorage();
   const issueToken = tokenIssuer();
@@ -237,6 +274,10 @@ function harness(options = {}) {
       statusSink = input.onCarrierStatus;
       const transport = new FakeTransport();
       const connection = actor.connect(transport, input.credentialReference);
+      input.onCarrierAttemptPrepared({
+        controllerGeneration: input.controllerGeneration,
+        carrierAttemptGeneration: String(connection.generation),
+      });
       const attempt = {
         input,
         transport,
@@ -246,6 +287,9 @@ function harness(options = {}) {
       };
       attempts.push(attempt);
       return Object.freeze({
+        fence() {
+          return true;
+        },
         async disposeAndDrain(drainInput) {
           attempt.drainCalls.push(structuredClone(drainInput));
           if (attempt.drainGate) await attempt.drainGate.promise;
@@ -254,6 +298,7 @@ function harness(options = {}) {
           return {
             status: "closed_and_drained",
             controllerGeneration: drainInput.controllerGeneration,
+            carrierAttemptGeneration: drainInput.carrierAttemptGeneration,
             carrierGeneration: drainInput.carrierGeneration,
             connectorId: drainInput.connectorId,
           };
@@ -267,11 +312,16 @@ function harness(options = {}) {
   });
   const signal = new AbortController().signal;
   const clock = () => NOW_MS;
+  const hostManagementBinding = createHostManagementBinding({
+    controller,
+    actor,
+    identity: IDENTITY,
+    credentialAuthority: authority,
+  });
   const compositionOptions = {
     credentialAuthority: authority,
     credentialExchangeCoordinator: coordinator,
-    connectorController: controller,
-    hostCarrierActor: actor,
+    hostManagementBinding,
     ...IDENTITY,
     bootstrapSecretReference: BOOTSTRAP_SECRET_REFERENCE,
     refreshSecretReference: REFRESH_SECRET_REFERENCE,
@@ -338,7 +388,11 @@ async function registerStartedAttempt(h, connectorId = "connector-composition-on
     },
   }));
   attempt.connection.acknowledge(attempt.transport.confirmNext());
-  return { attempt, response: await start, connectorId };
+  await start;
+  // The start operation resolves once the controller admits the attempt; the
+  // registered projection is observable through a subsequent status read.
+  const response = await h.composition.handleRequest(request("status"));
+  return { attempt, response, connectorId };
 }
 
 test("the real adapter composition projects stopped through registered_incomplete and uses one HostCarrier control", async () => {
@@ -403,6 +457,7 @@ test("the real adapter composition projects stopped through registered_incomplet
     const serialized = JSON.stringify(response);
     for (const marker of SECRET_MARKERS) assert.equal(serialized.includes(marker), false);
   }
+  await h.composition.closeAndDrain();
 });
 
 test("credential missing and authority failure remain closed non-secret projections", async (t) => {
@@ -473,6 +528,7 @@ test("close fences new requests, waits admitted management work, and drains only
   assert.equal(registered.attempt.drainCalls.length, 1);
   assert.deepEqual(registered.attempt.drainCalls[0], {
     controllerGeneration: "1",
+    carrierAttemptGeneration: "1",
     carrierGeneration: 1,
     connectorId: registered.connectorId,
   });
@@ -492,14 +548,17 @@ test("close fences new requests, waits admitted management work, and drains only
 test("activation rejects foreign lineages, structural ports, stale owners, and replacement", async (t) => {
   await t.test("structural controller", () => {
     const h = harness({ activate: false });
+    const structuralBinding = function (candidate, operation) {
+      if (candidate !== structuralBinding) return null;
+      if (operation === "consume") return null;
+      if (operation === "commit") return false;
+      if (operation === "abort") return true;
+      return null;
+    };
     assert.throws(
       () => createRelayV2DashboardManagementComposition({
         ...h.compositionOptions,
-        connectorController: {
-          inspectCut: () => ({ status: "stopped", controllerGeneration: "0" }),
-          start: async () => {},
-          stopAndDrain: async () => {},
-        },
+        hostManagementBinding: structuralBinding,
       }),
       RelayV2DashboardManagementCompositionClosedError,
     );
@@ -535,10 +594,21 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
         onRouteBound() {}, onClientFrame() {}, onRouteUnbound() {},
       },
     });
+    const foreignBinding = createHostManagementBinding({
+      controller: h.controller,
+      actor: foreignActor,
+      identity: {
+        hostId: "foreign-host",
+        hostEpoch: IDENTITY.hostEpoch,
+        hostInstanceId: IDENTITY.hostInstanceId,
+        credentialReference: IDENTITY.credentialReference,
+      },
+      credentialAuthority: h.authority,
+    });
     assert.throws(
       () => createRelayV2DashboardManagementComposition({
         ...h.compositionOptions,
-        hostCarrierActor: foreignActor,
+        hostManagementBinding: foreignBinding,
       }),
       RelayV2DashboardManagementCompositionClosedError,
     );
@@ -562,10 +632,23 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
       ...IDENTITY,
       signal: h.compositionOptions.signal,
     }));
+    const staleBinding = createHostManagementBinding({
+      controller: staleController,
+      actor: h.actor,
+      identity: IDENTITY,
+      credentialAuthority: h.authority,
+    });
+    // Force the binding's commit to fail, simulating a controller generation
+    // mismatch detected by the host runtime composition.
+    const originalCommit = staleBinding.bind(staleBinding);
+    const failingBinding = function (candidate, operation, consumedIdentity, consumedCredentialOwner) {
+      if (operation === "commit") return false;
+      return originalCommit(candidate, operation, consumedIdentity, consumedCredentialOwner);
+    };
     assert.throws(
       () => createRelayV2DashboardManagementComposition({
         ...h.compositionOptions,
-        connectorController: staleController,
+        hostManagementBinding: failingBinding,
       }),
       RelayV2DashboardManagementCompositionClosedError,
     );
@@ -584,10 +667,16 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
         onRouteBound() {}, onClientFrame() {}, onRouteUnbound() {},
       },
     });
+    const replacementBinding = createHostManagementBinding({
+      controller: h.controller,
+      actor: replacementActor,
+      identity: IDENTITY,
+      credentialAuthority: h.authority,
+    });
     assert.throws(
       () => createRelayV2DashboardManagementComposition({
         ...h.compositionOptions,
-        hostCarrierActor: replacementActor,
+        hostManagementBinding: replacementBinding,
       }),
       RelayV2DashboardManagementCompositionClosedError,
     );

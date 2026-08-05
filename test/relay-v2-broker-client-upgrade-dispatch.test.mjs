@@ -51,10 +51,6 @@ test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures i
       assert.equal(expectedRole, "client");
       throw Object.assign(new Error("redacted"), { code: "AUTH_INVALID" });
     },
-    verifyLegacySecret() {
-      legacyVerifierCalls += 1;
-      return true;
-    },
     prepareClientWss() {
       prepareCalls += 1;
       throw new Error("preflight must not run");
