@@ -1004,7 +1004,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       if (provisionTarget) {
         for (const stale of namedTargets) invalidateTarget(stale, this.now);
         state.targets.push(target);
-        await this.prepareOutput(state, target);
+        await this.prepareOutput(state, target, true);
       }
       ensureOperable(target);
       // ownership.status is serialized by this same canonical lock, but it
@@ -1312,7 +1312,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "managed target changed before Relay v2 exact observation",
         );
       }
-      const output = await this.prepareOutput(state, target);
+      const output = await this.prepareOutput(state, target, true);
       // inspectExactTarget/prepareOutput may yield while a same-target status
       // poll publishes its fence and waits on this lock. Recheck after the
       // final await, before releasing HELD or publishing the observation.
@@ -1649,6 +1649,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   private async prepareOutput(
     state: TerminalControlState,
     target: TerminalControlTargetRecord,
+    capturePane = false,
   ): Promise<TerminalControlOutputPosition> {
     try {
       const output = await this.backend.prepareOutput(
@@ -1656,6 +1657,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         target.managedSession.name,
         "0",
         target.outputGeneration,
+        capturePane,
       );
       target.outputGeneration = output.generation;
       return output;
