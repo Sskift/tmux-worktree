@@ -2916,9 +2916,7 @@ export class RelayV2HostCommandPlane {
               committed.value.resourceEvidence,
             ) as unknown;
             if (isThenable(publication)) {
-              throw new RelayV2HostCommandPlaneStateError(
-                "Relay v2 resource publication must be a synchronous bounded enqueue",
-              );
+              throw new Error("Relay v2 resource publication must be a synchronous bounded enqueue");
             }
           } catch (error) {
             try {
