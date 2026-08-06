@@ -9,6 +9,7 @@ import com.tmuxworktree.mobile.core.data.PreferencesStore
 import com.tmuxworktree.mobile.core.data.TwDatabase
 import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.network.NetworkMonitor
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRepository
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePostedNotificationCancellationCoordinator
@@ -141,7 +142,10 @@ class AppContainer internal constructor(
         outboxEnqueueAuthority = relayV2StateRepository,
         agentDurableRepository = agentTranscriptLifecycleRepository,
         agentNotificationPlatform = agentTranscriptLifecycleNotificationPlatform,
-        agentOptionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+        agentOptionalCapabilities = setOf(
+            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+            AGENT_CHAT_V1_CAPABILITY,
+        ),
         transportFactory = BoundedRelayV2TransportFactory(),
     )
 }

@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.app
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleScope
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleState
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentNotificationConfig
@@ -65,6 +66,8 @@ import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
 import com.tmuxworktree.mobile.core.model.TransportPhase
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatMutation
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatReducer
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.runtime.RelayClientEvent
 import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionRegistry
@@ -995,14 +998,23 @@ class V2ViewModel(
         }
     }
 
-    val agentChat: kotlinx.coroutines.flow.StateFlow<RelayChatState>
-        get() = relay.chat
+    /**
+     * Stable chat projection owned by the ViewModel. The active source mirrors the admission: the
+     * v1 actor under Relay v1, the v2 composition's agent.chat.v1 extension under Relay v2.
+     */
+    private val _agentChat: MutableStateFlow<RelayChatState> = MutableStateFlow(relay.chat.value)
+    val agentChat: kotlinx.coroutines.flow.StateFlow<RelayChatState> = _agentChat.asStateFlow()
 
     fun sendAgentChatMessage(session: RelaySession, message: String) {
         val normalized = message.trim()
         if (normalized.isBlank()) return
-        val relay = relayV1IfAdmitted() ?: return
-        relay.sendAgentChatMessage(
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val composition = synchronized(relayV2UiFenceLock) { relayV2Composition }
+                ?: return
+            composition.sendAgentChatMessage(session.name, normalized)
+            return
+        }
+        relayV1IfAdmitted()?.sendAgentChatMessage(
             hostId = session.hostId,
             sessionName = session.name,
             message = normalized,
@@ -1010,16 +1022,34 @@ class V2ViewModel(
     }
 
     fun fetchAgentChatHistory(session: RelaySession) {
-        val relay = relayV1IfAdmitted() ?: return
-        relay.fetchAgentChatHistory(
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val composition = synchronized(relayV2UiFenceLock) { relayV2Composition }
+                ?: return
+            composition.fetchAgentChatHistory(session.name)
+            return
+        }
+        relayV1IfAdmitted()?.fetchAgentChatHistory(
             hostId = session.hostId,
             sessionName = session.name,
         )
     }
 
     fun retryFailedAgentChatMessages(session: RelaySession) {
-        val relay = relayV1IfAdmitted() ?: return
-        relay.retryFailedChatMessages(session.hostId, session.name)
+        if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
+            val composition = synchronized(relayV2UiFenceLock) { relayV2Composition }
+                ?: return
+            val failed = _agentChat.value.pending(session.name).filter { it.failed }
+            if (failed.isEmpty()) return
+            _agentChat.value = RelayChatReducer.reduce(
+                _agentChat.value,
+                RelayChatMutation.RetryFailed(session.name),
+            )
+            failed.forEach { pending ->
+                composition.sendAgentChatMessage(session.name, pending.message)
+            }
+            return
+        }
+        relayV1IfAdmitted()?.retryFailedChatMessages(session.hostId, session.name)
     }
 
     fun cancelMessage(event: TimelineEvent) {
@@ -2808,6 +2838,40 @@ class V2ViewModel(
             }
         }
         viewModelScope.launch {
+            composition.negotiatedCapabilities.collect { capabilities ->
+                val current = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized false
+                    // The UI chat gate keys on the v1 wire name ("agent-chat-v1"); surface the v2
+                    // negotiated capability under both names so the existing entry point works.
+                    val uiCapabilities =
+                        if (AGENT_CHAT_V1_CAPABILITY in capabilities) {
+                            capabilities + RelayChatState.AGENT_CHAT_V1_CAPABILITY
+                        } else {
+                            capabilities
+                        }
+                    _uiState.value = _uiState.value.copy(
+                        hosts = _uiState.value.hosts.map { host ->
+                            host.copy(capabilities = uiCapabilities)
+                        },
+                    )
+                    true
+                }
+            }
+        }
+        viewModelScope.launch {
+            composition.agentChat.collect { chat ->
+                val current = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized false
+                    _agentChat.value = chat
+                    true
+                }
+            }
+        }
+        viewModelScope.launch {
             preferencesStore.values.collect { preferences ->
                 val current = synchronized(relayV2UiFenceLock) {
                     if (relayV2Composition !== composition ||
@@ -3029,6 +3093,13 @@ class V2ViewModel(
         }
         viewModelScope.launch {
             relay.terminal.collect { terminal -> _uiState.update { it.copy(terminal = terminal) } }
+        }
+        viewModelScope.launch {
+            relay.chat.collect { chat ->
+                if (_uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
+                    _agentChat.value = chat
+                }
+            }
         }
         viewModelScope.launch { relay.events.collect(::handleRelayEvent) }
         viewModelScope.launch {

@@ -19,6 +19,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSessionSelectionController
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSessionSelectionIntent
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
@@ -459,6 +460,15 @@ internal class RelayV2BaseRuntimeComposition(
     val agentTimelineRevision: StateFlow<Long> = _agentTimelineRevision.asStateFlow()
     val agentCapabilityAvailability: StateFlow<RelayV2AgentCapabilityAvailability> =
         actor.agentCapabilityAvailability
+    /** Frozen intersection of client-advertised, broker-blessed, and host-announced capabilities. */
+    val negotiatedCapabilities: StateFlow<Set<String>> = actor.negotiatedCapabilities
+    val agentChat: StateFlow<RelayChatState> = actor.agentChatState
+
+    fun sendAgentChatMessage(session: String, message: String): Boolean =
+        actor.sendAgentChatMessage(session, message)
+
+    fun fetchAgentChatHistory(session: String, limit: Int? = null): Boolean =
+        actor.fetchAgentChatHistory(session, limit)
 
     init {
         val completionHandle = parentScope.coroutineContext[Job]?.invokeOnCompletion { close() }

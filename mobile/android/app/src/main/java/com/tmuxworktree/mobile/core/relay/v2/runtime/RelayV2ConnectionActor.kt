@@ -26,7 +26,21 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1FrameMetadata
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1InboundFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1CodecException
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Error
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Event
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Frame
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1FrameMetadata
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1HistoryRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1HistoryResult
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1SendRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Sent
 import com.tmuxworktree.mobile.core.relay.runtime.BoundedActionQueue
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatMutation
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatReducer
+import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2CodecException
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
@@ -95,6 +109,7 @@ internal class RelayV2ConnectionActor(
     optionalCapabilities: Set<String> = emptySet(),
     private val agentExtensionCodec: AgentTranscriptLifecycleV1Codec =
         AgentTranscriptLifecycleV1Codec(),
+    private val agentChatCodec: AgentChatV1Codec = AgentChatV1Codec(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val attemptId: () -> String = { UUID.randomUUID().toString() },
     private val watchdogDelay: suspend (Long) -> Unit = { delay(it) },
@@ -205,6 +220,11 @@ internal class RelayV2ConnectionActor(
         )
     val agentCapabilityAvailability: StateFlow<RelayV2AgentCapabilityAvailability> =
         _agentCapabilityAvailability.asStateFlow()
+    private val _negotiatedCapabilities = MutableStateFlow<Set<String>>(emptySet())
+    /** Frozen intersection of client-advertised, broker-blessed, and host-announced capabilities. */
+    val negotiatedCapabilities: StateFlow<Set<String>> = _negotiatedCapabilities.asStateFlow()
+    private val _agentChatState = MutableStateFlow(RelayChatState())
+    val agentChatState: StateFlow<RelayChatState> = _agentChatState.asStateFlow()
     val effects: Flow<RelayV2RuntimeEffect> = multiplexedEffectFlow()
 
     /**
@@ -2419,7 +2439,7 @@ internal class RelayV2ConnectionActor(
         bytes: ByteArray,
         metadata: RelayV2FrameMetadata,
     ) {
-        val artifact = try {
+        val transcriptArtifact = try {
             agentExtensionCodec.decodePublicFrameArtifact(
                 bytes,
                 AgentTranscriptLifecycleV1FrameMetadata(
@@ -2428,10 +2448,75 @@ internal class RelayV2ConnectionActor(
                 ),
             )
         } catch (_: AgentTranscriptLifecycleV1CodecException) {
+            null
+        }
+        if (transcriptArtifact != null) {
+            deliverAgentExtensionArtifact(transcriptArtifact)
+            return
+        }
+        val chatFrame = try {
+            agentChatCodec.decodePublicFrame(
+                bytes,
+                AgentChatV1FrameMetadata(
+                    opcode = metadata.opcode,
+                    compressed = metadata.compressed,
+                ),
+            )
+        } catch (_: AgentChatV1CodecException) {
             failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             return
         }
-        deliverAgentExtensionArtifact(artifact)
+        deliverAgentChatFrame(chatFrame)
+    }
+
+    /**
+     * Updates the local chat projection from an inbound agent.chat.v1 frame. Only frames arriving
+     * under an ONLINE generation that negotiated agent.chat.v1 are accepted; anything else is a
+     * schema violation.
+     */
+    private fun deliverAgentChatFrame(frame: AgentChatV1Frame) {
+        val context = synchronized(lifecycleLock) {
+            val fence = agentExtensionSendFence.get()
+            onlineContext?.takeIf {
+                _state.value.phase in AGENT_EXTENSION_INBOUND_PHASES &&
+                    fence != null &&
+                    AGENT_CHAT_V1_CAPABILITY in fence.negotiatedCapabilities &&
+                    AGENT_CHAT_V1_CAPABILITY in it.negotiatedCapabilities
+            }
+        } ?: run {
+            failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            return
+        }
+        when (frame) {
+            is AgentChatV1Sent -> mutateAgentChat(
+                RelayChatMutation.Sent(
+                    requestId = frame.requestId,
+                    session = frame.session,
+                    turnId = frame.turnId,
+                    nowMillis = clock(),
+                ),
+            )
+            is AgentChatV1Event -> mutateAgentChat(
+                RelayChatMutation.TurnUpdated(frame.session, frame.turn.toView()),
+            )
+            is AgentChatV1HistoryResult -> mutateAgentChat(
+                RelayChatMutation.HistoryResult(
+                    frame.session,
+                    frame.turns.map { it.toView() },
+                ),
+            )
+            is AgentChatV1Error -> mutateAgentChat(
+                RelayChatMutation.SendFailed(
+                    requestId = frame.requestId,
+                    session = frame.sessionId,
+                    error = frame.message,
+                ),
+            )
+            else -> {
+                // Requests are never valid on the inbound lane; the host/broker own them.
+                failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            }
+        }
     }
 
     /**
@@ -2678,6 +2763,94 @@ internal class RelayV2ConnectionActor(
             ),
         )
         return null
+    }
+
+    // ==== agent.chat.v1 minimal extension ====
+
+    /**
+     * Sends an `agent.chat.send` request over the current ONLINE transport when agent.chat.v1 is
+     * negotiated. Returns true only when the frame was handed to the transport synchronously under
+     * the generation fence. The pending bubble is optimistically tracked and confirmed by the host
+     * via `agent.chat.sent` / `agent.chat.event`.
+     */
+    fun sendAgentChatMessage(session: String, message: String): Boolean {
+        val requestId = "agent-chat-" + attemptId()
+        val encoded = synchronized(lifecycleLock) {
+            val context = onlineAgentChatContextLocked() ?: return@synchronized null
+            val source = activeTransport ?: return@synchronized null
+            val frame = AgentChatV1SendRequest(
+                session = session,
+                message = message,
+                requestId = requestId,
+                hostId = context.hostId,
+                expectedHostEpoch = context.hostEpoch,
+                scopeId = scopeIdForSession(session),
+                sessionId = session,
+            )
+            try {
+                agentChatCodec.encodePublicFrame(frame) to source
+            } catch (_: AgentChatV1CodecException) {
+                null
+            }
+        } ?: return false
+        if (!encoded.second.send(encoded.first)) return false
+        mutateAgentChat(
+            RelayChatMutation.SendPending(
+                requestId = requestId,
+                session = session,
+                message = message,
+                nowMillis = clock(),
+            ),
+        )
+        return true
+    }
+
+    /** Sends an `agent.chat.history` request over the current ONLINE transport. */
+    fun fetchAgentChatHistory(session: String, limit: Int? = null): Boolean {
+        val requestId = "agent-chat-history-" + attemptId()
+        val encoded = synchronized(lifecycleLock) {
+            val context = onlineAgentChatContextLocked() ?: return@synchronized null
+            val source = activeTransport ?: return@synchronized null
+            val frame = AgentChatV1HistoryRequest(
+                session = session,
+                limit = limit,
+                requestId = requestId,
+                hostId = context.hostId,
+                expectedHostEpoch = context.hostEpoch,
+                scopeId = scopeIdForSession(session),
+                sessionId = session,
+            )
+            try {
+                agentChatCodec.encodePublicFrame(frame) to source
+            } catch (_: AgentChatV1CodecException) {
+                null
+            }
+        } ?: return false
+        return encoded.second.send(encoded.first)
+    }
+
+    /**
+     * Returns the handshake context only while agent.chat.v1 is negotiated and the actor is
+     * ONLINE. Guarded by lifecycleLock (callers must hold it).
+     */
+    private fun onlineAgentChatContextLocked(): RelayV2HandshakeContext? {
+        if (lifecycleState != LifecycleState.OPEN ||
+            _state.value.phase != RelayV2ConnectionPhase.ONLINE
+        ) {
+            return null
+        }
+        val fence = agentExtensionSendFence.get() ?: return null
+        if (AGENT_CHAT_V1_CAPABILITY !in fence.negotiatedCapabilities) return null
+        return onlineContext
+    }
+
+    private fun mutateAgentChat(mutation: RelayChatMutation) {
+        _agentChatState.value = RelayChatReducer.reduce(_agentChatState.value, mutation)
+    }
+
+    private fun scopeIdForSession(session: String): String {
+        val index = session.indexOf(":")
+        return if (index <= 0) "local" else session.substring(0, index)
     }
 
     private fun sendAgentExtensionRequest(action: SendAgentExtensionRequestAction) {
@@ -5675,6 +5848,10 @@ internal class RelayV2ConnectionActor(
         onlineContext = context
         publishedEffectGeneration.set(generation)
         agentExtensionSendFence.set(fence)
+        _negotiatedCapabilities.value = context.negotiatedCapabilities.toSet()
+        if (AGENT_CHAT_V1_CAPABILITY !in context.negotiatedCapabilities) {
+            _agentChatState.value = RelayChatState()
+        }
         _agentCapabilityAvailability.value =
             if (agentCapabilityWithdrawnGeneration != generation &&
                 AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in context.negotiatedCapabilities
@@ -5708,6 +5885,8 @@ internal class RelayV2ConnectionActor(
         activeProfile = null
         onlineQueryWindow = null
         hostAvailability = null
+        _negotiatedCapabilities.value = emptySet()
+        _agentChatState.value = RelayChatState()
         updateState(RelayV2ConnectionPhase.CLOSED, null)
         drainQueuedEffects()
         completeShutdownDrain()
