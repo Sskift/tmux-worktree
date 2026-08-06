@@ -6689,6 +6689,7 @@ internal class RelayV2ConnectionActor(
 
         private val SUPPORTED_OPTIONAL_CAPABILITIES = setOf(
             AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+            AGENT_CHAT_V1_CAPABILITY,
         )
 
         internal const val DEFAULT_ACTION_CAPACITY = 64
