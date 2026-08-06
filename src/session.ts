@@ -1146,6 +1146,34 @@ function decodeLegacyMigrationCorrelation(
   }
 }
 
+const RPC_V2_DISPLAY_LABEL_MAX_BYTES = 128;
+
+/**
+ * Converge a managed record name into a canonical RPC v2 display label that
+ * satisfies the persistedDisplayLabel contract: non-empty, no surrounding
+ * whitespace, no NUL characters, and at most 128 UTF-8 bytes. Over-long labels
+ * are truncated at a UTF-8 code point boundary so a multi-byte character is
+ * never split (a trailing partial sequence is backed off to its leading byte).
+ *
+ * Returns undefined when nothing can be salvaged — a whitespace-only or
+ * otherwise unrepresentable name — signalling the caller to skip the session.
+ */
+export function convergeRpcV2DisplayLabel(name: string): string | undefined {
+  let label = name.trim();
+  if (!label) return undefined;
+  label = label.replaceAll("\0", "");
+  if (!label) return undefined;
+  const bytes = Buffer.from(label, "utf8");
+  if (bytes.length > RPC_V2_DISPLAY_LABEL_MAX_BYTES) {
+    let end = RPC_V2_DISPLAY_LABEL_MAX_BYTES;
+    // Back up while the byte just past the cut is a continuation byte, so the
+    // cut never lands mid-character.
+    while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+    label = bytes.subarray(0, end).toString("utf8").trim();
+  }
+  return label || undefined;
+}
+
 export interface MarkRelayV2HostLegacySessionsLifecycleV1Result {
   /** Legacy sessions that were marked end-to-end in this run. */
   marked: number;
@@ -1168,15 +1196,21 @@ export interface MarkRelayV2HostLegacySessionsLifecycleV1Deps {
  * authority so that RPC v2 discovery (`tw rpc-v2 list`) projects them as
  * `lifecycleMarked: true`.
  *
- * Only a managed record with no lifecycle extension is a migration candidate;
- * records already carrying an extension are skipped. A live tmux session with
- * no birth marker receives generated markers plus a synthetic reservation
- * correlation, then the state extension is committed under the canonical
- * writer lock. If the tmux markers already exist from an earlier partially
- * applied run, the state extension is completed from those markers instead
- * (recovery). Sessions whose live markers do not carry this migration's
- * reservation namespace are left untouched and remain invisible to v2, which
- * preserves the frozen "foreign markers are not adopted" lifecycle semantics.
+ * A managed record with no lifecycle extension is a migration candidate; a
+ * live tmux session with no birth marker receives generated markers plus a
+ * synthetic reservation correlation, then the state extension is committed
+ * under the canonical writer lock. If the tmux markers already exist from an
+ * earlier partially applied run, the state extension is completed from those
+ * markers instead (recovery). Every extension written here persists the
+ * managed record name as the display label, converged with
+ * {@link convergeRpcV2DisplayLabel} so discovery's persistedDisplayLabel
+ * contract holds. Records already carrying an extension with a non-null label
+ * are skipped; records carrying an extension whose display label is null (the
+ * output of an earlier migration bug) are repaired in place from the managed
+ * record name, idempotently. Sessions whose live markers do not carry this
+ * migration's reservation namespace are left untouched and remain invisible
+ * to v2, which preserves the frozen "foreign markers are not adopted"
+ * lifecycle semantics.
  *
  * The migration never throws for per-session tmux/commit failures; it counts
  * them as skipped so that v2 list remains usable. State corruption still fails
@@ -1205,7 +1239,30 @@ export function markRelayV2HostLegacySessionsLifecycleV1(
   const liveByName = new Map(live.map((entry) => [entry.rawName, entry]));
 
   for (const managed of state.sessions) {
-    if (managedSessionLifecycleExtension(managed) !== undefined) {
+    const existing = managedSessionLifecycleExtension(managed);
+    // A record already carrying a non-null display label is fully migrated.
+    if (existing !== undefined && existing.displayLabel !== null) {
+      continue;
+    }
+    // The display label is always the converged managed record name, mirroring
+    // discovery's persistedDisplayLabel contract. Unrepresentable names are
+    // skipped rather than persisted with a broken label.
+    const label = convergeRpcV2DisplayLabel(managed.name);
+    if (label === undefined) {
+      result.skipped += 1;
+      continue;
+    }
+    // Repair an extension written by the pre-fix migration that persisted a
+    // null display label. The label derives from the managed record name, so
+    // current tmux liveness is not required for the state-only fix.
+    if (existing !== undefined) {
+      const extension = buildManagedSessionLifecycleExtension(
+        existing.tmux,
+        existing.reservationCorrelation,
+        label,
+      );
+      defaultRecordManagedSession(withManagedSessionLifecycleExtension(managed, extension), path);
+      result.recovered += 1;
       continue;
     }
     const entry = liveByName.get(managed.name);
@@ -1221,7 +1278,7 @@ export function markRelayV2HostLegacySessionsLifecycleV1(
       const extension = buildManagedSessionLifecycleExtension(
         tmuxIdentityFromLifecycle(entry),
         correlation,
-        null,
+        label,
       );
       defaultRecordManagedSession(withManagedSessionLifecycleExtension(managed, extension), path);
       result.recovered += 1;
@@ -1258,7 +1315,7 @@ export function markRelayV2HostLegacySessionsLifecycleV1(
       const extension = buildManagedSessionLifecycleExtension(
         tmuxIdentityFromLifecycle(confirmed),
         correlation,
-        null,
+        label,
       );
       defaultRecordManagedSession(withManagedSessionLifecycleExtension(managed, extension), path);
       result.marked += 1;

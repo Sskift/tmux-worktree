@@ -143,7 +143,7 @@ test("idempotently marks a v1-era legacy managed session into v2 lifecycle autho
     assert.ok(ext, "legacy record should carry a lifecycle extension after marking");
     assert.equal(ext.tmux.birthMarker, FIXED_BIRTH_MARKER);
     assert.equal(ext.tmux.rawName, "tw-term-legacy");
-    assert.equal(ext.displayLabel, null);
+    assert.equal(ext.displayLabel, "tw-term-legacy");
     assert.equal(
       ext.reservationCorrelation.reservationId,
       `${session.RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX}:tw-term-legacy`,
@@ -188,7 +188,66 @@ test("recovers a partially applied migration from live tmux markers", () => {
     const ext = state.managedSessionLifecycleExtension(recorded);
     assert.ok(ext, "partial migration should be completed by a later run");
     assert.equal(ext.tmux.birthMarker, FIXED_BIRTH_MARKER);
+    assert.equal(ext.displayLabel, "tw-term-legacy");
     assert.deepEqual(ext.reservationCorrelation, correlation);
+  });
+});
+
+test("repairs an already-migrated record whose display label is null", () => {
+  withTempDir("tw-legacy-repair-", (root) => {
+    const path = join(root, "state.json");
+    // Simulate the pre-fix migration output: a full lifecycle extension whose
+    // displayLabel was persisted as null.
+    const ext = state.buildManagedSessionLifecycleExtension(
+      {
+        serverSocketPath: "/tmp/tmux-501/default",
+        serverPid: "4200",
+        serverStarted: "1783700000",
+        sessionId: "$7",
+        rawName: "tw-term-legacy",
+        sessionCreated: "1783700010",
+        birthMarker: FIXED_BIRTH_MARKER,
+      },
+      migrationCorrelation(),
+      null,
+    );
+    writeState(path, [state.withManagedSessionLifecycleExtension(legacySession(), ext)]);
+    const live = makeLive([legacyLive({
+      birthMarker: FIXED_BIRTH_MARKER,
+      reservationCorrelation: encoded(migrationCorrelation()),
+    })]);
+    let execCalls = 0;
+
+    const result = session.markRelayV2HostLegacySessionsLifecycleV1({
+      statePath: path,
+      listTmuxSessionLifecycleEntries: live.list,
+      tmuxBin: () => "tmux",
+      exec: (bin, args) => { execCalls += 1; live.exec(bin, args); },
+    });
+    assert.deepEqual(result, { marked: 0, recovered: 1, skipped: 0 });
+    assert.equal(execCalls, 0, "the label repair is a state-only fix and must not touch tmux");
+
+    const recorded = readState(path).sessions[0];
+    const repaired = state.managedSessionLifecycleExtension(recorded);
+    assert.ok(repaired, "the extension must survive the repair");
+    assert.equal(repaired.displayLabel, "tw-term-legacy");
+    assert.equal(repaired.tmux.birthMarker, FIXED_BIRTH_MARKER);
+    assert.equal(repaired.incarnation, ext.incarnation, "repair must not rotate the incarnation");
+
+    // Idempotent: a second run sees a non-null label and writes nothing.
+    let execCallsAfter = 0;
+    const again = session.markRelayV2HostLegacySessionsLifecycleV1({
+      statePath: path,
+      listTmuxSessionLifecycleEntries: live.list,
+      tmuxBin: () => "tmux",
+      exec: (bin, args) => { execCallsAfter += 1; live.exec(bin, args); },
+    });
+    assert.deepEqual(again, { marked: 0, recovered: 0, skipped: 0 });
+    assert.equal(execCallsAfter, 0);
+    assert.equal(
+      state.managedSessionLifecycleExtension(readState(path).sessions[0]).displayLabel,
+      "tw-term-legacy",
+    );
   });
 });
 
@@ -263,6 +322,62 @@ test("an invalid synthetic birth marker is skipped without a state write", () =>
       randomBirthMarker: () => "not-a-birth-marker",
     });
     assert.deepEqual(result, { marked: 0, recovered: 0, skipped: 1 });
+    assert.equal(state.managedSessionLifecycleExtension(readState(path).sessions[0]), undefined);
+  });
+});
+
+test("converges an over-long session name into a byte-bounded display label", () => {
+  // Helper-level assertions for the persistedDisplayLabel convergence contract.
+  assert.equal(session.convergeRpcV2DisplayLabel("a".repeat(200)), "a".repeat(128));
+  assert.equal(
+    Buffer.byteLength(session.convergeRpcV2DisplayLabel("a".repeat(200)), "utf8"),
+    128,
+  );
+  // A multi-byte character straddling the 128-byte cut must be dropped whole,
+  // never split: 42 × 界 (3 bytes each) + "a" = 127 bytes, then another 界
+  // would push past the limit, so only "42界 + a" survives.
+  const multibyteName = "界".repeat(42) + "a" + "界";
+  assert.equal(session.convergeRpcV2DisplayLabel(multibyteName), "界".repeat(42) + "a");
+  assert.equal(session.convergeRpcV2DisplayLabel("  padded  "), "padded");
+  assert.equal(session.convergeRpcV2DisplayLabel("   "), undefined);
+
+  withTempDir("tw-legacy-label-", (root) => {
+    // A >128-byte name cannot be marked at all: the tmux incarnation identity
+    // byte-bounds rawName to 128, so the migration skips it without persisting
+    // a broken lifecycle extension (and never writes a truncated label that
+    // would diverge from the authoritative name).
+    const path = join(root, "state.json");
+    const longName = "界".repeat(42) + "a" + "界";
+    writeState(path, [legacySession({ name: longName })]);
+    const live = makeLive([legacyLive({ name: longName, rawName: longName })]);
+
+    const result = session.markRelayV2HostLegacySessionsLifecycleV1({
+      statePath: path,
+      listTmuxSessionLifecycleEntries: live.list,
+      tmuxBin: () => "tmux",
+      exec: (bin, args) => live.exec(bin, args),
+      randomBirthMarker: () => FIXED_BIRTH_MARKER,
+    });
+    assert.deepEqual(result, { marked: 0, recovered: 0, skipped: 1 });
+    assert.equal(state.managedSessionLifecycleExtension(readState(path).sessions[0]), undefined);
+  });
+});
+
+test("skips a whitespace-only session name without persisting an extension", () => {
+  withTempDir("tw-legacy-blank-", (root) => {
+    const path = join(root, "state.json");
+    writeState(path, [legacySession({ name: "   " })]);
+    const live = makeLive([legacyLive({ name: "   ", rawName: "   " })]);
+    let execCalls = 0;
+
+    const result = session.markRelayV2HostLegacySessionsLifecycleV1({
+      statePath: path,
+      listTmuxSessionLifecycleEntries: live.list,
+      tmuxBin: () => "tmux",
+      exec: (bin, args) => { execCalls += 1; live.exec(bin, args); },
+    });
+    assert.deepEqual(result, { marked: 0, recovered: 0, skipped: 1 });
+    assert.equal(execCalls, 0);
     assert.equal(state.managedSessionLifecycleExtension(readState(path).sessions[0]), undefined);
   });
 });
@@ -374,6 +489,11 @@ test("tw rpc-v2 list lazily promotes a legacy session and projects lifecycleMark
     assert.equal(response.sessions.length, 1);
     assert.equal(response.sessions[0].name, "tw-term-legacy");
     assert.equal(response.sessions[0].lifecycleMarked, true);
+    assert.equal(
+      response.sessions[0].label,
+      "tw-term-legacy",
+      "the persisted display label must be non-null and equal to the session name",
+    );
     assert.ok(response.sessions[0].reservationCorrelation, "migration correlation is projected");
 
     // State now carries a real lifecycle extension.
