@@ -85,6 +85,42 @@ function worktreeSession(overrides = {}) {
   };
 }
 
+const FIXED_DIGEST = "a".repeat(64);
+
+function migrationCorrelation(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    reservationId: "tw-migrate-legacy-v1:tw-term-legacy",
+    hostEpoch: "0",
+    principalId: "tw-cli-legacy-migration",
+    hostId: "localhost",
+    commandId: "migrate-legacy:tw-term-legacy",
+    requestFingerprint: {
+      schemaVersion: 1,
+      algorithm: "sha256-rfc8785",
+      digest: FIXED_DIGEST,
+    },
+    ...overrides,
+  };
+}
+
+function realCorrelation(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    reservationId: "tw-rsv-12345",
+    hostEpoch: "0",
+    principalId: "tw-cli",
+    hostId: "localhost",
+    commandId: "create-worktree",
+    requestFingerprint: {
+      schemaVersion: 1,
+      algorithm: "sha256-rfc8785",
+      digest: "b".repeat(64),
+    },
+    ...overrides,
+  };
+}
+
 function scope(
   kind,
   targetId,
@@ -226,6 +262,97 @@ test("canonical discovery authoritatively excludes unmarked legacy Sessions", as
     false,
     "legacy raw targets must not enter the public Relay projection",
   );
+});
+
+test("canonical discovery strips the synthetic legacy migration correlation from the projection", () => {
+  const projected = projectRelayV2CanonicalTwRpcDiscoveredSession({
+    processTarget: { kind: "local", targetId: "local" },
+    session: terminalSession({
+      reservationCorrelation: migrationCorrelation(),
+    }),
+  });
+  assert.equal("reservationCorrelation" in projected, false);
+  assert.equal(
+    JSON.stringify(projected).includes("tw-migrate-legacy-v1"),
+    false,
+    "the migration provenance marker must never leak into the public Relay projection",
+  );
+});
+
+test("canonical discovery preserves a real reservation correlation in the projection", () => {
+  const correlation = realCorrelation();
+  const projected = projectRelayV2CanonicalTwRpcDiscoveredSession({
+    processTarget: { kind: "local", targetId: "local" },
+    session: terminalSession({ reservationCorrelation: correlation }),
+  });
+  assert.deepEqual(projected.reservationCorrelation, correlation);
+});
+
+test("canonical discovery only filters the exact tw-migrate-legacy-v1: namespace", () => {
+  const correlation = realCorrelation({
+    reservationId: "tw-migrate-legacy-v1x:tw-term-legacy",
+  });
+  const projected = projectRelayV2CanonicalTwRpcDiscoveredSession({
+    processTarget: { kind: "local", targetId: "local" },
+    session: terminalSession({ reservationCorrelation: correlation }),
+  });
+  assert.deepEqual(
+    projected.reservationCorrelation,
+    correlation,
+    "a reservationId merely prefixed by the migration namespace must stay correlated",
+  );
+});
+
+test("materialized reconcile accepts a legacy-migrated session despite the synthetic correlation", async () => {
+  const temporaryHome = mkdtempSync(join(tmpdir(), "tw-rpc-v2-legacy-corr-"));
+  try {
+    const port = queryPort(({ command }) => (
+      command === "capabilities"
+        ? capabilities()
+        : {
+            protocolVersion: 2,
+            sessions: [terminalSession({
+              name: "raw.tmux.legacy",
+              label: "Legacy terminal label",
+              reservationCorrelation: migrationCorrelation(),
+            })],
+          }
+    ));
+    const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
+      scopes: [scope("local", "local")],
+      queryPort: port,
+      queryTimeoutMs: 5,
+    });
+    const store = await RelayV2HostStateStore.open({
+      paths: relayV2HostStatePaths(temporaryHome),
+    });
+    const foundation = new RelayV2MaterializedStateFoundation({
+      hostId: "host-under-test",
+      discovery,
+      store,
+      readinessSink: { apply: () => true },
+    });
+
+    // Before the fix this reconcile() rejected with an INTERNAL
+    // RelayV2MaterializedStateError: the synthetic correlation failed
+    // scanAuthorityConflict's "unknown reservation correlation" check.
+    const reconciled = await foundation.reconcile();
+    assert.equal(reconciled.readiness.snapshotMaterializationReady, true);
+    const cut = (await foundation.sessionsSnapshot(
+      "legacy-cut",
+      reconciled.snapshot.hostEpoch,
+      null,
+    )).payload;
+    assert.equal(cut.scopes[0].items.length, 1);
+    assert.equal(cut.scopes[0].items[0].displayName, "Legacy terminal label");
+    assert.equal(
+      JSON.stringify(cut).includes("tw-migrate-legacy-v1"),
+      false,
+      "the migration provenance marker must not materialize into the snapshot",
+    );
+  } finally {
+    rmSync(temporaryHome, { recursive: true, force: true });
+  }
 });
 
 test("canonical discovery swaps explicit config generations atomically and keeps raw targets process-local", async () => {
