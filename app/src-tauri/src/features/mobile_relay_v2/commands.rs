@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -706,6 +707,37 @@ pub(crate) async fn mobile_relay_v2_enrollment_artifact_copy(
     .await
     .map_err(|_| not_ready_error())?
     .map_err(|_| not_ready_error())
+}
+
+#[tauri::command]
+pub(crate) async fn mobile_relay_v2_enrollment_artifact_inline_png(
+    handle: String,
+    state: State<'_, Arc<MobileRelayV2ManagementCommandState>>,
+) -> Result<String, ManagementError> {
+    if !valid_artifact_handle(&handle) {
+        return Err(invalid_argument_error());
+    }
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        inline_enrollment_artifact_png(state.as_ref(), &handle)
+    })
+    .await
+    .map_err(|_| not_ready_error())?
+    .map_err(|_| not_ready_error())
+}
+
+/// Returns the live QR PNG as base64 (data-URL-ready payload) without
+/// consuming the artifact, so the renderer can display the pairing QR inline.
+/// The enrollment link and PNG bytes are never logged or persisted.
+fn inline_enrollment_artifact_png(
+    state: &MobileRelayV2ManagementCommandState,
+    handle: &str,
+) -> Result<String, ()> {
+    if state.disposed.load(Ordering::Acquire) {
+        return Err(());
+    }
+    let png = state.artifacts.claim_inline_png(handle)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png.as_ref()))
 }
 
 fn copy_enrollment_artifact(

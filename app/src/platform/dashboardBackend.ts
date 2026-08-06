@@ -51,6 +51,7 @@ import type {
   MobileRelayStatus,
   MobileRelayV2CreateEnrollmentInput,
   MobileRelayV2DashboardState,
+  MobileRelayV2InlineEnrollmentArtifactPngInput,
   MobileRelayV2RevokeClientGrantInput,
   MobileRelayV2SelfHostedConfigInput,
   MobileRelayV2SelfHostedStatus,
@@ -100,6 +101,9 @@ export interface MobileRelayV2ProductAdapter {
   stopConnector(): Promise<MobileRelayV2DashboardState>;
   showEnrollmentArtifact(input: MobileRelayV2ShowEnrollmentArtifactInput): Promise<void>;
   copyEnrollmentArtifact(input: MobileRelayV2CopyEnrollmentArtifactInput): Promise<void>;
+  inlineEnrollmentArtifactPng(
+    input: MobileRelayV2InlineEnrollmentArtifactPngInput,
+  ): Promise<string>;
   createEnrollment(
     input: MobileRelayV2CreateEnrollmentInput,
   ): Promise<MobileRelayV2DashboardState>;
@@ -296,6 +300,13 @@ export function createUnavailableMobileRelayV2Adapter(
       });
     },
     copyEnrollmentArtifact: async () => {
+      throw new MobileRelayV2BackendOperationError({
+        code: "relay_v2_adapter_unavailable",
+        message: reason,
+        retryable: false,
+      });
+    },
+    inlineEnrollmentArtifactPng: async () => {
       throw new MobileRelayV2BackendOperationError({
         code: "relay_v2_adapter_unavailable",
         message: reason,

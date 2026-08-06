@@ -5,6 +5,7 @@ import {
   type MobileRelayV2CopyEnrollmentArtifactInput,
   type MobileRelayV2CreateEnrollmentInput,
   type MobileRelayV2DashboardState,
+  type MobileRelayV2InlineEnrollmentArtifactPngInput,
   type MobileRelayV2RevokeClientGrantInput,
   type MobileRelayV2ShowEnrollmentArtifactInput,
 } from "./domainTypes";
@@ -16,6 +17,7 @@ import {
 const COMMAND = "mobile_relay_v2_management_call";
 const SHOW_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
 const COPY_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_copy";
+const INLINE_PNG_COMMAND = "mobile_relay_v2_enrollment_artifact_inline_png";
 const DEFAULT_OFF_REASON = "Relay v2 management is unavailable (default off).";
 const REQUEST_ID_PATTERNS = {
   1: /^dmgmt1\.[A-Za-z0-9_-]{21}[AQgw]$/,
@@ -643,6 +645,11 @@ function artifactCopyInput(input: MobileRelayV2CopyEnrollmentArtifactInput): unk
   return { handle: input.handle, field: input.field };
 }
 
+function inlinePngInput(input: MobileRelayV2InlineEnrollmentArtifactPngInput): unknown {
+  if (!NATIVE_QR_HANDLE_PATTERN.test(input.handle)) throw invalidInputError();
+  return { handle: input.handle };
+}
+
 export function createRelayV2ManagementAdapter(
   invoke: ManagementInvoke,
 ): MobileRelayV2ProductAdapter {
@@ -692,6 +699,17 @@ export function createRelayV2ManagementAdapter(
       try {
         await invoke(COPY_ARTIFACT_COMMAND, artifactCopyInput(input));
       } catch (error) {
+        const code = parseManagementError(error);
+        throw code ? operationError(code) : invalidOutcomeError();
+      }
+    },
+    inlineEnrollmentArtifactPng: async (input) => {
+      try {
+        const png = await invoke(INLINE_PNG_COMMAND, inlinePngInput(input));
+        if (typeof png !== "string" || png.length === 0) throw invalidOutcomeError();
+        return png;
+      } catch (error) {
+        if (error instanceof MobileRelayV2BackendOperationError) throw error;
         const code = parseManagementError(error);
         throw code ? operationError(code) : invalidOutcomeError();
       }

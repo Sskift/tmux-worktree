@@ -23,9 +23,11 @@ export interface RelayConnectionOverviewCardProps {
   revokingGrant: boolean;
   qrBusy: boolean;
   copiedEnrollmentLink: boolean;
+  inlineQr: { handle: string; pngBase64: string } | null;
   onPrimaryAction: (action: RelayConnectionOverviewPrimaryAction) => void;
   onCopyEnrollmentLink: (handle: string) => void;
   onRevokeKnownGrant: () => void;
+  onHidePairingQr: () => void;
 }
 
 function OverviewIcon({ tone }: { tone: RelayConnectionOverview["tone"] }): ReactNode {
@@ -49,9 +51,11 @@ export function RelayConnectionOverviewCard({
   revokingGrant,
   qrBusy,
   copiedEnrollmentLink,
+  inlineQr,
   onPrimaryAction,
   onCopyEnrollmentLink,
   onRevokeKnownGrant,
+  onHidePairingQr,
 }: RelayConnectionOverviewCardProps) {
   const action = overview.primaryAction;
   return (
@@ -91,6 +95,25 @@ export function RelayConnectionOverviewCard({
           </button>
         )}
       </div>
+
+      {inlineQr && (
+        <div className="connections-relay-overview__qr">
+          <img
+            src={`data:image/png;base64,${inlineQr.pngBase64}`}
+            alt="Pairing QR code"
+            className="connections-relay-overview__qr-image"
+            width={220}
+            height={220}
+          />
+          <button
+            type="button"
+            className="connections-relay-overview__qr-hide"
+            onClick={onHidePairingQr}
+          >
+            Hide
+          </button>
+        </div>
+      )}
 
       {activeReview && (
         <div className="connections-relay-overview__secondary">

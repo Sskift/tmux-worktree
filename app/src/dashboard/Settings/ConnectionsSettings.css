@@ -591,6 +591,37 @@
   line-height: 15px;
 }
 
+.connections-relay-overview__qr {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--shell-border);
+}
+
+.connections-relay-overview__qr-image {
+  width: 220px;
+  height: 220px;
+  padding: 10px;
+  background: #ffffff;
+  border-radius: var(--shell-radius-sm);
+}
+
+.connections-relay-overview__qr-hide {
+  padding: 2px 6px;
+  background: transparent;
+  border: none;
+  color: var(--shell-text-muted);
+  font-size: 10px;
+  line-height: 15px;
+  cursor: pointer;
+}
+
+.connections-relay-overview__qr-hide:hover {
+  color: var(--shell-text);
+  text-decoration: underline;
+}
+
 .connections-relay-overview__secondary,
 .connections-relay-overview__paired {
   display: flex;

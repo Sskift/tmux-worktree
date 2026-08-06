@@ -1165,9 +1165,11 @@ export function ConnectionsSettings({
             revokingGrant={relayOverview.revokingGrant}
             qrBusy={relayOverview.qrBusy}
             copiedEnrollmentLink={copiedEnrollmentLink}
+            inlineQr={relayOverview.inlineQr}
             onPrimaryAction={handleRelayOverviewPrimaryAction}
             onCopyEnrollmentLink={handleCopyEnrollmentLink}
             onRevokeKnownGrant={handleRevokeKnownGrant}
+            onHidePairingQr={relayOverview.hidePairingQr}
           />
 
           <details

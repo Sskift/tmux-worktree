@@ -390,6 +390,10 @@ export type MobileRelayV2ShowEnrollmentArtifactInput = {
   handle: string;
 };
 
+export type MobileRelayV2InlineEnrollmentArtifactPngInput = {
+  handle: string;
+};
+
 export type MobileRelayV2EnrollmentArtifactCopyField =
   | "issuer_url"
   | "relay_url"

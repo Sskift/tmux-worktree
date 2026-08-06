@@ -563,3 +563,43 @@ test("renderer can ask Tauri to show or copy only through an opaque current arti
       && error.code === "INVALID_ARGUMENT",
   );
 });
+
+test("renderer can fetch the inline QR PNG base64 through an opaque current artifact handle", async () => {
+  const calls: Array<{ command: string; args?: unknown }> = [];
+  const adapter = createRelayV2ManagementAdapter(async (command, args) => {
+    calls.push({ command, args });
+    if (command === "mobile_relay_v2_enrollment_artifact_inline_png") {
+      return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    }
+    return successOutcome("status");
+  });
+  const handle = `dqart1.${"C".repeat(32)}`;
+
+  const png = await adapter.inlineEnrollmentArtifactPng({ handle });
+  assert.match(png, /^[A-Za-z0-9+/=]+$/);
+  assert.deepEqual(calls, [
+    {
+      command: "mobile_relay_v2_enrollment_artifact_inline_png",
+      args: { handle },
+    },
+  ]);
+  assert.equal(JSON.stringify(calls).includes("tmuxworktree://enroll"), false);
+
+  await assert.rejects(
+    adapter.inlineEnrollmentArtifactPng({ handle: "tmuxworktree://enroll?secret=forbidden" }),
+    (error: unknown) => error instanceof MobileRelayV2BackendOperationError
+      && error.code === "INVALID_ARGUMENT",
+  );
+  await assert.rejects(
+    adapter.inlineEnrollmentArtifactPng({ handle: "dqart1.invalid" }),
+    (error: unknown) => error instanceof MobileRelayV2BackendOperationError
+      && error.code === "INVALID_ARGUMENT",
+  );
+
+  const malformed = createRelayV2ManagementAdapter(async () => null);
+  await assert.rejects(
+    malformed.inlineEnrollmentArtifactPng({ handle }),
+    (error: unknown) => error instanceof MobileRelayV2BackendOperationError
+      && error.code === "CHANNEL_CLOSED",
+  );
+});
