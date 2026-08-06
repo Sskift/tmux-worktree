@@ -1942,6 +1942,11 @@ class V2ViewModel(
             if (state.health.protocolLabel == RELAY_V2_TRANSPORT_LABEL) {
                 appendLine("capabilityReadiness=not-advertised")
             }
+            val lastActivationFailure = lastRelayV2ActivationFailureCause
+            if (lastActivationFailure != null) {
+                appendLine("lastActivationFailureAtMs=$lastRelayV2ActivationFailureAtMs")
+                appendLine("lastActivationFailure=$lastActivationFailure")
+            }
         }.trim()
     }
 
@@ -1963,36 +1968,79 @@ class V2ViewModel(
     }
 
     private suspend fun activateRelayV2Profile(expectedProfile: RelayV2Profile) {
-        trackProfileMutation(
-            expectedUrl = null,
-            updateProfileExpectation = false,
-        ) {
-            val runtime = requireRelayV2ProfileRuntime()
-            val admission = runtime.admitStartup()
-            check(admission.state == RelayStartupAdmissionState.RELAY_V2)
-            val admittedProfile = requireNotNull(admission.relayV2Profile)
-            check(admittedProfile == expectedProfile) {
-                "Confirmed Relay v2 profile changed before activation"
+        try {
+            trackProfileMutation(
+                expectedUrl = null,
+                updateProfileExpectation = false,
+            ) {
+                val runtime = requireRelayV2ProfileRuntime()
+                val admission = runtime.admitStartup()
+                check(admission.state == RelayStartupAdmissionState.RELAY_V2)
+                val admittedProfile = requireNotNull(admission.relayV2Profile)
+                // Reconciliation may repair the durable credential (bump credentialVersion) or a
+                // prior partial activation may have already persisted connect consent. Both are
+                // benign for the same activation lineage; only identity-bearing drift (endpoint,
+                // host, client lineage) must refuse the confirmed activation.
+                check(
+                    admittedProfile == expectedProfile ||
+                        admittedProfile.sharesActivationLineageWith(expectedProfile),
+                ) {
+                    "Confirmed Relay v2 profile changed before activation"
+                }
+                // The explicit second Connect is the exact-profile connect consent; the runtime is
+                // started from the profile returned by the durable CAS owner. A profile that was
+                // already consented (autoConnect == true) is its own consent receipt, matching the
+                // explicit Connect/Retry path; the CAS owner stays idempotent for the exact profile.
+                val consentedProfile = if (admittedProfile.autoConnect) {
+                    admittedProfile
+                } else {
+                    runtime.consentAutoConnect(admittedProfile)
+                        ?: error(
+                            "Relay v2 connect consent was rejected by the profile owner; " +
+                                "a self-revoke, pending activation, or endpoint change may be in progress",
+                        )
+                }
+                container.legacyIdentityImporter.discardForV2Profile()
+                applyStartupAdmission(admission)
+                try {
+                    startRelayV2BaseRuntime(consentedProfile)
+                } catch (failure: Throwable) {
+                    applyStartupAdmission(
+                        RelayStartupAdmission(
+                            state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
+                            message = "Relay v2 base runtime activation failed closed; " +
+                                "Relay v1 fallback is disabled.",
+                        ),
+                    )
+                    throw failure
+                }
             }
-            // The explicit second Connect is the exact-profile connect consent; the runtime is
-            // started from the profile returned by the durable CAS owner.
-            val consentedProfile = runtime.consentAutoConnect(admittedProfile)
-                ?: error("Relay v2 connect consent was rejected by the profile owner")
-            container.legacyIdentityImporter.discardForV2Profile()
-            applyStartupAdmission(admission)
-            try {
-                startRelayV2BaseRuntime(consentedProfile)
-            } catch (failure: Throwable) {
-                applyStartupAdmission(
-                    RelayStartupAdmission(
-                        state = RelayStartupAdmissionState.RELAY_V2_ADMISSION_FAILED,
-                        message = "Relay v2 base runtime activation failed closed; " +
-                            "Relay v1 fallback is disabled.",
-                    ),
-                )
-                throw failure
-            }
+        } catch (failure: Throwable) {
+            if (failure is CancellationException) throw failure
+            recordRelayV2ActivationFailure(failure)
+            throw failure
         }
+    }
+
+    /**
+     * Bounded in-memory breadcrumb for the last Relay v2 activation failure. Held in state only —
+     * the app deliberately has no logging — and surfaced on the existing sanitized diagnostics
+     * copy surface. The cause is the same bounded, static-English message shown in the review UI
+     * (credential-exchange failures are already redacted by design).
+     */
+    @Volatile
+    private var lastRelayV2ActivationFailureAtMs: Long = 0
+
+    @Volatile
+    private var lastRelayV2ActivationFailureCause: String? = null
+
+    private fun recordRelayV2ActivationFailure(failure: Throwable) {
+        val cause = failure.message?.takeIf(String::isNotBlank)
+            ?: failure::class.simpleName?.takeIf(String::isNotBlank)
+            ?: return
+        lastRelayV2ActivationFailureAtMs = System.currentTimeMillis()
+        lastRelayV2ActivationFailureCause =
+            cause.replace('\n', ' ').replace('\r', ' ').trim().take(MAX_ACTIVATION_FAILURE_CAUSE)
     }
 
     /**
@@ -2756,8 +2804,38 @@ class V2ViewModel(
         }
     }
 
+    /**
+     * Retires a stale ViewModel-owned composition before a fresh base-runtime start.
+     *
+     * A previous partial activation can leave [relayV2Composition] referencing a terminally
+     * failed, closed, or otherwise non-reusable composition. The check this replaces guarded
+     * against double-starting; retiring the stale owner first preserves that invariant (only one
+     * live composition is installed per ViewModel) while making a retried activation self-healing.
+     * [RelayV2BaseRuntimeComposition.close] begins the async actor shutdown on the composition's
+     * own scope and the registry is cleared so the foreground keep-alive never watches a retired
+     * owner, so no old actor/service is leaked.
+     */
+    private fun retireStaleRelayV2Composition() {
+        synchronized(relayV2UiFenceLock) {
+            val stale = relayV2Composition ?: return
+            runCatching { stale.close() }
+            RelayV2ConnectionRegistry.clear(stale)
+            relayV2Composition = null
+            relayV2NotificationProfileActive = false
+            relayV2SessionReplyCuts.value = emptyMap()
+            relayV2ScopeCreateCuts.value = emptyMap()
+            relayV2Terminal = null
+            _uiState.value = _uiState.value.copy(
+                agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
+                scopes = emptyList(),
+                sessions = emptyList(),
+                terminal = TerminalStreamState(),
+            )
+        }
+    }
+
     private fun startRelayV2BaseRuntime(profile: RelayV2Profile) {
-        check(relayV2Composition == null) { "Relay v2 base runtime already exists" }
+        retireStaleRelayV2Composition()
         // The composition lives on the process-level scope so it survives Activity/ViewModel
         // recreation. A recreated ViewModel re-attaches to the still-running composition instead of
         // building a fresh one; a stale owner is retired and replaced.
@@ -3613,6 +3691,7 @@ class V2ViewModel(
     )
 
     companion object {
+        private const val MAX_ACTIVATION_FAILURE_CAUSE = 200
         private const val DEFAULT_TERMINAL_COLS = 80
         private const val DEFAULT_TERMINAL_ROWS = 24
         private const val DEFAULT_SCOPE_ID = "local"
@@ -3914,3 +3993,21 @@ private fun RelayV2ScopeCreateFailure.createTerminalUserMessage(): String = when
     RelayV2ScopeCreateFailure.STORE_FAILURE,
     -> "The Terminal command could not be safely queued"
 }
+
+/**
+ * Same activation lineage as [other]: the durable admitted profile may legally differ from the
+ * confirmed enrollment profile only through benign repair or prior consent. Reconciliation repairs
+ * the credential by bumping [RelayV2Profile.credentialVersion] while preserving identity and
+ * lineage, and a prior partial activation may have already persisted [RelayV2Profile.autoConnect].
+ * Any identity-bearing or lineage-bearing field (profile ID, endpoints, host, client instance,
+ * activation generation, credential reference) difference means the confirmed profile is no
+ * longer the durable truth and activation must be refused.
+ */
+internal fun RelayV2Profile.sharesActivationLineageWith(other: RelayV2Profile): Boolean =
+    profileId == other.profileId &&
+        issuerUrl == other.issuerUrl &&
+        relayUrl == other.relayUrl &&
+        hostId == other.hostId &&
+        clientInstanceId == other.clientInstanceId &&
+        activationGeneration == other.activationGeneration &&
+        credentialReference == other.credentialReference

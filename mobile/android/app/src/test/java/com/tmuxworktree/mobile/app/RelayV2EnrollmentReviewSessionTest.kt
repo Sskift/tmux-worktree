@@ -16,6 +16,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
@@ -156,6 +157,77 @@ class RelayV2EnrollmentReviewSessionTest {
         releaseActivation.complete(Unit)
         assertEquals(RelayV2EnrollmentActivateResult.ACTIVATED, first.await())
         assertEquals(RelayV2EnrollmentReviewState.Idle, session.state)
+    }
+
+    @Test
+    fun `activation failure surfaces the underlying cause in the failure state`() = runBlocking {
+        val session = RelayV2EnrollmentReviewSession(
+            confirmationPort = RelayV2EnrollmentConfirmationPort {
+                RelayV2EnrollmentResult.Activated(activeProfile())
+            },
+            activationPort = RelayV2EnrollmentActivationPort {
+                error("Relay v2 connect consent was rejected by the profile owner")
+            },
+            deviceLabel = DEVICE_LABEL,
+        )
+        assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
+        assertEquals(RelayV2EnrollmentConfirmResult.COMPLETED, session.confirm())
+
+        assertEquals(RelayV2EnrollmentActivateResult.FAILED, session.activate())
+        val failure = session.state as RelayV2EnrollmentReviewState.ActivationFailure
+        assertEquals(
+            "Relay v2 connection could not be started: " +
+                "Relay v2 connect consent was rejected by the profile owner",
+            failure.message,
+        )
+        assertFalse(session.toString().contains(ENROLLMENT_CODE))
+    }
+
+    @Test
+    fun `activation failure cause is bounded and single line`() = runBlocking {
+        val longCause = "first line\nsecond line " + "x".repeat(1_000)
+        val session = RelayV2EnrollmentReviewSession(
+            confirmationPort = RelayV2EnrollmentConfirmationPort {
+                RelayV2EnrollmentResult.Activated(activeProfile())
+            },
+            activationPort = RelayV2EnrollmentActivationPort {
+                error(longCause)
+            },
+            deviceLabel = DEVICE_LABEL,
+        )
+        assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
+        assertEquals(RelayV2EnrollmentConfirmResult.COMPLETED, session.confirm())
+        assertEquals(RelayV2EnrollmentActivateResult.FAILED, session.activate())
+
+        val failure = session.state as RelayV2EnrollmentReviewState.ActivationFailure
+        assertFalse(failure.message.contains("\n"))
+        assertTrue(
+            failure.message.length <=
+                "Relay v2 connection could not be started: ".length + 200,
+        )
+        assertTrue(
+            failure.message.startsWith(
+                "Relay v2 connection could not be started: first line second line",
+            ),
+        )
+        assertFalse(session.toString().contains(ENROLLMENT_CODE))
+    }
+
+    @Test
+    fun `confirmation failure surfaces the underlying cause in the failure state`() = runBlocking {
+        val session = RelayV2EnrollmentReviewSession(DEVICE_LABEL) {
+            error("Relay v2 credential exchange failed (HTTP 403)")
+        }
+        assertEquals(RelayV2EnrollmentOfferResult.ACCEPTED, session.offer(enrollmentPayload()))
+
+        assertEquals(RelayV2EnrollmentConfirmResult.FAILED, session.confirm())
+        val failure = session.state as RelayV2EnrollmentReviewState.Failure
+        assertEquals(
+            "Relay v2 enrollment confirmation failed: " +
+                "Relay v2 credential exchange failed (HTTP 403)",
+            failure.message,
+        )
+        assertFalse(session.toString().contains(ENROLLMENT_CODE))
     }
 
     @Test

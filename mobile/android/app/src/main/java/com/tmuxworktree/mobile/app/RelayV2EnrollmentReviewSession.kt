@@ -42,13 +42,17 @@ internal sealed interface RelayV2EnrollmentReviewState {
     data class Activating(val facts: RelayV2EnrollmentReviewFacts) : RelayV2EnrollmentReviewState
     data class ActivationFailure(
         val facts: RelayV2EnrollmentReviewFacts,
+        val cause: String? = null,
     ) : RelayV2EnrollmentReviewState {
         val message: String
-            get() = FIXED_ACTIVATION_FAILURE_MESSAGE
+            get() = FIXED_ACTIVATION_FAILURE_MESSAGE + boundedCauseSuffix(cause)
     }
-    data class Failure(val facts: RelayV2EnrollmentReviewFacts) : RelayV2EnrollmentReviewState {
+    data class Failure(
+        val facts: RelayV2EnrollmentReviewFacts,
+        val cause: String? = null,
+    ) : RelayV2EnrollmentReviewState {
         val message: String
-            get() = FIXED_FAILURE_MESSAGE
+            get() = FIXED_FAILURE_MESSAGE + boundedCauseSuffix(cause)
     }
 }
 
@@ -198,8 +202,11 @@ internal class RelayV2EnrollmentReviewSession(
                     } catch (cancelled: CancellationException) {
                         currentState = RelayV2EnrollmentReviewState.Failure(observed.facts)
                         throw cancelled
-                    } catch (_: IllegalArgumentException) {
-                        SubmissionPreparation.Failed(observed.facts)
+                    } catch (failure: IllegalArgumentException) {
+                        SubmissionPreparation.Failed(
+                            observed.facts,
+                            failure.toBoundedFailureCause(),
+                        )
                     }
                 }
             }
@@ -207,11 +214,15 @@ internal class RelayV2EnrollmentReviewSession(
 
         if (submission is SubmissionPreparation.Failed) {
             return mutex.withLock {
-                currentState = RelayV2EnrollmentReviewState.Failure(submission.facts)
+                currentState = RelayV2EnrollmentReviewState.Failure(
+                    submission.facts,
+                    submission.cause,
+                )
                 RelayV2EnrollmentConfirmResult.FAILED
             }
         }
         submission as SubmissionPreparation.Ready
+        var failureCause: String? = null
         val activatedProfile = try {
             (confirmationPort.confirm(submission.confirmed) as? RelayV2EnrollmentResult.Activated)
                 ?.profile
@@ -222,7 +233,8 @@ internal class RelayV2EnrollmentReviewSession(
                 }
             }
             throw cancelled
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            failureCause = failure.toBoundedFailureCause()
             null
         }
         val settled = withContext(NonCancellable) {
@@ -231,7 +243,7 @@ internal class RelayV2EnrollmentReviewSession(
                 currentState = if (activatedProfile != null) {
                     RelayV2EnrollmentReviewState.Completed(submission.facts)
                 } else {
-                    RelayV2EnrollmentReviewState.Failure(submission.facts)
+                    RelayV2EnrollmentReviewState.Failure(submission.facts, failureCause)
                 }
                 if (activatedProfile != null) {
                     RelayV2EnrollmentConfirmResult.COMPLETED
@@ -267,6 +279,7 @@ internal class RelayV2EnrollmentReviewSession(
             }
         }
         activation as ActivationPreparation.Ready
+        var failureCause: String? = null
         val activated = try {
             activationPort.activate(activation.profile)
             true
@@ -279,7 +292,8 @@ internal class RelayV2EnrollmentReviewSession(
                 }
             }
             throw cancelled
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            failureCause = failure.toBoundedFailureCause()
             false
         }
         val settled = withContext(NonCancellable) {
@@ -291,6 +305,7 @@ internal class RelayV2EnrollmentReviewSession(
                 } else {
                     currentState = RelayV2EnrollmentReviewState.ActivationFailure(
                         activation.facts,
+                        cause = failureCause,
                     )
                     RelayV2EnrollmentActivateResult.FAILED
                 }
@@ -308,7 +323,10 @@ internal class RelayV2EnrollmentReviewSession(
             val confirmed: RelayV2ConfirmedEnrollment,
         ) : SubmissionPreparation
 
-        data class Failed(val facts: RelayV2EnrollmentReviewFacts) : SubmissionPreparation
+        data class Failed(
+            val facts: RelayV2EnrollmentReviewFacts,
+            val cause: String? = null,
+        ) : SubmissionPreparation
     }
 
     private sealed interface ActivationPreparation {
@@ -334,3 +352,26 @@ private fun RelayV2EnrollmentReviewDraft.toReviewFacts(
 
 private const val FIXED_FAILURE_MESSAGE = "Relay v2 enrollment confirmation failed"
 private const val FIXED_ACTIVATION_FAILURE_MESSAGE = "Relay v2 connection could not be started"
+
+/** Bounded, single-line suffix appended to the fixed failure message; blank causes add nothing. */
+private fun boundedCauseSuffix(cause: String?): String {
+    val trimmed = cause?.takeIf(String::isNotBlank) ?: return ""
+    return ": $trimmed"
+}
+
+/**
+ * Single-line, bounded cause captured from the activation/confirmation port.
+ *
+ * The messages thrown along the activation path are static English (admission, consent, and
+ * composition guards); credential-exchange failures are already redacted by design
+ * ([RelayV2CredentialExchangeException] retains no request/response body). The cause is truncated
+ * so a hostile or oversized message can never blow up the UI.
+ */
+private fun Throwable.toBoundedFailureCause(): String? {
+    val raw = message?.takeIf(String::isNotBlank)
+        ?: this::class.simpleName?.takeIf(String::isNotBlank)
+        ?: return null
+    return raw.replace('\n', ' ').replace('\r', ' ').trim().take(MAX_CAUSE_LENGTH)
+}
+
+private const val MAX_CAUSE_LENGTH = 200

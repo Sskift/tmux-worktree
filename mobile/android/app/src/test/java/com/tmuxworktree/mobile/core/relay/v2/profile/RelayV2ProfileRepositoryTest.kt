@@ -823,6 +823,11 @@ class RelayV2ProfileRepositoryTest {
                     val consented = requireNotNull(store.consentRelayV2AutoConnect(activated))
                     assertEquals(activated.copy(autoConnect = true), consented)
 
+                    // Re-consent with the exact already-consented profile is idempotent: an
+                    // activation retry after a partial failure must not be blocked by consent
+                    // already being granted for the same profile.
+                    assertEquals(consented, store.consentRelayV2AutoConnect(consented))
+
                     // A stale pre-consent snapshot can no longer match or rewrite.
                     assertEquals(null, store.consentRelayV2AutoConnect(activated))
                 }
@@ -3366,7 +3371,8 @@ class RelayV2ProfileRepositoryTest {
                 return null
             }
             val current = storedActiveV2 ?: return null
-            if (current != expectedProfile || current.autoConnect) return null
+            if (current != expectedProfile) return null
+            if (current.autoConnect) return current
             val updated = current.copy(autoConnect = true)
             storedActiveV2 = updated
             persistedValues = persistedValues + ("autoConnect" to true)
