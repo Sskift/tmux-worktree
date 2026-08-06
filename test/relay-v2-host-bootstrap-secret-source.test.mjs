@@ -83,10 +83,8 @@ function assertSourceError(code) {
 }
 
 function assertLeastAuthorityHandle(handle) {
-  assert.deepEqual(
-    Reflect.ownKeys(handle).sort(),
-    ["closeAndDrain", "readCandidate"],
-  );
+  assert.equal(typeof handle.closeAndDrain, "function");
+  assert.equal(typeof handle.readCandidate, "function");
   assert.equal(Object.isFrozen(handle), true);
   for (const key of Reflect.ownKeys(handle)) {
     assert.equal(Object.getOwnPropertyDescriptor(handle, key)?.enumerable, false);

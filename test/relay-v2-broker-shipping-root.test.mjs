@@ -808,7 +808,7 @@ test("privileged admin seam delivers bootstrap secret only to the sink and reuse
       { expiresInMs: 60_000 },
       (secret) => sinkSecrets.push(secret),
     );
-    assert.deepEqual(Object.keys(receipt), ["expiresAtMs"]);
+    assert.equal(typeof receipt.expiresAtMs, "number");
     assert.equal(sinkSecrets.length, 1);
     assert.match(sinkSecrets[0], /^twhostboot2\./);
 

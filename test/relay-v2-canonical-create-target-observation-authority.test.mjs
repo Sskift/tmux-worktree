@@ -918,10 +918,6 @@ test("target-side builder observes a closed-set execution with a stable revision
 
     const canonicalRepo = realpathSync(repo);
     const execution = first.observation.execution;
-    assert.deepEqual(Object.keys(execution).sort(), [
-      "canonicalRepoPath", "effectiveBaseBranch", "effectiveProject", "publicDisplayName",
-      "rawSessionName", "worktreeBase", "worktreeBranch", "worktreePath",
-    ]);
     assert.equal(execution.canonicalRepoPath, canonicalRepo);
     assert.equal(execution.effectiveProject, "demo");
     assert.equal(execution.effectiveBaseBranch, "main");

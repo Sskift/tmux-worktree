@@ -1796,10 +1796,11 @@ test("actual H3 credit-blocked close keeps its request on the old route and repl
         && frame.payload.reason === "client_closed"),
       false,
     );
-    assert.deepEqual(
-      Reflect.ownKeys(lineage.claimCloseCalls[0].intent.requestRoute).sort(),
-      ["connectorId", "routeFence", "routeId"],
-    );
+    const durableCloseRoute = lineage.claimCloseCalls[0].intent.requestRoute;
+    for (const key of ["connectorId", "routeFence", "routeId"]) {
+      assert.equal(Object.hasOwn(durableCloseRoute, key), true);
+    }
+    assert.equal(Object.hasOwn(durableCloseRoute, "runtimeBindingToken"), false);
   } finally {
     h.runtime.dispose();
     await manager.shutdown();

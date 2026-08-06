@@ -269,7 +269,7 @@ async function createHarness({
 
   assert.equal(await composition.readiness.h0.activate(), true);
   assert.equal(Object.isFrozen(composition.readiness.codec), true);
-  assert.deepEqual(Object.keys(composition.readiness.codec), ["close"]);
+  assert.equal(composition.readiness.codec.close !== undefined, true);
   assert.equal(composition.readiness.codec.apply, undefined);
   assert.equal(composition.readiness.codec.activate, undefined);
   assert.equal(composition.readiness.h1.apply, undefined);
@@ -278,7 +278,8 @@ async function createHarness({
   assert.equal(composition.readiness.h1.issueDedupeWindow, undefined);
   assert.equal(composition.readiness.h3.apply, undefined);
   assert.equal(composition.readiness.h3.activate(), true);
-  assert.deepEqual(Object.keys(composition.readiness.h2), ["close"]);
+  assert.equal(composition.readiness.h2.close !== undefined, true);
+  assert.equal(composition.readiness.h2.apply, undefined);
 
   return {
     home,

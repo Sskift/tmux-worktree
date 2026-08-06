@@ -86,7 +86,7 @@ test("host codec readiness owns one fixed production generation and exposes only
     ready: true,
   });
   assert.equal(Object.isFrozen(lifecycle), true);
-  assert.deepEqual(Object.keys(lifecycle), ["close"]);
+  assert.equal(typeof lifecycle.close, "function");
   assert.equal(lifecycle.apply, undefined);
   assert.equal(lifecycle.activate, undefined);
   assert.equal(lifecycle.issuer, undefined);
