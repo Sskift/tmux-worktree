@@ -458,6 +458,7 @@ export type MobileRelayV2SelfHostedConfigInput = {
   tlsKeyPath: string;
   tlsCertificatePath: string;
   tlsCaPath: string;
+  externalTlsManagement: boolean;
 };
 
 export type MobileRelayV2SelfHostedProbeStatus =

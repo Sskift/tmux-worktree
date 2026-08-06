@@ -20,12 +20,13 @@ use crate::remote::{
 use crate::support::{app_home_dir, atomic_write_file, shell_quote};
 
 const CONFIG_CONTRACT: &str = "tmux-worktree-dashboard-relay-v2-self-hosted";
-const CONFIG_SCHEMA_VERSION: u32 = 6;
+const CONFIG_SCHEMA_VERSION: u32 = 7;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 const HOST_PROFILE_CONFIG_SCHEMA_VERSION: u32 = 2;
 const ROTATION_PENDING_CONFIG_SCHEMA_VERSION: u32 = 3;
 const ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION: u32 = 4;
 const BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION: u32 = 5;
+const CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION: u32 = 6;
 const REMOTE_PROFILE_SCHEMA_VERSION: u32 = 1;
 const FEATURE_KIND: &str = "explicit_self_hosted";
 const CENTER_SESSION: &str = "tw-relay-v2-center";
@@ -284,6 +285,8 @@ pub(crate) struct MobileRelayV2SelfHostedConfigInput {
     tls_key_path: String,
     tls_certificate_path: String,
     tls_ca_path: String,
+    #[serde(default)]
+    external_tls_management: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -299,6 +302,8 @@ struct PersistedSelfHostedConfig {
     tls_key_path: String,
     tls_certificate_path: String,
     tls_ca_path: String,
+    #[serde(default)]
+    external_tls_management: bool,
     #[serde(default)]
     host_profile_identity: String,
     #[serde(default)]
@@ -357,6 +362,7 @@ pub(crate) struct MobileRelayV2SelfHostedConfigProjection {
     tls_key_path: String,
     tls_certificate_path: String,
     tls_ca_path: String,
+    external_tls_management: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -1040,35 +1046,38 @@ fn validated_config(
     if input.listen_port == 0 {
         return Err("Relay v2 listen port must be between 1 and 65535".to_string());
     }
-    let tls_key_path = if inspect_tls {
+    let external_tls_management = input.external_tls_management;
+    let tls_key_path = if inspect_tls && !external_tls_management {
         validate_local_tls_file(&input.tls_key_path, "TLS private key")?
     } else {
         input.tls_key_path.trim().to_string()
     };
-    let tls_certificate_path = if inspect_tls {
+    let tls_certificate_path = if inspect_tls && !external_tls_management {
         validate_local_tls_file(&input.tls_certificate_path, "TLS certificate")?
     } else {
         input.tls_certificate_path.trim().to_string()
     };
-    let tls_ca_path = if inspect_tls {
+    let tls_ca_path = if inspect_tls && !external_tls_management {
         validate_local_tls_file(&input.tls_ca_path, "TLS CA certificate")?
     } else {
         input.tls_ca_path.trim().to_string()
     };
-    if tls_key_path.is_empty()
-        || tls_certificate_path.is_empty()
-        || tls_ca_path.is_empty()
-        || !Path::new(&tls_key_path).is_absolute()
-        || !Path::new(&tls_certificate_path).is_absolute()
-        || !Path::new(&tls_ca_path).is_absolute()
+    if !external_tls_management
+        && (tls_key_path.is_empty()
+            || tls_certificate_path.is_empty()
+            || tls_ca_path.is_empty()
+            || !Path::new(&tls_key_path).is_absolute()
+            || !Path::new(&tls_certificate_path).is_absolute()
+            || !Path::new(&tls_ca_path).is_absolute())
     {
         return Err(
             "Select absolute local TLS key, leaf certificate, and CA certificate paths".to_string(),
         );
     }
-    if tls_key_path == tls_certificate_path
-        || tls_key_path == tls_ca_path
-        || tls_certificate_path == tls_ca_path
+    if !external_tls_management
+        && (tls_key_path == tls_certificate_path
+            || tls_key_path == tls_ca_path
+            || tls_certificate_path == tls_ca_path)
     {
         return Err(
             "TLS key, leaf certificate, and CA certificate must be distinct files".to_string(),
@@ -1085,6 +1094,7 @@ fn validated_config(
         tls_key_path,
         tls_certificate_path,
         tls_ca_path,
+        external_tls_management,
         host_profile_identity: String::new(),
         profile_provisioned: false,
         host_credential_provisioned: false,
@@ -1238,7 +1248,9 @@ fn verify_rotation_transfer_identity(
 }
 
 fn normalize_legacy_connector_desired_state(config: &mut PersistedSelfHostedConfig) {
-    if config.schema_version < CONFIG_SCHEMA_VERSION {
+    // Connector desired state became durable in schema 6. Schemas older than
+    // that are conservatively reset to stopped; schema 6 and above preserve it.
+    if config.schema_version < CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION {
         config.connector_desired_running = false;
     }
 }
@@ -1267,6 +1279,7 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
                 | ROTATION_PENDING_CONFIG_SCHEMA_VERSION
                 | ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION
                 | BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
+                | CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION
                 | CONFIG_SCHEMA_VERSION
         )
         || !config.enabled
@@ -1275,12 +1288,13 @@ fn load_config() -> Result<Option<PersistedSelfHostedConfig>, String> {
         || normalize_issuer_url(&config.issuer_url)? != config.issuer_url
         || validate_listen_host(&config.listen_host)? != config.listen_host
         || config.listen_port == 0
-        || config.tls_key_path.is_empty()
-        || config.tls_certificate_path.is_empty()
-        || config.tls_ca_path.is_empty()
-        || !Path::new(&config.tls_key_path).is_absolute()
-        || !Path::new(&config.tls_certificate_path).is_absolute()
-        || !Path::new(&config.tls_ca_path).is_absolute()
+        || (!config.external_tls_management
+            && (config.tls_key_path.is_empty()
+                || config.tls_certificate_path.is_empty()
+                || config.tls_ca_path.is_empty()
+                || !Path::new(&config.tls_key_path).is_absolute()
+                || !Path::new(&config.tls_certificate_path).is_absolute()
+                || !Path::new(&config.tls_ca_path).is_absolute()))
         || (config.schema_version != LEGACY_CONFIG_SCHEMA_VERSION
             && !valid_host_profile_identity(&config.host_profile_identity))
         || config.host_credential_provisioned && !config.profile_provisioned
@@ -1340,19 +1354,35 @@ fn projection(config: &PersistedSelfHostedConfig) -> MobileRelayV2SelfHostedConf
         tls_key_path: config.tls_key_path.clone(),
         tls_certificate_path: config.tls_certificate_path.clone(),
         tls_ca_path: config.tls_ca_path.clone(),
+        external_tls_management: config.external_tls_management,
     }
 }
 
 fn deployment_fingerprint(config: &PersistedSelfHostedConfig) -> String {
-    let input = serde_json::json!({
-        "brokerHostId": config.broker_host_id,
-        "issuerUrl": config.issuer_url,
-        "listenHost": config.listen_host,
-        "listenPort": config.listen_port,
-        "tlsKeyPath": config.tls_key_path,
-        "tlsCertificatePath": config.tls_certificate_path,
-        "tlsCaPath": config.tls_ca_path,
-    });
+    // Keep the private-mode fingerprint byte-for-byte stable across the schema 7
+    // upgrade: only externally managed deployments add the new key.
+    let input = if config.external_tls_management {
+        serde_json::json!({
+            "brokerHostId": config.broker_host_id,
+            "issuerUrl": config.issuer_url,
+            "listenHost": config.listen_host,
+            "listenPort": config.listen_port,
+            "tlsKeyPath": config.tls_key_path,
+            "tlsCertificatePath": config.tls_certificate_path,
+            "tlsCaPath": config.tls_ca_path,
+            "externalTlsManagement": true,
+        })
+    } else {
+        serde_json::json!({
+            "brokerHostId": config.broker_host_id,
+            "issuerUrl": config.issuer_url,
+            "listenHost": config.listen_host,
+            "listenPort": config.listen_port,
+            "tlsKeyPath": config.tls_key_path,
+            "tlsCertificatePath": config.tls_certificate_path,
+            "tlsCaPath": config.tls_ca_path,
+        })
+    };
     let bytes = serde_json::to_vec(&input).expect("fixed deployment fingerprint schema serializes");
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1385,9 +1415,18 @@ fn prepared_management_ca_would_change(
     config: &PersistedSelfHostedConfig,
     binding: &SelfHostedManagementBinding,
 ) -> Result<bool, String> {
+    let source_path = if config.external_tls_management {
+        local_host_ca_input_path()?
+    } else {
+        PathBuf::from(&config.tls_ca_path)
+    };
     let source = read_local_private_file(
-        &config.tls_ca_path,
-        "TLS CA certificate",
+        &source_path.to_string_lossy(),
+        if config.external_tls_management {
+            "external TLS chain certificate"
+        } else {
+            "TLS CA certificate"
+        },
         MAX_TLS_FILE_BYTES,
     )?;
     let prepared_path = local_host_ca_input_path()?;
@@ -1561,6 +1600,7 @@ fn ensure_host_profile_identity(config: &mut PersistedSelfHostedConfig) -> Resul
             | ROTATION_PENDING_CONFIG_SCHEMA_VERSION
             | ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION
             | BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION
+            | CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION
     ) {
         config.schema_version = CONFIG_SCHEMA_VERSION;
     }
@@ -1855,11 +1895,28 @@ fn prepare_local_host_prerequisites_for(
     ensure_local_host_private_tree()?;
     ensure_local_native_credential_directory()?;
 
-    let ca = read_local_private_file(
-        &config.tls_ca_path,
-        "TLS CA certificate",
-        MAX_TLS_FILE_BYTES,
-    )?;
+    let ca = if config.external_tls_management {
+        // Externally managed TLS: the Host trust cut is the public chain pulled
+        // back from the devbox into the same local CA input cell that private
+        // mode stages. A missing local chain means the external deploy (which
+        // fetches it) has not run yet.
+        let ca_input = local_host_ca_input_path()?;
+        read_local_private_file(
+            &ca_input.to_string_lossy(),
+            "external TLS chain certificate",
+            MAX_TLS_FILE_BYTES,
+        )
+        .map_err(|_| {
+            "External TLS chain is not available locally; run Deploy to fetch the Let's Encrypt chain from the devbox"
+                .to_string()
+        })?
+    } else {
+        read_local_private_file(
+            &config.tls_ca_path,
+            "TLS CA certificate",
+            MAX_TLS_FILE_BYTES,
+        )?
+    };
     let ca_input = local_host_ca_input_path()?;
     let ca_input_string = ca_input.to_string_lossy().to_string();
     let ca = match std::fs::symlink_metadata(&ca_input) {
@@ -2041,6 +2098,60 @@ fn probe_status(config: &PersistedSelfHostedConfig) -> MobileRelayV2SelfHostedSt
         }
     };
     let fingerprint = deployment_fingerprint(config);
+    let tls_probe = if config.external_tls_management {
+        let hostname = match issuer_hostname(&config.issuer_url) {
+            Ok(hostname) => hostname,
+            Err(error) => {
+                status.error = Some(error);
+                return status;
+            }
+        };
+        format!(
+            r#"tls_external=0
+if test -e "$HOME/{REMOTE_TLS_KEY}" || test -L "$HOME/{REMOTE_TLS_KEY}"; then
+  if require_private_file "$HOME/{REMOTE_TLS_KEY}"; then
+    if test -e "$HOME/{REMOTE_TLS_CERTIFICATE}" || test -L "$HOME/{REMOTE_TLS_CERTIFICATE}"; then
+      if require_private_file "$HOME/{REMOTE_TLS_CERTIFICATE}"; then
+        san="$(openssl x509 -in "$HOME/{REMOTE_TLS_CERTIFICATE}" -noout -ext subjectAltName 2>/dev/null || true)"
+        case "$san" in
+          *"DNS:{hostname}"*) tls_external=1 ;;
+          *) printf 'external-tls-san-mismatch\n' ;;
+        esac
+      fi
+    fi
+  fi
+fi
+if test "$tls_external" -eq 1; then
+  if grep -Fq '"deploymentFingerprint": "{fingerprint}"' "$HOME/{REMOTE_PROFILE}"; then
+    printf 'tls=ready\n'
+    if ! openssl x509 -in "$HOME/{REMOTE_TLS_CERTIFICATE}" -noout -checkend 2592000 >/dev/null 2>&1; then
+      printf 'tls-expiring-soon\n'
+    fi
+  else
+    printf 'tls=missing\n'
+  fi
+else
+  printf 'tls=missing\n'
+fi
+"#,
+        )
+    } else {
+        format!(
+            r#"tls_present=0
+for file in "$HOME/{REMOTE_TLS_KEY}" "$HOME/{REMOTE_TLS_CERTIFICATE}" "$HOME/{REMOTE_TLS_CA}" "$HOME/{REMOTE_PROFILE}"; do
+  if test -e "$file" || test -L "$file"; then
+    require_private_file "$file"
+    tls_present=$((tls_present + 1))
+  fi
+done
+if test "$tls_present" -eq 4 && grep -Fq '"deploymentFingerprint": "{fingerprint}"' "$HOME/{REMOTE_PROFILE}"; then
+  printf 'tls=ready\n'
+else
+  printf 'tls=missing\n'
+fi
+"#
+        )
+    };
     let script = format!(
         r#"{REMOTE_SECURITY_FUNCTIONS}
 set -u
@@ -2062,18 +2173,7 @@ if test -e "$root/current" || test -L "$root/current"; then
 else
   printf 'bundle=missing\n'
 fi
-tls_present=0
-for file in "$HOME/{REMOTE_TLS_KEY}" "$HOME/{REMOTE_TLS_CERTIFICATE}" "$HOME/{REMOTE_TLS_CA}" "$HOME/{REMOTE_PROFILE}"; do
-  if test -e "$file" || test -L "$file"; then
-    require_private_file "$file"
-    tls_present=$((tls_present + 1))
-  fi
-done
-if test "$tls_present" -eq 4 && grep -Fq '"deploymentFingerprint": "{fingerprint}"' "$HOME/{REMOTE_PROFILE}"; then
-  printf 'tls=ready\n'
-else
-  printf 'tls=missing\n'
-fi
+{tls_probe}
 if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n'; else printf 'center=stopped\n'; fi
 "#,
         remote_tmux_cmd(&host),
@@ -2086,6 +2186,24 @@ if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n
                     "bundle=missing" => status.bundle_status = DeploymentProbeStatus::Missing,
                     "tls=ready" => status.tls_status = DeploymentProbeStatus::Ready,
                     "tls=missing" => status.tls_status = DeploymentProbeStatus::Missing,
+                    "tls-expiring-soon" => {
+                        if status.tls_status == DeploymentProbeStatus::Ready
+                            && status.error.is_none()
+                        {
+                            status.error = Some(
+                                "Relay v2 TLS certificate expires within 30 days; Let's Encrypt renewal should refresh it automatically"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    "external-tls-san-mismatch" => {
+                        if status.tls_status != DeploymentProbeStatus::Ready {
+                            status.error = Some(
+                                "Relay v2 TLS certificate SAN does not match the advertised origin hostname"
+                                    .to_string(),
+                            );
+                        }
+                    }
                     "center=running" => status.center_status = DeploymentProbeStatus::Running,
                     "center=stopped" => status.center_status = DeploymentProbeStatus::Stopped,
                     _ => {}
@@ -2093,6 +2211,23 @@ if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n
             }
         }
         Err(error) => status.error = Some(error),
+    }
+    if config.external_tls_management && status.tls_status == DeploymentProbeStatus::Ready {
+        let chain_ready = local_host_ca_input_path().is_ok_and(|path| {
+            read_local_private_file(
+                &path.to_string_lossy(),
+                "external TLS chain certificate",
+                MAX_TLS_FILE_BYTES,
+            )
+            .is_ok()
+        });
+        if !chain_ready {
+            status.tls_status = DeploymentProbeStatus::Missing;
+            status.error = Some(
+                "External TLS chain is not available locally; run Deploy to fetch the Let's Encrypt chain from the devbox"
+                    .to_string(),
+            );
+        }
     }
     status
 }
@@ -2203,6 +2338,9 @@ pub(crate) fn call_relay_v2_self_hosted_connector_operation(
         Ok(None) => return None,
         Err(_) => return Some(Err(management_operation_failed_error())),
     };
+    if ensure_host_profile_identity(&mut config).is_err() {
+        return Some(Err(management_operation_failed_error()));
+    }
     let result = match operation {
         MobileRelayV2ManagementOperation::StartConnector => {
             let Some(binding) = owner.active_management.clone() else {
@@ -2456,25 +2594,105 @@ test ! -L "$HOME/{remote_stage}"
     let publish_script =
         build_remote_bundle_publish_script(&remote_stage, &bundle_name, &deployment_id, version);
     run_remote_cmd_check_strings(&host, &["sh".into(), "-lc".into(), publish_script])?;
-    let tls_key =
-        read_local_private_file(&config.tls_key_path, "TLS private key", MAX_TLS_FILE_BYTES)?;
-    let tls_certificate = read_local_private_file(
-        &config.tls_certificate_path,
-        "TLS leaf certificate",
-        MAX_TLS_FILE_BYTES,
-    )?;
-    let tls_ca = read_local_private_file(
-        &config.tls_ca_path,
-        "TLS CA certificate",
-        MAX_TLS_FILE_BYTES,
-    )?;
-    if tls_certificate.bytes == tls_ca.bytes {
-        return Err("TLS CA certificate must not be the Broker leaf certificate".to_string());
+    if config.external_tls_management {
+        // Externally managed TLS: never generate or overwrite the remote
+        // tls.key/tls.crt/ca.pem. Validate the Let's Encrypt cert in place and
+        // pull the public chain back so the Mac-side management child trusts it.
+        verify_external_tls_and_fetch_chain(&host, config)?;
+    } else {
+        let tls_key =
+            read_local_private_file(&config.tls_key_path, "TLS private key", MAX_TLS_FILE_BYTES)?;
+        let tls_certificate = read_local_private_file(
+            &config.tls_certificate_path,
+            "TLS leaf certificate",
+            MAX_TLS_FILE_BYTES,
+        )?;
+        let tls_ca = read_local_private_file(
+            &config.tls_ca_path,
+            "TLS CA certificate",
+            MAX_TLS_FILE_BYTES,
+        )?;
+        if tls_certificate.bytes == tls_ca.bytes {
+            return Err("TLS CA certificate must not be the Broker leaf certificate".to_string());
+        }
+        publish_remote_private_bytes(&host, &tls_key.bytes, REMOTE_TLS_KEY)?;
+        publish_remote_private_bytes(&host, &tls_certificate.bytes, REMOTE_TLS_CERTIFICATE)?;
+        publish_remote_private_bytes(&host, &tls_ca.bytes, REMOTE_TLS_CA)?;
     }
-    publish_remote_private_bytes(&host, &tls_key.bytes, REMOTE_TLS_KEY)?;
-    publish_remote_private_bytes(&host, &tls_certificate.bytes, REMOTE_TLS_CERTIFICATE)?;
-    publish_remote_private_bytes(&host, &tls_ca.bytes, REMOTE_TLS_CA)?;
     publish_remote_profile(&host, config)
+}
+
+fn issuer_hostname(issuer_url: &str) -> Result<String, String> {
+    let parsed = tauri::Url::parse(issuer_url)
+        .map_err(|_| "saved Relay URL is invalid".to_string())?;
+    parsed
+        .host_str()
+        .map(str::to_string)
+        .ok_or_else(|| "saved Relay URL has no hostname".to_string())
+}
+
+fn build_remote_external_tls_validation_script(hostname: &str) -> String {
+    format!(
+        r#"{REMOTE_SECURITY_FUNCTIONS}
+set -eu
+require_relay_layout
+require_private_file "$HOME/{REMOTE_TLS_KEY}"
+require_private_file "$HOME/{REMOTE_TLS_CERTIFICATE}"
+if ! command -v openssl >/dev/null 2>&1; then
+  printf 'external-tls-error: openssl is required on the devbox\n'
+  exit 1
+fi
+san="$(openssl x509 -in "$HOME/{REMOTE_TLS_CERTIFICATE}" -noout -ext subjectAltName 2>/dev/null || true)"
+case "$san" in
+  *"DNS:{hostname}"*) ;;
+  *)
+    printf 'external-tls-error: certificate SAN does not match {hostname}\n'
+    exit 1
+    ;;
+esac
+if ! openssl x509 -in "$HOME/{REMOTE_TLS_CERTIFICATE}" -noout -checkend 0 >/dev/null 2>&1; then
+  printf 'external-tls-error: certificate has expired\n'
+  exit 1
+fi
+require_private_file "$HOME/{REMOTE_TLS_CA}"
+node - "$HOME/{REMOTE_TLS_CA}" "{MAX_TLS_FILE_BYTES}" <<'TW_RELAY_V2_EXTERNAL_TLS_CHAIN_READER'
+{REMOTE_BOOTSTRAP_FD_READER}
+TW_RELAY_V2_EXTERNAL_TLS_CHAIN_READER
+"#
+    )
+}
+
+fn verify_external_tls_and_fetch_chain(
+    host: &HostConfig,
+    config: &PersistedSelfHostedConfig,
+) -> Result<(), String> {
+    let hostname = issuer_hostname(&config.issuer_url)?;
+    let script = build_remote_external_tls_validation_script(&hostname);
+    let output = run_remote_cmd_output(host, &["sh", "-lc", &script])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stdout.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+        return Err(format!(
+            "External TLS validation on the devbox failed: {detail}"
+        ));
+    }
+    if output.stdout.is_empty() || output.stdout.len() as u64 > MAX_TLS_FILE_BYTES {
+        return Err("External TLS chain pulled from the devbox is invalid".to_string());
+    }
+    ensure_local_host_private_tree()?;
+    let local = local_host_ca_input_path()?;
+    atomic_write_file(&local, &output.stdout)?;
+    read_local_private_file(
+        &local.to_string_lossy(),
+        "external TLS chain certificate",
+        MAX_TLS_FILE_BYTES,
+    )
+    .map(|_| ())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3208,7 +3426,12 @@ pub(crate) async fn mobile_relay_v2_self_hosted_save_config(
             config,
         )?;
         owner.startup_restore_error = None;
-        prepare_local_host_prerequisites_for(&config)?;
+        // Externally managed TLS has no local chain yet at save time; it is
+        // fetched from the devbox during Deploy. Skip the staging preflight so
+        // saving the external-mode settings does not require a prior deploy.
+        if !config.external_tls_management {
+            prepare_local_host_prerequisites_for(&config)?;
+        }
         Ok(probe_status(&config))
     })
     .await
@@ -3237,8 +3460,11 @@ pub(crate) async fn mobile_relay_v2_self_hosted_deploy(
             config,
         )?;
         owner.startup_restore_error = None;
-        prepare_local_host_prerequisites_for(&config)?;
+        // Deploy first: external mode pulls the public chain back during TLS
+        // validation, so the local Host prerequisites are only staged after
+        // the chain is available.
         deploy_bundle(&app, &config)?;
+        prepare_local_host_prerequisites_for(&config)?;
         Ok(probe_status(&config))
     })
     .await
@@ -3389,6 +3615,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_stop_center(
             .map_err(|_| "Relay v2 deployment owner is unavailable".to_string())?;
         let mut config =
             load_config()?.ok_or("Relay v2 self-hosted deployment is not configured")?;
+        ensure_host_profile_identity(&mut config)?;
         persist_connector_desired_running(&mut config, false)?;
         owner.startup_restore_error = None;
         stop_center_and_active_connector(
@@ -3418,7 +3645,7 @@ mod tests {
         build_remote_bundle_stage_validation_script, build_remote_center_stop_script,
         build_remote_relay_v2_center_command, build_remote_state_directory_launcher_preflight,
         commit_bootstrap_ready_state, commit_config_replacement_with_barrier,
-        consumed_local_private_file_path, ensure_host_profile_identity,
+        consumed_local_private_file_path, deployment_fingerprint, ensure_host_profile_identity,
         ensure_ordinary_center_start_allowed, finish_consuming_if_present,
         fresh_bootstrap_publication_correlation, load_ready_commit_journal_at,
         normalize_issuer_url, persisted_management_config_identity, read_local_private_file,
@@ -3428,7 +3655,8 @@ mod tests {
         valid_bootstrap_publication_correlation, validate_bootstrap_bytes, validate_listen_host,
         verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
         BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
-        BootstrapRotationTransferReceipt, DeploymentProbeStatus, LocalPrivateFileIdentity,
+        BootstrapRotationTransferReceipt, CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION,
+        DeploymentProbeStatus, LocalPrivateFileIdentity,
         PersistedSelfHostedConfig, ReadyCommitJournal, SelfHostedDeploymentOperationOwner,
         SelfHostedManagementBinding, BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT,
         CONFIG_SCHEMA_VERSION, HOST_PROFILE_CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT,
@@ -3448,6 +3676,7 @@ mod tests {
             tls_key_path: "/private/tls.key".to_string(),
             tls_certificate_path: "/private/tls.crt".to_string(),
             tls_ca_path: "/private/ca.pem".to_string(),
+            external_tls_management: false,
             host_profile_identity: "00112233445566778899aabbccddeeff".to_string(),
             profile_provisioned: false,
             host_credential_provisioned: false,
@@ -3589,6 +3818,69 @@ mod tests {
         ensure_host_profile_identity(&mut migrated).unwrap();
         assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
         assert!(!migrated.connector_desired_running);
+    }
+
+    #[test]
+    fn schema_six_migrates_to_external_tls_schema_preserving_connector_desired_state() {
+        // A schema-6 config (the pre-external-TLS current schema) must load
+        // without the new field and migrate to schema 7 while preserving the
+        // already-durable connector desired state.
+        let mut value = serde_json::to_value(config()).unwrap();
+        value["schemaVersion"] =
+            serde_json::json!(CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION);
+        value["connectorDesiredRunning"] = serde_json::json!(true);
+        value.as_object_mut().unwrap().remove("externalTlsManagement");
+
+        let migrated: PersistedSelfHostedConfig = serde_json::from_value(value).unwrap();
+        assert!(!migrated.external_tls_management);
+        assert!(migrated.connector_desired_running);
+        let mut migrated = migrated;
+        ensure_host_profile_identity(&mut migrated).unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(migrated.connector_desired_running);
+        assert!(!migrated.external_tls_management);
+    }
+
+    #[test]
+    fn external_tls_management_round_trips_and_defaults_to_false() {
+        let mut external = config();
+        external.external_tls_management = true;
+        external.tls_key_path = String::new();
+        external.tls_certificate_path = String::new();
+        external.tls_ca_path = String::new();
+        let serialized = serde_json::to_value(&external).unwrap();
+        assert_eq!(
+            serialized["externalTlsManagement"],
+            serde_json::json!(true)
+        );
+        let restored: PersistedSelfHostedConfig =
+            serde_json::from_value(serialized).unwrap();
+        assert!(restored.external_tls_management);
+
+        let mut legacy = serde_json::to_value(config()).unwrap();
+        legacy.as_object_mut().unwrap().remove("externalTlsManagement");
+        let legacy_restored: PersistedSelfHostedConfig =
+            serde_json::from_value(legacy).unwrap();
+        assert!(!legacy_restored.external_tls_management);
+    }
+
+    #[test]
+    fn external_tls_fingerprint_differs_but_private_fingerprint_stays_stable() {
+        let private = config();
+        let private_fingerprint = deployment_fingerprint(&private);
+
+        let mut external = private.clone();
+        external.external_tls_management = true;
+        external.tls_key_path = String::new();
+        external.tls_certificate_path = String::new();
+        external.tls_ca_path = String::new();
+        assert_ne!(deployment_fingerprint(&external), private_fingerprint);
+
+        // The private-mode fingerprint must remain byte-for-byte stable across
+        // the schema 7 upgrade so existing remote profiles stay valid.
+        let serialized = serde_json::to_value(&private).unwrap();
+        let restored: PersistedSelfHostedConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deployment_fingerprint(&restored), private_fingerprint);
     }
 
     #[test]

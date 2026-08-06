@@ -12,6 +12,7 @@ export type RelayV2SelfHostedDraft = {
   tlsKeyPath: string;
   tlsCertificatePath: string;
   tlsCaPath: string;
+  externalTlsManagement: boolean;
 };
 
 export type RelayV2SelfHostedDraftErrors = Partial<
@@ -40,6 +41,7 @@ export function createRelayV2SelfHostedDraft(): RelayV2SelfHostedDraft {
     tlsKeyPath: "",
     tlsCertificatePath: "",
     tlsCaPath: "",
+    externalTlsManagement: false,
   };
 }
 
@@ -56,6 +58,7 @@ export function selfHostedStatusToDraft(
     tlsKeyPath: status.config.tlsKeyPath,
     tlsCertificatePath: status.config.tlsCertificatePath,
     tlsCaPath: status.config.tlsCaPath,
+    externalTlsManagement: status.config.externalTlsManagement,
   };
 }
 
@@ -113,22 +116,24 @@ export function validateRelayV2SelfHostedDraft(
   if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65_535) {
     errors.listenPort = "Port must be a whole number from 1 to 65535.";
   }
-  if (!draft.tlsKeyPath.trim()) {
-    errors.tlsKeyPath = "Select an owner-only 0600 TLS private key.";
-  }
-  if (!draft.tlsCertificatePath.trim()) {
-    errors.tlsCertificatePath = "Select the owner-only 0600 TLS leaf certificate.";
-  }
-  if (!draft.tlsCaPath.trim()) {
-    errors.tlsCaPath = "Select the owner-only 0600 CA certificate.";
-  }
-  const tlsPaths = [
-    draft.tlsKeyPath.trim(),
-    draft.tlsCertificatePath.trim(),
-    draft.tlsCaPath.trim(),
-  ].filter(Boolean);
-  if (new Set(tlsPaths).size !== tlsPaths.length) {
-    errors.tlsCaPath = "TLS key, leaf certificate, and CA must be distinct files.";
+  if (!draft.externalTlsManagement) {
+    if (!draft.tlsKeyPath.trim()) {
+      errors.tlsKeyPath = "Select an owner-only 0600 TLS private key.";
+    }
+    if (!draft.tlsCertificatePath.trim()) {
+      errors.tlsCertificatePath = "Select the owner-only 0600 TLS leaf certificate.";
+    }
+    if (!draft.tlsCaPath.trim()) {
+      errors.tlsCaPath = "Select the owner-only 0600 CA certificate.";
+    }
+    const tlsPaths = [
+      draft.tlsKeyPath.trim(),
+      draft.tlsCertificatePath.trim(),
+      draft.tlsCaPath.trim(),
+    ].filter(Boolean);
+    if (new Set(tlsPaths).size !== tlsPaths.length) {
+      errors.tlsCaPath = "TLS key, leaf certificate, and CA must be distinct files.";
+    }
   }
 
   if (Object.keys(errors).length > 0) {
@@ -146,6 +151,7 @@ export function validateRelayV2SelfHostedDraft(
       tlsKeyPath: draft.tlsKeyPath.trim(),
       tlsCertificatePath: draft.tlsCertificatePath.trim(),
       tlsCaPath: draft.tlsCaPath.trim(),
+      externalTlsManagement: draft.externalTlsManagement,
     },
   };
 }
@@ -166,7 +172,8 @@ export function relayV2SelfHostedDraftMatchesStatus(
     && value.listenPort === saved.listenPort
     && value.tlsKeyPath === saved.tlsKeyPath
     && value.tlsCertificatePath === saved.tlsCertificatePath
-    && value.tlsCaPath === saved.tlsCaPath;
+    && value.tlsCaPath === saved.tlsCaPath
+    && value.externalTlsManagement === saved.externalTlsManagement;
 }
 
 export function relayV2SelfHostedStatusLabel(
