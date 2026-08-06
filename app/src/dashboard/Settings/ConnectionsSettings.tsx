@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Save,
   Server,
+  Settings2,
   Square,
   Trash2,
   Wifi,
@@ -61,13 +62,17 @@ import {
   type RelayDraft,
   type RelayDraftErrors,
 } from "./connectionsModel";
-import { RelayV2EnrollmentPanel } from "./RelayV2EnrollmentPreviewPanel";
+import { RelayV2EnrollmentPreviewPanel } from "./RelayV2EnrollmentPreviewPanel";
+import { RelayConnectionOverviewCard } from "./RelayConnectionOverviewCard";
+import type { RelayConnectionOverviewPrimaryAction } from "./relayConnectionOverviewModel";
 import {
   relayV2SelfHostedConnectorDesiredRunning,
   relayV2SelfHostedStackLabel,
   relayV2StackEffective,
 } from "./relayV2SelfHostedModel";
 import { RelayV2SelfHostedPanel } from "./RelayV2SelfHostedPanel";
+import { useRelayConnectionOverview } from "./useRelayConnectionOverview";
+import { useRelayV2EnrollmentController } from "./useRelayV2EnrollmentController";
 
 type HostEditorMode = "view" | "add" | "edit";
 type ConnectionTab = "hosts" | "relay";
@@ -254,6 +259,9 @@ export function ConnectionsSettings({
   const [relayNotice, setRelayNotice] = useState<AsyncNotice | null>(null);
   const [copiedField, setCopiedField] = useState<RelayCopyField | null>(null);
   const copyTimerRef = useRef<number | null>(null);
+  const [relayAdvancedOpen, setRelayAdvancedOpen] = useState(false);
+  const [copiedEnrollmentLink, setCopiedEnrollmentLink] = useState(false);
+  const copyEnrollmentLinkTimerRef = useRef<number | null>(null);
   const [relayV2Status, setRelayV2Status] = useState<MobileRelayV2SelfHostedStatus | null>(null);
   const asyncCoordinatorRef = useRef(createConnectionsAsyncCoordinator());
   const currentHostCatalogFingerprint = hostCatalogFingerprint(hosts);
@@ -315,6 +323,11 @@ export function ConnectionsSettings({
       active = false;
     };
   }, [dashboardBackend]);
+
+  // One shared Relay v2 management controller drives both the overview card and
+  // the Advanced enrollment panel, so both stay in sync on the same polled state.
+  const relayV2Controller = useRelayV2EnrollmentController(relay.tokenConfigured);
+  const relayOverview = useRelayConnectionOverview(relayV2Status, relayV2Controller);
 
   useEffect(() => {
     if (hostCatalogFingerprintRef.current === currentHostCatalogFingerprint) return;
@@ -632,6 +645,32 @@ export function ConnectionsSettings({
       if (!asyncCoordinatorRef.current.isCurrent(request)) return;
       setRelayNotice({ tone: "error", message: errorMessage(error) });
     }
+  };
+
+  const handleRelayOverviewPrimaryAction = (action: RelayConnectionOverviewPrimaryAction) => {
+    if (action.kind === "setup") {
+      setRelayAdvancedOpen(true);
+    } else if (action.kind === "fix") {
+      void relayOverview.runConnectionRepair();
+    } else if (action.kind === "show_qr") {
+      void relayOverview.showPairingQr();
+    }
+  };
+
+  const handleCopyEnrollmentLink = (handle: string) => {
+    relayOverview.copyEnrollmentLink(handle);
+    setCopiedEnrollmentLink(true);
+    if (copyEnrollmentLinkTimerRef.current !== null) {
+      window.clearTimeout(copyEnrollmentLinkTimerRef.current);
+    }
+    copyEnrollmentLinkTimerRef.current = window.setTimeout(
+      () => setCopiedEnrollmentLink(false),
+      1_200,
+    );
+  };
+
+  const handleRevokeKnownGrant = () => {
+    relayOverview.revokeKnownGrant();
   };
 
   const handleConnectionTabKeyDown = (
@@ -1115,152 +1154,160 @@ export function ConnectionsSettings({
           <div className="connections-heading-row">
             <div>
               <h3>Mobile Relay</h3>
-              <p>Choose a Relay center and set up the broker, trusted WSS, and this Mac in one step.</p>
+              <p>Connect a relay center and pair your phone. Everything else lives under Advanced.</p>
             </div>
           </div>
 
-          <div
-            className={`connections-relay-summary connections-relay-stack connections-relay-stack--${relayV2Effective ? "v2" : "v1"}`}
-            role="status"
+          <RelayConnectionOverviewCard
+            overview={relayOverview.overview}
+            activeReview={relayOverview.activeReview}
+            knownGrantActive={relayOverview.knownGrantActive}
+            revokingGrant={relayOverview.revokingGrant}
+            qrBusy={relayOverview.qrBusy}
+            copiedEnrollmentLink={copiedEnrollmentLink}
+            onPrimaryAction={handleRelayOverviewPrimaryAction}
+            onCopyEnrollmentLink={handleCopyEnrollmentLink}
+            onRevokeKnownGrant={handleRevokeKnownGrant}
+          />
+
+          <details
+            className="connections-relay-manual connections-relay-advanced"
+            open={relayAdvancedOpen}
+            onToggle={(event) => setRelayAdvancedOpen(event.currentTarget.open)}
           >
-            {relayV2Effective
-              ? <Radio aria-hidden="true" size={18} />
-              : <Server aria-hidden="true" size={18} />}
-            <div>
-              <strong>Current stack · {relayStackLabel}{relayV2Effective ? " · primary" : " · default"}</strong>
-              <span>
-                {relayV2Effective
-                  ? relayV2ConnectorDesired
-                    ? "Relay v2 self-hosted is the primary orchestration and the Host connector is desired to run."
-                    : "Relay v2 self-hosted is the primary orchestration; the Host connector is not requested right now."
-                  : "No enabled and provisioned self-hosted Relay v2 config. Relay v1 remains the default stack."}
+            <summary>
+              <span className="connections-relay-manual__icon">
+                <Settings2 aria-hidden="true" size={16} />
               </span>
-            </div>
-          </div>
-
-          <div className="connections-relay-stages" aria-label="Relay connection stages">
-            <div className={`connections-relay-summary${relay.busy.startBroker ? " connections-relay-summary--progress" : ""}`}>
-              {relay.busy.startBroker
-                ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
-                : <Server aria-hidden="true" size={18} />}
-              <div>
-                <strong>Relay center · {selectedRelayCenter?.label || "Not selected"}</strong>
-                <span>
-                  {relay.busy.startBroker
-                    ? "Deploying Relay v1, publishing trusted WSS, and starting this Mac connector."
-                    : "Set up / repair Relay reuses a fixed WSS URL, or provisions a temporary Cloudflare Quick Tunnel. DNS propagation is handled by connector retries."}
-                </span>
-              </div>
-            </div>
-            <div className={`connections-relay-summary connections-relay-summary--${relaySummary.tone}`}>
-              {relaySummary.tone === "success"
-                ? <Wifi aria-hidden="true" size={18} />
-                : relaySummary.tone === "danger"
-                  ? <AlertCircle aria-hidden="true" size={18} />
-                  : relaySummary.tone === "progress"
-                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
-                    : <Radio aria-hidden="true" size={18} />}
-              <div>
-                <strong>{relaySummary.label}</strong>
-                <span>{relaySummary.detail}</span>
-              </div>
-            </div>
-            <div className={`connections-relay-summary${relay.v1PairingPayload ? " connections-relay-summary--success" : ""}`}>
-              <QrCode aria-hidden="true" size={18} />
-              <div>
-                <strong>Android pairing · {relay.v1PairingPayload ? "Ready" : "Not ready"}</strong>
-                <span>
-                  {relay.v1PairingPayload
-                    ? "A trusted root wss:// profile is available. The phone still connects independently after review."
-                    : "Requires a connected Mac connector, a trusted root wss:// URL, Host ID, and Relay v1 token."}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div className="connections-card connections-relay-card">
-            <div className="connections-card__header">
-              <div>
-                <h4>Relay configuration</h4>
-                <p>Choose a Relay center, then use the one-click setup. Manual fields are only for fixed WSS and recovery.</p>
-              </div>
-            </div>
-
-            {relayV2Effective && (
-              <section
-                className="connections-relay-v2-primary"
-                aria-label="Relay v2 primary Android pairing"
+              <span>
+                <strong>Advanced</strong>
+                <small>
+                  Relay center status, deployment, and manual pairing controls. Collapsed by default.
+                </small>
+              </span>
+            </summary>
+            <div className="connections-relay-advanced__body">
+              <div
+                className={`connections-relay-summary connections-relay-stack connections-relay-stack--${relayV2Effective ? "v2" : "v1"}`}
+                role="status"
               >
-                <div className="connections-relay-pairing__copy">
-                  <span className="connections-relay-pairing__icon">
-                    <QrCode aria-hidden="true" size={17} />
+                {relayV2Effective
+                  ? <Radio aria-hidden="true" size={18} />
+                  : <Server aria-hidden="true" size={18} />}
+                <div>
+                  <strong>Current stack · {relayStackLabel}{relayV2Effective ? " · primary" : " · default"}</strong>
+                  <span>
+                    {relayV2Effective
+                      ? relayV2ConnectorDesired
+                        ? "Relay v2 self-hosted is the primary orchestration and the Host connector is desired to run."
+                        : "Relay v2 self-hosted is the primary orchestration; the Host connector is not requested right now."
+                      : "No enabled and provisioned self-hosted Relay v2 config. Relay v1 remains the default stack."}
                   </span>
+                </div>
+              </div>
+
+              <div className="connections-relay-stages" aria-label="Relay connection stages">
+                <div className={`connections-relay-summary${relay.busy.startBroker ? " connections-relay-summary--progress" : ""}`}>
+                  {relay.busy.startBroker
+                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
+                    : <Server aria-hidden="true" size={18} />}
                   <div>
-                    <strong>Relay v2 · Android pairing</strong>
+                    <strong>Relay center · {selectedRelayCenter?.label || "Not selected"}</strong>
                     <span>
-                      Primary entry: a one-time enrollment QR against the fixed
-                      self-hosted domain. Scan once with the Android app; no v1 token
-                      rotation is involved.
+                      {relay.busy.startBroker
+                        ? "Deploying Relay v1, publishing trusted WSS, and starting this Mac connector."
+                        : "Set up / repair Relay reuses a fixed WSS URL, or provisions a temporary Cloudflare Quick Tunnel. DNS propagation is handled by connector retries."}
                     </span>
                   </div>
                 </div>
-                <RelayV2EnrollmentPanel
-                  v1SharedSecretConfigured={relay.tokenConfigured}
-                />
-              </section>
-            )}
-
-            {relayV2Effective ? (
-              <details
-                className="connections-relay-manual connections-relay-legacy-v1"
-                open={false}
-              >
-                <summary>
-                  <span className="connections-relay-manual__icon">
-                    <Wrench aria-hidden="true" size={16} />
-                  </span>
-                  <span>
-                    <strong>Legacy Relay v1 (optional)</strong>
-                    <small>
-                      v1 broker setup, fixed WSS recovery, and the v1 Android profile
-                      remain available as a legacy path.
-                    </small>
-                  </span>
-                </summary>
-                {relayV1CenterField}
-                {relayV1ManualRecovery}
-                {relayV1Pairing}
-                {relayV1Actions}
-              </details>
-            ) : (
-              <>
-                {relayV1CenterField}
-                {relayV1ManualRecovery}
-                {relayV1Pairing}
-              </>
-            )}
-
-            <RelayV2SelfHostedPanel hosts={hosts} />
-
-            {!relayV2Effective && (
-              <RelayV2EnrollmentPanel
-                v1SharedSecretConfigured={relay.tokenConfigured}
-              />
-            )}
-
-            {(relay.error || relayNotice) && (
-              <div
-                className={`connections-notice connections-notice--${relay.error ? "error" : relayNotice?.tone}`}
-                role="status"
-                aria-live="polite"
-              >
-                {statusIcon(relay.error ? "error" : relayNotice?.tone ?? "pending")}
-                <span>{relay.error || relayNotice?.message}</span>
+                <div className={`connections-relay-summary connections-relay-summary--${relaySummary.tone}`}>
+                  {relaySummary.tone === "success"
+                    ? <Wifi aria-hidden="true" size={18} />
+                    : relaySummary.tone === "danger"
+                      ? <AlertCircle aria-hidden="true" size={18} />
+                      : relaySummary.tone === "progress"
+                        ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
+                        : <Radio aria-hidden="true" size={18} />}
+                  <div>
+                    <strong>{relaySummary.label}</strong>
+                    <span>{relaySummary.detail}</span>
+                  </div>
+                </div>
+                <div className={`connections-relay-summary${relay.v1PairingPayload ? " connections-relay-summary--success" : ""}`}>
+                  <QrCode aria-hidden="true" size={18} />
+                  <div>
+                    <strong>Android pairing · {relay.v1PairingPayload ? "Ready" : "Not ready"}</strong>
+                    <span>
+                      {relay.v1PairingPayload
+                        ? "A trusted root wss:// profile is available. The phone still connects independently after review."
+                        : "Requires a connected Mac connector, a trusted root wss:// URL, Host ID, and Relay v1 token."}
+                    </span>
+                  </div>
+                </div>
               </div>
-            )}
 
-            {!relayV2Effective && relayV1Actions}
-          </div>
+              <RelayV2SelfHostedPanel hosts={hosts} />
+
+              {relayV2Controller.loaded && (
+                <RelayV2EnrollmentPreviewPanel
+                  state={relayV2Controller.state}
+                  v1SharedSecretConfigured={relay.tokenConfigured}
+                  onBootstrapHost={relayV2Controller.bootstrapHost}
+                  onRefreshHost={relayV2Controller.refreshHost}
+                  onStartConnector={relayV2Controller.startConnector}
+                  onStopConnector={relayV2Controller.stopConnector}
+                  onCreateEnrollment={relayV2Controller.createEnrollment}
+                  onShowEnrollmentArtifact={relayV2Controller.showEnrollmentArtifact}
+                  onCopyEnrollmentArtifact={relayV2Controller.copyEnrollmentArtifact}
+                  artifactNotice={relayV2Controller.artifactNotice}
+                  onRevokeKnownGrant={relayV2Controller.revokeKnownGrant}
+                />
+              )}
+            </div>
+          </details>
+
+          {relayV2Effective ? (
+            <details
+              className="connections-relay-manual connections-relay-legacy-v1"
+              open={false}
+            >
+              <summary>
+                <span className="connections-relay-manual__icon">
+                  <Wrench aria-hidden="true" size={16} />
+                </span>
+                <span>
+                  <strong>Legacy Relay v1 (optional)</strong>
+                  <small>
+                    v1 broker setup, fixed WSS recovery, and the v1 Android profile
+                    remain available as a legacy path.
+                  </small>
+                </span>
+              </summary>
+              {relayV1CenterField}
+              {relayV1ManualRecovery}
+              {relayV1Pairing}
+              {relayV1Actions}
+            </details>
+          ) : (
+            <>
+              {relayV1CenterField}
+              {relayV1ManualRecovery}
+              {relayV1Pairing}
+            </>
+          )}
+
+          {(relay.error || relayNotice) && (
+            <div
+              className={`connections-notice connections-notice--${relay.error ? "error" : relayNotice?.tone}`}
+              role="status"
+              aria-live="polite"
+            >
+              {statusIcon(relay.error ? "error" : relayNotice?.tone ?? "pending")}
+              <span>{relay.error || relayNotice?.message}</span>
+            </div>
+          )}
+
+          {!relayV2Effective && relayV1Actions}
         </div>
       )}
     </div>

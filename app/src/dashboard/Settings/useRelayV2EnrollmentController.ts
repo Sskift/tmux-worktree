@@ -120,7 +120,7 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     action: () => Promise<MobileRelayV2DashboardState>,
     start: () => void,
     fail: (failure: MobileRelayV2OperationFailure) => void,
-  ) => {
+  ): Promise<MobileRelayV2DashboardState | void> => {
     if (operationRef.current) return;
     const requestEpoch = requestEpochRef.current;
     const activeOperation = { kind: operation, requestEpoch };
@@ -129,11 +129,16 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     start();
     try {
       const next = await action();
-      if (requestEpoch === requestEpochRef.current) publish(next);
+      if (requestEpoch === requestEpochRef.current) {
+        publish(next);
+        return next;
+      }
+      return undefined;
     } catch (error) {
       if (requestEpoch === requestEpochRef.current) {
         fail(classifyMobileRelayV2OperationFailure(error));
       }
+      return undefined;
     } finally {
       if (operationRef.current === activeOperation) {
         operationRef.current = null;
