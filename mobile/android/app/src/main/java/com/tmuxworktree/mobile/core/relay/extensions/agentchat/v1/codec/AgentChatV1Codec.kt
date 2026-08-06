@@ -21,7 +21,9 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.required
 import com.tmuxworktree.mobile.core.relay.v2.codec.schemaFailure
 import java.nio.charset.StandardCharsets
 
-/** Public-wire capability name for the optional agent.chat.v1 extension. */
+/** Relay v2 wire name for the optional agent.chat.v1 extension. See the relay v1 sibling
+ *  [com.tmuxworktree.mobile.core.relay.runtime.RelayChatState.V1_AGENT_CHAT_CAPABILITY]
+ *  ("agent-chat-v1"). */
 const val AGENT_CHAT_V1_CAPABILITY = "agent.chat.v1"
 
 class AgentChatV1CodecException(

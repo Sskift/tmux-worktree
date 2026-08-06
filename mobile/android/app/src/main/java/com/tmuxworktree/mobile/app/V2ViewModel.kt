@@ -2944,7 +2944,7 @@ class V2ViewModel(
                     // negotiated capability under both names so the existing entry point works.
                     val uiCapabilities =
                         if (AGENT_CHAT_V1_CAPABILITY in capabilities) {
-                            capabilities + RelayChatState.AGENT_CHAT_V1_CAPABILITY
+                            capabilities + RelayChatState.V1_AGENT_CHAT_CAPABILITY
                         } else {
                             capabilities
                         }

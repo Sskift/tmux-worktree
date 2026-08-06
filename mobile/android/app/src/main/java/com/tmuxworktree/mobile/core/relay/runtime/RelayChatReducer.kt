@@ -19,10 +19,13 @@ data class RelayChatState(
     fun pending(session: String): List<PendingChatSend> = pendingBySession[session].orEmpty()
 
     fun hasAgentChatCapability(hostCapabilities: Set<String>): Boolean =
-        AGENT_CHAT_V1_CAPABILITY in hostCapabilities
+        V1_AGENT_CHAT_CAPABILITY in hostCapabilities
 
     companion object {
-        const val AGENT_CHAT_V1_CAPABILITY = "agent-chat-v1"
+        /** Relay v1 wire name for the optional agent-chat extension. See the relay v2 sibling
+         *  [com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY]
+         *  ("agent.chat.v1"). */
+        const val V1_AGENT_CHAT_CAPABILITY = "agent-chat-v1"
     }
 }
 
