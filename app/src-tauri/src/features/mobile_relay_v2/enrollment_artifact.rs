@@ -215,6 +215,24 @@ impl EnrollmentArtifactRegistry {
         }))
     }
 
+    /// Non-consuming read of the live QR PNG bytes so the renderer can display
+    /// the pairing QR inline. Never creates or mutates a native window, and
+    /// repeated reads return identical bytes while the artifact stays live.
+    /// Revoke/expiry/supersede still clear the artifact through the existing
+    /// paths (`clear`, `clear_if_window`, `get_or_create` replacement, expiry).
+    pub(crate) fn claim_inline_png(&self, handle: &str) -> Result<Arc<[u8]>, ()> {
+        let now_ms = unix_now_ms()?;
+        let state = self.inner.state.lock().unwrap();
+        if state.closed {
+            return Err(());
+        }
+        let record = state.record.as_ref().ok_or(())?;
+        if record.handle != handle || record.lineage.expires_at_ms <= now_ms {
+            return Err(());
+        }
+        Ok(Arc::clone(&record.png))
+    }
+
     pub(crate) fn release_window(&self, handle: &str, label: &str) {
         let mut state = self.inner.state.lock().unwrap();
         if let Some(record) = &mut state.record {
@@ -426,6 +444,44 @@ mod tests {
             .is_err());
         assert!(registry.claim_window("dqart1.invalid").is_err());
         registry.close();
+    }
+
+    #[test]
+    fn inline_png_is_non_consuming_and_revoked_with_the_artifact() {
+        let registry = EnrollmentArtifactRegistry::new(|_| {}).unwrap();
+        let artifact = registry
+            .get_or_create(lineage(unix_now_ms().unwrap() + 60_000), || Ok(rendered()))
+            .unwrap();
+
+        // Repeated reads succeed and return identical bytes (non-consuming).
+        let first = registry.claim_inline_png(&artifact.handle).unwrap();
+        let second = registry.claim_inline_png(&artifact.handle).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.as_ref(), rendered().png);
+
+        // The native-window path still observes the same artifact untouched.
+        assert!(registry.claim_window(&artifact.handle).is_ok());
+
+        // Clearing (revoke/expiry/supersede path) revokes the inline read too.
+        registry.clear();
+        assert!(registry.claim_inline_png(&artifact.handle).is_err());
+        registry.close();
+    }
+
+    #[test]
+    fn inline_png_rejects_unknown_handles_and_closed_registries() {
+        let registry = EnrollmentArtifactRegistry::new(|_| {}).unwrap();
+        assert!(registry.claim_inline_png("dqart1.invalid").is_err());
+        let artifact = registry
+            .get_or_create(lineage(unix_now_ms().unwrap() + 60_000), || Ok(rendered()))
+            .unwrap();
+        let wrong_handle = format!("dqart1.{}", "b".repeat(32));
+        assert!(registry.claim_inline_png(&wrong_handle).is_err());
+
+        let disabled = EnrollmentArtifactRegistry::disabled();
+        assert!(disabled.claim_inline_png(&artifact.handle).is_err());
+        registry.close();
+        disabled.close();
     }
 
     #[test]

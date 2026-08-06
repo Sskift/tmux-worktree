@@ -36,6 +36,7 @@ export function useRelayConnectionOverview(
   });
   const [repairError, setRepairError] = useState<string | null>(null);
   const [qrBusy, setQrBusy] = useState(false);
+  const [inlineQr, setInlineQr] = useState<{ handle: string; pngBase64: string } | null>(null);
   const repairRunningRef = useRef(false);
   const qrBusyRef = useRef(false);
 
@@ -54,6 +55,17 @@ export function useRelayConnectionOverview(
         handle: view.qrArtifact.handle,
       }
     : null;
+
+  // Drop the cached inline QR whenever the active review disappears or its
+  // handle changes (revoke/expiry/supersede all flow through the status poll).
+  const activeQrHandle = activeReview?.handle ?? null;
+  useEffect(() => {
+    setInlineQr((current) => {
+      if (!current) return current;
+      if (activeQrHandle === null || activeQrHandle !== current.handle) return null;
+      return current;
+    });
+  }, [activeQrHandle]);
 
   const inFlight = useMemo(() => {
     if (repair.running) return { active: true, headline: repair.headline };
@@ -156,7 +168,8 @@ export function useRelayConnectionOverview(
 
   /**
    * "Show pairing QR": create a fresh enrollment when the current one is missing
-   * or expired, then surface the native QR for the fresh artifact handle.
+   * or expired, then fetch the Rust-generated QR PNG for the fresh artifact
+   * handle and render it inline in the overview card.
    */
   const showPairingQr = useCallback(async () => {
     if (qrBusyRef.current) return;
@@ -165,19 +178,20 @@ export function useRelayConnectionOverview(
     setRepairError(null);
     try {
       const currentHandle = view?.qrArtifact?.handle ?? null;
-      if (currentHandle) {
-        await backend.relay.v2.showEnrollmentArtifact({ handle: currentHandle });
-        return;
+      let handle = currentHandle;
+      if (!handle) {
+        const next = await controller.createEnrollment("create");
+        const freshHandle = next?.enrollment.status === "active"
+          ? next.enrollment.review.renderArtifact.handle
+          : null;
+        if (!freshHandle) {
+          setRepairError("A pairing code could not be created. Try again in a moment.");
+          return;
+        }
+        handle = freshHandle;
       }
-      const next = await controller.createEnrollment("create");
-      const freshHandle = next?.enrollment.status === "active"
-        ? next.enrollment.review.renderArtifact.handle
-        : null;
-      if (!freshHandle) {
-        setRepairError("A pairing code could not be created. Try again in a moment.");
-        return;
-      }
-      await backend.relay.v2.showEnrollmentArtifact({ handle: freshHandle });
+      const pngBase64 = await backend.relay.v2.inlineEnrollmentArtifactPng({ handle });
+      setInlineQr({ handle, pngBase64 });
     } catch (error) {
       setRepairError(errorMessage(error));
     } finally {
@@ -185,6 +199,10 @@ export function useRelayConnectionOverview(
       setQrBusy(false);
     }
   }, [backend, controller, view]);
+
+  const hidePairingQr = useCallback(() => {
+    setInlineQr(null);
+  }, []);
 
   const copyEnrollmentLink = useCallback((handle: string) => {
     controller.copyEnrollmentArtifact(handle, "enrollment_link");
@@ -200,8 +218,10 @@ export function useRelayConnectionOverview(
     knownGrantActive,
     revokingGrant,
     qrBusy,
+    inlineQr,
     runConnectionRepair,
     showPairingQr,
+    hidePairingQr,
     copyEnrollmentLink,
     revokeKnownGrant,
   };

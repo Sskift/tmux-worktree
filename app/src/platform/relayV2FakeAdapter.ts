@@ -21,6 +21,10 @@ export interface FakeMobileRelayV2AdapterOptions {
   hostId?: string;
 }
 
+/** 1x1 transparent PNG, base64 — a tiny valid placeholder for inline preview. */
+export const FAKE_INLINE_QR_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
 export function createFakeMobileRelayV2RenderArtifact(
   expiresAtMs: number,
   sequence = 0,
@@ -251,6 +255,19 @@ export function createFakeMobileRelayV2Adapter(
           "The Relay v2 enrollment artifact is unavailable.",
         );
       }
+    },
+    inlineEnrollmentArtifactPng: async ({ handle }) => {
+      expireEnrollment();
+      if (
+        state.enrollment.status !== "active"
+        || state.enrollment.review.renderArtifact.handle !== handle
+      ) {
+        fail(
+          "relay_v2_enrollment_artifact_unavailable",
+          "The Relay v2 enrollment artifact is unavailable.",
+        );
+      }
+      return FAKE_INLINE_QR_PNG_BASE64;
     },
     createEnrollment: async (input: MobileRelayV2CreateEnrollmentInput) => {
       requireAuthority();
