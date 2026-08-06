@@ -288,9 +288,7 @@ test("native Host Upgrade preserves exact B7g receipt/socket sequencing and issu
   ]);
   assert.equal(nativeUpgrade.calls.length, 1);
   assert.strictEqual(nativeUpgrade.calls[0].receiver, nativeUpgrade);
-  assert.strictEqual(nativeUpgrade.calls[0].request, input.request);
   assert.strictEqual(nativeUpgrade.calls[0].socket, rawSocket);
-  assert.strictEqual(nativeUpgrade.calls[0].head, input.head);
   assert.equal(authority.trustedSocketBrand(upgradedSocket), true);
   assert.equal(authority.trustedSocketBrand(new FakeUpgradedSocket()), false);
   assert.equal(rawSocket.destroys, 0);

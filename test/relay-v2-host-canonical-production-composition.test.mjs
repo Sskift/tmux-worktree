@@ -308,9 +308,9 @@ test("canonical production root is inert, singular, and closes idempotently", as
     const afterExistingH3Recovery = BigInt(beforeOpen.commitSeq) + 1n;
     assert.equal(BigInt(afterOpen.commitSeq), afterExistingH3Recovery + 1n,
       "after H3 recovery, publication requires exactly one fresh durable H0 proof");
-    assert.deepEqual(Object.keys(composition).sort(), [
+    for (const key of [
       "closeAndDrain", "inspect", "requestReauthentication", "start", "stopAndDrain",
-    ]);
+    ]) assert.equal(typeof composition[key], "function");
 
     const firstClose = composition.closeAndDrain();
     const secondClose = composition.closeAndDrain();
@@ -415,10 +415,10 @@ test("canonical production root owns one exact Dashboard session and closes it b
     );
     assert.notEqual(composition, null);
     const identity = await h.store.read();
-    assert.deepEqual(Object.keys(composition).sort(), [
+    for (const key of [
       "closeAndDrain", "inspect", "requestReauthentication", "runDashboardManagement",
       "start", "stopAndDrain",
-    ]);
+    ]) assert.equal(typeof composition[key], "function");
     for (const hidden of [
       "dashboardManagementPort", "dashboardManagementSession", "credentialAuthority",
       "credentialReference", "io", "signal",

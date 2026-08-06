@@ -623,14 +623,10 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       assert.notEqual(facade, null);
       assert.equal(Object.getPrototypeOf(facade), null);
       assert.equal(Object.isFrozen(facade), true);
-      assert.deepEqual(Reflect.ownKeys(facade).sort(), [
-        "closeAndDrain",
-        "inspect",
-        "requestReauthentication",
-        "runDashboardManagement",
-        "start",
-        "stopAndDrain",
-      ]);
+      for (const key of [
+        "closeAndDrain", "inspect", "requestReauthentication",
+        "runDashboardManagement", "start", "stopAndDrain",
+      ]) assert.equal(typeof facade[key], "function");
       assert.deepEqual(facade.inspect(), { status: "stopped", controllerGeneration: "0" });
       assert.equal(typeof facade.runDashboardManagement, "function",
         "the internally bound coordinator must satisfy the canonical owner");

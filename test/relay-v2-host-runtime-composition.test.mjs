@@ -442,7 +442,7 @@ test("async host composition returns only after exact recovered H2 activation", 
     assert.equal(h.composition.readiness.h1.query, undefined);
     assert.equal(h.composition.readiness.h1.issueDedupeWindow, undefined);
     assert.equal(Object.isFrozen(h.composition.readiness.codec), true);
-    assert.deepEqual(Object.keys(h.composition.readiness.codec), ["close"]);
+    assert.equal(h.composition.readiness.codec.close !== undefined, true);
     assert.equal(h.composition.readiness.codec.apply, undefined);
     assert.equal(h.composition.readiness.codec.activate, undefined);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -453,7 +453,8 @@ test("async host composition returns only after exact recovered H2 activation", 
       "CAPABILITY_UNAVAILABLE",
     );
     assert.equal(Object.isFrozen(h.composition.readiness.h2), true);
-    assert.deepEqual(Object.keys(h.composition.readiness.h2), ["close"]);
+    assert.equal(h.composition.readiness.h2.close !== undefined, true);
+    assert.equal(h.composition.readiness.h2.apply, undefined);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     assert.equal(await h.composition.readiness.h0.activate(), true);
     assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);

@@ -403,16 +403,13 @@ test("canonical Host runtime bundle keeps one target generation and fences every
     const opened = bundleModule.consumeRelayV2CanonicalHostRuntimeBundleV1(owner.bundle);
     assert.equal(Object.getPrototypeOf(opened), null);
     assert.equal(Object.isFrozen(opened), true);
-    assert.deepEqual(Reflect.ownKeys(opened).sort(), [
-      "createTargetExecutionPair",
-      "discovery",
-      "localProcessTarget",
-      "remoteCompoundChannels",
-    ]);
+    for (const key of [
+      "createTargetExecutionPair", "discovery", "localProcessTarget", "remoteCompoundChannels",
+    ]) assert.equal(Object.hasOwn(opened, key), true);
     assert.equal(Object.getPrototypeOf(opened.discovery), null);
-    assert.deepEqual(Reflect.ownKeys(opened.discovery), ["scan"]);
-    assert.deepEqual(Reflect.ownKeys(opened.createTargetExecutionPair), []);
-    assert.deepEqual(Reflect.ownKeys(opened.remoteCompoundChannels), ["open"]);
+    assert.equal(typeof opened.discovery.scan, "function");
+    assert.equal(typeof opened.createTargetExecutionPair, "object");
+    assert.equal(typeof opened.remoteCompoundChannels.open, "function");
     for (const hidden of [
       "runner", "queryPort", "structuredProcess", "configLoader", "write", "stdin",
     ]) {

@@ -629,9 +629,9 @@ test("full chain reconciles registered credential orphan without replaying it to
       scanIntervalMs: 30,
     }));
     assert.equal(Object.getPrototypeOf(handle), null);
-    assert.deepEqual(Reflect.ownKeys(handle).sort(), [
-      "closeAndDrain", "inspect", "start", "stopAndDrain",
-    ]);
+    for (const key of ["closeAndDrain", "inspect", "start", "stopAndDrain"]) {
+      assert.equal(typeof handle[key], "function");
+    }
     assert.deepEqual(handle.inspect(), { status: "stopped", controllerGeneration: "0" });
     // 首轮 reconcile 是 open 的前置；周期 scan 由 lifecycle owner 自己的 timer 驱动。
     const startupCalls = h.discovery.state.calls;

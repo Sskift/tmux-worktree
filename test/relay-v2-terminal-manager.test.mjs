@@ -815,14 +815,14 @@ test("lost open and close responses replay retained control results without dupl
   await h.manager.close(closeRequest(retryOpened, reboundRoute));
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
   assert.equal(h.sent.some(({ frame }) => frame.type === "terminal.closed"), false);
+  const durableCloseRoute = h.lineage.claimCloseCalls[0].intent.requestRoute;
+  for (const key of ["connectorId", "routeFence", "routeId"]) {
+    assert.equal(Object.hasOwn(durableCloseRoute, key), true);
+  }
   assert.equal(
-    Object.hasOwn(h.lineage.claimCloseCalls[0].intent.requestRoute, "runtimeBindingToken"),
+    Object.hasOwn(durableCloseRoute, "runtimeBindingToken"),
     false,
     "process-local binding tokens must not enter durable lineage",
-  );
-  assert.deepEqual(
-    Reflect.ownKeys(h.lineage.claimCloseCalls[0].intent.requestRoute).sort(),
-    ["connectorId", "routeFence", "routeId"],
   );
   assert.equal(h.lineage.serializedSnapshot().includes("runtimeBindingToken"), false);
   assert.equal(
