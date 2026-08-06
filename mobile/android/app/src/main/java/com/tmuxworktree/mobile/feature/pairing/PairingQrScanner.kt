@@ -66,7 +66,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * In-app Relay v1 QR scanner backed by CameraX and ML Kit's APK-bundled model.
+ * In-app Relay QR scanner backed by CameraX and ML Kit's APK-bundled model.
+ * Accepts both Relay v2 enrollment and Relay v1 pairing profiles.
  * No Google Play services optional scanner or recognition module is used here.
  */
 @Composable
@@ -199,7 +200,7 @@ private fun ScannerPreview(
                                         ) {
                                             currentOnError(
                                                 "The camera opened, but the QR reader could not start. " +
-                                                    "Enter the Relay v1 connection details manually.",
+                                                    "Enter the connection details manually.",
                                             )
                                         }
                                     }
@@ -217,7 +218,7 @@ private fun ScannerPreview(
                     if (!disposed.get() && completed.compareAndSet(false, true)) {
                         mainExecutor.execute {
                             currentOnError(
-                                "The camera is unavailable. Enter the Relay v1 connection details manually.",
+                                "The camera is unavailable. Enter the connection details manually.",
                             )
                         }
                     }
@@ -261,7 +262,7 @@ private fun ScannerPreview(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Scan Relay v1 profile",
+                    text = "Scan Relay QR code",
                     color = Color.White,
                     style = MaterialTheme.typography.titleLarge,
                 )
@@ -289,7 +290,7 @@ private fun CameraPermissionRequired(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = "Camera access is needed to scan the Relay v1 profile",
+            text = "Camera access is needed to scan a Relay QR code",
             color = TwTextPrimary,
             style = MaterialTheme.typography.headlineSmall,
         )

@@ -238,7 +238,7 @@ fun PairingScreen(
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            text = "Open Mobile pairing in tw-dashboard on your Mac, then scan the Relay v1 profile or enter the connection details.",
+            text = "Open Mobile pairing in tw-dashboard on your Mac, then scan the QR code on its Connections page (Relay v2 enrollment is preferred; Relay v1 pairing profiles are also supported), or enter the connection details below.",
             color = TwTextSecondary,
             style = MaterialTheme.typography.bodyLarge,
         )
