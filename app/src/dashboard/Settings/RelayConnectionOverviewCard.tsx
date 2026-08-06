@@ -57,7 +57,11 @@ export function RelayConnectionOverviewCard({
   onRevokeKnownGrant,
   onHidePairingQr,
 }: RelayConnectionOverviewCardProps) {
-  const action = overview.primaryAction;
+  // While the inline QR is expanded, the "Show pairing QR" button would do
+  // nothing new — the Hide affordance replaces it until collapsed.
+  const action = overview.primaryAction?.kind === "show_qr" && inlineQr
+    ? null
+    : overview.primaryAction;
   return (
     <section
       className={`connections-card connections-relay-overview connections-relay-overview--${overview.tone}`}
