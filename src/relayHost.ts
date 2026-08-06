@@ -40,6 +40,10 @@ import type {
   RelayV2HostCanonicalProductionCompositionOptions,
 } from "./relay/v2/hostCanonicalProductionComposition.js";
 import {
+  RelayV2HostProductionProfileStoreError,
+  readRelayV2HostProductionProfile,
+} from "./relay/v2/hostProductionProfileStore.js";
+import {
   AgentChatEngine,
   type AgentChatControl,
 } from "./relay/agentChat.js";
@@ -833,15 +837,100 @@ async function localTwOutput(args: string[], timeout: number): Promise<string> {
   return (await execFileTracked("tw", args, commandExecOptions(timeout))).stdout;
 }
 
-function relayHostProfile(argv: readonly string[], env: NodeJS.ProcessEnv): RelayHostProfile {
-  let profile = env.TW_RELAY_HOST_PROFILE?.trim() || "v1";
+const RELAY_V1_ONLY_HOST_ARGS = new Set([
+  "--relay",
+  "--host-id",
+  "--display-name",
+  "--secret",
+  "--local",
+  "--status-file",
+]);
+
+const RELAY_V2_ONLY_HOST_ARGS = new Set([
+  "--provision-profile-input",
+  "--bootstrap-secret-input",
+  "--local-development",
+  "--trusted-home",
+  "--credential-https-ca-input",
+  "--carrier-wss-ca-input",
+]);
+
+const RELAY_HOST_V1_FALLBACK_HINT =
+  "relay-host: 未检测到已 provision 的 Relay v2 host profile，本次使用 v1。"
+  + " 要启用 Relay v2，请先 provision canonical host profile（参考 MANUAL，"
+  + "或使用 `tw relay-host --profile v2 --provision-profile-input <owner-only-0600-profile.json>`"
+  + "），之后裸 `tw relay-host` 会自动默认走 v2；可用 `--v1` 随时强制回到 v1。";
+
+function relayV2HostProductionProfileProvisioned(): boolean {
+  try {
+    readRelayV2HostProductionProfile();
+    return true;
+  } catch (error) {
+    if (error instanceof RelayV2HostProductionProfileStoreError
+      && error.code === "RELAY_V2_HOST_PRODUCTION_PROFILE_NOT_FOUND") {
+      return false;
+    }
+    // 已存在但无法通过严格校验（corrupt/unsafe）的 profile 同样不默认走 v2，
+    // 回落 v1 并由用户显式修复/清理后再次选择。
+    return false;
+  }
+}
+
+/**
+ * Resolves the Relay host dialect. Precedence:
+ *  1. `--v1` 逃生门（任何情况下强制 v1）；
+ *  2. `--profile v1|v2`（argv 显式）；
+ *  3. `TW_RELAY_HOST_PROFILE`（env 显式通道）；
+ *  4. 裸调用（无任何 relay 参数）：若 canonical v2 host profile 已 provision 则
+ *     默认走 v2，否则回落 v1（`autoFellBackToV1` 提示 provisioning）；
+ *  5. 带 relay 参数但无显式 profile：保持既有默认 v1 行为。
+ */
+export function resolveRelayHostProfile(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+): { profile: RelayHostProfile; autoFellBackToV1: boolean } {
+  let profile = env.TW_RELAY_HOST_PROFILE?.trim() || "";
+  let explicitProfile = false;
+  let forceV1 = false;
+  let sawOtherRelayFlag = false;
+
   for (let index = 0; index < argv.length; index += 1) {
-    if (argv[index] === "--profile") profile = argv[index + 1] || "";
+    const arg = argv[index];
+    if (arg === "--profile") {
+      profile = argv[index + 1] || "";
+      explicitProfile = true;
+      index += 1;
+    } else if (arg === "--v1") {
+      forceV1 = true;
+    } else if (arg === "-h" || arg === "--help") {
+      // Help short-circuits later; it is not a relay selection flag.
+    } else {
+      sawOtherRelayFlag = true;
+    }
   }
-  if (profile !== "v1" && profile !== "v2") {
-    throw new CliError("relay-host --profile 只接受 v1 或 v2");
+
+  if (forceV1) {
+    if (explicitProfile && profile === "v2") {
+      throw new CliError("relay-host --v1 与 --profile v2 冲突");
+    }
+    return { profile: "v1", autoFellBackToV1: false };
   }
-  return profile;
+
+  if (explicitProfile || profile !== "") {
+    if (profile !== "v1" && profile !== "v2") {
+      throw new CliError("relay-host --profile 只接受 v1 或 v2");
+    }
+    return { profile, autoFellBackToV1: false };
+  }
+
+  if (!sawOtherRelayFlag) {
+    if (relayV2HostProductionProfileProvisioned()) {
+      return { profile: "v2", autoFellBackToV1: false };
+    }
+    return { profile: "v1", autoFellBackToV1: true };
+  }
+
+  return { profile: "v1", autoFellBackToV1: false };
 }
 
 const RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE = "relay-v2-host-credential-ref:";
@@ -956,7 +1045,7 @@ export function parseRelayHostOptions(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): RelayHostOptions {
-  const profile = relayHostProfile(argv, env);
+  const { profile } = resolveRelayHostProfile(argv, env);
   if (profile === "v2") {
     // 显式 default-off 选路：endpoint、hostId 与 credential reference 只来自
     // canonical 运行时 profile store；CLI 只可额外传入非敏感 provisioning /
@@ -1101,6 +1190,8 @@ export function parseRelayHostOptions(
     const arg = argv[i];
     if (arg === "--profile") {
       i += 1;
+    } else if (arg === "--v1") {
+      // 逃生门已由 resolveRelayHostProfile 消费；v1 解析循环无需再处理。
     } else if (arg === "--relay") {
       relay = argv[++i] || "";
     } else if (arg === "--host-id") {
@@ -1157,11 +1248,18 @@ function printHelp(): void {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
+  tw relay-host --v1 ...（逃生门：任何情况下强制走 v1）
   tw relay-host --profile v2 [--provision-profile-input <path>] [--bootstrap-secret-input <path>]
   tw relay-host --profile v2 --local-development \\
     --trusted-home <absolute-path> \\
     --credential-https-ca-input <path> --carrier-wss-ca-input <path> \\
     [--provision-profile-input <path>] [--bootstrap-secret-input <path>]
+
+默认语义:
+  无显式 --profile/--v1/TW_RELAY_HOST_PROFILE 且无其它 relay 参数时，裸 tw relay-host
+  会在 canonical v2 host profile（~/.tmux-worktree/relay-v2-host/profile-v1.json）已 provision
+  且通过严格校验时默认走 v2；否则回落 v1 并打印一行 provisioning 提示。带 v1/v2 专属参数
+  或显式 --profile/--v1 时保持原有显式选路语义不变。
 
 Relay v2:
   --profile v2 选择显式 default-off Relay v2 Host shipping root。relayUrl、issuer、hostId 与
@@ -4061,7 +4159,12 @@ async function runConnection(
 }
 
 export async function run(): Promise<void> {
-  const opts = parseRelayHostOptions(process.argv.slice(3));
+  const argv = process.argv.slice(3);
+  const resolved = resolveRelayHostProfile(argv, process.env);
+  if (resolved.profile === "v1" && resolved.autoFellBackToV1) {
+    console.error(RELAY_HOST_V1_FALLBACK_HINT);
+  }
+  const opts = parseRelayHostOptions(argv);
   if (opts.profile === "v2") {
     if (opts.localDevelopment === true) {
       const deployment = await import("./relay/v2/hostShippingDeploymentSource.js");

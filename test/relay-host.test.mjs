@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -34,6 +36,7 @@ const {
   remoteAttachCommand,
   relaySshConnectionArgs,
   relayV2HostCarrierUrl,
+  resolveRelayHostProfile,
   run,
   sessionNameFromTwWorktreeDir,
   writeTerminalRegistryAtomic,
@@ -163,6 +166,97 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
     "--secret", "legacy-shared-secret",
     "--credential-reference", "must-not-cross-profile",
   ], {}), /cannot read Relay v2 credential reference|不能读取 Relay v2 credential reference/);
+});
+
+function withEnvHome(home, operation) {
+  const previousHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    return operation();
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+  }
+}
+
+function canonicalPrivateHome(prefix) {
+  const created = mkdtempSync(join(tmpdir(), prefix));
+  const home = realpathSync.native(created);
+  chmodSync(home, 0o700);
+  return home;
+}
+
+test("relay-host bare default flips to v2 only when a canonical v2 host profile is provisioned", async () => {
+  const profileCases = JSON.parse(readFileSync(
+    new URL("../contracts/relay/v2/host-production-profile-v1/cases.json", import.meta.url),
+    "utf8",
+  ));
+  const profileStore = await import("../dist/relay/v2/hostProductionProfileStore.js");
+  const provisionedHome = canonicalPrivateHome("tw-relay-v2-host-default-provisioned-");
+  const emptyHome = canonicalPrivateHome("tw-relay-v2-host-default-empty-");
+  try {
+    // Provision a valid canonical v2 host production profile in an isolated home.
+    profileStore.loadOrCreateRelayV2HostProductionProfile({
+      profile: profileCases.validProfile,
+      trustedHome: provisionedHome,
+    });
+
+    // No profile -> v1 fallback carrying the provisioning hint.
+    assert.deepEqual(
+      withEnvHome(emptyHome, () => resolveRelayHostProfile([], {})),
+      { profile: "v1", autoFellBackToV1: true },
+    );
+
+    // Provisioned profile -> bare invocation defaults to v2.
+    assert.deepEqual(
+      withEnvHome(provisionedHome, () => resolveRelayHostProfile([], {})),
+      { profile: "v2", autoFellBackToV1: false },
+    );
+
+    // --v1 is a hard escape hatch even when v2 is provisioned.
+    assert.deepEqual(
+      withEnvHome(provisionedHome, () => resolveRelayHostProfile(["--v1"], {})),
+      { profile: "v1", autoFellBackToV1: false },
+    );
+
+    // --v1 conflicts with an explicit --profile v2.
+    assert.throws(
+      () => resolveRelayHostProfile(["--v1", "--profile", "v2"], {}),
+      /--v1 与 --profile v2 冲突/,
+    );
+
+    // Explicit profile / env channels are unchanged.
+    assert.deepEqual(resolveRelayHostProfile(["--profile", "v2"], {}), {
+      profile: "v2", autoFellBackToV1: false,
+    });
+    assert.deepEqual(resolveRelayHostProfile(["--profile", "v1"], {}), {
+      profile: "v1", autoFellBackToV1: false,
+    });
+    assert.deepEqual(resolveRelayHostProfile([], { TW_RELAY_HOST_PROFILE: "v2" }), {
+      profile: "v2", autoFellBackToV1: false,
+    });
+
+    // Carrying a v1-only relay arg keeps the old explicit v1 default even when
+    // a v2 profile is provisioned, so existing v1 invocations never silently
+    // switch dialect.
+    assert.deepEqual(
+      withEnvHome(provisionedHome, () => resolveRelayHostProfile(
+        ["--relay", "wss://relay.example.test"],
+        {},
+      )),
+      { profile: "v1", autoFellBackToV1: false },
+    );
+
+    // Relay-server-only flags such as --v2-local-dev must not accidentally
+    // select v2 on relay-host; they remain unrecognized relay-host args.
+    assert.deepEqual(
+      withEnvHome(provisionedHome, () => resolveRelayHostProfile(["--v2-local-dev"], {})),
+      { profile: "v1", autoFellBackToV1: false },
+    );
+  } finally {
+    rmSync(provisionedHome, { recursive: true, force: true });
+    rmSync(emptyHome, { recursive: true, force: true });
+  }
 });
 
 test("Relay v2 host argv carries only non-secret provisioning and bootstrap paths", () => {
