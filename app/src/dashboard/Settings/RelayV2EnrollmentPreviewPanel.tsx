@@ -4,31 +4,6 @@ import {
   deriveRelayV2EnrollmentView,
   type RelayV2EnrollmentState,
 } from "./relayV2EnrollmentModel";
-import { useRelayV2EnrollmentController } from "./useRelayV2EnrollmentController";
-
-export function RelayV2EnrollmentPanel({
-  v1SharedSecretConfigured,
-}: {
-  v1SharedSecretConfigured: boolean;
-}) {
-  const controller = useRelayV2EnrollmentController(v1SharedSecretConfigured);
-  if (!controller.loaded) return null;
-  return (
-    <RelayV2EnrollmentPreviewPanel
-      state={controller.state}
-      v1SharedSecretConfigured={v1SharedSecretConfigured}
-      onBootstrapHost={controller.bootstrapHost}
-      onRefreshHost={controller.refreshHost}
-      onStartConnector={controller.startConnector}
-      onStopConnector={controller.stopConnector}
-      onCreateEnrollment={controller.createEnrollment}
-      onShowEnrollmentArtifact={controller.showEnrollmentArtifact}
-      onCopyEnrollmentArtifact={controller.copyEnrollmentArtifact}
-      artifactNotice={controller.artifactNotice}
-      onRevokeKnownGrant={controller.revokeKnownGrant}
-    />
-  );
-}
 
 export function RelayV2EnrollmentPreviewPanel({
   state,

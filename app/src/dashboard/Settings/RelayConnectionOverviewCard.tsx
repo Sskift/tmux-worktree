@@ -133,11 +133,11 @@ export function RelayConnectionOverviewCard({
         </div>
       )}
 
-      {knownGrantActive && (
+      {(knownGrantActive || revokingGrant) && (
         <div className="connections-relay-overview__paired">
           <span>
             <Smartphone aria-hidden="true" size={14} />
-            Paired phone · active
+            Paired phone · {revokingGrant ? "revoking…" : "active"}
           </span>
           <button
             type="button"
