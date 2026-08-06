@@ -111,6 +111,9 @@ const virtualModules = new Map([
       const source = {
         capability() {
           h.events.push(["native.capability"]);
+          const byKind = h.nativeCapabilityByKind;
+          if (byKind !== undefined && byKind[kind] !== undefined) return byKind[kind];
+          if (h.nativeCapability !== undefined) return h.nativeCapability;
           return { status: "supported" };
         },
         takeNativeModule() {
@@ -484,6 +487,11 @@ globalThis.__hostDeploymentSelfHostedLoader =
 const module = await import(
   `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
 );
+// The bundled hostCredentialNativeLoader module captured the trusted loader
+// reference at import time. Keep a stable alias so later harnesses keep
+// matching that same identity even if an earlier test cleans the global.
+const trustedLoaderRef = globalThis.__hostDeploymentTrustedLoader;
+const selfHostedLoaderRef = globalThis.__hostDeploymentSelfHostedLoader;
 
 function canonicalProfile() {
   return Object.freeze(Object.assign(Object.create(null), {
@@ -511,9 +519,11 @@ function createHarness(home) {
     home,
     profile: canonicalProfile(),
     profileReads: 0,
-    trustedLoader: globalThis.__hostDeploymentTrustedLoader,
-    selfHostedLoader: globalThis.__hostDeploymentSelfHostedLoader,
+    trustedLoader: trustedLoaderRef,
+    selfHostedLoader: selfHostedLoaderRef,
     nativeModule: Object.freeze({ openRelayV2HostCredentialAtomicFileCellV1() {} }),
+    nativeCapability: undefined,
+    nativeCapabilityByKind: undefined,
     events: [],
     sources: [],
     trustCuts: [],
@@ -1332,3 +1342,316 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("Relay v2 Host trusted process lane degrades to the local credential cell when the native artifact is missing", async () => {
+  const home = createPrivateHome(58);
+  const cli = join(home, "cli.cjs");
+  writeFileSync(cli, "/* fixture */\n");
+  const savedArgv = process.argv;
+  const savedHome = process.env.HOME;
+  const bootstrapPath = join(home, "degraded-bootstrap.twhostboot2");
+  writeFileSync(
+    bootstrapPath,
+    "twhostboot2.degraded-bootstrap-secret\n",
+    { mode: 0o600 },
+  );
+  chmodSync(bootstrapPath, 0o600);
+  try {
+    process.argv = [process.execPath, cli];
+    const harness = createHarness(home);
+    harness.nativeCapabilityByKind = Object.freeze({
+      production: Object.freeze({
+        status: "unsupported",
+        reason: "native_artifact_missing",
+      }),
+    });
+    globalThis.__hostDeploymentHarness = harness;
+    assert.equal(
+      await module.runRelayV2HostShippingFromTrustedDeployment(bootstrapPath),
+      78,
+    );
+    assert.ok(
+      harness.events.some(([name]) => name === "native.create"),
+      "the fixed native source is still constructed before degradation",
+    );
+    assert.ok(
+      harness.events.some(([name]) => name === "native.capability"),
+      "the capability gate is still probed before degradation",
+    );
+    assert.ok(harness.events.some(([name]) => name === "local.intake.open"));
+    assert.equal(
+      harness.events.some(([name]) => name === "intake.open"),
+      false,
+      "degraded trusted shipping must not open the native intake bridge",
+    );
+    assert.equal(harness.localCapabilityHandoffIssueCount, 1);
+    assert.notStrictEqual(harness.localCredentialCell, null);
+    assert.strictEqual(
+      harness.localCapabilityHandoffs.get(
+        harness.localIntakeOptions.localDevelopmentCapabilityActivationHandoff,
+      ),
+      harness.localCredentialCell,
+      "degraded trusted shipping binds the local-development handoff to its exact cell",
+    );
+    assert.equal(harness.bootstrapSecretRaw, "twhostboot2.degraded-bootstrap-secret\n");
+    assert.ok(harness.events.some(([name]) => name === "process.run"));
+    assert.ok(harness.events.some(([name]) => name === "native.close"));
+    assert.ok(harness.events.some(([name]) => name === "local.intake.close"));
+  } finally {
+    process.argv = savedArgv;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    delete globalThis.__hostDeploymentHarness;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Relay v2 Host trusted dashboard lane degrades to a usable local credential cell when the native artifact is missing", async () => {
+  const home = createPrivateHome(58);
+  const cli = join(home, "cli.cjs");
+  writeFileSync(cli, "/* fixture */\n");
+  const savedArgv = process.argv;
+  const savedHome = process.env.HOME;
+  try {
+    process.argv = [process.execPath, cli];
+    const harness = createHarness(home);
+    harness.nativeCapabilityByKind = Object.freeze({
+      production: Object.freeze({
+        status: "unsupported",
+        reason: "native_artifact_missing",
+      }),
+    });
+    globalThis.__hostDeploymentHarness = harness;
+    const abort = new AbortController();
+    const handle =
+      await module.startRelayV2HostDashboardManagementFromTrustedDeployment(
+        Object.freeze({
+          clock: () => 1_783_700_000_000,
+          runtimeVersion: "0.0.0-dashboard-trusted-missing-native-test",
+          signal: abort.signal,
+          io: Object.freeze({
+            input: Object.freeze({ async *[Symbol.asyncIterator]() {} }),
+            writeFrame: async () => undefined,
+          }),
+        }),
+      );
+    assert.equal(typeof handle.runDashboardManagement, "function");
+    assert.equal(harness.localCapabilityHandoffIssueCount, 1);
+    assert.notStrictEqual(harness.localCredentialCell, null);
+    assert.strictEqual(
+      harness.localCapabilityHandoffs.get(
+        harness.localIntakeOptions.localDevelopmentCapabilityActivationHandoff,
+      ),
+      harness.localCredentialCell,
+      "degraded trusted dashboard reuses the exact-cell handoff path",
+    );
+    assert.ok(harness.events.some(([name]) => name === "local.intake.open"));
+    assert.equal(harness.events.some(([name]) => name === "intake.open"), false);
+    assert.equal(await handle.runDashboardManagement(), 0);
+    assert.equal(
+      harness.events.some(([name]) => name === "process.run"),
+      false,
+      "dashboard adoption does not start a competing process lifecycle",
+    );
+    await handle.closeAndDrain();
+    assert.ok(harness.events.some(([name]) => name === "local.intake.close"));
+    assert.ok(harness.events.some(([name]) => name === "native.close"));
+  } finally {
+    process.argv = savedArgv;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    delete globalThis.__hostDeploymentHarness;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Relay v2 Host trusted deployment stays fail-closed for non-missing unsupported reasons", async () => {
+  const home = createPrivateHome(58);
+  const savedHome = process.env.HOME;
+  const unsupportedReasons = ["target_unsupported", "interface_version_unsupported"];
+  try {
+    for (const reason of unsupportedReasons) {
+      const harness = createHarness(home);
+      harness.nativeCapabilityByKind = Object.freeze({
+        production: Object.freeze({ status: "unsupported", reason }),
+      });
+      globalThis.__hostDeploymentHarness = harness;
+      await assert.rejects(
+        module.startRelayV2HostDashboardManagementFromTrustedDeployment(
+          Object.freeze({
+            clock: () => 1_783_700_000_000,
+            runtimeVersion: "0.0.0-dashboard-trusted-unsupported-" + reason,
+            signal: new AbortController().signal,
+            io: Object.freeze({
+              input: Object.freeze({ async *[Symbol.asyncIterator]() {} }),
+              writeFrame: async () => undefined,
+            }),
+          }),
+        ),
+        (error) => error?.code === "ACTIVATION_FAILED",
+        `${reason} must stay fail-closed in trusted activation`,
+      );
+      assert.ok(harness.events.some(([name]) => name === "native.create"));
+      assert.equal(
+        harness.events.some(([name]) => name === "local.intake.open"),
+        false,
+        `${reason} must not open the local intake`,
+      );
+      assert.equal(harness.localCapabilityHandoffIssueCount, 0);
+      assert.ok(harness.events.some(([name]) => name === "native.close"));
+    }
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    delete globalThis.__hostDeploymentHarness;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+if (process.platform === "darwin" && process.arch === "arm64") {
+  test("Relay v2 Host self-hosted lane degrades to the local credential cell when the native artifact is missing", async () => {
+    const accountHome = createPrivateHome(60);
+    const cli = join(accountHome, "cli.cjs");
+    writeFileSync(cli, "/* fixture */\n");
+    const savedArgv = process.argv;
+    const credentialCaPath = join(accountHome, "degraded-credential-ca.pem");
+    const carrierCaPath = join(accountHome, "degraded-carrier-ca.pem");
+    const credentialCa = "degraded-self-hosted-credential-ca";
+    const carrierCa = "degraded-self-hosted-carrier-ca";
+    writeFileSync(credentialCaPath, credentialCa, { mode: 0o600 });
+    writeFileSync(carrierCaPath, carrierCa, { mode: 0o600 });
+    chmodSync(credentialCaPath, 0o600);
+    chmodSync(carrierCaPath, 0o600);
+    const savedHome = process.env.HOME;
+    try {
+      process.argv = [process.execPath, cli];
+      process.env.HOME = accountHome;
+      const harness = createHarness(accountHome);
+      harness.nativeCapabilityByKind = Object.freeze({
+        "self-hosted": Object.freeze({
+          status: "unsupported",
+          reason: "native_artifact_missing",
+        }),
+      });
+      globalThis.__hostDeploymentHarness = harness;
+      const abort = new AbortController();
+      const handle =
+        await module.startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+          Object.freeze({
+            credentialHttpsCaInputPath: credentialCaPath,
+            carrierWssCaInputPath: carrierCaPath,
+          }),
+          Object.freeze({
+            clock: () => 1_783_700_000_000,
+            runtimeVersion: "0.0.0-dashboard-self-hosted-missing-native-test",
+            signal: abort.signal,
+            io: Object.freeze({
+              input: Object.freeze({ async *[Symbol.asyncIterator]() {} }),
+              writeFrame: async () => undefined,
+            }),
+          }),
+        );
+      assert.equal(typeof handle.runDashboardManagement, "function");
+      assert.ok(
+        harness.events.some(([name]) => name === "native.create"),
+        "the self-hosted native source is still constructed before degradation",
+      );
+      assert.ok(harness.events.some(([name]) => name === "local.intake.open"));
+      assert.equal(
+        harness.events.some(([name]) => name === "intake.open"),
+        false,
+        "degraded self-hosted shipping must not open the native intake bridge",
+      );
+      assert.equal(harness.localCapabilityHandoffIssueCount, 1);
+      assert.notStrictEqual(harness.localCredentialCell, null);
+      assert.strictEqual(
+        harness.localCapabilityHandoffs.get(
+          harness.localIntakeOptions.localDevelopmentCapabilityActivationHandoff,
+        ),
+        harness.localCredentialCell,
+        "degraded self-hosted shipping binds the local-development handoff to its exact cell",
+      );
+      assert.equal(
+        Buffer.from(
+          harness.localTlsTrust.credential.certificateAuthorities[0],
+        ).toString("utf8"),
+        credentialCa,
+        "degraded self-hosted keeps the caller credential CA trust cut",
+      );
+      assert.equal(
+        Buffer.from(
+          harness.localTlsTrust.carrier.certificateAuthorities[0],
+        ).toString("utf8"),
+        carrierCa,
+        "degraded self-hosted keeps the caller carrier CA trust cut",
+      );
+      assert.equal(await handle.runDashboardManagement(), 0);
+      assert.equal(
+        harness.events.some(([name]) => name === "process.run"),
+        false,
+      );
+      await handle.closeAndDrain();
+      assert.ok(harness.events.some(([name]) => name === "local.intake.close"));
+      assert.ok(harness.events.some(([name]) => name === "native.close"));
+    } finally {
+      process.argv = savedArgv;
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      delete globalThis.__hostDeploymentHarness;
+      rmSync(accountHome, { recursive: true, force: true });
+    }
+  });
+
+  test("Relay v2 Host self-hosted lane stays fail-closed for non-missing unsupported reasons", async () => {
+    const accountHome = createPrivateHome(60);
+    const credentialCaPath = join(accountHome, "fail-closed-credential-ca.pem");
+    const carrierCaPath = join(accountHome, "fail-closed-carrier-ca.pem");
+    writeFileSync(credentialCaPath, "fail-closed-credential-ca", { mode: 0o600 });
+    writeFileSync(carrierCaPath, "fail-closed-carrier-ca", { mode: 0o600 });
+    chmodSync(credentialCaPath, 0o600);
+    chmodSync(carrierCaPath, 0o600);
+    const savedHome = process.env.HOME;
+    try {
+      process.env.HOME = accountHome;
+      const harness = createHarness(accountHome);
+      harness.nativeCapabilityByKind = Object.freeze({
+        "self-hosted": Object.freeze({
+          status: "unsupported",
+          reason: "target_unsupported",
+        }),
+      });
+      globalThis.__hostDeploymentHarness = harness;
+      await assert.rejects(
+        module.startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
+          Object.freeze({
+            credentialHttpsCaInputPath: credentialCaPath,
+            carrierWssCaInputPath: carrierCaPath,
+          }),
+          Object.freeze({
+            clock: () => 1_783_700_000_000,
+            runtimeVersion: "0.0.0-dashboard-self-hosted-unsupported-test",
+            signal: new AbortController().signal,
+            io: Object.freeze({
+              input: Object.freeze({ async *[Symbol.asyncIterator]() {} }),
+              writeFrame: async () => undefined,
+            }),
+          }),
+        ),
+        (error) => error?.code === "ACTIVATION_FAILED",
+        "target_unsupported must stay fail-closed in self-hosted activation",
+      );
+      assert.ok(harness.events.some(([name]) => name === "native.create"));
+      assert.equal(
+        harness.events.some(([name]) => name === "local.intake.open"),
+        false,
+      );
+      assert.equal(harness.localCapabilityHandoffIssueCount, 0);
+      assert.ok(harness.events.some(([name]) => name === "native.close"));
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      delete globalThis.__hostDeploymentHarness;
+      rmSync(accountHome, { recursive: true, force: true });
+    }
+  });
+}

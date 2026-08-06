@@ -95,10 +95,24 @@ export interface RelayV2HostSelfHostedDarwinArm64Activation {
   readonly [relayV2HostSelfHostedDarwinArm64ActivationBrand]: void;
 }
 
+/**
+ * Exact credential intake for one trusted/self-hosted activation record.
+ * Either the native module source (durable native cell) or the one-shot
+ * takeCredentialCell accessor (non-native in-memory cell) is present,
+ * depending on whether the fixed native artifact resolved at activation.
+ */
+export type RelayV2HostTrustedCredentialIntake =
+  | Readonly<{
+      nativeModuleSource: RelayV2HostCredentialNativeModuleSource;
+    }>
+  | Readonly<{
+      takeCredentialCell(): RelayV2HostCredentialAtomicByteCellOwner;
+    }>;
+
 export interface RelayV2HostTrustedDeploymentActivationRecord {
   readonly trustedHome: string;
   readonly profileSnapshot: Readonly<RelayV2HostProductionProfile>;
-  readonly nativeModuleSource: RelayV2HostCredentialNativeModuleSource;
+  readonly credentialIntake: RelayV2HostTrustedCredentialIntake;
   readonly runtimeBundle: RelayV2CanonicalHostRuntimeBundleV1;
   readonly terminalControlDaemonSocketPath: string;
   readonly credentialHttpsTlsTrustCut: RelayV2HostTlsCaTrustCut;
@@ -619,6 +633,7 @@ async function createTrustedActivationOwner(
   let bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null = null;
   let nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null = null;
   let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
+  let credentialCell: RelayV2HostCredentialAtomicByteCellOwner | null = null;
   try {
     requireStartupOpen(signal);
     const trustedHome = realpathSync.native(homedir());
@@ -639,8 +654,16 @@ async function createTrustedActivationOwner(
     // Drive the revision-7 trusted factory selection before constructing the
     // runtime bundle. This result is only native interface support; it never
     // becomes readiness, durability qualification, or advertised capability.
-    if (nativeModuleSource.capability().status !== "supported") {
-      throw failure("ACTIVATION_FAILED");
+    // Only the exact native-artifact-missing outcome degrades to the same
+    // non-native process-local credential cell the explicit local-development
+    // lane uses; every other unsupported or invalid outcome stays fail-closed.
+    const capability = nativeModuleSource.capability();
+    if (capability.status !== "supported") {
+      if (capability.status !== "unsupported"
+        || capability.reason !== "native_artifact_missing") {
+        throw failure("ACTIVATION_FAILED");
+      }
+      credentialCell = createRelayV2HostLocalDevelopmentCredentialCell();
     }
     requireStartupOpen(signal);
 
@@ -658,11 +681,23 @@ async function createTrustedActivationOwner(
     const ownedBootstrapSource = bootstrapSecretByteSource;
     const ownedRuntime = runtimeOwner;
     const ownedSource = nativeModuleSource;
+    const ownedCell = credentialCell;
+    let cellTaken = false;
+    const takeCredentialCell = (): RelayV2HostCredentialAtomicByteCellOwner => {
+      if (ownedCell === null || cellTaken) throw failure("ACTIVATION_INVALID");
+      cellTaken = true;
+      return ownedCell;
+    };
     let closePromise: Promise<void> | null = null;
     const closeAndDrain = (): Promise<void> => {
       if (closePromise !== null) return closePromise;
       closePromise = (async () => {
-        if (await closeOwned(ownedBootstrapSource, ownedRuntime, ownedSource)) {
+        if (await closeOwned(
+          ownedBootstrapSource,
+          ownedRuntime,
+          ownedSource,
+          ownedCell,
+        )) {
           throw failure("CLEANUP_FAILED");
         }
       })();
@@ -675,7 +710,9 @@ async function createTrustedActivationOwner(
     const record = Object.freeze(Object.assign(Object.create(null), {
       trustedHome,
       profileSnapshot,
-      nativeModuleSource: ownedSource,
+      credentialIntake: ownedCell === null
+        ? Object.freeze({ nativeModuleSource: ownedSource })
+        : Object.freeze({ takeCredentialCell }),
       runtimeBundle: ownedRuntime.bundle,
       terminalControlDaemonSocketPath,
       credentialHttpsTlsTrustCut,
@@ -693,6 +730,7 @@ async function createTrustedActivationOwner(
       bootstrapSecretByteSource,
       runtimeOwner,
       nativeModuleSource,
+      credentialCell,
     );
     throw failure(cleanupFailed ? "CLEANUP_FAILED" : "ACTIVATION_FAILED");
   }
@@ -809,6 +847,7 @@ async function createSelfHostedDarwinArm64ActivationOwner(
   let bootstrapSecretByteSource: RelayV2HostBootstrapSecretByteSource | null = null;
   let nativeModuleSource: RelayV2HostCredentialNativeModuleSource | null = null;
   let runtimeOwner: RelayV2CanonicalHostRuntimeBundleOwnerV1 | null = null;
+  let credentialCell: RelayV2HostCredentialAtomicByteCellOwner | null = null;
   try {
     requireStartupOpen(signal);
     // Deliberately use the real account home. Unlike local-development, this
@@ -850,8 +889,16 @@ async function createSelfHostedDarwinArm64ActivationOwner(
       architecture: process.arch,
       napiVersion: Number(process.versions.napi),
     }, loader);
-    if (nativeModuleSource.capability().status !== "supported") {
-      throw failure("ACTIVATION_FAILED");
+    // Only the exact native-artifact-missing outcome degrades to the same
+    // non-native process-local credential cell the explicit local-development
+    // lane uses; every other unsupported or invalid outcome stays fail-closed.
+    const capability = nativeModuleSource.capability();
+    if (capability.status !== "supported") {
+      if (capability.status !== "unsupported"
+        || capability.reason !== "native_artifact_missing") {
+        throw failure("ACTIVATION_FAILED");
+      }
+      credentialCell = createRelayV2HostLocalDevelopmentCredentialCell();
     }
     requireStartupOpen(signal);
 
@@ -873,11 +920,23 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     const ownedBootstrapSource = bootstrapSecretByteSource;
     const ownedRuntime = runtimeOwner;
     const ownedSource = nativeModuleSource;
+    const ownedCell = credentialCell;
+    let cellTaken = false;
+    const takeCredentialCell = (): RelayV2HostCredentialAtomicByteCellOwner => {
+      if (ownedCell === null || cellTaken) throw failure("ACTIVATION_INVALID");
+      cellTaken = true;
+      return ownedCell;
+    };
     let closePromise: Promise<void> | null = null;
     const closeAndDrain = (): Promise<void> => {
       if (closePromise !== null) return closePromise;
       closePromise = (async () => {
-        if (await closeOwned(ownedBootstrapSource, ownedRuntime, ownedSource)) {
+        if (await closeOwned(
+          ownedBootstrapSource,
+          ownedRuntime,
+          ownedSource,
+          ownedCell,
+        )) {
           throw failure("CLEANUP_FAILED");
         }
       })();
@@ -890,7 +949,9 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     const record = Object.freeze(Object.assign(Object.create(null), {
       trustedHome,
       profileSnapshot,
-      nativeModuleSource: ownedSource,
+      credentialIntake: ownedCell === null
+        ? Object.freeze({ nativeModuleSource: ownedSource })
+        : Object.freeze({ takeCredentialCell }),
       runtimeBundle: ownedRuntime.bundle,
       terminalControlDaemonSocketPath,
       credentialHttpsTlsTrustCut,
@@ -911,6 +972,7 @@ async function createSelfHostedDarwinArm64ActivationOwner(
       bootstrapSecretByteSource,
       runtimeOwner,
       nativeModuleSource,
+      credentialCell,
     );
     throw failure(cleanupFailed ? "CLEANUP_FAILED" : "ACTIVATION_FAILED");
   }

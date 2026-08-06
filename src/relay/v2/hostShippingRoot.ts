@@ -883,13 +883,19 @@ async function startRelayV2HostShippingRootFromNativeActivationRecord(
     dashboardManagement: capturedDashboardManagement,
   }) as CapturedShippingOptions;
 
+  const credentialIntake = deployment.credentialIntake;
   return startCapturedShippingRoot(
     captured,
     deployment.profileSnapshot,
-    Object.freeze({
-      kind: lane === "production" ? "native" : "native-self-hosted",
-      source: deployment.nativeModuleSource,
-    }),
+    "nativeModuleSource" in credentialIntake
+      ? Object.freeze({
+          kind: lane === "production" ? "native" : "native-self-hosted",
+          source: credentialIntake.nativeModuleSource,
+        })
+      : Object.freeze({
+          kind: "local-development",
+          takeCredentialCell: credentialIntake.takeCredentialCell,
+        }),
     deployment.closeAndDrain,
     startupSignal,
   );
