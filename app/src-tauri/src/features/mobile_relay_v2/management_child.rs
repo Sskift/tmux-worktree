@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 use super::management_protocol_v2;
@@ -33,6 +33,14 @@ const STDOUT_OBSERVATION_CAPACITY: usize = 4;
 const STDOUT_DRAIN_BYTES: usize = (MAX_FRAME_PAYLOAD_BYTES + 1) * 2;
 const MANAGEMENT_CHILD_ENVIRONMENT_ALLOWLIST: [&str; 6] =
     ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"];
+// The management child's stderr is appended to a per-deployment log so an
+// activation failure that otherwise exits silently with code 1 is inspectable
+// after the fact. The log lives next to the self-hosted deployment state
+// directory (~/.tmux-worktree/relay-v2-self-hosted). Purely observational: a
+// log open failure must never block the child spawn, so callers fall back to
+// discarding stderr exactly as before.
+const MANAGEMENT_CHILD_STDERR_LOG_NAME: &str = "management-child.stderr.log";
+const MANAGEMENT_CHILD_STDERR_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BundledManagementArtifact {
@@ -363,13 +371,23 @@ struct ExactChildState {
 
 struct ExactChildAuthority {
     state: Mutex<ExactChildState>,
+    // Best-effort observability sink for the child's stderr log. When set, the
+    // first observed exit is appended to the same log the child's stderr is
+    // redirected into; writes fail silently.
+    stderr_log: Option<PathBuf>,
 }
 
 impl ExactChildAuthority {
     fn new(child: Child) -> Self {
         Self {
             state: Mutex::new(ExactChildState { child, exit: None }),
+            stderr_log: None,
         }
+    }
+
+    fn with_stderr_log(mut self, stderr_log: Option<PathBuf>) -> Self {
+        self.stderr_log = stderr_log;
+        self
     }
 
     fn take_stdio(&self) -> (Option<ChildStdin>, Option<ChildStdout>) {
@@ -385,7 +403,12 @@ impl ExactChildAuthority {
         match state.child.try_wait().map_err(|_| ())? {
             Some(status) => {
                 let exit = child_exit(status);
-                state.exit = Some(exit);
+                let stderr_log = self.stderr_log.clone();
+                state.exit = Some(exit.clone());
+                drop(state);
+                if let Some(path) = stderr_log {
+                    append_management_child_exit_line(&path, &status);
+                }
                 Ok(Some(exit))
             }
             None => Ok(None),
@@ -400,7 +423,15 @@ impl ChildLifecycle for ExactChildAuthority {
             return;
         }
         match state.child.try_wait() {
-            Ok(Some(status)) => state.exit = Some(child_exit(status)),
+            Ok(Some(status)) => {
+                let exit = child_exit(status);
+                let stderr_log = self.stderr_log.clone();
+                state.exit = Some(exit);
+                drop(state);
+                if let Some(path) = stderr_log {
+                    append_management_child_exit_line(&path, &status);
+                }
+            }
             Ok(None) | Err(_) => {
                 let _ = state.child.kill();
             }
@@ -412,16 +443,24 @@ impl ChildLifecycle for ExactChildAuthority {
         if let Some(exit) = state.exit {
             return exit;
         }
-        let exit = loop {
+        let (status, exit) = loop {
             match state.child.wait() {
-                Ok(status) => break child_exit(status),
+                Ok(status) => {
+                    let exit = child_exit(status);
+                    break (status, exit);
+                }
                 Err(_) => {
                     let _ = state.child.kill();
                     thread::yield_now();
                 }
             }
         };
-        state.exit = Some(exit);
+        let stderr_log = self.stderr_log.clone();
+        state.exit = Some(exit.clone());
+        drop(state);
+        if let Some(path) = stderr_log {
+            append_management_child_exit_line(&path, &status);
+        }
         exit
     }
 
@@ -1094,6 +1133,90 @@ impl Drop for ProductionProcess {
     }
 }
 
+fn management_child_stderr_log_path(selection: &ManagementChildSelection) -> Option<PathBuf> {
+    // Self-hosted deployments already resolve and validate the account home
+    // (the child's HOME override); default production falls back to the
+    // dashboard configuration home. Only an existing/creatable parent
+    // directory lets the log take effect; any failure just leaves stderr
+    // discarded as before.
+    let home = selection
+        .account_home_override()
+        .map(Path::to_path_buf)
+        .or_else(crate::support::app_home_dir)?;
+    Some(
+        home.join(".tmux-worktree")
+            .join("relay-v2-self-hosted")
+            .join(MANAGEMENT_CHILD_STDERR_LOG_NAME),
+    )
+}
+
+/// Truncate the stderr log to zero bytes once it exceeds `max_bytes`, so an
+/// unbounded child cannot grow the file forever. Returns true when a rotation
+/// actually truncated the file. Errors (missing file, permission, non-regular
+/// file) are treated as "nothing to rotate" and never block the spawn.
+fn truncate_oversized_management_child_stderr_log(path: &Path, max_bytes: u64) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() <= max_bytes {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .is_ok()
+}
+
+fn open_management_child_stderr(path: Option<&Path>) -> Option<Stdio> {
+    let path = path?;
+    truncate_oversized_management_child_stderr_log(path, MANAGEMENT_CHILD_STDERR_LOG_MAX_BYTES);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(Stdio::from)
+}
+
+fn append_management_child_line(path: &Path, message: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{now}] {message}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+}
+
+fn append_management_child_spawn_line(path: &Path) {
+    append_management_child_line(path, "management child spawned");
+}
+
+#[cfg(unix)]
+fn append_management_child_exit_line(path: &Path, status: &ExitStatus) {
+    use std::os::unix::process::ExitStatusExt;
+    append_management_child_line(
+        path,
+        &format!(
+            "management child exited code={:?} signal={:?}",
+            status.code(),
+            status.signal()
+        ),
+    );
+}
+
+#[cfg(not(unix))]
+fn append_management_child_exit_line(path: &Path, status: &ExitStatus) {
+    append_management_child_line(
+        path,
+        &format!("management child exited code={:?}", status.code()),
+    );
+}
+
 struct ProductionFactory {
     node: PathBuf,
     selection: ManagementChildSelection,
@@ -1101,16 +1224,21 @@ struct ProductionFactory {
 
 impl ChildFactory for ProductionFactory {
     fn spawn(&self, artifact: &BundledManagementArtifact) -> SpawnAttempt {
+        let stderr_log = management_child_stderr_log_path(&self.selection);
+        let stderr = open_management_child_stderr(stderr_log.as_deref()).unwrap_or_else(Stdio::null);
         let child = match production_command(&self.node, artifact, &self.selection)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
         {
             Ok(child) => child,
             Err(_) => return SpawnAttempt::FailedBeforeChild,
         };
-        let authority = Arc::new(ExactChildAuthority::new(child));
+        if let Some(path) = stderr_log.as_deref() {
+            append_management_child_spawn_line(path);
+        }
+        let authority = Arc::new(ExactChildAuthority::new(child).with_stderr_log(stderr_log));
         let (stdin, stdout) = authority.take_stdio();
         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
             return SpawnAttempt::FailedAfterChild(authority);
@@ -4018,5 +4146,34 @@ mod tests {
             child.state.lock().unwrap().events,
             ["write", "kill-if-live", "wait-and-reap"]
         );
+    }
+
+    #[test]
+    fn oversized_management_child_stderr_log_is_truncated_on_next_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(MANAGEMENT_CHILD_STDERR_LOG_NAME);
+
+        // A log below the cap is left untouched.
+        fs::write(&path, b"startup noise").unwrap();
+        assert!(!truncate_oversized_management_child_stderr_log(&path, 1_024));
+        assert_eq!(fs::metadata(&path).unwrap().len(), 13);
+
+        // A log above the cap is truncated to zero bytes.
+        fs::write(&path, vec![b'x'; 2_048]).unwrap();
+        assert!(truncate_oversized_management_child_stderr_log(&path, 1_024));
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        // A missing file is not an error: nothing to rotate.
+        assert!(!truncate_oversized_management_child_stderr_log(
+            &temp.path().join("missing.log"),
+            1_024
+        ));
+
+        // open_management_child_stderr opens the rotated file for append; a
+        // missing parent directory falls back to no stderr capture instead of
+        // failing the spawn.
+        assert!(open_management_child_stderr(Some(&path)).is_some());
+        assert!(open_management_child_stderr(Some(&temp.path().join("missing/x.log"))).is_none());
+        assert!(open_management_child_stderr(None).is_none());
     }
 }
