@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
+  chownSync,
   existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -381,7 +384,19 @@ const virtualModules = new Map([
       }
       h.localIntakeOptions = options;
       const initial = options.credentialCell.runExclusive((transaction) => transaction.read());
-      if (initial.bytes !== null) throw new Error("local cell did not start empty");
+      const provisioned = h.provisionedCredentialBytes;
+      if (provisioned === undefined || provisioned === null) {
+        if (initial.bytes !== null) throw new Error("local cell did not start empty");
+      } else {
+        if (initial.bytes === null) {
+          throw new Error("file cell did not surface the provisioned credential");
+        }
+        const expected = Buffer.from(provisioned);
+        const actual = Buffer.from(initial.bytes);
+        if (expected.byteLength !== actual.byteLength || !expected.equals(actual)) {
+          throw new Error("file cell surfaced unexpected credential bytes");
+        }
+      }
       const replacement = Uint8Array.from([1, 2, 3]);
       const swapped = options.credentialCell.runExclusive((transaction) =>
         transaction.compareAndSwap(initial.revision, replacement));
@@ -533,6 +548,7 @@ function createHarness(home) {
     processSignalController: null,
     bootstrapSecretByteSource: undefined,
     bootstrapSecretRaw: null,
+    provisionedCredentialBytes: null,
     localCredentialCell: null,
     localTlsTrust: null,
     localCapabilityHandoffs: new WeakMap(),
@@ -566,6 +582,51 @@ function createPrivateHome(targetBytes) {
   chmodSync(home, 0o700);
   assert.equal(Buffer.byteLength(home, "utf8"), targetBytes);
   return home;
+}
+
+// Native-format Host credential vault envelope (host-credential-atomic-file-cell-v1,
+// contract revision 7): "tw-hcv1\0" magic, UInt32BE payload length, SHA-256
+// payload digest, then the JSON payload. The file cell is byte-opaque, so any
+// native envelope proves the persisted-bytes read path.
+function testCredentialEnvelope() {
+  const payload = Buffer.from(JSON.stringify({
+    schemaVersion: 1,
+    binding: {
+      hostId: "host-production-exact",
+      credentialReference: "relay-v2-host-credential-ref:host-production-exact",
+      bootstrapSecretReference: "bootstrap-exact",
+      refreshSecretReference: "refresh-exact",
+    },
+    credentialState: null,
+    secretSlots: { bootstrapSecret: null, refreshSecret: null },
+  }), "utf8");
+  const bytes = Buffer.alloc(8 + 4 + 32 + payload.byteLength);
+  bytes.write("tw-hcv1\0", 0, "utf8");
+  bytes.writeUInt32BE(payload.byteLength, 8);
+  createHash("sha256").update(payload).digest().copy(bytes, 12);
+  payload.copy(bytes, 44);
+  return bytes;
+}
+
+// Provision the exact native cell namespace beneath a private home: 0700
+// .tmux-worktree and 0700 cell directory, with a 0600 native-format credential
+// file. Mirrors what deployment pre-creates for the degraded lanes.
+function provisionCredentialCell(home, bytes) {
+  const privateDir = join(home, ".tmux-worktree");
+  const cellDir = join(privateDir, "relay-v2-host-credential-atomic-file-cell-v1");
+  mkdirSync(cellDir, { recursive: true, mode: 0o700 });
+  chmodSync(privateDir, 0o700);
+  chmodSync(cellDir, 0o700);
+  const cellPath = join(cellDir, "relay-v2-host-credential.cell");
+  writeFileSync(cellPath, bytes, { mode: 0o600 });
+  chmodSync(cellPath, 0o600);
+  // The native contract pins derived components and the credential file to
+  // euid/egid exactly. Temp dirs under /private/tmp inherit the parent gid, so
+  // the fixture must chown the provisioned namespace to the effective identity.
+  chownSync(privateDir, process.geteuid(), process.getegid());
+  chownSync(cellDir, process.geteuid(), process.getegid());
+  chownSync(cellPath, process.geteuid(), process.getegid());
+  return bytes;
 }
 
 test("Relay v2 Host normal process lifecycle prepares terminal control and freezes one trusted lineage", async () => {
@@ -1356,9 +1417,11 @@ test("Relay v2 Host trusted process lane degrades to the local credential cell w
     { mode: 0o600 },
   );
   chmodSync(bootstrapPath, 0o600);
+  const provisioned = provisionCredentialCell(home, testCredentialEnvelope());
   try {
     process.argv = [process.execPath, cli];
     const harness = createHarness(home);
+    harness.provisionedCredentialBytes = provisioned;
     harness.nativeCapabilityByKind = Object.freeze({
       production: Object.freeze({
         status: "unsupported",
@@ -1394,6 +1457,16 @@ test("Relay v2 Host trusted process lane degrades to the local credential cell w
       "degraded trusted shipping binds the local-development handoff to its exact cell",
     );
     assert.equal(harness.bootstrapSecretRaw, "twhostboot2.degraded-bootstrap-secret\n");
+    assert.deepEqual(
+      readFileSync(join(
+        home,
+        ".tmux-worktree",
+        "relay-v2-host-credential-atomic-file-cell-v1",
+        "relay-v2-host-credential.cell",
+      )),
+      Buffer.from([1, 2, 3]),
+      "degraded trusted shipping published the local swap through the file cell",
+    );
     assert.ok(harness.events.some(([name]) => name === "process.run"));
     assert.ok(harness.events.some(([name]) => name === "native.close"));
     assert.ok(harness.events.some(([name]) => name === "local.intake.close"));
@@ -1412,9 +1485,11 @@ test("Relay v2 Host trusted dashboard lane degrades to a usable local credential
   writeFileSync(cli, "/* fixture */\n");
   const savedArgv = process.argv;
   const savedHome = process.env.HOME;
+  const provisioned = provisionCredentialCell(home, testCredentialEnvelope());
   try {
     process.argv = [process.execPath, cli];
     const harness = createHarness(home);
+    harness.provisionedCredentialBytes = provisioned;
     harness.nativeCapabilityByKind = Object.freeze({
       production: Object.freeze({
         status: "unsupported",
@@ -1448,6 +1523,16 @@ test("Relay v2 Host trusted dashboard lane degrades to a usable local credential
     assert.ok(harness.events.some(([name]) => name === "local.intake.open"));
     assert.equal(harness.events.some(([name]) => name === "intake.open"), false);
     assert.equal(await handle.runDashboardManagement(), 0);
+    assert.deepEqual(
+      readFileSync(join(
+        home,
+        ".tmux-worktree",
+        "relay-v2-host-credential-atomic-file-cell-v1",
+        "relay-v2-host-credential.cell",
+      )),
+      Buffer.from([1, 2, 3]),
+      "degraded trusted dashboard published the local swap through the file cell",
+    );
     assert.equal(
       harness.events.some(([name]) => name === "process.run"),
       false,
@@ -1523,10 +1608,12 @@ if (process.platform === "darwin" && process.arch === "arm64") {
     chmodSync(credentialCaPath, 0o600);
     chmodSync(carrierCaPath, 0o600);
     const savedHome = process.env.HOME;
+    const provisioned = provisionCredentialCell(accountHome, testCredentialEnvelope());
     try {
       process.argv = [process.execPath, cli];
       process.env.HOME = accountHome;
       const harness = createHarness(accountHome);
+      harness.provisionedCredentialBytes = provisioned;
       harness.nativeCapabilityByKind = Object.freeze({
         "self-hosted": Object.freeze({
           status: "unsupported",
@@ -1586,6 +1673,16 @@ if (process.platform === "darwin" && process.arch === "arm64") {
         "degraded self-hosted keeps the caller carrier CA trust cut",
       );
       assert.equal(await handle.runDashboardManagement(), 0);
+      assert.deepEqual(
+        readFileSync(join(
+          accountHome,
+          ".tmux-worktree",
+          "relay-v2-host-credential-atomic-file-cell-v1",
+          "relay-v2-host-credential.cell",
+        )),
+        Buffer.from([1, 2, 3]),
+        "degraded self-hosted dashboard published the local swap through the file cell",
+      );
       assert.equal(
         harness.events.some(([name]) => name === "process.run"),
         false,

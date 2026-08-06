@@ -329,7 +329,11 @@ async function runQualifiedSession(
       signal: abort.signal,
       io: captured.io,
     }));
-  } catch {
+  } catch (error) {
+    console.error(
+      "relay-v2 dashboard-management child: host root declined activation",
+      error,
+    );
     return null;
   }
   const handle = captureHandle(rawHandle);
