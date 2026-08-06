@@ -138,6 +138,13 @@ function createSelfHostedAgentTranscriptLifecycleReadiness():
   return Object.freeze({ status: "ready" as const, subscribeLoss });
 }
 
+function createSelfHostedAgentChatReadiness():
+  import("./relay/broker/server.js").RelayV2BrokerServerAgentCapabilityReadinessReceipt {
+  const cancel = Object.freeze((): void => {});
+  const subscribeLoss = Object.freeze((_onLoss: () => void): (() => void) => cancel);
+  return Object.freeze({ status: "ready" as const, subscribeLoss });
+}
+
 class RelayV2BrokerCliSignalLatch {
   readonly #controller = new AbortController();
   readonly #stopped: Promise<void>;
@@ -205,6 +212,12 @@ async function runRelayV2BrokerSingleNodeSelfHostedCli(
           ? {
               agentTranscriptLifecycleReadiness:
                 createSelfHostedAgentTranscriptLifecycleReadiness(),
+            }
+          : {}),
+        ...(options.v2AgentChatV1 === true
+          ? {
+              agentChatReadiness:
+                createSelfHostedAgentChatReadiness(),
             }
           : {}),
       }, signalLatch.signal);

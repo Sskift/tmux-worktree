@@ -9,6 +9,7 @@ export type RelayServerOptions = {
   v2LocalDevelopment?: true;
   v2SingleNodeSelfHosted?: true;
   v2AgentTranscriptLifecycleV1?: true;
+  v2AgentChatV1?: true;
   v2LocalDevelopmentTlsKeyPath?: string;
   v2LocalDevelopmentTlsCertificatePath?: string;
   v2LocalDevelopmentAdvertisedOrigin?: string;
@@ -28,6 +29,7 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let v2LocalDevelopment = false;
   let v2SingleNodeSelfHosted = false;
   let v2AgentTranscriptLifecycleV1 = false;
+  let v2AgentChatV1 = false;
   let v2LocalDevelopmentTlsKeyPath: string | undefined;
   let v2LocalDevelopmentTlsCertificatePath: string | undefined;
   let v2LocalDevelopmentAdvertisedOrigin: string | undefined;
@@ -67,6 +69,11 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         );
       }
       v2AgentTranscriptLifecycleV1 = true;
+    } else if (arg === "--v2-agent-chat-v1") {
+      if (v2AgentChatV1) {
+        throw new CliError("relay-server --v2-agent-chat-v1 只能指定一次");
+      }
+      v2AgentChatV1 = true;
     } else if (arg === "--v2-dev-tls-key") {
       if (v2LocalDevelopmentTlsKeyPath !== undefined) {
         throw new CliError("relay-server --v2-dev-tls-key 只能指定一次");
@@ -121,6 +128,12 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   if (v2AgentTranscriptLifecycleV1 && !v2SingleNodeSelfHosted) {
     throw new CliError(
       "relay-server --v2-agent-transcript-lifecycle-v1 "
+        + "只适用于 --v2-single-node-self-hosted",
+    );
+  }
+  if (v2AgentChatV1 && !v2SingleNodeSelfHosted) {
+    throw new CliError(
+      "relay-server --v2-agent-chat-v1 "
         + "只适用于 --v2-single-node-self-hosted",
     );
   }
@@ -282,6 +295,9 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
       v2SingleNodeSelfHosted: true,
       ...(v2AgentTranscriptLifecycleV1
         ? { v2AgentTranscriptLifecycleV1: true as const }
+        : {}),
+      ...(v2AgentChatV1
+        ? { v2AgentChatV1: true as const }
         : {}),
       v2LocalDevelopmentTlsKeyPath,
       v2LocalDevelopmentTlsCertificatePath,

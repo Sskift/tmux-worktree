@@ -26,7 +26,10 @@ import {
   isRelayV2HostCredentialAuthority,
   type RelayV2HostCredentialAuthority,
 } from "./hostCredentialAuthority.js";
-import type { RelayV2HostRuntimeWelcomeSerializer } from "./hostRuntime.js";
+import type {
+  RelayV2HostOptionalExtensionAttachment,
+  RelayV2HostRuntimeWelcomeSerializer,
+} from "./hostRuntime.js";
 import {
   captureRelayV2RecoveredHostH2ProcessAuthority,
   type RelayV2StateSnapshotSpool,
@@ -141,6 +144,12 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
       RelayV2HostWssTransportLifecycleFactoryOptions["scheduleCloseDrain"]
     >;
   }>;
+  /**
+   * Default-off optional Agent extension attachment. When present the runtime
+   * advertises its capability and routes extension requests to it; omission
+   * keeps every optional Agent capability off.
+   */
+  readonly optionalExtension?: RelayV2HostOptionalExtensionAttachment;
 }
 
 export interface RelayV2HostCanonicalProductionComposition {
@@ -810,6 +819,9 @@ export async function openRelayV2HostCanonicalProductionComposition(
           h3RecoveryCandidate: h3Candidate,
         }),
         welcome: options.welcome,
+        ...(options.optionalExtension === undefined
+          ? {}
+          : { optionalExtension: options.optionalExtension }),
       }),
       connector: OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
         credentialAuthority: options.credentialAuthority,

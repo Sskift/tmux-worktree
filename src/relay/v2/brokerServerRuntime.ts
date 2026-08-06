@@ -29,6 +29,9 @@ import {
 import {
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
 } from "../extensions/agentTranscriptLifecycle/v1/codec.js";
+import {
+  RELAY_AGENT_CHAT_CAPABILITY,
+} from "../extensions/agentChat/v1/codec.js";
 import type {
   RelayV2BrokerServerAgentCapabilityReadinessReceipt,
   RelayV2BrokerServerComposition,
@@ -57,6 +60,7 @@ export interface RelayV2BrokerProductionCompositionBundle {
   readonly resolveHttpSourceKey: RelayV2BrokerServerComposition["resolveHttpSourceKey"];
   readonly closeDeadlineScheduler?: RelayV2BrokerServerComposition["closeDeadlineScheduler"];
   readonly agentTranscriptLifecycleReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  readonly agentChatReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
 type CapturedProductionBundle = Readonly<{
@@ -68,6 +72,7 @@ type CapturedProductionBundle = Readonly<{
   resolveHttpSourceKey: RelayV2BrokerServerComposition["resolveHttpSourceKey"];
   closeDeadlineScheduler?: RelayV2BrokerServerComposition["closeDeadlineScheduler"];
   agentTranscriptLifecycleReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  agentChatReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }>;
 
 function captureProductionBundle(
@@ -87,6 +92,7 @@ function captureProductionBundle(
   const optional = [
     "closeDeadlineScheduler",
     "agentTranscriptLifecycleReadiness",
+    "agentChatReadiness",
   ] as const;
   let descriptors: PropertyDescriptorMap;
   try {
@@ -146,9 +152,16 @@ function captureProductionBundle(
     || rejectedProxy(scheduler))) {
     throw new TypeError("Relay v2 Broker production composition bundle is invalid");
   }
-  const agentReadiness = captured("agentTranscriptLifecycleReadiness");
-  if (agentReadiness !== undefined && (agentReadiness === null
-    || typeof agentReadiness !== "object" || rejectedProxy(agentReadiness))) {
+  const agentTranscriptLifecycleReadiness = captured("agentTranscriptLifecycleReadiness");
+  if (agentTranscriptLifecycleReadiness !== undefined
+    && (agentTranscriptLifecycleReadiness === null
+      || typeof agentTranscriptLifecycleReadiness !== "object"
+      || rejectedProxy(agentTranscriptLifecycleReadiness))) {
+    throw new TypeError("Relay v2 Broker production composition bundle is invalid");
+  }
+  const agentChatReadiness = captured("agentChatReadiness");
+  if (agentChatReadiness !== undefined && (agentChatReadiness === null
+    || typeof agentChatReadiness !== "object" || rejectedProxy(agentChatReadiness))) {
     throw new TypeError("Relay v2 Broker production composition bundle is invalid");
   }
   // Validate all side-effect-free E0 bindings before the native store can open.
@@ -169,9 +182,13 @@ function captureProductionBundle(
     resolveHttpSourceKey:
       resolveHttpSourceKey as RelayV2BrokerServerComposition["resolveHttpSourceKey"],
     ...(scheduler === undefined ? {} : { closeDeadlineScheduler: scheduler }),
-    ...(agentReadiness === undefined ? {} : {
+    ...(agentTranscriptLifecycleReadiness === undefined ? {} : {
       agentTranscriptLifecycleReadiness:
-        agentReadiness as RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+        agentTranscriptLifecycleReadiness as RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+    }),
+    ...(agentChatReadiness === undefined ? {} : {
+      agentChatReadiness:
+        agentChatReadiness as RelayV2BrokerServerAgentCapabilityReadinessReceipt,
     }),
   });
 }
@@ -205,6 +222,9 @@ export function createRelayV2BrokerProductionComposition(
     }),
     ...(bundle.agentTranscriptLifecycleReadiness === undefined ? {} : {
       agentTranscriptLifecycleReadiness: bundle.agentTranscriptLifecycleReadiness,
+    }),
+    ...(bundle.agentChatReadiness === undefined ? {} : {
+      agentChatReadiness: bundle.agentChatReadiness,
     }),
   });
 }
@@ -253,16 +273,31 @@ function rejectedProxy(value: unknown): boolean {
   }
 }
 
+const OPTIONAL_AGENT_CAPABILITY_READINESS_SPECS: ReadonlyArray<Readonly<{
+  capability: string;
+  propertyName: "agentTranscriptLifecycleReadiness" | "agentChatReadiness";
+}>> = [
+  {
+    capability: RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+    propertyName: "agentTranscriptLifecycleReadiness",
+  },
+  {
+    capability: RELAY_AGENT_CHAT_CAPABILITY,
+    propertyName: "agentChatReadiness",
+  },
+];
+
 function captureAgentCapabilityReadiness(
   composition: RelayV2BrokerServerComposition,
+  propertyName: "agentTranscriptLifecycleReadiness" | "agentChatReadiness",
 ): AgentCapabilityReadinessCapture {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(
       composition,
-      "agentTranscriptLifecycleReadiness",
+      propertyName,
     );
     if (!descriptor) {
-      return Reflect.has(composition, "agentTranscriptLifecycleReadiness")
+      return Reflect.has(composition, propertyName)
         ? Object.freeze({ outcome: "invalid" })
         : Object.freeze({ outcome: "absent" });
     }
@@ -304,7 +339,10 @@ class RelayV2BrokerAgentCapabilityReadinessSubscription {
   private lost = false;
   private cancelSubscription: Function | null = null;
 
-  constructor(private readonly readiness: CapturedAgentCapabilityReadiness) {}
+  constructor(
+    private readonly readiness: CapturedAgentCapabilityReadiness,
+    readonly capability: string,
+  ) {}
 
   bind(port: RelayV2BrokerOptionalCapabilityReadinessPort): void {
     if (this.portBound || this.closed) {
@@ -314,7 +352,7 @@ class RelayV2BrokerAgentCapabilityReadinessSubscription {
     const onLoss = (): void => {
       if (this.closed || this.lost) return;
       this.lost = true;
-      port.withdraw(RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY);
+      port.withdraw(this.capability);
     };
     let cancel: unknown;
     try {
@@ -408,15 +446,21 @@ export async function createActivatedRelayV2BrokerServerRuntime(
     throw new Error("Relay v2 broker composition is incomplete");
   }
 
-  const capturedAgentReadiness = captureAgentCapabilityReadiness(composition);
-  if (capturedAgentReadiness.outcome === "invalid") {
-    throw new Error("Relay v2 Broker optional capability readiness is invalid");
+  const readinessSubscriptions: RelayV2BrokerAgentCapabilityReadinessSubscription[] = [];
+  for (const spec of OPTIONAL_AGENT_CAPABILITY_READINESS_SPECS) {
+    const captured = captureAgentCapabilityReadiness(composition, spec.propertyName);
+    if (captured.outcome === "invalid") {
+      throw new Error("Relay v2 Broker optional capability readiness is invalid");
+    }
+    if (captured.outcome === "ready") {
+      readinessSubscriptions.push(
+        new RelayV2BrokerAgentCapabilityReadinessSubscription(
+          captured.readiness,
+          spec.capability,
+        ),
+      );
+    }
   }
-  const agentReadinessSubscription = capturedAgentReadiness.outcome === "ready"
-    ? new RelayV2BrokerAgentCapabilityReadinessSubscription(
-        capturedAgentReadiness.readiness,
-      )
-    : null;
 
   let authority: RelayV2BrokerServerCredentialAuthority | null = null;
   let upgradeAuthorizationOpen = true;
@@ -458,19 +502,23 @@ export async function createActivatedRelayV2BrokerServerRuntime(
       sharedRuntimeOptions: {
         brokerOptions: {
           baseCapabilityReadiness: [...RELAY_V2_REQUIRED_CAPABILITIES],
-          ...(agentReadinessSubscription
+          ...(readinessSubscriptions.length > 0
             ? {
-                optionalCapabilityReadiness: [
-                  RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
-                ],
+                optionalCapabilityReadiness: readinessSubscriptions.map(
+                  (subscription) => subscription.capability,
+                ),
               }
             : {}),
         },
-        ...(agentReadinessSubscription
+        ...(readinessSubscriptions.length > 0
           ? {
               bindOptionalCapabilityReadinessPort: (
                 port: RelayV2BrokerOptionalCapabilityReadinessPort,
-              ) => agentReadinessSubscription.bind(port),
+              ) => {
+                for (const subscription of readinessSubscriptions) {
+                  subscription.bind(port);
+                }
+              },
             }
           : {}),
         ...(composition.closeDeadlineScheduler === undefined
@@ -479,11 +527,11 @@ export async function createActivatedRelayV2BrokerServerRuntime(
       },
     });
   } catch {
-    agentReadinessSubscription?.close();
+    for (const subscription of readinessSubscriptions) subscription.close();
     throw new Error("Relay v2 broker activated composition failed to open");
   }
-  if (!authority || (agentReadinessSubscription && !agentReadinessSubscription.bound)) {
-    agentReadinessSubscription?.close();
+  if (!authority || readinessSubscriptions.some((subscription) => !subscription.bound)) {
+    for (const subscription of readinessSubscriptions) subscription.close();
     try { await combined.closeAndDrain(); } catch {}
     throw new Error(!authority
       ? "Relay v2 credential authority is unavailable"
@@ -544,7 +592,7 @@ export async function createActivatedRelayV2BrokerServerRuntime(
     beginShutdown() {
       shuttingDown = true;
       upgradeAuthorizationOpen = false;
-      agentReadinessSubscription?.close();
+      for (const subscription of readinessSubscriptions) subscription.close();
     },
 
     shutdown() {

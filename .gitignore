@@ -4,5 +4,6 @@ log/
 package-lock.json
 app/installer/dmg/*.dmg
 mobile/android/.gradle/
+mobile/android/.kotlin/
 mobile/android/**/build/
 mobile/android/local.properties

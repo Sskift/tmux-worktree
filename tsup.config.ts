@@ -117,6 +117,8 @@ export default defineConfig({
     "src/relay/v2/terminalControlAuthorityAdapter.ts",
     "src/relay/v2/terminalControlObservedBytePlaneAdapter.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",
+    "src/relay/extensions/agentChat/v1/codec.ts",
+    "src/relay/extensions/agentChat/v1/hostExtension.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
     "src/feishuReplyCard.ts",
@@ -185,6 +187,7 @@ export default defineConfig({
     // credential-authority import keeps the relay/v2 module identity.
     "./relay/v2/hostProductionProfileStore.js",
     "../extensions/agentTranscriptLifecycle/v1/codec.js",
+    "../extensions/agentChat/v1/codec.js",
     // relayServer dynamically loads the canonical activated combined owner
     // from its matching dist/relay/v2 directory so private brands stay single.
     "../v2/brokerServerRuntime.js",

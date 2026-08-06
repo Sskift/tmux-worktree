@@ -20,6 +20,7 @@ const codec = await import("../dist/relay/v2/codec.js");
 const agentCodec = await import(
   "../dist/relay/extensions/agentTranscriptLifecycle/v1/codec.js"
 );
+const chatCodec = await import("../dist/relay/extensions/agentChat/v1/codec.js");
 
 const HOST_ID = "mac-admin";
 const NOW_MS = 1_783_700_000_000;
@@ -760,8 +761,12 @@ test("carrier route admission hard-bounds disconnect cleanup production", async 
 test("optional Agent capability is a three-party route intersection with isolated withdrawal", async () => {
   const baseCapabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES];
   const agentCapability = agentCodec.RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY;
+  const chatCapability = chatCodec.RELAY_AGENT_CHAT_CAPABILITY;
   const claimedCapabilities = [...baseCapabilities, agentCapability];
-  assert.deepEqual(brokerModule.RELAY_V2_OPTIONAL_CAPABILITIES, [agentCapability]);
+  assert.deepEqual(brokerModule.RELAY_V2_OPTIONAL_CAPABILITIES, [
+    agentCapability,
+    chatCapability,
+  ]);
 
   const disabled = new brokerModule.RelayV2BrokerCore({
     now: () => NOW_MS,
