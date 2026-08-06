@@ -80,6 +80,9 @@ export interface RelayV2BrokerSingleNodeSelfHostedOptions {
   /** Explicit optional routing receipt; omission remains default-off. */
   readonly agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  /** Explicit optional agent.chat.v1 routing receipt; omission remains default-off. */
+  readonly agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
 type CapturedOptions = Readonly<{
@@ -91,6 +94,8 @@ type CapturedOptions = Readonly<{
   tlsCertificatePath: string;
   stateDirectory: string;
   agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  agentChatReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }>;
 
@@ -170,7 +175,7 @@ function captureOwnDataOptions(value: unknown): Record<string, unknown> | null {
     "tlsCertificatePath",
     "stateDirectory",
   ];
-  const optional = ["agentTranscriptLifecycleReadiness"];
+  const optional = ["agentTranscriptLifecycleReadiness", "agentChatReadiness"];
   const allowed = [...required, ...optional];
   const keys = Reflect.ownKeys(descriptors);
   if (
@@ -277,6 +282,13 @@ function captureOptions(value: unknown): CapturedOptions {
       : {
           agentTranscriptLifecycleReadiness:
             captured.agentTranscriptLifecycleReadiness as
+              RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+        }),
+    ...(captured.agentChatReadiness === undefined
+      ? {}
+      : {
+          agentChatReadiness:
+            captured.agentChatReadiness as
               RelayV2BrokerServerAgentCapabilityReadinessReceipt,
         }),
   });
@@ -1223,6 +1235,12 @@ export async function startRelayV2BrokerSingleNodeSelfHosted(
           : {
               agentTranscriptLifecycleReadiness:
                 options.agentTranscriptLifecycleReadiness,
+            }),
+        ...(options.agentChatReadiness === undefined
+          ? {}
+          : {
+              agentChatReadiness:
+                options.agentChatReadiness,
             }),
       }),
     );

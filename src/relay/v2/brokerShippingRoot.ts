@@ -112,6 +112,9 @@ interface RelayV2BrokerShippingDeploymentInputsBase {
   /** Omission keeps agent.transcript-lifecycle.v1 default-off. */
   readonly agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  /** Omission keeps agent.chat.v1 default-off. */
+  readonly agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   readonly closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
   readonly createHttpsServer?: (options: Readonly<{
     key: string | Buffer | Uint8Array;
@@ -380,6 +383,8 @@ type CapturedDeploymentInputs = Readonly<{
   nativeLoader?: RelayV2BrokerCredentialStateStoreNativeLoader;
   agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   nonProductionCredentialAuthorityOpener?:
     RelayV2BrokerShippingNonProductionCredentialAuthorityOpener;
   closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
@@ -457,6 +462,7 @@ function captureDeploymentInputs(
     "nativeLoader",
     "nonProductionCredentialAuthorityOpener",
     "agentTranscriptLifecycleReadiness",
+    "agentChatReadiness",
     "closeDeadlineScheduler",
     "createHttpsServer",
   ]);
@@ -490,6 +496,12 @@ function captureDeploymentInputs(
       : captureAgentTranscriptLifecycleReadiness(
           record.agentTranscriptLifecycleReadiness,
         );
+  const agentChatReadiness =
+    record.agentChatReadiness === undefined
+      ? undefined
+      : captureAgentTranscriptLifecycleReadiness(
+          record.agentChatReadiness,
+        );
   const createHttpsServer = (record.createHttpsServer ?? ((options: Readonly<{
     key: string | Buffer | Uint8Array;
     cert: string | Buffer | Uint8Array;
@@ -518,6 +530,9 @@ function captureDeploymentInputs(
     ...(agentTranscriptLifecycleReadiness === undefined
       ? {}
       : { agentTranscriptLifecycleReadiness }),
+    ...(agentChatReadiness === undefined
+      ? {}
+      : { agentChatReadiness }),
     createHttpsServer,
   });
 }
@@ -748,6 +763,12 @@ export async function startRelayV2BrokerShippingRoot(
               agentTranscriptLifecycleReadiness:
                 inputs.agentTranscriptLifecycleReadiness,
             }),
+        ...(inputs.agentChatReadiness === undefined
+          ? {}
+          : {
+              agentChatReadiness:
+                inputs.agentChatReadiness,
+            }),
       })
     : createRelayV2BrokerProductionComposition({
         trustedHome: profile.trustedHome,
@@ -765,6 +786,12 @@ export async function startRelayV2BrokerShippingRoot(
           : {
               agentTranscriptLifecycleReadiness:
                 inputs.agentTranscriptLifecycleReadiness,
+            }),
+        ...(inputs.agentChatReadiness === undefined
+          ? {}
+          : {
+              agentChatReadiness:
+                inputs.agentChatReadiness,
             }),
       });
 
@@ -845,6 +872,12 @@ export async function startRelayV2BrokerShippingRoot(
       : {
           agentTranscriptLifecycleReadiness:
             composition.agentTranscriptLifecycleReadiness,
+        }),
+    ...(composition.agentChatReadiness === undefined
+      ? {}
+      : {
+          agentChatReadiness:
+            composition.agentChatReadiness,
         }),
   });
 

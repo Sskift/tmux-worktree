@@ -63,6 +63,9 @@ export interface RelayV2BrokerServerComposition {
   /** Omission keeps agent.transcript-lifecycle.v1 disabled. */
   agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  /** Omission keeps agent.chat.v1 disabled. */
+  agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
 export interface RelayBrokerServerHandle {
