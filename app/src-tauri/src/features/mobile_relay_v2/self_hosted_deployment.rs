@@ -46,6 +46,49 @@ const READY_COMMIT_JOURNAL_CONTRACT: &str =
     "tmux-worktree-dashboard-relay-v2-management-ready-commit";
 const READY_COMMIT_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
+/// Public trust anchor: the self-signed ISRG Root X1 certificate.
+///
+/// acme.sh's Let's Encrypt chain served by the devbox (leaf issuer chain
+/// YE2 <- Root YE <- ISRG Root X1 cross-signed by ISRG Root X1) omits the
+/// self-signed ISRG Root X1 anchor. Because Node's TLS `ca:` option REPLACES
+/// the system trust store, the runtime CA file must be a self-contained chain
+/// ending in this root; otherwise Node fails with UNABLE_TO_GET_ISSUER_CERT.
+/// `ensure_self_contained_ca_chain` appends this anchor at the write site in
+/// `verify_external_tls_and_fetch_chain` so every Deploy produces a complete
+/// chain. This is public trust-anchor data (from the macOS system roots
+/// keychain), NOT a secret — embedding it is intended.
+const ISRG_ROOT_X1_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----"#;
+
 const REMOTE_SECURITY_FUNCTIONS: &str = r#"LC_ALL=C
 export LC_ALL
 uid="$(id -u)"
@@ -2669,6 +2712,67 @@ TW_RELAY_V2_EXTERNAL_TLS_CHAIN_READER
     )
 }
 
+/// Node's TLS `ca:` option treats the whole file as one CA entry with a 16 KiB
+/// per-entry cap (see src/relay/v2/hostTlsTrustMaterial.ts
+/// RELAY_V2_HOST_TLS_CA_MAX_ENTRY_BYTES = 16_384). The LE chain plus the ISRG
+/// Root X1 anchor is ~5.5 KiB, but if a future chain plus the anchor would
+/// exceed this cap, skip appending and keep the original bytes so the
+/// Node-side trust material capture keeps working.
+const NODE_TLS_CA_MAX_ENTRY_BYTES: usize = 16_384;
+
+/// Strips all ASCII whitespace from a PEM base64 body so that line-wrapping
+/// differences do not defeat certificate comparisons.
+fn normalized_pem_body(body: &str) -> String {
+    body.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+}
+
+/// Returns the whitespace-normalized base64 bodies of every CERTIFICATE block
+/// in `pem`.
+fn certificate_bodies(pem: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    for block in pem.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        if let Some(end) = block.find("-----END CERTIFICATE-----") {
+            bodies.push(normalized_pem_body(&block[..end]));
+        }
+    }
+    bodies
+}
+
+fn bundle_contains_isrg_root_x1(bundle: &[u8]) -> bool {
+    let text = std::str::from_utf8(bundle).unwrap_or("");
+    let Some(needle) = certificate_bodies(ISRG_ROOT_X1_PEM).into_iter().next() else {
+        return false;
+    };
+    certificate_bodies(text).iter().any(|body| body == &needle)
+}
+
+/// Makes a pulled CA bundle self-contained for Node's TLS `ca:` option (which
+/// replaces the system trust store): if the bundle does not already contain the
+/// ISRG Root X1 self-signed anchor, append it separated by exactly one newline.
+///
+/// Guard rails: if the bundle already contains the root, or if appending would
+/// exceed `MAX_TLS_FILE_BYTES` or Node's 16 KiB per-entry cap
+/// (`NODE_TLS_CA_MAX_ENTRY_BYTES`), the original bytes are returned unchanged
+/// so a Deploy never fails for this.
+fn ensure_self_contained_ca_chain(bundle: &[u8]) -> Vec<u8> {
+    if bundle_contains_isrg_root_x1(bundle) {
+        return bundle.to_vec();
+    }
+    let mut merged = Vec::with_capacity(bundle.len() + ISRG_ROOT_X1_PEM.len() + 2);
+    merged.extend_from_slice(bundle);
+    if merged.last() != Some(&b'\n') {
+        merged.push(b'\n');
+    }
+    merged.extend_from_slice(ISRG_ROOT_X1_PEM.as_bytes());
+    if merged.last() != Some(&b'\n') {
+        merged.push(b'\n');
+    }
+    if merged.len() as u64 > MAX_TLS_FILE_BYTES || merged.len() > NODE_TLS_CA_MAX_ENTRY_BYTES {
+        return bundle.to_vec();
+    }
+    merged
+}
+
 fn verify_external_tls_and_fetch_chain(
     host: &HostConfig,
     config: &PersistedSelfHostedConfig,
@@ -2693,7 +2797,7 @@ fn verify_external_tls_and_fetch_chain(
     }
     ensure_local_host_private_tree()?;
     let local = local_host_ca_input_path()?;
-    atomic_write_file(&local, &output.stdout)?;
+    atomic_write_file(&local, &ensure_self_contained_ca_chain(&output.stdout))?;
     read_local_private_file(
         &local.to_string_lossy(),
         "external TLS chain certificate",
@@ -3652,24 +3756,25 @@ mod tests {
         build_remote_bootstrap_read_script, build_remote_bundle_publish_script,
         build_remote_bundle_stage_validation_script, build_remote_center_stop_script,
         build_remote_relay_v2_center_command, build_remote_state_directory_launcher_preflight,
-        commit_bootstrap_ready_state, commit_config_replacement_with_barrier,
+        certificate_bodies, commit_bootstrap_ready_state, commit_config_replacement_with_barrier,
         consumed_local_private_file_path, deployment_fingerprint, ensure_host_profile_identity,
-        ensure_ordinary_center_start_allowed, finish_consuming_if_present,
-        fresh_bootstrap_publication_correlation, load_ready_commit_journal_at,
-        normalize_issuer_url, persisted_management_config_identity, read_local_private_file,
-        ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
-        relay_url_from_issuer, self_hosted_connector_should_be_running,
-        stop_center_and_active_connector,
+        ensure_ordinary_center_start_allowed, ensure_self_contained_ca_chain,
+        finish_consuming_if_present, fresh_bootstrap_publication_correlation,
+        load_ready_commit_journal_at, normalize_issuer_url, persisted_management_config_identity,
+        read_local_private_file, ready_rotation_transfer_identity,
+        record_expired_bootstrap_rotation_intent, relay_url_from_issuer,
+        self_hosted_connector_should_be_running, stop_center_and_active_connector,
         valid_bootstrap_publication_correlation, validate_bootstrap_bytes, validate_listen_host,
         verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
         BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
-        BootstrapRotationTransferReceipt, CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION,
-        DeploymentProbeStatus, LocalPrivateFileIdentity,
+        BootstrapRotationTransferReceipt, DeploymentProbeStatus, LocalPrivateFileIdentity,
         PersistedSelfHostedConfig, ReadyCommitJournal, SelfHostedDeploymentOperationOwner,
         SelfHostedManagementBinding, BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT,
-        CONFIG_SCHEMA_VERSION, HOST_PROFILE_CONFIG_SCHEMA_VERSION, READY_COMMIT_JOURNAL_CONTRACT,
-        READY_COMMIT_JOURNAL_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
-        ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
+        CONFIG_SCHEMA_VERSION, CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION,
+        HOST_PROFILE_CONFIG_SCHEMA_VERSION, ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES,
+        READY_COMMIT_JOURNAL_CONTRACT, READY_COMMIT_JOURNAL_SCHEMA_VERSION,
+        REMOTE_BOOTSTRAP_FD_READER, ROTATION_PENDING_CONFIG_SCHEMA_VERSION,
+        ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
 
     fn config() -> PersistedSelfHostedConfig {
@@ -4536,5 +4641,74 @@ mod tests {
         let link = directory.path().join("bootstrap-link");
         symlink(&source, &link).unwrap();
         assert!(!run(&link).status.success());
+    }
+
+    #[test]
+    fn ensure_self_contained_ca_chain_appends_root_when_missing() {
+        // Bundle already ends with a newline: root appended after exactly one newline.
+        let leaf_chain = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let result =
+            String::from_utf8(ensure_self_contained_ca_chain(leaf_chain.as_bytes())).unwrap();
+        assert_eq!(result, format!("{leaf_chain}{ISRG_ROOT_X1_PEM}\n"));
+        // Bundle with no trailing newline: a single newline is inserted before the root.
+        let leaf_chain_no_nl = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+        let result_no_nl =
+            String::from_utf8(ensure_self_contained_ca_chain(leaf_chain_no_nl.as_bytes())).unwrap();
+        assert_eq!(
+            result_no_nl,
+            format!("{leaf_chain_no_nl}\n{ISRG_ROOT_X1_PEM}\n")
+        );
+        // Ends with exactly the root PEM (plus one trailing newline) in both
+        // cases, appearing exactly once.
+        for out in [&result, &result_no_nl] {
+            assert!(out.ends_with(&format!("{ISRG_ROOT_X1_PEM}\n")));
+            assert_eq!(
+                out.matches(&format!("{ISRG_ROOT_X1_PEM}")).count(),
+                1,
+                "root PEM should appear exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_self_contained_ca_chain_unchanged_when_root_present_differently_wrapped() {
+        // The same ISRG Root X1 cert, but with the base64 body on a single line
+        // so line-wrapping differs from ISRG_ROOT_X1_PEM.
+        let body = certificate_bodies(ISRG_ROOT_X1_PEM)
+            .into_iter()
+            .next()
+            .unwrap();
+        let single_line_root =
+            format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n");
+        let bundle = format!(
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n{single_line_root}"
+        );
+        let result = ensure_self_contained_ca_chain(bundle.as_bytes());
+        assert_eq!(result, bundle.as_bytes());
+    }
+
+    #[test]
+    fn ensure_self_contained_ca_chain_unchanged_when_node_entry_cap_exceeded() {
+        // A bundle that alone fits the 1 MiB local cap but, with the root
+        // appended, would exceed Node's 16 KiB per-entry CA cap.
+        let oversized = vec![b'A'; NODE_TLS_CA_MAX_ENTRY_BYTES];
+        let result = ensure_self_contained_ca_chain(&oversized);
+        assert_eq!(result, oversized);
+    }
+
+    #[test]
+    fn ensure_self_contained_ca_chain_unchanged_when_local_size_cap_exceeded() {
+        // Appending the root to a near-1MiB bundle would exceed MAX_TLS_FILE_BYTES.
+        let oversized = vec![b'B'; (1024 * 1024) - 32];
+        let result = ensure_self_contained_ca_chain(&oversized);
+        assert_eq!(result, oversized);
+    }
+
+    #[test]
+    fn ensure_self_contained_ca_chain_is_idempotent() {
+        let leaf_chain = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let once = ensure_self_contained_ca_chain(leaf_chain.as_bytes());
+        let twice = ensure_self_contained_ca_chain(&once);
+        assert_eq!(once, twice);
     }
 }
