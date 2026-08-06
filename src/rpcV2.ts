@@ -9,6 +9,7 @@ import {
   createManagedWorktreeSession,
   killManagedSessionV2,
   ManagedSessionLifecycleV2InDoubtError,
+  markRelayV2HostLegacySessionsLifecycleV1,
   observeManagedSessionIncarnation,
   SESSION_NAME_MAX_LEN,
   type CreateManagedWorktreeSessionDeps,
@@ -607,7 +608,14 @@ function currentRpcV2List(): RpcV2ListResponse {
   // invoke tmux, even though list itself performs no destructive mutation.
   const state = loadManagedStateForMutation();
   assertManagedStateLifecycleV2Authority(state);
-  return buildRpcV2ListResponse(state, listTmuxSessionLifecycleEntries());
+  // Lazily promote v1-era managed sessions into v2 lifecycle authority so they
+  // become visible to discovery. The migration is idempotent and never throws
+  // for per-session failures; state is re-read afterwards because it may have
+  // gained lifecycle extensions.
+  markRelayV2HostLegacySessionsLifecycleV1();
+  const next = loadManagedStateForMutation();
+  assertManagedStateLifecycleV2Authority(next);
+  return buildRpcV2ListResponse(next, listTmuxSessionLifecycleEntries());
 }
 
 function createFailure(
