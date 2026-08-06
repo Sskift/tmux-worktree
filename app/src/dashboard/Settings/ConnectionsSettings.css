@@ -524,6 +524,115 @@
   color: var(--shell-text-secondary);
 }
 
+.connections-relay-overview {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.connections-relay-overview__main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.connections-relay-overview__icon {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  background: var(--shell-surface-2);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--shell-radius-sm);
+}
+
+.connections-relay-overview--success .connections-relay-overview__icon {
+  color: var(--shell-success);
+  border-color: #315f39;
+}
+
+.connections-relay-overview--warning .connections-relay-overview__icon {
+  color: var(--shell-warning);
+  border-color: #665322;
+}
+
+.connections-relay-overview--danger .connections-relay-overview__icon {
+  color: var(--shell-danger);
+  border-color: #6f3734;
+}
+
+.connections-relay-overview--progress .connections-relay-overview__icon {
+  color: var(--shell-focus);
+  border-color: #305681;
+}
+
+.connections-relay-overview--neutral .connections-relay-overview__icon {
+  color: var(--shell-text-muted);
+}
+
+.connections-relay-overview__copy {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 2px;
+}
+
+.connections-relay-overview__headline {
+  color: var(--shell-text);
+  font-size: 12px;
+  line-height: 17px;
+  font-weight: 600;
+}
+
+.connections-relay-overview__detail {
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.connections-relay-overview__secondary,
+.connections-relay-overview__paired {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--shell-border);
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.connections-relay-overview__paired > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.connections-relay-overview__secondary .connections-button,
+.connections-relay-overview__paired .connections-button {
+  min-height: 26px;
+  padding: 3px 8px;
+  font-size: 10px;
+}
+
+.connections-relay-advanced {
+  margin-top: 0;
+}
+
+.connections-relay-advanced__body {
+  display: grid;
+  gap: 12px;
+  padding: 4px 11px 11px;
+}
+
+.connections-relay-advanced__body .connections-relay-summary,
+.connections-relay-advanced__body .connections-relay-v2-deployment,
+.connections-relay-advanced__body .connections-relay-v2-preview {
+  margin-top: 0;
+}
+
 .connections-fields--relay {
   grid-template-columns: minmax(0, 1fr);
 }
@@ -833,6 +942,15 @@
 
   .connections-relay-pairing__qr {
     align-self: center;
+  }
+
+  .connections-relay-overview__main {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .connections-relay-overview__main .connections-button {
+    align-self: stretch;
   }
 }
 
