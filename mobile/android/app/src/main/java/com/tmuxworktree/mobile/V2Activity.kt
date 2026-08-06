@@ -140,7 +140,7 @@ class V2Activity : ComponentActivity() {
                 val payload = PairingPayloadParser.parse(rawValue)
                 if (payload == null) {
                     viewModel.reportPairingError(
-                        "This QR code does not contain a valid Relay v1 pairing profile",
+                        "This QR code does not contain a valid Relay pairing profile",
                     )
                     return
                 }
