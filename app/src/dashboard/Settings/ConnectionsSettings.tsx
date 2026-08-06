@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -209,6 +210,10 @@ const HOST_FIELDS: readonly HostFieldDefinition[] = [
 const EMPTY_RELAY_ERRORS: RelayDraftErrors = {};
 const RELAY_BROKER_ID = "connection-relay-broker";
 const RELAY_BROKER_ERROR_ID = `${RELAY_BROKER_ID}-error`;
+// The underlying Rust status command runs load_config + probe per call, and
+// probe_status shells out over SSH to the devbox. Poll coarsely (15s) so the
+// relay tab does not hammer the remote host while it stays open.
+const RELAY_V2_STATUS_POLL_MS = 15_000;
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -312,6 +317,9 @@ export function ConnectionsSettings({
     if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
   }, []);
 
+  // Immediate fetch on mount; the interval below keeps it fresh while the
+  // Relay tab is visible so the overview is never stuck on a mount-time
+  // snapshot (e.g. "Relay center is not running" after a repair fixed it).
   useEffect(() => {
     let active = true;
     void dashboardBackend.relay.v2Deployment.status().then((next) => {
@@ -324,10 +332,32 @@ export function ConnectionsSettings({
     };
   }, [dashboardBackend]);
 
+  useEffect(() => {
+    if (activeTab !== "relay") return;
+    const timer = window.setInterval(() => {
+      void dashboardBackend.relay.v2Deployment.status().then((next) => {
+        setRelayV2Status(next);
+      }).catch(() => {
+        setRelayV2Status(null);
+      });
+    }, RELAY_V2_STATUS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [dashboardBackend, activeTab]);
+
   // One shared Relay v2 management controller drives both the overview card and
   // the Advanced enrollment panel, so both stay in sync on the same polled state.
   const relayV2Controller = useRelayV2EnrollmentController(relay.tokenConfigured);
-  const relayOverview = useRelayConnectionOverview(relayV2Status, relayV2Controller);
+
+  // Feed freshly read deployment statuses (repair results, post-repair
+  // refreshes) back into relayV2Status so the readiness branch is current.
+  const handleSelfHostedStatus = useCallback((status: MobileRelayV2SelfHostedStatus) => {
+    setRelayV2Status(status);
+  }, []);
+  const relayOverview = useRelayConnectionOverview(
+    relayV2Status,
+    relayV2Controller,
+    handleSelfHostedStatus,
+  );
 
   useEffect(() => {
     if (hostCatalogFingerprintRef.current === currentHostCatalogFingerprint) return;

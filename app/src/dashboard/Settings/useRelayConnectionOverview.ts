@@ -3,6 +3,7 @@ import { useDashboardBackend } from "../../platform";
 import type { MobileRelayV2SelfHostedStatus } from "../../platform/domainTypes";
 import {
   deriveRelayConnectionOverview,
+  selfHostedInfraReady,
   type RelayConnectionOverview,
 } from "./relayConnectionOverviewModel";
 import { deriveRelayV2EnrollmentView } from "./relayV2EnrollmentModel";
@@ -24,10 +25,15 @@ function errorMessage(error: unknown): string {
  *
  * The controller instance is owned by the caller (ConnectionsSettings) so the
  * Advanced enrollment panel shares the same polled state and operations.
+ *
+ * `onSelfHostedStatus` feeds a freshly read (or freshly returned) deployment
+ * status back to the caller so the readiness diagnosis is never stuck on the
+ * mount-time snapshot.
  */
 export function useRelayConnectionOverview(
   selfHosted: MobileRelayV2SelfHostedStatus | null,
   controller: RelayController,
+  onSelfHostedStatus?: (status: MobileRelayV2SelfHostedStatus) => void,
 ) {
   const backend = useDashboardBackend();
   const [repair, setRepair] = useState<{ running: boolean; headline: string }>({
@@ -71,23 +77,60 @@ export function useRelayConnectionOverview(
     return { active: false, headline: "" };
   }, [repair.running, repair.headline, controller.loaded, controller.state]);
 
+  const connectorStatus = controller.state.connector.status;
   const overview = useMemo<RelayConnectionOverview>(() => deriveRelayConnectionOverview({
     selfHosted,
     enrollmentView: view,
     knownGrantActive,
     inFlight,
     repairError,
-  }), [selfHosted, view, knownGrantActive, inFlight, repairError]);
+    connectorStatus,
+  }), [selfHosted, view, knownGrantActive, inFlight, repairError, connectorStatus]);
+
+  // Clear a stale repair error once the connector is healthy again: if the
+  // system recovers by other means (Advanced panel, self-heal), the danger
+  // tone and error one-liner must not linger over a recovered connection.
+  // The clear only fires on healthy, so it cannot race the repair-timeout
+  // effect (which sets the error while the connector is still unhealthy).
+  const healthy = connectorStatus === "registered" && view?.ready === true;
+  useEffect(() => {
+    if (healthy) setRepairError(null);
+  }, [healthy]);
+
+  // Surface a failed client-grant revoke through the same error/detail
+  // mechanism. The controller records the failure in knownClientGrant, so
+  // mirror it into repairError; a later successful revoke clears it.
+  const knownClientGrant = controller.state.knownClientGrant;
+  useEffect(() => {
+    if (knownClientGrant.status === "failed") {
+      setRepairError(knownClientGrant.error);
+    } else if (knownClientGrant.status === "revoked") {
+      setRepairError(null);
+    }
+  }, [knownClientGrant]);
+
+  /** Re-read the deployment status once and feed it back to the caller. */
+  const refreshSelfHostedStatus = useCallback(async () => {
+    try {
+      const next = await backend.relay.v2Deployment.status();
+      onSelfHostedStatus?.(next);
+    } catch {
+      // The polling loop in ConnectionsSettings keeps retrying; ignore.
+    }
+  }, [backend, onSelfHostedStatus]);
 
   // While a repair is running, watch the polled connector for registration.
   useEffect(() => {
     if (!repair.running) return;
-    if (controller.state.connector.status === "registered") {
+    if (connectorStatus === "registered") {
       repairRunningRef.current = false;
       setRepairError(null);
       setRepair({ running: false, headline: "" });
+      // Refresh the readiness branch promptly instead of waiting for the
+      // next poll tick.
+      void refreshSelfHostedStatus();
     }
-  }, [repair.running, controller.state.connector.status]);
+  }, [repair.running, connectorStatus, refreshSelfHostedStatus]);
 
   // Cap a repair at ~30s.
   useEffect(() => {
@@ -115,11 +158,8 @@ export function useRelayConnectionOverview(
     repairRunningRef.current = true;
     setRepairError(null);
 
-    const centerReady =
-      selfHosted?.centerStatus === "running" || selfHosted?.centerStatus === "ready";
-    const bundleReady = selfHosted?.bundleStatus === "ready";
-    const tlsReady = selfHosted?.tlsStatus === "ready";
-    const needsCenterStart = !centerReady || !bundleReady || !tlsReady;
+    const { ready: infraReady } = selfHostedInfraReady(selfHosted);
+    const needsCenterStart = !infraReady;
 
     try {
       if (needsCenterStart) {
@@ -127,14 +167,11 @@ export function useRelayConnectionOverview(
           throw new Error("Relay is not configured.");
         }
         setRepair({ running: true, headline: "Starting relay center…" });
-        await backend.relay.v2Deployment.startCenter(selfHosted.config);
+        const freshStatus = await backend.relay.v2Deployment.startCenter(selfHosted.config);
+        onSelfHostedStatus?.(freshStatus);
       } else {
         setRepair({ running: true, headline: "Connecting to the relay center…" });
-        const connectorStatus = controller.state.connector.status;
-        if (
-          connectorStatus !== "registered"
-          && connectorStatus !== "registered_incomplete"
-        ) {
+        if (connectorStatus !== "registered" && connectorStatus !== "registered_incomplete") {
           const credential = controller.state.hostCredential;
           if (credential.status !== "ready") {
             if (credential.credentialReference) {
@@ -152,7 +189,7 @@ export function useRelayConnectionOverview(
       setRepair({ running: false, headline: "" });
       setRepairError(errorMessage(error));
     }
-  }, [backend, selfHosted, controller]);
+  }, [backend, selfHosted, controller, connectorStatus, onSelfHostedStatus]);
 
   /**
    * "Show pairing QR": create a fresh enrollment when the current one is missing
@@ -191,6 +228,7 @@ export function useRelayConnectionOverview(
   }, [controller]);
 
   const revokeKnownGrant = useCallback(() => {
+    setRepairError(null);
     void controller.revokeKnownGrant();
   }, [controller]);
 

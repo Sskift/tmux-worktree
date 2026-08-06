@@ -245,8 +245,7 @@
   white-space: nowrap;
 }
 
-.connections-host-form,
-.connections-relay-card {
+.connections-host-form {
   padding: 14px;
 }
 
@@ -504,16 +503,6 @@
 
 .connections-relay-stack--v1 {
   color: var(--shell-text-muted);
-}
-
-.connections-relay-v2-primary {
-  display: grid;
-  gap: 8px;
-  margin-top: 13px;
-  padding: 12px;
-  background: var(--shell-surface-2);
-  border: 1px solid #315f39;
-  border-radius: var(--shell-radius-sm);
 }
 
 .connections-relay-legacy-v1 {

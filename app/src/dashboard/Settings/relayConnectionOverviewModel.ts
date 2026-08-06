@@ -1,4 +1,7 @@
-import type { MobileRelayV2SelfHostedStatus } from "../../platform/domainTypes";
+import type {
+  MobileRelayV2Connector,
+  MobileRelayV2SelfHostedStatus,
+} from "../../platform/domainTypes";
 import type { RelayV2EnrollmentView } from "./relayV2EnrollmentModel";
 
 export type RelayConnectionOverviewTone =
@@ -29,7 +32,29 @@ export type RelayConnectionOverviewInput = {
   knownGrantActive: boolean;
   inFlight: { active: boolean; headline: string } | null;
   repairError: string | null;
+  /** Normalized connector status; distinguishes registered_incomplete. */
+  connectorStatus: MobileRelayV2Connector["status"];
 };
+
+/**
+ * Shared self-hosted infra readiness predicate. Both the diagnosis and
+ * runConnectionRepair must use this so the center/bundle/TLS check can never
+ * diverge between "what the card says" and "what repair does".
+ */
+export function selfHostedInfraReady(
+  selfHosted: MobileRelayV2SelfHostedStatus | null,
+): { ready: boolean; centerReady: boolean; bundleReady: boolean; tlsReady: boolean } {
+  const centerReady =
+    selfHosted?.centerStatus === "running" || selfHosted?.centerStatus === "ready";
+  const bundleReady = selfHosted?.bundleStatus === "ready";
+  const tlsReady = selfHosted?.tlsStatus === "ready";
+  return {
+    ready: centerReady && bundleReady && tlsReady,
+    centerReady,
+    bundleReady,
+    tlsReady,
+  };
+}
 
 /**
  * Reduces the full Relay state to a single glance: "what should I do right now".
@@ -39,8 +64,9 @@ export type RelayConnectionOverviewInput = {
  *  2. in-flight operation          → progress, no button ("Starting relay center…" etc.)
  *  3. center/bundle/TLS not ready  → warning naming the stalled piece (fix)
  *  4. management backend down      → danger "Relay backend unavailable" (fix)
- *  5. connector not registered     → warning "Not connected to the relay center" (fix)
- *  6. connector registered         → success "Connected — ready to pair a phone" (show QR)
+ *  5. connector registered_incomplete → warning "Phone app needs an update" (no fix — repair cannot fix it)
+ *  6. connector not registered     → warning "Not connected to the relay center" (fix)
+ *  7. connector registered         → success "Connected — ready to pair a phone" (show QR)
  *
  * A failed repair escalates the current diagnosis to danger and carries the
  * error one-liner in `detail`.
@@ -48,7 +74,14 @@ export type RelayConnectionOverviewInput = {
 export function deriveRelayConnectionOverview(
   input: RelayConnectionOverviewInput,
 ): RelayConnectionOverview {
-  const { selfHosted, enrollmentView, knownGrantActive, inFlight, repairError } = input;
+  const {
+    selfHosted,
+    enrollmentView,
+    knownGrantActive,
+    inFlight,
+    repairError,
+    connectorStatus,
+  } = input;
 
   if (!selfHosted?.configured) {
     return {
@@ -68,18 +101,15 @@ export function deriveRelayConnectionOverview(
     };
   }
 
-  const centerReady =
-    selfHosted.centerStatus === "running" || selfHosted.centerStatus === "ready";
-  const bundleReady = selfHosted.bundleStatus === "ready";
-  const tlsReady = selfHosted.tlsStatus === "ready";
+  const { ready: infraReady, bundleReady, tlsReady } = selfHostedInfraReady(selfHosted);
   const backendUnavailable = enrollmentView?.adapterAvailable === false;
 
   let tone: RelayConnectionOverviewTone;
   let headline: string;
   let detail: string | null;
-  let primaryAction: RelayConnectionOverviewPrimaryAction;
+  let primaryAction: RelayConnectionOverviewPrimaryAction | null;
 
-  if (!centerReady || !bundleReady || !tlsReady) {
+  if (!infraReady) {
     tone = "warning";
     headline = !bundleReady
       ? "Relay server software is not ready"
@@ -93,6 +123,11 @@ export function deriveRelayConnectionOverview(
     headline = "Relay backend unavailable";
     detail = "The relay management service is not responding.";
     primaryAction = { kind: "fix", label: "Fix connection" };
+  } else if (connectorStatus === "registered_incomplete") {
+    tone = "warning";
+    headline = "Phone app needs an update";
+    detail = "The connected phone is missing required features. Update the phone app, then reconnect.";
+    primaryAction = null;
   } else if (enrollmentView?.ready !== true) {
     tone = "warning";
     headline = "Not connected to the relay center";

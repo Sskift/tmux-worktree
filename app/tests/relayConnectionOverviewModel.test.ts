@@ -72,6 +72,7 @@ function input(overrides: Partial<RelayConnectionOverviewInput> = {}): RelayConn
     knownGrantActive: false,
     inFlight: null,
     repairError: null,
+    connectorStatus: "registered",
     ...overrides,
   };
 }
@@ -157,10 +158,35 @@ test("a failed repair escalates the diagnosis to danger with the error in detail
 
 test("connector not registered is a warning with a fix action", () => {
   const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "stopped",
     enrollmentView: readyEnrollmentView({ ready: false }),
   }));
   assert.equal(overview.tone, "warning");
   assert.equal(overview.headline, "Not connected to the relay center");
+  assert.equal(overview.primaryAction?.kind, "fix");
+});
+
+test("registered_incomplete warns the phone app needs an update with no fix action", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "registered_incomplete",
+    enrollmentView: readyEnrollmentView({
+      ready: false,
+      missingCapabilities: ["terminal.stream.resume.v1"],
+    }),
+  }));
+  assert.equal(overview.tone, "warning");
+  assert.equal(overview.headline, "Phone app needs an update");
+  assert.match(overview.detail ?? "", /missing required features/);
+  assert.equal(overview.primaryAction, null);
+});
+
+test("registered_incomplete still names the stalled center when infra is down", () => {
+  const overview = deriveRelayConnectionOverview(input({
+    connectorStatus: "registered_incomplete",
+    selfHosted: { ...configuredSelfHosted, centerStatus: "stopped" },
+  }));
+  assert.equal(overview.tone, "warning");
+  assert.equal(overview.headline, "Relay center is not running");
   assert.equal(overview.primaryAction?.kind, "fix");
 });
 
