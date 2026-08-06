@@ -387,6 +387,9 @@ pub(crate) struct MobileRelayV2SelfHostedStatus {
     host_bootstrap_available: bool,
     host_bootstrap_pending: bool,
     host_credential_provisioned: bool,
+    profile_provisioned: bool,
+    connector_desired_running: bool,
+    effective: bool,
     bootstrap_rotation_pending: bool,
     remote_tls_key_path: String,
     remote_tls_certificate_path: String,
@@ -2076,6 +2079,9 @@ fn base_status(
         }),
         host_credential_provisioned: config
             .is_some_and(|config| config.host_credential_provisioned),
+        profile_provisioned: config.is_some_and(|config| config.profile_provisioned),
+        connector_desired_running: config.is_some_and(|config| config.connector_desired_running),
+        effective: config.is_some_and(self_hosted_connector_prerequisites_are_complete),
         bootstrap_rotation_pending: config.is_some_and(|config| config.bootstrap_rotation_pending),
         remote_tls_key_path: format!("~/{REMOTE_TLS_KEY}"),
         remote_tls_certificate_path: format!("~/{REMOTE_TLS_CERTIFICATE}"),
@@ -3789,6 +3795,42 @@ mod tests {
             &ready,
             &mismatched
         ));
+    }
+
+    #[test]
+    fn status_projection_exposes_the_v2_primary_flip_condition() {
+        let unprovisioned = base_status(Some(&config()), None);
+        assert_eq!(unprovisioned.configured, true);
+        assert_eq!(unprovisioned.profile_provisioned, false);
+        assert_eq!(unprovisioned.connector_desired_running, false);
+        assert_eq!(unprovisioned.effective, false);
+
+        let mut provisioned = config();
+        provisioned.profile_provisioned = true;
+        provisioned.host_credential_provisioned = true;
+        provisioned.connector_desired_running = true;
+        let projected = base_status(Some(&provisioned), None);
+        assert_eq!(projected.profile_provisioned, true);
+        assert_eq!(projected.connector_desired_running, true);
+        assert_eq!(projected.effective, true);
+
+        let mut disabled = provisioned.clone();
+        disabled.enabled = false;
+        assert_eq!(base_status(Some(&disabled), None).effective, false);
+
+        let mut incomplete = provisioned.clone();
+        incomplete.host_credential_provisioned = false;
+        assert_eq!(base_status(Some(&incomplete), None).effective, false);
+
+        let mut rotating = provisioned.clone();
+        rotating.bootstrap_rotation_pending = true;
+        assert_eq!(base_status(Some(&rotating), None).effective, false);
+
+        let absent = base_status(None, None);
+        assert_eq!(absent.configured, false);
+        assert_eq!(absent.profile_provisioned, false);
+        assert_eq!(absent.connector_desired_running, false);
+        assert_eq!(absent.effective, false);
     }
 
     #[test]

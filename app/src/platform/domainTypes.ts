@@ -478,6 +478,11 @@ export type MobileRelayV2SelfHostedStatus = {
   hostBootstrapAvailable: boolean;
   hostBootstrapPending: boolean;
   hostCredentialProvisioned: boolean;
+  profileProvisioned: boolean;
+  connectorDesiredRunning: boolean;
+  /** True when the self-hosted config is enabled, provisioned, and clean:
+   *  this is the flip condition that makes Relay v2 the primary stack. */
+  effective: boolean;
   bootstrapRotationPending: boolean;
   remoteTlsKeyPath: string;
   remoteTlsCertificatePath: string;

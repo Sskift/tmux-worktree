@@ -252,6 +252,14 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
                     ? "local input missing"
                     : "not created"}
           </span>
+          <span>
+            Stack · {status.effective
+              ? "v2 primary"
+              : "v1 default"}
+          </span>
+          <span>
+            Connector desired · {status.connectorDesiredRunning ? "running" : "stopped"}
+          </span>
         </div>
       )}
       <p className="connections-relay-v2-deployment__hint">

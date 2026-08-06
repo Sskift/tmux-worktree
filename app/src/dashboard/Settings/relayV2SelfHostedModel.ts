@@ -197,3 +197,29 @@ export function relayV2ExpiredBootstrapRotationAvailable(
     && status.hostBootstrapPending
     && !status.hostCredentialProvisioned;
 }
+
+/**
+ * The v2 switch decision: the self-hosted config is the primary orchestration
+ * stack only when it is enabled, provisioned, and clean (the Rust-side
+ * `self_hosted_connector_prerequisites_are_complete` projection, mirrored as
+ * `status.effective`). Otherwise the dashboard keeps today's Relay v1 default.
+ */
+export function relayV2StackEffective(
+  status: MobileRelayV2SelfHostedStatus | null,
+): boolean {
+  return status?.effective === true;
+}
+
+export function relayV2SelfHostedConnectorDesiredRunning(
+  status: MobileRelayV2SelfHostedStatus | null,
+): boolean {
+  return status?.connectorDesiredRunning === true;
+}
+
+export function relayV2SelfHostedStackLabel(
+  status: MobileRelayV2SelfHostedStatus | null,
+): string {
+  return relayV2StackEffective(status)
+    ? "Relay v2 self-hosted"
+    : "Relay v1 legacy";
+}

@@ -492,6 +492,38 @@
   border-color: #305681;
 }
 
+.connections-relay-stack {
+  align-items: center;
+  background: var(--shell-surface-1);
+}
+
+.connections-relay-stack--v2 {
+  color: var(--shell-success);
+  border-color: #315f39;
+}
+
+.connections-relay-stack--v1 {
+  color: var(--shell-text-muted);
+}
+
+.connections-relay-v2-primary {
+  display: grid;
+  gap: 8px;
+  margin-top: 13px;
+  padding: 12px;
+  background: var(--shell-surface-2);
+  border: 1px solid #315f39;
+  border-radius: var(--shell-radius-sm);
+}
+
+.connections-relay-legacy-v1 {
+  margin-top: 13px;
+}
+
+.connections-relay-legacy-v1 > summary {
+  color: var(--shell-text-secondary);
+}
+
 .connections-fields--relay {
   grid-template-columns: minmax(0, 1fr);
 }

@@ -3,8 +3,11 @@ import test from "node:test";
 import {
   createRelayV2SelfHostedDraft,
   relayV2ExpiredBootstrapRotationAvailable,
+  relayV2SelfHostedConnectorDesiredRunning,
+  relayV2SelfHostedStackLabel,
   relayV2SelfHostedStatusLabel,
   relayV2SelfHostedDraftMatchesStatus,
+  relayV2StackEffective,
   selfHostedStatusToDraft,
   validateRelayV2SelfHostedDraft,
 } from "../src/dashboard/Settings/relayV2SelfHostedModel.ts";
@@ -30,6 +33,9 @@ const configuredStatus: MobileRelayV2SelfHostedStatus = {
   hostBootstrapAvailable: false,
   hostBootstrapPending: false,
   hostCredentialProvisioned: false,
+  profileProvisioned: true,
+  connectorDesiredRunning: false,
+  effective: false,
   bootstrapRotationPending: false,
   remoteTlsKeyPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.key",
   remoteTlsCertificatePath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.crt",
@@ -119,6 +125,33 @@ test("expired Host bootstrap rotation is limited to version-zero pending state",
       hostBootstrapPending: false,
       hostCredentialProvisioned: true,
     }),
+    false,
+  );
+});
+
+test("Relay v2 stack is effective only when the self-hosted config is provisioned and clean", () => {
+  assert.equal(relayV2StackEffective(null), false);
+  assert.equal(relayV2StackEffective(configuredStatus), false);
+
+  const effective = {
+    ...configuredStatus,
+    hostCredentialProvisioned: true,
+    connectorDesiredRunning: true,
+    effective: true,
+    centerStatus: "running" as const,
+  };
+  assert.equal(relayV2StackEffective(effective), true);
+  assert.equal(relayV2SelfHostedStackLabel(effective), "Relay v2 self-hosted");
+  assert.equal(
+    relayV2SelfHostedStackLabel(configuredStatus),
+    "Relay v1 legacy",
+  );
+  assert.equal(
+    relayV2SelfHostedConnectorDesiredRunning(effective),
+    true,
+  );
+  assert.equal(
+    relayV2SelfHostedConnectorDesiredRunning(configuredStatus),
     false,
   );
 });
