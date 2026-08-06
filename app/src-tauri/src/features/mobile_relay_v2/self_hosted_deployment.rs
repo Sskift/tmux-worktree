@@ -250,6 +250,7 @@ try {
 // the deployment lifecycle never assemble Relay arguments independently.
 const SELF_HOSTED_FLAG: &str = "--v2-single-node-self-hosted";
 const AGENT_TRANSCRIPT_LIFECYCLE_FLAG: &str = "--v2-agent-transcript-lifecycle-v1";
+const AGENT_CHAT_FLAG: &str = "--v2-agent-chat-v1";
 const ADVERTISED_ORIGIN_FLAG: &str = "--v2-dev-advertised-origin";
 const TLS_KEY_FLAG: &str = "--v2-dev-tls-key";
 const TLS_CERTIFICATE_FLAG: &str = "--v2-dev-tls-cert";
@@ -2738,6 +2739,7 @@ fn build_remote_relay_v2_center_command(
         "relay-server".to_string(),
         SELF_HOSTED_FLAG.to_string(),
         AGENT_TRANSCRIPT_LIFECYCLE_FLAG.to_string(),
+        AGENT_CHAT_FLAG.to_string(),
         "--host".to_string(),
         shell_quote(&config.listen_host),
         "--port".to_string(),
@@ -4094,6 +4096,7 @@ mod tests {
         let command = build_remote_relay_v2_center_command(&pending, Some(&attempt));
         assert!(command.contains("--v2-single-node-self-hosted"));
         assert!(command.contains("--v2-agent-transcript-lifecycle-v1"));
+        assert!(command.contains("--v2-agent-chat-v1"));
         assert!(command.contains("--host '0.0.0.0' --port 443"));
         assert!(command.contains("--v2-dev-advertised-origin 'https://relay.company.test/'"));
         assert!(command.contains("--v2-dev-tls-key"));
