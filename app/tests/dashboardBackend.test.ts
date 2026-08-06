@@ -107,6 +107,7 @@ const relayV2DeploymentArgs = {
   tlsKeyPath: "/private/tls.key",
   tlsCertificatePath: "/private/tls.crt",
   tlsCaPath: "/private/ca.pem",
+  externalTlsManagement: false,
 };
 const layout = { schemaVersion: 2, sidebar: { width: 280 } };
 const layoutRevision = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";

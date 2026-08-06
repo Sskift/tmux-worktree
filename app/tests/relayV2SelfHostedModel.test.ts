@@ -22,6 +22,7 @@ const configuredStatus: MobileRelayV2SelfHostedStatus = {
     tlsKeyPath: "/private/tls.key",
     tlsCertificatePath: "/private/tls.crt",
     tlsCaPath: "/private/ca.pem",
+    externalTlsManagement: false,
   },
   bundleStatus: "ready",
   tlsStatus: "ready",
@@ -61,8 +62,46 @@ test("self-hosted Relay v2 draft is explicit and normalizes a root HTTPS origin"
       tlsKeyPath: "/private/tls.key",
       tlsCertificatePath: "/private/tls.crt",
       tlsCaPath: "/private/ca.pem",
+      externalTlsManagement: false,
     },
   });
+});
+
+test("external TLS management skips local TLS file requirements", () => {
+  const validation = validateRelayV2SelfHostedDraft({
+    ...createRelayV2SelfHostedDraft(),
+    enabled: true,
+    brokerHostId: "devbox",
+    issuerUrl: "https://relay.company.test/",
+    listenHost: "10.20.30.40",
+    externalTlsManagement: true,
+  });
+  assert.equal(validation.valid, true);
+  assert.deepEqual(validation.errors, {});
+  assert.equal(validation.value?.externalTlsManagement, true);
+});
+
+test("external TLS round-trips through the draft status mapping", () => {
+  const externalStatus: MobileRelayV2SelfHostedStatus = {
+    ...configuredStatus,
+    config: {
+      ...configuredStatus.config!,
+      externalTlsManagement: true,
+      tlsKeyPath: "",
+      tlsCertificatePath: "",
+      tlsCaPath: "",
+    },
+  };
+  const draft = selfHostedStatusToDraft(externalStatus);
+  assert.equal(draft.externalTlsManagement, true);
+  assert.equal(relayV2SelfHostedDraftMatchesStatus(draft, externalStatus), true);
+  assert.equal(
+    relayV2SelfHostedDraftMatchesStatus(
+      { ...draft, externalTlsManagement: false },
+      externalStatus,
+    ),
+    false,
+  );
 });
 
 test("expired Host bootstrap rotation is limited to version-zero pending state", () => {
@@ -166,6 +205,7 @@ test("persisted self-hosted inputs restore without implying Host or Android read
     tlsKeyPath: "/private/tls.key",
     tlsCertificatePath: "/private/tls.crt",
     tlsCaPath: "/private/ca.pem",
+    externalTlsManagement: false,
   });
   assert.equal(
     relayV2SelfHostedDraftMatchesStatus(

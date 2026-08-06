@@ -97,7 +97,9 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
       setNotice(kind === "save"
         ? "Self-hosted Relay v2 settings saved."
         : kind === "deploy"
-          ? "Canonical tw bundle, TLS files, and deployment profile published."
+          ? draft.externalTlsManagement
+            ? "Canonical tw bundle and deployment profile published; external TLS validated in place."
+            : "Canonical tw bundle, TLS files, and deployment profile published."
           : kind === "start"
             ? "Relay v2 Center started on the selected devbox."
             : kind === "rotate"
@@ -195,25 +197,41 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           disabled={locked || running || !draft.enabled}
           onChange={(value) => update("listenPort", value)}
         />
+        <label className="connections-relay-v2-deployment__toggle">
+          <input
+            type="checkbox"
+            checked={draft.externalTlsManagement}
+            disabled={locked || running || !draft.enabled}
+            onChange={(event) => update("externalTlsManagement", event.target.checked)}
+          />
+          TLS is externally managed (Let&apos;s Encrypt)
+        </label>
+        {draft.externalTlsManagement && (
+          <p className="connections-relay-v2-deployment__hint">
+            TLS is managed outside the Dashboard (for example, Let&apos;s Encrypt
+            auto-renewal on the devbox). Deploy validates the certificate in
+            place and never generates or overwrites the remote TLS files.
+          </p>
+        )}
         <DeploymentFileField
           label="Local TLS private key"
           value={draft.tlsKeyPath}
           error={errors.tlsKeyPath}
-          disabled={locked || running || !draft.enabled}
+          disabled={locked || running || !draft.enabled || draft.externalTlsManagement}
           onChoose={() => void selectFile("tlsKeyPath")}
         />
         <DeploymentFileField
           label="Local TLS leaf certificate"
           value={draft.tlsCertificatePath}
           error={errors.tlsCertificatePath}
-          disabled={locked || running || !draft.enabled}
+          disabled={locked || running || !draft.enabled || draft.externalTlsManagement}
           onChoose={() => void selectFile("tlsCertificatePath")}
         />
         <DeploymentFileField
           label="Local TLS CA certificate"
           value={draft.tlsCaPath}
           error={errors.tlsCaPath}
-          disabled={locked || running || !draft.enabled}
+          disabled={locked || running || !draft.enabled || draft.externalTlsManagement}
           onChoose={() => void selectFile("tlsCaPath")}
         />
       </div>
@@ -239,9 +257,9 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
       <p className="connections-relay-v2-deployment__hint">
         Enter the devbox&apos;s private IPv4 explicitly. Using 0.0.0.0 is an
         explicit opt-in to listen on every interface.{" "}
-        TLS key, leaf certificate, and CA certificate must be current-user-owned,
-        single-link, exact 0600 files. Deployment publishes separate 0600 copies and
-        keeps the Broker SQLite state directory 0700.
+        {draft.externalTlsManagement
+          ? "Deployment validates the devbox&apos;s existing TLS certificate (SAN matches the HTTPS Relay URL, not expired) and never generates or overwrites the remote TLS files. The public chain is pulled back locally for the management Host."
+          : "TLS key, leaf certificate, and CA certificate must be current-user-owned, single-link, exact 0600 files. Deployment publishes separate 0600 copies and keeps the Broker SQLite state directory 0700."}
       </p>
       <p className="connections-relay-v2-deployment__hint">
         Manual recovery only: rotate only when the Host native credential cell is
