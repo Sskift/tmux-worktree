@@ -63,6 +63,9 @@ import type {
 import {
   createRelayV2HostLocalDevelopmentCredentialCell,
 } from "./hostLocalDevelopmentCredentialCell.js";
+import {
+  createRelayV2HostCredentialFileCell,
+} from "./hostCredentialFileCell.js";
 import type { RelayV2HostShippingRootHandle } from "./hostShippingRoot.js";
 import {
   captureRelayV2HostTlsCaTrustCut,
@@ -663,7 +666,7 @@ async function createTrustedActivationOwner(
         || capability.reason !== "native_artifact_missing") {
         throw failure("ACTIVATION_FAILED");
       }
-      credentialCell = createRelayV2HostLocalDevelopmentCredentialCell();
+      credentialCell = createRelayV2HostCredentialFileCell(trustedHome);
     }
     requireStartupOpen(signal);
 
@@ -898,7 +901,7 @@ async function createSelfHostedDarwinArm64ActivationOwner(
         || capability.reason !== "native_artifact_missing") {
         throw failure("ACTIVATION_FAILED");
       }
-      credentialCell = createRelayV2HostLocalDevelopmentCredentialCell();
+      credentialCell = createRelayV2HostCredentialFileCell(trustedHome);
     }
     requireStartupOpen(signal);
 
