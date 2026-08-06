@@ -106,6 +106,24 @@ internal sealed interface RelayV2RetryNowResult {
     data object ProfileMismatch : RelayV2RetryNowResult
 }
 
+/** Typed outcome of an explicit network-availability hint delivered to one v2 composition. */
+internal enum class RelayV2NetworkHintResult {
+    /** A fresh single-attempt connect was claimed and started immediately. */
+    RECONNECTING,
+
+    /** Network is available before recovery is ready; the connect is armed to fire on recovery. */
+    ARMED,
+
+    /** A connection attempt or admission is already owned; nothing changed. */
+    IN_PROGRESS,
+
+    /** Network was lost; any owned backoff/in-flight claim was cancelled and retry slowed. */
+    PAUSED,
+
+    /** The composition is closed, terminally failed, or reconnect is disabled. */
+    FENCED,
+}
+
 /** Typed outcome of one bounded full-state refresh on the current v2 transport. */
 internal sealed interface RelayV2ManualResyncResult {
     data object Started : RelayV2ManualResyncResult
@@ -1089,6 +1107,81 @@ internal class RelayV2BaseRuntimeComposition(
         }
         attempt?.start()
         return result
+    }
+
+    /** Exact activation identity this composition currently owns, used by the re-attach owner. */
+    internal val activeProfileIdentity: RelayActiveProfileIdentity
+        get() = profile.identity
+
+    /** True while this composition can be reused for the same exact profile activation. */
+    internal fun isReusableFor(expectedIdentity: RelayActiveProfileIdentity): Boolean =
+        !closed.get() && terminalFailure.get() == null && profile.identity == expectedIdentity
+
+    /** True when the composition has been closed or terminally failed and cannot reconnect. */
+    internal fun isTerminalOrClosed(): Boolean = closed.get() || terminalFailure.get() != null
+
+    /**
+     * Network became available. Bypasses any owned backoff timer without waiting for it to expire
+     * and claims one fresh single-attempt connect (the same single-owner critical section used by
+     * [retryNow], minus the consent/profile compare). An in-flight actor admission remains the sole
+     * owner. Safe to call from any thread; the caller starts the returned lazy attempt.
+     */
+    internal fun onNetworkAvailable(): RelayV2NetworkHintResult {
+        var previousBackoff: Job? = null
+        var result: RelayV2NetworkHintResult = RelayV2NetworkHintResult.FENCED
+        val attempt = synchronized(connectionLock) {
+            if (closed.get() || terminalFailure.get() != null || !reconnectEnabled) {
+                result = RelayV2NetworkHintResult.FENCED
+                return@synchronized null
+            }
+            // Bypass a currently owned backoff timer without waiting for it to expire.
+            if (retryStateFence != null && connectionAttemptJob != null) {
+                previousBackoff = connectionAttemptJob
+                connectionAttemptJob = null
+                retryFence = Any()
+                retryStateFence = null
+                previousBackoff?.cancel()
+            }
+            retryAttempt = 0
+            val claimed = claimConnectionAttemptLocked()
+            result = when {
+                claimed != null -> RelayV2NetworkHintResult.RECONNECTING
+                !terminalRecoveryReady &&
+                    connectionAttemptJob == null &&
+                    pendingOutboxAdmission == null &&
+                    boundOutboxAdmission == null ->
+                    RelayV2NetworkHintResult.ARMED
+                else -> RelayV2NetworkHintResult.IN_PROGRESS
+            }
+            claimed
+        }
+        attempt?.start()
+        return result
+    }
+
+    /**
+     * Network became unavailable. Cancels any owned backoff timer and in-flight single-attempt
+     * claim, then pushes the retry ordinal to the slow tier so the next automatic retry waits out
+     * the max backoff. The composition stays armed (`reconnectEnabled` is left true) so a later
+     * [onNetworkAvailable] can reconnect immediately. Safe to call from any thread.
+     */
+    internal fun onNetworkLost(): RelayV2NetworkHintResult {
+        val fenced = synchronized(connectionLock) {
+            if (closed.get() || terminalFailure.get() != null || !reconnectEnabled) {
+                true
+            } else {
+                val owned = connectionAttemptJob
+                if (owned != null) {
+                    connectionAttemptJob = null
+                    retryFence = Any()
+                    retryStateFence = null
+                    owned.cancel()
+                }
+                retryAttempt = maxOf(retryAttempt, MAX_RETRY_EXPONENT)
+                false
+            }
+        }
+        return if (fenced) RelayV2NetworkHintResult.FENCED else RelayV2NetworkHintResult.PAUSED
     }
 
     /**

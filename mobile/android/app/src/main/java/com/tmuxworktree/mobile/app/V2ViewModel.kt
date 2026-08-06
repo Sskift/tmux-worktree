@@ -30,6 +30,7 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateTerminalInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ManualResyncResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2NetworkHintResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RetryNowResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateCut
@@ -69,6 +70,7 @@ import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.runtime.RelayClientEvent
 import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionRegistry
 import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionService
+import com.tmuxworktree.mobile.core.relay.runtime.RelayV2ConnectionRegistry
 import com.tmuxworktree.mobile.core.relay.runtime.RelayRequestKind
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionActor
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV1ConnectionConfig
@@ -2058,6 +2060,7 @@ class V2ViewModel(
                                         }
                                     } finally {
                                         runCatching { composition.close() }
+                                        RelayV2ConnectionRegistry.clear(composition)
                                         synchronized(relayV2UiFenceLock) {
                                             if (relayV2Composition === composition) {
                                                 if (drainCompleted) relayV2Composition = null
@@ -2252,6 +2255,7 @@ class V2ViewModel(
             }
         } finally {
             runCatching { failedComposition.close() }
+            RelayV2ConnectionRegistry.clear(failedComposition)
             synchronized(relayV2UiFenceLock) {
                 if (relayV2Composition === failedComposition &&
                     relayV2ExplicitRefreshReservation === reservation
@@ -2395,7 +2399,9 @@ class V2ViewModel(
         }
 
     override fun onCleared() {
-        relayV2Composition?.close()
+        // The v2 composition is owned by RelayV2ConnectionRegistry (process-level) and is kept
+        // alive by RelayConnectionService; a recreated ViewModel re-attaches to it. Only detach the
+        // UI-facing references here. The relay v1 actor is likewise owned by RelayConnectionService.
         synchronized(relayV2UiFenceLock) {
             relayV2NotificationProfileActive = false
             relayV2Terminal = null
@@ -2405,7 +2411,6 @@ class V2ViewModel(
             relayV2ExplicitRefreshReservation = null
         }
         relayV2ProfileRuntime = null
-        // The relay v1 actor is owned by RelayConnectionService; do not close it here.
         effectsClosed = true
         notificationPermissionRequestChannel.close()
         effectInputChannel.close()
@@ -2622,6 +2627,7 @@ class V2ViewModel(
                                         // The composition is permanently fenced even when drain
                                         // fails. Never replace a failed exact drain with a receipt.
                                         runCatching { composition.close() }
+                                        RelayV2ConnectionRegistry.clear(composition)
                                         synchronized(relayV2UiFenceLock) {
                                             if (relayV2Composition === composition) {
                                                 if (drainCompleted) relayV2Composition = null
@@ -2722,11 +2728,24 @@ class V2ViewModel(
 
     private fun startRelayV2BaseRuntime(profile: RelayV2Profile) {
         check(relayV2Composition == null) { "Relay v2 base runtime already exists" }
-        val composition = container.createRelayV2BaseRuntimeComposition(
-            viewModelScope,
-            profile,
-            requireRelayV2ProfileRuntime(),
-        )
+        // The composition lives on the process-level scope so it survives Activity/ViewModel
+        // recreation. A recreated ViewModel re-attaches to the still-running composition instead of
+        // building a fresh one; a stale owner is retired and replaced.
+        val existing = RelayV2ConnectionRegistry.composition.value
+        val composition: RelayV2BaseRuntimeComposition =
+            if (existing != null && existing.isReusableFor(profile.identity)) {
+                existing
+            } else {
+                existing?.close()
+                RelayV2ConnectionRegistry.clear(existing)
+                container.createRelayV2BaseRuntimeComposition(
+                    RelayV2ConnectionRegistry.scope,
+                    profile,
+                    requireRelayV2ProfileRuntime(),
+                ).also { RelayV2ConnectionRegistry.install(it) }
+            }
+        // Foreground keep-alive: v2 composition (like the v1 actor) is owned by the service.
+        RelayConnectionService.start(container.applicationContext)
         synchronized(relayV2UiFenceLock) {
             relayV2Composition = composition
             relayV2NotificationProfileActive = true
@@ -2864,6 +2883,31 @@ class V2ViewModel(
                     true
                 }
                 if (current) syncAgentNotificationConfig(composition)
+            }
+        }
+        viewModelScope.launch {
+            container.networkMonitor.state.collect { network ->
+                val available = network.available
+                val changed = available != _uiState.value.networkAvailable
+                val networkChanged = available && network.networkHandle != activeNetworkHandle
+                activeNetworkHandle = network.networkHandle
+                _uiState.update { it.copy(networkAvailable = available) }
+                refreshDecoratedHealth()
+                val current = synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+                    ) null else composition
+                } ?: return@collect
+                if (available) {
+                    if ((changed || networkChanged) && _uiState.value.preferences.autoConnect) {
+                        val hint = current.onNetworkAvailable()
+                        if (hint == RelayV2NetworkHintResult.RECONNECTING) {
+                            _uiState.update { it.copy(isConnecting = true) }
+                        }
+                    }
+                } else if (changed) {
+                    current.onNetworkLost()
+                }
             }
         }
     }

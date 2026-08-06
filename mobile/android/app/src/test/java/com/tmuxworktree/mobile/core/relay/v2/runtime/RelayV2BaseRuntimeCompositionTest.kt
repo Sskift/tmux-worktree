@@ -41,6 +41,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
+import com.tmuxworktree.mobile.core.relay.runtime.RelayV2ConnectionRegistry
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
@@ -147,6 +148,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -2802,6 +2804,133 @@ class RelayV2BaseRuntimeCompositionTest {
             harness.close()
         }
     }
+
+    @Test
+    fun `network available bypasses owned backoff and reconnects immediately`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
+        try {
+            harness.awaitTransport(0).fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            assertTrue(retry.awaitCount(1))
+            delay(50)
+            assertEquals(1, harness.factory.requests.size)
+            assertEquals(listOf(1_000L), retry.delays)
+
+            // Network returns while the owned backoff timer is still waiting.
+            assertEquals(
+                RelayV2NetworkHintResult.RECONNECTING,
+                harness.composition.onNetworkAvailable(),
+            )
+            harness.awaitTransport(1)
+            assertEquals(2, harness.factory.requests.size)
+            // The owned backoff was cancelled and never released.
+            assertEquals(listOf(1_000L), retry.delays)
+            assertEquals(RelayV2BaseRuntimePhase.CONNECTING, harness.composition.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `network lost cancels owned backoff and later availability reconnects`() = runBlocking {
+        val retry = ControlledRetryDelay()
+        val harness = Harness(autoConnect = true, retryDelayBlock = retry::awaitDelay)
+        try {
+            harness.awaitTransport(0).fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            assertTrue(retry.awaitCount(1))
+            delay(50)
+            assertEquals(1, harness.factory.requests.size)
+
+            // Network is lost: cancel the owned backoff so no reconnect fires.
+            assertEquals(
+                RelayV2NetworkHintResult.PAUSED,
+                harness.composition.onNetworkLost(),
+            )
+            retry.release(0)
+            delay(50)
+            assertEquals(1, harness.factory.requests.size)
+
+            // Network returns: reconnect immediately without waiting for a fresh backoff.
+            assertEquals(
+                RelayV2NetworkHintResult.RECONNECTING,
+                harness.composition.onNetworkAvailable(),
+            )
+            harness.awaitTransport(1)
+            assertEquals(2, harness.factory.requests.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `network available while recovery pending arms instead of connecting`() = runBlocking {
+        val recoveryGate = CompletableDeferred<Unit>()
+        val harness = Harness(
+            autoConnect = true,
+            beforeTerminalRecoveryAdmission = { recoveryGate.await() },
+        )
+        try {
+            assertEquals(
+                RelayV2NetworkHintResult.ARMED,
+                harness.composition.onNetworkAvailable(),
+            )
+            assertEquals(0, harness.factory.requests.size)
+            recoveryGate.complete(Unit)
+            harness.awaitTransport(0)
+            assertEquals(1, harness.factory.requests.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `network hint after close is fenced`() = runBlocking {
+        val harness = Harness(autoConnect = true)
+        try {
+            harness.composition.close()
+            assertEquals(
+                RelayV2NetworkHintResult.FENCED,
+                harness.composition.onNetworkAvailable(),
+            )
+            assertEquals(
+                RelayV2NetworkHintResult.FENCED,
+                harness.composition.onNetworkLost(),
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `registry installs clears and keeps a reusable composition until closed`() =
+        runBlocking {
+            val registry = RelayV2ConnectionRegistry
+            val harness = Harness(autoConnect = true)
+            try {
+                assertNull(registry.composition.value)
+
+                registry.install(harness.composition)
+                assertEquals(harness.composition, registry.composition.value)
+                assertFalse(harness.composition.isTerminalOrClosed())
+                assertTrue(harness.composition.isReusableFor(harness.profile.identity))
+                assertEquals(harness.profile.identity, harness.composition.activeProfileIdentity)
+
+                // A stale composition is retired before a successor is installed.
+                harness.composition.close()
+                assertTrue(harness.composition.isTerminalOrClosed())
+                assertFalse(harness.composition.isReusableFor(harness.profile.identity))
+
+                registry.clear(harness.composition)
+                assertNull(registry.composition.value)
+            } finally {
+                registry.clear(harness.composition)
+                harness.close()
+            }
+        }
 
     @Test
     fun `close during retry delay fences the pending successor`() = runBlocking {
