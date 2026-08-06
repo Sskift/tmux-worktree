@@ -559,7 +559,12 @@ function createPrivateHome(targetBytes) {
 }
 
 test("Relay v2 Host normal process lifecycle prepares terminal control and freezes one trusted lineage", async () => {
-  const home = createPrivateHome(58);
+  // 59-byte home makes the preferred daemon socket 99 bytes; its exact compound
+  // (.r2e-<digest>.sock beside the daemon, kept while <= 103 bytes) is then 101
+  // bytes: deterministically above the 100-byte local-development cap, so the
+  // owner must relocate to a shorter socket path (58 bytes would land the
+  // compound at exactly 100 and never exceed the cap).
+  const home = createPrivateHome(59);
   const tooLongHome = createPrivateHome(96);
   const cli = join(home, "cli.cjs");
   writeFileSync(cli, "/* fixture */\n");
