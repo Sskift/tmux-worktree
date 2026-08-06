@@ -6,6 +6,9 @@ import {
 } from "../../rpcV2.js";
 import { normalizeManagedSessionReservationCorrelation } from "../../state.js";
 import {
+  RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX,
+} from "../../session.js";
+import {
   issueRelayV2CanonicalBackendInstanceKey,
 } from "./canonicalBackendIdentity.js";
 import { RELAY_V2_MATERIALIZED_CAPACITY } from "./resourceState.js";
@@ -155,7 +158,19 @@ export function projectRelayV2CanonicalTwRpcDiscoveredSession(
     || session.baseBranch !== null) {
     throw new TypeError("canonical TW RPC terminal Session has worktree fields");
   }
+  // A legacy v1-era session has no real capacity reservation: the migration
+  // (markRelayV2HostLegacySessionsLifecycleV1) invents a well-formed correlation
+  // in the reserved tw-migrate-legacy-v1: namespace as an opaque provenance
+  // marker. It never corresponds to a real reservation, so it must not
+  // participate in reservation-correlation authority. Strip it here before the
+  // materialized reconcile's scanAuthorityConflict sees it (otherwise every
+  // migrated session fails as "unknown reservation correlation"). The full
+  // namespace is matched with its trailing ":" so a legitimate reservationId
+  // that merely starts with the prefix is never mis-filtered.
   const reservationCorrelation = session.reservationCorrelation === null
+    || session.reservationCorrelation.reservationId.startsWith(
+      `${RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX}:`,
+    )
     ? null
     : clone(session.reservationCorrelation) as RelayV2DiscoveredReservationCorrelation;
   return {
