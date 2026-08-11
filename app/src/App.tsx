@@ -256,6 +256,7 @@ function App() {
   const [showNewTerminal, setShowNewTerminal] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
+  const [connectionsInitialTab, setConnectionsInitialTab] = useState<"hosts" | "relay">("hosts");
   const [layoutResetMessage, setLayoutResetMessage] = useState<string | null>(null);
   const [defaultAgentCommand, setDefaultAgentCommand] = useState(loadLastAiCmd);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
@@ -406,7 +407,15 @@ function App() {
 
   const openSettings = useCallback((section: SettingsSectionId = "general") => {
     setCommandPaletteOpen(false);
+    if (section === "connections") setConnectionsInitialTab("hosts");
     setSettingsSection(section);
+    setSettingsOpen(true);
+  }, []);
+
+  const openRelaySettings = useCallback(() => {
+    setCommandPaletteOpen(false);
+    setConnectionsInitialTab("relay");
+    setSettingsSection("connections");
     setSettingsOpen(true);
   }, []);
 
@@ -1351,6 +1360,7 @@ function App() {
         onCreateTerminal={() => setShowNewTerminal(true)}
         onOpenCommandPalette={() => setCommandPaletteOpen(true)}
         onOpenConnections={() => openSettings("connections")}
+        onOpenRelay={openRelaySettings}
         onOpenAutomations={() => {
           void selectAutomation(automations[0]?.id ?? "");
         }}
@@ -1506,7 +1516,8 @@ function App() {
           ),
           connections: (
             <ConnectionsSettings
-              key={`connections:${connectionCatalogOwnerEpochKey}`}
+              key={`connections:${connectionCatalogOwnerEpochKey}:${connectionsInitialTab}`}
+              initialTab={connectionsInitialTab}
               hosts={hosts}
               hostStatuses={hostStatuses}
               hostCatalogError={hostsLoadError}

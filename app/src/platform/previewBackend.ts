@@ -334,6 +334,20 @@ relayV2PreviewState.enrollment = {
     ),
   },
 };
+relayV2PreviewState.connectedMobileDevices = [
+  {
+    status: "connected",
+    grantId: "preview-pixel-grant",
+    clientInstanceId: "pixel-9-pro-preview",
+    connectionCount: 1,
+  },
+  {
+    status: "connected",
+    grantId: "preview-fold-grant",
+    clientInstanceId: "fold-lab-preview",
+    connectionCount: 1,
+  },
+];
 const relayV2PreviewAdapter = createFakeMobileRelayV2Adapter({
   initialState: relayV2PreviewState,
 });

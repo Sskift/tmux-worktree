@@ -64,7 +64,7 @@ import { useRelayConnectionOverview } from "./useRelayConnectionOverview";
 import { useRelayV2EnrollmentController } from "./useRelayV2EnrollmentController";
 
 type HostEditorMode = "view" | "add" | "edit";
-type ConnectionTab = "hosts" | "relay";
+export type ConnectionTab = "hosts" | "relay";
 type AsyncNoticeTone = "pending" | "success" | "error";
 
 interface AsyncNotice {
@@ -73,6 +73,7 @@ interface AsyncNotice {
 }
 
 export interface ConnectionsSettingsProps {
+  initialTab?: ConnectionTab;
   hosts: readonly HostConfig[];
   hostStatuses: Readonly<Record<string, HostStatus>>;
   hostCatalogError?: string | null;
@@ -133,6 +134,7 @@ function HostStateIcon({ status }: { status: HostStatus | null }) {
 }
 
 export function ConnectionsSettings({
+  initialTab = "hosts",
   hosts,
   hostStatuses,
   hostCatalogError,
@@ -144,7 +146,7 @@ export function ConnectionsSettings({
   onInstallTw,
 }: ConnectionsSettingsProps) {
   const dashboardBackend = useDashboardBackend();
-  const [activeTab, setActiveTab] = useState<ConnectionTab>("hosts");
+  const [activeTab, setActiveTab] = useState<ConnectionTab>(initialTab);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(hosts[0]?.id ?? null);
   const [mode, setMode] = useState<HostEditorMode>(hosts.length ? "view" : "add");
   const [draft, setDraft] = useState<HostDraft>(() =>

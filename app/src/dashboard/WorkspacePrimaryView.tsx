@@ -1,8 +1,10 @@
 import {
   ArrowRight,
   FolderGit2,
+  RadioTower,
   Search,
   Server,
+  Smartphone,
   SquareTerminal,
   Workflow,
   X,
@@ -15,6 +17,7 @@ import type {
   WorkspaceDiffContext,
   WorkspacePrimaryContext,
 } from "./model/workspacePresentation";
+import { useRelayV2MissionControl } from "./hooks/useRelayV2MissionControl";
 
 export type WorkspaceHomeSummary = Readonly<{
   attentionAgents: number;
@@ -40,6 +43,7 @@ function WorkspaceHome({
   onCreateTerminal,
   onOpenCommandPalette,
   onOpenConnections,
+  onOpenRelay,
   onOpenAutomations,
   onSelectSession,
 }: {
@@ -48,13 +52,16 @@ function WorkspaceHome({
   onCreateTerminal(): void;
   onOpenCommandPalette(): void;
   onOpenConnections(): void;
+  onOpenRelay(): void;
   onOpenAutomations(): void;
   onSelectSession(sessionId: string): void;
 }) {
   const [filter, setFilter] = useState<WorkspaceHomeFilter>("attention");
+  const mobileRelay = useRelayV2MissionControl();
   const hostSummary = summary.totalHosts === 0
     ? "Local ready"
     : `${summary.onlineHosts}/${summary.totalHosts} remote ready`;
+  const mobileCount = mobileRelay.phase === "loading" ? "—" : mobileRelay.devices.length;
   const visibleSessions = summary.sessions.filter((session) => (
     filter === "attention"
       ? session.needsReview
@@ -73,10 +80,10 @@ function WorkspaceHome({
   return (
     <div className="workspace-home">
       <div className="workspace-home__intro">
-        <span className="workspace-home__eyebrow">Dashboard</span>
+        <span className="workspace-home__eyebrow">Mission control</span>
         <h2>Start something new or pick up active work.</h2>
         <p>
-          Keep agent worktrees, terminals, remote hosts, and automations in one place.
+          Agent activity, mobile access, remote hosts, and automations stay visible in one place.
         </p>
         <div className="workspace-home__actions">
           <button
@@ -110,8 +117,16 @@ function WorkspaceHome({
           <span>agents running</span>
         </div>
         <div>
-          <strong>{hostSummary}</strong>
-          <span>connections</span>
+          <strong>{mobileCount}</strong>
+          <span>phones connected</span>
+        </div>
+        <div>
+          <strong>
+            {summary.totalHosts === 0
+              ? "Ready"
+              : `${summary.onlineHosts}/${summary.totalHosts}`}
+          </strong>
+          <span>{summary.totalHosts === 0 ? "local runtime" : "remote hosts"}</span>
         </div>
       </div>
 
@@ -176,11 +191,77 @@ function WorkspaceHome({
           )}
         </section>
 
-        <section className="workspace-home__panel" aria-labelledby="workspace-home-tools">
+        <section
+          className="workspace-home__panel workspace-home__mobile-panel"
+          aria-labelledby="workspace-home-mobile"
+        >
           <div className="workspace-home__panel-heading">
             <div>
+              <span>Relay v2</span>
+              <h3 id="workspace-home-mobile">Mobile devices</h3>
+            </div>
+            <span
+              className="workspace-home__relay-status"
+              data-phase={mobileRelay.phase}
+            >
+              <i aria-hidden="true" />
+              {mobileRelay.statusLabel}
+            </span>
+          </div>
+          <div className="workspace-home__relay-overview">
+            <span className="workspace-home__relay-icon" data-phase={mobileRelay.phase}>
+              <RadioTower aria-hidden="true" size={17} strokeWidth={1.8} />
+            </span>
+            <span>
+              <strong>{mobileRelay.headline}</strong>
+              <small>{mobileRelay.detail}</small>
+            </span>
+          </div>
+          {mobileRelay.devices.length > 0 ? (
+            <div className="workspace-home__device-list" aria-label="Connected mobile devices">
+              {mobileRelay.devices.slice(0, 3).map((device) => (
+                <div key={device.id}>
+                  <Smartphone aria-hidden="true" size={14} strokeWidth={1.8} />
+                  <span>
+                    <strong title={device.clientInstanceId}>Mobile · {device.shortId}</strong>
+                    <small>
+                      {device.connectionCount} live {device.connectionCount === 1
+                        ? "connection"
+                        : "connections"}
+                    </small>
+                  </span>
+                  <i aria-hidden="true" />
+                </div>
+              ))}
+              {mobileRelay.devices.length > 3 && (
+                <span className="workspace-home__device-overflow">
+                  +{mobileRelay.devices.length - 3} more connected
+                </span>
+              )}
+            </div>
+          ) : (
+            <div className="workspace-home__device-empty">
+              <Smartphone aria-hidden="true" size={15} strokeWidth={1.7} />
+              <span>No phone is connected right now.</span>
+            </div>
+          )}
+          <button
+            className="workspace-home__relay-action"
+            type="button"
+            onClick={onOpenRelay}
+          >
+            <span>
+              {mobileRelay.phase === "online"
+                ? "Pair or manage phones"
+                : "Open Relay settings"}
+            </span>
+            <ArrowRight aria-hidden="true" size={15} strokeWidth={1.8} />
+          </button>
+          <div className="workspace-home__mobile-divider" />
+          <div className="workspace-home__panel-heading workspace-home__panel-heading--tools">
+            <div>
               <span>Manage</span>
-              <h3 id="workspace-home-tools">Workspace tools</h3>
+              <h3>Workspace tools</h3>
             </div>
           </div>
           <div className="workspace-home__tool-list">
@@ -224,6 +305,7 @@ export function WorkspacePrimaryView({
   onCreateTerminal,
   onOpenCommandPalette,
   onOpenConnections,
+  onOpenRelay,
   onOpenAutomations,
   onSelectSession,
 }: {
@@ -243,6 +325,7 @@ export function WorkspacePrimaryView({
   onCreateTerminal(): void;
   onOpenCommandPalette(): void;
   onOpenConnections(): void;
+  onOpenRelay(): void;
   onOpenAutomations(): void;
   onSelectSession(sessionId: string): void;
 }) {
@@ -292,6 +375,7 @@ export function WorkspacePrimaryView({
             onCreateTerminal={onCreateTerminal}
             onOpenCommandPalette={onOpenCommandPalette}
             onOpenConnections={onOpenConnections}
+            onOpenRelay={onOpenRelay}
             onOpenAutomations={onOpenAutomations}
             onSelectSession={onSelectSession}
           />
