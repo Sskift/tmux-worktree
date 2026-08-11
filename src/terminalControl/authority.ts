@@ -458,7 +458,6 @@ function existingOperation(
 
 function operationResult(
   state: TerminalControlState,
-  target: TerminalControlTargetRecord,
   operation: TerminalControlOperationRecord,
   deduplicated: boolean,
 ): Record<string, unknown> {
@@ -2395,7 +2394,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       );
       if (completed) {
         if (hasFencedRawPath) await this.assertTargetCurrent(state, target);
-        return operationResult(state, target, completed, true);
+        return operationResult(state, completed, true);
       }
       let output: { generation: string; cursor: number };
       if (hasFencedRawPath) {
@@ -2538,7 +2537,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       revision(target);
       target.updatedAt = isoNow(this.now);
       saveTerminalControlState(state, this.statePath);
-      return operationResult(state, target, record, false);
+      return operationResult(state, record, false);
     });
   }
 
@@ -2757,7 +2756,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         hash,
         "lifecycle-kill",
       );
-      if (completed) return operationResult(state, target, completed, true);
+      if (completed) return operationResult(state, completed, true);
       await this.assertTargetCurrent(state, target);
       validateLease(state, target, lease);
       const output = await this.prepareOutput(state, target);
@@ -2809,7 +2808,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       target.inFlight = undefined;
       invalidateTarget(target, this.now);
       saveTerminalControlState(state, this.statePath);
-      return operationResult(state, target, record, false);
+      return operationResult(state, record, false);
     });
   }
 }

@@ -1830,7 +1830,7 @@ export class RelayV2HostCarrierActor {
     }
     let publicFrame: RelayV2JsonObject | null;
     try {
-      publicFrame = this.validatePublicPayload(route, payload);
+      publicFrame = this.validatePublicPayload(payload);
     } catch {
       this.failRoute(connector, route, ROUTE_CLOSE_PROTOCOL_ERROR);
       this.finishReceiptAdmission(receiptCell, false);
@@ -2399,7 +2399,7 @@ export class RelayV2HostCarrierActor {
       return;
     }
     try {
-      this.validatePublicPayload(route, bytes);
+      this.validatePublicPayload(bytes);
     } catch {
       this.failConnector(connector, 4400, "invalid_public_route_frame");
       return;
@@ -2802,10 +2802,7 @@ export class RelayV2HostCarrierActor {
     return owner && owner.outstandingCarrierBytes > unownedBytes ? owner : null;
   }
 
-  private validatePublicPayload(
-    route: RouteState,
-    payload: Uint8Array,
-  ): RelayV2JsonObject | null {
+  private validatePublicPayload(payload: Uint8Array): RelayV2JsonObject | null {
     try {
       return decodeRelayV2WebSocketFrame("public", payload, {
         opcode: "text",

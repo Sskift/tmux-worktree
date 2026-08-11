@@ -2247,7 +2247,6 @@ export class RelayV2TerminalManager {
       || retained
     ) {
       const settled = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -2286,7 +2285,7 @@ export class RelayV2TerminalManager {
       request.mode === "new"
       && (claimAuthority.streamAuthority.status !== "absent" || existing)
     ) {
-      const outcome = await this.failOpenRecord(request, key, recordKey, requestFingerprint, {
+      const outcome = await this.failOpenRecord(key, recordKey, requestFingerprint, {
         kind: "error",
         code: "TERMINAL_STREAM_CONFLICT",
         message: "terminal streamId is already retained",
@@ -2312,7 +2311,6 @@ export class RelayV2TerminalManager {
     } catch (error) {
       if (!(error instanceof RelayV2TerminalManagerError) || error.code !== "BUSY") throw error;
       const outcome = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -2747,7 +2745,6 @@ export class RelayV2TerminalManager {
   }
 
   private async settleOpenRecord(
-    request: RelayV2TerminalOpenRequest,
     key: string,
     recordKey: string,
     requestFingerprint: string,
@@ -2820,7 +2817,6 @@ export class RelayV2TerminalManager {
   }
 
   private async failOpenRecord(
-    request: RelayV2TerminalOpenRequest,
     key: string,
     recordKey: string,
     requestFingerprint: string,
@@ -2830,7 +2826,6 @@ export class RelayV2TerminalManager {
     retainLocal = true,
   ): Promise<OpenRecordOutcome> {
     const result = await this.settleOpenRecord(
-      request,
       key,
       recordKey,
       requestFingerprint,
@@ -3136,7 +3131,6 @@ export class RelayV2TerminalManager {
         tailOffset: null,
       };
       const completed = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -3165,7 +3159,6 @@ export class RelayV2TerminalManager {
     let completion: OpenCommitResult;
     try {
       completion = await this.settleOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -3309,7 +3302,6 @@ export class RelayV2TerminalManager {
     }
     if (outcome.kind === "reset") {
       const completed = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -3340,7 +3332,6 @@ export class RelayV2TerminalManager {
       await this.setAttachmentDisplaySizeHint(authoritativeStream!, request.cols, request.rows);
     }
     const completion = await this.settleOpenRecord(
-      request,
       key,
       recordKey,
       requestFingerprint,
@@ -3410,7 +3401,6 @@ export class RelayV2TerminalManager {
         tailOffset: null,
       };
       const completed = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -3656,7 +3646,6 @@ export class RelayV2TerminalManager {
         ? error.message
         : "exact terminal target is unavailable";
       const completed = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -3733,7 +3722,6 @@ export class RelayV2TerminalManager {
         tailOffset: null,
       };
       const completed = await this.failOpenRecord(
-        request,
         key,
         recordKey,
         requestFingerprint,
@@ -4077,10 +4065,7 @@ export class RelayV2TerminalManager {
     return stream.status === "live" || stream.status === "detached" ? stream : undefined;
   }
 
-  private prepareClosedNotification(
-    stream: TerminalStream,
-    route: RelayV2TerminalRuntimeBinding,
-  ): "event" | null {
+  private prepareClosedNotification(stream: TerminalStream): "event" | null {
     if (!stream.close) return null;
     const record = [...this.closeRecords.values()].find((candidate) => (
       candidate.streamKey === stream.key
@@ -4144,7 +4129,7 @@ export class RelayV2TerminalManager {
       sentThroughOffset: replayFromOffset,
       phase: "replay",
       replayBoundary: through,
-      closeNotification: this.prepareClosedNotification(stream, request.route),
+      closeNotification: this.prepareClosedNotification(stream),
       closeNotified: false,
     };
     stream.lastUsedAt = this.now();
@@ -4291,7 +4276,7 @@ export class RelayV2TerminalManager {
       sentThroughOffset: fromOffset,
       phase: "replay",
       replayBoundary: through,
-      closeNotification: this.prepareClosedNotification(stream, request.route),
+      closeNotification: this.prepareClosedNotification(stream),
       closeNotified: false,
     };
     await this.sendFrame(request.route, asJson({

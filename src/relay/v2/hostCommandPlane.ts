@@ -3087,7 +3087,7 @@ export class RelayV2HostCommandPlane {
     const record = readCommand(snapshot, identity);
     if (record !== undefined && record.dedupeWindowId === item.dedupeWindowId) {
       if (record.recordType === "command_tombstone") {
-        return this.expiredQueryItem(item, record, now);
+        return this.expiredQueryItem(item, record);
       }
       return {
         commandId: item.commandId,
@@ -3157,7 +3157,6 @@ export class RelayV2HostCommandPlane {
   private expiredQueryItem(
     item: { commandId: string; dedupeWindowId: string },
     record: StoredCommandTombstone,
-    now: number,
   ): RelayV2HostJson {
     return {
       commandId: item.commandId,
