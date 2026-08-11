@@ -608,6 +608,7 @@ button:disabled {
 }
 
 .workspace-home__actions button,
+.workspace-home__filters button,
 .workspace-home__session-list button,
 .workspace-home__tool-list button {
   border: 1px solid var(--border);
@@ -628,6 +629,7 @@ button:disabled {
 }
 
 .workspace-home__actions button:hover,
+.workspace-home__filters button:hover,
 .workspace-home__session-list button:hover,
 .workspace-home__tool-list button:hover {
   border-color: color-mix(in srgb, var(--accent-a) 44%, var(--border));
@@ -636,6 +638,7 @@ button:disabled {
 }
 
 .workspace-home__actions button:focus-visible,
+.workspace-home__filters button:focus-visible,
 .workspace-home__session-list button:focus-visible,
 .workspace-home__tool-list button:focus-visible {
   outline: 2px solid var(--accent-a);
@@ -750,6 +753,42 @@ button:disabled {
   color: var(--text-faint);
 }
 
+.workspace-home__filters {
+  display: flex;
+  gap: 4px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.workspace-home__filters button {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border-color: transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 10px;
+}
+
+.workspace-home__filters button[aria-pressed="true"] {
+  border-color: var(--border);
+  background: var(--surface-selected);
+  color: var(--text);
+}
+
+.workspace-home__filters small {
+  min-width: 15px;
+  padding: 1px 4px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
 .workspace-home__empty-activity p {
   max-width: 260px;
   margin: 0;
@@ -782,6 +821,10 @@ button:disabled {
   padding: 6px 8px;
 }
 
+.workspace-home__session-list button[data-attention="true"] {
+  background: color-mix(in srgb, var(--accent-c) 7%, transparent);
+}
+
 .workspace-home__activity-dot {
   width: 7px;
   height: 7px;
@@ -794,8 +837,13 @@ button:disabled {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 12%, transparent);
 }
 
+.workspace-home__activity-dot[data-state="attention"],
 .workspace-home__activity-dot[data-state="stopped"] {
   background: var(--accent-c);
+}
+
+.workspace-home__activity-dot[data-state="attention"] {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-c) 12%, transparent);
 }
 
 .workspace-home__session-copy,

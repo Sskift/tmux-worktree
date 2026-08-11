@@ -68,6 +68,7 @@ export type DashboardSidebarProps = {
   hostsError?: string | null;
   localRuntimeState?: "checking" | "ready" | "error";
   selection: Selection;
+  attentionCount: number;
   sessionActivity: Readonly<Record<string, SessionActivityInfo | undefined>>;
   sessionOrder: readonly string[];
   worktreeGroupOrder: readonly string[];
@@ -83,6 +84,7 @@ export type DashboardSidebarProps = {
   activeView: SidebarView;
   filesContent: ReactNode;
   onViewChange: (view: SidebarView) => void;
+  onOpenOverview: () => void;
   onCreateWorktree: () => void;
   onCreateTerminal: () => void;
   onOpenCommandPalette: () => void;
@@ -176,6 +178,7 @@ export function DashboardSidebar({
   hostsError,
   localRuntimeState = "checking",
   selection,
+  attentionCount,
   sessionActivity,
   sessionOrder,
   worktreeGroupOrder,
@@ -191,6 +194,7 @@ export function DashboardSidebar({
   activeView,
   filesContent,
   onViewChange,
+  onOpenOverview,
   onCreateWorktree,
   onCreateTerminal,
   onOpenCommandPalette,
@@ -426,6 +430,25 @@ export function DashboardSidebar({
           inert={activeView !== "workspaces"}
         >
           <div className="tw-dashboard-sidebar__actions">
+            <button
+              className="tw-dashboard-sidebar__overview"
+              type="button"
+              data-selected={selection === null}
+              aria-current={selection === null ? "page" : undefined}
+              onClick={onOpenOverview}
+            >
+              <LayoutDashboard aria-hidden="true" size={16} strokeWidth={1.9} />
+              <span>Overview</span>
+              {attentionCount > 0 && (
+                <span
+                  className="tw-dashboard-sidebar__attention-count"
+                  aria-label={`${attentionCount} session${attentionCount === 1 ? "" : "s"} need review`}
+                >
+                  {Math.min(attentionCount, 99)}
+                </span>
+              )}
+            </button>
+
             <button
               className="tw-dashboard-sidebar__new-worktree"
               type="button"

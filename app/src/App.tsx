@@ -232,6 +232,8 @@ function App() {
     ownerEpochKey: connectionCatalogOwnerEpochKey,
   } = connectionCatalog;
   const [selection, setSelection] = useState<Selection>(null);
+  const [seenSessionOutputs, setSeenSessionOutputs] =
+    useState<ReadonlyMap<string, string | null>>(() => new Map());
   const terminalDeck = useTerminalDeckState(dashboardBackend);
   const {
     ownerEpochKey: terminalDeckOwnerEpochKey,
@@ -312,6 +314,33 @@ function App() {
     getLatestSuccessfulRefreshGeneration,
     ownerPhase: workspaceCatalogOwnerPhase,
   } = useWorkspaceCatalog(dashboardBackend);
+
+  useEffect(() => {
+    setSeenSessionOutputs((previous) => {
+      const currentNames = new Set(sessions.map((session) => session.name));
+      const selectedName = selection?.kind === "session" ? selection.name : null;
+      const selectedSession = selectedName
+        ? sessions.find((session) => session.name === selectedName)
+        : null;
+      let next: Map<string, string | null> | null = null;
+
+      for (const name of previous.keys()) {
+        if (currentNames.has(name)) continue;
+        next ??= new Map(previous);
+        next.delete(name);
+      }
+
+      if (selectedSession) {
+        const signature = selectedSession.output_signature ?? null;
+        if (previous.get(selectedSession.name) !== signature) {
+          next ??= new Map(previous);
+          next.set(selectedSession.name, signature);
+        }
+      }
+
+      return next ?? previous;
+    });
+  }, [selection, sessions]);
 
   useWorkspaceCatalogOwnerPhase(workspaceCatalogOwnerPhase, {
     dashboardBackend,
@@ -805,6 +834,18 @@ function App() {
     [requestEditorNavigation, viewportTier],
   );
 
+  const selectOverview = useCallback(
+    () => requestEditorNavigation(() => {
+      setPendingCatalogSelection(null);
+      setSelection(null);
+      setEditingFile(null);
+      setDiffFile(null);
+      setInspectorOpen(false);
+      if (viewportTier === "compact") setSidebarOpen(false);
+    }),
+    [requestEditorNavigation, viewportTier],
+  );
+
   const selectTerminal = useCallback(
     (id: string) => requestEditorNavigation(() => {
       setPendingCatalogSelection(null);
@@ -1230,10 +1271,14 @@ function App() {
   const workspaceHomeSummary = useMemo<WorkspaceHomeSummary>(() => {
     const hostsById = new Map(hosts.map((host) => [host.id, host]));
     const connectionSummary = summarizeSidebarConnections(hosts, hostStatuses);
-    const runningFirst = { running: 0, stopped: 1, unknown: 2 } as const;
     const activity = sessions
       .map((session) => {
         const currentActivity = sessionActivity[session.name];
+        const state = currentActivity?.state ?? "unknown";
+        const outputSignature = session.output_signature ?? null;
+        const needsReview = state !== "running"
+          && outputSignature !== null
+          && seenSessionOutputs.get(session.name) !== outputSignature;
         const hostLabel = session.hostId
           ? hostsById.get(session.hostId)?.label ?? session.hostId
           : "Local";
@@ -1241,25 +1286,33 @@ function App() {
           id: session.name,
           title: sessionDisplayName(session),
           detail: [session.project || "Worktree", hostLabel].join(" · "),
-          state: currentActivity?.state ?? "unknown",
-          status: currentActivity?.label ?? "unknown",
+          state,
+          needsReview,
+          status: needsReview
+            ? "Review"
+            : state === "running"
+              ? "Running"
+              : state === "stopped"
+                ? "Reviewed"
+                : "Status unavailable",
           updatedAt: session.activity,
         };
       })
       .sort((left, right) => (
-        runningFirst[left.state] - runningFirst[right.state]
+        Number(right.needsReview) - Number(left.needsReview)
+        || Number(right.state === "running") - Number(left.state === "running")
         || right.updatedAt - left.updatedAt
       ));
 
     return {
+      attentionAgents: activity.filter((session) => session.needsReview).length,
       activeAgents: activity.filter((session) => session.state === "running").length,
-      worktrees: sessions.length,
       onlineHosts: connectionSummary.readyCount,
       totalHosts: hosts.length,
       activeAutomations: automations.filter((automation) => automation.active).length,
-      sessions: activity.slice(0, 5).map(({ updatedAt: _updatedAt, ...session }) => session),
+      sessions: activity.map(({ updatedAt: _updatedAt, ...session }) => session),
     };
-  }, [automations, hostStatuses, hosts, sessionActivity, sessions]);
+  }, [automations, hostStatuses, hosts, seenSessionOutputs, sessionActivity, sessions]);
 
   const centralWorkspace = (
     <div
@@ -1575,6 +1628,7 @@ function App() {
           hostsError={hostsLoadError}
           localRuntimeState={error ? "error" : catalogRefreshGeneration > 0 ? "ready" : "checking"}
           selection={selection}
+          attentionCount={workspaceHomeSummary.attentionAgents}
           sessionActivity={sessionActivity}
           sessionOrder={sessionOrder}
           worktreeGroupOrder={worktreeGroupOrder}
@@ -1599,6 +1653,7 @@ function App() {
             setSidebarOpen(true);
             if (viewportTier === "compact") setInspectorOpen(false);
           }}
+          onOpenOverview={() => void selectOverview()}
           onCreateWorktree={() => setShowNewWorktree(true)}
           onCreateTerminal={() => setShowNewTerminal(true)}
           onOpenCommandPalette={() => setCommandPaletteOpen(true)}

@@ -7,7 +7,7 @@ import {
   Workflow,
   X,
 } from "lucide-react";
-import type { ComponentProps, ReactNode } from "react";
+import { useState, type ComponentProps, type ReactNode } from "react";
 import { FileEditor } from "../FileEditor";
 import { TerminalDeck } from "./TerminalDeck";
 import { WorkspaceDiffView } from "./WorkspaceContextViews";
@@ -17,8 +17,8 @@ import type {
 } from "./model/workspacePresentation";
 
 export type WorkspaceHomeSummary = Readonly<{
+  attentionAgents: number;
   activeAgents: number;
-  worktrees: number;
   onlineHosts: number;
   totalHosts: number;
   activeAutomations: number;
@@ -27,9 +27,12 @@ export type WorkspaceHomeSummary = Readonly<{
     title: string;
     detail: string;
     state: "running" | "stopped" | "unknown";
+    needsReview: boolean;
     status: string;
   }>>;
 }>;
+
+type WorkspaceHomeFilter = "attention" | "running" | "all";
 
 function WorkspaceHome({
   summary,
@@ -48,9 +51,24 @@ function WorkspaceHome({
   onOpenAutomations(): void;
   onSelectSession(sessionId: string): void;
 }) {
+  const [filter, setFilter] = useState<WorkspaceHomeFilter>("attention");
   const hostSummary = summary.totalHosts === 0
     ? "Local ready"
     : `${summary.onlineHosts}/${summary.totalHosts} remote ready`;
+  const visibleSessions = summary.sessions.filter((session) => (
+    filter === "attention"
+      ? session.needsReview
+      : filter === "running"
+        ? session.state === "running"
+        : true
+  )).slice(0, 6);
+  const emptyMessage = summary.sessions.length === 0
+    ? "No agent worktrees yet. Create one to start a focused task."
+    : filter === "attention"
+      ? "No new output needs review."
+      : filter === "running"
+        ? "No agents are running right now."
+        : "No recent agent activity.";
 
   return (
     <div className="workspace-home">
@@ -84,12 +102,12 @@ function WorkspaceHome({
 
       <div className="workspace-home__metrics" aria-label="Dashboard overview">
         <div>
-          <strong>{summary.activeAgents}</strong>
-          <span>agents running</span>
+          <strong>{summary.attentionAgents}</strong>
+          <span>need review</span>
         </div>
         <div>
-          <strong>{summary.worktrees}</strong>
-          <span>worktrees</span>
+          <strong>{summary.activeAgents}</strong>
+          <span>agents running</span>
         </div>
         <div>
           <strong>{hostSummary}</strong>
@@ -98,32 +116,52 @@ function WorkspaceHome({
       </div>
 
       <div className="workspace-home__content">
-        <section className="workspace-home__panel" aria-labelledby="workspace-home-activity">
+        <section className="workspace-home__panel" aria-labelledby="workspace-home-inbox">
           <div className="workspace-home__panel-heading">
             <div>
-              <span>Now</span>
-              <h3 id="workspace-home-activity">Agent activity</h3>
+              <span>Attention</span>
+              <h3 id="workspace-home-inbox">Agent inbox</h3>
             </div>
-            {summary.sessions.length > 0 && (
-              <span>{summary.activeAgents} running</span>
-            )}
+            <span>
+              {summary.attentionAgents > 0
+                ? `${summary.attentionAgents} to review`
+                : "All caught up"}
+            </span>
           </div>
-          {summary.sessions.length === 0 ? (
+          <div className="workspace-home__filters" aria-label="Filter agent inbox">
+            {([
+              ["attention", "Review", summary.attentionAgents],
+              ["running", "Running", summary.activeAgents],
+              ["all", "All", summary.sessions.length],
+            ] as const).map(([value, label, count]) => (
+              <button
+                type="button"
+                key={value}
+                aria-pressed={filter === value}
+                onClick={() => setFilter(value)}
+              >
+                <span>{label}</span>
+                <small>{count}</small>
+              </button>
+            ))}
+          </div>
+          {visibleSessions.length === 0 ? (
             <div className="workspace-home__empty-activity">
               <FolderGit2 aria-hidden="true" size={20} strokeWidth={1.6} />
-              <p>No agent worktrees yet. Create one to start a focused task.</p>
+              <p>{emptyMessage}</p>
             </div>
           ) : (
             <div className="workspace-home__session-list">
-              {summary.sessions.map((session) => (
+              {visibleSessions.map((session) => (
                 <button
                   type="button"
                   key={session.id}
+                  data-attention={session.needsReview || undefined}
                   onClick={() => onSelectSession(session.id)}
                 >
                   <span
                     className="workspace-home__activity-dot"
-                    data-state={session.state}
+                    data-state={session.needsReview ? "attention" : session.state}
                     aria-hidden="true"
                   />
                   <span className="workspace-home__session-copy">
