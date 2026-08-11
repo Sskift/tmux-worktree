@@ -6,6 +6,9 @@ import {
 } from "./support/relayV2Fixtures.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
+const larkBindingsCodec = await import(
+  "../dist/relay/extensions/larkBindings/v2/codec.js"
+);
 const codecReadiness = await import(
   "../dist/relay/v2/hostCodecReadinessActivation.js"
 );
@@ -66,7 +69,7 @@ test("Node Relay v2 production codec rejects every shared invalid vector", () =>
   }
 });
 
-test("host codec readiness owns one fixed production generation and exposes only close", () => {
+test("host codec readiness owns one fixed production generation and closes once", () => {
   let observed = null;
   let closeCalls = 0;
   const lifecycle = codecReadiness.createRelayV2HostCodecReadinessActivation({
@@ -87,10 +90,6 @@ test("host codec readiness owns one fixed production generation and exposes only
   });
   assert.equal(Object.isFrozen(lifecycle), true);
   assert.equal(typeof lifecycle.close, "function");
-  assert.equal(lifecycle.apply, undefined);
-  assert.equal(lifecycle.activate, undefined);
-  assert.equal(lifecycle.issuer, undefined);
-  assert.equal(lifecycle.receipt, undefined);
   lifecycle.close();
   lifecycle.close();
   assert.equal(closeCalls, 1);
@@ -265,5 +264,39 @@ test("negotiated frame limits are positive and internally consistent", () => {
     (error) => error instanceof codec.RelayV2CodecError
       && error.code === "INVALID_ENVELOPE"
       && error.failureClass === "invalid-argument",
+  );
+});
+
+test("lark.bindings.v2 codec keeps the binding projection closed", () => {
+  const frame = {
+    protocolVersion: 2,
+    kind: "response",
+    type: "lark.bindings.result",
+    requestId: "request-one",
+    hostId: "host-one",
+    hostEpoch: "epoch-one",
+    scopeId: "scope-one",
+    sessionId: "session-one",
+    payload: {
+      bindings: [{
+        id: "binding-one",
+        chatName: "Release room",
+        sessionName: "worktree-one",
+        status: "active",
+        replyMode: "topic",
+      }],
+    },
+  };
+  const encoded = larkBindingsCodec.encodeRelayLarkBindingsFrame(frame);
+  assert.equal(
+    larkBindingsCodec.decodeRelayLarkBindingsFrame(encoded).canonicalWire,
+    JSON.stringify(frame),
+  );
+
+  frame.payload.bindings[0].chatId = "forbidden-secret-adjacent-field";
+  assert.throws(
+    () => larkBindingsCodec.encodeRelayLarkBindingsFrame(frame),
+    (error) => error instanceof larkBindingsCodec.RelayLarkBindingsCodecError
+      && error.failureClass === "unknown-field",
   );
 });

@@ -143,11 +143,14 @@ class CreationNavigationInstrumentedTest {
                 relaySessionDestinations(
                     uiState = uiState,
                     missingContent = { Text("Missing", Modifier.testTag("route_missing")) },
-                    sessionContent = { _, _, _ ->
+                    sessionContent = { _, _ ->
                         Text("Session", Modifier.testTag("route_session"))
                     },
                     terminalContent = { _, _ ->
                         Text("Terminal", Modifier.testTag("route_terminal"))
+                    },
+                    chatContent = { _, _ ->
+                        Text("Chat", Modifier.testTag("route_chat"))
                     },
                 )
             }
@@ -171,13 +174,7 @@ class CreationNavigationInstrumentedTest {
                 composable(V2Routes.NEW_TERMINAL) { Box(Modifier) }
                 composable(
                     route = V2Routes.SESSION,
-                    arguments = listOf(
-                        navArgument("sessionKey") { type = NavType.StringType },
-                        navArgument("focusReply") {
-                            type = NavType.BoolType
-                            defaultValue = false
-                        },
-                    ),
+                    arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
                 ) { Box(Modifier) }
                 composable(
                     route = V2Routes.TERMINAL,

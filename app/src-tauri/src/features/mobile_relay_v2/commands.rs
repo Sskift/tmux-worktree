@@ -234,7 +234,7 @@ impl MobileRelayV2ManagementCommandState {
         if operation == MobileRelayV2ManagementOperation::RefreshHost {
             self.artifacts.clear();
         }
-        let owner = self.owner.lock().unwrap();
+        let mut owner = self.owner.lock().unwrap();
         match &*owner {
             ManagementCommandOwner::Ready {
                 launch_key,
@@ -264,9 +264,21 @@ impl MobileRelayV2ManagementCommandState {
                     match projected {
                         Ok(result) => outcome.result = result,
                         Err(()) => {
-                            self.disposed.store(true, Ordering::Release);
-                            drop(owner);
-                            self.shutdown_and_drain();
+                            self.artifacts.clear();
+                            let previous = std::mem::replace(
+                                &mut *owner,
+                                ManagementCommandOwner::StartFailed(
+                                    ManagementStartError::ChannelClosed,
+                                ),
+                            );
+                            let cleanup = drain_command_owner(previous);
+                            *owner = ManagementCommandOwner::StartFailed(
+                                if cleanup == ManagementCleanupOutcome::RecoveryRequired {
+                                    ManagementStartError::RecoveryRequired
+                                } else {
+                                    ManagementStartError::ChannelClosed
+                                },
+                            );
                             return Err(channel_closed_error());
                         }
                     }
@@ -1050,7 +1062,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn projection_failure_fences_then_drains_without_recursively_locking_owner() {
+    fn projection_failure_drains_owner_without_fencing_explicit_recovery() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -1071,7 +1083,11 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let response = exchange["responseFrame"].as_str().unwrap().trim_end();
+        let mut response: serde_json::Value =
+            serde_json::from_str(exchange["responseFrame"].as_str().unwrap()).unwrap();
+        response["result"]["enrollment"]["review"]["enrollment"]["expiresAtMs"] =
+            serde_json::json!(8_000_000_000_000_u64);
+        let response = serde_json::to_string(&response).unwrap();
         assert!(!response.contains('\''));
         let script = format!(
             "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; IFS= read -r request; printf '%s\\n' '{response}'; while IFS= read -r request; do :; done"
@@ -1095,6 +1111,15 @@ mod tests {
             Err(channel_closed_error())
         );
         worker.join().unwrap();
+        assert!(!state.disposed.load(Ordering::Acquire));
+        assert!(matches!(
+            &*state.shutdown.lock().unwrap(),
+            ManagementShutdown::Live
+        ));
+        assert!(matches!(
+            &*state.owner.lock().unwrap(),
+            ManagementCommandOwner::StartFailed(ManagementStartError::ChannelClosed)
+        ));
         assert_eq!(
             state.call(MobileRelayV2ManagementOperation::Status),
             Err(channel_closed_error())

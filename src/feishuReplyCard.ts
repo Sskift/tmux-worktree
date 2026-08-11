@@ -31,6 +31,99 @@ function neutralizeCardMentions(value: string): string {
   return value.replace(/<\/?at\b/gi, (tag) => `<\u200b${tag.slice(1)}`);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function jsonObjectEnd(value: string, start: number): number | undefined {
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') quoted = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}" && --depth === 0) return index + 1;
+  }
+  return undefined;
+}
+
+function neutralizeStructuredCardMentions(value: unknown): unknown {
+  if (typeof value === "string") return neutralizeCardMentions(value);
+  if (Array.isArray(value)) return value.map(neutralizeStructuredCardMentions);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, neutralizeStructuredCardMentions(item)]),
+  );
+}
+
+const AGENT_CARD_ACTION_TAGS = new Set([
+  "button",
+  "checker",
+  "date_picker",
+  "form",
+  "input",
+  "multi_select_person",
+  "multi_select_static",
+  "overflow",
+  "picker_datetime",
+  "picker_time",
+  "select_img",
+  "select_person",
+  "select_static",
+]);
+
+function isReadOnlyCardValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.every(isReadOnlyCardValue);
+  if (!isRecord(value)) return true;
+  if ((typeof value.tag === "string" && AGENT_CARD_ACTION_TAGS.has(value.tag))
+    || Object.hasOwn(value, "behaviors")
+    || Object.hasOwn(value, "card_link")) return false;
+  return Object.values(value).every(isReadOnlyCardValue);
+}
+
+/** Extract a complete top-level Card 2.0 object from an Agent reply, including fenced JSON. */
+export function extractFeishuReplyCard(text: string): FeishuReplyCard | undefined {
+  const markers = [...text.matchAll(/"schema"\s*:\s*"2\.0"/g)];
+  for (const marker of markers) {
+    let start = text.lastIndexOf("{", marker.index);
+    while (start >= 0) {
+      const end = jsonObjectEnd(text, start);
+      if (end !== undefined && end > (marker.index ?? 0)) {
+        try {
+          const parsed = JSON.parse(text.slice(start, end)) as unknown;
+          if (isRecord(parsed)
+            && parsed.schema === "2.0"
+            && isRecord(parsed.body)
+            && Array.isArray(parsed.body.elements)
+            && parsed.body.elements.length > 0
+            && parsed.body.elements.length <= 200
+            && isReadOnlyCardValue(parsed)) {
+            const card = neutralizeStructuredCardMentions(parsed) as FeishuReplyCard;
+            const config = isRecord(card.config) ? card.config : {};
+            card.config = {
+              ...config,
+              update_multi: true,
+              streaming_mode: false,
+            };
+            return card;
+          }
+        } catch {
+          // Keep walking backwards: prose can contain an unrelated opening brace.
+        }
+      }
+      start = start === 0 ? -1 : text.lastIndexOf("{", start - 1);
+    }
+  }
+  return undefined;
+}
+
 function conciseCardContext(value: string): string {
   const normalized = value
     .replace(/[\u0000-\u001f\u007f]+/g, " ")
@@ -44,8 +137,8 @@ function conciseCardContext(value: string): string {
 
 /**
  * Build the final, non-streaming Card JSON 2.0 payload used by the Bridge.
- * Agent text is kept inside one markdown element and cannot create a real
- * Feishu <at> mention as a side effect.
+ * A complete read-only Agent card is preserved; other text is kept inside one
+ * markdown element. Neither path can create a real Feishu <at> mention.
  */
 export function buildFeishuReplyCard(
   text: string,
@@ -53,12 +146,16 @@ export function buildFeishuReplyCard(
   tone: FeishuReplyCardTone = "answer",
 ): FeishuReplyCard {
   const status = tone === "status";
+  if (!status) {
+    const structuredCard = extractFeishuReplyCard(text);
+    if (structuredCard) return structuredCard;
+  }
   const title = `tw agent on ${conciseCardContext(sessionName)}`;
   return {
     schema: "2.0",
     config: {
       update_multi: true,
-      compact_width: false,
+      width_mode: "default",
       enable_forward: true,
       streaming_mode: false,
       summary: { content: status ? "TW Agent 状态" : "TW Agent 回复" },
@@ -96,6 +193,10 @@ export function buildFeishuReplyCard(
 export function buildFeishuLocalTaskResultCard(
   input: FeishuLocalTaskResultCardInput,
 ): FeishuReplyCard {
+  if (!input.truncated) {
+    const structuredCard = extractFeishuReplyCard(input.text);
+    if (structuredCard) return structuredCard;
+  }
   const titleContext = input.sessionSummary?.trim() || input.sessionName;
   const elements: Record<string, unknown>[] = [{
     tag: "markdown",
@@ -119,7 +220,7 @@ export function buildFeishuLocalTaskResultCard(
     schema: "2.0",
     config: {
       update_multi: true,
-      compact_width: false,
+      width_mode: "default",
       enable_forward: true,
       streaming_mode: false,
       summary: { content: "TW Agent 回复" },
@@ -312,7 +413,7 @@ export function buildFeishuBindingLifecycleCard(
     schema: "2.0",
     config: {
       update_multi: true,
-      compact_width: false,
+      width_mode: "default",
       enable_forward: true,
       streaming_mode: false,
       summary: { content: presentation.summary },

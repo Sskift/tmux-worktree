@@ -253,7 +253,7 @@ function binding(input: {
 }
 
 const OWNER_KINDS = new Set([
-  "feishu", "dashboard", "local-cli", "relay-v1", "relay-v2", "tw-serve",
+  "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
 ]);
 
 function ownership(value: unknown): TerminalControlOwnershipView {

@@ -142,7 +142,6 @@ export class RelayV2BrokerClientUpgradeDispatchOwner {
     }
     const request = captureRelayV2BrokerUpgradeMetadata(metadata, "client");
     const upgrade = await dispatchRelayBrokerUpgrade(request, {
-      verifyLegacySecret: () => false,
       verifyV2AccessToken: (token, expectedRole) => {
         if (expectedRole !== "client") throw roleMismatch();
         return this.verifyV2AccessToken(token, expectedRole);

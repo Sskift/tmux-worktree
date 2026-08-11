@@ -197,7 +197,7 @@ function isCanonicalTimestamp(value: unknown): value is string {
 
 function isOwner(value: unknown): value is TerminalControlOwner {
   if (!isRecord(value) || !exactKeys(value, ["kind", "instanceId"])) return false;
-  return ["feishu", "dashboard", "local-cli", "relay-v1", "relay-v2", "tw-serve"].includes(String(value.kind))
+  return ["feishu", "dashboard", "local-cli", "relay-v2", "tw-serve"].includes(String(value.kind))
     && isStoredString(value.instanceId, 256);
 }
 
@@ -270,7 +270,7 @@ function isRecovery(value: unknown): value is TerminalControlRecoveryRecord {
   ].includes(String(value.reason))
     && isCanonicalTimestamp(value.since)
     && isStoredString(value.previousControlEpoch, 128)
-    && (value.previousOwnerKind === undefined || ["feishu", "dashboard", "local-cli", "relay-v1", "relay-v2", "tw-serve"].includes(String(value.previousOwnerKind)))
+    && (value.previousOwnerKind === undefined || ["feishu", "dashboard", "local-cli", "relay-v2", "tw-serve"].includes(String(value.previousOwnerKind)))
     && (value.operationId === undefined || isStoredString(value.operationId, 192));
 }
 

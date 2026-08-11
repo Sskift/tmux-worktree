@@ -359,25 +359,6 @@ export function normalizeMobileRelayV2EnrollmentReview(
   };
 }
 
-function parseV1Profile(value: unknown): Parsed<MobileRelayV2DashboardState["v1Profile"]> {
-  const input = record(value);
-  if (
-    !input
-    || !hasOwnFields(input, ["protocolVersion", "credentialKind", "sharedSecretConfigured"])
-    || input.protocolVersion !== 1
-    || input.credentialKind !== "legacy_shared_secret"
-    || typeof input.sharedSecretConfigured !== "boolean"
-  ) return { valid: false };
-  return {
-    valid: true,
-    value: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured: input.sharedSecretConfigured,
-    },
-  };
-}
-
 function parseAuthority(value: unknown): Parsed<MobileRelayV2DashboardState["authority"]> {
   const input = record(value);
   if (!input || !hasOwnFields(input, ["kind", "reason"])) return { valid: false };
@@ -576,16 +557,38 @@ function parseKnownClientGrant(
   return { valid: false };
 }
 
-function unavailableDashboardState(
-  sharedSecretConfigured: boolean,
-): MobileRelayV2DashboardState {
+function parseConnectedMobileDevices(
+  value: unknown,
+): Parsed<MobileRelayV2DashboardState["connectedMobileDevices"]> {
+  if (!Array.isArray(value) || value.length > 256) return { valid: false };
+  const grantIds = new Set<string>();
+  const devices: MobileRelayV2DashboardState["connectedMobileDevices"][number][] = [];
+  for (const candidate of value) {
+    const input = record(candidate);
+    const grantId = opaqueIdentifier(input?.grantId);
+    const clientInstanceId = opaqueIdentifier(input?.clientInstanceId);
+    if (!input
+      || input.status !== "connected"
+      || !grantId
+      || !clientInstanceId
+      || !Number.isSafeInteger(input.connectionCount)
+      || (input.connectionCount as number) <= 0
+      || (input.connectionCount as number) > 256
+      || grantIds.has(grantId)) return { valid: false };
+    grantIds.add(grantId);
+    devices.push({
+      status: "connected",
+      grantId,
+      clientInstanceId,
+      connectionCount: input.connectionCount as number,
+    });
+  }
+  return { valid: true, value: devices };
+}
+
+function unavailableDashboardState(): MobileRelayV2DashboardState {
   return {
     authority: { kind: "unavailable", reason: MALFORMED_STATUS_ERROR },
-    v1Profile: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured,
-    },
     hostCredential: {
       protocolVersion: 2,
       credentialKind: "twcap2_grant",
@@ -603,63 +606,61 @@ function unavailableDashboardState(
       retryable: false,
     },
     knownClientGrant: { status: "unknown" },
+    connectedMobileDevices: [],
   };
 }
 
 /**
  * Rebuild the renderer's closed, non-sensitive projection from untrusted
  * adapter output. Unknown fields are discarded; malformed known state clears
- * every cached v2 readiness signal while preserving a valid v1 configured bit.
+ * every cached v2 readiness signal.
  */
 export function normalizeMobileRelayV2DashboardState(
   state: unknown,
   nowMs = Date.now(),
 ): MobileRelayV2DashboardState {
   const input = record(state);
-  const v1Profile = parseV1Profile(input?.v1Profile);
-  const sharedSecretConfigured = v1Profile.valid
-    ? v1Profile.value.sharedSecretConfigured
-    : false;
   if (
     !input
     || !hasOwnFields(input, [
       "authority",
-      "v1Profile",
       "hostCredential",
       "connector",
       "enrollment",
       "knownClientGrant",
+      "connectedMobileDevices",
     ])
-    || !v1Profile.valid
-  ) return unavailableDashboardState(sharedSecretConfigured);
+  ) return unavailableDashboardState();
 
   const authority = parseAuthority(input.authority);
   const hostCredential = parseHostCredential(input.hostCredential);
   const connector = parseMobileRelayV2Connector(input.connector);
   const knownClientGrant = parseKnownClientGrant(input.knownClientGrant);
+  const connectedMobileDevices = parseConnectedMobileDevices(input.connectedMobileDevices);
   const observationTime = safeTimestamp(nowMs);
   if (
     !authority.valid
     || !hostCredential.valid
     || !connector.valid
     || !knownClientGrant.valid
+    || !connectedMobileDevices.valid
     || observationTime === null
-  ) return unavailableDashboardState(sharedSecretConfigured);
+  ) return unavailableDashboardState();
 
   const enrollment = parseEnrollment(
     input.enrollment,
     connector.value,
     observationTime,
   );
-  if (!enrollment.valid) return unavailableDashboardState(sharedSecretConfigured);
+  if (!enrollment.valid) return unavailableDashboardState();
 
   return {
     authority: authority.value,
-    v1Profile: v1Profile.value,
     hostCredential: hostCredential.value,
     connector: connector.value,
     enrollment: enrollment.value,
     knownClientGrant: knownClientGrant.value,
+    connectedMobileDevices: connectedMobileDevices.value,
   };
 }
 

@@ -67,7 +67,6 @@ class RelayV2Codec {
             return RelayV2DialectRejected("HOST_DIALECT_UNAVAILABLE")
         }
         if (
-            clientDialect == RelayV2ClientDialect.V2 &&
             !hostCapabilities.containsAll(requiredCapabilities)
         ) {
             return RelayV2DialectRejected("CAPABILITY_UNAVAILABLE")

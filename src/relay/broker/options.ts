@@ -4,12 +4,12 @@ import { isRelayV2AuthIdentifier } from "../v2/token.js";
 export type RelayServerOptions = {
   host: string;
   port: number;
-  secret: string;
   v2ProfilePath?: string;
   v2LocalDevelopment?: true;
   v2SingleNodeSelfHosted?: true;
   v2AgentTranscriptLifecycleV1?: true;
-  v2AgentChatV1?: true;
+  v2AgentChatV2?: true;
+  v2LarkBindingsV2?: true;
   v2LocalDevelopmentTlsKeyPath?: string;
   v2LocalDevelopmentTlsCertificatePath?: string;
   v2LocalDevelopmentAdvertisedOrigin?: string;
@@ -21,15 +21,14 @@ export type RelayServerOptions = {
 export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   let host = "0.0.0.0";
   let port = 8787;
-  let secret = "";
-  let secretFlag = false;
   let hostFlag = false;
   let portFlag = false;
   let v2ProfilePath: string | undefined;
   let v2LocalDevelopment = false;
   let v2SingleNodeSelfHosted = false;
   let v2AgentTranscriptLifecycleV1 = false;
-  let v2AgentChatV1 = false;
+  let v2AgentChatV2 = false;
+  let v2LarkBindingsV2 = false;
   let v2LocalDevelopmentTlsKeyPath: string | undefined;
   let v2LocalDevelopmentTlsCertificatePath: string | undefined;
   let v2LocalDevelopmentAdvertisedOrigin: string | undefined;
@@ -45,9 +44,6 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     } else if (arg === "--port") {
       port = Number(argv[++i] || port);
       portFlag = true;
-    } else if (arg === "--secret") {
-      secret = argv[++i] || "";
-      secretFlag = true;
     } else if (arg === "--v2-profile") {
       v2ProfilePath = argv[++i] || "";
     } else if (arg === "--v2-local-dev") {
@@ -69,11 +65,16 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         );
       }
       v2AgentTranscriptLifecycleV1 = true;
-    } else if (arg === "--v2-agent-chat-v1") {
-      if (v2AgentChatV1) {
-        throw new CliError("relay-server --v2-agent-chat-v1 只能指定一次");
+    } else if (arg === "--v2-agent-chat-v2") {
+      if (v2AgentChatV2) {
+        throw new CliError("relay-server --v2-agent-chat-v2 只能指定一次");
       }
-      v2AgentChatV1 = true;
+      v2AgentChatV2 = true;
+    } else if (arg === "--v2-lark-bindings-v2") {
+      if (v2LarkBindingsV2) {
+        throw new CliError("relay-server --v2-lark-bindings-v2 只能指定一次");
+      }
+      v2LarkBindingsV2 = true;
     } else if (arg === "--v2-dev-tls-key") {
       if (v2LocalDevelopmentTlsKeyPath !== undefined) {
         throw new CliError("relay-server --v2-dev-tls-key 只能指定一次");
@@ -131,9 +132,15 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
         + "只适用于 --v2-single-node-self-hosted",
     );
   }
-  if (v2AgentChatV1 && !v2SingleNodeSelfHosted) {
+  if (v2AgentChatV2 && !v2SingleNodeSelfHosted) {
     throw new CliError(
-      "relay-server --v2-agent-chat-v1 "
+      "relay-server --v2-agent-chat-v2 "
+        + "只适用于 --v2-single-node-self-hosted",
+    );
+  }
+  if (v2LarkBindingsV2 && !v2SingleNodeSelfHosted) {
+    throw new CliError(
+      "relay-server --v2-lark-bindings-v2 "
         + "只适用于 --v2-single-node-self-hosted",
     );
   }
@@ -141,9 +148,6 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   if (v2ProfilePath !== undefined) {
     if (v2ProfilePath === "") {
       throw new CliError("relay-server --v2-profile 需要非空 profile 路径");
-    }
-    if (secretFlag) {
-      throw new CliError("relay-server --v2-profile 不能与 --secret 同时使用");
     }
     if (hostFlag || portFlag) {
       throw new CliError("relay-server --v2-profile 的监听地址只来自 profile，不能与 --host/--port 同时使用");
@@ -175,16 +179,10 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     if (v2HostBootstrapOutputPath === "") {
       throw new CliError("relay-server --host-bootstrap-output 需要非空输出路径");
     }
-    // 显式 v2 profile 模式：监听/凭证/continuity 只来自 profile 与 trusted
-    // deployment source；v1 shared secret 在该模式下不被读取或使用（env
-    // TW_RELAY_SECRET 也不读取），也绝不回退 v1。
-    return { host, port, secret: "", v2ProfilePath, v2HostBootstrapOutputPath };
+    return { host, port, v2ProfilePath, v2HostBootstrapOutputPath };
   }
 
   if (v2LocalDevelopment) {
-    if (secretFlag) {
-      throw new CliError("relay-server --v2-local-dev 不能与 --secret 同时使用");
-    }
     if (hostFlag) {
       throw new CliError("relay-server --v2-local-dev 固定监听 127.0.0.1，不能指定 --host");
     }
@@ -215,7 +213,6 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     return {
       host: "127.0.0.1",
       port,
-      secret: "",
       v2LocalDevelopment: true,
       v2LocalDevelopmentTlsKeyPath,
       v2LocalDevelopmentTlsCertificatePath,
@@ -225,11 +222,6 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
   }
 
   if (v2SingleNodeSelfHosted) {
-    if (secretFlag) {
-      throw new CliError(
-        "relay-server --v2-single-node-self-hosted 不能与 --secret 同时使用",
-      );
-    }
     if (!hostFlag || !host) {
       throw new CliError(
         "relay-server --v2-single-node-self-hosted 需要显式 --host",
@@ -291,13 +283,15 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     return {
       host,
       port,
-      secret: "",
       v2SingleNodeSelfHosted: true,
       ...(v2AgentTranscriptLifecycleV1
         ? { v2AgentTranscriptLifecycleV1: true as const }
         : {}),
-      ...(v2AgentChatV1
-        ? { v2AgentChatV1: true as const }
+      ...(v2AgentChatV2
+        ? { v2AgentChatV2: true as const }
+        : {}),
+      ...(v2LarkBindingsV2
+        ? { v2LarkBindingsV2: true as const }
         : {}),
       v2LocalDevelopmentTlsKeyPath,
       v2LocalDevelopmentTlsCertificatePath,
@@ -338,26 +332,13 @@ export function parseRelayServerOptions(argv: string[]): RelayServerOptions {
     );
   }
 
-  // 仅 v1 分支读取 env：--secret 优先，缺省回落 TW_RELAY_SECRET。
-  if (!secretFlag) {
-    secret = process.env.TW_RELAY_SECRET || "";
-  }
-
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new CliError(`无效端口: ${port}`);
-  }
-  if (!secret) {
-    throw new CliError("relay-server 需要 --secret 或 TW_RELAY_SECRET，避免暴露未鉴权的终端转发服务");
-  }
-
-  return { host, port, secret };
+  throw new CliError("relay-server 必须显式选择 Relay v2 lane");
 }
 
 function printRelayServerHelp(): void {
   console.log(`tw relay-server — experimental remote relay
 
 用法:
-  TW_RELAY_SECRET=<secret> tw relay-server [--host 0.0.0.0] [--port 8787]
   tw relay-server --v2-profile <path> [--host-bootstrap-output <path>]
   tw relay-server --v2-local-dev --port <1-65535> --v2-dev-tls-key <path>
     --v2-dev-tls-cert <path> [--v2-dev-advertised-origin <https-origin>]
@@ -366,14 +347,17 @@ function printRelayServerHelp(): void {
     --port <1-65535> --v2-dev-advertised-origin <https-origin>
     --v2-dev-tls-key <path> --v2-dev-tls-cert <path>
     --v2-self-hosted-state-dir <path> [--host-bootstrap-output <path>]
+    [--v2-agent-transcript-lifecycle-v1] [--v2-agent-chat-v2]
+    [--v2-lark-bindings-v2]
 
 说明:
+  必须显式选择 Relay v2 lane；缺少 v2 配置会 fail closed。
   relay-server 跑在一台稳定可达的 broker 机器上，只负责转发已鉴权 host 和 client 的 WebSocket 消息。
   Dashboard 所在机器运行 tw relay-host 主动连接 relay，不需要把本机端口暴露到公网。
   --v2-profile 选择显式 default-off Relay v2 shipping：profile 只保存非敏感
   reference/path；TLS/issuer keyring/E0 material 只来自 trustedHome 下固定
   namespace 的 0600 私有 deployment 文件，缺失或 unsafe 时在监听前 fail
-  closed，绝不回退 v1。
+  closed。
   --v2-local-dev 是严格 loopback-only、进程内且不持久的本机开发 lane；
   要求显式非零端口并固定监听 127.0.0.1，复用 canonical v2
   shipping/composition，绝不构成 production qualification/readiness，也不
@@ -382,7 +366,7 @@ function printRelayServerHelp(): void {
   >=22.16 的单进程持久自托管 lane。它要求显式 listen host/port 与独立
   advertised HTTPS origin；唯一 0600 SQLite owner 持久化 credential、
   co-located continuity 与稳定 issuer keyring。该 continuity 不是 E0，
-  不产生 production qualification/readiness，且绝不回退 v1。
+  不产生 production qualification/readiness，配置不完整时 fail closed。
   self-hosted state dir 必须是现存 canonical、当前用户拥有的 exact 0700
   dedicated 目录；绑定 machine-id 与目录 identity，禁止复制目录、恢复旧
   快照、并行启动或修改 DB，且不提供 override/import/recovery。

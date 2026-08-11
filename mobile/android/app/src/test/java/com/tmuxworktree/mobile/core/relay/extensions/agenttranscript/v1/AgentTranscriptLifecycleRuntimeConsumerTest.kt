@@ -1333,7 +1333,6 @@ private fun compositionReadRequest(namespace: AgentTranscriptLifecycleDurableNam
     AgentTranscriptLifecycleReadRequest(
         selectedNamespace = namespace,
         access = AgentTranscriptLifecycleReadAccess(
-            dialect = AgentTranscriptLifecycleReadDialect.RELAY_V2,
             negotiatedCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
             support = AgentExtensionSupport.AVAILABLE,
             activeNamespace = namespace,

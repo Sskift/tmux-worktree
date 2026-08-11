@@ -8,6 +8,8 @@ import {
 import {
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
 } from "../extensions/agentTranscriptLifecycle/v1/codec.js";
+import { RELAY_AGENT_CHAT_CAPABILITY } from "../extensions/agentChat/v2/codec.js";
+import { RELAY_LARK_BINDINGS_CAPABILITY } from "../extensions/larkBindings/v2/codec.js";
 
 export const RELAY_V2_DASHBOARD_MANAGEMENT_PROTOCOL_V2_CONTRACT =
   "tmux-worktree-dashboard-relay-v2-management-ipc";
@@ -24,6 +26,8 @@ export const RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES = Object.freeze
 ] as const);
 export const RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES = Object.freeze([
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+  RELAY_AGENT_CHAT_CAPABILITY,
+  RELAY_LARK_BINDINGS_CAPABILITY,
 ] as const);
 export const RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES = Object.freeze([
   ...RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
@@ -170,12 +174,20 @@ export type RelayV2DashboardManagementKnownClientGrantProjection =
     }>
   | Readonly<{ status: "failed"; grantId: string; retryable: boolean }>;
 
+export type RelayV2DashboardManagementConnectedMobileDeviceProjection = Readonly<{
+  status: "connected";
+  grantId: string;
+  clientInstanceId: string;
+  connectionCount: number;
+}>;
+
 export interface RelayV2DashboardManagementProjection {
   authority: Readonly<{ kind: "node"; reason: null }>;
   hostCredential: RelayV2DashboardManagementHostCredentialProjection;
   connector: RelayV2DashboardManagementConnectorProjection;
   enrollment: RelayV2DashboardManagementEnrollmentProjection;
   knownClientGrant: RelayV2DashboardManagementKnownClientGrantProjection;
+  connectedMobileDevices: readonly RelayV2DashboardManagementConnectedMobileDeviceProjection[];
 }
 
 export type RelayV2DashboardManagementProtocolV2ErrorCode = keyof typeof ERROR_VALUES;
@@ -500,6 +512,28 @@ function validateKnownGrant(value: unknown): value is RelayV2DashboardManagement
     && typeof value.alreadyRevoked === "boolean";
 }
 
+function validateConnectedMobileDevices(
+  value: unknown,
+): value is readonly RelayV2DashboardManagementConnectedMobileDeviceProjection[] {
+  if (!Array.isArray(value) || value.length > 256) return false;
+  const grantIds = new Set<string>();
+  for (const candidate of value) {
+    if (!isObject(candidate)
+      || !hasExactKeys(candidate, [
+        "status", "grantId", "clientInstanceId", "connectionCount",
+      ])
+      || candidate.status !== "connected"
+      || !validOpaque(candidate.grantId, 128)
+      || !validOpaque(candidate.clientInstanceId, 128)
+      || !Number.isSafeInteger(candidate.connectionCount)
+      || (candidate.connectionCount as number) <= 0
+      || (candidate.connectionCount as number) > 256
+      || grantIds.has(candidate.grantId)) return false;
+    grantIds.add(candidate.grantId);
+  }
+  return true;
+}
+
 function validateProjection(
   value: unknown,
   operation: RelayV2DashboardManagementProtocolV2Operation,
@@ -510,6 +544,7 @@ function validateProjection(
     "connector",
     "enrollment",
     "knownClientGrant",
+    "connectedMobileDevices",
   ])
     || !isObject(value.authority)
     || !hasExactKeys(value.authority, ["kind", "reason"])
@@ -518,7 +553,8 @@ function validateProjection(
     || !validateHostCredential(value.hostCredential)
     || !validateConnector(value.connector)
     || !validateEnrollment(value.enrollment)
-    || !validateKnownGrant(value.knownClientGrant)) {
+    || !validateKnownGrant(value.knownClientGrant)
+    || !validateConnectedMobileDevices(value.connectedMobileDevices)) {
     return false;
   }
   if (value.connector.status === "registered"

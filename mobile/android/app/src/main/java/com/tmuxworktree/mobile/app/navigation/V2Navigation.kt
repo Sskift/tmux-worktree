@@ -8,12 +8,21 @@ import android.content.Context
 import android.net.Uri
 import android.util.Base64
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -25,9 +34,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.DesktopWindows
 import androidx.compose.material.icons.outlined.Devices
+import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -42,6 +54,7 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -69,11 +82,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavGraphBuilder
+import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -82,6 +97,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.tmuxworktree.mobile.BuildConfig
+import com.tmuxworktree.mobile.R
 import com.tmuxworktree.mobile.app.AgentCapabilityAvailability
 import com.tmuxworktree.mobile.app.CreationTarget
 import com.tmuxworktree.mobile.app.NewWorktreeRequest
@@ -120,9 +136,11 @@ import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
 import com.tmuxworktree.mobile.feature.chat.AgentChatScreen
 import com.tmuxworktree.mobile.feature.settings.SettingsScreen
+import com.tmuxworktree.mobile.feature.settings.LarkBindingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
 import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
 import com.tmuxworktree.mobile.navigation.RootDestination
+import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 import java.util.UUID
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -133,14 +151,14 @@ internal object V2Routes {
     const val WORKSPACES = "workspaces"
     const val SETTINGS = "settings"
     const val HEALTH = "health"
+    const val LARK_BINDINGS = "lark-bindings"
     const val NEW_WORKTREE = "new-worktree"
     const val NEW_TERMINAL = "new-terminal"
-    const val SESSION = "session/{sessionKey}?focusReply={focusReply}"
+    const val SESSION = "session/{sessionKey}"
     const val TERMINAL = "terminal/{sessionKey}"
     const val CHAT = "chat/{sessionKey}"
 
-    fun session(sessionId: String, focusReply: Boolean = false): String =
-        "session/${encodeRouteValue(sessionId)}?focusReply=$focusReply"
+    fun session(sessionId: String): String = "session/${encodeRouteValue(sessionId)}"
     fun terminal(sessionId: String): String = "terminal/${encodeRouteValue(sessionId)}"
     fun chat(sessionId: String): String = "chat/${encodeRouteValue(sessionId)}"
 }
@@ -161,19 +179,13 @@ internal fun NavHostController.navigateAfterCreation(
 internal fun NavGraphBuilder.relaySessionDestinations(
     uiState: StateFlow<V2UiState>,
     missingContent: @Composable () -> Unit,
-    sessionContent: @Composable (RelaySession, V2UiState, Boolean) -> Unit,
+    sessionContent: @Composable (RelaySession, V2UiState) -> Unit,
     terminalContent: @Composable (RelaySession, V2UiState) -> Unit,
     chatContent: @Composable (RelaySession, V2UiState) -> Unit,
 ) {
     composable(
         route = V2Routes.SESSION,
-        arguments = listOf(
-            navArgument("sessionKey") { type = NavType.StringType },
-            navArgument("focusReply") {
-                type = NavType.BoolType
-                defaultValue = false
-            },
-        ),
+        arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
     ) { entry ->
         val routeState by uiState.collectAsStateWithLifecycle()
         val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
@@ -181,11 +193,7 @@ internal fun NavGraphBuilder.relaySessionDestinations(
         if (session == null) {
             missingContent()
         } else {
-            sessionContent(
-                session,
-                routeState,
-                entry.arguments?.getBoolean("focusReply") ?: false,
-            )
+            sessionContent(session, routeState)
         }
     }
     composable(
@@ -231,7 +239,7 @@ internal fun V2Navigation(
         viewModel.effects.collect { effect ->
             when (effect) {
                 is V2UiEffect.NavigateToSession -> navController.navigateAfterCreation(
-                    destinationRoute = V2Routes.session(effect.sessionId),
+                    destinationRoute = V2Routes.chat(effect.sessionId),
                     formRoute = V2Routes.NEW_WORKTREE,
                 )
                 is V2UiEffect.NavigateToTerminal -> navController.navigateAfterCreation(
@@ -342,44 +350,13 @@ private fun PairingGate(
     val canReturn = state.paired && state.health.overall != ConnectionStatus.AUTH_REQUIRED
     if (canReturn) BackHandler { viewModel.dismissPairing() }
     PairingScreen(
-        relayUrl = state.pairingRelayUrl,
-        token = state.pairingToken,
         isConnecting = state.isConnecting,
-        relayUrlError = state.pairingRelayUrlError,
         error = state.pairingError,
-        onRelayUrlChange = viewModel::setPairingRelayUrl,
-        onTokenChange = viewModel::setPairingToken,
         onScanQr = onScanQr,
-        onConnect = viewModel::connectPairing,
         onManualRelayV2Enrollment = viewModel::offerManualRelayV2Enrollment,
         onBack = if (canReturn) ({ viewModel.dismissPairing() }) else null,
         onForgetPairing = if (state.paired) viewModel::forgetPairing else null,
     )
-    if (state.confirmProfileSwitch) {
-        AlertDialog(
-            onDismissRequest = viewModel::cancelProfileSwitch,
-            containerColor = TwSurface,
-            title = { Text("Switch paired computer?", color = TwTextPrimary) },
-            text = {
-                Text(
-                    "Cached sessions and unsent messages from the current pairing will be removed before connecting to the new relay.",
-                    color = TwTextSecondary,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = viewModel::confirmProfileSwitch,
-                    modifier = Modifier.testTag("confirm_profile_switch"),
-                ) { Text("Switch", color = TwError) }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = viewModel::cancelProfileSwitch,
-                    modifier = Modifier.testTag("cancel_profile_switch"),
-                ) { Text("Keep current pairing", color = TwAccent) }
-            },
-        )
-    }
 }
 
 @Composable
@@ -393,6 +370,8 @@ private fun MainNavigation(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val latestState by rememberUpdatedState(state)
+    val currentEntry by navController.currentBackStackEntryAsState()
+    val rootDestination = currentEntry?.destination?.route.toRootDestination()
     val navigateRoot: (RootDestination) -> Unit = { destination ->
         val route = destination.route()
         navController.navigate(route) {
@@ -406,6 +385,11 @@ private fun MainNavigation(
         drawerContent = {
             DeviceDrawer(
                 state = state,
+                selectedDestination = rootDestination,
+                onDestinationSelected = { destination ->
+                    scope.launch { drawerState.close() }
+                    navigateRoot(destination)
+                },
                 onRefresh = {
                     scope.launch { drawerState.close() }
                     viewModel.refresh()
@@ -421,11 +405,64 @@ private fun MainNavigation(
             )
         },
     ) {
-        NavHost(
-            navController = navController,
-            startDestination = V2Routes.INBOX,
-            modifier = Modifier.fillMaxSize(),
-        ) {
+        Scaffold(
+            containerColor = TwBackground,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
+            bottomBar = {
+                rootDestination?.let { selected ->
+                    TwRootBottomBar(
+                        selectedDestination = selected,
+                        attentionCount = state.attentionCount,
+                        onDestinationSelected = navigateRoot,
+                    )
+                }
+            },
+        ) { navigationPadding ->
+            NavHost(
+                navController = navController,
+                startDestination = V2Routes.INBOX,
+                modifier = Modifier.fillMaxSize().padding(navigationPadding),
+                enterTransition = {
+                    if (isRootTabTransition()) {
+                        EnterTransition.None
+                    } else {
+                        slideInHorizontally(
+                            animationSpec = tween(durationMillis = 220),
+                            initialOffsetX = { width -> width / 5 },
+                        )
+                    }
+                },
+                exitTransition = {
+                    if (isRootTabTransition()) {
+                        ExitTransition.None
+                    } else {
+                        slideOutHorizontally(
+                            animationSpec = tween(durationMillis = 220),
+                            targetOffsetX = { width -> -width / 5 },
+                        )
+                    }
+                },
+                popEnterTransition = {
+                    if (isRootTabTransition()) {
+                        EnterTransition.None
+                    } else {
+                        slideInHorizontally(
+                            animationSpec = tween(durationMillis = 200),
+                            initialOffsetX = { width -> -width / 5 },
+                        )
+                    }
+                },
+                popExitTransition = {
+                    if (isRootTabTransition()) {
+                        ExitTransition.None
+                    } else {
+                        slideOutHorizontally(
+                            animationSpec = tween(durationMillis = 200),
+                            targetOffsetX = { width -> width / 5 },
+                        )
+                    }
+                },
+            ) {
             composable(V2Routes.INBOX) {
                 val routeState = latestState
                 InboxScreen(
@@ -434,11 +471,8 @@ private fun MainNavigation(
                     nowMillis = rememberNowMillis(),
                     onMenuClick = { scope.launch { drawerState.open() } },
                     onConnectionStatusClick = { navController.navigate(V2Routes.HEALTH) },
-                    onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
-                    onReplyClick = { navController.navigate(V2Routes.session(it.stableId, focusReply = true)) },
-                    onBottomDestinationSelected = navigateRoot,
+                    onSessionClick = { navController.navigate(V2Routes.chat(it.stableId)) },
                     agentEvidenceAvailability = routeState.agentEvidenceAvailability,
-                    showBottomNavigation = navController.isCurrentDestination(V2Routes.INBOX),
                 )
             }
             composable(V2Routes.WORKSPACES) {
@@ -448,27 +482,25 @@ private fun MainNavigation(
                     scopes = routeState.scopes,
                     connectionStatus = routeState.health.overall,
                     selectedScopeId = routeState.selectedScopeId,
-                    attentionCount = routeState.attentionCount,
                     onConnectionStatusClick = { navController.navigate(V2Routes.HEALTH) },
                     onScopeSelected = viewModel::selectScope,
-                    onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
+                    onSessionClick = { navController.navigate(V2Routes.chat(it.stableId)) },
                     onTerminalClick = { navController.navigate(V2Routes.terminal(it.stableId)) },
                     onNewWorktreeClick = { navController.navigate(V2Routes.NEW_WORKTREE) },
                     onNewTerminalClick = { navController.navigate(V2Routes.NEW_TERMINAL) },
-                    onBottomDestinationSelected = navigateRoot,
                     activeHostId = routeState.activeHostId,
-                    showBottomNavigation = navController.isCurrentDestination(V2Routes.WORKSPACES),
+                    onMenuClick = { scope.launch { drawerState.open() } },
                 )
             }
             composable(V2Routes.SETTINGS) {
                 val routeState = latestState
+                val larkBindings by viewModel.larkBindings.collectAsStateWithLifecycle()
                 SettingsScreen(
                     connectionStatus = routeState.health.overall,
                     preferences = routeState.preferences,
                     pairedDeviceName = routeState.hosts.firstOrNull {
                         it.hostId == routeState.activeHostId
                     }?.displayName.orEmpty(),
-                    attentionCount = routeState.attentionCount,
                     versionName = BuildConfig.VERSION_NAME,
                     onHealthClick = { navController.navigate(V2Routes.HEALTH) },
                     onPairedDeviceClick = viewModel::showPairing,
@@ -478,10 +510,33 @@ private fun MainNavigation(
                     onCopyDiagnostics = {
                         copyText(context, "tmux-worktree diagnostics", viewModel.diagnostics())
                     },
-                    onBottomDestinationSelected = navigateRoot,
                     notificationsAvailable = routeState.agentCapabilityAvailability ==
                         AgentCapabilityAvailability.AVAILABLE,
-                    showBottomNavigation = navController.isCurrentDestination(V2Routes.SETTINGS),
+                    larkBindingsSummary = when {
+                        !larkBindings.available -> "Unavailable on this Mac"
+                        larkBindings.loading && larkBindings.bindings.isEmpty() -> "Checking…"
+                        larkBindings.error != null && larkBindings.bindings.isEmpty() ->
+                            "Needs attention"
+                        !larkBindings.loaded -> "Open to check"
+                        larkBindings.bindings.isEmpty() -> "No linked groups"
+                        larkBindings.bindings.size == 1 -> "1 linked group"
+                        else -> "${larkBindings.bindings.size} linked groups"
+                    },
+                    onLarkBindingsClick = {
+                        navController.navigate(V2Routes.LARK_BINDINGS)
+                    },
+                    onMenuClick = { scope.launch { drawerState.open() } },
+                )
+            }
+            composable(V2Routes.LARK_BINDINGS) {
+                val larkBindings by viewModel.larkBindings.collectAsStateWithLifecycle()
+                LaunchedEffect(Unit) { viewModel.refreshLarkBindings() }
+                LarkBindingsScreen(
+                    state = larkBindings,
+                    onBack = { navController.popBackStack() },
+                    onRefresh = viewModel::refreshLarkBindings,
+                    onReplyModeChange = viewModel::updateLarkBindingReplyMode,
+                    onUnlink = viewModel::unlinkLarkBinding,
                 )
             }
             composable(V2Routes.HEALTH) {
@@ -517,20 +572,13 @@ private fun MainNavigation(
                 missingContent = {
                     MissingSession(onBack = { navController.popBackStack() })
                 },
-                sessionContent = { session, routeState, focusReply ->
+                sessionContent = { session, routeState ->
                     SessionRoute(
                         session = session,
                         state = routeState,
                         viewModel = viewModel,
                         onBack = { navController.popBackStack() },
                         onHealth = { navController.navigate(V2Routes.HEALTH) },
-                        onTerminal = {
-                            navController.navigate(V2Routes.terminal(session.stableId))
-                        },
-                        onChat = {
-                            navController.navigate(V2Routes.chat(session.stableId))
-                        },
-                        autoFocusReply = focusReply,
                     )
                 },
                 terminalContent = { session, routeState ->
@@ -549,22 +597,25 @@ private fun MainNavigation(
                         state = routeState,
                         viewModel = viewModel,
                         onBack = { navController.popBackStack() },
+                        onDetails = {
+                            navController.navigate(V2Routes.session(session.stableId))
+                        },
+                        onTerminal = {
+                            navController.navigate(V2Routes.terminal(session.stableId))
+                        },
                     )
                 },
             )
+            }
         }
     }
 }
 
 @Composable
-private fun NavHostController.isCurrentDestination(route: String): Boolean {
-    val currentEntry by currentBackStackEntryAsState()
-    return currentEntry?.destination?.route == route
-}
-
-@Composable
 private fun DeviceDrawer(
     state: V2UiState,
+    selectedDestination: RootDestination?,
+    onDestinationSelected: (RootDestination) -> Unit,
     onRefresh: () -> Unit,
     onHostSelected: (String) -> Unit,
     onPairing: () -> Unit,
@@ -578,19 +629,57 @@ private fun DeviceDrawer(
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState()),
         ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 28.dp)) {
-            Text("tw-dashboard", color = TwTextPrimary, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(6.dp))
-            Text(
-                state.hosts.firstOrNull { it.hostId == state.activeHostId }?.displayName
-                    ?: state.activeHostId.ifBlank { "Paired computer" },
-                color = TwTextSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Image(
+                painter = painterResource(R.drawable.tw_dashboard_logo),
+                contentDescription = null,
+                modifier = Modifier.size(56.dp),
             )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text("tw-dashboard", color = TwTextPrimary, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    state.hosts.firstOrNull { it.hostId == state.activeHostId }?.displayName
+                        ?: state.activeHostId.ifBlank { "Paired computer" },
+                    color = TwTextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         HorizontalDivider(color = TwBorder)
-        if (state.hosts.size > 1) {
+        Text(
+            text = "Navigate",
+            color = TwTextSecondary,
+            style = androidx.compose.material3.MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(start = 28.dp, top = 14.dp, end = 20.dp, bottom = 6.dp),
+        )
+        RootDestination.entries.forEach { destination ->
+            NavigationDrawerItem(
+                label = { Text(destination.label) },
+                selected = destination == selectedDestination,
+                onClick = { onDestinationSelected(destination) },
+                icon = {
+                    Icon(
+                        imageVector = when (destination) {
+                            RootDestination.INBOX -> Icons.Outlined.Inbox
+                            RootDestination.WORKSPACES -> Icons.Outlined.DesktopWindows
+                            RootDestination.SETTINGS -> Icons.Outlined.Settings
+                        },
+                        contentDescription = null,
+                    )
+                },
+                modifier = Modifier
+                    .padding(horizontal = 12.dp)
+                    .testTag("drawer_nav_${destination.name.lowercase()}"),
+            )
+        }
+        HorizontalDivider(color = TwBorder, modifier = Modifier.padding(vertical = 10.dp))
+        if (state.hosts.isNotEmpty()) {
             Text(
                 text = "Computers",
                 color = TwTextSecondary,
@@ -599,7 +688,13 @@ private fun DeviceDrawer(
             )
             state.hosts.forEach { host ->
                 NavigationDrawerItem(
-                    label = { Text(host.displayName) },
+                    label = {
+                        Text(
+                            text = host.displayName,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                     selected = host.hostId == state.activeHostId,
                     onClick = { onHostSelected(host.hostId) },
                     icon = { Icon(Icons.Outlined.Devices, null) },
@@ -636,9 +731,6 @@ private fun SessionRoute(
     viewModel: V2ViewModel,
     onBack: () -> Unit,
     onHealth: () -> Unit,
-    onTerminal: () -> Unit,
-    onChat: () -> Unit,
-    autoFocusReply: Boolean,
 ) {
     val timelineFlow = remember(
         session.stableId,
@@ -659,7 +751,7 @@ private fun SessionRoute(
                     state.demoMode -> AgentEvidenceAvailability.AVAILABLE
                     state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 ->
                         AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
-                    else -> AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED
+                    else -> AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
                 },
             ),
         )
@@ -672,20 +764,13 @@ private fun SessionRoute(
         session = session,
         connectionStatus = state.health.overall,
         timelineState = timelineState,
-        draft = state.drafts[session.stableId].orEmpty(),
         nowMillis = rememberNowMillis(),
-        onDraftChange = { viewModel.updateDraft(session.stableId, it) },
         onBack = onBack,
         onConnectionStatusClick = onHealth,
-        onOpenTerminal = onTerminal,
         onOverflowClick = { showActions = true },
-        onSend = { viewModel.sendMessage(session, it) },
-        autoFocusReply = autoFocusReply,
         agentStateAvailable =
             state.agentCapabilityAvailability == AgentCapabilityAvailability.AVAILABLE,
-        onCancelMessage = viewModel::cancelMessage,
-        agentChatAvailable = state.agentChatAvailable(session),
-        onOpenChat = onChat,
+        onCancelMessage = {},
     )
 
     if (showActions) {
@@ -990,7 +1075,7 @@ private fun TerminalRoute(
         onDispose {
             // Relay v2 WebView disposal owns the exact parser-generation fence and detach receipt.
             // Calling the route close owner in parallel could steal that attachment before its
-            // held parser false is allowed to settle. Relay v1 keeps its existing close path.
+            // held parser false is allowed to settle.
             if (currentRelayAdmission.value != RelayStartupAdmissionState.RELAY_V2) {
                 viewModel.closeTerminal(attachmentId)
             }
@@ -1052,6 +1137,8 @@ private fun ChatRoute(
     state: V2UiState,
     viewModel: V2ViewModel,
     onBack: () -> Unit,
+    onDetails: () -> Unit,
+    onTerminal: () -> Unit,
 ) {
     val chatState by viewModel.agentChat.collectAsStateWithLifecycle()
     var draft by rememberSaveable(session.stableId) { mutableStateOf("") }
@@ -1067,6 +1154,8 @@ private fun ChatRoute(
         draft = draft,
         onDraftChange = { draft = it },
         onBack = onBack,
+        onOpenDetails = onDetails,
+        onOpenTerminal = onTerminal,
         onSend = { message ->
             viewModel.sendAgentChatMessage(session, message)
             draft = ""
@@ -1111,6 +1200,17 @@ private fun RootDestination.route(): String = when (this) {
     RootDestination.WORKSPACES -> V2Routes.WORKSPACES
     RootDestination.SETTINGS -> V2Routes.SETTINGS
 }
+
+private fun String?.toRootDestination(): RootDestination? = when (this) {
+    V2Routes.INBOX -> RootDestination.INBOX
+    V2Routes.WORKSPACES -> RootDestination.WORKSPACES
+    V2Routes.SETTINGS -> RootDestination.SETTINGS
+    else -> null
+}
+
+private fun AnimatedContentTransitionScope<NavBackStackEntry>.isRootTabTransition(): Boolean =
+    initialState.destination.route.toRootDestination() != null &&
+        targetState.destination.route.toRootDestination() != null
 
 private fun encodeRouteValue(value: String): String = Base64.encodeToString(
     value.toByteArray(Charsets.UTF_8),

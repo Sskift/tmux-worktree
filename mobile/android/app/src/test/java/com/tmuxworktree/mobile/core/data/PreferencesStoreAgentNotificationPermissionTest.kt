@@ -27,7 +27,6 @@ class PreferencesStoreAgentNotificationPermissionTest {
                 withStore(file) { store ->
                     assertTrue(store.claimAutomaticAgentNotificationPermissionOffer())
                     assertFalse(store.claimAutomaticAgentNotificationPermissionOffer())
-                    store.clearProfile()
                 }
                 withStore(file) { reopened ->
                     assertFalse(reopened.claimAutomaticAgentNotificationPermissionOffer())

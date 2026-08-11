@@ -136,7 +136,6 @@
     "runningNotifies": false
   },
   "boundaries": {
-    "relayV1Unchanged": true,
     "relayV2BaseContractUnchanged": true,
     "baseCommandLedgerIndependent": true,
     "terminalTranscriptExcluded": true,
@@ -157,7 +156,6 @@
   "files": [
     { "kind": "wire-golden", "path": "golden-frames.json" },
     { "kind": "wire-invalid", "path": "invalid-frames.json" },
-    { "kind": "authority-machine", "path": "authority-machine-cases.json" },
     { "kind": "client-machine", "path": "client-machine-cases.json" }
   ],
   "requiredInvalidCategories": [

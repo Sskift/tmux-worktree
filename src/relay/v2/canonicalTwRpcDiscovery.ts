@@ -6,9 +6,6 @@ import {
 } from "../../rpcV2.js";
 import { normalizeManagedSessionReservationCorrelation } from "../../state.js";
 import {
-  RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX,
-} from "../../session.js";
-import {
   issueRelayV2CanonicalBackendInstanceKey,
 } from "./canonicalBackendIdentity.js";
 import { RELAY_V2_MATERIALIZED_CAPACITY } from "./resourceState.js";
@@ -32,7 +29,11 @@ export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SCOPES = Math.floor(
 /** Per-response input hard limit; independent of the remaining H2 record budget. */
 export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE =
   RELAY_V2_MATERIALIZED_CAPACITY.maxSnapshotRecords;
-export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS = 5_000;
+// GSSAPI-backed configured Hosts commonly need more than five seconds for a
+// fresh SSH handshake even on a healthy private network. Keep the query
+// bounded, but leave enough room for capabilities followed by list to reach
+// the canonical remote CLI without misclassifying it as unreachable.
+export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS = 15_000;
 
 export type RelayV2CanonicalTwRpcDiscoveryCommand = "capabilities" | "list";
 
@@ -158,19 +159,7 @@ export function projectRelayV2CanonicalTwRpcDiscoveredSession(
     || session.baseBranch !== null) {
     throw new TypeError("canonical TW RPC terminal Session has worktree fields");
   }
-  // A legacy v1-era session has no real capacity reservation: the migration
-  // (markRelayV2HostLegacySessionsLifecycleV1) invents a well-formed correlation
-  // in the reserved tw-migrate-legacy-v1: namespace as an opaque provenance
-  // marker. It never corresponds to a real reservation, so it must not
-  // participate in reservation-correlation authority. Strip it here before the
-  // materialized reconcile's scanAuthorityConflict sees it (otherwise every
-  // migrated session fails as "unknown reservation correlation"). The full
-  // namespace is matched with its trailing ":" so a legitimate reservationId
-  // that merely starts with the prefix is never mis-filtered.
   const reservationCorrelation = session.reservationCorrelation === null
-    || session.reservationCorrelation.reservationId.startsWith(
-      `${RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX}:`,
-    )
     ? null
     : clone(session.reservationCorrelation) as RelayV2DiscoveredReservationCorrelation;
   return {
@@ -178,6 +167,7 @@ export function projectRelayV2CanonicalTwRpcDiscoveredSession(
       processTarget: input.processTarget,
       incarnation: session.incarnation,
     }),
+    managedIncarnation: session.incarnation,
     kind: session.kind,
     displayName,
     state: "running",
@@ -320,7 +310,7 @@ function parseSession(value: unknown): RpcV2Session {
   if ((value.kind !== "worktree" && value.kind !== "terminal")
     || (value.profile !== "cli" && value.profile !== "dashboard")
     || typeof value.attached !== "boolean"
-    || typeof value.lifecycleMarked !== "boolean") {
+    || value.lifecycleMarked !== true) {
     throw new TypeError("invalid canonical TW RPC v2 Session response fields");
   }
   const createdAt = boundedString(value.createdAt, "createdAt", 64);
@@ -349,7 +339,7 @@ function parseSession(value: unknown): RpcV2Session {
     created: nonNegativeSafeInteger(value.created, "created"),
     activity: nonNegativeSafeInteger(value.activity, "activity"),
     incarnation,
-    lifecycleMarked: value.lifecycleMarked,
+    lifecycleMarked: true,
     reservationCorrelation: value.reservationCorrelation === null
       ? null
       : normalizeManagedSessionReservationCorrelation(value.reservationCorrelation),
@@ -713,18 +703,10 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
     }
     try {
       const response = parseListResponse(listResult.value);
-      // rpc-v2 list deliberately preserves readable legacy records without a
-      // synthesized lifecycle marker. The canonical H2 projection is the
-      // authority boundary that excludes them: every row is still parsed
-      // strictly above, but only lifecycle-marked Sessions may receive Relay
-      // identity, exact mutation targets, or terminal authority.
-      const authoritativeSessions = response.sessions.filter(
-        (session) => session.lifecycleMarked,
-      );
-      if (authoritativeSessions.length > maxSessions) {
-        throw new TypeError("canonical TW RPC v2 authoritative Session budget exceeded");
+      if (response.sessions.length > maxSessions) {
+        throw new TypeError("canonical TW RPC v2 Session budget exceeded");
       }
-      const sessions = authoritativeSessions.map((session) => (
+      const sessions = response.sessions.map((session) => (
         projectRelayV2CanonicalTwRpcDiscoveredSession({
           processTarget: scope.processTarget,
           session,
@@ -757,7 +739,7 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
           processTarget: { ...scope.processTarget },
           capabilities: [...capabilities.capabilities],
         },
-        sessionTargets: authoritativeSessions.map((session) => ({
+        sessionTargets: response.sessions.map((session) => ({
           scopeBackendIdentity: scope.backendIdentity,
           sessionBackendIdentity: issueRelayV2CanonicalBackendInstanceKey({
             processTarget: scope.processTarget,

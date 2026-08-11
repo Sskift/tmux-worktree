@@ -1,6 +1,5 @@
 import {
   MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
-  type MobileRelayV1SharedSecretProfile,
   type MobileRelayV2DashboardState,
   type MobileRelayV2EnrollmentReview,
   type MobileRelayV2OperationFailure,
@@ -17,14 +16,12 @@ import {
 export const RELAY_V2_REQUIRED_CAPABILITIES = MOBILE_RELAY_V2_REQUIRED_CAPABILITIES;
 
 export type RelayV2RequiredCapability = MobileRelayV2RequiredCapability;
-export type RelayV1SharedSecretProfile = MobileRelayV1SharedSecretProfile;
 export type RelayV2EnrollmentReview = MobileRelayV2EnrollmentReview;
 export type RelayV2EnrollmentState = MobileRelayV2DashboardState;
 
 export type RelayV2EnrollmentEvent =
   | { type: "backendStateObserved"; state: RelayV2EnrollmentState }
   | { type: "backendObservationFailed"; failure: MobileRelayV2OperationFailure }
-  | { type: "v1ProfileObserved"; sharedSecretConfigured: boolean }
   | { type: "v2CredentialReferenceObserved"; credentialReference: string | null }
   | { type: "hostCredentialOperationStarted"; operation: "bootstrap" | "refresh" }
   | { type: "hostCredentialOperationFailed"; error: string; retryable?: boolean }
@@ -43,14 +40,7 @@ export type RelayV2EnrollmentEvent =
       retryable?: boolean;
     }
   | { type: "enrollmentCleared" }
-  | { type: "clientGrantObserved"; grantId: string }
   | { type: "clientGrantRevokeStarted"; grantId: string }
-  | {
-      type: "clientGrantRevoked";
-      grantId: string;
-      revokedAtMs: number;
-      alreadyRevoked: boolean;
-    }
   | { type: "clientGrantRevokeFailed"; grantId: string; error: string; retryable?: boolean };
 
 export interface RelayV2EnrollmentView {
@@ -60,15 +50,12 @@ export interface RelayV2EnrollmentView {
   missingCapabilities: readonly RelayV2RequiredCapability[];
   readinessLabel: string;
   readinessDetail: string;
-  v1CredentialLabel: string;
   v2CredentialLabel: string;
   hostCredentialAction: "bootstrap" | "refresh" | null;
   connectorAction: "start" | "stop" | "restart" | null;
   enrollmentAction: "create" | "retry" | "rebuild" | null;
   enrollmentActionDisabled: boolean;
   enrollmentActionLabel: string;
-  grantRevokeDisabled: boolean;
-  grantRevokeLabel: string;
   error: string | null;
   review: RelayV2EnrollmentReview | null;
   qrArtifact: RelayV2EnrollmentReview["renderArtifact"] | null;
@@ -77,18 +64,11 @@ export interface RelayV2EnrollmentView {
 const NOT_READY_ERROR =
   "Relay v2 enrollment requires host.registered and all six required capabilities.";
 
-export function createRelayV2EnrollmentState(
-  sharedSecretConfigured = false,
-): RelayV2EnrollmentState {
+export function createRelayV2EnrollmentState(): RelayV2EnrollmentState {
   return {
     authority: {
       kind: "unavailable",
       reason: "Relay v2 backend authority has not been observed.",
-    },
-    v1Profile: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured,
     },
     hostCredential: {
       protocolVersion: 2,
@@ -111,6 +91,7 @@ export function createRelayV2EnrollmentState(
     },
     enrollment: { status: "idle" },
     knownClientGrant: { status: "unknown" },
+    connectedMobileDevices: [],
   };
 }
 
@@ -165,14 +146,6 @@ export function relayV2EnrollmentReducer(
         },
       };
     }
-    case "v1ProfileObserved":
-      return {
-        ...state,
-        v1Profile: {
-          ...state.v1Profile,
-          sharedSecretConfigured: event.sharedSecretConfigured,
-        },
-      };
     case "v2CredentialReferenceObserved":
       return normalizeMobileRelayV2DashboardState({
         ...state,
@@ -354,8 +327,6 @@ export function relayV2EnrollmentReducer(
       };
     case "enrollmentCleared":
       return { ...state, enrollment: { status: "idle" } };
-    case "clientGrantObserved":
-      return { ...state, knownClientGrant: { status: "active", grantId: event.grantId } };
     case "clientGrantRevokeStarted":
       if (
         state.knownClientGrant.status === "revoking"
@@ -364,16 +335,6 @@ export function relayV2EnrollmentReducer(
       return {
         ...state,
         knownClientGrant: { status: "revoking", grantId: event.grantId },
-      };
-    case "clientGrantRevoked":
-      return {
-        ...state,
-        knownClientGrant: {
-          status: "revoked",
-          grantId: event.grantId,
-          revokedAtMs: event.revokedAtMs,
-          alreadyRevoked: event.alreadyRevoked,
-        },
       };
     case "clientGrantRevokeFailed":
       return {
@@ -477,9 +438,6 @@ export function deriveRelayV2EnrollmentView(
     missingCapabilities,
     readinessLabel,
     readinessDetail,
-    v1CredentialLabel: normalizedState.v1Profile.sharedSecretConfigured
-      ? "Relay v1 shared secret configured"
-      : "Relay v1 shared secret not configured",
     v2CredentialLabel: `Relay v2 host credential ${normalizedState.hostCredential.status}`,
     hostCredentialAction: !adapterAvailable
       || normalizedState.hostCredential.status === "bootstrapping"
@@ -503,22 +461,8 @@ export function deriveRelayV2EnrollmentView(
     enrollmentAction,
     enrollmentActionDisabled: enrollmentAction === null,
     enrollmentActionLabel,
-    grantRevokeDisabled: !adapterAvailable || !(
-      normalizedState.knownClientGrant.status === "active"
-      || (
-        normalizedState.knownClientGrant.status === "failed"
-        && normalizedState.knownClientGrant.retryable
-      )
-    ),
-    grantRevokeLabel: normalizedState.knownClientGrant.status === "failed"
-      ? normalizedState.knownClientGrant.retryable
-        ? "Retry client grant revoke"
-        : "Client grant revoke failed — reconfigure Relay v2"
-      : normalizedState.knownClientGrant.status === "revoking"
-        ? "Revoking client grant"
-        : "Revoke known client grant",
     error: errors.length > 0
-      ? `${errors[0]} Relay v1 remains unchanged; no fallback was attempted.`
+      ? `${errors[0]} The Relay v2 operation failed closed.`
       : null,
     review,
     qrArtifact,

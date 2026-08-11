@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.feature.chat
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,14 +20,15 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
-import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.Send
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -57,9 +59,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatContentPart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
 import com.tmuxworktree.mobile.core.relay.runtime.PendingChatSend
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
-import com.tmuxworktree.mobile.core.relay.v1.AgentChatTurnView
 import com.tmuxworktree.mobile.designsystem.TwAccent
 import com.tmuxworktree.mobile.designsystem.TwAccentPressed
 import com.tmuxworktree.mobile.designsystem.TwBackground
@@ -80,13 +83,41 @@ fun AgentChatScreen(
     draft: String,
     onDraftChange: (String) -> Unit,
     onBack: () -> Unit,
+    onOpenDetails: () -> Unit,
+    onOpenTerminal: () -> Unit,
     onSend: (String) -> Unit,
     onRetryFailed: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val turns = chatState.turns(session.name)
-    val pending = chatState.pending(session.name)
+    val turns = chatState.turns(session.protocolSessionId)
+    val pending = chatState.pending(session.protocolSessionId)
     val hasWorkingTurn = turns.any { it.status == "working" }
+    val listState = rememberLazyListState()
+    val isUserDragging by listState.interactionSource.collectIsDraggedAsState()
+    var followTail by remember(session.protocolSessionId) { mutableStateOf(true) }
+    var userScrollInProgress by remember(session.protocolSessionId) { mutableStateOf(false) }
+    val tailIndex = turns.size + pending.size + if (hasWorkingTurn) 1 else 0
+
+    LaunchedEffect(isUserDragging, listState.isScrollInProgress) {
+        when {
+            isUserDragging -> {
+                userScrollInProgress = true
+                followTail = false
+            }
+            userScrollInProgress && !listState.isScrollInProgress -> {
+                followTail = !listState.canScrollForward
+                userScrollInProgress = false
+            }
+        }
+    }
+    LaunchedEffect(
+        session.protocolSessionId,
+        turns,
+        pending,
+        followTail,
+    ) {
+        if (followTail) listState.scrollToItem(tailIndex)
+    }
 
     Scaffold(
         modifier = modifier
@@ -98,6 +129,8 @@ fun AgentChatScreen(
                 sessionTitle = session.title,
                 connectionStatus = connectionStatus,
                 onBack = onBack,
+                onOpenDetails = onOpenDetails,
+                onOpenTerminal = onOpenTerminal,
             )
         },
         bottomBar = {
@@ -110,6 +143,7 @@ fun AgentChatScreen(
         },
     ) { innerPadding ->
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
@@ -125,7 +159,7 @@ fun AgentChatScreen(
                 items = turns,
                 key = { it.turnId },
             ) { turn ->
-                TurnBubble(turn = turn)
+                TurnBubble(turn = turn, chatState = chatState)
             }
             items(
                 items = pending,
@@ -141,6 +175,9 @@ fun AgentChatScreen(
                     TypingIndicator()
                 }
             }
+            item(key = "chat_tail") {
+                Spacer(Modifier.height(1.dp))
+            }
         }
     }
 }
@@ -150,6 +187,8 @@ private fun ChatTopBar(
     sessionTitle: String,
     connectionStatus: ConnectionStatus,
     onBack: () -> Unit,
+    onOpenDetails: () -> Unit,
+    onOpenTerminal: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -189,12 +228,38 @@ private fun ChatTopBar(
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+        IconButton(
+            onClick = onOpenDetails,
+            modifier = Modifier
+                .size(48.dp)
+                .testTag("chat_details"),
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Info,
+                contentDescription = "Session details",
+                tint = TwTextSecondary,
+                modifier = Modifier.size(24.dp),
+            )
+        }
+        IconButton(
+            onClick = onOpenTerminal,
+            modifier = Modifier
+                .size(48.dp)
+                .testTag("chat_terminal"),
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Terminal,
+                contentDescription = "Open terminal",
+                tint = TwAccent,
+                modifier = Modifier.size(24.dp),
+            )
+        }
     }
     HorizontalDivider(color = TwBorder, thickness = 1.dp)
 }
 
 @Composable
-private fun TurnBubble(turn: AgentChatTurnView) {
+private fun TurnBubble(turn: AgentChatTurnView, chatState: RelayChatState) {
     val isFailed = turn.status == "failed" || turn.status == "recovery-required"
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -237,14 +302,14 @@ private fun TurnBubble(turn: AgentChatTurnView) {
                     status = turn.status,
                 )
             }
-        } else if (turn.reply != null) {
+        } else if (turn.content.isNotEmpty()) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 8.dp),
                 horizontalArrangement = Arrangement.Start,
             ) {
-                AgentBubble(text = turn.reply)
+                AgentBubble(content = turn.content, chatState = chatState)
             }
         }
     }
@@ -267,16 +332,15 @@ private fun UserBubble(text: String) {
 }
 
 @Composable
-private fun AgentBubble(text: String) {
+private fun AgentBubble(content: List<AgentChatContentPart>, chatState: RelayChatState) {
     Surface(
         shape = RoundedCornerShape(18.dp, 18.dp, 18.dp, 4.dp),
         color = TwSurfaceRaised,
         modifier = Modifier.testTag("agent_bubble"),
     ) {
-        Text(
-            text = text,
-            color = TwTextPrimary,
-            style = MaterialTheme.typography.bodyLarge,
+        AgentRichContent(
+            content = content,
+            chatState = chatState,
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
         )
     }

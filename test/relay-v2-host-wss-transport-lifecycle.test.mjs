@@ -440,7 +440,6 @@ function actor(authority, admission, statuses = []) {
     },
     advertisedCapabilities: [],
     clientDialects: ["tw-relay.v2"],
-    dialectAdapters: Object.freeze({}),
     idFactory: () => "host-hello-one",
     onStatus: (status) => statuses.push(structuredClone(status)),
   });
@@ -581,7 +580,7 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
   assert.equal(socket.request.destroyCalls, 0);
   assert.equal(socket.construction.address.includes("?"), false);
   assert.equal(socket.construction.address.includes("#"), false);
-  assert.equal(socket.construction.protocols.includes("tw-relay.host.v1"), false);
+  assert.equal(socket.construction.protocols.includes("tw-relay.host.unsupported"), false);
 
   socket.emitOpen();
   assert.equal(socket.writes.length, 1);
@@ -1251,7 +1250,7 @@ test("stale, revoked, replayed, copied, and foreign admissions fail before WSS o
 
 test("text carrier, subprotocol, extension, and frame limits fail closed without fallback", async (t) => {
   for (const scenario of [
-    { name: "selected subprotocol", protocol: "tw-relay.host.v1", extensions: "" },
+    { name: "selected subprotocol", protocol: "tw-relay.host.unsupported", extensions: "" },
     { name: "negotiated extension", protocol: "tw-relay.host.v2", extensions: "permessage-deflate" },
   ]) {
     await t.test(scenario.name, async () => {
@@ -1464,7 +1463,6 @@ test("an actor.connect failure explicitly drains the exact unbound lifecycle", a
           },
           advertisedCapabilities: [],
           clientDialects: ["tw-relay.v2"],
-          dialectAdapters: Object.freeze({}),
           idFactory() {
             throw new Error("injected non-sensitive host.hello id failure");
           },

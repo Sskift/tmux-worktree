@@ -6,14 +6,14 @@ export default defineConfig({
     "src/canonicalWorktreePlacement.ts",
     "src/automation.ts",
     "src/hosts.ts",
-    "src/rpc.ts",
     "src/rpcV2.ts",
     "src/createTargetObservationV1.ts",
     "src/session.ts",
     "src/state.ts",
+    "src/twDashboardBootstrap.ts",
+    "src/twDashboardCli.ts",
     "src/relayHost.ts",
     "src/relayServer.ts",
-    "src/relay/agentChat.ts",
     "src/relay/broker/options.ts",
     "src/relay/broker/hostBootstrapOutput.ts",
     "src/relay/v2/hostCarrier.ts",
@@ -116,9 +116,10 @@ export default defineConfig({
     "src/relay/v2/terminalControlExactTargetAuthorityAdapter.ts",
     "src/relay/v2/terminalControlAuthorityAdapter.ts",
     "src/relay/v2/terminalControlObservedBytePlaneAdapter.ts",
+    "src/relay/v2/larkBindingsExtension.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",
-    "src/relay/extensions/agentChat/v1/codec.ts",
-    "src/relay/extensions/agentChat/v1/hostExtension.ts",
+    "src/relay/extensions/agentChat/v2/codec.ts",
+    "src/relay/extensions/larkBindings/v2/codec.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
     "src/feishuReplyCard.ts",
@@ -187,7 +188,8 @@ export default defineConfig({
     // credential-authority import keeps the relay/v2 module identity.
     "./relay/v2/hostProductionProfileStore.js",
     "../extensions/agentTranscriptLifecycle/v1/codec.js",
-    "../extensions/agentChat/v1/codec.js",
+    "../extensions/agentChat/v2/codec.js",
+    "../extensions/larkBindings/v2/codec.js",
     // relayServer dynamically loads the canonical activated combined owner
     // from its matching dist/relay/v2 directory so private brands stay single.
     "../v2/brokerServerRuntime.js",
@@ -228,4 +230,8 @@ export default defineConfig({
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
   },
   noExternal: ["ws"],
+  loader: {
+    ".md": "text",
+    ".yaml": "text",
+  },
 });

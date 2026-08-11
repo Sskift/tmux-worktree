@@ -69,7 +69,7 @@ class FakeClock implements RelayV2StatusObserverClock {
 }
 
 function registeredState() {
-  const state = createFakeMobileRelayV2State(true);
+  const state = createFakeMobileRelayV2State();
   return {
     ...state,
     hostCredential: {
@@ -130,7 +130,7 @@ test("Relay v2 status normalization rebuilds a closed non-sensitive projection",
   ]) assert.equal(serialized.includes(secret), false, secret);
 });
 
-test("Relay v2 malformed status clears cached readiness and preserves the v1 configured bit", () => {
+test("Relay v2 malformed status clears cached readiness and preserves configured state", () => {
   const registered = registeredState();
   const observed = {
     ...registered,
@@ -159,7 +159,6 @@ test("Relay v2 malformed status clears cached readiness and preserves the v1 con
   assert.equal(normalized.authority.kind, "unavailable");
   assert.equal(normalized.connector.status, "failed");
   assert.equal(normalized.enrollment.status, "failed");
-  assert.equal(normalized.v1Profile.sharedSecretConfigured, true);
   assert.equal(view.ready, false);
   assert.equal(view.qrArtifact, null);
   assert.equal(view.enrollmentAction, null);
@@ -192,7 +191,6 @@ test("Relay v2 credential references remain opaque but reject credential values"
     }, 1_000);
     assert.equal(rejected.authority.kind, "unavailable", credentialReference);
     assert.equal(rejected.hostCredential.credentialReference, null, credentialReference);
-    assert.equal(rejected.v1Profile.sharedSecretConfigured, true, credentialReference);
   }
 });
 
@@ -225,7 +223,7 @@ test("Relay v2 polling observes external supersede, credential, and grant change
     },
   };
   const observations = [registered, externallyChanged];
-  let current = createRelayV2EnrollmentState(true);
+  let current = createRelayV2EnrollmentState();
   let reads = 0;
   const observer = createRelayV2StatusObserver({
     clock,
@@ -319,7 +317,7 @@ test("Relay v2 persistent status failure clears cached readiness and late status
     message: "Authoritative Relay v2 status is unavailable.",
     retryable: true,
   };
-  let current = createRelayV2EnrollmentState(true);
+  let current = createRelayV2EnrollmentState();
   const observedState = (): MobileRelayV2DashboardState => current;
   let reads = 0;
   const observer = createRelayV2StatusObserver({

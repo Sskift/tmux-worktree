@@ -91,8 +91,9 @@ class ControlledManagementInput {
 class OneScanDiscovery {
   used = false;
 
-  constructor({ repeatable = false } = {}) {
+  constructor({ repeatable = false, includeRemote = false } = {}) {
     this.repeatable = repeatable;
+    this.includeRemote = includeRemote;
   }
 
   async scan() {
@@ -101,6 +102,16 @@ class OneScanDiscovery {
       this.used = true;
     }
     const processTarget = { kind: "local", targetId: "local" };
+    const remoteProcessTarget = { kind: "ssh", targetId: "configured-remote" };
+    const remoteScope = {
+      backendIdentity: "configured-host:remote",
+      displayName: "Remote",
+      kind: "ssh",
+      reachability: "online",
+      sessionsCompleteness: "complete",
+      sessions: [],
+      error: null,
+    };
     return {
       coverage: "complete",
       scopes: [{
@@ -111,14 +122,18 @@ class OneScanDiscovery {
         sessionsCompleteness: "complete",
         sessions: [],
         error: null,
-      }],
+      }, ...(this.includeRemote ? [remoteScope] : [])],
       [resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT]: {
         generation: "canonical-production-discovery-1",
         scopeTargets: [{
           scopeBackendIdentity: "local",
           processTarget,
           capabilities: ["session.list"],
-        }],
+        }, ...(this.includeRemote ? [{
+          scopeBackendIdentity: "configured-host:remote",
+          processTarget: remoteProcessTarget,
+          capabilities: ["session.list"],
+        }] : [])],
         sessionTargets: [],
         isCurrent() { return true; },
       },
@@ -159,14 +174,20 @@ function makeCredentialAuthority() {
   });
 }
 
-async function makeHarness(label, { fresh = false, released = false } = {}) {
+async function makeHarness(
+  label,
+  { fresh = false, released = false, includeRemote = false } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), `tw-relay-v2-host-root-${label}-`));
   const store = await hostState.RelayV2HostStateStore.open({
     paths: hostState.relayV2HostStatePaths(root),
   });
   const foundation = new resourceState.RelayV2MaterializedStateFoundation({
     hostId: HOST_ID,
-    discovery: new OneScanDiscovery({ repeatable: fresh || released }),
+    discovery: new OneScanDiscovery({
+      repeatable: fresh || released,
+      includeRemote,
+    }),
     store,
     readinessSink: { apply: () => true },
   });
@@ -210,6 +231,7 @@ async function makeHarness(label, { fresh = false, released = false } = {}) {
   );
   const statePath = join(root, "terminal-control-state-v1.json");
   const terminalBackend = noEffectTerminalControlBackend();
+  let remoteCompoundOpens = 0;
   const options = {
     hostState: store,
     recoveredH2Spool: spool,
@@ -221,7 +243,10 @@ async function makeHarness(label, { fresh = false, released = false } = {}) {
     terminalControl: {
       daemonSocketPath: socketPath,
       remoteCompoundChannels: {
-        async open() { throw new Error("unexpected remote compound target"); },
+        async open() {
+          remoteCompoundOpens += 1;
+          throw new Error("unexpected remote compound target");
+        },
       },
     },
   };
@@ -243,6 +268,7 @@ async function makeHarness(label, { fresh = false, released = false } = {}) {
     terminalBackend,
     options,
     profile,
+    remoteCompoundOpens: () => remoteCompoundOpens,
     cleanup() {
       rmSync(socketPath, { force: true });
       rmSync(`${socketPath}.server.lock`, { recursive: true, force: true });
@@ -319,6 +345,42 @@ test("canonical production root is inert, singular, and closes idempotently", as
     assert.equal(existsSync(h.socketPath), true, "Host close must not stop the external daemon");
     assert.equal(existsSync(`${h.socketPath}.server.lock`), true,
       "Host close must not release the daemon lock");
+  } finally {
+    abort.abort();
+    await daemon.catch(() => undefined);
+    h.cleanup();
+  }
+});
+
+test("an unavailable configured SSH exact channel does not block local H3 readiness", async () => {
+  const h = await makeHarness("remote-lazy-preflight", {
+    includeRemote: true,
+  });
+  const abort = new AbortController();
+  const daemonAuthority = new terminalControl.TerminalControlAuthority({
+    statePath: h.statePath,
+    backend: h.terminalBackend,
+  });
+  const daemon = terminalControl.runTerminalControlServer({
+    socketPath: h.socketPath,
+    authority: daemonAuthority,
+    signal: abort.signal,
+    relayV2RemoteExactCompoundV1: true,
+  });
+  try {
+    await waitForPath(h.socketPath);
+    await waitForPath(exactCompound.relayV2RemoteExactCompoundSocketPathV1(h.socketPath));
+    const composition = await relayHost.openRelayV2HostCanonicalProductionComposition(
+      h.profile,
+      h.options,
+    );
+    assert.notEqual(composition, null);
+    assert.equal(
+      h.remoteCompoundOpens(),
+      0,
+      "startup must not open an unreachable remote exact channel",
+    );
+    await composition.closeAndDrain();
   } finally {
     abort.abort();
     await daemon.catch(() => undefined);

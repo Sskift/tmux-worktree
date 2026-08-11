@@ -298,7 +298,6 @@ function captureRequestMetadata(
       pathname: target.pathname,
       search: target.search,
       authorizationHeaders: headers.authorizationHeaders,
-      legacyQuerySecret: null,
       offeredProtocols: headers.offeredProtocols,
     })) as RelayV2BrokerHostUpgradeMetadata;
   } catch {

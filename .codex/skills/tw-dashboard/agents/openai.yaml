@@ -1,0 +1,4 @@
+interface:
+  display_name: "tw-dashboard"
+  short_description: "Inspect and coordinate tw-dashboard Agent sessions"
+  default_prompt: "Use $tw-dashboard to inspect this session and see what other Agents are doing."

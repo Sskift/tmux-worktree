@@ -14,9 +14,7 @@ import {
   createEmptyHostDraft,
   hostConfigToDraft,
   sshCandidateToDraft,
-  summarizeRelayStatus,
   validateHostDraft,
-  validateRelayDraft,
 } from "../src/dashboard/Settings/connectionsModel";
 import {
   RELAY_V2_REQUIRED_CAPABILITIES,
@@ -96,10 +94,9 @@ function findButtonByAccessibleName(node: ReactNode, name: string): ButtonElemen
   return matches[0];
 }
 
-test("the existing Relay v1 UI receives no v2 preview markup without explicit fake state", () => {
+test("the Relay v2 preview stays empty without state", () => {
   const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
     state: undefined,
-    v1SharedSecretConfigured: true,
   }));
 
   assert.equal(markup, "");
@@ -204,110 +201,8 @@ test("host removal impact counts only matching remote sessions and terminals", (
   assert.deepEqual(impact, { sessions: 2, terminals: 1, total: 3 });
 });
 
-test("Relay summary distinguishes stopped, starting, connected, retrying, and error", () => {
-  assert.deepEqual(
-    summarizeRelayStatus({
-      statusKnown: false,
-      connectionState: "stopped",
-      active: false,
-      connected: false,
-    }),
-    {
-      label: "Checking Mac connector",
-      detail: "Reading the saved connector configuration and local process state.",
-      tone: "progress",
-    },
-  );
-  assert.deepEqual(
-    summarizeRelayStatus({ connectionState: "stopped", active: false, connected: false }),
-    {
-      label: "Mac connector stopped",
-      detail: "The Mac connector is stopped. A previously deployed Relay center keeps running independently.",
-      tone: "neutral",
-    },
-  );
-  assert.equal(summarizeRelayStatus({ connectionState: "starting", active: true, connected: false }).label, "Starting Mac connector");
-  assert.equal(summarizeRelayStatus({ connectionState: "connected", active: true, connected: true }).label, "Mac connector connected");
-  assert.equal(summarizeRelayStatus({ connectionState: "retrying", active: true, connected: false }).label, "Mac connector retrying");
-  assert.doesNotMatch(
-    summarizeRelayStatus({ connectionState: "connected", active: true, connected: true }).detail,
-    /mobile client can reach/i,
-  );
-  assert.deepEqual(
-    summarizeRelayStatus({ connectionState: "error", active: false, connected: false, error: "TLS rejected" }),
-    { label: "Mac connector error", detail: "TLS rejected", tone: "danger" },
-  );
-});
-
-test("Relay validation applies action-specific token and broker requirements", () => {
-  const draft = {
-    relayUrl: "wss://relay.company.test",
-    brokerHostId: "devbox",
-    hostId: "mac-admin",
-    token: "",
-  };
-
-  assert.equal(validateRelayDraft(draft, "save").valid, true);
-  const start = validateRelayDraft(draft, "start");
-  assert.equal(start.valid, false);
-  assert.match(start.errors.token ?? "", /required/);
-  assert.equal(validateRelayDraft(draft, "startBroker").valid, true);
-  const broker = validateRelayDraft({
-    relayUrl: "",
-    brokerHostId: "",
-    hostId: "",
-    token: "",
-  }, "startBroker");
-  assert.equal(broker.valid, false);
-  assert.match(broker.errors.brokerHostId ?? "", /Relay center/);
-
-  assert.equal(validateRelayDraft({
-    relayUrl: "",
-    brokerHostId: "devbox",
-    hostId: "",
-    token: "",
-  }, "startBroker").valid, true);
-});
-
-test("Relay validation requires trusted WSS or an explicit loopback diagnostic URL", () => {
-  const result = validateRelayDraft({
-    relayUrl: "https://relay.company.test",
-    brokerHostId: "remote",
-    hostId: "mac-admin",
-    token: "secret",
-  }, "start");
-
-  assert.equal(result.valid, false);
-  assert.match(result.errors.relayUrl ?? "", /trusted wss/);
-
-  for (const relayUrl of [
-    "wss://relay.example.com",
-    "wss://relay.example.com/",
-    "ws://desk-mac.local:8787",
-    "ws://10.0.0.8:8787",
-    "wss://user@relay.company.test",
-    "wss://@relay.company.test",
-    "wss://relay.company.test:0",
-    "wss://relay.company.test/client",
-  ]) {
-    assert.equal(validateRelayDraft({
-      relayUrl,
-      brokerHostId: "remote",
-      hostId: "mac-admin",
-      token: "secret",
-    }, "start").valid, false, relayUrl);
-  }
-
-  assert.equal(validateRelayDraft({
-    relayUrl: "ws://127.0.0.1:8787",
-    brokerHostId: "remote",
-    hostId: "mac-admin",
-    token: "secret",
-  }, "start").valid, true);
-});
-
-function readyRelayV2State(sharedSecretConfigured = true): RelayV2EnrollmentState {
-  const initial = createFakeMobileRelayV2State(sharedSecretConfigured);
+function readyRelayV2State(): RelayV2EnrollmentState {
+  const initial = createFakeMobileRelayV2State();
   return reduceRelayV2(initial, [
     {
       type: "v2CredentialReferenceObserved",
@@ -344,7 +239,7 @@ test("Relay v2 fake backend models host bootstrap, refresh, and authoritative re
 });
 
 test("Relay v2 enrollment stays unavailable without host.registered or one required capability", async () => {
-  const unregisteredState = createFakeMobileRelayV2State(true);
+  const unregisteredState = createFakeMobileRelayV2State();
   const unregistered = deriveRelayV2EnrollmentView(unregisteredState, 1_000);
 
   assert.equal(unregistered.ready, false);
@@ -353,7 +248,7 @@ test("Relay v2 enrollment stays unavailable without host.registered or one requi
   assert.match(unregistered.readinessLabel, /not registered/i);
   assert.match(unregistered.readinessDetail, /host\.registered/);
 
-  const missingTerminalResume = reduceRelayV2(createFakeMobileRelayV2State(true), [
+  const missingTerminalResume = reduceRelayV2(createFakeMobileRelayV2State(), [
     { type: "hostRegistered", hostId: "mac-admin", connectorId: "connector-1" },
     {
       type: "capabilityIntersectionObserved",
@@ -375,11 +270,9 @@ test("Relay v2 enrollment stays unavailable without host.registered or one requi
   );
   const afterRejectedCreate = await adapter.status();
   assert.deepEqual(afterRejectedCreate.enrollment, { status: "idle" });
-  assert.strictEqual(afterRejectedCreate.v1Profile.sharedSecretConfigured, true);
 
   const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
     state: missingTerminalResume,
-    v1SharedSecretConfigured: true,
   }));
   assert.match(markup, /Relay v2 capabilities incomplete/);
   assert.match(markup, /<button[^>]*disabled=""/);
@@ -394,7 +287,6 @@ test("Relay v2 readiness exposes only a one-time enrollment review and never cla
 
   assert.equal(ready.ready, true);
   assert.equal(ready.enrollmentActionDisabled, true);
-  assert.equal(ready.v1CredentialLabel, "Relay v1 shared secret configured");
   assert.equal(ready.v2CredentialLabel, "Relay v2 host credential ready");
   assert.match(ready.readinessDetail, /Phone connectivity is not verified/);
   assert.doesNotMatch(ready.readinessDetail, /phone is online/i);
@@ -406,7 +298,6 @@ test("Relay v2 readiness exposes only a one-time enrollment review and never cla
 
   const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
     state: readyState,
-    v1SharedSecretConfigured: true,
   }));
   assert.match(markup, /Relay v2 connector ready for enrollment/);
   assert.match(markup, /Fake-backed preview only/);
@@ -444,7 +335,7 @@ test("Relay v2 active enrollment survives connector stop and restores the same Q
 });
 
 test("Relay v2 invalid active enrollment requires authoritative recovery without creating a second code", () => {
-  const ready = readyRelayV2State(true);
+  const ready = readyRelayV2State();
   const activeState = (review: RelayV2EnrollmentReview): RelayV2EnrollmentState => ({
     ...ready,
     enrollment: { status: "active", review },
@@ -494,7 +385,6 @@ test("Relay v2 invalid active enrollment requires authoritative recovery without
     assert.equal(view.enrollmentActionDisabled, true, label);
     assert.doesNotMatch(view.enrollmentActionLabel, /active|retry|rebuild/i, label);
     assert.match(view.readinessDetail, /restore authoritative Relay v2 state/i, label);
-    assert.equal(view.v1CredentialLabel, "Relay v1 shared secret configured", label);
   }
 });
 
@@ -539,6 +429,12 @@ test("Relay v2 expiry drops the code, rebuilds once, and known-grant revoke is i
   const initial = {
     ...readyRelayV2State(),
     knownClientGrant: { status: "active" as const, grantId: "known-client-grant" },
+    connectedMobileDevices: [{
+      status: "connected" as const,
+      grantId: "known-client-grant",
+      clientInstanceId: "phone-client-instance",
+      connectionCount: 1,
+    }],
   };
   const adapter = createFakeMobileRelayV2Adapter({
     initialState: initial,
@@ -574,11 +470,11 @@ test("Relay v2 expiry drops the code, rebuilds once, and known-grant revoke is i
   });
   assert.deepEqual(repeated.knownClientGrant, revoked.knownClientGrant);
   assert.equal(revoked.knownClientGrant.status, "revoked");
+  assert.deepEqual(revoked.connectedMobileDevices, []);
 });
 
-test("Relay v2 non-retryable failures preserve v1 and offer reconfiguration, not Retry", () => {
+test("Relay v2 non-retryable failures stay closed and offer reconfiguration, not Retry", () => {
   const readyState = readyRelayV2State();
-  const v1Profile = readyState.v1Profile;
   const hostCredential = readyState.hostCredential;
   const failed = relayV2EnrollmentReducer(readyState, {
     type: "enrollmentCreateFailed",
@@ -586,18 +482,15 @@ test("Relay v2 non-retryable failures preserve v1 and offer reconfiguration, not
   });
   const view = deriveRelayV2EnrollmentView(failed, 1_000);
 
-  assert.strictEqual(failed.v1Profile, v1Profile);
   assert.strictEqual(failed.hostCredential, hostCredential);
-  assert.equal(failed.v1Profile.sharedSecretConfigured, true);
   assert.equal(failed.hostCredential.credentialReference, "fake-preview://host-grant-reference");
   assert.equal(view.enrollmentAction, null);
   assert.match(view.enrollmentActionLabel, /reconfigure Relay v2/i);
   assert.equal(view.qrArtifact, null);
-  assert.match(view.error ?? "", /Relay v1 remains unchanged; no fallback was attempted/);
+  assert.match(view.error ?? "", /Relay v2 operation failed closed/);
 
   const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
     state: failed,
-    v1SharedSecretConfigured: true,
   }));
   assert.doesNotMatch(markup, />Retry enrollment</);
   assert.match(markup, /Enrollment failed — reconfigure Relay v2/);
@@ -633,7 +526,7 @@ test("Relay v2 contradictory registered observations fail closed", async () => {
 
 test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollment is ready", () => {
   const ready = reduceRelayV2({
-    ...createRelayV2EnrollmentState(true),
+    ...createRelayV2EnrollmentState(),
     authority: { kind: "node", reason: null },
   }, [
     { type: "v2CredentialReferenceObserved", credentialReference: "host-grant-reference" },
@@ -656,7 +549,6 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
   assert.equal(superseded.connector.status, "superseded");
   assert.equal(superseded.connector.exitCode, 78);
   assert.strictEqual(superseded.enrollment, active.enrollment);
-  assert.strictEqual(superseded.v1Profile, active.v1Profile);
   assert.equal(supersededView.connectorAction, "restart");
   assert.equal(supersededView.ready, false);
   assert.equal(supersededView.qrArtifact, null);
@@ -665,7 +557,6 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
   let stopCalls = 0;
   const panel = RelayV2EnrollmentPreviewPanel({
     state: superseded,
-    v1SharedSecretConfigured: true,
     onStartConnector: () => {
       startCalls += 1;
     },
@@ -717,7 +608,7 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
     error: "The explicit connector restart failed.",
     retryable: false,
   });
-  const defaultOff = createRelayV2EnrollmentState(true);
+  const defaultOff = createRelayV2EnrollmentState();
 
   for (const [label, state, expectedAction, expectedQr] of [
     ["starting", starting, null, null],
@@ -732,7 +623,6 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
     const candidate = deriveRelayV2EnrollmentView(state, 1_000);
     assert.equal(candidate.connectorAction, expectedAction, label);
     assert.deepEqual(candidate.qrArtifact, expectedQr, label);
-    assert.equal(state.v1Profile.sharedSecretConfigured, true, label);
   }
 
   for (const state of [
@@ -744,13 +634,12 @@ test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollmen
     restartFailed,
   ]) {
     assert.deepEqual(state.enrollment, active.enrollment);
-    assert.deepEqual(state.v1Profile, active.v1Profile);
   }
 });
 
 test("Relay v2 renderer state exposes only a native opaque artifact handle", () => {
   const activeState = reduceRelayV2({
-    ...readyRelayV2State(true),
+    ...readyRelayV2State(),
     authority: { kind: "node", reason: null },
   }, [
     { type: "enrollmentCreated", review: relayV2Review },
@@ -777,7 +666,6 @@ test("Relay v2 renderer state exposes only a native opaque artifact handle", () 
   const copied: Array<[string, string]> = [];
   const panel = RelayV2EnrollmentPreviewPanel({
     state: activeState,
-    v1SharedSecretConfigured: true,
     onShowEnrollmentArtifact: (handle) => {
       shownHandle = handle;
     },

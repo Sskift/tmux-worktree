@@ -86,7 +86,7 @@ function snapshotDescriptor(value: unknown): Readonly<{
  * resolving that exact fixed artifact is optional ("missing"); every other
  * resolve failure and every load failure propagates so the holder redacts it
  * to invalid. There is no dynamic scan, alternate candidate, N-API version
- * decision (the holder is its only owner), or env/HOME/JSON/BAU/v1 fallback.
+ * decision (the holder is its only owner), or env/HOME/JSON/BAU alternate source.
  */
 export function createRelayV2HostCredentialNativeModuleFixedLoader(
   resolveArtifact: (fixedModuleSpecifier: string) => string,

@@ -70,7 +70,6 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
       projects: expectedProjects,
       worktreeBase: "/private/tmp/worktrees",
       feishuBridge: { marker: sensitiveServiceMarker },
-      mobileRelay: { marker: sensitiveServiceMarker },
       futureDashboardExtension: expectedUnknownExtension,
     })}\n`,
     { mode: 0o600 },
@@ -130,7 +129,6 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
     assert.equal(isolatedConfigText.includes(sensitiveServiceMarker), false);
     const isolatedConfig = JSON.parse(isolatedConfigText);
     assert.equal(Object.hasOwn(isolatedConfig, "feishuBridge"), false);
-    assert.equal(Object.hasOwn(isolatedConfig, "mobileRelay"), false);
     assert.deepEqual(isolatedConfig.hosts, expectedHosts);
     assert.deepEqual(isolatedConfig.projects, expectedProjects);
     assert.equal(isolatedConfig.worktreeBase, "/private/tmp/worktrees");
@@ -144,7 +142,6 @@ test("isolated Dashboard launchers use one short private socket namespace", asyn
       fs.readFileSync(sourceConfigPath, "utf8"),
     );
     assert.equal(Object.hasOwn(sourceConfigAfter, "feishuBridge"), true);
-    assert.equal(Object.hasOwn(sourceConfigAfter, "mobileRelay"), true);
     assert.equal(fs.existsSync(selfHostedConfigPath), true);
     assert.equal(
       fs.existsSync(

@@ -334,7 +334,6 @@ function metadataFromRawHeaders(
     pathname,
     search,
     authorizationHeaders: Object.freeze(authorizationHeaders),
-    legacyQuerySecret: null,
     offeredProtocols: Object.freeze(offeredProtocols),
   })) as RelayV2BrokerClientUpgradeMetadata;
 }

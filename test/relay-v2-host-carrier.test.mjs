@@ -134,7 +134,6 @@ function createHarness(options = {}) {
     advertisedCapabilities: options.advertisedCapabilities ?? [],
     preCarrierOfferClaim: options.preCarrierOfferClaim,
     clientDialects,
-    dialectAdapters: options.dialectAdapters,
     publicPayloadDecoder: options.publicPayloadDecoder,
     clock: options.clock ?? (() => 1_783_700_100_000),
     schedule: options.schedule,
@@ -450,7 +449,18 @@ test("v2 route bytes pass the production public codec and negotiated frame limit
   const active = connect(h);
   const connectorId = register(active.connection, active.hello);
   const valid = publicV2Frame();
-  const negotiatedMax = valid.byteLength + 8;
+  const extension = Buffer.from(JSON.stringify({
+    protocolVersion: 2,
+    kind: "request",
+    type: "agent.timeline.status.get",
+    requestId: "agent-status-1",
+    hostId: "mac-admin",
+    expectedHostEpoch: "authority-uuid",
+    scopeId: "local",
+    sessionId: "session-1",
+    payload: {},
+  }), "utf8");
+  const negotiatedMax = Math.max(valid.byteLength, extension.byteLength) + 8;
   active.connection.receive(wire(routeOpen(connectorId, {
     maxFrameBytes: negotiatedMax,
   })));
@@ -475,9 +485,19 @@ test("v2 route bytes pass the production public codec and negotiated frame limit
     binding.routeId,
     binding.routeFence,
     2,
+    extension,
+  )));
+  assert.equal(h.received.length, 2);
+  assert.deepEqual(Buffer.from(h.received[1].payload), extension);
+
+  active.connection.receive(wire(routeData(
+    connectorId,
+    binding.routeId,
+    binding.routeFence,
+    3,
     Uint8Array.from([0xff]),
   )));
-  assert.equal(h.received.length, 1);
+  assert.equal(h.received.length, 2);
   assert.deepEqual(active.transport.closes.at(-1), {
     code: 4400,
     reason: "invalid_public_route_frame",
@@ -645,91 +665,6 @@ test("route.unbound reports only the contiguous transport-emitted host watermark
   assert.deepEqual(emitted.map((frame) => frame.type), ["route.unbound"]);
   assert.equal(emitted[0].payload.lastHostToClientSeq, "0");
   assert.equal(h.unbound.at(-1).reason, "client_closed");
-});
-
-test("an explicitly configured v1 dialect uses only its own validator and preserves original bytes", () => {
-  const v1Adapter = {
-    validate(payload) {
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(payload);
-      const parsed = JSON.parse(text);
-      if (!parsed || typeof parsed.type !== "string") throw new Error("invalid v1 frame");
-    },
-  };
-  const h = createHarness({
-    clientDialects: ["tw-relay.v1", "tw-relay.v2"],
-    dialectAdapters: { "tw-relay.v1": v1Adapter },
-  });
-  const active = connect(h);
-  const connectorId = register(active.connection, active.hello);
-  active.connection.receive(wire(routeOpen(connectorId, {
-    clientDialect: "tw-relay.v1",
-  })));
-  const binding = h.bound.at(-1);
-  const valid = new TextEncoder().encode('{"type":"list_sessions"}');
-  active.connection.receive(wire(routeData(
-    connectorId,
-    binding.routeId,
-    binding.routeFence,
-    1,
-    valid,
-  )));
-  assert.equal(binding.clientDialect, "tw-relay.v1");
-  assert.deepEqual(h.received.at(-1).payload, valid);
-  active.connection.receive(wire(routeData(
-    connectorId,
-    binding.routeId,
-    binding.routeFence,
-    2,
-    Uint8Array.from([0xff]),
-  )));
-  assert.equal(h.received.length, 1);
-  assert.equal(active.transport.closes.at(-1).reason, "invalid_public_route_frame");
-});
-
-test("sendPublic validates bytes with the bound route dialect before carrier enqueue", async (t) => {
-  for (const clientDialect of ["tw-relay.v2", "tw-relay.v1"]) {
-    await t.test(clientDialect, () => {
-      let v1ValidationCalls = 0;
-      const dialectAdapters = clientDialect === "tw-relay.v1"
-        ? {
-            "tw-relay.v1": {
-              validate(payload) {
-                v1ValidationCalls += 1;
-                const text = new TextDecoder("utf-8", { fatal: true }).decode(payload);
-                const parsed = JSON.parse(text);
-                if (!parsed || typeof parsed.type !== "string") throw new Error("invalid v1 frame");
-              },
-            },
-          }
-        : undefined;
-      const h = createHarness({
-        clientDialects: [clientDialect],
-        dialectAdapters,
-      });
-      const active = connect(h);
-      const connectorId = register(active.connection, active.hello);
-      active.connection.receive(wire(routeOpen(connectorId, { clientDialect })));
-      const binding = h.bound.at(-1);
-      const baseline = active.transport.sent.length;
-      const valid = clientDialect === "tw-relay.v2"
-        ? publicV2Frame("outbound-validated")
-        : new TextEncoder().encode('{"type":"list_sessions"}');
-
-      assert.equal(h.actor.sendPublic(binding, valid), true);
-      if (clientDialect === "tw-relay.v1") assert.equal(v1ValidationCalls, 1);
-      assert.equal(h.actor.sendPublic(binding, Uint8Array.from([0xff])), false);
-      if (clientDialect === "tw-relay.v1") assert.equal(v1ValidationCalls, 2);
-      assert.deepEqual(h.closing.map((entry) => entry.code), ["INTERNAL"]);
-      const dataFrames = decoded(active.transport.sent.slice(baseline)).filter((frame) => (
-        frame.type === "route.data"
-      ));
-      assert.equal(dataFrames.length, 1);
-      assert.deepEqual(
-        Uint8Array.from(Buffer.from(dataFrames[0].payload.data, "base64")),
-        valid,
-      );
-    });
-  }
 });
 
 test("wrong current-carrier connector, route, fence, or sequence closes that source without delivery", async (t) => {

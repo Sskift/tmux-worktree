@@ -18,7 +18,6 @@ const contractsRoot = new URL("../contracts/storage/", import.meta.url);
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const state = await import("../dist/state.js");
 const config = await import("../dist/config.js");
-const relayHost = await import("../dist/relayHost.js");
 
 function readContract(name, file) {
   return JSON.parse(readFileSync(new URL(`${name}/${file}`, contractsRoot), "utf8"));
@@ -126,39 +125,6 @@ test("managed incarnation extension is optional and survives unrelated state mut
     const preserved = mutated.sessions.find((session) => session.name === cases.extended.name);
     assert.deepEqual(preserved.extensions, cases.extended.extensions);
     assert.deepEqual(mutated.sessions.find((session) => session.name === cases.legacy.name), cases.legacy);
-  });
-});
-
-test("terminal-registry-v1 preserves raw metadata and isolates invalid catalog items", () => {
-  const cases = readContract("terminal-registry-v1", "cases.json");
-  assert.deepEqual(
-    relayHost.parseDashboardTerminalPayload(cases.catalogInput),
-    cases.catalogNormalized,
-  );
-
-  const remote = relayHost.dashboardTerminalRecord(
-    cases.remoteScope.scope,
-    cases.remoteScope.name,
-    cases.remoteScope.cwd,
-    cases.remoteScope.label,
-  );
-  for (const [field, value] of Object.entries(cases.remoteScope.expected)) {
-    assert.deepEqual(remote[field], value, field);
-  }
-
-  withTempDir("tw-terminal-registry-contract-", (root) => {
-    const path = join(root, "terminals.json");
-    relayHost.writeTerminalRegistryAtomic(cases.stored, path);
-    assert.equal(readFileSync(path, "utf8"), `${JSON.stringify(cases.stored, null, 2)}\n`);
-    assert.equal(statSync(path).mode & 0o777, 0o600);
-
-    writeFileSync(path, cases.invalidMutation.contents);
-    assert.throws(
-      () => relayHost.mutateTerminalRegistry((current) => current, path),
-      new RegExp(cases.invalidMutation.errorIncludes),
-    );
-    assert.equal(readFileSync(path, "utf8"), cases.invalidMutation.contents);
-    assert.equal(existsSync(`${path}.lock`), false);
   });
 });
 

@@ -40,7 +40,7 @@ const PROFILE = Object.freeze(JSON.parse(readFileSync(new URL(
   import.meta.url,
 ), "utf8")).validProfile);
 const BOOTSTRAP_SECRET = "twhostboot2.shipping-root-secret-never-reflected";
-const V1_SECRET = "legacy-v1-shared-secret-never-promoted";
+const FORBIDDEN_SECRET = "forbidden-shared-secret-never-promoted";
 const MINT_GRANT_ID = "mint-grant-shipping-01";
 const MINT_REAUTH_REQUEST_ID = "mint-reauth-request-shipping-01";
 const ACCESS_EXP_S = Math.floor(Date.now() / 1_000) + 3_600;
@@ -515,7 +515,7 @@ function reauthenticateFrames(record, fromIndex) {
 function assertRedacted(error, code) {
   assert.equal(error?.code, code);
   const diagnostic = `${String(error)}\n${String(error?.stack)}\n${JSON.stringify(error)}`;
-  for (const forbidden of [BOOTSTRAP_SECRET, V1_SECRET]) {
+  for (const forbidden of [BOOTSTRAP_SECRET, FORBIDDEN_SECRET]) {
     assert.equal(diagnostic.includes(forbidden), false);
   }
   assert.equal(Object.hasOwn(error, "cause"), false);
@@ -622,8 +622,8 @@ test("full chain reconciles registered credential orphan without replaying it to
   const minted = await mintCredentialBytes();
   const h = await makeHarness("full", home, { initialBytes: minted.bytes });
   await h.openDaemon();
-  const previousSecret = process.env.TW_RELAY_SECRET;
-  process.env.TW_RELAY_SECRET = V1_SECRET;
+  const previousSecret = process.env.TW_FORBIDDEN_SECRET;
+  process.env.TW_FORBIDDEN_SECRET = FORBIDDEN_SECRET;
   try {
     const handle = await shippingRoot.startRelayV2HostShippingRoot(h.options({
       scanIntervalMs: 30,
@@ -696,9 +696,9 @@ test("full chain reconciles registered credential orphan without replaying it to
     const wire = second.record.sent.concat(first.record.sent)
       .map((frame) => (typeof frame === "string" ? frame : Buffer.from(frame).toString("utf8")))
       .join("\n");
-    assert.equal(wire.includes(V1_SECRET), false);
+    assert.equal(wire.includes(FORBIDDEN_SECRET), false);
     assert.equal(wire.includes(BOOTSTRAP_SECRET), false);
-    assert.equal(JSON.stringify(first.record.headers).includes(V1_SECRET), false);
+    assert.equal(JSON.stringify(first.record.headers).includes(FORBIDDEN_SECRET), false);
 
     // close fence：先拒新工作，drain 后幂等；lifecycle 停摆。
     const closing = handle.closeAndDrain();
@@ -717,8 +717,8 @@ test("full chain reconciles registered credential orphan without replaying it to
     // 既有 owner 复用而非复制：没有 fake lane 被驱动。
     assert.deepEqual(h.effects, { welcome: 0, create: 0, process: 0, remote: 0 });
   } finally {
-    if (previousSecret === undefined) delete process.env.TW_RELAY_SECRET;
-    else process.env.TW_RELAY_SECRET = previousSecret;
+    if (previousSecret === undefined) delete process.env.TW_FORBIDDEN_SECRET;
+    else process.env.TW_FORBIDDEN_SECRET = previousSecret;
     await h.daemon.close();
     h.cleanup();
   }

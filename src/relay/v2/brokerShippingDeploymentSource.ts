@@ -64,7 +64,7 @@ import type {
  * immediately; the privileged resolvers re-read freshly on every call and zero
  * their buffers on dispose. This owner reuses the existing fixed native
  * loader and the Node E0 attempt provider over the system Node stack, creates
- * no second authority/E0/native owner and never falls back to Relay v1. It
+ * no second authority/E0/native owner. It
  * invents no optional readiness fact: only an explicitly injected process-local
  * Agent receipt is forwarded, while omission remains default-off. That receipt
  * cannot affect native qualification or base-v2 readiness; native
@@ -664,7 +664,7 @@ export function createRelayV2BrokerShippingDeploymentInputs(
  * trustedHome namespace, and hands both to the existing shipping root. The
  * CLI omits the independent optional Agent receipt, keeping it default-off. Any
  * profile, identifier, ownership, material, E0, or native failure fails closed
- * before any listener — never falling back to Relay v1.
+ * before any listener.
  */
 export async function startRelayV2BrokerShippingFromTrustedDeployment(
   profilePath: string,

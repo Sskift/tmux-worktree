@@ -26,7 +26,9 @@ data class RelaySession(
     val agentState: AgentState = AgentState.UNKNOWN,
     val summary: String = "",
     val branch: String = "",
-    /** Optional UI-only identity for protocols whose opaque identity is not the v1 host/name pair. */
+    /** Opaque Relay v2 session identity used on target-scoped wire requests. */
+    val protocolSessionId: String = name,
+    /** Optional UI-only identity when a display name is not globally unique. */
     val stableIdOverride: String? = null,
 ) {
     val stableId: String get() = stableIdOverride ?: "$hostId:$name"

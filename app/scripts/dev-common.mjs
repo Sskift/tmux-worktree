@@ -103,7 +103,6 @@ function copyIsolatedStateFile(name, src, dst) {
   }
 
   delete config.feishuBridge;
-  delete config.mobileRelay;
   fs.writeFileSync(dst, `${JSON.stringify(config, null, 2)}\n`, {
     encoding: "utf8",
     flag: "wx",

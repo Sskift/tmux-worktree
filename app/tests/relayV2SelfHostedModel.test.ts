@@ -144,7 +144,7 @@ test("Relay v2 stack is effective only when the self-hosted config is provisione
   assert.equal(relayV2SelfHostedStackLabel(effective), "Relay v2 self-hosted");
   assert.equal(
     relayV2SelfHostedStackLabel(configuredStatus),
-    "Relay v1 legacy",
+    "Relay v2 setup required",
   );
   assert.equal(
     relayV2SelfHostedConnectorDesiredRunning(effective),

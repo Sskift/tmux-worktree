@@ -9,7 +9,7 @@ test("terminal recovery visibly reports progress and the canonical failure reaso
     controlled: true,
     readOnly: true,
     state: "RECOVERY_REQUIRED" as const,
-    ownerKind: "relay-v1" as const,
+    ownerKind: "relay-v2" as const,
     canTakeOver: false,
     canRecover: true,
     message: "PERMISSION_DENIED: recovery was prepared for a stale controller epoch",

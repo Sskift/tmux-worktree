@@ -146,7 +146,6 @@ test("forwards raw Host Upgrade metadata and leaves an upgraded socket to the de
       `Bearer ${TOKEN}-first`,
       `Bearer ${TOKEN}-second`,
     ],
-    legacyQuerySecret: null,
     offeredProtocols: [HOST_PROTOCOL, "tw-relay.v2", "tw-relay.extra"],
   });
   assert.equal(socket.responseText(), "");

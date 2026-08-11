@@ -26,4 +26,8 @@ export default defineConfig({
     "./relay/v2/relayV2DashboardManagementChildRuntime.js",
   ],
   noExternal: ["ws"],
+  loader: {
+    ".md": "text",
+    ".yaml": "text",
+  },
 });

@@ -664,10 +664,6 @@ pub(crate) fn run_remote_cmd_check_strings(
     run_remote_cmd_check(host, &refs)
 }
 
-pub(crate) fn run_remote_cmd_quiet(host: &HostConfig, remote_cmd: &[&str]) -> Option<String> {
-    run_remote_cmd_check(host, remote_cmd).ok()
-}
-
 /// Run a tw subcommand on a remote host and return stdout.
 pub(crate) fn run_remote_tw_check(host: &HostConfig, tw_args: &[&str]) -> Result<String, String> {
     if !has_custom_tmux_path(host) && !has_custom_tw_path(host) {

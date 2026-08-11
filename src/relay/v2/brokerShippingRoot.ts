@@ -53,8 +53,8 @@ import type {
  * stays behind the injected attempt provider. The one alternate profile shape
  * is the exact non-production single-node policy below, which may inject a
  * canonical credential-authority opener but cannot inject native/E0 inputs.
- * This root never exposes the admin seam on the public route and has no Relay
- * v1 fallback. Omission of the narrow optional Agent readiness receipt remains
+ * This root never exposes the admin seam on the public route. Omission of the
+ * narrow optional Agent readiness receipt remains
  * default-off; when explicitly injected, the receipt can affect only that
  * extension and cannot complete base-v2 readiness. Listener success is not
  * Relay v2 production readiness; native `qualifiedRecords=[]` and qualified
@@ -112,8 +112,11 @@ interface RelayV2BrokerShippingDeploymentInputsBase {
   /** Omission keeps agent.transcript-lifecycle.v1 default-off. */
   readonly agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
-  /** Omission keeps agent.chat.v1 default-off. */
+  /** Omission keeps agent.chat.v2 default-off. */
   readonly agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  /** Omission keeps lark.bindings.v2 default-off. */
+  readonly larkBindingsReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   readonly closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
   readonly createHttpsServer?: (options: Readonly<{
@@ -385,6 +388,8 @@ type CapturedDeploymentInputs = Readonly<{
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   agentChatReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  larkBindingsReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   nonProductionCredentialAuthorityOpener?:
     RelayV2BrokerShippingNonProductionCredentialAuthorityOpener;
   closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
@@ -463,6 +468,7 @@ function captureDeploymentInputs(
     "nonProductionCredentialAuthorityOpener",
     "agentTranscriptLifecycleReadiness",
     "agentChatReadiness",
+    "larkBindingsReadiness",
     "closeDeadlineScheduler",
     "createHttpsServer",
   ]);
@@ -502,6 +508,12 @@ function captureDeploymentInputs(
       : captureAgentTranscriptLifecycleReadiness(
           record.agentChatReadiness,
         );
+  const larkBindingsReadiness =
+    record.larkBindingsReadiness === undefined
+      ? undefined
+      : captureAgentTranscriptLifecycleReadiness(
+          record.larkBindingsReadiness,
+        );
   const createHttpsServer = (record.createHttpsServer ?? ((options: Readonly<{
     key: string | Buffer | Uint8Array;
     cert: string | Buffer | Uint8Array;
@@ -533,6 +545,9 @@ function captureDeploymentInputs(
     ...(agentChatReadiness === undefined
       ? {}
       : { agentChatReadiness }),
+    ...(larkBindingsReadiness === undefined
+      ? {}
+      : { larkBindingsReadiness }),
     createHttpsServer,
   });
 }
@@ -709,7 +724,7 @@ function captureRotationIdInput(value: unknown): { rotationId: string } {
  * deployment inputs. The selected production native/E0 chain or the one
  * explicit non-production authority opener fully opens before the listener
  * binds through the existing public HTTPS lifecycle root; startup failure
- * rolls back in reverse order and never falls back to Relay v1.
+ * rolls back in reverse order and fails closed.
  */
 export async function startRelayV2BrokerShippingRoot(
   profileInput: unknown,
@@ -769,6 +784,12 @@ export async function startRelayV2BrokerShippingRoot(
               agentChatReadiness:
                 inputs.agentChatReadiness,
             }),
+        ...(inputs.larkBindingsReadiness === undefined
+          ? {}
+          : {
+              larkBindingsReadiness:
+                inputs.larkBindingsReadiness,
+            }),
       })
     : createRelayV2BrokerProductionComposition({
         trustedHome: profile.trustedHome,
@@ -792,6 +813,12 @@ export async function startRelayV2BrokerShippingRoot(
           : {
               agentChatReadiness:
                 inputs.agentChatReadiness,
+            }),
+        ...(inputs.larkBindingsReadiness === undefined
+          ? {}
+          : {
+              larkBindingsReadiness:
+                inputs.larkBindingsReadiness,
             }),
       });
 
@@ -878,6 +905,12 @@ export async function startRelayV2BrokerShippingRoot(
       : {
           agentChatReadiness:
             composition.agentChatReadiness,
+        }),
+    ...(composition.larkBindingsReadiness === undefined
+      ? {}
+      : {
+          larkBindingsReadiness:
+            composition.larkBindingsReadiness,
         }),
   });
 
@@ -1112,7 +1145,7 @@ function readRelayV2BrokerShippingProfileFile(profilePath: string): CapturedProf
 /**
  * Deployment-injected entry: reads and validates the reference-only profile
  * file, then requires caller-provided inputs. Without injected inputs this
- * fails closed before any listener — never falling back to Relay v1. The CLI
+ * fails closed before any listener. The CLI
  * does not call this entry; its explicit `--v2-profile` selection activates
  * only the single trusted deployment source owner.
  */

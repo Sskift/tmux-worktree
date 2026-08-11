@@ -156,7 +156,7 @@ export function relayV2DashboardManagementProcessStdio(): RelayV2DashboardManage
 /**
  * The fail-closed session every unqualified selection converges to. It speaks
  * exact protocol v2 and answers each request with typed UNAVAILABLE; it is
- * never a Relay v1 fallback.
+ * never a second transport owner.
  */
 export function createRelayV2DashboardManagementUnavailableStdioSession(options: {
   runtimeVersion: string;

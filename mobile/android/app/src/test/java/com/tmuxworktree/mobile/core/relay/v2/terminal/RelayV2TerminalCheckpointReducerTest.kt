@@ -2637,6 +2637,12 @@ class RelayV2TerminalCheckpointReducerTest {
             tailOffset = "2",
             deduplicated = true,
         )
+        val firstServerAdmission = RelayV2TerminalCheckpointReducer.reduce(
+            retriedAfterRestore,
+            firstOpened.copy(tailOffset = "0", deduplicated = false),
+        )
+        assertEquals(RelayV2TerminalOutcome.Applied, firstServerAdmission.outcome)
+        assertEquals(RelayV2TerminalPhase.LIVE, firstServerAdmission.checkpoint?.phase)
         result = RelayV2TerminalCheckpointReducer.reduce(
             retriedAfterRestore,
             firstOpened,

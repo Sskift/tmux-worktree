@@ -14,19 +14,10 @@ const {
   recordManagedSession,
   releaseManagedStateLock,
   removeManagedSession,
-  removeManagedSessionIfCurrent,
   upsertManagedSession,
 } = await import("../dist/state.js");
 const {
-  buildRpcCapabilitiesResponse,
-  buildRpcKillSessionResponse,
-  buildRpcListResponse,
-  parseRpcCreateTerminalArgs,
-  parseRpcCreateWorktreeArgs,
-  parseRpcRestoreWorktreeArgs,
-  parseRpcKillSessionArgs,
-} = await import("../dist/rpc.js");
-const {
+  commandThenLoginShell,
   createManagedTerminalSession,
   createManagedWorktreeSession,
   restoreManagedWorktreeSession,
@@ -176,71 +167,6 @@ test("stale managed-state lock owner cannot remove the replacement lock", () => 
   assert.equal(existsSync(lockPath), false, "current owner releases its own state lock");
 });
 
-test("rpc list returns only managed sessions that still exist in tmux", () => {
-  const state = [
-    {
-      name: "managed-live",
-      kind: "worktree",
-      profile: "dashboard",
-      project: "web",
-      repoPath: "/repo/web",
-      worktreePath: "/home/dev/.tmux-worktree/worktrees/web/managed-live-bbbbb",
-      branch: "managed-live-bbbbb",
-      baseBranch: "main",
-      createdAt: "2026-07-02T00:00:00.000Z",
-    },
-    {
-      name: "managed-dead",
-      kind: "worktree",
-      profile: "cli",
-      project: "api",
-      repoPath: "/repo/api",
-      worktreePath: "/home/dev/.tmux-worktree/worktrees/api/managed-dead-ccccc",
-      branch: "managed-dead-ccccc",
-      baseBranch: "main",
-      createdAt: "2026-07-02T00:00:00.000Z",
-    },
-  ];
-  const response = buildRpcListResponse(
-    { version: 1, sessions: state },
-    [
-      {
-        name: "managed-live",
-        attached: false,
-        windows: 1,
-        created: 1760000000,
-        activity: 1760000100,
-        cwd: "/home/dev/.tmux-worktree/worktrees/web/managed-live-bbbbb",
-      },
-      {
-        name: "ordinary-tmux",
-        attached: false,
-        windows: 1,
-        created: 1760000200,
-        activity: 1760000300,
-        cwd: "/repo/other",
-      },
-    ],
-  );
-
-  assert.equal(response.protocolVersion, 1);
-  assert.deepEqual(response.sessions.map((session) => session.name), ["managed-live"]);
-  assert.equal(response.sessions[0].profile, "dashboard");
-  assert.equal(response.sessions[0].worktreePath, "/home/dev/.tmux-worktree/worktrees/web/managed-live-bbbbb");
-});
-
-test("rpc capabilities advertise hard-bounded remote mutations", () => {
-  assert.deepEqual(buildRpcCapabilitiesResponse().capabilities, [
-    "list",
-    "managed-state",
-    "hard-timeout",
-    "create-worktree",
-    "create-terminal",
-    "restore-worktree",
-    "kill-session",
-  ]);
-});
-
 test("query, exec, and run hard-kill TERM-ignoring command groups at timeout", (t) => {
   const root = mkdtempSync(join(tmpdir(), "tw-hard-timeout-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -339,181 +265,6 @@ test("hard-bound wrappers preserve normal stdout and stdio behavior", () => {
   assert.equal(hardBoundQuery(process.execPath, command, 1_000), "hard-bound ok");
   assert.equal(hardBoundRun(process.execPath, command, 1_000), "hard-bound ok");
   assert.equal(hardBoundExec(process.execPath, ["-e", "process.exit(0)"], 1_000), undefined);
-});
-
-test("rpc worktree creation accepts configured project targets", () => {
-  assert.deepEqual(
-    parseRpcCreateWorktreeArgs(["--project", "demo", "--ai-command", "codex"]),
-    {
-      project: "demo",
-      aiCommand: "codex",
-    },
-  );
-});
-
-test("rpc terminal and restore parsers keep the headless lifecycle surface narrow", () => {
-  assert.deepEqual(
-    parseRpcCreateTerminalArgs(["--cwd", " ~/src ", "--ai-command", " codex "]),
-    { cwd: "~/src", aiCommand: "codex" },
-  );
-  assert.deepEqual(
-    parseRpcRestoreWorktreeArgs([
-      "--path", " ~/worktrees/app/fix-abc12 ",
-      "--name", " app-fix ",
-      "--ai-command", " codex ",
-    ]),
-    {
-      path: "~/worktrees/app/fix-abc12",
-      name: "app-fix",
-      aiCommand: "codex",
-    },
-  );
-  assert.throws(() => parseRpcCreateTerminalArgs(["--cwd", "/tmp", "--name", "unsafe"]), /unknown create-terminal option/);
-});
-
-test("rpc kill-session only mutates TW-managed sessions and removes stale records idempotently", () => {
-  assert.deepEqual(parseRpcKillSessionArgs(["--name", "tw-term-abc12"]), { name: "tw-term-abc12" });
-  const killed = [];
-  const removed = [];
-  const response = buildRpcKillSessionResponse(
-    { name: "tw-term-abc12" },
-    {
-      loadState: () => ({
-        version: 1,
-        sessions: [{
-          name: "tw-term-abc12",
-          kind: "terminal",
-          profile: "dashboard",
-          cwd: "/repo/app",
-          createdAt: "2026-07-12T00:00:00.000Z",
-        }],
-      }),
-      exists: () => true,
-      kill: (name) => killed.push(name),
-      removeRecord: (name, expected) => removed.push({ name, expected }),
-    },
-  );
-  assert.deepEqual(response, {
-    protocolVersion: 1,
-    kind: "session-killed",
-    session: "tw-term-abc12",
-    sessionKind: "terminal",
-    killed: true,
-  });
-  assert.deepEqual(killed, ["tw-term-abc12"]);
-  assert.deepEqual(removed, [{
-    name: "tw-term-abc12",
-    expected: {
-      name: "tw-term-abc12",
-      kind: "terminal",
-      profile: "dashboard",
-      cwd: "/repo/app",
-      createdAt: "2026-07-12T00:00:00.000Z",
-    },
-  }]);
-  assert.throws(
-    () => buildRpcKillSessionResponse(
-      { name: "ordinary" },
-      { loadState: () => ({ version: 1, sessions: [] }) },
-    ),
-    /not TW-managed/,
-  );
-});
-
-test("rpc kill does not delete a same-named session recreated during cleanup", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-rpc-kill-recreate-race-"));
-  const statePath = join(root, ".tmux-worktree", "state.json");
-  const oldRecord = {
-    name: "app-fix",
-    kind: "worktree",
-    profile: "dashboard",
-    project: "app",
-    repoPath: "/repo/app",
-    worktreePath: "/worktrees/app/app-fix-old12",
-    branch: "app-fix-old12",
-    baseBranch: "main",
-    createdAt: "2026-07-12T00:00:00.000Z",
-  };
-  const replacement = {
-    ...oldRecord,
-    worktreePath: "/worktrees/app/app-fix-new34",
-    branch: "app-fix-new34",
-    createdAt: "2026-07-12T00:00:01.000Z",
-  };
-  recordManagedSession(oldRecord, statePath);
-
-  const response = buildRpcKillSessionResponse(
-    { name: oldRecord.name },
-    {
-      loadState: () => loadManagedState(statePath),
-      exists: () => true,
-      // Model the exact interleaving: the old tmux session is gone, then a
-      // creator records a replacement with the same deterministic name before
-      // the killer reaches state cleanup.
-      kill: () => recordManagedSession(replacement, statePath),
-      removeRecord: (_name, expected) => {
-        removeManagedSessionIfCurrent(expected, statePath);
-      },
-    },
-  );
-
-  assert.equal(response.killed, true);
-  assert.deepEqual(loadManagedState(statePath).sessions, [replacement]);
-});
-
-test("tw rpc kill-session fails closed when managed state is corrupt", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-rpc-kill-corrupt-state-"));
-  const home = join(root, "home");
-  const stateDir = join(home, ".tmux-worktree");
-  const statePath = join(stateDir, "state.json");
-  const fakeTmux = join(root, "tmux");
-  const tmuxLog = join(root, "tmux.log");
-  mkdirSync(stateDir, { recursive: true });
-  const invalid = '{"version":1,"sessions":[\n';
-  writeFileSync(statePath, invalid);
-  writeFileSync(fakeTmux, `#!/bin/sh
-printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
-case "$1" in
-  list-sessions)
-    printf 'tw-term-abc12\\0370\\0371\\0371760000000\\0371760000100\\037/repo/app\\n'
-    ;;
-  has-session)
-    exit 0
-    ;;
-esac
-exit 0
-`);
-  chmodSync(fakeTmux, 0o755);
-
-  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
-  const result = spawnSync(process.execPath, [cli, "rpc", "kill-session", "--name", "tw-term-abc12"], {
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      HOME: home,
-      TW_TMUX: fakeTmux,
-      TW_TEST_TMUX_LOG: tmuxLog,
-    },
-    timeout: 5_000,
-  });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /refusing to mutate invalid managed state.*original file preserved/);
-  assert.equal(readFileSync(statePath, "utf8"), invalid);
-  assert.equal(existsSync(tmuxLog), false, "corrupt state must not authorize a direct tmux kill");
-
-  const humanResult = spawnSync(process.execPath, [cli, "rm", "tw-term-abc12"], {
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      HOME: home,
-      TW_TMUX: fakeTmux,
-      TW_TEST_TMUX_LOG: tmuxLog,
-    },
-    timeout: 5_000,
-  });
-  assert.equal(humanResult.status, 1);
-  assert.match(humanResult.stderr, /refusing to mutate invalid managed state.*original file preserved/);
-  assert.doesNotMatch(readFileSync(tmuxLog, "utf8"), /kill-session/);
 });
 
 test("tw rm closes managed sessions through the state-aware lifecycle", async (t) => {
@@ -701,7 +452,7 @@ test("rpc worktree creation records a dashboard-managed remote session", () => {
       "app-fix-1",
       "-c",
       "/home/dev/.tmux-worktree/worktrees/app/app-fix-1-abc12",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex; exec \"${SHELL:-/bin/zsh}\" -l",
+      commandThenLoginShell("codex", "app-fix-1"),
     ]],
     ["setupClipboardBindings", []],
   ]);
@@ -751,7 +502,7 @@ test("rpc terminal creation uses the shared single-pane contract and records man
       "tw-term-abc12",
       "-c",
       "/home/dev/src/app",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+      commandThenLoginShell("codex --quiet", "tw-term-abc12"),
     ]],
     ["setupClipboardBindings", []],
   ]);
@@ -1126,58 +877,6 @@ exit 0
   assert.doesNotMatch(readFileSync(tmuxLog, "utf8"), /switch-client -t sample-app-inside/);
 });
 
-test("tw rpc create-terminal is headless, machine-readable, and discoverable through managed state", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-rpc-terminal-"));
-  const home = join(root, "home");
-  const cwd = join(root, "workspace");
-  const fakeTmux = join(root, "tmux");
-  const tmuxLog = join(root, "tmux.log");
-  mkdirSync(home, { recursive: true });
-  mkdirSync(cwd, { recursive: true });
-  writeFileSync(fakeTmux, `#!/bin/sh
-printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
-if [ "$1" = "has-session" ]; then exit 1; fi
-exit 0
-`);
-  chmodSync(fakeTmux, 0o755);
-  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
-  const result = spawnSync(process.execPath, [
-    cli,
-    "rpc",
-    "create-terminal",
-    "--cwd",
-    cwd,
-    "--ai-command",
-    "codex --quiet",
-  ], {
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      HOME: home,
-      TW_TMUX: fakeTmux,
-      TW_TEST_TMUX_LOG: tmuxLog,
-    },
-    timeout: 5_000,
-  });
-  assert.equal(result.status, 0, result.stderr);
-  const response = JSON.parse(result.stdout);
-  assert.equal(response.protocolVersion, 1);
-  assert.equal(response.kind, "terminal");
-  assert.match(response.session, /^tw-term-[0-9a-f]{5}$/);
-  assert.equal(response.cwd, cwd);
-  const state = JSON.parse(readFileSync(join(home, ".tmux-worktree", "state.json"), "utf8"));
-  assert.deepEqual(state.sessions[0], {
-    name: response.session,
-    kind: "terminal",
-    profile: "dashboard",
-    cwd,
-    createdAt: state.sessions[0].createdAt,
-  });
-  const calls = readFileSync(tmuxLog, "utf8");
-  assert.match(calls, new RegExp(`new-session -d -s ${response.session} -c `));
-  assert.doesNotMatch(calls, /split-window/);
-});
-
 test("CLI rejects non-git path targets before creating tmux or managed state", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-cli-non-git-path-"));
   const home = join(root, "home");
@@ -1263,7 +962,7 @@ test("CLI and Dashboard provenance use the same single-pane session contract", (
       "app-fix",
       "-c",
       "/repo/app",
-      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+      commandThenLoginShell("codex --quiet", "app-fix"),
     ]],
     ["setupClipboardBindings", []],
   ]);

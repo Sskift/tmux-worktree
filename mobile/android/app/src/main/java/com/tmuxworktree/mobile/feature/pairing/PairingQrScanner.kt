@@ -67,7 +67,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * In-app Relay QR scanner backed by CameraX and ML Kit's APK-bundled model.
- * Accepts both Relay v2 enrollment and Relay v1 pairing profiles.
+ * Returns the raw QR payload. V2Activity admits Relay v2 enrollment only.
  * No Google Play services optional scanner or recognition module is used here.
  */
 @Composable
@@ -146,7 +146,7 @@ private fun ScannerPreview(
     DisposableEffect(context, lifecycleOwner, previewView) {
         val mainExecutor = ContextCompat.getMainExecutor(context)
         val analysisExecutor = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "tw-relay-v1-qr-scanner").apply { isDaemon = true }
+            Thread(runnable, "tw-relay-v2-qr-scanner").apply { isDaemon = true }
         }
         val scanner = BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder()

@@ -1,31 +1,7 @@
 package com.tmuxworktree.mobile.core.terminal
 
 /**
- * Mouse and focus reports describe the read-only terminal attachment. They are not pane text and
- * must never enter Relay v1's controlled input lane.
- */
-internal fun isControlledTerminalTransportReport(data: String): Boolean =
-    CONTROLLED_TERMINAL_TRANSPORT_REPORT.matches(data)
-
-/**
- * Input admission selected by the product owner that already holds the current protocol
- * admission and terminal attachment. The WebView bridge itself remains protocol-neutral.
- */
-internal enum class TerminalAttachmentInputPolicy {
-    RELAY_V1_CONTROLLED {
-        override fun admit(data: String): String? =
-            data.takeUnless(::isControlledTerminalTransportReport)
-    },
-    RELAY_V2_RAW_BYTES {
-        override fun admit(data: String): String = data
-    },
-    ;
-
-    abstract fun admit(data: String): String?
-}
-
-/**
- * Prevents the read-only tmux attachment from enabling xterm mouse/focus reports. The filter keeps
+ * Prevents the terminal attachment from enabling xterm mouse/focus reports. The filter keeps
  * an incomplete CSI sequence across output chunks because terminal output is not frame aligned.
  */
 internal class ControlledTerminalOutputFilter {
@@ -119,13 +95,6 @@ internal class ControlledTerminalOutputFilter {
 
 private const val ESCAPE = '\u001B'
 private const val MAX_PENDING_PRIVATE_CSI_CHARS = 256
-
-private val CONTROLLED_TERMINAL_TRANSPORT_REPORT = Regex(
-    "^(?:(?:${ESCAPE}\\[<\\d+;\\d+;\\d+[mM])|" +
-        "(?:${ESCAPE}\\[\\d+;\\d+;\\d+M)|" +
-        "(?:${ESCAPE}\\[M[\\s\\S]{3})|" +
-        "(?:${ESCAPE}\\[[IO]))+$",
-)
 
 private val CONTROLLED_MOUSE_MODES = setOf(
     "9",

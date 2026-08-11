@@ -3,7 +3,7 @@ import {
   mkdirSync as fsMkdirSync,
   realpathSync as fsRealpathSync,
 } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import {
   assertCanonicalWorktreePlacementFilesystem,
@@ -44,11 +44,14 @@ import {
   type ManagedSessionLifecycleExtensionV1,
   type ManagedSessionProfile,
   type ManagedSessionReservationCorrelationV1,
-  type ManagedTmuxIncarnationIdentityV1,
   type ManagedState,
   withManagedSessionLifecycleExtension,
   managedStatePath,
 } from "./state";
+import {
+  bootstrapTwDashboardAgentCommand,
+  twDashboardShellPrelude,
+} from "./twDashboardBootstrap";
 
 export const SESSION_NAME_MAX_LEN = 20;
 
@@ -103,7 +106,7 @@ export interface CreatedManagedTerminalSession {
 }
 
 export interface ManagedSessionLifecycleV2Create {
-  reservationCorrelation: ManagedSessionReservationCorrelationV1;
+  reservationCorrelation: ManagedSessionReservationCorrelationV1 | null;
   displayLabel: string | null;
 }
 
@@ -145,6 +148,7 @@ export interface RestoreManagedWorktreeSessionParams {
   /** Records which surface requested the session; it does not affect tmux layout. */
   profile: ManagedSessionProfile;
   quiet?: boolean;
+  lifecycleV2?: ManagedSessionLifecycleV2Create;
 }
 
 export interface CreateManagedWorktreeSessionDeps {
@@ -186,11 +190,15 @@ export function aiCommandPathPrefix(): string {
   return 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH:$HOME/.kimi-code/bin"';
 }
 
-export function commandThenLoginShell(command: string): string {
+export function commandThenLoginShell(command: string, sessionName?: string): string {
   const path = aiCommandPathPrefix();
   const shell = "exec \"${SHELL:-/bin/zsh}\" -l";
-  if (!command.trim()) return `${path}; ${shell}`;
-  return `${path}; ${command}; ${shell}`;
+  const dashboard = sessionName
+    ? `${twDashboardShellPrelude({ sessionName })}; `
+    : "";
+  if (!command.trim()) return `${path}; ${dashboard}${shell}`;
+  const prepared = sessionName ? bootstrapTwDashboardAgentCommand(command) : command;
+  return `${path}; ${dashboard}${prepared}; ${shell}`;
 }
 
 function randomHexId(): string {
@@ -313,9 +321,9 @@ function prepareLifecycleV2Create(
   randomBirthMarker: () => string,
 ): PreparedLifecycleV2Create | undefined {
   if (!lifecycle) return undefined;
-  const reservationCorrelation = normalizeManagedSessionReservationCorrelation(
-    lifecycle.reservationCorrelation,
-  );
+  const reservationCorrelation = lifecycle.reservationCorrelation === null
+    ? null
+    : normalizeManagedSessionReservationCorrelation(lifecycle.reservationCorrelation);
   if (lifecycle.displayLabel !== null && (
     lifecycle.displayLabel.length === 0
     || lifecycle.displayLabel.trim() !== lifecycle.displayLabel
@@ -385,7 +393,7 @@ function lifecycleRecordWasCommitted(
 }
 
 function lifecycleV2InDoubtAfterTmuxMutation(
-  operation: "create-worktree" | "create-terminal",
+  operation: "create-worktree" | "create-terminal" | "restore-worktree",
   session: string,
   phase: string,
   error: unknown,
@@ -397,7 +405,7 @@ function lifecycleV2InDoubtAfterTmuxMutation(
 }
 
 function captureLifecycleV2AfterTmuxMutation(
-  operation: "create-worktree" | "create-terminal",
+  operation: "create-worktree" | "create-terminal" | "restore-worktree",
   phase: string,
   session: string,
   prepared: PreparedLifecycleV2Create,
@@ -411,7 +419,7 @@ function captureLifecycleV2AfterTmuxMutation(
 }
 
 function lifecycleRecordWasCommittedAfterTmuxMutation(
-  operation: "create-worktree" | "create-terminal",
+  operation: "create-worktree" | "create-terminal" | "restore-worktree",
   phase: string,
   session: string,
   expected: ManagedSessionLifecycleExtensionV1,
@@ -445,7 +453,7 @@ function startManagedSession(
     session,
     "-c",
     workDir,
-    commandThenLoginShell(aiCmd),
+    commandThenLoginShell(aiCmd, session),
   ];
   if (lifecycleV2) {
     args.push(
@@ -907,7 +915,7 @@ function incarnationIdentity(entry: TmuxSessionLifecycleEntry) {
 }
 
 function encodedReservationCorrelation(
-  correlation: ManagedSessionReservationCorrelationV1,
+  correlation: ManagedSessionReservationCorrelationV1 | null,
 ): string {
   return Buffer.from(JSON.stringify(correlation), "utf8").toString("base64url");
 }
@@ -1075,257 +1083,6 @@ export function killManagedSessionV2(
   }
 }
 
-// ─── 存量 v1 会话的 v2 lifecycle 幂等补标 ───
-
-/**
- * Synthetic reservation correlation namespace reserved for this migration. A
- * legacy session has no real reservation, so the marking invents a well-formed
- * correlation that a v2 consumer can treat as an opaque provenance marker. The
- * distinct reservationId prefix also lets a later run recognize and complete a
- * previously half-applied migration (tmux markers written, state extension not
- * yet committed).
- */
-export const RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX = "tw-migrate-legacy-v1";
-
-function legacyMigrationReservationCorrelation(
-  name: string,
-): ManagedSessionReservationCorrelationV1 {
-  const reservationId = `${RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX}:${name}`;
-  const canonical = JSON.stringify({
-    schemaVersion: 1,
-    reservationId,
-    hostEpoch: "0",
-    principalId: "tw-cli-legacy-migration",
-    hostId: "localhost",
-    commandId: `migrate-legacy:${name}`,
-  });
-  return {
-    schemaVersion: 1,
-    reservationId,
-    hostEpoch: "0",
-    principalId: "tw-cli-legacy-migration",
-    hostId: "localhost",
-    commandId: `migrate-legacy:${name}`,
-    requestFingerprint: {
-      schemaVersion: 1,
-      algorithm: "sha256-rfc8785",
-      digest: createHash("sha256").update(canonical, "utf8").digest("hex"),
-    },
-  };
-}
-
-function tmuxIdentityFromLifecycle(
-  entry: TmuxSessionLifecycleEntry,
-): ManagedTmuxIncarnationIdentityV1 & { birthMarker: string } {
-  if (entry.birthMarker === null) {
-    throw new CliError(`legacy migration requires a live birth marker for ${entry.rawName}`);
-  }
-  return {
-    serverSocketPath: entry.serverSocketPath,
-    serverPid: entry.serverPid,
-    serverStarted: entry.serverStarted,
-    sessionId: entry.sessionId,
-    rawName: entry.rawName,
-    sessionCreated: entry.sessionCreated,
-    birthMarker: entry.birthMarker,
-  };
-}
-
-function decodeLegacyMigrationCorrelation(
-  encoded: string,
-): ManagedSessionReservationCorrelationV1 | undefined {
-  try {
-    const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as unknown;
-    const normalized = normalizeManagedSessionReservationCorrelation(parsed);
-    if (!normalized.reservationId.startsWith(RELAY_V2_LEGACY_MIGRATION_RESERVATION_ID_PREFIX)) {
-      return undefined;
-    }
-    return normalized;
-  } catch {
-    return undefined;
-  }
-}
-
-const RPC_V2_DISPLAY_LABEL_MAX_BYTES = 128;
-
-/**
- * Converge a managed record name into a canonical RPC v2 display label that
- * satisfies the persistedDisplayLabel contract: non-empty, no surrounding
- * whitespace, no NUL characters, and at most 128 UTF-8 bytes. Over-long labels
- * are truncated at a UTF-8 code point boundary so a multi-byte character is
- * never split (a trailing partial sequence is backed off to its leading byte).
- *
- * Returns undefined when nothing can be salvaged — a whitespace-only or
- * otherwise unrepresentable name — signalling the caller to skip the session.
- */
-export function convergeRpcV2DisplayLabel(name: string): string | undefined {
-  let label = name.trim();
-  if (!label) return undefined;
-  label = label.replaceAll("\0", "");
-  if (!label) return undefined;
-  const bytes = Buffer.from(label, "utf8");
-  if (bytes.length > RPC_V2_DISPLAY_LABEL_MAX_BYTES) {
-    let end = RPC_V2_DISPLAY_LABEL_MAX_BYTES;
-    // Back up while the byte just past the cut is a continuation byte, so the
-    // cut never lands mid-character.
-    while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
-    label = bytes.subarray(0, end).toString("utf8").trim();
-  }
-  return label || undefined;
-}
-
-export interface MarkRelayV2HostLegacySessionsLifecycleV1Result {
-  /** Legacy sessions that were marked end-to-end in this run. */
-  marked: number;
-  /** Sessions whose tmux markers existed already and whose state extension was completed here. */
-  recovered: number;
-  /** Sessions that could not be marked this run (already marked, not live, or unsafe to adopt). */
-  skipped: number;
-}
-
-export interface MarkRelayV2HostLegacySessionsLifecycleV1Deps {
-  statePath?: string;
-  listTmuxSessionLifecycleEntries?: () => TmuxSessionLifecycleEntry[];
-  tmuxBin?: () => string;
-  exec?: (bin: string, args: string[], timeout?: number) => void;
-  randomBirthMarker?: () => string;
-}
-
-/**
- * Idempotently promote v1-era managed tmux sessions into v2 lifecycle
- * authority so that RPC v2 discovery (`tw rpc-v2 list`) projects them as
- * `lifecycleMarked: true`.
- *
- * A managed record with no lifecycle extension is a migration candidate; a
- * live tmux session with no birth marker receives generated markers plus a
- * synthetic reservation correlation, then the state extension is committed
- * under the canonical writer lock. If the tmux markers already exist from an
- * earlier partially applied run, the state extension is completed from those
- * markers instead (recovery). Every extension written here persists the
- * managed record name as the display label, converged with
- * {@link convergeRpcV2DisplayLabel} so discovery's persistedDisplayLabel
- * contract holds. Records already carrying an extension with a non-null label
- * are skipped; records carrying an extension whose display label is null (the
- * output of an earlier migration bug) are repaired in place from the managed
- * record name, idempotently. Sessions whose live markers do not carry this
- * migration's reservation namespace are left untouched and remain invisible
- * to v2, which preserves the frozen "foreign markers are not adopted"
- * lifecycle semantics.
- *
- * The migration never throws for per-session tmux/commit failures; it counts
- * them as skipped so that v2 list remains usable. State corruption still fails
- * closed before any tmux mutation because the strict reader and lifecycle
- * authority assertion run first.
- */
-export function markRelayV2HostLegacySessionsLifecycleV1(
-  deps: MarkRelayV2HostLegacySessionsLifecycleV1Deps = {},
-): MarkRelayV2HostLegacySessionsLifecycleV1Result {
-  const path = deps.statePath ?? managedStatePath();
-  const list = deps.listTmuxSessionLifecycleEntries
-    ?? defaultListTmuxSessionLifecycleEntries;
-  const tmux = deps.tmuxBin ?? defaultTmuxBin;
-  const exec = deps.exec ?? defaultExec;
-  const randomBirthMarker = deps.randomBirthMarker
-    ?? (() => `twbirth2.${randomBytes(16).toString("base64url")}`);
-  const result: MarkRelayV2HostLegacySessionsLifecycleV1Result = {
-    marked: 0,
-    recovered: 0,
-    skipped: 0,
-  };
-
-  const state = defaultLoadManagedStateForMutation(path);
-  assertManagedStateLifecycleV2Authority(state);
-  const live = list();
-  const liveByName = new Map(live.map((entry) => [entry.rawName, entry]));
-
-  for (const managed of state.sessions) {
-    const existing = managedSessionLifecycleExtension(managed);
-    // A record already carrying a non-null display label is fully migrated.
-    if (existing !== undefined && existing.displayLabel !== null) {
-      continue;
-    }
-    // The display label is always the converged managed record name, mirroring
-    // discovery's persistedDisplayLabel contract. Unrepresentable names are
-    // skipped rather than persisted with a broken label.
-    const label = convergeRpcV2DisplayLabel(managed.name);
-    if (label === undefined) {
-      result.skipped += 1;
-      continue;
-    }
-    // Repair an extension written by the pre-fix migration that persisted a
-    // null display label. The label derives from the managed record name, so
-    // current tmux liveness is not required for the state-only fix.
-    if (existing !== undefined) {
-      const extension = buildManagedSessionLifecycleExtension(
-        existing.tmux,
-        existing.reservationCorrelation,
-        label,
-      );
-      defaultRecordManagedSession(withManagedSessionLifecycleExtension(managed, extension), path);
-      result.recovered += 1;
-      continue;
-    }
-    const entry = liveByName.get(managed.name);
-    if (!entry || !entry.lifecycleMarkersValid) {
-      continue;
-    }
-    if (entry.birthMarker !== null) {
-      const correlation = decodeLegacyMigrationCorrelation(entry.reservationCorrelation ?? "");
-      if (!correlation) {
-        result.skipped += 1;
-        continue;
-      }
-      const extension = buildManagedSessionLifecycleExtension(
-        tmuxIdentityFromLifecycle(entry),
-        correlation,
-        label,
-      );
-      defaultRecordManagedSession(withManagedSessionLifecycleExtension(managed, extension), path);
-      result.recovered += 1;
-      continue;
-    }
-
-    const birthMarker = randomBirthMarker();
-    if (!/^twbirth2\.[A-Za-z0-9_-]{22}$/.test(birthMarker)) {
-      result.skipped += 1;
-      continue;
-    }
-    const correlation = legacyMigrationReservationCorrelation(managed.name);
-    const correlationEncoded = Buffer.from(
-      JSON.stringify(correlation),
-      "utf8",
-    ).toString("base64url");
-    try {
-      exec(
-        tmux(),
-        ["set-option", "-t", `=${managed.name}:`, TMUX_RPC_V2_BIRTH_MARKER_OPTION, birthMarker],
-      );
-      exec(
-        tmux(),
-        ["set-option", "-t", `=${managed.name}:`, TMUX_RPC_V2_RESERVATION_CORRELATION_OPTION, correlationEncoded],
-      );
-      const confirmed = list().find((candidate) => candidate.rawName === managed.name);
-      if (!confirmed
-        || !confirmed.lifecycleMarkersValid
-        || confirmed.birthMarker !== birthMarker
-        || confirmed.reservationCorrelation !== correlationEncoded) {
-        result.skipped += 1;
-        continue;
-      }
-      const extension = buildManagedSessionLifecycleExtension(
-        tmuxIdentityFromLifecycle(confirmed),
-        correlation,
-        label,
-      );
-      defaultRecordManagedSession(withManagedSessionLifecycleExtension(managed, extension), path);
-      result.marked += 1;
-    } catch (error) {
-      result.skipped += 1;
-    }
-  }
-  return result;
-}
-
 /** Re-attach a real, already-existing git worktree to the managed contract. */
 export function restoreManagedWorktreeSession(
   params: RestoreManagedWorktreeSessionParams,
@@ -1339,6 +1096,15 @@ export function restoreManagedWorktreeSession(
   const sessionExists = deps.sessionExists ?? defaultSessionExists;
   const now = deps.now ?? (() => new Date());
   const setupBindings = deps.setupClipboardBindings ?? setupClipboardBindings;
+  const loadMutationState = deps.loadManagedStateForMutation ?? defaultLoadManagedStateForMutation;
+  const listLifecycle = deps.listTmuxSessionLifecycleEntries
+    ?? defaultListTmuxSessionLifecycleEntries;
+  const preparedLifecycle = prepareLifecycleV2Create(
+    params.lifecycleV2,
+    deps.randomBirthMarker
+      ?? (() => `twbirth2.${randomBytes(16).toString("base64url")}`),
+  );
+  if (preparedLifecycle) assertManagedStateLifecycleV2Authority(loadMutationState());
   const worktreePath = params.worktreePath.trim();
   if (!worktreePath) throw new CliError("worktree path required");
   if (!existsSync(worktreePath)) throw new CliError(`目录不存在: ${worktreePath}`);
@@ -1348,7 +1114,42 @@ export function restoreManagedWorktreeSession(
 
   const session = resolveSessionName(params.sessionName.trim(), sessionExists);
   if (!session) throw new CliError("session name required");
-  startManagedSession(tmux, session, worktreePath, params.aiCmd ?? "", exec, setupBindings);
+  let capturedLifecycle: ReturnType<typeof captureLifecycleV2> | undefined;
+  try {
+    startManagedSession(
+      tmux,
+      session,
+      worktreePath,
+      params.aiCmd ?? "",
+      exec,
+      setupBindings,
+      preparedLifecycle,
+    );
+  } catch (error) {
+    if (!preparedLifecycle) throw error;
+    try {
+      capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+        "restore-worktree",
+        "tmux start confirmation",
+        session,
+        preparedLifecycle,
+        listLifecycle,
+      );
+    } catch {
+      throw new ManagedSessionLifecycleV2InDoubtError(
+        `RPC v2 restore-worktree could not confirm whether tmux session ${session} was created: ${errorDetail(error)}`,
+      );
+    }
+  }
+  if (preparedLifecycle && !capturedLifecycle) {
+    capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+      "restore-worktree",
+      "initial tmux identity capture",
+      session,
+      preparedLifecycle,
+      listLifecycle,
+    );
+  }
 
   const branch = gitQuery(worktreePath, ["branch", "--show-current"]).trim() || undefined;
   const commonDir = gitQuery(worktreePath, [
@@ -1358,28 +1159,72 @@ export function restoreManagedWorktreeSession(
   ]).trim();
   const repoPath = commonDir.endsWith("/.git") ? dirname(commonDir) : undefined;
   const project = params.projectKey?.trim() || basename(dirname(worktreePath)) || undefined;
+  const baseRecord: ManagedSession = {
+    name: session,
+    kind: "worktree",
+    profile: params.profile,
+    project,
+    repoPath,
+    worktreePath,
+    branch,
+    cwd: worktreePath,
+    createdAt: now().toISOString(),
+  };
+  const record = capturedLifecycle
+    ? withManagedSessionLifecycleExtension(baseRecord, capturedLifecycle.extension)
+    : baseRecord;
   try {
-    persistManagedSession({
-      name: session,
-      kind: "worktree",
-      profile: params.profile,
-      project,
-      repoPath,
-      worktreePath,
-      branch,
-      cwd: worktreePath,
-      createdAt: now().toISOString(),
-    }, deps);
+    persistManagedSession(record, deps);
   } catch (error) {
-    try {
-      rollbackManagedSession(session, tmux, exec, deps.killSession);
-    } catch (rollbackError) {
-      throw appendRollbackFailures(
-        new CliError(`写入 TW state 失败: ${errorDetail(error)}`),
-        [`停止 restored tmux session ${session} 失败: ${errorDetail(rollbackError)}`],
+    if (capturedLifecycle) {
+      if (!lifecycleRecordWasCommittedAfterTmuxMutation(
+        "restore-worktree",
+        "state commit re-read",
+        session,
+        capturedLifecycle.extension,
+        loadMutationState,
+      )) {
+        throw new ManagedSessionLifecycleV2InDoubtError(
+          `RPC v2 restore-worktree state commit is uncertain for ${session}: ${errorDetail(error)}`,
+        );
+      }
+    } else {
+      try {
+        rollbackManagedSession(session, tmux, exec, deps.killSession);
+      } catch (rollbackError) {
+        throw appendRollbackFailures(
+          new CliError(`写入 TW state 失败: ${errorDetail(error)}`),
+          [`停止 restored tmux session ${session} 失败: ${errorDetail(rollbackError)}`],
+        );
+      }
+      throw new CliError(`写入 TW state 失败，已回滚 restored session: ${errorDetail(error)}`);
+    }
+  }
+  if (capturedLifecycle) {
+    const confirmed = captureLifecycleV2AfterTmuxMutation(
+      "restore-worktree",
+      "final tmux identity confirmation",
+      session,
+      preparedLifecycle!,
+      listLifecycle,
+    );
+    if (confirmed.extension.incarnation !== capturedLifecycle.extension.incarnation
+      || !lifecycleRecordWasCommittedAfterTmuxMutation(
+        "restore-worktree",
+        "final state commit confirmation",
+        session,
+        capturedLifecycle.extension,
+        loadMutationState,
+      )) {
+      throw new ManagedSessionLifecycleV2InDoubtError(
+        `RPC v2 restore-worktree commit could not be confirmed for ${session}`,
       );
     }
-    throw new CliError(`写入 TW state 失败，已回滚 restored session: ${errorDetail(error)}`);
   }
-  return { session, workDir: worktreePath, worktree: null };
+  return {
+    session,
+    workDir: worktreePath,
+    worktree: null,
+    ...(capturedLifecycle ? { lifecycleV2: capturedLifecycle.extension } : {}),
+  };
 }

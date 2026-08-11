@@ -293,7 +293,8 @@ try {
 // the deployment lifecycle never assemble Relay arguments independently.
 const SELF_HOSTED_FLAG: &str = "--v2-single-node-self-hosted";
 const AGENT_TRANSCRIPT_LIFECYCLE_FLAG: &str = "--v2-agent-transcript-lifecycle-v1";
-const AGENT_CHAT_FLAG: &str = "--v2-agent-chat-v1";
+const AGENT_CHAT_FLAG: &str = "--v2-agent-chat-v2";
+const LARK_BINDINGS_FLAG: &str = "--v2-lark-bindings-v2";
 const ADVERTISED_ORIGIN_FLAG: &str = "--v2-dev-advertised-origin";
 const TLS_KEY_FLAG: &str = "--v2-dev-tls-key";
 const TLS_CERTIFICATE_FLAG: &str = "--v2-dev-tls-cert";
@@ -2591,7 +2592,6 @@ test ! -e "$target"
 test ! -L "$target"
 mv "$stage" "$target"
 require_bundle_tree "$target"
-if test -e "$root/current" || test -L "$root/current"; then require_current_bundle; fi
 next="$root/.current-{deployment_id}"
 test ! -e "$next"
 test ! -L "$next"
@@ -2673,8 +2673,8 @@ test ! -L "$HOME/{remote_stage}"
 }
 
 fn issuer_hostname(issuer_url: &str) -> Result<String, String> {
-    let parsed = tauri::Url::parse(issuer_url)
-        .map_err(|_| "saved Relay URL is invalid".to_string())?;
+    let parsed =
+        tauri::Url::parse(issuer_url).map_err(|_| "saved Relay URL is invalid".to_string())?;
     parsed
         .host_str()
         .map(str::to_string)
@@ -2844,6 +2844,7 @@ fn build_remote_relay_v2_center_command(
         SELF_HOSTED_FLAG.to_string(),
         AGENT_TRANSCRIPT_LIFECYCLE_FLAG.to_string(),
         AGENT_CHAT_FLAG.to_string(),
+        LARK_BINDINGS_FLAG.to_string(),
         "--host".to_string(),
         shell_quote(&config.listen_host),
         "--port".to_string(),
@@ -3975,10 +3976,12 @@ mod tests {
         // without the new field and migrate to schema 7 while preserving the
         // already-durable connector desired state.
         let mut value = serde_json::to_value(config()).unwrap();
-        value["schemaVersion"] =
-            serde_json::json!(CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION);
+        value["schemaVersion"] = serde_json::json!(CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION);
         value["connectorDesiredRunning"] = serde_json::json!(true);
-        value.as_object_mut().unwrap().remove("externalTlsManagement");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("externalTlsManagement");
 
         let migrated: PersistedSelfHostedConfig = serde_json::from_value(value).unwrap();
         assert!(!migrated.external_tls_management);
@@ -3998,18 +4001,16 @@ mod tests {
         external.tls_certificate_path = String::new();
         external.tls_ca_path = String::new();
         let serialized = serde_json::to_value(&external).unwrap();
-        assert_eq!(
-            serialized["externalTlsManagement"],
-            serde_json::json!(true)
-        );
-        let restored: PersistedSelfHostedConfig =
-            serde_json::from_value(serialized).unwrap();
+        assert_eq!(serialized["externalTlsManagement"], serde_json::json!(true));
+        let restored: PersistedSelfHostedConfig = serde_json::from_value(serialized).unwrap();
         assert!(restored.external_tls_management);
 
         let mut legacy = serde_json::to_value(config()).unwrap();
-        legacy.as_object_mut().unwrap().remove("externalTlsManagement");
-        let legacy_restored: PersistedSelfHostedConfig =
-            serde_json::from_value(legacy).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("externalTlsManagement");
+        let legacy_restored: PersistedSelfHostedConfig = serde_json::from_value(legacy).unwrap();
         assert!(!legacy_restored.external_tls_management);
     }
 
@@ -4201,7 +4202,8 @@ mod tests {
         let command = build_remote_relay_v2_center_command(&pending, Some(&attempt));
         assert!(command.contains("--v2-single-node-self-hosted"));
         assert!(command.contains("--v2-agent-transcript-lifecycle-v1"));
-        assert!(command.contains("--v2-agent-chat-v1"));
+        assert!(command.contains("--v2-agent-chat-v2"));
+        assert!(command.contains("--v2-lark-bindings-v2"));
         assert!(command.contains("--host '0.0.0.0' --port 443"));
         assert!(command.contains("--v2-dev-advertised-origin 'https://relay.company.test/'"));
         assert!(command.contains("--v2-dev-tls-key"));
@@ -4498,6 +4500,7 @@ mod tests {
         assert!(script.contains("ln -s \"bundles/dashboard-test\" \"$next\""));
         assert!(script.contains("mv -Tf \"$next\" \"$root/current\""));
         assert!(!script.contains("mv -f \"$next\" \"$root/current\""));
+        assert!(!script.contains("then require_current_bundle"));
         assert!(script.contains("require_current_bundle"));
         assert!(script.contains("require_bundle_tree \"$target\""));
     }

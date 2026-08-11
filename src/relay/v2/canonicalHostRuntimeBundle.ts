@@ -65,7 +65,7 @@ export interface RelayV2CanonicalHostRuntimeBundleOptionsV1 {
   terminalControlDaemonSocketPath: string;
   /** Fixed trust store for every configured SSH Host. */
   knownHostsFile: string;
-  /** Fixed SSH executable; SSH config is never consulted. */
+  /** Fixed SSH executable; only explicitly configured Host aliases are eligible. */
   sshExecutable: string;
   /** Explicit owner seams; trusted production construction omits these fields. */
   configLoader?: () => Pick<Config, "hosts"> | null;

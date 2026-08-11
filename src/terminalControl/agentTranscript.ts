@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -242,12 +243,29 @@ export function agentProviderFromStartCommand(command: string): AgentProvider | 
   return claude ? "claude" : "codex";
 }
 
+function resumableSessionId(value: unknown): string | undefined {
+  const id = safeText(value, 128);
+  return id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)
+    ? id
+    : undefined;
+}
+
+export function resumedAgentSessionIdFromStartCommand(
+  command: string,
+  provider: AgentProvider,
+): string | undefined {
+  const match = provider === "codex"
+    ? /(?:^|;)\s*codex(?:\s+-c\s+(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;'"\r\n]+))*\s+resume\s+'([0-9a-f-]+)'(?=\s*(?:;|$))/iu.exec(command)
+    : /(?:^|;)\s*claude(?:\s+--append-system-prompt\s+(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;'"\r\n]+))*\s+--resume\s+'([0-9a-f-]+)'(?=\s*(?:;|$))/iu.exec(command);
+  return resumableSessionId(match?.[1]);
+}
+
 function claudeProjectDirectory(cwd: string, home: string): string {
   const encoded = cwd.replace(/[^A-Za-z0-9]/g, "-");
   return join(home, ".claude", "projects", encoded);
 }
 
-function directJsonlCandidates(directory: string): TranscriptCandidate[] {
+function directJsonlCandidates(directory: string, sessionId?: string): TranscriptCandidate[] {
   let entries;
   try {
     entries = readdirSync(directory, { withFileTypes: true });
@@ -259,7 +277,8 @@ function directJsonlCandidates(directory: string): TranscriptCandidate[] {
     );
   }
   return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .filter((entry) => entry.isFile()
+      && (sessionId === undefined ? entry.name.endsWith(".jsonl") : entry.name === `${sessionId}.jsonl`))
     .map((entry) => {
       const path = join(directory, entry.name);
       return { path, mtimeMs: statSync(path).mtimeMs };
@@ -267,7 +286,7 @@ function directJsonlCandidates(directory: string): TranscriptCandidate[] {
     .sort((left, right) => right.mtimeMs - left.mtimeMs);
 }
 
-function codexJsonlCandidates(home: string): TranscriptCandidate[] {
+function codexJsonlCandidates(home: string, sessionId?: string): TranscriptCandidate[] {
   const root = join(home, ".codex", "sessions");
   const candidates: TranscriptCandidate[] = [];
   const visit = (directory: string, depth: number): void => {
@@ -288,7 +307,9 @@ function codexJsonlCandidates(home: string): TranscriptCandidate[] {
     for (const entry of entries) {
       if (entry.isDirectory()) {
         visit(join(directory, entry.name), depth + 1);
-      } else if (entry.isFile() && /^rollout-.*\.jsonl$/u.test(entry.name)) {
+      } else if (entry.isFile()
+        && /^rollout-.*\.jsonl$/u.test(entry.name)
+        && (sessionId === undefined || entry.name.endsWith(`-${sessionId}.jsonl`))) {
         const path = join(directory, entry.name);
         candidates.push({ path, mtimeMs: statSync(path).mtimeMs });
       }
@@ -319,6 +340,18 @@ function claudeHumanTurn(record: JsonRecord, cwd: string): {
   const turnId = safeText(record.uuid, 128);
   const startedAt = exactTimestamp(record.timestamp);
   return turnId && startedAt ? { turnId, startedAt } : undefined;
+}
+
+function claudeHasHumanTurnAtOrAfter(
+  records: JsonRecord[],
+  cwd: string,
+  sessionId: string,
+  startedAt: string,
+): boolean {
+  return records.some((record) => {
+    const turn = claudeHumanTurn(record, cwd);
+    return record.sessionId === sessionId && turn !== undefined && turn.startedAt >= startedAt;
+  });
 }
 
 function activeClaudeSource(records: JsonRecord[], cwd: string): TerminalControlAgentSource | undefined {
@@ -376,22 +409,52 @@ function claudeResult(
   }
   if (completionIndex < 0) return undefined;
   const completion = records[completionIndex];
-  const assistantUuid = safeText(completion.parentUuid, 128);
   const completedAt = exactTimestamp(completion.timestamp);
-  if (!assistantUuid || !completedAt) {
+  let ancestorUuid = safeText(completion.parentUuid, 128);
+  if (!ancestorUuid || !completedAt) {
     throw new TerminalControlProtocolError(
       "RECOVERY_REQUIRED",
       "Claude completion correlation is malformed",
     );
   }
-  let assistant: JsonRecord | undefined;
-  for (let index = completionIndex - 1; index >= 0; index -= 1) {
+  const correlated = new Map<string, JsonRecord>();
+  for (let index = startIndex; index < completionIndex; index += 1) {
     const candidate = records[index];
-    if (candidate.type === "assistant" && candidate.uuid === assistantUuid
-      && isRecord(candidate.message) && candidate.message.role === "assistant") {
+    const uuid = safeText(candidate.uuid, 128);
+    if (!uuid) continue;
+    if (correlated.has(uuid)) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "Claude completion ancestry contains a duplicate identity",
+      );
+    }
+    correlated.set(uuid, candidate);
+  }
+  let assistant: JsonRecord | undefined;
+  const visited = new Set<string>();
+  while (ancestorUuid && !visited.has(ancestorUuid)) {
+    visited.add(ancestorUuid);
+    const candidate = correlated.get(ancestorUuid);
+    if (!candidate
+      || candidate.sessionId !== expected.sessionId
+      || candidate.isSidechain === true
+      || (candidate.cwd !== cwd && candidate.type !== "system")) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "Claude completion ancestry is incomplete or mismatched",
+      );
+    }
+    if (candidate.type === "assistant"
+      && isRecord(candidate.message)
+      && candidate.message.role === "assistant"
+      && Array.isArray(candidate.message.content)
+      && candidate.message.content.some((block: unknown) =>
+        isRecord(block) && block.type === "text" && typeof block.text === "string"
+          && block.text.trim().length > 0)) {
       assistant = candidate;
       break;
     }
+    ancestorUuid = safeText(candidate.parentUuid, 128);
   }
   if (!assistant || !isRecord(assistant.message) || !Array.isArray(assistant.message.content)) {
     throw new TerminalControlProtocolError(
@@ -467,13 +530,6 @@ function codexResult(
     record.type === "event_msg" && isRecord(record.payload)
     && record.payload.type === "task_complete" && record.payload.turn_id === expected.turnId);
   if (!completion || !isRecord(completion.payload)) return undefined;
-  const text = safeText(completion.payload.last_agent_message, MAX_TRANSCRIPT_BYTES)?.trim();
-  if (!text) {
-    throw new TerminalControlProtocolError(
-      "RECOVERY_REQUIRED",
-      "Codex task completion contains no final assistant message",
-    );
-  }
   const completedAt = exactTimestamp(completion.timestamp);
   if (!completedAt) {
     throw new TerminalControlProtocolError(
@@ -481,27 +537,89 @@ function codexResult(
       "Codex completion timestamp is malformed",
     );
   }
+  const text = safeText(completion.payload.last_agent_message, MAX_TRANSCRIPT_BYTES)?.trim();
+  if (!text) {
+    const providerError = completion.payload.error;
+    if (isRecord(providerError)
+      && providerError.codex_error_info === "unauthorized"
+      && safeText(providerError.message)?.trim()) {
+      throw new TerminalControlProtocolError(
+        "PERMISSION_DENIED",
+        "Agent authentication is required",
+      );
+    }
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "Codex task completion contains no final assistant message",
+    );
+  }
   const bounded = boundedUtf8Head(text, maxBytes);
   return { source: expected, completedAt, text: bounded.text, truncated: bounded.truncated };
 }
 
-function transcriptCandidates(provider: AgentProvider, cwd: string, home: string): TranscriptCandidate[] {
+function transcriptCandidates(
+  provider: AgentProvider,
+  cwd: string,
+  home: string,
+  sessionId?: string,
+): TranscriptCandidate[] {
   return provider === "claude"
-    ? directJsonlCandidates(claudeProjectDirectory(cwd, home))
-    : codexJsonlCandidates(home);
+    ? directJsonlCandidates(claudeProjectDirectory(cwd, home), sessionId)
+    : codexJsonlCandidates(home, sessionId);
+}
+
+export function discoverLatestResumableAgentSession(input: {
+  provider: AgentProvider;
+  cwd: string;
+  home?: string;
+}): string | undefined {
+  const home = input.home ?? homedir();
+  if (input.provider === "codex") {
+    if (!existsSync(join(home, ".codex", "sessions"))) return undefined;
+    for (const candidate of codexJsonlCandidates(home)) {
+      const metadata = codexSessionMetadata(candidate.path);
+      const sessionId = resumableSessionId(metadata?.sessionId);
+      if (sessionId && metadata?.cwd === input.cwd) return sessionId;
+    }
+    return undefined;
+  }
+
+  const directory = claudeProjectDirectory(input.cwd, home);
+  if (!existsSync(directory)) return undefined;
+  for (const candidate of directJsonlCandidates(directory)) {
+    const records = readJsonLines(candidate.path);
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const record = records[index];
+      const sessionId = resumableSessionId(record.sessionId);
+      if (sessionId && record.cwd === input.cwd) return sessionId;
+    }
+  }
+  return undefined;
 }
 
 export function discoverActiveAgentSource(input: {
   provider: AgentProvider;
   cwd: string;
   home?: string;
+  sessionId?: string;
+  startedAtNotBefore?: string;
 }): TerminalControlAgentSource {
   const home = input.home ?? homedir();
+  const startedAtNotBefore = input.startedAtNotBefore === undefined
+    ? undefined
+    : exactTimestamp(input.startedAtNotBefore);
+  if (input.startedAtNotBefore !== undefined && startedAtNotBefore === undefined) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "Agent source discovery boundary is malformed",
+    );
+  }
   const matches: TerminalControlAgentSource[] = [];
-  for (const candidate of transcriptCandidates(input.provider, input.cwd, home)) {
+  for (const candidate of transcriptCandidates(input.provider, input.cwd, home, input.sessionId)) {
     if (input.provider === "codex") {
       const metadata = codexSessionMetadata(candidate.path);
-      if (!metadata || metadata.cwd !== input.cwd) continue;
+      if (!metadata || metadata.cwd !== input.cwd
+        || (input.sessionId !== undefined && metadata.sessionId !== input.sessionId)) continue;
     }
     const records = input.provider === "codex"
       ? readCodexJsonLines(candidate.path)
@@ -509,7 +627,18 @@ export function discoverActiveAgentSource(input: {
     const found = input.provider === "claude"
       ? activeClaudeSource(records, input.cwd)
       : activeCodexSource(records, input.cwd);
-    if (found) {
+    if (found
+      && (input.sessionId === undefined || found.sessionId === input.sessionId)
+      && (startedAtNotBefore === undefined
+        || found.startedAt >= startedAtNotBefore
+        || (input.provider === "claude"
+          && found.boundary === "after"
+          && claudeHasHumanTurnAtOrAfter(
+            records,
+            input.cwd,
+            found.sessionId,
+            startedAtNotBefore,
+          )))) {
       matches.push(found);
       break;
     }
@@ -541,8 +670,12 @@ export function readCompletedAgentResult(input: {
     );
   }
   const home = input.home ?? homedir();
-  for (const candidate of transcriptCandidates(input.source.provider, input.cwd, home)) {
-    if (!candidate.path.endsWith(`${input.source.sessionId}.jsonl`)) continue;
+  for (const candidate of transcriptCandidates(
+    input.source.provider,
+    input.cwd,
+    home,
+    input.source.sessionId,
+  )) {
     const records = input.source.provider === "codex"
       ? readCodexJsonLines(candidate.path)
       : readJsonLines(candidate.path);

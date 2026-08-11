@@ -44,43 +44,12 @@ import org.junit.Test
 
 class RelayV2ProfileRepositoryTest {
     @Test
-    fun `profile preferences persist stable tags and v1 owner cannot replace active v2`() {
-        val empty = mutablePreferencesOf()
-        assertTrue(
-            runCatching {
-                RelayProfilePreferencesCodec.saveRelayV1Profile(
-                    preferences = empty,
-                    relayUrl = "  ",
-                    hostId = "legacy-host",
-                    autoConnect = true,
-                )
-            }.isFailure,
-        )
-        assertTrue(empty.asMap().isEmpty())
-
+    fun `profile preferences persist stable v2 tags and ignore retired untagged data`() {
         val preferences = mutablePreferencesOf()
         preferences[stringPreferencesKey("relay_url")] = "wss://legacy.example.com/client"
 
-        assertEquals(
-            RelayProfileDialect.V1,
-            RelayProfilePreferencesCodec.activeProfileIdentity(preferences)?.dialect,
-        )
+        assertEquals(null, RelayProfilePreferencesCodec.activeProfileIdentity(preferences))
         assertEquals(null, RelayProfilePreferencesCodec.toRelayV2Profile(preferences))
-
-        RelayProfilePreferencesCodec.saveRelayV1Profile(
-            preferences = preferences,
-            relayUrl = "wss://legacy.example.com/client/",
-            hostId = "legacy-host",
-            autoConnect = true,
-        )
-        assertEquals(
-            "tw-relay.v1",
-            preferences.valueNamed("relay_active_profile_dialect"),
-        )
-        assertEquals(
-            "legacy_shared_secret",
-            preferences.valueNamed("relay_active_credential_kind"),
-        )
 
         val v2Profile = relayV2Profile()
         RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, v2Profile)
@@ -97,22 +66,6 @@ class RelayV2ProfileRepositoryTest {
             RelayProfilePreferencesCodec.activeProfileIdentity(preferences),
         )
         assertEquals(v2Profile, RelayProfilePreferencesCodec.toRelayV2Profile(preferences))
-
-        val activeV2Snapshot = preferences.namedValues()
-        assertTrue(
-            runCatching {
-                RelayProfilePreferencesCodec.saveRelayV1Profile(
-                    preferences,
-                    "wss://replacement.example.com/client",
-                    "replacement-host",
-                    false,
-                )
-            }.isFailure,
-        )
-        assertTrue(
-            runCatching { RelayProfilePreferencesCodec.clearRelayV1Profile(preferences) }.isFailure,
-        )
-        assertEquals(activeV2Snapshot, preferences.namedValues())
 
         preferences[stringPreferencesKey("relay_active_profile_dialect")] = "tw-relay.future"
         assertTrue(
@@ -225,14 +178,24 @@ class RelayV2ProfileRepositoryTest {
             val file = directory.resolve("preferences.preferences_pb").toFile()
             val target = relayV2Profile()
             lateinit var prepared: RelayV2ProfileActivationJournal
-            withPreferencesStore(file) { preferences ->
+            val previousProfile = target.copy(
+                profileId = "relay-v2-profile-previous",
+                credentialReference = RelayV2CredentialReference("credential-reference-previous"),
+                activationGeneration = 3,
+                autoConnect = true,
+            )
+            withRawPreferencesStore(file) { preferences, raw ->
+                raw.edit {
+                    RelayProfilePreferencesCodec.activateRelayV2Profile(it, previousProfile)
+                }
+                preferences.setPreferredHostAndScope(previousProfile.hostId, "local")
                 val store = PreferencesRelayV2ProfileStore(preferences)
                 assertEquals(
                     null,
                     store.prepareRelayV2Activation(
                         expectedActiveProfile = RelayActiveProfileIdentity(
                             profileId = "vanished-before-prepare",
-                            dialect = RelayProfileDialect.V1,
+                            dialect = RelayProfileDialect.V2,
                             activationGeneration = 3,
                         ),
                         operationId = "activation-active-cas-race",
@@ -241,15 +204,10 @@ class RelayV2ProfileRepositoryTest {
                         targetCredentialAttemptId = "attempt-active-cas-race",
                         targetCredentialSecretReference = "secret-active-cas-race",
                         barrierId = "barrier-active-cas-race",
-                        previousCredentialReference = null,
+                        previousCredentialReference = previousProfile.credentialReference,
                     ),
                 )
                 assertEquals(null, store.pendingRelayV2Activation())
-                preferences.saveProfile(
-                    relayUrl = "wss://legacy.example.com/client",
-                    hostId = "legacy-host",
-                    autoConnect = true,
-                )
                 val previous = requireNotNull(store.activeProfileIdentity())
                 prepared = requireNotNull(
                     store.prepareRelayV2Activation(
@@ -260,7 +218,7 @@ class RelayV2ProfileRepositoryTest {
                         targetCredentialAttemptId = "attempt-reopen-1",
                         targetCredentialSecretReference = "secret-reference-reopen-1",
                         barrierId = "barrier-reopen-1",
-                        previousCredentialReference = null,
+                        previousCredentialReference = previousProfile.credentialReference,
                     ),
                 )
                 assertEquals(previous, store.activeProfileIdentity())
@@ -295,18 +253,14 @@ class RelayV2ProfileRepositoryTest {
                         targetCredentialAttemptId = "different-attempt",
                         targetCredentialSecretReference = "different-secret-reference",
                         barrierId = "different-barrier",
-                        previousCredentialReference = null,
+                        previousCredentialReference = prepared.previousCredentialReference,
                     ),
                 )
                 assertEquals(prepared, store.pendingRelayV2Activation())
                 val connectionWatcher = async { preferences.values.take(2).toList() }
                 yield()
-                assertV1ProfileMutationsRejected(preferences)
-                assertEquals(
-                    "wss://legacy.example.com/client",
-                    preferences.values.first().relayUrl,
-                )
-                assertEquals("legacy-host", preferences.values.first().preferredHostId)
+                assertProfilePreferencesMutationsRejected(preferences)
+                assertEquals(previousProfile.hostId, preferences.values.first().preferredHostId)
                 assertTrue(preferences.values.first().autoConnect)
                 val proof = RelayV2CompletedCredentialProof(
                     credentialReference = target.credentialReference,
@@ -332,17 +286,14 @@ class RelayV2ProfileRepositoryTest {
                     store.markRelayV2CredentialReady(prepared.operationId, proof),
                 )
                 val observed = withTimeout(1_000) { connectionWatcher.await() }
-                assertEquals("wss://legacy.example.com/client", observed.first().relayUrl)
-                assertEquals("legacy-host", observed.first().preferredHostId)
+                assertEquals(previousProfile.hostId, observed.first().preferredHostId)
                 assertTrue(observed.first().autoConnect)
-                assertEquals("", observed.last().relayUrl)
                 assertEquals("", observed.last().preferredHostId)
                 assertEquals("local", observed.last().preferredScopeId)
                 assertFalse(observed.last().autoConnect)
                 assertEquals(RelayV2ProfileActivationPhase.CREDENTIAL_READY, ready.phase)
                 assertEquals(null, store.activeProfileIdentity())
-                assertEquals("", preferences.profile.first().relayUrl)
-                assertV1ProfileMutationsRejected(preferences)
+                assertProfilePreferencesMutationsRejected(preferences)
             }
 
             withPreferencesStore(file) { preferences ->
@@ -427,7 +378,7 @@ class RelayV2ProfileRepositoryTest {
                         null,
                         store.prepareSelfRevokeJournal(profile, "replacement-operation"),
                     )
-                    assertV1ProfileMutationsRejected(preferences)
+                    assertProfilePreferencesMutationsRejected(preferences)
                     assertEquals(
                         null,
                         store.prepareRelayV2Activation(
@@ -544,11 +495,7 @@ class RelayV2ProfileRepositoryTest {
                     assertTrue(runCatching { store.readSelfRevokeJournal() }.isFailure)
                     assertTrue(
                         runCatching {
-                            preferences.saveProfile(
-                                "wss://forbidden.example.com/client",
-                                "forbidden-host",
-                                true,
-                            )
+                            preferences.setPreferredHost("forbidden-host")
                         }.isFailure,
                     )
                     assertEquals(
@@ -556,6 +503,44 @@ class RelayV2ProfileRepositoryTest {
                         RelayProfilePreferencesCodec.toRelayV2Profile(raw.data.first()),
                     )
                 }
+                directory.toFile().deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `external revoke profile removal is exact and rejects durable journal overlap`() =
+        runBlocking {
+            val directory = Files.createTempDirectory("relay-v2-external-revoke")
+            val file = directory.resolve("preferences.preferences_pb").toFile()
+            val profile = relayV2Profile()
+            try {
+                withRawPreferencesStore(file) { preferences, raw ->
+                    raw.edit { RelayProfilePreferencesCodec.activateRelayV2Profile(it, profile) }
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+
+                    assertFalse(
+                        store.commitExternallyRevokedRelayV2ProfileRemoval(
+                            profile.copy(grantId = "stale-grant"),
+                        ),
+                    )
+                    assertEquals(profile, store.activeRelayV2Profile())
+
+                    requireNotNull(
+                        store.prepareSelfRevokeJournal(profile, "overlapping-self-revoke"),
+                    )
+                    assertFalse(store.commitExternallyRevokedRelayV2ProfileRemoval(profile))
+                    assertEquals(profile, store.activeRelayV2Profile())
+                }
+
+                Files.deleteIfExists(file.toPath())
+                withRawPreferencesStore(file) { preferences, raw ->
+                    raw.edit { RelayProfilePreferencesCodec.activateRelayV2Profile(it, profile) }
+                    val store = PreferencesRelayV2ProfileStore(preferences)
+                    assertTrue(store.commitExternallyRevokedRelayV2ProfileRemoval(profile))
+                    assertEquals(null, store.activeRelayV2Profile())
+                    assertFalse(store.commitExternallyRevokedRelayV2ProfileRemoval(profile))
+                }
+            } finally {
                 directory.toFile().deleteRecursively()
             }
         }
@@ -643,7 +628,7 @@ class RelayV2ProfileRepositoryTest {
             val draft = enrollmentDraft()
 
             assertEquals(0, harness.exchange.redeemCalls)
-            assertEquals(RelayProfileDialect.V1, harness.profiles.activeIdentity?.dialect)
+            assertEquals(RelayProfileDialect.V2, harness.profiles.activeIdentity?.dialect)
             assertTrue(harness.credentials.isEmpty())
 
             val activation = async {
@@ -652,7 +637,7 @@ class RelayV2ProfileRepositoryTest {
             harness.barrier.started.await()
 
             assertEquals(1, harness.exchange.redeemCalls)
-            assertEquals(RelayProfileDialect.V1, harness.profiles.activeIdentity?.dialect)
+            assertEquals(RelayProfileDialect.V2, harness.profiles.activeIdentity?.dialect)
             assertEquals(0, harness.profiles.activationCount)
             assertFalse(harness.credentials.values().single().hasCredentialMaterial)
 
@@ -767,13 +752,18 @@ class RelayV2ProfileRepositoryTest {
             val file = directory.resolve("preferences.preferences_pb").toFile()
             val target = relayV2Profile()
             try {
-                withPreferencesStore(file) { preferences ->
+                val previousProfile = target.copy(
+                    profileId = "relay-v2-profile-previous",
+                    credentialReference =
+                        RelayV2CredentialReference("credential-reference-previous"),
+                    activationGeneration = 3,
+                    autoConnect = true,
+                )
+                withRawPreferencesStore(file) { preferences, raw ->
+                    raw.edit {
+                        RelayProfilePreferencesCodec.activateRelayV2Profile(it, previousProfile)
+                    }
                     val store = PreferencesRelayV2ProfileStore(preferences)
-                    preferences.saveProfile(
-                        relayUrl = "wss://legacy.example.com/client",
-                        hostId = "legacy-host",
-                        autoConnect = true,
-                    )
                     val previous = requireNotNull(store.activeProfileIdentity())
                     val prepared = requireNotNull(
                         store.prepareRelayV2Activation(
@@ -784,7 +774,7 @@ class RelayV2ProfileRepositoryTest {
                             targetCredentialAttemptId = "attempt-connect-consent",
                             targetCredentialSecretReference = "secret-connect-consent",
                             barrierId = "barrier-connect-consent",
-                            previousCredentialReference = null,
+                            previousCredentialReference = previousProfile.credentialReference,
                         ),
                     )
                     val ready = requireNotNull(
@@ -924,7 +914,7 @@ class RelayV2ProfileRepositoryTest {
     @Test
     fun `startup admission repairs only monotonic credential state and types unavailability`() =
         runBlocking {
-            val inactive = Harness()
+            val inactive = Harness(hasActiveProfile = false)
             assertEquals(
                 RelayV2StartupAdmissionResult.NoActiveProfile,
                 inactive.repository.admitStartup(),
@@ -1155,7 +1145,7 @@ class RelayV2ProfileRepositoryTest {
                 assertEquals(0, harness.isolationCalls)
                 assertTrue(harness.isolationReceipts.isEmpty())
                 assertEquals(0, harness.profiles.activationCount)
-                assertEquals(RelayProfileDialect.V1, harness.profiles.activeIdentity?.dialect)
+                assertEquals(RelayProfileDialect.V2, harness.profiles.activeIdentity?.dialect)
             }
         }
 
@@ -1264,7 +1254,7 @@ class RelayV2ProfileRepositoryTest {
                 RelayV2EnrollmentResult.Superseded(cancelled.profiles.activeIdentity),
                 lateAfterCancel.await(),
             )
-            assertEquals(RelayProfileDialect.V1, cancelled.profiles.activeIdentity?.dialect)
+            assertEquals(RelayProfileDialect.V2, cancelled.profiles.activeIdentity?.dialect)
             assertEquals(0, cancelled.barrier.calls)
             assertEquals(0, cancelled.isolationCalls)
             assertEquals(0, cancelled.profiles.activationCount)
@@ -2611,7 +2601,7 @@ class RelayV2ProfileRepositoryTest {
             assertFalse(
                 harness.profileSwitch.accepts(
                     RelayProfileCallbackScope(
-                        profileId = "legacy-v1",
+                        profileId = "prior-profile",
                         activationGeneration = 0,
                     ),
                 ),
@@ -2689,12 +2679,6 @@ class RelayV2ProfileRepositoryTest {
                     RelayV2SelfRevokePhase.PREPARED,
                     configure = { it.exchange.failSelfRevokeBeforeHandoff = true },
                 ),
-                RevokeCase(
-                    "drain-failure",
-                    RelayV2SelfRevokePhase.PREPARED,
-                    configure = { it.barrier.failNextDisconnect() },
-                    expectedExchangeCalls = 0,
-                ),
             ).forEach { case ->
                 val harness = Harness()
                 val active = activate(harness)
@@ -2708,10 +2692,8 @@ class RelayV2ProfileRepositoryTest {
                         harness.events.indexOf("disconnect:start"),
                 )
                 assertTrue(
-                    harness.events.indexOf("disconnect:start") <
-                        harness.events.indexOf("revoke:request").let {
-                            if (it < 0) Int.MAX_VALUE else it
-                        },
+                    harness.events.indexOf("revoke:request") <
+                        harness.events.indexOf("disconnect:start"),
                 )
 
                 if (case.expectedPhase == null) {
@@ -2778,6 +2760,26 @@ class RelayV2ProfileRepositoryTest {
                 }
             }
 
+            val drainFailure = Harness()
+            val drainFailureProfile = activate(drainFailure)
+            drainFailure.events.clear()
+            drainFailure.barrier.failNextDisconnect()
+            assertEquals(
+                RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.CONFIRMED),
+                drainFailure.repository.selfRevokeActiveProfile(),
+            )
+            assertEquals(1, drainFailure.exchange.selfRevokeCalls)
+            assertEquals(drainFailureProfile, drainFailure.profiles.activeV2)
+            assertEquals(
+                RelayV2SelfRevokePhase.CONFIRMED,
+                drainFailure.profiles.readSelfRevokeJournal()?.phase,
+            )
+            drainFailure.restartRepository()
+            assertEquals(
+                RelayV2StartupAdmissionResult.NoActiveProfile,
+                drainFailure.repository.admitStartup(),
+            )
+
             val retry = Harness()
             val retryProfile = activate(retry)
             retry.events.clear()
@@ -2813,13 +2815,40 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(1, retry.exchange.selfRevokeCalls)
         }
 
+    @Test
+    fun `trusted broker revoke close removes only the exact active profile without HTTP retry`() =
+        runBlocking {
+            val harness = Harness()
+            val active = (harness.repository.confirmEnrollment(
+                enrollmentDraft().confirm(deviceLabel = "Pixel"),
+            ) as RelayV2EnrollmentResult.Activated).profile
+            harness.events.clear()
+
+            assertTrue(harness.repository.removeExternallyRevokedActiveProfile(active))
+            assertEquals(null, harness.profiles.activeV2)
+            assertEquals(null, harness.credentials.read(active.credentialReference))
+            assertEquals(null, harness.profiles.readSelfRevokeJournal())
+            assertEquals(0, harness.exchange.selfRevokeCalls)
+            assertTrue(
+                harness.events.indexOf("disconnect:start") < harness.events.indexOf("clear"),
+            )
+            assertTrue(
+                harness.events.indexOf("clear") <
+                    harness.events.indexOf("server-revoke:removed"),
+            )
+
+            assertTrue(harness.repository.removeExternallyRevokedActiveProfile(active))
+            assertEquals(0, harness.exchange.selfRevokeCalls)
+        }
+
     private class Harness(
         blockDisconnect: Boolean = false,
         disconnectReceipt: ((RelayActiveProfileIdentity, String) -> RelayProfileDisconnectReceipt)? = null,
+        hasActiveProfile: Boolean = true,
     ) {
         val events = mutableListOf<String>()
         val credentials = MemoryCredentialStore(events)
-        val profiles = MemoryProfileStore(events)
+        val profiles = MemoryProfileStore(events, hasActiveProfile)
         val barrier = RecordingDisconnectBarrier(events, blockDisconnect, disconnectReceipt)
         val isolation = RecordingIsolationBoundary(events, profiles, credentials)
         val isolationCalls: Int
@@ -2997,13 +3026,22 @@ class RelayV2ProfileRepositoryTest {
 
     private class MemoryProfileStore(
         private val events: MutableList<String>,
+        hasActiveProfile: Boolean,
     ) : RelayV2ProfileStore, RelayV2SelfRevokeJournalStore {
-        private var storedActiveIdentity: RelayActiveProfileIdentity? = RelayActiveProfileIdentity(
-            profileId = "legacy-v1",
-            dialect = RelayProfileDialect.V1,
-            activationGeneration = 0,
-        )
-        private var storedActiveV2: RelayV2Profile? = null
+        private var storedActiveV2: RelayV2Profile? = RelayV2Profile(
+            profileId = "prior-profile",
+            issuerUrl = "https://prior.example.com",
+            relayUrl = "wss://prior.example.com/client",
+            hostId = "prior-host",
+            principalId = "prior-principal",
+            grantId = "prior-grant",
+            clientInstanceId = "prior-client",
+            credentialReference = RelayV2CredentialReference("prior-credential-reference"),
+            credentialVersion = 1,
+            activationGeneration = 1,
+            autoConnect = true,
+        ).takeIf { hasActiveProfile }
+        private var storedActiveIdentity: RelayActiveProfileIdentity? = storedActiveV2?.identity
         var journal: RelayV2ProfileActivationJournal? = null
             private set
         var selfRevokeJournal: RelayV2SelfRevokeJournal? = null
@@ -3135,6 +3173,19 @@ class RelayV2ProfileRepositoryTest {
             persistedValues = emptyMap()
             selfRevokeJournal = null
             events += "revoke:removed"
+            return true
+        }
+
+        override suspend fun commitExternallyRevokedRelayV2ProfileRemoval(
+            expectedProfile: RelayV2Profile,
+        ): Boolean {
+            if (journal != null || selfRevokeJournal != null ||
+                storedActiveV2 != expectedProfile
+            ) return false
+            storedActiveIdentity = null
+            storedActiveV2 = null
+            persistedValues = emptyMap()
+            events += "server-revoke:removed"
             return true
         }
 
@@ -3738,9 +3789,6 @@ class RelayV2ProfileRepositoryTest {
     private fun Preferences.valueNamed(name: String): Any? =
         asMap().entries.singleOrNull { it.key.name == name }?.value
 
-    private fun Preferences.namedValues(): Map<String, Any> =
-        asMap().entries.associate { it.key.name to it.value }
-
     private suspend fun <T> withPreferencesStore(
         file: java.io.File,
         block: suspend (PreferencesStore) -> T,
@@ -3773,15 +3821,10 @@ class RelayV2ProfileRepositoryTest {
         }
     }
 
-    private suspend fun assertV1ProfileMutationsRejected(preferences: PreferencesStore) {
+    private suspend fun assertProfilePreferencesMutationsRejected(
+        preferences: PreferencesStore,
+    ) {
         val mutations = listOf<suspend () -> Unit>(
-            {
-                preferences.saveProfile(
-                    relayUrl = "wss://write-through.example.com/client",
-                    hostId = "write-through-host",
-                    autoConnect = true,
-                )
-            },
             { preferences.setPreferredHost("write-through-host") },
             {
                 preferences.setPreferredHostAndScope(
@@ -3790,8 +3833,6 @@ class RelayV2ProfileRepositoryTest {
                 )
             },
             { preferences.setPreferredScope("write-through-scope") },
-            { preferences.setAutoConnect(true) },
-            { preferences.clearProfile() },
         )
         mutations.forEach { mutate ->
             assertTrue(runCatching { mutate() }.isFailure)

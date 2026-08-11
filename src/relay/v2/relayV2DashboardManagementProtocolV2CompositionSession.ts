@@ -414,7 +414,7 @@ function createFixedWrite(
  * It constructs the canonical real-adapter composition itself and binds only
  * that composition to the existing serial stdio owner. It has no CLI, Tauri,
  * process, socket, credential, capability, selector, independent Host
- * lifecycle, or v1 fallback.
+ * lifecycle or alternate transport.
  */
 export function createRelayV2DashboardManagementProtocolV2CompositionSession(
   options: RelayV2DashboardManagementProtocolV2CompositionSessionOptions,

@@ -13,7 +13,6 @@ function metadata(overrides = {}) {
     pathname: "/host",
     search: "",
     authorizationHeaders: [`Bearer ${TOKEN}`],
-    legacyQuerySecret: null,
     offeredProtocols: ["tw-relay.host.v2"],
     ...overrides,
   };
@@ -96,9 +95,8 @@ test("Host Upgrade accept passes only closed auth through preflight before expos
   ]) assert.equal(Object.hasOwn(accepted, forbidden), false);
 });
 
-test("Host Upgrade rejects role, endpoint, protocol, and auth without verifier fallback or preflight", async () => {
+test("Host Upgrade rejects role, endpoint, protocol, and auth without preflight", async () => {
   let v2VerifierCalls = 0;
-  let legacyVerifierCalls = 0;
   let prepareCalls = 0;
   const owner = new upgradeModule.RelayV2BrokerHostUpgradeDispatchOwner({
     verifyV2AccessToken(token, expectedRole) {
@@ -106,10 +104,6 @@ test("Host Upgrade rejects role, endpoint, protocol, and auth without verifier f
       assert.equal(token, TOKEN);
       assert.equal(expectedRole, "host");
       throw Object.assign(new Error(`redacted ${TOKEN}`), { code: "PERMISSION_DENIED" });
-    },
-    verifyLegacySecret() {
-      legacyVerifierCalls += 1;
-      return true;
     },
     prepareHostWss() {
       prepareCalls += 1;
@@ -205,7 +199,7 @@ test("Host Upgrade rejects role, endpoint, protocol, and auth without verifier f
     },
     {
       name: "wrong Host protocol",
-      input: metadata({ offeredProtocols: ["tw-relay.v1"] }),
+      input: metadata({ offeredProtocols: ["tw-relay.unsupported"] }),
       expected: {
         outcome: "reject",
         status: 426,
@@ -217,7 +211,7 @@ test("Host Upgrade rejects role, endpoint, protocol, and auth without verifier f
       name: "v1 credential",
       input: metadata({
         authorizationHeaders: ["Bearer legacy-secret"],
-        offeredProtocols: ["tw-relay.v1"],
+        offeredProtocols: ["tw-relay.unsupported"],
       }),
       expected: { outcome: "reject", status: 401, errorCode: "AUTH_INVALID", fallback: false },
     },
@@ -246,6 +240,5 @@ test("Host Upgrade rejects role, endpoint, protocol, and auth without verifier f
   assert.equal(pathnameGetterCalls, 0);
   assert.equal(authorizationHeadersProxyTrapCalls, 0);
   assert.equal(v2VerifierCalls, 1);
-  assert.equal(legacyVerifierCalls, 0);
   assert.equal(prepareCalls, 0);
 });

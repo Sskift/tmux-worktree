@@ -9,22 +9,19 @@ use super::{
     delete_worktree_blocking, derive_session_name, ensure_terminal_session,
     fetchable_project_paths, find_host, finish_git_fetch_target, git_fetch_args, git_graph_for,
     git_graph_refs_for, hosts_from_config, install_host_tw_from_source,
-    invalidate_host_status_cache, is_git_worktree_dir, is_managed_worktree_session,
-    json_number_texts_semantically_equal_for_test, kill_canonical_first,
-    kill_legacy_plain_terminal, kill_legacy_session, kill_rpc_explicitly_allows_legacy_fallback,
+    invalidate_host_status_cache, is_git_worktree_dir,
+    json_number_texts_semantically_equal_for_test, kill_legacy_plain_terminal, kill_legacy_session,
     layout_backup_path, layout_lock_path, layout_revision_for_raw, list_automation_runs,
-    list_orphaned_worktrees, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
-    load_layout_from_path, load_pending_cleanup, load_terminals, managed_worktree_root_for_session,
-    orphaned_worktrees, parse_kill_session_rpc_response, parse_local_worktree_rpc_response,
-    parse_session_key, probe_local_agents_in_paths, project_from_config,
-    project_from_worktree_path, projects_from_config, projects_from_config_with_home,
-    read_dashboard_config_lock_owner, remote_config_for_host, remote_file_exists_for_host,
-    remote_home_dir_for_host, remote_orphaned_worktrees, remote_read_dirs_for_host,
-    remote_read_file_bytes_for_host, remote_write_file_for_host, remove_host_with_state,
-    remove_missing_project, reserve_git_fetch_target, restore_local_worktree_via_runtime,
-    run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
-    save_layout_to_path, save_pending_cleanup, save_terminals, scp_cli_command,
-    select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
+    list_orphaned_worktrees, load_hosts, load_layout_from_path, load_pending_cleanup,
+    load_terminals, orphaned_worktrees, parse_local_worktree_rpc_response, parse_session_key,
+    probe_local_agents_in_paths, project_from_config, projects_from_config,
+    projects_from_config_with_home, read_dashboard_config_lock_owner, remote_config_for_host,
+    remote_file_exists_for_host, remote_home_dir_for_host, remote_orphaned_worktrees,
+    remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
+    remove_host_with_state, remove_missing_project, reserve_git_fetch_target,
+    restore_local_worktree_via_runtime, run_remote_tmux_check, run_remote_tw_check,
+    save_automation, save_hosts_config, save_layout_to_path, save_pending_cleanup, save_terminals,
+    scp_cli_command, select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
     ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
     trigger_automation_with_creator, try_cleanup_remote_worktree, try_cleanup_worktree,
     tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
@@ -863,34 +860,6 @@ fn derive_session_name_strips_random_suffix() {
 }
 
 #[test]
-fn project_from_worktree_path_reads_project_segment() {
-    assert_eq!(
-        project_from_worktree_path(
-            "/tmp/tmux-worktree/projects/coco/fix-auth-abc12",
-            "/tmp/tmux-worktree/projects",
-        )
-        .as_deref(),
-        Some("coco"),
-    );
-    assert_eq!(
-        project_from_worktree_path(
-            "/home/dev/.tmux-worktree/worktrees/api/refactor-def34",
-            "/tmp/other",
-        )
-        .as_deref(),
-        Some("api"),
-    );
-    assert_eq!(
-        project_from_worktree_path(
-            "/private/tmp/tmux-worktree/projects/legacy/legacy-fix-abc12",
-            "/home/dev/.tmux-worktree/worktrees",
-        )
-        .as_deref(),
-        Some("legacy"),
-    );
-}
-
-#[test]
 fn no_config_orphan_scan_uses_canonical_home_default() {
     let _guard = test_env_lock().lock().expect("lock");
     let original_home = std::env::var("HOME").ok();
@@ -915,59 +884,6 @@ fn no_config_orphan_scan_uses_canonical_home_default() {
     }));
     restore_env("TW_DASHBOARD_HOME", original_tw_home);
     restore_env("HOME", original_home);
-}
-
-#[test]
-fn managed_worktree_session_requires_tw_name_and_git_worktree_shape() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let base = temp.path().join("worktrees");
-    let project = base.join("demo");
-    let managed = project.join("demo-task-abc12");
-    let plain = project.join("demo-task");
-    let mismatched = project.join("other-task-abc12");
-    let nested = managed.join("app/src");
-    fs::create_dir_all(&managed).expect("managed");
-    fs::create_dir_all(&plain).expect("plain");
-    fs::create_dir_all(&mismatched).expect("mismatched");
-    fs::create_dir_all(&nested).expect("nested");
-    fs::write(
-        managed.join(".git"),
-        "gitdir: /repo/.git/worktrees/demo-task-abc12",
-    )
-    .expect("managed git file");
-    fs::write(plain.join(".git"), "gitdir: /repo/.git/worktrees/demo-task")
-        .expect("plain git file");
-    fs::write(
-        mismatched.join(".git"),
-        "gitdir: /repo/.git/worktrees/other-task-abc12",
-    )
-    .expect("mismatched git file");
-
-    let base = base.to_string_lossy().to_string();
-    assert!(is_managed_worktree_session(
-        "demo-task",
-        managed.to_str().expect("managed path"),
-        &base,
-    ));
-    assert!(!is_managed_worktree_session(
-        "demo-task",
-        plain.to_str().expect("plain path"),
-        &base,
-    ));
-    assert!(!is_managed_worktree_session(
-        "demo-task",
-        mismatched.to_str().expect("mismatched path"),
-        &base,
-    ));
-    assert_eq!(
-        managed_worktree_root_for_session(
-            "demo-task",
-            nested.to_str().expect("nested path"),
-            &base,
-        )
-        .as_deref(),
-        managed.to_str(),
-    );
 }
 
 #[test]
@@ -1349,125 +1265,19 @@ fn local_tw_rpc_argument_and_response_contract_is_strict() {
     assert_eq!(missing_command, "ai command required");
 
     assert_eq!(
-            parse_local_worktree_rpc_response(
-                r#"{"protocolVersion":1,"kind":"worktree","session":" demo-session ","worktreePath":"/tmp/demo"}"#,
-                "test runtime",
-            )
-            .expect("valid response"),
-            "demo-session"
-        );
-    assert!(parse_local_worktree_rpc_response(
-        r#"{"protocolVersion":2,"kind":"worktree","session":"demo"}"#,
-        "test runtime",
-    )
-    .expect_err("unsupported protocol")
-    .contains("unsupported test runtime TW RPC protocol: 2"));
-    assert!(parse_local_worktree_rpc_response(
-        r#"{"protocolVersion":1,"kind":"terminal","session":"demo"}"#,
-        "test runtime",
-    )
-    .expect_err("wrong kind")
-    .contains("unexpected create kind: terminal"));
-    assert!(parse_local_worktree_rpc_response(
-        r#"{"protocolVersion":1,"kind":"worktree","session":"  "}"#,
-        "test runtime",
-    )
-    .expect_err("empty session")
-    .contains("empty worktree session name"));
-
-    parse_kill_session_rpc_response(
-        r#"{"protocolVersion":1,"kind":"session-killed","session":"demo"}"#,
-        "test runtime",
-        "demo",
-    )
-    .expect("valid managed kill response");
-    assert!(parse_kill_session_rpc_response(
-        r#"{"protocolVersion":1,"kind":"session-killed","session":"other"}"#,
-        "test runtime",
-        "demo",
-    )
-    .expect_err("mismatched managed kill response")
-    .contains("unexpected kill-session response"));
-}
-
-#[test]
-fn canonical_kill_fails_closed_on_corrupt_managed_state_for_every_ui_hint() {
-    let corrupt_state_error = "bundled TW RPC kill-session failed (exit status: 1): refusing to mutate invalid managed state: original file preserved";
-
-    for managed_hint in [None, Some(false), Some(true)] {
-        let canonical_called = std::cell::Cell::new(false);
-        let legacy_called = std::cell::Cell::new(false);
-        let error = kill_canonical_first(
-            managed_hint,
-            || {
-                canonical_called.set(true);
-                Err(corrupt_state_error.to_string())
-            },
-            || {
-                legacy_called.set(true);
-                Ok(())
-            },
+        parse_local_worktree_rpc_response(
+            r#"{"protocolVersion":2,"operation":"create-worktree","state":"succeeded","session":{"name":"demo-session","kind":"worktree","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/tmp/demo","lifecycleMarked":true}}"#,
+            "test runtime",
         )
-        .expect_err("corrupt managed state must fail closed");
-
-        assert!(canonical_called.get());
-        assert!(!legacy_called.get());
-        assert_eq!(error, corrupt_state_error);
-    }
-    assert!(!kill_rpc_explicitly_allows_legacy_fallback(
-        corrupt_state_error
-    ));
-    assert!(!kill_rpc_explicitly_allows_legacy_fallback(
-        "ssh on Dev failed: Connection reset by peer"
-    ));
-    assert!(!kill_rpc_explicitly_allows_legacy_fallback(
-        "parse bundled TW RPC kill-session response: expected value"
-    ));
-    assert!(!kill_rpc_explicitly_allows_legacy_fallback(
-        "unsupported bundled TW RPC protocol: 2"
-    ));
-}
-
-#[test]
-fn canonical_kill_only_falls_back_for_explicit_legacy_compatibility() {
-    for explicit_legacy_error in [
-        "session is not TW-managed: legacy-session",
-        "remote tw failed: unknown rpc command: kill-session",
-        "remote tw failed: unknown subcommand kill-session",
-        "remote tw failed: invalid kill-session option --name",
-        "remote tw failed: unknown command: rpc",
-        "ssh on Dev failed: sh: tw: command not found",
-    ] {
-        let legacy_called = std::cell::Cell::new(false);
-        kill_canonical_first(
-            Some(false),
-            || Err(explicit_legacy_error.to_string()),
-            || {
-                legacy_called.set(true);
-                Ok(())
-            },
-        )
-        .expect("explicit old-runtime signal may use legacy tmux lifecycle");
-        assert!(
-            legacy_called.get(),
-            "did not fall back for {explicit_legacy_error}"
-        );
-        assert!(kill_rpc_explicitly_allows_legacy_fallback(
-            explicit_legacy_error
-        ));
-    }
-
-    let legacy_called = std::cell::Cell::new(false);
-    kill_canonical_first(
-        Some(false),
-        || Ok(()),
-        || {
-            legacy_called.set(true);
-            Ok(())
-        },
+        .expect("valid response"),
+        "demo-session"
+    );
+    assert!(parse_local_worktree_rpc_response(
+        r#"{"protocolVersion":2,"operation":"create-worktree","state":"succeeded","session":{"name":"demo","kind":"worktree","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/tmp/demo","lifecycleMarked":false}}"#,
+        "test runtime",
     )
-    .expect("canonical kill");
-    assert!(!legacy_called.get());
+    .expect_err("unmarked session")
+    .contains("non-authoritative session"));
 }
 
 #[test]
@@ -1482,7 +1292,7 @@ fn local_tw_rpc_runtime_requires_bundled_node_or_exact_installed_version() {
     fs::write(
             &installed_tw,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nif [ \"$1 $2\" = \"rpc capabilities\" ]; then\n  printf '%s\\n' '{{\"protocolVersion\":1,\"capabilities\":[\"list\",\"create-worktree\",\"create-terminal\",\"restore-worktree\",\"kill-session\"]}}'\n  exit 0\nfi\nexit 2\n",
+                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nif [ \"$1 $2\" = \"rpc-v2 capabilities\" ]; then\n  printf '%s\\n' '{{\"protocolVersion\":2,\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"resolved-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\",\"dashboard-lifecycle.v2\"]}}'\n  exit 0\nfi\nexit 2\n",
                 env!("CARGO_PKG_VERSION")
             ),
         )
@@ -1509,7 +1319,7 @@ fn local_tw_rpc_runtime_requires_bundled_node_or_exact_installed_version() {
     fs::write(
             &installed_tw,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf '%s\\n' '{}'; exit 0; fi\nif [ \"$1 $2\" = \"rpc capabilities\" ]; then printf '%s\\n' '{{\"protocolVersion\":1,\"capabilities\":[\"list\",\"create-worktree\"]}}'; exit 0; fi\nexit 2\n",
+                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then printf '%s\\n' '{}'; exit 0; fi\nif [ \"$1 $2\" = \"rpc-v2 capabilities\" ]; then printf '%s\\n' '{{\"protocolVersion\":2,\"capabilities\":[\"incarnation-list.v1\"]}}'; exit 0; fi\nexit 2\n",
                 env!("CARGO_PKG_VERSION")
             ),
         )
@@ -1521,7 +1331,7 @@ fn local_tw_rpc_runtime_requires_bundled_node_or_exact_installed_version() {
         temp.path(),
     )
     .expect_err("same version without the lifecycle capabilities");
-    assert!(incompatible.contains("complete Dashboard TW RPC contract"));
+    assert!(incompatible.contains("complete Dashboard TW RPC v2 contract"));
 }
 
 #[test]
@@ -1559,9 +1369,7 @@ args_file="$HOME/rpc-args.txt"
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$args_file"
 done
-mkdir -p "$HOME/.tmux-worktree"
-printf '%s\n' '{"version":1,"sessions":[{"name":"demo-layout","kind":"worktree","profile":"dashboard","createdAt":"2026-07-11T00:00:00Z"}]}' > "$HOME/.tmux-worktree/state.json"
-printf '%s\n' '{"protocolVersion":1,"kind":"worktree","session":"demo-layout","worktreePath":"/tmp/demo-layout","branch":"develop"}'
+printf '%s\n' '{"protocolVersion":2,"operation":"create-worktree","state":"succeeded","session":{"name":"demo-layout","kind":"worktree","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/tmp/demo-layout","lifecycleMarked":true}}'
 "#,
         )
         .expect("fake cli");
@@ -1585,31 +1393,25 @@ printf '%s\n' '{"protocolVersion":1,"kind":"worktree","session":"demo-layout","w
 
     assert_eq!(session, "demo-layout");
     let forwarded = fs::read_to_string(home.join("rpc-args.txt")).expect("forwarded args");
+    let forwarded = forwarded.lines().collect::<Vec<_>>();
     assert_eq!(
-        forwarded.lines().collect::<Vec<_>>(),
-        vec![
-            "rpc",
-            "create-worktree",
-            "--path",
-            "/repo/path",
-            "--project",
-            "demo",
-            "--ai-command",
-            "codex --quiet",
-            "--name",
-            "layout",
-            "--branch",
-            "develop",
-            "--worktree-base",
-            base.to_str().expect("base str"),
-        ]
+        &forwarded[..3],
+        &["rpc-v2", "create-worktree", "--request-json"]
     );
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(home.join(".tmux-worktree/state.json")).expect("managed state"),
-    )
-    .expect("state json");
-    assert_eq!(state["sessions"][0]["name"], "demo-layout");
-    assert_eq!(state["sessions"][0]["profile"], "dashboard");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(forwarded[3]).expect("request json"),
+        serde_json::json!({
+            "arguments": {
+                "path": "/repo/path",
+                "project": "demo",
+                "name": "layout",
+                "branch": "develop",
+                "worktreeBase": base,
+                "aiCommand": "codex --quiet"
+            },
+            "reservationCorrelation": null
+        })
+    );
 
     restore_env("TW_DASHBOARD_HOME", original_tw_home);
     restore_env("HOME", original_home);
@@ -1635,7 +1437,7 @@ fn local_dashboard_terminal_delegates_to_bundled_tw_rpc() {
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$HOME/terminal-rpc-args.txt"
 done
-printf '%s\n' '{"protocolVersion":1,"kind":"terminal","session":"tw-term-abc12","cwd":"/repo/app"}'
+printf '%s\n' '{"protocolVersion":2,"operation":"create-terminal","state":"succeeded","session":{"name":"tw-term-abc12","kind":"terminal","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/repo/app","lifecycleMarked":true}}'
 "#,
     )
     .expect("fake cli");
@@ -1655,19 +1457,18 @@ printf '%s\n' '{"protocolVersion":1,"kind":"terminal","session":"tw-term-abc12",
     assert_eq!(terminal.raw_name, "tw-term-abc12");
     assert_eq!(terminal.tmux_name, "tw-term-abc12");
     assert_eq!(terminal.host_id, None);
+    let forwarded = fs::read_to_string(home.join("terminal-rpc-args.txt")).expect("terminal args");
+    let forwarded = forwarded.lines().collect::<Vec<_>>();
     assert_eq!(
-        fs::read_to_string(home.join("terminal-rpc-args.txt"))
-            .expect("terminal args")
-            .lines()
-            .collect::<Vec<_>>(),
-        vec![
-            "rpc",
-            "create-terminal",
-            "--cwd",
-            "/repo/app",
-            "--ai-command",
-            "codex --quiet",
-        ]
+        &forwarded[..3],
+        &["rpc-v2", "create-terminal", "--request-json"]
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(forwarded[3]).expect("request json"),
+        serde_json::json!({
+            "arguments": {"cwd": "/repo/app", "aiCommand": "codex --quiet"},
+            "reservationCorrelation": null
+        })
     );
     restore_env("TW_DASHBOARD_HOME", original_tw_home);
     restore_env("HOME", original_home);
@@ -1675,14 +1476,19 @@ printf '%s\n' '{"protocolVersion":1,"kind":"terminal","session":"tw-term-abc12",
 
 #[test]
 fn dashboard_terminal_without_ai_command_uses_the_frozen_optional_rpc_shape() {
+    let args = build_terminal_rpc_args(&CreateTerminalArgs {
+        cwd: "  /repo/app  ".to_string(),
+        ai_cmd: "   ".to_string(),
+        host_id: None,
+    })
+    .expect("terminal RPC args");
+    assert_eq!(&args[..3], &["rpc-v2", "create-terminal", "--request-json"]);
     assert_eq!(
-        build_terminal_rpc_args(&CreateTerminalArgs {
-            cwd: "  /repo/app  ".to_string(),
-            ai_cmd: "   ".to_string(),
-            host_id: None,
+        serde_json::from_str::<serde_json::Value>(&args[3]).expect("request json"),
+        serde_json::json!({
+            "arguments": {"cwd": "/repo/app"},
+            "reservationCorrelation": null
         })
-        .expect("terminal RPC args"),
-        vec!["rpc", "create-terminal", "--cwd", "/repo/app"]
     );
 }
 
@@ -1706,7 +1512,7 @@ fn restore_worktree_delegates_to_canonical_tw_rpc() {
 for arg in "$@"; do
   printf '%s\n' "$arg" >> "$HOME/restore-rpc-args.txt"
 done
-printf '%s\n' '{"protocolVersion":1,"kind":"worktree","session":"demo-restored","worktreePath":"/tmp/demo-restored","branch":"demo-restored-abc12"}'
+printf '%s\n' '{"protocolVersion":2,"operation":"restore-worktree","state":"succeeded","session":{"name":"demo-restored","kind":"worktree","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/tmp/demo-restored","lifecycleMarked":true}}'
 "#,
         )
         .expect("fake cli");
@@ -1725,21 +1531,22 @@ printf '%s\n' '{"protocolVersion":1,"kind":"worktree","session":"demo-restored",
     )
     .expect("restore through rpc");
     assert_eq!(session, "demo-restored");
+    let forwarded = fs::read_to_string(home.join("restore-rpc-args.txt")).expect("restore args");
+    let forwarded = forwarded.lines().collect::<Vec<_>>();
     assert_eq!(
-        fs::read_to_string(home.join("restore-rpc-args.txt"))
-            .expect("restore args")
-            .lines()
-            .collect::<Vec<_>>(),
-        vec![
-            "rpc",
-            "restore-worktree",
-            "--path",
-            "/tmp/demo-restored",
-            "--name",
-            "demo-restored",
-            "--ai-command",
-            "codex --quiet",
-        ]
+        &forwarded[..3],
+        &["rpc-v2", "restore-worktree", "--request-json"]
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(forwarded[3]).expect("request json"),
+        serde_json::json!({
+            "arguments": {
+                "path": "/tmp/demo-restored",
+                "name": "demo-restored",
+                "aiCommand": "codex --quiet"
+            },
+            "reservationCorrelation": null
+        })
     );
     restore_env("TW_DASHBOARD_HOME", original_tw_home);
     restore_env("HOME", original_home);
@@ -2136,206 +1943,6 @@ fn cleanup_pending_worktrees_removes_registered_worktree() {
 }
 
 #[test]
-fn create_remote_worktree_requires_remote_tw_rpc_when_tw_is_missing() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let bin_dir = temp.path().join("bin");
-    let log_path = temp.path().join("ssh.log");
-    fs::create_dir_all(&bin_dir).expect("bin dir");
-    let ssh_path = bin_dir.join("ssh");
-    fs::write(
-        &ssh_path,
-        r#"#!/bin/sh
-log="${TW_FAKE_SSH_LOG:?}"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -gt 0 ]; then shift; fi
-    break
-  fi
-  shift
-done
-printf '%s\n' "$*" >> "$log"
-if [ "$#" -eq 1 ]; then
-  case "$1" in
-    *"'tw'"*"'rpc'"*"'create-worktree'"*)
-      printf 'tw: command not found\n' >&2
-      exit 127
-      ;;
-    *"'git'"*|*"'tmux'"*)
-      printf 'dashboard must not use the legacy remote creator\n' >&2
-      exit 12
-      ;;
-  esac
-fi
-printf 'unexpected remote command: %s\n' "$*" >&2
-exit 12
-"#,
-    )
-    .expect("ssh shim");
-    let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).expect("ssh executable");
-
-    let original_path = std::env::var("PATH").ok();
-    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.to_string_lossy(),
-                original_path.clone().unwrap_or_default()
-            ),
-        );
-        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
-    }
-
-    let host = HostConfig {
-        id: "dev".to_string(),
-        label: "Dev".to_string(),
-        host: "ssh-host".to_string(),
-        user: None,
-        port: None,
-        identity_file: None,
-        worktree_base: Some("/tmp/tmux-worktree/projects".to_string()),
-        tmux_path: None,
-        tw_path: None,
-    };
-    let err = create_remote_worktree(
-        &host,
-        CreateArgs {
-            project: None,
-            path: Some("/remote/app".to_string()),
-            ai_cmd: "echo ready".to_string(),
-            name: None,
-            branch: None,
-            host_id: Some("dev".to_string()),
-        },
-    )
-    .expect_err("missing remote tw must reject creation");
-
-    let log = fs::read_to_string(&log_path).expect("ssh log");
-    assert!(err.contains("does not have a compatible `tw rpc create-worktree`"));
-    assert!(err.contains(&format!(
-        "Install or upgrade remote tw to {}",
-        env!("CARGO_PKG_VERSION")
-    )));
-    assert!(err.contains("will not fall back to direct remote git/tmux creation"));
-    assert!(log.contains("'tw' 'rpc' 'create-worktree'"));
-    assert!(!log.contains("'git'"));
-    assert!(!log.contains("'tmux'"));
-
-    restore_env("PATH", original_path);
-    restore_env("TW_FAKE_SSH_LOG", original_log);
-}
-
-#[test]
-fn create_remote_worktree_with_config_project_still_requires_remote_tw_rpc() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let bin_dir = temp.path().join("bin");
-    let log_path = temp.path().join("ssh.log");
-    fs::create_dir_all(&bin_dir).expect("bin dir");
-    let ssh_path = bin_dir.join("ssh");
-    fs::write(
-            &ssh_path,
-            r#"#!/bin/sh
-log="${TW_FAKE_SSH_LOG:?}"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -gt 0 ]; then shift; fi
-    break
-  fi
-  shift
-done
-printf '%s\n' "$*" >> "$log"
-
-if [ "$#" -eq 1 ]; then
-  case "$1" in
-    *"'tw'"*"'rpc'"*"'create-worktree'"*)
-      printf 'unknown rpc command: create-worktree\n' >&2
-      exit 2
-      ;;
-    *'pwd -P'*)
-      printf '/home/dev'
-      exit 0
-      ;;
-    *'.tmux-worktree.json'*)
-      cat <<'JSON'
-{"projects":{"demo":{"directory":"~/src/demo","defaultBranch":"develop"}},"worktreeBase":"~/.tmux-worktree/worktrees"}
-JSON
-      exit 0
-      ;;
-    *"'git'"*|*"'tmux'"*|*"'mkdir'"*)
-      printf 'dashboard must not use the legacy remote creator\n' >&2
-      exit 12
-      ;;
-  esac
-fi
-
-printf 'unexpected remote command: %s\n' "$*" >&2
-exit 12
-"#,
-        )
-        .expect("ssh shim");
-    let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).expect("ssh executable");
-
-    let original_path = std::env::var("PATH").ok();
-    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.to_string_lossy(),
-                original_path.clone().unwrap_or_default()
-            ),
-        );
-        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
-    }
-
-    let host = HostConfig {
-        id: "dev".to_string(),
-        label: "Dev".to_string(),
-        host: "ssh-host".to_string(),
-        user: None,
-        port: None,
-        identity_file: None,
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
-    };
-    let err = create_remote_worktree(
-        &host,
-        CreateArgs {
-            project: Some("demo".to_string()),
-            path: None,
-            ai_cmd: "codex".to_string(),
-            name: Some("fix".to_string()),
-            branch: None,
-            host_id: Some("dev".to_string()),
-        },
-    )
-    .expect_err("old remote tw must reject config-project creation");
-
-    let log = fs::read_to_string(&log_path).expect("ssh log");
-    assert!(err.contains("does not have a compatible `tw rpc create-worktree`"));
-    assert!(log.contains("'--path' '/home/dev/src/demo'"));
-    assert!(log.contains("'--project' 'demo'"));
-    assert!(log.contains("'--branch' 'develop'"));
-    assert!(!log.contains("'git'"));
-    assert!(!log.contains("'tmux'"));
-    assert!(!log.contains("'mkdir'"));
-
-    restore_env("PATH", original_path);
-    restore_env("TW_FAKE_SSH_LOG", original_log);
-}
-
-#[test]
 fn create_remote_worktree_prefers_remote_tw_rpc() {
     let _guard = test_env_lock().lock().expect("lock");
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2359,14 +1966,14 @@ printf '%s\n' "$*" >> "$log"
 
 if [ "$#" -eq 1 ]; then
   case "$1" in
-    *"'tw'"*"'rpc'"*"'create-worktree'"*)
+    *"'tw'"*"'rpc-v2'"*"'create-worktree'"*)
       cat <<'JSON'
-{"protocolVersion":1,"session":"app-fix","kind":"worktree"}
+{"protocolVersion":2,"operation":"create-worktree","state":"succeeded","session":{"name":"app-fix","kind":"worktree","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/remote/worktrees/app-fix","lifecycleMarked":true}}
 JSON
       exit 0
       ;;
     *"'git'"*|*"'tmux'"*)
-      printf 'dashboard should not run git/tmux directly when tw rpc create-worktree works\n' >&2
+      printf 'dashboard should not run git/tmux directly when tw rpc-v2 create-worktree works\n' >&2
       exit 12
       ;;
   esac
@@ -2417,16 +2024,17 @@ exit 12
             host_id: Some("dev".to_string()),
         },
     )
-    .expect("remote tw rpc worktree session");
+    .expect("remote tw rpc-v2 worktree session");
 
     assert_eq!(session, "dev:app-fix");
     let log = fs::read_to_string(&log_path).expect("ssh log");
-    assert!(log.contains("'tw' 'rpc' 'create-worktree'"));
-    assert!(log.contains("'--path' '/remote/app'"));
-    assert!(log.contains("'--project' 'app'"));
-    assert!(log.contains("'--ai-command' 'codex'"));
-    assert!(log.contains("'--name' 'fix'"));
-    assert!(log.contains("'--branch' 'develop'"));
+    assert!(log.contains("'tw' 'rpc-v2' 'create-worktree' '--request-json'"));
+    assert!(log.contains(r#""path":"/remote/app""#));
+    assert!(log.contains(r#""project":"app""#));
+    assert!(log.contains(r#""aiCommand":"codex""#));
+    assert!(log.contains(r#""name":"fix""#));
+    assert!(log.contains(r#""branch":"develop""#));
+    assert!(log.contains(r#""reservationCorrelation":null"#));
     assert!(!log.contains("'git'"));
     assert!(!log.contains("'tmux'"));
 
@@ -2458,7 +2066,7 @@ printf '%s\n' "$*" >> "$log"
 
 if [ "$#" -eq 1 ]; then
   case "$1" in
-    *"'tw'"*"'rpc'"*"'create-worktree'"*)
+    *"'tw'"*"'rpc-v2'"*"'create-worktree'"*)
       printf 'remote tw rejected request\n' >&2
       exit 9
       ;;
@@ -2518,438 +2126,9 @@ exit 12
 
     let log = fs::read_to_string(&log_path).expect("ssh log");
     assert!(err.contains("remote tw rejected request"), "{err}");
-    assert!(log.contains("'tw' 'rpc' 'create-worktree'"));
+    assert!(log.contains("'tw' 'rpc-v2' 'create-worktree'"));
     assert!(!log.contains("'git'"));
     assert!(!log.contains("'tmux'"));
-
-    restore_env("PATH", original_path);
-    restore_env("TW_FAKE_SSH_LOG", original_log);
-}
-
-#[test]
-fn list_remote_sessions_quotes_tmux_format_for_remote_shell() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let bin_dir = temp.path().join("bin");
-    let log_path = temp.path().join("ssh.log");
-    fs::create_dir_all(&bin_dir).expect("bin dir");
-    let ssh_path = bin_dir.join("ssh");
-    fs::write(
-        &ssh_path,
-        r#"#!/bin/sh
-log="${TW_FAKE_SSH_LOG:?}"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -gt 0 ]; then shift; fi
-    break
-  fi
-  shift
-done
-printf '%s\n' "$*" >> "$log"
-
-if [ "$#" -eq 1 ]; then
-  case "$1" in
-    *"'tmux'"*"'list-sessions'"*"'#{session_name}"*)
-      printf 'dev-session\0370\0371\03710\03720\n'
-      exit 0
-      ;;
-    *"tmux capture-pane"*)
-      printf 'dev-session\037123:45\037Kimi Code\037kimi\037kimi\n'
-      exit 0
-      ;;
-    *"'tmux'"*"'display-message'"*"'=dev-session:'"*)
-      printf '/remote/worktrees/dev-session-abc12\n'
-      exit 0
-      ;;
-    *"'git'"*"'rev-parse'"*"'--show-toplevel'"*)
-      printf '/remote/worktrees/dev-session-abc12\n'
-      exit 0
-      ;;
-  esac
-fi
-
-if [ "$1" = "tmux" ] && [ "$2" = "list-sessions" ] && [ "$3" = "-F" ]; then
-  printf 'tmux: option requires an argument -- F\n' >&2
-  exit 1
-fi
-
-printf 'unexpected remote command: %s\n' "$*" >&2
-exit 12
-"#,
-    )
-    .expect("ssh shim");
-    let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).expect("ssh executable");
-
-    let original_path = std::env::var("PATH").ok();
-    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.to_string_lossy(),
-                original_path.clone().unwrap_or_default()
-            ),
-        );
-        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
-    }
-
-    let host = HostConfig {
-        id: "dev".to_string(),
-        label: "Dev".to_string(),
-        host: "ssh-host".to_string(),
-        user: None,
-        port: None,
-        identity_file: None,
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
-    };
-
-    let sessions = list_remote_sessions(&host).expect("remote sessions");
-
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].name, "dev:dev-session");
-    assert_eq!(sessions[0].host_id.as_deref(), Some("dev"));
-    assert_eq!(sessions[0].raw_name, "dev-session");
-    assert_eq!(
-        sessions[0].output_signature.as_deref(),
-        Some("remote:123:45")
-    );
-    assert_eq!(sessions[0].agent_running, None);
-
-    restore_env("PATH", original_path);
-    restore_env("TW_FAKE_SSH_LOG", original_log);
-}
-
-#[test]
-fn list_remote_sessions_merges_rpc_state_with_legacy_tw_shaped_tmux_sessions() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let bin_dir = temp.path().join("bin");
-    let log_path = temp.path().join("ssh.log");
-    fs::create_dir_all(&bin_dir).expect("bin dir");
-    let ssh_path = bin_dir.join("ssh");
-    fs::write(
-            &ssh_path,
-            r#"#!/bin/sh
-log="${TW_FAKE_SSH_LOG:?}"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -gt 0 ]; then shift; fi
-    break
-  fi
-  shift
-done
-printf '%s\n' "$*" >> "$log"
-
-if [ "$#" -eq 1 ]; then
-  case "$1" in
-    *"'tw'"*"'rpc'"*"'list'"*)
-      cat <<'JSON'
-{"protocolVersion":1,"sessions":[{"name":"managed-cli","kind":"worktree","profile":"cli","project":"coco","repoPath":"/remote/coco","worktreePath":"/home/dev/.tmux-worktree/worktrees/coco/managed-cli-a1b2c","branch":"managed-cli-a1b2c","baseBranch":"main","createdAt":"2026-07-02T00:00:00.000Z","attached":false,"windows":3,"created":1760000000,"activity":1760000100,"cwd":"/home/dev/.tmux-worktree/worktrees/coco/managed-cli-a1b2c"}]}
-JSON
-      exit 0
-      ;;
-    *"tmux capture-pane"*)
-      printf 'managed-cli\037123:45\037 ⠇ managed-cli\nlegacy-cli\037456:78\037 idle\n'
-      exit 0
-      ;;
-    *"'tmux'"*"'list-sessions'"*)
-      printf 'managed-cli\0370\0373\0371760000000\0371760000100\nlegacy-cli\0370\0371\0371760000200\0371760000300\n'
-      exit 0
-      ;;
-    *"'tmux'"*"'display-message'"*"'=managed-cli:'"*)
-      printf '/home/dev/.tmux-worktree/worktrees/coco/managed-cli-a1b2c\n'
-      exit 0
-      ;;
-    *"'tmux'"*"'display-message'"*"'=legacy-cli:'"*)
-      printf '/home/dev/.tmux-worktree/worktrees/coco/legacy-cli-d3e4f\n'
-      exit 0
-      ;;
-    *"'git'"*"managed-cli-a1b2c"*"'rev-parse'"*"'--show-toplevel'"*)
-      printf '/home/dev/.tmux-worktree/worktrees/coco/managed-cli-a1b2c\n'
-      exit 0
-      ;;
-    *"'git'"*"legacy-cli-d3e4f"*"'rev-parse'"*"'--show-toplevel'"*)
-      printf '/home/dev/.tmux-worktree/worktrees/coco/legacy-cli-d3e4f\n'
-      exit 0
-      ;;
-  esac
-fi
-
-printf 'unexpected remote command: %s\n' "$*" >&2
-exit 12
-"#,
-        )
-        .expect("ssh shim");
-    let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).expect("ssh executable");
-
-    let original_path = std::env::var("PATH").ok();
-    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.to_string_lossy(),
-                original_path.clone().unwrap_or_default()
-            ),
-        );
-        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
-    }
-
-    let host = HostConfig {
-        id: "dev".to_string(),
-        label: "Dev".to_string(),
-        host: "ssh-host".to_string(),
-        user: None,
-        port: None,
-        identity_file: None,
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
-    };
-
-    let sessions = list_remote_sessions(&host).expect("remote rpc sessions");
-    let log = fs::read_to_string(&log_path).expect("ssh log");
-
-    assert_eq!(sessions.len(), 2, "ssh log:\n{log}");
-    assert_eq!(sessions[0].name, "dev:managed-cli");
-    assert_eq!(sessions[0].raw_name, "managed-cli");
-    assert_eq!(sessions[0].window_count, 3);
-    assert_eq!(sessions[0].host_id.as_deref(), Some("dev"));
-    assert_eq!(sessions[0].project.as_deref(), Some("coco"));
-    assert_eq!(
-        sessions[0].output_signature.as_deref(),
-        Some("remote:123:45")
-    );
-    assert_eq!(sessions[0].agent_running, Some(true));
-    assert_eq!(sessions[1].name, "dev:legacy-cli");
-    assert_eq!(sessions[1].raw_name, "legacy-cli");
-    assert_eq!(sessions[1].window_count, 1);
-    assert!(log.contains("'tw' 'rpc' 'list'"));
-    assert!(log.contains("tmux capture-pane"));
-    assert!(log.contains("'tmux' 'list-sessions'"));
-
-    restore_env("PATH", original_path);
-    restore_env("TW_FAKE_SSH_LOG", original_log);
-}
-
-#[test]
-fn remote_tmux_terminal_listing_only_includes_tw_managed_sessions() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let bin_dir = temp.path().join("bin");
-    let log_path = temp.path().join("ssh.log");
-    fs::create_dir_all(&bin_dir).expect("bin dir");
-    let ssh_path = bin_dir.join("ssh");
-    fs::write(
-            &ssh_path,
-            r#"#!/bin/sh
-log="${TW_FAKE_SSH_LOG:?}"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -gt 0 ]; then shift; fi
-    break
-  fi
-  shift
-done
-printf '%s\n' "$*" >> "$log"
-
-if [ "$#" -ne 1 ]; then
-  printf 'unexpected remote command: %s\n' "$*" >&2
-  exit 12
-fi
-
-case "$1" in
-  *"'tmux'"*"'list-sessions'"*)
-    printf 'demo\0370\0371\03710\03720\nplain-shell\0371\0371\03711\03721\ntw-term-shell\0371\0371\03712\03722\n'
-    exit 0
-    ;;
-  *"tmux capture-pane"*)
-    printf 'demo\037123:45\037 idle\n'
-    exit 0
-    ;;
-  *"'tmux'"*"'display-message'"*"'=demo:'"*)
-    printf '/remote/worktrees/demo-abc12\n'
-    exit 0
-    ;;
-  *"'tmux'"*"'display-message'"*"'=plain-shell:'"*)
-    printf '/home/dev\n'
-    exit 0
-    ;;
-  *"'tmux'"*"'display-message'"*"'=tw-term-shell:'"*)
-    printf '/home/dev/app\n'
-    exit 0
-    ;;
-  *"'git'"*"demo-abc12"*"'rev-parse'"*"'--show-toplevel'"*)
-    printf '/remote/worktrees/demo-abc12\n'
-    exit 0
-    ;;
-  *"'git'"*"'rev-parse'"*"'--show-toplevel'"*)
-    printf 'fatal: not a git repository\n' >&2
-    exit 128
-    ;;
-esac
-
-printf 'unexpected remote command: %s\n' "$*" >&2
-exit 12
-"#,
-        )
-        .expect("ssh shim");
-    let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).expect("ssh executable");
-
-    let original_path = std::env::var("PATH").ok();
-    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.to_string_lossy(),
-                original_path.clone().unwrap_or_default()
-            ),
-        );
-        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
-    }
-
-    let host = HostConfig {
-        id: "dev".to_string(),
-        label: "Dev".to_string(),
-        host: "ssh-host".to_string(),
-        user: None,
-        port: None,
-        identity_file: None,
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
-    };
-
-    let worktrees = list_remote_sessions(&host).expect("remote worktrees");
-    let terminals = list_remote_tmux_terminals(&host).expect("remote terminals");
-    let log = fs::read_to_string(&log_path).expect("ssh log");
-
-    assert_eq!(worktrees.len(), 1, "ssh log:\n{log}");
-    assert_eq!(worktrees[0].name, "dev:demo");
-    assert_eq!(terminals.len(), 1, "ssh log:\n{log}");
-    assert_eq!(terminals[0].id, "ssh:dev:tw-term-shell");
-    assert_eq!(terminals[0].label, "tw-term-shell");
-    assert_eq!(terminals[0].host_id.as_deref(), Some("dev"));
-    assert_eq!(terminals[0].raw_name, "tw-term-shell");
-
-    restore_env("PATH", original_path);
-    restore_env("TW_FAKE_SSH_LOG", original_log);
-}
-
-#[test]
-fn remote_tmux_terminal_listing_merges_rpc_state_with_dashboard_tmux_sessions() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let bin_dir = temp.path().join("bin");
-    let log_path = temp.path().join("ssh.log");
-    fs::create_dir_all(&bin_dir).expect("bin dir");
-    let ssh_path = bin_dir.join("ssh");
-    fs::write(
-            &ssh_path,
-            r#"#!/bin/sh
-log="${TW_FAKE_SSH_LOG:?}"
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -gt 0 ]; then shift; fi
-    break
-  fi
-  shift
-done
-printf '%s\n' "$*" >> "$log"
-
-if [ "$#" -eq 1 ]; then
-  case "$1" in
-    *"'tw'"*"'rpc'"*"'list'"*)
-      cat <<'JSON'
-{"protocolVersion":1,"sessions":[{"name":"managed-cli","kind":"worktree","attached":false,"windows":1,"created":1760000000,"activity":1760000100,"cwd":"/remote/worktrees/managed-cli"},{"name":"tw-term-agent","kind":"terminal","attached":true,"windows":1,"created":1760000200,"activity":1760000300,"cwd":"/remote/app"}]}
-JSON
-      exit 0
-      ;;
-    *"'tmux'"*"'list-sessions'"*)
-      printf 'tw-term-agent\0371\0371\0371760000200\0371760000300\ntw-term-direct\0370\0371\0371760000400\0371760000500\n'
-      exit 0
-      ;;
-    *"'tmux'"*"'display-message'"*"'=tw-term-agent:'"*)
-      printf '/remote/app\n'
-      exit 0
-      ;;
-    *"'tmux'"*"'display-message'"*"'=tw-term-direct:'"*)
-      printf '/remote/direct\n'
-      exit 0
-      ;;
-    *"'git'"*"'rev-parse'"*"'--show-toplevel'"*)
-      printf 'fatal: not a git repository\n' >&2
-      exit 128
-      ;;
-  esac
-fi
-
-printf 'unexpected remote command: %s\n' "$*" >&2
-exit 12
-"#,
-        )
-        .expect("ssh shim");
-    let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).expect("ssh executable");
-
-    let original_path = std::env::var("PATH").ok();
-    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.to_string_lossy(),
-                original_path.clone().unwrap_or_default()
-            ),
-        );
-        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
-    }
-
-    let host = HostConfig {
-        id: "dev".to_string(),
-        label: "Dev".to_string(),
-        host: "ssh-host".to_string(),
-        user: None,
-        port: None,
-        identity_file: None,
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
-    };
-
-    let terminals = list_remote_tmux_terminals(&host).expect("remote rpc terminals");
-    let log = fs::read_to_string(&log_path).expect("ssh log");
-
-    assert_eq!(terminals.len(), 2, "ssh log:\n{log}");
-    assert_eq!(terminals[0].id, "ssh:dev:tw-term-agent");
-    assert_eq!(terminals[0].label, "tw-term-agent");
-    assert_eq!(terminals[0].tmux_name, "dev:tw-term-agent");
-    assert_eq!(terminals[0].cwd, "/remote/app");
-    assert_eq!(terminals[0].host_id.as_deref(), Some("dev"));
-    assert_eq!(terminals[0].raw_name, "tw-term-agent");
-    assert_eq!(terminals[1].id, "ssh:dev:tw-term-direct");
-    assert_eq!(terminals[1].cwd, "/remote/direct");
-    assert_eq!(terminals[1].host_id.as_deref(), Some("dev"));
-    assert!(log.contains("'tw' 'rpc' 'list'"));
-    assert!(log.contains("'tmux' 'list-sessions'"));
 
     restore_env("PATH", original_path);
     restore_env("TW_FAKE_SSH_LOG", original_log);
@@ -3262,8 +2441,8 @@ done
 printf '%s\n' "$*" >> "$log"
 
 case "$1" in
-  *"'tw' 'rpc' 'create-terminal'"*)
-    printf '%s\n' '{"protocolVersion":1,"kind":"terminal","session":"tw-term-abc12","cwd":"/remote/app"}'
+  *"'tw' 'rpc-v2' 'create-terminal'"*)
+    printf '%s\n' '{"protocolVersion":2,"operation":"create-terminal","state":"succeeded","session":{"name":"tw-term-abc12","kind":"terminal","attached":false,"windows":1,"created":1,"activity":1,"cwd":"/remote/app","lifecycleMarked":true}}'
     exit 0
     ;;
 esac
@@ -3321,9 +2500,10 @@ exit 12
     assert_eq!(terminal.tmux_name, format!("dev:{}", terminal.raw_name));
 
     let log = fs::read_to_string(&log_path).expect("ssh log");
-    assert!(log.contains("'tw' 'rpc' 'create-terminal'"));
-    assert!(log.contains("'--cwd' '/remote/app'"));
-    assert!(log.contains("'--ai-command' 'codex --dangerously-bypass-approvals-and-sandbox'"));
+    assert!(log.contains("'tw' 'rpc-v2' 'create-terminal' '--request-json'"));
+    assert!(log.contains(r#""cwd":"/remote/app""#));
+    assert!(log.contains(r#""aiCommand":"codex --dangerously-bypass-approvals-and-sandbox""#));
+    assert!(log.contains(r#""reservationCorrelation":null"#));
     assert!(log.contains("codex --dangerously-bypass-approvals-and-sandbox"));
     assert!(!log.contains("'tmux' 'new-session'"));
 
@@ -3625,8 +2805,8 @@ case "$1" in
     printf '0.11.1\n'
     exit 0
     ;;
-  *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
+  *"'tw'"*"'rpc-v2'"*"'capabilities'"*)
+    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
     exit 0
     ;;
 esac
@@ -3775,8 +2955,8 @@ case "$1" in
   *"'true'"*) exit 0 ;;
   *"'tmux'"*"'-V'"*) printf 'tmux: command not found\n' >&2; exit 127 ;;
   *"'tw'"*"'version'"*) printf '1.0.3\n'; exit 0 ;;
-  *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
+  *"'tw'"*"'rpc-v2'"*"'capabilities'"*)
+    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
     exit 0
     ;;
 esac
@@ -3831,8 +3011,8 @@ fn install_host_tw_uses_github_source_install() {
     fs::create_dir_all(&bin_dir).expect("bin dir");
     let ssh_path = bin_dir.join("ssh");
     fs::write(
-            &ssh_path,
-            r#"#!/bin/sh
+        &ssh_path,
+        r#"#!/bin/sh
 log="${TW_FAKE_SSH_LOG:?}"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--" ]; then
@@ -3860,8 +3040,8 @@ case "$1" in
     printf '0.11.1\n'
     exit 0
     ;;
-  *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session"]}'
+  *"'tw'"*"'rpc-v2'"*"'capabilities'"*)
+    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1"]}'
     exit 0
     ;;
 esac
@@ -3869,8 +3049,8 @@ esac
 printf 'unexpected remote command: %s\n' "$*" >&2
 exit 12
 "#,
-        )
-        .expect("ssh shim");
+    )
+    .expect("ssh shim");
     let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&ssh_path, perms).expect("ssh executable");
@@ -4037,22 +3217,21 @@ fn ssh_host_validation_blocks_option_injection_and_control_characters() {
 #[test]
 fn host_compatibility_requires_hard_bounded_mutation_capabilities() {
     let complete = [
-        "list",
-        "create-worktree",
-        "create-terminal",
-        "kill-session",
-        "hard-timeout",
+        "incarnation-list.v1",
+        "reservation-correlation.v1",
+        "correlated-create-worktree.v1",
+        "resolved-create-worktree.v1",
+        "correlated-create-terminal.v1",
+        "expected-incarnation-kill-session.v1",
+        "hard-timeout.v1",
+        "dashboard-lifecycle.v2",
     ]
     .map(str::to_string);
-    assert!(tw_rpc_capabilities_compatible(1, &complete));
-    assert!(!tw_rpc_capabilities_compatible(2, &complete));
+    assert!(tw_rpc_capabilities_compatible(2, &complete));
+    assert!(!tw_rpc_capabilities_compatible(1, &complete));
     assert!(!tw_rpc_capabilities_compatible(
-        1,
-        &["list", "create-worktree", "create-terminal"].map(str::to_string),
-    ));
-    assert!(!tw_rpc_capabilities_compatible(
-        1,
-        &["list", "create-worktree", "create-terminal", "kill-session"].map(str::to_string),
+        2,
+        &["incarnation-list.v1", "hard-timeout.v1"].map(str::to_string),
     ));
 }
 
@@ -4333,9 +3512,8 @@ fn update_host_is_transactional_preserves_other_config_and_is_idempotent() {
             "projects": {
                 "dashboard": { "path": "/repo/dashboard" }
             },
-            "mobileRelay": {
-                "relayUrl": "wss://relay.example.test",
-                "secret": "keep-me"
+            "futureConfig": {
+                "mode": "keep-me"
             },
             "hosts": [
                 {
@@ -4393,7 +3571,7 @@ fn update_host_is_transactional_preserves_other_config_and_is_idempotent() {
         serde_json::from_str(&fs::read_to_string(&config_path).expect("read updated config"))
             .expect("parse updated config");
     assert_eq!(saved["projects"]["dashboard"]["path"], "/repo/dashboard");
-    assert_eq!(saved["mobileRelay"]["secret"], "keep-me");
+    assert_eq!(saved["futureConfig"]["mode"], "keep-me");
     assert_eq!(saved["hosts"][0]["futureHostField"]["mode"], "keep");
 
     let first_write = fs::read(&config_path).expect("first update bytes");

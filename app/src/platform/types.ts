@@ -73,7 +73,7 @@ export type PtyControlStatus = {
   controlled: boolean;
   readOnly: boolean;
   state: "UNCONTROLLED" | "FREE" | "HELD" | "DRAINING" | "RECOVERY_REQUIRED" | "TARGET_GONE";
-  ownerKind?: "feishu" | "dashboard" | "local-cli" | "relay-v1" | "relay-v2" | "tw-serve";
+  ownerKind?: "feishu" | "dashboard" | "local-cli" | "relay-v2" | "tw-serve";
   canTakeOver: boolean;
   canRecover: boolean;
   message?: string;

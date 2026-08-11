@@ -16,16 +16,19 @@ use super::management_protocol_v2;
 use crate::features::control_plane::node_bin;
 
 const CONTRACT: &str = "tmux-worktree-dashboard-relay-v2-management-ipc";
-const PROTOCOL_VERSION_V1: u32 = 1;
 const MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+// A fresh durable H2 cut queries every explicitly configured SSH Host before
+// the child can publish its ready frame. Two ordinary SSH aliases can exceed
+// thirty seconds when GSSAPI and rpc-v2 capability/list probes are involved;
+// keep one bounded startup deadline without misclassifying that valid recovery
+// as a dead child. Timeout cleanup below still closes stdin and fails closed.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 // The Node Host owns a bounded five-second WSS drain before it can close the
 // native credential cell and remove its exact admission claim. Keep the
 // supervisor deadline strictly outside that owner deadline so ordinary
 // Dashboard shutdown cannot turn a clean close into a SIGKILL/crash cut.
 const CLEAN_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
-const REQUEST_ID_PREFIX_V1: &str = "dmgmt1.";
 const SUPERSEDED_EXIT_CODE: i32 = 78;
 const HIDDEN_MANAGEMENT_ENTRY: &str = "__relay-v2-dashboard-management-stdio";
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -334,7 +337,6 @@ enum ChildPoll {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildWrite {
     Written(usize),
-    Exited(ChildExit),
     TimedOut,
     Failed,
 }
@@ -1225,7 +1227,8 @@ struct ProductionFactory {
 impl ChildFactory for ProductionFactory {
     fn spawn(&self, artifact: &BundledManagementArtifact) -> SpawnAttempt {
         let stderr_log = management_child_stderr_log_path(&self.selection);
-        let stderr = open_management_child_stderr(stderr_log.as_deref()).unwrap_or_else(Stdio::null);
+        let stderr =
+            open_management_child_stderr(stderr_log.as_deref()).unwrap_or_else(Stdio::null);
         let child = match production_command(&self.node, artifact, &self.selection)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1419,50 +1422,11 @@ pub(crate) enum ManagementOperation {
     RevokeClientGrant,
 }
 
-impl ManagementOperation {
-    fn is_status(self) -> bool {
-        self == Self::Status
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ManagementProtocol {
-    #[cfg_attr(not(test), allow(dead_code))]
-    V1,
-    V2,
-}
-
-impl ManagementProtocol {
-    fn version(self) -> u32 {
-        match self {
-            Self::V1 => PROTOCOL_VERSION_V1,
-            Self::V2 => management_protocol_v2::PROTOCOL_VERSION,
-        }
-    }
-
-    fn request_id_prefix(self) -> &'static str {
-        match self {
-            Self::V1 => REQUEST_ID_PREFIX_V1,
-            Self::V2 => management_protocol_v2::REQUEST_ID_PREFIX,
-        }
-    }
-}
-
-const PRODUCTION_EXPECTED_PROTOCOL: ManagementProtocol = ManagementProtocol::V2;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagementInput {
     None,
     CreateEnrollment { device_label: Option<String> },
     RevokeClientGrant { grant_id: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RequestFrameV1<'a> {
-    protocol_version: u32,
-    request_id: &'a str,
-    operation: ManagementOperation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1471,14 +1435,6 @@ struct StartupReady {
     contract: String,
     protocol_version: u32,
     runtime_version: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DefaultOffStatus {
-    pub(crate) availability: String,
-    pub(crate) capabilities: Vec<String>,
-    pub(crate) reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1497,93 +1453,6 @@ pub(crate) struct ManagementOutcome {
     pub(crate) ok: bool,
     pub(crate) result: Option<serde_json::Value>,
     pub(crate) error: Option<ManagementError>,
-}
-
-struct ManagementOutcomeWire {
-    protocol_version: u32,
-    request_id: String,
-    ok: bool,
-    result: Option<DefaultOffStatus>,
-    error: Option<ManagementError>,
-}
-
-impl<'de> Deserialize<'de> for ManagementOutcomeWire {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct OutcomeVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for OutcomeVisitor {
-            type Value = ManagementOutcomeWire;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("the exact closed management outcome object")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: serde::de::MapAccess<'de>,
-            {
-                let mut protocol_version = None;
-                let mut request_id = None;
-                let mut ok = None;
-                let mut result: Option<Option<DefaultOffStatus>> = None;
-                let mut error: Option<Option<ManagementError>> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "protocolVersion" => {
-                            if protocol_version.is_some() {
-                                return Err(serde::de::Error::duplicate_field("protocolVersion"));
-                            }
-                            protocol_version = Some(map.next_value()?);
-                        }
-                        "requestId" => {
-                            if request_id.is_some() {
-                                return Err(serde::de::Error::duplicate_field("requestId"));
-                            }
-                            request_id = Some(map.next_value()?);
-                        }
-                        "ok" => {
-                            if ok.is_some() {
-                                return Err(serde::de::Error::duplicate_field("ok"));
-                            }
-                            ok = Some(map.next_value()?);
-                        }
-                        "result" => {
-                            if result.is_some() {
-                                return Err(serde::de::Error::duplicate_field("result"));
-                            }
-                            result = Some(map.next_value::<Option<DefaultOffStatus>>()?);
-                        }
-                        "error" => {
-                            if error.is_some() {
-                                return Err(serde::de::Error::duplicate_field("error"));
-                            }
-                            error = Some(map.next_value::<Option<ManagementError>>()?);
-                        }
-                        _ => {
-                            return Err(serde::de::Error::unknown_field(
-                                &key,
-                                &["protocolVersion", "requestId", "ok", "result", "error"],
-                            ));
-                        }
-                    }
-                }
-                Ok(ManagementOutcomeWire {
-                    protocol_version: protocol_version
-                        .ok_or_else(|| serde::de::Error::missing_field("protocolVersion"))?,
-                    request_id: request_id
-                        .ok_or_else(|| serde::de::Error::missing_field("requestId"))?,
-                    ok: ok.ok_or_else(|| serde::de::Error::missing_field("ok"))?,
-                    result: result.ok_or_else(|| serde::de::Error::missing_field("result"))?,
-                    error: error.ok_or_else(|| serde::de::Error::missing_field("error"))?,
-                })
-            }
-        }
-
-        deserializer.deserialize_map(OutcomeVisitor)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1646,9 +1515,7 @@ pub(crate) struct ManagementChildManager {
 }
 
 struct ManagerInner {
-    artifact: BundledManagementArtifact,
     child: Arc<dyn ManagementChildProcess>,
-    protocol: ManagementProtocol,
     request_ids: Arc<dyn RequestIdGenerator>,
     in_flight: AtomicBool,
     observation: Mutex<()>,
@@ -1682,7 +1549,6 @@ impl ManagementChildManager {
             artifact,
             Arc::new(ProductionFactory { node, selection }),
             Arc::new(OsRequestIdGenerator),
-            PRODUCTION_EXPECTED_PROTOCOL,
             env!("CARGO_PKG_VERSION"),
             STARTUP_TIMEOUT,
             OPERATION_TIMEOUT,
@@ -1708,7 +1574,6 @@ impl ManagementChildManager {
             },
             Arc::new(CommandRegressionScriptFactory { script }),
             Arc::new(CommandRegressionRequestId(Mutex::new(request_ids.into()))),
-            ManagementProtocol::V2,
             "1.2.3",
             Duration::from_secs(2),
             Duration::from_secs(2),
@@ -1719,7 +1584,6 @@ impl ManagementChildManager {
         artifact: BundledManagementArtifact,
         factory: Arc<dyn ChildFactory>,
         request_ids: Arc<dyn RequestIdGenerator>,
-        expected_protocol: ManagementProtocol,
         expected_version: &str,
         startup_timeout: Duration,
         operation_timeout: Duration,
@@ -1732,9 +1596,7 @@ impl ManagementChildManager {
             Err(FrameFailure::TimedOut)
         };
         match ready {
-            Ok(payload)
-                if decode_startup_ready(&payload, expected_version, expected_protocol).is_ok() =>
-            {
+            Ok(payload) if decode_startup_ready(&payload, expected_version).is_ok() => {
                 if Instant::now() >= deadline {
                     return Err(cleanup_timed_out_start(child.as_ref()));
                 }
@@ -1749,9 +1611,7 @@ impl ManagementChildManager {
             }
         }
         let inner = Arc::new(ManagerInner {
-            artifact,
             child,
-            protocol: expected_protocol,
             request_ids,
             in_flight: AtomicBool::new(false),
             observation: Mutex::new(()),
@@ -1776,10 +1636,6 @@ impl ManagementChildManager {
         })
     }
 
-    pub(crate) fn artifact_path(&self) -> &Path {
-        self.inner.artifact.path()
-    }
-
     pub(crate) fn is_reusable_after_observation(&self) -> bool {
         if self.inner.supervisor_stop.load(Ordering::Acquire) {
             return false;
@@ -1801,6 +1657,7 @@ impl ManagementChildManager {
             && self.inner.lifecycle_kind_now() == LifecycleKind::Ready
     }
 
+    #[cfg(test)]
     pub(crate) fn request(
         &self,
         operation: ManagementOperation,
@@ -1844,72 +1701,54 @@ impl ManagementChildManager {
                 return Err(ManagementCallError::RequestIdUnavailable);
             }
         };
-        let frame =
-            encode_request(self.inner.protocol, &request_id, operation, &input).map_err(|_| {
-                self.inner.terminalize(LifecycleKind::Poisoned, true);
-                ManagementCallError::ChannelClosed
-            })?;
+        let frame = encode_request(&request_id, operation, &input).map_err(|_| {
+            self.inner.terminalize(LifecycleKind::Poisoned, true);
+            ManagementCallError::ChannelClosed
+        })?;
 
         // This is the only operation deadline. It begins immediately before
         // the sole stdin write attempt and is never reset.
         let deadline = Instant::now() + self.inner.operation_timeout;
         match self.inner.child.write_stdin_once(&frame, deadline) {
             ChildWrite::Written(written) if written == frame.len() => {}
-            ChildWrite::Exited(exit) => {
-                let kind = self.inner.classify_post_handshake_exit(exit);
-                return Ok(local_terminal_outcome(
-                    self.inner.protocol,
-                    request_id,
-                    kind,
-                ));
-            }
             ChildWrite::Written(_) | ChildWrite::TimedOut | ChildWrite::Failed => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
+                return Ok(channel_closed_outcome(request_id));
             }
         }
         if Instant::now() >= deadline {
             self.inner.terminalize(LifecycleKind::Poisoned, true);
-            return Ok(channel_closed_outcome(self.inner.protocol, request_id));
+            return Ok(channel_closed_outcome(request_id));
         }
 
         let payload = match read_frame(self.inner.child.as_ref(), deadline) {
             Ok(payload) => payload,
             Err(FrameFailure::Exited(exit)) => {
                 let kind = self.inner.classify_post_handshake_exit(exit);
-                return Ok(local_terminal_outcome(
-                    self.inner.protocol,
-                    request_id,
-                    kind,
-                ));
+                return Ok(local_terminal_outcome(request_id, kind));
             }
             Err(_) => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
+                return Ok(channel_closed_outcome(request_id));
             }
         };
-        let response = match decode_response(self.inner.protocol, &payload, &request_id, operation)
-        {
+        let response = match decode_response(&payload, &request_id, operation) {
             Ok(response) if Instant::now() < deadline => response,
             _ => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
+                return Ok(channel_closed_outcome(request_id));
             }
         };
         match self.inner.child.poll_after_response(deadline) {
             ChildPoll::Output | ChildPoll::Failed => {
                 self.inner.terminalize(LifecycleKind::Poisoned, true);
-                return Ok(channel_closed_outcome(self.inner.protocol, request_id));
+                return Ok(channel_closed_outcome(request_id));
             }
             ChildPoll::Pending | ChildPoll::Eof | ChildPoll::Exited(_) => {}
         }
         match self.inner.lifecycle_kind_after_barrier() {
             LifecycleKind::Ready => Ok(response),
-            kind => Ok(local_terminal_outcome(
-                self.inner.protocol,
-                request_id,
-                kind,
-            )),
+            kind => Ok(local_terminal_outcome(request_id, kind)),
         }
     }
 
@@ -1929,7 +1768,7 @@ impl ManagerInner {
         self.request_ids.fill(&mut bytes)?;
         Ok(format!(
             "{}{}",
-            self.protocol.request_id_prefix(),
+            management_protocol_v2::REQUEST_ID_PREFIX,
             URL_SAFE_NO_PAD.encode(bytes)
         ))
     }
@@ -2171,17 +2010,13 @@ fn closed_object_payload(payload: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-fn decode_startup_ready(
-    payload: &[u8],
-    expected_version: &str,
-    expected_protocol: ManagementProtocol,
-) -> Result<(), ()> {
+fn decode_startup_ready(payload: &[u8], expected_version: &str) -> Result<(), ()> {
     closed_object_payload(payload)?;
     let ready: StartupReady = serde_json::from_slice(payload).map_err(|_| ())?;
     if ready.contract != CONTRACT
         || !valid_ascii_semver(&ready.runtime_version)
         || ready.runtime_version.as_bytes() != expected_version.as_bytes()
-        || ready.protocol_version != expected_protocol.version()
+        || ready.protocol_version != management_protocol_v2::PROTOCOL_VERSION
     {
         return Err(());
     }
@@ -2189,25 +2024,14 @@ fn decode_startup_ready(
 }
 
 fn encode_request(
-    protocol: ManagementProtocol,
     request_id: &str,
     operation: ManagementOperation,
     input: &ManagementInput,
 ) -> Result<Vec<u8>, ()> {
-    if !valid_request_id(protocol, request_id) {
+    if !valid_request_id(request_id) {
         return Err(());
     }
-    let mut frame = match protocol {
-        ManagementProtocol::V1 => serde_json::to_vec(&RequestFrameV1 {
-            protocol_version: PROTOCOL_VERSION_V1,
-            request_id,
-            operation,
-        })
-        .map_err(|_| ())?,
-        ManagementProtocol::V2 => {
-            management_protocol_v2::encode_request(request_id, operation, input)?
-        }
-    };
+    let mut frame = management_protocol_v2::encode_request(request_id, operation, input)?;
     if frame.len() > MAX_FRAME_PAYLOAD_BYTES {
         return Err(());
     }
@@ -2216,62 +2040,12 @@ fn encode_request(
 }
 
 fn decode_response(
-    protocol: ManagementProtocol,
     payload: &[u8],
     expected_request_id: &str,
     operation: ManagementOperation,
 ) -> Result<ManagementOutcome, ()> {
     closed_object_payload(payload)?;
-    match protocol {
-        ManagementProtocol::V1 => decode_v1_response(payload, expected_request_id, operation),
-        ManagementProtocol::V2 => decode_v2_response(payload, expected_request_id, operation),
-    }
-}
-
-fn decode_v1_response(
-    payload: &[u8],
-    expected_request_id: &str,
-    operation: ManagementOperation,
-) -> Result<ManagementOutcome, ()> {
-    let wire: ManagementOutcomeWire = serde_json::from_slice(payload).map_err(|_| ())?;
-    if wire.protocol_version != PROTOCOL_VERSION_V1
-        || !valid_request_id(ManagementProtocol::V1, &wire.request_id)
-        || wire.request_id.as_bytes() != expected_request_id.as_bytes()
-    {
-        return Err(());
-    }
-    if operation.is_status() {
-        let result = wire.result.as_ref().ok_or(())?;
-        if !wire.ok
-            || wire.error.is_some()
-            || result.availability != "unavailable"
-            || !result.capabilities.is_empty()
-            || result.reason != "default_off"
-        {
-            return Err(());
-        }
-    } else {
-        let error = wire.error.as_ref().ok_or(())?;
-        if wire.ok
-            || wire.result.is_some()
-            || error.code != "UNAVAILABLE"
-            || error.message != "Relay v2 management is unavailable"
-            || error.retryable
-        {
-            return Err(());
-        }
-    }
-    let response = ManagementOutcome {
-        protocol_version: wire.protocol_version,
-        request_id: wire.request_id,
-        ok: wire.ok,
-        result: wire
-            .result
-            .map(|result| serde_json::to_value(result).map_err(|_| ()))
-            .transpose()?,
-        error: wire.error,
-    };
-    Ok(response)
+    decode_v2_response(payload, expected_request_id, operation)
 }
 
 fn decode_v2_response(
@@ -2297,8 +2071,8 @@ fn decode_v2_response(
     })
 }
 
-fn valid_request_id(protocol: ManagementProtocol, value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix(protocol.request_id_prefix()) else {
+fn valid_request_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(management_protocol_v2::REQUEST_ID_PREFIX) else {
         return false;
     };
     if value.len() != 29
@@ -2369,9 +2143,9 @@ fn fixed_error(code: &str, message: &str) -> ManagementError {
     }
 }
 
-fn channel_closed_outcome(protocol: ManagementProtocol, request_id: String) -> ManagementOutcome {
+fn channel_closed_outcome(request_id: String) -> ManagementOutcome {
     ManagementOutcome {
-        protocol_version: protocol.version(),
+        protocol_version: management_protocol_v2::PROTOCOL_VERSION,
         request_id,
         ok: false,
         result: None,
@@ -2382,9 +2156,9 @@ fn channel_closed_outcome(protocol: ManagementProtocol, request_id: String) -> M
     }
 }
 
-fn superseded_outcome(protocol: ManagementProtocol, request_id: String) -> ManagementOutcome {
+fn superseded_outcome(request_id: String) -> ManagementOutcome {
     ManagementOutcome {
-        protocol_version: protocol.version(),
+        protocol_version: management_protocol_v2::PROTOCOL_VERSION,
         request_id,
         ok: false,
         result: None,
@@ -2395,15 +2169,11 @@ fn superseded_outcome(protocol: ManagementProtocol, request_id: String) -> Manag
     }
 }
 
-fn local_terminal_outcome(
-    protocol: ManagementProtocol,
-    request_id: String,
-    kind: LifecycleKind,
-) -> ManagementOutcome {
+fn local_terminal_outcome(request_id: String, kind: LifecycleKind) -> ManagementOutcome {
     if kind == LifecycleKind::Superseded {
-        superseded_outcome(protocol, request_id)
+        superseded_outcome(request_id)
     } else {
-        channel_closed_outcome(protocol, request_id)
+        channel_closed_outcome(request_id)
     }
 }
 
@@ -2418,7 +2188,6 @@ fn call_error_for(kind: LifecycleKind) -> ManagementCallError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD;
     use serde_json::Value;
     use std::collections::VecDeque;
     use std::fs;
@@ -2426,8 +2195,6 @@ mod tests {
     use std::thread;
 
     const CASES: &str =
-        include_str!("../../../../../contracts/dashboard-relay-v2-management/v1/cases.json");
-    const CASES_V2: &str =
         include_str!("../../../../../contracts/dashboard-relay-v2-management/v2/cases.json");
 
     #[derive(Clone, Copy)]
@@ -2850,7 +2617,6 @@ mod tests {
                 script: script.into(),
             }),
             Arc::new(FixedIds(Mutex::new(ids.into()))),
-            ManagementProtocol::V1,
             "1.2.3",
             Duration::from_secs(2),
             Duration::from_secs(2),
@@ -2902,13 +2668,6 @@ mod tests {
 
     fn ready_frame(version: &str) -> Vec<u8> {
         format!(
-            "{{\"contract\":\"{CONTRACT}\",\"protocolVersion\":1,\"runtimeVersion\":\"{version}\"}}\n"
-        )
-        .into_bytes()
-    }
-
-    fn ready_frame_v2(version: &str) -> Vec<u8> {
-        format!(
             "{{\"contract\":\"{CONTRACT}\",\"protocolVersion\":2,\"runtimeVersion\":\"{version}\"}}\n"
         )
         .into_bytes()
@@ -2959,20 +2718,10 @@ mod tests {
         ids: Vec<[u8; 16]>,
         expected_version: &str,
     ) -> ManagementChildManager {
-        start_fake_for_protocol(child, ids, expected_version, ManagementProtocol::V1)
-    }
-
-    fn start_fake_for_protocol(
-        child: Arc<FakeChild>,
-        ids: Vec<[u8; 16]>,
-        expected_version: &str,
-        expected_protocol: ManagementProtocol,
-    ) -> ManagementChildManager {
         ManagementChildManager::start_with_factory(
             artifact(),
             FakeFactory::new(child, FakeSpawnAction::Ready),
             Arc::new(FixedIds(Mutex::new(ids.into()))),
-            expected_protocol,
             expected_version,
             Duration::from_millis(100),
             Duration::from_millis(100),
@@ -2991,30 +2740,11 @@ mod tests {
             artifact(),
             FakeFactory::new(child, FakeSpawnAction::Ready),
             Arc::new(FixedIds(Mutex::new(ids.into()))),
-            ManagementProtocol::V1,
             expected_version,
             startup_timeout,
             operation_timeout,
         )
         .expect("start fake management child")
-    }
-
-    fn fixture_input(input: &Value) -> Vec<u8> {
-        match input["kind"].as_str().unwrap() {
-            "utf8" => input["value"].as_str().unwrap().as_bytes().to_vec(),
-            "base64" => STANDARD.decode(input["value"].as_str().unwrap()).unwrap(),
-            "repeat-ascii" => {
-                let mut value = vec![
-                    input["ascii"].as_str().unwrap().as_bytes()[0];
-                    input["count"].as_u64().unwrap() as usize
-                ];
-                if input["terminator"].as_str() == Some("LF") {
-                    value.push(b'\n');
-                }
-                value
-            }
-            _ => panic!("unsupported fixture input"),
-        }
     }
 
     #[test]
@@ -3173,18 +2903,11 @@ mod tests {
     }
 
     #[test]
-    fn startup_and_all_golden_exchanges_conform_to_the_shared_fixture() {
-        let fixture = fixture();
+    fn v2_startup_and_all_successes_cross_the_supervisor() {
+        let fixture: Value = serde_json::from_str(CASES).unwrap();
         let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
-        let ready = fixture["startupHandshakeCases"][0]["input"]["firstStdoutFrame"]
-            .as_str()
-            .unwrap();
-        decode_startup_ready(
-            ready.trim_end_matches('\n').as_bytes(),
-            version,
-            ManagementProtocol::V1,
-        )
-        .unwrap();
+        let ready = fixture["startupReadyFrame"].as_str().unwrap();
+        decode_startup_ready(ready.trim_end_matches('\n').as_bytes(), version).unwrap();
 
         for exchange in fixture["goldenExchanges"].as_array().unwrap() {
             let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
@@ -3202,57 +2925,6 @@ mod tests {
                 ),
             ]);
             let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
-            let outcome = manager
-                .request(operation(exchange["operation"].as_str().unwrap()))
-                .unwrap();
-            assert_eq!(
-                serde_json::to_value(outcome).unwrap(),
-                exchange["normalizedResponse"]
-            );
-            assert_eq!(
-                child.state.lock().unwrap().writes,
-                vec![exchange["requestFrame"]
-                    .as_str()
-                    .unwrap()
-                    .as_bytes()
-                    .to_vec()]
-            );
-        }
-    }
-
-    #[test]
-    fn private_expected_v2_accepts_v2_and_all_successes_cross_the_supervisor() {
-        let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
-        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
-        let ready = fixture["startupReadyFrame"].as_str().unwrap();
-        decode_startup_ready(
-            ready.trim_end_matches('\n').as_bytes(),
-            version,
-            ManagementProtocol::V2,
-        )
-        .unwrap();
-
-        for exchange in fixture["goldenExchanges"].as_array().unwrap() {
-            let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
-            let child = FakeChild::sequenced(vec![
-                (0, ChildRead::Bytes(ready.as_bytes().to_vec())),
-                (
-                    1,
-                    ChildRead::Bytes(
-                        exchange["responseFrame"]
-                            .as_str()
-                            .unwrap()
-                            .as_bytes()
-                            .to_vec(),
-                    ),
-                ),
-            ]);
-            let manager = start_fake_for_protocol(
-                child.clone(),
-                vec![id_bytes(request_id)],
-                version,
-                ManagementProtocol::V2,
-            );
             let operation = operation(exchange["operation"].as_str().unwrap());
             let outcome = manager
                 .request_with_input(
@@ -3275,91 +2947,17 @@ mod tests {
     }
 
     #[test]
-    fn protocol_mismatch_kills_and_reaps_before_request_id_or_stdin_write() {
-        for (name, expected_protocol, ready) in [
-            (
-                "expected-v1-child-v2",
-                ManagementProtocol::V1,
-                ready_frame_v2("1.2.3"),
-            ),
-            (
-                "expected-v2-child-v1",
-                ManagementProtocol::V2,
-                ready_frame("1.2.3"),
-            ),
-        ] {
-            let child = FakeChild::sequenced(vec![(0, ChildRead::Bytes(ready))]);
-            let request_ids = Arc::new(CountingIds(Mutex::new(0)));
-            let result = ManagementChildManager::start_with_factory(
-                artifact(),
-                FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
-                request_ids.clone(),
-                expected_protocol,
-                "1.2.3",
-                Duration::from_millis(100),
-                Duration::from_millis(100),
-            );
-            assert_eq!(
-                result.err(),
-                Some(ManagementStartError::ChannelClosed),
-                "{name}"
-            );
-            assert_eq!(*request_ids.0.lock().unwrap(), 0, "{name}");
-            let state = child.state.lock().unwrap();
-            assert!(state.writes.is_empty(), "{name}");
-            assert_eq!(state.events, ["kill-if-live", "wait-and-reap"], "{name}");
-        }
-    }
-
-    #[test]
-    fn dashboard_management_v2_real_v1_selection_stays_default_off_and_drops_v2_inputs() {
-        let fixture = fixture();
-        let exchange = fixture["goldenExchanges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|exchange| exchange["operation"] == "create_enrollment")
-            .unwrap();
-        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
-        let child = FakeChild::ready_then(
-            "1.2.3",
-            vec![ChildRead::Bytes(
-                exchange["responseFrame"]
-                    .as_str()
-                    .unwrap()
-                    .as_bytes()
-                    .to_vec(),
-            )],
-        );
-        let manager = start_fake(child.clone(), vec![id_bytes(request_id)], "1.2.3");
-        let outcome = manager
-            .request_with_input(
-                ManagementOperation::CreateEnrollment,
-                ManagementInput::CreateEnrollment {
-                    device_label: Some("Pixel".to_string()),
-                },
-            )
-            .unwrap();
-        assert_eq!(outcome.protocol_version, 1);
-        assert_eq!(outcome.error.unwrap().code, "UNAVAILABLE");
-        assert_eq!(
-            child.state.lock().unwrap().writes,
-            vec![exchange["requestFrame"]
-                .as_str()
-                .unwrap()
-                .as_bytes()
-                .to_vec()]
-        );
-    }
-
-    #[test]
     fn dashboard_management_v2_invalid_or_forged_stdout_poisons_without_switching_protocol() {
-        let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
+        let fixture: Value = serde_json::from_str(CASES).unwrap();
         let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
 
+        let unsupported_protocol = format!(
+            "{{\"contract\":\"{CONTRACT}\",\"protocolVersion\":999,\"runtimeVersion\":\"{version}\"}}\n"
+        )
+        .into_bytes();
         for (name, ready) in [
-            ("v1-ready", ready_frame(version)),
-            ("wrong-runtime", ready_frame_v2("9.9.9")),
+            ("unsupported-protocol", unsupported_protocol),
+            ("wrong-runtime", ready_frame("9.9.9")),
         ] {
             let child = FakeChild::sequenced(vec![(0, ChildRead::Bytes(ready))]);
             let request_ids = Arc::new(CountingIds(Mutex::new(0)));
@@ -3367,7 +2965,6 @@ mod tests {
                 artifact(),
                 FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
                 request_ids.clone(),
-                PRODUCTION_EXPECTED_PROTOCOL,
                 version,
                 Duration::from_millis(100),
                 Duration::from_millis(100),
@@ -3388,15 +2985,10 @@ mod tests {
             let mut response = case["frame"].as_str().unwrap().as_bytes().to_vec();
             response.push(b'\n');
             let child = FakeChild::sequenced(vec![
-                (0, ChildRead::Bytes(ready_frame_v2(version))),
+                (0, ChildRead::Bytes(ready_frame(version))),
                 (1, ChildRead::Bytes(response)),
             ]);
-            let manager = start_fake_for_protocol(
-                child.clone(),
-                vec![id_bytes(request_id)],
-                version,
-                PRODUCTION_EXPECTED_PROTOCOL,
-            );
+            let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
             let outcome = manager
                 .request(operation(case["operation"].as_str().unwrap()))
                 .unwrap();
@@ -3421,12 +3013,12 @@ mod tests {
 
     #[test]
     fn dashboard_management_v2_extra_stdout_frame_poisons_and_clears_the_channel() {
-        let fixture: Value = serde_json::from_str(CASES_V2).unwrap();
+        let fixture: Value = serde_json::from_str(CASES).unwrap();
         let exchange = &fixture["goldenExchanges"][0];
         let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
         let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
         let child = FakeChild::sequenced(vec![
-            (0, ChildRead::Bytes(ready_frame_v2(version))),
+            (0, ChildRead::Bytes(ready_frame(version))),
             (
                 1,
                 ChildRead::Bytes(
@@ -3439,12 +3031,7 @@ mod tests {
             ),
             (1, ChildRead::Bytes(b"{}\n".to_vec())),
         ]);
-        let manager = start_fake_for_protocol(
-            child.clone(),
-            vec![id_bytes(request_id)],
-            version,
-            ManagementProtocol::V2,
-        );
+        let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
         let outcome = manager.request(ManagementOperation::Status).unwrap();
         assert_eq!(outcome.protocol_version, 2);
         assert_eq!(outcome.error.unwrap().code, "CHANNEL_CLOSED");
@@ -3508,70 +3095,16 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(manager.request(ManagementOperation::Status).unwrap()).unwrap(),
-            status["normalizedResponse"]
+            serde_json::from_str::<Value>(status["responseFrame"].as_str().unwrap()).unwrap()
         );
         assert_eq!(
             serde_json::to_value(manager.request(ManagementOperation::StopConnector).unwrap())
                 .unwrap(),
-            stop["normalizedResponse"]
+            serde_json::from_str::<Value>(stop["responseFrame"].as_str().unwrap()).unwrap()
         );
         let state = child.state.lock().unwrap();
         assert_eq!(state.writes.len(), 2);
         assert_eq!(state.events, ["write", "write"]);
-    }
-
-    #[test]
-    fn startup_timeout_drains_but_bad_ready_fixtures_kill_before_returning() {
-        let fixture = fixture();
-        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
-        for case in fixture["startupHandshakeCases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .skip(1)
-        {
-            let startup = match &case["input"] {
-                Value::Object(input) => vec![ChildRead::Bytes(
-                    input["firstStdoutFrame"]
-                        .as_str()
-                        .unwrap()
-                        .as_bytes()
-                        .to_vec(),
-                )],
-                Value::Null if case["name"] == "startup-eof-before-ready-poisons" => {
-                    vec![ChildRead::Eof]
-                }
-                Value::Null => vec![ChildRead::TimedOut],
-                _ => panic!("unsupported startup fixture"),
-            };
-            let child = FakeChild::sequenced(startup.into_iter().map(|read| (0, read)).collect());
-            assert_eq!(
-                ManagementChildManager::start_with_factory(
-                    artifact(),
-                    FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
-                    Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
-                    ManagementProtocol::V1,
-                    version,
-                    Duration::from_millis(100),
-                    Duration::from_millis(100),
-                )
-                .err(),
-                Some(ManagementStartError::ChannelClosed),
-                "{}",
-                case["name"]
-            );
-            assert_eq!(
-                child.state.lock().unwrap().events,
-                if case["name"] == "startup-handshake-timeout-covers-spawn-through-validated-ready"
-                {
-                    vec!["close-stdin", "wait-and-reap"]
-                } else {
-                    vec!["kill-if-live", "wait-and-reap"]
-                },
-                "{}",
-                case["name"]
-            );
-        }
     }
 
     #[test]
@@ -3582,7 +3115,6 @@ mod tests {
             artifact(),
             FakeFactory::new(child.clone(), FakeSpawnAction::Ready),
             Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
-            ManagementProtocol::V1,
             "1.2.3",
             Duration::from_millis(10),
             Duration::from_millis(100),
@@ -3606,7 +3138,6 @@ mod tests {
                 artifact(),
                 start_factory,
                 Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
-                ManagementProtocol::V1,
                 "1.2.3",
                 Duration::ZERO,
                 Duration::from_millis(100),
@@ -3633,7 +3164,6 @@ mod tests {
             artifact(),
             FakeFactory::new(child.clone(), FakeSpawnAction::FailedAfterChild),
             Arc::new(FixedIds(Mutex::new(VecDeque::new()))),
-            ManagementProtocol::V1,
             "1.2.3",
             Duration::from_millis(100),
             Duration::from_millis(100),
@@ -3773,7 +3303,7 @@ mod tests {
     #[test]
     fn buffered_output_takes_priority_over_simultaneous_exit_78() {
         let manager = start_script(
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; printf 'unexpected\\n'; exit 78",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; printf 'unexpected\\n'; exit 78",
             vec![[6; 16]],
         )
         .unwrap();
@@ -3834,12 +3364,12 @@ mod tests {
             .trim_end_matches('\n');
         assert!(!response.contains('\''));
         let script = format!(
-            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}}'; IFS= read -r request; printf '%s\\n' '{response}'; exit 78"
+            "printf '%s\\n' '{{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}}'; IFS= read -r request; printf '%s\\n' '{response}'; exit 78"
         );
         let manager = start_script(script, vec![id_bytes(request_id)]).unwrap();
         assert_eq!(
             serde_json::to_value(manager.request(ManagementOperation::Status).unwrap()).unwrap(),
-            exchange["normalizedResponse"]
+            serde_json::from_str::<Value>(exchange["responseFrame"].as_str().unwrap()).unwrap()
         );
         assert_eq!(wait_until_terminal(&manager), LifecycleKind::Superseded);
         assert_eq!(
@@ -3883,7 +3413,7 @@ mod tests {
     #[test]
     fn idle_exit_78_is_supervised_without_waiting_for_another_request() {
         let manager = start_script(
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; (sleep 1) & exit 78",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; (sleep 1) & exit 78",
             vec![[4; 16]],
         )
         .unwrap();
@@ -3952,37 +3482,6 @@ mod tests {
     }
 
     #[test]
-    fn every_invalid_response_fixture_poisons_kills_and_reaps_without_replay() {
-        let fixture = fixture();
-        let version = fixture["constants"]["expectedVersion"].as_str().unwrap();
-        for case in fixture["invalidResponseFrameCases"].as_array().unwrap() {
-            let request_id = case["inFlightRequestId"].as_str().unwrap();
-            let child = FakeChild::ready_then(
-                version,
-                vec![ChildRead::Bytes(fixture_input(&case["input"]))],
-            );
-            let manager = start_fake(child.clone(), vec![id_bytes(request_id)], version);
-            let outcome = manager
-                .request(operation(case["operation"].as_str().unwrap()))
-                .unwrap();
-            assert_eq!(
-                outcome.error.unwrap().code,
-                "CHANNEL_CLOSED",
-                "{}",
-                case["name"]
-            );
-            let state = child.state.lock().unwrap();
-            assert_eq!(state.writes.len(), 1, "{}", case["name"]);
-            assert_eq!(
-                state.events,
-                ["write", "kill-if-live", "wait-and-reap"],
-                "{}",
-                case["name"]
-            );
-        }
-    }
-
-    #[test]
     fn partial_write_uses_one_write_then_poisons_and_reaps() {
         let child = FakeChild::ready_then("1.2.3", Vec::new());
         child.set_write_action(WriteAction::Partial(17));
@@ -4036,8 +3535,8 @@ mod tests {
     #[test]
     fn ordinary_and_signal_exits_wait_then_return_channel_closed() {
         for script in [
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; exit 1",
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; kill -TERM $$",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; exit 1",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; kill -TERM $$",
         ] {
             let manager = start_script(script, vec![[2; 16]]).unwrap();
             let outcome = manager.request(ManagementOperation::Status).unwrap();
@@ -4049,7 +3548,7 @@ mod tests {
     #[test]
     fn partial_frame_then_exit_78_is_protocol_poison_not_superseded() {
         let manager = start_script(
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; printf '{\"protocolVersion\":1'; exit 78",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; printf '{\"protocolVersion\":2'; exit 78",
             vec![[1; 16]],
         )
         .unwrap();
@@ -4061,7 +3560,7 @@ mod tests {
     #[test]
     fn post_handshake_exit_78_is_superseded_only_after_wait_without_kill() {
         let manager = start_script(
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; exit 78",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; IFS= read -r request; exit 78",
             vec![[8; 16]],
         )
         .unwrap();
@@ -4101,8 +3600,8 @@ mod tests {
     #[test]
     fn dispose_closed_wins_over_idle_exit_and_protocol_poison_classifiers() {
         for script in [
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; (sleep 1) & exit 78",
-            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":1,\"runtimeVersion\":\"1.2.3\"}'; printf 'unexpected\\n'; sleep 1",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; (sleep 1) & exit 78",
+            "printf '%s\\n' '{\"contract\":\"tmux-worktree-dashboard-relay-v2-management-ipc\",\"protocolVersion\":2,\"runtimeVersion\":\"1.2.3\"}'; printf 'unexpected\\n'; sleep 1",
         ] {
             let manager = Arc::new(start_script(script, vec![[13; 16]]).unwrap());
             let dispose_manager = manager.clone();
@@ -4155,7 +3654,9 @@ mod tests {
 
         // A log below the cap is left untouched.
         fs::write(&path, b"startup noise").unwrap();
-        assert!(!truncate_oversized_management_child_stderr_log(&path, 1_024));
+        assert!(!truncate_oversized_management_child_stderr_log(
+            &path, 1_024
+        ));
         assert_eq!(fs::metadata(&path).unwrap().len(), 13);
 
         // A log above the cap is truncated to zero bytes.

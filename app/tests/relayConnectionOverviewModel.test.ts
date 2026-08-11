@@ -49,15 +49,12 @@ function readyEnrollmentView(
     missingCapabilities: [],
     readinessLabel: "Relay v2 connector ready for enrollment",
     readinessDetail: "The Mac host connector is registered with all six required capabilities.",
-    v1CredentialLabel: "Relay v1 shared secret configured",
     v2CredentialLabel: "Relay v2 host credential ready",
     hostCredentialAction: "refresh",
     connectorAction: "stop",
     enrollmentAction: null,
     enrollmentActionDisabled: true,
     enrollmentActionLabel: "One-time enrollment active",
-    grantRevokeDisabled: false,
-    grantRevokeLabel: "Revoke known client grant",
     error: null,
     review: null,
     qrArtifact: null,
@@ -69,7 +66,7 @@ function input(overrides: Partial<RelayConnectionOverviewInput> = {}): RelayConn
   return {
     selfHosted: configuredSelfHosted,
     enrollmentView: readyEnrollmentView(),
-    knownGrantActive: false,
+    connectedMobileDeviceCount: 0,
     inFlight: null,
     repairError: null,
     connectorStatus: "registered",
@@ -166,7 +163,7 @@ test("connector not registered is a warning with a fix action", () => {
   assert.equal(overview.primaryAction?.kind, "fix");
 });
 
-test("registered_incomplete warns the phone app needs an update with no fix action", () => {
+test("registered_incomplete identifies the incomplete Mac connector with no unsafe repair", () => {
   const overview = deriveRelayConnectionOverview(input({
     connectorStatus: "registered_incomplete",
     enrollmentView: readyEnrollmentView({
@@ -175,8 +172,8 @@ test("registered_incomplete warns the phone app needs an update with no fix acti
     }),
   }));
   assert.equal(overview.tone, "warning");
-  assert.equal(overview.headline, "Phone app needs an update");
-  assert.match(overview.detail ?? "", /missing required features/);
+  assert.equal(overview.headline, "Mac connector is missing Relay v2 capabilities");
+  assert.match(overview.detail ?? "", /Dashboard bundle/);
   assert.equal(overview.primaryAction, null);
 });
 
@@ -193,15 +190,15 @@ test("registered_incomplete still names the stalled center when infra is down", 
 test("registered connector is a success with show-QR action", () => {
   const overview = deriveRelayConnectionOverview(input());
   assert.equal(overview.tone, "success");
-  assert.equal(overview.headline, "Connected — ready to pair a phone");
+  assert.equal(overview.headline, "Mac connected — Relay v2 enrollment available");
   assert.equal(overview.primaryAction?.kind, "show_qr");
   assert.equal(overview.primaryAction?.label, "Show pairing QR");
-  assert.equal(overview.detail, null);
+  assert.match(overview.detail ?? "", /No mobile device is connected/i);
 });
 
-test("success mentions an already-paired phone", () => {
-  const overview = deriveRelayConnectionOverview(input({ knownGrantActive: true }));
+test("success reports the live mobile-device count", () => {
+  const overview = deriveRelayConnectionOverview(input({ connectedMobileDeviceCount: 2 }));
   assert.equal(overview.tone, "success");
-  assert.match(overview.detail ?? "", /1 phone already paired/);
+  assert.match(overview.detail ?? "", /2 mobile devices are connected/);
   assert.equal(overview.primaryAction?.kind, "show_qr");
 });

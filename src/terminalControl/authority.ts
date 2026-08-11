@@ -2467,12 +2467,20 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           }
         } else if (kind === "agent-message") {
           const separator = (payload as string).lastIndexOf("\0");
-          await this.backend.sendAgentMessage(
-            sessionName,
-            pane,
-            (payload as string).slice(0, separator),
-            (payload as string).slice(separator + 1) === "1",
-          );
+          const message = (payload as string).slice(0, separator);
+          const submit = (payload as string).slice(separator + 1) === "1";
+          if (this.backend.sendAgentMessageFenced !== undefined) {
+            await this.backend.sendAgentMessageFenced(
+              target.managedSession,
+              target.backend.tmuxInstanceId,
+              output.generation,
+              pane,
+              message,
+              submit,
+            );
+          } else {
+            await this.backend.sendAgentMessage(sessionName, pane, message, submit);
+          }
         } else if (kind === "scroll") {
           const match = /^(up|down):(\d+)$/.exec(payload as string);
           if (!match) throw new Error("invalid normalized scroll payload");
@@ -2592,7 +2600,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   ): Promise<unknown> {
     return this.locked(async (state) => {
       const target = targetById(state, lease.controlTargetId);
-      if (lease.owner.kind !== "feishu") {
+      if (lease.owner.kind !== "feishu" && lease.owner.kind !== "relay-v2") {
         throw new TerminalControlProtocolError(
           "PERMISSION_DENIED",
           "rendered terminal snapshots require the exact Feishu owner",
@@ -2640,10 +2648,10 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   ): Promise<unknown> {
     return this.locked(async (state) => {
       const target = targetById(state, lease.controlTargetId);
-      if (lease.owner.kind !== "feishu") {
+      if (lease.owner.kind !== "feishu" && lease.owner.kind !== "relay-v2") {
         throw new TerminalControlProtocolError(
           "PERMISSION_DENIED",
-          "agent status observations require the exact Feishu owner",
+          "agent status observations require an exact Agent consumer owner",
         );
       }
       await this.assertTargetCurrent(state, target);
@@ -2671,9 +2679,10 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         controlEpoch: state.controlEpoch,
         leaseId: lease.leaseId,
         fence: target.ownership.fence,
-        ownerKind: "feishu",
+        ownerKind: lease.owner.kind,
         outputGeneration,
         pane,
+        agentSupported: activity.agentSupported,
         agentRunning: activity.agentRunning,
         ...(activity.source === undefined ? {} : { source: activity.source }),
       };
@@ -2689,10 +2698,10 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   ): Promise<unknown> {
     return this.locked(async (state) => {
       const target = targetById(state, lease.controlTargetId);
-      if (lease.owner.kind !== "feishu") {
+      if (lease.owner.kind !== "feishu" && lease.owner.kind !== "relay-v2") {
         throw new TerminalControlProtocolError(
           "PERMISSION_DENIED",
-          "Agent final response extraction requires the exact Feishu owner",
+          "Agent final response extraction requires an exact Agent consumer owner",
         );
       }
       await this.assertTargetCurrent(state, target);
@@ -2722,7 +2731,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         controlEpoch: state.controlEpoch,
         leaseId: lease.leaseId,
         fence: target.ownership.fence,
-        ownerKind: "feishu",
+        ownerKind: lease.owner.kind,
         outputGeneration,
         pane,
         source: result.source,

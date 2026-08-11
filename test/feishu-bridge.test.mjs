@@ -157,6 +157,7 @@ class JointTerminalBackend {
     assert.equal(outputGeneration, this.outputGeneration);
     assert.equal(pane, "0");
     return {
+      agentSupported: true,
       agentRunning: this.agentRunning,
       ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
     };
@@ -366,6 +367,7 @@ class FakeControlClient {
       ownerKind: "feishu",
       outputGeneration: this.target.outputGeneration,
       pane: "0",
+      agentSupported: true,
       agentRunning: this.agentRunning,
       ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
     };
@@ -1108,6 +1110,25 @@ test("Lark CLI bridge selects topic or direct Card replies and manages bot react
   assert.equal(card.config.streaming_mode, false);
   assert.equal(card.header.title.content, "tw agent on feature/card-title");
   assert.equal(card.body.elements[0].content.includes("<at"), false, "card output must not create a real mention");
+  const structuredCard = buildFeishuReplyCard(`Result follows:\n\`\`\`json\n${JSON.stringify({
+    schema: "2.0",
+    config: { streaming_mode: true },
+    header: { title: { tag: "plain_text", content: "Agent report" }, template: "green" },
+    body: { elements: [{ tag: "markdown", content: "**Ready** {now} <at id='all'></at>" }] },
+  })}\n\`\`\``, "ignored-session");
+  assert.equal(structuredCard.header.title.content, "Agent report");
+  assert.equal(structuredCard.config.streaming_mode, false);
+  assert.equal(structuredCard.config.update_multi, true);
+  assert.doesNotMatch(structuredCard.body.elements[0].content, /<at\b/i);
+  const actionableJson = JSON.stringify({
+    schema: "2.0",
+    body: { elements: [{ tag: "button", text: { tag: "plain_text", content: "Unsupported" } }] },
+  });
+  assert.equal(
+    buildFeishuReplyCard(actionableJson, "safe-fallback").header.title.content,
+    "tw agent on safe-fallback",
+    "Agent cards stay read-only until the Bridge owns card action callbacks",
+  );
   assert.equal(
     buildFeishuReplyCard("status", `  ${"x".repeat(60)}\nprivate  `, "status").header.title.content,
     `tw agent on ${"x".repeat(47)}…`,
@@ -1453,6 +1474,7 @@ test("a group message converts an inherited local task into one marker-correlate
     }));
     assert.equal(h.control.inputs.length, 1, "the group message must enter the running Agent");
     assert.match(h.control.inputs[0].message, /treat this as a steering update/i);
+    assert.match(h.control.inputs[0].message, /Feishu Card 2\.0 JSON object/);
     assert.equal(h.store.read().bindings[0].activityWatch.status, "cancelled");
     assert.match(
       h.store.read().bindings[0].activityWatch.error,

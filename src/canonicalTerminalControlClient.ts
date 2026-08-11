@@ -107,9 +107,10 @@ export interface CanonicalAgentStatusResult {
   controlEpoch: string;
   leaseId: string;
   fence: string;
-  ownerKind: "feishu";
+  ownerKind: "feishu" | "relay-v2";
   outputGeneration: string;
   pane: string;
+  agentSupported: boolean;
   agentRunning: boolean;
   source?: TerminalControlAgentSource;
 }
@@ -124,7 +125,7 @@ export interface CanonicalAgentResultResult {
   controlEpoch: string;
   leaseId: string;
   fence: string;
-  ownerKind: "feishu";
+  ownerKind: "feishu" | "relay-v2";
   outputGeneration: string;
   pane: string;
   source: TerminalControlAgentSource;
@@ -264,7 +265,7 @@ function owner(value: unknown, field = "owner"): CanonicalTerminalOwner {
     throw new CanonicalTerminalControlError("CONTROLLER_UNAVAILABLE", `canonical terminal-control returned invalid ${field}`);
   }
   const kinds: CanonicalTerminalOwnerKind[] = [
-    "feishu", "dashboard", "local-cli", "relay-v1", "relay-v2", "tw-serve",
+    "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
   ];
   if (!kinds.includes(value.kind as CanonicalTerminalOwnerKind)) {
     throw new CanonicalTerminalControlError("CONTROLLER_UNAVAILABLE", `canonical terminal-control returned invalid ${field}.kind`);
@@ -293,7 +294,7 @@ function lease(value: unknown): CanonicalTerminalLease {
 function ownerKind(value: unknown, field: string): CanonicalTerminalOwnerKind | undefined {
   if (value === undefined) return undefined;
   const kinds: CanonicalTerminalOwnerKind[] = [
-    "feishu", "dashboard", "local-cli", "relay-v1", "relay-v2", "tw-serve",
+    "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
   ];
   if (!kinds.includes(value as CanonicalTerminalOwnerKind)) {
     throw new CanonicalTerminalControlError("CONTROLLER_UNAVAILABLE", `canonical terminal-control returned invalid ${field}`);
@@ -313,7 +314,7 @@ function requiredOwnerKind(value: unknown, field: string): CanonicalTerminalOwne
 }
 
 function validateRenderedSnapshotInput(input: CanonicalRenderedSnapshotInput): void {
-  if (input.lease.owner.kind !== "feishu"
+  if ((input.lease.owner.kind !== "feishu" && input.lease.owner.kind !== "relay-v2")
     || input.pane !== "0"
     || typeof input.outputGeneration !== "string"
     || !input.outputGeneration
@@ -412,8 +413,10 @@ export function parseCanonicalAgentStatusResult(
       "ownerKind",
       "outputGeneration",
       "pane",
+      "agentSupported",
       "agentRunning",
     ], ["source"])
+    || typeof value.agentSupported !== "boolean"
     || typeof value.agentRunning !== "boolean") {
     throw new CanonicalTerminalControlError(
       "CONTROLLER_UNAVAILABLE",
@@ -421,7 +424,8 @@ export function parseCanonicalAgentStatusResult(
     );
   }
   const parsedOwnerKind = requiredOwnerKind(value.ownerKind, "agentStatus.ownerKind");
-  if (parsedOwnerKind !== "feishu") {
+  if (parsedOwnerKind !== input.lease.owner.kind
+    || (parsedOwnerKind !== "feishu" && parsedOwnerKind !== "relay-v2")) {
     throw new CanonicalTerminalControlError(
       "CONTROLLER_UNAVAILABLE",
       "canonical terminal-control returned mismatched agent status correlation",
@@ -435,12 +439,14 @@ export function parseCanonicalAgentStatusResult(
     ownerKind: parsedOwnerKind,
     outputGeneration: requiredString(value.outputGeneration, "agentStatus.outputGeneration"),
     pane: requiredString(value.pane, "agentStatus.pane", 8),
+    agentSupported: value.agentSupported,
     agentRunning: value.agentRunning,
     ...(value.source === undefined ? {} : {
       source: parseAgentSource(value.source, "agentStatus.source"),
     }),
   };
-  if (result.agentRunning !== (result.source !== undefined)) {
+  if ((!result.agentSupported && (result.agentRunning || result.source !== undefined))
+    || result.agentRunning !== (result.source !== undefined)) {
     throw new CanonicalTerminalControlError(
       "CONTROLLER_UNAVAILABLE",
       "canonical terminal-control returned an Agent status without exact result correlation",
@@ -489,7 +495,9 @@ export function parseCanonicalAgentResultResult(
     controlEpoch: requiredString(value.controlEpoch, "agentResult.controlEpoch"),
     leaseId: requiredString(value.leaseId, "agentResult.leaseId"),
     fence: decimal(value.fence, "agentResult.fence"),
-    ownerKind: parsedOwnerKind === "feishu" ? parsedOwnerKind : (() => {
+    ownerKind: parsedOwnerKind === input.lease.owner.kind
+      && (parsedOwnerKind === "feishu" || parsedOwnerKind === "relay-v2")
+      ? parsedOwnerKind : (() => {
       throw new CanonicalTerminalControlError(
         "CONTROLLER_UNAVAILABLE",
         "canonical terminal-control returned mismatched Agent final response owner",

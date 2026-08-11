@@ -8,23 +8,6 @@ import org.junit.Test
 
 class InboxAgentStatusPresentationTest {
     @Test
-    fun relayV1KeepsTheExistingUnsupportedExplanation() {
-        val state = V2UiState(
-            relayStartupAdmission = RelayStartupAdmissionState.RELAY_V1,
-            agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
-        )
-
-        assertEquals(
-            InboxUnavailableAgentStatus(
-                subtitle = "Relay v1 does not report reply state",
-                emptyContentDescription =
-                    "Agent reply state is unavailable with Relay version 1",
-            ),
-            inboxUnavailableAgentStatus(state.agentEvidenceAvailability),
-        )
-    }
-
-    @Test
     fun relayV2NamesTheUnavailableOrUnnegotiatedAgentCapability() {
         val state = V2UiState(
             relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2,

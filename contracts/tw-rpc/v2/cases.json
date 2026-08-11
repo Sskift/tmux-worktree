@@ -1,7 +1,7 @@
 {
   "capabilities": {
     "argv": ["rpc-v2", "capabilities"],
-    "stdout": "{\"protocolVersion\":2,\"app\":\"tmux-worktree\",\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"resolved-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\"]}\n",
+    "stdout": "{\"protocolVersion\":2,\"app\":\"tmux-worktree\",\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"resolved-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\",\"dashboard-lifecycle.v2\"]}\n",
     "normalized": {
       "protocolVersion": 2,
       "app": "tmux-worktree",
@@ -12,7 +12,8 @@
         "resolved-create-worktree.v1",
         "correlated-create-terminal.v1",
         "expected-incarnation-kill-session.v1",
-        "hard-timeout.v1"
+        "hard-timeout.v1",
+        "dashboard-lifecycle.v2"
       ]
     }
   },
@@ -241,6 +242,41 @@
               "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             }
           }
+        }
+      }
+    },
+    "restoreWorktree": {
+      "request": {
+        "arguments": {
+          "path": "/worktrees/demo/demo-restored-a1b2c",
+          "name": "demo-restored",
+          "aiCommand": "codex"
+        },
+        "reservationCorrelation": null
+      },
+      "normalized": {
+        "protocolVersion": 2,
+        "operation": "restore-worktree",
+        "state": "succeeded",
+        "session": {
+          "name": "demo-restored",
+          "kind": "worktree",
+          "profile": "dashboard",
+          "project": null,
+          "label": "demo-restored",
+          "repoPath": "/repo/demo",
+          "worktreePath": "/worktrees/demo/demo-restored-a1b2c",
+          "branch": "demo-restored-a1b2c",
+          "baseBranch": "main",
+          "cwd": "/worktrees/demo/demo-restored-a1b2c",
+          "createdAt": "2026-07-12T00:00:01.000Z",
+          "attached": false,
+          "windows": 1,
+          "created": 1783700012,
+          "activity": 1783700020,
+          "incarnation": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y",
+          "lifecycleMarked": true,
+          "reservationCorrelation": null
         }
       }
     },

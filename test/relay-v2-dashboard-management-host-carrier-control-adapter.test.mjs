@@ -211,25 +211,28 @@ function superseded(connectorId) {
   };
 }
 
-function routeOpen(connectorId) {
+function routeOpen(connectorId, options = {}) {
+  const suffix = options.suffix ?? "one";
+  const grantId = options.grantId ?? "client-grant-one";
+  const clientInstanceId = options.clientInstanceId ?? "client-instance-one";
   return {
     carrierVersion: 1,
     type: "route.open",
-    requestId: "route-open-one",
+    requestId: `route-open-${suffix}`,
     connectorId,
-    routeId: "route-one",
-    routeFence: "route-fence-one",
+    routeId: `route-${suffix}`,
+    routeFence: `route-fence-${suffix}`,
     payload: {
-      connectionId: "client-connection-one",
+      connectionId: `client-connection-${suffix}`,
       clientDialect: "tw-relay.v2",
       authContext: {
         scheme: "twcap2",
         role: "client",
         hostId: HOST_ID,
-        principalId: "principal-one",
-        grantId: "client-grant-one",
-        clientInstanceId: "client-instance-one",
-        jti: "client-jti-one",
+        principalId: `principal-${suffix}`,
+        grantId,
+        clientInstanceId,
+        jti: `client-jti-${suffix}`,
         kid: "issuer-key-one",
         expiresAtMs: 1_783_703_600_000,
       },
@@ -274,9 +277,51 @@ test("the native-private adapter exposes no reflective owner or bypass port", as
   assert.equal(bypassCalls, 0);
 });
 
-test("registered create and revoke each emit one fixed control and return exact receipts", async () => {
+test("registered inspection lists concurrent devices and revokes only the selected grant", async () => {
   const h = harness();
   const active = connect(h);
+  const inspectInput = { hostId: HOST_ID, connectorId: active.connectorId };
+  assert.deepEqual(await h.adapter.inspectKnownClientGrant(inspectInput), {
+    grantId: null,
+    connectedMobileDevices: [],
+    ...inspectInput,
+  });
+  active.connection.receive(wire(routeOpen(active.connectorId)));
+  assert.deepEqual(await h.adapter.inspectKnownClientGrant(inspectInput), {
+    grantId: "client-grant-one",
+    connectedMobileDevices: [{
+      status: "connected",
+      grantId: "client-grant-one",
+      clientInstanceId: "client-instance-one",
+      connectionCount: 1,
+    }],
+    ...inspectInput,
+  });
+  active.connection.receive(wire(routeOpen(active.connectorId, {
+    suffix: "two",
+    grantId: "client-grant-two",
+    clientInstanceId: "client-instance-two",
+  })));
+  active.connection.receive(wire(routeOpen(active.connectorId, {
+    suffix: "three",
+    grantId: "client-grant-two",
+    clientInstanceId: "client-instance-two",
+  })));
+  assert.deepEqual(await h.adapter.inspectKnownClientGrant(inspectInput), {
+    grantId: null,
+    connectedMobileDevices: [{
+      status: "connected",
+      grantId: "client-grant-one",
+      clientInstanceId: "client-instance-one",
+      connectionCount: 1,
+    }, {
+      status: "connected",
+      grantId: "client-grant-two",
+      clientInstanceId: "client-instance-two",
+      connectionCount: 2,
+    }],
+    ...inspectInput,
+  });
 
   const enrollmentPending = h.adapter.createEnrollment(createInput());
   const enrollmentFrames = decoded(active.transport.sent)
@@ -318,6 +363,16 @@ test("registered create and revoke each emit one fixed control and return exact 
     alreadyRevoked: false,
     hostId: HOST_ID,
     connectorId: active.connectorId,
+  });
+  assert.deepEqual(await h.adapter.inspectKnownClientGrant(inspectInput), {
+    grantId: "client-grant-two",
+    connectedMobileDevices: [{
+      status: "connected",
+      grantId: "client-grant-two",
+      clientInstanceId: "client-instance-two",
+      connectionCount: 2,
+    }],
+    ...inspectInput,
   });
 
   const serialized = JSON.stringify(enrollment);

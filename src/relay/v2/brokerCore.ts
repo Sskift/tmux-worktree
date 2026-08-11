@@ -10,7 +10,12 @@ import {
   decodeRelayAgentChatFrame,
   encodeRelayAgentChatFrame,
   RELAY_AGENT_CHAT_CAPABILITY,
-} from "../extensions/agentChat/v1/codec.js";
+} from "../extensions/agentChat/v2/codec.js";
+import {
+  decodeRelayLarkBindingsFrame,
+  encodeRelayLarkBindingsFrame,
+  RELAY_LARK_BINDINGS_CAPABILITY,
+} from "../extensions/larkBindings/v2/codec.js";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
@@ -79,15 +84,37 @@ export const RELAY_V2_BROKER_AGENT_EXTENSIONS: readonly RelayV2BrokerAgentExtens
       clientToHostTypes: Object.freeze(new Set([
         "agent.chat.send",
         "agent.chat.history",
+        "agent.chat.image.get",
       ])),
       hostToClientTypes: Object.freeze(new Set([
         "agent.chat.sent",
         "agent.chat.event",
         "agent.chat.history.result",
+        "agent.chat.image.chunk",
         "error",
       ])),
       unavailableCode: "AGENT_CHAT_UNAVAILABLE",
       unavailableMessage: "The Relay Agent chat request cannot be satisfied",
+    }),
+    Object.freeze({
+      capability: RELAY_LARK_BINDINGS_CAPABILITY,
+      codec: Object.freeze({
+        decode: decodeRelayLarkBindingsFrame,
+        encode: encodeRelayLarkBindingsFrame,
+      }),
+      clientToHostTypes: Object.freeze(new Set([
+        "lark.bindings.get",
+        "lark.binding.reply_mode.update",
+        "lark.binding.unlink",
+      ])),
+      hostToClientTypes: Object.freeze(new Set([
+        "lark.bindings.result",
+        "lark.binding.updated",
+        "lark.binding.unlinked",
+        "error",
+      ])),
+      unavailableCode: "LARK_BINDINGS_UNAVAILABLE",
+      unavailableMessage: "The Lark bindings request cannot be satisfied",
     }),
   ]);
 
@@ -177,12 +204,10 @@ export interface RelayBrokerUpgradeRequest {
   pathname: string;
   search: string;
   authorizationHeaders: readonly string[];
-  legacyQuerySecret?: string | null;
   offeredProtocols: readonly string[];
 }
 
 export interface RelayBrokerUpgradeDependencies {
-  verifyLegacySecret(secret: string): boolean | Promise<boolean>;
   verifyV2AccessToken(
     token: string,
     expectedRole: RelayBrokerRole,
@@ -199,14 +224,6 @@ export interface RelayV2BrokerConnectionAuthorization extends RelayV2AuthContext
 }
 
 export type RelayBrokerUpgradeResult =
-  | {
-      outcome: "accept";
-      stack: "v1";
-      credentialKind: "legacy_shared_secret";
-      role: RelayBrokerRole;
-      selectedProtocol: "tw-relay.v1" | null;
-      fallback: false;
-    }
   | {
       outcome: "accept";
       stack: "v2";
@@ -466,7 +483,7 @@ export interface RelayV2HostDirectoryView {
   hostEpoch: string | null;
   hostInstanceId: string | null;
   connectorId: string | null;
-  clientDialects: ("tw-relay.v1" | "tw-relay.v2")[];
+  clientDialects: "tw-relay.v2"[];
   capabilities: string[];
   observedAtMs: number;
 }
@@ -587,7 +604,7 @@ type HostHello = {
   hostId: string;
   hostEpoch: string;
   hostInstanceId: string;
-  clientDialects: ("tw-relay.v1" | "tw-relay.v2")[];
+  clientDialects: "tw-relay.v2"[];
   capabilities: string[];
   maxFrameBytes: number;
   terminalMaxFrameBytes: number;
@@ -720,7 +737,7 @@ type DirectoryRecord = {
   hostEpoch: string | null;
   hostInstanceId: string | null;
   connectorId: string | null;
-  clientDialects: ("tw-relay.v1" | "tw-relay.v2")[];
+  clientDialects: "tw-relay.v2"[];
   capabilities: string[];
   observedAtMs: number;
   presenceReason: RelayV2PresenceReason;
@@ -775,10 +792,7 @@ function authFailureStatus(code: unknown): 401 | 403 {
 }
 
 /**
- * Selects exactly one legacy or v2 authentication stack before WebSocket
- * Upgrade. The caller must use the returned stack directly; retrying the
- * other verifier after any rejection would violate the credential boundary.
- *
+ * Selects the Relay v2 authentication stack before WebSocket Upgrade.
  * This function deliberately does not read issuer/grant persistence. The
  * broker authentication owner supplies that transaction-backed verifier.
  */
@@ -796,18 +810,11 @@ export async function dispatchRelayBrokerUpgrade(
   if (authorization !== undefined && headerCredential === undefined) {
     return upgradeReject(401, "AUTH_INVALID");
   }
-  const queryCredential = request.legacyQuerySecret ?? undefined;
-  const credential = headerCredential ?? queryCredential;
+  const credential = headerCredential;
   if (!credential) return upgradeReject(401, "AUTH_REQUIRED");
 
   const role = roleForPath(request.pathname);
-  const credentialLooksV2 = credential.startsWith("twcap2.");
-  if (credentialLooksV2) {
-    if (headerCredential === undefined) {
-      // A twcap2 token in the legacy query slot is still a v2 credential, but
-      // v2 credentials are forbidden in URLs. It can never become v1 input.
-      return upgradeReject(401, "AUTH_INVALID");
-    }
+  if (credential.startsWith("twcap2.")) {
     if (role === undefined) return upgradeReject(404, "PROTOCOL_UNSUPPORTED");
     if (request.search !== "") return upgradeReject(400, "PROTOCOL_UNSUPPORTED");
     const requiredProtocol = role === "client" ? "tw-relay.v2" : "tw-relay.host.v2";
@@ -851,25 +858,7 @@ export async function dispatchRelayBrokerUpgrade(
     }
   }
 
-  if (role === undefined) return upgradeReject(404, "PROTOCOL_UNSUPPORTED");
-  if (
-    request.offeredProtocols.length > 1
-    || (request.offeredProtocols.length === 1
-      && request.offeredProtocols[0] !== "tw-relay.v1")
-  ) {
-    return upgradeReject(426, "PROTOCOL_UNSUPPORTED");
-  }
-  if (!await dependencies.verifyLegacySecret(credential)) {
-    return upgradeReject(401, "AUTH_INVALID");
-  }
-  return {
-    outcome: "accept",
-    stack: "v1",
-    credentialKind: "legacy_shared_secret",
-    role,
-    selectedProtocol: request.offeredProtocols.length === 1 ? "tw-relay.v1" : null,
-    fallback: false,
-  };
+  return upgradeReject(401, "AUTH_INVALID");
 }
 
 function structuredError(

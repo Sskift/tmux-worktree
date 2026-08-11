@@ -102,7 +102,6 @@ internal class AgentTranscriptLifecycleSelectedSessionReadController(
                 access = AgentTranscriptLifecycleReadAccess(
                     // The actor-issued read lease is available only after an exact v2 welcome and
                     // the single requested capability is in the negotiated three-party cut.
-                    dialect = AgentTranscriptLifecycleReadDialect.RELAY_V2,
                     negotiatedCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
                     support = extension.support,
                     activeNamespace = record.namespace,

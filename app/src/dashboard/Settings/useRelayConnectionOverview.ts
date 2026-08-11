@@ -51,8 +51,14 @@ export function useRelayConnectionOverview(
     [controller.loaded, controller.state],
   );
 
-  const knownGrantActive = controller.state.knownClientGrant.status === "active";
-  const revokingGrant = controller.state.knownClientGrant.status === "revoking";
+  const connectedMobileDevices = controller.state.connectedMobileDevices;
+  const revokingGrantId = controller.state.knownClientGrant.status === "revoking"
+    ? controller.state.knownClientGrant.grantId
+    : null;
+  const mobileDeviceObservationAvailable = controller.loaded
+    && controller.state.authority.kind !== "unavailable"
+    && (controller.state.connector.status === "registered"
+      || controller.state.connector.status === "registered_incomplete");
   // The derived view normalizes expiry and registration match, so only a
   // currently valid one-time enrollment surfaces as the active review.
   const activeReview = view?.review && view.qrArtifact
@@ -93,11 +99,18 @@ export function useRelayConnectionOverview(
   const overview = useMemo<RelayConnectionOverview>(() => deriveRelayConnectionOverview({
     selfHosted,
     enrollmentView: view,
-    knownGrantActive,
+    connectedMobileDeviceCount: connectedMobileDevices.length,
     inFlight,
     repairError,
     connectorStatus,
-  }), [selfHosted, view, knownGrantActive, inFlight, repairError, connectorStatus]);
+  }), [
+    selfHosted,
+    view,
+    connectedMobileDevices.length,
+    inFlight,
+    repairError,
+    connectorStatus,
+  ]);
 
   // Clear a stale repair error once the connector is healthy again: if the
   // system recovers by other means (Advanced panel, self-heal), the danger
@@ -159,8 +172,8 @@ export function useRelayConnectionOverview(
 
   /**
    * One-click "Fix connection". Sequences existing commands only:
-   *  - center/bundle/TLS not ready → start the center (which respawns the
-   *    management child and sends start_connector);
+   *  - center/bundle/TLS not ready, or management unavailable → start the
+   *    center (which respawns the management child and sends start_connector);
    *  - otherwise refresh an unhealthy host credential, then start the connector.
    * Afterwards the 2s status observer is watched until the connector registers
    * or the 30s timeout fires.
@@ -171,7 +184,7 @@ export function useRelayConnectionOverview(
     setRepairError(null);
 
     const { ready: infraReady } = selfHostedInfraReady(selfHosted);
-    const needsCenterStart = !infraReady;
+    const needsCenterStart = !infraReady || view?.adapterAvailable === false;
 
     try {
       if (needsCenterStart) {
@@ -201,7 +214,14 @@ export function useRelayConnectionOverview(
       setRepair({ running: false, headline: "" });
       setRepairError(errorMessage(error));
     }
-  }, [backend, selfHosted, controller, connectorStatus, onSelfHostedStatus]);
+  }, [
+    backend,
+    selfHosted,
+    controller,
+    connectorStatus,
+    onSelfHostedStatus,
+    view?.adapterAvailable,
+  ]);
 
   /**
    * "Show pairing QR": create a fresh enrollment when the current one is missing
@@ -245,22 +265,23 @@ export function useRelayConnectionOverview(
     controller.copyEnrollmentArtifact(handle, "enrollment_link");
   }, [controller]);
 
-  const revokeKnownGrant = useCallback(() => {
+  const revokeClientGrant = useCallback((grantId: string) => {
     setRepairError(null);
-    void controller.revokeKnownGrant();
+    void controller.revokeClientGrant(grantId);
   }, [controller]);
 
   return {
     overview,
     activeReview,
-    knownGrantActive,
-    revokingGrant,
+    connectedMobileDevices,
+    revokingGrantId,
+    mobileDeviceObservationAvailable,
     qrBusy,
     inlineQr,
     runConnectionRepair,
     showPairingQr,
     hidePairingQr,
     copyEnrollmentLink,
-    revokeKnownGrant,
+    revokeClientGrant,
   };
 }

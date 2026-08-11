@@ -66,11 +66,12 @@ export interface RelayV2CanonicalTwRpcSshQueryTargetDescriptor {
   host: string;
   knownHostsFile: string;
   sshExecutable?: string;
-  user: string;
-  port: number;
-  identityFile: string;
-  /** Absolute, shell-safe remote path to the caller-selected canonical tw CLI. */
-  twExecutable: string;
+  /** Explicit overrides; omission retains the configured alias's SSH resolution. */
+  user?: string;
+  port?: number;
+  identityFile?: string;
+  /** Shell-safe absolute, home-relative, or PATH-resolved canonical tw CLI. */
+  twExecutable?: string;
 }
 
 export type RelayV2CanonicalTwRpcQueryTargetDescriptor =
@@ -357,9 +358,9 @@ type NormalizedTarget =
       host: string;
       knownHostsFile: string;
       sshExecutable: string;
-      user: string;
-      port: number;
-      identityFile: string;
+      user?: string;
+      port?: number;
+      identityFile?: string;
       twExecutable: string;
     }>;
 
@@ -432,9 +433,9 @@ function targetDescriptorForHash(target: NormalizedTarget): object {
       host: target.host,
       knownHostsFile: target.knownHostsFile,
       sshExecutable: target.sshExecutable,
-      user: target.user,
-      port: target.port,
-      identityFile: target.identityFile,
+      ...(target.user === undefined ? {} : { user: target.user }),
+      ...(target.port === undefined ? {} : { port: target.port }),
+      ...(target.identityFile === undefined ? {} : { identityFile: target.identityFile }),
       twExecutable: target.twExecutable,
     };
 }
@@ -473,7 +474,11 @@ function normalizeLocalTarget(
 
 function normalizeRemoteTwExecutable(value: unknown): string {
   const executable = boundedString(value);
-  if (!executable.startsWith("/") || !/^\/[A-Za-z0-9._+@%=/:-]+$/.test(executable)) {
+  if (!(
+    /^\/[A-Za-z0-9._+@%=/:-]+$/.test(executable)
+    || /^~\/[A-Za-z0-9._+@%=/:-]+$/.test(executable)
+    || /^[A-Za-z0-9._+-]+$/.test(executable)
+  )) {
     throw new TypeError("invalid canonical remote tw executable");
   }
   return executable;
@@ -484,11 +489,8 @@ function normalizeSshTarget(
 ): Extract<NormalizedTarget, { kind: "ssh" }> {
   if (!hasExactKeys(
     value,
-    [
-      "kind", "targetId", "host", "knownHostsFile", "user", "port",
-      "identityFile", "twExecutable",
-    ],
-    ["sshExecutable"],
+    ["kind", "targetId", "host", "knownHostsFile"],
+    ["sshExecutable", "user", "port", "identityFile", "twExecutable"],
   )) {
     throw new TypeError("invalid canonical TW RPC v2 SSH query target");
   }
@@ -496,12 +498,13 @@ function normalizeSshTarget(
   if (host.startsWith("-") || !/^[A-Za-z0-9._:[\]-]+$/.test(host)) {
     throw new TypeError("invalid canonical TW RPC v2 SSH host");
   }
-  const user = boundedString(value.user, 128);
-  if (!/^[A-Za-z0-9._-]+$/.test(user)) {
+  const user = value.user === undefined ? undefined : boundedString(value.user, 128);
+  if (user !== undefined && !/^[A-Za-z0-9._-]+$/.test(user)) {
     throw new TypeError("invalid canonical TW RPC v2 SSH user");
   }
   const port = value.port;
-  if (!Number.isSafeInteger(port) || (port as number) < 1 || (port as number) > 65_535) {
+  if (port !== undefined
+    && (!Number.isSafeInteger(port) || (port as number) < 1 || (port as number) > 65_535)) {
     throw new TypeError("invalid canonical TW RPC v2 SSH port");
   }
   return Object.freeze({
@@ -510,10 +513,12 @@ function normalizeSshTarget(
     host,
     knownHostsFile: absolutePath(value.knownHostsFile),
     sshExecutable: boundedString(value.sshExecutable ?? "ssh"),
-    user,
-    port: port as number,
-    identityFile: absolutePath(value.identityFile),
-    twExecutable: normalizeRemoteTwExecutable(value.twExecutable),
+    ...(user === undefined ? {} : { user }),
+    ...(port === undefined ? {} : { port: port as number }),
+    ...(value.identityFile === undefined
+      ? {}
+      : { identityFile: absolutePath(value.identityFile) }),
+    twExecutable: normalizeRemoteTwExecutable(value.twExecutable ?? "tw"),
   });
 }
 
@@ -584,8 +589,7 @@ function sshInvocationOptions(
   target: Extract<NormalizedTarget, { kind: "ssh" }>,
   timeoutMs: number,
 ): string[] {
-  return [
-    "-F", "/dev/null",
+  const options = [
     "-o", "BatchMode=yes",
     "-o", "PasswordAuthentication=no",
     "-o", "KbdInteractiveAuthentication=no",
@@ -595,11 +599,13 @@ function sshInvocationOptions(
     "-o", "ClearAllForwardings=yes",
     "-o", "RequestTTY=no",
     "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutMs / 1_000))}`,
-    "-o", "IdentitiesOnly=yes",
-    "-i", target.identityFile,
-    "-p", String(target.port),
-    "-l", target.user,
   ];
+  if (target.identityFile !== undefined) {
+    options.push("-o", "IdentitiesOnly=yes", "-i", target.identityFile);
+  }
+  if (target.port !== undefined) options.push("-p", String(target.port));
+  if (target.user !== undefined) options.push("-l", target.user);
+  return options;
 }
 
 function sshInvocationPrefix(
@@ -622,6 +628,11 @@ function sshInvocationPrefix(
  */
 function posixShellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function remoteExecutableExpression(value: string): string {
+  if (!value.startsWith("~/")) return posixShellQuote(value);
+  return `"$HOME/${value.slice(2)}"`;
 }
 
 function structuredProcessArgv(value: unknown): string[] {
@@ -698,20 +709,7 @@ function compoundInvocationFor(
   return Object.freeze({
     executable: target.sshExecutable,
     argv: Object.freeze([
-      "-F", "/dev/null",
-      "-o", "BatchMode=yes",
-      "-o", "PasswordAuthentication=no",
-      "-o", "KbdInteractiveAuthentication=no",
-      "-o", "StrictHostKeyChecking=yes",
-      "-o", `UserKnownHostsFile=${target.knownHostsFile}`,
-      "-o", "GlobalKnownHostsFile=/dev/null",
-      "-o", "ClearAllForwardings=yes",
-      "-o", "RequestTTY=no",
-      "-o", "ConnectTimeout=10",
-      "-o", "IdentitiesOnly=yes",
-      "-i", target.identityFile,
-      "-p", String(target.port),
-      "-l", target.user,
+      ...sshInvocationOptions(target, 10_000),
       "--",
       target.host,
       target.twExecutable,
@@ -1152,9 +1150,10 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort, RelayV2CanonicalProcessTarge
         ...rpcArgv,
       ], target.home);
     }
-    const remoteCommand = [target.twExecutable, ...rpcArgv]
-      .map((item) => posixShellQuote(item))
-      .join(" ");
+    const remoteCommand = [
+      remoteExecutableExpression(target.twExecutable),
+      ...rpcArgv.map((item) => posixShellQuote(item)),
+    ].join(" ");
     return boundedStructuredInvocation(target.sshExecutable, [
       ...sshInvocationOptions(target, timeoutMs),
       "--",
@@ -1416,15 +1415,9 @@ function deriveExplicitConfigSnapshotTargets(
   for (const host of configSnapshot?.hosts ?? []) {
     if (!isRecord(host)
       || typeof host.id !== "string"
-      || typeof host.host !== "string"
-      || typeof host.user !== "string"
-      || !Number.isSafeInteger(host.port)
-      || typeof host.identityFile !== "string"
-      || !isAbsolute(host.identityFile)
-      || typeof host.twPath !== "string"
-      || !isAbsolute(host.twPath)) {
+      || typeof host.host !== "string") {
       throw new TypeError(
-        "canonical TW RPC v2 configured Host lacks explicit user/port/key/absolute tw path",
+        "canonical TW RPC v2 configured Host lacks an explicit identity and target",
       );
     }
     const sshDescriptor = {
@@ -1432,10 +1425,10 @@ function deriveExplicitConfigSnapshotTargets(
       host: host.host,
       knownHostsFile: options.knownHostsFile,
       sshExecutable: options.sshExecutable,
-      user: host.user,
-      port: host.port as number,
-      identityFile: host.identityFile,
-      twExecutable: host.twPath,
+      ...(host.user === undefined ? {} : { user: host.user }),
+      ...(host.port === undefined ? {} : { port: host.port }),
+      ...(host.identityFile === undefined ? {} : { identityFile: host.identityFile }),
+      twExecutable: host.twPath ?? "tw",
     } as const;
     const targetId = effectiveTargetId(sshDescriptor);
     descriptors.push({ ...sshDescriptor, targetId });

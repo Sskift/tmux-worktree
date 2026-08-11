@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
@@ -15,7 +15,7 @@ const broker = Object.freeze({
   },
 });
 const codec = await import("../dist/relay/v2/codec.js");
-const chatCodec = await import("../dist/relay/extensions/agentChat/v1/codec.js");
+const chatCodec = await import("../dist/relay/extensions/agentChat/v2/codec.js");
 
 const HOST_ID = "mac-admin";
 const NOW_MS = 1_783_700_000_000;
@@ -48,7 +48,7 @@ function hostHello({
   hostEpoch = randomUUID(),
   hostInstanceId = randomUUID(),
   capabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
-  clientDialects = ["tw-relay.v1", "tw-relay.v2"],
+  clientDialects = ["tw-relay.v2"],
   maxFrameBytes = 1_048_576,
   terminalMaxFrameBytes = Math.min(65_536, maxFrameBytes),
 } = {}) {
@@ -268,6 +268,20 @@ function chatHistory(requestId, hostEpoch, sessionId, limit) {
   };
 }
 
+function chatImageGet(requestId, hostEpoch, sessionId, imageId, offset = 0) {
+  return {
+    protocolVersion: 2,
+    kind: "request",
+    type: "agent.chat.image.get",
+    requestId,
+    hostId: HOST_ID,
+    expectedHostEpoch: hostEpoch,
+    scopeId: "scope-local",
+    sessionId,
+    payload: { session: sessionId, imageId, offset },
+  };
+}
+
 function chatSent(requestId, hostEpoch, sessionId, turnId) {
   return {
     protocolVersion: 2,
@@ -309,12 +323,40 @@ function chatHistoryResult(requestId, hostEpoch, sessionId, turns) {
   };
 }
 
+function chatImageChunk(requestId, hostEpoch, sessionId, sha256, data) {
+  const imageId = `image-${sha256}`;
+  return {
+    protocolVersion: 2,
+    kind: "response",
+    type: "agent.chat.image.chunk",
+    requestId,
+    hostId: HOST_ID,
+    hostEpoch,
+    scopeId: "scope-local",
+    sessionId,
+    payload: {
+      session: sessionId,
+      imageId,
+      mimeType: "image/png",
+      byteLength: data.byteLength,
+      sha256,
+      offset: 0,
+      dataBase64: data.toString("base64"),
+      nextOffset: null,
+    },
+  };
+}
+
+function markdownContent(text) {
+  return [{ type: "markdown", text }];
+}
+
 function chatTurn({
   turnId = "turn-1",
   session = SESSION_ID,
   userMessage = "list current worktrees",
   status = "working",
-  reply = null,
+  content = null,
   error = null,
   completedAt = null,
   steeredMessages = null,
@@ -325,7 +367,7 @@ function chatTurn({
     session,
     userMessage,
     status,
-    reply,
+    content,
     error,
     completedAt,
     steeredMessages,
@@ -335,19 +377,22 @@ function chatTurn({
 
 // --- codec round-trip -----------------------------------------------------------
 
-test("Node agent.chat.v1 codec round-trips every wire type", () => {
+test("Node agent.chat.v2 codec round-trips every wire type", () => {
   const hostEpoch = randomUUID();
+  const imageSha256 = "a".repeat(64);
+  const imageBytes = Buffer.from("png-test-chunk", "utf8");
   const frames = [
     chatSend("req-send", hostEpoch, SESSION_ID, "list worktrees"),
     chatHistory("req-history", hostEpoch, SESSION_ID),
     chatHistory("req-history-limit", hostEpoch, SESSION_ID, 10),
+    chatImageGet("req-image", hostEpoch, SESSION_ID, `image-${imageSha256}`),
     chatSent("req-send", hostEpoch, SESSION_ID, "turn-1"),
     chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "working",
     })),
     chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "replied",
-      reply: "Here are the worktrees.",
+      content: markdownContent("Here are the worktrees."),
       completedAt: "2026-08-06T00:00:01.000Z",
     })),
     chatEvent(hostEpoch, SESSION_ID, chatTurn({
@@ -362,7 +407,7 @@ test("Node agent.chat.v1 codec round-trips every wire type", () => {
     })),
     chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "replied",
-      reply: "Done.",
+      content: markdownContent("Done."),
       completedAt: "2026-08-06T00:00:01.000Z",
       steeredMessages: [
         { message: "finish the turn", sentAt: "2026-08-06T00:00:00.100Z" },
@@ -372,41 +417,42 @@ test("Node agent.chat.v1 codec round-trips every wire type", () => {
       chatTurn({ status: "working" }),
       chatTurn({
         status: "replied",
-        reply: "Here.",
+        content: markdownContent("Here."),
         completedAt: "2026-08-06T00:00:01.000Z",
       }),
     ]),
+    chatImageChunk("req-image", hostEpoch, SESSION_ID, imageSha256, imageBytes),
   ];
   for (const frame of frames) {
     const bytes = chatBytes(frame);
     const decoded = chatCodec.decodeRelayAgentChatFrame(bytes);
     assert.equal(decoded.normalized.channel, "public");
     assert.equal(decoded.normalized.version, 2);
-    assert.equal(decoded.normalized.capability, "agent.chat.v1");
+    assert.equal(decoded.normalized.capability, "agent.chat.v2");
     assert.equal(decoded.normalized.type, frame.type);
     assert.deepEqual(JSON.parse(decoded.canonicalWire), frame);
     assert.deepEqual(Buffer.from(chatCodec.encodeRelayAgentChatFrame(decoded.frame)), Buffer.from(bytes));
   }
 });
 
-test("Node agent.chat.v1 codec rejects turn state inconsistency and unknown types", () => {
+test("Node agent.chat.v2 codec rejects turn state inconsistency and unknown types", () => {
   const hostEpoch = randomUUID();
   const invalid = [
-    ["working with reply", chatEvent(hostEpoch, SESSION_ID, chatTurn({
+    ["working with content", chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "working",
-      reply: "should not exist",
+      content: markdownContent("should not exist"),
     })), "INVALID_ENVELOPE"],
     ["working with completedAt", chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "working",
       completedAt: "2026-08-06T00:00:01.000Z",
     })), "INVALID_ENVELOPE"],
-    ["replied without reply", chatEvent(hostEpoch, SESSION_ID, chatTurn({
+    ["replied without content", chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "replied",
       completedAt: "2026-08-06T00:00:01.000Z",
     })), "INVALID_ENVELOPE"],
     ["replied with error", chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "replied",
-      reply: "ok",
+      content: markdownContent("ok"),
       error: "boom",
       completedAt: "2026-08-06T00:00:01.000Z",
     })), "INVALID_ENVELOPE"],
@@ -414,9 +460,9 @@ test("Node agent.chat.v1 codec rejects turn state inconsistency and unknown type
       status: "failed",
       completedAt: "2026-08-06T00:00:01.000Z",
     })), "INVALID_ENVELOPE"],
-    ["failed with reply", chatEvent(hostEpoch, SESSION_ID, chatTurn({
+    ["failed with content", chatEvent(hostEpoch, SESSION_ID, chatTurn({
       status: "failed",
-      reply: "partial",
+      content: markdownContent("partial"),
       error: "boom",
       completedAt: "2026-08-06T00:00:01.000Z",
     })), "INVALID_ENVELOPE"],
@@ -454,7 +500,7 @@ test("Node agent.chat.v1 codec rejects turn state inconsistency and unknown type
   }
 });
 
-test("Node agent.chat.v1 unavailable error envelope is encodable", () => {
+test("Node agent.chat.v2 unavailable error envelope is encodable", () => {
   const bytes = chatCodec.encodeRelayAgentChatUnavailableError({
     requestId: "req-u",
     hostId: HOST_ID,
@@ -475,7 +521,7 @@ test("Node agent.chat.v1 unavailable error envelope is encodable", () => {
 
 // --- broker three-party gating ----------------------------------------------------
 
-test("agent.chat.v1 is a three-party route intersection with isolated withdrawal", async () => {
+test("agent.chat.v2 is a three-party route intersection with isolated withdrawal", async () => {
   const baseCapabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES];
   const chatCapability = chatCodec.RELAY_AGENT_CHAT_CAPABILITY;
   const claimedCapabilities = [...baseCapabilities, chatCapability];
@@ -582,7 +628,7 @@ test("agent.chat.v1 is a three-party route intersection with isolated withdrawal
   // agent.chat.event host→client is delivered.
   const eventFrame = chatEvent(hostEpoch, SESSION_ID, chatTurn({
     status: "replied",
-    reply: "Here are the worktrees.",
+    content: markdownContent("Here are the worktrees."),
     completedAt: "2026-08-06T00:00:01.000Z",
   }));
   assert.equal((await core.receiveHostFrame(
@@ -615,6 +661,48 @@ test("agent.chat.v1 is a three-party route intersection with isolated withdrawal
     "agent.chat.history.result",
   );
   core.acknowledgeClientDelivery(route.connectionId, resultDelivery.deliveryId);
+
+  // Image chunks use the same negotiated v2 chat lane in both directions.
+  const imageData = Buffer.from("89504e470d0a1a0a", "hex");
+  const imageSha256 = createHash("sha256").update(imageData).digest("hex");
+  const imageGetFrame = chatImageGet(
+    "chat-image-1",
+    hostEpoch,
+    SESSION_ID,
+    `image-${imageSha256}`,
+  );
+  assert.equal(core.forwardClientFrame(
+    route.connectionId,
+    chatBytes(imageGetFrame),
+  ).accepted, true);
+  const [imageGetDelivery] = core.drainHostCarrier("chat-host", { maxFrames: 1 });
+  assert.equal(
+    chatCodec.decodeRelayAgentChatFrame(
+      Buffer.from(imageGetDelivery.frame.payload.data, "base64"),
+    ).frame.type,
+    "agent.chat.image.get",
+  );
+  core.acknowledgeHostDelivery("chat-host", imageGetDelivery.deliveryId);
+  assert.equal((await core.receiveHostFrame(
+    "chat-host",
+    carrierBytes(hostRouteDataBytes(
+      route.routeOpen,
+      "5",
+      chatBytes(chatImageChunk(
+        "chat-image-1",
+        hostEpoch,
+        SESSION_ID,
+        imageSha256,
+        imageData,
+      )),
+    )),
+  )).accepted, true);
+  const [imageChunkDelivery] = core.drainClient(route.connectionId, { maxFrames: 1 });
+  assert.equal(
+    chatCodec.decodeRelayAgentChatFrame(Buffer.from(imageChunkDelivery.bytes)).frame.type,
+    "agent.chat.image.chunk",
+  );
+  core.acknowledgeClientDelivery(route.connectionId, imageChunkDelivery.deliveryId);
 
   // Non-offering client: the host.welcome is filtered and a chat frame is rejected.
   const noOfferRoute = await openRoute(

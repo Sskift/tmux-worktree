@@ -22,7 +22,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/** Dedicated Relay v2 namespace; it never reads or rewrites the Relay v1 secret store. */
+/** Dedicated Relay v2 credential namespace. */
 internal class AndroidKeystoreRelayV2CredentialStore(context: Context) : RelayV2CredentialStore {
     private val preferences = context.applicationContext.getSharedPreferences(
         SECURE_PREFERENCES,

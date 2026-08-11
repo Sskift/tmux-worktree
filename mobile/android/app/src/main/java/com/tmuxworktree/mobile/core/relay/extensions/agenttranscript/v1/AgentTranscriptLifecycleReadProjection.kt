@@ -6,12 +6,6 @@ import kotlinx.coroutines.CancellationException
 
 internal const val AGENT_TRANSCRIPT_LIFECYCLE_READ_PAGE_LIMIT = 256
 
-/** The selected transport dialect is supplied by future composition; this foundation selects none. */
-internal enum class AgentTranscriptLifecycleReadDialect {
-    RELAY_V1,
-    RELAY_V2,
-}
-
 /**
  * Capability and active-lineage facts supplied by a future composition boundary.
  *
@@ -19,7 +13,6 @@ internal enum class AgentTranscriptLifecycleReadDialect {
  * the caller cannot prove that the exact selected namespace is the active negotiated v2 namespace.
  */
 internal data class AgentTranscriptLifecycleReadAccess(
-    val dialect: AgentTranscriptLifecycleReadDialect,
     val negotiatedCapabilities: Set<String>,
     val support: AgentExtensionSupport,
     val activeNamespace: AgentTranscriptLifecycleDurableNamespace?,
@@ -96,7 +89,6 @@ internal data class AgentTranscriptLifecycleReadRequest(
 
 internal enum class AgentTranscriptLifecycleReadUnavailableReason {
     NO_SELECTED_LINEAGE,
-    RELAY_V1,
     EXTENSION_NOT_NEGOTIATED,
     EXTENSION_UNAVAILABLE,
     LINEAGE_NOT_ACTIVE,
@@ -321,9 +313,6 @@ internal class AgentTranscriptLifecycleReadProjectionCore(
             return unavailable(AgentTranscriptLifecycleReadUnavailableReason.NO_SELECTED_LINEAGE)
         }
         val access = request.access
-        if (access.dialect != AgentTranscriptLifecycleReadDialect.RELAY_V2) {
-            return unavailable(AgentTranscriptLifecycleReadUnavailableReason.RELAY_V1)
-        }
         if (AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in access.negotiatedCapabilities ||
             access.support == AgentExtensionSupport.UNNEGOTIATED
         ) {

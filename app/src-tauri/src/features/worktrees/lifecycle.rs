@@ -7,9 +7,10 @@ use crate::config::{
     config_worktree_base, find_host, project_from_config_with_home, remote_config_for_host,
 };
 use crate::features::control_plane::{
-    resolve_local_tw_rpc_runtime, run_local_tw_rpc_runtime, LocalTwRpcRuntime,
+    build_tw_rpc_v2_args, parse_tw_rpc_v2_create_response, resolve_local_tw_rpc_runtime,
+    run_local_tw_rpc_runtime, LocalTwRpcRuntime,
 };
-use crate::ipc::{CreateArgs, DeleteWorktreeArgs, RestoreArgs, TwRpcCreateWorktreeResponse};
+use crate::ipc::{CreateArgs, DeleteWorktreeArgs, RestoreArgs};
 use crate::remote::{run_remote_tw_check, HostConfig};
 use crate::support::{app_home_dir, default_worktree_base};
 use std::path::Path;
@@ -31,7 +32,13 @@ pub(crate) fn build_local_worktree_rpc_args(
     args: &CreateArgs,
     worktree_base: &str,
 ) -> Result<Vec<String>, String> {
-    let mut rpc_args = vec!["rpc".to_string(), "create-worktree".to_string()];
+    build_worktree_rpc_args(args, Some(worktree_base))
+}
+
+fn build_worktree_rpc_args(
+    args: &CreateArgs,
+    worktree_base: Option<&str>,
+) -> Result<Vec<String>, String> {
     let path = args
         .path
         .as_deref()
@@ -45,67 +52,61 @@ pub(crate) fn build_local_worktree_rpc_args(
     if path.is_none() && project.is_none() {
         return Err("project or path required".to_string());
     }
-    if let Some(path) = path {
-        rpc_args.extend(["--path".to_string(), path.to_string()]);
-    }
-    if let Some(project) = project {
-        rpc_args.extend(["--project".to_string(), project.to_string()]);
-    }
-
     let ai_command = args.ai_cmd.trim();
     if ai_command.is_empty() {
         return Err("ai command required".to_string());
     }
-    rpc_args.extend(["--ai-command".to_string(), ai_command.to_string()]);
-    if let Some(name) = args
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        rpc_args.extend(["--name".to_string(), name.to_string()]);
+    let mut arguments = serde_json::Map::new();
+    for (key, value) in [
+        ("path", path),
+        ("project", project),
+        (
+            "name",
+            args.name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ),
+        (
+            "branch",
+            args.branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ),
+    ] {
+        if let Some(value) = value {
+            arguments.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
     }
-    if let Some(branch) = args
-        .branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|branch| !branch.is_empty())
-    {
-        rpc_args.extend(["--branch".to_string(), branch.to_string()]);
+    if let Some(worktree_base) = worktree_base {
+        arguments.insert(
+            "worktreeBase".to_string(),
+            serde_json::Value::String(worktree_base.to_string()),
+        );
     }
-    rpc_args.extend(["--worktree-base".to_string(), worktree_base.to_string()]);
-    Ok(rpc_args)
+    arguments.insert(
+        "aiCommand".to_string(),
+        serde_json::Value::String(ai_command.to_string()),
+    );
+    Ok(build_tw_rpc_v2_args(
+        "create-worktree",
+        serde_json::json!({
+            "arguments": arguments,
+            "reservationCorrelation": null
+        }),
+    ))
 }
 
 pub(crate) fn parse_local_worktree_rpc_response(
     output: &str,
     runtime_label: &str,
 ) -> Result<String, String> {
-    let response: TwRpcCreateWorktreeResponse = serde_json::from_str(output.trim())
-        .map_err(|error| format!("parse {runtime_label} create-worktree response: {error}"))?;
-    if response.protocol_version != 1 {
-        return Err(format!(
-            "unsupported {runtime_label} TW RPC protocol: {}",
-            response.protocol_version
-        ));
-    }
-    if response
-        .kind
-        .as_deref()
-        .is_some_and(|kind| kind != "worktree")
-    {
-        return Err(format!(
-            "{runtime_label} returned unexpected create kind: {}",
-            response.kind.as_deref().unwrap_or_default()
-        ));
-    }
-    let session = response.session.trim();
-    if session.is_empty() {
-        return Err(format!(
-            "{runtime_label} returned an empty worktree session name"
-        ));
-    }
-    Ok(session.to_string())
+    parse_tw_rpc_v2_create_response(output, runtime_label, "create-worktree", "worktree")
+        .map(|session| session.name)
 }
 
 pub(crate) fn build_restore_worktree_rpc_args(args: &RestoreArgs) -> Result<Vec<String>, String> {
@@ -117,19 +118,29 @@ pub(crate) fn build_restore_worktree_rpc_args(args: &RestoreArgs) -> Result<Vec<
     if name.is_empty() {
         return Err("session name required".to_string());
     }
-    let mut rpc_args = vec![
-        "rpc".to_string(),
-        "restore-worktree".to_string(),
-        "--path".to_string(),
-        path.to_string(),
-        "--name".to_string(),
-        name.to_string(),
-    ];
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
+    arguments.insert(
+        "name".to_string(),
+        serde_json::Value::String(name.to_string()),
+    );
     let ai_command = args.ai_cmd.trim();
     if !ai_command.is_empty() {
-        rpc_args.extend(["--ai-command".to_string(), ai_command.to_string()]);
+        arguments.insert(
+            "aiCommand".to_string(),
+            serde_json::Value::String(ai_command.to_string()),
+        );
     }
-    Ok(rpc_args)
+    Ok(build_tw_rpc_v2_args(
+        "restore-worktree",
+        serde_json::json!({
+            "arguments": arguments,
+            "reservationCorrelation": null
+        }),
+    ))
 }
 
 pub(crate) fn create_local_worktree_via_runtime(
@@ -167,7 +178,7 @@ pub(crate) fn create_remote_worktree(
     match create_remote_worktree_via_tw_rpc(host, &args) {
         Ok(session) => Ok(session),
         Err(err) if remote_tw_rpc_create_unavailable(&err) => Err(format!(
-            "Remote host {} does not have a compatible `tw rpc create-worktree`. Install or upgrade remote tw to {} (the Dashboard version), then retry. Dashboard will not fall back to direct remote git/tmux creation. Original error: {err}",
+            "Remote host {} does not have a compatible `tw rpc-v2 create-worktree`. Install or upgrade remote tw to {} (the Dashboard version), then retry. Original error: {err}",
             host.label,
             env!("CARGO_PKG_VERSION")
         )),
@@ -179,10 +190,9 @@ fn remote_tw_rpc_create_unavailable(err: &str) -> bool {
     let lower = err.to_lowercase();
     (lower.contains("tw") && lower.contains("command not found"))
         || lower.contains("tw: not found")
-        || (lower.contains("unknown") && lower.contains("rpc"))
-        || lower.contains("unknown create-worktree option")
-        || lower.contains("unsupported tw rpc protocol")
-        || lower.contains("parse tw rpc create-worktree")
+        || (lower.contains("unknown") && lower.contains("rpc-v2"))
+        || lower.contains("incompatible tw rpc v2")
+        || lower.contains("parse remote tw create-worktree")
 }
 
 fn resolve_remote_worktree_target(
@@ -265,52 +275,20 @@ fn create_remote_worktree_via_tw_rpc(
     args: &CreateArgs,
 ) -> Result<String, String> {
     let target = resolve_remote_worktree_target(host, args)?;
-
-    let mut remote_cmd = vec![
-        "rpc".to_string(),
-        "create-worktree".to_string(),
-        "--path".to_string(),
-        target.project_dir.clone(),
-        "--ai-command".to_string(),
-        args.ai_cmd.clone(),
-    ];
-    remote_cmd.push("--project".to_string());
-    remote_cmd.push(target.label.clone());
-    if let Some(worktree_base) = target.worktree_base.as_deref() {
-        remote_cmd.push("--worktree-base".to_string());
-        remote_cmd.push(worktree_base.to_string());
-    }
-    if let Some(name) = args
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        remote_cmd.push("--name".to_string());
-        remote_cmd.push(name.to_string());
-    }
-    if let Some(branch) = target.branch.as_deref() {
-        remote_cmd.push("--branch".to_string());
-        remote_cmd.push(branch.to_string());
-    }
-
+    let direct = CreateArgs {
+        project: Some(target.label.clone()),
+        path: Some(target.project_dir.clone()),
+        ai_cmd: args.ai_cmd.clone(),
+        name: args.name.clone(),
+        branch: target.branch.clone(),
+        host_id: None,
+    };
+    let remote_cmd = build_worktree_rpc_args(&direct, target.worktree_base.as_deref())?;
     let remote_args = remote_cmd.iter().map(String::as_str).collect::<Vec<_>>();
     let output = run_remote_tw_check(host, &remote_args)?;
-    // Intentionally keep the remote parser separate from the local parser:
-    // their accepted response shapes and audit labels are frozen independently.
-    let response: TwRpcCreateWorktreeResponse =
-        serde_json::from_str(&output).map_err(|e| format!("parse tw rpc create-worktree: {e}"))?;
-    if response.protocol_version != 1 {
-        return Err(format!(
-            "unsupported tw rpc protocol: {}",
-            response.protocol_version
-        ));
-    }
-    let session = response.session.trim();
-    if session.is_empty() {
-        return Err("tw rpc create-worktree returned empty session".to_string());
-    }
-    Ok(format!("{}:{}", host.id, session))
+    let session =
+        parse_tw_rpc_v2_create_response(&output, "remote tw", "create-worktree", "worktree")?;
+    Ok(format!("{}:{}", host.id, session.name))
 }
 
 pub(crate) fn restore_local_worktree_via_runtime(
@@ -319,15 +297,22 @@ pub(crate) fn restore_local_worktree_via_runtime(
 ) -> Result<String, String> {
     let rpc_args = build_restore_worktree_rpc_args(args)?;
     let output = run_local_tw_rpc_runtime(runtime, &rpc_args, "restore-worktree")?;
-    parse_local_worktree_rpc_response(&output, runtime.audit_label())
+    parse_tw_rpc_v2_create_response(
+        &output,
+        runtime.audit_label(),
+        "restore-worktree",
+        "worktree",
+    )
+    .map(|session| session.name)
 }
 
 fn restore_remote_worktree(host: &HostConfig, args: &RestoreArgs) -> Result<String, String> {
     let rpc_args = build_restore_worktree_rpc_args(args)?;
     let refs = rpc_args.iter().map(String::as_str).collect::<Vec<_>>();
     let output = run_remote_tw_check(host, &refs)?;
-    let session = parse_local_worktree_rpc_response(&output, "remote tw")?;
-    Ok(format!("{}:{session}", host.id))
+    let session =
+        parse_tw_rpc_v2_create_response(&output, "remote tw", "restore-worktree", "worktree")?;
+    Ok(format!("{}:{}", host.id, session.name))
 }
 
 #[tauri::command]

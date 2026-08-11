@@ -18,7 +18,7 @@ export type RelayConnectionOverviewPrimaryAction =
 
 export type RelayConnectionOverview = {
   tone: RelayConnectionOverviewTone;
-  /** One sentence: "Connected — ready to pair a phone" etc. */
+  /** One sentence describing the Mac/Relay state, never inferred phone reachability. */
   headline: string;
   /** At most one short supporting sentence. */
   detail: string | null;
@@ -29,7 +29,7 @@ export type RelayConnectionOverviewInput = {
   selfHosted: MobileRelayV2SelfHostedStatus | null;
   /** Derived v2 enrollment view, or null before the status poll has loaded. */
   enrollmentView: RelayV2EnrollmentView | null;
-  knownGrantActive: boolean;
+  connectedMobileDeviceCount: number;
   inFlight: { active: boolean; headline: string } | null;
   repairError: string | null;
   /** Normalized connector status; distinguishes registered_incomplete. */
@@ -64,9 +64,9 @@ export function selfHostedInfraReady(
  *  2. in-flight operation          → progress, no button ("Starting relay center…" etc.)
  *  3. center/bundle/TLS not ready  → warning naming the stalled piece (fix)
  *  4. management backend down      → danger "Relay backend unavailable" (fix)
- *  5. connector registered_incomplete → warning "Phone app needs an update" (no fix — repair cannot fix it)
+ *  5. connector registered_incomplete → warning naming the incomplete Mac connector
  *  6. connector not registered     → warning "Not connected to the relay center" (fix)
- *  7. connector registered         → success "Connected — ready to pair a phone" (show QR)
+ *  7. connector registered         → success "Mac connected — enrollment available" (show QR)
  *
  * A failed repair escalates the current diagnosis to danger and carries the
  * error one-liner in `detail`.
@@ -77,7 +77,7 @@ export function deriveRelayConnectionOverview(
   const {
     selfHosted,
     enrollmentView,
-    knownGrantActive,
+    connectedMobileDeviceCount,
     inFlight,
     repairError,
     connectorStatus,
@@ -125,8 +125,8 @@ export function deriveRelayConnectionOverview(
     primaryAction = { kind: "fix", label: "Fix connection" };
   } else if (connectorStatus === "registered_incomplete") {
     tone = "warning";
-    headline = "Phone app needs an update";
-    detail = "The connected phone is missing required features. Update the phone app, then reconnect.";
+    headline = "Mac connector is missing Relay v2 capabilities";
+    detail = "Update the Dashboard bundle on this Mac, then restart the connector.";
     primaryAction = null;
   } else if (enrollmentView?.ready !== true) {
     tone = "warning";
@@ -135,10 +135,10 @@ export function deriveRelayConnectionOverview(
     primaryAction = { kind: "fix", label: "Fix connection" };
   } else {
     tone = "success";
-    headline = "Connected — ready to pair a phone";
-    detail = knownGrantActive
-      ? "1 phone already paired. You can pair another phone at any time."
-      : null;
+    headline = "Mac connected — Relay v2 enrollment available";
+    detail = connectedMobileDeviceCount > 0
+      ? `${connectedMobileDeviceCount} mobile ${connectedMobileDeviceCount === 1 ? "device is" : "devices are"} connected through Relay v2.`
+      : "No mobile device is connected. Use the pairing QR to connect one.";
     primaryAction = { kind: "show_qr", label: "Show pairing QR" };
   }
 

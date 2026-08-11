@@ -294,7 +294,7 @@ export function encodeRelayV2HttpsBody(
   }
 }
 
-export type RelayV2ClientDialect = "tw-relay.v1" | "tw-relay.v2";
+export type RelayV2ClientDialect = "tw-relay.v2";
 
 export type RelayV2DialectOutcome =
   | {

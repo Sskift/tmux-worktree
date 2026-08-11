@@ -90,7 +90,6 @@ class RelayV2CodecException(
 )
 
 enum class RelayV2ClientDialect(val wireName: String) {
-    V1("tw-relay.v1"),
     V2("tw-relay.v2"),
     ;
 

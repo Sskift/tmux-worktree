@@ -404,7 +404,7 @@ export function createRelayV2DashboardManagementChildStdioRunner(
  * trusted deployment source opens one explicit-v2 Host root and threads this
  * child's channel into that root's same-lineage protocol-v2 management
  * session. Any activation/qualification gap converges to typed UNAVAILABLE,
- * with no second Host owner, process lifecycle, or Relay v1 fallback.
+ * with no second Host owner or process lifecycle.
  */
 export function runRelayV2DashboardManagementChildStdio(
   options: RelayV2DashboardManagementChildStdioOptions,

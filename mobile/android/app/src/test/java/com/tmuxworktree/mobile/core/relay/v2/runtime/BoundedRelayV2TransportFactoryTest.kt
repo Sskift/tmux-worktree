@@ -402,7 +402,7 @@ class BoundedRelayV2TransportFactoryTest {
 
     @Test
     fun selectedSubprotocolMustBePresentAndExactAndDiagnosticsStayRedacted() {
-        listOf(null, "tw-relay.v1", "tw-relay.v2, tw-relay.v1").forEach { selected ->
+        listOf(null, "tw-relay.unsupported", "tw-relay.v2, tw-relay.unsupported").forEach { selected ->
             RawTlsWebSocketServer().use { server ->
                 server.start { socket ->
                     val request = server.readRequest(socket)

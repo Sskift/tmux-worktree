@@ -1,9 +1,7 @@
 package com.tmuxworktree.mobile.app
 
-import com.tmuxworktree.mobile.core.data.AndroidKeystoreCredentialStore
 import com.tmuxworktree.mobile.core.data.PreferencesRelayV2ProfileStore
 import com.tmuxworktree.mobile.core.data.PreferencesStore
-import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePostedNotificationCancellationResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
@@ -46,9 +44,6 @@ internal data class RelayStartupAdmission(
                 (selfRevokePhase != null),
         ) { "Only self-revoke quarantine admission may carry its phase" }
     }
-
-    val allowsRelayV1: Boolean
-        get() = state == RelayStartupAdmissionState.RELAY_V1
 }
 
 /** Closed outcome of the explicit Connect/Retry refresh orchestration. */
@@ -124,7 +119,8 @@ internal suspend fun explicitConnectRefreshOrchestration(
 internal fun RelayV2StartupAdmissionResult.toRelayStartupAdmission(): RelayStartupAdmission =
     when (this) {
         RelayV2StartupAdmissionResult.NoActiveProfile -> RelayStartupAdmission(
-            state = RelayStartupAdmissionState.RELAY_V1,
+            state = RelayStartupAdmissionState.RELAY_V2_ENROLLMENT_REQUIRED,
+            message = "Relay v2 enrollment is required.",
         )
 
         is RelayV2StartupAdmissionResult.Ready -> RelayStartupAdmission(
@@ -134,17 +130,17 @@ internal fun RelayV2StartupAdmissionResult.toRelayStartupAdmission(): RelayStart
 
         is RelayV2StartupAdmissionResult.ReenrollmentRequired -> RelayStartupAdmission(
             state = RelayStartupAdmissionState.RELAY_V2_REENROLLMENT_REQUIRED,
-            message = "Relay v2 re-enrollment is required; Relay v1 fallback is disabled.",
+            message = "Relay v2 re-enrollment is required.",
         )
 
         is RelayV2StartupAdmissionResult.RecoveryRequired -> RelayStartupAdmission(
             state = RelayStartupAdmissionState.RELAY_V2_RECOVERY_REQUIRED,
-            message = "Relay v2 profile recovery is required; Relay v1 fallback is disabled.",
+            message = "Relay v2 profile recovery is required.",
         )
 
         is RelayV2StartupAdmissionResult.CredentialUnavailable -> RelayStartupAdmission(
             state = credentialUnavailableState(reason),
-            message = "Relay v2 credential is unavailable; Relay v1 fallback is disabled.",
+            message = "Relay v2 credential is unavailable.",
         )
 
         is RelayV2StartupAdmissionResult.SelfRevokeQuarantined ->
@@ -160,8 +156,6 @@ internal fun RelayV2StartupAdmissionResult.toRelayStartupAdmission(): RelayStart
  */
 internal class RelayV2ProfileRuntimeAdapter(
     preferencesStore: PreferencesStore,
-    legacyRepository: TwRepository,
-    legacyCredentialStore: AndroidKeystoreCredentialStore,
     relayV2CredentialStore: RelayV2CredentialStore,
     relayV2StateRepository: () -> RelayV2StateRepository,
     terminalResumeCredentialStore: RelayV2TerminalResumeCredentialStore,
@@ -182,15 +176,6 @@ internal class RelayV2ProfileRuntimeAdapter(
         val profileStore = PreferencesRelayV2ProfileStore(preferencesStore)
         val isolationBoundary = RelayProfileIsolationBoundary { receipt, previousCredentialReference ->
             when (receipt.profile.dialect) {
-                RelayProfileDialect.V1 -> {
-                    check(previousCredentialReference == null) {
-                        "Relay v1 isolation must not receive a Relay v2 credential reference"
-                    }
-                    legacyRepository.clearProfileData()
-                    clearEphemeralAfterDisconnect(receipt)
-                    legacyCredentialStore.clear()
-                }
-
                 RelayProfileDialect.V2 -> {
                     val credentialReference = requireNotNull(previousCredentialReference) {
                         "Relay v2 isolation requires its exact credential reference"
@@ -314,6 +299,12 @@ internal class RelayV2ProfileRuntimeAdapter(
             repository.selfRevokeActiveProfile()
         }
 
+    suspend fun removeExternallyRevokedActiveProfile(
+        expectedProfile: RelayV2Profile,
+    ): Boolean = profileMutationCoordinator.mutate {
+        repository.removeExternallyRevokedActiveProfile(expectedProfile)
+    }
+
     override suspend fun rollover(
         expectedProfile: RelayV2Profile,
     ): RelayV2CredentialRolloverResult = profileMutationCoordinator.mutate {
@@ -342,17 +333,13 @@ internal fun selfRevokeQuarantineAdmission(
     state = RelayStartupAdmissionState.RELAY_V2_SELF_REVOKE_QUARANTINED,
     message = when (phase) {
         RelayV2SelfRevokePhase.PREPARED ->
-            "Self-revoke is prepared; confirm Forget again to continue. " +
-                "Relay v1 fallback is disabled."
+            "Self-revoke is prepared; confirm Forget again to continue."
         RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED ->
-            "Self-revoke may have committed; the profile remains quarantined. " +
-                "Relay v1 fallback is disabled."
+            "Self-revoke may have committed; the profile remains quarantined."
         RelayV2SelfRevokePhase.REJECTED ->
-            "Self-revoke was rejected; the profile remains quarantined. " +
-                "Relay v1 fallback is disabled."
+            "Self-revoke was rejected; the profile remains quarantined."
         RelayV2SelfRevokePhase.CONFIRMED ->
-            "Self-revoke is confirmed but local cleanup is incomplete. " +
-                "Relay v1 fallback is disabled."
+            "Self-revoke is confirmed but local cleanup is incomplete."
     },
     selfRevokePhase = phase,
 )

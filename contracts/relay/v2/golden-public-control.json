@@ -94,7 +94,7 @@
             "state": "online",
             "hostEpoch": "authority-uuid",
             "hostInstanceId": "host-process-uuid",
-            "clientDialects": ["tw-relay.v1", "tw-relay.v2"],
+            "clientDialects": ["tw-relay.v2"],
             "capabilities": [
               "error.structured.v1",
               "command.ledger.v1",

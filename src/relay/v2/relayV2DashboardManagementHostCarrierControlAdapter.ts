@@ -4,6 +4,7 @@ import {
   type RelayV2DashboardManagementCarrierControlPort,
   type RelayV2DashboardManagementEnrollmentReceipt,
   type RelayV2DashboardManagementGrantRevocationReceipt,
+  type RelayV2DashboardManagementKnownClientGrantInspection,
 } from "./relayV2DashboardManagementAuthority.js";
 import {
   RelayV2HostCarrierDashboardManagementControlOwner,
@@ -179,6 +180,53 @@ function projectEnrollment(
   });
 }
 
+function projectKnownClientGrant(
+  value: unknown,
+  input: Readonly<{ hostId: string; connectorId: string }>,
+): RelayV2DashboardManagementKnownClientGrantInspection {
+  const fields = exactDataObject(value, [
+    "type",
+    "connectorGeneration",
+    "connectorId",
+    "hostId",
+    "grantId",
+    "connectedMobileDevices",
+  ]);
+  if (fields.type !== "known-client-grant.inspected"
+    || fields.hostId !== input.hostId
+    || fields.connectorId !== input.connectorId
+    || !Number.isSafeInteger(fields.connectorGeneration)
+    || (fields.connectorGeneration as number) <= 0) return closed();
+  if (!Array.isArray(fields.connectedMobileDevices)
+    || fields.connectedMobileDevices.length > 256) return closed();
+  const seenGrantIds = new Set<string>();
+  const connectedMobileDevices = fields.connectedMobileDevices.map((value) => {
+    const device = exactDataObject(value, [
+      "status", "grantId", "clientInstanceId", "connectionCount",
+    ]);
+    const grantId = identifier(device.grantId);
+    const clientInstanceId = identifier(device.clientInstanceId);
+    if (device.status !== "connected"
+      || !Number.isSafeInteger(device.connectionCount)
+      || (device.connectionCount as number) <= 0
+      || (device.connectionCount as number) > 256
+      || seenGrantIds.has(grantId)) return closed();
+    seenGrantIds.add(grantId);
+    return Object.freeze({
+      status: "connected" as const,
+      grantId,
+      clientInstanceId,
+      connectionCount: device.connectionCount as number,
+    });
+  });
+  return Object.freeze({
+    grantId: fields.grantId === null ? null : identifier(fields.grantId),
+    hostId: input.hostId,
+    connectorId: input.connectorId,
+    connectedMobileDevices: Object.freeze(connectedMobileDevices),
+  });
+}
+
 function projectRevocation(
   value: unknown,
   input: ReturnType<typeof parseRevokeInput>,
@@ -270,6 +318,28 @@ implements RelayV2DashboardManagementCarrierControlPort {
       return closed();
     }
     this.#owner = owner;
+  }
+
+  async inspectKnownClientGrant(input: Readonly<{
+    hostId: string;
+    connectorId: string;
+  }>): Promise<RelayV2DashboardManagementKnownClientGrantInspection> {
+    this.ensureOpen();
+    try {
+      const parsed = Object.freeze({
+        hostId: identifier(input.hostId),
+        connectorId: identifier(input.connectorId),
+      });
+      return projectKnownClientGrant(
+        await this.#owner.invoke(Object.freeze({
+          operation: "inspect_known_client_grant",
+          input: parsed,
+        })),
+        parsed,
+      );
+    } catch (error) {
+      return this.fail(error);
+    }
   }
 
   async createEnrollment(input: Readonly<{

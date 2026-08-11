@@ -20,7 +20,6 @@ import {
   useDashboardViewportResizePhase,
   useDashboardWindowCapturePhase,
 } from "./dashboard/hooks/useDashboardLayout";
-import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayController";
 import { useCatalogSelectionHydration } from "./dashboard/hooks/useCatalogSelectionHydration";
 import {
   useTerminalDeckAttachPhase,
@@ -65,10 +64,7 @@ import {
   SettingsDialog,
   type SettingsSectionId,
 } from "./dashboard/Settings";
-import {
-  ConnectionsSettings,
-  relaySettingsBindingsFromController,
-} from "./dashboard/Settings/ConnectionsSettings";
+import { ConnectionsSettings } from "./dashboard/Settings/ConnectionsSettings";
 import {
   DashboardShell,
   type DashboardDrawer,
@@ -229,7 +225,6 @@ function App() {
     installRemoteTw,
     ownerEpochKey: connectionCatalogOwnerEpochKey,
   } = connectionCatalog;
-  const mobileRelay = useMobileRelayController({ hosts });
   const [selection, setSelection] = useState<Selection>(null);
   const terminalDeck = useTerminalDeckState(dashboardBackend);
   const {
@@ -437,10 +432,6 @@ function App() {
     window.addEventListener("keydown", handleSettingsShortcut);
     return () => window.removeEventListener("keydown", handleSettingsShortcut);
   }, [openSettings, settingsOpen, settingsSection, showNewTerminal, showNewWorktree]);
-
-  useEffect(() => {
-    mobileRelay.setPopoverOpen(settingsOpen && settingsSection === "connections");
-  }, [mobileRelay.setPopoverOpen, settingsOpen, settingsSection]);
 
   const anyModalOpen =
     showNewWorktree ||
@@ -1192,8 +1183,6 @@ function App() {
     pinnedItems,
     togglePinned,
   ]);
-  const relaySettingsBindings = relaySettingsBindingsFromController(mobileRelay);
-
   const openGitDiff = useCallback(
     (path: string, cwd: string, hostId?: string | null) =>
       requestEditorNavigation(() => {
@@ -1425,7 +1414,6 @@ function App() {
               onHostsMutationSettled={onHostsMutationSettled}
               installingHostId={installingHostId}
               onInstallTw={installRemoteTw}
-              {...relaySettingsBindings}
             />
           ),
           integrations: <FeishuIntegrationSettings />,
@@ -1536,13 +1524,6 @@ function App() {
           hosts={hosts}
           hostStatuses={hostStatuses}
           hostsError={hostsLoadError}
-          mobileRelay={{
-            statusKnown: mobileRelay.statusKnown,
-            connected: mobileRelay.connected,
-            active: mobileRelay.active,
-            statusText: mobileRelay.statusText,
-            error: mobileRelay.error,
-          }}
           localRuntimeState={error ? "error" : catalogRefreshGeneration > 0 ? "ready" : "checking"}
           selection={selection}
           sessionActivity={sessionActivity}

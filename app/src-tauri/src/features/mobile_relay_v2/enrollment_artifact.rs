@@ -6,6 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ARTIFACT_HANDLE_PREFIX: &str = "dqart1.";
 const MAX_ARTIFACT_LIFETIME_MS: u64 = 5 * 60 * 1_000;
+// The broker issues an exact 300_000 ms enrollment against its own clock.
+// Admit only a small, fixed amount of cross-machine skew; the record and the
+// expiry owner still retain and enforce the broker's absolute expiresAtMs.
+const MAX_ARTIFACT_CLOCK_SKEW_MS: u64 = 5_000;
 const MAX_PNG_BYTES: usize = 512 * 1_024;
 const MAX_COPY_VALUE_BYTES: usize = 8 * 1_024;
 
@@ -43,6 +47,12 @@ pub(crate) struct RenderedEnrollmentArtifact {
     pub(crate) relay_url: String,
     pub(crate) enrollment_link: String,
     pub(crate) png: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnrollmentArtifactAdmissionError {
+    Expired,
+    Rejected,
 }
 
 struct ArtifactRecord {
@@ -113,21 +123,22 @@ impl EnrollmentArtifactRegistry {
         &self,
         lineage: EnrollmentArtifactLineage,
         render: F,
-    ) -> Result<RendererEnrollmentArtifact, ()>
+    ) -> Result<RendererEnrollmentArtifact, EnrollmentArtifactAdmissionError>
     where
         F: FnOnce() -> Result<RenderedEnrollmentArtifact, ()>,
     {
-        let now_ms = unix_now_ms()?;
-        if lineage.expires_at_ms <= now_ms
-            || lineage.expires_at_ms - now_ms > MAX_ARTIFACT_LIFETIME_MS
-        {
-            return Err(());
+        let now_ms = unix_now_ms().map_err(|_| EnrollmentArtifactAdmissionError::Rejected)?;
+        if lineage.expires_at_ms <= now_ms {
+            return Err(EnrollmentArtifactAdmissionError::Expired);
+        }
+        if lineage.expires_at_ms - now_ms > MAX_ARTIFACT_LIFETIME_MS + MAX_ARTIFACT_CLOCK_SKEW_MS {
+            return Err(EnrollmentArtifactAdmissionError::Rejected);
         }
 
         let old_window = {
             let mut state = self.inner.state.lock().unwrap();
             if state.closed {
-                return Err(());
+                return Err(EnrollmentArtifactAdmissionError::Rejected);
             }
             if let Some(record) = &state.record {
                 if record.lineage == lineage {
@@ -138,7 +149,7 @@ impl EnrollmentArtifactRegistry {
         };
         close_window(&self.inner, old_window);
 
-        let rendered = render()?;
+        let rendered = render().map_err(|_| EnrollmentArtifactAdmissionError::Rejected)?;
         if rendered.png.is_empty()
             || rendered.png.len() > MAX_PNG_BYTES
             || !rendered.png.starts_with(b"\x89PNG\r\n\x1a\n")
@@ -149,9 +160,10 @@ impl EnrollmentArtifactRegistry {
                 .enrollment_link
                 .starts_with("tmuxworktree://enroll?")
         {
-            return Err(());
+            return Err(EnrollmentArtifactAdmissionError::Rejected);
         }
-        let handle = random_handle(ARTIFACT_HANDLE_PREFIX)?;
+        let handle = random_handle(ARTIFACT_HANDLE_PREFIX)
+            .map_err(|_| EnrollmentArtifactAdmissionError::Rejected)?;
         let record = ArtifactRecord {
             lineage,
             handle,
@@ -164,7 +176,7 @@ impl EnrollmentArtifactRegistry {
         let artifact = renderer_artifact(&record);
         let mut state = self.inner.state.lock().unwrap();
         if state.closed || state.record.is_some() {
-            return Err(());
+            return Err(EnrollmentArtifactAdmissionError::Rejected);
         }
         state.record = Some(record);
         self.inner.wake.notify_all();
@@ -421,17 +433,30 @@ mod tests {
     }
 
     #[test]
-    fn expired_or_overlong_artifacts_are_never_admitted() {
+    fn bounded_clock_skew_is_admitted_without_extending_absolute_expiry() {
         let registry = EnrollmentArtifactRegistry::new(|_| {}).unwrap();
         let now = unix_now_ms().unwrap();
-        assert!(registry
-            .get_or_create(lineage(now), || Ok(rendered()))
-            .is_err());
-        assert!(registry
-            .get_or_create(lineage(now + MAX_ARTIFACT_LIFETIME_MS + 1), || {
-                Ok(rendered())
-            })
-            .is_err());
+        assert_eq!(
+            registry
+                .get_or_create(lineage(now), || Ok(rendered()))
+                .unwrap_err(),
+            EnrollmentArtifactAdmissionError::Expired
+        );
+
+        let absolute_expires_at = now + MAX_ARTIFACT_LIFETIME_MS + MAX_ARTIFACT_CLOCK_SKEW_MS;
+        let artifact = registry
+            .get_or_create(lineage(absolute_expires_at), || Ok(rendered()))
+            .unwrap();
+        assert_eq!(artifact.expires_at_ms, absolute_expires_at);
+        registry.clear();
+
+        let overlong_expires_at = absolute_expires_at + 60_000;
+        assert_eq!(
+            registry
+                .get_or_create(lineage(overlong_expires_at), || Ok(rendered()))
+                .unwrap_err(),
+            EnrollmentArtifactAdmissionError::Rejected
+        );
         registry.close();
     }
 

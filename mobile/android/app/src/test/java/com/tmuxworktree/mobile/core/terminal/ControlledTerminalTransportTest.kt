@@ -1,36 +1,9 @@
 package com.tmuxworktree.mobile.core.terminal
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertSame
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ControlledTerminalTransportTest {
-    @Test
-    fun `input policy drops v1 reports and forwards identical v2 raw input`() {
-        val reports = listOf("\u001B[<0;12;7M", "\u001B[I\u001B[O")
-
-        reports.forEach { report ->
-            assertNull(TerminalAttachmentInputPolicy.RELAY_V1_CONTROLLED.admit(report))
-            assertSame(report, TerminalAttachmentInputPolicy.RELAY_V2_RAW_BYTES.admit(report))
-        }
-    }
-
-    @Test
-    fun `mouse and focus transport reports are not pane input`() {
-        assertTrue(isControlledTerminalTransportReport("\u001B[<0;12;7M"))
-        assertTrue(isControlledTerminalTransportReport("\u001B[32;12;7M"))
-        assertTrue(isControlledTerminalTransportReport("\u001B[M !!"))
-        assertTrue(isControlledTerminalTransportReport("\u001B[I\u001B[O"))
-
-        assertFalse(isControlledTerminalTransportReport("\u001B[3~"))
-        assertFalse(isControlledTerminalTransportReport("\u001B[A"))
-        assertFalse(isControlledTerminalTransportReport("\u007F"))
-        assertFalse(isControlledTerminalTransportReport("text"))
-    }
-
     @Test
     fun `controlled output strips mouse and focus enables across chunk boundaries`() {
         val filter = ControlledTerminalOutputFilter()

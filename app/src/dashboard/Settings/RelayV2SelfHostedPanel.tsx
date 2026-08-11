@@ -140,7 +140,6 @@ export function RelayV2SelfHostedPanel({ hosts }: { hosts: readonly HostConfig[]
           <p>
             Explicit feature: deploy the complete canonical tw bundle to one SSH devbox.
             Requires Linux x86_64, Node.js 22.16+, and an ext-family filesystem.
-            Relay v1 tokens are neither read nor changed.
           </p>
         </div>
         <strong className="connections-relay-v2-deployment__status">

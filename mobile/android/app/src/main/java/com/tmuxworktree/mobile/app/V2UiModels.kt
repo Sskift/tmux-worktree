@@ -17,7 +17,7 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
 
 enum class RelayStartupAdmissionState {
     CHECKING,
-    RELAY_V1,
+    RELAY_V2_ENROLLMENT_REQUIRED,
     RELAY_V2,
     RELAY_V2_REENROLLMENT_REQUIRED,
     RELAY_V2_RECOVERY_REQUIRED,
@@ -56,12 +56,7 @@ data class V2UiState(
     val networkAvailable: Boolean = true,
     val paired: Boolean = false,
     val pairingRequired: Boolean = false,
-    val pairingRelayUrl: String = "",
-    val pairingToken: String = "",
-    val pairingHostId: String = "",
-    val pairingRelayUrlError: String? = null,
     val pairingError: String? = null,
-    val confirmProfileSwitch: Boolean = false,
     val isConnecting: Boolean = false,
     val preferences: AppPreferences = AppPreferences(),
     val hosts: List<RelayHost> = emptyList(),
@@ -69,7 +64,6 @@ data class V2UiState(
     val sessions: List<RelaySession> = emptyList(),
     val health: ConnectionHealth = ConnectionHealth(),
     val terminal: TerminalStreamState = TerminalStreamState(),
-    val drafts: Map<String, String> = emptyMap(),
     val selectedScopeId: String? = null,
     val creatingWorktree: Boolean = false,
     val creatingTerminal: Boolean = false,
@@ -104,19 +98,10 @@ data class V2UiState(
                 AgentEvidenceAvailability.AVAILABLE
             relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2 ->
                 AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
-            else -> AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED
+            else -> AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
         }
 
-    val hasStoredProfile: Boolean
-        get() = preferences.relayUrl.isNotBlank() || hosts.isNotEmpty() ||
-            scopes.isNotEmpty() || sessions.isNotEmpty()
-
     fun session(stableId: String): RelaySession? = sessions.firstOrNull { it.stableId == stableId }
-
-    fun agentChatAvailable(session: RelaySession): Boolean {
-        val host = hosts.firstOrNull { it.hostId == session.hostId }
-        return host?.capabilities?.contains("agent-chat-v1") == true
-    }
 
     // State may be captured by a crash reporter or debugger through toString().
     // Never include the in-memory review token or the unvalidated imported URL.
@@ -128,22 +113,6 @@ data class V2UiState(
             "isConnecting=$isConnecting, hosts=${hosts.size}, scopes=${scopes.size}, " +
             "sessions=${sessions.size}, health=$health)"
 }
-
-/**
- * The UI submits a normalized body but keeps its original draft text. Capture that original text
- * before sending, then remove it only if no byte of the draft changed while Room was committing.
- */
-internal fun V2UiState.afterCommittedReply(
-    sessionId: String,
-    submittedRawDraft: String?,
-): V2UiState = copy(
-    drafts = if (submittedRawDraft != null && drafts[sessionId] == submittedRawDraft) {
-        drafts - sessionId
-    } else {
-        drafts
-    },
-    actionError = null,
-)
 
 internal data class RelayV2ReplyUiCallbackFence(
     val composition: Any,
@@ -187,6 +156,19 @@ internal fun relayV2SessionUiStableId(vararg opaqueParts: String): String = buil
 }
 
 internal const val RELAY_V2_TRANSPORT_LABEL = "Relay v2 transport"
+
+internal fun relayHostDisplayName(hostId: String): String {
+    val normalized = hostId.trim()
+    val dashboardIdentity = normalized.removePrefix("dashboard-")
+    return if (
+        dashboardIdentity.length == 32 &&
+        dashboardIdentity.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+    ) {
+        "Dashboard · ${dashboardIdentity.take(6)}"
+    } else {
+        normalized
+    }
+}
 
 internal fun projectRelayV2RuntimeState(
     state: V2UiState,
@@ -244,7 +226,7 @@ internal fun projectRelayV2RuntimeState(
         relayV2ProfileFailureCode = failureCode.ifBlank { null },
         isConnecting = connection == RelayV2ProfileConnectionState.CONNECTING,
         pairingError = failureCode.takeIf(String::isNotBlank)?.let { code ->
-            "Relay v2 transport failed ($code); Relay v1 fallback is disabled."
+            "Relay v2 transport failed ($code)."
         },
         hosts = state.hosts.map { host ->
             host.copy(

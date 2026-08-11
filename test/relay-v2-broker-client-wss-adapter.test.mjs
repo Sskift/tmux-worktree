@@ -305,7 +305,7 @@ test("broker client WSS adapter preserves binary metadata and rejects unsafe sen
   assert.deepEqual(completions, ["delivered", "rejected"]);
 
   const invalidSocket = new StrictFakeSocket();
-  invalidSocket._protocol = "tw-relay.v1";
+  invalidSocket._protocol = "tw-relay.unsupported";
   assert.throws(
     () => createAdapter(invalidSocket, createFakeTransport()),
     adapterModule.RelayV2BrokerClientWssAdapterError,

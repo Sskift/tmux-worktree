@@ -6,7 +6,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
-import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -35,7 +34,6 @@ import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
 import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
 import com.tmuxworktree.mobile.feature.workspaces.WorkspacesScreen
-import com.tmuxworktree.mobile.navigation.RootDestination
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Rule
@@ -71,10 +69,8 @@ class CoreScreensInstrumentedTest {
             activityAtSeconds = 1,
         )
         var opened: RelaySession? = null
-        var replied: RelaySession? = null
         var menuClicks = 0
         var healthClicks = 0
-        var destination: RootDestination? = null
         composeRule.setContent {
             TwTheme {
                 InboxScreen(
@@ -84,8 +80,6 @@ class CoreScreensInstrumentedTest {
                     onMenuClick = { menuClicks++ },
                     onConnectionStatusClick = { healthClicks++ },
                     onSessionClick = { opened = it },
-                    onReplyClick = { replied = it },
-                    onBottomDestinationSelected = { destination = it },
                 )
             }
         }
@@ -93,8 +87,6 @@ class CoreScreensInstrumentedTest {
         composeRule.onNodeWithTag("topbar_menu").performClick()
         composeRule.onNodeWithTag("connection_status_chip").performClick()
         composeRule.onNodeWithTag("attention_session_${waiting.stableId}").performClick()
-        composeRule.onNodeWithTag("reply_session_${waiting.stableId}").performClick()
-        composeRule.onNodeWithTag("nav_workspaces").performClick()
         composeRule.onNodeWithTag("running_session_${terminal.stableId}")
             .assertDoesNotExist()
 
@@ -102,81 +94,7 @@ class CoreScreensInstrumentedTest {
             assertEquals(1, menuClicks)
             assertEquals(1, healthClicks)
             assertSame(waiting, opened)
-            assertSame(waiting, replied)
-            assertEquals(RootDestination.WORKSPACES, destination)
         }
-    }
-
-    @Test
-    fun sessionReplyShortcutFocusesTheComposer() {
-        val session = RelaySession(
-            hostId = "host",
-            name = "local:demo",
-            rawName = "demo",
-            agentState = AgentState.WAITING_FOR_USER,
-        )
-        composeRule.setContent {
-            TwTheme {
-                SessionDetailScreen(
-                    session = session,
-                    connectionStatus = ConnectionStatus.ONLINE,
-                    timelineState = SessionTimelineState(
-                        events = emptyList(),
-                        agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
-                    ),
-                    draft = "",
-                    nowMillis = 1_000,
-                    onDraftChange = {},
-                    onBack = {},
-                    onConnectionStatusClick = {},
-                    onOpenTerminal = {},
-                    onOverflowClick = {},
-                    onSend = {},
-                    autoFocusReply = true,
-                )
-            }
-        }
-
-        composeRule.onNodeWithTag("reply_input").assertIsFocused()
-    }
-
-    @Test
-    fun sessionSendDeliversTrimmedTextWithoutClearingDraftBeforeOwnerConfirmsEnqueue() {
-        val session = RelaySession(
-            hostId = "host",
-            name = "local:demo",
-            rawName = "demo",
-            agentState = AgentState.WAITING_FOR_USER,
-        )
-        var draft by mutableStateOf("  keep this draft  ")
-        var sent: String? = null
-        composeRule.setContent {
-            TwTheme {
-                SessionDetailScreen(
-                    session = session,
-                    connectionStatus = ConnectionStatus.ONLINE,
-                    timelineState = SessionTimelineState(
-                        events = emptyList(),
-                        agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
-                    ),
-                    draft = draft,
-                    nowMillis = 1_000,
-                    onDraftChange = { draft = it },
-                    onBack = {},
-                    onConnectionStatusClick = {},
-                    onOpenTerminal = {},
-                    onOverflowClick = {},
-                    onSend = { sent = it },
-                )
-            }
-        }
-
-        composeRule.onNodeWithTag("send_reply").performClick()
-
-        composeRule.runOnIdle { assertEquals("keep this draft", sent) }
-        composeRule.onNodeWithTag("reply_input")
-            .assertIsDisplayed()
-            .assertTextEquals("  keep this draft  ")
     }
 
     @Test
@@ -209,7 +127,7 @@ class CoreScreensInstrumentedTest {
     }
 
     @Test
-    fun sessionAgentEvidenceAvailabilityUsesDialectSpecificNoticesAndKeepsReplyAvailable() {
+    fun sessionAgentEvidenceUnavailableNoticeKeepsTimelineActionAvailable() {
         val session = RelaySession(
             hostId = "host",
             name = "local:demo",
@@ -226,7 +144,7 @@ class CoreScreensInstrumentedTest {
         )
         var cancelled: TimelineEvent? = null
         var agentEvidenceAvailability by mutableStateOf(
-            AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED,
+            AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE,
         )
         composeRule.setContent {
             TwTheme {
@@ -237,34 +155,18 @@ class CoreScreensInstrumentedTest {
                         events = listOf(queued),
                         agentEvidenceAvailability = agentEvidenceAvailability,
                     ),
-                    draft = "Reply remains available",
                     nowMillis = 1_000,
-                    onDraftChange = {},
                     onBack = {},
                     onConnectionStatusClick = {},
-                    onOpenTerminal = {},
                     onOverflowClick = {},
-                    onSend = {},
                     agentStateAvailable = false,
                     onCancelMessage = { cancelled = it },
                 )
             }
         }
 
-        composeRule.onNodeWithTag("relay_v1_session_limitation")
-            .assertIsDisplayed()
         composeRule.onNodeWithTag("relay_v2_agent_evidence_unavailable")
-            .assertDoesNotExist()
-        composeRule.onNodeWithTag("reply_input")
-            .assertIsEnabled()
-        composeRule.onNodeWithTag("send_reply")
-            .assertIsEnabled()
-        composeRule.onNodeWithTag("session_attachment")
-            .performClick()
-        composeRule.onNodeWithText("Attachments need Relay v2")
             .assertIsDisplayed()
-        composeRule.onNodeWithTag("dismiss_attachment_notice")
-            .performClick()
         composeRule.onNodeWithTag(
             "message_delivery_action_${queued.eventId}",
             useUnmergedTree = true,
@@ -274,33 +176,17 @@ class CoreScreensInstrumentedTest {
 
         composeRule.runOnIdle {
             assertSame(queued, cancelled)
-            agentEvidenceAvailability = AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE
         }
-        composeRule.onNodeWithTag("relay_v1_session_limitation")
-            .assertDoesNotExist()
-        composeRule.onNodeWithTag("relay_v2_agent_evidence_unavailable")
-            .assertIsDisplayed()
         composeRule.onNodeWithText(
             "Agent transcript and lifecycle evidence are unavailable for this Relay v2 session. " +
-                "You can still compose a reply; sending uses the separate command path and " +
-                "requires the session to be currently online.",
+                "Chat remains disabled until the Host provides that capability.",
         ).assertIsDisplayed()
-        composeRule.onNodeWithTag("reply_input")
-            .assertIsEnabled()
-        composeRule.onNodeWithTag("send_reply")
-            .assertIsEnabled()
 
         composeRule.runOnIdle {
             agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE
         }
-        composeRule.onNodeWithTag("relay_v1_session_limitation")
-            .assertDoesNotExist()
         composeRule.onNodeWithTag("relay_v2_agent_evidence_unavailable")
             .assertDoesNotExist()
-        composeRule.onNodeWithTag("reply_input")
-            .assertIsEnabled()
-        composeRule.onNodeWithTag("send_reply")
-            .assertIsEnabled()
     }
 
     @Test
@@ -330,13 +216,11 @@ class CoreScreensInstrumentedTest {
                     scopes = listOf(RelayScope("host", "local", sessionCount = 2)),
                     connectionStatus = ConnectionStatus.ONLINE,
                     selectedScopeId = null,
-                    attentionCount = 0,
                     onConnectionStatusClick = {},
                     onScopeSelected = {},
                     onSessionClick = { openedWorktree = it },
                     onTerminalClick = { openedTerminal = it },
                     onNewWorktreeClick = {},
-                    onBottomDestinationSelected = {},
                     activeHostId = "host",
                 )
             }
@@ -446,15 +330,9 @@ class CoreScreensInstrumentedTest {
         composeRule.setContent {
             TwTheme {
                 PairingScreen(
-                    relayUrl = "wss://relay.example.com",
-                    token = "paired-token",
                     isConnecting = false,
-                    relayUrlError = null,
                     error = null,
-                    onRelayUrlChange = {},
-                    onTokenChange = {},
                     onScanQr = {},
-                    onConnect = {},
                     onManualRelayV2Enrollment = { _, _ -> },
                     onForgetPairing = { forgetCount++ },
                 )
@@ -477,30 +355,27 @@ class CoreScreensInstrumentedTest {
     }
 
     @Test
-    fun pairingReviewShowsImportedUrlErrorAndKeepsConnectActionDisabled() {
+    fun pairingScreenExposesOnlyRelayV2EnrollmentActions() {
         val error = "Debug ws:// is limited to emulator or loopback hosts. " +
             "Use wss:// for .local and other network hosts"
         composeRule.setContent {
             TwTheme {
                 PairingScreen(
-                    relayUrl = "ws://mac.local:8787",
-                    token = "review-only-token",
                     isConnecting = false,
-                    relayUrlError = error,
-                    error = null,
-                    onRelayUrlChange = {},
-                    onTokenChange = {},
+                    error = error,
                     onScanQr = {},
-                    onConnect = {},
                     onManualRelayV2Enrollment = { _, _ -> },
                 )
             }
         }
 
-        composeRule.onNodeWithText(error)
+        composeRule.onNodeWithText("This app accepts Relay v2 enrollment only", substring = true)
             .assertIsDisplayed()
+        composeRule.onNodeWithTag("pairing_scan_qr").assertIsDisplayed()
+        composeRule.onNodeWithTag("pairing_relay_v2_enrollment").assertIsDisplayed()
+        composeRule.onNodeWithText(error).assertIsDisplayed()
         composeRule.onNodeWithTag("pairing_connect")
-            .assertIsNotEnabled()
+            .assertDoesNotExist()
     }
 
     @Test
@@ -548,7 +423,6 @@ class CoreScreensInstrumentedTest {
                     connectionStatus = ConnectionStatus.ONLINE,
                     preferences = AppPreferences(),
                     pairedDeviceName = "Mac",
-                    attentionCount = 0,
                     versionName = "test",
                     onHealthClick = {},
                     onPairedDeviceClick = {},
@@ -559,7 +433,6 @@ class CoreScreensInstrumentedTest {
                     onNotificationChanged = { _, _ -> },
                     onDarkThemeChanged = {},
                     onCopyDiagnostics = {},
-                    onBottomDestinationSelected = {},
                 )
             }
         }
@@ -590,15 +463,9 @@ class CoreScreensInstrumentedTest {
         composeRule.setContent {
             TwTheme {
                 PairingScreen(
-                    relayUrl = "",
-                    token = "",
                     isConnecting = false,
-                    relayUrlError = null,
                     error = null,
-                    onRelayUrlChange = {},
-                    onTokenChange = {},
                     onScanQr = {},
-                    onConnect = {},
                     onManualRelayV2Enrollment = { enteredIssuer, enteredToken ->
                         submittedIssuer = enteredIssuer
                         submittedToken = enteredToken

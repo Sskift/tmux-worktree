@@ -87,23 +87,6 @@ function worktreeSession(overrides = {}) {
 
 const FIXED_DIGEST = "a".repeat(64);
 
-function migrationCorrelation(overrides = {}) {
-  return {
-    schemaVersion: 1,
-    reservationId: "tw-migrate-legacy-v1:tw-term-legacy",
-    hostEpoch: "0",
-    principalId: "tw-cli-legacy-migration",
-    hostId: "localhost",
-    commandId: "migrate-legacy:tw-term-legacy",
-    requestFingerprint: {
-      schemaVersion: 1,
-      algorithm: "sha256-rfc8785",
-      digest: FIXED_DIGEST,
-    },
-    ...overrides,
-  };
-}
-
 function realCorrelation(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -224,61 +207,6 @@ test("canonical TW RPC v2 discovery scans only configured scopes and projects de
   }
 });
 
-test("canonical discovery authoritatively excludes unmarked legacy Sessions", async () => {
-  assert.throws(
-    () => projectRelayV2CanonicalTwRpcDiscoveredSession({
-      processTarget: { kind: "local", targetId: "local" },
-      session: terminalSession({ lifecycleMarked: false }),
-    }),
-    /lacks lifecycle authority/,
-  );
-  const port = queryPort(({ command }) => command === "capabilities"
-    ? capabilities()
-    : {
-        protocolVersion: 2,
-        sessions: [
-          terminalSession({ lifecycleMarked: false }),
-          worktreeSession({ lifecycleMarked: false }),
-        ],
-      });
-  const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
-    scopes: [scope("local", "local")],
-    queryPort: port,
-  });
-
-  const scan = await discovery.scan();
-  const cut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
-
-  assert.equal(scan.coverage, "complete");
-  assert.equal(scan.scopes[0].reachability, "online");
-  assert.equal(scan.scopes[0].sessionsCompleteness, "complete");
-  assert.deepEqual(scan.scopes[0].sessions, []);
-  assert.equal(scan.scopes[0].error, null);
-  assert.equal(scan.scopes[0].reservationCorrelationCompleteness, "complete");
-  assert.equal(cut.scopeTargets.length, 1);
-  assert.deepEqual(cut.sessionTargets, []);
-  assert.equal(
-    JSON.stringify(scan).includes("raw.tmux"),
-    false,
-    "legacy raw targets must not enter the public Relay projection",
-  );
-});
-
-test("canonical discovery strips the synthetic legacy migration correlation from the projection", () => {
-  const projected = projectRelayV2CanonicalTwRpcDiscoveredSession({
-    processTarget: { kind: "local", targetId: "local" },
-    session: terminalSession({
-      reservationCorrelation: migrationCorrelation(),
-    }),
-  });
-  assert.equal("reservationCorrelation" in projected, false);
-  assert.equal(
-    JSON.stringify(projected).includes("tw-migrate-legacy-v1"),
-    false,
-    "the migration provenance marker must never leak into the public Relay projection",
-  );
-});
-
 test("canonical discovery preserves a real reservation correlation in the projection", () => {
   const correlation = realCorrelation();
   const projected = projectRelayV2CanonicalTwRpcDiscoveredSession({
@@ -286,73 +214,6 @@ test("canonical discovery preserves a real reservation correlation in the projec
     session: terminalSession({ reservationCorrelation: correlation }),
   });
   assert.deepEqual(projected.reservationCorrelation, correlation);
-});
-
-test("canonical discovery only filters the exact tw-migrate-legacy-v1: namespace", () => {
-  const correlation = realCorrelation({
-    reservationId: "tw-migrate-legacy-v1x:tw-term-legacy",
-  });
-  const projected = projectRelayV2CanonicalTwRpcDiscoveredSession({
-    processTarget: { kind: "local", targetId: "local" },
-    session: terminalSession({ reservationCorrelation: correlation }),
-  });
-  assert.deepEqual(
-    projected.reservationCorrelation,
-    correlation,
-    "a reservationId merely prefixed by the migration namespace must stay correlated",
-  );
-});
-
-test("materialized reconcile accepts a legacy-migrated session despite the synthetic correlation", async () => {
-  const temporaryHome = mkdtempSync(join(tmpdir(), "tw-rpc-v2-legacy-corr-"));
-  try {
-    const port = queryPort(({ command }) => (
-      command === "capabilities"
-        ? capabilities()
-        : {
-            protocolVersion: 2,
-            sessions: [terminalSession({
-              name: "raw.tmux.legacy",
-              label: "Legacy terminal label",
-              reservationCorrelation: migrationCorrelation(),
-            })],
-          }
-    ));
-    const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
-      scopes: [scope("local", "local")],
-      queryPort: port,
-      queryTimeoutMs: 5,
-    });
-    const store = await RelayV2HostStateStore.open({
-      paths: relayV2HostStatePaths(temporaryHome),
-    });
-    const foundation = new RelayV2MaterializedStateFoundation({
-      hostId: "host-under-test",
-      discovery,
-      store,
-      readinessSink: { apply: () => true },
-    });
-
-    // Before the fix this reconcile() rejected with an INTERNAL
-    // RelayV2MaterializedStateError: the synthetic correlation failed
-    // scanAuthorityConflict's "unknown reservation correlation" check.
-    const reconciled = await foundation.reconcile();
-    assert.equal(reconciled.readiness.snapshotMaterializationReady, true);
-    const cut = (await foundation.sessionsSnapshot(
-      "legacy-cut",
-      reconciled.snapshot.hostEpoch,
-      null,
-    )).payload;
-    assert.equal(cut.scopes[0].items.length, 1);
-    assert.equal(cut.scopes[0].items[0].displayName, "Legacy terminal label");
-    assert.equal(
-      JSON.stringify(cut).includes("tw-migrate-legacy-v1"),
-      false,
-      "the migration provenance marker must not materialize into the snapshot",
-    );
-  } finally {
-    rmSync(temporaryHome, { recursive: true, force: true });
-  }
 });
 
 test("canonical discovery swaps explicit config generations atomically and keeps raw targets process-local", async () => {
@@ -448,38 +309,7 @@ test("a canonical scope with more than 256 valid Sessions remains complete", asy
   assert.equal(scan.scopes[0].sessions.length, 257);
 });
 
-test("unmarked legacy rows do not consume the remaining H2 Session budget", async () => {
-  const legacy = terminalSession({ lifecycleMarked: false });
-  const port = queryPort((request) => request.command === "capabilities"
-    ? capabilities()
-    : {
-        protocolVersion: 2,
-        sessions: new Array(request.maxSessions + 1).fill(legacy),
-      });
-  const scan = await new RelayV2CanonicalTwRpcDiscoveryAdapter({
-    scopes: [scope("local", "local")],
-    queryPort: port,
-  }).scan();
-  const cut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
-  const listCall = port.calls.find((call) => call.command === "list");
-
-  assert.equal(
-    listCall.maxSessions,
-    RELAY_V2_MATERIALIZED_CAPACITY.maxSnapshotRecords - 2,
-  );
-  assert.ok(
-    listCall.maxSessions + 1
-      <= RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE,
-  );
-  assert.equal(scan.coverage, "complete");
-  assert.equal(scan.scopes[0].sessionsCompleteness, "complete");
-  assert.deepEqual(scan.scopes[0].sessions, []);
-  assert.equal(scan.scopes[0].error, null);
-  assert.equal(cut.scopeTargets.length, 1);
-  assert.deepEqual(cut.sessionTargets, []);
-});
-
-test("the independent input hard limit still rejects oversized unmarked responses", async () => {
+test("the independent input hard limit still rejects oversized responses", async () => {
   const port = queryPort(({ command }) => command === "capabilities"
     ? capabilities()
     : {
@@ -602,23 +432,6 @@ test("timeout, transport, capability, and malformed-session failures remain part
         : {
           protocolVersion: 2,
           sessions: [terminalSession(), worktreeSession({ incarnation: "invalid" })],
-        },
-      expectedCode: "INTERNAL",
-      expectedReachability: "online",
-      expectedCommands: ["capabilities", "list"],
-    },
-    {
-      name: "malformed unmarked legacy session is not hidden by exclusion",
-      handler: ({ command }) => command === "capabilities"
-        ? capabilities()
-        : {
-          protocolVersion: 2,
-          sessions: [
-            terminalSession({
-              lifecycleMarked: false,
-              incarnation: "invalid",
-            }),
-          ],
         },
       expectedCode: "INTERNAL",
       expectedReachability: "online",

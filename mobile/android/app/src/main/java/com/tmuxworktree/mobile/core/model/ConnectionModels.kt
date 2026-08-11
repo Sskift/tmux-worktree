@@ -22,13 +22,6 @@ enum class TransportPhase {
     INCOMPATIBLE,
 }
 
-data class RelayProfile(
-    val relayUrl: String = "",
-    val hostId: String = "",
-    val autoConnect: Boolean = false,
-    val hasCredential: Boolean = false,
-)
-
 data class RelayHost(
     val hostId: String,
     val displayName: String = hostId,
@@ -67,7 +60,7 @@ data class ConnectionHealth(
     val lastSyncedAtMillis: Long = 0,
     val errorCode: String = "",
     val errorMessage: String = "",
-    val protocolLabel: String = "Relay v1",
+    val protocolLabel: String = "Relay v2",
 )
 
 data class TerminalStreamState(

@@ -448,6 +448,12 @@ test("empty controller capabilities project as registered_incomplete and cannot 
     },
     connector: adapter,
     carrierControl: {
+      inspectKnownClientGrant: async (input) => ({
+        grantId: null,
+        hostId: input.hostId,
+        connectorId: input.connectorId,
+        connectedMobileDevices: [],
+      }),
       createEnrollment: async () => {
         enrollmentCalls += 1;
         throw new Error("must not create enrollment");

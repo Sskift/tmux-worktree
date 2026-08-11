@@ -92,12 +92,6 @@ const updateHostArgs = {
   tmuxPath: "~/.local/bin/tmux",
   twPath: "~/.local/bin/tw",
 };
-const relayArgs = {
-  relayUrl: "wss://relay.example.test",
-  brokerHostId: "host-1",
-  hostId: "dashboard-host",
-  secret: "test-secret",
-};
 const relayV2DeploymentArgs = {
   enabled: true as const,
   brokerHostId: "host-1",
@@ -571,36 +565,6 @@ const commandCases: CommandCase[] = [
     command: "probe_agents",
     args: { hostId: "host-1" },
     call: (backend) => backend.agents.probe({ kind: "host", hostId: "host-1" }),
-  },
-  {
-    label: "relay.status",
-    command: "mobile_relay_status",
-    args: undefined,
-    call: (backend) => backend.relay.status(),
-  },
-  {
-    label: "relay.start",
-    command: "mobile_relay_start",
-    args: undefined,
-    call: (backend) => backend.relay.start(),
-  },
-  {
-    label: "relay.saveConfig",
-    command: "mobile_relay_save_config",
-    args: { args: relayArgs },
-    call: (backend) => backend.relay.saveConfig(relayArgs),
-  },
-  {
-    label: "relay.startBroker",
-    command: "mobile_relay_start_broker",
-    args: { args: { hostId: "host-1", port: 8787, quickTunnel: true } },
-    call: (backend) => backend.relay.startBroker({ hostId: "host-1", port: 8787, quickTunnel: true }),
-  },
-  {
-    label: "relay.stop",
-    command: "mobile_relay_stop",
-    args: undefined,
-    call: (backend) => backend.relay.stop(),
   },
   {
     label: "relay.v2Deployment.status",

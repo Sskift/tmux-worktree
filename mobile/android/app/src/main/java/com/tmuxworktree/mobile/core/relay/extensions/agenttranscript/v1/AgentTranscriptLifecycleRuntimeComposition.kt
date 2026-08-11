@@ -309,6 +309,18 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
             onDurablePresentationCommit()
         }
         val postCommitEffects = consumption.postCommitEffects()
+        val postCommitNamespace = if (postCommitEffects.isEmpty()) {
+            namespace
+        } else {
+            durableRepository.load(consumer)?.namespace
+                ?.takeIf { it.consumer == consumer }
+                ?: return AgentTranscriptLifecycleRuntimeCompositionResult
+                    .DurableNamespaceUnavailable
+        }
+        val postCommitFence = fence.copy(
+            expectedNamespace = postCommitNamespace,
+            requestAdmission = null,
+        )
         val notificationResults = mutableListOf<AgentTranscriptLifecycleNotificationDispatchResult>()
         val requestSyncResults = mutableListOf<AgentTranscriptLifecycleRequestSyncResult>()
         postCommitEffects.forEach { postCommitEffect ->
@@ -317,14 +329,14 @@ internal class AgentTranscriptLifecycleRuntimeComposition(
                     notificationResults += notificationDispatch.dispatch(
                         AgentTranscriptLifecycleNotificationDispatchRequest(
                             authority = effect.repositoryAuthority,
-                            expectedNamespace = namespace,
+                            expectedNamespace = postCommitNamespace,
                             intent = postCommitEffect.intent,
                         ),
                     )
                 }
                 else -> requestSync?.let { coordinator ->
                     requestSyncResults += coordinator.dispatchPostCommitEffect(
-                        fence,
+                        postCommitFence,
                         postCommitEffect,
                     )
                 }

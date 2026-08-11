@@ -13,8 +13,8 @@ android {
         applicationId = "com.tmuxworktree.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 20005
-        versionName = "1.0.8"
+        versionCode = 20008
+        versionName = "1.0.11"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -38,9 +38,6 @@ android {
     }
 
     sourceSets {
-        getByName("test").resources.directories.add(
-            rootProject.file("../../contracts/relay/v1").absolutePath,
-        )
         getByName("test").resources.directories.add(
             rootProject.file("../../contracts/relay").absolutePath,
         )
@@ -114,6 +111,7 @@ dependencies {
     implementation("androidx.webkit:webkit:1.16.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.commonmark:commonmark:0.29.0")
     // The bundled ML Kit artifact keeps QR recognition available immediately
     // after APK install. Do not replace this with a Play services scanner/model,
     // which would reintroduce an optional runtime module download.

@@ -157,7 +157,6 @@ test("query transport invokes only structured no-shell canonical read entrypoint
   assert.deepEqual(runner.calls[1], {
     executable: "/usr/bin/ssh",
     argv: [
-      "-F", "/dev/null",
       "-o", "BatchMode=yes",
       "-o", "PasswordAuthentication=no",
       "-o", "KbdInteractiveAuthentication=no",
@@ -206,7 +205,7 @@ test("query transport invokes only structured no-shell canonical read entrypoint
     }),
     /invalid canonical remote tw executable/,
   );
-  for (const missing of ["knownHostsFile", "user", "port", "identityFile", "twExecutable"]) {
+  for (const missing of ["knownHostsFile"]) {
     const incomplete = { ...sshTarget() };
     delete incomplete[missing];
     assert.throws(
@@ -371,7 +370,7 @@ test("default-off config factory derives only local plus explicit Hosts and reti
   assert.equal(oldKills, 1);
 });
 
-test("config factory rejects incomplete Host provenance before any process spawn", () => {
+test("config factory accepts SSH aliases and rejects malformed Host provenance before spawn", async () => {
   const validHost = {
     id: "configured",
     host: "configured.example.com",
@@ -380,8 +379,36 @@ test("config factory rejects incomplete Host provenance before any process spawn
     identityFile: "/configured/ssh/id_ed25519",
     twPath: "/opt/tw/bin/tw",
   };
-  const runner = fakeRunner(() => assert.fail("invalid config must not spawn"));
-  for (const missing of ["user", "port", "identityFile", "twPath"]) {
+  const runner = fakeRunner((request) => (
+    request.argv.at(-1) === "capabilities"
+      ? jsonProcess(capabilities())
+      : jsonProcess({ protocolVersion: 2, sessions: [] })
+  ));
+  const aliasFoundation = createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
+    configLoader: () => ({ hosts: [{ id: "devbox", host: "devbox" }] }),
+    localTarget: localTarget(),
+    knownHostsFile: "/configured/ssh/known_hosts",
+    sshExecutable: "/usr/bin/ssh",
+    runner,
+  });
+  const aliasScan = await aliasFoundation.discovery.scan({
+    signal: new AbortController().signal,
+    fresh: true,
+  });
+  assert.equal(aliasScan.coverage, "complete");
+  const aliasCall = runner.calls.find((call) => call.argv.includes("devbox"));
+  assert.ok(aliasCall);
+  assert.equal(aliasCall.argv.includes("-F"), false);
+  assert.equal(aliasCall.argv.includes("-i"), false);
+  assert.equal(aliasCall.argv.includes("-p"), false);
+  assert.equal(aliasCall.argv.includes("-l"), false);
+  assert.deepEqual(
+    aliasCall.argv.slice(-5),
+    ["--", "devbox", "tw", "rpc-v2", "capabilities"],
+  );
+  await aliasFoundation.closeAndDrain();
+
+  for (const missing of ["id", "host"]) {
     const host = { ...validHost };
     delete host[missing];
     assert.throws(
@@ -392,7 +419,7 @@ test("config factory rejects incomplete Host provenance before any process spawn
         sshExecutable: "/usr/bin/ssh",
         runner,
       }),
-      /lacks explicit/,
+      /lacks an explicit identity and target/,
       missing,
     );
   }
@@ -415,7 +442,7 @@ test("config factory rejects incomplete Host provenance before any process spawn
     }),
     /absolute paths/,
   );
-  assert.equal(runner.calls.length, 0);
+  assert.equal(runner.calls.length, 4);
 });
 
 test("query transport accepts exactly one bounded strict UTF-8 JSON object", async (t) => {
@@ -743,7 +770,6 @@ test("structured mutation process lane invokes only the exact configured target 
   assert.deepEqual(runner.calls[1], {
     executable: "/usr/bin/ssh",
     argv: [
-      "-F", "/dev/null",
       "-o", "BatchMode=yes",
       "-o", "PasswordAuthentication=no",
       "-o", "KbdInteractiveAuthentication=no",

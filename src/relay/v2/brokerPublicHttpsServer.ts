@@ -258,7 +258,7 @@ export async function startRelayV2BrokerPublicHttpsServerLifecycle(
       return;
     }
     try {
-      if (!runtime.admitUpgrade(request, socket, head, target, null)) {
+      if (!runtime.admitUpgrade(request, socket, head, target)) {
         rejectUpgrade(socket, 503);
       }
     } catch {

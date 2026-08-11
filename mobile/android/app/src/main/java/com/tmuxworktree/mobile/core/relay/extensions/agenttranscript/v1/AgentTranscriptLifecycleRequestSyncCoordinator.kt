@@ -313,6 +313,12 @@ internal class AgentTranscriptLifecycleRequestSyncCoordinator(
     ): AgentTranscriptLifecycleRequestSyncResult {
         val token = requestToken()
         val applied = applyLease.withEffectApplyLease(context.authority) {
+            durableRepository.applyControlUnderApplyLease(
+                AgentTranscriptLifecycleDurableControlCommand(
+                    context.durableOperationFence(),
+                    AgentTranscriptLifecycleClientInput.ExtensionNegotiated,
+                ),
+            )
             durableRepository.prepareRequestUnderApplyLease(
                 AgentTranscriptLifecycleDurablePrepareRequestCommand.Status(
                     context.durableOperationFence(),

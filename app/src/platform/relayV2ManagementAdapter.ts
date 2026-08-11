@@ -18,11 +18,7 @@ const COMMAND = "mobile_relay_v2_management_call";
 const SHOW_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
 const COPY_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_copy";
 const INLINE_PNG_COMMAND = "mobile_relay_v2_enrollment_artifact_inline_png";
-const DEFAULT_OFF_REASON = "Relay v2 management is unavailable (default off).";
-const REQUEST_ID_PATTERNS = {
-  1: /^dmgmt1\.[A-Za-z0-9_-]{21}[AQgw]$/,
-  2: /^dmgmt2\.[A-Za-z0-9_-]{21}[AQgw]$/,
-} as const;
+const REQUEST_ID_PATTERN = /^dmgmt2\.[A-Za-z0-9_-]{21}[AQgw]$/;
 const NATIVE_QR_HANDLE_PATTERN = /^dqart1\.[A-Za-z0-9_-]{32}$/;
 
 const MANAGEMENT_ERRORS = {
@@ -167,47 +163,6 @@ function parseManagementError(value: unknown): ManagementErrorCode | null {
     ) return code;
   }
   return null;
-}
-
-function defaultOffDashboardState(): MobileRelayV2DashboardState {
-  return {
-    authority: { kind: "unavailable", reason: DEFAULT_OFF_REASON },
-    v1Profile: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured: false,
-    },
-    hostCredential: {
-      protocolVersion: 2,
-      credentialKind: "twcap2_grant",
-      status: "missing",
-      credentialReference: null,
-      expiresAtMs: null,
-      error: null,
-      retryable: null,
-    },
-    connector: {
-      status: "stopped",
-      acknowledgement: null,
-      hostId: null,
-      connectorId: null,
-      negotiatedCapabilityIntersection: [],
-      exitCode: null,
-      error: null,
-      retryable: null,
-    },
-    enrollment: { status: "idle" },
-    knownClientGrant: { status: "unknown" },
-  };
-}
-
-function parseDefaultOffStatus(value: unknown): boolean {
-  const input = exactObject(value, ["availability", "capabilities", "reason"]);
-  return !!input
-    && input.availability === "unavailable"
-    && Array.isArray(input.capabilities)
-    && input.capabilities.length === 0
-    && input.reason === "default_off";
 }
 
 function parseHostCredential(value: unknown): MobileRelayV2DashboardState["hostCredential"] | null {
@@ -497,6 +452,37 @@ function parseKnownClientGrant(
   return null;
 }
 
+function parseConnectedMobileDevices(
+  value: unknown,
+): MobileRelayV2DashboardState["connectedMobileDevices"] | null {
+  if (!Array.isArray(value) || value.length > 256) return null;
+  const grantIds = new Set<string>();
+  const devices: MobileRelayV2DashboardState["connectedMobileDevices"][number][] = [];
+  for (const candidate of value) {
+    const input = exactObject(candidate, [
+      "status", "grantId", "clientInstanceId", "connectionCount",
+    ]);
+    const grantId = projectionOpaque(input?.grantId);
+    const clientInstanceId = projectionOpaque(input?.clientInstanceId);
+    if (!input
+      || input.status !== "connected"
+      || !grantId
+      || !clientInstanceId
+      || !Number.isSafeInteger(input.connectionCount)
+      || (input.connectionCount as number) <= 0
+      || (input.connectionCount as number) > 256
+      || grantIds.has(grantId)) return null;
+    grantIds.add(grantId);
+    devices.push({
+      status: "connected",
+      grantId,
+      clientInstanceId,
+      connectionCount: input.connectionCount as number,
+    });
+  }
+  return devices;
+}
+
 function parseV2Projection(value: unknown): MobileRelayV2DashboardState | null {
   const input = exactObject(value, [
     "authority",
@@ -504,6 +490,7 @@ function parseV2Projection(value: unknown): MobileRelayV2DashboardState | null {
     "connector",
     "enrollment",
     "knownClientGrant",
+    "connectedMobileDevices",
   ]);
   const authority = exactObject(input?.authority, ["kind", "reason"]);
   if (!input || !authority || authority.kind !== "node" || authority.reason !== null) return null;
@@ -511,7 +498,12 @@ function parseV2Projection(value: unknown): MobileRelayV2DashboardState | null {
   const connector = parseConnector(input.connector);
   const enrollment = parseEnrollment(input.enrollment);
   const knownClientGrant = parseKnownClientGrant(input.knownClientGrant);
-  if (!hostCredential || !connector || !enrollment || !knownClientGrant) return null;
+  const connectedMobileDevices = parseConnectedMobileDevices(input.connectedMobileDevices);
+  if (!hostCredential
+    || !connector
+    || !enrollment
+    || !knownClientGrant
+    || !connectedMobileDevices) return null;
   if (connector.status === "registered" && hostCredential.status !== "ready") return null;
   if (enrollment.status === "active") {
     if (
@@ -521,41 +513,22 @@ function parseV2Projection(value: unknown): MobileRelayV2DashboardState | null {
   }
   const normalized = normalizeMobileRelayV2DashboardState({
     authority: { kind: "node", reason: null },
-    v1Profile: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured: false,
-    },
     hostCredential,
     connector,
     enrollment,
     knownClientGrant,
+    connectedMobileDevices,
   });
   return normalized.authority.kind === "node" ? normalized : null;
 }
 
 function decodeOutcome(value: unknown, operation: ManagementOperation): DecodedOutcome | null {
   const input = exactObject(value, ["protocolVersion", "requestId", "ok", "result", "error"]);
-  if (!input || (input.protocolVersion !== 1 && input.protocolVersion !== 2)) return null;
-  const protocolVersion = input.protocolVersion;
+  if (!input || input.protocolVersion !== 2) return null;
   if (
     typeof input.requestId !== "string"
-    || !REQUEST_ID_PATTERNS[protocolVersion].test(input.requestId)
+    || !REQUEST_ID_PATTERN.test(input.requestId)
   ) return null;
-
-  if (protocolVersion === 1) {
-    if (
-      operation === "status"
-      && input.ok === true
-      && parseDefaultOffStatus(input.result)
-      && input.error === null
-    ) return { kind: "state", state: defaultOffDashboardState() };
-    if (input.ok !== false || input.result !== null) return null;
-    const code = parseManagementError(input.error);
-    return code && (code === "UNAVAILABLE" || code === "CHANNEL_CLOSED" || code === "SUPERSEDED")
-      ? { kind: "error", code }
-      : null;
-  }
 
   if (input.ok === true && input.error === null) {
     const state = parseV2Projection(input.result);

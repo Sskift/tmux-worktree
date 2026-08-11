@@ -1,9 +1,9 @@
 import { parseRelayServerOptions } from "./relay/broker/options.js";
-import {
-  startRelayBroker as startRelayBrokerRuntime,
-  type RelayBrokerServerHandle,
-  type RelayV2BrokerServerComposition,
-} from "./relay/broker/server.js";
+import type {
+  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+  RelayV2BrokerServerComposition,
+  RelayV2BrokerServerCredentialAuthority,
+} from "./relay/v2/brokerServerRuntime.js";
 import {
   startRelayV2BrokerPublicHttpsServerLifecycle,
   type RelayV2BrokerPublicHttpsListenOptions,
@@ -14,11 +14,10 @@ import type { RelayServerOptions } from "./relay/broker/options.js";
 import { createRelayV2HostBootstrapOutputSink } from "./relay/broker/hostBootstrapOutput.js";
 
 export type {
-  RelayBrokerServerHandle,
   RelayV2BrokerServerAgentCapabilityReadinessReceipt,
   RelayV2BrokerServerComposition,
   RelayV2BrokerServerCredentialAuthority,
-} from "./relay/broker/server.js";
+} from "./relay/v2/brokerServerRuntime.js";
 export type {
   RelayV2BrokerPublicHttpsListenOptions,
   RelayV2BrokerPublicHttpsServerHandle,
@@ -30,18 +29,6 @@ export type {
   RelayV2BrokerShippingProfile,
   RelayV2BrokerShippingRootHandle,
 } from "./relay/v2/brokerShippingRoot.js";
-
-/** Explicit opt-in wrapper; the CLI calls it without a v2 composition. */
-export async function startRelayBroker(
-  options: RelayServerOptions,
-  relayV2Composition?: RelayV2BrokerServerComposition,
-): Promise<RelayBrokerServerHandle> {
-  const relayV2 = relayV2Composition === undefined
-    ? undefined
-    : await (await import("./relay/v2/brokerServerRuntime.js"))
-        .createActivatedRelayV2BrokerServerRuntime(relayV2Composition);
-  return startRelayBrokerRuntime(options, relayV2);
-}
 
 /**
  * Explicit default-off Relay v2 public transport root. The caller supplies an
@@ -66,7 +53,7 @@ export async function startRelayV2BrokerPublicHttpsServer(
  * deployment-provided privileged inputs are validated and all durable
  * authorities are opened before any listener binds; without injectable
  * deployment inputs the CLI has no trusted resolver/E0 channel and this fails
- * closed — it never falls back to Relay v1.
+ * closed.
  */
 export async function startRelayV2BrokerShippingRoot(
   profile: unknown,
@@ -94,7 +81,7 @@ export async function startRelayV2BrokerShippingFromProfileFile(
 export async function startRelayV2BrokerShippingFromTrustedDeployment(
   profilePath: string,
   agentTranscriptLifecycleReadiness?:
-    import("./relay/broker/server.js").RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt,
 ): Promise<import("./relay/v2/brokerShippingRoot.js").RelayV2BrokerShippingRootHandle> {
   return (await import("./relay/v2/brokerShippingDeploymentSource.js"))
     .startRelayV2BrokerShippingFromTrustedDeployment(
@@ -131,15 +118,8 @@ export async function startRelayV2BrokerSingleNodeSelfHosted(
     .startRelayV2BrokerSingleNodeSelfHosted(options, signal);
 }
 
-function createSelfHostedAgentTranscriptLifecycleReadiness():
-  import("./relay/broker/server.js").RelayV2BrokerServerAgentCapabilityReadinessReceipt {
-  const cancel = Object.freeze((): void => {});
-  const subscribeLoss = Object.freeze((_onLoss: () => void): (() => void) => cancel);
-  return Object.freeze({ status: "ready" as const, subscribeLoss });
-}
-
-function createSelfHostedAgentChatReadiness():
-  import("./relay/broker/server.js").RelayV2BrokerServerAgentCapabilityReadinessReceipt {
+function createSelfHostedOptionalCapabilityReadiness():
+  RelayV2BrokerServerAgentCapabilityReadinessReceipt {
   const cancel = Object.freeze((): void => {});
   const subscribeLoss = Object.freeze((_onLoss: () => void): (() => void) => cancel);
   return Object.freeze({ status: "ready" as const, subscribeLoss });
@@ -211,13 +191,19 @@ async function runRelayV2BrokerSingleNodeSelfHostedCli(
         ...(options.v2AgentTranscriptLifecycleV1 === true
           ? {
               agentTranscriptLifecycleReadiness:
-                createSelfHostedAgentTranscriptLifecycleReadiness(),
+                createSelfHostedOptionalCapabilityReadiness(),
             }
           : {}),
-        ...(options.v2AgentChatV1 === true
+        ...(options.v2AgentChatV2 === true
           ? {
               agentChatReadiness:
-                createSelfHostedAgentChatReadiness(),
+                createSelfHostedOptionalCapabilityReadiness(),
+            }
+          : {}),
+        ...(options.v2LarkBindingsV2 === true
+          ? {
+              larkBindingsReadiness:
+                createSelfHostedOptionalCapabilityReadiness(),
             }
           : {}),
       }, signalLatch.signal);
@@ -270,7 +256,6 @@ async function runRelayV2BrokerSingleNodeSelfHostedCli(
   }
 }
 
-/** Stable CLI/tsup facade for the Relay v1 broker implementation. */
 export async function run(): Promise<void> {
   const options = parseRelayServerOptions(process.argv.slice(3));
   if (options.v2LocalDevelopment === true) {
@@ -303,7 +288,7 @@ export async function run(): Promise<void> {
     // 下固定 namespace（.tmux-worktree/relay-v2-broker-deployment/）按 identifier
     // 映射的 fd-bound regular-file/no-symlink、owner、exact 0600/0700、bounded
     // 私有文件；任何 profile/reference/ownership/TLS/E0/keyring/native 失败仍在
-    // 任何监听前 fail closed，绝不回退 v1；qualifiedRecords=[] 与 NO-GO 不变。
+    // 任何监听前 fail closed；qualifiedRecords=[] 与 NO-GO 不变。
     const bootstrapSink = options.v2HostBootstrapOutputPath === undefined
       ? undefined
       : createRelayV2HostBootstrapOutputSink(options.v2HostBootstrapOutputPath);
@@ -318,5 +303,5 @@ export async function run(): Promise<void> {
     }
     return;
   }
-  await startRelayBroker(options);
+  throw new Error("relay-server requires an explicit Relay v2 lane");
 }

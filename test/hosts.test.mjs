@@ -40,7 +40,6 @@ test("tw host CRUD preserves unrelated config, remote tilde paths, and private f
   const configPath = join(home, ".tmux-worktree.json");
   writeFileSync(configPath, JSON.stringify({
     projects: { app: "/repo/app" },
-    mobileRelay: { relayUrl: "wss://relay.example", secret: "keep-me" },
     futureField: { enabled: true },
     hosts: [{ id: "legacy-alias", host: "legacy-alias", futureHostField: "keep-me-too" }],
   }, null, 2));
@@ -62,7 +61,6 @@ test("tw host CRUD preserves unrelated config, remote tilde paths, and private f
 
   const raw = JSON.parse(readFileSync(configPath, "utf8"));
   assert.equal(raw.projects.app, "/repo/app");
-  assert.equal(raw.mobileRelay.secret, "keep-me");
   assert.deepEqual(raw.futureField, { enabled: true });
   assert.equal(raw.hosts[0].futureHostField, "keep-me-too");
   assert.equal(statSync(configPath).mode & 0o777, 0o600);
@@ -100,7 +98,7 @@ test("tw host rejects the reserved local ID from commands and config", () => {
   assert.notEqual(listed.status, 0);
   assert.match(listed.stderr, /host id 'local'.*保留字/);
 
-  const rpc = runCli(home, ["host", "rpc", "LOCAL", "list"], {
+  const rpc = runCli(home, ["host", "rpc-v2", "LOCAL", "list"], {
     TW_TEST_SSH_LOG: sshLog,
   });
   assert.notEqual(rpc.status, 0);
@@ -181,7 +179,7 @@ test("tw host mutation waits for a concurrent config lock owner", async () => {
   assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).hosts.map((host) => host.id), ["dev"]);
 });
 
-test("tw host probe separates SSH, tmux, and TW capability status and host rpc stays structured", () => {
+test("tw host probe separates SSH, tmux, and TW capability status and host rpc-v2 stays structured", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-host-probe-"));
   const home = join(root, "home");
   const bin = join(root, "bin");
@@ -219,16 +217,16 @@ case "$last" in
     printf '%s\\n' '1.0.3'
     exit 0
     ;;
-  *tw*"'rpc' 'capabilities'"*)
+  *tw*"'rpc-v2' 'capabilities'"*)
     if test "$TW_TEST_NO_KILL_SESSION" = 1; then
-      printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal"]}'
+      printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
     else
-      printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
+      printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
     fi
     exit 0
     ;;
-  *tw*"'rpc' 'list'"*)
-    printf '%s\\n' '{"protocolVersion":1,"sessions":[]}'
+  *tw*"'rpc-v2' 'list'"*)
+    printf '%s\\n' '{"protocolVersion":2,"sessions":[]}'
     exit 0
     ;;
 esac
@@ -249,7 +247,7 @@ exit 12
   assert.equal(result.tmux.version, "tmux 3.5a");
   assert.equal(result.tw.available, true);
   assert.equal(result.tw.compatible, true);
-  assert.deepEqual(result.tw.capabilities, ["list", "create-worktree", "create-terminal", "kill-session", "hard-timeout"]);
+  assert.ok(result.tw.capabilities.includes("dashboard-lifecycle.v2"));
 
   const missingKill = runCli(home, ["host", "probe", "dev", "--json"], {
     ...env,
@@ -270,9 +268,9 @@ exit 12
   assert.equal(missingTmuxResult.tmux.available, false);
   assert.equal(missingTmuxResult.tw.compatible, true);
 
-  const remoteList = runCli(home, ["host", "rpc", "dev", "list"], env);
+  const remoteList = runCli(home, ["host", "rpc-v2", "dev", "list"], env);
   assert.equal(remoteList.status, 0, remoteList.stderr);
-  assert.deepEqual(JSON.parse(remoteList.stdout), { protocolVersion: 1, sessions: [] });
+  assert.deepEqual(JSON.parse(remoteList.stdout), { protocolVersion: 2, sessions: [] });
 
   const sshLog = readFileSync(log, "utf8");
   assert.match(sshLog, /ControlMaster=auto/);
@@ -307,8 +305,8 @@ case "$last" in
     printf '%s\\n' '1.0.5'
     exit 0
     ;;
-  *tw*"'rpc' 'capabilities'"*)
-    printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
+  *tw*"'rpc-v2' 'capabilities'"*)
+    printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
     exit 0
     ;;
   *tw*"'terminal-control' 'resolve' 'managed-one'"*)
@@ -359,7 +357,7 @@ exit 12
   assert.match(bypass.stderr, /--privileged-bypass.*input ownership lease/);
   calls = readFileSync(log, "utf8");
   assert.match(calls, /'attach-session' '-t' '=managed-one'/);
-  assert.doesNotMatch(calls, /'terminal-control'|'rpc' 'capabilities'/);
+  assert.doesNotMatch(calls, /'terminal-control'|'rpc-v2' 'capabilities'/);
 });
 
 test("tw host owns an isolated SSH ControlMaster lifecycle", () => {

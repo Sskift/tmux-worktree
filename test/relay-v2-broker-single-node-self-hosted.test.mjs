@@ -178,7 +178,7 @@ function waitForChildExit(child) {
   });
 }
 
-test("self-hosted CLI is explicit and never consumes a v1 secret", () => {
+test("self-hosted CLI requires the complete explicit v2 profile", () => {
   const missingHost = spawnSync(process.execPath, [
     path.resolve("dist/cli.cjs"),
     "relay-server",
@@ -187,22 +187,20 @@ test("self-hosted CLI is explicit and never consumes a v1 secret", () => {
     encoding: "utf8",
     env: {
       ...process.env,
-      TW_RELAY_SECRET: "v1-secret-that-must-not-be-used",
+      TW_FORBIDDEN_SECRET: "forbidden-secret-that-must-not-be-used",
     },
   });
   assert.equal(missingHost.status, 1);
   assert.equal(missingHost.stdout, "");
   assert.match(missingHost.stderr, /需要显式 --host/);
   assert.equal(
-    missingHost.stderr.includes("v1-secret-that-must-not-be-used"),
+    missingHost.stderr.includes("forbidden-secret-that-must-not-be-used"),
     false,
   );
 
   const accidentalStateDirectory = spawnSync(process.execPath, [
     path.resolve("dist/cli.cjs"),
     "relay-server",
-    "--secret",
-    "v1-secret",
     "--v2-self-hosted-state-dir",
     "/not/read",
   ], { encoding: "utf8" });
@@ -228,11 +226,12 @@ test("Agent routing CLI opt-in is exact and self-hosted-only", () => {
   const enabled = relayServerOptions.parseRelayServerOptions([
     ...base,
     "--v2-agent-transcript-lifecycle-v1",
+    "--v2-lark-bindings-v2",
   ]);
   assert.equal(enabled.v2AgentTranscriptLifecycleV1, true);
+  assert.equal(enabled.v2LarkBindingsV2, true);
 
   for (const invalid of [
-    ["--secret", "v1-secret", "--v2-agent-transcript-lifecycle-v1"],
     ["--v2-profile", "/not/read", "--v2-agent-transcript-lifecycle-v1"],
     ["--v2-local-dev", "--v2-agent-transcript-lifecycle-v1"],
   ]) {
@@ -287,18 +286,18 @@ test("self-hosted bootstrap correlation is a strict output-paired hidden seam", 
     /有效的非敏感 attempt identifier/,
   );
 
-  const v1Correlation = spawnSync(process.execPath, [
+  const unaffiliatedCorrelation = spawnSync(process.execPath, [
     path.resolve("dist/cli.cjs"),
     "relay-server",
     "--v2-self-hosted-bootstrap-correlation",
-    "not-a-v1-secret",
+    "private-correlation-marker",
   ], { encoding: "utf8" });
-  assert.equal(v1Correlation.status, 1);
+  assert.equal(unaffiliatedCorrelation.status, 1);
   assert.match(
-    v1Correlation.stderr,
+    unaffiliatedCorrelation.stderr,
     /只适用于 --v2-single-node-self-hosted/,
   );
-  assert.equal(v1Correlation.stderr.includes("not-a-v1-secret"), false);
+  assert.equal(unaffiliatedCorrelation.stderr.includes("private-correlation-marker"), false);
 });
 
 test("single-node SQLite owner preserves Host and Android credentials across restart", {

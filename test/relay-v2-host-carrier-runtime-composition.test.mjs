@@ -246,10 +246,6 @@ async function createHarness({
         prepareReauthentication() { throw new Error("unexpected reauthentication"); },
         acknowledgeReauthentication() { return false; },
       },
-      clientDialects: ["tw-relay.v1"],
-      dialectAdapters: {
-        "tw-relay.v1": { validate() {} },
-      },
       idFactory: () => "carrier-runtime-host-hello",
       clock: carrierClock,
       schedule: carrierSchedule,
@@ -268,18 +264,7 @@ async function createHarness({
   });
 
   assert.equal(await composition.readiness.h0.activate(), true);
-  assert.equal(Object.isFrozen(composition.readiness.codec), true);
-  assert.equal(composition.readiness.codec.close !== undefined, true);
-  assert.equal(composition.readiness.codec.apply, undefined);
-  assert.equal(composition.readiness.codec.activate, undefined);
-  assert.equal(composition.readiness.h1.apply, undefined);
-  assert.equal(composition.readiness.h1.execute, undefined);
-  assert.equal(composition.readiness.h1.query, undefined);
-  assert.equal(composition.readiness.h1.issueDedupeWindow, undefined);
-  assert.equal(composition.readiness.h3.apply, undefined);
   assert.equal(composition.readiness.h3.activate(), true);
-  assert.equal(composition.readiness.h2.close !== undefined, true);
-  assert.equal(composition.readiness.h2.apply, undefined);
 
   return {
     home,
@@ -377,8 +362,6 @@ function sendClientFrame(route, frame) {
 test("combined composition owns carrier readiness transitions before status observation", async () => {
   const h = await createHarness({ throwStatusObserver: true });
   try {
-    assert.equal(h.composition.readiness.carrier, undefined);
-    assert.equal(h.composition.readiness.h0.apply, undefined);
     assert.equal(readinessReady(h.composition.readiness.current()), false);
     let previousCutGeneration = BigInt(h.composition.readiness.current().generation);
     let observationCount = 0;

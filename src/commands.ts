@@ -21,7 +21,6 @@ import {
   type WorktreeEntry,
 } from "./tmux";
 import { defaultWorktreeBase, loadConfigFile, type Config } from "./config";
-import { buildRpcKillSessionResponse } from "./rpc";
 import { runControlledAttach } from "./terminalControl/attach";
 import { requestTerminalControl } from "./terminalControl/client";
 import type { TerminalControlLease } from "./terminalControl/protocol";
@@ -254,15 +253,7 @@ export async function rmSessionCmd(args: string[]): Promise<void> {
   } else if (managedMatches.length > 1) {
     throw new CliError(`managed state 中存在重名 session，拒绝删除: ${name}`);
   } else {
-    try {
-      buildRpcKillSessionResponse({ name });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      if (!detail.startsWith("session is not TW-managed:")) throw error;
-      // Explicit legacy compatibility: sessions absent from valid managed state
-      // may still be closed, but mutation failures/corruption never authorize it.
-      exec(tmuxBin(), ["kill-session", "-t", `=${name}`]);
-    }
+    exec(tmuxBin(), ["kill-session", "-t", `=${name}`]);
   }
   console.log(C.green(`✓ 已杀掉 session ${name}`));
 

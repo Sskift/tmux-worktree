@@ -7,7 +7,6 @@ import {
 
 export function RelayV2EnrollmentPreviewPanel({
   state,
-  v1SharedSecretConfigured,
   onBootstrapHost,
   onRefreshHost,
   onStartConnector,
@@ -16,10 +15,8 @@ export function RelayV2EnrollmentPreviewPanel({
   onShowEnrollmentArtifact,
   onCopyEnrollmentArtifact,
   artifactNotice,
-  onRevokeKnownGrant,
 }: {
   state?: RelayV2EnrollmentState;
-  v1SharedSecretConfigured: boolean;
   onBootstrapHost?: () => void;
   onRefreshHost?: () => void;
   onStartConnector?: () => void;
@@ -31,17 +28,10 @@ export function RelayV2EnrollmentPreviewPanel({
     field: MobileRelayV2EnrollmentArtifactCopyField,
   ) => void;
   artifactNotice?: string | null;
-  onRevokeKnownGrant?: () => void;
 }) {
   if (!state) return null;
 
-  const view = deriveRelayV2EnrollmentView({
-    ...state,
-    v1Profile: {
-      ...state.v1Profile,
-      sharedSecretConfigured: v1SharedSecretConfigured,
-    },
-  });
+  const view = deriveRelayV2EnrollmentView(state);
 
   return (
     <div className="connections-relay-v2-preview" aria-label="Relay v2 enrollment preview">
@@ -53,7 +43,7 @@ export function RelayV2EnrollmentPreviewPanel({
           <div>
             <strong>{view.readinessLabel}</strong>
             <span>{view.readinessDetail}</span>
-            <span>{view.v1CredentialLabel}. {view.v2CredentialLabel}.</span>
+            <span>{view.v2CredentialLabel}.</span>
             {view.previewOnly && (
               <span>
                 Fake-backed preview only: no credential was issued or exchanged, and no phone
@@ -152,25 +142,6 @@ export function RelayV2EnrollmentPreviewPanel({
         {artifactNotice && (
           <div className="connections-notice connections-notice--pending" role="status">
             <span>{artifactNotice}</span>
-          </div>
-        )}
-        {(state.knownClientGrant.status === "active"
-          || state.knownClientGrant.status === "failed"
-          || state.knownClientGrant.status === "revoking") && (
-          <div className="connections-relay-v2-preview__review">
-            <div>
-              <strong>Known Android grant</strong>
-              <span>{state.knownClientGrant.grantId}</span>
-              <span>Status · {state.knownClientGrant.status}</span>
-            </div>
-            <button
-              type="button"
-              className="connections-button connections-button--danger"
-              disabled={view.grantRevokeDisabled}
-              onClick={onRevokeKnownGrant}
-            >
-              {view.grantRevokeLabel}
-            </button>
           </div>
         )}
       </div>

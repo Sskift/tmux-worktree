@@ -20,6 +20,7 @@ import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.HealthAndSafety
+import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.VpnKey
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -42,6 +43,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
@@ -54,15 +56,12 @@ import com.tmuxworktree.mobile.designsystem.TwSurface
 import com.tmuxworktree.mobile.designsystem.TwTextPrimary
 import com.tmuxworktree.mobile.designsystem.TwTextSecondary
 import com.tmuxworktree.mobile.feature.pairing.ManualRelayV2EnrollmentDialog
-import com.tmuxworktree.mobile.navigation.RootDestination
-import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 
 @Composable
 fun SettingsScreen(
     connectionStatus: ConnectionStatus,
     preferences: AppPreferences,
     pairedDeviceName: String,
-    attentionCount: Int,
     versionName: String,
     onHealthClick: () -> Unit,
     onPairedDeviceClick: () -> Unit,
@@ -70,10 +69,11 @@ fun SettingsScreen(
     onNotificationChanged: (NotificationKind, Boolean) -> Unit,
     onDarkThemeChanged: (Boolean) -> Unit,
     onCopyDiagnostics: () -> Unit,
-    onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
     notificationsAvailable: Boolean = true,
-    showBottomNavigation: Boolean = true,
+    larkBindingsSummary: String = "Unavailable",
+    onLarkBindingsClick: () -> Unit = {},
+    onMenuClick: (() -> Unit)? = null,
 ) {
     var showManualRelayV2Enrollment by remember { mutableStateOf(false) }
 
@@ -85,22 +85,14 @@ fun SettingsScreen(
                 title = "Settings",
                 connectionStatus = connectionStatus,
                 onConnectionStatusClick = {},
+                onMenuClick = onMenuClick,
                 showConnectionStatus = false,
             )
-        },
-        bottomBar = {
-            if (showBottomNavigation) {
-                TwRootBottomBar(
-                    selectedDestination = RootDestination.SETTINGS,
-                    attentionCount = attentionCount,
-                    onDestinationSelected = onBottomDestinationSelected,
-                )
-            }
         },
     ) { innerPadding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(innerPadding),
-            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
         ) {
             item("appearance_heading") { SectionHeading("Appearance") }
             item("appearance_group") {
@@ -149,11 +141,24 @@ fun SettingsScreen(
                 }
             }
 
+            item("integrations_heading") { SectionHeading("Integrations") }
+            item("integrations_group") {
+                SettingsGroup {
+                    NavigationSettingRow(
+                        title = "Lark bindings",
+                        subtitle = larkBindingsSummary,
+                        icon = { Icon(Icons.Outlined.Link, null, tint = TwAccent) },
+                        testTag = "settings_lark_bindings",
+                        onClick = onLarkBindingsClick,
+                    )
+                }
+            }
+
             item("notifications_heading") { SectionHeading("Notifications") }
             if (!notificationsAvailable) {
                 item("notifications_unavailable") {
                     Text(
-                        text = "Agent-state notifications require Relay v2 and are unavailable with the connected Relay v1.",
+                        text = "Agent-state notifications are unavailable because the Relay v2 Agent capability was not negotiated.",
                         color = TwTextSecondary,
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(bottom = 10.dp),
@@ -226,12 +231,12 @@ fun SettingsScreen(
 
 @Composable
 private fun SectionHeading(text: String) {
-    Spacer(Modifier.height(8.dp))
+    Spacer(Modifier.height(4.dp))
     Text(
         text = text,
         color = TwTextSecondary,
         style = MaterialTheme.typography.labelLarge,
-        modifier = Modifier.padding(bottom = 10.dp).semantics { heading() },
+        modifier = Modifier.padding(bottom = 6.dp).semantics { heading() },
     )
 }
 
@@ -261,14 +266,22 @@ private fun NavigationSettingRow(
                 role = Role.Button
                 contentDescription = "$title. $subtitle"
             }
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         icon()
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(title, color = TwTextPrimary, style = MaterialTheme.typography.bodyLarge)
-            if (subtitle.isNotBlank()) Text(subtitle, color = TwTextSecondary, style = MaterialTheme.typography.bodyMedium)
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    color = TwTextSecondary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         if (showChevron) Icon(Icons.Outlined.ChevronRight, null, tint = TwTextSecondary, modifier = Modifier.size(22.dp))
     }

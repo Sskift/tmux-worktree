@@ -18,6 +18,7 @@ import {
   normalizeConfig,
   type HostConfig,
 } from "./config";
+import { RPC_V2_CAPABILITIES } from "./rpcV2";
 import { CliError } from "./tmux";
 
 const CONFIG_LOCK_PATH = `${CONFIG_PATH}.lock`;
@@ -440,7 +441,7 @@ export function probeHost(host: HostConfig): HostProbeResult {
   const tmux = runRemoteCommand(host, remoteTmuxCommand(host, ["-V"]));
   const twVersion = runRemoteCommand(host, remoteTwCommand(host, ["version"]));
   const twCapabilities = twVersion.ok
-    ? runRemoteCommand(host, remoteTwCommand(host, ["rpc", "capabilities"]))
+    ? runRemoteCommand(host, remoteTwCommand(host, ["rpc-v2", "capabilities"]))
     : undefined;
   let capabilities: string[] = [];
   let protocolVersion: number | undefined;
@@ -453,17 +454,13 @@ export function probeHost(host: HostConfig): HostProbeResult {
         ? parsed.capabilities.filter((value): value is string => typeof value === "string")
         : [];
     } catch (error) {
-      capabilityError = `invalid tw rpc capabilities: ${error instanceof Error ? error.message : String(error)}`;
+      capabilityError = `invalid tw rpc-v2 capabilities: ${error instanceof Error ? error.message : String(error)}`;
     }
   } else if (twCapabilities) {
     capabilityError = resultError(twCapabilities);
   }
-  const compatible = protocolVersion === 1
-    && capabilities.includes("list")
-    && capabilities.includes("create-worktree")
-    && capabilities.includes("create-terminal")
-    && capabilities.includes("kill-session")
-    && capabilities.includes("hard-timeout");
+  const compatible = protocolVersion === 2
+    && RPC_V2_CAPABILITIES.every((capability) => capabilities.includes(capability));
   if (!capabilityError && !compatible && twVersion.ok) {
     capabilityError = "remote tw is missing a required RPC capability";
   }
@@ -682,12 +679,12 @@ export async function hostCmd(args: string[]): Promise<void> {
       printConnection(host, sub === "disconnect" ? "disconnected" : "connected", json);
       return;
     }
-    case "rpc": {
+    case "rpc-v2": {
       const id = rest[0];
-      if (!id || rest.length < 2) throw new CliError("用法: tw host rpc <id> <rpc-command> [args...]");
+      if (!id || rest.length < 2) throw new CliError("用法: tw host rpc-v2 <id> <rpc-command> [args...]");
       const host = findHost(id);
-      const result = runRemoteCommand(host, remoteTwCommand(host, ["rpc", ...rest.slice(1)]), 120_000);
-      if (!result.ok) throw new CliError(`remote tw rpc 失败: ${resultError(result)}`);
+      const result = runRemoteCommand(host, remoteTwCommand(host, ["rpc-v2", ...rest.slice(1)]), 120_000);
+      if (!result.ok) throw new CliError(`remote tw rpc-v2 失败: ${resultError(result)}`);
       console.log(result.stdout);
       return;
     }

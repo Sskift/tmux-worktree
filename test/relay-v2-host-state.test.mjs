@@ -489,7 +489,7 @@ test("commit faults expose either the previous cut or the complete associated cu
   });
 });
 
-test("terminal durable lineage admits exact reset resume identity without a requested offset", async () => {
+test("terminal durable lineage admits exact reset resume identity with a refreshed proof", async () => {
   const h = harness();
   try {
     const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
@@ -510,13 +510,22 @@ test("terminal durable lineage admits exact reset resume identity without a requ
     assert.equal(winner.status, "claimed");
     assert.equal(winner.streamAuthority.status, "live");
     assert.equal(winner.streamAuthority.generation, opened.generation);
+    const replacementBinding = canonicalBinding(TERMINAL_TARGET, 0, {
+      exactControlIdentity: {
+        ...canonicalBinding().exactControlIdentity,
+        targetIncarnationProof: "host-state-refreshed-target-incarnation-proof",
+      },
+    });
     assert.equal((await authority.prepareOpen({
       key: reset.key,
       fingerprint: reset.fingerprint,
       hostInstanceId: store.hostInstanceId,
       claimToken: winner.claimToken,
       fence: winner.fence,
-      preparation: { kind: "current", resolution: terminalResolution() },
+      preparation: {
+        kind: "current",
+        resolution: terminalResolution(TERMINAL_TARGET, 0, replacementBinding),
+      },
     })).status, "prepared");
     const outcome = {
       kind: "opened",
@@ -541,6 +550,7 @@ test("terminal durable lineage admits exact reset resume identity without a requ
     assert.equal(Object.hasOwn(record, "resumeToken"), false);
     assert.equal(record.requestedOffset, null);
     assert.equal(record.streamAuthority.requestedOffset, null);
+    assert.deepEqual(record.preparedBinding, replacementBinding);
   } finally {
     h.cleanup();
   }

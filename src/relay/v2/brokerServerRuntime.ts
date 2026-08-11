@@ -24,19 +24,49 @@ import {
 import type { RelayV2BrokerCredentialStateStoreNativeLoader } from "./brokerCredentialStateStoreLoader.js";
 import {
   RELAY_V2_REQUIRED_CAPABILITIES,
+  type RelayV2BrokerAuthControlAuthority,
+  type RelayV2LiveAuthorizationFencePort,
   type RelayV2BrokerOptionalCapabilityReadinessPort,
 } from "./brokerCore.js";
+import type {
+  RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort,
+} from "./brokerCredentialNodeHttpAdapter.js";
+import type {
+  RelayV2BrokerTransportCloseDeadlineScheduler,
+} from "./brokerTransportCloseCoordinator.js";
 import {
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
 } from "../extensions/agentTranscriptLifecycle/v1/codec.js";
 import {
   RELAY_AGENT_CHAT_CAPABILITY,
-} from "../extensions/agentChat/v1/codec.js";
-import type {
-  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
-  RelayV2BrokerServerComposition,
-  RelayV2BrokerServerCredentialAuthority,
-} from "../broker/server.js";
+} from "../extensions/agentChat/v2/codec.js";
+import {
+  RELAY_LARK_BINDINGS_CAPABILITY,
+} from "../extensions/larkBindings/v2/codec.js";
+
+export interface RelayV2BrokerServerCredentialAuthority
+  extends RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort,
+  RelayV2BrokerAuthControlAuthority {
+  readonly authorityContinuityReadiness: Readonly<{ status: string }>;
+  close(): Promise<void>;
+}
+
+export interface RelayV2BrokerServerAgentCapabilityReadinessReceipt {
+  readonly status: "ready";
+  subscribeLoss(onLoss: () => void): () => void;
+}
+
+export interface RelayV2BrokerServerComposition {
+  openCredentialAuthority(input: {
+    liveAuthorizationFence: RelayV2LiveAuthorizationFencePort;
+  }): Promise<RelayV2BrokerServerCredentialAuthority>;
+  resolveHttpSourceKey(socket: Socket): string;
+  closeDeadlineScheduler?: RelayV2BrokerTransportCloseDeadlineScheduler;
+  agentTranscriptLifecycleReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  agentChatReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  larkBindingsReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+}
 
 export interface RelayV2BrokerServerRuntimeV2 {
   handleHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void>;
@@ -45,7 +75,6 @@ export interface RelayV2BrokerServerRuntimeV2 {
     socket: Socket,
     head: Buffer,
     target: Readonly<{ pathname: string; search: string }>,
-    legacyQuerySecret: string | null,
   ): boolean;
   beginShutdown(): void;
   shutdown(): Promise<void>;
@@ -61,6 +90,7 @@ export interface RelayV2BrokerProductionCompositionBundle {
   readonly closeDeadlineScheduler?: RelayV2BrokerServerComposition["closeDeadlineScheduler"];
   readonly agentTranscriptLifecycleReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   readonly agentChatReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  readonly larkBindingsReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
 type CapturedProductionBundle = Readonly<{
@@ -73,6 +103,7 @@ type CapturedProductionBundle = Readonly<{
   closeDeadlineScheduler?: RelayV2BrokerServerComposition["closeDeadlineScheduler"];
   agentTranscriptLifecycleReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   agentChatReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  larkBindingsReadiness?: RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }>;
 
 function captureProductionBundle(
@@ -93,6 +124,7 @@ function captureProductionBundle(
     "closeDeadlineScheduler",
     "agentTranscriptLifecycleReadiness",
     "agentChatReadiness",
+    "larkBindingsReadiness",
   ] as const;
   let descriptors: PropertyDescriptorMap;
   try {
@@ -164,6 +196,11 @@ function captureProductionBundle(
     || typeof agentChatReadiness !== "object" || rejectedProxy(agentChatReadiness))) {
     throw new TypeError("Relay v2 Broker production composition bundle is invalid");
   }
+  const larkBindingsReadiness = captured("larkBindingsReadiness");
+  if (larkBindingsReadiness !== undefined && (larkBindingsReadiness === null
+    || typeof larkBindingsReadiness !== "object" || rejectedProxy(larkBindingsReadiness))) {
+    throw new TypeError("Relay v2 Broker production composition bundle is invalid");
+  }
   // Validate all side-effect-free E0 bindings before the native store can open.
   const binding = bindRelayV2ExternalContinuityAuthorityConfig(
     externalContinuityConfig as RelayV2ExternalContinuityAuthorityConfig,
@@ -181,7 +218,10 @@ function captureProductionBundle(
     genesis: capturedGenesis,
     resolveHttpSourceKey:
       resolveHttpSourceKey as RelayV2BrokerServerComposition["resolveHttpSourceKey"],
-    ...(scheduler === undefined ? {} : { closeDeadlineScheduler: scheduler }),
+    ...(scheduler === undefined ? {} : {
+      closeDeadlineScheduler:
+        scheduler as RelayV2BrokerTransportCloseDeadlineScheduler,
+    }),
     ...(agentTranscriptLifecycleReadiness === undefined ? {} : {
       agentTranscriptLifecycleReadiness:
         agentTranscriptLifecycleReadiness as RelayV2BrokerServerAgentCapabilityReadinessReceipt,
@@ -189,6 +229,10 @@ function captureProductionBundle(
     ...(agentChatReadiness === undefined ? {} : {
       agentChatReadiness:
         agentChatReadiness as RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+    }),
+    ...(larkBindingsReadiness === undefined ? {} : {
+      larkBindingsReadiness:
+        larkBindingsReadiness as RelayV2BrokerServerAgentCapabilityReadinessReceipt,
     }),
   });
 }
@@ -225,6 +269,9 @@ export function createRelayV2BrokerProductionComposition(
     }),
     ...(bundle.agentChatReadiness === undefined ? {} : {
       agentChatReadiness: bundle.agentChatReadiness,
+    }),
+    ...(bundle.larkBindingsReadiness === undefined ? {} : {
+      larkBindingsReadiness: bundle.larkBindingsReadiness,
     }),
   });
 }
@@ -275,7 +322,10 @@ function rejectedProxy(value: unknown): boolean {
 
 const OPTIONAL_AGENT_CAPABILITY_READINESS_SPECS: ReadonlyArray<Readonly<{
   capability: string;
-  propertyName: "agentTranscriptLifecycleReadiness" | "agentChatReadiness";
+  propertyName:
+    | "agentTranscriptLifecycleReadiness"
+    | "agentChatReadiness"
+    | "larkBindingsReadiness";
 }>> = [
   {
     capability: RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
@@ -285,11 +335,18 @@ const OPTIONAL_AGENT_CAPABILITY_READINESS_SPECS: ReadonlyArray<Readonly<{
     capability: RELAY_AGENT_CHAT_CAPABILITY,
     propertyName: "agentChatReadiness",
   },
+  {
+    capability: RELAY_LARK_BINDINGS_CAPABILITY,
+    propertyName: "larkBindingsReadiness",
+  },
 ];
 
 function captureAgentCapabilityReadiness(
   composition: RelayV2BrokerServerComposition,
-  propertyName: "agentTranscriptLifecycleReadiness" | "agentChatReadiness",
+  propertyName:
+    | "agentTranscriptLifecycleReadiness"
+    | "agentChatReadiness"
+    | "larkBindingsReadiness",
 ): AgentCapabilityReadinessCapture {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(
@@ -432,7 +489,7 @@ async function rejectHttpAndDrain(
  * Explicit, default-off adoption of the single activated combined WSS owner.
  * It borrows that same credential authority for the five strict HTTP
  * endpoints; only the combined runtime owns its close. No listener, E0 store,
- * secret, retry owner, enrollment, or v1 fallback is created here.
+ * secret, retry owner, enrollment, or alternate transport is created here.
  */
 export async function createActivatedRelayV2BrokerServerRuntime(
   composition: RelayV2BrokerServerComposition,

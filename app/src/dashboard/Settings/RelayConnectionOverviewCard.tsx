@@ -11,6 +11,7 @@ import {
   Wifi,
 } from "lucide-react";
 import type { ReactNode } from "react";
+import type { MobileRelayV2ConnectedDevice } from "../../platform/domainTypes";
 import type {
   RelayConnectionOverview,
   RelayConnectionOverviewPrimaryAction,
@@ -19,15 +20,20 @@ import type {
 export interface RelayConnectionOverviewCardProps {
   overview: RelayConnectionOverview;
   activeReview: { expiresAtMs: number; handle: string } | null;
-  knownGrantActive: boolean;
-  revokingGrant: boolean;
+  connectedMobileDevices: readonly MobileRelayV2ConnectedDevice[];
+  revokingGrantId: string | null;
+  mobileDeviceObservationAvailable: boolean;
   qrBusy: boolean;
   copiedEnrollmentLink: boolean;
   inlineQr: { handle: string; pngBase64: string } | null;
   onPrimaryAction: (action: RelayConnectionOverviewPrimaryAction) => void;
   onCopyEnrollmentLink: (handle: string) => void;
-  onRevokeKnownGrant: () => void;
+  onRevokeClientGrant: (grantId: string) => void;
   onHidePairingQr: () => void;
+}
+
+function compactIdentifier(value: string): string {
+  return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-5)}`;
 }
 
 function OverviewIcon({ tone }: { tone: RelayConnectionOverview["tone"] }): ReactNode {
@@ -47,14 +53,15 @@ function OverviewIcon({ tone }: { tone: RelayConnectionOverview["tone"] }): Reac
 export function RelayConnectionOverviewCard({
   overview,
   activeReview,
-  knownGrantActive,
-  revokingGrant,
+  connectedMobileDevices,
+  revokingGrantId,
+  mobileDeviceObservationAvailable,
   qrBusy,
   copiedEnrollmentLink,
   inlineQr,
   onPrimaryAction,
   onCopyEnrollmentLink,
-  onRevokeKnownGrant,
+  onRevokeClientGrant,
   onHidePairingQr,
 }: RelayConnectionOverviewCardProps) {
   // While the inline QR is expanded, the "Show pairing QR" button would do
@@ -137,23 +144,47 @@ export function RelayConnectionOverviewCard({
         </div>
       )}
 
-      {(knownGrantActive || revokingGrant) && (
-        <div className="connections-relay-overview__paired">
-          <span>
-            <Smartphone aria-hidden="true" size={14} />
-            Paired phone · {revokingGrant ? "revoking…" : "active"}
-          </span>
-          <button
-            type="button"
-            className="connections-button connections-button--danger-quiet"
-            disabled={revokingGrant}
-            onClick={onRevokeKnownGrant}
-          >
-            {revokingGrant && (
-              <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-            )}
-            {revokingGrant ? "Revoking" : "Revoke"}
-          </button>
+      {mobileDeviceObservationAvailable && (
+        <div className="connections-relay-overview__devices">
+          <div className="connections-relay-overview__devices-heading">
+            <span>Connected mobile devices</span>
+            <strong>{connectedMobileDevices.length}</strong>
+          </div>
+          {connectedMobileDevices.length === 0 ? (
+            <span className="connections-relay-overview__devices-empty">
+              No mobile device is currently connected.
+            </span>
+          ) : connectedMobileDevices.map((device) => {
+            const revoking = revokingGrantId === device.grantId;
+            return (
+              <div className="connections-relay-overview__device" key={device.grantId}>
+                <span className="connections-relay-overview__device-icon">
+                  <Smartphone aria-hidden="true" size={14} />
+                </span>
+                <div className="connections-relay-overview__device-copy">
+                  <strong>Mobile device · Connected</strong>
+                  <span title={device.clientInstanceId}>
+                    Client · {compactIdentifier(device.clientInstanceId)}
+                  </span>
+                  <span title={device.grantId}>
+                    Grant · {compactIdentifier(device.grantId)} · {device.connectionCount}
+                    {device.connectionCount === 1 ? " connection" : " connections"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="connections-button connections-button--danger-quiet"
+                  disabled={revokingGrantId !== null}
+                  onClick={() => onRevokeClientGrant(device.grantId)}
+                >
+                  {revoking && (
+                    <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
+                  )}
+                  {revoking ? "Revoking" : "Revoke"}
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </section>

@@ -2,7 +2,6 @@ package com.tmuxworktree.mobile.feature.session
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
@@ -14,8 +13,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -24,46 +21,28 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.AttachFile
-import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SmartToy
-import androidx.compose.material.icons.outlined.Terminal
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -92,23 +71,14 @@ fun SessionDetailScreen(
     session: RelaySession,
     connectionStatus: ConnectionStatus,
     timelineState: SessionTimelineState,
-    draft: String,
     nowMillis: Long,
-    onDraftChange: (String) -> Unit,
     onBack: () -> Unit,
     onConnectionStatusClick: () -> Unit,
-    onOpenTerminal: () -> Unit,
     onOverflowClick: () -> Unit,
-    onSend: (String) -> Unit,
-    autoFocusReply: Boolean = false,
     agentStateAvailable: Boolean = true,
     onCancelMessage: (TimelineEvent) -> Unit = {},
-    agentChatAvailable: Boolean = false,
-    onOpenChat: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    var showAttachmentNotice by rememberSaveable { mutableStateOf(false) }
-
     Scaffold(
         modifier = modifier
             .fillMaxSize()
@@ -123,15 +93,6 @@ fun SessionDetailScreen(
                 onOverflowClick = onOverflowClick,
             )
         },
-        bottomBar = {
-            ReplyComposer(
-                draft = draft,
-                onDraftChange = onDraftChange,
-                onSend = { onSend(draft.trim()) },
-                onAttachmentClick = { showAttachmentNotice = true },
-                autoFocus = autoFocusReply,
-            )
-        },
     ) { innerPadding ->
         Column(
             modifier = Modifier
@@ -140,14 +101,11 @@ fun SessionDetailScreen(
         ) {
             SessionSummary(
                 session = session,
+                agentState = timelineState.currentAgentState ?: session.agentState,
                 agentStateAvailable = agentStateAvailable,
-                onOpenTerminal = onOpenTerminal,
-                agentChatAvailable = agentChatAvailable,
-                onOpenChat = onOpenChat,
             )
             when (timelineState.agentEvidenceAvailability) {
                 AgentEvidenceAvailability.AVAILABLE -> Unit
-                AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED -> RelayV1SessionNotice()
                 AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE -> RelayV2AgentEvidenceNotice()
             }
             HorizontalDivider(
@@ -191,27 +149,6 @@ fun SessionDetailScreen(
         }
     }
 
-    if (showAttachmentNotice) {
-        AlertDialog(
-            onDismissRequest = { showAttachmentNotice = false },
-            containerColor = TwSurface,
-            title = { Text("Attachments need Relay v2", color = TwTextPrimary) },
-            text = {
-                Text(
-                    "The connected Relay v1 cannot transfer or safely retry attachments yet. Text replies remain available.",
-                    color = TwTextSecondary,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = { showAttachmentNotice = false },
-                    modifier = Modifier.testTag("dismiss_attachment_notice"),
-                ) {
-                    Text("Got it", color = TwAccent)
-                }
-            },
-        )
-    }
 }
 
 @Composable
@@ -279,12 +216,10 @@ private fun SessionTopBar(
 @Composable
 private fun SessionSummary(
     session: RelaySession,
+    agentState: com.tmuxworktree.mobile.core.model.AgentState,
     agentStateAvailable: Boolean,
-    onOpenTerminal: () -> Unit,
-    agentChatAvailable: Boolean,
-    onOpenChat: () -> Unit,
 ) {
-    val visual = session.agentState.visual()
+    val visual = agentState.visual()
     val statusLabel = if (agentStateAvailable) visual.label else "Agent state unavailable"
     val statusDescription = if (agentStateAvailable) {
         visual.accessibleLabel
@@ -292,128 +227,41 @@ private fun SessionSummary(
         "session-wide agent state unavailable"
     }
     val statusColor = if (agentStateAvailable) visual.color else TwTextMuted
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 20.dp, top = 4.dp, end = 20.dp, bottom = 16.dp),
-    ) {
-        Column(modifier = Modifier.padding(end = if (agentChatAvailable) 280.dp else 144.dp)) {
-            Row(
-                modifier = Modifier
-                    .testTag("session_semantic_status")
-                    .semantics {
-                        contentDescription = "Session status: $statusDescription"
-                    },
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    imageVector = if (agentStateAvailable) Icons.Outlined.Schedule else Icons.Outlined.Info,
-                    contentDescription = null,
-                    tint = statusColor,
-                    modifier = Modifier.size(22.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = statusLabel,
-                    color = statusColor,
-                    style = MaterialTheme.typography.labelLarge,
-                )
-            }
-            Spacer(Modifier.height(12.dp))
-            Text(
-                text = sessionMetadata(session),
-                color = TwTextSecondary,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier
-                    .testTag("session_metadata"),
-            )
-        }
-        Row(
-            modifier = Modifier.align(Alignment.BottomEnd),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            if (agentChatAvailable) {
-                OutlinedButton(
-                    onClick = onOpenChat,
-                    modifier = Modifier
-                        .width(132.dp)
-                        .height(48.dp)
-                        .testTag("open_chat"),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, TwAccent),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
-                    contentPadding = PaddingValues(horizontal = 4.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.ChatBubbleOutline,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = "Chat",
-                        style = MaterialTheme.typography.labelMedium,
-                        maxLines = 1,
-                    )
-                }
-            }
-            OutlinedButton(
-                onClick = onOpenTerminal,
-                modifier = Modifier
-                    .width(132.dp)
-                    .height(48.dp)
-                    .testTag("open_terminal"),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, TwAccent),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
-                contentPadding = PaddingValues(horizontal = 4.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Terminal,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    text = "Open terminal",
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun RelayV1SessionNotice() {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
-            .testTag("relay_v1_session_limitation"),
-        shape = RoundedCornerShape(12.dp),
-        color = TwSurface,
-        border = BorderStroke(1.dp, TwBorder),
+            .padding(start = 20.dp, top = 4.dp, end = 20.dp, bottom = 12.dp),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.Top,
+            modifier = Modifier
+                .testTag("session_semantic_status")
+                .semantics {
+                    contentDescription = "Session status: $statusDescription"
+                },
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                imageVector = Icons.Outlined.Info,
+                imageVector = if (agentStateAvailable) Icons.Outlined.Schedule else Icons.Outlined.Info,
                 contentDescription = null,
-                tint = TwTextSecondary,
-                modifier = Modifier.size(20.dp),
+                tint = statusColor,
+                modifier = Modifier.size(22.dp),
             )
-            Spacer(Modifier.width(10.dp))
+            Spacer(Modifier.width(8.dp))
             Text(
-                text = "Relay v1 does not provide agent transcript or lifecycle state. Timeline shows only messages queued from this phone.",
-                color = TwTextSecondary,
-                style = MaterialTheme.typography.bodyMedium,
+                text = statusLabel,
+                color = statusColor,
+                style = MaterialTheme.typography.labelLarge,
             )
         }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = sessionMetadata(session),
+            color = TwTextSecondary,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.testTag("session_metadata"),
+        )
     }
 }
 
@@ -422,14 +270,14 @@ private fun RelayV2AgentEvidenceNotice() {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
+            .padding(start = 20.dp, end = 20.dp, bottom = 8.dp)
             .testTag("relay_v2_agent_evidence_unavailable"),
         shape = RoundedCornerShape(12.dp),
         color = TwSurface,
         border = BorderStroke(1.dp, TwBorder),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.Top,
         ) {
             Icon(
@@ -438,9 +286,9 @@ private fun RelayV2AgentEvidenceNotice() {
                 tint = TwTextSecondary,
                 modifier = Modifier.size(20.dp),
             )
-            Spacer(Modifier.width(10.dp))
+            Spacer(Modifier.width(8.dp))
             Text(
-                text = "Agent transcript and lifecycle evidence are unavailable for this Relay v2 session. You can still compose a reply; sending uses the separate command path and requires the session to be currently online.",
+                text = "Agent transcript and lifecycle evidence are unavailable for this Relay v2 session. Chat remains disabled until the Host provides that capability.",
                 color = TwTextSecondary,
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -619,147 +467,6 @@ private fun TimelineEventRow(
     }
 }
 
-@Composable
-private fun ReplyComposer(
-    draft: String,
-    onDraftChange: (String) -> Unit,
-    onSend: () -> Unit,
-    onAttachmentClick: () -> Unit,
-    autoFocus: Boolean,
-) {
-    val sendEnabled = draft.isNotBlank()
-    val focusRequester = remember { FocusRequester() }
-    val keyboardController = LocalSoftwareKeyboardController.current
-    LaunchedEffect(autoFocus) {
-        if (autoFocus) {
-            focusRequester.requestFocus()
-            keyboardController?.show()
-        }
-    }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(TwBackground)
-            .imePadding()
-            .navigationBarsPadding()
-            .padding(start = 20.dp, top = 8.dp, end = 20.dp, bottom = 18.dp),
-    ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 124.dp)
-                .testTag("reply_composer"),
-            shape = RoundedCornerShape(12.dp),
-            color = Color.Transparent,
-            border = BorderStroke(1.dp, TwBorder),
-        ) {
-            Box(modifier = Modifier.padding(16.dp)) {
-                BasicTextField(
-                    value = draft,
-                    onValueChange = onDraftChange,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .focusRequester(focusRequester)
-                        .heightIn(min = 48.dp, max = 104.dp)
-                        .padding(end = 4.dp, bottom = 48.dp)
-                        .testTag("reply_input")
-                        .semantics {
-                            contentDescription = "Reply to agent"
-                        },
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = TwTextPrimary),
-                    cursorBrush = SolidColor(TwAccent),
-                    decorationBox = { innerTextField ->
-                        Box {
-                            if (draft.isEmpty()) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Outlined.ChatBubbleOutline,
-                                        contentDescription = null,
-                                        tint = TwTextSecondary,
-                                        modifier = Modifier.size(22.dp),
-                                    )
-                                    Spacer(Modifier.width(12.dp))
-                                    Text(
-                                        text = "Reply to agent",
-                                        color = TwTextSecondary,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                    )
-                                }
-                            }
-                            innerTextField()
-                        }
-                    },
-                )
-                IconButton(
-                    onClick = onAttachmentClick,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .size(48.dp)
-                        .testTag("session_attachment"),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.AttachFile,
-                        contentDescription = "Add attachment",
-                        tint = TwTextSecondary,
-                        modifier = Modifier.size(22.dp),
-                    )
-                }
-                Button(
-                    onClick = onSend,
-                    enabled = sendEnabled,
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .width(88.dp)
-                        .height(48.dp)
-                        .testTag("send_reply")
-                        .semantics {
-                            contentDescription = "Send reply"
-                            stateDescription = if (sendEnabled) "Ready to send" else "No content to send"
-                        },
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = TwAccent,
-                        contentColor = TwOnAccent,
-                        disabledContainerColor = TwSurfaceRaised,
-                        disabledContentColor = TwTextMuted,
-                    ),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                ) {
-                    Text(
-                        text = "Send",
-                        style = MaterialTheme.typography.labelLarge,
-                        maxLines = 1,
-                    )
-                }
-            }
-        }
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 44.dp)
-                .padding(top = 12.dp)
-                .testTag("safe_queue_note")
-                .semantics(mergeDescendants = true) {
-                    contentDescription = "Replies queue safely if the network changes"
-                },
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.Shield,
-                contentDescription = null,
-                tint = TwSuccess,
-                modifier = Modifier.size(20.dp),
-            )
-            Spacer(Modifier.width(10.dp))
-            Text(
-                text = "Replies queue safely if the network changes",
-                color = TwTextSecondary,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        }
-    }
-}
-
 private data class TimelineActorVisual(
     val label: String,
     val icon: ImageVector,
@@ -820,16 +527,10 @@ private fun SessionDetailScreenPreview() {
                 events = DemoData.timeline(session.stableId),
                 agentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
             ),
-            draft = "",
             nowMillis = System.currentTimeMillis(),
-            onDraftChange = {},
             onBack = {},
             onConnectionStatusClick = {},
-            onOpenTerminal = {},
             onOverflowClick = {},
-            onSend = {},
-            agentChatAvailable = true,
-            onOpenChat = {},
         )
     }
 }

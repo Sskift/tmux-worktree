@@ -1,6 +1,8 @@
 package com.tmuxworktree.mobile.app
 
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ConfirmedEnrollment
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeException
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeFailureKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EndpointValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentReviewDraft
@@ -86,8 +88,8 @@ internal enum class RelayV2EnrollmentActivateResult {
  * Default-off, in-memory owner for one Relay v2 enrollment review session.
  *
  * The parsed draft is deliberately private because it contains the enrollment code. Offering a
- * payload never calls [confirmationPort], and this owner has no persistence, connection, or Relay
- * v1 fallback dependency. A submission consumes the private draft before invoking the port, so a
+ * payload never calls [confirmationPort], and this owner has no persistence or connection
+ * dependency. A submission consumes the private draft before invoking the port, so a
  * second concurrent confirmation cannot repeat the exchange.
  */
 internal class RelayV2EnrollmentReviewSession(
@@ -368,7 +370,21 @@ private fun boundedCauseSuffix(cause: String?): String {
  * so a hostile or oversized message can never blow up the UI.
  */
 private fun Throwable.toBoundedFailureCause(): String? {
-    val raw = message?.takeIf(String::isNotBlank)
+    val raw = when (this) {
+        is RelayV2CredentialExchangeException -> when (kind) {
+            RelayV2CredentialExchangeFailureKind.NETWORK ->
+                "This phone cannot reach the Relay issuer. Check Wi-Fi or VPN and make sure the HTTPS endpoint is reachable from the phone."
+            RelayV2CredentialExchangeFailureKind.AUTH ->
+                "The one-time enrollment was rejected or expired. Create a new Relay v2 QR on the Mac."
+            RelayV2CredentialExchangeFailureKind.HTTP ->
+                "The Relay issuer returned HTTP ${httpStatus ?: "error"}. Check the Relay center and try a new enrollment."
+            RelayV2CredentialExchangeFailureKind.CONFIGURATION ->
+                "The Relay v2 endpoint configuration is invalid. Review the issuer and Relay URLs on the Mac."
+            RelayV2CredentialExchangeFailureKind.SCHEMA ->
+                "The Relay response is incompatible with this app. Update the Dashboard and Android app together."
+        }
+        else -> message?.takeIf(String::isNotBlank)
+    }
         ?: this::class.simpleName?.takeIf(String::isNotBlank)
         ?: return null
     return raw.replace('\n', ' ').replace('\r', ' ').trim().take(MAX_CAUSE_LENGTH)

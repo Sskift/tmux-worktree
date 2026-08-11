@@ -32,7 +32,6 @@ function metadata() {
     pathname: "/host",
     search: "",
     authorizationHeaders: [`Bearer ${TOKEN}`],
-    legacyQuerySecret: null,
     offeredProtocols: ["tw-relay.host.v2"],
   };
 }

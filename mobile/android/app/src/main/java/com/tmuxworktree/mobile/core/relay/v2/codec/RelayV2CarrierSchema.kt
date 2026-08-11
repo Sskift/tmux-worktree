@@ -207,10 +207,10 @@ private fun validateHostHello(frame: RelayV2JsonObject) {
     jsonId(required(payload, "hostInstanceId"))
     val dialects = jsonArray(
         required(payload, "clientDialects"),
-        maximum = 2,
+        maximum = 1,
         minimum = 1,
     ) {
-        jsonOneOf(it, setOf("tw-relay.v1", "tw-relay.v2"))
+        jsonLiteral(it, "tw-relay.v2")
     }.map { it as String }
     if (dialects.toSet().size != dialects.size) schemaFailure("schema-mismatch")
     jsonCapabilities(required(payload, "capabilities"))

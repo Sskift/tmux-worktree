@@ -1,9 +1,9 @@
 {
   "contract": "tmux-worktree-relay-v2-base",
-  "contractVersion": "2.0.0-android-first",
+  "contractVersion": "2.1.0-v2-only",
   "fixtureFormatVersion": 2,
   "contractStatus": "frozen",
-  "implementationScope": "codec-and-conformance-only",
+  "implementationScope": "v2-only-runtime-and-conformance",
   "conformanceStatus": "shared-node-android-runtime-codecs",
   "capabilityAdvertisementAllowed": false,
   "encoding": "strict-utf-8-json-text",

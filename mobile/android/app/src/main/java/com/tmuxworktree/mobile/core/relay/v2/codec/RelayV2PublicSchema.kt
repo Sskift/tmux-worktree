@@ -301,8 +301,8 @@ private fun validateHostsSnapshotFrame(frame: RelayV2JsonObject) {
         jsonOneOf(required(item, "state"), setOf("online", "offline"))
         jsonNullable(item["hostEpoch"]) { jsonId(it) }
         jsonNullable(item["hostInstanceId"]) { jsonId(it) }
-        jsonArray(required(item, "clientDialects"), maximum = 2) {
-            jsonOneOf(it, setOf("tw-relay.v1", "tw-relay.v2"))
+        jsonArray(required(item, "clientDialects"), maximum = 1) {
+            jsonLiteral(it, "tw-relay.v2")
         }
         jsonCapabilities(required(item, "capabilities"))
         jsonInteger(required(item, "observedAtMs"))

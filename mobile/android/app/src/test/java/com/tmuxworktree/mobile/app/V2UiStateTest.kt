@@ -104,20 +104,7 @@ class V2UiStateTest {
 
     @Test
     fun protocolLabelNamesTheImplementedRelayVersionExplicitly() {
-        assertEquals("Relay v1", ConnectionHealth().protocolLabel)
-    }
-
-    @Test
-    fun committedReplyRetainsAnewerRawDraft() {
-        val submitted = "  first reply  "
-        val unchanged = V2UiState(drafts = mapOf("session-a" to submitted))
-        val edited = unchanged.copy(drafts = mapOf("session-a" to "first reply plus more"))
-
-        assertTrue(unchanged.afterCommittedReply("session-a", submitted).drafts.isEmpty())
-        assertEquals(
-            "first reply plus more",
-            edited.afterCommittedReply("session-a", submitted).drafts["session-a"],
-        )
+        assertEquals("Relay v2", ConnectionHealth().protocolLabel)
     }
 
     @Test
@@ -163,7 +150,7 @@ class V2UiStateTest {
     }
 
     @Test
-    fun relayV2ReplyCallbackRequiresTheCapturedCompositionCutAndAdmission() {
+    fun relayV2SessionCallbackRequiresTheCapturedCompositionCutAndAdmission() {
         val oldComposition = Any()
         val newComposition = Any()
         val oldCut = Any()
@@ -176,21 +163,21 @@ class V2UiStateTest {
         assertFalse(fence.isCurrent(admitted, oldComposition, mapOf("session-a" to newCut)))
         assertFalse(
             fence.isCurrent(
-                admitted.copy(relayStartupAdmission = RelayStartupAdmissionState.RELAY_V1),
+                admitted.copy(
+                    relayStartupAdmission =
+                        RelayStartupAdmissionState.RELAY_V2_ENROLLMENT_REQUIRED,
+                ),
                 oldComposition,
                 mapOf("session-a" to oldCut),
             ),
         )
 
-        val newProfileState = admitted.copy(
-            drafts = mapOf("session-a" to "new profile draft"),
-            actionError = "new profile error",
-        )
+        val newProfileState = admitted.copy(actionError = "new profile error")
         val staleSuccess = fence.applyIfCurrent(
             newProfileState,
             newComposition,
             mapOf("session-a" to newCut),
-        ) { it.afterCommittedReply("session-a", "new profile draft") }
+        ) { it.copy(actionError = null) }
         val staleRejection = fence.applyIfCurrent(
             newProfileState,
             newComposition,

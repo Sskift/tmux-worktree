@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.app
 
 import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
+import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.DeliveryState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLifecycleFailure
@@ -126,6 +127,7 @@ class RelayV2SelectedSessionTimelineProjectionTest {
         val timeline = timelineState.events
 
         assertEquals(AgentEvidenceAvailability.AVAILABLE, timelineState.agentEvidenceAvailability)
+        assertEquals(AgentState.RUNNING, timelineState.currentAgentState)
         assertEquals(3, timeline.size)
         assertEquals(TimelineActor.USER, timeline[0].actor)
         assertEquals("hello", timeline[0].body)
@@ -222,6 +224,7 @@ class RelayV2SelectedSessionTimelineProjectionTest {
         val timeline = timelineState.events
 
         assertEquals(AgentEvidenceAvailability.AVAILABLE, timelineState.agentEvidenceAvailability)
+        assertEquals(AgentState.FAILED, timelineState.currentAgentState)
         assertEquals(
             listOf(
                 "Run lifecycle: Running",

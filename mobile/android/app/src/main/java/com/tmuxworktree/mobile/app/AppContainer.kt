@@ -1,19 +1,18 @@
 package com.tmuxworktree.mobile.app
 
 import android.content.Context
-import com.tmuxworktree.mobile.core.data.AndroidKeystoreCredentialStore
 import com.tmuxworktree.mobile.core.data.AndroidKeystoreRelayV2CredentialStore
 import com.tmuxworktree.mobile.core.data.AndroidKeystoreRelayV2TerminalResumeCredentialStore
-import com.tmuxworktree.mobile.core.data.LegacyIdentityImporter
 import com.tmuxworktree.mobile.core.data.PreferencesStore
 import com.tmuxworktree.mobile.core.data.TwDatabase
 import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.network.NetworkMonitor
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_V2_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRepository
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePostedNotificationCancellationCoordinator
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AndroidAgentTranscriptLifecycleNotificationPlatform
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LARK_BINDINGS_V2_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.v2.profile.OkHttpRelayV2CredentialExchange
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
@@ -52,9 +51,6 @@ class AppContainer internal constructor(
     val database: TwDatabase by lazy { TwDatabase.get(appContext) }
     val repository: TwRepository by lazy { TwRepository(database) }
     val preferences: PreferencesStore by lazy { PreferencesStore(appContext) }
-    val credentials: AndroidKeystoreCredentialStore by lazy {
-        AndroidKeystoreCredentialStore(appContext)
-    }
     private val relayV2Credentials: AndroidKeystoreRelayV2CredentialStore by lazy {
         AndroidKeystoreRelayV2CredentialStore(appContext)
     }
@@ -85,13 +81,6 @@ class AppContainer internal constructor(
             agentTranscriptLifecycleNotificationPlatform,
         )
     }
-    val legacyIdentityImporter: LegacyIdentityImporter by lazy {
-        LegacyIdentityImporter(
-            context = appContext,
-            preferencesStore = preferences,
-            credentialStore = credentials,
-        )
-    }
     val networkMonitor: NetworkMonitor by lazy { NetworkMonitor(appContext) }
     internal val profileMutationCoordinator: ProfileMutationCoordinator
         get() = AndroidProcessProfileOwners.mutationCoordinator
@@ -101,8 +90,6 @@ class AppContainer internal constructor(
         clearEphemeralAfterDisconnect: suspend (RelayProfileDisconnectReceipt) -> Unit,
     ): RelayV2ProfileRuntimeAdapter = RelayV2ProfileRuntimeAdapter(
         preferencesStore = preferences,
-        legacyRepository = repository,
-        legacyCredentialStore = credentials,
         relayV2CredentialStore = relayV2Credentials,
         relayV2StateRepository = { relayV2StateRepository },
         terminalResumeCredentialStore = relayV2TerminalCredentials,
@@ -144,7 +131,8 @@ class AppContainer internal constructor(
         agentNotificationPlatform = agentTranscriptLifecycleNotificationPlatform,
         agentOptionalCapabilities = setOf(
             AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
-            AGENT_CHAT_V1_CAPABILITY,
+            AGENT_CHAT_V2_CAPABILITY,
+            LARK_BINDINGS_V2_CAPABILITY,
         ),
         transportFactory = BoundedRelayV2TransportFactory(),
     )

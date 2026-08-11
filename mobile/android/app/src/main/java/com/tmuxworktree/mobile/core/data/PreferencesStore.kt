@@ -10,7 +10,6 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import com.tmuxworktree.mobile.core.model.RelayProfile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CompletedCredentialProof
@@ -33,11 +32,9 @@ private val Context.twPreferencesDataStore: DataStore<Preferences> by preference
 )
 
 data class AppPreferences(
-    val relayUrl: String = "",
     val preferredHostId: String = "",
     val preferredScopeId: String = "local",
     val autoConnect: Boolean = false,
-    val legacyIdentityMigrated: Boolean = false,
     val waitingNotifications: Boolean = true,
     val failedNotifications: Boolean = true,
     val completedNotifications: Boolean = false,
@@ -45,11 +42,8 @@ data class AppPreferences(
 )
 
 private object Keys {
-    val relayUrl = stringPreferencesKey("relay_url")
     val hostId = stringPreferencesKey("preferred_host_id")
     val scopeId = stringPreferencesKey("preferred_scope_id")
-    val autoConnect = booleanPreferencesKey("auto_connect")
-    val legacyMigrated = booleanPreferencesKey("legacy_identity_migrated")
     val waitingNotifications = booleanPreferencesKey("notify_waiting")
     val failedNotifications = booleanPreferencesKey("notify_failed")
     val completedNotifications = booleanPreferencesKey("notify_completed")
@@ -158,21 +152,17 @@ private const val SELF_REVOKE_FAILURE_FORBIDDEN = "forbidden"
  * The on-disk active-profile discriminator used by the real DataStore owner.
  *
  * These strings are frozen disk tags. They deliberately do not use enum names or ordinals.
- * The only untagged state accepted is a pre-v2 Relay v1 profile with a non-empty relay URL.
+ * Untagged or retired profile data is not an active profile.
  */
 internal object RelayProfilePreferencesCodec {
-    private const val DIALECT_V1_TAG = "tw-relay.v1"
     private const val DIALECT_V2_TAG = "tw-relay.v2"
-    private const val CREDENTIAL_V1_TAG = "legacy_shared_secret"
     private const val CREDENTIAL_V2_TAG = "twcap2_grant"
 
     fun dialectStorageTag(dialect: RelayProfileDialect): String = when (dialect) {
-        RelayProfileDialect.V1 -> DIALECT_V1_TAG
         RelayProfileDialect.V2 -> DIALECT_V2_TAG
     }
 
     fun dialectFromStorageTag(tag: String): RelayProfileDialect = when (tag) {
-        DIALECT_V1_TAG -> RelayProfileDialect.V1
         DIALECT_V2_TAG -> RelayProfileDialect.V2
         else -> error("Unknown Relay profile dialect tag")
     }
@@ -180,13 +170,6 @@ internal object RelayProfilePreferencesCodec {
     fun activeProfileIdentity(preferences: Preferences): RelayActiveProfileIdentity? =
         when (val active = decodeActive(preferences)) {
             ActiveProfile.None -> null
-            ActiveProfile.LegacyV1,
-            ActiveProfile.TaggedV1,
-            -> RelayActiveProfileIdentity(
-                profileId = LEGACY_V1_PROFILE_ID,
-                dialect = RelayProfileDialect.V1,
-                activationGeneration = 0,
-            )
             is ActiveProfile.V2 -> active.profile.identity
         }
 
@@ -197,10 +180,6 @@ internal object RelayProfilePreferencesCodec {
         preferences: MutablePreferences,
         profile: RelayV2Profile,
     ) {
-        preferences.remove(Keys.relayUrl)
-        preferences.remove(Keys.hostId)
-        preferences.remove(Keys.scopeId)
-        preferences[Keys.autoConnect] = false
         preferences.removeRelayV2Profile()
         preferences[Keys.activeProfileDialect] = DIALECT_V2_TAG
         preferences[Keys.activeCredentialKind] = CREDENTIAL_V2_TAG
@@ -229,38 +208,6 @@ internal object RelayProfilePreferencesCodec {
         return true
     }
 
-    fun saveRelayV1Profile(
-        preferences: MutablePreferences,
-        relayUrl: String,
-        hostId: String,
-        autoConnect: Boolean,
-    ) {
-        val normalizedRelayUrl = relayUrl.trim().removeSuffix("/")
-        require(normalizedRelayUrl.isNotBlank()) { "Relay v1 URL is required" }
-        requireV1MutationAllowed(preferences)
-        preferences[Keys.activeProfileDialect] = DIALECT_V1_TAG
-        preferences[Keys.activeCredentialKind] = CREDENTIAL_V1_TAG
-        preferences[Keys.relayUrl] = normalizedRelayUrl
-        preferences[Keys.hostId] = hostId
-        preferences[Keys.autoConnect] = autoConnect
-    }
-
-    fun clearRelayV1Profile(preferences: MutablePreferences) {
-        requireV1MutationAllowed(preferences)
-        preferences.remove(Keys.relayUrl)
-        preferences.remove(Keys.hostId)
-        preferences.remove(Keys.scopeId)
-        preferences[Keys.autoConnect] = false
-        preferences.remove(Keys.activeProfileDialect)
-        preferences.remove(Keys.activeCredentialKind)
-    }
-
-    fun requireV1MutationAllowed(preferences: Preferences) {
-        check(decodeActive(preferences) !is ActiveProfile.V2) {
-            "Relay v1 profile mutation cannot replace an active Relay v2 profile"
-        }
-    }
-
     private fun decodeActive(preferences: Preferences): ActiveProfile {
         val dialectTag = preferences[Keys.activeProfileDialect]
         val credentialTag = preferences[Keys.activeCredentialKind]
@@ -270,38 +217,23 @@ internal object RelayProfilePreferencesCodec {
 
         if (dialectTag == null && credentialTag == null) {
             check(!hasV2State) { "Untagged Relay v2 profile state is not supported" }
-            return if (preferences[Keys.relayUrl].isNullOrBlank()) {
-                ActiveProfile.None
-            } else {
-                ActiveProfile.LegacyV1
-            }
+            return ActiveProfile.None
         }
         check(dialectTag != null && credentialTag != null) {
             "Relay active profile tags are incomplete"
         }
 
         return when (dialectTag) {
-            DIALECT_V1_TAG -> {
-                check(credentialTag == CREDENTIAL_V1_TAG) {
-                    "Relay v1 credential kind tag is invalid"
-                }
-                check(!hasV2State) { "Relay v1 profile contains Relay v2 state" }
-                check(!preferences[Keys.relayUrl].isNullOrBlank()) {
-                    "Tagged Relay v1 profile is incomplete"
-                }
-                ActiveProfile.TaggedV1
-            }
             DIALECT_V2_TAG -> {
                 check(credentialTag == CREDENTIAL_V2_TAG) {
                     "Relay v2 credential kind tag is invalid"
                 }
-                check(preferences[Keys.relayUrl].isNullOrBlank() &&
-                    preferences[Keys.hostId].isNullOrBlank() &&
-                    preferences[Keys.scopeId].isNullOrBlank()
-                ) { "Relay v2 profile contains Relay v1 state" }
                 ActiveProfile.V2(decodeRelayV2Profile(preferences))
             }
-            else -> error("Unknown Relay active profile dialect tag")
+            else -> {
+                check(!hasV2State) { "Unknown active profile tags contain Relay v2 state" }
+                ActiveProfile.None
+            }
         }
     }
 
@@ -354,13 +286,10 @@ internal object RelayProfilePreferencesCodec {
 
     private sealed interface ActiveProfile {
         data object None : ActiveProfile
-        data object LegacyV1 : ActiveProfile
-        data object TaggedV1 : ActiveProfile
         data class V2(val profile: RelayV2Profile) : ActiveProfile
     }
 
     private const val RELAY_V2_PROFILE_KEY_PREFIX = "relay_v2_profile_"
-    private const val LEGACY_V1_PROFILE_ID = "legacy-v1-active-profile"
 }
 
 class PreferencesStore internal constructor(
@@ -373,21 +302,6 @@ class PreferencesStore internal constructor(
 
     /** Connection-visible preferences; a fenced profile is never exposed as reconnectable. */
     val values: Flow<AppPreferences> = rawData.map(::toConnectionVisibleAppPreferences)
-
-    val profile: Flow<RelayProfile> = rawData.map { stored ->
-        if (activeProfileIsUsable(stored)) {
-            toAppPreferences(stored).let { preferences ->
-                RelayProfile(
-                    relayUrl = preferences.relayUrl,
-                    hostId = preferences.preferredHostId,
-                    autoConnect = preferences.autoConnect,
-                    hasCredential = false,
-                )
-            }
-        } else {
-            RelayProfile()
-        }
-    }
 
     /** Independent non-sensitive Relay v2 profile namespace. Tokens are not representable here. */
     internal val relayV2Profile: Flow<RelayV2Profile?> =
@@ -989,6 +903,26 @@ class PreferencesStore internal constructor(
         return consented
     }
 
+    internal suspend fun commitExternallyRevokedRelayV2ProfileRemoval(
+        expectedProfile: RelayV2Profile,
+    ): Boolean {
+        var committed = false
+        store.edit { preferences ->
+            if (activationJournal(preferences) != null ||
+                selfRevokeJournal(preferences) != null
+            ) return@edit
+            val active = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            if (active != expectedProfile) return@edit
+            if (!RelayProfilePreferencesCodec.removeExactRelayV2Profile(
+                    preferences,
+                    expectedProfile,
+                )
+            ) return@edit
+            committed = true
+        }
+        return committed
+    }
+
     suspend fun getOrCreateRelayV2ClientInstanceId(): String {
         var resolved = ""
         store.edit { preferences ->
@@ -1001,22 +935,9 @@ class PreferencesStore internal constructor(
         return resolved
     }
 
-    suspend fun saveProfile(relayUrl: String, hostId: String, autoConnect: Boolean) {
-        store.edit { preferences ->
-            requireNoRelayV2Activation(preferences)
-            RelayProfilePreferencesCodec.saveRelayV1Profile(
-                preferences = preferences,
-                relayUrl = relayUrl,
-                hostId = hostId,
-                autoConnect = autoConnect,
-            )
-        }
-    }
-
     suspend fun setPreferredHost(hostId: String) {
         store.edit {
             requireNoRelayV2Activation(it)
-            RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.hostId] = hostId
         }
     }
@@ -1024,7 +945,6 @@ class PreferencesStore internal constructor(
     suspend fun setPreferredHostAndScope(hostId: String, scopeId: String) {
         store.edit {
             requireNoRelayV2Activation(it)
-            RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.hostId] = hostId
             it[Keys.scopeId] = scopeId
         }
@@ -1033,21 +953,8 @@ class PreferencesStore internal constructor(
     suspend fun setPreferredScope(scopeId: String) {
         store.edit {
             requireNoRelayV2Activation(it)
-            RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.scopeId] = scopeId
         }
-    }
-
-    suspend fun setAutoConnect(enabled: Boolean) {
-        store.edit {
-            requireNoRelayV2Activation(it)
-            RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
-            it[Keys.autoConnect] = enabled
-        }
-    }
-
-    suspend fun setLegacyIdentityMigrated(migrated: Boolean = true) {
-        store.edit { it[Keys.legacyMigrated] = migrated }
     }
 
     suspend fun setNotificationPreference(kind: NotificationKind, enabled: Boolean) {
@@ -1081,13 +988,6 @@ class PreferencesStore internal constructor(
         store.edit { it[Keys.darkThemeEnabled] = enabled }
     }
 
-    suspend fun clearProfile() {
-        store.edit { preferences ->
-            requireNoRelayV2Activation(preferences)
-            RelayProfilePreferencesCodec.clearRelayV1Profile(preferences)
-        }
-    }
-
     private fun requireNoRelayV2Activation(preferences: Preferences) {
         check(activationJournal(preferences) == null) {
             "Relay profile is immutable while Relay v2 activation is pending"
@@ -1098,11 +998,10 @@ class PreferencesStore internal constructor(
     }
 
     private fun toAppPreferences(preferences: Preferences) = AppPreferences(
-        relayUrl = preferences[Keys.relayUrl].orEmpty(),
         preferredHostId = preferences[Keys.hostId].orEmpty(),
         preferredScopeId = preferences[Keys.scopeId] ?: "local",
-        autoConnect = preferences[Keys.autoConnect] ?: false,
-        legacyIdentityMigrated = preferences[Keys.legacyMigrated] ?: false,
+        autoConnect = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            ?.autoConnect == true,
         waitingNotifications = preferences[Keys.waitingNotifications] ?: true,
         failedNotifications = preferences[Keys.failedNotifications] ?: true,
         completedNotifications = preferences[Keys.completedNotifications] ?: false,
@@ -1116,7 +1015,6 @@ class PreferencesStore internal constructor(
             stored
         } else {
             stored.copy(
-                relayUrl = "",
                 preferredHostId = "",
                 preferredScopeId = "local",
                 autoConnect = false,
@@ -1229,4 +1127,10 @@ internal class PreferencesRelayV2ProfileStore(
     override suspend fun consentRelayV2AutoConnect(
         expectedProfile: RelayV2Profile,
     ): RelayV2Profile? = preferencesStore.consentRelayV2AutoConnect(expectedProfile)
+
+    override suspend fun commitExternallyRevokedRelayV2ProfileRemoval(
+        expectedProfile: RelayV2Profile,
+    ): Boolean = preferencesStore.commitExternallyRevokedRelayV2ProfileRemoval(
+        expectedProfile,
+    )
 }

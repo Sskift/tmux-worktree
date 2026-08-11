@@ -384,7 +384,6 @@ test("host WSS lifecycle: pong responses keep the transport open", async () => {
     routeSink: { onRouteBound() {}, onClientFrame() {}, onRouteUnbound() {} },
     advertisedCapabilities: [],
     clientDialects: ["tw-relay.v2"],
-    dialectAdapters: Object.freeze({}),
     idFactory: () => "host-hello-one",
     onStatus() {},
   });
@@ -491,7 +490,6 @@ test("host WSS lifecycle: missing pongs terminate the transport within 2x interv
     routeSink: { onRouteBound() {}, onClientFrame() {}, onRouteUnbound() {} },
     advertisedCapabilities: [],
     clientDialects: ["tw-relay.v2"],
-    dialectAdapters: Object.freeze({}),
     idFactory: () => "host-hello-two",
     onStatus() {},
   });

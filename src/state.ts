@@ -63,7 +63,7 @@ export interface ManagedSessionLifecycleExtensionV1 {
   schemaVersion: 1;
   incarnation: string;
   tmux: ManagedTmuxIncarnationIdentityV1 & { birthMarker: string };
-  reservationCorrelation: ManagedSessionReservationCorrelationV1;
+  reservationCorrelation: ManagedSessionReservationCorrelationV1 | null;
   displayLabel: string | null;
 }
 
@@ -217,7 +217,7 @@ export function issueManagedSessionIncarnation(
 
 export function buildManagedSessionLifecycleExtension(
   identity: ManagedTmuxIncarnationIdentityV1 & { birthMarker: string },
-  reservationCorrelation: ManagedSessionReservationCorrelationV1,
+  reservationCorrelation: ManagedSessionReservationCorrelationV1 | null,
   displayLabel: string | null,
 ): ManagedSessionLifecycleExtensionV1 {
   assertManagedTmuxIncarnationIdentity(identity);
@@ -228,7 +228,9 @@ export function buildManagedSessionLifecycleExtension(
     schemaVersion: MANAGED_SESSION_LIFECYCLE_EXTENSION_VERSION,
     incarnation: issueManagedSessionIncarnation(identity),
     tmux: { ...identity },
-    reservationCorrelation: normalizeManagedSessionReservationCorrelation(reservationCorrelation),
+    reservationCorrelation: reservationCorrelation === null
+      ? null
+      : normalizeManagedSessionReservationCorrelation(reservationCorrelation),
     displayLabel,
   };
 }
@@ -294,7 +296,9 @@ export function managedSessionLifecycleExtension(
     schemaVersion: 1,
     incarnation: value.incarnation,
     tmux: { ...identity },
-    reservationCorrelation: normalizeManagedSessionReservationCorrelation(value.reservationCorrelation),
+    reservationCorrelation: value.reservationCorrelation === null
+      ? null
+      : normalizeManagedSessionReservationCorrelation(value.reservationCorrelation),
     displayLabel: value.displayLabel,
   };
 }

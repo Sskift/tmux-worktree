@@ -45,10 +45,7 @@ import type {
   HostConfig,
   HostInput,
   HostStatus,
-  MobileRelayBrokerInput,
-  MobileRelayConfigInput,
   MobileRelayV2CopyEnrollmentArtifactInput,
-  MobileRelayStatus,
   MobileRelayV2CreateEnrollmentInput,
   MobileRelayV2DashboardState,
   MobileRelayV2InlineEnrollmentArtifactPngInput,
@@ -216,11 +213,6 @@ export interface DashboardBackend {
     probe(target: AgentProbeTarget): Promise<AgentProbeResult[]>;
   };
   relay: {
-    status(): Promise<MobileRelayStatus>;
-    start(): Promise<void>;
-    saveConfig(args: MobileRelayConfigInput): Promise<MobileRelayStatus>;
-    startBroker(args: MobileRelayBrokerInput): Promise<MobileRelayStatus>;
-    stop(): Promise<void>;
     v2: MobileRelayV2ProductAdapter;
     v2Deployment: MobileRelayV2SelfHostedDeploymentPort;
   };
@@ -252,11 +244,6 @@ export function createUnavailableMobileRelayV2Adapter(
 ): MobileRelayV2ProductAdapter {
   const state = (): MobileRelayV2DashboardState => ({
     authority: { kind: "unavailable", reason },
-    v1Profile: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured: false,
-    },
     hostCredential: {
       protocolVersion: 2,
       credentialKind: "twcap2_grant",
@@ -278,6 +265,7 @@ export function createUnavailableMobileRelayV2Adapter(
     },
     enrollment: { status: "idle" },
     knownClientGrant: { status: "unknown" },
+    connectedMobileDevices: [],
   });
   const unavailable = async (): Promise<MobileRelayV2DashboardState> => {
     throw new MobileRelayV2BackendOperationError({
@@ -660,13 +648,6 @@ export function createDashboardBackend(
       }),
     },
     relay: {
-      status: () => transport.invoke<MobileRelayStatus>("mobile_relay_status"),
-      start: () => transport.invoke<void>("mobile_relay_start"),
-      saveConfig: (args) =>
-        transport.invoke<MobileRelayStatus>("mobile_relay_save_config", { args }),
-      startBroker: (args) =>
-        transport.invoke<MobileRelayStatus>("mobile_relay_start_broker", { args }),
-      stop: () => transport.invoke<void>("mobile_relay_stop"),
       v2: adapters.relayV2 ?? createUnavailableMobileRelayV2Adapter(),
       v2Deployment: {
         status: () =>

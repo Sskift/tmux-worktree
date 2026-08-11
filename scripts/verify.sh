@@ -4,9 +4,8 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 MODE=${1:-core}
 
-run_docs() {
-  echo "==> documentation"
-  node "$ROOT/scripts/check-docs.mjs"
+run_repository_hygiene() {
+  echo "==> repository hygiene"
   git -C "$ROOT" diff --check
   git -C "$ROOT" diff --cached --check
 }
@@ -75,25 +74,22 @@ run_device() {
 }
 
 case "$MODE" in
-  docs)
-    run_docs
-    ;;
   core)
     run_cli
     run_dashboard
     run_rust
-    run_docs
+    run_repository_hygiene
     ;;
   android)
     run_android
-    run_docs
+    run_repository_hygiene
     ;;
   all)
     run_cli
     run_dashboard
     run_rust
     run_android
-    run_docs
+    run_repository_hygiene
     ;;
   device)
     run_cli
@@ -101,10 +97,10 @@ case "$MODE" in
     run_rust
     run_android
     run_device
-    run_docs
+    run_repository_hygiene
     ;;
   *)
-    echo "usage: $0 [docs|core|android|all|device]" >&2
+    echo "usage: $0 [core|android|all|device]" >&2
     exit 2
     ;;
 esac

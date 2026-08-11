@@ -316,18 +316,6 @@ class AgentTranscriptLifecycleReadProjectionTest {
             ),
         )
         assertUnavailable(
-            AgentTranscriptLifecycleReadUnavailableReason.RELAY_V1,
-            projection.read(
-                readRequest(
-                    old,
-                    availableAccess(old).copy(
-                        dialect = AgentTranscriptLifecycleReadDialect.RELAY_V1,
-                    ),
-                    limit = 1,
-                ),
-            ),
-        )
-        assertUnavailable(
             AgentTranscriptLifecycleReadUnavailableReason.EXTENSION_NOT_NEGOTIATED,
             projection.read(
                 readRequest(
@@ -431,7 +419,6 @@ private fun readRequest(
 private fun availableAccess(
     namespace: AgentTranscriptLifecycleDurableNamespace,
 ) = AgentTranscriptLifecycleReadAccess(
-    dialect = AgentTranscriptLifecycleReadDialect.RELAY_V2,
     negotiatedCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
     support = AgentExtensionSupport.AVAILABLE,
     activeNamespace = namespace,

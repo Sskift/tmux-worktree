@@ -22,15 +22,15 @@ import org.junit.Test
 
 class RelayV2EnrollmentReviewSessionTest {
     @Test
-    fun `payload routing keeps malformed enrollment separate from Relay v1 pairing`() {
+    fun `payload routing accepts only enrollment authority`() {
         assertEquals(
             PairingPayloadRoute.RELAY_V2_ENROLLMENT,
             pairingPayloadRoute("tmuxworktree://enroll?v=2&enrollmentCode=%ZZ"),
         )
         assertEquals(
-            PairingPayloadRoute.RELAY_V1_PAIRING,
+            PairingPayloadRoute.UNKNOWN,
             pairingPayloadRoute(
-                "tmuxworktree://pair?relayUrl=wss%3A%2F%2Frelay.example.com&token=legacy",
+                "tmuxworktree://unsupported?payload=legacy",
             ),
         )
         assertEquals(
@@ -296,7 +296,7 @@ class RelayV2EnrollmentReviewSessionTest {
             assertEquals(
                 RelayV2EnrollmentOfferResult.REJECTED,
                 session.offer(
-                    "tmuxworktree://pair?relayUrl=wss%3A%2F%2Frelay.example.com&token=legacy",
+                    "tmuxworktree://unsupported?payload=legacy",
                 ),
             )
             assertEquals(

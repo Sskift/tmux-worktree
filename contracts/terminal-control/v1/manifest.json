@@ -20,7 +20,7 @@
     }
   ],
   "notes": [
-    "This local contract is independent from tw-rpc v1 and Relay v1/v2.",
+    "This local contract is independent from tw-rpc and Relay transport protocols.",
     "controlTargetId, controlEpoch, leaseId and fence are terminal-control namespace values.",
     "Input adapters MUST NOT query status and then write a backend themselves; input operations execute inside the authority critical section.",
     "ping advertises additive capabilities. A missing capabilities field is a valid legacy response and means output.rendered-snapshot, activity.agent-status, and activity.agent-result are unsupported; Feishu must preflight required support before relying on these observations.",

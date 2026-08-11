@@ -172,7 +172,14 @@ internal class RelayV2ProfileSwitchStateMachine(
         }
     }
 
-    suspend fun isolateConfirmedSelfRevoke(
+    suspend fun awaitServerGrantRevocation(profile: RelayV2Profile): Boolean = mutex.withLock {
+        check(profileStore.activeRelayV2Profile() == profile) {
+            "Self-revoke profile changed before server revocation evidence"
+        }
+        disconnectBarrier.awaitServerGrantRevocation(profile.identity)
+    }
+
+    suspend fun isolateConfirmedRevocation(
         profile: RelayV2Profile,
         receipt: RelayProfileDisconnectReceipt,
     ): Unit = mutex.withLock {
@@ -964,16 +971,6 @@ internal class RelayV2ProfileRepository(
             RelayV2SelfRevokePhase.PREPARED -> Unit
         }
 
-        val receipt = try {
-            profileSwitch.disconnectSelfRevoke(
-                profile = profile,
-                barrierId = "self-revoke-drain-${newId()}",
-            )
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Throwable) {
-            return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.PREPARED)
-        }
         val request = try {
             val blob = requireSelfRevokeCredential(profile, journal)
             RelayV2SelfRevokeRequest(
@@ -981,6 +978,7 @@ internal class RelayV2ProfileRepository(
                 accessToken = requireNotNull(blob.accessToken),
             )
         } catch (_: Throwable) {
+            disconnectAfterSelfRevoke(profile)
             return RelayV2SelfRevokeResult.Quarantined(RelayV2SelfRevokePhase.PREPARED)
         }
         val mayHaveCommitted = journal.copy(
@@ -997,22 +995,30 @@ internal class RelayV2ProfileRepository(
                 }
             }
         } catch (cancelled: CancellationException) {
-            withContext(NonCancellable) { currentSelfRevokeJournal(journal) }
+            withContext(NonCancellable) {
+                currentSelfRevokeJournal(journal)
+                runCatching { disconnectAfterSelfRevoke(profile) }
+                    .exceptionOrNull()
+                    ?.let(cancelled::addSuppressed)
+            }
             throw cancelled
         } catch (_: Throwable) {
             val current = withContext(NonCancellable) { currentSelfRevokeJournal(journal) }
+            disconnectAfterSelfRevoke(profile)
             return RelayV2SelfRevokeResult.Quarantined(current.phase)
         }
         val durableHandoff = withContext(NonCancellable) {
             currentSelfRevokeJournal(journal)
         }
         if (durableHandoff != mayHaveCommitted) {
+            disconnectAfterSelfRevoke(profile)
             return RelayV2SelfRevokeResult.Quarantined(durableHandoff.phase)
         }
 
         return when (exchangeResult) {
             is RelayV2SelfRevokeExchangeResult.Confirmed -> {
                 if (exchangeResult.grantId != journal.grantId) {
+                    disconnectAfterSelfRevoke(profile)
                     RelayV2SelfRevokeResult.Quarantined(
                         RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
                     )
@@ -1022,9 +1028,29 @@ internal class RelayV2ProfileRepository(
                         phase = RelayV2SelfRevokePhase.CONFIRMED,
                         revokedAtMs = exchangeResult.revokedAtMs,
                         failureCode = null,
-                    ) ?: return RelayV2SelfRevokeResult.Quarantined(
-                        RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
                     )
+                    if (confirmed == null) {
+                        disconnectAfterSelfRevoke(profile)
+                        return RelayV2SelfRevokeResult.Quarantined(
+                            RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
+                        )
+                    }
+                    try {
+                        profileSwitch.awaitServerGrantRevocation(profile)
+                    } catch (cancelled: CancellationException) {
+                        withContext(NonCancellable) {
+                            runCatching { disconnectAfterSelfRevoke(profile) }
+                                .exceptionOrNull()
+                                ?.let(cancelled::addSuppressed)
+                        }
+                        throw cancelled
+                    } catch (_: Throwable) {
+                        // The bounded evidence wait is advisory. Exact drain still owns cleanup.
+                    }
+                    val receipt = disconnectAfterSelfRevoke(profile)
+                        ?: return RelayV2SelfRevokeResult.Quarantined(
+                            RelayV2SelfRevokePhase.CONFIRMED,
+                        )
                     cleanupConfirmedSelfRevokeOrQuarantine(confirmed, profile, receipt)
                 }
             }
@@ -1036,15 +1062,57 @@ internal class RelayV2ProfileRepository(
                     revokedAtMs = null,
                     failureCode = RelayV2SelfRevokeFailureCode.FORBIDDEN,
                 )
+                disconnectAfterSelfRevoke(profile)
                 RelayV2SelfRevokeResult.Quarantined(
                     rejected?.phase ?: RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
                 )
             }
-            RelayV2SelfRevokeExchangeResult.MayHaveCommitted ->
+            RelayV2SelfRevokeExchangeResult.MayHaveCommitted -> {
+                disconnectAfterSelfRevoke(profile)
                 RelayV2SelfRevokeResult.Quarantined(
                     RelayV2SelfRevokePhase.MAY_HAVE_COMMITTED,
                 )
+            }
         }
+    }
+
+    private suspend fun disconnectAfterSelfRevoke(
+        profile: RelayV2Profile,
+    ): RelayProfileDisconnectReceipt? = try {
+        profileSwitch.disconnectSelfRevoke(
+            profile = profile,
+            barrierId = "self-revoke-drain-${newId()}",
+        )
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * Clears the exact active profile after the authenticated Relay socket receives broker close
+     * 4403. The frozen protocol defines that close as post-commit grant revocation, so this path
+     * neither retries self-revoke with an invalid token nor fabricates an HTTP receipt.
+     */
+    suspend fun removeExternallyRevokedActiveProfile(
+        expectedProfile: RelayV2Profile,
+    ): Boolean {
+        val profile = profileStore.activeRelayV2Profile() ?: return true
+        if (profile != expectedProfile ||
+            selfRevokeJournalStore.readSelfRevokeJournal() != null
+        ) return false
+        val receipt = profileSwitch.disconnectSelfRevoke(
+            profile = profile,
+            barrierId = "server-revoke-drain-${newId()}",
+        )
+        profileSwitch.isolateConfirmedRevocation(profile, receipt)
+        val committed = try {
+            profileStore.commitExternallyRevokedRelayV2ProfileRemoval(profile)
+        } catch (error: Throwable) {
+            if (profileStore.activeRelayV2Profile() == null) true else throw error
+        }
+        check(committed) { "Server-confirmed revoke lost its exact active profile" }
+        return true
     }
 
     private suspend fun requireSelfRevokeCredential(
@@ -1117,7 +1185,7 @@ internal class RelayV2ProfileRepository(
             profile = profile,
             barrierId = "self-revoke-cleanup-${newId()}",
         )
-        profileSwitch.isolateConfirmedSelfRevoke(profile, exactReceipt)
+        profileSwitch.isolateConfirmedRevocation(profile, exactReceipt)
         val committed = try {
             selfRevokeJournalStore.commitConfirmedSelfRevokeRemoval(journal)
         } catch (error: Throwable) {

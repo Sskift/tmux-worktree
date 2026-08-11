@@ -91,7 +91,7 @@ function canonicalOwner(value: unknown, name: string): CanonicalTerminalOwner {
     throw new Error(`invalid ${name}`);
   }
   const kinds: CanonicalTerminalOwnerKind[] = [
-    "feishu", "dashboard", "local-cli", "relay-v1", "relay-v2", "tw-serve",
+    "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
   ];
   if (!kinds.includes(value.kind as CanonicalTerminalOwnerKind)) throw new Error(`invalid ${name}.kind`);
   return {

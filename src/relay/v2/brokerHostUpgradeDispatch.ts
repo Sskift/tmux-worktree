@@ -103,7 +103,6 @@ export class RelayV2BrokerHostUpgradeDispatchOwner {
   ): Promise<RelayV2BrokerHostUpgradeDispatchResult> {
     const request = captureRelayV2BrokerUpgradeMetadata(metadata, "host");
     const upgrade = await dispatchRelayBrokerUpgrade(request, {
-      verifyLegacySecret: () => false,
       verifyV2AccessToken: (token, expectedRole) => {
         if (expectedRole !== "host") throw roleMismatch();
         return this.verifyV2AccessToken(token, expectedRole);

@@ -1060,10 +1060,6 @@ class RelayV2StateSyncRepositoryCoreTest {
 
         listOf(
             RelayProfileDisconnectReceipt(
-                RelayActiveProfileIdentity("profile-one", RelayProfileDialect.V1, 9),
-                "wrong-dialect",
-            ),
-            RelayProfileDisconnectReceipt(
                 RelayActiveProfileIdentity("profile-one", RelayProfileDialect.V2, 0),
                 "missing-activation",
             ),

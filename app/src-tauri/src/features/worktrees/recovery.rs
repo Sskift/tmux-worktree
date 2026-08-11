@@ -1,5 +1,5 @@
 use crate::config::{config_worktree_base, config_worktree_base_with_home, remote_config_for_host};
-use crate::features::sessions::{derive_session_name, is_git_worktree_dir, list_local_sessions};
+use crate::features::sessions::{derive_session_name, is_git_worktree_dir};
 use crate::ipc::OrphanedWorktree;
 use crate::remote::{
     remote_home_dir_for_host, run_remote_cmd_output, run_remote_tmux_output, HostConfig,
@@ -43,11 +43,21 @@ pub(crate) fn remove_pending_cleanup_path(path: &str) {
 }
 
 fn live_session_names() -> HashSet<String> {
-    list_local_sessions()
+    let output = std::process::Command::new(crate::support::tmux_bin())
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output();
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.raw_name)
-        .collect()
 }
 
 pub(crate) fn orphaned_worktrees(

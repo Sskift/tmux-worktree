@@ -995,14 +995,9 @@ test("Relay v2 Host normal process lifecycle prepares terminal control and freez
       const selfHostedRuntimeOptions = selfHosted.events
         .find(([name]) => name === "runtime.create")[1];
       assert.equal(
-      typeof selfHostedRuntimeOptions.configLoader,
-      "function",
-      "self-hosted installs an explicit local-only config owner",
-      );
-      assert.deepEqual(
-      selfHostedRuntimeOptions.configLoader(),
-      { hosts: [] },
-      "self-hosted must not activate legacy remote account aliases",
+      Object.hasOwn(selfHostedRuntimeOptions, "configLoader"),
+      false,
+      "self-hosted uses the canonical account Host config owner",
       );
       assert.equal(
       Object.hasOwn(selfHostedRuntimeOptions.localCliTarget, "home"),

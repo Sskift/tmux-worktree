@@ -18,7 +18,11 @@ import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { managedStatePath, loadManagedStateForMutation, type ManagedSession } from "../state";
-import { observeManagedSessionIncarnation } from "../session";
+import {
+  commandThenLoginShell,
+  killManagedSessionV2,
+  observeManagedSessionIncarnation,
+} from "../session";
 import { listTmuxSessionLifecycleEntries, tmuxBin } from "../tmux";
 import {
   TERMINAL_CONTROL_MAX_AGENT_RESULT_BYTES,
@@ -31,7 +35,9 @@ import {
 import {
   agentProviderFromStartCommand,
   discoverActiveAgentSource,
+  discoverLatestResumableAgentSession,
   readCompletedAgentResult,
+  resumedAgentSessionIdFromStartCommand,
 } from "./agentTranscript";
 
 const TMUX_INSTANCE_OPTION = "@tw_terminal_control_instance_v1";
@@ -42,6 +48,11 @@ const MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
 const OUTPUT_SEGMENT_BYTES = TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES;
 const MAX_OUTPUT_SEGMENTS = 2;
 const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
+const AGENT_RESUME_READY_TIMEOUT_MS = 5_000;
+const AGENT_RESUME_POLL_MS = 50;
+const AGENT_RESUME_SETTLE_MS = 500;
+const AGENT_RESUME_INPUT_TIMEOUT_MS = 8_000;
+const AGENT_RESUME_INITIAL_SOURCE_WAIT_MS = 2_000;
 const MAX_RENDERED_SNAPSHOT_SOURCE_BYTES = 2 * 1024 * 1024;
 const RENDERED_SNAPSHOT_HISTORY_LINES = 1024;
 
@@ -151,6 +162,7 @@ export interface TerminalControlRenderedSnapshot {
 }
 
 export interface TerminalControlAgentStatus {
+  agentSupported: boolean;
   agentRunning: boolean;
   source?: TerminalControlAgentSource;
 }
@@ -221,6 +233,14 @@ export interface TerminalControlBackend {
     data: Buffer,
   ): Promise<void>;
   sendAgentMessage(sessionName: string, pane: string, message: string, submit: boolean): Promise<void>;
+  sendAgentMessageFenced?(
+    session: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    message: string,
+    submit: boolean,
+  ): Promise<void>;
   resize(sessionName: string, pane: string, cols: number, rows: number): Promise<void>;
   scroll(sessionName: string, pane: string, direction: "up" | "down", lines: number): Promise<void>;
   killManaged(sessionName: string): Promise<void>;
@@ -280,6 +300,15 @@ type TmuxResult = {
   stderr: string;
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
+};
+
+type AgentSourceBoundary = {
+  paneId: string;
+  provider: TerminalControlAgentSource["provider"];
+  cwd: string;
+  sessionId?: string;
+  startedAtNotBefore: string;
+  capturedSource?: TerminalControlAgentSource;
 };
 
 class TmuxStdoutLimitError extends Error {
@@ -650,7 +679,9 @@ async function requireFencedTerminalPane(
   paneId: string;
   agentRunning: boolean;
   paneStartCommand: string;
+  paneCurrentCommand: string;
   paneCurrentPath: string;
+  panePid: number;
 }> {
   if (pane !== "0") {
     throw new TerminalControlProtocolError(
@@ -694,7 +725,9 @@ async function requireFencedTerminalPane(
         "#{window_panes}",
         "#{pane_title}",
         "#{pane_start_command}",
+        "#{pane_current_command}",
         "#{pane_current_path}",
+        "#{pane_pid}",
       ].join("\u001f"),
     ]);
   } catch (error) {
@@ -705,7 +738,7 @@ async function requireFencedTerminalPane(
   }
   const fields = probe.stdout.replace(/\r?\n$/, "").split("\u001f");
   if (
-    fields.length !== 10
+    fields.length !== 12
     || !/^%\d+$/.test(fields[0])
     || fields[1] !== sessionId
     || fields[2] !== tmuxInstanceId
@@ -713,6 +746,7 @@ async function requireFencedTerminalPane(
     || fields[4] !== "1"
     || fields[5] !== "1"
     || fields[6] !== "1"
+    || !/^[1-9][0-9]*$/.test(fields[11])
   ) {
     throw new TerminalControlProtocolError(
       "RECOVERY_REQUIRED",
@@ -723,8 +757,180 @@ async function requireFencedTerminalPane(
     paneId: fields[0],
     agentRunning: agentRunningFromPaneTitle(fields[7]),
     paneStartCommand: fields[8],
-    paneCurrentPath: fields[9],
+    paneCurrentCommand: fields[9],
+    paneCurrentPath: fields[10],
+    panePid: Number(fields[11]),
   };
+}
+
+function processBasename(command: string): string {
+  return command.trim().split("/").at(-1)?.toLowerCase() ?? "";
+}
+
+function isAgentProcess(command: string, provider: "claude" | "codex"): boolean {
+  const name = processBasename(command);
+  return name === provider || name.startsWith(`${provider}-`);
+}
+
+function paneAgentProcessState(
+  panePid: number,
+  provider: "claude" | "codex",
+): Promise<"agent" | "idle" | "occupied"> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("/bin/ps", ["-axo", "pid=,ppid=,comm="], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const finish = (error?: Error, result?: "agent" | "idle" | "occupied") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(result ?? "idle");
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(new TerminalControlProtocolError("RECOVERY_REQUIRED", "Agent process observation timed out"));
+    }, COMMAND_TIMEOUT_MS);
+    timer.unref();
+    child.stdout!.on("data", (raw: Buffer) => {
+      stdoutBytes += raw.byteLength;
+      if (stdoutBytes > MAX_RENDERED_SNAPSHOT_SOURCE_BYTES) {
+        try { child.kill("SIGKILL"); } catch {}
+        finish(new TerminalControlProtocolError("RESOURCE_EXHAUSTED", "Agent process catalog is too large"));
+        return;
+      }
+      stdout.push(Buffer.from(raw));
+    });
+    child.stderr!.on("data", (raw: Buffer) => {
+      stderrBytes += raw.byteLength;
+      if (stderrBytes > MAX_COMMAND_OUTPUT_BYTES) {
+        try { child.kill("SIGKILL"); } catch {}
+        finish(new TerminalControlProtocolError("RESOURCE_EXHAUSTED", "Agent process observation failed"));
+        return;
+      }
+      stderr.push(Buffer.from(raw));
+    });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, signal) => {
+      if (code !== 0 || signal !== null) {
+        const detail = Buffer.concat(stderr, stderrBytes).toString("utf8").trim();
+        finish(new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          `Agent process observation failed${detail ? `: ${detail}` : ""}`,
+        ));
+        return;
+      }
+      const processes = new Map<number, { parent: number; command: string }>();
+      for (const line of Buffer.concat(stdout, stdoutBytes).toString("utf8").split("\n")) {
+        const match = /^\s*([0-9]+)\s+([0-9]+)\s+(.+?)\s*$/.exec(line);
+        if (!match) continue;
+        processes.set(Number(match[1]), { parent: Number(match[2]), command: match[3] });
+      }
+      const descendants: Array<{ pid: number; command: string }> = [];
+      for (const [pid, processInfo] of processes) {
+        let current = pid;
+        const visited = new Set<number>();
+        while (current > 0 && !visited.has(current)) {
+          if (current === panePid) {
+            if (pid !== panePid) descendants.push({ pid, command: processInfo.command });
+            break;
+          }
+          visited.add(current);
+          current = processes.get(current)?.parent ?? 0;
+        }
+      }
+      finish(undefined, descendants.some(({ command }) => isAgentProcess(command, provider))
+        ? "agent"
+        : descendants.length === 0
+          ? "idle"
+          : "occupied");
+    });
+  });
+}
+
+function isShellProcess(command: string): boolean {
+  return ["sh", "bash", "dash", "fish", "ksh", "mksh", "tcsh", "zsh"]
+    .includes(processBasename(command));
+}
+
+function agentSourceBoundaryKey(
+  expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+  tmuxInstanceId: string,
+  pane: string,
+): string {
+  return `${expected.name}\0${expected.kind}\0${expected.createdAt}\0${tmuxInstanceId}\0${pane}`;
+}
+
+function pendingAgentSource(boundary: AgentSourceBoundary): TerminalControlAgentSource | undefined {
+  try {
+    return discoverActiveAgentSource({
+      provider: boundary.provider,
+      cwd: boundary.cwd,
+      sessionId: boundary.sessionId,
+      startedAtNotBefore: boundary.startedAtNotBefore,
+    });
+  } catch (error) {
+    if (error instanceof TerminalControlProtocolError
+      && error.code === "RESOURCE_EXHAUSTED"
+      && error.retryable) return undefined;
+    throw error;
+  }
+}
+
+async function waitForAgentSource(
+  boundary: AgentSourceBoundary,
+  deadline: number,
+): Promise<TerminalControlAgentSource | undefined> {
+  while (Date.now() < deadline) {
+    const found = pendingAgentSource(boundary);
+    if (found !== undefined) return found;
+    await new Promise<void>((resolve) => setTimeout(
+      resolve,
+      Math.min(AGENT_RESUME_POLL_MS, Math.max(1, deadline - Date.now())),
+    ));
+  }
+  return undefined;
+}
+
+async function pasteAgentMessage(
+  paneTarget: string,
+  message: string,
+  submit: boolean,
+): Promise<void> {
+  const normalized = message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!normalized && !submit) return;
+  if (!normalized) {
+    try {
+      await runTmux(["send-keys", "-t", paneTarget, "C-m"]);
+    } catch (error) {
+      throw new Error(`agent message submit failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return;
+  }
+  const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
+  try {
+    await runTmux([
+      "load-buffer", "-b", bufferName, "-",
+      ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
+    ], { input: normalized });
+  } catch (error) {
+    await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
+    throw new Error(`agent message paste failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!submit) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
+  try {
+    await runTmux(["send-keys", "-t", paneTarget, "C-m"]);
+  } catch (error) {
+    throw new Error(
+      `agent message submit failed after paste; input may remain in the target pane: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 function boundedUtf8Tail(value: string, maxBytes: number): {
@@ -1298,6 +1504,8 @@ async function exactTargetInspection(
 }
 
 export class TmuxTerminalControlBackend implements TerminalControlBackend {
+  private readonly agentSourceBoundaries = new Map<string, AgentSourceBoundary>();
+
   async resolveManagedSession(sessionName: string): Promise<ResolvedManagedTerminalBackend> {
     const managedSession = exactManagedSession(sessionName);
     const sessionId = await requireTmuxSession(sessionName, "TARGET_NOT_FOUND");
@@ -1559,35 +1767,173 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     submit: boolean,
   ): Promise<void> {
     const { paneTarget } = await requirePane(sessionName, pane);
-    const normalized = message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    if (!normalized && !submit) return;
-    if (!normalized) {
-      try {
-        await runTmux(["send-keys", "-t", paneTarget, "C-m"]);
-      } catch (error) {
-        throw new Error(`agent message submit failed: ${error instanceof Error ? error.message : String(error)}`);
+    await pasteAgentMessage(paneTarget, message, submit);
+  }
+
+  async sendAgentMessageFenced(
+    expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    message: string,
+    submit: boolean,
+  ): Promise<void> {
+    let observed = await requireFencedTerminalPane(
+      expected,
+      tmuxInstanceId,
+      outputGeneration,
+      pane,
+    );
+    const provider = agentProviderFromStartCommand(observed.paneStartCommand);
+    if (!provider) {
+      throw new TerminalControlProtocolError(
+        "INVALID_REQUEST",
+        "managed terminal was not created for a supported Agent",
+      );
+    }
+    const boundaryKey = agentSourceBoundaryKey(expected, tmuxInstanceId, pane);
+    const processState = await paneAgentProcessState(observed.panePid, provider);
+    // A long-lived idle Codex TUI keeps the credential snapshot it started
+    // with. Resume the same persisted session before a new submitted turn so
+    // account changes are picked up without losing conversation history.
+    // Active turns still accept steering input through the existing process.
+    const refreshIdleCodex = provider === "codex"
+      && processState === "agent"
+      && !observed.agentRunning
+      && submit;
+    if (processState === "agent" && !refreshIdleCodex) {
+      let boundary: AgentSourceBoundary | undefined;
+      if (!observed.agentRunning && submit) {
+        const sessionId = resumedAgentSessionIdFromStartCommand(
+          observed.paneStartCommand,
+          provider,
+        );
+        boundary = {
+          paneId: observed.paneId,
+          provider,
+          cwd: observed.paneCurrentPath,
+          ...(sessionId === undefined ? {} : { sessionId }),
+          startedAtNotBefore: new Date().toISOString(),
+        };
+        this.agentSourceBoundaries.set(boundaryKey, boundary);
+      }
+      await pasteAgentMessage(observed.paneId, message, submit);
+      if (boundary !== undefined) {
+        const freshSource = await waitForAgentSource(
+          boundary,
+          Date.parse(boundary.startedAtNotBefore) + AGENT_RESUME_INPUT_TIMEOUT_MS,
+        );
+        if (freshSource === undefined) {
+          throw new Error("managed Agent did not start a fresh transcript source before the input deadline");
+        }
+        boundary.capturedSource = freshSource;
       }
       return;
     }
-    const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
-    try {
-      await runTmux([
-        "load-buffer", "-b", bufferName, "-",
-        ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
-      ], { input: normalized });
-    } catch (error) {
-      await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
-      throw new Error(`agent message paste failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (!submit) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
-    try {
-      await runTmux(["send-keys", "-t", paneTarget, "C-m"]);
-    } catch (error) {
-      throw new Error(
-        `agent message submit failed after paste; input may remain in the target pane: ${error instanceof Error ? error.message : String(error)}`,
+    if (!refreshIdleCodex
+      && (processState !== "idle" || !isShellProcess(observed.paneCurrentCommand))) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "managed Agent pane is occupied by a different foreground process",
       );
     }
+
+    const inputDeadline = Date.now() + AGENT_RESUME_INPUT_TIMEOUT_MS;
+    const sessionId = resumedAgentSessionIdFromStartCommand(
+      observed.paneStartCommand,
+      provider,
+    ) ?? discoverLatestResumableAgentSession({ provider, cwd: observed.paneCurrentPath });
+    if (Date.now() >= inputDeadline) {
+      throw new TerminalControlProtocolError(
+        "RESOURCE_EXHAUSTED",
+        "managed Agent resume discovery exceeded the input deadline",
+        true,
+      );
+    }
+    const codexCommand = "codex -c check_for_update_on_startup=false";
+    const command = sessionId === undefined
+      ? provider === "codex" ? codexCommand : provider
+      : provider === "codex"
+        ? `${codexCommand} resume ${shellQuote(sessionId)}`
+        : `claude --resume ${shellQuote(sessionId)}`;
+    await runTmux([
+      "respawn-pane",
+      "-k",
+      "-t", observed.paneId,
+      "-c", observed.paneCurrentPath,
+      commandThenLoginShell(command, expected.name),
+    ]);
+
+    const readyDeadline = Math.min(
+      inputDeadline,
+      Date.now() + AGENT_RESUME_READY_TIMEOUT_MS,
+    );
+    while (Date.now() < readyDeadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, AGENT_RESUME_POLL_MS));
+      observed = await requireFencedTerminalPane(
+        expected,
+        tmuxInstanceId,
+        outputGeneration,
+        pane,
+      );
+      if (await paneAgentProcessState(observed.panePid, provider) !== "agent") continue;
+      await new Promise<void>((resolve) => setTimeout(resolve, AGENT_RESUME_SETTLE_MS));
+      observed = await requireFencedTerminalPane(
+        expected,
+        tmuxInstanceId,
+        outputGeneration,
+        pane,
+      );
+      if (await paneAgentProcessState(observed.panePid, provider) !== "agent") continue;
+      const boundary: AgentSourceBoundary = {
+        paneId: observed.paneId,
+        provider,
+        cwd: observed.paneCurrentPath,
+        ...(sessionId === undefined ? {} : { sessionId }),
+        startedAtNotBefore: new Date().toISOString(),
+      };
+      this.agentSourceBoundaries.set(boundaryKey, boundary);
+      await pasteAgentMessage(observed.paneId, message, submit);
+      if (submit) {
+        const initialSourceDeadline = Math.min(
+          inputDeadline,
+          Date.now() + AGENT_RESUME_INITIAL_SOURCE_WAIT_MS,
+        );
+        let freshSource = await waitForAgentSource(boundary, initialSourceDeadline);
+        if (freshSource === undefined && Date.now() < inputDeadline) {
+          observed = await requireFencedTerminalPane(
+            expected,
+            tmuxInstanceId,
+            outputGeneration,
+            pane,
+          );
+          if (observed.paneId !== boundary.paneId
+            || observed.paneCurrentPath !== boundary.cwd
+            || agentProviderFromStartCommand(observed.paneStartCommand) !== boundary.provider
+            || resumedAgentSessionIdFromStartCommand(
+              observed.paneStartCommand,
+              boundary.provider,
+            ) !== boundary.sessionId
+            || await paneAgentProcessState(observed.panePid, provider) !== "agent") {
+            throw new TerminalControlProtocolError(
+              "RECOVERY_REQUIRED",
+              "managed Agent changed before cold-resume submit confirmation",
+            );
+          }
+          await pasteAgentMessage(observed.paneId, "", true);
+          freshSource = await waitForAgentSource(boundary, inputDeadline);
+        }
+        if (freshSource === undefined) {
+          throw new Error("managed Agent did not start a fresh transcript source before the input deadline");
+        }
+        boundary.capturedSource = freshSource;
+      }
+      return;
+    }
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "managed Agent could not be resumed before the input deadline",
+    );
   }
 
   async resize(sessionName: string, pane: string, cols: number, rows: number): Promise<void> {
@@ -1645,57 +1991,41 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
   }
 
   async killManaged(sessionName: string): Promise<void> {
-    const cli = process.env.TW_TERMINAL_CONTROL_CLI?.trim()
-      || process.env.TW_DASHBOARD_CLI?.trim()
-      || process.argv[1];
-    if (!cli) throw new Error("cannot locate the canonical tw CLI for managed kill");
-    const result = await new Promise<TmuxResult>((resolve, reject) => {
-      const child = spawn(process.execPath, [cli, "rpc", "kill-session", "--name", sessionName], {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      });
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      let stdoutBytes = 0;
-      let stderrBytes = 0;
-      const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
-      timer.unref();
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdoutBytes += chunk.byteLength;
-        if (stdoutBytes > MAX_COMMAND_OUTPUT_BYTES) child.kill("SIGKILL");
-        else stdout.push(Buffer.from(chunk));
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderrBytes += chunk.byteLength;
-        if (stderrBytes > MAX_COMMAND_OUTPUT_BYTES) child.kill("SIGKILL");
-        else stderr.push(Buffer.from(chunk));
-      });
-      child.once("error", reject);
-      child.once("close", (code, signal) => {
-        clearTimeout(timer);
-        const output = {
-          stdout: Buffer.concat(stdout, stdoutBytes).toString("utf8"),
-          stderr: Buffer.concat(stderr, stderrBytes).toString("utf8"),
-        };
-        if (code === 0 && signal === null) resolve(output);
-        else reject(new Error(output.stderr.trim() || output.stdout.trim() || "managed kill failed"));
-      });
-    });
-    let parsed: unknown;
+    const managed = exactManagedSession(sessionName);
+    let live;
     try {
-      parsed = JSON.parse(result.stdout);
-    } catch {
-      throw new Error("canonical tw managed kill returned invalid JSON");
+      live = listTmuxSessionLifecycleEntries()
+        .find((candidate) => candidate.rawName === sessionName);
+    } catch (error) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        error instanceof Error ? error.message : "could not read the managed tmux identity",
+      );
     }
-    if (
-      !parsed
-      || typeof parsed !== "object"
-      || (parsed as Record<string, unknown>).protocolVersion !== 1
-      || (parsed as Record<string, unknown>).kind !== "session-killed"
-      || (parsed as Record<string, unknown>).session !== sessionName
-    ) {
-      throw new Error("canonical tw managed kill returned an incompatible response");
+    if (!live) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        `managed session is not live: ${sessionName}`,
+      );
     }
+    const observed = observeManagedSessionIncarnation(managed, live);
+    if (!observed?.lifecycleMarked) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `managed session has no authoritative v2 lifecycle identity: ${sessionName}`,
+      );
+    }
+    const result = killManagedSessionV2({
+      name: sessionName,
+      expectedIncarnation: observed.incarnation,
+    });
+    if (result.state === "succeeded") return;
+    throw new TerminalControlProtocolError(
+      result.state === "failed" && result.code === "SESSION_NOT_FOUND"
+        ? "TARGET_GONE"
+        : "RECOVERY_REQUIRED",
+      result.message,
+    );
   }
 
   async prepareOutput(
@@ -1923,13 +2253,12 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       outputGeneration,
       pane,
     );
-    if (!observed.agentRunning) return { agentRunning: false };
+    const boundaryKey = agentSourceBoundaryKey(expected, tmuxInstanceId, pane);
+    const boundary = this.agentSourceBoundaries.get(boundaryKey);
     const provider = agentProviderFromStartCommand(observed.paneStartCommand);
     if (!provider) {
-      throw new TerminalControlProtocolError(
-        "RECOVERY_REQUIRED",
-        "the running managed Agent is not a supported Claude or Codex session",
-      );
+      this.agentSourceBoundaries.delete(boundaryKey);
+      return { agentSupported: false, agentRunning: false };
     }
     if (!observed.paneCurrentPath.startsWith("/")) {
       throw new TerminalControlProtocolError(
@@ -1937,11 +2266,41 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         "the running Agent working directory is not absolute",
       );
     }
+    if (boundary !== undefined
+      && (boundary.paneId !== observed.paneId
+        || boundary.provider !== provider
+        || boundary.cwd !== observed.paneCurrentPath)) {
+      this.agentSourceBoundaries.delete(boundaryKey);
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "the managed Agent changed across its input source boundary",
+      );
+    }
+    const resumedSessionId = resumedAgentSessionIdFromStartCommand(
+      observed.paneStartCommand,
+      provider,
+    );
+    if (boundary !== undefined && boundary.sessionId !== resumedSessionId) {
+      this.agentSourceBoundaries.delete(boundaryKey);
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "the resumed Agent session changed across its input source boundary",
+      );
+    }
+    if (boundary?.capturedSource !== undefined) {
+      const source = boundary.capturedSource;
+      delete boundary.capturedSource;
+      return { agentSupported: true, agentRunning: true, source };
+    }
+    if (!observed.agentRunning) return { agentSupported: true, agentRunning: false };
     return {
+      agentSupported: true,
       agentRunning: true,
       source: discoverActiveAgentSource({
         provider,
         cwd: observed.paneCurrentPath,
+        sessionId: boundary?.sessionId ?? resumedSessionId,
+        startedAtNotBefore: boundary?.startedAtNotBefore,
       }),
     };
   }

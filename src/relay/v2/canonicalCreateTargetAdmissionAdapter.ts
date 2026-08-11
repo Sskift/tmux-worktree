@@ -289,7 +289,7 @@ function createClaimKey(
  * claim issued by the same-owner config process-target generation owner for
  * that exact kind+targetId; the admission fence synchronously and atomically
  * consumes the claim before delegating to the observation authority's catalog
- * fence. No public constructor, no v1 fallback, no capability advertisement.
+ * fence. No public constructor or capability advertisement.
  */
 class CreateTargetClaimWrapper implements RelayV2CanonicalCreateTargetAuthorityPortV1 {
   private readonly authority: RelayV2CanonicalCreateTargetAuthorityPortV1;
@@ -402,7 +402,7 @@ function staleFrame(operation: "create_worktree" | "create_terminal"): Uint8Arra
  * request, and invoked on the pair's live target lookup and runner. Every
  * other operation delegates untouched to the pair's sealed inner rpc-v2
  * lane. A stale admit maps to a proved not_applied failure frame; transport
- * failures fail closed as uncertain. No retry, no v1 fallback, no capability
+ * failures fail closed as uncertain. No retry or capability
  * advertisement.
  */
 class CreateTargetAdmissionAdapter implements RelayV2StructuredProcessPort {

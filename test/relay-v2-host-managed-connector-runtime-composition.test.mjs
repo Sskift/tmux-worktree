@@ -59,6 +59,7 @@ const terminal = await import("../dist/relay/v2/terminalManager.js");
 const HOST_ID = "mac-admin";
 const CREDENTIAL_REFERENCE = "relay-v2-host-credential-ref:managed-primary";
 const AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY = "agent.transcript-lifecycle.v1";
+const AGENT_CHAT_CAPABILITY = "agent.chat.v2";
 const corpus = loadRelayV2FixtureCorpus();
 const dashboardManagementContract = JSON.parse(readFileSync(new URL(
   "../contracts/dashboard-relay-v2-management/v2/cases.json",
@@ -164,9 +165,9 @@ function readinessReady(snapshot) {
   return Object.values(snapshot.capabilities).every((ready) => ready === true);
 }
 
-function readyAgentTranscriptLifecycleAttachment() {
+function readyAgentAttachment(capability) {
   return Object.freeze({
-    capability: AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+    capability,
     subscribe(sink) {
       sink.apply(true);
       return Object.freeze({ unsubscribe() {} });
@@ -608,8 +609,8 @@ async function createHarness(options = {}) {
       },
     },
   };
-  if (options.optionalExtension !== undefined) {
-    runtimeOptions.optionalExtension = options.optionalExtension;
+  if (options.optionalExtensions !== undefined) {
+    runtimeOptions.optionalExtensions = options.optionalExtensions;
   }
   const carrierOptions = {
     idFactory: () => `managed-host-hello-${++helloSequence}`,
@@ -1101,7 +1102,7 @@ test("local-development activation is opaque, exact-owner-bound, and one-shot", 
   }
 });
 
-test("Dashboard-owned connector enrolls while automatic reauth uses its exact closed port", async () => {
+test("Dashboard-owned connector observes its client grant and enrolls while automatic reauth uses its exact closed port", async () => {
   const h = await createHarness({ managedWss: true });
   try {
     const owner = createDashboardManagementOwner(h);
@@ -1215,6 +1216,18 @@ test("Dashboard-owned connector enrolls while automatic reauth uses its exact cl
     record.socket.receive(carrierWire(reauthenticated));
     await settle();
 
+    const observedRoute = fixture("route-open");
+    observedRoute.connectorId = `managed-connector-${record.sequence}`;
+    observedRoute.routeId = "managed-route-dashboard-grant";
+    observedRoute.routeFence = "managed-fence-dashboard-grant";
+    observedRoute.payload.connectionId = "managed-connection-dashboard-grant";
+    observedRoute.payload.authContext.hostId = HOST_ID;
+    observedRoute.payload.authContext.principalId = "managed-runtime-principal";
+    observedRoute.payload.authContext.clientInstanceId = "managed-composition-client";
+    record.socket.receive(carrierWire(observedRoute));
+    await settle();
+    assert.equal(decodeCarrier(record.sent.at(-1).bytes).type, "route.opened");
+
     owner.input.push(Buffer.from(dashboardManagementCreateEnrollmentFrame));
     owner.input.push(Buffer.from(dashboardManagementStatusFrame));
     owner.input.end();
@@ -1263,6 +1276,10 @@ test("Dashboard-owned connector enrolls while automatic reauth uses its exact cl
       hostId: HOST_ID,
       connectorId: `managed-connector-${record.sequence}`,
       negotiatedCapabilityIntersection: [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+    });
+    assert.deepEqual(statusResponse.result.knownClientGrant, {
+      status: "active",
+      grantId: observedRoute.payload.authContext.grantId,
     });
     assert.equal(createResponse.result.enrollment.status, "active");
     assert.equal(
@@ -1956,10 +1973,13 @@ test("local-development activation advertises the atomic full offer and becomes 
   }
 });
 
-test("managed Host hello snapshots only the runtime-ready Agent capability", async () => {
+test("managed Host hello snapshots all runtime-ready Agent capabilities", async () => {
   const ready = await createHarness({
     managedWss: true,
-    optionalExtension: readyAgentTranscriptLifecycleAttachment(),
+    optionalExtensions: [
+      readyAgentAttachment(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+      readyAgentAttachment(AGENT_CHAT_CAPABILITY),
+    ],
   });
   try {
     const owner = createDashboardManagementOwner(ready);
@@ -1971,6 +1991,7 @@ test("managed Host hello snapshots only the runtime-ready Agent capability", asy
     assert.deepEqual(record.hello.payload.capabilities, [
       ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
       AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      AGENT_CHAT_CAPABILITY,
     ]);
     owner.input.push(Buffer.from(dashboardManagementStatusFrame));
     owner.input.end();
@@ -1987,6 +2008,7 @@ test("managed Host hello snapshots only the runtime-ready Agent capability", asy
       negotiatedCapabilityIntersection: [
         ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
         AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+        AGENT_CHAT_CAPABILITY,
       ],
     });
   } finally {

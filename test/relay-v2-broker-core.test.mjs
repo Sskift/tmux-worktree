@@ -20,7 +20,10 @@ const codec = await import("../dist/relay/v2/codec.js");
 const agentCodec = await import(
   "../dist/relay/extensions/agentTranscriptLifecycle/v1/codec.js"
 );
-const chatCodec = await import("../dist/relay/extensions/agentChat/v1/codec.js");
+const chatCodec = await import("../dist/relay/extensions/agentChat/v2/codec.js");
+const larkBindingsCodec = await import(
+  "../dist/relay/extensions/larkBindings/v2/codec.js"
+);
 
 const HOST_ID = "mac-admin";
 const NOW_MS = 1_783_700_000_000;
@@ -52,7 +55,7 @@ function hostHello({
   hostEpoch = randomUUID(),
   hostInstanceId = randomUUID(),
   capabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
-  clientDialects = ["tw-relay.v1", "tw-relay.v2"],
+  clientDialects = ["tw-relay.v2"],
   maxFrameBytes = 1_048_576,
   terminalMaxFrameBytes = Math.min(65_536, maxFrameBytes),
 } = {}) {
@@ -435,14 +438,9 @@ function agentTimelineReset(host) {
   };
 }
 
-test("Relay v2 Upgrade dispatch isolates credential and dialect stacks without fallback", async () => {
-  let legacyCalls = 0;
+test("Relay v2 Upgrade dispatch admits only bearer twcap2 credentials", async () => {
   let v2Calls = 0;
   const dependencies = {
-    verifyLegacySecret(secret) {
-      legacyCalls += 1;
-      return secret === "legacy-secret" || secret.startsWith("twcap2.");
-    },
     verifyV2AccessToken(token, expectedRole) {
       v2Calls += 1;
       if (token === "twcap2.invalid") {
@@ -452,22 +450,18 @@ test("Relay v2 Upgrade dispatch isolates credential and dialect stacks without f
     },
   };
 
-  const legacy = await broker.dispatchRelayBrokerUpgrade({
+  const retiredCredential = await broker.dispatchRelayBrokerUpgrade({
     pathname: "/client",
     search: "?secret=legacy-secret&hostId=mac-admin",
     authorizationHeaders: [],
-    legacyQuerySecret: "legacy-secret",
     offeredProtocols: [],
   }, dependencies);
-  assert.deepEqual(legacy, {
-    outcome: "accept",
-    stack: "v1",
-    credentialKind: "legacy_shared_secret",
-    role: "client",
-    selectedProtocol: null,
+  assert.deepEqual(retiredCredential, {
+    outcome: "reject",
+    status: 401,
+    errorCode: "AUTH_REQUIRED",
     fallback: false,
   });
-  assert.equal(legacyCalls, 1);
   assert.equal(v2Calls, 0);
 
   const v2 = await broker.dispatchRelayBrokerUpgrade({
@@ -481,7 +475,6 @@ test("Relay v2 Upgrade dispatch isolates credential and dialect stacks without f
   assert.equal(v2.selectedProtocol, "tw-relay.v2");
   assert.equal(v2.fallback, false);
   assert.equal(v2Calls, 1);
-  assert.equal(legacyCalls, 1);
 
   const rejectedV2 = await broker.dispatchRelayBrokerUpgrade({
     pathname: "/client",
@@ -496,25 +489,22 @@ test("Relay v2 Upgrade dispatch isolates credential and dialect stacks without f
     fallback: false,
   });
   assert.equal(v2Calls, 2);
-  assert.equal(legacyCalls, 1, "a rejected twcap2 credential must never reach v1 verification");
 
   const queryV2 = await broker.dispatchRelayBrokerUpgrade({
     pathname: "/client",
     search: "?secret=twcap2.valid",
     authorizationHeaders: [],
-    legacyQuerySecret: "twcap2.valid",
-    offeredProtocols: ["tw-relay.v1"],
+    offeredProtocols: ["tw-relay.unsupported"],
   }, dependencies);
   assert.equal(queryV2.outcome, "reject");
-  assert.equal(queryV2.errorCode, "AUTH_INVALID");
+  assert.equal(queryV2.errorCode, "AUTH_REQUIRED");
   assert.equal(v2Calls, 2);
-  assert.equal(legacyCalls, 1);
 
   const wrongDialect = await broker.dispatchRelayBrokerUpgrade({
     pathname: "/host",
     search: "",
     authorizationHeaders: ["Bearer twcap2.valid"],
-    offeredProtocols: ["tw-relay.v1", "tw-relay.host.v2"],
+    offeredProtocols: ["tw-relay.unsupported", "tw-relay.host.v2"],
   }, dependencies);
   assert.equal(wrongDialect.outcome, "reject");
   assert.equal(wrongDialect.status, 426);
@@ -758,7 +748,7 @@ test("carrier route admission hard-bounds disconnect cleanup production", async 
   assert.equal(core.inspectHost(HOST_ID).state, "offline");
 });
 
-test("optional Agent capability is a three-party route intersection with isolated withdrawal", async () => {
+test("optional capability is a three-party route intersection with isolated withdrawal", async () => {
   const baseCapabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES];
   const agentCapability = agentCodec.RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY;
   const chatCapability = chatCodec.RELAY_AGENT_CHAT_CAPABILITY;
@@ -766,6 +756,7 @@ test("optional Agent capability is a three-party route intersection with isolate
   assert.deepEqual(brokerModule.RELAY_V2_OPTIONAL_CAPABILITIES, [
     agentCapability,
     chatCapability,
+    larkBindingsCodec.RELAY_LARK_BINDINGS_CAPABILITY,
   ]);
 
   const disabled = new brokerModule.RelayV2BrokerCore({
@@ -2086,10 +2077,8 @@ test("authorization clone rejects credential extras and getter TOCTOU without le
     pathname: "/client",
     search: "",
     authorizationHeaders: ["Bearer twcap2.redacted"],
-    legacyQuerySecret: null,
     offeredProtocols: ["tw-relay.v2"],
   }, {
-    verifyLegacySecret: () => true,
     verifyV2AccessToken: () => credentialBearing,
   });
   assert.equal(upgrade.outcome, "reject");

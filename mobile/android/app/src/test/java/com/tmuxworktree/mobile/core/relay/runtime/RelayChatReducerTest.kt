@@ -1,6 +1,10 @@
 package com.tmuxworktree.mobile.core.relay.runtime
 
-import com.tmuxworktree.mobile.core.relay.v1.AgentChatTurnView
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatMarkdownPart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
+import java.security.MessageDigest
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -35,7 +39,7 @@ class RelayChatReducerTest {
             session = session,
             userMessage = "hello",
             status = "replied",
-            reply = "hi",
+            content = listOf(AgentChatMarkdownPart("hi")),
             sentAt = "2026-01-01T00:00:01Z",
         )
         val hostTurn2 = AgentChatTurnView(
@@ -57,7 +61,10 @@ class RelayChatReducerTest {
         assertEquals(2, turns.size)
         assertEquals(listOf("turn-1", "turn-2"), turns.map { it.turnId })
         // Host authoritative: stale local turn is gone, host turn-1 reply wins.
-        assertEquals("hi", turns.first { it.turnId == "turn-1" }.reply)
+        assertEquals(
+            "hi",
+            (turns.first { it.turnId == "turn-1" }.content.single() as AgentChatMarkdownPart).text,
+        )
         // Pending sends are retained so the user can still see / retry them.
         assertEquals(1, reduced.pending(session).size)
         assertEquals("req-1", reduced.pending(session).single().requestId)
@@ -66,6 +73,10 @@ class RelayChatReducerTest {
     @Test
     fun `turn updated upserts by turnId and sorts by sentAt`() {
         val session = "local:demo"
+        val imageBytes = "image bytes".toByteArray()
+        val imageSha256 = MessageDigest.getInstance("SHA-256")
+            .digest(imageBytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
         val existing = AgentChatTurnView(
             turnId = "turn-1",
             session = session,
@@ -75,7 +86,19 @@ class RelayChatReducerTest {
         )
         val state = RelayChatState(turnsBySession = mapOf(session to listOf(existing)))
 
-        val updated = existing.copy(status = "replied", reply = "hi")
+        val updated = existing.copy(
+            status = "replied",
+            content = listOf(
+                AgentChatMarkdownPart("hi"),
+                AgentChatImagePart(
+                    imageId = "image-$imageSha256",
+                    mimeType = "image/png",
+                    altText = "preview",
+                    byteLength = imageBytes.size,
+                    sha256 = imageSha256,
+                ),
+            ),
+        )
         val reduced = RelayChatReducer.reduce(
             state,
             RelayChatMutation.TurnUpdated(session, updated),
@@ -84,7 +107,23 @@ class RelayChatReducerTest {
         val turns = reduced.turns(session)
         assertEquals(1, turns.size)
         assertEquals("replied", turns.single().status)
-        assertEquals("hi", turns.single().reply)
+        assertEquals("hi", (turns.single().content.first() as AgentChatMarkdownPart).text)
+
+        val withImage = RelayChatReducer.reduce(
+            reduced,
+            RelayChatMutation.ImageChunk(
+                session = session,
+                imageId = "image-$imageSha256",
+                mimeType = "image/png",
+                byteLength = imageBytes.size,
+                sha256 = imageSha256,
+                offset = 0,
+                data = imageBytes,
+                nextOffset = null,
+            ),
+        )
+        assertTrue(withImage.image("image-$imageSha256")?.complete == true)
+        assertArrayEquals(imageBytes, withImage.image("image-$imageSha256")?.bytes)
     }
 
     @Test

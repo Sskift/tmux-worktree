@@ -13,6 +13,11 @@ function readVersion(): string {
   return typeof packageMetadata.version === "string" ? packageMetadata.version : "";
 }
 
+async function installTwDashboardAgentSupport(): Promise<void> {
+  const { ensureTwDashboardSkillInstalled } = await import("./twDashboardBootstrap.js");
+  ensureTwDashboardSkillInstalled();
+}
+
 /**
  * The hidden Dashboard management child. Only module resolution and export
  * capture run inside the try: a failure there leaves the channel untouched
@@ -54,28 +59,23 @@ function printHelp(): void {
   tw rm <session> [--worktree]  杀掉 session，加 --worktree 连带删除其 worktree
   tw status                   一次性列出 session（tw ls 的兼容别名）
 
+Agent:
+  tw context [--json]         查看当前 tw-dashboard Host、session 与输出能力
+  tw agents ls [--json]       列出 managed Agent 及运行状态
+  tw agents show <session> [--lines N] [--json]
+                              查看一个 Agent 的有界 tmux 最近输出
+
 Worktree:
   tw worktree ls              列出所有 worktree（跨项目，标记孤儿）
   tw worktree rm <name|path> [--force]   删除某个 worktree 及其分支
   tw worktree prune [--dry-run] [--force]  清理无对应 session 的孤儿 worktree
 
-RPC:
-  tw rpc list                 输出 TW 管理的 session/worktree JSON
-  tw rpc create-worktree (--path <path> | --project <name>) --ai-command <cmd> [--name <name>] [--branch <name>]
-                              创建 Dashboard-managed worktree session 并登记到 TW state
-  tw rpc create-terminal --cwd <path> [--ai-command <cmd>]
-                              创建 headless managed terminal，不写 Dashboard UI 元数据
-  tw rpc restore-worktree --path <path> --name <session> [--ai-command <cmd>]
-                              恢复已有 git worktree 并重新登记到 TW state
-  tw rpc kill-session --name <session>
-                              停止并移除一个 TW-managed session 记录
-  tw rpc capabilities         输出 Dashboard 可消费的协议能力 JSON
-
-RPC v2（与冻结 v1 并行）:
+RPC v2（managed lifecycle 唯一链路）:
   tw rpc-v2 capabilities      输出原子 v2 lifecycle capability JSON
   tw rpc-v2 list              输出带 opaque incarnation 的 managed session JSON
   tw rpc-v2 create-worktree --request-json <json>
   tw rpc-v2 create-terminal --request-json <json>
+  tw rpc-v2 restore-worktree --request-json <json>
   tw rpc-v2 kill-session --request-json <json>
                               correlated create 与 expected-incarnation kill
 
@@ -93,8 +93,8 @@ SSH Host（本地控制面）:
   tw host probe [id] [--json] 独立检查 SSH、tmux、tw RPC 能力
   tw host connect|connection-status|disconnect <id> [--json]
                               管理 TW 自有的 SSH ControlMaster 连接
-  tw host rpc <id> <rpc-command> [args...]
-                              在目标 Host 调用机器可读 tw RPC
+  tw host rpc-v2 <id> <rpc-command> [args...]
+                              在目标 Host 调用机器可读 tw RPC v2
   tw host attach <id> <session> [--take-over|--privileged-bypass]
                               通过远程 input ownership authority 接入 session
 
@@ -107,8 +107,8 @@ Automation:
 
 其它:
   tw serve [--host HOST] [--port N]  启动网页终端（默认监听所有网卡）
-  tw relay-server             启动实验性远程 relay 服务（显式 v2 可写一次 Host bootstrap）
-  tw relay-host               连接 relay；显式 v2 可从 owner-only 文件 provision Host profile
+  tw relay-server             启动 Relay v2 服务
+  tw relay-host               连接 Relay v2；缺失 profile 时 fail closed
   tw terminal-control ...     运行 / 查询本机 terminal input ownership authority
   tw setup                    安装 / 配置向导
   tw doctor                   检查 tmux/git/node 与配置是否就绪
@@ -176,6 +176,7 @@ async function main() {
       return;
     }
     case "terminal-control": {
+      await installTwDashboardAgentSupport();
       const { terminalControlCmd } = await import("./terminalControl/cli.js");
       await terminalControlCmd(process.argv.slice(3));
       return;
@@ -212,12 +213,10 @@ async function main() {
       await worktreeCmd(process.argv.slice(3));
       return;
     }
-    case "rpc": {
-      const { rpcCmd } = await import("./rpc.js");
-      await rpcCmd(process.argv.slice(3));
-      return;
-    }
     case "rpc-v2": {
+      if (["create-worktree", "create-terminal", "restore-worktree"].includes(process.argv[3] ?? "")) {
+        await installTwDashboardAgentSupport();
+      }
       const { rpcV2Cmd } = await import("./rpcV2.js");
       await rpcV2Cmd(process.argv.slice(3));
       return;
@@ -246,6 +245,17 @@ async function main() {
       await hostCmd(process.argv.slice(3));
       return;
     }
+    case "context": {
+      await installTwDashboardAgentSupport();
+      const { twContextCmd } = await import("./twDashboardCli.js");
+      await twContextCmd(process.argv.slice(3));
+      return;
+    }
+    case "agents": {
+      const { twAgentsCmd } = await import("./twDashboardCli.js");
+      await twAgentsCmd(process.argv.slice(3));
+      return;
+    }
     case "doctor": {
       const { doctorCmd } = await import("./commands.js");
       await doctorCmd();
@@ -264,6 +274,7 @@ async function main() {
         process.exit(1);
       }
       // 否则视为 dev 模式：tw <ai-command> <project> ...
+      await installTwDashboardAgentSupport();
       const { run } = await import("./dev.js");
       await run();
       return;

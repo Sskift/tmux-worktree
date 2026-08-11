@@ -346,7 +346,7 @@ test("listener-free client ingress rejects path, query, credential, and protocol
     ["wrong path", 404, { url: "/client/" }],
     ["query", 400, { url: "/client?hostId=mac-admin" }],
     ["bad credential", 401, { authorizationHeader: "Bearer twcap2.invalid" }],
-    ["extra protocol", 426, { protocols: `${CLIENT_PROTOCOL}, tw-relay.v1` }],
+    ["extra protocol", 426, { protocols: `${CLIENT_PROTOCOL}, tw-relay.unsupported` }],
   ];
 
   for (const [name, status, requestOptions] of cases) {

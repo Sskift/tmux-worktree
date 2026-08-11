@@ -6,13 +6,10 @@ const UPGRADE_METADATA_KEYS = Object.freeze([
   "pathname",
   "search",
   "authorizationHeaders",
-  "legacyQuerySecret",
   "offeredProtocols",
 ] as const);
 
-export interface RelayV2BrokerUpgradeMetadata extends RelayBrokerUpgradeRequest {
-  legacyQuerySecret: string | null;
-}
+export type RelayV2BrokerUpgradeMetadata = RelayBrokerUpgradeRequest;
 
 function isRejectedProxy(value: unknown): boolean {
   if (value === null || (typeof value !== "object" && typeof value !== "function")) {
@@ -88,7 +85,6 @@ export function captureRelayV2BrokerUpgradeMetadata(
     if (
       typeof values.pathname !== "string"
       || typeof values.search !== "string"
-      || (values.legacyQuerySecret !== null && typeof values.legacyQuerySecret !== "string")
       || !authorizationHeaders
       || !offeredProtocols
     ) throw new Error("invalid Upgrade metadata value");
@@ -96,7 +92,6 @@ export function captureRelayV2BrokerUpgradeMetadata(
       pathname: values.pathname,
       search: values.search,
       authorizationHeaders,
-      legacyQuerySecret: values.legacyQuerySecret,
       offeredProtocols,
     }) as Readonly<RelayV2BrokerUpgradeMetadata>;
   } catch {

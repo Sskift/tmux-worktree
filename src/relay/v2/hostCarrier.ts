@@ -175,25 +175,9 @@ export interface RelayV2HostRouteV2AuthContext {
   expiresAtMs: number;
 }
 
-export interface RelayV2HostRouteV1AuthContext {
-  scheme: "legacy_shared_secret";
-  role: "client";
-  hostId: string;
-  principalId: null;
-  grantId: null;
-  clientInstanceId: null;
-}
+export type RelayV2HostRouteAuthContext = RelayV2HostRouteV2AuthContext;
 
-export type RelayV2HostRouteAuthContext =
-  | RelayV2HostRouteV2AuthContext
-  | RelayV2HostRouteV1AuthContext;
-
-export type RelayV2HostCarrierClientDialect = "tw-relay.v1" | "tw-relay.v2";
-
-export interface RelayV2HostCarrierDialectAdapter {
-  /** Validate inbound and outbound bytes without rewriting either direction. */
-  validate(payload: Uint8Array): void;
-}
+export type RelayV2HostCarrierClientDialect = "tw-relay.v2";
 
 export interface RelayV2HostCarrierPublicPayloadDecoder {
   /** Called only after canonical encoded-length preflight passed. */
@@ -290,7 +274,6 @@ export interface RelayV2HostCarrierOptions {
   credentialConnectionAdmission?: RelayV2HostCredentialConnectionAdmission;
   routeSink: RelayV2HostCarrierRouteSink;
   clientDialects?: readonly RelayV2HostCarrierClientDialect[];
-  dialectAdapters?: Partial<Record<RelayV2HostCarrierClientDialect, RelayV2HostCarrierDialectAdapter>>;
   publicPayloadDecoder?: RelayV2HostCarrierPublicPayloadDecoder;
   /** Defaults to no base capabilities. The actor is not a readiness signal. */
   advertisedCapabilities?: readonly string[];
@@ -342,7 +325,28 @@ export interface RelayV2HostCarrierDashboardManagementRevocationResult {
   readonly alreadyRevoked: boolean;
 }
 
+export interface RelayV2HostCarrierDashboardManagementKnownClientGrantResult {
+  readonly type: "known-client-grant.inspected";
+  readonly connectorGeneration: number;
+  readonly connectorId: string;
+  readonly hostId: string;
+  readonly grantId: string | null;
+  readonly connectedMobileDevices: readonly Readonly<{
+    status: "connected";
+    grantId: string;
+    clientInstanceId: string;
+    connectionCount: number;
+  }>[];
+}
+
 export type RelayV2HostCarrierDashboardManagementControlOperation =
+  | Readonly<{
+      operation: "inspect_known_client_grant";
+      input: Readonly<{
+        hostId: string;
+        connectorId: string;
+      }>;
+    }>
   | Readonly<{
       operation: "create_enrollment";
       input: Readonly<{
@@ -364,6 +368,7 @@ export type RelayV2HostCarrierDashboardManagementControlOperation =
     }>;
 
 export type RelayV2HostCarrierDashboardManagementControlResult =
+  | RelayV2HostCarrierDashboardManagementKnownClientGrantResult
   | RelayV2HostCarrierDashboardManagementEnrollmentResult
   | RelayV2HostCarrierDashboardManagementRevocationResult;
 
@@ -528,6 +533,7 @@ interface RouteState {
     deadlineMs: number;
     cancel: () => void;
   } | null;
+  dashboardGrantRevoked: boolean;
 }
 
 interface ConnectorState {
@@ -1012,7 +1018,6 @@ export class RelayV2HostCarrierActor {
   private readonly capabilities: string[];
   readonly #preCarrierOfferClaim: RelayV2HostPreCarrierOfferClaim | null;
   private readonly clientDialects: RelayV2HostCarrierClientDialect[];
-  private readonly v1DialectAdapter?: RelayV2HostCarrierDialectAdapter;
   private readonly publicPayloadDecoder: RelayV2HostCarrierPublicPayloadDecoder;
   private readonly maxFrameBytes: number;
   private readonly terminalMaxFrameBytes: number;
@@ -1059,20 +1064,13 @@ export class RelayV2HostCarrierActor {
     this.capabilities = [];
     this.#preCarrierOfferClaim = options.preCarrierOfferClaim ?? null;
     this.clientDialects = [...(options.clientDialects ?? ["tw-relay.v2"])];
-    this.v1DialectAdapter = options.dialectAdapters?.["tw-relay.v1"];
     this.publicPayloadDecoder = options.publicPayloadDecoder ?? {
       decodeCanonicalBase64: publicBytes,
     };
-    if (this.clientDialects.length === 0
+    if (this.clientDialects.length !== 1
       || new Set(this.clientDialects).size !== this.clientDialects.length
-      || this.clientDialects.some((dialect) => (
-        dialect !== "tw-relay.v1" && dialect !== "tw-relay.v2"
-      ))) {
+      || this.clientDialects[0] !== "tw-relay.v2") {
       throw new Error("Relay v2 host carrier dialect advertisement is invalid");
-    }
-    if (this.clientDialects.includes("tw-relay.v1")
-      && !this.v1DialectAdapter) {
-      throw new Error("Relay v1 carrier advertisement requires an explicit v1 codec adapter");
     }
     this.maxFrameBytes = positiveLimit(options.maxFrameBytes, RELAY_V2_PUBLIC_FRAME_BYTES);
     this.terminalMaxFrameBytes = positiveLimit(
@@ -1175,13 +1173,92 @@ export class RelayV2HostCarrierActor {
     }
     const owner = Object.freeze(new RelayV2HostCarrierDashboardManagementControlOwner(
       dashboardManagementControlOwnerConstructionKey,
-      (operation) => operation.operation === "create_enrollment"
-        ? this.requestDashboardEnrollment(operation.input)
-        : this.requestDashboardGrantRevocation(operation.input),
+      (operation) => {
+        switch (operation.operation) {
+          case "inspect_known_client_grant":
+            return this.inspectDashboardKnownClientGrant(operation.input);
+          case "create_enrollment":
+            return this.requestDashboardEnrollment(operation.input);
+          case "revoke_grant":
+            return this.requestDashboardGrantRevocation(operation.input);
+        }
+      },
     ));
     const adapter = new RelayV2DashboardManagementHostCarrierControlAdapter({ owner });
     this.dashboardManagementControlAdapter = adapter;
     return adapter;
+  }
+
+  private inspectDashboardKnownClientGrant(input: Readonly<{
+    hostId: string;
+    connectorId: string;
+  }>): Promise<RelayV2HostCarrierDashboardManagementKnownClientGrantResult> {
+    const values = captureExactOwnDataValues(input, ["hostId", "connectorId"]);
+    if (!values) {
+      return Promise.reject(
+        new RelayV2HostCarrierDashboardManagementControlError("CARRIER_REJECTED"),
+      );
+    }
+    let hostId: string;
+    let connectorId: string;
+    try {
+      hostId = dashboardControlIdentifier(values[0]);
+      connectorId = dashboardControlIdentifier(values[1]);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const connector = this.current;
+    if (this.disposed
+      || this.permanentlySuperseded
+      || !connector
+      || connector.phase !== "registered"
+      || connector.connectorId !== connectorId
+      || hostId !== this.#hostId) {
+      return Promise.reject(
+        new RelayV2HostCarrierDashboardManagementControlError("NOT_REGISTERED"),
+      );
+    }
+    const connectedByGrant = new Map<string, {
+      status: "connected";
+      grantId: string;
+      clientInstanceId: string;
+      connectionCount: number;
+    }>();
+    for (const route of connector.routes.values()) {
+      if (route.phase !== "open" || route.dashboardGrantRevoked) continue;
+      const { grantId, clientInstanceId } = route.binding.authContext;
+      const existing = connectedByGrant.get(grantId);
+      if (existing) {
+        if (existing.clientInstanceId !== clientInstanceId) {
+          return Promise.reject(
+            new RelayV2HostCarrierDashboardManagementControlError("CARRIER_REJECTED"),
+          );
+        }
+        existing.connectionCount += 1;
+      } else {
+        connectedByGrant.set(grantId, {
+          status: "connected",
+          grantId,
+          clientInstanceId,
+          connectionCount: 1,
+        });
+      }
+    }
+    const connectedMobileDevices = Object.freeze([...connectedByGrant.values()]
+      .sort((left, right) => left.clientInstanceId.localeCompare(right.clientInstanceId)
+        || left.grantId.localeCompare(right.grantId))
+      .map((device) => Object.freeze(device)));
+    const grantId = connectedMobileDevices.length === 1
+      ? connectedMobileDevices[0].grantId
+      : null;
+    return Promise.resolve(Object.freeze({
+      type: "known-client-grant.inspected" as const,
+      connectorGeneration: connector.generation,
+      connectorId,
+      hostId,
+      grantId,
+      connectedMobileDevices,
+    }));
   }
 
   private requestDashboardEnrollment(input: Readonly<{
@@ -2032,6 +2109,11 @@ export class RelayV2HostCarrierActor {
       revokedAtMs: payload.revokedAtMs as number,
       alreadyRevoked: payload.alreadyRevoked as boolean,
     });
+    for (const route of connector.routes.values()) {
+      if (route.binding.authContext.grantId === pending.grantId) {
+        route.dashboardGrantRevoked = true;
+      }
+    }
     this.resolveDashboardManagementControl(connector, pending, result);
   }
 
@@ -2166,26 +2248,17 @@ export class RelayV2HostCarrierActor {
     }
     const requestedMax = objectField(payload, "limits").maxFrameBytes as number;
     const routeFence = stringField(frame, "routeFence");
-    const authContext: RelayV2HostRouteAuthContext = clientDialect === "tw-relay.v2"
-      ? Object.freeze({
-          scheme: "twcap2" as const,
-          role: "client" as const,
-          hostId: stringField(auth, "hostId"),
-          principalId: stringField(auth, "principalId"),
-          grantId: stringField(auth, "grantId"),
-          clientInstanceId: stringField(auth, "clientInstanceId"),
-          jti: stringField(auth, "jti"),
-          kid: stringField(auth, "kid"),
-          expiresAtMs: auth.expiresAtMs as number,
-        })
-      : Object.freeze({
-          scheme: "legacy_shared_secret" as const,
-          role: "client" as const,
-          hostId: stringField(auth, "hostId"),
-          principalId: null,
-          grantId: null,
-          clientInstanceId: null,
-        });
+    const authContext: RelayV2HostRouteAuthContext = Object.freeze({
+      scheme: "twcap2" as const,
+      role: "client" as const,
+      hostId: stringField(auth, "hostId"),
+      principalId: stringField(auth, "principalId"),
+      grantId: stringField(auth, "grantId"),
+      clientInstanceId: stringField(auth, "clientInstanceId"),
+      jti: stringField(auth, "jti"),
+      kid: stringField(auth, "kid"),
+      expiresAtMs: auth.expiresAtMs as number,
+    });
     const binding: RelayV2HostRouteBinding = Object.freeze({
       connectorGeneration: connector.generation,
       connectorId: connector.connectorId!,
@@ -2209,6 +2282,7 @@ export class RelayV2HostCarrierActor {
       outstandingCarrierBytes: 0,
       pressureSinceMs: null,
       commandWindowRotation: null,
+      dashboardGrantRevoked: false,
     };
     connector.routes.set(routeId, route);
     try {
@@ -2732,14 +2806,30 @@ export class RelayV2HostCarrierActor {
     route: RouteState,
     payload: Uint8Array,
   ): RelayV2JsonObject | null {
-    if (route.binding.clientDialect === "tw-relay.v2") {
+    try {
       return decodeRelayV2WebSocketFrame("public", payload, {
         opcode: "text",
         compressed: false,
       }).frame;
+    } catch {
+      // Optional public capabilities own their strict codec in HostRuntime.
+      // The carrier still admits only one canonical bounded text envelope;
+      // HostRuntime then matches it against the exact negotiated attachment.
+      const text = Buffer.from(payload).toString("utf8");
+      const frame = JSON.parse(text) as unknown;
+      if (typeof frame !== "object"
+        || frame === null
+        || Array.isArray(frame)
+        || !Buffer.from(JSON.stringify(frame), "utf8").equals(Buffer.from(payload))
+        || (frame as Record<string, unknown>).protocolVersion !== 2
+        || !["request", "response", "event"].includes(
+          (frame as Record<string, unknown>).kind as string,
+        )
+        || typeof (frame as Record<string, unknown>).type !== "string") {
+        throw new Error("Relay v2 public payload is not a canonical extension envelope");
+      }
+      return frame as RelayV2JsonObject;
     }
-    this.v1DialectAdapter!.validate(payload.slice());
-    return null;
   }
 
   private armCommandWindowRotation(

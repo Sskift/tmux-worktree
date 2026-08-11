@@ -1,7 +1,9 @@
 package com.tmuxworktree.mobile.core.relay.runtime
 
-import com.tmuxworktree.mobile.core.relay.v1.AgentChatSteeredMessage
-import com.tmuxworktree.mobile.core.relay.v1.AgentChatTurnView
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatSteeredMessage
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
+import java.security.MessageDigest
 
 /**
  * Per-session agent chat state.
@@ -13,21 +15,24 @@ import com.tmuxworktree.mobile.core.relay.v1.AgentChatTurnView
 data class RelayChatState(
     val turnsBySession: Map<String, List<AgentChatTurnView>> = emptyMap(),
     val pendingBySession: Map<String, List<PendingChatSend>> = emptyMap(),
+    val imagesById: Map<String, RelayChatImageState> = emptyMap(),
 ) {
     fun turns(session: String): List<AgentChatTurnView> = turnsBySession[session].orEmpty()
 
     fun pending(session: String): List<PendingChatSend> = pendingBySession[session].orEmpty()
 
-    fun hasAgentChatCapability(hostCapabilities: Set<String>): Boolean =
-        V1_AGENT_CHAT_CAPABILITY in hostCapabilities
-
-    companion object {
-        /** Relay v1 wire name for the optional agent-chat extension. See the relay v2 sibling
-         *  [com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY]
-         *  ("agent.chat.v1"). */
-        const val V1_AGENT_CHAT_CAPABILITY = "agent-chat-v1"
-    }
+    fun image(imageId: String): RelayChatImageState? = imagesById[imageId]
 }
+
+data class RelayChatImageState(
+    val imageId: String,
+    val mimeType: String,
+    val byteLength: Int,
+    val sha256: String,
+    val bytes: ByteArray = byteArrayOf(),
+    val complete: Boolean = false,
+    val error: String? = null,
+)
 
 data class PendingChatSend(
     val requestId: String,
@@ -69,6 +74,22 @@ sealed interface RelayChatMutation {
         val error: String,
     ) : RelayChatMutation
 
+    data class ImageChunk(
+        val session: String,
+        val imageId: String,
+        val mimeType: String,
+        val byteLength: Int,
+        val sha256: String,
+        val offset: Int,
+        val data: ByteArray,
+        val nextOffset: Int?,
+    ) : RelayChatMutation
+
+    data class ImageFailed(
+        val imageId: String,
+        val error: String,
+    ) : RelayChatMutation
+
     data class RetryFailed(val session: String) : RelayChatMutation
 
     data class ClearSession(val session: String) : RelayChatMutation
@@ -81,6 +102,8 @@ object RelayChatReducer {
         is RelayChatMutation.TurnUpdated -> upsertTurn(state, mutation)
         is RelayChatMutation.HistoryResult -> mergeHistory(state, mutation)
         is RelayChatMutation.SendFailed -> markFailed(state, mutation)
+        is RelayChatMutation.ImageChunk -> appendImageChunk(state, mutation)
+        is RelayChatMutation.ImageFailed -> markImageFailed(state, mutation)
         is RelayChatMutation.RetryFailed -> retryFailed(state, mutation)
         is RelayChatMutation.ClearSession -> clearSession(state, mutation)
     }
@@ -119,9 +142,9 @@ object RelayChatReducer {
             turns += mutation.turn
         }
         turns.sortBy { it.sentAt }
-        return state.copy(
+        return syncImages(state.copy(
             turnsBySession = state.turnsBySession + (mutation.session to turns),
-        )
+        ))
     }
 
     /**
@@ -133,9 +156,9 @@ object RelayChatReducer {
         val deduped = mutation.turns
             .distinctBy { it.turnId }
             .sortedBy { it.sentAt }
-        return state.copy(
+        return syncImages(state.copy(
             turnsBySession = state.turnsBySession + (mutation.session to deduped),
-        )
+        ))
     }
 
     private fun markFailed(state: RelayChatState, mutation: RelayChatMutation.SendFailed): RelayChatState {
@@ -160,10 +183,78 @@ object RelayChatReducer {
         )
     }
 
-    private fun clearSession(state: RelayChatState, mutation: RelayChatMutation.ClearSession): RelayChatState {
+    private fun appendImageChunk(
+        state: RelayChatState,
+        mutation: RelayChatMutation.ImageChunk,
+    ): RelayChatState {
+        val current = state.imagesById[mutation.imageId] ?: return state
+        val referenced = state.turns(mutation.session).any { turn ->
+            turn.content.any { it is AgentChatImagePart && it.imageId == mutation.imageId }
+        }
+        if (!referenced || current.complete || current.error != null) return state
+        if (current.mimeType != mutation.mimeType || current.byteLength != mutation.byteLength ||
+            current.sha256 != mutation.sha256 || current.bytes.size != mutation.offset
+        ) {
+            return state.copy(
+                imagesById = state.imagesById + (
+                    mutation.imageId to current.copy(error = "Image transfer did not match metadata")
+                ),
+            )
+        }
+        val bytes = current.bytes + mutation.data
+        val complete = mutation.nextOffset == null
+        val validCompletion = !complete || (
+            bytes.size == current.byteLength && bytes.sha256() == current.sha256
+        )
+        val updated = current.copy(
+            bytes = bytes,
+            complete = complete && validCompletion,
+            error = if (validCompletion) null else "Image integrity check failed",
+        )
+        return state.copy(imagesById = state.imagesById + (mutation.imageId to updated))
+    }
+
+    private fun markImageFailed(
+        state: RelayChatState,
+        mutation: RelayChatMutation.ImageFailed,
+    ): RelayChatState {
+        val current = state.imagesById[mutation.imageId] ?: return state
         return state.copy(
-            turnsBySession = state.turnsBySession - mutation.session,
-            pendingBySession = state.pendingBySession - mutation.session,
+            imagesById = state.imagesById + (
+                mutation.imageId to current.copy(error = mutation.error)
+            ),
         )
     }
+
+    private fun syncImages(state: RelayChatState): RelayChatState {
+        val metadata = state.turnsBySession.values
+            .flatten()
+            .flatMap { turn -> turn.content.filterIsInstance<AgentChatImagePart>() }
+            .associateBy { it.imageId }
+        val images = metadata.mapValues { (imageId, part) ->
+            state.imagesById[imageId]
+                ?.takeIf {
+                    it.mimeType == part.mimeType && it.byteLength == part.byteLength &&
+                        it.sha256 == part.sha256
+                }
+                ?: RelayChatImageState(
+                    imageId = imageId,
+                    mimeType = part.mimeType,
+                    byteLength = part.byteLength,
+                    sha256 = part.sha256,
+                )
+        }
+        return state.copy(imagesById = images)
+    }
+
+    private fun clearSession(state: RelayChatState, mutation: RelayChatMutation.ClearSession): RelayChatState {
+        return syncImages(state.copy(
+            turnsBySession = state.turnsBySession - mutation.session,
+            pendingBySession = state.pendingBySession - mutation.session,
+        ))
+    }
+
+    private fun ByteArray.sha256(): String = MessageDigest.getInstance("SHA-256")
+        .digest(this)
+        .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
 }

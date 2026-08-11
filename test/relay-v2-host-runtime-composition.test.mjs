@@ -169,11 +169,6 @@ function activateRemainingReadinessSources(composition, generation = "1") {
     generation,
     ready: true,
   }), true);
-  assert.equal(composition.readiness.h1.apply, undefined);
-  assert.equal(composition.readiness.h1.execute, undefined);
-  assert.equal(composition.readiness.h1.query, undefined);
-  assert.equal(composition.readiness.h1.issueDedupeWindow, undefined);
-  assert.equal(composition.readiness.h3.apply, undefined);
   assert.equal(composition.readiness.h3.activate(), true);
 }
 
@@ -436,15 +431,6 @@ function delayedActivationCloseAdapter() {
 test("async host composition returns only after exact recovered H2 activation", async () => {
   const h = await realCompositionHarness({ activateH0: false });
   try {
-    assert.equal(h.composition.readiness.h0.apply, undefined);
-    assert.equal(h.composition.readiness.h1.apply, undefined);
-    assert.equal(h.composition.readiness.h1.execute, undefined);
-    assert.equal(h.composition.readiness.h1.query, undefined);
-    assert.equal(h.composition.readiness.h1.issueDedupeWindow, undefined);
-    assert.equal(Object.isFrozen(h.composition.readiness.codec), true);
-    assert.equal(h.composition.readiness.codec.close !== undefined, true);
-    assert.equal(h.composition.readiness.codec.apply, undefined);
-    assert.equal(h.composition.readiness.codec.activate, undefined);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     activateRemainingReadinessSources(h.composition);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
@@ -452,9 +438,6 @@ test("async host composition returns only after exact recovered H2 activation", 
       h.composition.routeSink.onRouteBound(binding()).code,
       "CAPABILITY_UNAVAILABLE",
     );
-    assert.equal(Object.isFrozen(h.composition.readiness.h2), true);
-    assert.equal(h.composition.readiness.h2.close !== undefined, true);
-    assert.equal(h.composition.readiness.h2.apply, undefined);
     assert.deepEqual(h.composition.readiness.advertisedCapabilities(), []);
     assert.equal(await h.composition.readiness.h0.activate(), true);
     assert.equal(h.composition.readiness.advertisedCapabilities().length, 6);

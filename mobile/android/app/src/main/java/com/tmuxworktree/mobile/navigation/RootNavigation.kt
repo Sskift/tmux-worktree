@@ -68,7 +68,7 @@ fun TwRootBottomBar(
             windowInsets = WindowInsets(0, 0, 0, 0),
             modifier = Modifier
                 .fillMaxWidth()
-                .height(72.dp),
+                .height(64.dp),
         ) {
             RootDestination.entries.forEach { destination ->
                 val selected = destination == selectedDestination

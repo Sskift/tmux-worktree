@@ -10,8 +10,6 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.tmuxworktree.mobile.R
-import com.tmuxworktree.mobile.core.model.ConnectionStatus
-import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -19,7 +17,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -28,10 +25,8 @@ import kotlinx.coroutines.launch
 /**
  * Foreground service that keeps the relay connection alive while the app is in the background.
  *
- * The service keeps the process foreground while either the [RelayV1ConnectionActor] (owned by
- * [RelayConnectionRegistry]) or the Relay v2 base runtime composition (owned by
- * [RelayV2ConnectionRegistry]) is not fully stopped. It stops itself once every connection is
- * disconnected.
+ * The service keeps the process foreground while the Relay v2 base runtime composition owned by
+ * [RelayV2ConnectionRegistry] is not fully stopped. It stops itself once v2 is disconnected.
  */
 class RelayConnectionService : Service() {
 
@@ -45,7 +40,6 @@ class RelayConnectionService : Service() {
         // Promote to foreground immediately; the notification text is updated from health.
         startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.relay_notification_connecting)))
         healthCollectionJob = serviceScope.launch {
-            val v1 = RelayConnectionRegistry.actor.health.map { it.phase to it.overall }
             // A present-but-not-yet-STOPPED composition is treated as active so the foreground
             // keep-alive survives the startup/recovery window between install and CONNECTING.
             val v2 = RelayV2ConnectionRegistry.composition.flatMapLatest { composition ->
@@ -57,18 +51,8 @@ class RelayConnectionService : Service() {
                     }
                 }
             }
-            combine(v1, v2) { (v1Phase, v1Overall), v2Phase ->
-                when {
-                    v1Phase != TransportPhase.STOPPED -> when (v1Overall) {
-                        ConnectionStatus.ONLINE -> R.string.relay_notification_connected
-                        ConnectionStatus.CONNECTING,
-                        ConnectionStatus.RECOVERING,
-                        -> R.string.relay_notification_reconnecting
-                        ConnectionStatus.PAUSED -> R.string.relay_notification_waiting_network
-                        else -> R.string.relay_notification_connecting
-                    }
-
-                    v2Phase != null -> when (v2Phase) {
+            v2.map { v2Phase ->
+                if (v2Phase == null) null else when (v2Phase) {
                         RelayV2BaseRuntimePhase.ONLINE -> R.string.relay_notification_connected
                         RelayV2BaseRuntimePhase.CONNECTING,
                         RelayV2BaseRuntimePhase.RESYNCING,
@@ -76,9 +60,6 @@ class RelayConnectionService : Service() {
                         RelayV2BaseRuntimePhase.SUSPENDED ->
                             R.string.relay_notification_waiting_network
                         else -> R.string.relay_notification_connecting
-                    }
-
-                    else -> null
                 }
             }.collectLatest { textRes ->
                 if (textRes == null) {
@@ -94,10 +75,9 @@ class RelayConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // If every connection is already stopped, stop the service immediately. A present-but-not
         // terminal/closed v2 composition counts as active during its startup/recovery window.
-        val v1Active = RelayConnectionRegistry.actor.health.value.phase != TransportPhase.STOPPED
         val v2 = RelayV2ConnectionRegistry.composition.value
         val v2Active = v2 != null && !v2.isTerminalOrClosed()
-        if (!v1Active && !v2Active) {
+        if (!v2Active) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }

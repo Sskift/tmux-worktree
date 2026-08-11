@@ -60,8 +60,6 @@ import com.tmuxworktree.mobile.designsystem.TwTextPrimary
 import com.tmuxworktree.mobile.designsystem.TwTextSecondary
 import com.tmuxworktree.mobile.designsystem.TwTextMuted
 import com.tmuxworktree.mobile.designsystem.TwWarning
-import com.tmuxworktree.mobile.navigation.RootDestination
-import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 
 @Composable
 fun WorkspacesScreen(
@@ -69,17 +67,15 @@ fun WorkspacesScreen(
     scopes: List<RelayScope>,
     connectionStatus: ConnectionStatus,
     selectedScopeId: String?,
-    attentionCount: Int,
     onConnectionStatusClick: () -> Unit,
     onScopeSelected: (String?) -> Unit,
     onSessionClick: (RelaySession) -> Unit,
     onTerminalClick: (RelaySession) -> Unit,
     onNewWorktreeClick: () -> Unit,
-    onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
     onNewTerminalClick: () -> Unit = {},
     activeHostId: String = "",
-    showBottomNavigation: Boolean = true,
+    onMenuClick: (() -> Unit)? = null,
 ) {
     val hostSessions = if (activeHostId.isBlank()) sessions else sessions.filter { it.hostId == activeHostId }
     val visibleScopes = if (activeHostId.isBlank()) scopes else scopes.filter { it.hostId == activeHostId }
@@ -100,16 +96,8 @@ fun WorkspacesScreen(
                 title = "Workspaces",
                 connectionStatus = connectionStatus,
                 onConnectionStatusClick = onConnectionStatusClick,
+                onMenuClick = onMenuClick,
             )
-        },
-        bottomBar = {
-            if (showBottomNavigation) {
-                TwRootBottomBar(
-                    selectedDestination = RootDestination.WORKSPACES,
-                    attentionCount = attentionCount,
-                    onDestinationSelected = onBottomDestinationSelected,
-                )
-            }
         },
     ) { innerPadding ->
         LazyColumn(

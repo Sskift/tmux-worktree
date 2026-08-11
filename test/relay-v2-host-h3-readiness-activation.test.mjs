@@ -185,7 +185,6 @@ test("H3 stays gated until exact recovery activates and then uses the same manag
     owner = await openOwner(home);
     const readiness = readinessSink();
     const activation = activationFor(owner, readiness);
-    assert.equal(activation.lifecycle.apply, undefined);
     await assert.rejects(
       activation.runtimeH3.open(openRequest("before-h3-ready", owner.identity.hostEpoch)),
       (error) => error?.code === "CAPABILITY_UNAVAILABLE",

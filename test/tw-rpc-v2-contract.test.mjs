@@ -24,7 +24,6 @@ const storageCases = JSON.parse(readFileSync(
 ));
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const worktreePlacement = await import("../dist/canonicalWorktreePlacement.js");
-const rpc = await import("../dist/rpc.js");
 const rpcV2 = await import("../dist/rpcV2.js");
 const session = await import("../dist/session.js");
 const state = await import("../dist/state.js");
@@ -69,7 +68,7 @@ function writeState(path, sessions) {
   writeFileSync(path, `${JSON.stringify({ version: 1, sessions }, null, 2)}\n`);
 }
 
-test("TW RPC v2 manifest and capability golden are explicit and parallel to frozen v1", () => {
+test("TW RPC v2 manifest and capability golden are explicit", () => {
   assert.deepEqual(manifest, {
     contract: "tmux-worktree-tw-rpc-v2",
     version: 2,
@@ -82,6 +81,7 @@ test("TW RPC v2 manifest and capability golden are explicit and parallel to froz
       "create-worktree",
       "create-worktree-resolved",
       "create-terminal",
+      "restore-worktree",
       "kill-session",
     ],
     requestEncoding: "--request-json",
@@ -98,16 +98,6 @@ test("TW RPC v2 manifest and capability golden are explicit and parallel to froz
   assert.equal(result.stderr, "");
   assert.equal(result.stdout, cases.capabilities.stdout);
 
-  const frozenV1 = spawnSync(process.execPath, [cli, "rpc", "capabilities"], {
-    encoding: "utf8",
-    timeout: 5_000,
-  });
-  assert.equal(frozenV1.status, 0, frozenV1.stderr);
-  assert.equal(JSON.parse(frozenV1.stdout).protocolVersion, 1);
-  assert.throws(
-    () => rpcV2.assertRpcV2Capabilities(JSON.parse(frozenV1.stdout)),
-    /RPC v2 capabilities response is incompatible/,
-  );
   for (const capability of cases.capabilities.normalized.capabilities) {
     const missing = structuredClone(cases.capabilities.normalized);
     missing.capabilities = missing.capabilities.filter((item) => item !== capability);
@@ -133,6 +123,10 @@ test("TW RPC v2 fixtures freeze closed requests and response unions", () => {
     cases.wire.createTerminal.request,
   );
   assert.deepEqual(
+    rpcV2.parseRpcV2RestoreWorktreeRequest(cases.wire.restoreWorktree.request),
+    cases.wire.restoreWorktree.request,
+  );
+  assert.deepEqual(
     rpcV2.parseRpcV2KillSessionRequest(cases.wire.killSession.request),
     cases.wire.killSession.request,
   );
@@ -153,6 +147,10 @@ test("TW RPC v2 fixtures freeze closed requests and response unions", () => {
   assert.deepEqual(
     rpcV2.parseRpcV2CreateResponse(cases.wire.createTerminal.normalized, "create-terminal"),
     cases.wire.createTerminal.normalized,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2CreateResponse(cases.wire.restoreWorktree.normalized, "restore-worktree"),
+    cases.wire.restoreWorktree.normalized,
   );
   assert.deepEqual(
     rpcV2.parseRpcV2CreateResponse(cases.wire.outcomes.createFailed, "create-terminal"),
@@ -237,6 +235,15 @@ test("production execute mappers conform to frozen create and kill outcomes", ()
     worktree: null,
     lifecycleV2: worktreeExtension,
   });
+  const committedRestore = () => ({
+    session: "demo-restored",
+    workDir: "/worktrees/demo/demo-restored-a1b2c",
+    worktree: null,
+    lifecycleV2: {
+      incarnation: cases.wire.restoreWorktree.normalized.session.incarnation,
+      reservationCorrelation: null,
+    },
+  });
   const worktreeDeps = {
     loadConfig: () => ({ projects: { demo: { path: "/repo/demo", branch: "main" } } }),
     createWorktree: committedWorktree,
@@ -309,6 +316,20 @@ test("production execute mappers conform to frozen create and kill outcomes", ()
           loadConfig: () => { throw new Error("resolved execution must not read config"); },
           createWorktree: committedResolvedWorktree,
           currentList: resolvedList,
+        },
+      ),
+    },
+    {
+      id: "restore-worktree-success",
+      expected: cases.wire.restoreWorktree.normalized,
+      execute: () => rpcV2.executeRpcV2RestoreWorktree(
+        cases.wire.restoreWorktree.request,
+        {
+          restoreWorktree: committedRestore,
+          currentList: () => ({
+            protocolVersion: 2,
+            sessions: [structuredClone(cases.wire.restoreWorktree.normalized.session)],
+          }),
         },
       ),
     },
@@ -1063,41 +1084,6 @@ test("lifecycle-marked commits reject raced or candidate authority corruption in
     assert.equal(readFileSync(path, "utf8"), originalBytes);
     assert.equal(existsSync(`${path}.lock`), false);
   });
-});
-
-test("legacy records stay readable without a synthesized marker and v1 list white-lists frozen fields", () => {
-  const legacyLive = liveSession({
-    name: storageCases.legacy.name,
-    rawName: storageCases.legacy.name,
-    sessionId: "$3",
-    birthMarker: null,
-    reservationCorrelation: null,
-  });
-  const response = rpcV2.buildRpcV2ListResponse(
-    { version: 1, sessions: [storageCases.legacy] },
-    [legacyLive],
-  );
-  assert.equal(response.sessions.length, 1);
-  assert.equal(response.sessions[0].lifecycleMarked, false);
-  assert.equal(response.sessions[0].reservationCorrelation, null);
-
-  const v1 = rpc.buildRpcListResponse(
-    { version: 1, sessions: [storageCases.extended] },
-    [{
-      name: storageCases.extended.name,
-      attached: false,
-      windows: 1,
-      created: 1783700010,
-      activity: 1783700020,
-      cwd: storageCases.extended.cwd,
-    }],
-  );
-  assert.equal(Object.hasOwn(v1.sessions[0], "extensions"), false);
-  assert.equal(Object.hasOwn(v1.sessions[0], "incarnation"), false);
-  assert.deepEqual(Object.keys(v1.sessions[0]), [
-    "name", "kind", "profile", "cwd", "createdAt",
-    "attached", "windows", "created", "activity",
-  ]);
 });
 
 test("expected-incarnation kill targets one session ID and removes only the matching record", () => {

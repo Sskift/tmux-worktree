@@ -392,6 +392,7 @@ class FakeBackend {
       pane,
     });
     return {
+      agentSupported: true,
       agentRunning: this.agentRunning,
       ...(this.agentRunning ? { source: structuredClone(this.agentSource) } : {}),
     };
@@ -732,6 +733,7 @@ test("permission-protected socket serves correlated local requests and shortens 
       ownerKind: "feishu",
       outputGeneration: feishu.ownership.outputGeneration,
       pane: "0",
+      agentSupported: true,
       agentRunning: true,
       source: structuredClone(backend.agentSource),
     });
@@ -995,7 +997,7 @@ test("local-development exact auto-start binds the child to its validated manage
   }
 });
 
-test("agent status requires the exact Feishu lease and output generation", async () => {
+test("agent status requires an exact Agent consumer lease and output generation", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
   const authority = new terminalControl.TerminalControlAuthority({
@@ -1047,6 +1049,7 @@ test("agent status requires the exact Feishu lease and output generation", async
       ownerKind: "feishu",
       outputGeneration: feishu.ownership.outputGeneration,
       pane: "0",
+      agentSupported: true,
       agentRunning: true,
       source: structuredClone(backend.agentSource),
     });
@@ -1063,6 +1066,25 @@ test("agent status requires the exact Feishu lease and output generation", async
       }),
       (error) => error.code === "PERMISSION_DENIED",
     );
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "release-feishu-activity",
+      type: "lease.release",
+      lease: feishu.lease,
+    });
+    const relayV2 = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("relay-v2", "agent-lifecycle:android-client"),
+    );
+    const relayStatus = await authority.handle({
+      ...request,
+      requestId: "relay-v2-agent-status",
+      lease: relayV2.lease,
+      outputGeneration: relayV2.ownership.outputGeneration,
+    });
+    assert.equal(relayStatus.ownerKind, "relay-v2");
+    assert.equal(relayStatus.agentSupported, true);
   } finally {
     temp.cleanup();
   }
@@ -1090,7 +1112,8 @@ test("structured Claude and Codex transcripts yield only the exact final assista
     claudeRows.push(
       { type: "assistant", uuid: "claude-final", timestamp: "2026-07-21T01:03:00.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "assistant", content: [{ type: "text", text: "Claude final answer" }, { type: "tool_use", name: "ignored-tool" }] } },
       { type: "user", uuid: "claude-tool-result", timestamp: "2026-07-21T01:03:01.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false, message: { role: "user", content: [{ type: "tool_result", content: "composer footer must stay private" }] } },
-      { type: "system", subtype: "turn_duration", uuid: "claude-duration-2", parentUuid: "claude-final", timestamp: "2026-07-21T01:03:02.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false },
+      { type: "system", subtype: "stop_hook_summary", uuid: "claude-stop-hook", parentUuid: "claude-final", timestamp: "2026-07-21T01:03:02.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false },
+      { type: "system", subtype: "turn_duration", uuid: "claude-duration-2", parentUuid: "claude-stop-hook", timestamp: "2026-07-21T01:03:03.000Z", cwd: claudeCwd, sessionId: claudeSessionId, isSidechain: false },
     );
     writeFileSync(claudePath, `${claudeRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
     const claudeResult = terminalControl.readCompletedAgentResult({
@@ -1123,6 +1146,97 @@ test("structured Claude and Codex transcripts yield only the exact final assista
     assert.equal(terminalControl.readCompletedAgentResult({
       source: codexSource, cwd: codexCwd, home: root, maxBytes: 1024,
     }).text, "Codex final answer");
+
+    assert.equal(terminalControl.resumedAgentSessionIdFromStartCommand(
+      `export PATH='/bin'; codex resume '${codexSessionId}'; exec /bin/zsh -l`,
+      "codex",
+    ), codexSessionId);
+    assert.equal(terminalControl.resumedAgentSessionIdFromStartCommand(
+      `export PATH='/bin'; codex -c check_for_update_on_startup=false resume '${codexSessionId}'; exec /bin/zsh -l`,
+      "codex",
+    ), codexSessionId);
+    const preBoundaryTurnId = "019f3333-3333-7333-8333-333333333333";
+    codexRows.push(
+      { type: "event_msg", timestamp: "2026-07-21T02:02:00.000Z", payload: { type: "task_started", turn_id: preBoundaryTurnId } },
+    );
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+
+    const staleSessionId = "019f4444-4444-7444-8444-444444444444";
+    const staleTurnId = "019f5555-5555-7555-8555-555555555555";
+    const stalePath = join(codexDirectory, `rollout-2026-07-21T02-02-30-${staleSessionId}.jsonl`);
+    writeFileSync(stalePath, `${[
+      { type: "session_meta", timestamp: "2026-07-21T02:02:30.000Z", payload: { id: staleSessionId, cwd: codexCwd } },
+      { type: "event_msg", timestamp: "2026-07-21T02:02:31.000Z", payload: { type: "task_started", turn_id: staleTurnId } },
+    ].map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const mtime = new Date();
+    utimesSync(codexPath, new Date(mtime.getTime() - 1_000), new Date(mtime.getTime() - 1_000));
+    utimesSync(stalePath, mtime, mtime);
+    assert.equal(terminalControl.discoverActiveAgentSource({
+      provider: "codex", cwd: codexCwd, home: root,
+    }).sessionId, staleSessionId);
+
+    const startedAtNotBefore = "2026-07-21T02:03:00.000Z";
+    assert.throws(
+      () => terminalControl.discoverActiveAgentSource({
+        provider: "codex",
+        cwd: codexCwd,
+        home: root,
+        sessionId: codexSessionId,
+        startedAtNotBefore,
+      }),
+      (error) => error.code === "RESOURCE_EXHAUSTED" && error.retryable === true,
+    );
+    const freshTurnId = "019f6666-6666-7666-8666-666666666666";
+    codexRows.push(
+      { type: "event_msg", timestamp: "2026-07-21T02:03:01.000Z", payload: { type: "task_started", turn_id: freshTurnId } },
+    );
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const freshSource = terminalControl.discoverActiveAgentSource({
+      provider: "codex",
+      cwd: codexCwd,
+      home: root,
+      sessionId: codexSessionId,
+      startedAtNotBefore,
+    });
+    assert.equal(freshSource.sessionId, codexSessionId);
+    assert.equal(freshSource.turnId, freshTurnId);
+    codexRows.push(
+      { type: "event_msg", timestamp: "2026-07-21T02:03:02.000Z", payload: { type: "task_complete", turn_id: freshTurnId, last_agent_message: "fresh answer" } },
+    );
+
+    const unauthorizedTurnId = "019f7777-7777-7777-8777-777777777777";
+    codexRows.push(
+      { type: "event_msg", timestamp: "2026-07-21T02:04:00.000Z", payload: { type: "task_started", turn_id: unauthorizedTurnId } },
+    );
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const unauthorizedSource = terminalControl.discoverActiveAgentSource({
+      provider: "codex",
+      cwd: codexCwd,
+      home: root,
+      sessionId: codexSessionId,
+      startedAtNotBefore: "2026-07-21T02:04:00.000Z",
+    });
+    codexRows.push({
+      type: "event_msg",
+      timestamp: "2026-07-21T02:04:01.000Z",
+      payload: {
+        type: "task_complete",
+        turn_id: unauthorizedTurnId,
+        last_agent_message: null,
+        error: {
+          message: "sensitive provider authentication detail",
+          codex_error_info: "unauthorized",
+        },
+      },
+    });
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    assert.throws(
+      () => terminalControl.readCompletedAgentResult({
+        source: unauthorizedSource, cwd: codexCwd, home: root, maxBytes: 1024,
+      }),
+      (error) => error.code === "PERMISSION_DENIED"
+        && error.message === "Agent authentication is required",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1386,7 +1500,7 @@ test("operation IDs deduplicate exact retries and reject payload reuse", async (
   const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
   try {
     const target = await resolved(authority);
-    const relay = await acquired(authority, target.controlTargetId, owner("relay-v1", "connector:client:target"));
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v2", "connector:client:target"));
     const first = await authority.handle(rawRequest(relay.lease, "stream-1:input-1", "abc"));
     const duplicate = await authority.handle(rawRequest(relay.lease, "stream-1:input-1", "abc"));
     assert.equal(first.deduplicated, false);
@@ -1465,7 +1579,7 @@ test("Dashboard and Relay share interactive input without fencing each other", a
     const relay = await acquired(
       authority,
       target.controlTargetId,
-      owner("relay-v1", "connector:android-client:target"),
+      owner("relay-v2", "connector:android-client:target"),
     );
 
     assert.equal(relay.lease.leaseId, dashboard.lease.leaseId);
@@ -1595,7 +1709,7 @@ test("invalid logical panes are rejected before an in-flight operation is persis
   const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
   try {
     const target = await resolved(authority);
-    const relay = await acquired(authority, target.controlTargetId, owner("relay-v1", "client:logical-pane"));
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v2", "client:logical-pane"));
     const invalidRequests = [
       {
         ...rawRequest(relay.lease, "invalid-logical-raw", "must-not-write"),
@@ -1654,7 +1768,7 @@ test("backend INVALID_REQUEST after an operation starts remains operation-in-dou
   const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
   try {
     const target = await resolved(authority);
-    const relay = await acquired(authority, target.controlTargetId, owner("relay-v1", "backend-invalid"));
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v2", "backend-invalid"));
     backend.failWrite = new terminalControl.TerminalControlProtocolError(
       "INVALID_REQUEST",
       "backend rejected after entering its write boundary",
@@ -1859,9 +1973,9 @@ test("an idle expired non-Feishu lease is fenced and safely returns to FREE", as
       authority.handle(rawRequest(dashboard.lease, "expired-dashboard-input", "stale")),
       (error) => error.code === "PERMISSION_DENIED",
     );
-    const relay = await acquired(authority, target.controlTargetId, owner("relay-v1", "phone-after-expiry"));
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v2", "phone-after-expiry"));
     assert.equal(relay.ownership.state, "HELD");
-    assert.equal(relay.ownership.ownerKind, "relay-v1");
+    assert.equal(relay.ownership.ownerKind, "relay-v2");
   } finally {
     temp.cleanup();
   }
@@ -2554,16 +2668,11 @@ test("production backend resumes a full legacy capture without explicit recovery
       owner("dashboard", "legacy-open:pty-1"),
     );
     const marker = "TW_LEGACY_CAPTURE_CONTINUED";
-    const accepted = await authority.handle({
-      protocolVersion: 1,
-      requestId: "legacy-continue-input",
-      type: "input.agent-message",
-      lease: dashboard.lease,
-      operationId: "legacy-continue-input",
-      pane: "0",
-      message: `printf '${marker}\\n'`,
-      submit: true,
-    });
+    const accepted = await authority.handle(rawRequest(
+      dashboard.lease,
+      "legacy-continue-input",
+      `printf '${marker}\\n'\r`,
+    ));
     assert.equal(accepted.outputGeneration, currentGeneration);
     let cursor = accepted.outputCursor;
     let observed = "";
@@ -2863,16 +2972,11 @@ test("production capture rolls over with an absolute cursor and garbage-collects
     );
     const marker = "TW_RING_CAPTURE_TAIL";
     const script = `process.stdout.write("x".repeat(${emittedBytes}));process.stdout.write("\\n${marker}\\n")`;
-    const accepted = await authority.handle({
-      protocolVersion: 1,
-      requestId: "ring-output-input",
-      type: "input.agent-message",
-      lease: feishu.lease,
-      operationId: "ring-output-input",
-      pane: "0",
-      message: `${shellSingleQuote(process.execPath)} -e ${shellSingleQuote(script)}`,
-      submit: true,
-    });
+    const accepted = await authority.handle(rawRequest(
+      feishu.lease,
+      "ring-output-input",
+      `${shellSingleQuote(process.execPath)} -e ${shellSingleQuote(script)}\r`,
+    ));
     const originalGeneration = accepted.outputGeneration;
     const originalCursor = accepted.outputCursor;
     let healthy;
@@ -3218,16 +3322,11 @@ test("production tmux backend captures bounded correlated output on an isolated 
     }
     assert.equal(existsSync(join(temp.root, "key-right-ok")), true);
     assert.equal(existsSync(join(temp.root, "key-delete-ok")), true);
-    const sent = await authority.handle({
-      protocolVersion: 1,
-      requestId: "real-tmux-agent-message",
-      type: "input.agent-message",
-      lease: feishu.lease,
-      operationId: "real-tmux-agent-message",
-      pane: "0",
-      message: "printf '[[notify-group]]real-output[[/notify-group]]\\n'",
-      submit: true,
-    });
+    const sent = await authority.handle(rawRequest(
+      feishu.lease,
+      "real-tmux-agent-message",
+      "printf '[[notify-group]]real-output[[/notify-group]]\\n'\r",
+    ));
     let cursor = sent.outputCursor;
     let observed = "";
     const deadline = Date.now() + 3_000;
@@ -3260,16 +3359,11 @@ test("production tmux backend captures bounded correlated output on an isolated 
       renderedCloseMarker,
       "\n",
     ].join(""), "utf8").toString("base64");
-    const renderedTurn = await authority.handle({
-      protocolVersion: 1,
-      requestId: "real-tmux-rendered-message",
-      type: "input.agent-message",
-      lease: feishu.lease,
-      operationId: "real-tmux-rendered-message",
-      pane: "0",
-      message: `printf '%s' '${renderedPayload}' | base64 -d`,
-      submit: true,
-    });
+    const renderedTurn = await authority.handle(rawRequest(
+      feishu.lease,
+      "real-tmux-rendered-message",
+      `printf '%s' '${renderedPayload}' | base64 -d\r`,
+    ));
     let renderedRawCursor = renderedTurn.outputCursor;
     let renderedRaw = "";
     const renderedRawDeadline = Date.now() + 3_000;
@@ -3352,16 +3446,11 @@ test("production tmux backend captures bounded correlated output on an isolated 
       renderedText.slice(renderedOpenPosition + renderedOpenMarker.length, renderedClosePosition),
       "public rendered answer",
     );
-    const history = await authority.handle({
-      protocolVersion: 1,
-      requestId: "real-tmux-history",
-      type: "input.agent-message",
-      lease: feishu.lease,
-      operationId: "real-tmux-history",
-      pane: "0",
-      message: "seq 1 200",
-      submit: true,
-    });
+    const history = await authority.handle(rawRequest(
+      feishu.lease,
+      "real-tmux-history",
+      "seq 1 200\r",
+    ));
     cursor = history.outputCursor;
     observed = "";
     const historyDeadline = Date.now() + 3_000;

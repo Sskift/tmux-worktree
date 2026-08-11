@@ -533,7 +533,7 @@ function probeUpgrade(port, requestPath) {
 
 async function runCli(argv) {
   const savedArgv = process.argv;
-  const savedSecret = process.env.TW_RELAY_SECRET;
+  const savedSecret = process.env.TW_FORBIDDEN_SECRET;
   process.argv = ["node", "tw", "relay-server", ...argv];
   try {
     await relayServer.run();
@@ -543,9 +543,9 @@ async function runCli(argv) {
   } finally {
     process.argv = savedArgv;
     if (savedSecret === undefined) {
-      delete process.env.TW_RELAY_SECRET;
+      delete process.env.TW_FORBIDDEN_SECRET;
     } else {
-      process.env.TW_RELAY_SECRET = savedSecret;
+      process.env.TW_FORBIDDEN_SECRET = savedSecret;
     }
   }
 }
@@ -677,17 +677,17 @@ test("host bootstrap output sink rejects different and unsafe existing targets w
   }
 });
 
-test("explicit v2 profile selects shipping and fails closed; default v1 path is unchanged", async () => {
-  delete process.env.TW_RELAY_SECRET;
-  const missingSecret = await runCli([]);
-  assert.match(String(missingSecret?.message), /--secret|TW_RELAY_SECRET/);
+test("explicit v2 profile selects shipping and missing lane fails closed", async () => {
+  delete process.env.TW_FORBIDDEN_SECRET;
+  const missingLane = await runCli([]);
+  assert.match(String(missingLane?.message), /必须显式选择 Relay v2 lane|不会自动启动/);
 
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "tw-v2-shipping-cli-"));
   try {
     const validProfilePath = path.join(tempDir, "profile.json");
     writeFileSync(validProfilePath, JSON.stringify(shippingProfile()), { mode: 0o600 });
 
-    process.env.TW_RELAY_SECRET = "v1-secret-that-must-not-be-used";
+    process.env.TW_FORBIDDEN_SECRET = "forbidden-secret-that-must-not-be-used";
     const blocker = await runCli(["--v2-profile", validProfilePath]);
     assert.match(String(blocker?.message), /deployment source is unavailable/);
 
@@ -701,8 +701,8 @@ test("explicit v2 profile selects shipping and fails closed; default v1 path is 
     assert.match(String(bootstrapBlocker?.message), /deployment source is unavailable/);
     assert.equal(readdirSync(tempDir).includes("first-host.bootstrap"), false);
 
-    const v1Bootstrap = await runCli(["--host-bootstrap-output", outputPath]);
-    assert.match(String(v1Bootstrap?.message), /--v2-profile|只适用于/);
+    const unprofiledBootstrap = await runCli(["--host-bootstrap-output", outputPath]);
+    assert.match(String(unprofiledBootstrap?.message), /--v2-profile|只适用于/);
 
     const malformedPath = path.join(tempDir, "malformed.json");
     writeFileSync(malformedPath, "{ not json", { mode: 0o600 });
@@ -712,13 +712,10 @@ test("explicit v2 profile selects shipping and fails closed; default v1 path is 
     const missing = await runCli(["--v2-profile", path.join(tempDir, "absent.json")]);
     assert.match(String(missing?.message), /profile is unavailable/);
 
-    const ambiguousSecret = await runCli(["--v2-profile", validProfilePath, "--secret", "x"]);
-    assert.match(String(ambiguousSecret?.message), /--secret/);
-
     const ambiguousListen = await runCli(["--v2-profile", validProfilePath, "--port", "9999"]);
     assert.match(String(ambiguousListen?.message), /--host\/\--port/);
   } finally {
-    delete process.env.TW_RELAY_SECRET;
+    delete process.env.TW_FORBIDDEN_SECRET;
     rmSync(tempDir, { recursive: true, force: true });
   }
 });

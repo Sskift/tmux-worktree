@@ -303,7 +303,9 @@ function createHarness(options = {}) {
     terminals,
     welcome: { build: options.buildWelcome ?? hostWelcome },
     outbound,
-    optionalExtension: options.optionalExtension,
+    optionalExtensions: options.optionalExtension === undefined
+      ? undefined
+      : [options.optionalExtension],
     testLimits: options.testLimits,
   });
   return { runtime, state, readiness, commands, resources, snapshots, terminals, outbound };
@@ -2802,11 +2804,11 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
   }
 });
 
-test("a misrouted v1 dialect returns the typed rejection consumed as route.rejected", () => {
+test("a misrouted unsupported dialect returns the typed rejection consumed as route.rejected", () => {
   const h = createHarness();
   const legacyBinding = {
     ...binding(),
-    clientDialect: "tw-relay.v1",
+    clientDialect: "tw-relay.unsupported",
     authContext: {
       scheme: "legacy_shared_secret",
       role: "client",

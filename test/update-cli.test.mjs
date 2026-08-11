@@ -31,7 +31,7 @@ test("release-facing package versions stay aligned", () => {
   );
 });
 
-test("bundled CLI runs version and RPC without a runtime package or node_modules", () => {
+test("bundled CLI runs version and RPC v2 without a runtime package or node_modules", () => {
   const isolatedDir = mkdtempSync(join(tmpdir(), "tw-bundled-cli-version-"));
   const isolatedCli = join(isolatedDir, "cli.cjs");
   copyFileSync(cli, isolatedCli);
@@ -50,7 +50,7 @@ test("bundled CLI runs version and RPC without a runtime package or node_modules
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), expectedVersion);
-  const capabilities = spawnSync(process.execPath, [isolatedCli, "rpc", "capabilities"], {
+  const capabilities = spawnSync(process.execPath, [isolatedCli, "rpc-v2", "capabilities"], {
     cwd: isolatedDir,
     encoding: "utf8",
     env: isolatedEnv,
@@ -58,28 +58,19 @@ test("bundled CLI runs version and RPC without a runtime package or node_modules
   assert.equal(capabilities.status, 0, capabilities.stderr);
   assert.equal(capabilities.stderr, "");
   assert.deepEqual(JSON.parse(capabilities.stdout), {
-    protocolVersion: 1,
+    protocolVersion: 2,
     app: "tmux-worktree",
     capabilities: [
-      "list",
-      "managed-state",
-      "hard-timeout",
-      "create-worktree",
-      "create-terminal",
-      "restore-worktree",
-      "kill-session",
+      "incarnation-list.v1",
+      "reservation-correlation.v1",
+      "correlated-create-worktree.v1",
+      "resolved-create-worktree.v1",
+      "correlated-create-terminal.v1",
+      "expected-incarnation-kill-session.v1",
+      "hard-timeout.v1",
+      "dashboard-lifecycle.v2",
     ],
   });
-  for (const command of ["relay-server", "relay-host"]) {
-    const help = spawnSync(process.execPath, [isolatedCli, command, "--help"], {
-      cwd: isolatedDir,
-      encoding: "utf8",
-      env: isolatedEnv,
-    });
-    assert.equal(help.status, 0, help.stderr);
-    assert.equal(help.stderr, "");
-    assert.match(help.stdout, new RegExp(`tw ${command}`));
-  }
 });
 
 describe("tw update", () => {

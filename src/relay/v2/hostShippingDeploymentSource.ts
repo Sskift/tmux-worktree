@@ -855,11 +855,11 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     requireStartupOpen(signal);
     // Deliberately use the real account home. Unlike local-development, this
     // lane does not require or synthesize a 0700 replacement home; canonical
-    // Local TW session discovery and terminal-control ownership stay on the
-    // current Mac account. This non-production lane injects a static empty
-    // Host config below, so legacy remote aliases cannot enter activation.
-    // The native producer alone derives its fixed 0700 credential namespace
-    // beneath this account home.
+    // local and explicitly configured SSH TW discovery plus terminal-control
+    // ownership stay on the current Mac account. The canonical config loader
+    // is also the only source of remote scopes: SSH config discovery and
+    // unconfigured aliases never enter activation. The native producer alone
+    // derives its fixed 0700 credential namespace beneath this account home.
     const trustedHome = requireSelfHostedDarwinArm64AccountHome();
     if (options.provisionProfileInputPath !== undefined) {
       const profile = readRelayV2HostProductionProfileProvisioningInput({
@@ -905,11 +905,7 @@ async function createSelfHostedDarwinArm64ActivationOwner(
     }
     requireStartupOpen(signal);
 
-    const openedRuntime = await openCanonicalRuntimeOwner(
-      trustedHome,
-      signal,
-      Object.freeze({ configLoader: loadLocalOnlyHostConfig }),
-    );
+    const openedRuntime = await openCanonicalRuntimeOwner(trustedHome, signal);
     const terminalControlDaemonSocketPath = openedRuntime.terminalControlDaemonSocketPath;
     runtimeOwner = openedRuntime.runtimeOwner;
     requireStartupOpen(signal);
@@ -1024,7 +1020,7 @@ export function takeRelayV2HostSelfHostedDarwinArm64Activation(
  * profile, optional byte source, revision-7 trusted native source, canonical
  * runtime bundle, and the two independent TLS trust cuts are frozen into one
  * opaque one-shot ticket before the shipping root is called. Any failure
- * drains in reverse order and never selects Relay v1.
+ * drains in reverse order and fails closed.
  */
 export async function startRelayV2HostShippingFromTrustedDeployment(
 ): Promise<RelayV2HostShippingRootHandle> {
@@ -1156,7 +1152,7 @@ export async function startRelayV2HostDashboardManagementFromLocalDevelopment(
  * Darwin arm64 lane. It uses the real account home/profile, canonical local
  * runtime discovery with an explicit empty Host config, the persistent native
  * cell selected by one policy ticket, and two distinct owner-only CA inputs.
- * It never selects production or Relay v1 on failure.
+ * It never selects production on failure.
  */
 export async function startRelayV2HostDashboardManagementFromSelfHostedDarwinArm64(
   options: unknown,

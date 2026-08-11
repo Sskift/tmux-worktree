@@ -368,7 +368,7 @@ export interface RelayV2HostRuntimeCompositionOptions {
   hostInstanceId: string;
   authorities: RelayV2HostRuntimeCompositionAuthorities;
   welcome: RelayV2HostRuntimeWelcomeSerializer;
-  optionalExtension?: RelayV2HostOptionalExtensionAttachment;
+  optionalExtensions?: readonly RelayV2HostOptionalExtensionAttachment[];
   outbound: RelayV2HostRuntimeOutboundPort;
   /** Tests may only make the existing runtime limits stricter. */
   testLimits?: RelayV2HostRuntimeOptions["testLimits"];
@@ -390,7 +390,6 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   | "advertisedCapabilities"
   | "preCarrierOfferClaim"
   | "clientDialects"
-  | "dialectAdapters"
 > & Readonly<{
   hostId?: never;
   hostEpoch?: never;
@@ -400,7 +399,6 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   advertisedCapabilities?: never;
   preCarrierOfferClaim?: never;
   clientDialects?: never;
-  dialectAdapters?: never;
 }>;
 
 export interface RelayV2HostCarrierRuntimeCompositionOptions {
@@ -669,34 +667,20 @@ function sameAuthContext(
   if (left.scheme !== right.scheme || left.role !== right.role || left.hostId !== right.hostId) {
     return false;
   }
-  if (left.scheme === "twcap2" && right.scheme === "twcap2") {
-    return hasExactKeys(left, [
+  return hasExactKeys(left, [
+    "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
+    "jti", "kid", "expiresAtMs",
+  ])
+    && hasExactKeys(right, [
       "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
       "jti", "kid", "expiresAtMs",
     ])
-      && hasExactKeys(right, [
-        "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
-        "jti", "kid", "expiresAtMs",
-      ])
-      && left.principalId === right.principalId
-      && left.grantId === right.grantId
-      && left.clientInstanceId === right.clientInstanceId
-      && left.jti === right.jti
-      && left.kid === right.kid
-      && left.expiresAtMs === right.expiresAtMs;
-  }
-  if (left.scheme === "legacy_shared_secret" && right.scheme === "legacy_shared_secret") {
-    return hasExactKeys(left, [
-      "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
-    ])
-      && hasExactKeys(right, [
-        "scheme", "role", "hostId", "principalId", "grantId", "clientInstanceId",
-      ])
-      && left.principalId === right.principalId
-      && left.grantId === right.grantId
-      && left.clientInstanceId === right.clientInstanceId;
-  }
-  return false;
+    && left.principalId === right.principalId
+    && left.grantId === right.grantId
+    && left.clientInstanceId === right.clientInstanceId
+    && left.jti === right.jti
+    && left.kid === right.kid
+    && left.expiresAtMs === right.expiresAtMs;
 }
 
 function sameRouteBinding(
@@ -812,8 +796,8 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
   let h3Activation: ReturnType<typeof createRelayV2HostH3ReadinessActivation> | null = null;
   const abandonConstruction = async (): Promise<void> => {
     const barriers: Promise<unknown>[] = [];
-    if (options.optionalExtension !== undefined) {
-      try { barriers.push(options.optionalExtension.closeAndDrain()); } catch {}
+    for (const extension of options.optionalExtensions ?? []) {
+      try { barriers.push(extension.closeAndDrain()); } catch {}
     }
     if (codecActivation !== null) {
       try { codecActivation.close(); } catch {}
@@ -908,7 +892,7 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       capabilityIntersection: readinessOwner,
       welcome: options.welcome,
       outbound: options.outbound,
-      optionalExtension: options.optionalExtension,
+      optionalExtensions: options.optionalExtensions,
       testLimits: options.testLimits,
     });
   } catch (error) {
@@ -973,7 +957,9 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
       let h3Barrier: Promise<void> = Promise.resolve();
       let extensionBarrier: Promise<void> = Promise.resolve();
       try {
-        extensionBarrier = options.optionalExtension?.closeAndDrain() ?? Promise.resolve();
+        extensionBarrier = Promise.all(
+          (options.optionalExtensions ?? []).map((extension) => extension.closeAndDrain()),
+        ).then(() => undefined);
       } catch (error) { rememberFailure(error); }
       try { h1Barrier = h1Activation.close(); } catch (error) { rememberFailure(error); }
       try { h3Barrier = h3Activation.dispose(); } catch (error) { rememberFailure(error); }
@@ -1064,7 +1050,7 @@ function captureRelayV2HostCarrierRuntimeOptions(
     hostInstanceId: options.hostInstanceId,
     authorities: options.authorities,
     welcome: options.welcome,
-    optionalExtension: options.optionalExtension,
+    optionalExtensions: options.optionalExtensions,
     testLimits: options.testLimits,
   });
 }
@@ -1129,7 +1115,7 @@ async function openRelayV2HostCarrierRuntimeBridge(
     hostInstanceId: runtimeOptions.hostInstanceId,
     authorities: runtimeOptions.authorities,
     welcome: runtimeOptions.welcome,
-    optionalExtension: runtimeOptions.optionalExtension,
+    optionalExtensions: runtimeOptions.optionalExtensions,
     outbound,
     testLimits: runtimeOptions.testLimits,
   });
@@ -1291,7 +1277,6 @@ export async function openRelayV2HostCarrierRuntimeComposition(
       advertisedCapabilities: [],
       preCarrierOfferClaim: undefined,
       clientDialects: ["tw-relay.v2"],
-      dialectAdapters: Object.freeze({}),
       onStatus(status): void {
         bridge.observeCarrierStatus(actor, status);
         observedStatus?.(status);
@@ -1863,7 +1848,7 @@ function captureManagedWssRuntimeOptions(
   const required = [
     "hostId", "hostEpoch", "hostInstanceId", "authorities", "welcome",
   ] as const;
-  const allowed = new Set<string>([...required, "optionalExtension", "testLimits"]);
+  const allowed = new Set<string>([...required, "optionalExtensions", "testLimits"]);
   const keys = Reflect.ownKeys(descriptors);
   if (keys.some((key) => typeof key !== "string"
     || !allowed.has(key)
@@ -2322,7 +2307,6 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
             advertisedCapabilities: [],
             preCarrierOfferClaim: preCarrierOfferClaim ?? undefined,
             clientDialects: ["tw-relay.v2"],
-            dialectAdapters: Object.freeze({}),
             onStatus: input.onCarrierStatus,
           });
           runtimeBinding.attach(actor, input.carrierAttemptGeneration);
@@ -2881,6 +2865,8 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
       return control;
     };
     const carrierControl: RelayV2DashboardManagementCarrierControlPort = Object.freeze({
+      inspectKnownClientGrant: (input) =>
+        currentCarrierControl().inspectKnownClientGrant(input),
       createEnrollment: (input) => currentCarrierControl().createEnrollment(input),
       revokeGrant: (input) => currentCarrierControl().revokeGrant(input),
     });
@@ -3004,7 +2990,7 @@ async function openRelayV2HostManagedConnectorRuntimeCompositionInternal(
  * Construction only closes the existing managed composition and WSS factory
  * over one canonical credential authority/reference. It does not open a
  * socket, resolve credential material, start a process/timer/retry, or provide
- * a Relay v1 fallback. Capabilities remain empty unless the exact credential
+ * another transport. Capabilities remain empty unless the exact credential
  * owner supplies a recognized one-shot local-development or explicit
  * self-hosted activation.
  */

@@ -168,7 +168,7 @@ internal data class AgentSnapshotPreFirstFence(
 /**
  * Persistence-friendly identity for one optional Agent extension consumer lane.
  *
- * This model deliberately has no Relay v1 name fallback and no terminal/command-derived fields.
+ * This model deliberately has no terminal/command-derived fields.
  */
 internal data class AgentExtensionSessionIdentity(
     val profileId: String,

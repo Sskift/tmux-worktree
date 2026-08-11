@@ -771,7 +771,8 @@ internal object RelayV2TerminalCheckpointReducer {
             action.parserContinuityId != current.parserContinuityId ||
             action.parserContinuityId != pending.parserContinuityId ||
             action.cols != pending.cols || action.rows != pending.rows ||
-            (pending.requiresDeduplicatedResponse && !action.deduplicated) ||
+            (pending.requiresDeduplicatedResponse && !action.deduplicated &&
+                pending.mode != RelayV2TerminalOpenMode.NEW) ||
             !dispositionMatches(pending.mode, action.disposition) ||
             replayFrom != ZERO || tail == null || tail < ZERO ||
             (tail != ZERO &&

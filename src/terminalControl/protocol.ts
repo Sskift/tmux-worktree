@@ -18,7 +18,6 @@ export type TerminalControlOwnerKind =
   | "feishu"
   | "dashboard"
   | "local-cli"
-  | "relay-v1"
   | "relay-v2"
   | "tw-serve";
 
@@ -320,7 +319,6 @@ function owner(value: unknown): TerminalControlOwner {
     "feishu",
     "dashboard",
     "local-cli",
-    "relay-v1",
     "relay-v2",
     "tw-serve",
   ];

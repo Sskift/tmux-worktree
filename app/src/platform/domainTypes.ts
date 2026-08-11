@@ -237,34 +237,6 @@ export type FileSearchResult = {
   line_content: string | null;
 };
 
-export type MobileRelayStatus = {
-  active: boolean;
-  connected: boolean;
-  connectionState: string;
-  relayUrl: string;
-  brokerHostId: string;
-  hostId: string;
-  secret: string;
-  token: string;
-  connectedAt?: number | null;
-  updatedAt?: number | null;
-  retryInMs?: number | null;
-  error?: string | null;
-};
-
-export type MobileRelayConfigInput = {
-  relayUrl: string;
-  brokerHostId: string;
-  hostId: string;
-  secret: string;
-};
-
-export type MobileRelayBrokerInput = {
-  hostId: string;
-  port?: number;
-  quickTunnel?: boolean;
-};
-
 export const MOBILE_RELAY_V2_REQUIRED_CAPABILITIES = [
   "error.structured.v1",
   "command.ledger.v1",
@@ -275,6 +247,8 @@ export const MOBILE_RELAY_V2_REQUIRED_CAPABILITIES = [
 ] as const;
 export const MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES = [
   "agent.transcript-lifecycle.v1",
+  "agent.chat.v2",
+  "lark.bindings.v2",
 ] as const;
 export const MOBILE_RELAY_V2_KNOWN_CAPABILITIES = [
   ...MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
@@ -288,12 +262,6 @@ export type MobileRelayV2AdapterAuthority =
   | { kind: "unavailable"; reason: string }
   | { kind: "fake_preview"; reason: null }
   | { kind: "node"; reason: null };
-
-export type MobileRelayV1SharedSecretProfile = {
-  protocolVersion: 1;
-  credentialKind: "legacy_shared_secret";
-  sharedSecretConfigured: boolean;
-};
 
 export type MobileRelayV2HostCredential = {
   protocolVersion: 2;
@@ -428,13 +396,20 @@ export type MobileRelayV2KnownClientGrant =
     }
   | { status: "failed"; grantId: string; error: string; retryable: boolean };
 
+export type MobileRelayV2ConnectedDevice = {
+  status: "connected";
+  grantId: string;
+  clientInstanceId: string;
+  connectionCount: number;
+};
+
 export type MobileRelayV2DashboardState = {
   authority: MobileRelayV2AdapterAuthority;
-  v1Profile: MobileRelayV1SharedSecretProfile;
   hostCredential: MobileRelayV2HostCredential;
   connector: MobileRelayV2Connector;
   enrollment: MobileRelayV2Enrollment;
   knownClientGrant: MobileRelayV2KnownClientGrant;
+  connectedMobileDevices: readonly MobileRelayV2ConnectedDevice[];
 };
 
 export type MobileRelayV2CreateEnrollmentInput = {

@@ -501,18 +501,6 @@
   border-color: #315f39;
 }
 
-.connections-relay-stack--v1 {
-  color: var(--shell-text-muted);
-}
-
-.connections-relay-legacy-v1 {
-  margin-top: 13px;
-}
-
-.connections-relay-legacy-v1 > summary {
-  color: var(--shell-text-secondary);
-}
-
 .connections-relay-overview {
   display: grid;
   gap: 10px;
@@ -611,8 +599,7 @@
   text-decoration: underline;
 }
 
-.connections-relay-overview__secondary,
-.connections-relay-overview__paired {
+.connections-relay-overview__secondary {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -624,14 +611,99 @@
   line-height: 15px;
 }
 
-.connections-relay-overview__paired > span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+.connections-relay-overview__secondary .connections-button {
+  min-height: 26px;
+  padding: 3px 8px;
+  font-size: 10px;
 }
 
-.connections-relay-overview__secondary .connections-button,
-.connections-relay-overview__paired .connections-button {
+.connections-relay-overview__devices {
+  display: grid;
+  gap: 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--shell-border);
+}
+
+.connections-relay-overview__devices-heading,
+.connections-relay-overview__device {
+  display: grid;
+  align-items: center;
+}
+
+.connections-relay-overview__devices-heading {
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding-bottom: 6px;
+  color: var(--shell-text-secondary);
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 580;
+}
+
+.connections-relay-overview__devices-heading strong {
+  min-width: 20px;
+  padding: 1px 6px;
+  color: var(--shell-text-muted);
+  background: var(--shell-surface-2);
+  border-radius: 999px;
+  font-size: 10px;
+  text-align: center;
+}
+
+.connections-relay-overview__devices-empty {
+  padding: 3px 0;
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.connections-relay-overview__device {
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  gap: 8px;
+  min-height: 50px;
+  padding: 7px 0;
+}
+
+.connections-relay-overview__device + .connections-relay-overview__device {
+  border-top: 1px solid var(--shell-border);
+}
+
+.connections-relay-overview__device-icon {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  color: var(--shell-success);
+  background: var(--shell-surface-2);
+  border-radius: var(--shell-radius-sm);
+}
+
+.connections-relay-overview__device-copy {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.connections-relay-overview__device-copy strong,
+.connections-relay-overview__device-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connections-relay-overview__device-copy strong {
+  color: var(--shell-text-secondary);
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 580;
+}
+
+.connections-relay-overview__device-copy span {
+  color: var(--shell-text-muted);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.connections-relay-overview__device .connections-button {
   min-height: 26px;
   padding: 3px 8px;
   font-size: 10px;

@@ -16,13 +16,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.ErrorOutline
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -48,8 +45,6 @@ import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.designsystem.*
-import com.tmuxworktree.mobile.navigation.RootDestination
-import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 
 @Composable
 fun InboxScreen(
@@ -59,11 +54,8 @@ fun InboxScreen(
     onMenuClick: () -> Unit,
     onConnectionStatusClick: () -> Unit,
     onSessionClick: (RelaySession) -> Unit,
-    onReplyClick: (RelaySession) -> Unit,
-    onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
     agentEvidenceAvailability: AgentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
-    showBottomNavigation: Boolean = true,
 ) {
     // Inbox is the agent workflow. Plain terminal sessions remain available
     // under Workspaces > Terminals and must not be presented as agents.
@@ -93,15 +85,6 @@ fun InboxScreen(
                 onMenuClick = onMenuClick,
                 onConnectionStatusClick = onConnectionStatusClick,
             )
-        },
-        bottomBar = {
-            if (showBottomNavigation) {
-                TwRootBottomBar(
-                    selectedDestination = RootDestination.INBOX,
-                    attentionCount = attentionSessions.size,
-                    onDestinationSelected = onBottomDestinationSelected,
-                )
-            }
         },
     ) { innerPadding ->
         LazyColumn(
@@ -145,8 +128,8 @@ fun InboxScreen(
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(min = 88.dp)
-                            .padding(top = 24.dp)
+                            .heightIn(min = 56.dp)
+                            .padding(top = 12.dp)
                             .testTag("inbox_attention_empty")
                             .semantics {
                                 contentDescription = unavailableAgentStatus?.emptyContentDescription
@@ -163,14 +146,13 @@ fun InboxScreen(
                         session = session,
                         nowMillis = nowMillis,
                         onOpen = { onSessionClick(session) },
-                        onReply = { onReplyClick(session) },
                     )
                 }
             }
 
             item(key = "attention_divider") {
                 HorizontalDivider(color = TwBorder, thickness = 1.dp)
-                Spacer(Modifier.height(28.dp))
+                Spacer(Modifier.height(16.dp))
             }
 
             item(key = "running_header") {
@@ -224,10 +206,6 @@ internal fun inboxUnavailableAgentStatus(
     availability: AgentEvidenceAvailability,
 ): InboxUnavailableAgentStatus? = when (availability) {
     AgentEvidenceAvailability.AVAILABLE -> null
-    AgentEvidenceAvailability.RELAY_V1_UNSUPPORTED -> InboxUnavailableAgentStatus(
-        subtitle = "Relay v1 does not report reply state",
-        emptyContentDescription = "Agent reply state is unavailable with Relay version 1",
-    )
     AgentEvidenceAvailability.RELAY_V2_UNAVAILABLE -> InboxUnavailableAgentStatus(
         subtitle = "Relay v2 Agent capability is unavailable or was not negotiated",
         emptyContentDescription =
@@ -241,15 +219,21 @@ private fun AttentionSessionRow(
     session: RelaySession,
     nowMillis: Long,
     onOpen: () -> Unit,
-    onReply: () -> Unit,
 ) {
     val visual = session.agentState.visual()
     val age = relativeTimeFromSeconds(session.activityAtSeconds, nowMillis).ifBlank { "now" }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 108.dp)
-            .padding(vertical = 12.dp),
+            .heightIn(min = 88.dp)
+            .clickable(role = Role.Button, onClick = onOpen)
+            .testTag("attention_session_${session.stableId}")
+            .semantics(mergeDescendants = true) {
+                role = Role.Button
+                contentDescription = "${session.title}, ${visual.accessibleLabel}, " +
+                    "${relativeTimeDescriptionFromSeconds(session.activityAtSeconds, nowMillis)}. ${session.summary}"
+            }
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
@@ -265,15 +249,7 @@ private fun AttentionSessionRow(
         }
         Spacer(Modifier.width(10.dp))
         Column(
-            modifier = Modifier
-                .weight(1f)
-                .clickable(role = Role.Button, onClick = onOpen)
-                .testTag("attention_session_${session.stableId}")
-                .semantics(mergeDescendants = true) {
-                    role = Role.Button
-                    contentDescription = "${session.title}, ${visual.accessibleLabel}, " +
-                        "${relativeTimeDescriptionFromSeconds(session.activityAtSeconds, nowMillis)}. ${session.summary}"
-                },
+            modifier = Modifier.weight(1f),
         ) {
             Text(
                 text = session.title,
@@ -312,28 +288,13 @@ private fun AttentionSessionRow(
                 color = TwTextSecondary,
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = onReply,
-                modifier = Modifier
-                    .width(72.dp)
-                    .height(48.dp)
-                    .testTag("reply_session_${session.stableId}")
-                    .semantics {
-                        contentDescription = "Reply to ${session.title}"
-                    },
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TwAccent,
-                    contentColor = TwOnAccent,
-                ),
-                contentPadding = PaddingValues(horizontal = 10.dp),
-            ) {
-                Text(
-                    text = if (session.agentState == AgentState.FAILED) "Open" else "Reply",
-                    style = MaterialTheme.typography.labelLarge,
-                )
-            }
+            Spacer(Modifier.height(4.dp))
+            Icon(
+                imageVector = Icons.Outlined.ChevronRight,
+                contentDescription = null,
+                tint = TwTextSecondary,
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 }
@@ -347,14 +308,14 @@ private fun RunningSessionRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 76.dp)
+            .heightIn(min = 64.dp)
             .clickable(role = Role.Button, onClick = onClick)
             .testTag("running_session_${session.stableId}")
             .semantics(mergeDescendants = true) {
                 role = Role.Button
                 contentDescription = "${session.title}, ${visual.accessibleLabel}. ${session.summary}"
             }
-            .padding(vertical = 14.dp),
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -363,7 +324,7 @@ private fun RunningSessionRow(
             tint = visual.color,
             modifier = Modifier.size(10.dp),
         )
-        Spacer(Modifier.width(22.dp))
+        Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = session.title,
@@ -410,8 +371,6 @@ private fun InboxScreenPreview() {
             onMenuClick = {},
             onConnectionStatusClick = {},
             onSessionClick = {},
-            onReplyClick = {},
-            onBottomDestinationSelected = {},
         )
     }
 }

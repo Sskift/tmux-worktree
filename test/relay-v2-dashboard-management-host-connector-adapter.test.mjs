@@ -176,7 +176,11 @@ test("inspectCut consumes one atomic controller cut and canonicalizes only the f
     negotiatedCapabilityIntersection: REQUIRED.slice(0, 5),
   });
   assert.equal(h.calls.inspect, 2, "each projection consumes exactly one atomic cut");
-  assert.deepEqual(OPTIONAL, ["agent.transcript-lifecycle.v1"]);
+  assert.deepEqual(OPTIONAL, [
+    "agent.transcript-lifecycle.v1",
+    "agent.chat.v2",
+    "lark.bindings.v2",
+  ]);
 });
 
 test("the adapter captures one controller and rejects foreign lineage, generation, and connector cuts", async (t) => {

@@ -2,13 +2,16 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentClientDisposition
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentExtensionSupport
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLocalRequestFence
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptDurableStorageAccounting
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientReduction
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientReducer
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientState
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedHandoffReceipt
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableControlCommand
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLiveEventCommand
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableNamespace
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableOperationResult
@@ -583,7 +586,7 @@ class RelayV2BaseRuntimeCompositionTest {
                         assertEquals(case.name, 1, agent.loadCalls.get())
                         assertEquals(case.name, 1, agent.statusInitializationCalls.get())
                         assertEquals(case.name, 1, agent.statusPrepareCalls.get())
-                        assertEquals(case.name, 1, agent.mutationCommits.get())
+                        assertEquals(case.name, 2, agent.mutationCommits.get())
                         assertEquals(
                             case.name,
                             1,
@@ -3611,12 +3614,29 @@ class RelayV2BaseRuntimeCompositionTest {
                             ).also(current::set)
                         }
                     }
+                    "applyControlUnderApplyLease" -> {
+                        val command = arguments!![0]
+                            as AgentTranscriptLifecycleDurableControlCommand
+                        val before = current.get()
+                        check(command.fence.expectedNamespace == before.namespace)
+                        val reduction = AgentTranscriptLifecycleClientReducer.reduce(
+                            before.state,
+                            command.input,
+                        )
+                        current.set(before.copy(state = reduction.state))
+                        mutationCommits.incrementAndGet()
+                        AgentTranscriptLifecycleDurableOperationResult(reduction)
+                    }
                     "prepareRequestUnderApplyLease" -> {
                         statusPrepareCalls.incrementAndGet()
                         val command = arguments!![0]
                             as AgentTranscriptLifecycleDurablePrepareRequestCommand.Status
                         val record = current.get()
                         check(command.fence.expectedNamespace == record.namespace)
+                        check(
+                            record.state.extensionLane.support !=
+                                AgentExtensionSupport.UNNEGOTIATED,
+                        )
                         mutationCommits.incrementAndGet()
                         AgentTranscriptLifecycleDurablePrepareRequestResult(
                             reduction = AgentTranscriptLifecycleClientReduction(

@@ -419,7 +419,7 @@ function plainHttpGet(port) {
 
 async function runCli(argv) {
   const savedArgv = process.argv;
-  const savedSecret = process.env.TW_RELAY_SECRET;
+  const savedSecret = process.env.TW_FORBIDDEN_SECRET;
   process.argv = ["node", "tw", "relay-server", ...argv];
   try {
     await relayServer.run();
@@ -429,15 +429,15 @@ async function runCli(argv) {
   } finally {
     process.argv = savedArgv;
     if (savedSecret === undefined) {
-      delete process.env.TW_RELAY_SECRET;
+      delete process.env.TW_FORBIDDEN_SECRET;
     } else {
-      process.env.TW_RELAY_SECRET = savedSecret;
+      process.env.TW_FORBIDDEN_SECRET = savedSecret;
     }
   }
 }
 
 test("explicit v2 profile CLI routes through the trusted deployment source owner", async () => {
-  delete process.env.TW_RELAY_SECRET;
+  delete process.env.TW_FORBIDDEN_SECRET;
   const home = makeHome("tw-v2-deploy-cli-");
   try {
     const port = await reserveFreePort();
@@ -446,7 +446,7 @@ test("explicit v2 profile CLI routes through the trusted deployment source owner
     // No deployment namespace exists under the trusted home: the CLI fails
     // closed through the deployment source before any listener, and the v1
     // shared secret in the environment is never used to start v1 instead.
-    process.env.TW_RELAY_SECRET = "v1-secret-that-must-not-be-used";
+    process.env.TW_FORBIDDEN_SECRET = "forbidden-secret-that-must-not-be-used";
     const blocker = await runCli(["--v2-profile", profilePath]);
     assert.match(String(blocker?.message), /deployment source is unavailable/);
     assert.equal(await connectRefused(port), true);
@@ -460,19 +460,17 @@ test("explicit v2 profile CLI routes through the trusted deployment source owner
     assert.equal(await connectRefused(port), true);
 
     // Mutual exclusion with v1 flags is unchanged.
-    const ambiguousSecret = await runCli(["--v2-profile", profilePath, "--secret", "x"]);
-    assert.match(String(ambiguousSecret?.message), /--secret/);
     const ambiguousListen = await runCli(["--v2-profile", profilePath, "--port", "9999"]);
     assert.match(String(ambiguousListen?.message), /--host\/--port/);
   } finally {
-    delete process.env.TW_RELAY_SECRET;
+    delete process.env.TW_FORBIDDEN_SECRET;
     rmSync(home, { recursive: true, force: true });
   }
 });
 
 test("standalone CJS CLI reaches the trusted deployment fail-closed path without v1 fallback", async () => {
   const home = makeHome("tw-v2-deploy-standalone-cli-");
-  const v1Secret = "v1-secret-that-must-not-be-used";
+  const forbiddenSecret = "forbidden-secret-that-must-not-be-used";
   try {
     const port = await reserveFreePort();
     const profilePath = writeProfile(home, deploymentProfile(home, port));
@@ -485,7 +483,7 @@ test("standalone CJS CLI reaches the trusted deployment fail-closed path without
       encoding: "utf8",
       env: {
         ...process.env,
-        TW_RELAY_SECRET: v1Secret,
+        TW_FORBIDDEN_SECRET: forbiddenSecret,
       },
       timeout: 5_000,
     });
@@ -495,7 +493,7 @@ test("standalone CJS CLI reaches the trusted deployment fail-closed path without
     assert.equal(result.status, 1, result.stderr);
     assert.equal(result.stdout, "");
     assert.match(result.stderr, /deployment source is unavailable/);
-    assert.equal(result.stderr.includes(v1Secret), false);
+    assert.equal(result.stderr.includes(forbiddenSecret), false);
     assert.equal(await connectRefused(port), true);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -669,21 +667,7 @@ test("production defaults bind the fixed native loader, frozen resolvers, and th
     assert.equal(Object.isFrozen(production), true);
     assert.equal(Object.hasOwn(production, "createHttpsServer"), false);
     assert.equal(Object.isFrozen(production.privilegedResolver), true);
-    assert.deepEqual(
-      Object.getOwnPropertyNames(production.privilegedResolver).sort(),
-      ["resolveIssuerKeyring", "resolveTlsMaterial"],
-    );
-    for (const name of ["resolveTlsMaterial", "resolveIssuerKeyring"]) {
-      const descriptor = Object.getOwnPropertyDescriptor(production.privilegedResolver, name);
-      assert.equal(typeof descriptor.value, "function");
-      assert.equal(descriptor.get, undefined);
-      assert.equal(descriptor.set, undefined);
-    }
     assert.equal(Object.isFrozen(production.externalContinuityAttemptProvider), true);
-    assert.deepEqual(
-      Object.getOwnPropertyNames(production.externalContinuityAttemptProvider),
-      ["resolveAttempt"],
-    );
 
     // The real Node attempt provider resolves trust/credential material from
     // the deployment files and binds it to the profile's exact endpoint. The

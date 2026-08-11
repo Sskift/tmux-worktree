@@ -1,24 +1,19 @@
 import {
   AlertCircle,
   Check,
-  Clipboard,
   Download,
   LoaderCircle,
   Pencil,
-  Play,
   PlugZap,
   Plus,
-  QrCode,
   Radio,
   RotateCcw,
   Save,
   Server,
   Settings2,
-  Square,
   Trash2,
   Wifi,
   WifiOff,
-  Wrench,
   X,
 } from "lucide-react";
 import {
@@ -31,7 +26,6 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
-import QRCode from "qrcode";
 import { MenuSelect, type MenuOption } from "../../MenuSelect";
 import type {
   HostConfig,
@@ -41,7 +35,6 @@ import type {
   Session,
 } from "../../platform";
 import { useDashboardBackend } from "../../platform";
-import type { MobileRelayController } from "../hooks/useMobileRelayController";
 import "../design/tokens.css";
 import "./ConnectionsSettings.css";
 import {
@@ -53,15 +46,10 @@ import {
   createEmptyHostDraft,
   hostConfigToDraft,
   sshCandidateToDraft,
-  summarizeRelayStatus,
   validateHostDraft,
-  validateRelayDraft,
   type HostDraft,
   type HostDraftErrors,
   type HostDraftField,
-  type RelayConnectionState,
-  type RelayDraft,
-  type RelayDraftErrors,
 } from "./connectionsModel";
 import { RelayV2EnrollmentPreviewPanel } from "./RelayV2EnrollmentPreviewPanel";
 import { RelayConnectionOverviewCard } from "./RelayConnectionOverviewCard";
@@ -84,40 +72,6 @@ interface AsyncNotice {
   message: string;
 }
 
-export type RelayCopyField = "relayUrl" | "hostId" | "token";
-export type RelayBusyAction = "save" | "start" | "startBroker" | "stop";
-export type RelayActionResult = boolean | void;
-
-export interface RelaySettingsBusyState {
-  save: boolean;
-  start: boolean;
-  startBroker: boolean;
-  stop: boolean;
-}
-
-export interface RelaySettingsModel extends RelayDraft {
-  statusKnown: boolean;
-  connectionState: RelayConnectionState;
-  active: boolean;
-  connected: boolean;
-  tokenConfigured: boolean;
-  v1PairingPayload: string | null;
-  error?: string | null;
-  busy: RelaySettingsBusyState;
-}
-
-export interface RelaySettingsActions {
-  setRelayUrl: (value: string) => void;
-  setBrokerHostId: (value: string) => void;
-  setHostId: (value: string) => void;
-  setToken: (value: string) => void;
-  save: () => RelayActionResult | Promise<RelayActionResult>;
-  start: () => RelayActionResult | Promise<RelayActionResult>;
-  startBroker: () => RelayActionResult | Promise<RelayActionResult>;
-  stop: () => RelayActionResult | Promise<RelayActionResult>;
-  copy: (field: RelayCopyField, value: string) => void | Promise<void>;
-}
-
 export interface ConnectionsSettingsProps {
   hosts: readonly HostConfig[];
   hostStatuses: Readonly<Record<string, HostStatus>>;
@@ -131,60 +85,6 @@ export interface ConnectionsSettingsProps {
   ) => boolean;
   installingHostId: string | null;
   onInstallTw: (hostId: string) => void | Promise<void>;
-  relay: RelaySettingsModel;
-  relayActions: RelaySettingsActions;
-}
-
-export interface RelaySettingsBindings {
-  relay: RelaySettingsModel;
-  relayActions: RelaySettingsActions;
-}
-
-export function relaySettingsBindingsFromController(
-  controller: MobileRelayController,
-): RelaySettingsBindings {
-  const connectionState: RelayConnectionState = controller.error
-    ? "error"
-    : controller.connected
-      ? "connected"
-      : controller.connectionState === "retrying"
-        ? "retrying"
-        : controller.active || controller.busy
-          ? "starting"
-          : "stopped";
-
-  return {
-    relay: {
-      statusKnown: controller.statusKnown,
-      relayUrl: controller.draftUrl,
-      brokerHostId: controller.brokerHostId,
-      hostId: controller.draftHostId,
-      token: controller.draftSecret,
-      tokenConfigured: controller.tokenState === "Configured",
-      v1PairingPayload: controller.v1PairingPayload,
-      connectionState,
-      active: controller.active,
-      connected: controller.connected,
-      error: controller.error,
-      busy: {
-        save: controller.saving,
-        start: controller.loading,
-        startBroker: controller.brokerStarting,
-        stop: controller.stopping,
-      },
-    },
-    relayActions: {
-      setRelayUrl: controller.setDraftUrl,
-      setBrokerHostId: controller.setBrokerHostId,
-      setHostId: controller.setDraftHostId,
-      setToken: controller.setDraftSecret,
-      save: controller.save,
-      start: controller.start,
-      startBroker: controller.startBroker,
-      stop: controller.stop,
-      copy: (_field, value) => controller.copyValue(value),
-    },
-  };
 }
 
 interface HostFieldDefinition {
@@ -207,9 +107,6 @@ const HOST_FIELDS: readonly HostFieldDefinition[] = [
   { field: "twPath", label: "tw path", placeholder: "tw" },
 ] as const;
 
-const EMPTY_RELAY_ERRORS: RelayDraftErrors = {};
-const RELAY_BROKER_ID = "connection-relay-broker";
-const RELAY_BROKER_ERROR_ID = `${RELAY_BROKER_ID}-error`;
 // The underlying Rust status command runs load_config + probe per call, and
 // probe_status shells out over SSH to the devbox. Poll coarsely (15s) so the
 // relay tab does not hammer the remote host while it stays open.
@@ -245,8 +142,6 @@ export function ConnectionsSettings({
   onHostsMutationSettled,
   installingHostId,
   onInstallTw,
-  relay,
-  relayActions,
 }: ConnectionsSettingsProps) {
   const dashboardBackend = useDashboardBackend();
   const [activeTab, setActiveTab] = useState<ConnectionTab>("hosts");
@@ -260,10 +155,6 @@ export function ConnectionsSettings({
   const [hostNotice, setHostNotice] = useState<AsyncNotice | null>(null);
   const [testedStatus, setTestedStatus] = useState<HostStatus | null>(null);
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
-  const [relayErrors, setRelayErrors] = useState<RelayDraftErrors>(EMPTY_RELAY_ERRORS);
-  const [relayNotice, setRelayNotice] = useState<AsyncNotice | null>(null);
-  const [copiedField, setCopiedField] = useState<RelayCopyField | null>(null);
-  const copyTimerRef = useRef<number | null>(null);
   const [relayAdvancedOpen, setRelayAdvancedOpen] = useState(false);
   const [copiedEnrollmentLink, setCopiedEnrollmentLink] = useState(false);
   const copyEnrollmentLinkTimerRef = useRef<number | null>(null);
@@ -288,33 +179,17 @@ export function ConnectionsSettings({
         : candidate.host || candidate.id,
     })),
   ], [sshHostCandidates]);
-  const brokerOptions = useMemo<MenuOption[]>(() => hosts.length
-    ? [
-        { value: "", label: "Choose a Relay center…" },
-        ...hosts.map((host) => ({
-          value: host.id,
-          label: host.label || host.id,
-          detail: host.host,
-        })),
-      ]
-    : [{ value: "", label: "No SSH hosts configured" }], [hosts]);
   const hostImpact = useMemo(
     () => calculateHostRemovalImpact(selectedHostId ?? "", sessions, terminals),
     [selectedHostId, sessions, terminals],
   );
-  const relaySummary = summarizeRelayStatus(relay);
   const relayV2Effective = relayV2StackEffective(relayV2Status);
   const relayStackLabel = relayV2SelfHostedStackLabel(relayV2Status);
   const relayV2ConnectorDesired = relayV2SelfHostedConnectorDesiredRunning(relayV2Status);
-  const selectedRelayCenter = hosts.find((host) => host.id === relay.brokerHostId) ?? null;
-  const relayBusy = Object.values(relay.busy).some(Boolean);
-  const relayDraftLocked = relayBusy || relay.active || !relay.statusKnown;
-  const relayActionLocked = relayBusy || !relay.statusKnown;
   const hostBusy = hostNotice?.tone === "pending";
 
   useEffect(() => () => {
     asyncCoordinatorRef.current.invalidateAll();
-    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
   }, []);
 
   // Immediate fetch on mount; the interval below keeps it fresh while the
@@ -346,7 +221,7 @@ export function ConnectionsSettings({
 
   // One shared Relay v2 management controller drives both the overview card and
   // the Advanced enrollment panel, so both stay in sync on the same polled state.
-  const relayV2Controller = useRelayV2EnrollmentController(relay.tokenConfigured);
+  const relayV2Controller = useRelayV2EnrollmentController();
 
   // Feed freshly read deployment statuses (repair results, post-repair
   // refreshes) back into relayV2Status so the readiness branch is current.
@@ -599,84 +474,6 @@ export function ConnectionsSettings({
     }
   };
 
-  const runRelayAction = async (
-    intent: "save" | "start" | "startBroker" | "stop",
-    action: () => RelayActionResult | Promise<RelayActionResult>,
-  ) => {
-    if (intent !== "stop" && !relay.statusKnown) {
-      setRelayErrors({});
-      setRelayNotice({
-        tone: "error",
-        message: "Wait for Relay status before changing its configuration.",
-      });
-      return;
-    }
-    const request = asyncCoordinatorRef.current.issue(
-      "relay",
-      intent,
-      relay.relayUrl,
-      relay.brokerHostId,
-      relay.hostId,
-      relay.token,
-    );
-    if (intent !== "stop") {
-      const validation = validateRelayDraft(relay, intent);
-      setRelayErrors(validation.errors);
-      if (!validation.valid) {
-        setRelayNotice({ tone: "error", message: "Review the highlighted Relay fields." });
-        return;
-      }
-    } else {
-      setRelayErrors({});
-    }
-
-    const pendingLabel: Record<typeof intent, string> = {
-      save: "Saving Relay configuration…",
-      start: "Connecting this Mac to the saved Relay…",
-      startBroker: "Setting up broker, trusted WSS, and the Mac connector…",
-      stop: "Disconnecting this Mac from the Relay…",
-    };
-    const successLabel: Record<typeof intent, string> = {
-      save: "Relay configuration saved.",
-      start: "This Mac is connecting to the saved Relay. The connector retries while DNS propagates.",
-      startBroker: "Relay setup started. The broker and tunnel stay available while the Mac connector retries DNS. The QR appears after it reaches the generated WSS endpoint. Existing Android pairing must be updated after token rotation.",
-      stop: "This Mac disconnected. The selected Relay center keeps running.",
-    };
-
-    setRelayNotice({ tone: "pending", message: pendingLabel[intent] });
-    try {
-      const completed = await action();
-      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
-      if (completed === false) {
-        setRelayNotice({
-          tone: "error",
-          message: "Relay action did not complete. Review the status above for details.",
-        });
-        return;
-      }
-      setRelayNotice({ tone: "success", message: successLabel[intent] });
-    } catch (error) {
-      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
-      setRelayNotice({ tone: "error", message: errorMessage(error) });
-    }
-  };
-
-  const copyRelayValue = async (field: RelayCopyField, value: string) => {
-    if (!value) return;
-    const request = asyncCoordinatorRef.current.issue("relay", "copy", field, value);
-    setRelayNotice(null);
-    try {
-      await relayActions.copy(field, value);
-      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
-      setCopiedField(field);
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = window.setTimeout(() => setCopiedField(null), 1_200);
-    } catch (error) {
-      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
-      setRelayNotice({ tone: "error", message: errorMessage(error) });
-    }
-  };
-
   const handleRelayOverviewPrimaryAction = (action: RelayConnectionOverviewPrimaryAction) => {
     if (action.kind === "setup") {
       setRelayAdvancedOpen(true);
@@ -699,8 +496,8 @@ export function ConnectionsSettings({
     );
   };
 
-  const handleRevokeKnownGrant = () => {
-    relayOverview.revokeKnownGrant();
+  const handleRevokeClientGrant = (grantId: string) => {
+    relayOverview.revokeClientGrant(grantId);
   };
 
   const handleConnectionTabKeyDown = (
@@ -724,189 +521,6 @@ export function ConnectionsSettings({
       document.getElementById(`connections-tab-${nextTab}`)?.focus();
     });
   };
-
-  // Relay v1 blocks are kept intact and re-composed: as the default layout when
-  // Relay v2 is not effective, and collapsed under a "Legacy Relay v1" entry
-  // when Relay v2 self-hosted is the primary stack.
-  const relayV1CenterField = (
-    <div className="connections-fields connections-fields--relay">
-      <div className={`connections-field connections-field--wide${relayErrors.brokerHostId ? " connections-field--error" : ""}`}>
-        <span>Relay center</span>
-        <MenuSelect
-          id={RELAY_BROKER_ID}
-          ariaLabel="Relay center"
-          ariaInvalid={Boolean(relayErrors.brokerHostId)}
-          ariaDescribedBy={relayErrors.brokerHostId ? RELAY_BROKER_ERROR_ID : undefined}
-          ariaErrorMessage={relayErrors.brokerHostId ? RELAY_BROKER_ERROR_ID : undefined}
-          className="connections-menu-select"
-          value={relay.brokerHostId}
-          options={brokerOptions}
-          disabled={relayDraftLocked || hosts.length === 0}
-          onChange={(value) => {
-            relayActions.setBrokerHostId(value);
-            setRelayErrors((current) => ({ ...current, brokerHostId: undefined }));
-          }}
-        />
-        {relayErrors.brokerHostId && (
-          <small id={RELAY_BROKER_ERROR_ID} className="connections-field__error">
-            {relayErrors.brokerHostId}
-          </small>
-        )}
-        {!relayErrors.brokerHostId && (
-          <small>Saved with this connection. Set up Relay deploys only to this SSH host and rotates the v1 token.</small>
-        )}
-      </div>
-    </div>
-  );
-
-  const relayV1ManualRecovery = (
-    <details className="connections-relay-manual">
-      <summary>
-        <span className="connections-relay-manual__icon">
-          <Wrench aria-hidden="true" size={16} />
-        </span>
-        <span>
-          <strong>Manual recovery</strong>
-          <small>Inspect or supply a fixed WSS profile. These controls do not create a Relay center.</small>
-        </span>
-      </summary>
-      <div className="connections-fields connections-fields--relay connections-relay-manual__fields">
-        <RelayField
-          id="connection-relay-url"
-          label="Relay URL"
-          value={relay.relayUrl}
-          placeholder="Enter the trusted wss:// endpoint for this Relay center"
-          error={relayErrors.relayUrl}
-          disabled={relayDraftLocked}
-          copyDisabled={!relay.statusKnown}
-          copied={copiedField === "relayUrl"}
-          onChange={(value) => {
-            relayActions.setRelayUrl(value);
-            setRelayErrors((current) => ({ ...current, relayUrl: undefined }));
-          }}
-          onCopy={() => copyRelayValue("relayUrl", relay.relayUrl)}
-        />
-        <RelayField
-          id="connection-relay-host"
-          label="Host ID"
-          value={relay.hostId}
-          placeholder="mac-admin"
-          error={relayErrors.hostId}
-          disabled={relayDraftLocked}
-          copyDisabled={!relay.statusKnown}
-          copied={copiedField === "hostId"}
-          onChange={(value) => {
-            relayActions.setHostId(value);
-            setRelayErrors((current) => ({ ...current, hostId: undefined }));
-          }}
-          onCopy={() => copyRelayValue("hostId", relay.hostId)}
-        />
-        <RelayField
-          id="connection-relay-token"
-          label="Token"
-          value={relay.token}
-          placeholder={relay.tokenConfigured ? "Configured" : "Required to start Relay"}
-          error={relayErrors.token}
-          disabled={relayDraftLocked}
-          copyDisabled={!relay.statusKnown}
-          copied={copiedField === "token"}
-          secret
-          onChange={(value) => {
-            relayActions.setToken(value);
-            setRelayErrors((current) => ({ ...current, token: undefined }));
-          }}
-          onCopy={() => copyRelayValue("token", relay.token)}
-        />
-      </div>
-      {!relay.active && (
-        <div className="connections-actions connections-actions--relay-manual">
-          <span className="connections-actions__spacer" />
-          <button
-            type="button"
-            className="connections-button"
-            disabled={relayActionLocked}
-            title="Save these fields without starting any local or remote process"
-            onClick={() => runRelayAction("save", relayActions.save)}
-          >
-            {relay.busy.save
-              ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-              : <Save aria-hidden="true" size={14} />}
-            {relay.busy.save ? "Saving fields" : "Save fields only"}
-          </button>
-          <button
-            type="button"
-            className="connections-button"
-            disabled={relayActionLocked}
-            title="Connect this Mac to an already running Relay using the saved fields"
-            onClick={() => runRelayAction("start", relayActions.start)}
-          >
-            {relay.busy.start
-              ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-              : <Play aria-hidden="true" size={14} />}
-            {relay.busy.start ? "Connecting this Mac" : "Connect this Mac"}
-          </button>
-        </div>
-      )}
-    </details>
-  );
-
-  const relayV1Pairing = (
-    <div className="connections-relay-pairing">
-      <div className="connections-relay-pairing__copy">
-        <span className="connections-relay-pairing__icon">
-          <QrCode aria-hidden="true" size={17} />
-        </span>
-        <div>
-          <strong>Relay v1 profile</strong>
-          <span>
-            {relay.v1PairingPayload
-              ? "Contains the current shared Relay v1 token. Scan only on a trusted Android device and review before saving. This is not a Relay v2 capability."
-              : relay.active && relay.tokenConfigured
-                ? "Android pairing is unavailable until the connector reaches a trusted root wss:// URL with a valid Host ID. Cleartext and local URLs are never exported."
-                : "Start the Mac connector with a trusted WSS configuration to create an Android profile."}
-          </span>
-        </div>
-      </div>
-      {relay.v1PairingPayload && (
-        <MobileRelayV1ProfileQrCode payload={relay.v1PairingPayload} />
-      )}
-    </div>
-  );
-
-  const relayV1Actions = (
-    <div className="connections-actions connections-actions--relay">
-      <span className="connections-actions__spacer" />
-      {relay.active ? (
-        <button
-          type="button"
-          className="connections-button connections-button--danger"
-          disabled={relayBusy}
-          title="Disconnect this Mac only; the selected Relay center keeps running"
-          onClick={() => runRelayAction("stop", relayActions.stop)}
-        >
-          {relay.busy.stop
-            ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-            : <Square aria-hidden="true" size={14} />}
-          {relay.busy.stop ? "Disconnecting this Mac" : "Disconnect this Mac"}
-        </button>
-      ) : (
-        <button
-          type="button"
-          className="connections-button connections-button--primary"
-          disabled={relayActionLocked || !hosts.length}
-          title="Create or repair the broker, trusted WSS tunnel, token, and this Mac connector"
-          onClick={() => runRelayAction("startBroker", relayActions.startBroker)}
-        >
-          {relay.busy.startBroker
-            ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-            : <Server aria-hidden="true" size={14} />}
-          {relay.busy.startBroker
-            ? "Setting up Relay"
-            : "Set up / repair Relay"}
-        </button>
-      )}
-    </div>
-  );
 
   return (
     <div className="connections-settings">
@@ -1183,22 +797,23 @@ export function ConnectionsSettings({
         >
           <div className="connections-heading-row">
             <div>
-              <h3>Mobile Relay</h3>
-              <p>Connect a relay center and pair your phone. Everything else lives under Advanced.</p>
+              <h3>Mobile Relay v2</h3>
+              <p>Connect the Mac Host, then enroll the phone through the v2 one-time QR.</p>
             </div>
           </div>
 
           <RelayConnectionOverviewCard
             overview={relayOverview.overview}
             activeReview={relayOverview.activeReview}
-            knownGrantActive={relayOverview.knownGrantActive}
-            revokingGrant={relayOverview.revokingGrant}
+            connectedMobileDevices={relayOverview.connectedMobileDevices}
+            revokingGrantId={relayOverview.revokingGrantId}
+            mobileDeviceObservationAvailable={relayOverview.mobileDeviceObservationAvailable}
             qrBusy={relayOverview.qrBusy}
             copiedEnrollmentLink={copiedEnrollmentLink}
             inlineQr={relayOverview.inlineQr}
             onPrimaryAction={handleRelayOverviewPrimaryAction}
             onCopyEnrollmentLink={handleCopyEnrollmentLink}
-            onRevokeKnownGrant={handleRevokeKnownGrant}
+            onRevokeClientGrant={handleRevokeClientGrant}
             onHidePairingQr={relayOverview.hidePairingQr}
           />
 
@@ -1227,54 +842,14 @@ export function ConnectionsSettings({
                   ? <Radio aria-hidden="true" size={18} />
                   : <Server aria-hidden="true" size={18} />}
                 <div>
-                  <strong>Current stack · {relayStackLabel}{relayV2Effective ? " · primary" : " · default"}</strong>
+                  <strong>Current stack · {relayStackLabel}{relayV2Effective ? " · primary" : ""}</strong>
                   <span>
                     {relayV2Effective
                       ? relayV2ConnectorDesired
                         ? "Relay v2 self-hosted is the primary orchestration and the Host connector is desired to run."
                         : "Relay v2 self-hosted is the primary orchestration; the Host connector is not requested right now."
-                      : "No enabled and provisioned self-hosted Relay v2 config. Relay v1 remains the default stack."}
+                      : "No enabled and provisioned self-hosted Relay v2 config. Complete v2 setup before pairing."}
                   </span>
-                </div>
-              </div>
-
-              <div className="connections-relay-stages" aria-label="Relay connection stages">
-                <div className={`connections-relay-summary${relay.busy.startBroker ? " connections-relay-summary--progress" : ""}`}>
-                  {relay.busy.startBroker
-                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
-                    : <Server aria-hidden="true" size={18} />}
-                  <div>
-                    <strong>Relay center · {selectedRelayCenter?.label || "Not selected"}</strong>
-                    <span>
-                      {relay.busy.startBroker
-                        ? "Deploying Relay v1, publishing trusted WSS, and starting this Mac connector."
-                        : "Set up / repair Relay reuses a fixed WSS URL, or provisions a temporary Cloudflare Quick Tunnel. DNS propagation is handled by connector retries."}
-                    </span>
-                  </div>
-                </div>
-                <div className={`connections-relay-summary connections-relay-summary--${relaySummary.tone}`}>
-                  {relaySummary.tone === "success"
-                    ? <Wifi aria-hidden="true" size={18} />
-                    : relaySummary.tone === "danger"
-                      ? <AlertCircle aria-hidden="true" size={18} />
-                      : relaySummary.tone === "progress"
-                        ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
-                        : <Radio aria-hidden="true" size={18} />}
-                  <div>
-                    <strong>{relaySummary.label}</strong>
-                    <span>{relaySummary.detail}</span>
-                  </div>
-                </div>
-                <div className={`connections-relay-summary${relay.v1PairingPayload ? " connections-relay-summary--success" : ""}`}>
-                  <QrCode aria-hidden="true" size={18} />
-                  <div>
-                    <strong>Android pairing · {relay.v1PairingPayload ? "Ready" : "Not ready"}</strong>
-                    <span>
-                      {relay.v1PairingPayload
-                        ? "A trusted root wss:// profile is available. The phone still connects independently after review."
-                        : "Requires a connected Mac connector, a trusted root wss:// URL, Host ID, and Relay v1 token."}
-                    </span>
-                  </div>
                 </div>
               </div>
 
@@ -1283,7 +858,6 @@ export function ConnectionsSettings({
               {relayV2Controller.loaded && (
                 <RelayV2EnrollmentPreviewPanel
                   state={relayV2Controller.state}
-                  v1SharedSecretConfigured={relay.tokenConfigured}
                   onBootstrapHost={relayV2Controller.bootstrapHost}
                   onRefreshHost={relayV2Controller.refreshHost}
                   onStartConnector={relayV2Controller.startConnector}
@@ -1292,151 +866,13 @@ export function ConnectionsSettings({
                   onShowEnrollmentArtifact={relayV2Controller.showEnrollmentArtifact}
                   onCopyEnrollmentArtifact={relayV2Controller.copyEnrollmentArtifact}
                   artifactNotice={relayV2Controller.artifactNotice}
-                  onRevokeKnownGrant={relayV2Controller.revokeKnownGrant}
                 />
               )}
             </div>
           </details>
 
-          {relayV2Effective ? (
-            <details
-              className="connections-relay-manual connections-relay-legacy-v1"
-              open={false}
-            >
-              <summary>
-                <span className="connections-relay-manual__icon">
-                  <Wrench aria-hidden="true" size={16} />
-                </span>
-                <span>
-                  <strong>Legacy Relay v1 (optional)</strong>
-                  <small>
-                    v1 broker setup, fixed WSS recovery, and the v1 Android profile
-                    remain available as a legacy path.
-                  </small>
-                </span>
-              </summary>
-              {relayV1CenterField}
-              {relayV1ManualRecovery}
-              {relayV1Pairing}
-              {relayV1Actions}
-            </details>
-          ) : (
-            <>
-              {relayV1CenterField}
-              {relayV1ManualRecovery}
-              {relayV1Pairing}
-            </>
-          )}
-
-          {(relay.error || relayNotice) && (
-            <div
-              className={`connections-notice connections-notice--${relay.error ? "error" : relayNotice?.tone}`}
-              role="status"
-              aria-live="polite"
-            >
-              {statusIcon(relay.error ? "error" : relayNotice?.tone ?? "pending")}
-              <span>{relay.error || relayNotice?.message}</span>
-            </div>
-          )}
-
-          {!relayV2Effective && relayV1Actions}
         </div>
       )}
     </div>
-  );
-}
-
-function MobileRelayV1ProfileQrCode({ payload }: { payload: string }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    let active = true;
-    void QRCode.toCanvas(canvas, payload, {
-      width: 156,
-      margin: 1,
-      errorCorrectionLevel: "M",
-      color: {
-        dark: "#111113",
-        light: "#ffffff",
-      },
-    }).catch(() => {
-      if (!active) return;
-      canvas.width = 0;
-      canvas.height = 0;
-    });
-    return () => {
-      active = false;
-    };
-  }, [payload]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      className="connections-relay-pairing__qr"
-      aria-label="Android Relay v1 profile QR code"
-      role="img"
-    />
-  );
-}
-
-interface RelayFieldProps {
-  id: string;
-  label: string;
-  value: string;
-  placeholder: string;
-  error?: string;
-  disabled: boolean;
-  copyDisabled?: boolean;
-  copied: boolean;
-  secret?: boolean;
-  onChange: (value: string) => void;
-  onCopy: () => void;
-}
-
-function RelayField({
-  id,
-  label,
-  value,
-  placeholder,
-  error,
-  disabled,
-  copyDisabled = false,
-  copied,
-  secret = false,
-  onChange,
-  onCopy,
-}: RelayFieldProps) {
-  const errorId = `${id}-error`;
-  return (
-    <label className={`connections-field connections-field--wide${error ? " connections-field--error" : ""}`} htmlFor={id}>
-      <span>{label}</span>
-      <span className="connections-copy-field">
-        <input
-          id={id}
-          type={secret ? "password" : "text"}
-          value={value}
-          placeholder={placeholder}
-          disabled={disabled}
-          autoComplete="off"
-          spellCheck={false}
-          aria-invalid={Boolean(error)}
-          aria-describedby={error ? errorId : undefined}
-          aria-errormessage={error ? errorId : undefined}
-          onChange={(event) => onChange(event.target.value)}
-        />
-        <button
-          type="button"
-          className="connections-icon-button"
-          disabled={copyDisabled || !value}
-          aria-label={copied ? `${label} copied` : `Copy ${label}`}
-          onClick={onCopy}
-        >
-          {copied ? <Check aria-hidden="true" size={15} /> : <Clipboard aria-hidden="true" size={15} />}
-        </button>
-      </span>
-      {error && <small id={errorId} className="connections-field__error">{error}</small>}
-    </label>
   );
 }

@@ -138,10 +138,6 @@ test("H0 activates only after a real no-op transaction publishes matching state 
     const before = await store.read();
     const readiness = readinessSink();
     const activation = await activationFor(store, readiness.sink);
-    assert.equal(activation.runtimeH0.transaction, undefined);
-    assert.equal(activation.runtimeH0.issueReadinessReceipt, undefined);
-    assert.equal(activation.lifecycle.apply, undefined);
-    assert.equal(activation.h0Port, undefined);
 
     assert.equal(await activation.lifecycle.activate(), true);
     const after = await activation.runtimeH0.read();

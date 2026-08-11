@@ -1253,8 +1253,8 @@ export function validateRelayV2PublicFrame(
         nullable(field(item, "hostEpoch"), id);
         nullable(field(item, "hostInstanceId"), id);
         array(field(item, "clientDialects"), (dialect) => {
-          oneOf(dialect, ["tw-relay.v1", "tw-relay.v2"] as const);
-        }, 2);
+          literal(dialect, "tw-relay.v2");
+        }, 1);
         capabilities(field(item, "capabilities"));
         integer(field(item, "observedAtMs"));
       }, 256);
@@ -1951,8 +1951,8 @@ export function validateRelayV2CarrierFrame(
       id(field(payload, "hostEpoch"));
       id(field(payload, "hostInstanceId"));
       const dialects = array(field(payload, "clientDialects"), (entry) => {
-        oneOf(entry, ["tw-relay.v1", "tw-relay.v2"] as const);
-      }, 2, 1);
+        literal(entry, "tw-relay.v2");
+      }, 1, 1);
       if (new Set(dialects as string[]).size !== dialects.length) {
         reject("schema-mismatch");
       }
@@ -1999,52 +1999,32 @@ export function validateRelayV2CarrierFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["connectionId", "clientDialect", "authContext", "limits"]);
       id(field(payload, "connectionId"));
-      const clientDialect = oneOf(
-        field(payload, "clientDialect"),
-        ["tw-relay.v1", "tw-relay.v2"] as const,
-      );
+      literal(field(payload, "clientDialect"), "tw-relay.v2");
       const auth = object(field(payload, "authContext"));
-      if (clientDialect === "tw-relay.v2") {
-        exact(auth, [
-          "scheme",
-          "role",
-          "hostId",
-          "principalId",
-          "grantId",
-          "clientInstanceId",
-          "jti",
-          "kid",
-          "expiresAtMs",
-        ]);
-        literal(field(auth, "scheme"), "twcap2");
-        literal(field(auth, "role"), "client");
-        for (const name of [
-          "hostId",
-          "principalId",
-          "grantId",
-          "clientInstanceId",
-          "jti",
-          "kid",
-        ]) {
-          id(field(auth, name));
-        }
-        integer(field(auth, "expiresAtMs"));
-      } else {
-        exact(auth, [
-          "scheme",
-          "role",
-          "hostId",
-          "principalId",
-          "grantId",
-          "clientInstanceId",
-        ]);
-        literal(field(auth, "scheme"), "legacy_shared_secret");
-        literal(field(auth, "role"), "client");
-        id(field(auth, "hostId"));
-        nullValue(field(auth, "principalId"));
-        nullValue(field(auth, "grantId"));
-        nullValue(field(auth, "clientInstanceId"));
+      exact(auth, [
+        "scheme",
+        "role",
+        "hostId",
+        "principalId",
+        "grantId",
+        "clientInstanceId",
+        "jti",
+        "kid",
+        "expiresAtMs",
+      ]);
+      literal(field(auth, "scheme"), "twcap2");
+      literal(field(auth, "role"), "client");
+      for (const name of [
+        "hostId",
+        "principalId",
+        "grantId",
+        "clientInstanceId",
+        "jti",
+        "kid",
+      ]) {
+        id(field(auth, name));
       }
+      integer(field(auth, "expiresAtMs"));
       const limits = object(field(payload, "limits"));
       exact(limits, ["maxFrameBytes"]);
       integer(field(limits, "maxFrameBytes"), 1);

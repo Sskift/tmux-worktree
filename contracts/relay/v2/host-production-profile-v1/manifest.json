@@ -29,7 +29,6 @@
     "credential or secret values",
     "access or refresh tokens",
     "enrollment material",
-    "Relay v1 shared secret",
     "native filesystem paths",
     "TLS key, certificate, or trust material",
     "E0 configuration",

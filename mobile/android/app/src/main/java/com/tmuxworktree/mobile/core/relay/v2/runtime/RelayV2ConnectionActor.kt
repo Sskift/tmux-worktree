@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleActorRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
@@ -26,17 +27,31 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1FrameMetadata
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1InboundFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AGENT_CHAT_V1_CAPABILITY
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Codec
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1CodecException
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Error
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Event
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Frame
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1FrameMetadata
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1HistoryRequest
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1HistoryResult
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1SendRequest
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v1.codec.AgentChatV1Sent
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_V2_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2CodecException
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Error
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Event
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Frame
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2FrameMetadata
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2HistoryRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2HistoryResult
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2ImageChunk
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2ImageGetRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2SendRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Sent
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LARK_BINDINGS_V2_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingReplyModeUpdateRequest
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingUnlinkRequest
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingV2Unlinked
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingV2Updated
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsState
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsV2Codec
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsV2CodecException
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsV2Error
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsV2Frame
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsV2GetRequest
+import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsV2Result
 import com.tmuxworktree.mobile.core.relay.runtime.BoundedActionQueue
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatMutation
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatReducer
@@ -96,8 +111,7 @@ internal sealed interface RelayV2AgentCapabilityAvailability {
  * Serialized Relay v2 client runtime seam.
  *
  * The actor owns transport identity and all handshake state. Callback entry atomically binds and
- * fences its source before enqueueing generation-tagged actions; this class has no dependency on
- * the Relay v1 profile, actor, or codec.
+ * fences its source before enqueueing generation-tagged actions.
  */
 internal class RelayV2ConnectionActor(
     parentScope: CoroutineScope,
@@ -109,7 +123,8 @@ internal class RelayV2ConnectionActor(
     optionalCapabilities: Set<String> = emptySet(),
     private val agentExtensionCodec: AgentTranscriptLifecycleV1Codec =
         AgentTranscriptLifecycleV1Codec(),
-    private val agentChatCodec: AgentChatV1Codec = AgentChatV1Codec(),
+    private val agentChatCodec: AgentChatV2Codec = AgentChatV2Codec(),
+    private val larkBindingsCodec: LarkBindingsV2Codec = LarkBindingsV2Codec(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val attemptId: () -> String = { UUID.randomUUID().toString() },
     private val watchdogDelay: suspend (Long) -> Unit = { delay(it) },
@@ -225,6 +240,8 @@ internal class RelayV2ConnectionActor(
     val negotiatedCapabilities: StateFlow<Set<String>> = _negotiatedCapabilities.asStateFlow()
     private val _agentChatState = MutableStateFlow(RelayChatState())
     val agentChatState: StateFlow<RelayChatState> = _agentChatState.asStateFlow()
+    private val _larkBindingsState = MutableStateFlow(LarkBindingsState())
+    val larkBindingsState: StateFlow<LarkBindingsState> = _larkBindingsState.asStateFlow()
     val effects: Flow<RelayV2RuntimeEffect> = multiplexedEffectFlow()
 
     /**
@@ -613,6 +630,12 @@ internal class RelayV2ConnectionActor(
         linkedMapOf<String, PendingAgentExtensionRequest>()
     private val retiredAgentExtensionRequests =
         linkedMapOf<String, RetiredAgentExtensionRequestIdentity>()
+    private val pendingLarkBindingRequests = linkedMapOf<String, PendingLarkBindingRequest>()
+    private val retiredLarkBindingRequests =
+        linkedMapOf<String, RetiredLarkBindingRequestIdentity>()
+    private val pendingAgentChatImageRequests =
+        linkedMapOf<String, PendingAgentChatImageRequest>()
+    private val agentChatImageScopeBySession = linkedMapOf<String, String>()
     private var nextAgentExtensionAdmissionSequence = 0L
 
     init {
@@ -651,7 +674,7 @@ internal class RelayV2ConnectionActor(
                 cancelHandshakeWatchdogs()
                 clearRecoveryAttempt()
                 clearPendingHostsSnapshot()
-                clearPendingAgentExtensionRequests()
+                clearPendingOptionalExtensionRequests()
                 invalidateConnectionOwnershipAndDrain()
                 val source = activeTransport
                 activeTransport = null
@@ -1211,7 +1234,7 @@ internal class RelayV2ConnectionActor(
                 lastTerminationGeneration.set(null)
                 pendingTerminalIntent = null
                 clearRecoveryAttempt()
-                clearPendingAgentExtensionRequests()
+                clearPendingOptionalExtensionRequests()
                 clearPendingHostsSnapshot()
                 hostReconnectGeneration = null
                 authRolloverGeneration = null
@@ -1631,7 +1654,7 @@ internal class RelayV2ConnectionActor(
             activeProfile = profile
             pendingHelloRequestId = null
             clearRecoveryAttempt()
-            clearPendingAgentExtensionRequests()
+            clearPendingOptionalExtensionRequests()
             updateState(RelayV2ConnectionPhase.FAILED, profile, failure)
             source
         }
@@ -2429,7 +2452,7 @@ internal class RelayV2ConnectionActor(
         } ?: return false
         if (changed) {
             clearRecoveryAttempt()
-            clearPendingAgentExtensionRequests()
+            clearPendingOptionalExtensionRequests()
             onlineQueryWindow = null
         }
         return true
@@ -2457,38 +2480,185 @@ internal class RelayV2ConnectionActor(
         val chatFrame = try {
             agentChatCodec.decodePublicFrame(
                 bytes,
-                AgentChatV1FrameMetadata(
+                AgentChatV2FrameMetadata(
                     opcode = metadata.opcode,
                     compressed = metadata.compressed,
                 ),
             )
-        } catch (_: AgentChatV1CodecException) {
+        } catch (_: AgentChatV2CodecException) {
+            null
+        }
+        if (chatFrame != null) {
+            deliverAgentChatFrame(chatFrame)
+            return
+        }
+        val larkFrame = try {
+            larkBindingsCodec.decodePublicFrame(bytes, metadata)
+        } catch (_: LarkBindingsV2CodecException) {
             failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             return
         }
-        deliverAgentChatFrame(chatFrame)
+        deliverLarkBindingsFrame(larkFrame)
+    }
+
+    private fun deliverLarkBindingsFrame(frame: LarkBindingsV2Frame) {
+        val responseIdentity = when (frame) {
+            is LarkBindingsV2Result -> listOf(
+                frame.requestId, frame.hostId, frame.hostEpoch, frame.scopeId, frame.sessionId,
+            )
+            is LarkBindingV2Updated -> listOf(
+                frame.requestId, frame.hostId, frame.hostEpoch, frame.scopeId, frame.sessionId,
+            )
+            is LarkBindingV2Unlinked -> listOf(
+                frame.requestId, frame.hostId, frame.hostEpoch, frame.scopeId, frame.sessionId,
+            )
+            is LarkBindingsV2Error -> listOf(
+                frame.requestId, frame.hostId, frame.hostEpoch, frame.scopeId, frame.sessionId,
+            )
+            else -> null
+        } ?: return failConnection(
+            RelayV2FailureKind.SCHEMA,
+            "INVALID_ENVELOPE",
+            false,
+            4400,
+        )
+        var ignoredLateResponse = false
+        val pending = synchronized(lifecycleLock) {
+            val context = onlineContext
+            val request = pendingLarkBindingRequests[responseIdentity[0]]
+            if (lifecycleState != LifecycleState.OPEN ||
+                _state.value.phase != RelayV2ConnectionPhase.ONLINE ||
+                context == null ||
+                LARK_BINDINGS_V2_CAPABILITY !in context.negotiatedCapabilities ||
+                (request == null && retiredLarkBindingRequests[responseIdentity[0]] == null)
+            ) {
+                null
+            } else if (request == null) {
+                val retired = retiredLarkBindingRequests[responseIdentity[0]]
+                if (retired != null &&
+                    responseIdentity[1] == retired.hostId &&
+                    responseIdentity[2] == retired.hostEpoch &&
+                    responseIdentity[3] == retired.scopeId &&
+                    responseIdentity[4] == retired.sessionId
+                ) {
+                    retiredLarkBindingRequests.remove(responseIdentity[0])
+                    ignoredLateResponse = true
+                }
+                null
+            } else if (responseIdentity[1] != request.hostId ||
+                responseIdentity[2] != request.hostEpoch ||
+                responseIdentity[3] != request.scopeId ||
+                responseIdentity[4] != request.sessionId
+            ) {
+                null
+            } else {
+                pendingLarkBindingRequests.remove(responseIdentity[0])
+                request.watchdog?.cancel()
+                request
+            }
+        }
+        if (ignoredLateResponse) return
+        pending ?: return failConnection(
+            RelayV2FailureKind.SCHEMA,
+            "INVALID_ENVELOPE",
+            false,
+            4400,
+        )
+        _larkBindingsState.value = when (frame) {
+            is LarkBindingsV2Result -> {
+                if (pending.kind != LarkBindingRequestKind.LIST) {
+                    return failConnection(
+                        RelayV2FailureKind.SCHEMA,
+                        "INVALID_ENVELOPE",
+                        false,
+                        4400,
+                    )
+                }
+                _larkBindingsState.value.copy(
+                    available = true,
+                    loaded = true,
+                    loading = false,
+                    bindings = frame.bindings,
+                    busyBindingId = null,
+                    error = null,
+                )
+            }
+            is LarkBindingV2Updated -> {
+                if (pending.kind != LarkBindingRequestKind.UPDATE_REPLY_MODE ||
+                    pending.bindingId != frame.binding.id
+                ) {
+                    return failConnection(
+                        RelayV2FailureKind.SCHEMA,
+                        "INVALID_ENVELOPE",
+                        false,
+                        4400,
+                    )
+                }
+                val current = _larkBindingsState.value.bindings
+                val updated = if (current.any { it.id == frame.binding.id }) {
+                    current.map { if (it.id == frame.binding.id) frame.binding else it }
+                } else {
+                    current + frame.binding
+                }
+                _larkBindingsState.value.copy(
+                    available = true,
+                    loaded = true,
+                    bindings = updated,
+                    busyBindingId = null,
+                    error = null,
+                )
+            }
+            is LarkBindingV2Unlinked -> {
+                if (pending.kind != LarkBindingRequestKind.UNLINK ||
+                    pending.bindingId != frame.bindingId
+                ) {
+                    return failConnection(
+                        RelayV2FailureKind.SCHEMA,
+                        "INVALID_ENVELOPE",
+                        false,
+                        4400,
+                    )
+                }
+                _larkBindingsState.value.copy(
+                    available = true,
+                    loaded = true,
+                    bindings = _larkBindingsState.value.bindings.filterNot {
+                        it.id == frame.bindingId
+                    },
+                    busyBindingId = null,
+                    error = null,
+                )
+            }
+            is LarkBindingsV2Error -> _larkBindingsState.value.copy(
+                available = true,
+                loading = false,
+                busyBindingId = null,
+                error = frame.message,
+            )
+            else -> error("request frame reached inbound Lark binding lane")
+        }
     }
 
     /**
-     * Updates the local chat projection from an inbound agent.chat.v1 frame. Only frames arriving
-     * under an ONLINE generation that negotiated agent.chat.v1 are accepted; anything else is a
+     * Updates the local chat projection from an inbound agent.chat.v2 frame. Only frames arriving
+     * under an ONLINE generation that negotiated agent.chat.v2 are accepted; anything else is a
      * schema violation.
      */
-    private fun deliverAgentChatFrame(frame: AgentChatV1Frame) {
+    private fun deliverAgentChatFrame(frame: AgentChatV2Frame) {
         val context = synchronized(lifecycleLock) {
             val fence = agentExtensionSendFence.get()
             onlineContext?.takeIf {
                 _state.value.phase in AGENT_EXTENSION_INBOUND_PHASES &&
                     fence != null &&
-                    AGENT_CHAT_V1_CAPABILITY in fence.negotiatedCapabilities &&
-                    AGENT_CHAT_V1_CAPABILITY in it.negotiatedCapabilities
+                    AGENT_CHAT_V2_CAPABILITY in fence.negotiatedCapabilities &&
+                    AGENT_CHAT_V2_CAPABILITY in it.negotiatedCapabilities
             }
         } ?: run {
             failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             return
         }
         when (frame) {
-            is AgentChatV1Sent -> mutateAgentChat(
+            is AgentChatV2Sent -> mutateAgentChat(
                 RelayChatMutation.Sent(
                     requestId = frame.requestId,
                     session = frame.session,
@@ -2496,22 +2666,70 @@ internal class RelayV2ConnectionActor(
                     nowMillis = clock(),
                 ),
             )
-            is AgentChatV1Event -> mutateAgentChat(
-                RelayChatMutation.TurnUpdated(frame.session, frame.turn.toView()),
-            )
-            is AgentChatV1HistoryResult -> mutateAgentChat(
-                RelayChatMutation.HistoryResult(
-                    frame.session,
-                    frame.turns.map { it.toView() },
-                ),
-            )
-            is AgentChatV1Error -> mutateAgentChat(
-                RelayChatMutation.SendFailed(
-                    requestId = frame.requestId,
-                    session = frame.sessionId,
-                    error = frame.message,
-                ),
-            )
+            is AgentChatV2Event -> {
+                mutateAgentChat(RelayChatMutation.TurnUpdated(frame.session, frame.turn.toView()))
+                synchronized(lifecycleLock) {
+                    agentChatImageScopeBySession[frame.session] = frame.scopeId
+                }
+                requestNextAgentChatImage()
+            }
+            is AgentChatV2HistoryResult -> {
+                mutateAgentChat(
+                    RelayChatMutation.HistoryResult(
+                        frame.session,
+                        frame.turns.map { it.toView() },
+                    ),
+                )
+                synchronized(lifecycleLock) {
+                    agentChatImageScopeBySession[frame.session] = frame.scopeId
+                }
+                requestNextAgentChatImage()
+            }
+            is AgentChatV2ImageChunk -> {
+                val pending = synchronized(lifecycleLock) {
+                    pendingAgentChatImageRequests.remove(frame.requestId)?.takeIf {
+                        it.hostId == frame.hostId && it.hostEpoch == frame.hostEpoch &&
+                            it.scopeId == frame.scopeId && it.sessionId == frame.sessionId &&
+                            it.sessionId == frame.session && it.imageId == frame.imageId &&
+                            it.offset == frame.offset
+                    }
+                } ?: return failConnection(
+                    RelayV2FailureKind.SCHEMA,
+                    "INVALID_ENVELOPE",
+                    false,
+                    4400,
+                )
+                mutateAgentChat(
+                    RelayChatMutation.ImageChunk(
+                        session = pending.sessionId,
+                        imageId = frame.imageId,
+                        mimeType = frame.mimeType,
+                        byteLength = frame.byteLength,
+                        sha256 = frame.sha256,
+                        offset = frame.offset,
+                        data = Base64.getDecoder().decode(frame.dataBase64),
+                        nextOffset = frame.nextOffset,
+                    ),
+                )
+                requestNextAgentChatImage()
+            }
+            is AgentChatV2Error -> {
+                val image = synchronized(lifecycleLock) {
+                    pendingAgentChatImageRequests.remove(frame.requestId)
+                }
+                if (image != null) {
+                    mutateAgentChat(RelayChatMutation.ImageFailed(image.imageId, frame.message))
+                    requestNextAgentChatImage()
+                } else {
+                    mutateAgentChat(
+                        RelayChatMutation.SendFailed(
+                            requestId = frame.requestId,
+                            session = frame.sessionId,
+                            error = frame.message,
+                        ),
+                    )
+                }
+            }
             else -> {
                 // Requests are never valid on the inbound lane; the host/broker own them.
                 failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
@@ -2765,31 +2983,31 @@ internal class RelayV2ConnectionActor(
         return null
     }
 
-    // ==== agent.chat.v1 minimal extension ====
+    // ==== agent.chat.v2 minimal extension ====
 
     /**
-     * Sends an `agent.chat.send` request over the current ONLINE transport when agent.chat.v1 is
+     * Sends an `agent.chat.send` request over the current ONLINE transport when agent.chat.v2 is
      * negotiated. Returns true only when the frame was handed to the transport synchronously under
      * the generation fence. The pending bubble is optimistically tracked and confirmed by the host
      * via `agent.chat.sent` / `agent.chat.event`.
      */
-    fun sendAgentChatMessage(session: String, message: String): Boolean {
+    fun sendAgentChatMessage(scopeId: String, sessionId: String, message: String): Boolean {
         val requestId = "agent-chat-" + attemptId()
         val encoded = synchronized(lifecycleLock) {
             val context = onlineAgentChatContextLocked() ?: return@synchronized null
             val source = activeTransport ?: return@synchronized null
-            val frame = AgentChatV1SendRequest(
-                session = session,
+            val frame = AgentChatV2SendRequest(
+                session = sessionId,
                 message = message,
                 requestId = requestId,
                 hostId = context.hostId,
                 expectedHostEpoch = context.hostEpoch,
-                scopeId = scopeIdForSession(session),
-                sessionId = session,
+                scopeId = scopeId,
+                sessionId = sessionId,
             )
             try {
                 agentChatCodec.encodePublicFrame(frame) to source
-            } catch (_: AgentChatV1CodecException) {
+            } catch (_: AgentChatV2CodecException) {
                 null
             }
         } ?: return false
@@ -2797,7 +3015,7 @@ internal class RelayV2ConnectionActor(
         mutateAgentChat(
             RelayChatMutation.SendPending(
                 requestId = requestId,
-                session = session,
+                session = sessionId,
                 message = message,
                 nowMillis = clock(),
             ),
@@ -2806,31 +3024,85 @@ internal class RelayV2ConnectionActor(
     }
 
     /** Sends an `agent.chat.history` request over the current ONLINE transport. */
-    fun fetchAgentChatHistory(session: String, limit: Int? = null): Boolean {
+    fun fetchAgentChatHistory(scopeId: String, sessionId: String, limit: Int? = null): Boolean {
         val requestId = "agent-chat-history-" + attemptId()
         val encoded = synchronized(lifecycleLock) {
             val context = onlineAgentChatContextLocked() ?: return@synchronized null
             val source = activeTransport ?: return@synchronized null
-            val frame = AgentChatV1HistoryRequest(
-                session = session,
+            val frame = AgentChatV2HistoryRequest(
+                session = sessionId,
                 limit = limit,
                 requestId = requestId,
                 hostId = context.hostId,
                 expectedHostEpoch = context.hostEpoch,
-                scopeId = scopeIdForSession(session),
-                sessionId = session,
+                scopeId = scopeId,
+                sessionId = sessionId,
             )
             try {
                 agentChatCodec.encodePublicFrame(frame) to source
-            } catch (_: AgentChatV1CodecException) {
+            } catch (_: AgentChatV2CodecException) {
                 null
             }
         } ?: return false
         return encoded.second.send(encoded.first)
     }
 
+    private fun requestNextAgentChatImage() {
+        val requestId = "agent-chat-image-" + attemptId()
+        val outbound = synchronized(lifecycleLock) {
+            if (pendingAgentChatImageRequests.isNotEmpty()) return@synchronized null
+            val context = onlineAgentChatContextLocked() ?: return@synchronized null
+            val source = activeTransport ?: return@synchronized null
+            val candidate = agentChatImageScopeBySession.entries.firstNotNullOfOrNull {
+                (sessionId, scopeId) ->
+                _agentChatState.value.turns(sessionId)
+                    .asSequence()
+                    .flatMap { it.content.asSequence() }
+                    .mapNotNull { part ->
+                        (part as? AgentChatImagePart)
+                            ?.let { image -> _agentChatState.value.image(image.imageId) }
+                    }
+                    .firstOrNull { image -> !image.complete && image.error == null }
+                    ?.let { image -> Triple(scopeId, sessionId, image) }
+            } ?: return@synchronized null
+            val (scopeId, sessionId, image) = candidate
+            val frame = AgentChatV2ImageGetRequest(
+                session = sessionId,
+                imageId = image.imageId,
+                offset = image.bytes.size,
+                requestId = requestId,
+                hostId = context.hostId,
+                expectedHostEpoch = context.hostEpoch,
+                scopeId = scopeId,
+                sessionId = sessionId,
+            )
+            val bytes = try {
+                agentChatCodec.encodePublicFrame(frame)
+            } catch (_: AgentChatV2CodecException) {
+                return@synchronized null
+            }
+            pendingAgentChatImageRequests[requestId] = PendingAgentChatImageRequest(
+                hostId = context.hostId,
+                hostEpoch = context.hostEpoch,
+                scopeId = scopeId,
+                sessionId = sessionId,
+                imageId = image.imageId,
+                offset = image.bytes.size,
+            )
+            Triple(bytes, source, image.imageId)
+        } ?: return
+        if (outbound.second.send(outbound.first)) return
+        synchronized(lifecycleLock) {
+            pendingAgentChatImageRequests.remove(requestId)
+        }
+        mutateAgentChat(
+            RelayChatMutation.ImageFailed(outbound.third, "Could not request the image"),
+        )
+        requestNextAgentChatImage()
+    }
+
     /**
-     * Returns the handshake context only while agent.chat.v1 is negotiated and the actor is
+     * Returns the handshake context only while agent.chat.v2 is negotiated and the actor is
      * ONLINE. Guarded by lifecycleLock (callers must hold it).
      */
     private fun onlineAgentChatContextLocked(): RelayV2HandshakeContext? {
@@ -2840,7 +3112,7 @@ internal class RelayV2ConnectionActor(
             return null
         }
         val fence = agentExtensionSendFence.get() ?: return null
-        if (AGENT_CHAT_V1_CAPABILITY !in fence.negotiatedCapabilities) return null
+        if (AGENT_CHAT_V2_CAPABILITY !in fence.negotiatedCapabilities) return null
         return onlineContext
     }
 
@@ -2848,9 +3120,135 @@ internal class RelayV2ConnectionActor(
         _agentChatState.value = RelayChatReducer.reduce(_agentChatState.value, mutation)
     }
 
-    private fun scopeIdForSession(session: String): String {
-        val index = session.indexOf(":")
-        return if (index <= 0) "local" else session.substring(0, index)
+    fun fetchLarkBindings(scopeId: String, sessionId: String): Boolean =
+        sendLarkBindingsRequest(
+            scopeId = scopeId,
+            sessionId = sessionId,
+            kind = LarkBindingRequestKind.LIST,
+            bindingId = null,
+        ) { requestId, context ->
+            LarkBindingsV2GetRequest(
+                requestId = requestId,
+                hostId = context.hostId,
+                expectedHostEpoch = context.hostEpoch,
+                scopeId = scopeId,
+                sessionId = sessionId,
+            )
+        }
+
+    fun updateLarkBindingReplyMode(
+        scopeId: String,
+        sessionId: String,
+        bindingId: String,
+        replyMode: String,
+    ): Boolean = sendLarkBindingsRequest(
+        scopeId = scopeId,
+        sessionId = sessionId,
+        kind = LarkBindingRequestKind.UPDATE_REPLY_MODE,
+        bindingId = bindingId,
+    ) { requestId, context ->
+        LarkBindingReplyModeUpdateRequest(
+            bindingId = bindingId,
+            replyMode = replyMode,
+            requestId = requestId,
+            hostId = context.hostId,
+            expectedHostEpoch = context.hostEpoch,
+            scopeId = scopeId,
+            sessionId = sessionId,
+        )
+    }
+
+    fun unlinkLarkBinding(
+        scopeId: String,
+        sessionId: String,
+        bindingId: String,
+    ): Boolean = sendLarkBindingsRequest(
+        scopeId = scopeId,
+        sessionId = sessionId,
+        kind = LarkBindingRequestKind.UNLINK,
+        bindingId = bindingId,
+    ) { requestId, context ->
+        LarkBindingUnlinkRequest(
+            bindingId = bindingId,
+            requestId = requestId,
+            hostId = context.hostId,
+            expectedHostEpoch = context.hostEpoch,
+            scopeId = scopeId,
+            sessionId = sessionId,
+        )
+    }
+
+    private fun sendLarkBindingsRequest(
+        scopeId: String,
+        sessionId: String,
+        kind: LarkBindingRequestKind,
+        bindingId: String?,
+        frame: (String, RelayV2HandshakeContext) -> LarkBindingsV2Frame,
+    ): Boolean {
+        val requestId = "lark-binding-" + attemptId()
+        var blockedByInFlightRequest = false
+        val outbound = synchronized(lifecycleLock) {
+            val context = onlineLarkBindingsContextLocked() ?: return@synchronized null
+            if (pendingLarkBindingRequests.isNotEmpty()) {
+                blockedByInFlightRequest = true
+                return@synchronized null
+            }
+            if (requestId in pendingLarkBindingRequests ||
+                requestId in retiredLarkBindingRequests
+            ) return@synchronized null
+            val source = activeTransport ?: return@synchronized null
+            val bytes = try {
+                larkBindingsCodec.encodePublicFrame(frame(requestId, context))
+            } catch (_: LarkBindingsV2CodecException) {
+                return@synchronized null
+            }
+            pendingLarkBindingRequests[requestId] = PendingLarkBindingRequest(
+                kind = kind,
+                bindingId = bindingId,
+                hostId = context.hostId,
+                hostEpoch = context.hostEpoch,
+                scopeId = scopeId,
+                sessionId = sessionId,
+            )
+            _larkBindingsState.value = _larkBindingsState.value.copy(
+                available = true,
+                loading = kind == LarkBindingRequestKind.LIST,
+                busyBindingId = bindingId,
+                error = null,
+            )
+            bytes to source
+        }
+        if (outbound == null) {
+            if (blockedByInFlightRequest) return false
+            _larkBindingsState.value = _larkBindingsState.value.copy(
+                loading = false,
+                busyBindingId = null,
+                error = "Lark binding management is unavailable",
+            )
+            return false
+        }
+        if (outbound.second.send(outbound.first)) {
+            scheduleLarkBindingsRequestWatchdog(requestId)
+            return true
+        }
+        synchronized(lifecycleLock) {
+            pendingLarkBindingRequests.remove(requestId)?.watchdog?.cancel()
+        }
+        _larkBindingsState.value = _larkBindingsState.value.copy(
+            loading = false,
+            busyBindingId = null,
+            error = "Could not send the Lark binding request",
+        )
+        return false
+    }
+
+    private fun onlineLarkBindingsContextLocked(): RelayV2HandshakeContext? {
+        if (lifecycleState != LifecycleState.OPEN ||
+            _state.value.phase != RelayV2ConnectionPhase.ONLINE
+        ) return null
+        val fence = agentExtensionSendFence.get() ?: return null
+        if (LARK_BINDINGS_V2_CAPABILITY !in fence.negotiatedCapabilities) return null
+        return onlineContext
     }
 
     private fun sendAgentExtensionRequest(action: SendAgentExtensionRequestAction) {
@@ -2912,13 +3310,26 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    private fun clearPendingAgentExtensionRequests() = synchronized(lifecycleLock) {
+    private fun clearPendingOptionalExtensionRequests() = synchronized(lifecycleLock) {
         pendingAgentExtensionRequests.values.forEach {
             it.watchdog?.cancel()
             releasePendingAgentExtensionDeliveryBytesLocked(it)
         }
         pendingAgentExtensionRequests.clear()
         retiredAgentExtensionRequests.clear()
+        pendingLarkBindingRequests.values.forEach { it.watchdog?.cancel() }
+        pendingLarkBindingRequests.clear()
+        retiredLarkBindingRequests.clear()
+        pendingAgentChatImageRequests.clear()
+        agentChatImageScopeBySession.clear()
+        _larkBindingsState.value = _larkBindingsState.value.copy(
+            available = false,
+            loaded = false,
+            loading = false,
+            bindings = emptyList(),
+            busyBindingId = null,
+            error = null,
+        )
         drainQueuedEffects(agentExtensionHandoffEffectChannel, null)
     }
 
@@ -2937,6 +3348,38 @@ internal class RelayV2ConnectionActor(
             if (pending?.admission == admission &&
                 pending.state == AgentExtensionPendingState.SENT
             ) {
+                pending.watchdog?.cancel()
+                pending.watchdog = job
+            } else {
+                job.cancel()
+            }
+        }
+    }
+
+    private fun scheduleLarkBindingsRequestWatchdog(requestId: String) {
+        val job = scope.launch {
+            extensionRequestWatchdogDelay(extensionRequestTimeoutMs)
+            val timedOut = synchronized(lifecycleLock) {
+                pendingLarkBindingRequests.remove(requestId)?.also {
+                    it.watchdog = null
+                    retiredLarkBindingRequests[requestId] = it.retiredIdentity()
+                    while (retiredLarkBindingRequests.size > MAX_RETIRED_LARK_BINDING_REQUESTS) {
+                        retiredLarkBindingRequests.remove(retiredLarkBindingRequests.keys.first())
+                    }
+                }
+            } ?: return@launch
+            _larkBindingsState.value = _larkBindingsState.value.copy(
+                loading = false,
+                busyBindingId = null,
+                error = when (timedOut.kind) {
+                    LarkBindingRequestKind.LIST -> "Could not load Lark bindings in time"
+                    else -> "The Lark binding update timed out"
+                },
+            )
+        }
+        synchronized(lifecycleLock) {
+            val pending = pendingLarkBindingRequests[requestId]
+            if (pending != null) {
                 pending.watchdog?.cancel()
                 pending.watchdog = job
             } else {
@@ -4565,7 +5008,7 @@ internal class RelayV2ConnectionActor(
             activeTransport.also { activeTransport = null }
         }
         clearRecoveryAttempt()
-        clearPendingAgentExtensionRequests()
+        clearPendingOptionalExtensionRequests()
         clearPendingHostsSnapshot()
         hostReconnectGeneration = null
         source?.let {
@@ -4966,7 +5409,7 @@ internal class RelayV2ConnectionActor(
         clearRecoveryAttempt()
         clearPendingHostsSnapshot()
         hostReconnectGeneration = null
-        clearPendingAgentExtensionRequests()
+        clearPendingOptionalExtensionRequests()
         val retirementCommand = terminalSource?.let {
             claimTerminalRetirementLocked(terminalCause, it)
         }
@@ -5089,7 +5532,11 @@ internal class RelayV2ConnectionActor(
                 RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false),
             )
             4403 -> TerminalDisposition(
-                RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "AUTH_INVALID", false),
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.AUTH,
+                    RELAY_V2_GRANT_REVOKED,
+                    false,
+                ),
             )
             4406 -> TerminalDisposition(
                 RelayV2ConnectionFailure(
@@ -5198,7 +5645,7 @@ internal class RelayV2ConnectionActor(
             activeTransport = null
             advanceConnectionGeneration()
             clearRecoveryAttempt()
-            clearPendingAgentExtensionRequests()
+            clearPendingOptionalExtensionRequests()
             updateState(_state.value.phase, current, _state.value.failure)
             DisconnectPreparation(source, applyDrain)
         }
@@ -5849,9 +6296,19 @@ internal class RelayV2ConnectionActor(
         publishedEffectGeneration.set(generation)
         agentExtensionSendFence.set(fence)
         _negotiatedCapabilities.value = context.negotiatedCapabilities.toSet()
-        if (AGENT_CHAT_V1_CAPABILITY !in context.negotiatedCapabilities) {
+        if (AGENT_CHAT_V2_CAPABILITY !in context.negotiatedCapabilities) {
             _agentChatState.value = RelayChatState()
+            pendingAgentChatImageRequests.clear()
+            agentChatImageScopeBySession.clear()
         }
+        _larkBindingsState.value = _larkBindingsState.value.copy(
+            available = LARK_BINDINGS_V2_CAPABILITY in context.negotiatedCapabilities,
+            loaded = false,
+            loading = false,
+            bindings = emptyList(),
+            busyBindingId = null,
+            error = null,
+        )
         _agentCapabilityAvailability.value =
             if (agentCapabilityWithdrawnGeneration != generation &&
                 AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in context.negotiatedCapabilities
@@ -5870,7 +6327,7 @@ internal class RelayV2ConnectionActor(
         activeTransport = null
         advanceConnectionGeneration()
         clearRecoveryAttempt()
-        clearPendingAgentExtensionRequests()
+        clearPendingOptionalExtensionRequests()
         clearPendingHostsSnapshot()
         hostReconnectGeneration = null
         source?.let {
@@ -6087,6 +6544,45 @@ internal class RelayV2ConnectionActor(
         val authority: RelayV2RepositoryEffectAuthority,
         val negotiatedCapabilities: Set<String>,
     )
+
+    private data class PendingLarkBindingRequest(
+        val kind: LarkBindingRequestKind,
+        val bindingId: String?,
+        val hostId: String,
+        val hostEpoch: String,
+        val scopeId: String,
+        val sessionId: String,
+        var watchdog: Job? = null,
+    ) {
+        fun retiredIdentity() = RetiredLarkBindingRequestIdentity(
+            hostId = hostId,
+            hostEpoch = hostEpoch,
+            scopeId = scopeId,
+            sessionId = sessionId,
+        )
+    }
+
+    private data class RetiredLarkBindingRequestIdentity(
+        val hostId: String,
+        val hostEpoch: String,
+        val scopeId: String,
+        val sessionId: String,
+    )
+
+    private data class PendingAgentChatImageRequest(
+        val hostId: String,
+        val hostEpoch: String,
+        val scopeId: String,
+        val sessionId: String,
+        val imageId: String,
+        val offset: Int,
+    )
+
+    private enum class LarkBindingRequestKind {
+        LIST,
+        UPDATE_REPLY_MODE,
+        UNLINK,
+    }
 
     private data class OutboxExecuteReadyCut(
         val authority: RelayV2RepositoryEffectAuthority,
@@ -6689,7 +7185,8 @@ internal class RelayV2ConnectionActor(
 
         private val SUPPORTED_OPTIONAL_CAPABILITIES = setOf(
             AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
-            AGENT_CHAT_V1_CAPABILITY,
+            AGENT_CHAT_V2_CAPABILITY,
+            LARK_BINDINGS_V2_CAPABILITY,
         )
 
         internal const val DEFAULT_ACTION_CAPACITY = 64
@@ -6710,6 +7207,7 @@ internal class RelayV2ConnectionActor(
         private const val MAX_QUERY_WINDOW_BINDINGS = 129
         private const val MAX_PENDING_AGENT_EXTENSION_REQUESTS = 64
         private const val MAX_TRACKED_AGENT_EXTENSION_REQUESTS = 1_024
+        private const val MAX_RETIRED_LARK_BINDING_REQUESTS = 8
         private const val MAX_MANUAL_RESYNC_PENDING_COMMANDS = 4_096
 
         private val AGENT_EXTENSION_INBOUND_PHASES = setOf(

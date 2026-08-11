@@ -315,6 +315,47 @@ test("H2 materializes the canonical discovery key from the shared backend identi
   }
 });
 
+test("H2 retains the public Session ID when the process target rotates around one tmux incarnation", async () => {
+  const h = await harness();
+  try {
+    const managedIncarnation = `twinc2.${"R".repeat(43)}`;
+    const discovered = (backendIdentity) => ({
+      ...terminal(backendIdentity, "Stable terminal"),
+      managedIncarnation,
+    });
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "local",
+        displayName: "Local",
+        kind: "local",
+        sessions: [discovered("backend-before-app-update")],
+      })],
+    });
+    const before = materializedRoot((await h.foundation.reconcile()).snapshot)
+      .scopes[0].sessions[0];
+
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "local",
+        displayName: "Local",
+        kind: "local",
+        sessions: [discovered("backend-after-app-update")],
+      })],
+    });
+    const sessions = materializedRoot((await h.foundation.reconcile()).snapshot)
+      .scopes[0].sessions;
+
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].item.sessionId, before.item.sessionId);
+    assert.equal(sessions[0].backendIdentity, "backend-after-app-update");
+    assert.equal(sessions[0].managedIncarnation, managedIncarnation);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("resolver reconcile rejects forged managed incarnation evidence without publishing a target", async () => {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-forged-resolver-"));
   try {

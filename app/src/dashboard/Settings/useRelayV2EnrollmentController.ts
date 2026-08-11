@@ -34,26 +34,15 @@ type ActiveRelayV2Operation = {
   requestEpoch: number;
 };
 
-function rendererState(
-  state: MobileRelayV2DashboardState,
-  sharedSecretConfigured: boolean,
-): RelayV2EnrollmentState {
-  const normalized = normalizeMobileRelayV2DashboardState(state);
-  return {
-    ...normalized,
-    v1Profile: {
-      ...normalized.v1Profile,
-      sharedSecretConfigured,
-    },
-  };
+function rendererState(state: MobileRelayV2DashboardState): RelayV2EnrollmentState {
+  return normalizeMobileRelayV2DashboardState(state);
 }
 
-export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) {
+export function useRelayV2EnrollmentController() {
   const backend = useDashboardBackend();
   const [state, dispatch] = useReducer(
     relayV2EnrollmentReducer,
-    sharedSecretConfigured,
-    createRelayV2EnrollmentState,
+    createRelayV2EnrollmentState(),
   );
   const [loaded, setLoaded] = useState(false);
   const [artifactNotice, setArtifactNotice] = useState<string | null>(null);
@@ -65,9 +54,9 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
   const publish = useCallback((next: MobileRelayV2DashboardState) => {
     dispatch({
       type: "backendStateObserved",
-      state: rendererState(next, sharedSecretConfigured),
+      state: rendererState(next),
     });
-  }, [sharedSecretConfigured]);
+  }, []);
 
   const refresh = useCallback(() => observerRef.current?.refresh(), []);
 
@@ -101,11 +90,7 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
       requestEpochRef.current += 1;
       operationRef.current = null;
     };
-  }, [backend, publish, sharedSecretConfigured]);
-
-  useEffect(() => {
-    dispatch({ type: "v1ProfileObserved", sharedSecretConfigured });
-  }, [sharedSecretConfigured]);
+  }, [backend, publish]);
 
   const activeArtifactHandle = state.enrollment.status === "active"
     ? state.enrollment.review.renderArtifact.handle
@@ -203,15 +188,14 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     }),
   ), [backend, run]);
 
-  const revokeKnownGrant = useCallback(() => {
-    if (
-      state.knownClientGrant.status !== "active"
-      && !(
-        state.knownClientGrant.status === "failed"
-        && state.knownClientGrant.retryable
-      )
-    ) return Promise.resolve();
-    const { grantId } = state.knownClientGrant;
+  const revokeClientGrant = useCallback((grantId: string) => {
+    const retryingFailure = state.knownClientGrant.status === "failed"
+      && state.knownClientGrant.grantId === grantId
+      && state.knownClientGrant.retryable;
+    if (!retryingFailure
+      && !state.connectedMobileDevices.some((device) => device.grantId === grantId)) {
+      return Promise.resolve();
+    }
     return run(
       "grant-revoke",
       () => backend.relay.v2.revokeClientGrant({ grantId, reason: "user_revoked" }),
@@ -223,7 +207,7 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
         retryable: failure.retryable,
       }),
     );
-  }, [backend, run, state.knownClientGrant]);
+  }, [backend, run, state.connectedMobileDevices, state.knownClientGrant]);
 
   const showEnrollmentArtifact = useCallback((handle: string) => {
     void backend.relay.v2.showEnrollmentArtifact({ handle }).catch(() => {
@@ -269,6 +253,6 @@ export function useRelayV2EnrollmentController(sharedSecretConfigured: boolean) 
     showEnrollmentArtifact,
     copyEnrollmentArtifact,
     artifactNotice,
-    revokeKnownGrant,
+    revokeClientGrant,
   };
 }

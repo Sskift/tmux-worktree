@@ -66,13 +66,6 @@ export type DashboardSidebarProps = {
   hosts: readonly HostConfig[];
   hostStatuses: Readonly<Record<string, HostStatus | undefined>>;
   hostsError?: string | null;
-  mobileRelay?: {
-    statusKnown: boolean;
-    active: boolean;
-    connected: boolean;
-    statusText: string;
-    error?: string | null;
-  };
   localRuntimeState?: "checking" | "ready" | "error";
   selection: Selection;
   sessionActivity: Readonly<Record<string, SessionActivityInfo | undefined>>;
@@ -181,7 +174,6 @@ export function DashboardSidebar({
   hosts,
   hostStatuses,
   hostsError,
-  mobileRelay,
   localRuntimeState = "checking",
   selection,
   sessionActivity,
@@ -307,25 +299,9 @@ export function DashboardSidebar({
     : localRuntimeState === "error"
       ? "Local unavailable"
       : "Local checking";
-  const relayState = !mobileRelay
-    ? "unknown"
-    : mobileRelay.error
-      ? "error"
-      : !mobileRelay.statusKnown
-        ? "unknown"
-        : mobileRelay.connected
-          ? "connected"
-          : mobileRelay.active
-            ? "starting"
-            : "stopped";
-  const relayLabel = relayState === "unknown"
-    ? "Checking"
-    : relayState === "error"
-      ? "Error"
-      : mobileRelay?.statusText ?? "Unknown";
-  const footerTone = localRuntimeState === "error" || relayState === "error" || hostsError
+  const footerTone = localRuntimeState === "error" || hostsError
     ? "danger"
-    : localRuntimeState === "checking" || relayState === "unknown"
+    : localRuntimeState === "checking"
       ? "warning"
       : connections.tone;
   const rootClassName = ["tw-dashboard-sidebar", className].filter(Boolean).join(" ");
@@ -952,14 +928,13 @@ export function DashboardSidebar({
             type="button"
             onClick={() => onOpenSettings()}
             data-tone={footerTone}
-            data-relay={relayState}
-            title={`${localRuntimeLabel}. ${hostsLabel}. ${hostsDetail}. Mobile Relay: ${relayLabel}${mobileRelay?.error ? ` — ${mobileRelay.error}` : ""}`}
+            title={`${localRuntimeLabel}. ${hostsLabel}. ${hostsDetail}.`}
           >
             <Settings aria-hidden="true" size={16} strokeWidth={1.8} />
             <span className="tw-dashboard-sidebar__connection-copy">
               <span className="tw-dashboard-sidebar__connection-title">Settings</span>
               <span className="tw-dashboard-sidebar__connection-detail">
-                {localRuntimeLabel} · {hostsLabel} · Relay {relayLabel}
+                {localRuntimeLabel} · {hostsLabel}
               </span>
             </span>
           </button>

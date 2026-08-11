@@ -100,6 +100,8 @@ export interface RelayV2DiscoveryError {
 export interface RelayV2DiscoveredSession {
   /** Backend instance key; authority also includes hostEpoch, scopeId, and kind. */
   backendIdentity: string;
+  /** Stable tmux lifecycle identity used only to retain the public Session ID across target rotation. */
+  managedIncarnation?: string;
   kind: RelayV2Session["kind"];
   displayName: string;
   state: "running";
@@ -592,6 +594,7 @@ export function isRelayV2MaterializedStateError(
 
 interface PersistedSession {
   backendIdentity: string;
+  managedIncarnation?: string;
   item: RelayV2Session;
   originReservation: PersistedReservationIdentity | null;
 }
@@ -762,6 +765,23 @@ function discoveredSessionAuthorityKey(session: RelayV2DiscoveredSession): strin
     backendKind: session.kind,
     backendInstanceKey: session.backendIdentity,
   });
+}
+
+function managedSessionContinuityKey(
+  backendKind: RelayV2Session["kind"],
+  managedIncarnation: string,
+): string {
+  return canonicalJson({ backendKind, managedIncarnation });
+}
+
+function sameManagedSessionIncarnation(
+  persisted: PersistedSession,
+  discovered: RelayV2DiscoveredSession,
+): boolean {
+  return persisted.managedIncarnation !== undefined
+    && discovered.managedIncarnation !== undefined
+    && persisted.item.kind === discovered.kind
+    && persisted.managedIncarnation === discovered.managedIncarnation;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1103,6 +1123,12 @@ function normalizeDiscoveredSession(
   session: RelayV2DiscoveredSession,
 ): RelayV2DiscoveredSession {
   assertString(session.backendIdentity, "discovered session backend identity", 4_096);
+  if (session.managedIncarnation !== undefined) {
+    assertString(session.managedIncarnation, "discovered managed incarnation", 128);
+    if (!/^twinc2\.[A-Za-z0-9_-]{43}$/.test(session.managedIncarnation)) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "invalid discovered managed incarnation");
+    }
+  }
   validateSession({
     scopeId: "validation",
     sessionId: "validation",
@@ -1265,12 +1291,33 @@ function parseMaterializedState(snapshot: RelayV2HostStateSnapshot): PersistedMa
       throw new RelayV2MaterializedStateError("INTERNAL", "materialized sessions are malformed");
     }
     const sessionBackends = new Set<string>();
+    const managedIncarnations = new Set<string>();
     for (const session of scope.sessions) {
-      if (!isRecord(session) || !exactKeys(session, ["backendIdentity", "item", "originReservation"])) {
+      if (!isRecord(session)) {
+        throw new RelayV2MaterializedStateError("INTERNAL", "materialized session is malformed");
+      }
+      const sessionKeys = Object.hasOwn(session, "managedIncarnation")
+        ? ["backendIdentity", "managedIncarnation", "item", "originReservation"]
+        : ["backendIdentity", "item", "originReservation"];
+      if (!exactKeys(session, sessionKeys)) {
         throw new RelayV2MaterializedStateError("INTERNAL", "materialized session is malformed");
       }
       assertString(session.backendIdentity, "session backend identity", 4_096);
       validateSession(session.item, scope.item.scopeId);
+      if (session.managedIncarnation !== undefined) {
+        assertString(session.managedIncarnation, "managed Session incarnation", 128);
+        if (!/^twinc2\.[A-Za-z0-9_-]{43}$/.test(session.managedIncarnation)) {
+          throw new RelayV2MaterializedStateError("INTERNAL", "managed Session incarnation is malformed");
+        }
+        const continuityKey = managedSessionContinuityKey(
+          session.item.kind,
+          session.managedIncarnation,
+        );
+        if (managedIncarnations.has(continuityKey)) {
+          throw new RelayV2MaterializedStateError("INTERNAL", "managed Session incarnation is duplicated");
+        }
+        managedIncarnations.add(continuityKey);
+      }
       if (session.originReservation !== null) {
         const origin = parseReservationIdentity(session.originReservation);
         const commandTuple = canonicalReservationTuple(origin);
@@ -1866,12 +1913,12 @@ function normalizeResolverDiscoveryCut(
       capabilities: normalizeResolverCapabilities(raw.capabilities),
     };
   });
-  const discoveredSessions = new Set(scopes.flatMap((scope) => (
-    scope.sessions.map((session) => resolverEvidenceSessionKey(
+  const discoveredSessions = new Map(scopes.flatMap((scope) => (
+    scope.sessions.map((session) => [resolverEvidenceSessionKey(
       scope.backendIdentity,
       session.kind,
       session.backendIdentity,
-    ))
+    ), session] as const)
   )));
   const sessionKeys = new Set<string>();
   const sessionTargets = value.sessionTargets.map((raw) => {
@@ -1895,14 +1942,17 @@ function normalizeResolverDiscoveryCut(
       raw.backendKind,
       raw.sessionBackendIdentity,
     );
+    const discoveredSession = discoveredSessions.get(key);
     const processTarget = normalizeResolverProcessTarget(raw.processTarget);
     const scopeTarget = scopeTargets.find((candidate) => (
       candidate.scopeBackendIdentity === raw.scopeBackendIdentity
     ));
-    if (!discoveredSessions.has(key)
+    if (discoveredSession === undefined
       || sessionKeys.has(key)
       || scopeTarget === undefined
-      || !sameJson(scopeTarget.processTarget, processTarget)) {
+      || !sameJson(scopeTarget.processTarget, processTarget)
+      || (discoveredSession.managedIncarnation !== undefined
+        && discoveredSession.managedIncarnation !== raw.managedTarget.incarnation)) {
       throw new RelayV2MaterializedStateError("INTERNAL", "resolver Session evidence crossed authority");
     }
     sessionKeys.add(key);
@@ -2185,7 +2235,7 @@ class MaterializedMutation {
       scope.item.scopeId,
       session.item.kind,
       session.backendIdentity,
-    ) === authorityKey);
+    ) === authorityKey || sameManagedSessionIncarnation(session, normalized));
     if (collision) {
       if (collision.originReservation !== null) {
         throw new RelayV2MaterializedStateError("INTERNAL", "backend incarnation belongs to another reservation");
@@ -2223,7 +2273,7 @@ class MaterializedMutation {
       scopeId,
       session.item.kind,
       session.backendIdentity,
-    )) {
+    ) && !sameManagedSessionIncarnation(session, normalized)) {
       throw new RelayV2MaterializedStateError("INTERNAL", "reservation mapping backend changed");
     }
     return this.upsertNormalizedSession(scope, normalized);
@@ -2249,10 +2299,16 @@ class MaterializedMutation {
         normalized.backendIdentity,
       )
     ));
+    session ??= scope.sessions.find((candidate) => (
+      sameManagedSessionIncarnation(candidate, normalized)
+    ));
     const isNew = session === undefined;
     if (!session) {
       session = {
         backendIdentity: normalized.backendIdentity,
+        ...(normalized.managedIncarnation === undefined
+          ? {}
+          : { managedIncarnation: normalized.managedIncarnation }),
         originReservation: originReservation === null ? null : clone(originReservation),
         item: {
           scopeId,
@@ -2270,6 +2326,11 @@ class MaterializedMutation {
         },
       };
       scope.sessions.push(session);
+    } else {
+      session.backendIdentity = normalized.backendIdentity;
+      if (normalized.managedIncarnation !== undefined) {
+        session.managedIncarnation = normalized.managedIncarnation;
+      }
     }
     const desired: RelayV2Session = {
       scopeId,
@@ -2366,7 +2427,8 @@ function scanAuthorityConflict(
       }
       if (!sameReservationIdentity(mapped.origin, reservationIdentityFromCorrelation(correlation))
         || materializedScope?.item.scopeId !== mapped.scope.item.scopeId
-        || discovered.backendIdentity !== mapped.session.backendIdentity
+        || (discovered.backendIdentity !== mapped.session.backendIdentity
+          && !sameManagedSessionIncarnation(mapped.session, discovered))
         || discovered.kind !== mapped.session.item.kind) {
         return "discovery correlation crossed mapped Session authority";
       }
@@ -2444,6 +2506,12 @@ function applyDiscovery(
       authorityKey(session.item.kind, session.backendIdentity),
       session,
     ]));
+    const sessionsByManagedIncarnation = new Map(scope.sessions.flatMap((session) => (
+      session.managedIncarnation === undefined ? [] : [[
+        managedSessionContinuityKey(session.item.kind, session.managedIncarnation),
+        session,
+      ] as const]
+    )));
     const observedSessions = new Set(discoveredSessions.map((session) => (
       authorityKey(session.kind, session.backendIdentity)
     )));
@@ -2470,6 +2538,16 @@ function applyDiscovery(
       const reservation = correlatedReservation;
       const discoveredAuthorityKey = authorityKey(discovered.kind, discovered.backendIdentity);
       let session = sessionsByBackend.get(discoveredAuthorityKey);
+      const continuityMatch = discovered.managedIncarnation === undefined
+        ? undefined
+        : sessionsByManagedIncarnation.get(managedSessionContinuityKey(
+            discovered.kind,
+            discovered.managedIncarnation,
+          ));
+      if (session !== undefined && continuityMatch !== undefined && session !== continuityMatch) {
+        throw new RelayV2MaterializedStateError("INTERNAL", "Session continuity crossed backend authority");
+      }
+      session ??= continuityMatch;
       const isNewSession = session === undefined;
       if (reservation !== undefined) {
         const target = mutation.materializeReservation(reservation, discovered);
@@ -2479,13 +2557,27 @@ function applyDiscovery(
         if (!materialized) {
           throw new RelayV2MaterializedStateError("INTERNAL", "reserved Session was not materialized");
         }
+        for (const [key, candidate] of sessionsByBackend) {
+          if (candidate === materialized && key !== discoveredAuthorityKey) {
+            sessionsByBackend.delete(key);
+          }
+        }
         sessionsByBackend.set(discoveredAuthorityKey, materialized);
+        if (materialized.managedIncarnation !== undefined) {
+          sessionsByManagedIncarnation.set(
+            managedSessionContinuityKey(materialized.item.kind, materialized.managedIncarnation),
+            materialized,
+          );
+        }
         reservationsById.delete(reservation.reservationId);
         continue;
       }
       if (!session) {
         session = {
           backendIdentity: discovered.backendIdentity,
+          ...(discovered.managedIncarnation === undefined
+            ? {}
+            : { managedIncarnation: discovered.managedIncarnation }),
           originReservation: null,
           item: {
             scopeId: desiredScope.scopeId,
@@ -2503,6 +2595,21 @@ function applyDiscovery(
           },
         };
         sessionsByBackend.set(discoveredAuthorityKey, session);
+      } else {
+        for (const [key, candidate] of sessionsByBackend) {
+          if (candidate === session && key !== discoveredAuthorityKey) sessionsByBackend.delete(key);
+        }
+        session.backendIdentity = discovered.backendIdentity;
+        if (discovered.managedIncarnation !== undefined) {
+          session.managedIncarnation = discovered.managedIncarnation;
+        }
+        sessionsByBackend.set(discoveredAuthorityKey, session);
+      }
+      if (session.managedIncarnation !== undefined) {
+        sessionsByManagedIncarnation.set(
+          managedSessionContinuityKey(session.item.kind, session.managedIncarnation),
+          session,
+        );
       }
       const desired: RelayV2Session = {
         scopeId: desiredScope.scopeId,

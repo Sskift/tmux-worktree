@@ -8,7 +8,6 @@ import {
 import { MobileRelayV2BackendOperationError } from "../src/platform/relayV2Domain.ts";
 import { createRelayV2ManagementAdapter } from "../src/platform/relayV2ManagementAdapter.ts";
 
-const requestIdV1 = "dmgmt1.AquZUdkZ9FXG7OEIfRHmjw";
 const requestIdV2 = "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw";
 const futureMs = 4_000_000_000_000;
 
@@ -28,6 +27,7 @@ function defaultProjection() {
     connector: { status: "stopped" },
     enrollment: { status: "idle" },
     knownClientGrant: { status: "unknown" },
+    connectedMobileDevices: [],
   };
 }
 
@@ -127,22 +127,7 @@ function successOutcome(operation: Operation, result = projectionFor(operation))
   };
 }
 
-function v1StatusOutcome() {
-  return {
-    protocolVersion: 1,
-    requestId: requestIdV1,
-    ok: true,
-    result: {
-      availability: "unavailable",
-      capabilities: [],
-      reason: "default_off",
-    },
-    error: null,
-  };
-}
-
 function errorOutcome(
-  protocolVersion: 1 | 2,
   code: "UNAVAILABLE" | "CHANNEL_CLOSED" | "SUPERSEDED",
 ) {
   const errors = {
@@ -163,40 +148,13 @@ function errorOutcome(
     },
   } as const;
   return {
-    protocolVersion,
-    requestId: protocolVersion === 1 ? requestIdV1 : requestIdV2,
+    protocolVersion: 2,
+    requestId: requestIdV2,
     ok: false,
     result: null,
     error: errors[code],
   };
 }
-
-test("management adapter preserves the permanent v1 default-off child behavior", async () => {
-  const calls: Array<{ command: string; args?: unknown }> = [];
-  const adapter = createRelayV2ManagementAdapter(async (command, args) => {
-    calls.push({ command, args });
-    const operation = (args as { operation: Operation }).operation;
-    return operation === "status" ? v1StatusOutcome() : errorOutcome(1, "UNAVAILABLE");
-  });
-
-  const state = await adapter.status();
-  assert.equal(state.authority.kind, "unavailable");
-  assert.deepEqual(state.connector.negotiatedCapabilityIntersection, []);
-  await assert.rejects(adapter.createEnrollment({ intent: "retry", deviceLabel: "Pixel" }),
-    (error: unknown) => error instanceof MobileRelayV2BackendOperationError
-      && error.code === "UNAVAILABLE");
-  assert.deepEqual(calls, [
-    {
-      command: "mobile_relay_v2_management_call",
-      args: { operation: "status", input: null },
-    },
-    {
-      command: "mobile_relay_v2_management_call",
-      args: { operation: "create_enrollment", input: { deviceLabel: "Pixel" } },
-    },
-  ]);
-  assert.equal(JSON.stringify(state).includes(requestIdV1), false);
-});
 
 test("management v2 maps all seven successful projections and only approved inputs", async () => {
   const calls: Array<{ command: string; args?: unknown }> = [];
@@ -236,7 +194,7 @@ test("management v2 maps all seven successful projections and only approved inpu
     revokedAtMs: 1_783_700_200_000,
     alreadyRevoked: false,
   });
-  assert.equal(Object.prototype.hasOwnProperty.call(states[6], "devices"), false);
+  assert.deepEqual(states[6].connectedMobileDevices, []);
 });
 
 test("incomplete registration or any missing required capability cannot expose enrollment QR", async () => {
@@ -440,7 +398,7 @@ test("closed v2 outcomes reject malformed, unknown, credential, and contradictor
 
 test("only exact native supervisor failures cross the adapter", async () => {
   for (const code of ["UNAVAILABLE", "CHANNEL_CLOSED", "SUPERSEDED"] as const) {
-    const nativeError = errorOutcome(2, code).error;
+    const nativeError = errorOutcome(code).error;
     const adapter = createRelayV2ManagementAdapter(async () => {
       throw nativeError;
     });

@@ -1709,7 +1709,6 @@ class RelayV2StateDatabaseInstrumentedTest {
     ) = AgentTranscriptLifecycleReadRequest(
         selectedNamespace = namespace,
         access = AgentTranscriptLifecycleReadAccess(
-            dialect = AgentTranscriptLifecycleReadDialect.RELAY_V2,
             negotiatedCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
             support = AgentExtensionSupport.AVAILABLE,
             activeNamespace = namespace,

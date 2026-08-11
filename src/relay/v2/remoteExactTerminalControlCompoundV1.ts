@@ -403,6 +403,7 @@ function effectRequest(value: unknown, activeLease: TerminalControlLease): Termi
   const allowed = new Set([
     "ownership.status", "lease.renew", "lease.release",
     "input.raw", "input.agent-message", "input.resize",
+    "activity.agent-status", "activity.agent-result",
   ]);
   if (!allowed.has(request.type)) {
     throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound effect is not allowed");

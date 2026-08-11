@@ -132,6 +132,9 @@ internal data class RelayV2ConnectionFailure(
     val retryable: Boolean,
 )
 
+/** Trusted broker close 4403: the current grant is durably revoked, not merely invalid. */
+internal const val RELAY_V2_GRANT_REVOKED = "GRANT_REVOKED"
+
 internal data class RelayV2ConnectionState(
     val phase: RelayV2ConnectionPhase = RelayV2ConnectionPhase.STOPPED,
     val profileId: String? = null,

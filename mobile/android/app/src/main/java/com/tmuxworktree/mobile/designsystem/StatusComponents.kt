@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.designsystem
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -16,7 +17,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Circle
-import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -26,6 +26,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -35,6 +36,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.tmuxworktree.mobile.R
 import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 
@@ -91,11 +93,10 @@ fun TwRootTopBar(
                     .testTag("topbar_menu"),
                 contentAlignment = Alignment.CenterStart,
             ) {
-                Icon(
-                    imageVector = Icons.Outlined.Menu,
+                Image(
+                    painter = painterResource(R.drawable.tw_dashboard_logo),
                     contentDescription = "Open device menu",
-                    tint = TwTextPrimary,
-                    modifier = Modifier.size(24.dp),
+                    modifier = Modifier.size(40.dp),
                 )
             }
         }

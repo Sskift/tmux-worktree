@@ -71,7 +71,23 @@ export interface RelayV2DashboardManagementGrantRevocationReceipt {
   connectorId: string;
 }
 
+export interface RelayV2DashboardManagementKnownClientGrantInspection {
+  grantId: string | null;
+  hostId: string;
+  connectorId: string;
+  connectedMobileDevices: readonly Readonly<{
+    status: "connected";
+    grantId: string;
+    clientInstanceId: string;
+    connectionCount: number;
+  }>[];
+}
+
 export interface RelayV2DashboardManagementCarrierControlPort {
+  inspectKnownClientGrant(input: Readonly<{
+    hostId: string;
+    connectorId: string;
+  }>): MaybePromise<RelayV2DashboardManagementKnownClientGrantInspection>;
   createEnrollment(input: Readonly<{
     requestId: string;
     hostId: string;
@@ -111,8 +127,11 @@ export class RelayV2DashboardManagementAuthorityClosedError extends Error {
 interface PostOperationCut {
   credential: RelayV2DashboardManagementCredentialInspection;
   connector: RelayV2DashboardManagementConnectorCut;
+  connectedMobileDevices: RelayV2DashboardManagementProjection["connectedMobileDevices"];
   observedAtMs: number;
 }
+
+type GateCut = Pick<PostOperationCut, "credential" | "connector">;
 
 interface ReadyGate {
   hostId: string;
@@ -344,6 +363,31 @@ function revocationReceipt(
   });
 }
 
+function connectedMobileDevices(
+  value: unknown,
+): RelayV2DashboardManagementProjection["connectedMobileDevices"] {
+  if (!Array.isArray(value) || value.length > 256) return closed();
+  const seenGrantIds = new Set<string>();
+  return Object.freeze(value.map((candidate) => {
+    const fields = exactDataObject(candidate, [
+      "status", "grantId", "clientInstanceId", "connectionCount",
+    ]);
+    const grantId = opaque(fields.grantId, 128);
+    if (fields.status !== "connected"
+      || !Number.isSafeInteger(fields.connectionCount)
+      || (fields.connectionCount as number) <= 0
+      || (fields.connectionCount as number) > 256
+      || seenGrantIds.has(grantId)) return closed();
+    seenGrantIds.add(grantId);
+    return Object.freeze({
+      status: "connected" as const,
+      grantId,
+      clientInstanceId: opaque(fields.clientInstanceId, 128),
+      connectionCount: fields.connectionCount as number,
+    });
+  }));
+}
+
 function completeCapabilities(connector: RelayV2DashboardManagementConnectorCut): boolean {
   return connector.status === "registered"
     && RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES.every(
@@ -351,7 +395,7 @@ function completeCapabilities(connector: RelayV2DashboardManagementConnectorCut)
     );
 }
 
-function activeGate(cut: PostOperationCut): ReadyGate | null {
+function activeGate(cut: GateCut): ReadyGate | null {
   const { connector, credential } = cut;
   if (connector.status !== "registered"
     || !completeCapabilities(connector)
@@ -363,7 +407,7 @@ function activeGate(cut: PostOperationCut): ReadyGate | null {
   });
 }
 
-function registeredCarrierGate(cut: PostOperationCut): ReadyGate | null {
+function registeredCarrierGate(cut: GateCut): ReadyGate | null {
   const { connector, credential } = cut;
   if (connector.status !== "registered"
     || credential.status !== "ready"
@@ -402,6 +446,7 @@ implements RelayV2DashboardManagementProtocolV2Handler {
       || typeof options.connector.start !== "function"
       || typeof options.connector.stop !== "function"
       || !isObject(options.carrierControl)
+      || typeof options.carrierControl.inspectKnownClientGrant !== "function"
       || typeof options.carrierControl.createEnrollment !== "function"
       || typeof options.carrierControl.revokeGrant !== "function"
       || (options.clock !== undefined && typeof options.clock !== "function")) {
@@ -565,12 +610,42 @@ implements RelayV2DashboardManagementProtocolV2Handler {
   private async readPostOperationCut(): Promise<PostOperationCut> {
     const credential = inspectCredential(await this.credential.inspect());
     const connector = inspectConnectorCut(await this.connector.inspectCut());
-    const cut = Object.freeze({
+    const gate = registeredCarrierGate({ credential, connector });
+    let mobileDevices: RelayV2DashboardManagementProjection["connectedMobileDevices"] =
+      Object.freeze([]);
+    if (gate !== null) {
+      const inspected = await this.carrierControl.inspectKnownClientGrant(gate);
+      const grantId = inspected.grantId === null ? null : opaque(inspected.grantId, 128);
+      if (inspected.hostId !== gate.hostId || inspected.connectorId !== gate.connectorId) {
+        return closed();
+      }
+      mobileDevices = connectedMobileDevices(inspected.connectedMobileDevices);
+      if (grantId !== null
+        && !(this.knownClientGrant.status === "revoked"
+          && this.knownClientGrant.grantId === grantId)) {
+        const newlyObserved = this.knownClientGrant.status !== "active"
+          || this.knownClientGrant.grantId !== grantId;
+        this.knownClientGrant = Object.freeze({ status: "active", grantId });
+        // A new live client grant is the Host-owned evidence that the one-time
+        // enrollment has been consumed; its code must leave the projection.
+        if (newlyObserved) this.currentEnrollment = null;
+      } else if (grantId === null && this.knownClientGrant.status !== "revoked") {
+        this.knownClientGrant = Object.freeze({ status: "unknown" });
+      }
+    } else if (this.knownClientGrant.status !== "revoked") {
+      this.knownClientGrant = Object.freeze({ status: "unknown" });
+    }
+    if (this.knownClientGrant.status === "revoked") {
+      mobileDevices = Object.freeze(mobileDevices.filter(
+        (device) => device.grantId !== this.knownClientGrant.grantId,
+      ));
+    }
+    return Object.freeze({
       credential,
       connector,
+      connectedMobileDevices: mobileDevices,
       observedAtMs: this.now(),
     });
-    return cut;
   }
 
   private now(): number {
@@ -647,6 +722,7 @@ implements RelayV2DashboardManagementProtocolV2Handler {
       connector: this.projectConnector(cut),
       enrollment,
       knownClientGrant: this.knownClientGrant,
+      connectedMobileDevices: cut.connectedMobileDevices,
     });
   }
 

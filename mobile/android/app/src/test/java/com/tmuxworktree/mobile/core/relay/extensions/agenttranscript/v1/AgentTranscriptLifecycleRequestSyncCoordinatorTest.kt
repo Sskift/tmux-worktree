@@ -97,7 +97,8 @@ class AgentTranscriptLifecycleRequestSyncCoordinatorTest {
             harness.sent.map { it.requestId },
         )
         assertEquals(harness.sent.map { it.requestId }.toSet(), harness.operations.committedTokens)
-        assertEquals(3, harness.operations.applyCount)
+        assertEquals(4, harness.operations.applyCount)
+        assertEquals(1, harness.operations.negotiationCommitCount)
         assertFalse(harness.lease.insideBlock)
     }
 
@@ -430,6 +431,8 @@ private class CoordinatorDurableOperations(
         >()
     var applyCount = 0
         private set
+    var negotiationCommitCount = 0
+        private set
     var preparedReadCount = 0
         private set
 
@@ -510,6 +513,16 @@ private class CoordinatorDurableOperations(
         check(lease.insideBlock)
         applyCount += 1
         return when (val input = command.input) {
+            AgentTranscriptLifecycleClientInput.ExtensionNegotiated -> {
+                negotiationCommitCount += 1
+                reduction(
+                    AgentTranscriptLifecycleExtensionState(
+                        localGeneration = "1",
+                        support = AgentExtensionSupport.UNKNOWN,
+                        unavailableReason = null,
+                    ),
+                )
+            }
             is AgentTranscriptLifecycleClientInput.StatusRequestStarted -> {
                 committedTokens += input.requestNetworkToken
                 reduction(

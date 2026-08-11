@@ -195,8 +195,7 @@ export type RelayV2HostShippingRootErrorCode =
 const ERROR_MESSAGES: Readonly<Record<RelayV2HostShippingRootErrorCode, string>> = Object.freeze({
   INPUTS_INVALID: "Relay v2 Host shipping root inputs are invalid",
   INPUTS_UNAVAILABLE:
-    "Relay v2 Host shipping root deployment inputs are unavailable; "
-    + "the explicit v2 selection never falls back to Relay v1",
+    "Relay v2 Host shipping root deployment inputs are unavailable",
   NATIVE_MODULE_INVALID: "Relay v2 Host credential native module is invalid",
   NATIVE_ARTIFACT_MISSING: "Relay v2 Host credential native module artifact is missing",
   NATIVE_TARGET_UNSUPPORTED: "Relay v2 Host credential native module target is unsupported",
@@ -605,7 +604,7 @@ function issueHandle(
  * deployment inputs. Validation, the native-source capability probe, H0
  * recovery, materialized reconcile, and the privileged intake all complete
  * before any socket can be constructed; a failure at any stage rolls back
- * in reverse order and never falls back to Relay v1.
+ * in reverse order and fails closed.
  */
 export async function startRelayV2HostShippingRoot(
   options: unknown,

@@ -1,7 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.profile
 
 internal enum class RelayProfileDialect {
-    V1,
     V2,
 }
 
@@ -369,6 +368,11 @@ internal interface RelayV2ProfileStore {
     suspend fun consentRelayV2AutoConnect(
         expectedProfile: RelayV2Profile,
     ): RelayV2Profile?
+
+    /** Removes only the exact active profile after trusted broker close 4403 evidence. */
+    suspend fun commitExternallyRevokedRelayV2ProfileRemoval(
+        expectedProfile: RelayV2Profile,
+    ): Boolean
 }
 
 /** Exact-CAS durable owner for the default-off self-revoke quarantine foundation. */
@@ -393,6 +397,11 @@ internal interface RelayV2SelfRevokeJournalStore {
 }
 
 internal interface RelayProfileDisconnectBarrier {
+    /** Waits only for trusted broker close 4403 evidence; false means the bounded wait elapsed. */
+    suspend fun awaitServerGrantRevocation(
+        profile: RelayActiveProfileIdentity,
+    ): Boolean = false
+
     suspend fun disconnectAndDrain(
         profile: RelayActiveProfileIdentity,
         barrierId: String,
@@ -491,7 +500,7 @@ internal data class RelayV2ProfileActivationJournal(
             proof.completedSecretReference == targetCredentialSecretReference
 }
 
-/** Clears the old profile's Room cache, Outbox, drafts, terminal queue, and credential. */
+/** Clears the old profile's Room cache, Outbox, terminal queue, and credential. */
 internal fun interface RelayProfileIsolationBoundary {
     suspend fun clearAfterDisconnect(
         receipt: RelayProfileDisconnectReceipt,

@@ -2,8 +2,8 @@ use qrcode::{types::Color, EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 
 use super::enrollment_artifact::{
-    EnrollmentArtifactLineage, EnrollmentArtifactRegistry, RenderedEnrollmentArtifact,
-    RendererEnrollmentArtifact,
+    EnrollmentArtifactAdmissionError, EnrollmentArtifactLineage, EnrollmentArtifactRegistry,
+    RenderedEnrollmentArtifact, RendererEnrollmentArtifact,
 };
 use super::management_child::{ManagementInput, ManagementOperation};
 
@@ -25,7 +25,7 @@ pub(crate) const REQUIRED_CAPABILITIES: [&str; 6] = [
     "event.sequence.v1",
     "terminal.stream.resume.v1",
 ];
-const KNOWN_CAPABILITIES: [&str; 7] = [
+const KNOWN_CAPABILITIES: [&str; 9] = [
     "error.structured.v1",
     "command.ledger.v1",
     "command.query.v1",
@@ -33,6 +33,8 @@ const KNOWN_CAPABILITIES: [&str; 7] = [
     "event.sequence.v1",
     "terminal.stream.resume.v1",
     "agent.transcript-lifecycle.v1",
+    "agent.chat.v2",
+    "lark.bindings.v2",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -67,6 +69,7 @@ pub(crate) struct DashboardProjection {
     connector: ConnectorProjection,
     enrollment: EnrollmentProjection,
     known_client_grant: KnownClientGrantProjection,
+    connected_mobile_devices: Vec<ConnectedMobileDeviceProjection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +221,22 @@ struct RendererDashboardProjection {
     connector: ConnectorProjection,
     enrollment: RendererEnrollmentProjection,
     known_client_grant: KnownClientGrantProjection,
+    connected_mobile_devices: Vec<ConnectedMobileDeviceProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectedMobileDeviceProjection {
+    status: ConnectedMobileDeviceStatus,
+    grant_id: String,
+    client_instance_id: String,
+    connection_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectedMobileDeviceStatus {
+    Connected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,13 +389,22 @@ pub(crate) fn project_for_renderer(
             artifacts.clear();
             RendererEnrollmentProjection::Idle
         }
-        EnrollmentProjection::Active { review } => RendererEnrollmentProjection::Active {
-            review: renderer_enrollment_review(
-                review,
-                registered_connector_id.ok_or(())?,
-                artifacts,
-            )?,
-        },
+        EnrollmentProjection::Active { review } => {
+            let enrollment_id = review.enrollment.enrollment_id.clone();
+            let expired_at_ms = review.enrollment.expires_at_ms;
+            match renderer_enrollment_review(review, registered_connector_id.ok_or(())?, artifacts)
+            {
+                Ok(review) => RendererEnrollmentProjection::Active { review },
+                Err(EnrollmentArtifactAdmissionError::Expired) => {
+                    artifacts.clear();
+                    RendererEnrollmentProjection::Expired {
+                        enrollment_id,
+                        expired_at_ms,
+                    }
+                }
+                Err(EnrollmentArtifactAdmissionError::Rejected) => return Err(()),
+            }
+        }
         EnrollmentProjection::Expired {
             enrollment_id,
             expired_at_ms,
@@ -398,6 +426,7 @@ pub(crate) fn project_for_renderer(
         connector: projection.connector,
         enrollment,
         known_client_grant: projection.known_client_grant,
+        connected_mobile_devices: projection.connected_mobile_devices,
     })
     .map_err(|_| ())
 }
@@ -420,6 +449,7 @@ pub(crate) fn projection_ready_host_credential_expires_at_ms(
             "connector",
             "enrollment",
             "knownClientGrant",
+            "connectedMobileDevices",
         ],
     )
     .ok()?;
@@ -442,6 +472,7 @@ pub(crate) fn projection_base_connector_readiness(
             "connector",
             "enrollment",
             "knownClientGrant",
+            "connectedMobileDevices",
         ],
     ) else {
         return BaseConnectorReadiness::NotReady;
@@ -493,7 +524,7 @@ fn renderer_enrollment_review(
     review: EnrollmentReview,
     connector_id: String,
     artifacts: &EnrollmentArtifactRegistry,
-) -> Result<RendererEnrollmentReview, ()> {
+) -> Result<RendererEnrollmentReview, EnrollmentArtifactAdmissionError> {
     let lineage = EnrollmentArtifactLineage {
         enrollment_id: review.enrollment.enrollment_id.clone(),
         host_id: review.display.host_id.clone(),
@@ -586,6 +617,7 @@ fn validate_response_shape(value: &serde_json::Value) -> Result<(), ()> {
                     "connector",
                     "enrollment",
                     "knownClientGrant",
+                    "connectedMobileDevices",
                 ],
             )?;
             exact_object(&projection["authority"], &["kind", "reason"])?;
@@ -634,6 +666,7 @@ fn validate_response_shape(value: &serde_json::Value) -> Result<(), ()> {
                     ("failed", &["grantId", "retryable"]),
                 ],
             )?;
+            validate_connected_mobile_devices_shape(&projection["connectedMobileDevices"])?;
             Ok(())
         }
         (serde_json::Value::Null, serde_json::Value::Object(_)) => {
@@ -642,6 +675,20 @@ fn validate_response_shape(value: &serde_json::Value) -> Result<(), ()> {
         }
         _ => Err(()),
     }
+}
+
+fn validate_connected_mobile_devices_shape(value: &serde_json::Value) -> Result<(), ()> {
+    let devices = value.as_array().ok_or(())?;
+    if devices.len() > 256 {
+        return Err(());
+    }
+    for device in devices {
+        exact_object(
+            device,
+            &["status", "grantId", "clientInstanceId", "connectionCount"],
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_enrollment_shape(value: &serde_json::Value) -> Result<(), ()> {
@@ -828,6 +875,23 @@ fn validate_projection(
         } => {
             valid_identifier(grant_id)?;
             valid_timestamp(*revoked_at_ms)?;
+        }
+    }
+
+    if projection.connected_mobile_devices.len() > 256 {
+        return Err(());
+    }
+    for (index, device) in projection.connected_mobile_devices.iter().enumerate() {
+        valid_identifier(&device.grant_id)?;
+        valid_identifier(&device.client_instance_id)?;
+        if device.connection_count == 0 || device.connection_count > 256 {
+            return Err(());
+        }
+        if projection.connected_mobile_devices[..index]
+            .iter()
+            .any(|seen| seen.grant_id == device.grant_id)
+        {
+            return Err(());
         }
     }
 
@@ -1178,6 +1242,48 @@ mod tests {
             link_fields.get("enrollmentCode").unwrap(),
             "twenroll2.one-time-code"
         );
+        registry.close();
+    }
+
+    #[test]
+    fn renderer_projection_downgrades_an_active_enrollment_that_expired_in_transit() {
+        let fixture: Value = serde_json::from_str(CASES).unwrap();
+        let exchange = fixture["goldenExchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| exchange["operation"] == "create_enrollment")
+            .unwrap();
+        let request_id = exchange["normalizedRequest"]["requestId"].as_str().unwrap();
+        let decoded = decode_response(
+            exchange["responseFrame"]
+                .as_str()
+                .unwrap()
+                .trim_end_matches('\n')
+                .as_bytes(),
+            request_id,
+            ManagementOperation::CreateEnrollment,
+        )
+        .unwrap();
+        let mut child_projection = serde_json::to_value(decoded.result.unwrap()).unwrap();
+        let expired_at_ms = super::super::enrollment_artifact::tests_now_ms();
+        child_projection["enrollment"]["review"]["enrollment"]["expiresAtMs"] =
+            serde_json::json!(expired_at_ms);
+        let registry = EnrollmentArtifactRegistry::new(|_| {}).unwrap();
+
+        let renderer = project_for_renderer(child_projection, &registry).unwrap();
+        assert_eq!(
+            renderer["enrollment"],
+            serde_json::json!({
+                "status": "expired",
+                "enrollmentId": "enrollment-1",
+                "expiredAtMs": expired_at_ms,
+            })
+        );
+        let serialized = serde_json::to_string(&renderer).unwrap();
+        for forbidden in ["enrollmentCode", "twenroll2.", "renderArtifact", "dqart1."] {
+            assert!(!serialized.contains(forbidden), "{forbidden}");
+        }
         registry.close();
     }
 

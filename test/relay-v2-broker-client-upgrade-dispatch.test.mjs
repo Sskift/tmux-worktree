@@ -13,7 +13,6 @@ function metadata(overrides = {}) {
     pathname: "/client",
     search: "",
     authorizationHeaders: [`Bearer ${TOKEN}`],
-    legacyQuerySecret: null,
     offeredProtocols: ["tw-relay.v2"],
     ...overrides,
   };
@@ -40,9 +39,8 @@ const producerTarget = Object.freeze({
   generation: "1",
 });
 
-test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures in canonical dispatch", async () => {
+test("client Upgrade dispatch keeps malformed, host, and verifier failures in canonical dispatch", async () => {
   let v2VerifierCalls = 0;
-  let legacyVerifierCalls = 0;
   let prepareCalls = 0;
   const owner = new upgradeModule.RelayV2BrokerClientUpgradeDispatchOwner({
     verifyV2AccessToken(token, expectedRole) {
@@ -87,7 +85,6 @@ test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures i
   await assert.rejects(owner.dispatch(metadata(), new Proxy(producerTarget, {})),
     /Host producer target/);
   assert.equal(v2VerifierCalls, 0);
-  assert.equal(legacyVerifierCalls, 0);
   assert.equal(prepareCalls, 0);
 
   const cases = [
@@ -103,9 +100,8 @@ test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures i
       input: metadata({
         search: `?secret=${TOKEN}`,
         authorizationHeaders: [],
-        legacyQuerySecret: TOKEN,
       }),
-      expected: { outcome: "reject", status: 401, errorCode: "AUTH_INVALID", fallback: false },
+      expected: { outcome: "reject", status: 401, errorCode: "AUTH_REQUIRED", fallback: false },
     },
     {
       name: "query on v2 path",
@@ -129,7 +125,7 @@ test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures i
     },
     {
       name: "wrong protocol",
-      input: metadata({ offeredProtocols: ["tw-relay.v1", "tw-relay.v2"] }),
+      input: metadata({ offeredProtocols: ["tw-relay.unsupported", "tw-relay.v2"] }),
       expected: {
         outcome: "reject",
         status: 426,
@@ -146,7 +142,7 @@ test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures i
       name: "v1 credential",
       input: metadata({
         authorizationHeaders: ["Bearer legacy-secret"],
-        offeredProtocols: ["tw-relay.v1"],
+        offeredProtocols: ["tw-relay.unsupported"],
       }),
       expected: { outcome: "reject", status: 401, errorCode: "AUTH_INVALID", fallback: false },
     },
@@ -161,7 +157,6 @@ test("client Upgrade dispatch keeps malformed, host, v1, and verifier failures i
     assert.deepEqual(await owner.dispatch(entry.input, producerTarget), entry.expected, entry.name);
   }
   assert.equal(v2VerifierCalls, 1);
-  assert.equal(legacyVerifierCalls, 0);
   assert.equal(prepareCalls, 0);
 });
 

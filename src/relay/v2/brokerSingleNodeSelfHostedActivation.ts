@@ -80,8 +80,11 @@ export interface RelayV2BrokerSingleNodeSelfHostedOptions {
   /** Explicit optional routing receipt; omission remains default-off. */
   readonly agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
-  /** Explicit optional agent.chat.v1 routing receipt; omission remains default-off. */
+  /** Explicit optional agent.chat.v2 routing receipt; omission remains default-off. */
   readonly agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  /** Explicit optional lark.bindings.v2 routing receipt; omission remains default-off. */
+  readonly larkBindingsReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }
 
@@ -96,6 +99,8 @@ type CapturedOptions = Readonly<{
   agentTranscriptLifecycleReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
   agentChatReadiness?:
+    RelayV2BrokerServerAgentCapabilityReadinessReceipt;
+  larkBindingsReadiness?:
     RelayV2BrokerServerAgentCapabilityReadinessReceipt;
 }>;
 
@@ -175,7 +180,11 @@ function captureOwnDataOptions(value: unknown): Record<string, unknown> | null {
     "tlsCertificatePath",
     "stateDirectory",
   ];
-  const optional = ["agentTranscriptLifecycleReadiness", "agentChatReadiness"];
+  const optional = [
+    "agentTranscriptLifecycleReadiness",
+    "agentChatReadiness",
+    "larkBindingsReadiness",
+  ];
   const allowed = [...required, ...optional];
   const keys = Reflect.ownKeys(descriptors);
   if (
@@ -289,6 +298,13 @@ function captureOptions(value: unknown): CapturedOptions {
       : {
           agentChatReadiness:
             captured.agentChatReadiness as
+              RelayV2BrokerServerAgentCapabilityReadinessReceipt,
+        }),
+    ...(captured.larkBindingsReadiness === undefined
+      ? {}
+      : {
+          larkBindingsReadiness:
+            captured.larkBindingsReadiness as
               RelayV2BrokerServerAgentCapabilityReadinessReceipt,
         }),
   });
@@ -1241,6 +1257,12 @@ export async function startRelayV2BrokerSingleNodeSelfHosted(
           : {
               agentChatReadiness:
                 options.agentChatReadiness,
+            }),
+        ...(options.larkBindingsReadiness === undefined
+          ? {}
+          : {
+              larkBindingsReadiness:
+                options.larkBindingsReadiness,
             }),
       }),
     );

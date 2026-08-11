@@ -89,8 +89,25 @@ function harness(options = {}) {
   let now = options.now ?? 1_783_700_000_000;
   let credentialState = structuredClone(options.credential ?? { status: "missing" });
   let connectorState = structuredClone(options.connector ?? { status: "stopped" });
+  let knownClientGrantId = options.knownClientGrantId ?? null;
+  let connectedMobileDevices = structuredClone(options.connectedMobileDevices
+    ?? (knownClientGrantId === null ? [] : [{
+      status: "connected",
+      grantId: knownClientGrantId,
+      clientInstanceId: "client-instance-1",
+      connectionCount: 1,
+    }]));
   const calls = [];
   const control = {
+    inspectKnownClientGrant: async (input) => {
+      await options.onInspectKnownClientGrant?.();
+      return {
+        grantId: knownClientGrantId,
+        hostId: input.hostId,
+        connectorId: input.connectorId,
+        connectedMobileDevices: structuredClone(connectedMobileDevices),
+      };
+    },
     createEnrollment: async (input) => {
       calls.push(["createEnrollment", structuredClone(input)]);
       if (options.createFailure) throw options.createFailure;
@@ -163,6 +180,15 @@ function harness(options = {}) {
     authority,
     calls,
     setNow(value) { now = value; },
+    setKnownClientGrantId(value) {
+      knownClientGrantId = value;
+      connectedMobileDevices = value === null ? [] : [{
+        status: "connected",
+        grantId: value,
+        clientInstanceId: "client-instance-1",
+        connectionCount: 1,
+      }];
+    },
     setCredential(value) { credentialState = structuredClone(value); },
     setConnector(value) {
       connectorState = structuredClone(value);
@@ -307,6 +333,7 @@ test("each authority operation invokes its mutation port once with only the clos
       setup: {
         credential: readyCredential(),
         connector: registeredConnector(),
+        knownClientGrantId: "client-grant-1",
       },
       input: { grantId: "client-grant-1", reason: "user_revoked" },
       expectedCall: ["revokeGrant", {
@@ -403,10 +430,12 @@ test("registered projection preserves the known Agent optional without widening 
   );
 });
 
-test("expiry and gate loss synchronously clear the only retained enrollment code", async () => {
+test("expiry, consumption, and gate loss synchronously clear the retained enrollment code", async () => {
+  let onInspectKnownClientGrant = () => {};
   const h = harness({
     credential: readyCredential(),
     connector: registeredConnector(),
+    onInspectKnownClientGrant: () => onInspectKnownClientGrant(),
   });
   const created = await h.authority.handle(request(
     "create_enrollment",
@@ -415,7 +444,7 @@ test("expiry and gate loss synchronously clear the only retained enrollment code
   assert.equal(created.result.enrollment.status, "active");
   assert.equal(JSON.stringify(created).includes("twenroll2.one-time-code"), true);
 
-  h.setNow(1_783_700_300_000);
+  onInspectKnownClientGrant = () => h.setNow(1_783_700_300_000);
   const expired = await h.authority.handle(request("status"));
   assert.deepEqual(expired.result.enrollment, {
     status: "expired",
@@ -426,12 +455,24 @@ test("expiry and gate loss synchronously clear the only retained enrollment code
   const afterExpiry = await h.authority.handle(request("status"));
   assert.deepEqual(afterExpiry.result.enrollment, { status: "idle" });
 
+  onInspectKnownClientGrant = () => {};
   h.setNow(1_783_700_000_000);
   await h.authority.handle(request("create_enrollment", { deviceLabel: null }));
   h.setConnector({ status: "stopped" });
   const lost = await h.authority.handle(request("status"));
   assert.deepEqual(lost.result.enrollment, { status: "idle" });
   assert.equal(JSON.stringify(lost).includes("twenroll2."), false);
+
+  h.setConnector(registeredConnector());
+  await h.authority.handle(request("create_enrollment", { deviceLabel: null }));
+  h.setKnownClientGrantId("client-grant-2");
+  const consumed = await h.authority.handle(request("status"));
+  assert.deepEqual(consumed.result.enrollment, { status: "idle" });
+  assert.deepEqual(consumed.result.knownClientGrant, {
+    status: "active",
+    grantId: "client-grant-2",
+  });
+  assert.equal(JSON.stringify(consumed).includes("twenroll2."), false);
 });
 
 test("typed failures use only the fixed D2 error table; unknown output closes silently", async (t) => {
@@ -508,6 +549,14 @@ test("authority serializes concurrent requests through each atomic connector cut
       stop() {},
     },
     carrierControl: {
+      inspectKnownClientGrant(input) {
+        return {
+          grantId: null,
+          hostId: input.hostId,
+          connectorId: input.connectorId,
+          connectedMobileDevices: [],
+        };
+      },
       createEnrollment() { assert.fail("not called"); },
       revokeGrant() { assert.fail("not called"); },
     },

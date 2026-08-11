@@ -93,7 +93,8 @@
       "hostCredential",
       "connector",
       "enrollment",
-      "knownClientGrant"
+      "knownClientGrant",
+      "connectedMobileDevices"
     ],
     "authority": { "kind": "node", "reason": null },
     "requiredCapabilities": [
@@ -105,13 +106,21 @@
       "terminal.stream.resume.v1"
     ],
     "optionalCapabilities": [
-      "agent.transcript-lifecycle.v1"
+      "agent.transcript-lifecycle.v1",
+      "agent.chat.v2",
+      "lark.bindings.v2"
     ],
     "registeredRequiresAllSix": true,
     "registeredAllowsKnownOptionalCapabilities": true,
     "registeredIncompleteRequiresMissingCapability": true,
     "activeEnrollmentRequiresRegisteredAndAllSix": true,
-    "knownGrantIsSingleClosedProjectionNotDeviceList": true,
+    "connectedMobileDevicesAreLiveHostRoutesGroupedByGrant": true,
+    "connectedMobileDeviceExactKeys": [
+      "status",
+      "grantId",
+      "clientInstanceId",
+      "connectionCount"
+    ],
     "persistenceAllowed": false
   },
   "rendererBoundary": {

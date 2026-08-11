@@ -561,7 +561,6 @@ function prepareWssLifecycle(factory, authority, input) {
     },
     advertisedCapabilities: [],
     clientDialects: ["tw-relay.v2"],
-    dialectAdapters: TEST_OBJECT_FREEZE({}),
     idFactory: () => "host-hello-one",
     onStatus() {},
   });

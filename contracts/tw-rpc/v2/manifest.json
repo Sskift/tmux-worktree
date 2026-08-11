@@ -10,6 +10,7 @@
     "create-worktree",
     "create-worktree-resolved",
     "create-terminal",
+    "restore-worktree",
     "kill-session"
   ],
   "requestEncoding": "--request-json",

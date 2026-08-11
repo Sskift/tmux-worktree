@@ -276,21 +276,6 @@ const previewDirectories = new Map<string, Array<{
   ]],
 ]);
 
-const relayStatus = {
-  active: false,
-  connected: false,
-  connectionState: "stopped",
-  relayUrl: "",
-  brokerHostId: "devbox",
-  hostId: "mac-admin",
-  secret: "",
-  token: "",
-  connectedAt: null,
-  updatedAt: null,
-  retryInMs: null,
-  error: null,
-};
-
 const relayV2DeploymentStatus = {
   feature: "explicit_self_hosted",
   configured: false,
@@ -313,7 +298,7 @@ const relayV2DeploymentStatus = {
   error: null,
 };
 
-const relayV2PreviewState = createFakeMobileRelayV2State(false);
+const relayV2PreviewState = createFakeMobileRelayV2State();
 const relayV2PreviewEnrollmentExpiresAtMs = Date.now() + 5 * 60_000;
 relayV2PreviewState.hostCredential = {
   ...relayV2PreviewState.hostCredential,
@@ -440,11 +425,6 @@ transport.handlers.set("save_automation", (payload) => {
 });
 transport.handlers.set("delete_automation", nothing);
 transport.handlers.set("trigger_automation", value(automationRuns[0]));
-transport.handlers.set("mobile_relay_status", value(relayStatus));
-transport.handlers.set("mobile_relay_start", nothing);
-transport.handlers.set("mobile_relay_stop", nothing);
-transport.handlers.set("mobile_relay_save_config", value(relayStatus));
-transport.handlers.set("mobile_relay_start_broker", value(relayStatus));
 transport.handlers.set("mobile_relay_v2_self_hosted_status", value(relayV2DeploymentStatus));
 transport.handlers.set("mobile_relay_v2_self_hosted_save_config", value(relayV2DeploymentStatus));
 transport.handlers.set("mobile_relay_v2_self_hosted_deploy", value(relayV2DeploymentStatus));

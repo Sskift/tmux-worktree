@@ -1796,6 +1796,7 @@ export class FeishuBridge {
       `Open fragments: "[[" + "notify-group:" + "${markerNonce}" + "]]".`,
       `Close fragments: "[[" + "/notify-group:" + "${markerNonce}" + "]]".`,
       "Place only the public reply between the constructed delimiters.",
+      "Use Markdown for ordinary replies. For a structured report, you may instead place one complete read-only Feishu Card 2.0 JSON object (schema 2.0) there, with no surrounding prose.",
       "Do not place private terminal context inside those markers.",
     ].join("\n"), MAX_PROMPT_BYTES);
   }

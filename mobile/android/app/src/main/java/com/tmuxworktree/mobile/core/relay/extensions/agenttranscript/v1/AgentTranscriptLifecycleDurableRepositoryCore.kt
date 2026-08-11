@@ -1242,6 +1242,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private fun AgentTranscriptLifecycleDurableTransaction.clearSnapshotFence(
         namespace: AgentTranscriptLifecycleDurableNamespace,
     ) {
+        if (namespace.timelineEpoch == null) return
         snapshots(namespace).singleOrNull()?.let { snapshot ->
             if (deleteSnapshot(snapshot) != 1) {
                 throw AgentTranscriptLifecyclePersistenceConflictException()

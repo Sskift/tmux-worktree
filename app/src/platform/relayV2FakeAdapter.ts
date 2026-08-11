@@ -40,16 +40,9 @@ function cloneState(state: MobileRelayV2DashboardState): MobileRelayV2DashboardS
   return structuredClone(state);
 }
 
-export function createFakeMobileRelayV2State(
-  sharedSecretConfigured = false,
-): MobileRelayV2DashboardState {
+export function createFakeMobileRelayV2State(): MobileRelayV2DashboardState {
   return {
     authority: { kind: "fake_preview", reason: null },
-    v1Profile: {
-      protocolVersion: 1,
-      credentialKind: "legacy_shared_secret",
-      sharedSecretConfigured,
-    },
     hostCredential: {
       protocolVersion: 2,
       credentialKind: "twcap2_grant",
@@ -71,6 +64,7 @@ export function createFakeMobileRelayV2State(
     },
     enrollment: { status: "idle" },
     knownClientGrant: { status: "unknown" },
+    connectedMobileDevices: [],
   };
 }
 
@@ -323,10 +317,7 @@ export function createFakeMobileRelayV2Adapter(
         state.knownClientGrant.status === "revoked"
         && state.knownClientGrant.grantId === input.grantId
       ) return publish();
-      if (
-        state.knownClientGrant.status !== "active"
-        || state.knownClientGrant.grantId !== input.grantId
-      ) {
+      if (!state.connectedMobileDevices.some((device) => device.grantId === input.grantId)) {
         fail(
           "relay_v2_client_grant_unknown",
           "The requested Relay v2 client grant is not known to this host.",
@@ -338,6 +329,9 @@ export function createFakeMobileRelayV2Adapter(
       };
       state = {
         ...state,
+        connectedMobileDevices: state.connectedMobileDevices.filter(
+          (device) => device.grantId !== input.grantId,
+        ),
         knownClientGrant: {
           status: "revoked",
           grantId: input.grantId,

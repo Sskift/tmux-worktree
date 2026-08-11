@@ -29,7 +29,6 @@ pub fn run() {
             app.manage(Arc::new(PtyState::default()));
             app.manage(Arc::new(TerminalControlState::new()));
             app.manage(Arc::new(FeishuBridgeRuntimeState::default()));
-            app.manage(Arc::new(MobileRelayState::default()));
             let relay_v2_deployment = Arc::new(MobileRelayV2SelfHostedDeploymentState::default());
             let (relay_v2_management, restore_self_hosted_connector) =
                 match prepare_relay_v2_self_hosted_management_prerequisites() {
@@ -164,11 +163,6 @@ pub fn run() {
             remote_home_dir,
             remote_read_dir,
             probe_agents,
-            mobile_relay_start,
-            mobile_relay_start_broker,
-            mobile_relay_save_config,
-            mobile_relay_stop,
-            mobile_relay_status,
             mobile_relay_v2_management_call,
             mobile_relay_v2_enrollment_artifact_show,
             mobile_relay_v2_enrollment_artifact_copy,
@@ -192,8 +186,6 @@ pub fn run() {
                     pty_state.inner().as_ref(),
                     control_state.inner().as_ref(),
                 );
-                let relay_state = app.state::<Arc<MobileRelayState>>();
-                stop_mobile_relay_processes(relay_state.inner().as_ref());
                 let relay_v2_management_state =
                     app.state::<Arc<MobileRelayV2ManagementCommandState>>();
                 relay_v2_management_state.dispose();

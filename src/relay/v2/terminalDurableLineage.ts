@@ -531,7 +531,7 @@ function cloneCanonicalBinding(
   };
 }
 
-function sameCanonicalBinding(
+function sameResetReplacementBinding(
   left: RelayV2TerminalCanonicalTargetBindingV1,
   right: RelayV2TerminalCanonicalTargetBindingV1,
 ): boolean {
@@ -546,7 +546,14 @@ function sameCanonicalBinding(
     && left.managedTarget.incarnation === right.managedTarget.incarnation
     && left.exactControlIdentity.schemaVersion === right.exactControlIdentity.schemaVersion
     && left.exactControlIdentity.controlTargetId === right.exactControlIdentity.controlTargetId
-    && left.exactControlIdentity.controlEpoch === right.exactControlIdentity.controlEpoch
+    && left.exactControlIdentity.controlEpoch === right.exactControlIdentity.controlEpoch;
+}
+
+function sameCanonicalBinding(
+  left: RelayV2TerminalCanonicalTargetBindingV1,
+  right: RelayV2TerminalCanonicalTargetBindingV1,
+): boolean {
+  return sameResetReplacementBinding(left, right)
     && left.exactControlIdentity.targetIncarnationProof
       === right.exactControlIdentity.targetIncarnationProof;
 }
@@ -1137,10 +1144,15 @@ function parseState(
       !sameTarget(record.preparedBinding, record.target)
       || record.preparedBinding.pane !== record.pane
       || (record.streamAuthority.status !== "absent"
-        && !sameCanonicalBinding(
-          record.preparedBinding,
-          record.streamAuthority.canonicalBinding,
-        ))
+        && !(record.mode === "reset"
+          ? sameResetReplacementBinding(
+              record.preparedBinding,
+              record.streamAuthority.canonicalBinding,
+            )
+          : sameCanonicalBinding(
+              record.preparedBinding,
+              record.streamAuthority.canonicalBinding,
+            )))
     )) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
@@ -1827,10 +1839,15 @@ export class RelayV2TerminalDurableLineageAuthority
             );
           }
           if (record.streamAuthority.status !== "absent"
-            && !sameCanonicalBinding(
-              record.streamAuthority.canonicalBinding,
-              proposedBinding,
-            )) {
+            && !(record.mode === "reset"
+              ? sameResetReplacementBinding(
+                  record.streamAuthority.canonicalBinding,
+                  proposedBinding,
+                )
+              : sameCanonicalBinding(
+                  record.streamAuthority.canonicalBinding,
+                  proposedBinding,
+                ))) {
             return lineageError(
               "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
               "Relay v2 terminal replacement changed its exact target/control binding",
@@ -2381,7 +2398,7 @@ export class RelayV2TerminalDurableLineageAuthority
       || !sameTarget(record.target, record.streamAuthority.target)
       || record.pane !== record.streamAuthority.pane
       || record.requestedOffset !== record.streamAuthority.requestedOffset
-      || !sameCanonicalBinding(
+      || !sameResetReplacementBinding(
         record.preparedBinding,
         record.streamAuthority.canonicalBinding,
       )
@@ -2576,7 +2593,7 @@ export class RelayV2TerminalDurableLineageAuthority
       || record.streamAuthority.pane !== record.pane
       || record.streamAuthority.resumeTokenHash !== record.resumeTokenHash
       || (record.preparedBinding !== null
-        && !sameCanonicalBinding(
+        && !sameResetReplacementBinding(
           record.preparedBinding,
           record.streamAuthority.canonicalBinding,
         ))
@@ -2617,7 +2634,7 @@ export class RelayV2TerminalDurableLineageAuthority
       && record.streamAuthority.pane === record.pane
       && record.streamAuthority.resumeTokenHash === record.resumeTokenHash
       && (record.preparedBinding === null
-        || sameCanonicalBinding(
+        || sameResetReplacementBinding(
           record.preparedBinding,
           record.streamAuthority.canonicalBinding,
         ))

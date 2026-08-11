@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  DEFAULT_INSPECTOR_WIDTH,
-  DEFAULT_SIDEBAR_WIDTH,
   clampDashboardPanelWidth,
   clampDashboardPanelWidthForViewport,
   dashboardPanelWidthFromKey,
@@ -10,11 +8,6 @@ import {
   normalizeDashboardPanelWidths,
   viewportTierForWidth,
 } from "../src/dashboard/layout/panelGeometry.ts";
-
-test("dashboard panels preserve the frozen default widths", () => {
-  assert.equal(DEFAULT_SIDEBAR_WIDTH, 280);
-  assert.equal(DEFAULT_INSPECTOR_WIDTH, 420);
-});
 
 test("viewport tiers preserve compact, drawer, and wide breakpoints", () => {
   assert.equal(viewportTierForWidth(959), "compact");

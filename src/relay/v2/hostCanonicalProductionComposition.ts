@@ -28,8 +28,14 @@ import {
 } from "./hostCredentialAuthority.js";
 import type {
   RelayV2HostOptionalExtensionAttachment,
+  RelayV2HostOptionalExtensionRouteContext,
   RelayV2HostRuntimeWelcomeSerializer,
 } from "./hostRuntime.js";
+import {
+  createRelayV2AgentConversationAttachments,
+  RelayV2AgentConversationAuthority,
+} from "./agentConversationAuthority.js";
+import { createRelayV2LarkBindingsAttachment } from "./larkBindingsExtension.js";
 import {
   captureRelayV2RecoveredHostH2ProcessAuthority,
   type RelayV2StateSnapshotSpool,
@@ -144,12 +150,6 @@ export interface RelayV2HostCanonicalProductionCompositionOptions {
       RelayV2HostWssTransportLifecycleFactoryOptions["scheduleCloseDrain"]
     >;
   }>;
-  /**
-   * Default-off optional Agent extension attachment. When present the runtime
-   * advertises its capability and routes extension requests to it; omission
-   * keeps every optional Agent capability off.
-   */
-  readonly optionalExtension?: RelayV2HostOptionalExtensionAttachment;
 }
 
 export interface RelayV2HostCanonicalProductionComposition {
@@ -675,6 +675,8 @@ export async function openRelayV2HostCanonicalProductionComposition(
   let exactTargets: RelayV2RemoteExactTerminalControlCompoundAdapterV1 | null = null;
   let observedBytePlane: RelayV2TerminalControlObservedBytePlaneAdapterV1 | null = null;
   let terminalManager: RelayV2TerminalManager | null = null;
+  let agentAuthority: RelayV2AgentConversationAuthority | null = null;
+  let larkBindingsExtension: RelayV2HostOptionalExtensionAttachment | null = null;
   let managed: RelayV2HostManagedConnectorRuntimeComposition | null = null;
   let reauthOwner: RelayV2HostReauthenticationLifecycleOwner | null = null;
   let dashboardManagementSession:
@@ -724,10 +726,14 @@ export async function openRelayV2HostCanonicalProductionComposition(
           : terminalOptions.remoteCompoundChannels.open(target);
       },
     });
-    const h2ProcessTargets = await h2.captureProcessTargets(snapshot.hostEpoch);
+    // Host-level H3 readiness is established against the mandatory local
+    // authority. Configured SSH scopes may be unreachable or run an older TW;
+    // they remain materialized as partial/unreachable H2 state and their exact
+    // compound channel is admitted lazily on first target-scoped operation.
+    // A remote failure therefore fences only that scope instead of preventing
+    // every local and otherwise healthy remote scope from registering.
     await preflightRelayV2ExactCompoundTargetsV1(compoundChannels, [
       options.localProcessTarget,
-      ...h2ProcessTargets,
     ]);
     const reservationOwner = Object.freeze({
       kind: "relay-v2" as const,
@@ -770,6 +776,21 @@ export async function openRelayV2HostCanonicalProductionComposition(
     const terminalResolver = new RelayV2CanonicalTerminalTargetResolverAdapter({
       resourceResolver: h2.resourceResolver,
       exactControlTarget: exactTargets,
+    });
+    agentAuthority = new RelayV2AgentConversationAuthority({
+      hostId: profile.hostId,
+      hostEpoch: snapshot.hostEpoch,
+      hostState: options.hostState,
+      resourceResolver: h2.resourceResolver,
+      resolver: terminalResolver,
+      exactTargets,
+    });
+    const agentExtensions = createRelayV2AgentConversationAttachments(agentAuthority);
+    larkBindingsExtension = createRelayV2LarkBindingsAttachment({
+      authorization: Object.freeze({
+        authorize: (context: RelayV2HostOptionalExtensionRouteContext) =>
+          agentAuthority!.authorize(context),
+      }),
     });
     const terminalLineage = new RelayV2TerminalDurableLineageAuthority({
       store: options.hostState,
@@ -819,9 +840,10 @@ export async function openRelayV2HostCanonicalProductionComposition(
           h3RecoveryCandidate: h3Candidate,
         }),
         welcome: options.welcome,
-        ...(options.optionalExtension === undefined
-          ? {}
-          : { optionalExtension: options.optionalExtension }),
+        optionalExtensions: Object.freeze([
+          ...agentExtensions,
+          larkBindingsExtension,
+        ]),
       }),
       connector: OUTER_REFLECT_APPLY(OUTER_OBJECT_FREEZE, undefined, [{
         credentialAuthority: options.credentialAuthority,
@@ -999,6 +1021,10 @@ export async function openRelayV2HostCanonicalProductionComposition(
       ...(reauthenticationRollbackBarrier === null
         ? [] : [() => reauthenticationRollbackBarrier]),
       ...(dashboardRollbackBarrier === null ? [] : [() => dashboardRollbackBarrier]),
+      ...(managed !== null || larkBindingsExtension === null
+        ? [] : [() => larkBindingsExtension!.closeAndDrain()]),
+      ...(managed !== null || agentAuthority === null
+        ? [] : [() => agentAuthority!.closeAndDrain()]),
       ...(managed !== null
         ? [() => managed!.closeAndDrain()]
         : terminalManager === null ? [] : [() => terminalManager!.shutdown()]),

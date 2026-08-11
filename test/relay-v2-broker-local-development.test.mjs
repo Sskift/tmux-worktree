@@ -225,7 +225,7 @@ test("explicit local development CLI opens only loopback and writes a redeemable
     stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
-      TW_RELAY_SECRET: "v1-secret-that-must-not-be-used",
+      TW_FORBIDDEN_SECRET: "forbidden-secret-that-must-not-be-used",
     },
   });
   child.stdout.on("data", (chunk) => { output.text += chunk.toString("utf8"); });
@@ -278,13 +278,13 @@ test("local development CLI refuses a non-loopback host before reading TLS", () 
     encoding: "utf8",
     env: {
       ...process.env,
-      TW_RELAY_SECRET: "v1-secret-that-must-not-be-used",
+      TW_FORBIDDEN_SECRET: "forbidden-secret-that-must-not-be-used",
     },
   });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
   assert.match(result.stderr, /固定监听 127\.0\.0\.1/);
-  assert.equal(result.stderr.includes("v1-secret-that-must-not-be-used"), false);
+  assert.equal(result.stderr.includes("forbidden-secret-that-must-not-be-used"), false);
 
   const missingPort = spawnSync(process.execPath, [
     path.resolve("dist/cli.cjs"),
@@ -308,15 +308,12 @@ test("local development CLI refuses a non-loopback host before reading TLS", () 
     "relay-server",
     "--v2-dev-advertised-origin",
     "https://relay-smoke.example.duckdns.org/",
-    "--secret",
-    "option-test-secret",
   ], {
     encoding: "utf8",
   });
   assert.equal(outsideLocalDevelopment.status, 1);
   assert.equal(outsideLocalDevelopment.stdout, "");
   assert.match(outsideLocalDevelopment.stderr, /只适用于显式 v2 开发 lane/);
-  assert.equal(outsideLocalDevelopment.stderr.includes("option-test-secret"), false);
 
   const emptyAdvertisedOrigin = spawnSync(process.execPath, [
     path.resolve("dist/cli.cjs"),

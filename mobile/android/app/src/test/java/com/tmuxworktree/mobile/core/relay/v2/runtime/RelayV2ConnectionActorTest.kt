@@ -493,20 +493,17 @@ class RelayV2ConnectionActorTest {
                     isolated.reason,
                 )
 
-                harness.transport().sendAgentFrame(
-                    AgentTimelineResetFrame(
-                        hostId = HOST_ID,
-                        hostEpoch = HOST_EPOCH,
-                        scopeId = "scope-local",
-                        sessionId = "session-1",
-                        previousTimelineEpoch = "timeline-1",
-                        newTimelineEpoch = "timeline-2",
-                        reason = AgentTimelineResetReason.DELETED,
-                    ),
+                assertEquals(
+                    RelayV2AgentCapabilityAvailability.Unavailable,
+                    harness.actor.agentCapabilityAvailability.value,
                 )
-                val live = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
-                    as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
-                assertEquals(AgentTranscriptLifecycleTrustedIngress.Live, live.ingress)
+                harness.transport().sendFixture("sessions-changed-upsert")
+                val base = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first {
+                        it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                    }
+                } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                assertEquals("sessions.changed", base.message.frame["type"])
                 assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
                 assertTrue(harness.transport().closeCodes.isEmpty())
 
@@ -832,13 +829,13 @@ class RelayV2ConnectionActorTest {
             assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
             assertTrue(harness.transport().closeCodes.isEmpty())
 
-            harness.transport().sendFixture("host-presence-online")
+            harness.transport().sendFixture("sessions-changed-upsert")
             val base = withTimeout(TIMEOUT_MS) {
                 harness.actor.effects.first {
                     it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
                 }
             } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
-            assertEquals("host.presence", base.message.frame["type"])
+            assertEquals("sessions.changed", base.message.frame["type"])
         } finally {
             releaseRedriveSwap.countDown()
             releaseReplacementSend.complete(Unit)
@@ -867,24 +864,19 @@ class RelayV2ConnectionActorTest {
                     val request = agentStatusRequest(authority, "agent-queued-owner-${phase.name}")
                     requireNotNull(harness.actor.send(request))
                     sendEntered.await()
-                    listOf(
-                        hostEpochMismatch(request.requestId),
-                        hostEpochMismatch(request.requestId).copy(scopeId = "scope-impossible"),
-                    ).forEach { frame ->
-                        harness.transport().sendAgentFrame(frame)
-                        val isolated = withTimeout(TIMEOUT_MS) {
-                            harness.actor.effects.first {
-                                it is RelayV2RuntimeEffect.AgentExtensionUnavailable
-                            }
-                        } as RelayV2RuntimeEffect.AgentExtensionUnavailable
-                        assertEquals(
-                            RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
-                            isolated.reason,
-                        )
-                        assertNull(isolated.requestAdmission)
-                        assertEquals(phase, harness.actor.state.value.phase)
-                        assertTrue(harness.transport().closeCodes.isEmpty())
-                    }
+                    harness.transport().sendAgentFrame(hostEpochMismatch(request.requestId))
+                    val isolated = withTimeout(TIMEOUT_MS) {
+                        harness.actor.effects.first {
+                            it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                        }
+                    } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+                    assertEquals(
+                        RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                        isolated.reason,
+                    )
+                    assertNull(isolated.requestAdmission)
+                    assertEquals(phase, harness.actor.state.value.phase)
+                    assertTrue(harness.transport().closeCodes.isEmpty())
                 } finally {
                     releaseSend.complete(Unit)
                     harness.close()
@@ -1132,21 +1124,14 @@ class RelayV2ConnectionActorTest {
 
                     harness.transport().sendAgentFrame(agentUnavailableStatus(status.requestId))
                     expectUncorrelatedResponse()
-                    listOf(status.requestId, snapshot.requestId).forEach { retiredRequestId ->
-                        harness.transport().sendAgentFrame(hostEpochMismatch(retiredRequestId))
-                        expectUncorrelatedResponse()
-                        assertEquals(phase, harness.actor.state.value.phase)
-                        assertTrue(harness.transport().closeCodes.isEmpty())
-                    }
-
                     if (phase == RelayV2ConnectionPhase.ONLINE) {
-                        harness.transport().sendFixture("host-presence-online")
+                        harness.transport().sendFixture("sessions-changed-upsert")
                         val base = withTimeout(TIMEOUT_MS) {
                             harness.actor.effects.first {
                                 it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
                             }
                         } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
-                        assertEquals("host.presence", base.message.frame["type"])
+                        assertEquals("sessions.changed", base.message.frame["type"])
                     }
                     assertEquals(phase, harness.actor.state.value.phase)
                     assertTrue(harness.transport().closeCodes.isEmpty())
@@ -1225,14 +1210,14 @@ class RelayV2ConnectionActorTest {
                     assertNull(unavailable.failedRequest)
                     assertNull(unavailable.requestAdmission)
                 }
-                harness.transport().sendFixture("host-presence-online")
+                harness.transport().sendFixture("sessions-changed-upsert")
 
                 val base = withTimeout(TIMEOUT_MS) {
                     harness.actor.effects.first {
                         it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
                     }
                 } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
-                assertEquals(case.name, "host.presence", base.message.frame["type"])
+                assertEquals(case.name, "sessions.changed", base.message.frame["type"])
                 assertEquals(case.name, RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
                 assertTrue(case.name, harness.transport().closeCodes.isEmpty())
             } finally {
@@ -5714,7 +5699,11 @@ class RelayV2ConnectionActorTest {
             ) { it.closed(4401) },
             Scenario(
                 "close-4403",
-                RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "AUTH_INVALID", false),
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.AUTH,
+                    RELAY_V2_GRANT_REVOKED,
+                    false,
+                ),
             ) { it.closed(4403) },
             Scenario(
                 "close-4406",
@@ -6550,7 +6539,7 @@ class RelayV2ConnectionActorTest {
                 )
                 val handshake = withTimeout(TIMEOUT_MS) { scopedHarness.actor.effects.first() }
                     as RelayV2RuntimeEffect.QueryPendingCommands
-                scopedHarness.transport().sendFixture("host-presence-online")
+                scopedHarness.transport().sendFixture("sessions-changed-upsert")
                 val delivered = withTimeout(TIMEOUT_MS) { scopedHarness.actor.effects.first() }
                     as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
                 assertEquals(handshake.generation, delivered.generation)
@@ -6631,7 +6620,7 @@ class RelayV2ConnectionActorTest {
                 transport.sendRaw("{}".toByteArray())
             },
             FailureScenario("dialect", RelayV2FailureKind.DIALECT) { _, transport ->
-                transport.open("tw-relay.v1")
+                transport.open("tw-relay.unsupported")
             },
             FailureScenario("capability", RelayV2FailureKind.CAPABILITY) { harness, transport ->
                 transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
