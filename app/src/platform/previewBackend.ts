@@ -272,7 +272,6 @@ const previewDirectories = new Map<string, Array<{
   ]],
   [`${previewRoot}/app/src/dashboard`, [
     { name: "DashboardShell.tsx", path: `${previewRoot}/app/src/dashboard/DashboardShell.tsx`, is_dir: false, is_symlink: false, is_hidden: false, size: 12400 },
-    { name: "layoutPreferences.ts", path: `${previewRoot}/app/src/dashboard/layoutPreferences.ts`, is_dir: false, is_symlink: false, is_hidden: false, size: 7200 },
   ]],
 ]);
 
