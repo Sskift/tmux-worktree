@@ -1,7 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { execFileSync } from "node:child_process";
 import {
   CliError,
   exec,
@@ -486,12 +485,4 @@ function warn(msg: string): void {
 }
 function bad(msg: string): void {
   console.log(`  ${C.red("✗")} ${msg}`);
-}
-
-function which(cmd: string): string {
-  try {
-    return execFileSync("which", [cmd], { encoding: "utf-8", timeout: 3000 }).trim();
-  } catch {
-    return "";
-  }
 }

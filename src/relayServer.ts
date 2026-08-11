@@ -2,7 +2,6 @@ import { parseRelayServerOptions } from "./relay/broker/options.js";
 import type {
   RelayV2BrokerServerAgentCapabilityReadinessReceipt,
   RelayV2BrokerServerComposition,
-  RelayV2BrokerServerCredentialAuthority,
 } from "./relay/v2/brokerServerRuntime.js";
 import {
   startRelayV2BrokerPublicHttpsServerLifecycle,

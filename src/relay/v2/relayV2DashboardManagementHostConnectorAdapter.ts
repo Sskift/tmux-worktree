@@ -7,7 +7,6 @@ import type { RelayV2DashboardManagementProtocolV2ErrorCode } from
   "./relayV2DashboardManagementProtocolV2.js";
 import {
   RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES,
-  RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
 } from "./relayV2DashboardManagementProtocolV2.js";
 import {
   RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE,

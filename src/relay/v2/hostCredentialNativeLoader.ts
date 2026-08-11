@@ -6,7 +6,6 @@ import {
 } from "./hostCredentialNativeTarget.js";
 import {
   RELAY_V2_HOST_CREDENTIAL_NATIVE_MODULE_OPEN_METHOD,
-  type RelayV2HostCredentialNativeModuleLoad,
   type RelayV2HostCredentialNativeModuleLoader,
 } from "./hostCredentialNativeModuleSource.js";
 import {

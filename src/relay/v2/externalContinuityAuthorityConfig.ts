@@ -36,12 +36,6 @@ const NAMESPACE_BINDING_KEYS = ["namespace", "ownerBinding", "anchorId"] as cons
 const PROVIDER_KEYS = ["resolveAttempt"] as const;
 const RESOLVED_ATTEMPT_KEYS = ["authenticationHeaders", "transport"] as const;
 const TRANSPORT_KEYS = ["start", "discard"] as const;
-const RESOLUTION_REQUEST_KEYS = [
-  "endpoint",
-  "authenticationMode",
-  "credentialReference",
-  "tlsTrustReference",
-] as const;
 
 export type RelayV2ExternalContinuityAuthenticationMode =
   | "mutual_tls"

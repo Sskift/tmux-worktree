@@ -14,7 +14,6 @@ import {
   type RelayV2BrokerHostUpgradeDispatchResult,
   type RelayV2BrokerHostUpgradeMetadata,
   type RelayV2BrokerHostUpgradeVerifyPort,
-  type RelayV2BrokerHostWssPreflightPort,
 } from "./brokerHostUpgradeDispatch.js";
 import {
   createRelayV2BrokerHostWssNodeUpgradeRequestAdapter,

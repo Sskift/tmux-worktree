@@ -26,7 +26,6 @@ import type {
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
   RelayV2BrokerCredentialStateStoreError,
-  type RelayV2BrokerCredentialStateRead,
   type RelayV2BrokerCredentialStateRevision,
   type RelayV2BrokerCredentialStateStore,
   type RelayV2BrokerCredentialStateTransaction,

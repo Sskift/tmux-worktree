@@ -2129,14 +2129,6 @@ export class RelayV2TerminalManager {
     }
   }
 
-  private liveOrDetachedCount(): number {
-    let count = 0;
-    for (const stream of this.streams.values()) {
-      if (stream.status === "live" || stream.status === "detached") count += 1;
-    }
-    return count;
-  }
-
   private backendSlotCount(): number {
     let count = this.quarantinedBackends.size;
     for (const stream of this.streams.values()) {
@@ -4898,25 +4890,6 @@ export class RelayV2TerminalManager {
       return;
     }
     await this.sendCloseResponse(request.route, request.requestId, record, stream, deduplicated);
-  }
-
-  private closeRecordToDurable(record: CloseRecord): RelayV2TerminalDurableCloseTombstone {
-    return {
-      key: record.key,
-      streamKey: record.streamKey,
-      fingerprint: record.fingerprint,
-      hostInstanceId: record.hostInstanceId,
-      target: { ...record.target },
-      streamId: record.streamId,
-      closeId: record.closeId,
-      requestId: record.requestId,
-      requestRoute: durableRoute(record.requestRoute),
-      generation: record.generation,
-      finalOffset: record.finalOffset.toString(10),
-      reason: record.reason,
-      exitCode: record.exitCode,
-      expiresAtMs: record.expiresAt,
-    };
   }
 
   private closeRecordFromDurable(
