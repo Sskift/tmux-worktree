@@ -70,7 +70,10 @@ import {
   type DashboardDrawer,
 } from "./dashboard/DashboardShell";
 import { DashboardSidebar } from "./dashboard/DashboardSidebar";
-import { WorkspacePrimaryView } from "./dashboard/WorkspacePrimaryView";
+import {
+  WorkspacePrimaryView,
+  type WorkspaceHomeSummary,
+} from "./dashboard/WorkspacePrimaryView";
 import {
   WorkspaceFilesView,
   WorkspaceGitView,
@@ -121,7 +124,10 @@ import {
   terminalSessionKey,
 } from "./dashboard/model/terminalIdentity";
 import { deriveWorkspacePresentation } from "./dashboard/model/workspacePresentation";
-import { projectKey } from "./dashboard/model/workspaceSelectors";
+import {
+  projectKey,
+  summarizeSidebarConnections,
+} from "./dashboard/model/workspaceSelectors";
 import { buildSshShellArgs } from "./terminal/attach";
 import "./App.css";
 
@@ -1221,6 +1227,40 @@ function App() {
     />
   );
 
+  const workspaceHomeSummary = useMemo<WorkspaceHomeSummary>(() => {
+    const hostsById = new Map(hosts.map((host) => [host.id, host]));
+    const connectionSummary = summarizeSidebarConnections(hosts, hostStatuses);
+    const runningFirst = { running: 0, stopped: 1, unknown: 2 } as const;
+    const activity = sessions
+      .map((session) => {
+        const currentActivity = sessionActivity[session.name];
+        const hostLabel = session.hostId
+          ? hostsById.get(session.hostId)?.label ?? session.hostId
+          : "Local";
+        return {
+          id: session.name,
+          title: sessionDisplayName(session),
+          detail: [session.project || "Worktree", hostLabel].join(" · "),
+          state: currentActivity?.state ?? "unknown",
+          status: currentActivity?.label ?? "unknown",
+          updatedAt: session.activity,
+        };
+      })
+      .sort((left, right) => (
+        runningFirst[left.state] - runningFirst[right.state]
+        || right.updatedAt - left.updatedAt
+      ));
+
+    return {
+      activeAgents: activity.filter((session) => session.state === "running").length,
+      worktrees: sessions.length,
+      onlineHosts: connectionSummary.readyCount,
+      totalHosts: hosts.length,
+      activeAutomations: automations.filter((automation) => automation.active).length,
+      sessions: activity.slice(0, 5).map(({ updatedAt: _updatedAt, ...session }) => session),
+    };
+  }, [automations, hostStatuses, hosts, sessionActivity, sessions]);
+
   const centralWorkspace = (
     <div
       ref={dashboardWorkspaceRef}
@@ -1248,11 +1288,20 @@ function App() {
         }}
         editorNavigationRevision={editorNavigationRevision}
         automationContent={automationPanel}
+        homeSummary={workspaceHomeSummary}
         onCloseEditor={() => void closeEditingFile()}
         onOpenFile={handleOpenFile}
         onEditorDirtyChange={handleEditorDirtyChange}
         onCloseDiff={() => setDiffFile(null)}
         onReturnFromAutomation={() => void returnFromAutomationManager()}
+        onCreateWorktree={() => setShowNewWorktree(true)}
+        onCreateTerminal={() => setShowNewTerminal(true)}
+        onOpenCommandPalette={() => setCommandPaletteOpen(true)}
+        onOpenConnections={() => openSettings("connections")}
+        onOpenAutomations={() => {
+          void selectAutomation(automations[0]?.id ?? "");
+        }}
+        onSelectSession={selectSession}
       />
 
       <button
