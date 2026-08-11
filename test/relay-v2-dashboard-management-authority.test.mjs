@@ -125,6 +125,12 @@ function harness(options = {}) {
     revokeGrant: async (input) => {
       calls.push(["revokeGrant", structuredClone(input)]);
       if (options.revokeFailure) throw options.revokeFailure;
+      connectedMobileDevices = connectedMobileDevices.filter(
+        (device) => device.grantId !== input.grantId,
+      );
+      knownClientGrantId = connectedMobileDevices.length === 1
+        ? connectedMobileDevices[0].grantId
+        : null;
       return options.revocationReceipt ?? {
         grantId: input.grantId,
         revokedAtMs: 1_783_700_200_000,
@@ -333,7 +339,20 @@ test("each authority operation invokes its mutation port once with only the clos
       setup: {
         credential: readyCredential(),
         connector: registeredConnector(),
-        knownClientGrantId: "client-grant-1",
+        connectedMobileDevices: [
+          {
+            status: "connected",
+            grantId: "client-grant-1",
+            clientInstanceId: "client-instance-1",
+            connectionCount: 1,
+          },
+          {
+            status: "connected",
+            grantId: "client-grant-2",
+            clientInstanceId: "client-instance-2",
+            connectionCount: 1,
+          },
+        ],
       },
       input: { grantId: "client-grant-1", reason: "user_revoked" },
       expectedCall: ["revokeGrant", {
@@ -343,7 +362,16 @@ test("each authority operation invokes its mutation port once with only the clos
         grantId: "client-grant-1",
         reason: "user_revoked",
       }],
-      expected: cases.goldenExchanges[6].responseFrame,
+      expected: (() => {
+        const response = JSON.parse(cases.goldenExchanges[6].responseFrame);
+        response.result.connectedMobileDevices = [{
+          status: "connected",
+          grantId: "client-grant-2",
+          clientInstanceId: "client-instance-2",
+          connectionCount: 1,
+        }];
+        return JSON.stringify(response);
+      })(),
     },
   ];
   for (const scenario of scenarios) {

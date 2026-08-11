@@ -594,15 +594,22 @@ implements RelayV2DashboardManagementProtocolV2Handler {
     if (receipt.hostId !== gate.hostId || receipt.connectorId !== gate.connectorId) {
       return closed();
     }
+    const postOperationCut = await this.readPostOperationCut();
     this.knownClientGrant = Object.freeze({
       status: "revoked",
       grantId: receipt.grantId,
       revokedAtMs: receipt.revokedAtMs,
       alreadyRevoked: receipt.alreadyRevoked,
     });
+    const revokedCut = Object.freeze({
+      ...postOperationCut,
+      connectedMobileDevices: Object.freeze(postOperationCut.connectedMobileDevices.filter(
+        (device) => device.grantId !== receipt.grantId,
+      )),
+    });
     return this.success(
       request.requestId,
-      await this.readPostOperationCut(),
+      revokedCut,
       "revoke_client_grant",
     );
   }

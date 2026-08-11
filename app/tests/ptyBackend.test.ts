@@ -6,6 +6,7 @@ import type {
   DashboardTransport,
   DashboardWindow,
   DirectoryDialogOptions,
+  FileDialogOptions,
   PtyOpenArgs,
 } from "../src/platform/types.ts";
 
@@ -81,6 +82,10 @@ class InstrumentedPtyTransport implements DashboardTransport {
   }
 
   async selectDirectory(_options: DirectoryDialogOptions): Promise<string | null> {
+    return null;
+  }
+
+  async selectFile(_options: FileDialogOptions): Promise<string | null> {
     return null;
   }
 
