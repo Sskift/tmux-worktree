@@ -1450,23 +1450,6 @@ function claimAuthorityFromLost(
   };
 }
 
-function sameClaimAuthority(
-  left: PersistedClaimStreamAuthority,
-  right: PersistedClaimStreamAuthority,
-): boolean {
-  if (left.status === "absent" || right.status === "absent") {
-    return left.status === right.status;
-  }
-  return left.status === right.status
-    && left.generation === right.generation
-    && left.hostInstanceId === right.hostInstanceId
-    && sameTarget(left.target, right.target)
-    && left.pane === right.pane
-    && left.resumeTokenHash === right.resumeTokenHash
-    && sameCanonicalBinding(left.canonicalBinding, right.canonicalBinding)
-    && left.requestedOffset === right.requestedOffset;
-}
-
 function streamMatchesClaim(
   stream: PersistedStreamAuthority | undefined,
   authority: PersistedClaimStreamAuthority,

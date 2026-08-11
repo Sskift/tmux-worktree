@@ -4,7 +4,6 @@ import {
   RELAY_V2_BROKER_LIMITS,
   type RelayV2BrokerAction,
   type RelayV2BrokerConnectionAuthorization,
-  type RelayV2BrokerResult,
   type RelayV2CarrierDelivery,
 } from "./brokerCore.js";
 import {

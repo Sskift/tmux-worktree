@@ -304,7 +304,7 @@ private fun WorkspaceSessionRow(session: RelaySession, onClick: () -> Unit) {
             .testTag("workspace_session_${session.stableId}")
             .semantics(mergeDescendants = true) {
                 role = Role.Button
-                contentDescription = "${session.title}, ${session.summary.ifBlank { session.kind }}, open worktree details"
+                contentDescription = "${session.title}, ${session.summary.ifBlank { session.kind }}, open agent chat"
             }
             .padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,

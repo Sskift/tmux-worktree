@@ -2992,16 +2992,25 @@ test("production capture rolls over with an absolute cursor and garbage-collects
       assert.equal(healthy.state, "HELD");
       assert.equal(healthy.outputGeneration, originalGeneration);
       const cursor = Math.max(originalCursor, healthy.outputCursor - 4096);
-      const chunk = await authority.handle({
-        protocolVersion: 1,
-        requestId: `ring-tail-${healthy.outputCursor}`,
-        type: "output.tail",
-        controlTargetId: target.controlTargetId,
-        controlEpoch: accepted.controlEpoch,
-        outputGeneration: originalGeneration,
-        cursor,
-        maxBytes: 4096,
-      });
+      let chunk;
+      try {
+        chunk = await authority.handle({
+          protocolVersion: 1,
+          requestId: `ring-tail-${healthy.outputCursor}`,
+          type: "output.tail",
+          controlTargetId: target.controlTargetId,
+          controlEpoch: accepted.controlEpoch,
+          outputGeneration: originalGeneration,
+          cursor,
+          maxBytes: 4096,
+        });
+      } catch (error) {
+        if (error?.code === "STALE_OUTPUT_CURSOR") {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          continue;
+        }
+        throw error;
+      }
       tail = Buffer.from(chunk.dataBase64, "base64").toString("utf8");
       if (!tail.includes(marker)) await new Promise((resolve) => setTimeout(resolve, 20));
     }

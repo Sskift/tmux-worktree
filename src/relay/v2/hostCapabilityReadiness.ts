@@ -5,7 +5,6 @@ import type {
   RelayV2HostReadinessSink,
   RelayV2HostReadinessSnapshot,
   RelayV2HostReadinessSubscription,
-  RelayV2RequiredCapability,
 } from "./hostRuntime.js";
 
 export const RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES = Object.freeze([
