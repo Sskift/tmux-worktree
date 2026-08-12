@@ -31,6 +31,12 @@ data class RelayHost(
     val capabilities: Set<String> = emptySet(),
 )
 
+data class RelayProject(
+    val name: String,
+    val path: String,
+    val branch: String? = null,
+)
+
 data class RelayScope(
     val hostId: String,
     val scopeId: String,
@@ -39,6 +45,7 @@ data class RelayScope(
     val reachable: Boolean = true,
     val sessionCount: Int = 0,
     val error: String = "",
+    val projects: List<RelayProject> = emptyList(),
 ) {
     val stableId: String get() = "$hostId:$scopeId"
 }

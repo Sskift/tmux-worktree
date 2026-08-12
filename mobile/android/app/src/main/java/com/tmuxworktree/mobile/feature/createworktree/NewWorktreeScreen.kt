@@ -78,6 +78,7 @@ import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelayHost
+import com.tmuxworktree.mobile.core.model.RelayProject
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.designsystem.*
 
@@ -129,6 +130,7 @@ fun NewWorktreeScreen(
     onNextStep: () -> Unit,
     onHostSelected: (RelayHost) -> Unit,
     onScopeSelected: (RelayScope) -> Unit,
+    onProjectSelected: (RelayProject) -> Unit,
     onRepositoryPathChange: (String) -> Unit,
     onBaseBranchChange: (String) -> Unit,
     onAiCommandChange: (String) -> Unit,
@@ -140,6 +142,7 @@ fun NewWorktreeScreen(
     val selectedHost = hosts.firstOrNull { it.hostId == form.hostId }
     val visibleScopes = scopes.filter { it.hostId == form.hostId }
     val selectedScope = visibleScopes.firstOrNull { it.scopeId == form.scopeId }
+    val projects = selectedScope?.projects.orEmpty()
     val canContinue = when (step) {
         NewWorktreeStep.TARGET -> selectedHost?.status == ConnectionStatus.ONLINE &&
             selectedScope?.reachable == true &&
@@ -236,7 +239,9 @@ fun NewWorktreeScreen(
                 NewWorktreeStep.CONFIGURE -> item(key = "configure_step") {
                     ConfigureStep(
                         form = form,
+                        projects = projects,
                         errors = validationErrors,
+                        onProjectSelected = onProjectSelected,
                         onRepositoryPathChange = onRepositoryPathChange,
                         onBaseBranchChange = onBaseBranchChange,
                         onAiCommandChange = onAiCommandChange,
@@ -490,12 +495,35 @@ private fun <T> SelectorField(
 @Composable
 private fun ConfigureStep(
     form: NewWorktreeForm,
+    projects: List<RelayProject>,
     errors: NewWorktreeValidationErrors,
+    onProjectSelected: (RelayProject) -> Unit,
     onRepositoryPathChange: (String) -> Unit,
     onBaseBranchChange: (String) -> Unit,
     onAiCommandChange: (String) -> Unit,
     onWorktreeNameChange: (String) -> Unit,
 ) {
+    if (projects.isNotEmpty()) {
+        val selectedProject = projects.firstOrNull { it.name == form.repositoryPath }
+        SelectorField(
+            label = "Saved project",
+            selectedValue = selectedProject?.let { "${it.name} · ${it.path}" }.orEmpty(),
+            placeholder = "Choose from Dashboard projects",
+            icon = Icons.Outlined.FolderOpen,
+            options = projects,
+            optionLabel = { project ->
+                "${project.name} · ${project.path}${project.branch?.let { " @ $it" }.orEmpty()}"
+            },
+            optionId = { it.name },
+            optionEnabled = { true },
+            error = null,
+            enabled = true,
+            testTag = "create_saved_project_selector",
+            optionTagPrefix = "create_saved_project_option",
+            onSelected = onProjectSelected,
+        )
+        Spacer(Modifier.height(14.dp))
+    }
     WorktreeTextField(
         value = form.repositoryPath,
         onValueChange = onRepositoryPathChange,
@@ -927,6 +955,7 @@ private fun NewWorktreeTargetPreview() {
             onNextStep = {},
             onHostSelected = {},
             onScopeSelected = {},
+            onProjectSelected = {},
             onRepositoryPathChange = {},
             onBaseBranchChange = {},
             onAiCommandChange = {},
@@ -965,6 +994,7 @@ private fun NewWorktreeReviewPreview() {
             onNextStep = {},
             onHostSelected = {},
             onScopeSelected = {},
+            onProjectSelected = {},
             onRepositoryPathChange = {},
             onBaseBranchChange = {},
             onAiCommandChange = {},

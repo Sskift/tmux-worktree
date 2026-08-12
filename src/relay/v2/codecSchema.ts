@@ -414,9 +414,25 @@ function validateStructuredError(value: RelayV2JsonValue): void {
   }
 }
 
+function validateProject(value: RelayV2JsonValue): void {
+  const project = object(value);
+  exact(project, ["name", "path"], ["branch"]);
+  stringValue(field(project, "name"), { maxBytes: 128 });
+  stringValue(field(project, "path"), {
+    allowOuterWhitespace: true,
+    maxBytes: 4_096,
+  });
+  if (OBJECT_HAS_OWN(project, "branch")) {
+    stringValue(field(project, "branch"), {
+      allowOuterWhitespace: true,
+      maxBytes: 255,
+    });
+  }
+}
+
 function validateScope(value: RelayV2JsonValue): void {
   const scope = object(value);
-  exact(scope, ["scopeId", "displayName", "kind", "reachability"]);
+  exact(scope, ["scopeId", "displayName", "kind", "reachability", "projects"]);
   id(field(scope, "scopeId"));
   stringValue(field(scope, "displayName"), {
     allowOuterWhitespace: true,
@@ -424,6 +440,7 @@ function validateScope(value: RelayV2JsonValue): void {
   });
   oneOf(field(scope, "kind"), ["local", "ssh"] as const);
   oneOf(field(scope, "reachability"), ["online", "unreachable"] as const);
+  array(field(scope, "projects"), validateProject, 256);
 }
 
 function validateSession(value: RelayV2JsonValue): void {

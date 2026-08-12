@@ -6,8 +6,10 @@ import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.runtime.mutableStateOf
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelayHost
+import com.tmuxworktree.mobile.core.model.RelayProject
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.designsystem.TwTheme
 import com.tmuxworktree.mobile.feature.createterminal.NewTerminalForm
@@ -24,6 +26,63 @@ import org.junit.Test
 class CreationScreensInstrumentedTest {
     @get:Rule
     val composeRule = createComposeRule()
+
+    @Test
+    fun savedDashboardProjectsAreVisibleInBothCreationForms() {
+        val host = RelayHost("host")
+        val project = RelayProject("tmux-worktree", "/repo/tmux-worktree", "main")
+        val scope = RelayScope("host", "local", projects = listOf(project))
+        val showTerminal = mutableStateOf(false)
+        composeRule.setContent {
+            TwTheme {
+                if (showTerminal.value) {
+                    NewTerminalScreen(
+                        form = NewTerminalForm(hostId = host.hostId, scopeId = scope.scopeId),
+                        hosts = listOf(host),
+                        scopes = listOf(scope),
+                        isLoadingTargets = false,
+                        isCreating = false,
+                        validationErrors = NewTerminalValidationErrors(),
+                        targetLoadError = null,
+                        creationError = null,
+                        onBack = {},
+                        onHostSelected = {},
+                        onScopeSelected = {},
+                        onProjectSelected = {},
+                        onWorkingDirectoryChange = {},
+                        onLabelChange = {},
+                        onRetryLoadTargets = {},
+                        onCreate = {},
+                    )
+                } else NewWorktreeScreen(
+                    step = NewWorktreeStep.CONFIGURE,
+                    form = NewWorktreeForm(hostId = host.hostId, scopeId = scope.scopeId),
+                    hosts = listOf(host),
+                    scopes = listOf(scope),
+                    isLoadingTargets = false,
+                    isCreating = false,
+                    validationErrors = NewWorktreeValidationErrors(),
+                    targetLoadError = null,
+                    creationError = null,
+                    onBack = {},
+                    onPreviousStep = {},
+                    onNextStep = {},
+                    onHostSelected = {},
+                    onScopeSelected = {},
+                    onProjectSelected = {},
+                    onRepositoryPathChange = {},
+                    onBaseBranchChange = {},
+                    onAiCommandChange = {},
+                    onWorktreeNameChange = {},
+                    onRetryLoadTargets = {},
+                    onCreate = {},
+                )
+            }
+        }
+        composeRule.onNodeWithTag("create_saved_project_selector").assertIsDisplayed()
+        composeRule.runOnIdle { showTerminal.value = true }
+        composeRule.onNodeWithTag("new_terminal_saved_project_selector").assertIsDisplayed()
+    }
 
     @Test
     fun recoveringWorktreeTargetsExposeTheErrorAndRetryInsteadOfAPermanentSpinner() {
@@ -45,6 +104,7 @@ class CreationScreensInstrumentedTest {
                     onNextStep = {},
                     onHostSelected = {},
                     onScopeSelected = {},
+                    onProjectSelected = {},
                     onRepositoryPathChange = {},
                     onBaseBranchChange = {},
                     onAiCommandChange = {},
@@ -78,6 +138,7 @@ class CreationScreensInstrumentedTest {
                     onBack = {},
                     onHostSelected = {},
                     onScopeSelected = {},
+                    onProjectSelected = {},
                     onWorkingDirectoryChange = {},
                     onLabelChange = {},
                     onRetryLoadTargets = { retries++ },
@@ -119,6 +180,7 @@ class CreationScreensInstrumentedTest {
                     onNextStep = {},
                     onHostSelected = {},
                     onScopeSelected = {},
+                    onProjectSelected = {},
                     onRepositoryPathChange = {},
                     onBaseBranchChange = {},
                     onAiCommandChange = {},

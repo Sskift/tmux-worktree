@@ -161,16 +161,39 @@ internal enum class RelayV2ScopeReachability(val wireValue: String) {
     UNREACHABLE("unreachable"),
 }
 
+internal data class RelayV2ProjectResource(
+    val name: String,
+    val path: String,
+    val branch: String? = null,
+) {
+    init {
+        require(name.isNotEmpty() && name.toByteArray(Charsets.UTF_8).size <= 128)
+        require(path.isNotEmpty() && path.toByteArray(Charsets.UTF_8).size <= 4_096)
+        require(branch == null || branch.isNotEmpty() && branch.toByteArray(Charsets.UTF_8).size <= 255)
+        require(listOfNotNull(name, path, branch).none { '\u0000' in it })
+    }
+
+    fun wireMap(): Map<String, Any?> = linkedMapOf(
+        "name" to name,
+        "path" to path,
+    ).apply {
+        branch?.let { put("branch", it) }
+    }
+}
+
 internal data class RelayV2ScopeResource(
     val scopeId: String,
     val displayName: String,
     val kind: RelayV2ScopeKind,
     val reachability: RelayV2ScopeReachability,
+    val projects: List<RelayV2ProjectResource> = emptyList(),
 ) {
     init {
         requireRelayV2Id(scopeId)
         require(displayName.toByteArray(Charsets.UTF_8).size <= 128)
         require('\u0000' !in displayName)
+        require(projects.size <= 256)
+        require(projects.map { it.name }.distinct().size == projects.size)
     }
 
     fun wireMap(): Map<String, Any?> = mapOf(
@@ -178,6 +201,7 @@ internal data class RelayV2ScopeResource(
         "displayName" to displayName,
         "kind" to kind.wireValue,
         "reachability" to reachability.wireValue,
+        "projects" to projects.map { it.wireMap() },
     )
 }
 

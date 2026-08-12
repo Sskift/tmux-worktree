@@ -103,6 +103,7 @@ test("rpc-v2 capabilities is one machine-readable JSON line with no stderr", () 
       "expected-incarnation-kill-session.v1",
       "hard-timeout.v1",
       "dashboard-lifecycle.v2",
+      "project-catalog.v2",
     ],
   });
 });

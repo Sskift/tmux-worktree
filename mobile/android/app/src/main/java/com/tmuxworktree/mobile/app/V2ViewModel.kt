@@ -56,6 +56,7 @@ import com.tmuxworktree.mobile.core.model.DeliveryState
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.HealthLayer
 import com.tmuxworktree.mobile.core.model.RelayHost
+import com.tmuxworktree.mobile.core.model.RelayProject
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.model.SessionTimelineState
@@ -2445,6 +2446,9 @@ class V2ViewModel(
                             kind = scope.kind.wireValue,
                             reachable = scope.reachability.wireValue == "online",
                             sessionCount = sessionCounts[scope.scopeId] ?: 0,
+                            projects = scope.projects.map { project ->
+                                RelayProject(project.name, project.path, project.branch)
+                            },
                         )
                     }
                     .sortedBy { it.scopeId }

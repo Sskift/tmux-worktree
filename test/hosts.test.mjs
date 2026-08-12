@@ -219,14 +219,14 @@ case "$last" in
     ;;
   *tw*"'rpc-v2' 'capabilities'"*)
     if test "$TW_TEST_NO_KILL_SESSION" = 1; then
-      printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
+      printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","hard-timeout.v1","dashboard-lifecycle.v2","project-catalog.v2"]}'
     else
-      printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
+      printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2","project-catalog.v2"]}'
     fi
     exit 0
     ;;
   *tw*"'rpc-v2' 'list'"*)
-    printf '%s\\n' '{"protocolVersion":2,"sessions":[]}'
+    printf '%s\\n' '{"protocolVersion":2,"projects":[],"sessions":[]}'
     exit 0
     ;;
 esac
@@ -270,7 +270,7 @@ exit 12
 
   const remoteList = runCli(home, ["host", "rpc-v2", "dev", "list"], env);
   assert.equal(remoteList.status, 0, remoteList.stderr);
-  assert.deepEqual(JSON.parse(remoteList.stdout), { protocolVersion: 2, sessions: [] });
+  assert.deepEqual(JSON.parse(remoteList.stdout), { protocolVersion: 2, projects: [], sessions: [] });
 
   const sshLog = readFileSync(log, "utf8");
   assert.match(sshLog, /ControlMaster=auto/);
@@ -306,7 +306,7 @@ case "$last" in
     exit 0
     ;;
   *tw*"'rpc-v2' 'capabilities'"*)
-    printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
+    printf '%s\\n' '{"protocolVersion":2,"app":"tmux-worktree","capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2","project-catalog.v2"]}'
     exit 0
     ;;
   *tw*"'terminal-control' 'resolve' 'managed-one'"*)

@@ -72,6 +72,13 @@ export interface RelayV2Scope {
   displayName: string;
   kind: RelayV2ScopeKind;
   reachability: RelayV2ScopeReachability;
+  projects: readonly RelayV2Project[];
+}
+
+export interface RelayV2Project {
+  name: string;
+  path: string;
+  branch?: string;
 }
 
 export interface RelayV2Session {
@@ -132,6 +139,7 @@ export interface RelayV2DiscoveredScope {
   displayName: string;
   kind: RelayV2ScopeKind;
   reachability: RelayV2ScopeReachability;
+  projects?: readonly RelayV2Project[];
   sessionsCompleteness: RelayV2DiscoveryCompleteness;
   sessions: readonly RelayV2DiscoveredSession[];
   error: RelayV2DiscoveryError | null;
@@ -1025,7 +1033,7 @@ function canonicalResolverMiss(
 
 function validateScope(value: unknown): asserts value is RelayV2Scope {
   if (!isRecord(value) || !exactKeys(value, [
-    "scopeId", "displayName", "kind", "reachability",
+    "scopeId", "displayName", "kind", "reachability", "projects",
   ])) {
     throw new RelayV2MaterializedStateError("INTERNAL", "invalid materialized Scope");
   }
@@ -1037,6 +1045,34 @@ function validateScope(value: unknown): asserts value is RelayV2Scope {
   if (value.reachability !== "online" && value.reachability !== "unreachable") {
     throw new RelayV2MaterializedStateError("INTERNAL", "invalid materialized reachability");
   }
+  normalizeProjects(value.projects);
+}
+
+function normalizeProjects(value: unknown): RelayV2Project[] {
+  if (!Array.isArray(value) || value.length > 256) {
+    throw new RelayV2MaterializedStateError("INTERNAL", "Scope Projects are malformed");
+  }
+  const names = new Set<string>();
+  return value.map((raw) => {
+    if (!isRecord(raw)
+      || !exactKeys(raw, Object.hasOwn(raw, "branch")
+        ? ["name", "path", "branch"]
+        : ["name", "path"])) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "Scope Project is malformed");
+    }
+    assertString(raw.name, "Scope Project name", 128);
+    assertString(raw.path, "Scope Project path", 4_096);
+    if (raw.branch !== undefined) assertString(raw.branch, "Scope Project branch", 255);
+    if (names.has(raw.name)) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "Scope Project is duplicated");
+    }
+    names.add(raw.name);
+    return {
+      name: raw.name,
+      path: raw.path,
+      ...(raw.branch === undefined ? {} : { branch: raw.branch }),
+    };
+  }).sort((left, right) => utf8Compare(left.name, right.name));
 }
 
 function validateSession(value: unknown, scopeId?: string): asserts value is RelayV2Session {
@@ -1207,8 +1243,11 @@ function normalizeReservationPlan(
 }
 
 function parseMaterializedState(snapshot: RelayV2HostStateSnapshot): PersistedMaterializedState {
-  const raw = snapshot.materialized[MATERIALIZED_STATE_KEY];
-  if (raw === undefined) return clone(EMPTY_STATE);
+  const persisted = snapshot.materialized[MATERIALIZED_STATE_KEY];
+  if (persisted === undefined) return clone(EMPTY_STATE);
+  // Parse a private copy so recovery normalization never mutates the H0
+  // snapshot supplied by the state store.
+  const raw: unknown = clone(persisted);
   if (!isRecord(raw) || !exactKeys(raw, [
     "version", "generation", "aggregateAuthorityEstablished", "aggregateCoverage",
     "usedScopeIds", "usedSessionIds", "scopes", "capacityReservations",
@@ -1266,6 +1305,11 @@ function parseMaterializedState(snapshot: RelayV2HostStateSnapshot): PersistedMa
       throw new RelayV2MaterializedStateError("INTERNAL", "materialized scope is malformed");
     }
     assertString(scope.backendIdentity, "scope backend identity", 4_096);
+    // H2 v1 records written before Scope project projection are upgraded in
+    // place on read; public Relay v2 frames remain strict and always carry it.
+    if (isRecord(scope.item) && !Object.hasOwn(scope.item, "projects")) {
+      scope.item = { ...scope.item, projects: [] };
+    }
     validateScope(scope.item);
     if (!usedScopeIds.has(scope.item.scopeId)
       || scopeIds.has(scope.item.scopeId)
@@ -2016,6 +2060,7 @@ function normalizeScan(scan: RelayV2ResourceDiscoveryScan): RelayV2ResourceDisco
       displayName: scope.displayName,
       kind: scope.kind,
       reachability: scope.reachability,
+      projects: scope.projects ?? [],
     });
     if (scope.sessionsCompleteness !== "complete" && scope.sessionsCompleteness !== "partial") {
       throw new RelayV2MaterializedStateError("INTERNAL", "discovery completeness is invalid");
@@ -2059,7 +2104,12 @@ function normalizeScan(scan: RelayV2ResourceDiscoveryScan): RelayV2ResourceDisco
     }).sort((left: RelayV2DiscoveredSession, right: RelayV2DiscoveredSession) => (
       utf8Compare(discoveredSessionAuthorityKey(left), discoveredSessionAuthorityKey(right))
     ));
-    return { ...clone(scope), reservationCorrelationCompleteness, sessions };
+    return {
+      ...clone(scope),
+      projects: normalizeProjects(scope.projects ?? []),
+      reservationCorrelationCompleteness,
+      sessions,
+    };
   }).sort((left, right) => utf8Compare(left.backendIdentity, right.backendIdentity));
   const normalized: RelayV2ResourceDiscoveryScan = { coverage: scan.coverage, scopes };
   const resolverCut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
@@ -2459,6 +2509,7 @@ function applyDiscovery(
           displayName: observed.displayName,
           kind: observed.kind,
           reachability: observed.reachability,
+          projects: normalizeProjects(observed.projects),
         },
         sessionsCompleteness: established ? "complete" : "partial",
         sessionsAuthorityEstablished: established,
@@ -2474,6 +2525,7 @@ function applyDiscovery(
       displayName: observed.displayName,
       kind: observed.kind,
       reachability: observed.reachability,
+      projects: normalizeProjects(observed.projects),
     };
     if (isNewScope || !sameJson(scope.item, desiredScope)) {
       mutation.changes.push({

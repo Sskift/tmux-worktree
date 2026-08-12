@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelayHost
+import com.tmuxworktree.mobile.core.model.RelayProject
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.designsystem.*
 
@@ -103,6 +104,7 @@ fun NewTerminalScreen(
     onBack: () -> Unit,
     onHostSelected: (RelayHost) -> Unit,
     onScopeSelected: (RelayScope) -> Unit,
+    onProjectSelected: (RelayProject) -> Unit,
     onWorkingDirectoryChange: (String) -> Unit,
     onLabelChange: (String) -> Unit,
     onRetryLoadTargets: () -> Unit,
@@ -115,6 +117,7 @@ fun NewTerminalScreen(
         it.hostId == form.hostId && it.reachable
     }
     val selectedScope = reachableScopes.firstOrNull { it.scopeId == form.scopeId }
+    val projects = selectedScope?.projects.orEmpty()
     val canCreate = selectedHost != null &&
         selectedScope != null &&
         form.workingDirectory.isNotBlank() &&
@@ -207,10 +210,12 @@ fun NewTerminalScreen(
                         scopes = reachableScopes,
                         selectedHost = selectedHost,
                         selectedScope = selectedScope,
+                        projects = projects,
                         validationErrors = validationErrors,
                         enabled = !isCreating,
                         onHostSelected = onHostSelected,
                         onScopeSelected = onScopeSelected,
+                        onProjectSelected = onProjectSelected,
                         onWorkingDirectoryChange = onWorkingDirectoryChange,
                         onLabelChange = onLabelChange,
                     )
@@ -275,10 +280,12 @@ private fun NewTerminalFormContent(
     scopes: List<RelayScope>,
     selectedHost: RelayHost?,
     selectedScope: RelayScope?,
+    projects: List<RelayProject>,
     validationErrors: NewTerminalValidationErrors,
     enabled: Boolean,
     onHostSelected: (RelayHost) -> Unit,
     onScopeSelected: (RelayScope) -> Unit,
+    onProjectSelected: (RelayProject) -> Unit,
     onWorkingDirectoryChange: (String) -> Unit,
     onLabelChange: (String) -> Unit,
 ) {
@@ -320,6 +327,24 @@ private fun NewTerminalFormContent(
         onSelected = onScopeSelected,
     )
     Spacer(Modifier.height(18.dp))
+    if (projects.isNotEmpty()) {
+        val selectedProject = projects.firstOrNull { it.path == form.workingDirectory }
+        NewTerminalSelector(
+            label = "Saved project directory",
+            selectedValue = selectedProject?.let { "${it.name} · ${it.path}" }.orEmpty(),
+            placeholder = "Choose from Dashboard projects",
+            icon = Icons.Outlined.FolderOpen,
+            options = projects,
+            optionLabel = { "${it.name} · ${it.path}" },
+            optionId = { it.name },
+            error = null,
+            enabled = enabled,
+            testTag = "new_terminal_saved_project_selector",
+            optionTagPrefix = "new_terminal_saved_project_option",
+            onSelected = onProjectSelected,
+        )
+        Spacer(Modifier.height(14.dp))
+    }
     NewTerminalTextField(
         value = form.workingDirectory,
         onValueChange = onWorkingDirectoryChange,
@@ -747,6 +772,7 @@ private fun NewTerminalScreenPreview() {
             onBack = {},
             onHostSelected = {},
             onScopeSelected = {},
+            onProjectSelected = {},
             onWorkingDirectoryChange = {},
             onLabelChange = {},
             onRetryLoadTargets = {},

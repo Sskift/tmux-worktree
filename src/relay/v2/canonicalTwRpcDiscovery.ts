@@ -1,5 +1,6 @@
 import {
   RPC_V2_CAPABILITIES,
+  type RpcV2Project,
   type RpcV2CapabilitiesResponse,
   type RpcV2ListResponse,
   type RpcV2Session,
@@ -92,6 +93,22 @@ interface ScannedScope {
   publicScope: RelayV2DiscoveredScope;
   scopeTarget: RelayV2ResourceResolverScopeEvidence | null;
   sessionTargets: RelayV2ResourceResolverSessionEvidence[];
+}
+
+function parseProject(value: unknown): RpcV2Project {
+  if (!isRecord(value)
+    || !hasExactKeys(value, Object.hasOwn(value, "branch")
+      ? ["name", "path", "branch"]
+      : ["name", "path"])) {
+    throw new TypeError("invalid canonical TW RPC v2 Project response");
+  }
+  return {
+    name: boundedString(value.name, "project name", 128),
+    path: boundedString(value.path, "project path", 4_096),
+    ...(Object.hasOwn(value, "branch")
+      ? { branch: boundedString(value.branch, "project branch", 255) }
+      : {}),
+  };
 }
 
 export interface RelayV2CanonicalTwRpcDiscoveryInput {
@@ -348,14 +365,17 @@ function parseSession(value: unknown): RpcV2Session {
 
 function parseListResponse(value: unknown): RpcV2ListResponse {
   if (!isRecord(value)
-    || !hasExactKeys(value, ["protocolVersion", "sessions"])
+    || !hasExactKeys(value, ["protocolVersion", "projects", "sessions"])
     || value.protocolVersion !== 2
+    || !Array.isArray(value.projects)
+    || value.projects.length > 256
     || !Array.isArray(value.sessions)
     || value.sessions.length > RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE) {
     throw new TypeError("invalid canonical TW RPC v2 list response");
   }
   return {
     protocolVersion: 2,
+    projects: Array.from(value.projects, parseProject),
     // Array.from visits sparse slots as undefined, so every claimed row is
     // parsed and malformed input cannot disappear before the authority cut.
     sessions: Array.from(value.sessions, parseSession),
@@ -421,6 +441,7 @@ function failedScope(
     displayName: scope.displayName,
     kind: scope.kind,
     reachability,
+    projects: [],
     sessionsCompleteness: "partial",
     sessions: [],
     error: { ...error },
@@ -729,6 +750,7 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
           displayName: scope.displayName,
           kind: scope.kind,
           reachability: "online",
+          projects: response.projects,
           sessionsCompleteness: "complete",
           sessions,
           error: null,

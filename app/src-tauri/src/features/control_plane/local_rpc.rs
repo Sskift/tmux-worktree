@@ -60,6 +60,7 @@ fn validate_installed_tw_rpc(program: &str, home: &Path) -> Result<(), String> {
         "expected-incarnation-kill-session.v1",
         "hard-timeout.v1",
         "dashboard-lifecycle.v2",
+        "project-catalog.v2",
     ];
     if response.protocol_version != 2
         || required.iter().any(|required| {

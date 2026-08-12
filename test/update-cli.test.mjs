@@ -69,6 +69,7 @@ test("bundled CLI runs version and RPC v2 without a runtime package or node_modu
       "expected-incarnation-kill-session.v1",
       "hard-timeout.v1",
       "dashboard-lifecycle.v2",
+      "project-catalog.v2",
     ],
   });
 });

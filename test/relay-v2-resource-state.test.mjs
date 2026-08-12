@@ -686,7 +686,7 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
         }
         return request.command === "capabilities"
           ? capabilities
-          : { protocolVersion: 2, sessions: [canonicalSession(currentIncarnation)] };
+          : { protocolVersion: 2, projects: [], sessions: [canonicalSession(currentIncarnation)] };
       },
     };
     const discovery = new canonicalDiscovery.RelayV2CanonicalTwRpcDiscoveryAdapter(
@@ -864,7 +864,7 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
         if (request.command === "capabilities") return capabilities;
         announceStaleScan();
         await staleScanBarrier;
-        return { protocolVersion: 2, sessions: [canonicalSession(incarnationB)] };
+        return { protocolVersion: 2, projects: [], sessions: [canonicalSession(incarnationB)] };
       },
     };
     discovery.reconfigure(scopeConfig("configured-a", "scope:configured-a", stalePort));
@@ -887,7 +887,7 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
       async query(request) {
         return request.command === "capabilities"
           ? capabilities
-          : { protocolVersion: 2, sessions: [canonicalSession(incarnationB)] };
+          : { protocolVersion: 2, projects: [], sessions: [canonicalSession(incarnationB)] };
       },
     };
     discovery.reconfigure(scopeConfig(

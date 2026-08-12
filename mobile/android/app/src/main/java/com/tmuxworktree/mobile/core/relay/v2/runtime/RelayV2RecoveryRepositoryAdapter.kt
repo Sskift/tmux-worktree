@@ -5,6 +5,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2BufferedRecoveryAction
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2PostReleasePhase
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ProjectResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ResyncReason
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeKind
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeReachability
@@ -546,6 +547,14 @@ internal class RelayV2RecoveryRepositoryAdapter(
         kind = RelayV2ScopeKind.entries.single { it.wireValue == item["kind"] },
         reachability = RelayV2ScopeReachability.entries.single {
             it.wireValue == item["reachability"]
+        },
+        projects = item.listValue("projects").map { raw ->
+            val project = raw.objectValue()
+            RelayV2ProjectResource(
+                name = project.stringValue("name"),
+                path = project.stringValue("path"),
+                branch = project["branch"] as? String,
+            )
         },
     )
 

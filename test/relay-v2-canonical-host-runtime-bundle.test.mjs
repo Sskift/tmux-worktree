@@ -313,6 +313,7 @@ test("canonical Host runtime bundle keeps one target generation and fences every
       if (request.argv.at(-1) === "list") {
         return jsonProcess({
           protocolVersion: 2,
+          projects: [],
           sessions: request.executable === "/usr/bin/ssh" ? remoteSessions : [],
         });
       }

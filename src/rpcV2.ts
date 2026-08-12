@@ -3,7 +3,12 @@ import {
   canonicalWorktreePlacementSegment,
   parseCanonicalWorktreePlacement,
 } from "./canonicalWorktreePlacement";
-import { expandHomePath, loadConfigFile, resolveWorktreeBase } from "./config";
+import {
+  expandHomePath,
+  loadConfigFile,
+  resolveWorktreeBase,
+  type ProjectConfig,
+} from "./config";
 import {
   createManagedTerminalSession,
   createManagedWorktreeSession,
@@ -37,6 +42,7 @@ export const RPC_V2_CAPABILITIES = Object.freeze([
   "expected-incarnation-kill-session.v1",
   "hard-timeout.v1",
   "dashboard-lifecycle.v2",
+  "project-catalog.v2",
 ] as const);
 
 export interface RpcV2CapabilitiesResponse {
@@ -66,8 +72,11 @@ export interface RpcV2Session {
   reservationCorrelation: ManagedSessionReservationCorrelationV1 | null;
 }
 
+export type RpcV2Project = ProjectConfig;
+
 export interface RpcV2ListResponse {
   protocolVersion: 2;
+  projects: ProjectConfig[];
   sessions: RpcV2Session[];
 }
 
@@ -643,10 +652,17 @@ function projectRpcV2Session(
 export function buildRpcV2ListResponse(
   state: ManagedState,
   liveSessions: TmuxSessionLifecycleEntry[],
+  projects: readonly ProjectConfig[] = [],
 ): RpcV2ListResponse {
   const liveByName = new Map(liveSessions.map((session) => [session.rawName, session]));
   return {
     protocolVersion: RPC_V2_PROTOCOL_VERSION,
+    projects: [...projects]
+      .map((project) => ({ ...project }))
+      .sort((left, right) => Buffer.compare(
+        Buffer.from(left.name, "utf8"),
+        Buffer.from(right.name, "utf8"),
+      )),
     sessions: state.sessions.flatMap((managed) => {
       const live = liveByName.get(managed.name);
       if (!live) return [];
@@ -661,7 +677,11 @@ export function currentRpcV2List(): RpcV2ListResponse {
   // invoke tmux, even though list itself performs no destructive mutation.
   const state = loadManagedStateForMutation();
   assertManagedStateLifecycleV2Authority(state);
-  return buildRpcV2ListResponse(state, listTmuxSessionLifecycleEntries());
+  return buildRpcV2ListResponse(
+    state,
+    listTmuxSessionLifecycleEntries(),
+    Object.values(loadConfigFile()?.projects ?? {}),
+  );
 }
 
 function createFailure(

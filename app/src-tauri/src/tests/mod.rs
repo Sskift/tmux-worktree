@@ -1292,7 +1292,7 @@ fn local_tw_rpc_runtime_requires_bundled_node_or_exact_installed_version() {
     fs::write(
             &installed_tw,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nif [ \"$1 $2\" = \"rpc-v2 capabilities\" ]; then\n  printf '%s\\n' '{{\"protocolVersion\":2,\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"resolved-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\",\"dashboard-lifecycle.v2\"]}}'\n  exit 0\nfi\nexit 2\n",
+                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nif [ \"$1 $2\" = \"rpc-v2 capabilities\" ]; then\n  printf '%s\\n' '{{\"protocolVersion\":2,\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"resolved-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\",\"dashboard-lifecycle.v2\",\"project-catalog.v2\"]}}'\n  exit 0\nfi\nexit 2\n",
                 env!("CARGO_PKG_VERSION")
             ),
         )
@@ -2806,7 +2806,7 @@ case "$1" in
     exit 0
     ;;
   *"'tw'"*"'rpc-v2'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
+    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2","project-catalog.v2"]}'
     exit 0
     ;;
 esac
@@ -2956,7 +2956,7 @@ case "$1" in
   *"'tmux'"*"'-V'"*) printf 'tmux: command not found\n' >&2; exit 127 ;;
   *"'tw'"*"'version'"*) printf '1.0.3\n'; exit 0 ;;
   *"'tw'"*"'rpc-v2'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2"]}'
+    printf '%s\n' '{"protocolVersion":2,"capabilities":["incarnation-list.v1","reservation-correlation.v1","correlated-create-worktree.v1","resolved-create-worktree.v1","correlated-create-terminal.v1","expected-incarnation-kill-session.v1","hard-timeout.v1","dashboard-lifecycle.v2","project-catalog.v2"]}'
     exit 0
     ;;
 esac
@@ -3225,6 +3225,7 @@ fn host_compatibility_requires_hard_bounded_mutation_capabilities() {
         "expected-incarnation-kill-session.v1",
         "hard-timeout.v1",
         "dashboard-lifecycle.v2",
+        "project-catalog.v2",
     ]
     .map(str::to_string);
     assert!(tw_rpc_capabilities_compatible(2, &complete));

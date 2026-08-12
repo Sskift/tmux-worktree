@@ -44,7 +44,8 @@
             "scopeId": "scope-local",
             "displayName": "本机",
             "kind": "local",
-            "reachability": "online"
+            "reachability": "online",
+            "projects": []
           }
         ]
       }
@@ -207,7 +208,8 @@
               "scopeId": "scope-local",
               "displayName": "本机",
               "kind": "local",
-              "reachability": "online"
+              "reachability": "online",
+              "projects": []
             }
           },
           {
@@ -402,7 +404,8 @@
             "scopeId": "scope-devbox",
             "displayName": "Devbox",
             "kind": "ssh",
-            "reachability": "unreachable"
+            "reachability": "unreachable",
+            "projects": []
           }
         }
       }

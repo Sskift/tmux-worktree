@@ -170,9 +170,10 @@ async function waitUntil(predicate, message) {
 test("canonical TW RPC v2 discovery scans only configured scopes and projects deterministic complete results", async () => {
   const port = queryPort(({ processTarget, command }) => {
     if (command === "capabilities") return capabilities();
-    if (processTarget.targetId === "local") return { protocolVersion: 2, sessions: [] };
+    if (processTarget.targetId === "local") return { protocolVersion: 2, projects: [], sessions: [] };
     return {
       protocolVersion: 2,
+      projects: [{ name: "tmux-worktree", path: "/repo/tmux-worktree", branch: "main" }],
       sessions: [terminalSession(), worktreeSession()],
     };
   });
@@ -189,6 +190,9 @@ test("canonical TW RPC v2 discovery scans only configured scopes and projects de
   assert.equal(scan.coverage, "complete");
   assert.deepEqual(scan.scopes.map((item) => item.backendIdentity), ["scope:a", "scope:z"]);
   assert.deepEqual(scan.scopes.map((item) => item.sessionsCompleteness), ["complete", "complete"]);
+  assert.deepEqual(scan.scopes[1].projects, [
+    { name: "tmux-worktree", path: "/repo/tmux-worktree", branch: "main" },
+  ]);
   assert.deepEqual(scan.scopes[1].sessions.map((session) => session.kind), ["terminal", "worktree"]);
   assert.deepEqual(scan.scopes[1].sessions.map((session) => session.displayName), [
     "Terminal label",
@@ -220,7 +224,7 @@ test("canonical discovery swaps explicit config generations atomically and keeps
   const portA = queryPort(({ command }) => (
     command === "capabilities"
       ? capabilities()
-      : { protocolVersion: 2, sessions: [terminalSession()] }
+      : { protocolVersion: 2, projects: [], sessions: [terminalSession()] }
   ));
   const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
     scopes: [scope("ssh", "configured-a", "scope:configured-a")],
@@ -248,7 +252,7 @@ test("canonical discovery swaps explicit config generations atomically and keeps
   const portB = queryPort(({ command }) => (
     command === "capabilities"
       ? capabilities()
-      : { protocolVersion: 2, sessions: [terminalSession({ incarnation: INCARNATION_B })] }
+      : { protocolVersion: 2, projects: [], sessions: [terminalSession({ incarnation: INCARNATION_B })] }
   ));
   discovery.reconfigure({
     scopes: [scope("ssh", "configured-b", "scope:configured-b")],
@@ -278,7 +282,7 @@ test("only a successful complete-empty scan is represented as complete deletion 
   assert.equal(noScopePort.calls.length, 0);
 
   const port = queryPort(({ command }) => (
-    command === "capabilities" ? capabilities() : { protocolVersion: 2, sessions: [] }
+    command === "capabilities" ? capabilities() : { protocolVersion: 2, projects: [], sessions: [] }
   ));
   const scan = await new RelayV2CanonicalTwRpcDiscoveryAdapter({
     scopes: [scope("local", "local")],
@@ -297,7 +301,7 @@ test("a canonical scope with more than 256 valid Sessions remains complete", asy
     incarnation: `twinc2.${String(index).padStart(43, "0")}`,
   }));
   const port = queryPort(({ command }) => (
-    command === "capabilities" ? capabilities() : { protocolVersion: 2, sessions }
+    command === "capabilities" ? capabilities() : { protocolVersion: 2, projects: [], sessions }
   ));
   const scan = await new RelayV2CanonicalTwRpcDiscoveryAdapter({
     scopes: [scope("local", "local")],
@@ -333,7 +337,7 @@ test("multiple scopes share the deterministic H2 full-cut record budget without 
   const port = queryPort((request) => {
     if (request.command === "capabilities") return capabilities();
     if (request.processTarget.targetId === "a") {
-      return { protocolVersion: 2, sessions: [terminalSession()] };
+      return { protocolVersion: 2, projects: [], sessions: [terminalSession()] };
     }
     return {
       protocolVersion: 2,
@@ -492,7 +496,7 @@ test("materialized reconciliation preserves a stale cut for unreachable and dupl
           ],
         };
       }
-      return { protocolVersion: 2, sessions: [terminalSession()] };
+      return { protocolVersion: 2, projects: [], sessions: [terminalSession()] };
     });
     const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
       scopes: [scope("ssh", "configured-host")],
@@ -566,7 +570,7 @@ test("discovery timeout waits for the query transport child barrier before prese
         }
         const value = command === "capabilities"
           ? capabilities()
-          : { protocolVersion: 2, sessions: [terminalSession()] };
+          : { protocolVersion: 2, projects: [], sessions: [terminalSession()] };
         const stdout = encoder.encode(`${JSON.stringify(value)}\n`);
         return {
           stdout: {
@@ -713,7 +717,7 @@ test("reconfigure aborts the active scan barrier before any retired later scope 
       }
       const value = request.argv.at(-1) === "capabilities"
         ? capabilities()
-        : { protocolVersion: 2, sessions: [terminalSession()] };
+        : { protocolVersion: 2, projects: [], sessions: [terminalSession()] };
       return {
         stdout: {
           async *[Symbol.asyncIterator]() {

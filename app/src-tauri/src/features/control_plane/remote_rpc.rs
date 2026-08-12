@@ -27,6 +27,7 @@ pub(crate) fn tw_rpc_capabilities_compatible(
             "expected-incarnation-kill-session.v1",
             "hard-timeout.v1",
             "dashboard-lifecycle.v2",
+            "project-catalog.v2",
         ]
         .iter()
         .all(|required| capabilities.iter().any(|capability| capability == required))

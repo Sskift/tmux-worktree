@@ -241,9 +241,27 @@ internal fun validateStructuredError(value: Any?) {
     }
 }
 
+private fun validateProject(value: Any?) {
+    val project = jsonObject(value)
+    exactKeys(project, listOf("name", "path"), listOf("branch"))
+    jsonString(required(project, "name"), maxBytes = 128)
+    jsonString(
+        required(project, "path"),
+        allowOuterWhitespace = true,
+        maxBytes = 4_096,
+    )
+    if (project.containsKey("branch")) {
+        jsonString(
+            required(project, "branch"),
+            allowOuterWhitespace = true,
+            maxBytes = 255,
+        )
+    }
+}
+
 internal fun validateScope(value: Any?) {
     val scope = jsonObject(value)
-    exactKeys(scope, listOf("scopeId", "displayName", "kind", "reachability"))
+    exactKeys(scope, listOf("scopeId", "displayName", "kind", "reachability", "projects"))
     jsonId(required(scope, "scopeId"))
     jsonString(
         required(scope, "displayName"),
@@ -252,6 +270,7 @@ internal fun validateScope(value: Any?) {
     )
     jsonOneOf(required(scope, "kind"), setOf("local", "ssh"))
     jsonOneOf(required(scope, "reachability"), setOf("online", "unreachable"))
+    jsonArray(required(scope, "projects"), maximum = 256, validator = ::validateProject)
 }
 
 internal fun validateSession(value: Any?) {

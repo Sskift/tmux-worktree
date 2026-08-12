@@ -442,26 +442,8 @@ private fun MainNavigation(
                         )
                     }
                 },
-                popEnterTransition = {
-                    if (isRootTabTransition()) {
-                        EnterTransition.None
-                    } else {
-                        slideInHorizontally(
-                            animationSpec = tween(durationMillis = 200),
-                            initialOffsetX = { width -> -width / 5 },
-                        )
-                    }
-                },
-                popExitTransition = {
-                    if (isRootTabTransition()) {
-                        ExitTransition.None
-                    } else {
-                        slideOutHorizontally(
-                            animationSpec = tween(durationMillis = 200),
-                            targetOffsetX = { width -> width / 5 },
-                        )
-                    }
-                },
+                popEnterTransition = { EnterTransition.None },
+                popExitTransition = { ExitTransition.None },
             ) {
             composable(V2Routes.INBOX) {
                 val routeState = latestState
@@ -937,6 +919,10 @@ private fun NewWorktreeRoute(
             scopeId = it.scopeId
             errors = errors.copy(scope = null)
         },
+        onProjectSelected = { project ->
+            repositoryPath = project.name
+            errors = errors.copy(repositoryPath = null)
+        },
         onRepositoryPathChange = {
             repositoryPath = it
             errors = errors.copy(repositoryPath = null)
@@ -1022,6 +1008,10 @@ private fun NewTerminalRoute(
         onScopeSelected = {
             scopeId = it.scopeId
             errors = errors.copy(scope = null)
+        },
+        onProjectSelected = { project ->
+            workingDirectory = project.path
+            errors = errors.copy(workingDirectory = null)
         },
         onWorkingDirectoryChange = {
             workingDirectory = it

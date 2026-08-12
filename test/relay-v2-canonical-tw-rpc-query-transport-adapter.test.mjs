@@ -128,7 +128,7 @@ test("query transport invokes only structured no-shell canonical read entrypoint
     const command = request.argv.at(-1);
     return command === "capabilities"
       ? jsonProcess(capabilities())
-      : jsonProcess({ protocolVersion: 2, sessions: [] });
+      : jsonProcess({ protocolVersion: 2, projects: [], sessions: [] });
   });
   const adapter = new RelayV2CanonicalTwRpcQueryTransportAdapter({
     targets: [localTarget(), sshTarget()],
@@ -256,7 +256,7 @@ test("default-off config factory derives only local plus explicit Hosts and reti
     }
     return command === "capabilities"
       ? jsonProcess(capabilities())
-      : jsonProcess({ protocolVersion: 2, sessions: [] });
+      : jsonProcess({ protocolVersion: 2, projects: [], sessions: [] });
   });
   const foundation = createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
     configLoader: () => structuredClone(configSnapshot),
@@ -382,7 +382,7 @@ test("config factory accepts SSH aliases and rejects malformed Host provenance b
   const runner = fakeRunner((request) => (
     request.argv.at(-1) === "capabilities"
       ? jsonProcess(capabilities())
-      : jsonProcess({ protocolVersion: 2, sessions: [] })
+      : jsonProcess({ protocolVersion: 2, projects: [], sessions: [] })
   ));
   const aliasFoundation = createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
     configLoader: () => ({ hosts: [{ id: "devbox", host: "devbox" }] }),
@@ -651,7 +651,7 @@ test("process and response failures stay partial through discovery and never aut
       name: "malformed list response",
       handler: (request) => request.argv.at(-1) === "capabilities"
         ? jsonProcess(capabilities())
-        : jsonProcess({ protocolVersion: 2, sessions: "not-an-array" }),
+        : jsonProcess({ protocolVersion: 2, projects: [], sessions: "not-an-array" }),
       expectedCode: "INTERNAL",
       expectedReachability: "online",
       expectedCalls: 2,

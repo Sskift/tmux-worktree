@@ -1,6 +1,8 @@
 package com.tmuxworktree.mobile.core.relay.v2.state
 
 import androidx.room.withTransaction
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
@@ -904,6 +906,7 @@ private fun RelayV2ScopeEntity.toStored() = RelayV2StoredScope(
         displayName,
         RelayV2ScopeKind.entries.single { it.wireValue == kind },
         RelayV2ScopeReachability.entries.single { it.wireValue == reachability },
+        scopeProjectsFromCanonicalJson(scopeRecordCanonicalJson),
     ),
     sessionsRevision = sessionsRevision,
     scopeRecordCanonicalJson = scopeRecordCanonicalJson,
@@ -1124,6 +1127,7 @@ private fun RelayV2SnapshotRecordEntity.toScopeResource() = RelayV2ScopeResource
     requireNotNull(displayName),
     RelayV2ScopeKind.entries.single { it.wireValue == kind },
     RelayV2ScopeReachability.entries.single { it.wireValue == reachability },
+    scopeProjectsFromCanonicalJson(canonicalJson),
 )
 
 private fun RelayV2StateEventEntity.toScopeResource() = RelayV2ScopeResource(
@@ -1131,7 +1135,39 @@ private fun RelayV2StateEventEntity.toScopeResource() = RelayV2ScopeResource(
     requireNotNull(displayName),
     RelayV2ScopeKind.entries.single { it.wireValue == kind },
     RelayV2ScopeReachability.entries.single { it.wireValue == reachability },
+    scopeProjectsFromCanonicalJson(canonicalJson),
 )
+
+private val SCOPE_PROJECTS_JSON_LIMITS = RelayV2JsonLimits(
+    maxDepth = 6,
+    maxDirectKeys = 16,
+    maxTotalKeys = 1_024,
+    maxNodes = 2_048,
+)
+
+/**
+ * Scope projects stay in the already-durable canonical record, avoiding a
+ * duplicate Room column and database migration for the same authority data.
+ * Records written before project projection legitimately normalize to empty.
+ */
+private fun scopeProjectsFromCanonicalJson(canonicalJson: String): List<RelayV2ProjectResource> {
+    val root = RelayV2StrictJson.parseObject(canonicalJson, SCOPE_PROJECTS_JSON_LIMITS)
+    val item = (root["item"] as? Map<*, *>)
+        ?: ((root["change"] as? Map<*, *>)?.get("item") as? Map<*, *>)
+        ?: error("Relay v2 canonical Scope record has no item")
+    val rawProjects = item["projects"] ?: return emptyList()
+    require(rawProjects is List<*>) { "Relay v2 canonical Scope projects are malformed" }
+    return rawProjects.map { raw ->
+        require(raw is Map<*, *>) { "Relay v2 canonical Scope project is malformed" }
+        val name = raw["name"]
+        val path = raw["path"]
+        val branch = raw["branch"]
+        require(name is String && path is String && (branch == null || branch is String)) {
+            "Relay v2 canonical Scope project fields are malformed"
+        }
+        RelayV2ProjectResource(name, path, branch as String?)
+    }
+}
 
 private fun RelayV2SnapshotRecordEntity.toSessionResource() = RelayV2SessionResource(
     scopeId,
