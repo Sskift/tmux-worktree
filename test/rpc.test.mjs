@@ -710,6 +710,7 @@ test("orphan restore validates the git entry and records the actual collision-fr
     repoPath: "/home/dev/src/app",
     worktreePath: "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12",
     branch: "app-fix-abc12",
+    baseBranch: "app-fix-abc12",
     cwd: "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12",
     createdAt: "2026-07-12T00:00:00.000Z",
   }]);

@@ -1112,6 +1112,16 @@ export function restoreManagedWorktreeSession(
     throw new CliError(`${worktreePath} 不是可恢复的 git worktree`);
   }
 
+  const branch = gitQuery(worktreePath, ["branch", "--show-current"]).trim();
+  if (!branch) throw new CliError(`${worktreePath} 处于 detached HEAD，无法恢复`);
+  const commonDir = gitQuery(worktreePath, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]).trim();
+  const repoPath = commonDir.endsWith("/.git") ? dirname(commonDir) : undefined;
+  const project = params.projectKey?.trim() || basename(dirname(worktreePath)) || undefined;
+
   const session = resolveSessionName(params.sessionName.trim(), sessionExists);
   if (!session) throw new CliError("session name required");
   let capturedLifecycle: ReturnType<typeof captureLifecycleV2> | undefined;
@@ -1151,14 +1161,6 @@ export function restoreManagedWorktreeSession(
     );
   }
 
-  const branch = gitQuery(worktreePath, ["branch", "--show-current"]).trim() || undefined;
-  const commonDir = gitQuery(worktreePath, [
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-common-dir",
-  ]).trim();
-  const repoPath = commonDir.endsWith("/.git") ? dirname(commonDir) : undefined;
-  const project = params.projectKey?.trim() || basename(dirname(worktreePath)) || undefined;
   const baseRecord: ManagedSession = {
     name: session,
     kind: "worktree",
@@ -1167,6 +1169,7 @@ export function restoreManagedWorktreeSession(
     repoPath,
     worktreePath,
     branch,
+    baseBranch: branch,
     cwd: worktreePath,
     createdAt: now().toISOString(),
   };
