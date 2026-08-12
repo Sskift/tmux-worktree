@@ -22,6 +22,7 @@ export const RELAY_AGENT_CHAT_MAX_IMAGE_BYTES = 4 * 1_024 * 1_024;
 export const RELAY_AGENT_CHAT_IMAGE_CHUNK_BYTES = 192 * 1_024;
 export const RELAY_AGENT_CHAT_MAX_HISTORY_TURNS = 256;
 export const RELAY_AGENT_CHAT_MAX_STEERED_MESSAGES = 64;
+export const RELAY_AGENT_CHAT_MAX_PROGRESS_STEPS = 16;
 export const RELAY_AGENT_CHAT_CODEC_ERROR_DOMAIN =
   "relay-agent-chat-codec-v2" as const;
 
@@ -277,6 +278,15 @@ function validateSteeredMessage(value: RelayV2JsonValue): void {
   text(field(item, "sentAt"), 64);
 }
 
+function validateProgressStep(value: RelayV2JsonValue): void {
+  const step = object(value);
+  exact(step, ["stepId", "kind", "title", "status"]);
+  id(field(step, "stepId"));
+  oneOf(field(step, "kind"), ["status", "tool"] as const);
+  text(field(step, "title"), 240);
+  oneOf(field(step, "status"), ["running", "completed", "failed"] as const);
+}
+
 const IMAGE_MIME_TYPES = [
   "image/png",
   "image/jpeg",
@@ -315,7 +325,7 @@ function validateTurn(value: RelayV2JsonValue): void {
     turn,
     [
       "turnId", "session", "userMessage", "status", "content", "error", "sentAt",
-      "completedAt", "steeredMessages",
+      "completedAt", "steeredMessages", "progress",
     ],
   );
   id(field(turn, "turnId"));
@@ -328,6 +338,7 @@ function validateTurn(value: RelayV2JsonValue): void {
   const content = nullable(field(turn, "content"), (items) => (
     array(items, validateContentPart, RELAY_AGENT_CHAT_MAX_CONTENT_PARTS, 1)
   ));
+  array(field(turn, "progress"), validateProgressStep, RELAY_AGENT_CHAT_MAX_PROGRESS_STEPS);
   const error = nullable(field(turn, "error"), (item) => (
     text(item, 4_096)
   ));

@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec
 
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatContentPart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatProgressStep
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatMarkdownPart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatSteeredMessage
@@ -66,6 +67,7 @@ data class AgentChatV2Turn(
     val userMessage: String,
     val status: String,
     val content: List<AgentChatContentPart>? = null,
+    val progress: List<AgentChatProgressStep> = emptyList(),
     val error: String? = null,
     val sentAt: String,
     val completedAt: String? = null,
@@ -77,6 +79,7 @@ data class AgentChatV2Turn(
         userMessage = userMessage,
         status = status,
         content = content.orEmpty(),
+        progress = progress,
         error = error,
         sentAt = sentAt,
         completedAt = completedAt,
@@ -469,7 +472,7 @@ class AgentChatV2Codec {
             turn,
             required = listOf(
                 "turnId", "session", "userMessage", "status", "content", "error", "sentAt",
-                "completedAt", "steeredMessages",
+                "completedAt", "steeredMessages", "progress",
             ),
         )
         val turnId = id(required(turn, "turnId"))
@@ -485,6 +488,11 @@ class AgentChatV2Codec {
             ).map { decodeContentPart(it) }
         }
         val error = turn["error"]?.let { text(it, MAX_ERROR_MESSAGE_UTF8_BYTES) }
+        val progress = jsonArray(
+            required(turn, "progress"),
+            maximum = MAX_PROGRESS_STEPS,
+            validator = { decodeProgressStep(it) },
+        ).map { decodeProgressStep(it) }
         val completedAt = turn["completedAt"]?.let { text(it, MAX_TIMESTAMP_BYTES) }
         when (status) {
             "working" -> {
@@ -516,6 +524,7 @@ class AgentChatV2Codec {
             userMessage = userMessage,
             status = status,
             content = content,
+            progress = progress,
             error = error,
             sentAt = sentAt,
             completedAt = completedAt,
@@ -554,6 +563,17 @@ class AgentChatV2Codec {
             }
             else -> schemaFailure("schema-mismatch")
         }
+    }
+
+    private fun decodeProgressStep(value: Any?): AgentChatProgressStep {
+        val step = jsonObject(value)
+        exactKeys(step, listOf("stepId", "kind", "title", "status"))
+        return AgentChatProgressStep(
+            stepId = id(required(step, "stepId")),
+            kind = jsonOneOf(required(step, "kind"), PROGRESS_KINDS),
+            title = text(required(step, "title"), MAX_PROGRESS_TITLE_UTF8_BYTES),
+            status = jsonOneOf(required(step, "status"), PROGRESS_STATUSES),
+        )
     }
 
     private fun decodeCanonicalBase64(value: String): ByteArray {
@@ -821,12 +841,20 @@ class AgentChatV2Codec {
         "userMessage" to userMessage,
         "status" to status,
         "content" to content?.map { it.toWireObject() },
+        "progress" to progress.map { it.toWireObject() },
         "error" to error,
         "sentAt" to sentAt,
         "completedAt" to completedAt,
         "steeredMessages" to if (steeredMessages.isEmpty()) null else steeredMessages.map {
             linkedMapOf("message" to it.message, "sentAt" to it.sentAt)
         },
+    )
+
+    private fun AgentChatProgressStep.toWireObject(): LinkedHashMap<String, Any?> = linkedMapOf(
+        "stepId" to stepId,
+        "kind" to kind,
+        "title" to title,
+        "status" to status,
     )
 
     private fun AgentChatContentPart.toWireObject(): LinkedHashMap<String, Any?> = when (this) {
@@ -913,6 +941,8 @@ class AgentChatV2Codec {
         private const val MAX_ERROR_MESSAGE_UTF8_BYTES = 4_096
         private const val MAX_TIMESTAMP_BYTES = 64
         private const val MAX_ALT_TEXT_UTF8_BYTES = 1_024
+        private const val MAX_PROGRESS_STEPS = 16
+        private const val MAX_PROGRESS_TITLE_UTF8_BYTES = 240
 
         private val EXTENSION_ERROR_CODES = setOf(
             "AGENT_CHAT_UNAVAILABLE",
@@ -921,6 +951,8 @@ class AgentChatV2Codec {
         )
         private val TURN_STATUSES = setOf("working", "replied", "failed", "recovery-required")
         private val CONTENT_PART_TYPES = setOf("markdown", "image")
+        private val PROGRESS_KINDS = setOf("status", "tool")
+        private val PROGRESS_STATUSES = setOf("running", "completed", "failed")
         private val IMAGE_MIME_TYPES = setOf("image/png", "image/jpeg", "image/gif", "image/webp")
         private val SHA256_REGEX = Regex("^[0-9a-f]{64}$")
         private val STANDARD_JSON_LIMITS = RelayV2JsonLimits(

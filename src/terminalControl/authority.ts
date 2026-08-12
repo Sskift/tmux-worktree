@@ -2684,6 +2684,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         agentSupported: activity.agentSupported,
         agentRunning: activity.agentRunning,
         ...(activity.source === undefined ? {} : { source: activity.source }),
+        ...(activity.progress === undefined ? {} : { progress: activity.progress }),
       };
     });
   }

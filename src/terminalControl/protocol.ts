@@ -50,6 +50,13 @@ export interface TerminalControlAgentSource {
   startedAt: string;
 }
 
+export interface TerminalControlAgentProgressStep {
+  stepId: string;
+  kind: "status" | "tool";
+  title: string;
+  status: "running" | "completed" | "failed";
+}
+
 export interface TerminalControlAgentResult {
   source: TerminalControlAgentSource;
   completedAt: string;

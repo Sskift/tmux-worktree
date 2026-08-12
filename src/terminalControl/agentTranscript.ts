@@ -14,12 +14,15 @@ import { join } from "node:path";
 import {
   TerminalControlProtocolError,
   type TerminalControlAgentResult,
+  type TerminalControlAgentProgressStep,
   type TerminalControlAgentSource,
 } from "./protocol";
 
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_CODEX_HEADER_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_CANDIDATES = 4096;
+const MAX_AGENT_PROGRESS_STEPS = 16;
+const MAX_AGENT_PROGRESS_TITLE_BYTES = 240;
 
 type AgentProvider = TerminalControlAgentSource["provider"];
 
@@ -557,6 +560,176 @@ function codexResult(
   return { source: expected, completedAt, text: bounded.text, truncated: bounded.truncated };
 }
 
+function progressStepId(source: TerminalControlAgentSource, identity: string): string {
+  return `agent-step-${createHash("sha256")
+    .update(source.sourceId, "utf8")
+    .update("\0")
+    .update(identity, "utf8")
+    .digest("base64url")
+    .slice(0, 24)}`;
+}
+
+function progressTitle(value: unknown): string | undefined {
+  const raw = safeText(value, 16 * 1024)?.replace(/\s+/gu, " ").trim();
+  if (!raw) return undefined;
+  return boundedUtf8Head(raw, MAX_AGENT_PROGRESS_TITLE_BYTES).text;
+}
+
+function toolTitle(value: unknown): string | undefined {
+  const name = safeText(value, 128);
+  if (!name) return undefined;
+  const normalized = name.replace(/^.*(?:__|\.)/u, "").replace(/[_-]+/gu, " ").trim();
+  const known: Record<string, string> = {
+    exec: "执行命令",
+    "exec command": "执行命令",
+    "apply patch": "修改文件",
+    wait: "等待任务",
+    "wait agent": "等待子任务",
+    "spawn agent": "启动子任务",
+    "list agents": "查看子任务",
+    "send message": "协调子任务",
+    "followup task": "协调子任务",
+    "view image": "查看图片",
+    imagegen: "生成图片",
+    run: "查询外部服务",
+  };
+  const title = known[normalized] ?? (normalized.startsWith("mcp ")
+    ? "调用外部工具"
+    : progressTitle(`调用 ${normalized}`));
+  return title && !/[\x00-\x1f\x7f]/u.test(title) ? title : undefined;
+}
+
+function progressWindow(
+  records: JsonRecord[],
+  cwd: string,
+  expected: TerminalControlAgentSource,
+): Array<{ record: JsonRecord; index: number }> {
+  if (expected.provider === "codex") {
+    const startIndex = records.findIndex((record) => record.type === "event_msg"
+      && isRecord(record.payload)
+      && record.payload.type === "task_started"
+      && record.payload.turn_id === expected.turnId
+      && exactTimestamp(record.timestamp) === expected.startedAt);
+    if (startIndex < 0) return [];
+    const completionOffset = records.slice(startIndex + 1).findIndex((record) =>
+      record.type === "event_msg" && isRecord(record.payload)
+      && record.payload.type === "task_complete"
+      && record.payload.turn_id === expected.turnId);
+    const endIndex = completionOffset < 0
+      ? records.length
+      : startIndex + completionOffset + 2;
+    return records.slice(startIndex + 1, endIndex)
+      .map((record, index) => ({ record, index: startIndex + index + 1 }));
+  }
+
+  const boundaryIndex = records.findIndex((record) => record.uuid === expected.turnId
+    && record.sessionId === expected.sessionId
+    && exactTimestamp(record.timestamp) === expected.startedAt
+    && (record.cwd === cwd || record.type === "system"));
+  if (boundaryIndex < 0) return [];
+  const startIndex = expected.boundary === "inclusive" ? boundaryIndex : boundaryIndex + 1;
+  let endIndex = records.length;
+  for (let index = startIndex; index < records.length; index += 1) {
+    const record = records[index];
+    if (record.type === "system" && record.subtype === "turn_duration"
+      && record.isSidechain !== true) {
+      endIndex = index + 1;
+      break;
+    }
+  }
+  return records.slice(startIndex, endIndex)
+    .map((record, index) => ({ record, index: startIndex + index }));
+}
+
+function agentProgress(
+  records: JsonRecord[],
+  cwd: string,
+  expected: TerminalControlAgentSource,
+): TerminalControlAgentProgressStep[] {
+  const steps: Array<TerminalControlAgentProgressStep & { sequence: number }> = [];
+  const toolSteps = new Map<string, TerminalControlAgentProgressStep & { sequence: number }>();
+  const window = progressWindow(records, cwd, expected);
+  for (const { record, index } of window) {
+    if (expected.provider === "codex" && record.type === "event_msg" && isRecord(record.payload)
+      && record.payload.type === "agent_message" && record.payload.phase === "commentary") {
+      const title = progressTitle(record.payload.message);
+      if (title) {
+        steps.push({
+          stepId: progressStepId(expected, `status:${record.timestamp ?? ""}:${index}`),
+          kind: "status",
+          title,
+          status: "completed",
+          sequence: index,
+        });
+      }
+      continue;
+    }
+
+    if (expected.provider === "codex" && record.type === "response_item" && isRecord(record.payload)) {
+      const payload = record.payload;
+      if (payload.type === "function_call" || payload.type === "custom_tool_call") {
+        const callId = safeText(payload.call_id, 128) ?? safeText(payload.id, 128);
+        const title = toolTitle(payload.name);
+        if (!callId || !title) continue;
+        const step = {
+          stepId: progressStepId(expected, `tool:${callId}`),
+          kind: "tool" as const,
+          title,
+          status: payload.status === "failed"
+            ? "failed" as const
+            : payload.status === "completed"
+              ? "completed" as const
+              : "running" as const,
+          sequence: index,
+        };
+        toolSteps.set(callId, step);
+        steps.push(step);
+      } else if (payload.type === "function_call_output" || payload.type === "custom_tool_call_output") {
+        const callId = safeText(payload.call_id, 128);
+        const step = callId ? toolSteps.get(callId) : undefined;
+        if (step && step.status === "running") step.status = "completed";
+      }
+      continue;
+    }
+
+    if (expected.provider === "claude" && record.type === "assistant"
+      && record.sessionId === expected.sessionId && record.isSidechain !== true
+      && isRecord(record.message) && Array.isArray(record.message.content)) {
+      for (const block of record.message.content) {
+        if (!isRecord(block) || block.type !== "tool_use") continue;
+        const callId = safeText(block.id, 128);
+        const title = toolTitle(block.name);
+        if (!callId || !title || toolSteps.has(callId)) continue;
+        const step = {
+          stepId: progressStepId(expected, `tool:${callId}`),
+          kind: "tool" as const,
+          title,
+          status: "running" as const,
+          sequence: index,
+        };
+        toolSteps.set(callId, step);
+        steps.push(step);
+      }
+      continue;
+    }
+
+    if (expected.provider === "claude" && record.type === "user"
+      && record.sessionId === expected.sessionId && record.isSidechain !== true
+      && isRecord(record.message) && Array.isArray(record.message.content)) {
+      for (const block of record.message.content) {
+        if (!isRecord(block) || block.type !== "tool_result") continue;
+        const callId = safeText(block.tool_use_id, 128);
+        const step = callId ? toolSteps.get(callId) : undefined;
+        if (step) step.status = block.is_error === true ? "failed" : "completed";
+      }
+    }
+  }
+  const retained = steps.slice(-MAX_AGENT_PROGRESS_STEPS);
+  const last = retained.at(-1);
+  if (last?.kind === "status") last.status = "running";
+  return retained.map(({ sequence: _sequence, ...step }) => step);
+}
+
 function transcriptCandidates(
   provider: AgentProvider,
   cwd: string,
@@ -604,6 +777,16 @@ export function discoverActiveAgentSource(input: {
   sessionId?: string;
   startedAtNotBefore?: string;
 }): TerminalControlAgentSource {
+  return discoverActiveAgentActivity(input).source;
+}
+
+export function discoverActiveAgentActivity(input: {
+  provider: AgentProvider;
+  cwd: string;
+  home?: string;
+  sessionId?: string;
+  startedAtNotBefore?: string;
+}): { source: TerminalControlAgentSource; progress: TerminalControlAgentProgressStep[] } {
   const home = input.home ?? homedir();
   const startedAtNotBefore = input.startedAtNotBefore === undefined
     ? undefined
@@ -614,7 +797,10 @@ export function discoverActiveAgentSource(input: {
       "Agent source discovery boundary is malformed",
     );
   }
-  const matches: TerminalControlAgentSource[] = [];
+  const matches: Array<{
+    source: TerminalControlAgentSource;
+    progress: TerminalControlAgentProgressStep[];
+  }> = [];
   for (const candidate of transcriptCandidates(input.provider, input.cwd, home, input.sessionId)) {
     if (input.provider === "codex") {
       const metadata = codexSessionMetadata(candidate.path);
@@ -639,7 +825,7 @@ export function discoverActiveAgentSource(input: {
             found.sessionId,
             startedAtNotBefore,
           )))) {
-      matches.push(found);
+      matches.push({ source: found, progress: agentProgress(records, input.cwd, found) });
       break;
     }
   }
@@ -649,6 +835,39 @@ export function discoverActiveAgentSource(input: {
     "the running Agent turn is not yet available in its structured transcript",
     true,
   );
+}
+
+export function readAgentProgress(input: {
+  source: TerminalControlAgentSource;
+  cwd: string;
+  home?: string;
+}): TerminalControlAgentProgressStep[] {
+  const expectedId = sourceId(
+    input.source.provider,
+    input.source.boundary,
+    input.source.sessionId,
+    input.source.turnId,
+  );
+  if (expectedId !== input.source.sourceId) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "Agent progress source identity is malformed",
+    );
+  }
+  const home = input.home ?? homedir();
+  for (const candidate of transcriptCandidates(
+    input.source.provider,
+    input.cwd,
+    home,
+    input.source.sessionId,
+  )) {
+    const records = input.source.provider === "codex"
+      ? readCodexJsonLines(candidate.path)
+      : readJsonLines(candidate.path);
+    const progress = progressWindow(records, input.cwd, input.source);
+    if (progress.length > 0) return agentProgress(records, input.cwd, input.source);
+  }
+  return [];
 }
 
 export function readCompletedAgentResult(input: {

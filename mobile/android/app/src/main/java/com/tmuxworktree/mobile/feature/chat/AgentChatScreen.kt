@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.feature.chat
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,8 +28,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -60,6 +66,7 @@ import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatContentPart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatProgressStep
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
 import com.tmuxworktree.mobile.core.relay.runtime.PendingChatSend
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
@@ -287,10 +294,16 @@ private fun TurnBubble(turn: AgentChatTurnView, chatState: RelayChatState) {
                 )
             }
         }
+        if (turn.progress.isNotEmpty()) {
+            AgentProgressCard(
+                progress = turn.progress,
+                isWorking = turn.status == "working",
+                turnId = turn.turnId,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
         // Agent reply or status (left side)
-        if (turn.status == "working") {
-            // typing indicator is shown at the list level; nothing else here
-        } else if (isFailed) {
+        if (isFailed) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -312,6 +325,108 @@ private fun TurnBubble(turn: AgentChatTurnView, chatState: RelayChatState) {
                 AgentBubble(content = turn.content, chatState = chatState)
             }
         }
+    }
+}
+
+@Composable
+private fun AgentProgressCard(
+    progress: List<AgentChatProgressStep>,
+    isWorking: Boolean,
+    turnId: String,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember(turnId) { mutableStateOf(false) }
+    val completedCount = progress.count { it.status == "completed" }
+    val summary = if (isWorking) {
+        "执行中 · ${progress.size} 个步骤"
+    } else {
+        "执行过程 · $completedCount/${progress.size}"
+    }
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = TwSurface,
+        border = androidx.compose.foundation.BorderStroke(1.dp, TwBorder),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("agent_progress_$turnId"),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .semantics { contentDescription = "$summary，${if (expanded) "收起" else "展开"}" }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = if (isWorking) Icons.Outlined.RadioButtonUnchecked else Icons.Outlined.CheckCircle,
+                    contentDescription = null,
+                    tint = if (isWorking) TwAccent else TwTextSecondary,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = summary,
+                    color = TwTextSecondary,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    imageVector = if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                    contentDescription = null,
+                    tint = TwTextMuted,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            if (expanded) {
+                HorizontalDivider(color = TwBorder, thickness = 1.dp)
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    progress.forEach { step ->
+                        ProgressStepRow(step)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProgressStepRow(step: AgentChatProgressStep) {
+    val icon = when (step.status) {
+        "completed" -> Icons.Outlined.CheckCircle
+        "failed" -> Icons.Outlined.WarningAmber
+        else -> Icons.Outlined.RadioButtonUnchecked
+    }
+    val tint = when (step.status) {
+        "failed" -> TwError
+        "running" -> TwAccent
+        else -> TwTextMuted
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("agent_progress_step_${step.stepId}"),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = tint,
+            modifier = Modifier
+                .padding(top = 2.dp)
+                .size(16.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = step.title,
+            color = if (step.status == "running") TwTextPrimary else TwTextSecondary,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 

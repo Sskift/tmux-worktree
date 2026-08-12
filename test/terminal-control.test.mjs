@@ -1139,10 +1139,21 @@ test("structured Claude and Codex transcripts yield only the exact final assista
     });
     assert.equal(codexSource.boundary, "exact");
     codexRows.push(
+      { type: "event_msg", timestamp: "2026-07-21T02:00:30.000Z", payload: { type: "agent_message", phase: "commentary", message: "Checking the current state" } },
+      { type: "response_item", timestamp: "2026-07-21T02:00:31.000Z", payload: { type: "function_call", name: "exec_command", call_id: "call-1", arguments: "sensitive command" } },
+      { type: "response_item", timestamp: "2026-07-21T02:00:32.000Z", payload: { type: "function_call_output", call_id: "call-1", output: "sensitive output" } },
       { type: "response_item", timestamp: "2026-07-21T02:01:00.000Z", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Codex final answer" }] } },
       { type: "event_msg", timestamp: "2026-07-21T02:01:01.000Z", payload: { type: "task_complete", turn_id: codexTurnId, last_agent_message: "Codex final answer" } },
     );
     writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    const codexProgress = terminalControl.readAgentProgress({
+      source: codexSource, cwd: codexCwd, home: root,
+    });
+    assert.deepEqual(codexProgress.map(({ kind, title, status }) => ({ kind, title, status })), [
+      { kind: "status", title: "Checking the current state", status: "completed" },
+      { kind: "tool", title: "执行命令", status: "completed" },
+    ]);
+    assert.doesNotMatch(JSON.stringify(codexProgress), /sensitive command|sensitive output/);
     assert.equal(terminalControl.readCompletedAgentResult({
       source: codexSource, cwd: codexCwd, home: root, maxBytes: 1024,
     }).text, "Codex final answer");

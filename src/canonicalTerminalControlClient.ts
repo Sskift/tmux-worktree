@@ -17,6 +17,7 @@ import {
   type TerminalControlOwner,
   type TerminalControlOwnerKind,
   type TerminalControlOwnershipView,
+  type TerminalControlAgentProgressStep,
   type TerminalControlAgentSource,
 } from "./terminalControl/protocol.js";
 import { terminalControlSocketPath } from "./terminalControl/store.js";
@@ -113,6 +114,7 @@ export interface CanonicalAgentStatusResult {
   agentSupported: boolean;
   agentRunning: boolean;
   source?: TerminalControlAgentSource;
+  progress?: TerminalControlAgentProgressStep[];
 }
 
 export interface CanonicalAgentResultInput extends CanonicalAgentStatusInput {
@@ -237,6 +239,32 @@ function requiredString(value: unknown, field: string, maxBytes = 1024): string 
     );
   }
   return value;
+}
+
+function parseAgentProgress(value: unknown): TerminalControlAgentProgressStep[] {
+  if (!Array.isArray(value) || value.length > 16) {
+    throw new CanonicalTerminalControlError(
+      "CONTROLLER_UNAVAILABLE",
+      "canonical terminal-control returned invalid Agent progress",
+    );
+  }
+  return value.map((item, index) => {
+    if (!isRecord(item)
+      || !exactKeys(item, ["stepId", "kind", "title", "status"])
+      || (item.kind !== "status" && item.kind !== "tool")
+      || (item.status !== "running" && item.status !== "completed" && item.status !== "failed")) {
+      throw new CanonicalTerminalControlError(
+        "CONTROLLER_UNAVAILABLE",
+        `canonical terminal-control returned invalid Agent progress item ${index}`,
+      );
+    }
+    return {
+      stepId: requiredString(item.stepId, `agentProgress[${index}].stepId`, 128),
+      kind: item.kind,
+      title: requiredString(item.title, `agentProgress[${index}].title`, 240),
+      status: item.status,
+    };
+  });
 }
 
 function decimal(value: unknown, field: string): string {
@@ -415,7 +443,7 @@ export function parseCanonicalAgentStatusResult(
       "pane",
       "agentSupported",
       "agentRunning",
-    ], ["source"])
+    ], ["source", "progress"])
     || typeof value.agentSupported !== "boolean"
     || typeof value.agentRunning !== "boolean") {
     throw new CanonicalTerminalControlError(
@@ -444,9 +472,13 @@ export function parseCanonicalAgentStatusResult(
     ...(value.source === undefined ? {} : {
       source: parseAgentSource(value.source, "agentStatus.source"),
     }),
+    ...(value.progress === undefined ? {} : {
+      progress: parseAgentProgress(value.progress),
+    }),
   };
   if ((!result.agentSupported && (result.agentRunning || result.source !== undefined))
-    || result.agentRunning !== (result.source !== undefined)) {
+    || result.agentRunning !== (result.source !== undefined)
+    || (!result.agentRunning && (result.progress?.length ?? 0) > 0)) {
     throw new CanonicalTerminalControlError(
       "CONTROLLER_UNAVAILABLE",
       "canonical terminal-control returned an Agent status without exact result correlation",

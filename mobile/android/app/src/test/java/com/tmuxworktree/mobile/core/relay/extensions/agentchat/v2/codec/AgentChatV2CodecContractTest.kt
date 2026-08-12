@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec
 
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatMarkdownPart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatProgressStep
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import java.nio.charset.StandardCharsets
@@ -84,6 +85,10 @@ class AgentChatV2CodecContractTest {
                     sha256 = "a".repeat(64),
                 ),
             ),
+            progress = listOf(
+                AgentChatProgressStep("step-1", "status", "正在检查链路", "completed"),
+                AgentChatProgressStep("step-2", "tool", "执行命令", "completed"),
+            ),
             sentAt = "2026-08-06T00:00:00Z",
             completedAt = "2026-08-06T00:00:01Z",
             steeredMessages = listOf(
@@ -108,6 +113,7 @@ class AgentChatV2CodecContractTest {
         assertEquals("**hi there**", (view.content.first() as AgentChatMarkdownPart).text)
         assertEquals("2026-08-06T00:00:01Z", view.completedAt)
         assertEquals(1, view.steeredMessages.size)
+        assertEquals(2, view.progress.size)
 
         val workingTurn = repliedTurn.copy(
             status = "working",

@@ -30,12 +30,15 @@ import {
   TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   TerminalControlProtocolError,
   type TerminalControlAgentResult,
+  type TerminalControlAgentProgressStep,
   type TerminalControlAgentSource,
 } from "./protocol";
 import {
   agentProviderFromStartCommand,
+  discoverActiveAgentActivity,
   discoverActiveAgentSource,
   discoverLatestResumableAgentSession,
+  readAgentProgress,
   readCompletedAgentResult,
   resumedAgentSessionIdFromStartCommand,
 } from "./agentTranscript";
@@ -165,6 +168,7 @@ export interface TerminalControlAgentStatus {
   agentSupported: boolean;
   agentRunning: boolean;
   source?: TerminalControlAgentSource;
+  progress?: TerminalControlAgentProgressStep[];
 }
 
 export interface ResolvedManagedTerminalBackend {
@@ -2289,19 +2293,29 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     }
     if (boundary?.capturedSource !== undefined) {
       const source = boundary.capturedSource;
+      let progress: TerminalControlAgentProgressStep[] = [];
+      try {
+        progress = readAgentProgress({ source, cwd: observed.paneCurrentPath });
+      } catch (error) {
+        if (!(error instanceof TerminalControlProtocolError
+          && error.code === "RESOURCE_EXHAUSTED"
+          && error.retryable)) throw error;
+      }
       delete boundary.capturedSource;
-      return { agentSupported: true, agentRunning: true, source };
+      return { agentSupported: true, agentRunning: true, source, progress };
     }
     if (!observed.agentRunning) return { agentSupported: true, agentRunning: false };
+    const activity = discoverActiveAgentActivity({
+      provider,
+      cwd: observed.paneCurrentPath,
+      sessionId: boundary?.sessionId ?? resumedSessionId,
+      startedAtNotBefore: boundary?.startedAtNotBefore,
+    });
     return {
       agentSupported: true,
       agentRunning: true,
-      source: discoverActiveAgentSource({
-        provider,
-        cwd: observed.paneCurrentPath,
-        sessionId: boundary?.sessionId ?? resumedSessionId,
-        startedAtNotBefore: boundary?.startedAtNotBefore,
-      }),
+      source: activity.source,
+      progress: activity.progress,
     };
   }
 

@@ -6,6 +6,7 @@ data class AgentChatTurnView(
     val userMessage: String,
     val status: String,
     val content: List<AgentChatContentPart> = emptyList(),
+    val progress: List<AgentChatProgressStep> = emptyList(),
     val error: String? = null,
     val sentAt: String,
     val completedAt: String? = null,
@@ -17,6 +18,13 @@ sealed interface AgentChatContentPart
 data class AgentChatMarkdownPart(
     val text: String,
 ) : AgentChatContentPart
+
+data class AgentChatProgressStep(
+    val stepId: String,
+    val kind: String,
+    val title: String,
+    val status: String,
+)
 
 data class AgentChatImagePart(
     val imageId: String,

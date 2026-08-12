@@ -4,6 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type {
+  TerminalControlAgentProgressStep,
   TerminalControlAgentSource,
   TerminalControlLease,
   TerminalControlOwner,
@@ -72,6 +73,7 @@ type ChatTurn = {
   userMessage: string;
   status: "working" | "replied" | "failed" | "recovery-required";
   content: ChatContentPart[] | null;
+  progress: TerminalControlAgentProgressStep[];
   error: string | null;
   sentAt: string;
   completedAt: string | null;
@@ -172,7 +174,12 @@ function storedConversation(value: unknown, scopeId: string, sessionId: string):
     || (value.activeSource !== null && !isRecord(value.activeSource))) {
     throw new Error("Relay v2 Agent conversation state is invalid");
   }
-  return structuredClone(value) as StoredConversation;
+  const state = structuredClone(value) as StoredConversation;
+  state.turns = state.turns.map((turn) => ({
+    ...turn,
+    progress: Array.isArray(turn.progress) ? turn.progress : [],
+  }));
+  return state;
 }
 
 function stateKey(scopeId: string, sessionId: string): string {
@@ -429,6 +436,7 @@ function parseAgentStatus(value: unknown, control: ControlSession): {
   agentSupported: boolean;
   agentRunning: boolean;
   source: TerminalControlAgentSource | null;
+  progress: TerminalControlAgentProgressStep[];
 } {
   if (!isRecord(value)
     || value.controlTargetId !== control.lease.controlTargetId
@@ -441,13 +449,30 @@ function parseAgentStatus(value: unknown, control: ControlSession): {
     || typeof value.agentSupported !== "boolean"
     || typeof value.agentRunning !== "boolean"
     || (!value.agentSupported && value.agentRunning)
-    || value.agentRunning !== isRecord(value.source)) {
+    || value.agentRunning !== isRecord(value.source)
+    || (value.progress !== undefined && !Array.isArray(value.progress))) {
     throw new Error("Relay v2 Agent status is invalid");
+  }
+  const progress = value.progress === undefined ? [] : value.progress.map((item) => {
+    if (!isRecord(item)
+      || !opaque(item.stepId)
+      || (item.kind !== "status" && item.kind !== "tool")
+      || typeof item.title !== "string"
+      || item.title.length === 0
+      || Buffer.byteLength(item.title, "utf8") > 240
+      || (item.status !== "running" && item.status !== "completed" && item.status !== "failed")) {
+      throw new Error("Relay v2 Agent progress is invalid");
+    }
+    return structuredClone(item) as TerminalControlAgentProgressStep;
+  });
+  if (progress.length > 16 || (!value.agentRunning && progress.length > 0)) {
+    throw new Error("Relay v2 Agent progress is invalid");
   }
   return {
     agentSupported: value.agentSupported,
     agentRunning: value.agentRunning,
     source: value.agentRunning ? structuredClone(value.source) as TerminalControlAgentSource : null,
+    progress,
   };
 }
 
@@ -871,6 +896,7 @@ export class RelayV2AgentConversationAuthority {
           userMessage: message,
           status: "working",
           content: null,
+          progress: [],
           error: null,
           sentAt: timestamp(now),
           completedAt: null,
@@ -948,6 +974,16 @@ export class RelayV2AgentConversationAuthority {
         if (status.agentRunning) {
           active.source = status.source;
           const state = await this.readState(active.context.scopeId, active.context.sessionId);
+          let chatTurn: ChatTurn | null = null;
+          let progressChanged = false;
+          if (state && active.turnId !== null) {
+            chatTurn = state.turns.find((turn) => turn.turnId === active.turnId) ?? null;
+            if (chatTurn
+              && JSON.stringify(chatTurn.progress) !== JSON.stringify(status.progress)) {
+              chatTurn.progress = status.progress;
+              progressChanged = true;
+            }
+          }
           if (state && status.source && state.activeSource?.sourceId !== status.source.sourceId) {
             const events: RelayV2JsonObject[] = [];
             state.activeSource = status.source;
@@ -959,7 +995,10 @@ export class RelayV2AgentConversationAuthority {
             }, this.now()));
             await this.writeState(state);
             await this.publishTimeline(state, events);
+          } else if (state && progressChanged) {
+            await this.writeState(state);
           }
+          if (state && chatTurn && progressChanged) await this.publishChat(state, chatTurn);
           if (this.now() >= active.deadlineAtMs) {
             throw Object.assign(new Error("Agent turn timed out"), { code: "TURN_TIMEOUT" });
           }
@@ -1025,6 +1064,9 @@ export class RelayV2AgentConversationAuthority {
         const steered = state.pendingSteered.find((item) => item.turnId === chatTurn!.turnId);
         chatTurn.status = "replied";
         chatTurn.content = materialized.content;
+        chatTurn.progress = chatTurn.progress.map((step) => (
+          step.status === "running" ? { ...step, status: "completed" } : step
+        ));
         chatTurn.error = null;
         chatTurn.completedAt = completedAt;
         chatTurn.steeredMessages = steered?.messages.length ? steered.messages : null;
@@ -1085,6 +1127,9 @@ export class RelayV2AgentConversationAuthority {
       if (chatTurn) {
         chatTurn.status = "failed";
         chatTurn.error = boundedError(error);
+        chatTurn.progress = chatTurn.progress.map((step) => (
+          step.status === "running" ? { ...step, status: "failed" } : step
+        ));
         chatTurn.completedAt = timestamp(now);
         chatTurn.content = null;
         const steered = state.pendingSteered.find((item) => item.turnId === chatTurn!.turnId);
