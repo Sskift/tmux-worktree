@@ -1197,6 +1197,29 @@ test("structured Claude and Codex transcripts yield only the exact final assista
       }),
       (error) => error.code === "RESOURCE_EXHAUSTED" && error.retryable === true,
     );
+    codexRows.push({
+      type: "event_msg",
+      timestamp: "2026-07-21T02:03:00.001Z",
+      payload: {
+        type: "item_completed",
+        turn_id: preBoundaryTurnId,
+        item: { type: "UserMessage", content: [{ type: "text", text: "mobile input" }] },
+      },
+    });
+    writeFileSync(codexPath, `${codexRows.map(JSON.stringify).join("\n")}\n`, { mode: 0o600 });
+    assert.equal(terminalControl.discoverActiveAgentSource({
+      provider: "codex",
+      cwd: codexCwd,
+      home: root,
+      sessionId: codexSessionId,
+      startedAtNotBefore,
+      expectedUserMessage: "mobile input",
+    }).turnId, preBoundaryTurnId);
+    codexRows.push({
+      type: "event_msg",
+      timestamp: "2026-07-21T02:03:00.002Z",
+      payload: { type: "task_complete", turn_id: preBoundaryTurnId, last_agent_message: "done" },
+    });
     const freshTurnId = "019f6666-6666-7666-8666-666666666666";
     codexRows.push(
       { type: "event_msg", timestamp: "2026-07-21T02:03:01.000Z", payload: { type: "task_started", turn_id: freshTurnId } },

@@ -312,6 +312,7 @@ type AgentSourceBoundary = {
   cwd: string;
   sessionId?: string;
   startedAtNotBefore: string;
+  expectedUserMessage: string;
   capturedSource?: TerminalControlAgentSource;
 };
 
@@ -877,6 +878,7 @@ function pendingAgentSource(boundary: AgentSourceBoundary): TerminalControlAgent
       cwd: boundary.cwd,
       sessionId: boundary.sessionId,
       startedAtNotBefore: boundary.startedAtNotBefore,
+      expectedUserMessage: boundary.expectedUserMessage,
     });
   } catch (error) {
     if (error instanceof TerminalControlProtocolError
@@ -1818,6 +1820,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
           cwd: observed.paneCurrentPath,
           ...(sessionId === undefined ? {} : { sessionId }),
           startedAtNotBefore: new Date().toISOString(),
+          expectedUserMessage: message,
         };
         this.agentSourceBoundaries.set(boundaryKey, boundary);
       }
@@ -1895,6 +1898,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         cwd: observed.paneCurrentPath,
         ...(sessionId === undefined ? {} : { sessionId }),
         startedAtNotBefore: new Date().toISOString(),
+        expectedUserMessage: message,
       };
       this.agentSourceBoundaries.set(boundaryKey, boundary);
       await pasteAgentMessage(observed.paneId, message, submit);
@@ -2310,6 +2314,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       cwd: observed.paneCurrentPath,
       sessionId: boundary?.sessionId ?? resumedSessionId,
       startedAtNotBefore: boundary?.startedAtNotBefore,
+      expectedUserMessage: boundary?.expectedUserMessage,
     });
     return {
       agentSupported: true,

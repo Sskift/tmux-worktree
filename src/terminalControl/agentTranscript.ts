@@ -513,6 +513,28 @@ function activeCodexSource(records: JsonRecord[], cwd: string): TerminalControlA
   return undefined;
 }
 
+function codexHasUserMessageAtOrAfter(
+  records: JsonRecord[],
+  turnId: string,
+  startedAt: string,
+  expectedMessage: string,
+): boolean {
+  return records.some((record) => {
+    if (record.type !== "event_msg" || !isRecord(record.payload)
+      || record.payload.type !== "item_completed"
+      || record.payload.turn_id !== turnId
+      || !isRecord(record.payload.item)
+      || record.payload.item.type !== "UserMessage"
+      || !Array.isArray(record.payload.item.content)) return false;
+    const occurredAt = exactTimestamp(record.timestamp);
+    return occurredAt !== undefined
+      && occurredAt >= startedAt
+      && record.payload.item.content.some((part: unknown) => (
+        isRecord(part) && part.type === "text" && part.text === expectedMessage
+      ));
+  });
+}
+
 function codexResult(
   records: JsonRecord[],
   cwd: string,
@@ -776,6 +798,7 @@ export function discoverActiveAgentSource(input: {
   home?: string;
   sessionId?: string;
   startedAtNotBefore?: string;
+  expectedUserMessage?: string;
 }): TerminalControlAgentSource {
   return discoverActiveAgentActivity(input).source;
 }
@@ -786,6 +809,7 @@ export function discoverActiveAgentActivity(input: {
   home?: string;
   sessionId?: string;
   startedAtNotBefore?: string;
+  expectedUserMessage?: string;
 }): { source: TerminalControlAgentSource; progress: TerminalControlAgentProgressStep[] } {
   const home = input.home ?? homedir();
   const startedAtNotBefore = input.startedAtNotBefore === undefined
@@ -817,6 +841,14 @@ export function discoverActiveAgentActivity(input: {
       && (input.sessionId === undefined || found.sessionId === input.sessionId)
       && (startedAtNotBefore === undefined
         || found.startedAt >= startedAtNotBefore
+        || (input.provider === "codex"
+          && input.expectedUserMessage !== undefined
+          && codexHasUserMessageAtOrAfter(
+            records,
+            found.turnId,
+            startedAtNotBefore,
+            input.expectedUserMessage,
+          ))
         || (input.provider === "claude"
           && found.boundary === "after"
           && claudeHasHumanTurnAtOrAfter(
