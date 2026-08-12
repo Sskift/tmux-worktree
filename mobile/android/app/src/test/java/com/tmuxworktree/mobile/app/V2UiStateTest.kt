@@ -108,6 +108,15 @@ class V2UiStateTest {
     }
 
     @Test
+    fun dashboardHostUsesTheMacDeviceName() {
+        assertEquals(
+            "D2N6M7MMCX",
+            relayHostDisplayName("dashboard-c6777640f11d1abb6e6e83afa8d6e911"),
+        )
+        assertEquals("devbox", relayHostDisplayName("devbox"))
+    }
+
+    @Test
     fun relayV2CreateSubmissionIsFencedUntilQueuedResultLeavesTheForm() {
         val initial = V2UiState(relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2)
 
