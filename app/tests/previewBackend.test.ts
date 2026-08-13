@@ -57,7 +57,7 @@ test("preview PTY follows the same facade and emits deterministic output", async
   await Promise.resolve();
 
   assert.equal(connection.active, true);
-  assert.match(chunks.join(""), /preview backend connected/);
+  assert.match(chunks.join(""), /Workspace ready\. Agent output is live\./);
   await connection.close();
   assert.equal(previewDashboardTransport.listenerCount(`pty:${id}`), 0);
   assert.equal(previewDashboardTransport.listenerCount(`pty-exit:${id}`), 0);

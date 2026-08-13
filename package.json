@@ -20,6 +20,7 @@
   },
   "scripts": {
     "build": "tsup && tsup --config tsup.standalone.config.ts",
+    "demo": "npm --prefix app run demo",
     "test:cli": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
     "verify": "sh scripts/verify.sh core",
     "verify:android": "sh scripts/verify.sh android",
