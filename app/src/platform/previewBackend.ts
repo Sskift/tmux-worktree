@@ -84,7 +84,7 @@ const hostStatuses: HostStatus[] = [
     latencyMs: 24,
     error: null,
     twAvailable: true,
-    twVersion: "1.0.3",
+    twVersion: "1.0.14",
     twError: null,
   },
 ];
@@ -140,8 +140,8 @@ const automationRuns: AutomationRunRecord[] = [
 ];
 
 const gitStatus: GitStatus = {
-  branch: "tmux-worktree-app-re-ddf7c",
-  upstream: "origin/tmux-worktree-app-re-ddf7c",
+  branch: "feature/mission-control",
+  upstream: "origin/feature/mission-control",
   ahead: 2,
   behind: 0,
   staged: 0,
@@ -156,31 +156,31 @@ const gitStatus: GitStatus = {
 };
 
 const graphRefs: GitGraphRef[] = [
-  { name: "refs/heads/tmux-worktree-app-re-ddf7c", shortName: "tmux-worktree-app-re-ddf7c", kind: "local", current: true, upstream: "refs/remotes/origin/tmux-worktree-app-re-ddf7c" },
+  { name: "refs/heads/feature/mission-control", shortName: "feature/mission-control", kind: "local", current: true, upstream: "refs/remotes/origin/feature/mission-control" },
   { name: "refs/heads/main", shortName: "main", kind: "local", current: false, upstream: "refs/remotes/origin/main" },
   { name: "refs/heads/feature/renderer", shortName: "feature/renderer", kind: "local", current: false, upstream: null },
-  { name: "refs/remotes/origin/tmux-worktree-app-re-ddf7c", shortName: "origin/tmux-worktree-app-re-ddf7c", kind: "remote", current: false, upstream: null },
+  { name: "refs/remotes/origin/feature/mission-control", shortName: "origin/feature/mission-control", kind: "remote", current: false, upstream: null },
   { name: "refs/remotes/origin/main", shortName: "origin/main", kind: "remote", current: false, upstream: null },
-  { name: "refs/tags/v1.0.3", shortName: "v1.0.3", kind: "tag", current: false, upstream: null },
+  { name: "refs/tags/v1.0.14", shortName: "v1.0.14", kind: "tag", current: false, upstream: null },
 ];
 
 const refByName = new Map(graphRefs.map((ref) => [ref.name, ref]));
 const decoration = (name: string): GitGraphRef => ({ ...refByName.get(name)! });
 const graphCommits: GitGraphCommit[] = [
-  { hash: "a1b2c3d000000000000000000000000000000001", short: "a1b2c3d", parents: ["b2c3d4e000000000000000000000000000000002"], subject: "feat(editor): refine CodeMirror workspace", author: "Dashboard Preview", relTime: "4 minutes ago", decorations: [{ name: "HEAD", shortName: "HEAD", kind: "head", current: true, upstream: null }, decoration("refs/heads/tmux-worktree-app-re-ddf7c")] },
-  { hash: "b2c3d4e000000000000000000000000000000002", short: "b2c3d4e", parents: ["c3d4e5f000000000000000000000000000000003", "f6a7b8c000000000000000000000000000000006"], subject: "merge: renderer graph into dashboard", author: "Dashboard Preview", relTime: "18 minutes ago", decorations: [decoration("refs/remotes/origin/tmux-worktree-app-re-ddf7c")] },
+  { hash: "a1b2c3d000000000000000000000000000000001", short: "a1b2c3d", parents: ["b2c3d4e000000000000000000000000000000002"], subject: "feat(editor): refine CodeMirror workspace", author: "Dashboard Preview", relTime: "4 minutes ago", decorations: [{ name: "HEAD", shortName: "HEAD", kind: "head", current: true, upstream: null }, decoration("refs/heads/feature/mission-control")] },
+  { hash: "b2c3d4e000000000000000000000000000000002", short: "b2c3d4e", parents: ["c3d4e5f000000000000000000000000000000003", "f6a7b8c000000000000000000000000000000006"], subject: "merge: renderer graph into dashboard", author: "Dashboard Preview", relTime: "18 minutes ago", decorations: [decoration("refs/remotes/origin/feature/mission-control")] },
   { hash: "c3d4e5f000000000000000000000000000000003", short: "c3d4e5f", parents: ["d4e5f6a000000000000000000000000000000004"], subject: "fix(editor): preserve cursor and undo history", author: "Maya Patel", relTime: "31 minutes ago", decorations: [] },
   { hash: "d4e5f6a000000000000000000000000000000004", short: "d4e5f6a", parents: ["e5f6a7b000000000000000000000000000000005"], subject: "style(editor): align syntax palette with shell", author: "Maya Patel", relTime: "1 hour ago", decorations: [] },
   { hash: "f6a7b8c000000000000000000000000000000006", short: "f6a7b8c", parents: ["a7b8c9d000000000000000000000000000000007"], subject: "feat(git): add compact commit topology", author: "Alex Chen", relTime: "44 minutes ago", decorations: [decoration("refs/heads/feature/renderer")] },
   { hash: "a7b8c9d000000000000000000000000000000007", short: "a7b8c9d", parents: ["e5f6a7b000000000000000000000000000000005"], subject: "test(git): cover fork and merge lanes", author: "Alex Chen", relTime: "2 hours ago", decorations: [] },
   { hash: "e5f6a7b000000000000000000000000000000005", short: "e5f6a7b", parents: ["c8d9e0f000000000000000000000000000000008"], subject: "refactor: separate files from Git workspace", author: "Dashboard Preview", relTime: "yesterday", decorations: [decoration("refs/heads/main"), decoration("refs/remotes/origin/main")] },
-  { hash: "c8d9e0f000000000000000000000000000000008", short: "c8d9e0f", parents: [], subject: "release: dashboard v1.0.3", author: "Release Bot", relTime: "2 days ago", decorations: [decoration("refs/tags/v1.0.3")] },
+  { hash: "c8d9e0f000000000000000000000000000000008", short: "c8d9e0f", parents: [], subject: "release: dashboard v1.0.14", author: "Release Bot", relTime: "2 days ago", decorations: [decoration("refs/tags/v1.0.14")] },
 ];
 
 const gitGraphRefs: GitGraphRefs = {
   refs: graphRefs,
-  current: "refs/heads/tmux-worktree-app-re-ddf7c",
-  upstream: "refs/remotes/origin/tmux-worktree-app-re-ddf7c",
+  current: "refs/heads/feature/mission-control",
+  upstream: "refs/remotes/origin/feature/mission-control",
 };
 
 const gitGraph: GitGraphResponse = {
@@ -277,17 +277,27 @@ const previewDirectories = new Map<string, Array<{
 
 const relayV2DeploymentStatus = {
   feature: "explicit_self_hosted",
-  configured: false,
-  config: null,
-  bundleStatus: "missing",
-  tlsStatus: "missing",
-  centerStatus: "stopped",
-  hostBootstrapAvailable: false,
+  configured: true,
+  config: {
+    enabled: true,
+    brokerHostId: "builder-1",
+    issuerUrl: "https://relay.preview.invalid",
+    listenHost: "127.0.0.1",
+    listenPort: 7443,
+    tlsKeyPath: "/Users/demo/.tmux-worktree/preview/tls.key",
+    tlsCertificatePath: "/Users/demo/.tmux-worktree/preview/tls.crt",
+    tlsCaPath: "/Users/demo/.tmux-worktree/preview/ca.pem",
+    externalTlsManagement: true,
+  },
+  bundleStatus: "ready",
+  tlsStatus: "ready",
+  centerStatus: "running",
+  hostBootstrapAvailable: true,
   hostBootstrapPending: false,
-  hostCredentialProvisioned: false,
-  profileProvisioned: false,
-  connectorDesiredRunning: false,
-  effective: false,
+  hostCredentialProvisioned: true,
+  profileProvisioned: true,
+  connectorDesiredRunning: true,
+  effective: true,
   bootstrapRotationPending: false,
   remoteTlsKeyPath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.key",
   remoteTlsCertificatePath: "~/.tmux-worktree/relay-v2-self-hosted/tls/tls.crt",
@@ -408,7 +418,7 @@ transport.handlers.set("tmux_session_exists", value(true));
 transport.handlers.set("session_root", value("/Users/demo/Code/tmux-worktree"));
 transport.handlers.set("session_cwd", value("/Users/demo/Code/tmux-worktree"));
 transport.handlers.set("capture_pane_history", value([
-  "\u001b[1;34m~/Code/tmux-worktree\u001b[0m  \u001b[2m(tmux-worktree-app-re-ddf7c)\u001b[0m",
+  "\u001b[1;34m~/Code/tmux-worktree\u001b[0m  \u001b[2m(feature/mission-control)\u001b[0m",
   "$ codex",
   "\u001b[2mAnalyzing dashboard architecture and preserving the active PTY…\u001b[0m",
   "",
@@ -587,7 +597,7 @@ transport.handlers.set("pty_open", (payload) => {
   queueMicrotask(() => {
     transport.emit(`pty:${args.id}`, {
       id: args.id,
-      data: "\r\n\u001b[2m[preview backend connected]\u001b[0m\r\n$ ",
+      data: "\r\n\u001b[2mWorkspace ready. Agent output is live.\u001b[0m\r\n$ ",
     });
   });
   return args.id;

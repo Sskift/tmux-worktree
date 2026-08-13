@@ -7,3 +7,5 @@ mobile/android/.gradle/
 mobile/android/.kotlin/
 mobile/android/**/build/
 mobile/android/local.properties
+docs/demo/build/
+docs/assets/*.mp4

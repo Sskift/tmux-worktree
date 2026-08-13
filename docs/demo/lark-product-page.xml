@@ -1,0 +1,116 @@
+<title>TW｜你的 Agent，你的机器，一张控制台</title>
+
+<p align="center"><span text-color="purple"><b>TW · AGENT MISSION CONTROL</b></span></p>
+<h1 align="center">AI 在跑，你不必守着。</h1>
+<p align="center">让多个 AI 编码 Agent 在彼此隔离的工作区里并行工作。所有进展、所有等待、所有真正需要你的事，都回到同一张控制台。</p>
+<p align="center"><b>Your agents. Your machines. One control room.</b></p>
+
+<button action="OpenLink" src="https://github.com/Sskift/tmux-worktree/releases/latest" background-color="light-purple">下载 macOS 版</button>
+<button action="OpenLink" src="https://github.com/Sskift/tmux-worktree" background-color="light-gray">查看 GitHub 仓库</button>
+
+<p align="center"><span text-color="gray">产品片 · 52 秒</span></p>
+<p align="center"><b>点击播放完整产品片</b></p>
+
+<hr/>
+
+<h1>一个 Agent 很简单。一整队 Agent，是另一回事。</h1>
+
+<p>编码 Agent 改变了瓶颈。难点不再是启动一个 Agent，而是同时推进多个任务，又不丢掉分支、终端、机器与未完成的对话。</p>
+
+<p>TW 不是另一个 coding agent，也不是另一个云 IDE。它把你已经在用的 Claude Code、Codex、Gemini CLI、OpenCode、Aider、Kimi Code，以及现有 Mac、SSH 主机与 Git 仓库，组织成一间本地优先的 Agent 控制室。</p>
+
+<p><b>真实产品画面 · Mission Control</b></p>
+
+<h1>一起开工。互不打架。</h1>
+
+<p>选定仓库、基线分支、Agent 与目标机器，TW 会为任务创建专属 branch、Git worktree 和受管理的 tmux session。每个 Agent 都有自己的工位，不共用 checkout，也不会让未提交修改彼此污染。</p>
+
+<p>本机任务与 SSH devbox 上的任务出现在同一份目录里。任务在远程机器上运行，不代表它必须消失在另一个终端窗口里。</p>
+
+<h1>少巡视终端。只处理变化。</h1>
+
+<p>Mission Control 把许多终端窗口变成一条注意力队列。谁在运行、谁有新输出、谁停了、谁等你审阅，一眼就能看到。Agent Inbox 主动把下一次决策送到你面前。</p>
+
+<p>你可以启动更多工作，却不必盯着更多终端。真正需要判断时，再点进那个任务。</p>
+
+<h1>在工作发生的地方，审查工作。</h1>
+
+<p>终端、文件树、源码编辑器、Git 状态、diff 与 commit graph 都属于同一个 worktree。从 Agent 的回答到真正发生改变的那一行代码，不必再去另一款应用里重新拼上下文。</p>
+
+<p><b>真实产品画面 · 代码与 Git</b></p>
+
+<h1>离开电脑。不离开任务。</h1>
+
+<p>TW 可以连接眼前的 Mac、远处的 SSH devbox、Android 客户端与飞书群聊。Relay v2 让已配对手机看到同一份受管理任务目录；飞书绑定则让团队在选定的本机 Agent session 中继续追问，并把结果带回会话。</p>
+
+<p>终端输入不是“谁连上谁就能写”。目标级 ownership lease 与 fencing 会保护支持的输入路径，避免桌面、手机、CLI 与飞书在接力时互相抢键盘。系统不能证明安全时，会拒绝输入，而不是猜测或重放。</p>
+
+<h1>把重复的事，交给自动化。</h1>
+
+<p>把日常 review、检查与总结提示词保存成 Automation，随时运行，或用 cron 表达式和时区定时触发。每次运行都会成为一个可检查的 session，而不是消失在后台日志里。</p>
+
+<p>当前 Automation 由正在运行的 Dashboard 负责调度。这是一个本地生产力功能，不是假装常驻云端的调度服务。</p>
+
+<hr/>
+
+<h1>围绕你已经在用的工具，而不是取代它们。</h1>
+
+<table>
+  <colgroup><col width="150"/><col width="430"/></colgroup>
+  <thead><tr><th background-color="light-gray">产品面</th><th background-color="light-gray">它负责什么</th></tr></thead>
+  <tbody>
+    <tr><td><b>TW Dashboard</b></td><td>原生 macOS Mission Control：Agent Inbox、worktree、terminal、文件、Git、连接与 Automation。</td></tr>
+    <tr><td><b>tw CLI</b></td><td>创建和管理隔离 worktree session、terminal、SSH Host、Automation 与机器可读生命周期 RPC。</td></tr>
+    <tr><td><b>TW Mobile</b></td><td>面向已配对 Relay v2 Host 的 Android 客户端，支持任务可见性、Agent 对话与 terminal。</td></tr>
+    <tr><td><b>飞书 Bridge</b></td><td>把授权群聊绑定到一个确切的本机 managed session，并受控地交接输入权。</td></tr>
+  </tbody>
+</table>
+
+<h1>三分钟，开始第一个任务。</h1>
+
+<p>想先看看产品，不必碰任何真实仓库。仓库内置了确定性的假数据 Demo：</p>
+
+<pre lang="bash" caption="零风险产品 Demo"><code>git clone https://github.com/Sskift/tmux-worktree.git
+cd tmux-worktree
+npm install
+npm --prefix app install
+npm run demo</code></pre>
+
+<p>要创建真正的隔离任务，先在每台目标机器安装 Git、tmux、Node.js 20+ 与 tw：</p>
+
+<pre lang="bash" caption="创建第一个真实任务"><code>npm install
+npm run build
+npm link
+tw setup
+tw doctor
+tw codex /path/to/your/repository improve-search</code></pre>
+
+<button action="OpenLink" src="https://github.com/Sskift/tmux-worktree/blob/master/docs/quickstart.md" background-color="light-blue">打开完整快速开始</button>
+
+<h1>今天已经可用。</h1>
+
+<table>
+  <colgroup><col width="390"/><col width="190"/></colgroup>
+  <thead><tr><th background-color="light-gray">能力</th><th background-color="light-gray">状态</th></tr></thead>
+  <tbody>
+    <tr><td>macOS Dashboard、tw CLI、本机 managed worktree</td><td><span text-color="green">可用</span></td></tr>
+    <tr><td>SSH Host、文件编辑、Git diff / graph、手动 Automation</td><td><span text-color="green">可用</span></td></tr>
+    <tr><td>定时 Automation</td><td>Dashboard 运行期间可用</td></tr>
+    <tr><td>本机 managed session 的飞书绑定</td><td>配置 lark-cli 后可用</td></tr>
+    <tr><td>Relay v2 self-hosted</td><td>显式个人 / 单节点模式</td></tr>
+    <tr><td>Android 客户端</td><td><span text-color="yellow">设备测试构建</span></td></tr>
+  </tbody>
+</table>
+
+<callout emoji="📌" background-color="light-gray" border-color="gray">
+  <p><b>坦诚的边界。</b>TW 面向个人开发者或在自有机器上协作的可信小团队。Dashboard 目前仅支持 macOS；TW Mobile 仅支持 Android，且当前 revision 尚未发布签名生产包；Relay v2 self-hosted 不是多租户 SaaS 控制面。多数 CLI Agent 使用它们原生的 terminal 交互，而不是统一的结构化 tool-call 协议。</p>
+</callout>
+
+<hr/>
+
+<h1 align="center">让 Agent 多跑一点。让你少守几个终端。</h1>
+<p align="center"><b>你的 Agent。你的机器。一张控制台。</b></p>
+<p align="center"><span text-color="gray">Local-first · Self-hosted · MIT Licensed</span></p>
+
+<button action="OpenLink" src="https://github.com/Sskift/tmux-worktree/releases/latest" background-color="light-purple">下载 TW</button>
+<button action="OpenLink" src="https://github.com/Sskift/tmux-worktree" background-color="light-gray">从源码开始</button>
