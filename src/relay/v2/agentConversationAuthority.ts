@@ -16,8 +16,11 @@ import {
   encodeRelayAgentChatFrame,
   encodeRelayAgentChatUnavailableError,
   RELAY_AGENT_CHAT_CAPABILITY,
+  RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
   RELAY_AGENT_CHAT_IMAGE_CHUNK_BYTES,
   RELAY_AGENT_CHAT_MAX_IMAGE_BYTES,
+  type RelayAgentChatRuntimeSettings,
+  type RelayAgentChatRuntimeSettingsStatus,
 } from "../extensions/agentChat/v2/codec.js";
 import {
   decodeRelayAgentTranscriptLifecycleFrame,
@@ -435,6 +438,7 @@ function parseOwnership(value: unknown, lease: TerminalControlLease): string {
 function parseAgentStatus(value: unknown, control: ControlSession): {
   agentSupported: boolean;
   agentRunning: boolean;
+  provider: "claude" | "codex" | null;
   source: TerminalControlAgentSource | null;
   progress: TerminalControlAgentProgressStep[];
 } {
@@ -448,6 +452,7 @@ function parseAgentStatus(value: unknown, control: ControlSession): {
     || value.pane !== "0"
     || typeof value.agentSupported !== "boolean"
     || typeof value.agentRunning !== "boolean"
+    || (value.provider !== undefined && value.provider !== "claude" && value.provider !== "codex")
     || (!value.agentSupported && value.agentRunning)
     || value.agentRunning !== isRecord(value.source)
     || (value.progress !== undefined && !Array.isArray(value.progress))) {
@@ -471,6 +476,9 @@ function parseAgentStatus(value: unknown, control: ControlSession): {
   return {
     agentSupported: value.agentSupported,
     agentRunning: value.agentRunning,
+    provider: value.provider === "claude" || value.provider === "codex"
+      ? value.provider
+      : null,
     source: value.agentRunning ? structuredClone(value.source) as TerminalControlAgentSource : null,
     progress,
   };
@@ -504,6 +512,7 @@ export class RelayV2AgentConversationAuthority {
   private readonly now: () => number;
   private readonly lanes = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, ActiveTurn>();
+  private readonly agentProviders = new Map<string, "claude" | "codex">();
   private readonly chat: ExtensionState = { sink: null, ready: true, closed: false };
   private readonly timeline: ExtensionState = { sink: null, ready: true, closed: false };
   private closeBarrier: Promise<void> | null = null;
@@ -757,6 +766,7 @@ export class RelayV2AgentConversationAuthority {
   private async ensureState(
     context: RelayV2HostOptionalExtensionRouteContext,
   ): Promise<StoredConversation | null> {
+    const key = stateKey(context.scopeId, context.sessionId);
     const existing = await this.readState(context.scopeId, context.sessionId);
     if (existing !== null) return existing;
     const control = await this.openControl(context);
@@ -771,6 +781,8 @@ export class RelayV2AgentConversationAuthority {
       await this.releaseControl(control);
       return null;
     }
+    const provider = observed.provider ?? observed.source?.provider ?? null;
+    if (provider !== null) this.agentProviders.set(key, provider);
     const created = initialState(
       context.scopeId,
       context.sessionId,
@@ -827,6 +839,7 @@ export class RelayV2AgentConversationAuthority {
     requestId: string,
     context: RelayV2HostOptionalExtensionRouteContext,
     message: string,
+    settings?: RelayAgentChatRuntimeSettings,
   ): Promise<string> {
     const key = stateKey(context.scopeId, context.sessionId);
     return this.serialize(key, async () => {
@@ -838,9 +851,14 @@ export class RelayV2AgentConversationAuthority {
       if (replay) return replay.turnId;
 
       let active = this.activeTurns.get(key) ?? null;
+      let openedHere = false;
       const working = [...state.turns].reverse().find((turn) => turn.status === "working") ?? null;
+      if (settings !== undefined && working !== null) {
+        throw new Error("Agent runtime settings can only be changed between turns");
+      }
       if (active === null) {
         const control = await this.openControl(context);
+        openedHere = true;
         active = {
           key,
           context,
@@ -856,20 +874,27 @@ export class RelayV2AgentConversationAuthority {
       const operationId = `agent-chat-${createHash("sha256")
         .update(requestId)
         .digest("hex").slice(0, 32)}`;
-      const accepted = await this.exactTargets.request({
-        type: "input.agent-message",
-        lease: active.control.lease,
-        operationId,
-        pane: "0",
-        message,
-        submit: true,
-      });
+      let accepted: unknown;
+      try {
+        accepted = await this.exactTargets.request({
+          type: "input.agent-message",
+          lease: active.control.lease,
+          operationId,
+          pane: "0",
+          message,
+          submit: true,
+          ...(settings === undefined ? {} : { runtime: settings }),
+        });
+      } catch (error) {
+        if (openedHere) await this.releaseControl(active.control);
+        throw error;
+      }
       if (!isRecord(accepted)
         || accepted.accepted !== true
         || accepted.controlEpoch !== active.control.lease.controlEpoch
         || accepted.fence !== active.control.lease.fence
         || typeof accepted.outputGeneration !== "string") {
-        await this.releaseControl(active.control);
+        if (openedHere) await this.releaseControl(active.control);
         throw new Error("Relay v2 Agent input acknowledgement is invalid");
       }
       active.control.outputGeneration = accepted.outputGeneration;
@@ -971,6 +996,8 @@ export class RelayV2AgentConversationAuthority {
         if (!status.agentSupported) throw Object.assign(new Error("Agent is unsupported"), {
           code: "AGENT_UNSUPPORTED",
         });
+        const provider = status.provider ?? status.source?.provider ?? null;
+        if (provider !== null) this.agentProviders.set(active.key, provider);
         if (status.agentRunning) {
           active.source = status.source;
           const state = await this.readState(active.context.scopeId, active.context.sessionId);
@@ -1170,6 +1197,40 @@ export class RelayV2AgentConversationAuthority {
         code: "AGENT_CHAT_SESSION_UNAVAILABLE",
       });
       return state.turns.slice(-(limit ?? MAX_CHAT_TURNS)).map((turn) => structuredClone(turn));
+    });
+  }
+
+  async runtimeSettingsStatus(
+    context: RelayV2HostOptionalExtensionRouteContext,
+  ): Promise<RelayAgentChatRuntimeSettingsStatus> {
+    const key = stateKey(context.scopeId, context.sessionId);
+    return this.serialize(key, async () => {
+      let provider = this.agentProviders.get(key)
+        ?? (await this.readState(context.scopeId, context.sessionId))?.activeSource?.provider
+        ?? null;
+      if (provider === null) {
+        let control: ControlSession | null = null;
+        try {
+          control = await this.openControl(context);
+          const observed = await this.observeStatus(control);
+          if (!observed.agentSupported) {
+            return { available: false, provider: null, reason: "agent_unsupported" };
+          }
+          provider = observed.provider ?? observed.source?.provider ?? null;
+          if (provider !== null) this.agentProviders.set(key, provider);
+        } catch {
+          return { available: false, provider: null, reason: "temporarily_unavailable" };
+        } finally {
+          if (control !== null) await this.releaseControl(control);
+        }
+      }
+      if (provider === null) {
+        return { available: false, provider: null, reason: "target_update_required" };
+      }
+      if (provider !== "codex") {
+        return { available: false, provider, reason: "provider_unsupported" };
+      }
+      return { available: true, provider, reason: "available" };
     });
   }
 
@@ -1396,6 +1457,7 @@ export class RelayV2AgentConversationAuthority {
     this.timeline.sink = null;
     const active = [...this.activeTurns.values()];
     this.activeTurns.clear();
+    this.agentProviders.clear();
     for (const item of active) if (item.timer) clearTimeout(item.timer);
     this.closeBarrier = Promise.allSettled(
       active.map((item) => this.releaseControl(item.control)),
@@ -1471,6 +1533,46 @@ function chatError(
   return { frame: decodeRelayAgentChatFrame(bytes).frame, bytes };
 }
 
+function chatSendError(
+  request: RelayV2JsonObject,
+  context: RelayV2HostOptionalExtensionRouteContext,
+  error: unknown,
+  configured: boolean,
+): RelayV2HostOptionalExtensionDelivery {
+  const code = isRecord(error) && typeof error.code === "string" ? error.code : "INTERNAL";
+  const rawMessage = error instanceof Error ? error.message : "";
+  const sessionUnavailable = code === "AGENT_CHAT_SESSION_UNAVAILABLE"
+    || code === "TARGET_GONE"
+    || code === "TARGET_NOT_FOUND"
+    || code === "SESSION_NOT_FOUND";
+  const message = sessionUnavailable
+    ? "This Agent session is no longer available. Refresh Sessions and open a current target."
+    : rawMessage === "Agent runtime settings can only be changed between turns"
+    ? rawMessage
+    : code === "RESOURCE_EXHAUSTED" || code === "BUSY"
+      ? configured
+        ? "Codex was not ready to apply the selected model, effort or mode. Retry this message."
+        : "The Agent target is busy. Wait for the current operation to settle, then retry this message."
+        : code === "RECOVERY_REQUIRED" || code === "PERMISSION_DENIED"
+          ? "This Agent session needs to be reopened before another message can be sent."
+          : code === "OPERATION_IN_DOUBT" || code === "COMMAND_IN_DOUBT"
+            ? "Codex may have received the message, so automatic retry is disabled. Check the terminal."
+            : configured
+              ? "The selected model, effort or mode is not supported by this Codex session."
+              : "The Host could not hand this message to the Agent. Check the Host and terminal, then retry.";
+  const bytes = encodeRelayAgentChatUnavailableError({
+    requestId: request.requestId as string,
+    hostId: context.hostId,
+    hostEpoch: context.hostEpoch,
+    scopeId: context.scopeId,
+    sessionId: context.sessionId,
+    code: sessionUnavailable ? "AGENT_CHAT_SESSION_UNAVAILABLE" : "AGENT_CHAT_UNAVAILABLE",
+    message,
+    retryable: !sessionUnavailable && isRecord(error) && error.retryable === true,
+  });
+  return { frame: decodeRelayAgentChatFrame(bytes).frame, bytes };
+}
+
 export function createRelayV2AgentConversationAttachments(
   authority: RelayV2AgentConversationAuthority,
 ): readonly RelayV2HostOptionalExtensionAttachment[] {
@@ -1504,10 +1606,12 @@ export function createRelayV2AgentConversationAttachments(
         }
         try {
           if (frame.type === "agent.chat.send") {
+            const payload = frame.payload as RelayV2JsonObject;
             const turnId = await authority.send(
               frame.requestId as string,
               context,
-              (frame.payload as RelayV2JsonObject).message as string,
+              payload.message as string,
+              payload.settings as unknown as RelayAgentChatRuntimeSettings | undefined,
             );
             const response: RelayV2JsonObject = {
               protocolVersion: 2,
@@ -1542,10 +1646,14 @@ export function createRelayV2AgentConversationAttachments(
             };
             return responseDelivery(response, encodeRelayAgentChatFrame);
           }
+          const historyPayload = frame.payload as RelayV2JsonObject;
           const turns = await authority.history(
             context,
-            (frame.payload as RelayV2JsonObject).limit as number | undefined,
+            historyPayload.limit as number | undefined,
           );
+          const runtimeSettingsStatus = historyPayload.includeRuntimeSettingsStatus === true
+            ? await authority.runtimeSettingsStatus(context)
+            : undefined;
           const response: RelayV2JsonObject = {
             protocolVersion: 2,
             kind: "response",
@@ -1555,10 +1663,22 @@ export function createRelayV2AgentConversationAttachments(
             hostEpoch: context.hostEpoch,
             scopeId: context.scopeId,
             sessionId: context.sessionId,
-            payload: { session: context.sessionId, turns },
+            payload: {
+              session: context.sessionId,
+              turns,
+              ...(runtimeSettingsStatus === undefined ? {} : { runtimeSettingsStatus }),
+            },
           };
           return responseDelivery(response, encodeRelayAgentChatFrame);
         } catch (error) {
+          if (frame.type === "agent.chat.send") {
+            return chatSendError(
+              frame,
+              context,
+              error,
+              Object.hasOwn(frame.payload as RelayV2JsonObject, "settings"),
+            );
+          }
           const code = isRecord(error) && error.code === "AGENT_CHAT_SESSION_UNAVAILABLE"
             ? "AGENT_CHAT_SESSION_UNAVAILABLE"
             : "AGENT_CHAT_UNAVAILABLE";
@@ -1620,8 +1740,38 @@ export function createRelayV2AgentConversationAttachments(
     };
     return Object.freeze(result);
   };
+  let runtimeSettingsSink: RelayV2HostOptionalExtensionIngressSink | null = null;
+  const runtimeSettingsMarker: RelayV2HostOptionalExtensionAttachment = {
+    capability: RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+    subscribe(sink) {
+      runtimeSettingsSink = sink;
+      sink.apply(true);
+      return Object.freeze({
+        unsubscribe: () => {
+          if (runtimeSettingsSink === sink) runtimeSettingsSink = null;
+        },
+      });
+    },
+    inspectRequest() {
+      throw new Error("Agent runtime settings marker owns no frames");
+    },
+    async authorize() { return false; },
+    async handleRequest() {
+      throw new Error("Agent runtime settings marker owns no frames");
+    },
+    handleUnavailableRequest() {
+      throw new Error("Agent runtime settings marker owns no frames");
+    },
+    isolateFailure() {
+      runtimeSettingsSink?.apply(false);
+    },
+    async closeAndDrain() {
+      runtimeSettingsSink = null;
+    },
+  };
   return Object.freeze([
     attachment("timeline", RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
     attachment("chat", RELAY_AGENT_CHAT_CAPABILITY),
+    Object.freeze(runtimeSettingsMarker),
   ]);
 }

@@ -490,6 +490,43 @@ internal interface RelayV2StateDao {
     fun deleteProfileOutboxMeta(profileId: String)
 
     @Query(
+        "SELECT * FROM relay_v2_create_outcomes WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "ORDER BY createdOrder, commandId",
+    )
+    fun createOutcomes(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+    ): List<RelayV2CreateOutcomeEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun putCreateOutcome(outcome: RelayV2CreateOutcomeEntity)
+
+    @Query(
+        "UPDATE relay_v2_create_outcomes SET acknowledged = 1 " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND expectedHostEpoch = :expectedHostEpoch " +
+            "AND commandId = :commandId AND acknowledged = 0",
+    )
+    fun acknowledgeCreateOutcome(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        expectedHostEpoch: String,
+        commandId: String,
+    ): Int
+
+    @Query("DELETE FROM relay_v2_create_outcomes WHERE profileId = :profileId")
+    fun deleteProfileCreateOutcomes(profileId: String)
+
+    @Query(
         "SELECT * FROM relay_v2_terminal_checkpoints WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +

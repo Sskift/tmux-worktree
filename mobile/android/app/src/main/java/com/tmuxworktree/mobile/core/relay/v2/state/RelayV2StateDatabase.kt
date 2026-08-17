@@ -17,6 +17,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2StateEventEntity::class,
         RelayV2OutboxMetaEntity::class,
         RelayV2OutboxEntryEntity::class,
+        RelayV2CreateOutcomeEntity::class,
         RelayV2TerminalCheckpointEntity::class,
         RelayV2TerminalPostCommitBatchEntity::class,
         RelayV2TerminalPostCommitFenceEntity::class,
@@ -32,7 +33,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2AgentRecentEventEvidenceEntity::class,
         RelayV2AgentNotificationLedgerEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 internal abstract class RelayV2StateDatabase : RoomDatabase() {
@@ -54,6 +55,7 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
             MIGRATION_3_4,
             MIGRATION_4_5,
             MIGRATION_5_6,
+            MIGRATION_6_7,
         ).build()
 
         /**
@@ -1003,6 +1005,47 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                         `singletonId` INTEGER NOT NULL,
                         `globallyClosed` INTEGER NOT NULL,
                         PRIMARY KEY(`singletonId`)
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        /** Persists sanitized create-command completion evidence and its UI acknowledgement. */
+        val MIGRATION_6_7: Migration = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_create_outcomes` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `expectedHostEpoch` TEXT NOT NULL,
+                        `commandId` TEXT NOT NULL,
+                        `createdOrder` INTEGER NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `operation` TEXT NOT NULL,
+                        `outcomeState` TEXT NOT NULL,
+                        `sessionId` TEXT,
+                        `errorCode` TEXT,
+                        `errorMessage` TEXT,
+                        `acknowledged` INTEGER NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `expectedHostEpoch`, `commandId`
+                        )
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_relay_v2_create_outcomes_profileId_profileActivationGeneration_principalId_clientInstanceId_createdOrder`
+                    ON `relay_v2_create_outcomes` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `createdOrder`
                     )
                     """.trimIndent(),
                 )

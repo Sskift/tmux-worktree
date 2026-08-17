@@ -42,6 +42,8 @@
     let lastCols = 0;
     let lastRows = 0;
     let fontSize = 14;
+    let fitTimer = 0;
+    let fitFrame = 0;
     const pending = [];
 
     function fit() {
@@ -59,10 +61,22 @@
     }
 
     function fitBurst() {
-      [0, 60, 160, 320, 640].forEach(delay => setTimeout(() => {
-        if (window.requestAnimationFrame) requestAnimationFrame(fit);
-        else fit();
-      }, delay));
+      // IME animation can fan out through window, visualViewport and three ResizeObservers.
+      // Coalesce that burst into one trailing fit so xterm does not repeatedly discard and
+      // recreate its renderer canvas while Android is still changing the WebView bounds.
+      if (fitTimer) clearTimeout(fitTimer);
+      fitTimer = setTimeout(() => {
+        fitTimer = 0;
+        if (window.requestAnimationFrame) {
+          if (fitFrame) cancelAnimationFrame(fitFrame);
+          fitFrame = requestAnimationFrame(() => {
+            fitFrame = 0;
+            fit();
+          });
+        } else {
+          fit();
+        }
+      }, 120);
     }
 
     function lineHeight() {
@@ -121,7 +135,9 @@
         lineHeight: 1.18,
         cursorBlink: true,
         cursorStyle: 'bar',
-        scrollback: 5000,
+        // Relay owns durable output. Keep only a bounded local viewing window so a constrained
+        // Android WebView renderer cannot be evicted while the keyboard changes the canvas size.
+        scrollback: 1000,
         allowTransparency: false,
         // Keep Android IME composition on xterm's insertText path. In screen-reader
         // mode Gboard's composing textarea replacements are emitted as cumulative data.

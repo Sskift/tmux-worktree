@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -15,7 +17,7 @@ import {
   writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import type {
   TerminalControlDrainProof,
   TerminalControlLease,
@@ -414,6 +416,58 @@ function processExists(pid: number): boolean {
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Returns the live same-user process recorded by a store lock without ever
+ * following a replacement owner-file symlink. This is deliberately narrower
+ * than exposing the lock record: callers may use it only as process-liveness
+ * evidence, never as authority to mutate the lock itself.
+ */
+export function terminalControlStoreLockOwnerProcessId(path: string): number | undefined {
+  if (!isAbsolute(path)
+    || path.includes("\0")
+    || typeof process.geteuid !== "function"
+    || typeof fsConstants.O_NOFOLLOW !== "number") return undefined;
+  const uid = process.geteuid();
+  let descriptor = -1;
+  try {
+    const directory = lstatSync(path);
+    if (!directory.isDirectory()
+      || directory.isSymbolicLink()
+      || directory.uid !== uid
+      || (directory.mode & 0o077) !== 0) return undefined;
+    descriptor = openSync(
+      lockOwnerPath(path),
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    const file = fstatSync(descriptor);
+    if (!file.isFile()
+      || file.uid !== uid
+      || file.nlink !== 1
+      || (file.mode & 0o077) !== 0
+      || file.size <= 0
+      || file.size > 1_024) return undefined;
+    const value = JSON.parse(readFileSync(descriptor, "utf8")) as unknown;
+    if (!isRecord(value)
+      || !exactKeys(value, ["owner", "pid", "createdAt"])
+      || typeof value.owner !== "string"
+      || value.owner.length === 0
+      || value.owner.length > 256
+      || !Number.isSafeInteger(value.pid)
+      || (value.pid as number) < 2
+      || !Number.isSafeInteger(value.createdAt)
+      || (value.createdAt as number) < 0
+      || (value.createdAt as number) > Date.now() + 60_000
+      || !processExists(value.pid as number)) return undefined;
+    return value.pid as number;
+  } catch {
+    return undefined;
+  } finally {
+    if (descriptor >= 0) {
+      try { closeSync(descriptor); } catch {}
+    }
   }
 }
 

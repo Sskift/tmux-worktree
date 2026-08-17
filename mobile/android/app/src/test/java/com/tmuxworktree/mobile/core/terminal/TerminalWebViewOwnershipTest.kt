@@ -9,6 +9,20 @@ import org.junit.Test
 
 class TerminalWebViewOwnershipTest {
     @Test
+    fun `each ready document owns a fresh parser generation`() {
+        val owner = TerminalWebViewOwnership()
+        val view = Any()
+        assertTrue(owner.bind(view))
+
+        val firstReadyGeneration = requireNotNull(owner.renewContentGeneration(view))
+        val reloadedDocumentGeneration = requireNotNull(owner.renewContentGeneration(view))
+
+        assertTrue(reloadedDocumentGeneration > firstReadyGeneration)
+        assertNull(owner.renewContentGeneration(Any()))
+        assertSame(view, owner.currentView())
+    }
+
+    @Test
     fun `renderer loss blocks replacement until detach then settles false and rebuilds once`() {
         val owner = TerminalWebViewOwnership()
         val deadView = Any()
@@ -96,6 +110,72 @@ class TerminalWebViewOwnershipTest {
         assertFalse(loss.completeAfterAttachmentDetach())
         assertEquals(listOf(false), parserSettlements)
         assertEquals(0L, owner.rebuildGeneration.value)
+    }
+
+    @Test
+    fun `manual reconnect rebuilds after automatic renderer recovery is exhausted`() {
+        val owner = TerminalWebViewOwnership()
+        val deadView = Any()
+        val replacementView = Any()
+        assertTrue(owner.bind(deadView))
+
+        val loss = requireNotNull(
+            owner.beginViewLoss(
+                view = deadView,
+                kind = TerminalWebViewLossKind.RENDERER_GONE,
+                didCrash = true,
+                allowAutomaticRebuild = false,
+                settleParserFailure = {},
+            ),
+        )
+        assertFalse(loss.completeAfterAttachmentDetach())
+        assertEquals(0L, owner.rebuildGeneration.value)
+
+        assertTrue(owner.requestRendererRebuild())
+        assertEquals(1L, owner.rebuildGeneration.value)
+        assertTrue(owner.bind(replacementView))
+        assertFalse(owner.requestRendererRebuild())
+    }
+
+    @Test
+    fun `manual reconnect waits for exact attachment detach before rebuilding`() {
+        val owner = TerminalWebViewOwnership()
+        val deadView = Any()
+        val replacementView = Any()
+        assertTrue(owner.bind(deadView))
+
+        val loss = requireNotNull(
+            owner.beginViewLoss(
+                view = deadView,
+                kind = TerminalWebViewLossKind.RENDERER_GONE,
+                didCrash = true,
+                allowAutomaticRebuild = false,
+                settleParserFailure = {},
+            ),
+        )
+        assertTrue(owner.requestRendererRebuild())
+        assertEquals(0L, owner.rebuildGeneration.value)
+        assertFalse(owner.bind(replacementView))
+
+        assertFalse(loss.completeAfterAttachmentDetach())
+        assertEquals(1L, owner.rebuildGeneration.value)
+        assertTrue(owner.bind(replacementView))
+    }
+
+    @Test
+    fun `manual reconnect replaces a bound renderer that never became ready`() {
+        val owner = TerminalWebViewOwnership()
+        val stuckView = Any()
+
+        assertTrue(owner.bind(stuckView))
+        assertFalse(owner.requestRendererRebuild())
+        assertTrue(owner.requestRendererRebuild(replaceUnreadyBoundView = true))
+        assertEquals(1L, owner.rebuildGeneration.value)
+        assertFalse(owner.bind(stuckView))
+
+        val replacementView = Any()
+        assertTrue(owner.bind(replacementView))
+        assertSame(replacementView, owner.currentView())
     }
 
     @Test

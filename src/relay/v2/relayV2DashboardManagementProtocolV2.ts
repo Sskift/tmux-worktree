@@ -8,7 +8,10 @@ import {
 import {
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
 } from "../extensions/agentTranscriptLifecycle/v1/codec.js";
-import { RELAY_AGENT_CHAT_CAPABILITY } from "../extensions/agentChat/v2/codec.js";
+import {
+  RELAY_AGENT_CHAT_CAPABILITY,
+  RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+} from "../extensions/agentChat/v2/codec.js";
 import { RELAY_LARK_BINDINGS_CAPABILITY } from "../extensions/larkBindings/v2/codec.js";
 
 export const RELAY_V2_DASHBOARD_MANAGEMENT_PROTOCOL_V2_CONTRACT =
@@ -27,6 +30,7 @@ export const RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES = Object.freeze
 export const RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES = Object.freeze([
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
   RELAY_AGENT_CHAT_CAPABILITY,
+  RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
   RELAY_LARK_BINDINGS_CAPABILITY,
 ] as const);
 export const RELAY_V2_DASHBOARD_MANAGEMENT_KNOWN_CAPABILITIES = Object.freeze([

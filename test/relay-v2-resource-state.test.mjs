@@ -235,6 +235,7 @@ async function harness(options = {}) {
     discovery,
     store,
     readinessSink,
+    resourceMutationReconcileSignal: options.resourceMutationReconcileSignal,
     reservationSettlementAuthority: options.settlementAuthority,
     testCapacityLimits: options.capacityLimits,
     testReservationLimits: options.reservationLimits,
@@ -1541,6 +1542,33 @@ async function openCommandPlane(h, executor, options = {}) {
 async function issueWindow(h, plane) {
   return plane.issueDedupeWindow();
 }
+
+test("committed resource mutation requests an immediate discovery reconciliation", async () => {
+  let reconcileSignals = 0;
+  const h = await harness({
+    resourceMutationReconcileSignal: () => { reconcileSignals += 1; },
+  });
+  try {
+    const { seeded, scopeId } = await seedLocalScope(h);
+    const fake = commandExecutor();
+    const plane = await openCommandPlane(h, fake.executor, { recover: false });
+    const window = await issueWindow(h, plane);
+    const response = await plane.execute(
+      commandAuth(),
+      createTerminalFrame(
+        seeded.snapshot.hostEpoch,
+        window.windowId,
+        scopeId,
+        "cmd-immediate-reconcile-signal",
+      ),
+    );
+
+    assert.equal(response.payload.state, "succeeded");
+    assert.equal(reconcileSignals, 1);
+  } finally {
+    h.cleanup();
+  }
+});
 
 test("H2 resolution cuts are re-fenced inside H1 final admission", async (t) => {
   for (const outcome of ["positive", "complete_negative"]) {

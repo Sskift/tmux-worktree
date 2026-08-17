@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatSteeredMessage
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
 import java.security.MessageDigest
@@ -15,11 +16,15 @@ import java.security.MessageDigest
 data class RelayChatState(
     val turnsBySession: Map<String, List<AgentChatTurnView>> = emptyMap(),
     val pendingBySession: Map<String, List<PendingChatSend>> = emptyMap(),
+    /** Host accepted the send, but its authoritative turn event has not arrived yet. */
+    val awaitingTurnIdsBySession: Map<String, Set<String>> = emptyMap(),
     val imagesById: Map<String, RelayChatImageState> = emptyMap(),
 ) {
     fun turns(session: String): List<AgentChatTurnView> = turnsBySession[session].orEmpty()
 
     fun pending(session: String): List<PendingChatSend> = pendingBySession[session].orEmpty()
+
+    fun awaitingTurn(session: String): Boolean = awaitingTurnIdsBySession[session].orEmpty().isNotEmpty()
 
     fun image(imageId: String): RelayChatImageState? = imagesById[imageId]
 }
@@ -39,8 +44,11 @@ data class PendingChatSend(
     val session: String,
     val message: String,
     val sentAtMillis: Long,
+    val settings: AgentChatRuntimeSettings? = null,
     val failed: Boolean = false,
     val error: String? = null,
+    val errorCode: String? = null,
+    val retryable: Boolean = true,
 )
 
 sealed interface RelayChatMutation {
@@ -49,6 +57,7 @@ sealed interface RelayChatMutation {
         val session: String,
         val message: String,
         val nowMillis: Long,
+        val settings: AgentChatRuntimeSettings? = null,
     ) : RelayChatMutation
 
     data class Sent(
@@ -72,6 +81,8 @@ sealed interface RelayChatMutation {
         val requestId: String,
         val session: String,
         val error: String,
+        val errorCode: String? = null,
+        val retryable: Boolean = true,
     ) : RelayChatMutation
 
     data class ImageChunk(
@@ -90,7 +101,16 @@ sealed interface RelayChatMutation {
         val error: String,
     ) : RelayChatMutation
 
-    data class RetryFailed(val session: String) : RelayChatMutation
+    /**
+     * Starts a retry for one exact failed send. The replacement request ID is installed before
+     * transport handoff so an immediate response cannot leave the old failed bubble orphaned.
+     */
+    data class RetryFailed(
+        val requestId: String,
+        val session: String,
+        val replacementRequestId: String,
+        val nowMillis: Long,
+    ) : RelayChatMutation
 
     data class ClearSession(val session: String) : RelayChatMutation
 }
@@ -114,6 +134,7 @@ object RelayChatReducer {
             session = mutation.session,
             message = mutation.message,
             sentAtMillis = mutation.nowMillis,
+            settings = mutation.settings,
         )
         return state.copy(
             pendingBySession = state.pendingBySession + (mutation.session to pending),
@@ -128,9 +149,22 @@ object RelayChatReducer {
         } else {
             state.pendingBySession + (mutation.session to pending)
         }
-        // The host will push the authoritative working turn via agent_chat_event; we only drop the
-        // pending entry here so the UI stops showing the local "sending" bubble.
-        return state.copy(pendingBySession = pendingBySession)
+        // Keep a non-visual fence until the host's authoritative turn arrives. Otherwise the
+        // response/event reordering window briefly unlocks runtime settings for an active turn.
+        val alreadyProjected = state.turns(mutation.session).any { it.turnId == mutation.turnId }
+        val awaiting = if (alreadyProjected) {
+            state.awaitingTurnIdsBySession
+        } else {
+            state.awaitingTurnIdsBySession + (
+                mutation.session to (
+                    state.awaitingTurnIdsBySession[mutation.session].orEmpty() + mutation.turnId
+                )
+            )
+        }
+        return state.copy(
+            pendingBySession = pendingBySession,
+            awaitingTurnIdsBySession = awaiting,
+        )
     }
 
     private fun upsertTurn(state: RelayChatState, mutation: RelayChatMutation.TurnUpdated): RelayChatState {
@@ -142,8 +176,17 @@ object RelayChatReducer {
             turns += mutation.turn
         }
         turns.sortBy { it.sentAt }
+        val remainingAwaiting = state.awaitingTurnIdsBySession[mutation.session]
+            .orEmpty()
+            .minus(mutation.turn.turnId)
+        val awaiting = if (remainingAwaiting.isEmpty()) {
+            state.awaitingTurnIdsBySession - mutation.session
+        } else {
+            state.awaitingTurnIdsBySession + (mutation.session to remainingAwaiting)
+        }
         return syncImages(state.copy(
             turnsBySession = state.turnsBySession + (mutation.session to turns),
+            awaitingTurnIdsBySession = awaiting,
         ))
     }
 
@@ -156,15 +199,32 @@ object RelayChatReducer {
         val deduped = mutation.turns
             .distinctBy { it.turnId }
             .sortedBy { it.sentAt }
+        val projectedIds = deduped.mapTo(HashSet()) { it.turnId }
+        val remainingAwaiting = state.awaitingTurnIdsBySession[mutation.session]
+            .orEmpty()
+            .minus(projectedIds)
+        val awaiting = if (remainingAwaiting.isEmpty()) {
+            state.awaitingTurnIdsBySession - mutation.session
+        } else {
+            state.awaitingTurnIdsBySession + (mutation.session to remainingAwaiting)
+        }
         return syncImages(state.copy(
             turnsBySession = state.turnsBySession + (mutation.session to deduped),
+            awaitingTurnIdsBySession = awaiting,
         ))
     }
 
     private fun markFailed(state: RelayChatState, mutation: RelayChatMutation.SendFailed): RelayChatState {
-        val pending = state.pending(mutation.session).map { item ->
+        val current = state.pending(mutation.session)
+        if (current.none { it.requestId == mutation.requestId }) return state
+        val pending = current.map { item ->
             if (item.requestId == mutation.requestId) {
-                item.copy(failed = true, error = mutation.error)
+                item.copy(
+                    failed = true,
+                    error = mutation.error,
+                    errorCode = mutation.errorCode,
+                    retryable = mutation.retryable,
+                )
             } else {
                 item
             }
@@ -175,8 +235,28 @@ object RelayChatReducer {
     }
 
     private fun retryFailed(state: RelayChatState, mutation: RelayChatMutation.RetryFailed): RelayChatState {
-        val pending = state.pending(mutation.session).map { item ->
-            if (item.failed) item.copy(failed = false, error = null) else item
+        val current = state.pending(mutation.session)
+        val target = current.singleOrNull {
+            it.requestId == mutation.requestId && it.failed && it.retryable
+        } ?: return state
+        if (mutation.replacementRequestId != mutation.requestId &&
+            current.any { it.requestId == mutation.replacementRequestId }
+        ) {
+            return state
+        }
+        val pending = current.map { item ->
+            if (item === target) {
+                item.copy(
+                    requestId = mutation.replacementRequestId,
+                    sentAtMillis = mutation.nowMillis,
+                    failed = false,
+                    error = null,
+                    errorCode = null,
+                    retryable = true,
+                )
+            } else {
+                item
+            }
         }
         return state.copy(
             pendingBySession = state.pendingBySession + (mutation.session to pending),
@@ -251,6 +331,7 @@ object RelayChatReducer {
         return syncImages(state.copy(
             turnsBySession = state.turnsBySession - mutation.session,
             pendingBySession = state.pendingBySession - mutation.session,
+            awaitingTurnIdsBySession = state.awaitingTurnIdsBySession - mutation.session,
         ))
     }
 

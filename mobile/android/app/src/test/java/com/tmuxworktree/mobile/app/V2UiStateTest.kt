@@ -5,14 +5,25 @@ import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionHealth
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelayHost
+import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateCommandReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateResult
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
+import com.tmuxworktree.mobile.app.navigation.preferredCreationScopeId
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -21,6 +32,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class V2UiStateTest {
+    @Test
+    fun terminalCreationKeepsTheScopeSelectedOnWorkspaces() {
+        val state = V2UiState(
+            preferences = AppPreferences(
+                preferredHostId = "host-a",
+                preferredScopeId = "mew-dev",
+            ),
+            selectedScopeId = "local",
+            scopes = listOf(
+                RelayScope(hostId = "host-a", scopeId = "mew-dev", kind = "ssh"),
+                RelayScope(hostId = "host-a", scopeId = "local", kind = "local"),
+            ),
+        )
+
+        assertEquals("local", preferredCreationScopeId(state, "host-a"))
+    }
+
     @Test
     fun activeSessionsAndAttentionBadgeFollowSelectedComputer() {
         val hostAWaiting = RelaySession(
@@ -117,7 +145,7 @@ class V2UiStateTest {
     }
 
     @Test
-    fun relayV2CreateSubmissionIsFencedUntilQueuedResultLeavesTheForm() {
+    fun relayV2CreateSubmissionStaysBusyUntilTheHostConfirmsSuccess() {
         val initial = V2UiState(relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2)
 
         val submitting = requireNotNull(
@@ -139,14 +167,136 @@ class V2UiStateTest {
             rejectionMessage = "",
         )
 
-        assertFalse(queued.state.creatingTerminal)
+        assertTrue(queued.state.creatingTerminal)
+        assertEquals("Waiting for computer…", queued.state.terminalCreationStatus)
+        assertNull(queued.state.beginCreationSubmission(CreationTarget.TERMINAL))
         assertNull(queued.state.actionError)
         assertEquals(
             V2UiEffect.CreationQueued(
                 target = CreationTarget.TERMINAL,
-                message = "Terminal creation queued",
+                message = "Terminal request saved; waiting for the computer",
             ),
             queued.effect,
+        )
+
+        val completed = queued.state.afterRelayV2CreationStatus(
+            target = CreationTarget.TERMINAL,
+            status = RelayV2CreateCommandReadState.Succeeded("session-created"),
+        )
+
+        assertFalse(completed.state.creatingTerminal)
+        assertNull(completed.state.terminalCreationStatus)
+        assertNull(completed.state.actionError)
+        assertEquals(
+            V2UiEffect.CreationCompleted(
+                target = CreationTarget.TERMINAL,
+                message = "Terminal created",
+            ),
+            completed.effect,
+        )
+    }
+
+    @Test
+    fun relayV2CreatePendingStatusAndHostFailureStayVisibleOnTheForm() {
+        val submitting = V2UiState(
+            relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2,
+            creatingWorktree = true,
+            worktreeCreationStatus = "Waiting for computer…",
+        )
+
+        val pending = RelayV2CreateCommandReadState.Pending(RelayV2OutboxStateTag.ACCEPTED)
+        assertEquals(RelayV2OutboxStateTag.ACCEPTED, pending.state)
+
+        val failed = submitting.afterRelayV2CreationStatus(
+            target = CreationTarget.WORKTREE,
+            status = RelayV2CreateCommandReadState.Failed(
+                code = "SCOPE_NOT_FOUND",
+                message = "Scope is no longer available",
+                ambiguous = false,
+            ),
+        )
+
+        val expected =
+            "Worktree creation failed (SCOPE_NOT_FOUND): Scope is no longer available"
+        assertFalse(failed.state.creatingWorktree)
+        assertNull(failed.state.worktreeCreationStatus)
+        assertEquals(expected, failed.state.actionError)
+        assertEquals(V2UiEffect.Notice(expected), failed.effect)
+    }
+
+    @Test
+    fun relayV2UnavailableCreateStatusExplainsHowToRecover() {
+        val failed = V2UiState(
+            creatingTerminal = true,
+            terminalCreationStatus = "Queued on this phone…",
+        ).afterRelayV2CreationStatus(
+            target = CreationTarget.TERMINAL,
+            status = RelayV2CreateCommandReadState.Unavailable,
+        )
+
+        assertEquals(
+            "Terminal creation status is unavailable. Reconnect and check Sessions before deciding whether to retry.",
+            failed.state.actionError,
+        )
+        assertFalse(failed.state.creatingTerminal)
+    }
+
+    @Test
+    fun recreatedUiRebindsDurablePendingCreateAndRejectsAnotherSubmission() {
+        val recreated = V2UiState(
+            relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2,
+        ).rebindRelayV2PendingCreation(
+            target = CreationTarget.TERMINAL,
+            state = RelayV2OutboxStateTag.SENDING,
+        )
+
+        assertTrue(recreated.creatingTerminal)
+        assertEquals("Waiting for computer…", recreated.terminalCreationStatus)
+        assertNull(recreated.beginCreationSubmission(CreationTarget.TERMINAL))
+    }
+
+    @Test
+    fun pendingCreateRebindRetriesTheSameRevisionWhenAdmissionSettles() = runBlocking {
+        val revisions = MutableStateFlow(7L)
+        val admissions = MutableStateFlow(RelayStartupAdmissionState.CHECKING)
+        val observed = CompletableDeferred<Long>()
+        val collector = launch {
+            observed.complete(
+                admittedRelayV2PendingCreationRevisions(revisions, admissions).first(),
+            )
+        }
+
+        yield()
+        assertFalse(observed.isCompleted)
+        admissions.value = RelayStartupAdmissionState.RELAY_V2
+
+        assertEquals(7L, withTimeout(1_000) { observed.await() })
+        collector.join()
+    }
+
+    @Test
+    fun recreatedUiSurfacesAnAmbiguousDurableOutcome() {
+        val rebound = V2UiState(
+            relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2,
+        ).rebindRelayV2PendingCreation(
+            target = CreationTarget.TERMINAL,
+            state = RelayV2OutboxStateTag.AMBIGUOUS,
+        )
+
+        val outcome = rebound.afterRelayV2CreationStatus(
+            target = CreationTarget.TERMINAL,
+            status = RelayV2CreateCommandReadState.Failed(
+                code = "COMMAND_IN_DOUBT",
+                message = "The computer cannot confirm the result",
+                ambiguous = true,
+            ),
+        )
+
+        assertFalse(outcome.state.creatingTerminal)
+        assertEquals(
+            "Terminal creation outcome is uncertain (COMMAND_IN_DOUBT): " +
+                "The computer cannot confirm the result",
+            outcome.state.actionError,
         )
     }
 
@@ -261,6 +411,39 @@ class V2UiStateTest {
                     sessionId = "session-b",
                     status = ConnectionStatus.CONNECTING,
                 ),
+            ),
+        )
+    }
+
+    @Test
+    fun createdSessionBecomesRoutableOnlyAfterUiAndExactCutConverge() {
+        val created = RelaySession(
+            hostId = "host-a",
+            name = "created-terminal",
+            stableIdOverride = "created-stable-id",
+        )
+        val cut = object : RelayV2SessionReplyCut {}
+
+        assertNull(
+            routableRelayV2CreatedSession(
+                created,
+                emptyMap(),
+                V2UiState(sessions = listOf(created)),
+            ),
+        )
+        assertNull(
+            routableRelayV2CreatedSession(
+                created,
+                mapOf(created.stableId to cut),
+                V2UiState(),
+            ),
+        )
+        assertEquals(
+            created,
+            routableRelayV2CreatedSession(
+                created,
+                mapOf(created.stableId to cut),
+                V2UiState(sessions = listOf(created)),
             ),
         )
     }

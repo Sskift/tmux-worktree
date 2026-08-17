@@ -111,6 +111,63 @@ class RelayV2DurableStateRepositoryCoreTest {
         }
 
     @Test
+    fun `create completion and surfaced acknowledgement survive repository restart`() = runBlocking {
+        val store = MemoryStore()
+        val namespace = outboxNamespace()
+        val repository = RelayV2DurableStateRepositoryCore(store)
+        val draft = RelayV2OutboxDraft(
+            profileId = namespace.profileId,
+            principalId = namespace.principalId,
+            hostId = "host-a",
+            expectedHostEpoch = "epoch-a",
+            dedupeWindowId = "window-a",
+            commandId = "create-terminal-a",
+            scopeId = "scope-a",
+            sessionId = null,
+            arguments = RelayV2OutboxArguments.createTerminal("/tmp/project", "Project shell"),
+        )
+        repository.enqueueOutbox(namespace, draft, createdAtMillis = 11)
+        repository.dispatchFreshUnderApplyLease(namespace, listOf("execute-create-a"))
+        val sending = repository.loadOutbox(namespace).entries.single()
+        val reconcile = RelayV2OutboxAction.ReconcileStatus(
+            evidence = RelayV2CommandStatusEvidence(
+                entryId = sending.id,
+                dedupeWindowId = sending.dedupeWindowId,
+                hostEpoch = sending.expectedHostEpoch,
+                scopeId = sending.scopeId,
+                sessionId = null,
+                operation = sending.operation,
+                source = RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+                attemptKind = RelayV2OutboxAttemptKind.EXECUTE,
+                state = RelayV2CommandStatusState.SUCCEEDED,
+                attemptRequestId = sending.attempts.single().requestId,
+                result = RelayV2CommandResult.CreatedSession(
+                    sessionId = "terminal-session-a",
+                    scopeId = sending.scopeId,
+                    kind = RelayV2ResultSessionKind.TERMINAL,
+                ),
+            ),
+            recovery = RelayV2OutboxRecovery.None,
+        )
+
+        store.failNextCommit = true
+        assertTrue(runCatching {
+            repository.reduceOutboxBatchUnderApplyLease(namespace) { listOf(reconcile) }
+        }.isFailure)
+        assertEquals(RelayV2OutboxStateTag.SENDING, repository.loadOutbox(namespace).entries.single().state)
+        assertTrue(repository.readCreateOutcomes(namespace).isEmpty())
+
+        repository.reduceOutboxBatchUnderApplyLease(namespace) { listOf(reconcile) }
+        val restarted = RelayV2DurableStateRepositoryCore(store)
+        val outcome = restarted.readCreateOutcomes(namespace).single()
+        assertEquals(RelayV2CreateOutcomeState.SUCCEEDED, outcome.state)
+        assertEquals("terminal-session-a", outcome.sessionId)
+        assertFalse(outcome.acknowledged)
+        assertTrue(restarted.acknowledgeCreateOutcome(outcome.key))
+        assertTrue(restarted.readCreateOutcomes(namespace).single().acknowledged)
+    }
+
+    @Test
     fun `enqueue authority rejects duplicate capacity and foreign activation without writes`() =
         runBlocking {
             val namespace = outboxNamespace()
@@ -1610,6 +1667,7 @@ class RelayV2DurableStateRepositoryCoreTest {
 
         private var metas = linkedMapOf<RelayV2OutboxAuthorityNamespace, RelayV2PersistedOutboxMeta>()
         private var entries = linkedMapOf<EntryKey, RelayV2PersistedOutboxEntry>()
+        private var createOutcomes = linkedMapOf<RelayV2CreateOutcomeKey, RelayV2CreateOutcome>()
         private var terminals = linkedMapOf<
             RelayV2TerminalCheckpointKey,
             RelayV2PersistedTerminalCheckpoint
@@ -1624,6 +1682,7 @@ class RelayV2DurableStateRepositoryCoreTest {
         override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T {
             val metasBefore = LinkedHashMap(metas)
             val entriesBefore = LinkedHashMap(entries)
+            val createOutcomesBefore = LinkedHashMap(createOutcomes)
             val terminalsBefore = LinkedHashMap(terminals)
             val writesBefore = writeCount
             return try {
@@ -1637,6 +1696,7 @@ class RelayV2DurableStateRepositoryCoreTest {
             } catch (failure: Throwable) {
                 metas = metasBefore
                 entries = entriesBefore
+                createOutcomes = createOutcomesBefore
                 terminals = terminalsBefore
                 writeCount = writesBefore
                 throw failure
@@ -1670,6 +1730,29 @@ class RelayV2DurableStateRepositoryCoreTest {
             })
             writeCount += 1
             entries[key] = entry
+        }
+
+        override fun createOutcomes(
+            namespace: RelayV2OutboxAuthorityNamespace,
+        ): List<RelayV2CreateOutcome> = createOutcomes.values
+            .filter { it.key.namespace == namespace }
+            .sortedWith(compareBy({ it.createdOrder }, { it.key.commandId }))
+
+        override fun putCreateOutcome(outcome: RelayV2CreateOutcome) {
+            check(createOutcomes.values.none {
+                it.key.namespace == outcome.key.namespace &&
+                    it.createdOrder == outcome.createdOrder && it.key != outcome.key
+            })
+            writeCount += 1
+            createOutcomes[outcome.key] = outcome
+        }
+
+        override fun acknowledgeCreateOutcome(key: RelayV2CreateOutcomeKey): Boolean {
+            val current = createOutcomes[key] ?: return false
+            if (current.acknowledged) return false
+            writeCount += 1
+            createOutcomes[key] = current.copy(acknowledged = true)
+            return true
         }
 
         override fun replaceOutboxEntry(

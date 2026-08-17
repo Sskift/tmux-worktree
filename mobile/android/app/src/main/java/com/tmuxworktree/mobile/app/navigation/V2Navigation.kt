@@ -8,12 +8,8 @@ import android.content.Context
 import android.net.Uri
 import android.util.Base64
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -88,7 +84,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavGraphBuilder
-import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -135,6 +130,8 @@ import com.tmuxworktree.mobile.feature.pairing.PairingScreen
 import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
 import com.tmuxworktree.mobile.feature.chat.AgentChatScreen
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.runtimeSettingsUnavailableMessage
 import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.settings.LarkBindingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
@@ -175,6 +172,22 @@ internal fun NavHostController.navigateAfterCreation(
         launchSingleTop = true
     }
 }
+
+internal fun V2UiEffect.creationFormRouteToDismiss(): String? =
+    (this as? V2UiEffect.CreationCompleted)?.let { completed ->
+        when (completed.target) {
+            CreationTarget.WORKTREE -> V2Routes.NEW_WORKTREE
+            CreationTarget.TERMINAL -> V2Routes.NEW_TERMINAL
+        }
+    }
+
+internal fun V2UiEffect.CreationCompleted.createdSessionDestinationRoute(): String? =
+    sessionStableId?.let { stableId ->
+        when (target) {
+            CreationTarget.WORKTREE -> V2Routes.chat(stableId)
+            CreationTarget.TERMINAL -> V2Routes.terminal(stableId)
+        }
+    }
 
 internal fun NavGraphBuilder.relaySessionDestinations(
     uiState: StateFlow<V2UiState>,
@@ -247,11 +260,17 @@ internal fun V2Navigation(
                     formRoute = V2Routes.NEW_TERMINAL,
                 )
                 is V2UiEffect.CreationQueued -> {
-                    val formRoute = when (effect.target) {
-                        CreationTarget.WORKTREE -> V2Routes.NEW_WORKTREE
-                        CreationTarget.TERMINAL -> V2Routes.NEW_TERMINAL
-                    }
-                    if (navController.currentDestination?.route == formRoute) {
+                    launch { snackbarHostState.showSnackbar(effect.message) }
+                }
+                is V2UiEffect.CreationCompleted -> {
+                    val formRoute = requireNotNull(effect.creationFormRouteToDismiss())
+                    val destinationRoute = effect.createdSessionDestinationRoute()
+                    if (destinationRoute != null) {
+                        navController.navigateAfterCreation(
+                            destinationRoute = destinationRoute,
+                            formRoute = formRoute,
+                        )
+                    } else if (navController.currentDestination?.route == formRoute) {
                         navController.popBackStack()
                     }
                     launch { snackbarHostState.showSnackbar(effect.message) }
@@ -360,6 +379,26 @@ private fun PairingGate(
 }
 
 @Composable
+internal fun V2MainNavHost(
+    navController: NavHostController,
+    modifier: Modifier = Modifier,
+    content: NavGraphBuilder.() -> Unit,
+) {
+    NavHost(
+        navController = navController,
+        startDestination = V2Routes.INBOX,
+        modifier = modifier,
+        // Route changes replace content atomically. Keeping all four directions on the
+        // same policy prevents expensive parent and child screens from rendering together.
+        enterTransition = { EnterTransition.None },
+        exitTransition = { ExitTransition.None },
+        popEnterTransition = { EnterTransition.None },
+        popExitTransition = { ExitTransition.None },
+        builder = content,
+    )
+}
+
+@Composable
 private fun MainNavigation(
     state: V2UiState,
     viewModel: V2ViewModel,
@@ -418,32 +457,9 @@ private fun MainNavigation(
                 }
             },
         ) { navigationPadding ->
-            NavHost(
+            V2MainNavHost(
                 navController = navController,
-                startDestination = V2Routes.INBOX,
                 modifier = Modifier.fillMaxSize().padding(navigationPadding),
-                enterTransition = {
-                    if (isRootTabTransition()) {
-                        EnterTransition.None
-                    } else {
-                        slideInHorizontally(
-                            animationSpec = tween(durationMillis = 220),
-                            initialOffsetX = { width -> width / 5 },
-                        )
-                    }
-                },
-                exitTransition = {
-                    if (isRootTabTransition()) {
-                        ExitTransition.None
-                    } else {
-                        slideOutHorizontally(
-                            animationSpec = tween(durationMillis = 220),
-                            targetOffsetX = { width -> -width / 5 },
-                        )
-                    }
-                },
-                popEnterTransition = { EnterTransition.None },
-                popExitTransition = { ExitTransition.None },
             ) {
             composable(V2Routes.INBOX) {
                 val routeState = latestState
@@ -861,7 +877,7 @@ private fun NewWorktreeRoute(
     }
 
     BackHandler(enabled = step != NewWorktreeStep.TARGET) {
-        if (!state.creatingWorktree) previousStep()
+        if (state.creatingWorktree) onBack() else previousStep()
     }
 
     LaunchedEffect(Unit) { viewModel.clearActionError() }
@@ -871,9 +887,18 @@ private fun NewWorktreeRoute(
             hostId = state.activeHostId
         }
     }
-    LaunchedEffect(state.scopes, hostId, scopeId) {
-        if (scopeId.isBlank() || state.scopes.none { it.hostId == hostId && it.scopeId == scopeId }) {
-            scopeId = state.scopes.firstOrNull { it.hostId == hostId && it.reachable }?.scopeId.orEmpty()
+    LaunchedEffect(
+        state.scopes,
+        state.selectedScopeId,
+        state.preferences.preferredScopeId,
+        hostId,
+        scopeId,
+    ) {
+        if (scopeId.isBlank() || state.scopes.none {
+                it.hostId == hostId && it.scopeId == scopeId && it.reachable
+            }
+        ) {
+            scopeId = preferredCreationScopeId(state, hostId)
         }
     }
 
@@ -940,6 +965,7 @@ private fun NewWorktreeRoute(
             errors = errors.copy(worktreeName = null)
         },
         onRetryLoadTargets = viewModel::refresh,
+        creationStatus = state.worktreeCreationStatus,
         onCreate = {
             val looksLikePath = repositoryPath.startsWith("/") || repositoryPath.startsWith("~") ||
                 repositoryPath.startsWith(".")
@@ -970,17 +996,24 @@ private fun NewTerminalRoute(
     var label by rememberSaveable { mutableStateOf("") }
     var errors by remember { mutableStateOf(NewTerminalValidationErrors()) }
 
-    BackHandler(enabled = state.creatingTerminal) { /* Creation result owns navigation. */ }
-
     LaunchedEffect(Unit) { viewModel.clearActionError() }
     LaunchedEffect(state.hosts, hostId) {
         if (hostId.isBlank() || state.hosts.none { it.hostId == hostId }) {
             hostId = state.activeHostId
         }
     }
-    LaunchedEffect(state.scopes, hostId, scopeId) {
-        if (scopeId.isBlank() || state.scopes.none { it.hostId == hostId && it.scopeId == scopeId }) {
-            scopeId = state.scopes.firstOrNull { it.hostId == hostId && it.reachable }?.scopeId.orEmpty()
+    LaunchedEffect(
+        state.scopes,
+        state.selectedScopeId,
+        state.preferences.preferredScopeId,
+        hostId,
+        scopeId,
+    ) {
+        if (scopeId.isBlank() || state.scopes.none {
+                it.hostId == hostId && it.scopeId == scopeId && it.reachable
+            }
+        ) {
+            scopeId = preferredCreationScopeId(state, hostId)
         }
     }
 
@@ -1022,6 +1055,7 @@ private fun NewTerminalRoute(
             errors = errors.copy(label = null)
         },
         onRetryLoadTargets = viewModel::refresh,
+        creationStatus = state.terminalCreationStatus,
         onCreate = {
             errors = NewTerminalValidationErrors(
                 host = "Choose a computer".takeIf { hostId.isBlank() },
@@ -1038,6 +1072,26 @@ private fun NewTerminalRoute(
             }
         },
     )
+}
+
+/**
+ * Keeps the creation target aligned with the scope the user selected on Workspaces. Falling back
+ * to the first reachable scope silently redirects a local terminal to an unrelated SSH target
+ * whenever that target happens to sort first.
+ */
+internal fun preferredCreationScopeId(state: V2UiState, hostId: String): String {
+    val preferredIds = listOfNotNull(
+        state.selectedScopeId?.takeIf(String::isNotBlank),
+        state.preferences.preferredScopeId.takeIf(String::isNotBlank),
+    ).distinct()
+    preferredIds.forEach { preferredId ->
+        state.scopes.firstOrNull {
+            it.hostId == hostId && it.scopeId == preferredId && it.reachable
+        }?.let { return it.scopeId }
+    }
+    return state.scopes.firstOrNull { it.hostId == hostId && it.reachable }
+        ?.scopeId
+        .orEmpty()
 }
 
 @Composable
@@ -1079,13 +1133,21 @@ private fun TerminalRoute(
         ownershipReadOnly = ownershipReadOnly,
         keyboardVisible = keyboardVisible,
         terminalFontSizeSp = fontSize,
-        disconnectReason = state.terminal.resetReason.ifBlank { state.health.errorMessage }.ifBlank { null },
+        disconnectReason = state.terminal.resetReason
+            .ifBlank { state.actionError.orEmpty() }
+            .ifBlank { state.health.errorMessage }
+            .ifBlank { null },
         onBack = onBack,
         onConnectionStatusClick = onHealth,
         onReconnect = {
             if (state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-                controller.currentParserBinding()?.let {
-                    viewModel.openTerminal(session, attachmentId, it)
+                val rendererBinding = controller.currentParserBinding()
+                if (rendererBinding != null) {
+                    viewModel.openTerminal(session, attachmentId, rendererBinding)
+                } else {
+                    // A WebView crash can intentionally exhaust automatic recovery. Recreate the
+                    // renderer first; its ready callback will attach a fresh parser generation.
+                    controller.requestRendererRebuild()
                 }
             } else {
                 viewModel.openTerminal(session, attachmentId)
@@ -1131,7 +1193,27 @@ private fun ChatRoute(
     onTerminal: () -> Unit,
 ) {
     val chatState by viewModel.agentChat.collectAsStateWithLifecycle()
+    val runtimeSettingsStatuses by
+        viewModel.agentChatRuntimeSettingsStatuses.collectAsStateWithLifecycle()
     var draft by rememberSaveable(session.stableId) { mutableStateOf("") }
+    var selectedModel by rememberSaveable(session.stableId) { mutableStateOf<String?>(null) }
+    var selectedEffort by rememberSaveable(session.stableId) { mutableStateOf<String?>(null) }
+    var selectedMode by rememberSaveable(session.stableId) { mutableStateOf("default") }
+    var settingsTouched by rememberSaveable(session.stableId) { mutableStateOf(false) }
+    val runtimeSettings = AgentChatRuntimeSettings(
+        model = selectedModel,
+        reasoningEffort = selectedEffort,
+        mode = selectedMode,
+    )
+    val hostSupportsRuntimeSettings = viewModel.supportsAgentChatRuntimeSettings()
+    val runtimeSettingsStatus = runtimeSettingsStatuses[session.protocolSessionId]
+    val runtimeSettingsAvailable =
+        hostSupportsRuntimeSettings && runtimeSettingsStatus?.available == true
+    val runtimeSettingsUnavailableMessage = if (hostSupportsRuntimeSettings) {
+        runtimeSettingsStatus.runtimeSettingsUnavailableMessage()
+    } else {
+        null
+    }
 
     LaunchedEffect(session.stableId) {
         viewModel.fetchAgentChatHistory(session)
@@ -1146,11 +1228,24 @@ private fun ChatRoute(
         onBack = onBack,
         onOpenDetails = onDetails,
         onOpenTerminal = onTerminal,
-        onSend = { message ->
-            viewModel.sendAgentChatMessage(session, message)
-            draft = ""
+        runtimeSettings = runtimeSettings,
+        onRuntimeSettingsChange = { settings ->
+            settingsTouched = true
+            selectedModel = settings.model
+            selectedEffort = settings.reasoningEffort
+            selectedMode = settings.mode
         },
-        onRetryFailed = { viewModel.retryFailedAgentChatMessages(session) },
+        runtimeSettingsAvailable = runtimeSettingsAvailable,
+        runtimeSettingsUnavailableMessage = runtimeSettingsUnavailableMessage,
+        onSend = { message, settings ->
+            val requestedSettings = settings.takeIf { settingsTouched }
+            if (viewModel.sendAgentChatMessage(session, message, requestedSettings)) {
+                draft = ""
+            }
+        },
+        onRetryFailed = { requestId ->
+            viewModel.retryFailedAgentChatMessage(session, requestId)
+        },
     )
 }
 
@@ -1197,10 +1292,6 @@ private fun String?.toRootDestination(): RootDestination? = when (this) {
     V2Routes.SETTINGS -> RootDestination.SETTINGS
     else -> null
 }
-
-private fun AnimatedContentTransitionScope<NavBackStackEntry>.isRootTabTransition(): Boolean =
-    initialState.destination.route.toRootDestination() != null &&
-        targetState.destination.route.toRootDestination() != null
 
 private fun encodeRouteValue(value: String): String = Base64.encodeToString(
     value.toByteArray(Charsets.UTF_8),

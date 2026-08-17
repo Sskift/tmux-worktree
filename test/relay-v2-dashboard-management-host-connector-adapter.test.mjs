@@ -179,6 +179,7 @@ test("inspectCut consumes one atomic controller cut and canonicalizes only the f
   assert.deepEqual(OPTIONAL, [
     "agent.transcript-lifecycle.v1",
     "agent.chat.v2",
+    "agent.chat.runtime-settings.v1",
     "lark.bindings.v2",
   ]);
 });

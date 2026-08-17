@@ -1735,6 +1735,7 @@ function captureManagedWssOptions(
     "webSocketConstructor",
     "maxBufferedBytes",
     "closeDrainDeadlineMs",
+    "handshakeTimeoutMs",
     "scheduleCloseDrain",
     "tlsTrust",
   ] as const;

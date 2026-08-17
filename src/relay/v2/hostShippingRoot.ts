@@ -668,6 +668,12 @@ async function startCapturedShippingRoot(
       discovery: captured.discovery,
       store,
       readinessSink: Object.freeze({ apply: () => true }),
+      resourceMutationReconcileSignal: () => {
+        const owner = lifecycleOwner;
+        if (owner !== null) {
+          void owner.triggerScan().catch(() => undefined);
+        }
+      },
     });
     // The root is the only constructor and starter of the existing reconcile
     // lifecycle owner; its startup scan is the first authoritative reconcile

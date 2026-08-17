@@ -374,6 +374,24 @@ class RelayV2StateDatabaseMigrationTest {
     }
 
     @Test
+    fun migration6To7AddsEmptyDurableCreateOutcomesWithoutChangingAuthority() {
+        migration.createDatabase(DATABASE_NAME, 6).apply {
+            insertLegacyAuthority()
+            close()
+        }
+
+        migration.runMigrationsAndValidate(
+            DATABASE_NAME,
+            7,
+            true,
+            RelayV2StateDatabase.MIGRATION_6_7,
+        ).use { migrated ->
+            assertEquals(1, migrated.count("relay_v2_authority"))
+            assertEquals(0, migrated.count("relay_v2_create_outcomes"))
+        }
+    }
+
+    @Test
     fun migratedReleaseJournalCorruptionFailsClosedOnReopen() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         migration.createDatabase(DATABASE_NAME, 2).apply {
@@ -396,6 +414,7 @@ class RelayV2StateDatabaseMigrationTest {
             RelayV2StateDatabase.MIGRATION_3_4,
             RelayV2StateDatabase.MIGRATION_4_5,
             RelayV2StateDatabase.MIGRATION_5_6,
+            RelayV2StateDatabase.MIGRATION_6_7,
         ).build()
         val corruptions = listOf(
             "pendingReleaseSnapshotRequestId='request-only'",

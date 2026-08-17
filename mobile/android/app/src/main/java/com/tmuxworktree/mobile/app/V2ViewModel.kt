@@ -12,6 +12,9 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTim
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptEntryContent
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecyclePresentationItem
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionPresentationState
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettingsStatus
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingsState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
@@ -27,10 +30,13 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2AgentCapabilityAvailability
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateCommandReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateTerminalInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateWorktreeInputs
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ManualResyncResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2NetworkHintResult
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2PendingCreateCommand
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2PendingCreateCommandsReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ProductSession
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RetryNowResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateCut
@@ -46,6 +52,8 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.SelectedSessionReplyRow
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RELAY_V2_CREDENTIAL_ROLLOVER_UNAVAILABLE
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RELAY_V2_GRANT_REVOKED
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
 import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
@@ -64,12 +72,11 @@ import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
 import com.tmuxworktree.mobile.core.model.TransportPhase
-import com.tmuxworktree.mobile.core.relay.runtime.RelayChatMutation
-import com.tmuxworktree.mobile.core.relay.runtime.RelayChatReducer
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV2ConnectionRegistry
 import com.tmuxworktree.mobile.core.relay.runtime.RelayConnectionService
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCorrelatedError
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalParserCallbackBarrier
 import com.tmuxworktree.mobile.core.terminal.RelayV2TerminalWebViewParserAdapter
@@ -89,6 +96,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -108,14 +117,35 @@ internal fun shouldPersistRelaySelectedHost(
     selectedHostId != preferredHostId &&
     preferredHostId !in availableHostIds
 
+/** Re-emits the current durable revision when startup admission later becomes Relay v2. */
+internal fun admittedRelayV2PendingCreationRevisions(
+    outboxRevisions: Flow<Long>,
+    admissions: Flow<RelayStartupAdmissionState>,
+): Flow<Long> = combine(
+    outboxRevisions,
+    admissions.distinctUntilChanged(),
+) { revision, admission ->
+    revision.takeIf { admission == RelayStartupAdmissionState.RELAY_V2 }
+}.filterNotNull()
+
+internal fun routableRelayV2CreatedSession(
+    createdSession: RelaySession?,
+    currentCuts: Map<String, RelayV2SessionReplyCut>,
+    state: V2UiState,
+): RelaySession? = createdSession?.takeIf { created ->
+    currentCuts[created.stableId] != null && state.session(created.stableId) != null
+}?.let { state.session(it.stableId) }
+
 internal fun V2UiState.beginCreationSubmission(target: CreationTarget): V2UiState? =
     when (target) {
         CreationTarget.WORKTREE -> if (creatingWorktree) null else copy(
             creatingWorktree = true,
+            worktreeCreationStatus = "Submitting…",
             actionError = null,
         )
         CreationTarget.TERMINAL -> if (creatingTerminal) null else copy(
             creatingTerminal = true,
+            terminalCreationStatus = "Submitting…",
             actionError = null,
         )
     }
@@ -132,11 +162,21 @@ internal fun V2UiState.afterRelayV2Creation(
 ): RelayV2CreationUiTransition {
     val settledState = when (target) {
         CreationTarget.WORKTREE -> copy(
-            creatingWorktree = false,
+            creatingWorktree = result is RelayV2ScopeCreateResult.Queued,
+            worktreeCreationStatus = if (result is RelayV2ScopeCreateResult.Queued) {
+                "Waiting for computer…"
+            } else {
+                null
+            },
             actionError = rejectionMessage.takeIf { result is RelayV2ScopeCreateResult.Rejected },
         )
         CreationTarget.TERMINAL -> copy(
-            creatingTerminal = false,
+            creatingTerminal = result is RelayV2ScopeCreateResult.Queued,
+            terminalCreationStatus = if (result is RelayV2ScopeCreateResult.Queued) {
+                "Waiting for computer…"
+            } else {
+                null
+            },
             actionError = rejectionMessage.takeIf { result is RelayV2ScopeCreateResult.Rejected },
         )
     }
@@ -147,12 +187,98 @@ internal fun V2UiState.afterRelayV2Creation(
     val effect = when (result) {
         is RelayV2ScopeCreateResult.Queued -> V2UiEffect.CreationQueued(
             target = target,
-            message = "$label creation queued",
+            message = "$label request saved; waiting for the computer",
         )
         is RelayV2ScopeCreateResult.Rejected ->
             V2UiEffect.Notice("$label creation was not queued")
     }
     return RelayV2CreationUiTransition(settledState, effect)
+}
+
+internal fun V2UiState.afterRelayV2CreationStatus(
+    target: CreationTarget,
+    status: RelayV2CreateCommandReadState,
+    sessionStableId: String? = null,
+    sessionProjectionPending: Boolean = false,
+): RelayV2CreationUiTransition {
+    val label = when (target) {
+        CreationTarget.WORKTREE -> "Worktree"
+        CreationTarget.TERMINAL -> "Terminal"
+    }
+    val failed = status as? RelayV2CreateCommandReadState.Failed
+    val failureMessage = failed?.let {
+        val prefix = if (it.ambiguous) {
+            "$label creation outcome is uncertain"
+        } else {
+            "$label creation failed"
+        }
+        "$prefix (${it.code}): ${it.message}"
+    } ?: if (status == RelayV2CreateCommandReadState.Unavailable) {
+        "$label creation status is unavailable. Reconnect and check Sessions before deciding whether to retry."
+    } else {
+        null
+    }
+    val settledState = when (target) {
+        CreationTarget.WORKTREE -> copy(
+            creatingWorktree = false,
+            worktreeCreationStatus = null,
+            actionError = failureMessage,
+        )
+        CreationTarget.TERMINAL -> copy(
+            creatingTerminal = false,
+            terminalCreationStatus = null,
+            actionError = failureMessage,
+        )
+    }
+    val effect = when (status) {
+        is RelayV2CreateCommandReadState.Succeeded -> V2UiEffect.CreationCompleted(
+            target = target,
+            message = if (sessionProjectionPending) {
+                "$label created on the computer; Sessions is still syncing"
+            } else {
+                "$label created"
+            },
+            sessionStableId = sessionStableId,
+        )
+        is RelayV2CreateCommandReadState.Failed -> V2UiEffect.Notice(
+            failureMessage ?: "$label creation failed",
+        )
+        RelayV2CreateCommandReadState.Unavailable -> V2UiEffect.Notice(
+            requireNotNull(failureMessage),
+        )
+        is RelayV2CreateCommandReadState.Pending,
+        RelayV2CreateCommandReadState.Stale,
+        -> error("Creation status has not settled")
+    }
+    return RelayV2CreationUiTransition(settledState, effect)
+}
+
+internal fun V2UiState.rebindRelayV2PendingCreation(
+    target: CreationTarget,
+    state: RelayV2OutboxStateTag,
+): V2UiState {
+    val message = when (state) {
+        RelayV2OutboxStateTag.QUEUED -> "Queued on this phone…"
+        RelayV2OutboxStateTag.SENDING -> "Waiting for computer…"
+        RelayV2OutboxStateTag.ACCEPTED,
+        RelayV2OutboxStateTag.CONFIRMING,
+        -> "Creating on computer…"
+        RelayV2OutboxStateTag.SUCCEEDED -> "Created; syncing Session…"
+        RelayV2OutboxStateTag.AMBIGUOUS -> "Checking creation outcome…"
+        else -> "Waiting for computer…"
+    }
+    return when (target) {
+        CreationTarget.WORKTREE -> copy(
+            creatingWorktree = true,
+            worktreeCreationStatus = message,
+            actionError = null,
+        )
+        CreationTarget.TERMINAL -> copy(
+            creatingTerminal = true,
+            terminalCreationStatus = message,
+            actionError = null,
+        )
+    }
 }
 
 /** Owns one exact selected-Session cut from status admission through its revision collector. */
@@ -210,6 +336,7 @@ class V2ViewModel(
         val fence: RelayV2TerminalUiAttachmentFence,
         val parser: RelayV2TerminalWebViewParserAdapter,
         val rendererBinding: TerminalWebViewParserBinding,
+        val openRetryAttempt: Int,
         val lifecycle: RelayV2TerminalUiAttachmentLifecycle<RelayV2TerminalAttachment> =
             RelayV2TerminalUiAttachmentLifecycle(),
     )
@@ -249,6 +376,14 @@ class V2ViewModel(
     private val relayV2ScopeCreateCuts =
         MutableStateFlow<Map<Pair<String, String>, RelayV2ScopeCreateCut>>(emptyMap())
     private val relayV2UiFenceLock = Any()
+    /** Exact command observers; guarded by [relayV2UiFenceLock]. */
+    private val relayV2CreateObservationJobs = mutableMapOf<String, Job>()
+    /** Target ownership for every exact observer; guarded by [relayV2UiFenceLock]. */
+    private val relayV2CreateObservationTargets = mutableMapOf<String, CreationTarget>()
+    /** Durable create rebind collector; guarded by [relayV2UiFenceLock]. */
+    private var relayV2CreateRebindJob: Job? = null
+    /** Terminal outcomes already surfaced by this ViewModel; guarded by [relayV2UiFenceLock]. */
+    private val relayV2ReportedCreateOutcomes = mutableSetOf<String>()
     private var relayV2Terminal: RelayV2UiTerminalAttachment? = null
     private var relayV2NotificationProfileActive = false
     private var notificationPermissionGranted = false
@@ -591,15 +726,36 @@ class V2ViewModel(
      */
     private val _agentChat: MutableStateFlow<RelayChatState> = MutableStateFlow(RelayChatState())
     val agentChat: kotlinx.coroutines.flow.StateFlow<RelayChatState> = _agentChat.asStateFlow()
+    private val _agentChatRuntimeSettingsStatuses =
+        MutableStateFlow<Map<String, AgentChatRuntimeSettingsStatus>>(emptyMap())
+    val agentChatRuntimeSettingsStatuses = _agentChatRuntimeSettingsStatuses.asStateFlow()
     private val _larkBindings = MutableStateFlow(LarkBindingsState())
     val larkBindings: kotlinx.coroutines.flow.StateFlow<LarkBindingsState> =
         _larkBindings.asStateFlow()
 
-    fun sendAgentChatMessage(session: RelaySession, message: String) {
+    fun supportsAgentChatRuntimeSettings(): Boolean = synchronized(relayV2UiFenceLock) {
+        relayV2Composition?.negotiatedCapabilities?.value?.contains(
+            AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+        ) == true
+    }
+
+    fun sendAgentChatMessage(
+        session: RelaySession,
+        message: String,
+        settings: AgentChatRuntimeSettings? = null,
+    ): Boolean {
         val normalized = message.trim()
-        if (normalized.isBlank()) return
-        val composition = synchronized(relayV2UiFenceLock) { relayV2Composition } ?: return
-        composition.sendAgentChatMessage(session.scopeId, session.protocolSessionId, normalized)
+        if (normalized.isBlank()) return false
+        val composition = synchronized(relayV2UiFenceLock) { relayV2Composition } ?: return false
+        composition.sendAgentChatMessage(
+            session.scopeId,
+            session.protocolSessionId,
+            normalized,
+            settings,
+        )
+        // Once a composition owns the call, its chat projection retains either a sending item or
+        // an exact failed item. Returning true means the composer may clear without losing text.
+        return true
     }
 
     fun fetchAgentChatHistory(session: RelaySession) {
@@ -607,21 +763,13 @@ class V2ViewModel(
         composition.fetchAgentChatHistory(session.scopeId, session.protocolSessionId)
     }
 
-    fun retryFailedAgentChatMessages(session: RelaySession) {
+    fun retryFailedAgentChatMessage(session: RelaySession, requestId: String) {
         val composition = synchronized(relayV2UiFenceLock) { relayV2Composition } ?: return
-        val failed = _agentChat.value.pending(session.protocolSessionId).filter { it.failed }
-        if (failed.isEmpty()) return
-        _agentChat.value = RelayChatReducer.reduce(
-            _agentChat.value,
-            RelayChatMutation.RetryFailed(session.protocolSessionId),
+        composition.retryAgentChatMessage(
+            scopeId = session.scopeId,
+            sessionId = session.protocolSessionId,
+            requestId = requestId,
         )
-        failed.forEach { pending ->
-            composition.sendAgentChatMessage(
-                session.scopeId,
-                session.protocolSessionId,
-                pending.message,
-            )
-        }
     }
 
     fun refreshLarkBindings() {
@@ -764,6 +912,15 @@ class V2ViewModel(
                     }
                 }
                 transition?.let { emit(it.effect) }
+                if (result is RelayV2ScopeCreateResult.Queued && transition != null) {
+                    observeRelayV2Creation(
+                        composition = composition,
+                        target = CreationTarget.WORKTREE,
+                        receipt = result.receipt,
+                        scopeId = request.scopeId,
+                        operation = RelayV2OutboxOperation.CREATE_WORKTREE,
+                    )
+                }
             }
             return
         }
@@ -870,10 +1027,307 @@ class V2ViewModel(
                     }
                 }
                 transition?.let { emit(it.effect) }
+                if (result is RelayV2ScopeCreateResult.Queued && transition != null) {
+                    observeRelayV2Creation(
+                        composition = composition,
+                        target = CreationTarget.TERMINAL,
+                        receipt = result.receipt,
+                        scopeId = scopeId,
+                        operation = RelayV2OutboxOperation.CREATE_TERMINAL,
+                    )
+                }
             }
             return
         }
         _uiState.update { it.copy(actionError = "Relay v2 is not connected") }
+    }
+
+    private fun observeRelayV2Creation(
+        composition: RelayV2BaseRuntimeComposition,
+        target: CreationTarget,
+        receipt: RelayV2OutboxEnqueueReceipt,
+        scopeId: String,
+        operation: RelayV2OutboxOperation,
+        reboundState: RelayV2OutboxStateTag? = null,
+    ) {
+        lateinit var observation: Job
+        val shouldStart = synchronized(relayV2UiFenceLock) {
+            if (relayV2Composition !== composition ||
+                _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2 ||
+                relayV2CreateObservationJobs.containsKey(receipt.commandId) ||
+                receipt.commandId in relayV2ReportedCreateOutcomes
+            ) {
+                false
+            } else {
+                reboundState?.let {
+                    _uiState.value = _uiState.value.rebindRelayV2PendingCreation(target, it)
+                }
+                observation = viewModelScope.launch(start = CoroutineStart.LAZY) {
+                    try {
+                        awaitRelayV2CreationResult(
+                            composition = composition,
+                            target = target,
+                            receipt = receipt,
+                            scopeId = scopeId,
+                            operation = operation,
+                        )
+                    } finally {
+                        synchronized(relayV2UiFenceLock) {
+                            if (relayV2CreateObservationJobs[receipt.commandId] === observation) {
+                                relayV2CreateObservationJobs.remove(receipt.commandId)
+                                relayV2CreateObservationTargets.remove(receipt.commandId)
+                            }
+                        }
+                    }
+                }
+                relayV2CreateObservationJobs[receipt.commandId] = observation
+                relayV2CreateObservationTargets[receipt.commandId] = target
+                true
+            }
+        }
+        if (shouldStart) observation.start()
+    }
+
+    private fun resumeRelayV2PendingCreations(
+        composition: RelayV2BaseRuntimeComposition,
+    ) {
+        val collector = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            admittedRelayV2PendingCreationRevisions(
+                outboxRevisions = composition.outboxTimelineRevision,
+                admissions = _uiState.map { it.relayStartupAdmission },
+            ).collect { revision ->
+                when (val read = composition.readPendingCreateCommands(revision)) {
+                    is RelayV2PendingCreateCommandsReadState.Content ->
+                        read.commands.forEach { command ->
+                            observeRelayV2PendingCreation(composition, command)
+                        }
+                    RelayV2PendingCreateCommandsReadState.Stale -> Unit
+                    RelayV2PendingCreateCommandsReadState.Unavailable ->
+                        synchronized(relayV2UiFenceLock) {
+                            if (relayV2Composition === composition &&
+                                _uiState.value.relayStartupAdmission ==
+                                RelayStartupAdmissionState.RELAY_V2
+                            ) {
+                                _uiState.value = _uiState.value.copy(
+                                    actionError = "Pending creation status is unavailable. " +
+                                        "Reconnect and check Sessions before retrying.",
+                                )
+                            }
+                        }
+                }
+            }
+        }
+        synchronized(relayV2UiFenceLock) {
+            relayV2CreateRebindJob?.cancel()
+            relayV2CreateRebindJob = collector
+        }
+        collector.start()
+    }
+
+    private fun observeRelayV2PendingCreation(
+        composition: RelayV2BaseRuntimeComposition,
+        command: RelayV2PendingCreateCommand,
+    ) {
+        val target = when (command.operation) {
+            RelayV2OutboxOperation.CREATE_WORKTREE -> CreationTarget.WORKTREE
+            RelayV2OutboxOperation.CREATE_TERMINAL -> CreationTarget.TERMINAL
+            else -> return
+        }
+        observeRelayV2Creation(
+            composition = composition,
+            target = target,
+            receipt = command.receipt,
+            scopeId = command.scopeId,
+            operation = command.operation,
+            reboundState = command.state,
+        )
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun awaitRelayV2CreationResult(
+        composition: RelayV2BaseRuntimeComposition,
+        target: CreationTarget,
+        receipt: RelayV2OutboxEnqueueReceipt,
+        scopeId: String,
+        operation: RelayV2OutboxOperation,
+    ) {
+        val settled = composition.outboxTimelineRevision.transformLatest { revision ->
+            when (val status = composition.readCreateCommand(
+                receipt = receipt,
+                scopeId = scopeId,
+                operation = operation,
+                expectedRevision = revision,
+            )) {
+                is RelayV2CreateCommandReadState.Pending -> {
+                    synchronized(relayV2UiFenceLock) {
+                        if (relayV2Composition !== composition ||
+                            _uiState.value.relayStartupAdmission !=
+                            RelayStartupAdmissionState.RELAY_V2
+                        ) return@synchronized
+                        val message = when (status.state) {
+                            RelayV2OutboxStateTag.QUEUED -> "Queued on this phone…"
+                            RelayV2OutboxStateTag.SENDING -> "Waiting for computer…"
+                            RelayV2OutboxStateTag.ACCEPTED,
+                            RelayV2OutboxStateTag.CONFIRMING,
+                            -> "Creating on computer…"
+                            else -> "Waiting for computer…"
+                        }
+                        _uiState.value = when (target) {
+                            CreationTarget.WORKTREE -> _uiState.value.copy(
+                                worktreeCreationStatus = message,
+                            )
+                            CreationTarget.TERMINAL -> _uiState.value.copy(
+                                terminalCreationStatus = message,
+                            )
+                        }
+                    }
+                }
+                RelayV2CreateCommandReadState.Stale -> Unit
+                else -> emit(status)
+            }
+        }.first()
+        val createdSession = (settled as? RelayV2CreateCommandReadState.Succeeded)
+            ?.sessionId
+            ?.let { sessionId ->
+                synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition === composition &&
+                        _uiState.value.relayStartupAdmission ==
+                        RelayStartupAdmissionState.RELAY_V2
+                    ) {
+                        _uiState.value = when (target) {
+                            CreationTarget.WORKTREE -> _uiState.value.copy(
+                                worktreeCreationStatus = "Created; syncing Session…",
+                            )
+                            CreationTarget.TERMINAL -> _uiState.value.copy(
+                                terminalCreationStatus = "Created; syncing Session…",
+                            )
+                        }
+                    }
+                }
+                awaitRelayV2CreatedSession(
+                    composition = composition,
+                    scopeId = scopeId,
+                    sessionId = sessionId,
+                )
+            }
+        val transition = synchronized(relayV2UiFenceLock) {
+            if (relayV2Composition !== composition ||
+                _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2
+            ) {
+                null
+            } else {
+                val succeeded = settled as? RelayV2CreateCommandReadState.Succeeded
+                val base = _uiState.value.afterRelayV2CreationStatus(
+                    target = target,
+                    status = settled,
+                    sessionStableId = createdSession?.stableId,
+                    sessionProjectionPending = succeeded?.sessionId != null &&
+                        createdSession == null,
+                )
+                if (settled is RelayV2CreateCommandReadState.Succeeded ||
+                    settled is RelayV2CreateCommandReadState.Failed
+                ) {
+                    relayV2ReportedCreateOutcomes += receipt.commandId
+                }
+                val hasAnotherPendingTarget = relayV2CreateObservationTargets.any {
+                    (commandId, observedTarget) ->
+                    commandId != receipt.commandId && observedTarget == target
+                }
+                val retainedState = if (!hasAnotherPendingTarget) {
+                    base.state
+                } else {
+                    when (target) {
+                        CreationTarget.WORKTREE -> base.state.copy(
+                            creatingWorktree = true,
+                            worktreeCreationStatus =
+                                _uiState.value.worktreeCreationStatus
+                                    ?: "Waiting for computer…",
+                        )
+                        CreationTarget.TERMINAL -> base.state.copy(
+                            creatingTerminal = true,
+                            terminalCreationStatus =
+                                _uiState.value.terminalCreationStatus
+                                    ?: "Waiting for computer…",
+                        )
+                    }
+                }
+                _uiState.value = retainedState
+                if (hasAnotherPendingTarget &&
+                    base.effect is V2UiEffect.CreationCompleted
+                ) {
+                    RelayV2CreationUiTransition(
+                        state = retainedState,
+                        effect = V2UiEffect.Notice(
+                            base.effect.message + "; another creation request is still pending",
+                        ),
+                    )
+                } else {
+                    RelayV2CreationUiTransition(retainedState, base.effect)
+                }
+            }
+        }
+        transition?.let {
+            emit(it.effect)
+            if (settled is RelayV2CreateCommandReadState.Succeeded ||
+                settled is RelayV2CreateCommandReadState.Failed
+            ) {
+                composition.acknowledgeCreateOutcome(receipt)
+            }
+        }
+    }
+
+    /**
+     * A command result proves creation, but only the materialized Session projection is routable.
+     * Trigger one authoritative resync and wait for the exact returned protocol Session ID instead
+     * of dropping the result and hoping that an unrelated sessions.changed event arrives later.
+     */
+    private suspend fun awaitRelayV2CreatedSession(
+        composition: RelayV2BaseRuntimeComposition,
+        scopeId: String,
+        sessionId: String,
+    ): RelaySession? {
+        fun routableSession(): RelaySession? {
+            val product = composition.productProjection.value.sessions.singleOrNull { candidate ->
+                candidate.materialized.session.scopeId == scopeId &&
+                    candidate.materialized.session.sessionId == sessionId
+            } ?: return null
+            val created = product.toUiSession()
+            return synchronized(relayV2UiFenceLock) {
+                if (relayV2Composition !== composition ||
+                    _uiState.value.relayStartupAdmission !=
+                    RelayStartupAdmissionState.RELAY_V2
+                ) {
+                    null
+                } else {
+                    routableRelayV2CreatedSession(
+                        created,
+                        relayV2SessionReplyCuts.value,
+                        _uiState.value,
+                    )
+                }
+            }
+        }
+
+        // The composition projection and its ViewModel-facing routable cut are collected by
+        // separate coroutines. A create result is not navigable until both have crossed the same
+        // Session identity; otherwise TerminalRoute can render before open admission exists and
+        // leave a successfully created terminal disconnected.
+        routableSession()?.let { return it }
+        try {
+            composition.manualResync()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // The exact projection wait below still accepts an already in-flight host refresh.
+        }
+        return withTimeoutOrNull(CREATED_SESSION_PROJECTION_TIMEOUT_MILLIS) {
+            combine(
+                composition.productProjection,
+                relayV2SessionReplyCuts,
+            ) { _, _ -> routableSession() }
+                .filterNotNull()
+                .first()
+        }
     }
 
     fun killSession(session: RelaySession) {
@@ -954,6 +1408,7 @@ class V2ViewModel(
         session: RelaySession,
         attachmentId: String,
         rendererBinding: TerminalWebViewParserBinding,
+        openRetryAttempt: Int = 0,
     ) {
         if (demoMode || _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
             return
@@ -986,6 +1441,7 @@ class V2ViewModel(
                     fence = fence,
                     parser = parser,
                     rendererBinding = rendererBinding,
+                    openRetryAttempt = openRetryAttempt,
                 )
                 val previousDetach = previous?.let {
                     val callbacks = it.parser.fenceAttachment()
@@ -1047,6 +1503,72 @@ class V2ViewModel(
                                 resetReason = reason.name.lowercase(),
                             ),
                         )
+                    }
+                }
+
+                override fun openRejected(error: RelayV2TerminalCorrelatedError) {
+                    val retry = error.retryable &&
+                        issued.openRetryAttempt < MAX_TERMINAL_OPEN_RETRY_ATTEMPTS
+                    val message = error.message.ifBlank { error.code }
+                    val detach = synchronized(relayV2UiFenceLock) {
+                        if (relayV2Terminal !== issued ||
+                            relayV2Composition !== issued.composition
+                        ) {
+                            null
+                        } else {
+                            relayV2Terminal = null
+                            _uiState.value = _uiState.value.copy(
+                                terminal = TerminalStreamState(
+                                    sessionId = session.stableId,
+                                    status = if (retry) {
+                                        ConnectionStatus.RECOVERING
+                                    } else {
+                                        ConnectionStatus.OFFLINE
+                                    },
+                                    resetReason = message,
+                                ),
+                                actionError = message,
+                            )
+                            Triple(
+                                issued,
+                                issued.lifecycle.requestDetach(),
+                                issued.parser.fenceAttachment(),
+                            )
+                        }
+                    } ?: return
+                    viewModelScope.launch {
+                        try {
+                            detachRelayV2TerminalAttachment(
+                                detach.first,
+                                detach.second,
+                                detach.third,
+                            )
+                        } catch (_: Exception) {
+                            return@launch
+                        }
+                        if (!retry) return@launch
+                        val delayMs = (
+                            TERMINAL_OPEN_RETRY_BASE_DELAY_MS *
+                                (1L shl issued.openRetryAttempt.coerceAtMost(3))
+                        ).coerceAtMost(TERMINAL_OPEN_RETRY_MAX_DELAY_MS)
+                        delay(delayMs)
+                        val stillCurrent = synchronized(relayV2UiFenceLock) {
+                            relayV2Terminal == null &&
+                                relayV2Composition === issued.composition &&
+                                issued.rendererBinding.isCurrent() &&
+                                issued.fence.isCurrent(
+                                    attachmentId,
+                                    relayV2SessionReplyCuts.value,
+                                )
+                        }
+                        if (stillCurrent) {
+                            openTerminal(
+                                session,
+                                attachmentId,
+                                issued.rendererBinding,
+                                issued.openRetryAttempt + 1,
+                            )
+                        }
                     }
                 }
             }
@@ -1151,7 +1673,9 @@ class V2ViewModel(
         when (val detach = claimed) {
             is RelayV2TerminalAttachmentDetach.Detach -> {
                 try {
-                    issued.composition.detachTerminal(detach.attachment)
+                    issued.composition.detachTerminalAfterParserCallbacksDrained(
+                        detach.attachment,
+                    )
                 } catch (failure: Throwable) {
                     issued.lifecycle.failDetach(detach.attachment, failure)
                     throw failure
@@ -1306,8 +1830,20 @@ class V2ViewModel(
                     relayV2Terminal?.takeIf {
                         it.fence.ownsRoute(attachmentId)
                     }
-                } ?: return
-                val attachment = current.lifecycle.attached() ?: return
+                }
+                if (current == null) {
+                    publishTerminalInputUnavailable(
+                        message = "Terminal connection is not ready",
+                    )
+                    return
+                }
+                val attachment = current.lifecycle.attached()
+                if (attachment == null) {
+                    publishTerminalInputUnavailable(
+                        message = "Terminal connection is still opening",
+                    )
+                    return
+                }
                 viewModelScope.launch {
                     if (!current.composition.sendTerminalInput(
                             attachment,
@@ -1321,6 +1857,20 @@ class V2ViewModel(
                 }
             }
             else -> Unit
+        }
+    }
+
+    private fun publishTerminalInputUnavailable(message: String) {
+        _uiState.update { state ->
+            if (state.terminal.status != ConnectionStatus.ONLINE) return@update state
+            state.copy(
+                terminal = TerminalStreamState(
+                    sessionId = state.terminal.sessionId,
+                    status = ConnectionStatus.OFFLINE,
+                    resetReason = "terminal_attachment_unavailable",
+                ),
+                actionError = message,
+            )
         }
     }
 
@@ -2007,6 +2557,12 @@ class V2ViewModel(
             relayV2ScopeCreateCuts.value = emptyMap()
             relayV2Composition = null
             relayV2ExplicitRefreshReservation = null
+            relayV2CreateRebindJob?.cancel()
+            relayV2CreateRebindJob = null
+            relayV2CreateObservationJobs.values.forEach(Job::cancel)
+            relayV2CreateObservationJobs.clear()
+            relayV2CreateObservationTargets.clear()
+            relayV2ReportedCreateOutcomes.clear()
         }
         relayV2ProfileRuntime = null
         effectsClosed = true
@@ -2221,7 +2777,14 @@ class V2ViewModel(
      */
     private fun retireStaleRelayV2Composition() {
         synchronized(relayV2UiFenceLock) {
-            val stale = relayV2Composition ?: return
+            val stale = relayV2Composition
+            relayV2CreateRebindJob?.cancel()
+            relayV2CreateRebindJob = null
+            relayV2CreateObservationJobs.values.forEach(Job::cancel)
+            relayV2CreateObservationJobs.clear()
+            relayV2CreateObservationTargets.clear()
+            relayV2ReportedCreateOutcomes.clear()
+            if (stale == null) return
             runCatching { stale.close() }
             RelayV2ConnectionRegistry.clear(stale)
             relayV2Composition = null
@@ -2230,11 +2793,16 @@ class V2ViewModel(
             relayV2ScopeCreateCuts.value = emptyMap()
             relayV2Terminal = null
             _larkBindings.value = LarkBindingsState()
+            _agentChatRuntimeSettingsStatuses.value = emptyMap()
             _uiState.value = _uiState.value.copy(
                 agentCapabilityAvailability = AgentCapabilityAvailability.UNAVAILABLE,
                 scopes = emptyList(),
                 sessions = emptyList(),
                 terminal = TerminalStreamState(),
+                creatingWorktree = false,
+                creatingTerminal = false,
+                worktreeCreationStatus = null,
+                terminalCreationStatus = null,
             )
         }
     }
@@ -2282,6 +2850,7 @@ class V2ViewModel(
                 ),
             )
         }
+        resumeRelayV2PendingCreations(composition)
         viewModelScope.launch {
             composition.state.collect { runtime ->
                 val connectionFailure =
@@ -2389,6 +2958,17 @@ class V2ViewModel(
                     ) return@synchronized false
                     _agentChat.value = chat
                     true
+                }
+            }
+        }
+        viewModelScope.launch {
+            composition.agentChatRuntimeSettingsStatuses.collect { statuses ->
+                synchronized(relayV2UiFenceLock) {
+                    if (relayV2Composition !== composition ||
+                        _uiState.value.relayStartupAdmission !=
+                        RelayStartupAdmissionState.RELAY_V2
+                    ) return@synchronized
+                    _agentChatRuntimeSettingsStatuses.value = statuses
                 }
             }
         }
@@ -2672,6 +3252,7 @@ class V2ViewModel(
         is V2UiEffect.NavigateToSession,
         is V2UiEffect.NavigateToTerminal,
         is V2UiEffect.CreationQueued,
+        is V2UiEffect.CreationCompleted,
         is V2UiEffect.TerminalReset,
         V2UiEffect.ProfileCleared,
         -> true
@@ -2687,10 +3268,14 @@ class V2ViewModel(
         private const val MAX_ACTIVATION_FAILURE_CAUSE = 200
         private const val DEFAULT_TERMINAL_COLS = 80
         private const val DEFAULT_TERMINAL_ROWS = 24
+        private const val MAX_TERMINAL_OPEN_RETRY_ATTEMPTS = 5
+        private const val TERMINAL_OPEN_RETRY_BASE_DELAY_MS = 250L
+        private const val TERMINAL_OPEN_RETRY_MAX_DELAY_MS = 2_000L
         private const val DEFAULT_SCOPE_ID = "local"
         private const val MAX_PENDING_UI_EFFECTS = 64
         private const val MAX_PENDING_CRITICAL_UI_EFFECTS = 16
         private const val RELAY_V2_SERVER_REVOKE_PROPAGATION_TIMEOUT_MILLIS = 5_500L
+        private const val CREATED_SESSION_PROJECTION_TIMEOUT_MILLIS = 10_000L
         fun factory(
             container: AppContainer,
             demoMode: Boolean,
@@ -2970,7 +3555,8 @@ private fun RelayV2ScopeCreateFailure.createWorktreeUserMessage(): String = when
     RelayV2ScopeCreateFailure.SCOPE_STALE -> "The Relay v2 Scope is no longer current"
     RelayV2ScopeCreateFailure.INVALID_INPUT -> "The Worktree settings are invalid"
     RelayV2ScopeCreateFailure.CAPACITY_EXCEEDED -> "The Relay v2 Outbox is full"
-    RelayV2ScopeCreateFailure.DUPLICATE_COMMAND,
+    RelayV2ScopeCreateFailure.DUPLICATE_COMMAND ->
+        "A Worktree creation request is already pending"
     RelayV2ScopeCreateFailure.FOREIGN_LINEAGE,
     RelayV2ScopeCreateFailure.CORRUPT_STATE,
     RelayV2ScopeCreateFailure.STORE_FAILURE,
@@ -2983,7 +3569,8 @@ private fun RelayV2ScopeCreateFailure.createTerminalUserMessage(): String = when
     RelayV2ScopeCreateFailure.SCOPE_STALE -> "The Relay v2 Scope is no longer current"
     RelayV2ScopeCreateFailure.INVALID_INPUT -> "The Terminal settings are invalid"
     RelayV2ScopeCreateFailure.CAPACITY_EXCEEDED -> "The Relay v2 Outbox is full"
-    RelayV2ScopeCreateFailure.DUPLICATE_COMMAND,
+    RelayV2ScopeCreateFailure.DUPLICATE_COMMAND ->
+        "A Terminal creation request is already pending"
     RelayV2ScopeCreateFailure.FOREIGN_LINEAGE,
     RelayV2ScopeCreateFailure.CORRUPT_STATE,
     RelayV2ScopeCreateFailure.STORE_FAILURE,

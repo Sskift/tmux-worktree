@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableLoadOrInitializeAdapter
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentNotificationConfig
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDisabledNotificationPlatform
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationConfigMutationAdapter
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleNotificationConfigMutationCommand
@@ -25,7 +26,9 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2AttemptInterruptionCause
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusState
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
@@ -40,10 +43,13 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionRea
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedScopeReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueFailure
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueReceipt
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxEnqueueResult
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2CreateOutcomeKey
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2CreateOutcomeState
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeReachability
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
@@ -200,6 +206,43 @@ internal data class RelayV2CreateTerminalInputs(
     val label: String?,
 )
 
+/** Exact durable state of one locally accepted create command. */
+internal sealed interface RelayV2CreateCommandReadState {
+    data class Pending(
+        val state: RelayV2OutboxStateTag,
+    ) : RelayV2CreateCommandReadState
+
+    data class Succeeded(
+        val sessionId: String?,
+    ) : RelayV2CreateCommandReadState
+
+    data class Failed(
+        val code: String,
+        val message: String,
+        val ambiguous: Boolean,
+    ) : RelayV2CreateCommandReadState
+
+    data object Unavailable : RelayV2CreateCommandReadState
+    data object Stale : RelayV2CreateCommandReadState
+}
+
+/** Durable pending create or terminal failure that a recreated UI must resume projecting. */
+internal data class RelayV2PendingCreateCommand(
+    val receipt: RelayV2OutboxEnqueueReceipt,
+    val scopeId: String,
+    val operation: RelayV2OutboxOperation,
+    val state: RelayV2OutboxStateTag,
+)
+
+internal sealed interface RelayV2PendingCreateCommandsReadState {
+    data class Content(
+        val commands: List<RelayV2PendingCreateCommand>,
+    ) : RelayV2PendingCreateCommandsReadState
+
+    data object Unavailable : RelayV2PendingCreateCommandsReadState
+    data object Stale : RelayV2PendingCreateCommandsReadState
+}
+
 internal enum class RelayV2ScopeCreateFailure {
     NOT_ONLINE,
     PROFILE_BARRIER,
@@ -319,7 +362,7 @@ internal class RelayV2BaseRuntimeComposition(
     terminalResumeCredentials: RelayV2TerminalResumeCredentialStore,
     private val materializedSessions: RelayV2MaterializedSessionReadAuthority,
     private val activationOutbox: RelayV2ActivationOutboxReadPort,
-    outboxAuthority: RelayV2OutboxRuntimeAuthority,
+    private val outboxAuthority: RelayV2OutboxRuntimeAuthority,
     private val outboxEnqueueAuthority: RelayV2OutboxEnqueueAuthority,
     agentDurableRepository: AgentTranscriptLifecycleRuntimeDurableRepository? = null,
     agentNotificationPlatform: AgentTranscriptLifecycleNotificationPlatformPort =
@@ -332,6 +375,7 @@ internal class RelayV2BaseRuntimeComposition(
     private val clock: () -> Long = System::currentTimeMillis,
     private val retryDelay: suspend (Long) -> Unit = { delay(it) },
     private val commandRetryDelay: suspend (Long) -> Unit = { delay(it) },
+    private val commandDeliveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
     private val actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
     private val beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
     private val beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
@@ -476,6 +520,8 @@ internal class RelayV2BaseRuntimeComposition(
         productProjection.map { it.sessions }
     private val _outboxTimelineRevision = MutableStateFlow(0L)
     val outboxTimelineRevision: StateFlow<Long> = _outboxTimelineRevision.asStateFlow()
+    private val createCommandEvidenceLock = Any()
+    private val createCommandEvidence = HashMap<RelayV2OutboxEntryId, RelayV2OutboxEvidenceApplied>()
     private val _agentTimelineRevision = MutableStateFlow(0L)
     val agentTimelineRevision: StateFlow<Long> = _agentTimelineRevision.asStateFlow()
     val agentCapabilityAvailability: StateFlow<RelayV2AgentCapabilityAvailability> =
@@ -483,10 +529,21 @@ internal class RelayV2BaseRuntimeComposition(
     /** Frozen intersection of client-advertised, broker-blessed, and host-announced capabilities. */
     val negotiatedCapabilities: StateFlow<Set<String>> = actor.negotiatedCapabilities
     val agentChat: StateFlow<RelayChatState> = actor.agentChatState
+    val agentChatRuntimeSettingsStatuses = actor.agentChatRuntimeSettingsStatuses
     val larkBindings: StateFlow<LarkBindingsState> = actor.larkBindingsState
 
-    fun sendAgentChatMessage(scopeId: String, sessionId: String, message: String): Boolean =
-        actor.sendAgentChatMessage(scopeId, sessionId, message)
+    fun sendAgentChatMessage(
+        scopeId: String,
+        sessionId: String,
+        message: String,
+        settings: AgentChatRuntimeSettings? = null,
+    ): Boolean = actor.sendAgentChatMessage(scopeId, sessionId, message, settings)
+
+    fun retryAgentChatMessage(
+        scopeId: String,
+        sessionId: String,
+        requestId: String,
+    ): Boolean = actor.retryAgentChatMessage(scopeId, sessionId, requestId)
 
     fun fetchAgentChatHistory(scopeId: String, sessionId: String, limit: Int? = null): Boolean =
         actor.fetchAgentChatHistory(scopeId, sessionId, limit)
@@ -633,6 +690,14 @@ internal class RelayV2BaseRuntimeComposition(
         val issued = attachment as? CompositionTerminalAttachment ?: return
         if (issued.origin !== this) return
         terminalRuntime.detach(issued.runtimeAttachment)
+    }
+
+    internal suspend fun detachTerminalAfterParserCallbacksDrained(
+        attachment: RelayV2TerminalAttachment,
+    ) {
+        val issued = attachment as? CompositionTerminalAttachment ?: return
+        if (issued.origin !== this) return
+        terminalRuntime.detachAfterParserCallbacksDrained(issued.runtimeAttachment)
     }
 
     private suspend fun withTerminalOnline(
@@ -1032,6 +1097,215 @@ internal class RelayV2BaseRuntimeComposition(
             return SelectedSessionReplyReadState.Stale
         }
         return SelectedSessionReplyReadState.Content(expectedRevision, rows)
+    }
+
+    /**
+     * Reads one exact create command from the activation Outbox. Local enqueue is deliberately
+     * not success: callers keep the creation UI pending until this read reaches a Host-authored
+     * final state. Reissued commands are followed only through the persisted replacement chain.
+     */
+    suspend fun readCreateCommand(
+        receipt: RelayV2OutboxEnqueueReceipt,
+        scopeId: String,
+        operation: RelayV2OutboxOperation,
+        expectedRevision: Long,
+    ): RelayV2CreateCommandReadState {
+        if (operation != RelayV2OutboxOperation.CREATE_WORKTREE &&
+            operation != RelayV2OutboxOperation.CREATE_TERMINAL
+        ) return RelayV2CreateCommandReadState.Unavailable
+        if (_outboxTimelineRevision.value != expectedRevision) {
+            return RelayV2CreateCommandReadState.Stale
+        }
+        val snapshot = try {
+            activationOutbox.readSnapshot(profile)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return RelayV2CreateCommandReadState.Unavailable
+        }
+        val original = snapshot.entries.singleOrNull { entry ->
+            entry.profileId == profile.profileId &&
+                entry.principalId == profile.principalId &&
+                entry.hostId == receipt.hostId &&
+                entry.expectedHostEpoch == receipt.expectedHostEpoch &&
+                entry.commandId == receipt.commandId &&
+                entry.createdOrder == receipt.createdOrder &&
+                entry.scopeId == scopeId &&
+                entry.sessionId == null &&
+                entry.operation == operation
+        } ?: return RelayV2CreateCommandReadState.Unavailable
+        var current = original
+        val visited = HashSet<String>()
+        while (current.state == RelayV2OutboxStateTag.REISSUED) {
+            if (!visited.add(current.commandId)) {
+                return RelayV2CreateCommandReadState.Unavailable
+            }
+            val replacementId = current.replacementCommandId
+                ?: return RelayV2CreateCommandReadState.Unavailable
+            current = snapshot.entries.singleOrNull { candidate ->
+                candidate.profileId == original.profileId &&
+                    candidate.principalId == original.principalId &&
+                    candidate.commandId == replacementId &&
+                    candidate.reissuedFromCommandId == current.commandId &&
+                    candidate.scopeId == scopeId &&
+                    candidate.sessionId == null &&
+                    candidate.operation == operation
+            } ?: return RelayV2CreateCommandReadState.Unavailable
+        }
+        val durableOutcome = try {
+            outboxAuthority.readCreateOutcomes(profile.outboxNamespace())
+                .singleOrNull { outcome ->
+                    outcome.key.hostId == receipt.hostId &&
+                        outcome.key.expectedHostEpoch == receipt.expectedHostEpoch &&
+                        outcome.key.commandId == receipt.commandId &&
+                        outcome.createdOrder == receipt.createdOrder &&
+                        outcome.scopeId == scopeId &&
+                        outcome.operation == operation
+                }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return RelayV2CreateCommandReadState.Unavailable
+        }
+        if (_outboxTimelineRevision.value != expectedRevision) {
+            return RelayV2CreateCommandReadState.Stale
+        }
+        val evidence = synchronized(createCommandEvidenceLock) {
+            createCommandEvidence[current.id]
+        }
+        return when (current.state) {
+            RelayV2OutboxStateTag.QUEUED,
+            RelayV2OutboxStateTag.SENDING,
+            RelayV2OutboxStateTag.ACCEPTED,
+            RelayV2OutboxStateTag.CONFIRMING,
+            -> RelayV2CreateCommandReadState.Pending(current.state)
+            RelayV2OutboxStateTag.SUCCEEDED -> {
+                val created = evidence?.result as? com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandResult.CreatedSession
+                RelayV2CreateCommandReadState.Succeeded(
+                    durableOutcome
+                        ?.takeIf { it.state == RelayV2CreateOutcomeState.SUCCEEDED }
+                        ?.sessionId
+                        ?: created?.sessionId,
+                )
+            }
+            RelayV2OutboxStateTag.FAILED_FINAL,
+            RelayV2OutboxStateTag.AMBIGUOUS,
+            -> {
+                val ambiguous = current.state == RelayV2OutboxStateTag.AMBIGUOUS
+                val durableFailure = durableOutcome?.takeIf { outcome ->
+                    outcome.state == if (ambiguous) {
+                        RelayV2CreateOutcomeState.AMBIGUOUS
+                    } else {
+                        RelayV2CreateOutcomeState.FAILED_FINAL
+                    }
+                }
+                RelayV2CreateCommandReadState.Failed(
+                    code = durableFailure?.errorCode ?: evidence?.errorCode ?: if (ambiguous) {
+                        "COMMAND_OUTCOME_UNCERTAIN"
+                    } else {
+                        "CREATE_REJECTED"
+                    },
+                    message = durableFailure?.errorMessage ?: evidence?.errorMessage ?: if (ambiguous) {
+                        "The computer could not confirm whether creation completed."
+                    } else {
+                        "The computer rejected the creation command."
+                    },
+                    ambiguous = ambiguous,
+                )
+            }
+            RelayV2OutboxStateTag.REISSUED -> error("replacement traversal did not settle")
+        }
+    }
+
+    /** Restores pending create fences and unsurfaced failures after UI recreation. */
+    suspend fun readPendingCreateCommands(
+        expectedRevision: Long,
+    ): RelayV2PendingCreateCommandsReadState {
+        if (_outboxTimelineRevision.value != expectedRevision) {
+            return RelayV2PendingCreateCommandsReadState.Stale
+        }
+        val commands = try {
+            val entries = activationOutbox.readSnapshot(profile).entries
+            val durableOutcomes = outboxAuthority
+                .readCreateOutcomes(profile.outboxNamespace())
+                .associateBy { outcome ->
+                    RelayV2OutboxEntryId(
+                        profileId = outcome.key.namespace.profileId,
+                        principalId = outcome.key.namespace.principalId,
+                        hostId = outcome.key.hostId,
+                        expectedHostEpoch = outcome.key.expectedHostEpoch,
+                        commandId = outcome.key.commandId,
+                    )
+                }
+            entries.asSequence()
+                .filter { entry ->
+                    entry.operation in CREATE_OPERATIONS && entry.reissuedFromCommandId == null
+                }
+                .sortedWith(compareBy<RelayV2OutboxEntry> { it.createdOrder }
+                    .thenBy { it.commandId })
+                .mapNotNull { root ->
+                    var leaf = root
+                    val visited = HashSet<String>()
+                    while (leaf.state == RelayV2OutboxStateTag.REISSUED) {
+                        if (!visited.add(leaf.commandId)) return@mapNotNull null
+                        val replacementId = leaf.replacementCommandId ?: return@mapNotNull null
+                        leaf = entries.singleOrNull { candidate ->
+                            candidate.commandId == replacementId &&
+                                candidate.reissuedFromCommandId == leaf.commandId &&
+                                candidate.scopeId == root.scopeId &&
+                                candidate.operation == root.operation
+                        } ?: return@mapNotNull null
+                    }
+                    if (leaf.state !in CREATE_REBIND_STATES) return@mapNotNull null
+                    if (leaf.state in CREATE_TERMINAL_OUTCOME_STATES) {
+                        durableOutcomes[root.id]
+                            ?.takeIf { outcome ->
+                                !outcome.acknowledged &&
+                                    outcome.createdOrder == root.createdOrder &&
+                                    outcome.scopeId == root.scopeId &&
+                                    outcome.operation == root.operation &&
+                                    outcome.state.matches(leaf.state)
+                            }
+                            ?: return@mapNotNull null
+                    }
+                    RelayV2PendingCreateCommand(
+                        receipt = RelayV2OutboxEnqueueReceipt(
+                            hostId = root.hostId,
+                            expectedHostEpoch = root.expectedHostEpoch,
+                            commandId = root.commandId,
+                            createdOrder = root.createdOrder,
+                        ),
+                        scopeId = root.scopeId,
+                        operation = root.operation,
+                        state = leaf.state,
+                    )
+                }
+                .toList()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return RelayV2PendingCreateCommandsReadState.Unavailable
+        }
+        if (_outboxTimelineRevision.value != expectedRevision) {
+            return RelayV2PendingCreateCommandsReadState.Stale
+        }
+        return RelayV2PendingCreateCommandsReadState.Content(commands)
+    }
+
+    /** Durably marks one exact Host create outcome as surfaced by an attached UI. */
+    suspend fun acknowledgeCreateOutcome(receipt: RelayV2OutboxEnqueueReceipt): Boolean = try {
+        outboxAuthority.acknowledgeCreateOutcome(
+            RelayV2CreateOutcomeKey(
+                namespace = profile.outboxNamespace(),
+                hostId = receipt.hostId,
+                expectedHostEpoch = receipt.expectedHostEpoch,
+                commandId = receipt.commandId,
+            ),
+        )
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        false
     }
 
     private fun currentIssuedSession(
@@ -1673,6 +1947,7 @@ internal class RelayV2BaseRuntimeComposition(
         }
         when (result) {
             is RelayV2OutboxRecoveryApplyResult.Committed -> {
+                rememberCreateCommandEvidence(result.commit)
                 markOutboxTimelineCommit()
                 val commit = result.commit
                 if (commit is RelayV2OutboxRecoveryCommit.CommandStatuses) {
@@ -1690,6 +1965,20 @@ internal class RelayV2BaseRuntimeComposition(
             RelayV2OutboxRecoveryApplyResult.Stale -> clearRecoveredDispatch()
         }
         return true
+    }
+
+    private fun rememberCreateCommandEvidence(commit: RelayV2OutboxRecoveryCommit) {
+        val evidence = when (commit) {
+            is RelayV2OutboxRecoveryCommit.CommandEvidence -> listOf(commit.receipt)
+            is RelayV2OutboxRecoveryCommit.CommandStatuses -> commit.evidence
+        }.filter {
+            it.operation == RelayV2OutboxOperation.CREATE_WORKTREE ||
+                it.operation == RelayV2OutboxOperation.CREATE_TERMINAL
+        }
+        if (evidence.isEmpty()) return
+        synchronized(createCommandEvidenceLock) {
+            evidence.forEach { createCommandEvidence[it.entryId] = it }
+        }
     }
 
     private suspend fun applyOnlineCommandEvidence(
@@ -1731,7 +2020,11 @@ internal class RelayV2BaseRuntimeComposition(
                     failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
                     return
                 }
-                scheduleCommandRetry(capability, onlyEffect)
+                scheduleCommandRetry(
+                    authority = delivered.repositoryAuthority,
+                    capability = capability,
+                    effect = onlyEffect,
+                )
             }
             is RelayV2OutboxEffect.ReissueCreated -> {
                 if (issuance != RelayV2OutboxDispatchIssuance.NoDispatch ||
@@ -1865,6 +2158,8 @@ internal class RelayV2BaseRuntimeComposition(
         authority: RelayV2RepositoryEffectAuthority,
     ): Boolean {
         var failureCode: String? = null
+        val submitted = ArrayList<RelayV2OutboxDispatchIdentity>()
+        var confirmingRequired: RelayV2OutboxDispatchIdentity? = null
         synchronized(recoveredDispatchLock) {
             if (closed.get() || terminalFailure.get() != null) {
                 recoveredDispatch = null
@@ -1880,12 +2175,31 @@ internal class RelayV2BaseRuntimeComposition(
             }
             recoveredDispatch = null
             for (capability in buffer.capabilities) {
-                if (outboxDispatcher.dispatch(capability) !is
-                    RelayV2OutboxDispatchOutcome.Submitted
-                ) {
-                    failureCode = "COMMAND_OUTBOX_RECOVERED_DISPATCH_FAILED"
-                    break
+                when (val outcome = outboxDispatcher.dispatch(capability)) {
+                    is RelayV2OutboxDispatchOutcome.Submitted -> submitted += outcome.identity
+                    is RelayV2OutboxDispatchOutcome.ConfirmingRequired -> {
+                        confirmingRequired = outcome.identity
+                        break
+                    }
+                    is RelayV2OutboxDispatchOutcome.Stale,
+                    is RelayV2OutboxDispatchOutcome.AlreadyDispatched,
+                    is RelayV2OutboxDispatchOutcome.CapabilityRejected,
+                    -> {
+                        failureCode = "COMMAND_OUTBOX_RECOVERED_DISPATCH_FAILED"
+                        break
+                    }
                 }
+            }
+        }
+        submitted.forEach { scheduleCommandDeliveryWatchdog(authority, it) }
+        confirmingRequired?.let { identity ->
+            pumpScope.launch {
+                recoverUncertainCommandDelivery(
+                    authority = authority,
+                    identity = identity,
+                    cause = RelayV2AttemptInterruptionCause.DISCONNECTED,
+                    failureCode = "COMMAND_DELIVERY_INTERRUPTED",
+                )
             }
         }
         failureCode?.let(::failRuntimeIncomplete)
@@ -1930,9 +2244,21 @@ internal class RelayV2BaseRuntimeComposition(
                     for (capability in capabilities) {
                         if (closed.get() || terminalFailure.get() != null) return
                         when (outboxDispatcher.dispatch(capability)) {
-                            is RelayV2OutboxDispatchOutcome.Submitted -> Unit
+                            is RelayV2OutboxDispatchOutcome.Submitted ->
+                                scheduleCommandDeliveryWatchdog(authority, capability.identity)
                             is RelayV2OutboxDispatchOutcome.Stale -> return
-                            else -> {
+                            is RelayV2OutboxDispatchOutcome.ConfirmingRequired -> {
+                                recoverUncertainCommandDelivery(
+                                    authority = authority,
+                                    identity = capability.identity,
+                                    cause = RelayV2AttemptInterruptionCause.DISCONNECTED,
+                                    failureCode = "COMMAND_DELIVERY_INTERRUPTED",
+                                )
+                                return
+                            }
+                            is RelayV2OutboxDispatchOutcome.AlreadyDispatched,
+                            is RelayV2OutboxDispatchOutcome.CapabilityRejected,
+                            -> {
                                 failRuntimeIncomplete("COMMAND_OUTBOX_FRESH_DISPATCH_FAILED")
                                 return
                             }
@@ -1943,7 +2269,113 @@ internal class RelayV2BaseRuntimeComposition(
         }
     }
 
+    /**
+     * A successful WebSocket `send` proves only that OkHttp accepted bytes into its local queue.
+     * If no correlated Host evidence reaches Room, force a ledger-query reconnect instead of
+     * leaving the lane's head in SENDING forever and blocking every later command in that lane.
+     */
+    private fun scheduleCommandDeliveryWatchdog(
+        authority: RelayV2RepositoryEffectAuthority,
+        identity: RelayV2OutboxDispatchIdentity,
+    ) {
+        pumpScope.launch {
+            try {
+                commandDeliveryWatchdogDelay(COMMAND_DELIVERY_WATCHDOG_MS)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                failRuntimeIncomplete("COMMAND_DELIVERY_WATCHDOG_FAILED")
+                return@launch
+            }
+            if (closed.get() || terminalFailure.get() != null) return@launch
+            recoverUncertainCommandDelivery(
+                authority = authority,
+                identity = identity,
+                cause = RelayV2AttemptInterruptionCause.TIMEOUT,
+                failureCode = "COMMAND_DELIVERY_TIMEOUT",
+            )
+        }
+    }
+
+    private suspend fun recoverUncertainCommandDelivery(
+        authority: RelayV2RepositoryEffectAuthority,
+        identity: RelayV2OutboxDispatchIdentity,
+        cause: RelayV2AttemptInterruptionCause,
+        failureCode: String,
+    ) {
+        when (interruptUnsettledCommandDelivery(authority, identity, cause)) {
+            CommandDeliveryInterruption.INTERRUPTED -> {
+                // Retiring this exact generation drives the normal retryable reconnect path. The
+                // next Hello admits CONFIRMING and queries the Host before any retry is issued.
+                actor.retireCurrentOutboxDelivery(authority, failureCode)
+            }
+            CommandDeliveryInterruption.SETTLED,
+            CommandDeliveryInterruption.STALE,
+            -> Unit
+            CommandDeliveryInterruption.REJECTED ->
+                failRuntimeIncomplete("COMMAND_DELIVERY_INTERRUPTION_COMMIT_FAILED")
+        }
+    }
+
+    private suspend fun interruptUnsettledCommandDelivery(
+        authority: RelayV2RepositoryEffectAuthority,
+        identity: RelayV2OutboxDispatchIdentity,
+        cause: RelayV2AttemptInterruptionCause,
+    ): CommandDeliveryInterruption {
+        if (identity.generation != authority.generation) {
+            return CommandDeliveryInterruption.STALE
+        }
+        val entryId = RelayV2OutboxEntryId(
+            profileId = authority.profileId,
+            principalId = authority.principalId,
+            hostId = authority.hostId,
+            expectedHostEpoch = authority.hostEpoch,
+            commandId = identity.commandId,
+        )
+        var matched = false
+        val leased = actor.withEffectApplyLease(authority) {
+            productMutationLock.withLock {
+                outboxAuthority.reduceOutboxBatchUnderApplyLease(
+                    authority.outboxNamespace(),
+                ) { state ->
+                    val entry = state.entries.singleOrNull { candidate ->
+                        candidate.id == entryId &&
+                            candidate.state == RelayV2OutboxStateTag.SENDING &&
+                            candidate.attempts.lastOrNull()?.requestId == identity.requestId
+                    } ?: return@reduceOutboxBatchUnderApplyLease null
+                    matched = true
+                    listOf(
+                        RelayV2OutboxAction.AttemptInterrupted(
+                            entryId = entry.id,
+                            attemptRequestId = identity.requestId,
+                            cause = cause,
+                        ),
+                    )
+                }
+            }
+        }
+        return when (leased) {
+            RelayV2EffectApplyResult.Stale -> CommandDeliveryInterruption.STALE
+            is RelayV2EffectApplyResult.Applied -> when (val result = leased.value) {
+                is RelayV2OutboxBatchResult.Applied -> {
+                    if (!matched || result.effects.isNotEmpty()) {
+                        CommandDeliveryInterruption.REJECTED
+                    } else {
+                        markOutboxTimelineCommit()
+                        CommandDeliveryInterruption.INTERRUPTED
+                    }
+                }
+                is RelayV2OutboxBatchResult.Rejected -> if (!matched && result.reason == null) {
+                    CommandDeliveryInterruption.SETTLED
+                } else {
+                    CommandDeliveryInterruption.REJECTED
+                }
+            }
+        }
+    }
+
     private fun scheduleCommandRetry(
+        authority: RelayV2RepositoryEffectAuthority,
         capability: RelayV2OutboxDispatchCapability,
         effect: RelayV2OutboxEffect.ExecuteCommand,
     ) {
@@ -1959,10 +2391,19 @@ internal class RelayV2BaseRuntimeComposition(
             }
             if (closed.get() || terminalFailure.get() != null) return@launch
             when (outboxDispatcher.dispatch(capability)) {
-                is RelayV2OutboxDispatchOutcome.Submitted,
-                is RelayV2OutboxDispatchOutcome.Stale,
-                -> Unit
-                else -> failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
+                is RelayV2OutboxDispatchOutcome.Submitted ->
+                    scheduleCommandDeliveryWatchdog(authority, capability.identity)
+                is RelayV2OutboxDispatchOutcome.Stale -> Unit
+                is RelayV2OutboxDispatchOutcome.ConfirmingRequired ->
+                    recoverUncertainCommandDelivery(
+                        authority = authority,
+                        identity = capability.identity,
+                        cause = RelayV2AttemptInterruptionCause.DISCONNECTED,
+                        failureCode = "COMMAND_DELIVERY_INTERRUPTED",
+                    )
+                is RelayV2OutboxDispatchOutcome.AlreadyDispatched,
+                is RelayV2OutboxDispatchOutcome.CapabilityRejected,
+                -> failRuntimeIncomplete("COMMAND_OUTBOX_RECOVERED_DISPATCH_INVALID")
             }
         }
     }
@@ -2104,6 +2545,22 @@ internal class RelayV2BaseRuntimeComposition(
             createArguments()
         } catch (_: Exception) {
             return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.INVALID_INPUT)
+        }
+        val duplicatePending = try {
+            activationOutbox.readSnapshot(profile).entries.any { entry ->
+                entry.scopeId == issued.scope.scopeId &&
+                    entry.sessionId == null &&
+                    entry.operation == arguments.operation &&
+                    entry.canonicalRequestArguments.value == arguments &&
+                    entry.state in CREATE_DUPLICATE_FENCE_STATES
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.STORE_FAILURE)
+        }
+        if (duplicatePending) {
+            return ScopeCreateCommit.Rejected(RelayV2ScopeCreateFailure.DUPLICATE_COMMAND)
         }
         val enqueue = try {
             outboxEnqueueAuthority.enqueueOutbox(
@@ -2822,6 +3279,28 @@ internal class RelayV2BaseRuntimeComposition(
         const val RETRY_BASE_DELAY_MS = 1_000L
         const val RETRY_MAX_DELAY_MS = 30_000L
         const val MAX_RETRY_EXPONENT = 5
+        const val COMMAND_DELIVERY_WATCHDOG_MS = 15_000L
+        val CREATE_OPERATIONS = setOf(
+            RelayV2OutboxOperation.CREATE_WORKTREE,
+            RelayV2OutboxOperation.CREATE_TERMINAL,
+        )
+        val CREATE_OBSERVATION_STATES = setOf(
+            RelayV2OutboxStateTag.QUEUED,
+            RelayV2OutboxStateTag.SENDING,
+            RelayV2OutboxStateTag.ACCEPTED,
+            RelayV2OutboxStateTag.CONFIRMING,
+        )
+        val CREATE_REBIND_STATES = CREATE_OBSERVATION_STATES + setOf(
+            RelayV2OutboxStateTag.SUCCEEDED,
+            RelayV2OutboxStateTag.FAILED_FINAL,
+            RelayV2OutboxStateTag.AMBIGUOUS,
+        )
+        val CREATE_TERMINAL_OUTCOME_STATES = setOf(
+            RelayV2OutboxStateTag.SUCCEEDED,
+            RelayV2OutboxStateTag.FAILED_FINAL,
+            RelayV2OutboxStateTag.AMBIGUOUS,
+        )
+        val CREATE_DUPLICATE_FENCE_STATES = CREATE_OBSERVATION_STATES
     }
 
     private data class ActivationOutboxSnapshot(
@@ -2855,6 +3334,13 @@ internal class RelayV2BaseRuntimeComposition(
         SCHEDULED,
         FENCED,
         STALE,
+    }
+
+    private enum class CommandDeliveryInterruption {
+        INTERRUPTED,
+        SETTLED,
+        STALE,
+        REJECTED,
     }
 
     private data class RecoveredDispatchLineage(
@@ -2933,6 +3419,20 @@ private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
         principalId = principalId,
         clientInstanceId = clientInstanceId,
     )
+
+private fun RelayV2Profile.outboxNamespace() =
+    RelayV2OutboxAuthorityNamespace(
+        profileId = profileId,
+        profileActivationGeneration = activationGeneration,
+        principalId = principalId,
+        clientInstanceId = clientInstanceId,
+    )
+
+private fun RelayV2CreateOutcomeState.matches(state: RelayV2OutboxStateTag): Boolean = when (this) {
+    RelayV2CreateOutcomeState.SUCCEEDED -> state == RelayV2OutboxStateTag.SUCCEEDED
+    RelayV2CreateOutcomeState.FAILED_FINAL -> state == RelayV2OutboxStateTag.FAILED_FINAL
+    RelayV2CreateOutcomeState.AMBIGUOUS -> state == RelayV2OutboxStateTag.AMBIGUOUS
+}
 
 private fun RelayV2OutboxEntryId.belongsTo(
     authority: RelayV2RepositoryEffectAuthority,

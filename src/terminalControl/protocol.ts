@@ -64,6 +64,13 @@ export interface TerminalControlAgentResult {
   truncated: boolean;
 }
 
+/** Codex runtime overrides that are only valid at an idle, submitted turn boundary. */
+export interface TerminalControlAgentRuntimeSettings {
+  model: string | null;
+  reasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
+  mode: "default" | "plan";
+}
+
 export interface TerminalControlRecoveryProof {
   kind: "feishu-turn-cancelled" | "operator-acknowledged-in-doubt" | "owner-unreachable";
   recordId: string;
@@ -149,6 +156,7 @@ export type TerminalControlRequest =
       pane: string;
       message: string;
       submit: boolean;
+      runtime?: TerminalControlAgentRuntimeSettings;
     })
   | (TerminalControlRequestBase & {
       type: "input.resize";
@@ -316,6 +324,38 @@ function optionalTtl(value: unknown, field = "ttlMs"): number | undefined {
     );
   }
   return value as number;
+}
+
+function agentRuntimeSettings(value: unknown): TerminalControlAgentRuntimeSettings {
+  if (!isRecord(value) || !exactKeys(value, ["model", "reasoningEffort", "mode"])) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "runtime is invalid");
+  }
+  let model: string | null;
+  if (value.model === null) {
+    model = null;
+  } else {
+    model = boundedString(value.model, "runtime.model", 128);
+    if (!/^[A-Za-z0-9._:-]+$/u.test(model)) {
+      throw new TerminalControlProtocolError("INVALID_REQUEST", "runtime.model is invalid");
+    }
+  }
+  const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+  const reasoningEffort = value.reasoningEffort === null
+    ? null
+    : efforts.find((effort) => effort === value.reasoningEffort);
+  if (reasoningEffort === undefined) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "runtime.reasoningEffort is invalid");
+  }
+  if (value.mode !== "default" && value.mode !== "plan") {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "runtime.mode is invalid");
+  }
+  if (model === "gpt-5.6-luna" && reasoningEffort === "ultra") {
+    throw new TerminalControlProtocolError(
+      "INVALID_REQUEST",
+      "GPT-5.6-Luna does not support ultra reasoning effort",
+    );
+  }
+  return { model, reasoningEffort, mode: value.mode };
 }
 
 function owner(value: unknown): TerminalControlOwner {
@@ -541,7 +581,7 @@ export function parseTerminalControlRequest(value: unknown): TerminalControlRequ
       };
     }
     case "input.agent-message":
-      if (!exactKeys(record, ["protocolVersion", "requestId", "type", "lease", "operationId", "pane", "message", "submit"])) break;
+      if (!exactKeys(record, ["protocolVersion", "requestId", "type", "lease", "operationId", "pane", "message", "submit"], ["runtime"])) break;
       if (typeof record.message !== "string" || Buffer.byteLength(record.message, "utf8") > TERMINAL_CONTROL_MAX_INPUT_BYTES) {
         throw new TerminalControlProtocolError("INVALID_REQUEST", "message is invalid or too large");
       }
@@ -556,6 +596,7 @@ export function parseTerminalControlRequest(value: unknown): TerminalControlRequ
         pane: pane(record.pane),
         message: record.message,
         submit: record.submit,
+        ...(record.runtime === undefined ? {} : { runtime: agentRuntimeSettings(record.runtime) }),
       };
     case "input.resize":
       if (!exactKeys(record, ["protocolVersion", "requestId", "type", "lease", "operationId", "pane", "cols", "rows"])) break;

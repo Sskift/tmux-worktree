@@ -20,6 +20,22 @@ fn trigger_automation(app: tauri::AppHandle, id: String) -> Result<AutomationRun
     trigger_automation_with_creator(id, |args| create_worktree(app, args))
 }
 
+#[tauri::command]
+fn close_dashboard_window(window: tauri::WebviewWindow) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    if relay_v2_connector_should_survive_dashboard_window_close() {
+        window
+            .hide()
+            .map_err(|_| "Could not hide Dashboard window".to_string())?;
+        return Ok("hidden".to_string());
+    }
+
+    window
+        .destroy()
+        .map_err(|_| "Could not close Dashboard window".to_string())?;
+    Ok("destroyed".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     inherit_shell_env();
@@ -114,6 +130,7 @@ pub fn run() {
             save_automation,
             delete_automation,
             trigger_automation,
+            close_dashboard_window,
             list_automation_runs,
             home_dir,
             pty_open,
@@ -177,6 +194,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 cleanup_pending_worktrees();
                 let pty_state = app.state::<Arc<PtyState>>();

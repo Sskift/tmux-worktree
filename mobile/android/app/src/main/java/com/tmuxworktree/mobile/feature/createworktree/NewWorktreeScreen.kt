@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -36,7 +35,6 @@ import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.RocketLaunch
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.Workspaces
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -137,6 +135,7 @@ fun NewWorktreeScreen(
     onWorktreeNameChange: (String) -> Unit,
     onRetryLoadTargets: () -> Unit,
     onCreate: () -> Unit,
+    creationStatus: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val selectedHost = hosts.firstOrNull { it.hostId == form.hostId }
@@ -164,7 +163,11 @@ fun NewWorktreeScreen(
             NewWorktreeTopBar(
                 step = step,
                 isCreating = isCreating,
-                onBack = if (step == NewWorktreeStep.TARGET) onBack else onPreviousStep,
+                onBack = if (isCreating || step == NewWorktreeStep.TARGET) {
+                    onBack
+                } else {
+                    onPreviousStep
+                },
             )
         },
         bottomBar = {
@@ -172,7 +175,12 @@ fun NewWorktreeScreen(
                 step = step,
                 canContinue = canContinue,
                 isCreating = isCreating,
-                onBack = if (step == NewWorktreeStep.TARGET) onBack else onPreviousStep,
+                creationStatus = creationStatus,
+                onBack = if (isCreating || step == NewWorktreeStep.TARGET) {
+                    onBack
+                } else {
+                    onPreviousStep
+                },
                 onNext = onNextStep,
                 onCreate = onCreate,
             )
@@ -283,7 +291,6 @@ private fun NewWorktreeTopBar(
         ) {
             IconButton(
                 onClick = onBack,
-                enabled = !isCreating,
                 modifier = Modifier
                     .size(48.dp)
                     .testTag("topbar_back"),
@@ -291,11 +298,11 @@ private fun NewWorktreeTopBar(
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
                     contentDescription = when {
-                        isCreating -> "Creating worktree, back unavailable"
+                        isCreating -> "Leave while worktree creation continues"
                         step == NewWorktreeStep.TARGET -> "Cancel new worktree"
                         else -> "Return to step ${step.number - 1}"
                     },
-                    tint = if (isCreating) TwTextMuted else TwTextSecondary,
+                    tint = TwTextSecondary,
                     modifier = Modifier.size(24.dp),
                 )
             }
@@ -505,18 +512,11 @@ private fun ConfigureStep(
 ) {
     if (projects.isNotEmpty()) {
         val selectedProject = projects.firstOrNull { it.name == form.repositoryPath }
-        SelectorField(
+        SavedProjectSelector(
             label = "Saved project",
-            selectedValue = selectedProject?.let { "${it.name} · ${it.path}" }.orEmpty(),
+            projects = projects,
+            selectedProject = selectedProject,
             placeholder = "Choose from Dashboard projects",
-            icon = Icons.Outlined.FolderOpen,
-            options = projects,
-            optionLabel = { project ->
-                "${project.name} · ${project.path}${project.branch?.let { " @ $it" }.orEmpty()}"
-            },
-            optionId = { it.name },
-            optionEnabled = { true },
-            error = null,
             enabled = true,
             testTag = "create_saved_project_selector",
             optionTagPrefix = "create_saved_project_option",
@@ -849,89 +849,30 @@ private fun NewWorktreeBottomBar(
     step: NewWorktreeStep,
     canContinue: Boolean,
     isCreating: Boolean,
+    creationStatus: String?,
     onBack: () -> Unit,
     onNext: () -> Unit,
     onCreate: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(TwSurface)
-            .navigationBarsPadding(),
-    ) {
-        HorizontalDivider(color = TwBorder, thickness = 1.dp)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            OutlinedButton(
-                onClick = onBack,
-                enabled = !isCreating,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(48.dp)
-                    .testTag("create_back"),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, TwBorder),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = TwTextSecondary),
-            ) {
-                Text(if (step == NewWorktreeStep.TARGET) "Cancel" else "Back")
-            }
-
-            Button(
-                onClick = if (step == NewWorktreeStep.REVIEW) onCreate else onNext,
-                enabled = canContinue && !isCreating,
-                modifier = Modifier
-                    .weight(1.45f)
-                    .height(48.dp)
-                    .testTag(if (step == NewWorktreeStep.REVIEW) "create_submit" else "create_next")
-                    .semantics {
-                        stateDescription = when {
-                            isCreating -> "Creating worktree"
-                            canContinue -> "Ready"
-                            else -> "Complete required fields"
-                        }
-                    },
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TwAccent,
-                    contentColor = TwOnAccent,
-                    disabledContainerColor = TwSurfaceRaised,
-                    disabledContentColor = TwTextMuted,
-                ),
-            ) {
-                if (isCreating) {
-                    CircularProgressIndicator(
-                        color = TwTextSecondary,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                } else {
-                    Icon(
-                        imageVector = if (step == NewWorktreeStep.REVIEW) {
-                            Icons.Outlined.RocketLaunch
-                        } else {
-                            Icons.Outlined.ChevronRight
-                        },
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                }
-                Text(
-                    text = when {
-                        isCreating -> "Creating…"
-                        step == NewWorktreeStep.REVIEW -> "Create worktree"
-                        else -> "Continue"
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                )
-            }
-        }
-    }
+    val isReview = step == NewWorktreeStep.REVIEW
+    CreationActionBar(
+        secondaryLabel = if (step == NewWorktreeStep.TARGET) "Cancel" else "Back",
+        primaryLabel = if (isReview) "Create worktree" else "Continue",
+        busyLabel = creationStatus ?: "Creating…",
+        primaryIcon = if (isReview) Icons.Outlined.RocketLaunch else Icons.Outlined.ChevronRight,
+        secondaryEnabled = true,
+        primaryEnabled = canContinue && !isCreating,
+        isBusy = isCreating,
+        secondaryTestTag = "create_back",
+        primaryTestTag = if (isReview) "create_submit" else "create_next",
+        primaryStateDescription = when {
+            isCreating -> "Creating worktree"
+            canContinue -> "Ready"
+            else -> "Complete required fields"
+        },
+        onSecondary = onBack,
+        onPrimary = if (isReview) onCreate else onNext,
+    )
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF070A0E, widthDp = 390, heightDp = 844)

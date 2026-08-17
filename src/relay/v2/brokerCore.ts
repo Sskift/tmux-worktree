@@ -10,6 +10,7 @@ import {
   decodeRelayAgentChatFrame,
   encodeRelayAgentChatFrame,
   RELAY_AGENT_CHAT_CAPABILITY,
+  RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
 } from "../extensions/agentChat/v2/codec.js";
 import {
   decodeRelayLarkBindingsFrame,
@@ -95,6 +96,24 @@ export const RELAY_V2_BROKER_AGENT_EXTENSIONS: readonly RelayV2BrokerAgentExtens
       ])),
       unavailableCode: "AGENT_CHAT_UNAVAILABLE",
       unavailableMessage: "The Relay Agent chat request cannot be satisfied",
+    }),
+    // Negotiated marker for the backwards-compatible optional `settings`
+    // member on agent.chat.send. It owns no frames; traffic remains on the
+    // agent.chat.v2 lane after both sides have selected this marker.
+    Object.freeze({
+      capability: RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+      codec: Object.freeze({
+        decode(_bytes: Uint8Array): { frame: RelayV2JsonObject } {
+          throw new Error("Agent chat runtime settings is a marker capability");
+        },
+        encode(_frame: RelayV2JsonObject): Uint8Array {
+          throw new Error("Agent chat runtime settings is a marker capability");
+        },
+      }),
+      clientToHostTypes: Object.freeze(new Set<string>()),
+      hostToClientTypes: Object.freeze(new Set<string>()),
+      unavailableCode: "AGENT_CHAT_UNAVAILABLE",
+      unavailableMessage: "Agent runtime settings are unavailable",
     }),
     Object.freeze({
       capability: RELAY_LARK_BINDINGS_CAPABILITY,
@@ -2263,6 +2282,17 @@ export class RelayV2BrokerCore {
         "INVALID_ENVELOPE",
         "Relay Agent extension was not negotiated",
         actions,
+      );
+    }
+    if (publicFrame.type === "agent.chat.send"
+      && Object.hasOwn(publicFrame.payload as RelayV2JsonObject, "settings")
+      && !this.agentExtensionNegotiatedForRoute(
+        route,
+        RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+      )) {
+      return this.failure(
+        "INVALID_ENVELOPE",
+        "Agent chat runtime settings capability was not negotiated",
       );
     }
     const seq = route.nextClientToHostSeq;

@@ -57,6 +57,24 @@ export function selfHostedInfraReady(
 }
 
 /**
+ * A failed/superseded connector is terminal inside its current management
+ * child. Retrying start_connector against that same child cannot recover it;
+ * repair must rebuild the management child through startCenter instead.
+ */
+export function relayRepairRequiresManagementRestart(input: {
+  infraReady: boolean;
+  adapterAvailable: boolean | undefined;
+  connectorStatus: MobileRelayV2Connector["status"];
+  connectorStartingStalled?: boolean;
+}): boolean {
+  return !input.infraReady
+    || input.adapterAvailable === false
+    || input.connectorStartingStalled === true
+    || input.connectorStatus === "failed"
+    || input.connectorStatus === "superseded";
+}
+
+/**
  * Reduces the full Relay state to a single glance: "what should I do right now".
  *
  * State mapping (in effective priority order):

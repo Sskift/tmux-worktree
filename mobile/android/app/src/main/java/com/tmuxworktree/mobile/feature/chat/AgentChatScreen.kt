@@ -37,6 +37,8 @@ import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -67,6 +69,7 @@ import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatContentPart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatProgressStep
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
 import com.tmuxworktree.mobile.core.relay.runtime.PendingChatSend
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
@@ -92,13 +95,19 @@ fun AgentChatScreen(
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
     onOpenTerminal: () -> Unit,
-    onSend: (String) -> Unit,
-    onRetryFailed: () -> Unit,
+    runtimeSettings: AgentChatRuntimeSettings,
+    onRuntimeSettingsChange: (AgentChatRuntimeSettings) -> Unit,
+    runtimeSettingsAvailable: Boolean,
+    runtimeSettingsUnavailableMessage: String? = null,
+    onSend: (String, AgentChatRuntimeSettings?) -> Unit,
+    onRetryFailed: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val turns = chatState.turns(session.protocolSessionId)
     val pending = chatState.pending(session.protocolSessionId)
     val hasWorkingTurn = turns.any { it.status == "working" }
+    val settingsLocked = hasWorkingTurn || chatState.awaitingTurn(session.protocolSessionId) ||
+        pending.any { !it.failed }
     val listState = rememberLazyListState()
     val isUserDragging by listState.interactionSource.collectIsDraggedAsState()
     var followTail by remember(session.protocolSessionId) { mutableStateOf(true) }
@@ -144,8 +153,18 @@ fun AgentChatScreen(
             ChatComposer(
                 draft = draft,
                 onDraftChange = onDraftChange,
-                onSend = { onSend(draft.trim()) },
+                onSend = {
+                    onSend(
+                        draft.trim(),
+                        if (settingsLocked || !runtimeSettingsAvailable) null else runtimeSettings,
+                    )
+                },
                 hasWorkingTurn = hasWorkingTurn,
+                runtimeSettings = runtimeSettings,
+                onRuntimeSettingsChange = onRuntimeSettingsChange,
+                settingsLocked = settingsLocked,
+                runtimeSettingsAvailable = runtimeSettingsAvailable,
+                runtimeSettingsUnavailableMessage = runtimeSettingsUnavailableMessage,
             )
         },
     ) { innerPadding ->
@@ -174,7 +193,7 @@ fun AgentChatScreen(
             ) { pendingSend ->
                 PendingBubble(
                     pending = pendingSend,
-                    onRetry = onRetryFailed,
+                    onRetry = { onRetryFailed(pendingSend.requestId) },
                 )
             }
             if (hasWorkingTurn) {
@@ -510,22 +529,51 @@ private fun PendingBubble(
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                     )
                 }
-                TextButton(
-                    onClick = onRetry,
-                    modifier = Modifier.testTag("retry_failed_${pending.requestId}"),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Refresh,
-                        contentDescription = null,
-                        tint = TwError,
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Spacer(Modifier.width(4.dp))
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = pending.error?.takeIf { it.isNotBlank() }
+                        ?: "The message could not be sent.",
+                    color = TwError,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier
+                        .padding(horizontal = 8.dp)
+                        .testTag("pending_error_${pending.requestId}"),
+                )
+                pending.errorCode?.takeIf { it.isNotBlank() }?.let { code ->
                     Text(
-                        text = "Retry",
-                        color = TwError,
+                        text = "Error code: $code",
+                        color = TwTextMuted,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    )
+                }
+                if (pending.retryable) {
+                    TextButton(
+                        onClick = onRetry,
+                        modifier = Modifier.testTag("retry_failed_${pending.requestId}"),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Refresh,
+                            contentDescription = null,
+                            tint = TwError,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = "Retry",
+                            color = TwError,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "Edit the message and send it again.",
+                        color = TwTextMuted,
                         style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("retry_unavailable_${pending.requestId}"),
                     )
                 }
             }
@@ -575,6 +623,11 @@ private fun ChatComposer(
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     hasWorkingTurn: Boolean,
+    runtimeSettings: AgentChatRuntimeSettings,
+    onRuntimeSettingsChange: (AgentChatRuntimeSettings) -> Unit,
+    settingsLocked: Boolean,
+    runtimeSettingsAvailable: Boolean,
+    runtimeSettingsUnavailableMessage: String?,
 ) {
     val sendEnabled = draft.isNotBlank()
     val focusRequester = remember { FocusRequester() }
@@ -586,6 +639,14 @@ private fun ChatComposer(
             .navigationBarsPadding()
             .padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 16.dp),
     ) {
+        RuntimeSettingsBar(
+            settings = runtimeSettings,
+            enabled = !settingsLocked && runtimeSettingsAvailable,
+            available = runtimeSettingsAvailable,
+            unavailableMessage = runtimeSettingsUnavailableMessage,
+            onSettingsChange = onRuntimeSettingsChange,
+        )
+        Spacer(Modifier.height(6.dp))
         if (hasWorkingTurn) {
             Text(
                 text = "Another message now will be folded into the current task.",
@@ -654,6 +715,173 @@ private fun ChatComposer(
                         modifier = Modifier.size(20.dp),
                     )
                 }
+            }
+        }
+    }
+}
+
+private data class RuntimeSettingOption(
+    val value: String?,
+    val label: String,
+)
+
+private val MODEL_OPTIONS = listOf(
+    RuntimeSettingOption(null, "Host default"),
+    RuntimeSettingOption("gpt-5.6-sol", "Sol"),
+    RuntimeSettingOption("gpt-5.6-terra", "Terra"),
+    RuntimeSettingOption("gpt-5.6-luna", "Luna"),
+)
+
+private val EFFORT_OPTIONS = listOf(
+    RuntimeSettingOption(null, "Default"),
+    RuntimeSettingOption("low", "Low"),
+    RuntimeSettingOption("medium", "Medium"),
+    RuntimeSettingOption("high", "High"),
+    RuntimeSettingOption("xhigh", "XHigh"),
+    RuntimeSettingOption("max", "Max"),
+    RuntimeSettingOption("ultra", "Ultra"),
+)
+
+private val MODE_OPTIONS = listOf(
+    RuntimeSettingOption("default", "Default"),
+    RuntimeSettingOption("plan", "Plan"),
+)
+
+private fun allowedEfforts(model: String?): Set<String?> = when (model) {
+        "gpt-5.6-sol", "gpt-5.6-terra" -> setOf(null, "low", "medium", "high", "xhigh", "max", "ultra")
+        "gpt-5.6-luna" -> setOf(null, "low", "medium", "high", "xhigh", "max")
+        else -> setOf(null, "low", "medium", "high", "xhigh")
+}
+
+@Composable
+private fun RuntimeSettingsBar(
+    settings: AgentChatRuntimeSettings,
+    enabled: Boolean,
+    available: Boolean,
+    unavailableMessage: String?,
+    onSettingsChange: (AgentChatRuntimeSettings) -> Unit,
+) {
+    val allowedEffortValues = allowedEfforts(settings.model)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("chat_runtime_settings"),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        RuntimeSettingMenu(
+            label = "Model",
+            selected = MODEL_OPTIONS.first { it.value == settings.model }.label,
+            options = MODEL_OPTIONS,
+            enabled = enabled,
+            testTag = "chat_model_selector",
+            modifier = Modifier.weight(1f),
+        ) { model ->
+            onSettingsChange(
+                settings.copy(
+                    model = model,
+                    reasoningEffort = settings.reasoningEffort.takeIf {
+                        it in allowedEfforts(model)
+                    },
+                ),
+            )
+        }
+        RuntimeSettingMenu(
+            label = "Effort",
+            selected = EFFORT_OPTIONS.first { it.value == settings.reasoningEffort }.label,
+            options = EFFORT_OPTIONS.filter { it.value in allowedEffortValues },
+            enabled = enabled,
+            testTag = "chat_effort_selector",
+            modifier = Modifier.weight(1f),
+        ) { effort -> onSettingsChange(settings.copy(reasoningEffort = effort)) }
+        RuntimeSettingMenu(
+            label = "Mode",
+            selected = MODE_OPTIONS.first { it.value == settings.mode }.label,
+            options = MODE_OPTIONS,
+            enabled = enabled,
+            testTag = "chat_mode_selector",
+            modifier = Modifier.weight(1f),
+        ) { mode ->
+            val nextMode = mode ?: "default"
+            onSettingsChange(
+                settings.copy(
+                    mode = nextMode,
+                ),
+            )
+        }
+    }
+    if (!available && !unavailableMessage.isNullOrBlank()) {
+        Text(
+            text = unavailableMessage,
+            color = TwTextMuted,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp)
+                .testTag("chat_runtime_settings_unavailable"),
+        )
+    } else if (!enabled) {
+        Text(
+            text = "Model, effort and mode apply to the next new turn.",
+            color = TwTextMuted,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp)
+                .testTag("chat_runtime_settings_locked"),
+        )
+    }
+}
+
+@Composable
+private fun RuntimeSettingMenu(
+    label: String,
+    selected: String,
+    options: List<RuntimeSettingOption>,
+    enabled: Boolean,
+    testTag: String,
+    modifier: Modifier = Modifier,
+    onSelect: (String?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = modifier) {
+        Surface(
+            shape = RoundedCornerShape(10.dp),
+            color = TwSurface,
+            border = androidx.compose.foundation.BorderStroke(1.dp, TwBorder),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled) { expanded = true }
+                .testTag(testTag)
+                .semantics { contentDescription = "$label: $selected" },
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+                Text(
+                    text = label,
+                    color = TwTextMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                )
+                Text(
+                    text = selected,
+                    color = if (enabled) TwTextPrimary else TwTextMuted,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option.label) },
+                    onClick = {
+                        expanded = false
+                        onSelect(option.value)
+                    },
+                )
             }
         }
     }

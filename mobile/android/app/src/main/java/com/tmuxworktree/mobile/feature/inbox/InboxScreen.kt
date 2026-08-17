@@ -57,21 +57,12 @@ fun InboxScreen(
     modifier: Modifier = Modifier,
     agentEvidenceAvailability: AgentEvidenceAvailability = AgentEvidenceAvailability.AVAILABLE,
 ) {
-    // Inbox is the agent workflow. Plain terminal sessions remain available
-    // under Workspaces > Terminals and must not be presented as agents.
-    val agentSessions = sessions.filterNot { it.kind.equals("terminal", ignoreCase = true) }
-    val attentionSessions = agentSessions.filter {
-        it.agentState == AgentState.WAITING_FOR_USER || it.agentState == AgentState.FAILED
-    }
-    // Keep sessions visible when the current protocol/capability cut cannot
-    // provide lifecycle evidence instead of silently dropping them from the inbox.
-    val runningSessions = agentSessions.filter {
-        it.agentState == AgentState.RUNNING ||
-            it.agentState == AgentState.UNKNOWN ||
-            it.agentState == AgentState.COMPLETED
-    }
     val unavailableAgentStatus = inboxUnavailableAgentStatus(agentEvidenceAvailability)
     val agentStateAvailable = unavailableAgentStatus == null
+    val sessionGroups = inboxSessionGroups(sessions, agentStateAvailable)
+    val attentionSessions = sessionGroups.attention
+    val primarySessions = sessionGroups.primary
+    val otherSessions = sessionGroups.other
 
     Scaffold(
         modifier = modifier
@@ -166,10 +157,14 @@ fun InboxScreen(
                 )
             }
 
-            if (runningSessions.isEmpty()) {
+            if (primarySessions.isEmpty()) {
                 item(key = "running_empty") {
                     Text(
-                        text = "No agents are running.",
+                        text = if (agentStateAvailable) {
+                            "No agents are running."
+                        } else {
+                            "No sessions available."
+                        },
                         color = TwTextSecondary,
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier
@@ -181,19 +176,92 @@ fun InboxScreen(
                 }
             } else {
                 items(
-                    items = runningSessions,
+                    items = primarySessions,
                     key = { "running_${it.stableId}" },
                 ) { session ->
-                    RunningSessionRow(
+                    InboxSessionRow(
                         session = session,
+                        testTag = if (agentStateAvailable) {
+                            "running_session_${session.stableId}"
+                        } else {
+                            "inbox_session_${session.stableId}"
+                        },
+                        showStateLabel = false,
                         onClick = { onSessionClick(session) },
                     )
-                    if (session != runningSessions.last()) {
+                    if (session != primarySessions.last()) {
+                        HorizontalDivider(color = TwBorder, thickness = 1.dp)
+                    }
+                }
+            }
+
+            if (otherSessions.isNotEmpty()) {
+                item(key = "other_divider") {
+                    HorizontalDivider(color = TwBorder, thickness = 1.dp)
+                    Spacer(Modifier.height(16.dp))
+                }
+                item(key = "other_header") {
+                    Text(
+                        text = "Other sessions",
+                        color = TwTextPrimary,
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier
+                            .testTag("inbox_other_heading")
+                            .semantics { heading() },
+                    )
+                }
+                items(
+                    items = otherSessions,
+                    key = { "other_${it.stableId}" },
+                ) { session ->
+                    InboxSessionRow(
+                        session = session,
+                        testTag = "other_session_${session.stableId}",
+                        showStateLabel = true,
+                        onClick = { onSessionClick(session) },
+                    )
+                    if (session != otherSessions.last()) {
                         HorizontalDivider(color = TwBorder, thickness = 1.dp)
                     }
                 }
             }
         }
+    }
+}
+
+internal data class InboxSessionGroups(
+    val attention: List<RelaySession>,
+    val primary: List<RelaySession>,
+    val other: List<RelaySession>,
+)
+
+/**
+ * Keeps unknown or completed sessions visible without claiming that they are running.
+ * When lifecycle evidence is unavailable, the primary section is deliberately named "Sessions".
+ */
+internal fun inboxSessionGroups(
+    sessions: List<RelaySession>,
+    agentStateAvailable: Boolean,
+): InboxSessionGroups {
+    // Inbox is the agent workflow. Plain terminal sessions remain available
+    // under Workspaces > Terminals and must not be presented as agents.
+    val agentSessions = sessions.filterNot { it.kind.equals("terminal", ignoreCase = true) }
+    val attention = agentSessions.filter {
+        it.agentState == AgentState.WAITING_FOR_USER || it.agentState == AgentState.FAILED
+    }
+    val remaining = agentSessions.filterNot { it in attention }
+    return if (agentStateAvailable) {
+        InboxSessionGroups(
+            attention = attention,
+            primary = remaining.filter { it.agentState == AgentState.RUNNING },
+            other = remaining.filter {
+                it.agentState == AgentState.UNKNOWN || it.agentState == AgentState.COMPLETED
+            },
+        )
+    } else {
+        // No lifecycle cut means no session may be described as running. Keep the rows under
+        // the neutral "Sessions" heading so users can still open them.
+        InboxSessionGroups(attention = attention, primary = remaining, other = emptyList())
     }
 }
 
@@ -300,8 +368,10 @@ private fun AttentionSessionRow(
 }
 
 @Composable
-private fun RunningSessionRow(
+private fun InboxSessionRow(
     session: RelaySession,
+    testTag: String,
+    showStateLabel: Boolean,
     onClick: () -> Unit,
 ) {
     val visual = session.agentState.visual()
@@ -310,7 +380,7 @@ private fun RunningSessionRow(
             .fillMaxWidth()
             .heightIn(min = 64.dp)
             .clickable(role = Role.Button, onClick = onClick)
-            .testTag("running_session_${session.stableId}")
+            .testTag(testTag)
             .semantics(mergeDescendants = true) {
                 role = Role.Button
                 contentDescription = "${session.title}, ${visual.accessibleLabel}. ${session.summary}"
@@ -345,6 +415,14 @@ private fun RunningSessionRow(
             }
         }
         Spacer(Modifier.width(12.dp))
+        if (showStateLabel) {
+            Text(
+                text = visual.label,
+                color = visual.color,
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Spacer(Modifier.width(8.dp))
+        }
         Icon(
             imageVector = Icons.Outlined.ChevronRight,
             contentDescription = null,

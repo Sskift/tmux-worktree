@@ -273,6 +273,7 @@ function fakeWebSockets(expectedAuthorizationDigest, behavior = {}) {
         perMessageDeflate: options.perMessageDeflate,
         maxPayload: options.maxPayload,
         rejectUnauthorized: options.rejectUnauthorized,
+        handshakeTimeout: options.handshakeTimeout,
         checkServerIdentityIsNode:
           options.checkServerIdentity === TEST_NODE_CHECK_SERVER_IDENTITY,
       });
@@ -562,6 +563,7 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
       "maxPayload",
       "rejectUnauthorized",
       "checkServerIdentity",
+      "handshakeTimeout",
       "finishRequest",
     ],
     hasHeadersOption: false,
@@ -571,6 +573,7 @@ test("credential-exact lifecycle opens one exact WSS and preserves FIFO ACK owne
     perMessageDeflate: false,
     maxPayload: codec.RELAY_V2_CARRIER_FRAME_BYTES,
     rejectUnauthorized: true,
+    handshakeTimeout: 15_000,
     checkServerIdentityIsNode: true,
   });
   assert.equal(socket.request.authorizationHeaderNameIsExact, true);
@@ -682,6 +685,7 @@ test("carrier private CA trust is exact, immutable, and cannot weaken TLS", asyn
     "maxPayload",
     "rejectUnauthorized",
     "checkServerIdentity",
+    "handshakeTimeout",
     "ca",
     "finishRequest",
   ]);

@@ -7,13 +7,14 @@ import type {
 import {
   createWindowCloseBridge,
   type NativeDashboardCloseRequest,
+  type NativeWindowCloseDisposition,
 } from "./windowCloseBridge";
 
 export interface RawDashboardWindowCloseLifecycle {
   onCloseRequested(
     handler: (event: NativeDashboardCloseRequest) => void,
   ): Promise<BackendUnlisten>;
-  destroy(): Promise<void>;
+  destroy(): Promise<void | NativeWindowCloseDisposition>;
 }
 
 export interface RawDashboardWindow {

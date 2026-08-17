@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleActorRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
@@ -28,6 +29,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1InboundFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_V2_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Codec
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2CodecException
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Error
@@ -40,6 +42,8 @@ import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentCha
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2ImageGetRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2SendRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Sent
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettingsStatus
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.runtimeSettingsUnavailableMessage
 import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LARK_BINDINGS_V2_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingReplyModeUpdateRequest
 import com.tmuxworktree.mobile.core.relay.extensions.larkbindings.v2.LarkBindingUnlinkRequest
@@ -240,6 +244,10 @@ internal class RelayV2ConnectionActor(
     val negotiatedCapabilities: StateFlow<Set<String>> = _negotiatedCapabilities.asStateFlow()
     private val _agentChatState = MutableStateFlow(RelayChatState())
     val agentChatState: StateFlow<RelayChatState> = _agentChatState.asStateFlow()
+    private val _agentChatRuntimeSettingsStatuses =
+        MutableStateFlow<Map<String, AgentChatRuntimeSettingsStatus>>(emptyMap())
+    val agentChatRuntimeSettingsStatuses: StateFlow<Map<String, AgentChatRuntimeSettingsStatus>> =
+        _agentChatRuntimeSettingsStatuses.asStateFlow()
     private val _larkBindingsState = MutableStateFlow(LarkBindingsState())
     val larkBindingsState: StateFlow<LarkBindingsState> = _larkBindingsState.asStateFlow()
     val effects: Flow<RelayV2RuntimeEffect> = multiplexedEffectFlow()
@@ -453,6 +461,46 @@ internal class RelayV2ConnectionActor(
                 RelayV2OutboxExactGenerationSendResult.NotSent
             }
         }
+    }
+
+    /**
+     * Retires the exact ONLINE transport after a durably submitted command could not be proven
+     * delivered. The successor connection queries the Host ledger before retrying, so a late
+     * acceptance cannot create a duplicate. A newer generation is never retired.
+     */
+    fun retireCurrentOutboxDelivery(
+        authority: RelayV2RepositoryEffectAuthority,
+        failureCode: String,
+    ): Boolean {
+        val cause = TerminalIntentCause.DirectFailure(
+            failure = RelayV2ConnectionFailure(
+                kind = RelayV2FailureKind.TRANSPORT,
+                code = failureCode,
+                retryable = true,
+            ),
+            closeCode = 1013,
+            rawBytes = 0,
+        )
+        beforeTerminalClaim()
+        val claim = synchronized(lifecycleLock) {
+            val current = currentOnlineCommandReadyLocked()
+                ?: return@synchronized null
+            if (current.second.authority != authority) return@synchronized null
+            val committed = committedCallbackOwner
+                ?: return@synchronized null
+            val source = activeTransport
+                ?: return@synchronized null
+            if (committed.effectGeneration != authority.generation ||
+                committed.source !== source ||
+                !isCurrentCallbackLocked(committed.key, source)
+            ) {
+                return@synchronized null
+            }
+            recordTerminalIntentLocked(committed.key, cause)
+            claimPendingTerminalLocked(committed.key, source)
+        } ?: return false
+        completeTerminalClaim(claim)
+        return true
     }
 
     /**
@@ -2683,6 +2731,10 @@ internal class RelayV2ConnectionActor(
                 synchronized(lifecycleLock) {
                     agentChatImageScopeBySession[frame.session] = frame.scopeId
                 }
+                frame.runtimeSettingsStatus?.let { status ->
+                    _agentChatRuntimeSettingsStatuses.value =
+                        _agentChatRuntimeSettingsStatuses.value + (frame.session to status)
+                }
                 requestNextAgentChatImage()
             }
             is AgentChatV2ImageChunk -> {
@@ -2726,6 +2778,8 @@ internal class RelayV2ConnectionActor(
                             requestId = frame.requestId,
                             session = frame.sessionId,
                             error = frame.message,
+                            errorCode = frame.code,
+                            retryable = frame.retryable,
                         ),
                     )
                 }
@@ -2985,42 +3039,224 @@ internal class RelayV2ConnectionActor(
 
     // ==== agent.chat.v2 minimal extension ====
 
+    private sealed interface AgentChatSendPreparation {
+        data class Ready(
+            val bytes: ByteArray,
+            val source: RelayV2Transport,
+        ) : AgentChatSendPreparation
+
+        data class Rejected(
+            val message: String,
+            val code: String,
+            val retryable: Boolean,
+        ) : AgentChatSendPreparation
+    }
+
     /**
      * Sends an `agent.chat.send` request over the current ONLINE transport when agent.chat.v2 is
      * negotiated. Returns true only when the frame was handed to the transport synchronously under
      * the generation fence. The pending bubble is optimistically tracked and confirmed by the host
      * via `agent.chat.sent` / `agent.chat.event`.
      */
-    fun sendAgentChatMessage(scopeId: String, sessionId: String, message: String): Boolean {
+    fun sendAgentChatMessage(
+        scopeId: String,
+        sessionId: String,
+        message: String,
+        settings: AgentChatRuntimeSettings? = null,
+    ): Boolean {
         val requestId = "agent-chat-" + attemptId()
-        val encoded = synchronized(lifecycleLock) {
-            val context = onlineAgentChatContextLocked() ?: return@synchronized null
-            val source = activeTransport ?: return@synchronized null
-            val frame = AgentChatV2SendRequest(
-                session = sessionId,
-                message = message,
-                requestId = requestId,
-                hostId = context.hostId,
-                expectedHostEpoch = context.hostEpoch,
-                scopeId = scopeId,
-                sessionId = sessionId,
-            )
-            try {
-                agentChatCodec.encodePublicFrame(frame) to source
-            } catch (_: AgentChatV2CodecException) {
-                null
-            }
-        } ?: return false
-        if (!encoded.second.send(encoded.first)) return false
         mutateAgentChat(
             RelayChatMutation.SendPending(
                 requestId = requestId,
                 session = sessionId,
                 message = message,
                 nowMillis = clock(),
+                settings = settings,
             ),
         )
-        return true
+        val preparation = synchronized(lifecycleLock) {
+            prepareAgentChatSendLocked(scopeId, sessionId, message, settings, requestId)
+        }
+        return dispatchPreparedAgentChatSend(requestId, sessionId, preparation)
+    }
+
+    /**
+     * Retries only the exact failed pending bubble selected by the user. A new wire request ID is
+     * installed on that same logical bubble before transport handoff; other failed sends are left
+     * untouched and a successful response can therefore retire only this retry.
+     */
+    fun retryAgentChatMessage(
+        scopeId: String,
+        sessionId: String,
+        requestId: String,
+    ): Boolean {
+        val pending = _agentChatState.value.pending(sessionId).singleOrNull {
+            it.requestId == requestId && it.failed && it.retryable
+        } ?: return false
+        val replacementRequestId = "agent-chat-" + attemptId()
+        val preparation = synchronized(lifecycleLock) {
+            prepareAgentChatSendLocked(
+                scopeId = scopeId,
+                sessionId = sessionId,
+                message = pending.message,
+                settings = pending.settings,
+                requestId = replacementRequestId,
+            )
+        }
+        if (preparation is AgentChatSendPreparation.Rejected) {
+            mutateAgentChat(
+                RelayChatMutation.SendFailed(
+                    requestId = requestId,
+                    session = sessionId,
+                    error = preparation.message,
+                    errorCode = preparation.code,
+                    retryable = preparation.retryable,
+                ),
+            )
+            return false
+        }
+        if (!mutateAgentChat(
+                RelayChatMutation.RetryFailed(
+                    requestId = requestId,
+                    session = sessionId,
+                    replacementRequestId = replacementRequestId,
+                    nowMillis = clock(),
+                ),
+            )
+        ) {
+            return false
+        }
+        return dispatchPreparedAgentChatSend(
+            replacementRequestId,
+            sessionId,
+            preparation,
+        )
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun prepareAgentChatSendLocked(
+        scopeId: String,
+        sessionId: String,
+        message: String,
+        settings: AgentChatRuntimeSettings?,
+        requestId: String,
+    ): AgentChatSendPreparation {
+        val context = onlineAgentChatContextLocked()
+            ?: return unavailableAgentChatSendLocked()
+        if (settings != null && AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY !in context.negotiatedCapabilities) {
+            return AgentChatSendPreparation.Rejected(
+                message = "This host does not support model, effort or mode controls yet. " +
+                    "Update the host and reconnect, then retry.",
+                code = "CLIENT_RUNTIME_SETTINGS_UNAVAILABLE",
+                retryable = false,
+            )
+        }
+        if (settings != null &&
+            _agentChatRuntimeSettingsStatuses.value[sessionId]?.available != true
+        ) {
+            val status = _agentChatRuntimeSettingsStatuses.value[sessionId]
+            return AgentChatSendPreparation.Rejected(
+                message = status.runtimeSettingsUnavailableMessage(),
+                code = "CLIENT_RUNTIME_SETTINGS_SESSION_UNAVAILABLE",
+                retryable = status?.reason == "temporarily_unavailable",
+            )
+        }
+        val source = activeTransport ?: return AgentChatSendPreparation.Rejected(
+            message = "Message was not sent because the Relay connection was interrupted. " +
+                "Reconnect and retry.",
+            code = "CLIENT_TRANSPORT_UNAVAILABLE",
+            retryable = true,
+        )
+        val frame = AgentChatV2SendRequest(
+            session = sessionId,
+            message = message,
+            settings = settings,
+            requestId = requestId,
+            hostId = context.hostId,
+            expectedHostEpoch = context.hostEpoch,
+            scopeId = scopeId,
+            sessionId = sessionId,
+        )
+        return try {
+            AgentChatSendPreparation.Ready(
+                bytes = agentChatCodec.encodePublicFrame(frame),
+                source = source,
+            )
+        } catch (_: AgentChatV2CodecException) {
+            AgentChatSendPreparation.Rejected(
+                message = "Message was not sent because it is too long or contains " +
+                    "unsupported content. Edit it and send again.",
+                code = "CLIENT_MESSAGE_INVALID",
+                retryable = false,
+            )
+        }
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun unavailableAgentChatSendLocked(): AgentChatSendPreparation.Rejected = when {
+        lifecycleState != LifecycleState.OPEN -> AgentChatSendPreparation.Rejected(
+            message = "Message was not sent because the Relay connection is closed. " +
+                "Reconnect and retry.",
+            code = "CLIENT_RELAY_CLOSED",
+            retryable = true,
+        )
+        _state.value.phase != RelayV2ConnectionPhase.ONLINE ->
+            AgentChatSendPreparation.Rejected(
+                message = "Message was not sent because Relay is offline. Reconnect and retry.",
+                code = "CLIENT_RELAY_OFFLINE",
+                retryable = true,
+            )
+        agentExtensionSendFence.get()?.negotiatedCapabilities
+            ?.contains(AGENT_CHAT_V2_CAPABILITY) != true ||
+            onlineContext?.negotiatedCapabilities?.contains(AGENT_CHAT_V2_CAPABILITY) != true ->
+            AgentChatSendPreparation.Rejected(
+                message = "Message was not sent because Agent chat is unavailable for this Host.",
+                code = "CLIENT_AGENT_CHAT_UNAVAILABLE",
+                retryable = true,
+            )
+        else -> AgentChatSendPreparation.Rejected(
+            message = "Message was not sent because the Relay connection was interrupted. " +
+                "Reconnect and retry.",
+            code = "CLIENT_TRANSPORT_UNAVAILABLE",
+            retryable = true,
+        )
+    }
+
+    private fun dispatchPreparedAgentChatSend(
+        requestId: String,
+        sessionId: String,
+        preparation: AgentChatSendPreparation,
+    ): Boolean {
+        if (preparation is AgentChatSendPreparation.Rejected) {
+            mutateAgentChat(
+                RelayChatMutation.SendFailed(
+                    requestId = requestId,
+                    session = sessionId,
+                    error = preparation.message,
+                    errorCode = preparation.code,
+                    retryable = preparation.retryable,
+                ),
+            )
+            return false
+        }
+        preparation as AgentChatSendPreparation.Ready
+        val sent = try {
+            preparation.source.send(preparation.bytes)
+        } catch (_: RuntimeException) {
+            false
+        }
+        if (sent) return true
+        mutateAgentChat(
+            RelayChatMutation.SendFailed(
+                requestId = requestId,
+                session = sessionId,
+                error = "Message was not sent because the Relay connection was interrupted. " +
+                    "Reconnect and retry.",
+                errorCode = "CLIENT_TRANSPORT_SEND_FAILED",
+                retryable = true,
+            ),
+        )
+        return false
     }
 
     /** Sends an `agent.chat.history` request over the current ONLINE transport. */
@@ -3029,9 +3265,12 @@ internal class RelayV2ConnectionActor(
         val encoded = synchronized(lifecycleLock) {
             val context = onlineAgentChatContextLocked() ?: return@synchronized null
             val source = activeTransport ?: return@synchronized null
+            val includeRuntimeSettingsStatus =
+                AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY in context.negotiatedCapabilities
             val frame = AgentChatV2HistoryRequest(
                 session = sessionId,
                 limit = limit,
+                includeRuntimeSettingsStatus = includeRuntimeSettingsStatus,
                 requestId = requestId,
                 hostId = context.hostId,
                 expectedHostEpoch = context.hostEpoch,
@@ -3039,6 +3278,10 @@ internal class RelayV2ConnectionActor(
                 sessionId = sessionId,
             )
             try {
+                if (includeRuntimeSettingsStatus) {
+                    _agentChatRuntimeSettingsStatuses.value =
+                        _agentChatRuntimeSettingsStatuses.value - sessionId
+                }
                 agentChatCodec.encodePublicFrame(frame) to source
             } catch (_: AgentChatV2CodecException) {
                 null
@@ -3116,8 +3359,12 @@ internal class RelayV2ConnectionActor(
         return onlineContext
     }
 
-    private fun mutateAgentChat(mutation: RelayChatMutation) {
-        _agentChatState.value = RelayChatReducer.reduce(_agentChatState.value, mutation)
+    private fun mutateAgentChat(mutation: RelayChatMutation): Boolean {
+        val current = _agentChatState.value
+        val updated = RelayChatReducer.reduce(current, mutation)
+        if (updated == current) return false
+        _agentChatState.value = updated
+        return true
     }
 
     fun fetchLarkBindings(scopeId: String, sessionId: String): Boolean =
@@ -6241,6 +6488,7 @@ internal class RelayV2ConnectionActor(
         _agentCapabilityAvailability.value = RelayV2AgentCapabilityAvailability.Unavailable
         onlineContext = null
         agentExtensionSendFence.set(null)
+        _agentChatRuntimeSettingsStatuses.value = emptyMap()
         publishedEffectGeneration.set(null)
     }
 
@@ -6344,6 +6592,7 @@ internal class RelayV2ConnectionActor(
         hostAvailability = null
         _negotiatedCapabilities.value = emptySet()
         _agentChatState.value = RelayChatState()
+        _agentChatRuntimeSettingsStatuses.value = emptyMap()
         updateState(RelayV2ConnectionPhase.CLOSED, null)
         drainQueuedEffects()
         completeShutdownDrain()
@@ -7186,6 +7435,7 @@ internal class RelayV2ConnectionActor(
         private val SUPPORTED_OPTIONAL_CAPABILITIES = setOf(
             AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
             AGENT_CHAT_V2_CAPABILITY,
+            AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
             LARK_BINDINGS_V2_CAPABILITY,
         )
 

@@ -108,6 +108,7 @@ internal class TerminalWebViewOwnership {
     private var nextGeneration = 0L
     private var bound: Bound? = null
     private var pendingLoss: PendingLoss? = null
+    private var manualRebuildRequested = false
     private val deadViews = Collections.newSetFromMap(WeakHashMap<Any, Boolean>())
     private val _rebuildGeneration = MutableStateFlow(0L)
     val rebuildGeneration = _rebuildGeneration.asStateFlow()
@@ -122,6 +123,19 @@ internal class TerminalWebViewOwnership {
     }
 
     fun currentView(): Any? = synchronized(lock) { bound?.view }
+
+    /**
+     * A JavaScript ready event represents a freshly initialized xterm document, even when
+     * Android reused the same WebView instance. Advance the parser generation so a terminal
+     * attachment that acknowledged output into the previous document cannot be retained for the
+     * now-empty renderer.
+     */
+    fun renewContentGeneration(view: Any): Long? = synchronized(lock) {
+        val current = bound?.takeIf { it.view === view } ?: return@synchronized null
+        nextGeneration += 1
+        bound = Bound(current.view, nextGeneration)
+        nextGeneration
+    }
 
     fun currentBinding(
         controller: TerminalWebViewController,
@@ -145,6 +159,30 @@ internal class TerminalWebViewOwnership {
     fun unbind(view: Any): Boolean = synchronized(lock) {
         if (bound?.view !== view) return@synchronized false
         bound = null
+        true
+    }
+
+    /**
+     * Re-admits a renderer after automatic crash recovery has deliberately stopped. When the
+     * exact attachment detach barrier is still pending, remember the request and publish the new
+     * generation only after that barrier settles.
+     */
+    fun requestRendererRebuild(replaceUnreadyBoundView: Boolean = false): Boolean = synchronized(lock) {
+        val current = bound
+        if (current != null) {
+            if (!replaceUnreadyBoundView) return@synchronized false
+            // A replacement WebView can bind successfully after a renderer crash yet never reach
+            // JavaScript ready. It has never published a parser binding, so it owns no Relay
+            // attachment; fence it here and let the Compose key dispose it after publishing a
+            // fresh generation.
+            bound = null
+            deadViews.add(current.view)
+        }
+        if (pendingLoss != null) {
+            manualRebuildRequested = true
+        } else {
+            _rebuildGeneration.value += 1
+        }
         true
     }
 
@@ -185,9 +223,11 @@ internal class TerminalWebViewOwnership {
                 val pending = pendingLoss
                 if (pending?.receipt === loss) {
                     pendingLoss = null
-                    if (loss.allowAutomaticRebuild ||
-                        loss.kind == TerminalWebViewLossKind.VIEW_DISPOSED
-                    ) {
+                    val shouldRebuild = loss.allowAutomaticRebuild ||
+                        loss.kind == TerminalWebViewLossKind.VIEW_DISPOSED ||
+                        manualRebuildRequested
+                    manualRebuildRequested = false
+                    if (shouldRebuild) {
                         _rebuildGeneration.value += 1
                     }
                 }
@@ -222,6 +262,7 @@ class TerminalWebViewController internal constructor() {
 
     internal fun markReady(view: WebView): TerminalWebViewParserBinding? {
         val ready = synchronized(lock) {
+            ownership.renewContentGeneration(view) ?: return null
             val binding = ownership.currentBinding(this, view) ?: return null
             isReady = true
             val queued = pendingScripts.toList()
@@ -307,6 +348,12 @@ class TerminalWebViewController internal constructor() {
     internal fun currentParserBinding(): TerminalWebViewParserBinding? = synchronized(lock) {
         if (!isReady) return@synchronized null
         ownership.currentBinding(this)
+    }
+
+    /** Rebuilds a missing or bound-but-never-ready renderer; the new ready event reopens Relay. */
+    internal fun requestRendererRebuild(): Boolean = synchronized(lock) {
+        if (isReady) return@synchronized false
+        ownership.requestRendererRebuild(replaceUnreadyBoundView = true)
     }
 
     internal fun owns(binding: TerminalWebViewParserBinding): Boolean = synchronized(lock) {
@@ -791,7 +838,8 @@ internal fun TerminalWebView(
                 // Route re-entry can create this AndroidView while the prior route's exact
                 // attachment detach is still pending. Leave it inert; the detach receipt
                 // publishes a new generation and replaces it without a main-thread exception.
-                if (controller.bind(view)) {
+                val bound = controller.bind(view)
+                if (bound) {
                     boundView[0] = view
                     runCatching { view.loadUrl(TERMINAL_URL) }
                         .onFailure { currentOnFailure.value("Terminal view could not load") }

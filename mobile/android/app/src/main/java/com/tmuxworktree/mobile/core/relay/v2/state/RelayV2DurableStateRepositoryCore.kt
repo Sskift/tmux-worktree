@@ -2,12 +2,14 @@ package com.tmuxworktree.mobile.core.relay.v2.state
 
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxMutation
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRejection
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
@@ -51,6 +53,45 @@ internal data class RelayV2PersistedOutboxEntry(
     val payload: RelayV2EncodedPayload,
 )
 
+internal data class RelayV2CreateOutcomeKey(
+    val namespace: RelayV2OutboxAuthorityNamespace,
+    val hostId: String,
+    val expectedHostEpoch: String,
+    val commandId: String,
+)
+
+internal enum class RelayV2CreateOutcomeState {
+    SUCCEEDED,
+    FAILED_FINAL,
+    AMBIGUOUS,
+}
+
+internal data class RelayV2CreateOutcome(
+    val key: RelayV2CreateOutcomeKey,
+    val createdOrder: Long,
+    val scopeId: String,
+    val operation: RelayV2OutboxOperation,
+    val state: RelayV2CreateOutcomeState,
+    val sessionId: String?,
+    val errorCode: String?,
+    val errorMessage: String?,
+    val acknowledged: Boolean,
+) {
+    init {
+        require(operation == RelayV2OutboxOperation.CREATE_WORKTREE ||
+            operation == RelayV2OutboxOperation.CREATE_TERMINAL)
+        require(createdOrder >= 0)
+        when (state) {
+            RelayV2CreateOutcomeState.SUCCEEDED -> {
+                require(sessionId != null && errorCode == null && errorMessage == null)
+            }
+            RelayV2CreateOutcomeState.FAILED_FINAL,
+            RelayV2CreateOutcomeState.AMBIGUOUS,
+            -> require(sessionId == null && errorCode != null && errorMessage != null)
+        }
+    }
+}
+
 internal data class RelayV2PersistedTerminalCheckpoint(
     val key: RelayV2TerminalCheckpointKey,
     val kind: String,
@@ -78,6 +119,14 @@ internal interface RelayV2DurableStateTransaction {
         previousId: RelayV2OutboxEntryId,
         replacement: RelayV2PersistedOutboxEntry,
     ): Boolean
+
+    fun createOutcomes(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2CreateOutcome> = emptyList()
+
+    fun putCreateOutcome(outcome: RelayV2CreateOutcome) = Unit
+
+    fun acknowledgeCreateOutcome(key: RelayV2CreateOutcomeKey): Boolean = false
 
     fun terminalCheckpoint(
         key: RelayV2TerminalCheckpointKey,
@@ -182,10 +231,20 @@ internal interface RelayV2OutboxEnqueueAuthority {
     ): RelayV2OutboxEnqueueResult
 }
 
+/** Durable completion evidence used to reconnect an accepted create command to the APK UI. */
+internal interface RelayV2CreateOutcomeAuthority {
+    suspend fun readCreateOutcomes(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2CreateOutcome> = emptyList()
+
+    suspend fun acknowledgeCreateOutcome(key: RelayV2CreateOutcomeKey): Boolean = false
+}
+
 /** Single production Outbox owner paired into query/recovery and fresh dispatch adapters. */
 internal interface RelayV2OutboxRuntimeAuthority :
     RelayV2OutboxRecoveryAuthority,
-    RelayV2OutboxFreshDispatchAuthority
+    RelayV2OutboxFreshDispatchAuthority,
+    RelayV2CreateOutcomeAuthority
 
 /**
  * Narrow durable authority used only by the default-off terminal runtime adapter.
@@ -263,6 +322,17 @@ internal class RelayV2DurableStateRepositoryCore(
     ): RelayV2OutboxState = store.transaction {
         decodeOutbox(namespace)
     }
+
+    override suspend fun readCreateOutcomes(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2CreateOutcome> = store.transaction {
+        createOutcomes(namespace)
+    }
+
+    override suspend fun acknowledgeCreateOutcome(key: RelayV2CreateOutcomeKey): Boolean =
+        store.transaction {
+            this.acknowledgeCreateOutcome(key)
+        }
 
     override suspend fun enqueueOutbox(
         namespace: RelayV2OutboxAuthorityNamespace,
@@ -352,6 +422,7 @@ internal class RelayV2DurableStateRepositoryCore(
         requireOutboxNamespace(namespace, result.state)
         if (result is RelayV2OutboxResult.Applied) {
             applyOutboxPlan(namespace, current, result)
+            persistCreateOutcome(namespace, action, result.state)
             putOutboxMeta(
                 RelayV2PersistedOutboxMeta(
                     namespace,
@@ -395,9 +466,10 @@ internal class RelayV2DurableStateRepositoryCore(
         }
 
         var persistedState = current
-        applied.forEach { result ->
+        applied.forEachIndexed { index, result ->
             applyOutboxPlan(namespace, persistedState, result)
             persistedState = result.state
+            persistCreateOutcome(namespace, actions[index], persistedState)
         }
         putOutboxMeta(
             RelayV2PersistedOutboxMeta(
@@ -413,6 +485,81 @@ internal class RelayV2DurableStateRepositoryCore(
             reducedState,
             applied.flatMap { it.effects },
         )
+    }
+
+    private fun RelayV2DurableStateTransaction.persistCreateOutcome(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        action: RelayV2OutboxAction,
+        state: RelayV2OutboxState,
+    ) {
+        val reconciliation = action as? RelayV2OutboxAction.ReconcileStatus ?: return
+        val evidence = reconciliation.evidence
+        if (evidence.operation != RelayV2OutboxOperation.CREATE_WORKTREE &&
+            evidence.operation != RelayV2OutboxOperation.CREATE_TERMINAL
+        ) return
+        val leaf = state.entry(evidence.entryId) ?: return
+        val outcomeState = when (leaf.state) {
+            RelayV2OutboxStateTag.SUCCEEDED -> RelayV2CreateOutcomeState.SUCCEEDED
+            RelayV2OutboxStateTag.FAILED_FINAL -> RelayV2CreateOutcomeState.FAILED_FINAL
+            RelayV2OutboxStateTag.AMBIGUOUS -> RelayV2CreateOutcomeState.AMBIGUOUS
+            else -> return
+        }
+        val root = state.createRootFor(leaf) ?: return
+        val created = evidence.result as? RelayV2CommandResult.CreatedSession
+        val errorCode = when (outcomeState) {
+            RelayV2CreateOutcomeState.SUCCEEDED -> null
+            RelayV2CreateOutcomeState.FAILED_FINAL -> evidence.errorCode ?: "CREATE_REJECTED"
+            RelayV2CreateOutcomeState.AMBIGUOUS ->
+                evidence.errorCode ?: "COMMAND_OUTCOME_UNCERTAIN"
+        }
+        val errorMessage = when (outcomeState) {
+            RelayV2CreateOutcomeState.SUCCEEDED -> null
+            RelayV2CreateOutcomeState.FAILED_FINAL ->
+                evidence.errorMessage ?: "The computer rejected the creation command."
+            RelayV2CreateOutcomeState.AMBIGUOUS ->
+                evidence.errorMessage ?: "The computer could not confirm whether creation completed."
+        }
+        val sessionId = if (outcomeState == RelayV2CreateOutcomeState.SUCCEEDED) {
+            requireNotNull(created).sessionId
+        } else {
+            null
+        }
+        putCreateOutcome(
+            RelayV2CreateOutcome(
+                key = RelayV2CreateOutcomeKey(
+                    namespace = namespace,
+                    hostId = root.hostId,
+                    expectedHostEpoch = root.expectedHostEpoch,
+                    commandId = root.commandId,
+                ),
+                createdOrder = root.createdOrder,
+                scopeId = root.scopeId,
+                operation = root.operation,
+                state = outcomeState,
+                sessionId = sessionId,
+                errorCode = errorCode,
+                errorMessage = errorMessage,
+                acknowledged = false,
+            ),
+        )
+    }
+
+    private fun RelayV2OutboxState.createRootFor(
+        terminalEntry: RelayV2OutboxEntry,
+    ): RelayV2OutboxEntry? {
+        var current = terminalEntry
+        val visited = HashSet<String>()
+        while (current.reissuedFromCommandId != null) {
+            if (!visited.add(current.commandId)) return null
+            val parentId = requireNotNull(current.reissuedFromCommandId)
+            current = entries.singleOrNull { candidate ->
+                candidate.commandId == parentId &&
+                    candidate.replacementCommandId == current.commandId &&
+                    candidate.operation == current.operation &&
+                    candidate.scopeId == current.scopeId
+            } ?: return null
+        }
+        return current
     }
 
     override suspend fun dispatchFreshUnderApplyLease(

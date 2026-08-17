@@ -23,11 +23,12 @@ class RelayV2TerminalProductionCompositionTest {
         }
         val sent = mutableListOf<ByteArray>()
         val credentials = RecordingCredentials()
+        val terminalJournal = EmptyJournal()
         var nextId = 0
         val composition = RelayV2TerminalProductionComposition(
             applyLease = CurrentApplyLease,
             terminal = terminal,
-            journal = EmptyJournal(),
+            journal = terminalJournal,
             credentials = credentials,
             sendPort = RelayV2TerminalExactGenerationSendPort { _, bytes ->
                 sent += bytes
@@ -154,9 +155,10 @@ class RelayV2TerminalProductionCompositionTest {
         terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(checkpoint))
         val sentBeforeDetach = sent.size
 
-        composition.detach(attachment)
+        composition.detachAfterParserCallbacksDrained(attachment)
 
         assertEquals(sentBeforeDetach, sent.size)
+        assertEquals(0, terminalJournal.fenceCount())
         val replacement = composition.attach(target, RejectingParser)
         assertTrue(composition.open(replacement, authority, 120, 36))
 
@@ -531,6 +533,7 @@ class RelayV2TerminalProductionCompositionTest {
         val terminal = BlockingTerminalAuthority()
         terminal.releaseClaim.complete(Unit)
         var observedReset: RelayV2TerminalResetReason? = null
+        var observedOpenRejection: RelayV2TerminalCorrelatedError? = null
         var nextId = 0
         val composition = RelayV2TerminalProductionComposition(
             applyLease = CurrentApplyLease,
@@ -572,6 +575,10 @@ class RelayV2TerminalProductionCompositionTest {
                 }
 
                 override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+
+                override fun openRejected(error: RelayV2TerminalCorrelatedError) {
+                    observedOpenRejection = error
+                }
             },
         )
         assertTrue(composition.open(attachment, authority, 120, 36))
@@ -790,7 +797,26 @@ class RelayV2TerminalProductionCompositionTest {
                     ),
                 ),
             )
-            assertEquals(case.name, case.stored, terminal.stored(key))
+            if (case.name == "pre-open owned") {
+                val rejected = (terminal.stored(key) as RelayV2TerminalStoredCheckpoint.PreOpen)
+                    .checkpoint
+                assertEquals(
+                    RelayV2TerminalPreOpenPhase.RESET_REQUIRED,
+                    rejected.phase,
+                )
+                assertEquals(RelayV2TerminalResetReason.STREAM_LOST, rejected.resetReason)
+                assertEquals(null, rejected.pendingOpen)
+                assertEquals(
+                    RelayV2TerminalCorrelatedError(
+                        code = "INTERNAL",
+                        retryable = case.retryable,
+                        message = case.message,
+                    ),
+                    observedOpenRejection,
+                )
+            } else {
+                assertEquals(case.name, case.stored, terminal.stored(key))
+            }
         }
 
         terminal.install(key, RelayV2TerminalStoredCheckpoint.Present(pendingOpen))

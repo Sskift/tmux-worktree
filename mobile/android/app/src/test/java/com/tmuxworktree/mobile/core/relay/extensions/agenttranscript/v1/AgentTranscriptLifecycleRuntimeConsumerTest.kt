@@ -733,7 +733,10 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             val dispatched = handled.requestSyncDispatches.single()
                 as AgentTranscriptLifecycleRequestSyncResult.Dispatched
 
-            assertEquals(listOf("consume", "handoff", "prepare", "send"), harness.events)
+            assertEquals(
+                listOf("consume", "handoff", "consume", "prepare", "send"),
+                harness.events,
+            )
             assertEquals(prepared.toActorRequest(harness.fence()), dispatched.request)
             assertEquals(dispatched.request, sent)
             assertTrue(
@@ -967,7 +970,8 @@ private class RecordingApplyLease(
 
 private class RecordingDurableOperationPort(
     private val events: MutableList<String> = mutableListOf(),
-) : AgentTranscriptLifecycleRuntimeDurableRepository {
+) : AgentTranscriptLifecycleRuntimeDurableRepository,
+    AgentTranscriptLifecyclePostedNotificationDurablePort {
     data class ApplyGate(
         val entered: CompletableDeferred<Unit> = CompletableDeferred(),
         val release: CompletableDeferred<Unit> = CompletableDeferred(),
@@ -1039,6 +1043,21 @@ private class RecordingDurableOperationPort(
             ),
         )
     }
+
+    override suspend fun markNotificationPostedUnderApplyLease(
+        ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ): AgentTranscriptLifecycleMarkNotificationPostedResult {
+        check(ticket.namespace == compositionNamespace)
+        return AgentTranscriptLifecycleMarkNotificationPostedResult.MARKED
+    }
+
+    override suspend fun readPostedNotificationPage(
+        profileId: String,
+        profileActivationGeneration: Long,
+        offset: Int,
+        limit: Int,
+    ): AgentTranscriptLifecyclePostedNotificationPage =
+        AgentTranscriptLifecyclePostedNotificationPage(emptyList(), null)
 
     override suspend fun readRevisionPinnedPage(
         namespace: AgentTranscriptLifecycleDurableNamespace,

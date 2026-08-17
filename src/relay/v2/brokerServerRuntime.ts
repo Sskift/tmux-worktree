@@ -39,6 +39,7 @@ import {
 } from "../extensions/agentTranscriptLifecycle/v1/codec.js";
 import {
   RELAY_AGENT_CHAT_CAPABILITY,
+  RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
 } from "../extensions/agentChat/v2/codec.js";
 import {
   RELAY_LARK_BINDINGS_CAPABILITY,
@@ -333,6 +334,10 @@ const OPTIONAL_AGENT_CAPABILITY_READINESS_SPECS: ReadonlyArray<Readonly<{
   },
   {
     capability: RELAY_AGENT_CHAT_CAPABILITY,
+    propertyName: "agentChatReadiness",
+  },
+  {
+    capability: RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
     propertyName: "agentChatReadiness",
   },
   {
