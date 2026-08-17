@@ -2,14 +2,47 @@ package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatMarkdownPart
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatTurnView
 import java.security.MessageDigest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RelayChatReducerTest {
+    @Test
+    fun `sent keeps an active fence until its authoritative turn arrives`() {
+        val session = "local:demo"
+        val pending = RelayChatReducer.reduce(
+            RelayChatState(),
+            RelayChatMutation.SendPending("req-1", session, "hello", 100),
+        )
+        val accepted = RelayChatReducer.reduce(
+            pending,
+            RelayChatMutation.Sent("req-1", session, "turn-1", 101),
+        )
+
+        assertTrue(accepted.pending(session).isEmpty())
+        assertTrue(accepted.awaitingTurn(session))
+
+        val projected = RelayChatReducer.reduce(
+            accepted,
+            RelayChatMutation.TurnUpdated(
+                session,
+                AgentChatTurnView(
+                    turnId = "turn-1",
+                    session = session,
+                    userMessage = "hello",
+                    status = "working",
+                    sentAt = "2026-01-01T00:00:00Z",
+                ),
+            ),
+        )
+        assertFalse(projected.awaitingTurn(session))
+    }
+
     @Test
     fun `history result replaces local turns deduplicated by turnId and keeps pending sends`() {
         val session = "local:demo"
@@ -127,29 +160,98 @@ class RelayChatReducerTest {
     }
 
     @Test
-    fun `send failed marks pending as failed and retry clears the flag`() {
+    fun `retry replaces only the exact failed request and preserves other failures`() {
         val session = "local:demo"
-        val pending = PendingChatSend(
+        val first = PendingChatSend(
             requestId = "req-1",
             session = session,
             message = "hello",
             sentAtMillis = 100,
+            settings = AgentChatRuntimeSettings(
+                model = "gpt-5.6-sol",
+                reasoningEffort = "high",
+                mode = "plan",
+            ),
         )
-        val state = RelayChatState(pendingBySession = mapOf(session to listOf(pending)))
+        val second = PendingChatSend(
+            requestId = "req-2",
+            session = session,
+            message = "world",
+            sentAtMillis = 200,
+        )
+        val state = RelayChatState(pendingBySession = mapOf(session to listOf(first, second)))
 
-        val failed = RelayChatReducer.reduce(
+        val firstFailed = RelayChatReducer.reduce(
             state,
-            RelayChatMutation.SendFailed("req-1", session, "offline"),
+            RelayChatMutation.SendFailed(
+                requestId = "req-1",
+                session = session,
+                error = "Relay Agent chat is unavailable",
+                errorCode = "AGENT_CHAT_UNAVAILABLE",
+                retryable = true,
+            ),
         )
-        assertTrue(failed.pending(session).single().failed)
-        assertEquals("offline", failed.pending(session).single().error)
+        val bothFailed = RelayChatReducer.reduce(
+            firstFailed,
+            RelayChatMutation.SendFailed(
+                requestId = "req-2",
+                session = session,
+                error = "Session is gone",
+                errorCode = "AGENT_CHAT_SESSION_UNAVAILABLE",
+                retryable = false,
+            ),
+        )
 
         val retried = RelayChatReducer.reduce(
-            failed,
-            RelayChatMutation.RetryFailed(session),
+            bothFailed,
+            RelayChatMutation.RetryFailed(
+                requestId = "req-1",
+                session = session,
+                replacementRequestId = "req-1-retry",
+                nowMillis = 300,
+            ),
         )
-        val item = retried.pending(session).single()
-        assertEquals(false, item.failed)
-        assertEquals(null, item.error)
+        val retriedFirst = retried.pending(session)[0]
+        assertEquals("req-1-retry", retriedFirst.requestId)
+        assertEquals(300, retriedFirst.sentAtMillis)
+        assertFalse(retriedFirst.failed)
+        assertEquals(null, retriedFirst.error)
+        assertEquals(null, retriedFirst.errorCode)
+        assertEquals(first.settings, retriedFirst.settings)
+
+        val untouchedSecond = retried.pending(session)[1]
+        assertEquals("req-2", untouchedSecond.requestId)
+        assertTrue(untouchedSecond.failed)
+        assertEquals("Session is gone", untouchedSecond.error)
+        assertEquals("AGENT_CHAT_SESSION_UNAVAILABLE", untouchedSecond.errorCode)
+        assertFalse(untouchedSecond.retryable)
+    }
+
+    @Test
+    fun `non retryable failed request cannot be transitioned back to sending`() {
+        val session = "local:demo"
+        val failed = PendingChatSend(
+            requestId = "req-final",
+            session = session,
+            message = "hello",
+            sentAtMillis = 100,
+            failed = true,
+            error = "Session is gone",
+            errorCode = "AGENT_CHAT_SESSION_UNAVAILABLE",
+            retryable = false,
+        )
+        val state = RelayChatState(pendingBySession = mapOf(session to listOf(failed)))
+
+        val reduced = RelayChatReducer.reduce(
+            state,
+            RelayChatMutation.RetryFailed(
+                requestId = "req-final",
+                session = session,
+                replacementRequestId = "req-final-retry",
+                nowMillis = 200,
+            ),
+        )
+
+        assertEquals(state, reduced)
     }
 }

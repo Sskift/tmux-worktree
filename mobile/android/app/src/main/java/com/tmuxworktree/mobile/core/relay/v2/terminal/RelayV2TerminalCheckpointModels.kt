@@ -495,6 +495,7 @@ internal data class RelayV2TerminalPendingClose(
 internal data class RelayV2TerminalCorrelatedError(
     val code: String,
     val retryable: Boolean,
+    val message: String = code,
 )
 
 internal data class RelayV2TerminalOpenResultLineage(

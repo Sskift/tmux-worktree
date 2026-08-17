@@ -702,6 +702,25 @@ function goldenOpen(overrides = {}) {
   };
 }
 
+test("open waits for the post-create canonical resolver cut instead of persisting failure", async () => {
+  const resolver = new FakeResolver();
+  resolver.resolveResults.push(
+    Object.assign(
+      new Error("canonical target resolver has no current complete discovery cut"),
+      { code: "CAPABILITY_UNAVAILABLE" },
+    ),
+  );
+  const h = harness({ resolver });
+  const request = goldenOpen({ requestId: "post-create-resolver-refresh" });
+
+  await h.manager.open(request);
+
+  assert.equal(h.resolver.calls.length, 2);
+  assert.equal(h.lineage.failOpenCalls.length, 0);
+  assert.equal(h.backend.opens.length, 1);
+  assert.ok(opened(h.sent, request.requestId));
+});
+
 function opened(sent, requestId) {
   return sent.find(({ frame }) => (
     frame.type === "terminal.opened" && frame.requestId === requestId

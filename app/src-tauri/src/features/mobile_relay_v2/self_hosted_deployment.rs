@@ -2309,6 +2309,19 @@ fn self_hosted_connector_should_be_running(
         && status.center_status == DeploymentProbeStatus::Running
 }
 
+fn self_hosted_connector_should_survive_dashboard_window_close(
+    config: &PersistedSelfHostedConfig,
+) -> bool {
+    config.connector_desired_running
+}
+
+pub(crate) fn relay_v2_connector_should_survive_dashboard_window_close() -> bool {
+    load_config()
+        .ok()
+        .flatten()
+        .is_some_and(|config| self_hosted_connector_should_survive_dashboard_window_close(&config))
+}
+
 pub(crate) fn restore_relay_v2_self_hosted_connector_desired_state(
     state: &MobileRelayV2SelfHostedDeploymentState,
     management: &MobileRelayV2ManagementCommandState,
@@ -3628,7 +3641,7 @@ pub(crate) async fn mobile_relay_v2_self_hosted_start_center(
         let selection = prepared.selection();
         let binding = prepared.management_binding()?;
         management
-            .replace_self_hosted(&app, selection, move || prepared.commit_ready())
+            .restart_self_hosted(&app, selection, move || prepared.commit_ready())
             .map_err(|error| match error {
                 ManagementStartError::RecoveryRequired => {
                     "Relay v2 Host cleanup is uncertain; operator recovery is required".to_string()
@@ -3764,18 +3777,19 @@ mod tests {
         load_ready_commit_journal_at, normalize_issuer_url, persisted_management_config_identity,
         read_local_private_file, ready_rotation_transfer_identity,
         record_expired_bootstrap_rotation_intent, relay_url_from_issuer,
-        self_hosted_connector_should_be_running, stop_center_and_active_connector,
-        valid_bootstrap_publication_correlation, validate_bootstrap_bytes, validate_listen_host,
-        verify_rotation_transfer_identity, verify_rotation_transfer_receipt_local_at,
-        BootstrapRotationRequestPhase, BootstrapRotationTransferPhase,
-        BootstrapRotationTransferReceipt, DeploymentProbeStatus, LocalPrivateFileIdentity,
-        PersistedSelfHostedConfig, ReadyCommitJournal, SelfHostedDeploymentOperationOwner,
-        SelfHostedManagementBinding, BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT,
-        CONFIG_SCHEMA_VERSION, CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION,
-        HOST_PROFILE_CONFIG_SCHEMA_VERSION, ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES,
-        READY_COMMIT_JOURNAL_CONTRACT, READY_COMMIT_JOURNAL_SCHEMA_VERSION,
-        REMOTE_BOOTSTRAP_FD_READER, ROTATION_PENDING_CONFIG_SCHEMA_VERSION,
-        ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
+        self_hosted_connector_should_be_running,
+        self_hosted_connector_should_survive_dashboard_window_close,
+        stop_center_and_active_connector, valid_bootstrap_publication_correlation,
+        validate_bootstrap_bytes, validate_listen_host, verify_rotation_transfer_identity,
+        verify_rotation_transfer_receipt_local_at, BootstrapRotationRequestPhase,
+        BootstrapRotationTransferPhase, BootstrapRotationTransferReceipt, DeploymentProbeStatus,
+        LocalPrivateFileIdentity, PersistedSelfHostedConfig, ReadyCommitJournal,
+        SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
+        BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
+        CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, HOST_PROFILE_CONFIG_SCHEMA_VERSION,
+        ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES, READY_COMMIT_JOURNAL_CONTRACT,
+        READY_COMMIT_JOURNAL_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
+        ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
 
     fn config() -> PersistedSelfHostedConfig {
@@ -3902,6 +3916,22 @@ mod tests {
         assert!(!self_hosted_connector_should_be_running(
             &ready,
             &mismatched
+        ));
+    }
+
+    #[test]
+    fn dashboard_close_preserves_a_desired_connector_during_transient_recovery() {
+        let mut persisted = config();
+        assert!(!self_hosted_connector_should_survive_dashboard_window_close(&persisted));
+
+        persisted.connector_desired_running = true;
+        assert!(self_hosted_connector_should_survive_dashboard_window_close(
+            &persisted
+        ));
+
+        persisted.management_recovery_required = true;
+        assert!(self_hosted_connector_should_survive_dashboard_window_close(
+            &persisted
         ));
     }
 

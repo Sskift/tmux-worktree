@@ -730,6 +730,12 @@ export interface RelayV2MaterializedStateOptions {
   discovery: RelayV2ResourceDiscovery;
   store: Pick<RelayV2HostStateStore, "serialize">;
   readinessSink: RelayV2MaterializedReadinessSink;
+  /**
+   * Best-effort synchronous signal that asks the shipping root to run a fresh
+   * discovery pass after a command commits a resource mutation. The signal
+   * owns scheduling only; it must not perform discovery or re-enter H0.
+   */
+  resourceMutationReconcileSignal?: () => void;
   reservationSettlementAuthority?: RelayV2ReservationSettlementAuthority;
   /** Tests may only shrink frozen capacity boundaries. */
   testCapacityLimits?: Partial<MaterializedCapacity>;
@@ -3143,6 +3149,7 @@ export class RelayV2MaterializedStateFoundation {
   private readonly reservationSettlementAuthority: RelayV2ReservationSettlementAuthority | undefined;
   private readonly store: Pick<RelayV2HostStateStore, "serialize">;
   private readonly readinessSink: RelayV2MaterializedReadinessSink;
+  private readonly resourceMutationReconcileSignal: (() => void) | undefined;
   private readonly now: () => number;
   private readonly snapshotCandidateLimits: Readonly<MaterializedCutCandidateLimits>;
   private readonly testHooks: RelayV2MaterializedStateTestHooks | undefined;
@@ -3166,6 +3173,11 @@ export class RelayV2MaterializedStateFoundation {
     this.reservationSettlementAuthority = options.reservationSettlementAuthority;
     this.store = options.store;
     this.readinessSink = options.readinessSink;
+    if (options.resourceMutationReconcileSignal !== undefined
+      && typeof options.resourceMutationReconcileSignal !== "function") {
+      throw new TypeError("invalid Relay v2 resource mutation reconcile signal");
+    }
+    this.resourceMutationReconcileSignal = options.resourceMutationReconcileSignal;
     this.now = options.now ?? Date.now;
     this.testHooks = options.testHooks;
     this.capacity = Object.freeze({
@@ -3236,6 +3248,18 @@ export class RelayV2MaterializedStateFoundation {
           evidence.events,
           readinessFor(snapshot, parseMaterializedState(snapshot), this.capacity),
         );
+        // The committed Session is already authoritative and has been
+        // published to subscribers, but the resolver cut still belongs to the
+        // previous discovery generation. Ask the lifecycle owner to rebuild
+        // that cut now instead of leaving terminal.open unavailable until the
+        // periodic scan (30s in production). Scheduling is deliberately
+        // best-effort: a signal failure must not turn a committed create into
+        // an uncertain command outcome; the periodic scan remains the fallback.
+        try {
+          this.resourceMutationReconcileSignal?.();
+        } catch {
+          // Periodic reconciliation will still repair the resolver cut.
+        }
       },
       fenceCommitUncertain: (snapshot: RelayV2HostStateSnapshot) => {
         this.publishedCanonicalResolver = null;

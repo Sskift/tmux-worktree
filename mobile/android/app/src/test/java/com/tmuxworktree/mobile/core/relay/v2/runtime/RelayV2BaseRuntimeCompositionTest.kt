@@ -52,6 +52,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAcceptanceEvide
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxArguments
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandDisposition
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusEvidence
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusSource
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusState
@@ -66,6 +67,7 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRecovery
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2ResultSessionKind
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialBlob
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasExpectation
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasResult
@@ -76,6 +78,9 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2DurableStateRepositoryCore
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2DurableStateStore
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2DurableStateTransaction
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2CreateOutcome
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2CreateOutcomeKey
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2CreateOutcomeState
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedScopeReadCut
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2MaterializedSessionReadCut
@@ -103,6 +108,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectIdentity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectPlan
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectRecovery
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateEvent
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateChange
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHello
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncAuthority
@@ -1900,19 +1906,16 @@ class RelayV2BaseRuntimeCompositionTest {
                 assertTrue(harness.transport().framesOfType("command.execute").isEmpty())
 
                 harness.authority.releaseEnqueue.complete(Unit)
-                assertTrue(
-                    withTimeout(TIMEOUT_MS) { create.await() } is
-                        RelayV2ScopeCreateResult.Queued,
-                )
-                assertTrue(
-                    harness.composition.submitCreateTerminal(
+                val worktreeResult = withTimeout(TIMEOUT_MS) { create.await() }
+                assertTrue(worktreeResult is RelayV2ScopeCreateResult.Queued)
+                val terminalResult = harness.composition.submitCreateTerminal(
                         scopeCut = scopeCut,
                         inputs = RelayV2CreateTerminalInputs(
                             cwd = "/work/project-a",
                             label = "Project A shell",
                         ),
-                    ) is RelayV2ScopeCreateResult.Queued,
-                )
+                    )
+                assertTrue(terminalResult is RelayV2ScopeCreateResult.Queued)
                 val entries = harness.authority.outboxState().entries
                 val worktree = entries.single { it.commandId == "create-worktree" }
                 val terminal = entries.single { it.commandId == "create-terminal" }
@@ -1968,14 +1971,242 @@ class RelayV2BaseRuntimeCompositionTest {
                 )
                 assertEquals(2, harness.authority.enqueueCommits.get())
                 assertEquals(
+                    setOf(
+                        RelayV2OutboxOperation.CREATE_WORKTREE,
+                        RelayV2OutboxOperation.CREATE_TERMINAL,
+                    ),
+                    (harness.composition.readPendingCreateCommands(
+                        harness.composition.outboxTimelineRevision.value,
+                    ) as RelayV2PendingCreateCommandsReadState.Content)
+                        .commands.map { it.operation }.toSet(),
+                )
+                assertEquals(
+                    RelayV2ScopeCreateResult.Rejected(
+                        RelayV2ScopeCreateFailure.DUPLICATE_COMMAND,
+                    ),
+                    harness.composition.submitCreateTerminal(
+                        scopeCut = scopeCut,
+                        inputs = RelayV2CreateTerminalInputs(
+                            cwd = "/work/project-a",
+                            label = "Project A shell",
+                        ),
+                    ),
+                )
+                assertEquals(2, harness.authority.outboxState().entries.size)
+                val terminalReceipt =
+                    (terminalResult as RelayV2ScopeCreateResult.Queued).receipt
+                val pendingRevision = harness.composition.outboxTimelineRevision.value
+                assertEquals(
+                    RelayV2CreateCommandReadState.Pending(RelayV2OutboxStateTag.SENDING),
+                    harness.composition.readCreateCommand(
+                        receipt = terminalReceipt,
+                        scopeId = "scope-a",
+                        operation = RelayV2OutboxOperation.CREATE_TERMINAL,
+                        expectedRevision = pendingRevision,
+                    ),
+                )
+                assertEquals(
                     listOf("scope-a"),
                     harness.composition.productProjection.value.scopes.map {
                         it.materialized.scope.scopeId
                     },
                 )
                 assertTrue(harness.composition.productProjection.value.sessions.isEmpty())
+
+                harness.transport().sendCreateCommandResult(
+                    commandId = "create-terminal",
+                    scopeId = "scope-a",
+                    sessionId = "session-a",
+                    kind = "terminal",
+                )
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.authority.outboxState().entries
+                            .single { it.commandId == "create-terminal" }
+                            .state != RelayV2OutboxStateTag.SUCCEEDED ||
+                        harness.composition.outboxTimelineRevision.value == pendingRevision
+                    ) {
+                        delay(1)
+                    }
+                }
+                assertEquals(
+                    RelayV2CreateCommandReadState.Succeeded("session-a"),
+                    harness.composition.readCreateCommand(
+                        receipt = terminalReceipt,
+                        scopeId = "scope-a",
+                        operation = RelayV2OutboxOperation.CREATE_TERMINAL,
+                        expectedRevision = harness.composition.outboxTimelineRevision.value,
+                    ),
+                )
+                harness.composition.acknowledgeCreateOutcome(terminalReceipt)
+
+                val worktreeReceipt =
+                    (worktreeResult as RelayV2ScopeCreateResult.Queued).receipt
+                val beforeFailureRevision = harness.composition.outboxTimelineRevision.value
+                harness.transport().sendCreateCommandFailure(
+                    commandId = "create-worktree",
+                    scopeId = "scope-a",
+                    code = "SCOPE_NOT_FOUND",
+                    message = "Scope is no longer available",
+                )
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.composition.outboxTimelineRevision.value ==
+                        beforeFailureRevision
+                    ) {
+                        delay(1)
+                    }
+                }
+                assertEquals(
+                    RelayV2CreateCommandReadState.Failed(
+                        code = "SCOPE_NOT_FOUND",
+                        message = "Scope is no longer available",
+                        ambiguous = false,
+                    ),
+                    harness.composition.readCreateCommand(
+                        receipt = worktreeReceipt,
+                        scopeId = "scope-a",
+                        operation = RelayV2OutboxOperation.CREATE_WORKTREE,
+                        expectedRevision = harness.composition.outboxTimelineRevision.value,
+                    ),
+                )
+                val restoredFailure = harness.composition.readPendingCreateCommands(
+                    harness.composition.outboxTimelineRevision.value,
+                ) as RelayV2PendingCreateCommandsReadState.Content
+                assertEquals(listOf("create-worktree"), restoredFailure.commands.map {
+                    it.receipt.commandId
+                })
+                assertEquals(
+                    RelayV2OutboxStateTag.FAILED_FINAL,
+                    restoredFailure.commands.single().state,
+                )
+                val durableFinalOutbox = harness.authority.outboxState()
+                val durableCreateOutcomes = harness.authority.createOutcomeState()
+
+                // A cold composition restores the exact durable Host failure once, including
+                // evidence, and the durable acknowledgement prevents subsequent replays.
+                val coldHarness = Harness(
+                    autoConnect = false,
+                    outbox = durableFinalOutbox,
+                    createOutcomes = durableCreateOutcomes,
+                    includeMaterializedSession = false,
+                )
+                try {
+                    val coldPending = coldHarness.composition.readPendingCreateCommands(
+                        coldHarness.composition.outboxTimelineRevision.value,
+                    ) as RelayV2PendingCreateCommandsReadState.Content
+                    assertEquals(
+                        listOf("create-worktree"),
+                        coldPending.commands.map { it.receipt.commandId },
+                    )
+                    coldHarness.composition.acknowledgeCreateOutcome(worktreeReceipt)
+                    assertTrue(
+                        (coldHarness.composition.readPendingCreateCommands(
+                            coldHarness.composition.outboxTimelineRevision.value,
+                        ) as RelayV2PendingCreateCommandsReadState.Content).commands.isEmpty(),
+                    )
+                } finally {
+                    coldHarness.close()
+                }
+
+                // command.result settles the exact Outbox item; sessions.changed remains the
+                // authoritative product projection. Verify the following Host event makes the
+                // created Session visible to the APK.
+                harness.transport().sendFixture("sessions-changed-upsert")
+                val createdSession = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { it.sessions.isNotEmpty() }
+                }.sessions.single()
+                assertEquals("session-a", createdSession.materialized.session.sessionId)
             } finally {
                 harness.authority.releaseEnqueue.complete(Unit)
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `unanswered terminal creation reconnects queries and retries instead of blocking its lane`() =
+        runBlocking {
+            val deliveryWatchdog = ControlledRetryDelay()
+            val reconnect = ControlledRetryDelay()
+            val harness = Harness(
+                autoConnect = true,
+                includeMaterializedSession = false,
+                newCommandId = { "create-delivery-timeout" },
+                retryDelayBlock = reconnect::awaitDelay,
+                commandDeliveryWatchdogDelayBlock = deliveryWatchdog::awaitDelay,
+            )
+            try {
+                harness.connectOnline()
+                val scopeCut = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first {
+                        it.scopes.singleOrNull()?.createCut != null
+                    }.scopes.single().createCut
+                }
+                checkNotNull(scopeCut)
+                val queued = harness.composition.submitCreateTerminal(
+                    scopeCut = scopeCut,
+                    inputs = RelayV2CreateTerminalInputs(
+                        cwd = "/work/project-a",
+                        label = "Project A shell",
+                    ),
+                ) as RelayV2ScopeCreateResult.Queued
+                val first = harness.transport(0).awaitSentType("command.execute")
+                assertEquals("create-delivery-timeout", first.stringValue("commandId"))
+                assertTrue(deliveryWatchdog.awaitCount(1))
+                assertEquals(listOf(15_000L), deliveryWatchdog.delays)
+
+                // The local WebSocket accepted the frame, but no Host evidence arrived. The
+                // watchdog must durably make it queryable and retire only this generation.
+                deliveryWatchdog.release(0)
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.authority.outboxState().entries.single().state !=
+                        RelayV2OutboxStateTag.CONFIRMING
+                    ) {
+                        delay(1)
+                    }
+                }
+                assertTrue(reconnect.awaitCount(1))
+                assertEquals(RelayV2BaseRuntimePhase.CONNECTING, harness.composition.state.value.phase)
+
+                reconnect.release(0)
+                val successor = harness.openThroughHostWelcome(index = 1)
+                val query = successor.awaitSentType("command.query")
+                assertEquals(
+                    listOf("create-delivery-timeout"),
+                    query.payloadReadOnly().objectList("items").map {
+                        it.stringValue("commandId")
+                    },
+                )
+                successor.sendCommandStatuses(query, StatusMode.RETRY_IMMEDIATE)
+                harness.awaitPhase(RelayV2BaseRuntimePhase.ONLINE)
+
+                val retried = successor.awaitSentType("command.execute")
+                assertEquals(first.stringValue("commandId"), retried.stringValue("commandId"))
+                assertFalse(first.stringValue("requestId") == retried.stringValue("requestId"))
+                assertTrue(deliveryWatchdog.awaitCount(2))
+                successor.sendCreateCommandResult(
+                    commandId = "create-delivery-timeout",
+                    scopeId = "scope-a",
+                    sessionId = "created-after-recovery",
+                    kind = "terminal",
+                )
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.authority.outboxState().entries.single().state !=
+                        RelayV2OutboxStateTag.SUCCEEDED
+                    ) {
+                        delay(1)
+                    }
+                }
+                assertEquals(
+                    RelayV2CreateCommandReadState.Succeeded("created-after-recovery"),
+                    harness.composition.readCreateCommand(
+                        receipt = queued.receipt,
+                        scopeId = "scope-a",
+                        operation = RelayV2OutboxOperation.CREATE_TERMINAL,
+                        expectedRevision = harness.composition.outboxTimelineRevision.value,
+                    ),
+                )
+            } finally {
+                deliveryWatchdog.delays.indices.forEach(deliveryWatchdog::release)
+                reconnect.delays.indices.forEach(reconnect::release)
                 harness.close()
             }
         }
@@ -3274,10 +3505,12 @@ class RelayV2BaseRuntimeCompositionTest {
     private inner class Harness(
         autoConnect: Boolean,
         outbox: RelayV2OutboxState = RelayV2OutboxState.empty(),
+        createOutcomes: List<RelayV2CreateOutcome> = emptyList(),
         outboxReadFailure: Throwable? = null,
         newCommandId: () -> String = { "reply-${System.nanoTime()}" },
         retryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
         commandRetryDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
+        commandDeliveryWatchdogDelayBlock: suspend (Long) -> Unit = { millis -> delay(millis) },
         actorRecoveryWatchdogDelay: suspend (Long) -> Unit = { millis -> delay(millis) },
         beforeHelloOutboxAdmissionRead: suspend () -> Unit = {},
         beforeTerminalRecoveryAdmission: suspend () -> Unit = {},
@@ -3304,6 +3537,7 @@ class RelayV2BaseRuntimeCompositionTest {
         private val credentials = MemoryCredentialStore()
         val authority = FakeDurableAuthority(
             outbox,
+            createOutcomes,
             outboxReadFailure,
             beforeOutboxRead,
             includeMaterializedSession,
@@ -3364,6 +3598,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 clock = { NOW_MS },
                 retryDelay = retryDelayBlock,
                 commandRetryDelay = commandRetryDelayBlock,
+                commandDeliveryWatchdogDelay = commandDeliveryWatchdogDelayBlock,
                 actorRecoveryWatchdogDelay = actorRecoveryWatchdogDelay,
                 beforeHelloOutboxAdmissionRead = beforeHelloOutboxAdmissionRead,
                 beforeTerminalRecoveryAdmission = beforeTerminalRecoveryAdmission,
@@ -4025,9 +4260,10 @@ class RelayV2BaseRuntimeCompositionTest {
 
     private class FakeDurableAuthority(
         initialOutbox: RelayV2OutboxState,
+        initialCreateOutcomes: List<RelayV2CreateOutcome>,
         private val outboxReadFailure: Throwable?,
         private val beforeOutboxRead: suspend (Int) -> Unit,
-        private val includeMaterializedSession: Boolean,
+        includeMaterializedSession: Boolean,
     ) : RelayV2StateSyncAuthority,
         RelayV2OutboxRuntimeAuthority,
         RelayV2OutboxEnqueueAuthority,
@@ -4036,7 +4272,13 @@ class RelayV2BaseRuntimeCompositionTest {
         private val outboxCore = RelayV2OutboxAuthorityCore()
 
         @Volatile
+        private var materializedSessionAvailable = includeMaterializedSession
+
+        @Volatile
         private var outbox = initialOutbox
+
+        @Volatile
+        private var createOutcomes = initialCreateOutcomes.associateBy { it.key }
 
         val helloCommits = AtomicInteger()
         val stateEventCommits = AtomicInteger()
@@ -4090,6 +4332,21 @@ class RelayV2BaseRuntimeCompositionTest {
 
         fun outboxState(): RelayV2OutboxState = outbox
 
+        fun createOutcomeState(): List<RelayV2CreateOutcome> = createOutcomes.values.toList()
+
+        override suspend fun readCreateOutcomes(
+            namespace: RelayV2OutboxAuthorityNamespace,
+        ): List<RelayV2CreateOutcome> = createOutcomes.values
+            .filter { it.key.namespace == namespace }
+            .sortedWith(compareBy({ it.createdOrder }, { it.key.commandId }))
+
+        override suspend fun acknowledgeCreateOutcome(key: RelayV2CreateOutcomeKey): Boolean {
+            val current = createOutcomes[key] ?: return false
+            if (current.acknowledged) return false
+            createOutcomes = createOutcomes + (key to current.copy(acknowledged = true))
+            return true
+        }
+
         fun replaceOutbox(replacement: RelayV2OutboxState) {
             outbox = replacement
         }
@@ -4109,7 +4366,7 @@ class RelayV2BaseRuntimeCompositionTest {
             namespace: RelayV2StateNamespace,
         ): List<RelayV2MaterializedSessionReadCut> {
             productProjectionReads.incrementAndGet()
-            return if (includeMaterializedSession) {
+            return if (materializedSessionAvailable) {
                 listOf(materializedSession(namespace))
             } else {
                 emptyList()
@@ -4123,7 +4380,7 @@ class RelayV2BaseRuntimeCompositionTest {
         ): RelayV2MaterializedSessionReadCut? {
             materializedSessionCutReads.incrementAndGet()
             return materializedSession(namespace).takeIf {
-                includeMaterializedSession &&
+                materializedSessionAvailable &&
                     it.session.scopeId == scopeId &&
                     it.session.sessionId == sessionId
             }
@@ -4238,6 +4495,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 return RelayV2OutboxBatchResult.Rejected(current, null)
             }
             var reduced = current
+            var reducedCreateOutcomes = createOutcomes
             val effects = ArrayList<RelayV2OutboxEffect>()
             actions.forEach { action ->
                 when (val result = outboxCore.reduce(reduced, action)) {
@@ -4245,6 +4503,12 @@ class RelayV2BaseRuntimeCompositionTest {
                         return RelayV2OutboxBatchResult.Rejected(current, result.reason)
                     is RelayV2OutboxResult.Applied -> {
                         reduced = result.state
+                        reducedCreateOutcomes = persistCreateOutcome(
+                            namespace,
+                            reducedCreateOutcomes,
+                            action,
+                            reduced,
+                        )
                         effects += result.effects
                     }
                 }
@@ -4255,12 +4519,76 @@ class RelayV2BaseRuntimeCompositionTest {
                 releaseQueryCommit.await()
             }
             outbox = reduced
+            createOutcomes = reducedCreateOutcomes
             if (isQuery) queryCommits.incrementAndGet() else statusCommits.incrementAndGet()
             if (!isQuery && blockAfterStatusCommit) {
                 statusCommitCompleted.complete(Unit)
                 releaseAfterStatusCommit.await()
             }
             return RelayV2OutboxBatchResult.Applied(reduced, effects)
+        }
+
+        private fun persistCreateOutcome(
+            namespace: RelayV2OutboxAuthorityNamespace,
+            current: Map<RelayV2CreateOutcomeKey, RelayV2CreateOutcome>,
+            action: RelayV2OutboxAction,
+            state: RelayV2OutboxState,
+        ): Map<RelayV2CreateOutcomeKey, RelayV2CreateOutcome> {
+            val reconciliation = action as? RelayV2OutboxAction.ReconcileStatus ?: return current
+            val evidence = reconciliation.evidence
+            if (evidence.operation != RelayV2OutboxOperation.CREATE_WORKTREE &&
+                evidence.operation != RelayV2OutboxOperation.CREATE_TERMINAL
+            ) return current
+            val leaf = state.entry(evidence.entryId) ?: return current
+            val outcomeState = when (leaf.state) {
+                RelayV2OutboxStateTag.SUCCEEDED -> RelayV2CreateOutcomeState.SUCCEEDED
+                RelayV2OutboxStateTag.FAILED_FINAL -> RelayV2CreateOutcomeState.FAILED_FINAL
+                RelayV2OutboxStateTag.AMBIGUOUS -> RelayV2CreateOutcomeState.AMBIGUOUS
+                else -> return current
+            }
+            var root = leaf
+            val visited = HashSet<String>()
+            while (root.reissuedFromCommandId != null) {
+                if (!visited.add(root.commandId)) return current
+                val parentId = requireNotNull(root.reissuedFromCommandId)
+                root = state.entries.singleOrNull { candidate ->
+                    candidate.commandId == parentId &&
+                        candidate.replacementCommandId == root.commandId &&
+                        candidate.scopeId == root.scopeId &&
+                        candidate.operation == root.operation
+                } ?: return current
+            }
+            val key = RelayV2CreateOutcomeKey(
+                namespace = namespace,
+                hostId = root.hostId,
+                expectedHostEpoch = root.expectedHostEpoch,
+                commandId = root.commandId,
+            )
+            val created = evidence.result as? RelayV2CommandResult.CreatedSession
+            val outcome = RelayV2CreateOutcome(
+                key = key,
+                createdOrder = root.createdOrder,
+                scopeId = root.scopeId,
+                operation = root.operation,
+                state = outcomeState,
+                sessionId = created?.sessionId,
+                errorCode = when (outcomeState) {
+                    RelayV2CreateOutcomeState.SUCCEEDED -> null
+                    RelayV2CreateOutcomeState.FAILED_FINAL ->
+                        evidence.errorCode ?: "CREATE_REJECTED"
+                    RelayV2CreateOutcomeState.AMBIGUOUS ->
+                        evidence.errorCode ?: "COMMAND_OUTCOME_UNCERTAIN"
+                },
+                errorMessage = when (outcomeState) {
+                    RelayV2CreateOutcomeState.SUCCEEDED -> null
+                    RelayV2CreateOutcomeState.FAILED_FINAL ->
+                        evidence.errorMessage ?: "The computer rejected the creation command."
+                    RelayV2CreateOutcomeState.AMBIGUOUS -> evidence.errorMessage
+                        ?: "The computer could not confirm whether creation completed."
+                },
+                acknowledged = false,
+            )
+            return current + (key to outcome)
         }
 
         override suspend fun dispatchFreshUnderApplyLease(
@@ -4348,6 +4676,9 @@ class RelayV2BaseRuntimeCompositionTest {
                     requiredThroughEventSeq = event.eventSeq,
                     supersedesQueryCompletion = true,
                 )
+            }
+            if (event.change is RelayV2StateChange.SessionUpsert) {
+                materializedSessionAvailable = true
             }
             return RelayV2StateSyncResult.Live(event.namespace, event.eventSeq)
         }
@@ -4770,6 +5101,80 @@ class RelayV2BaseRuntimeCompositionTest {
                         ),
                     ),
                     "error" to null,
+                ),
+            )
+        }
+
+        fun sendCreateCommandResult(
+            commandId: String,
+            scopeId: String,
+            sessionId: String,
+            kind: String,
+        ) {
+            require(kind == "worktree" || kind == "terminal")
+            sendFrame(
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "event",
+                    "type" to "command.result",
+                    "commandId" to commandId,
+                    "hostId" to HOST_ID,
+                    "hostEpoch" to HOST_EPOCH,
+                    "scopeId" to scopeId,
+                    "payload" to linkedMapOf(
+                        "dedupeWindowId" to "dedupe-window-uuid",
+                        "state" to "succeeded",
+                        "updatedAtMs" to NOW_MS,
+                        "result" to linkedMapOf(
+                            "session" to linkedMapOf(
+                                "scopeId" to scopeId,
+                                "sessionId" to sessionId,
+                                "kind" to kind,
+                                "displayName" to "Created session",
+                                "state" to "running",
+                                "project" to if (kind == "worktree") "project-a" else null,
+                                "label" to if (kind == "terminal") "Project A shell" else null,
+                                "cwd" to "/work/project-a",
+                                "attached" to false,
+                                "windowCount" to 1L,
+                                "createdAtMs" to NOW_MS,
+                                "activityAtMs" to NOW_MS,
+                            ),
+                        ),
+                    ),
+                    "error" to null,
+                ),
+            )
+        }
+
+        fun sendCreateCommandFailure(
+            commandId: String,
+            scopeId: String,
+            code: String,
+            message: String,
+        ) {
+            sendFrame(
+                linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "event",
+                    "type" to "command.result",
+                    "commandId" to commandId,
+                    "hostId" to HOST_ID,
+                    "hostEpoch" to HOST_EPOCH,
+                    "scopeId" to scopeId,
+                    "payload" to linkedMapOf(
+                        "dedupeWindowId" to "dedupe-window-uuid",
+                        "state" to "failed",
+                        "updatedAtMs" to NOW_MS,
+                        "result" to null,
+                    ),
+                    "error" to linkedMapOf(
+                        "code" to code,
+                        "message" to message,
+                        "retryable" to false,
+                        "commandDisposition" to "completed",
+                        "details" to null,
+                    ),
                 ),
             )
         }

@@ -26,7 +26,8 @@ export const tauriTransport = createTauriTransport({
     onMoved: (handler) => currentWindow.onMoved(handler),
     closeLifecycle: {
       onCloseRequested: (handler) => currentWindow.onCloseRequested(handler),
-      destroy: () => currentWindow.destroy(),
+      destroy: () =>
+        invoke<"destroyed" | "hidden">("close_dashboard_window"),
     },
   }),
   setLogicalSize: (width, height) =>

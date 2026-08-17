@@ -35,6 +35,8 @@ export const RELAY_V2_HOST_WSS_SUBPROTOCOL = "tw-relay.host.v2" as const;
 const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1_048_576;
 const DEFAULT_CLOSE_DRAIN_DEADLINE_MS = 5_000;
 const MAX_CLOSE_DRAIN_DEADLINE_MS = 30_000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
+const MAX_HANDSHAKE_TIMEOUT_MS = 120_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT = 2;
 const NODE_CHECK_SERVER_IDENTITY = checkServerIdentity;
@@ -131,6 +133,7 @@ export interface RelayV2HostWssConstructorOptions {
   readonly maxPayload: number;
   readonly rejectUnauthorized: true;
   readonly checkServerIdentity: typeof checkServerIdentity;
+  readonly handshakeTimeout: number;
   readonly ca?: readonly (string | Uint8Array)[];
   readonly finishRequest: (request: object, webSocket: object) => void;
 }
@@ -151,6 +154,8 @@ export interface RelayV2HostWssTransportLifecycleFactoryOptions {
   readonly webSocketConstructor?: RelayV2HostWssConstructorPort;
   readonly maxBufferedBytes?: number;
   readonly closeDrainDeadlineMs?: number;
+  /** Bounds TCP/TLS/WebSocket opening before HostCarrier heartbeat ownership exists. */
+  readonly handshakeTimeoutMs?: number;
   readonly scheduleCloseDrain?: CloseDrainScheduler;
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatMissedPongLimit?: number;
@@ -531,6 +536,7 @@ function createLifecycle(input: Readonly<{
   attempt: RelayV2HostManagedConnectorTransportLifecycleFactoryInput;
   maxBufferedBytes: number;
   closeDrainDeadlineMs: number;
+  handshakeTimeoutMs: number;
   scheduleCloseDrain: CloseDrainScheduler;
   tlsTrust: RelayV2HostTlsCaTrust | undefined;
   heartbeatIntervalMs: number;
@@ -914,6 +920,7 @@ function createLifecycle(input: Readonly<{
             maxPayload: RELAY_V2_CARRIER_FRAME_BYTES,
             rejectUnauthorized: true,
             checkServerIdentity: NODE_CHECK_SERVER_IDENTITY,
+            handshakeTimeout: input.handshakeTimeoutMs,
             ...(input.tlsTrust === undefined
               ? {}
               : { ca: input.tlsTrust.certificateAuthorities }),
@@ -1068,6 +1075,7 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
   readonly #webSocketConstructor: RelayV2HostWssConstructorPort;
   readonly #maxBufferedBytes: number;
   readonly #closeDrainDeadlineMs: number;
+  readonly #handshakeTimeoutMs: number;
   readonly #scheduleCloseDrain: CloseDrainScheduler;
   readonly #tlsTrust: RelayV2HostTlsCaTrust | undefined;
   readonly #transportOwner: RelayV2HostCredentialConnectionTransportOwner;
@@ -1078,7 +1086,7 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
   constructor(options: RelayV2HostWssTransportLifecycleFactoryOptions) {
     const fields = exactDataObject(options, ["relayUrl", "credentialAuthority"], [
       "webSocketConstructor", "maxBufferedBytes", "closeDrainDeadlineMs",
-      "scheduleCloseDrain", "tlsTrust", "heartbeatIntervalMs",
+      "handshakeTimeoutMs", "scheduleCloseDrain", "tlsTrust", "heartbeatIntervalMs",
       "heartbeatMissedPongLimit",
     ]);
     if (!isRelayV2HostCredentialAuthority(fields.credentialAuthority)) throw failure();
@@ -1114,6 +1122,11 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
       fields.closeDrainDeadlineMs,
       DEFAULT_CLOSE_DRAIN_DEADLINE_MS,
       MAX_CLOSE_DRAIN_DEADLINE_MS,
+    );
+    this.#handshakeTimeoutMs = positiveBound(
+      fields.handshakeTimeoutMs,
+      DEFAULT_HANDSHAKE_TIMEOUT_MS,
+      MAX_HANDSHAKE_TIMEOUT_MS,
     );
     this.#scheduleCloseDrain = scheduleCloseDrain as CloseDrainScheduler;
     this.#tlsTrust = tlsTrust;
@@ -1218,6 +1231,7 @@ implements RelayV2HostManagedConnectorTransportLifecycleFactoryPort {
       attempt: input,
       maxBufferedBytes: this.#maxBufferedBytes,
       closeDrainDeadlineMs: this.#closeDrainDeadlineMs,
+      handshakeTimeoutMs: this.#handshakeTimeoutMs,
       scheduleCloseDrain: this.#scheduleCloseDrain,
       tlsTrust: this.#tlsTrust,
       heartbeatIntervalMs: this.#heartbeatIntervalMs,

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   TerminalControlDrainProof,
   TerminalControlLease,
+  TerminalControlAgentRuntimeSettings,
   TerminalControlOwner,
   TerminalControlOwnershipView,
   TerminalControlRecoveryProof,
@@ -20,6 +21,7 @@ import {
 } from "./protocol";
 import {
   TmuxTerminalControlBackend,
+  TerminalControlAgentMessageNotAppliedError,
   type TerminalControlBackend,
   type TerminalControlExactTargetObservation,
   type TerminalControlOutputPosition,
@@ -1311,8 +1313,16 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "managed target changed before Relay v2 exact observation",
         );
       }
-      const output = await this.prepareOutput(state, target, true);
-      // inspectExactTarget/prepareOutput may yield while a same-target status
+      // The first observer must start from a pane snapshot produced while the
+      // Host is fully live.  A generation prepared during controller shutdown
+      // can be structurally valid yet contain only a partial late redraw (or
+      // no bytes at all).  Rotate here so the first phone observer always gets
+      // the complete current pane.  Additional concurrent observers stay on
+      // the already-pinned generation and do not fence each other.
+      const output = this.relayV2ExactObserverCount(target.controlTargetId) === 0
+        ? await this.resetOutput(state, target)
+        : await this.prepareOutput(state, target, true);
+      // Exact target inspection/output preparation may yield while a same-target status
       // poll publishes its fence and waits on this lock. Recheck after the
       // final await, before releasing HELD or publishing the observation.
       if (!this.relayV2ExactClaimCurrent(record)) {
@@ -1813,12 +1823,14 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     }
     if (request.type === "input.agent-message") {
       const normalized = request.message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const payload = `${normalized}\0${request.submit ? "1" : "0"}`
+        + (request.runtime === undefined ? "" : `\0${JSON.stringify(request.runtime)}`);
       return this.executeInput(
         request.lease,
         request.operationId,
         request.pane,
         "agent-message",
-        `${normalized}\0${request.submit ? "1" : "0"}`,
+        payload,
       );
     }
     if (request.type === "input.scroll") {
@@ -2465,9 +2477,18 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
             await this.backend.writeRaw(sessionName, pane, payload as Buffer);
           }
         } else if (kind === "agent-message") {
-          const separator = (payload as string).lastIndexOf("\0");
-          const message = (payload as string).slice(0, separator);
-          const submit = (payload as string).slice(separator + 1) === "1";
+          const encoded = payload as string;
+          const finalSeparator = encoded.lastIndexOf("\0");
+          const finalSegment = encoded.slice(finalSeparator + 1);
+          let runtime: TerminalControlAgentRuntimeSettings | undefined;
+          let messageAndSubmit = encoded;
+          if (finalSegment.startsWith("{")) {
+            runtime = JSON.parse(finalSegment) as TerminalControlAgentRuntimeSettings;
+            messageAndSubmit = encoded.slice(0, finalSeparator);
+          }
+          const separator = messageAndSubmit.lastIndexOf("\0");
+          const message = messageAndSubmit.slice(0, separator);
+          const submit = messageAndSubmit.slice(separator + 1) === "1";
           if (this.backend.sendAgentMessageFenced !== undefined) {
             await this.backend.sendAgentMessageFenced(
               target.managedSession,
@@ -2476,8 +2497,15 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
               pane,
               message,
               submit,
+              runtime,
             );
           } else {
+            if (runtime !== undefined) {
+              throw new TerminalControlProtocolError(
+                "INVALID_REQUEST",
+                "Agent runtime settings require the fenced terminal backend",
+              );
+            }
             await this.backend.sendAgentMessage(sessionName, pane, message, submit);
           }
         } else if (kind === "scroll") {
@@ -2495,6 +2523,23 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           await this.backend.resize(sessionName, pane, Number(match[1]), Number(match[2]));
         }
       } catch (error) {
+        if (kind === "agent-message" && error instanceof TerminalControlAgentMessageNotAppliedError) {
+          // This narrow backend error is emitted only before user-message paste. Preserve the
+          // backend's target/recovery classification while proving this operation absent.
+          target.inFlight = undefined;
+          if (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND") {
+            invalidateTarget(target, this.now);
+            saveTerminalControlState(state, this.statePath);
+            throw new TerminalControlProtocolError("TARGET_GONE", error.message);
+          }
+          if (error.code === "RECOVERY_REQUIRED") {
+            markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
+            saveTerminalControlState(state, this.statePath);
+            throw error;
+          }
+          saveTerminalControlState(state, this.statePath);
+          throw error;
+        }
         if (
           hasFencedRawPath
           && error instanceof TerminalControlProtocolError
@@ -2683,6 +2728,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         pane,
         agentSupported: activity.agentSupported,
         agentRunning: activity.agentRunning,
+        ...(activity.provider === undefined ? {} : { provider: activity.provider }),
         ...(activity.source === undefined ? {} : { source: activity.source }),
         ...(activity.progress === undefined ? {} : { progress: activity.progress }),
       };

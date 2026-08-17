@@ -97,6 +97,22 @@ export class RelayV2TerminalManagerError extends Error {
 // manager/lineage authority itself was lost.
 const relayV2TerminalRequestScopedErrors = new WeakSet<RelayV2TerminalManagerError>();
 
+const CANONICAL_RESOLVER_REFRESH_RETRY_DELAY_MS = 100;
+const CANONICAL_RESOLVER_REFRESH_RETRY_ATTEMPTS = 50;
+
+function canonicalResolverCutIsRefreshing(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown };
+  return candidate.code === "CAPABILITY_UNAVAILABLE"
+    && candidate.message === "canonical target resolver has no current complete discovery cut";
+}
+
+function waitForCanonicalResolverRefresh(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, CANONICAL_RESOLVER_REFRESH_RETRY_DELAY_MS);
+  });
+}
+
 export function isRelayV2TerminalManagerError(
   error: unknown,
 ): error is RelayV2TerminalManagerError {
@@ -3558,7 +3574,27 @@ export class RelayV2TerminalManager {
     let resolution: RelayV2TerminalCanonicalResolution;
     let resolvingExactTarget = true;
     try {
-      resolution = await this.resolveTarget(request);
+      // A successful create publishes the new Session immediately and
+      // invalidates the previous resolver cut. The shipping root now triggers
+      // an immediate discovery pass, but terminal.open can race that short
+      // rebuild window. Keep this unprepared claim local while the exact cut
+      // refreshes; never persist that transient gap as the request's permanent
+      // CAPABILITY_UNAVAILABLE winner.
+      let refreshAttempts = 0;
+      while (true) {
+        try {
+          resolution = await this.resolveTarget(request);
+          break;
+        } catch (error) {
+          if (!canonicalResolverCutIsRefreshing(error)
+            || refreshAttempts >= CANONICAL_RESOLVER_REFRESH_RETRY_ATTEMPTS) {
+            throw error;
+          }
+          refreshAttempts += 1;
+          await waitForCanonicalResolverRefresh();
+          this.assertRunning();
+        }
+      }
       resolvingExactTarget = false;
       const prepared = await this.lineage.prepareOpen({
         key: recordKey,

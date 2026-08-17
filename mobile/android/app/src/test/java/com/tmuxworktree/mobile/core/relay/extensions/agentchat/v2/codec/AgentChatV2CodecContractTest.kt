@@ -3,6 +3,8 @@ package com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatMarkdownPart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatProgressStep
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettingsStatus
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import java.nio.charset.StandardCharsets
@@ -34,6 +36,26 @@ class AgentChatV2CodecContractTest {
     }
 
     @Test
+    fun `configured send request round trips advanced plan effort and rejects Luna ultra`() {
+        val frame = AgentChatV2SendRequest(
+            session = "scope-1:project",
+            message = "plan this",
+            settings = AgentChatRuntimeSettings("gpt-5.6-terra", "ultra", "plan"),
+            requestId = "agent-chat-request-configured",
+            hostId = "host-1",
+            expectedHostEpoch = "epoch-1",
+            scopeId = "scope-1",
+            sessionId = "scope-1:project",
+        )
+        assertEquals(frame, codec.decodePublicFrame(codec.encodePublicFrame(frame)))
+        assertThrows(AgentChatV2CodecException::class.java) {
+            codec.encodePublicFrame(
+                frame.copy(settings = AgentChatRuntimeSettings("gpt-5.6-luna", "ultra", "plan")),
+            )
+        }
+    }
+
+    @Test
     fun `history request round trips with and without limit`() {
         val withoutLimit = AgentChatV2HistoryRequest(
             session = "scope-1:project",
@@ -48,7 +70,10 @@ class AgentChatV2CodecContractTest {
         assertEquals(withoutLimit, codec.decodePublicFrame(withoutBytes))
         assertNull((codec.decodePublicFrame(withoutBytes) as AgentChatV2HistoryRequest).limit)
 
-        val withLimit = withoutLimit.copy(limit = 12)
+        val withLimit = withoutLimit.copy(
+            limit = 12,
+            includeRuntimeSettingsStatus = true,
+        )
         val withBytes = codec.encodePublicFrame(withLimit)
         assertEquals(withLimit, codec.decodePublicFrame(withBytes))
     }
@@ -151,6 +176,11 @@ class AgentChatV2CodecContractTest {
         val frame = AgentChatV2HistoryResult(
             session = "scope-1:project",
             turns = turns,
+            runtimeSettingsStatus = AgentChatRuntimeSettingsStatus(
+                available = true,
+                provider = "codex",
+                reason = "available",
+            ),
             requestId = "agent-chat-history-1",
             hostId = "host-1",
             hostEpoch = "epoch-1",
@@ -159,6 +189,18 @@ class AgentChatV2CodecContractTest {
         )
         val decoded = codec.decodePublicFrame(codec.encodePublicFrame(frame))
         assertEquals(frame, decoded)
+
+        assertThrows(AgentChatV2CodecException::class.java) {
+            codec.encodePublicFrame(
+                frame.copy(
+                    runtimeSettingsStatus = AgentChatRuntimeSettingsStatus(
+                        available = true,
+                        provider = "claude",
+                        reason = "available",
+                    ),
+                ),
+            )
+        }
     }
 
     @Test
@@ -245,6 +287,7 @@ class AgentChatV2CodecContractTest {
     @Test
     fun `capability constant matches contract`() {
         assertEquals("agent.chat.v2", AGENT_CHAT_V2_CAPABILITY)
+        assertEquals("agent.chat.runtime-settings.v1", AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY)
     }
 
     @Test

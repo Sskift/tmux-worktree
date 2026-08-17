@@ -337,6 +337,52 @@ internal data class RelayV2OutboxEntryEntity(
 )
 
 /**
+ * Sanitized terminal result for one create-command root. Unlike transient protocol evidence this
+ * row survives APK process death until the UI acknowledges that it surfaced the outcome.
+ */
+@Entity(
+    tableName = "relay_v2_create_outcomes",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "expectedHostEpoch",
+        "commandId",
+    ],
+    indices = [
+        Index(
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "createdOrder",
+            ],
+            unique = true,
+        ),
+    ],
+)
+internal data class RelayV2CreateOutcomeEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val expectedHostEpoch: String,
+    val commandId: String,
+    val createdOrder: Long,
+    val scopeId: String,
+    val operation: String,
+    val outcomeState: String,
+    val sessionId: String?,
+    val errorCode: String?,
+    val errorMessage: String?,
+    val acknowledged: Boolean,
+)
+
+/**
  * One atomically replaced terminal checkpoint union for an exact profile activation and target.
  *
  * Host process/generation lineage stays inside the versioned payload because an explicit reset may

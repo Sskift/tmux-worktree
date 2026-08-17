@@ -258,7 +258,7 @@ export function resumedAgentSessionIdFromStartCommand(
   provider: AgentProvider,
 ): string | undefined {
   const match = provider === "codex"
-    ? /(?:^|;)\s*codex(?:\s+-c\s+(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;'"\r\n]+))*\s+resume\s+'([0-9a-f-]+)'(?=\s*(?:;|$))/iu.exec(command)
+    ? /(?:^|;)\s*codex(?:(?:\s+-c\s+(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;'"\r\n]+))|(?:\s+(?:-m|--model)\s+(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;'"\r\n]+)))*\s+resume\s+'([0-9a-f-]+)'(?=\s*(?:;|$))/iu.exec(command)
     : /(?:^|;)\s*claude(?:\s+--append-system-prompt\s+(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;'"\r\n]+))*\s+--resume\s+'([0-9a-f-]+)'(?=\s*(?:;|$))/iu.exec(command);
   return resumableSessionId(match?.[1]);
 }

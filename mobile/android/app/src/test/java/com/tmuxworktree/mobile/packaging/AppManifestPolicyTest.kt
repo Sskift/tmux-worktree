@@ -59,6 +59,24 @@ class AppManifestPolicyTest {
     }
 
     @Test
+    fun `adaptive launcher keeps both logo layers inside the safe zone`() {
+        listOf("ic_launcher_foreground.xml", "ic_launcher_monochrome.xml").forEach { name ->
+            val layerList = parseXml(appProjectDir.resolve("src/main/res/drawable/$name"))
+                .documentElement
+            assertEquals("layer-list", layerList.tagName)
+
+            val logoLayer = layerList.directElement("item")
+            setOf("top", "right", "bottom", "left").forEach { edge ->
+                assertEquals("$name $edge inset", "15dp", logoLayer.androidAttribute(edge))
+            }
+
+            val bitmap = logoLayer.directElement("bitmap")
+            assertEquals("@drawable/tw_dashboard_logo", bitmap.androidAttribute("src"))
+            assertEquals("fill", bitmap.androidAttribute("gravity"))
+        }
+    }
+
+    @Test
     fun `backup and device transfer exclude all private app state`() {
         val manifest = parseXml(appProjectDir.resolve("src/main/AndroidManifest.xml"))
         val application = manifest.elements("application").single()

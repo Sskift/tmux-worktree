@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   deriveRelayConnectionOverview,
+  relayRepairRequiresManagementRestart,
   type RelayConnectionOverviewInput,
 } from "../src/dashboard/Settings/relayConnectionOverviewModel.ts";
 import type { RelayV2EnrollmentView } from "../src/dashboard/Settings/relayV2EnrollmentModel.ts";
@@ -140,6 +141,46 @@ test("backend unavailable surfaces as danger when the center is up", () => {
   assert.equal(overview.tone, "danger");
   assert.equal(overview.headline, "Relay backend unavailable");
   assert.equal(overview.primaryAction?.kind, "fix");
+});
+
+test("repair rebuilds the management child after terminal connector failure", () => {
+  for (const connectorStatus of ["failed", "superseded"] as const) {
+    assert.equal(relayRepairRequiresManagementRestart({
+      infraReady: true,
+      adapterAvailable: true,
+      connectorStatus,
+    }), true);
+  }
+});
+
+test("repair rebuilds a connector that remains in starting past its handshake deadline", () => {
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: true,
+    adapterAvailable: true,
+    connectorStatus: "starting",
+    connectorStartingStalled: true,
+  }), true);
+});
+
+test("repair reuses a healthy management child for ordinary stopped connectors", () => {
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: true,
+    adapterAvailable: true,
+    connectorStatus: "stopped",
+  }), false);
+});
+
+test("repair starts the center when infrastructure or management is unavailable", () => {
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: false,
+    adapterAvailable: true,
+    connectorStatus: "stopped",
+  }), true);
+  assert.equal(relayRepairRequiresManagementRestart({
+    infraReady: true,
+    adapterAvailable: false,
+    connectorStatus: "stopped",
+  }), true);
 });
 
 test("a failed repair escalates the diagnosis to danger with the error in detail", () => {

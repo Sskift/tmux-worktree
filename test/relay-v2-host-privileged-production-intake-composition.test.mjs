@@ -66,13 +66,17 @@ const PROFILE = Object.freeze(profileCases.validProfile);
 const BOOTSTRAP_SECRET = "twhostboot2.privileged-intake-secret-never-reflect";
 const REFRESH_SECRET = "twref2.privileged-intake-refresh-never-reflect";
 const relayV2Corpus = loadRelayV2FixtureCorpus();
-const EXPLICIT_BASE_CAPABILITIES = Object.freeze([
+const SELF_HOSTED_CAPABILITIES = Object.freeze([
   "error.structured.v1",
   "command.ledger.v1",
   "command.query.v1",
   "snapshot.revision.v1",
   "event.sequence.v1",
   "terminal.stream.resume.v1",
+  "agent.transcript-lifecycle.v1",
+  "agent.chat.v2",
+  "agent.chat.runtime-settings.v1",
+  "lark.bindings.v2",
 ]);
 
 function privateHome(prefix) {
@@ -736,7 +740,7 @@ test("privileged Host intake owns one exact profile/source/vault/canonical lifec
       const record = wss.records[0];
       assert.deepEqual(
         record.hello.payload.capabilities,
-        EXPLICIT_BASE_CAPABILITIES,
+        SELF_HOSTED_CAPABILITIES,
       );
       assert.deepEqual(record.hello.payload.clientDialects, ["tw-relay.v2"]);
       const registered = structuredClone(
@@ -1081,7 +1085,7 @@ function createPlainModuleSource(nativeModule) {
 
 test("native credential privileged intake bridge transfers one-shot ownership once", async (t) => {
   await t.test(
-    "self-hosted native bridge advertises the six base capabilities while production stays empty",
+    "self-hosted native bridge advertises its ready capabilities while production stays empty",
     async () => {
       const run = async (lane) => {
         const home = privateHome(`tw-relay-v2-bridge-${lane}-capability-home-`);
@@ -1127,7 +1131,7 @@ test("native credential privileged intake bridge transfers one-shot ownership on
           const capabilities = record.hello.payload.capabilities;
           assert.deepEqual(
             capabilities,
-            lane === "self-hosted" ? EXPLICIT_BASE_CAPABILITIES : [],
+            lane === "self-hosted" ? SELF_HOSTED_CAPABILITIES : [],
           );
           const registered = structuredClone(
             relayV2Corpus.goldenByName.get("host-registered").frame,
@@ -1148,7 +1152,7 @@ test("native credential privileged intake bridge transfers one-shot ownership on
       assert.deepEqual(await run("production"), []);
       assert.deepEqual(
         await run("self-hosted"),
-        EXPLICIT_BASE_CAPABILITIES,
+        SELF_HOSTED_CAPABILITIES,
       );
     },
   );

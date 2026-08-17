@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
 const compound = await import(
@@ -16,6 +25,11 @@ const commandTarget = await import(
   "../dist/relay/v2/canonicalCommandTargetAuthorityAdapter.js"
 );
 const backendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
+const terminalControlCli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
+const legacyDaemonFixture = fileURLToPath(new URL(
+  "./fixtures/terminal-control-legacy-daemon.mjs",
+  import.meta.url,
+));
 
 const encoder = new TextEncoder();
 const INCARNATION = `twinc2.${"A".repeat(43)}`;
@@ -87,6 +101,14 @@ async function waitFor(predicate, message) {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail(message);
+}
+
+async function waitForLong(predicate, message) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail(message);
 }
@@ -485,7 +507,6 @@ test("remote exact compound keeps prepare, admission, effect, and release in one
     assert.deepEqual(invocations[0], {
       executable: "/usr/bin/ssh",
       argv: [
-        "-F", "/dev/null",
         "-o", "BatchMode=yes",
         "-o", "PasswordAuthentication=no",
         "-o", "KbdInteractiveAuthentication=no",
@@ -531,6 +552,148 @@ test("remote exact compound keeps prepare, admission, effect, and release in one
     assert.equal(invocations.length, 1, "remote unavailable never falls back to local");
   } finally {
     await remote.close().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("remote exact child safely upgrades an idle legacy terminal-control daemon", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tw-relay-v2-legacy-daemon-")));
+  const statePath = join(root, "terminal-control-state-v1.json");
+  const socketPath = join(tmpdir(), `twv2u-${process.pid}-${root.slice(-6)}.sock`);
+  const compoundSocketPath = compound.relayV2RemoteExactCompoundSocketPathV1(socketPath);
+  const serverLockPath = `${socketPath}.server.lock`;
+  terminalControl.saveTerminalControlState({
+    version: 1,
+    controlEpoch: "pre-upgrade-epoch",
+    targets: [],
+  }, statePath);
+  const legacy = spawn(process.execPath, [legacyDaemonFixture, socketPath, statePath], {
+    stdio: "ignore",
+  });
+  let upgradedPid;
+  try {
+    await waitForLong(
+      () => existsSync(socketPath) && existsSync(serverLockPath),
+      "legacy terminal-control daemon did not start",
+    );
+    assert.equal(existsSync(compoundSocketPath), false);
+    assert.equal(
+      terminalControl.terminalControlStoreLockOwnerProcessId(serverLockPath),
+      legacy.pid,
+    );
+
+    await compound.ensureRelayV2RemoteExactCompoundDaemonV1({
+      daemonSocketPath: socketPath,
+      statePath,
+      autoStartCliTarget: {
+        executable: process.execPath,
+        entrypoint: terminalControlCli,
+        home: root,
+      },
+    });
+
+    upgradedPid = terminalControl.terminalControlStoreLockOwnerProcessId(serverLockPath);
+    assert.equal(Number.isSafeInteger(upgradedPid), true);
+    assert.notEqual(upgradedPid, legacy.pid);
+    assert.equal(existsSync(compoundSocketPath), true);
+    assert.equal(
+      (await terminalControl.requestTerminalControl(
+        { type: "ping" },
+        { socketPath, autoStart: false },
+      )).authority,
+      "local-terminal-control",
+    );
+  } finally {
+    const pid = terminalControl.terminalControlStoreLockOwnerProcessId(serverLockPath)
+      ?? upgradedPid;
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+    }
+    if (legacy.exitCode === null && legacy.signalCode === null) {
+      try { legacy.kill("SIGTERM"); } catch {}
+    }
+    await waitForLong(
+      () => !existsSync(serverLockPath),
+      "upgraded terminal-control daemon did not stop",
+    ).catch(() => undefined);
+    rmSync(socketPath, { force: true });
+    rmSync(compoundSocketPath, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("remote exact child never restarts a legacy daemon with active input ownership", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tw-relay-v2-busy-daemon-")));
+  const statePath = join(root, "terminal-control-state-v1.json");
+  const socketPath = join(tmpdir(), `twv2b-${process.pid}-${root.slice(-6)}.sock`);
+  const compoundSocketPath = compound.relayV2RemoteExactCompoundSocketPathV1(socketPath);
+  const serverLockPath = `${socketPath}.server.lock`;
+  terminalControl.saveTerminalControlState({
+    version: 1,
+    controlEpoch: "pre-busy-upgrade-epoch",
+    targets: [],
+  }, statePath);
+  const legacy = spawn(process.execPath, [legacyDaemonFixture, socketPath, statePath], {
+    stdio: "ignore",
+  });
+  try {
+    await waitForLong(
+      () => existsSync(socketPath) && existsSync(serverLockPath),
+      "busy legacy terminal-control daemon did not start",
+    );
+    terminalControl.saveTerminalControlState({
+      version: 1,
+      controlEpoch: "busy-upgrade-epoch",
+      targets: [{
+        controlTargetId: "busy-control-target",
+        lifecycle: "ACTIVE",
+        managedSession: {
+          name: "busy-session",
+          kind: "terminal",
+          createdAt: "2026-08-13T00:00:00.000Z",
+        },
+        backend: { kind: "tmux", tmuxInstanceId: "busy-tmux-instance" },
+        outputGeneration: "busy-output-generation",
+        ownership: {
+          state: "HELD",
+          fence: "1",
+          owner: { kind: "local-cli", instanceId: "busy-owner" },
+          leaseId: "busy-lease",
+          leaseExpiresAt: "2099-08-13T00:00:00.000Z",
+        },
+        revision: "1",
+        completedOperations: [],
+        updatedAt: "2026-08-13T00:00:00.000Z",
+      }],
+    }, statePath);
+
+    await assert.rejects(
+      compound.ensureRelayV2RemoteExactCompoundDaemonV1({
+        daemonSocketPath: socketPath,
+        statePath,
+        autoStartCliTarget: {
+          executable: process.execPath,
+          entrypoint: terminalControlCli,
+          home: root,
+        },
+      }),
+      /terminal input is currently active/,
+    );
+    assert.equal(
+      terminalControl.terminalControlStoreLockOwnerProcessId(serverLockPath),
+      legacy.pid,
+    );
+    assert.equal(existsSync(compoundSocketPath), false);
+  } finally {
+    if (legacy.exitCode === null && legacy.signalCode === null) {
+      try { legacy.kill("SIGTERM"); } catch {}
+    }
+    await waitForLong(
+      () => !existsSync(serverLockPath),
+      "busy legacy terminal-control daemon did not stop",
+    ).catch(() => undefined);
+    rmSync(socketPath, { force: true });
+    rmSync(compoundSocketPath, { force: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -820,8 +983,8 @@ test("a fresh exact target is established before one child carries observation a
       throw new Error("name-only resolution must not run");
     },
     async assertCurrent() {},
-    async prepareOutput() {
-      return { generation: "output-generation-one", cursor: output.byteLength };
+    async prepareOutput(_target, _session, _pane, generation) {
+      return { generation: generation ?? "output-generation-one", cursor: output.byteLength };
     },
     async resetOutput() {
       calls.reset += 1;
@@ -829,7 +992,7 @@ test("a fresh exact target is established before one child carries observation a
       return { generation: "output-generation-two", cursor: 0 };
     },
     async tailOutput(_target, _session, _pane, generation, cursor, maxBytes) {
-      if (generation !== "output-generation-one" || cursor > output.byteLength) {
+      if (generation !== "output-generation-two" || cursor > output.byteLength) {
         throw new terminalControl.TerminalControlProtocolError("STALE_OUTPUT_CURSOR", "stale");
       }
       const chunk = output.subarray(cursor, cursor + maxBytes);
@@ -956,7 +1119,7 @@ test("a fresh exact target is established before one child carries observation a
       observation.targetIncarnationProof,
       evidence.exactControlIdentity.targetIncarnationProof,
     );
-    assert.equal(observation.outputGeneration, "output-generation-one");
+    assert.equal(observation.outputGeneration, "output-generation-two");
     assert.equal(observation.outputCursor, 0);
     assert.equal(
       terminalControl.loadTerminalControlState(statePath).targets[0].ownership.state,
@@ -986,19 +1149,19 @@ test("a fresh exact target is established before one child carries observation a
       submit: true,
     });
     assert.equal(written.accepted, true);
-    assert.equal(written.outputGeneration, "output-generation-one");
+    assert.equal(written.outputGeneration, "output-generation-two");
     assert.equal(calls.send, 1);
     const released = await remote.request({ type: "lease.release", lease });
     assert.equal(released.state, "FREE");
-    assert.equal(calls.reset, 0, "release must not reset the observed output generation");
+    assert.equal(calls.reset, 1, "release must not reset the observed output generation");
     const continued = await remote.tailObservedTarget(observation, observation.outputCursor);
-    assert.equal(continued.outputGeneration, "output-generation-one");
+    assert.equal(continued.outputGeneration, "output-generation-two");
     assert.equal(Buffer.from(continued.dataBase64, "base64").toString("utf8"), "done\n");
 
     // Closing the observation is idempotent and runs the deferred reset.
     await remote.closeObservedTarget(observation);
     await remote.closeObservedTarget(observation);
-    assert.equal(calls.reset, 1);
+    assert.equal(calls.reset, 2);
     await assert.rejects(
       remote.tailObservedTarget(observation, continued.nextCursor),
       (error) => error?.code === "PERMISSION_DENIED",
@@ -1166,7 +1329,7 @@ test("close-observe is idempotent and a pending claim drains before the deferred
     assert.deepEqual(firstClose, { protocolVersion: 1, ok: true, result: { closed: true } });
     const secondClose = await send({ protocolVersion: 1, type: "close-observe" });
     assert.deepEqual(secondClose, { protocolVersion: 1, ok: true, result: { closed: true } });
-    assert.equal(calls.reset, 1, "close-observe on a FREE target runs the deferred reset");
+    assert.equal(calls.reset, 2, "close-observe on a FREE target runs the deferred reset");
 
     // Second observation, then an interactive lease whose release skips the
     // reset, then a fresh pending claim: ending the child must drain the
@@ -1182,7 +1345,7 @@ test("close-observe is idempotent and a pending claim drains before the deferred
       request: { type: "lease.release", lease: admitted.result },
     });
     assert.equal(released.ok, true);
-    assert.equal(calls.reset, 1, "release must not reset while the observation is active");
+    assert.equal(calls.reset, 3, "release must not reset while the observation is active");
     assert.equal((await send(prepare())).ok, true);
     assert.equal(calls.ownerOpen, 1, "every phase stays on one authority owner");
     input.end();
@@ -1194,7 +1357,7 @@ test("close-observe is idempotent and a pending claim drains before the deferred
     );
     assert.equal(
       calls.reset,
-      2,
+      4,
       "the pending claim drains before the observation deferred reset runs",
     );
   } finally {
@@ -1353,7 +1516,7 @@ test("closeObservedTarget rolls back a pending claim before the deferred observa
     await remote.closeObservedTarget(observation);
     assert.equal(
       calls.reset,
-      1,
+      2,
       "rollback precedes close-observe, so the deferred reset runs",
     );
     await remote.close();

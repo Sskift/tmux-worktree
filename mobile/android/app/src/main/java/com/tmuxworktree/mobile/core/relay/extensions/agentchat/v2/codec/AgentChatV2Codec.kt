@@ -2,6 +2,8 @@ package com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec
 
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatContentPart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatProgressStep
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettingsStatus
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatMarkdownPart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatSteeredMessage
@@ -28,6 +30,7 @@ import java.util.Base64
 
 /** Relay v2 wire name for the optional agent.chat.v2 extension. */
 const val AGENT_CHAT_V2_CAPABILITY = "agent.chat.v2"
+const val AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY = "agent.chat.runtime-settings.v1"
 
 class AgentChatV2CodecException(
     val code: String,
@@ -90,6 +93,7 @@ data class AgentChatV2Turn(
 data class AgentChatV2SendRequest(
     val session: String,
     val message: String,
+    val settings: AgentChatRuntimeSettings? = null,
     val requestId: String,
     val hostId: String,
     val expectedHostEpoch: String,
@@ -103,6 +107,7 @@ data class AgentChatV2SendRequest(
 data class AgentChatV2HistoryRequest(
     val session: String,
     val limit: Int?,
+    val includeRuntimeSettingsStatus: Boolean = false,
     val requestId: String,
     val hostId: String,
     val expectedHostEpoch: String,
@@ -155,6 +160,7 @@ data class AgentChatV2Event(
 data class AgentChatV2HistoryResult(
     val session: String,
     val turns: List<AgentChatV2Turn>,
+    val runtimeSettingsStatus: AgentChatRuntimeSettingsStatus? = null,
     val requestId: String,
     val hostId: String,
     val hostEpoch: String,
@@ -259,10 +265,15 @@ class AgentChatV2Codec {
     private fun decodeSend(frame: RelayV2JsonObject): AgentChatV2SendRequest {
         requestRoot(frame, "agent.chat.send")
         val payload = jsonObject(required(frame, "payload"))
-        exactKeys(payload, listOf("session", "message"))
+        exactKeys(payload, listOf("session", "message"), optional = listOf("settings"))
         return AgentChatV2SendRequest(
             session = id(required(payload, "session")),
             message = text(required(payload, "message"), MAX_MESSAGE_UTF8_BYTES),
+            settings = if (payload.containsKey("settings")) {
+                runtimeSettings(required(payload, "settings"))
+            } else {
+                null
+            },
             requestId = id(required(frame, "requestId")),
             hostId = id(required(frame, "hostId")),
             expectedHostEpoch = id(required(frame, "expectedHostEpoch")),
@@ -271,19 +282,49 @@ class AgentChatV2Codec {
         )
     }
 
+    private fun runtimeSettings(value: Any?): AgentChatRuntimeSettings {
+        val settings = jsonObject(value)
+        exactKeys(settings, listOf("model", "reasoningEffort", "mode"))
+        val model = required(settings, "model")?.let {
+            id(it).also { candidate ->
+                if (!MODEL_ID.matches(candidate)) schemaFailure("invalid-argument")
+            }
+        }
+        val reasoningEffort = required(settings, "reasoningEffort")?.let {
+            jsonOneOf(it, REASONING_EFFORTS)
+        }
+        val mode = jsonOneOf(required(settings, "mode"), RUNTIME_MODES)
+        if (model == "gpt-5.6-luna" && reasoningEffort == "ultra") {
+            schemaFailure("invalid-argument")
+        }
+        return AgentChatRuntimeSettings(model, reasoningEffort, mode)
+    }
+
     private fun decodeHistory(frame: RelayV2JsonObject): AgentChatV2HistoryRequest {
         requestRoot(frame, "agent.chat.history")
         val payload = jsonObject(required(frame, "payload"))
-        exactKeys(payload, listOf("session"), optional = listOf("limit"))
+        exactKeys(
+            payload,
+            listOf("session"),
+            optional = listOf("limit", "includeRuntimeSettingsStatus"),
+        )
         val limit = if (payload.containsKey("limit")) {
             jsonInteger(required(payload, "limit"), minimum = 1, maximum = MAX_HISTORY_TURNS.toLong())
                 .toInt()
         } else {
             null
         }
+        val includeRuntimeSettingsStatus = if (payload.containsKey("includeRuntimeSettingsStatus")) {
+            jsonBoolean(required(payload, "includeRuntimeSettingsStatus")).also {
+                if (!it) schemaFailure("schema-mismatch")
+            }
+        } else {
+            false
+        }
         return AgentChatV2HistoryRequest(
             session = id(required(payload, "session")),
             limit = limit,
+            includeRuntimeSettingsStatus = includeRuntimeSettingsStatus,
             requestId = id(required(frame, "requestId")),
             hostId = id(required(frame, "hostId")),
             expectedHostEpoch = id(required(frame, "expectedHostEpoch")),
@@ -344,19 +385,41 @@ class AgentChatV2Codec {
     private fun decodeHistoryResult(frame: RelayV2JsonObject): AgentChatV2HistoryResult {
         responseRoot(frame, "agent.chat.history.result")
         val payload = jsonObject(required(frame, "payload"))
-        exactKeys(payload, listOf("session", "turns"))
+        exactKeys(payload, listOf("session", "turns"), optional = listOf("runtimeSettingsStatus"))
         val turnsRaw = jsonArray(required(payload, "turns"), maximum = MAX_HISTORY_TURNS) {
             decodeTurn(it)
         }
         return AgentChatV2HistoryResult(
             session = id(required(payload, "session")),
             turns = turnsRaw.map { decodeTurn(it) },
+            runtimeSettingsStatus = payload["runtimeSettingsStatus"]?.let {
+                decodeRuntimeSettingsStatus(it)
+            },
             requestId = id(required(frame, "requestId")),
             hostId = id(required(frame, "hostId")),
             hostEpoch = id(required(frame, "hostEpoch")),
             scopeId = id(required(frame, "scopeId")),
             sessionId = id(required(frame, "sessionId")),
         )
+    }
+
+    private fun decodeRuntimeSettingsStatus(value: Any?): AgentChatRuntimeSettingsStatus {
+        val status = jsonObject(value)
+        exactKeys(status, listOf("available", "provider", "reason"))
+        val available = jsonBoolean(required(status, "available"))
+        val provider = required(status, "provider")?.let {
+            jsonOneOf(it, setOf("claude", "codex"))
+        }
+        val reason = jsonOneOf(required(status, "reason"), RUNTIME_SETTINGS_STATUS_REASONS)
+        if ((available && (provider != "codex" || reason != "available")) ||
+            (!available && reason == "available") ||
+            (reason == "provider_unsupported" && provider != "claude") ||
+            ((reason == "agent_unsupported" || reason == "target_update_required") &&
+                provider != null)
+        ) {
+            schemaFailure("schema-mismatch")
+        }
+        return AgentChatRuntimeSettingsStatus(available, provider, reason)
     }
 
     private fun decodeImageChunk(frame: RelayV2JsonObject): AgentChatV2ImageChunk {
@@ -734,10 +797,21 @@ class AgentChatV2Codec {
             expectedHostEpoch = expectedHostEpoch,
             scopeId = scopeId,
             sessionId = sessionId,
-            payload = linkedMapOf(
+            payload = linkedMapOf<String, Any?>(
                 "session" to session,
                 "message" to message,
-            ),
+            ).apply {
+                if (settings != null) {
+                    put(
+                        "settings",
+                        linkedMapOf(
+                            "model" to settings.model,
+                            "reasoningEffort" to settings.reasoningEffort,
+                            "mode" to settings.mode,
+                        ),
+                    )
+                }
+            },
         )
         is AgentChatV2HistoryRequest -> requestWire(
             type = type,
@@ -748,6 +822,7 @@ class AgentChatV2Codec {
             sessionId = sessionId,
             payload = linkedMapOf<String, Any?>("session" to session).apply {
                 if (limit != null) put("limit", limit)
+                if (includeRuntimeSettingsStatus) put("includeRuntimeSettingsStatus", true)
             },
         )
         is AgentChatV2ImageGetRequest -> requestWire(
@@ -793,10 +868,21 @@ class AgentChatV2Codec {
             hostEpoch = hostEpoch,
             scopeId = scopeId,
             sessionId = sessionId,
-            payload = linkedMapOf(
+            payload = linkedMapOf<String, Any?>(
                 "session" to session,
                 "turns" to turns.map { it.toWireObject() },
-            ),
+            ).apply {
+                runtimeSettingsStatus?.let { status ->
+                    put(
+                        "runtimeSettingsStatus",
+                        linkedMapOf(
+                            "available" to status.available,
+                            "provider" to status.provider,
+                            "reason" to status.reason,
+                        ),
+                    )
+                }
+            },
         )
         is AgentChatV2ImageChunk -> responseWire(
             type = type,
@@ -953,6 +1039,16 @@ class AgentChatV2Codec {
         private val CONTENT_PART_TYPES = setOf("markdown", "image")
         private val PROGRESS_KINDS = setOf("status", "tool")
         private val PROGRESS_STATUSES = setOf("running", "completed", "failed")
+        private val RUNTIME_MODES = setOf("default", "plan")
+        private val RUNTIME_SETTINGS_STATUS_REASONS = setOf(
+            "available",
+            "agent_unsupported",
+            "provider_unsupported",
+            "target_update_required",
+            "temporarily_unavailable",
+        )
+        private val REASONING_EFFORTS = setOf("low", "medium", "high", "xhigh", "max", "ultra")
+        private val MODEL_ID = Regex("^[A-Za-z0-9._:-]{1,128}$")
         private val IMAGE_MIME_TYPES = setOf("image/png", "image/jpeg", "image/gif", "image/webp")
         private val SHA256_REGEX = Regex("^[0-9a-f]{64}$")
         private val STANDARD_JSON_LIMITS = RelayV2JsonLimits(

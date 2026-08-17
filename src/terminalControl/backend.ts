@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -30,8 +31,10 @@ import {
   TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   TerminalControlProtocolError,
   type TerminalControlAgentResult,
+  type TerminalControlAgentRuntimeSettings,
   type TerminalControlAgentProgressStep,
   type TerminalControlAgentSource,
+  type TerminalControlErrorCode,
 } from "./protocol";
 import {
   agentProviderFromStartCommand,
@@ -167,6 +170,7 @@ export interface TerminalControlRenderedSnapshot {
 export interface TerminalControlAgentStatus {
   agentSupported: boolean;
   agentRunning: boolean;
+  provider?: TerminalControlAgentSource["provider"];
   source?: TerminalControlAgentSource;
   progress?: TerminalControlAgentProgressStep[];
 }
@@ -244,6 +248,7 @@ export interface TerminalControlBackend {
     pane: string,
     message: string,
     submit: boolean,
+    runtime?: TerminalControlAgentRuntimeSettings,
   ): Promise<void>;
   resize(sessionName: string, pane: string, cols: number, rows: number): Promise<void>;
   scroll(sessionName: string, pane: string, direction: "up" | "down", lines: number): Promise<void>;
@@ -297,6 +302,13 @@ export interface TerminalControlBackend {
     source: TerminalControlAgentSource,
     maxBytes: number,
   ): Promise<TerminalControlAgentResult>;
+}
+
+export class TerminalControlAgentMessageNotAppliedError extends TerminalControlProtocolError {
+  constructor(code: TerminalControlErrorCode, message: string, retryable = false) {
+    super(code, message, retryable);
+    this.name = "TerminalControlAgentMessageNotAppliedError";
+  }
 }
 
 type TmuxResult = {
@@ -962,6 +974,80 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+export function buildCodexResumeCommand(
+  sessionId?: string,
+  runtime?: TerminalControlAgentRuntimeSettings,
+): string {
+  const args = ["codex", "-c", shellQuote("check_for_update_on_startup=false")];
+  if (runtime?.model !== null && runtime?.model !== undefined) {
+    args.push("-m", shellQuote(runtime.model));
+  }
+  if (runtime?.reasoningEffort !== null && runtime?.reasoningEffort !== undefined) {
+    const effort = JSON.stringify(runtime.reasoningEffort);
+    args.push(
+      "-c",
+      shellQuote(`model_reasoning_effort=${effort}`),
+      "-c",
+      shellQuote(`plan_mode_reasoning_effort=${effort}`),
+    );
+  }
+  if (sessionId !== undefined) args.push("resume", shellQuote(sessionId));
+  return args.join(" ");
+}
+
+export function codexModeFromRenderedSnapshot(snapshot: string): "default" | "plan" | null {
+  const status = snapshot
+    .split(/\r?\n/u)
+    .slice(-12)
+    .map((line) => line.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, ""));
+  const line = status.find((candidate) => (
+    /^\s+[A-Za-z0-9._:-]+\s+(?:default|low|medium|high|xhigh|max|ultra)\s+·\s+\S.*$/u
+      .test(candidate)
+  ));
+  if (line === undefined) return null;
+  return /\sPlan mode\s*$/u.test(line) ? "plan" : "default";
+}
+
+async function ensureCodexMode(
+  paneTarget: string,
+  desired: TerminalControlAgentRuntimeSettings["mode"],
+): Promise<void> {
+  const capture = async (): Promise<string> => (await runTmux([
+    "capture-pane", "-p", "-J", "-S", "-80", "-E", "-", "-t", paneTarget,
+  ], { maxStdoutBytes: MAX_RENDERED_SNAPSHOT_SOURCE_BYTES })).stdout;
+  const statusDeadline = Date.now() + 1_000;
+  let observedMode: "default" | "plan" | null = null;
+  while (Date.now() < statusDeadline) {
+    observedMode = codexModeFromRenderedSnapshot(await capture());
+    if (observedMode === desired) return;
+    if (observedMode !== null) break;
+    await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
+  }
+  if (observedMode === null) {
+    throw new TerminalControlAgentMessageNotAppliedError(
+      "RESOURCE_EXHAUSTED",
+      "Codex did not publish its collaboration mode before the input deadline",
+      true,
+    );
+  }
+  // Codex's fixed Shift-Tab binding cycles collaboration modes. Check the
+  // anchored status line after every step rather than assuming a two-state UI.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await runTmux(["send-keys", "-t", paneTarget, "BTab"]);
+    const deadline = Date.now() + 1_000;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
+      if (codexModeFromRenderedSnapshot(await capture()) === desired) return;
+    }
+  }
+  {
+    throw new TerminalControlAgentMessageNotAppliedError(
+      "INVALID_REQUEST",
+      `Codex did not switch to ${desired === "plan" ? "Plan" : "Default"} mode`,
+    );
+  }
+}
+
 function outputRoot(home = homedir()): string {
   return process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR?.trim()
     || join(home, ".tmux-worktree", "terminal-control-output-v1");
@@ -1313,7 +1399,13 @@ async function establishSegmentedOutputCapture(
     // before later pane output can pass that boundary.
     await runTmux([
       "capture-pane", "-e", "-b", snapshotBuffer, "-t", paneTarget,
-      ";", "save-buffer", "-a", "-b", snapshotBuffer, current.path,
+      // This is a brand-new, exclusively owned generation segment.  Write
+      // the snapshot as its initial contents; the live capture process opens
+      // the same file with O_APPEND immediately afterwards.  Using tmux's
+      // append mode here can leave the pre-created file at zero bytes on the
+      // Dashboard-managed shutdown/open path even though the buffer is not
+      // empty.
+      ";", "save-buffer", "-b", snapshotBuffer, current.path,
       ";", "delete-buffer", "-b", snapshotBuffer,
       ";", "set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, generation,
       ";", "pipe-pane", "-O", "-t", paneTarget, outputCaptureCommand(paths, current),
@@ -1332,8 +1424,34 @@ async function establishSegmentedOutputCapture(
       "terminal output capture generation or pipe could not be established",
     );
   }
+  let segments = currentOutputSegments(paths);
+  if (outputPositionFromSegments(generation, segments).cursor === 0) {
+    // Some real Dashboard-managed tmux lifecycles acknowledge the queued
+    // capture/save/pipe sequence while leaving the pre-created segment empty.
+    // The pipe is already live at this point, so repair the renderer without
+    // losing subsequent output: append a terminal reset plus a direct current
+    // pane snapshot, then restart the writer so its retained-size accounting
+    // includes the externally appended seed.
+    const captured = await runTmux(
+      ["capture-pane", "-p", "-e", "-t", paneTarget],
+      { maxStdoutBytes: MAX_RENDERED_SNAPSHOT_SOURCE_BYTES },
+    );
+    const seed = Buffer.concat([
+      Buffer.from("\u001bc", "ascii"),
+      Buffer.from(captured.stdout, "utf8"),
+    ]);
+    if (seed.byteLength > OUTPUT_SEGMENT_BYTES) {
+      throw new TerminalControlProtocolError(
+        "RESOURCE_EXHAUSTED",
+        "terminal pane snapshot exceeded the initial capture segment",
+      );
+    }
+    appendFileSync(current.path, seed);
+    await replaceSegmentedOutputCapture(sessionId, paneTarget, paths, generation, current);
+    segments = currentOutputSegments(paths);
+  }
   pruneObsoleteOutputFiles(paths);
-  return outputPositionFromSegments(generation, currentOutputSegments(paths));
+  return outputPositionFromSegments(generation, segments);
 }
 
 async function resumeSegmentedOutputCapture(
@@ -1783,8 +1901,11 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     pane: string,
     message: string,
     submit: boolean,
+    runtime?: TerminalControlAgentRuntimeSettings,
   ): Promise<void> {
-    let observed = await requireFencedTerminalPane(
+    let userMessagePasteStarted = false;
+    try {
+      let observed = await requireFencedTerminalPane(
       expected,
       tmuxInstanceId,
       outputGeneration,
@@ -1797,6 +1918,18 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         "managed terminal was not created for a supported Agent",
       );
     }
+    if (runtime !== undefined && provider !== "codex") {
+      throw new TerminalControlAgentMessageNotAppliedError(
+        "INVALID_REQUEST",
+        "Agent runtime settings are currently supported only for Codex sessions",
+      );
+    }
+    if (runtime !== undefined && !submit) {
+      throw new TerminalControlAgentMessageNotAppliedError(
+        "INVALID_REQUEST",
+        "Agent runtime settings require a submitted new turn",
+      );
+    }
     const boundaryKey = agentSourceBoundaryKey(expected, tmuxInstanceId, pane);
     const processState = await paneAgentProcessState(observed.panePid, provider);
     // A long-lived idle Codex TUI keeps the credential snapshot it started
@@ -1807,6 +1940,12 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       && processState === "agent"
       && !observed.agentRunning
       && submit;
+    if (runtime !== undefined && processState === "agent" && !refreshIdleCodex) {
+      throw new TerminalControlAgentMessageNotAppliedError(
+        "INVALID_REQUEST",
+        "Agent runtime settings can only be changed between turns",
+      );
+    }
     if (processState === "agent" && !refreshIdleCodex) {
       let boundary: AgentSourceBoundary | undefined;
       if (!observed.agentRunning && submit) {
@@ -1824,6 +1963,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         };
         this.agentSourceBoundaries.set(boundaryKey, boundary);
       }
+      userMessagePasteStarted = true;
       await pasteAgentMessage(observed.paneId, message, submit);
       if (boundary !== undefined) {
         const freshSource = await waitForAgentSource(
@@ -1851,17 +1991,17 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       provider,
     ) ?? discoverLatestResumableAgentSession({ provider, cwd: observed.paneCurrentPath });
     if (Date.now() >= inputDeadline) {
-      throw new TerminalControlProtocolError(
+      throw new TerminalControlAgentMessageNotAppliedError(
         "RESOURCE_EXHAUSTED",
         "managed Agent resume discovery exceeded the input deadline",
         true,
       );
     }
-    const codexCommand = "codex -c check_for_update_on_startup=false";
+    const codexCommand = buildCodexResumeCommand(sessionId, runtime);
     const command = sessionId === undefined
       ? provider === "codex" ? codexCommand : provider
       : provider === "codex"
-        ? `${codexCommand} resume ${shellQuote(sessionId)}`
+        ? codexCommand
         : `claude --resume ${shellQuote(sessionId)}`;
     await runTmux([
       "respawn-pane",
@@ -1892,6 +2032,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         pane,
       );
       if (await paneAgentProcessState(observed.panePid, provider) !== "agent") continue;
+      if (runtime !== undefined) await ensureCodexMode(observed.paneId, runtime.mode);
       const boundary: AgentSourceBoundary = {
         paneId: observed.paneId,
         provider,
@@ -1901,6 +2042,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         expectedUserMessage: message,
       };
       this.agentSourceBoundaries.set(boundaryKey, boundary);
+      userMessagePasteStarted = true;
       await pasteAgentMessage(observed.paneId, message, submit);
       if (submit) {
         const initialSourceDeadline = Math.min(
@@ -1938,10 +2080,35 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       }
       return;
     }
+    if (runtime !== undefined) {
+      throw new TerminalControlAgentMessageNotAppliedError(
+        "RESOURCE_EXHAUSTED",
+        "managed Codex could not be resumed before the input deadline",
+        true,
+      );
+    }
     throw new TerminalControlProtocolError(
       "RECOVERY_REQUIRED",
       "managed Agent could not be resumed before the input deadline",
     );
+    } catch (error) {
+      if (runtime !== undefined && !userMessagePasteStarted) {
+        if (error instanceof TerminalControlAgentMessageNotAppliedError) throw error;
+        if (error instanceof TerminalControlProtocolError) {
+          throw new TerminalControlAgentMessageNotAppliedError(
+            error.code,
+            error.message,
+            error.retryable,
+          );
+        }
+        throw new TerminalControlAgentMessageNotAppliedError(
+          "RESOURCE_EXHAUSTED",
+          error instanceof Error ? error.message : "Codex runtime settings could not be applied",
+          true,
+        );
+      }
+      throw error;
+    }
   }
 
   async resize(sessionName: string, pane: string, cols: number, rows: number): Promise<void> {
@@ -2055,8 +2222,24 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       const paths = outputCapturePaths(controlTargetId, generation);
       const segments = currentOutputSegments(paths);
       if (segments.length > 0) {
+        const position = outputPositionFromSegments(generation, segments);
+        // A controller can be asked to close while the pane snapshot is not
+        // yet observable (for example during app shutdown).  Do not let that
+        // empty generation strand the next Relay v2 observer until the pane
+        // happens to emit more output: an explicit capture request is the
+        // safe point to rotate and seed the current rendered pane again.
+        if (capturePane && position.cursor === 0) {
+          const nextGeneration = randomUUID();
+          return establishSegmentedOutputCapture(
+            sessionId,
+            target,
+            outputCapturePaths(controlTargetId, nextGeneration),
+            nextGeneration,
+            true,
+          );
+        }
         pruneObsoleteOutputFiles(paths);
-        return outputPositionFromSegments(generation, segments);
+        return position;
       }
       if (outputCaptureKind(paths) === "legacy") legacyCaptureRequiresRotation(paths.legacyPath);
       throw new TerminalControlProtocolError(
@@ -2113,6 +2296,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       target,
       outputCapturePaths(controlTargetId, nextGeneration),
       nextGeneration,
+      true,
     );
   }
 
@@ -2306,9 +2490,11 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
           && error.retryable)) throw error;
       }
       delete boundary.capturedSource;
-      return { agentSupported: true, agentRunning: true, source, progress };
+      return { agentSupported: true, agentRunning: true, provider, source, progress };
     }
-    if (!observed.agentRunning) return { agentSupported: true, agentRunning: false };
+    if (!observed.agentRunning) {
+      return { agentSupported: true, agentRunning: false, provider };
+    }
     const activity = discoverActiveAgentActivity({
       provider,
       cwd: observed.paneCurrentPath,
@@ -2319,6 +2505,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     return {
       agentSupported: true,
       agentRunning: true,
+      provider,
       source: activity.source,
       progress: activity.progress,
     };

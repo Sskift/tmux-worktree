@@ -1,5 +1,14 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_V2_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettingsStatus
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Error
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2HistoryRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2HistoryResult
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Sent
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLocalRequestFence
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleActorRequest
@@ -92,6 +101,7 @@ import org.junit.Test
 
 class RelayV2ConnectionActorTest {
     private val codec = RelayV2Codec()
+    private val agentChatCodec = AgentChatV2Codec()
     private val agentExtensionCodec = AgentTranscriptLifecycleV1Codec()
     private val fixtures = RelayV2ContractFixtures()
 
@@ -359,6 +369,239 @@ class RelayV2ConnectionActorTest {
                 )
             } finally {
                 disconnectedHarness.close()
+            }
+        }
+
+    @Test
+    fun `agent chat synchronous rejection leaves one actionable failed bubble`() = runBlocking {
+        val harness = Harness(optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY))
+        try {
+            assertFalse(
+                harness.actor.sendAgentChatMessage(
+                    scopeId = "local",
+                    sessionId = "session-offline",
+                    message = "keep this message",
+                ),
+            )
+            val failed = harness.actor.agentChatState.value.pending("session-offline").single()
+            assertTrue(failed.failed)
+            assertEquals("keep this message", failed.message)
+            assertEquals("CLIENT_RELAY_OFFLINE", failed.errorCode)
+            assertEquals(
+                "Message was not sent because Relay is offline. Reconnect and retry.",
+                failed.error,
+            )
+            assertTrue(failed.retryable)
+
+            assertFalse(
+                harness.actor.retryAgentChatMessage(
+                    scopeId = "local",
+                    sessionId = "session-offline",
+                    requestId = failed.requestId,
+                ),
+            )
+            val afterRetry = harness.actor.agentChatState.value
+                .pending("session-offline")
+                .single()
+            assertEquals(failed.requestId, afterRetry.requestId)
+            assertEquals(1, harness.actor.agentChatState.value.pending("session-offline").size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `agent chat errors remain visible and retry sends only the selected request`() =
+        runBlocking {
+            val harness = Harness(
+                optionalCapabilities = setOf(
+                    AGENT_CHAT_V2_CAPABILITY,
+                    AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+                ),
+            )
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    resume = RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                    brokerOptionalCapabilities = setOf(
+                        AGENT_CHAT_V2_CAPABILITY,
+                        AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+                    ),
+                )
+                val welcome = fixture("host-welcome-caught-up")
+                welcome["requestId"] = hello.stringValue("requestId")
+                welcome.payload()["capabilities"] =
+                    RelayV2ConnectionActor.REQUIRED_CAPABILITIES + setOf(
+                        AGENT_CHAT_V2_CAPABILITY,
+                        AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
+                    )
+                harness.transport().sendFrame(welcome)
+                val query = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first { it is RelayV2RuntimeEffect.QueryPendingCommands }
+                } as RelayV2RuntimeEffect.QueryPendingCommands
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        query,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = query.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+
+                val runtimeSettings = AgentChatRuntimeSettings(
+                    model = "gpt-5.6-sol",
+                    reasoningEffort = "high",
+                    mode = "plan",
+                )
+                assertFalse(
+                    harness.actor.sendAgentChatMessage(
+                        "local",
+                        "session-unprobed",
+                        "must not reach an unprobed target",
+                        runtimeSettings,
+                    ),
+                )
+                assertEquals(
+                    "CLIENT_RUNTIME_SETTINGS_SESSION_UNAVAILABLE",
+                    harness.actor.agentChatState.value
+                        .pending("session-unprobed")
+                        .single()
+                        .errorCode,
+                )
+
+                val transport = harness.transport()
+                val historySendIndex = transport.sent.size
+                assertTrue(harness.actor.fetchAgentChatHistory("local", "session-1"))
+                val historyRequest = withTimeout(TIMEOUT_MS) {
+                    while (transport.sent.size <= historySendIndex) delay(1)
+                    agentChatCodec.decodePublicFrame(transport.sent[historySendIndex])
+                        as AgentChatV2HistoryRequest
+                }
+                assertTrue(historyRequest.includeRuntimeSettingsStatus)
+                transport.sendRaw(
+                    agentChatCodec.encodePublicFrame(
+                        AgentChatV2HistoryResult(
+                            session = "session-1",
+                            turns = emptyList(),
+                            runtimeSettingsStatus = AgentChatRuntimeSettingsStatus(
+                                available = true,
+                                provider = "codex",
+                                reason = "available",
+                            ),
+                            requestId = historyRequest.requestId,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            scopeId = "local",
+                            sessionId = "session-1",
+                        ),
+                    ),
+                )
+                withTimeout(TIMEOUT_MS) {
+                    while (harness.actor.agentChatRuntimeSettingsStatuses.value["session-1"]
+                            ?.available != true
+                    ) {
+                        delay(1)
+                    }
+                }
+                assertTrue(
+                    harness.actor.sendAgentChatMessage(
+                        "local",
+                        "session-1",
+                        "first",
+                        runtimeSettings,
+                    ),
+                )
+                assertTrue(harness.actor.sendAgentChatMessage("local", "session-1", "second"))
+                val initial = harness.actor.agentChatState.value.pending("session-1")
+                assertEquals(2, initial.size)
+                assertEquals(runtimeSettings, initial[0].settings)
+
+                harness.transport().sendRaw(
+                    agentChatCodec.encodePublicFrame(
+                        AgentChatV2Error(
+                            requestId = initial[0].requestId,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            scopeId = "local",
+                            sessionId = "session-1",
+                            code = "AGENT_CHAT_UNAVAILABLE",
+                            message = "Relay Agent chat is temporarily unavailable",
+                            retryable = true,
+                        ),
+                    ),
+                )
+                harness.transport().sendRaw(
+                    agentChatCodec.encodePublicFrame(
+                        AgentChatV2Error(
+                            requestId = initial[1].requestId,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            scopeId = "local",
+                            sessionId = "session-1",
+                            code = "AGENT_CHAT_SESSION_UNAVAILABLE",
+                            message = "The selected Agent session no longer exists",
+                            retryable = false,
+                        ),
+                    ),
+                )
+                val failed = withTimeout(TIMEOUT_MS) {
+                    while (true) {
+                        val candidate = harness.actor.agentChatState.value.pending("session-1")
+                        if (candidate.size == 2 && candidate.all { it.failed }) {
+                            return@withTimeout candidate
+                        }
+                        delay(1)
+                    }
+                    error("unreachable")
+                }
+                assertEquals("Relay Agent chat is temporarily unavailable", failed[0].error)
+                assertEquals("AGENT_CHAT_UNAVAILABLE", failed[0].errorCode)
+                assertTrue(failed[0].retryable)
+                assertEquals("AGENT_CHAT_SESSION_UNAVAILABLE", failed[1].errorCode)
+                assertFalse(failed[1].retryable)
+
+                assertTrue(
+                    harness.actor.retryAgentChatMessage(
+                        scopeId = "local",
+                        sessionId = "session-1",
+                        requestId = failed[0].requestId,
+                    ),
+                )
+                val afterRetry = harness.actor.agentChatState.value.pending("session-1")
+                assertEquals(2, afterRetry.size)
+                assertFalse(afterRetry[0].failed)
+                assertTrue(afterRetry[0].requestId != failed[0].requestId)
+                assertEquals(runtimeSettings, afterRetry[0].settings)
+                assertEquals(failed[1], afterRetry[1])
+
+                harness.transport().sendRaw(
+                    agentChatCodec.encodePublicFrame(
+                        AgentChatV2Sent(
+                            session = "session-1",
+                            turnId = "turn-retried",
+                            requestId = afterRetry[0].requestId,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            scopeId = "local",
+                            sessionId = "session-1",
+                        ),
+                    ),
+                )
+                val remaining = withTimeout(TIMEOUT_MS) {
+                    while (true) {
+                        val candidate = harness.actor.agentChatState.value.pending("session-1")
+                        if (candidate.size == 1) return@withTimeout candidate.single()
+                        delay(1)
+                    }
+                    error("unreachable")
+                }
+                assertEquals(failed[1], remaining)
+            } finally {
+                harness.close()
             }
         }
 

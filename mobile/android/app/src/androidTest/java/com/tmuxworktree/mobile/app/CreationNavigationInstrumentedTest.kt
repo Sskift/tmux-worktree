@@ -17,6 +17,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
 import androidx.navigation.testing.TestNavHostController
 import com.tmuxworktree.mobile.app.navigation.V2Routes
+import com.tmuxworktree.mobile.app.navigation.creationFormRouteToDismiss
+import com.tmuxworktree.mobile.app.navigation.createdSessionDestinationRoute
 import com.tmuxworktree.mobile.app.navigation.navigateAfterCreation
 import com.tmuxworktree.mobile.app.navigation.relaySessionDestinations
 import com.tmuxworktree.mobile.core.model.RelaySession
@@ -64,6 +66,34 @@ class CreationNavigationInstrumentedTest {
             assertEquals(V2Routes.TERMINAL, navController.currentDestination?.route)
             assertTrue(navController.popBackStack())
             assertEquals(V2Routes.INBOX, navController.currentDestination?.route)
+        }
+    }
+
+    @Test
+    fun queuedCreationKeepsFormAndOnlyHostConfirmedCompletionDismissesIt() {
+        val navController = installCreationGraph()
+
+        composeRule.runOnIdle { navController.navigate(V2Routes.NEW_TERMINAL) }
+        composeRule.runOnIdle {
+            val queued = V2UiEffect.CreationQueued(
+                CreationTarget.TERMINAL,
+                "Terminal request saved; waiting for the computer",
+            )
+            assertEquals(null, queued.creationFormRouteToDismiss())
+            assertEquals(V2Routes.NEW_TERMINAL, navController.currentDestination?.route)
+        }
+        composeRule.runOnIdle {
+            val completed = V2UiEffect.CreationCompleted(
+                CreationTarget.TERMINAL,
+                "Terminal created",
+                sessionStableId = "created-terminal-stable-id",
+            )
+            val formRoute = completed.creationFormRouteToDismiss()
+            navController.navigateAfterCreation(
+                destinationRoute = requireNotNull(completed.createdSessionDestinationRoute()),
+                formRoute = requireNotNull(formRoute),
+            )
+            assertEquals(V2Routes.TERMINAL, navController.currentDestination?.route)
         }
     }
 

@@ -6,6 +6,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxDraft
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
@@ -138,6 +139,14 @@ internal class RelayV2StateRepository(
         action: RelayV2OutboxAction,
     ): RelayV2OutboxResult = durableCore.reduceOutboxUnderApplyLease(namespace, action)
 
+    override suspend fun readCreateOutcomes(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2CreateOutcome> = durableCore.readCreateOutcomes(namespace)
+
+    override suspend fun acknowledgeCreateOutcome(
+        key: RelayV2CreateOutcomeKey,
+    ): Boolean = durableCore.acknowledgeCreateOutcome(key)
+
     override suspend fun reduceOutboxBatchUnderApplyLease(
         namespace: RelayV2OutboxAuthorityNamespace,
         actionSource: (RelayV2OutboxState) -> List<RelayV2OutboxAction>?,
@@ -255,6 +264,30 @@ private class RoomDurableTransaction(
     override fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry) {
         dao.insertOutboxEntry(entry.toEntity())
     }
+
+    override fun createOutcomes(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2CreateOutcome> = dao.createOutcomes(
+        namespace.profileId,
+        namespace.profileActivationGeneration,
+        namespace.principalId,
+        namespace.clientInstanceId,
+    ).map(RelayV2CreateOutcomeEntity::toPersisted)
+
+    override fun putCreateOutcome(outcome: RelayV2CreateOutcome) {
+        dao.putCreateOutcome(outcome.toEntity())
+    }
+
+    override fun acknowledgeCreateOutcome(key: RelayV2CreateOutcomeKey): Boolean =
+        dao.acknowledgeCreateOutcome(
+            key.namespace.profileId,
+            key.namespace.profileActivationGeneration,
+            key.namespace.principalId,
+            key.namespace.clientInstanceId,
+            key.hostId,
+            key.expectedHostEpoch,
+            key.commandId,
+        ) == 1
 
     override fun replaceOutboxEntry(
         namespace: RelayV2OutboxAuthorityNamespace,
@@ -421,6 +454,48 @@ private fun RelayV2PersistedOutboxEntry.toEntity(): RelayV2OutboxEntryEntity =
         payloadSha256 = payload.sha256,
     )
 
+private fun RelayV2CreateOutcomeEntity.toPersisted(): RelayV2CreateOutcome =
+    RelayV2CreateOutcome(
+        key = RelayV2CreateOutcomeKey(
+            namespace = RelayV2OutboxAuthorityNamespace(
+                profileId = profileId,
+                profileActivationGeneration = profileActivationGeneration,
+                principalId = principalId,
+                clientInstanceId = clientInstanceId,
+            ),
+            hostId = hostId,
+            expectedHostEpoch = expectedHostEpoch,
+            commandId = commandId,
+        ),
+        createdOrder = createdOrder,
+        scopeId = scopeId,
+        operation = RelayV2OutboxOperation.valueOf(operation),
+        state = RelayV2CreateOutcomeState.valueOf(outcomeState),
+        sessionId = sessionId,
+        errorCode = errorCode,
+        errorMessage = errorMessage,
+        acknowledged = acknowledged,
+    )
+
+private fun RelayV2CreateOutcome.toEntity(): RelayV2CreateOutcomeEntity =
+    RelayV2CreateOutcomeEntity(
+        profileId = key.namespace.profileId,
+        profileActivationGeneration = key.namespace.profileActivationGeneration,
+        principalId = key.namespace.principalId,
+        clientInstanceId = key.namespace.clientInstanceId,
+        hostId = key.hostId,
+        expectedHostEpoch = key.expectedHostEpoch,
+        commandId = key.commandId,
+        createdOrder = createdOrder,
+        scopeId = scopeId,
+        operation = operation.name,
+        outcomeState = state.name,
+        sessionId = sessionId,
+        errorCode = errorCode,
+        errorMessage = errorMessage,
+        acknowledged = acknowledged,
+    )
+
 private fun RelayV2TerminalCheckpointEntity.toCheckpointKey(): RelayV2TerminalCheckpointKey =
     RelayV2TerminalCheckpointKey(
         profileId = profileId,
@@ -504,6 +579,7 @@ private class RoomTransaction(
         dao.deleteProfileAgentTranscriptLifecycleNotificationClaims(profileId)
         dao.deleteProfileAgentTranscriptLifecycleStates(profileId)
         dao.deleteProfileTerminalCheckpoints(profileId)
+        dao.deleteProfileCreateOutcomes(profileId)
         dao.deleteProfileOutboxEntries(profileId)
         dao.deleteProfileOutboxMeta(profileId)
         dao.deleteProfileEvents(profileId)

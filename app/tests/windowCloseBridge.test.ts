@@ -54,7 +54,8 @@ function bridgeHarness() {
   let nativeHandler: ((event: NativeDashboardCloseRequest) => void) | null = null;
   let registrationCount = 0;
   let destroyCount = 0;
-  let destroyImplementation: () => Promise<void> = async () => {};
+  let destroyImplementation: () => Promise<void | "destroyed" | "hidden"> =
+    async () => {};
   const bridge = createWindowCloseBridge({
     onCloseRequested(handler) {
       registrationCount += 1;
@@ -81,7 +82,9 @@ function bridgeHarness() {
     events,
     registrationCount: () => registrationCount,
     scheduler,
-    setDestroy(implementation: () => Promise<void>) {
+    setDestroy(
+      implementation: () => Promise<void | "destroyed" | "hidden">,
+    ) {
       destroyImplementation = implementation;
     },
   };
@@ -231,6 +234,29 @@ test("destroy rejection clears only that cycle and late handler settle is inert"
   assert.equal(harness.destroyCount(), 2);
   secondDestroy.resolve();
   await flushPromises();
+});
+
+test("a hidden close re-arms the bridge after the window is reopened", async () => {
+  const harness = bridgeHarness();
+  let closeCount = 0;
+  harness.bridge.bind(() => {});
+  harness.setDestroy(async () => {
+    closeCount += 1;
+    return closeCount === 1 ? "hidden" : "destroyed";
+  });
+
+  harness.emitClose("hide");
+  await flushPromises();
+  harness.emitClose("after-reopen");
+  await flushPromises();
+  harness.emitClose("after-destroy");
+
+  assert.equal(harness.destroyCount(), 2);
+  assert.deepEqual(harness.events, [
+    "prevent:hide",
+    "prevent:after-reopen",
+    "prevent:after-destroy",
+  ]);
 });
 
 test("registration rejection and synchronous throw are fully contained", async () => {

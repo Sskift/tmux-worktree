@@ -22,6 +22,9 @@ internal interface RelayV2TerminalAttachmentObserver {
     fun opened(streamId: String)
     fun reset(reason: RelayV2TerminalResetReason)
     fun closed(reason: RelayV2TerminalCloseReason)
+    fun openRejected(error: RelayV2TerminalCorrelatedError) {
+        reset(RelayV2TerminalResetReason.STREAM_LOST)
+    }
 }
 
 internal object RelayV2TerminalNoopAttachmentObserver : RelayV2TerminalAttachmentObserver {
@@ -365,10 +368,37 @@ internal class RelayV2TerminalProductionComposition(
             val stored = terminal.loadTerminalUnderApplyLease(state.key)
             if (stored is RelayV2TerminalStoredCheckpoint.PreOpen) {
                 val action = actionForPreOpenError(stored.checkpoint, frame)
-                return dispatchFrameReduction(
-                    state,
-                    terminal.reduceTerminalUnderApplyLease(state.key, action),
+                val rejected = terminal.reduceTerminalUnderApplyLease(state.key, action)
+                if (rejected.outcome !is RelayV2TerminalOutcome.CorrelatedErrorRejected) {
+                    return dispatchFrameReduction(state, rejected)
+                }
+                val pending = stored.checkpoint.pendingOpen
+                    ?: return RelayV2TerminalFrameResult.ProtocolViolation
+                val reset = terminal.reduceTerminalUnderApplyLease(
+                    state.key,
+                    RelayV2TerminalAction.PreOpenResetRequired(
+                        fence = RelayV2TerminalOpenFence(
+                            target = pending.target,
+                            deliveryToken = pending.deliveryToken,
+                            openAttempt = pending.openAttempt,
+                            parserContinuityId = pending.parserContinuityId,
+                            mode = pending.mode,
+                            cols = pending.cols,
+                            rows = pending.rows,
+                            resume = pending.resume,
+                        ),
+                        requestId = action.requestId,
+                        reason = RelayV2TerminalResetReason.STREAM_LOST,
+                        requestedOffset = null,
+                        bufferStartOffset = null,
+                        tailOffset = null,
+                    ),
                 )
+                val result = dispatchFrameReduction(state, reset)
+                if (result == RelayV2TerminalFrameResult.Applied) {
+                    state.attachment.observer.openRejected(action.error)
+                }
+                return result
             }
             val present = stored as? RelayV2TerminalStoredCheckpoint.Present
                 ?: return RelayV2TerminalFrameResult.NotOwned
@@ -532,6 +562,8 @@ internal class RelayV2TerminalProductionComposition(
                 code,
                 (errorObject["retryable"] as? Boolean)
                     ?: error("Invalid terminal generic error retryable"),
+                (errorObject["message"] as? String)
+                    ?: error("Invalid terminal generic error message"),
             ),
         )
     }
@@ -545,6 +577,25 @@ internal class RelayV2TerminalProductionComposition(
             active.also { active = null }
         }
         if (previous != null) teardownActive(previous)
+    }
+
+    /**
+     * Releases a UI attachment after its parser adapter has rejected new callbacks and drained
+     * every callback admitted before that cut. At this point no post-commit executor can still be
+     * using the attachment, so permanently fencing the exact authority/key would be both
+     * unnecessary and harmful: a later view attachment may resume on the same Relay connection.
+     */
+    suspend fun detachAfterParserCallbacksDrained(
+        issued: RelayV2TerminalAttachment,
+    ) = lifecycleMutex.withLock {
+        val handle = issued as? Attachment ?: return
+        if (handle.origin !== this) return
+        val previous = synchronized(lock) {
+            if (attachment !== handle) return@synchronized null
+            attachment = null
+            active.also { active = null }
+        }
+        if (previous != null) releaseDrainedAttachment(previous)
     }
 
     suspend fun teardownGeneration(
@@ -778,6 +829,10 @@ internal class RelayV2TerminalProductionComposition(
         state.attachment.observer.reset(RelayV2TerminalResetReason.STREAM_LOST)
     }
 
+    private fun releaseDrainedAttachment(state: Active) {
+        state.attachment.observer.reset(RelayV2TerminalResetReason.STREAM_LOST)
+    }
+
     private fun actionForFrame(
         checkpoint: RelayV2TerminalCheckpoint,
         frame: Map<String, Any?>,
@@ -798,7 +853,11 @@ internal class RelayV2TerminalProductionComposition(
                 sessionId = frame["sessionId"] as? String,
                 streamId = frame["streamId"] as? String,
                 commandDisposition = errorObject["commandDisposition"] as? String ?: "",
-                error = RelayV2TerminalCorrelatedError(code, retryable),
+                error = RelayV2TerminalCorrelatedError(
+                    code,
+                    retryable,
+                    (errorObject["message"] as? String).orEmpty().ifBlank { code },
+                ),
             )
         }
         val payload = frame.objectValue("payload")

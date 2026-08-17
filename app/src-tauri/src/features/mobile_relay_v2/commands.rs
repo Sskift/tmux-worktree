@@ -503,6 +503,34 @@ impl MobileRelayV2ManagementCommandState {
     where
         F: FnOnce() -> Result<(), String>,
     {
+        self.replace_self_hosted_with_reuse(app, selection, true, commit_ready)
+    }
+
+    /// Rebuild the self-hosted management child even when its process is still
+    /// responsive. Connector failures are terminal within a management root,
+    /// so process liveness alone is not sufficient for connection repair.
+    pub(crate) fn restart_self_hosted<F>(
+        &self,
+        app: &tauri::AppHandle,
+        selection: ManagementChildSelection,
+        commit_ready: F,
+    ) -> Result<(), ManagementStartError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        self.replace_self_hosted_with_reuse(app, selection, false, commit_ready)
+    }
+
+    fn replace_self_hosted_with_reuse<F>(
+        &self,
+        app: &tauri::AppHandle,
+        selection: ManagementChildSelection,
+        reuse_ready_child: bool,
+        commit_ready: F,
+    ) -> Result<(), ManagementStartError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
         if self.disposed.load(Ordering::Acquire) {
             return Err(ManagementStartError::ChannelClosed);
         }
@@ -512,13 +540,15 @@ impl MobileRelayV2ManagementCommandState {
         if self.disposed.load(Ordering::Acquire) {
             return Err(ManagementStartError::ChannelClosed);
         }
-        if matches!(
-            &*owner,
-            ManagementCommandOwner::Ready {
-                launch_key,
-                manager,
-            } if launch_key == &desired_key && manager.is_reusable_after_observation()
-        ) {
+        if reuse_ready_child
+            && matches!(
+                &*owner,
+                ManagementCommandOwner::Ready {
+                    launch_key,
+                    manager,
+                } if launch_key == &desired_key && manager.is_reusable_after_observation()
+            )
+        {
             return Ok(());
         }
 

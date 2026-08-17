@@ -12,13 +12,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
@@ -30,7 +30,6 @@ import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Terminal
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -109,6 +108,7 @@ fun NewTerminalScreen(
     onLabelChange: (String) -> Unit,
     onRetryLoadTargets: () -> Unit,
     onCreate: () -> Unit,
+    creationStatus: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val onlineHosts = hosts.filter { it.status == ConnectionStatus.ONLINE }
@@ -143,6 +143,7 @@ fun NewTerminalScreen(
             NewTerminalBottomBar(
                 canCreate = canCreate,
                 isCreating = isCreating,
+                creationStatus = creationStatus,
                 onBack = onBack,
                 onCreate = onCreate,
             )
@@ -218,6 +219,7 @@ fun NewTerminalScreen(
                         onProjectSelected = onProjectSelected,
                         onWorkingDirectoryChange = onWorkingDirectoryChange,
                         onLabelChange = onLabelChange,
+                        onCreate = onCreate,
                     )
                 }
             }
@@ -245,7 +247,6 @@ private fun NewTerminalTopBar(
         ) {
             IconButton(
                 onClick = onBack,
-                enabled = !isCreating,
                 modifier = Modifier
                     .size(48.dp)
                     .testTag("new_terminal_back"),
@@ -253,11 +254,11 @@ private fun NewTerminalTopBar(
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
                     contentDescription = if (isCreating) {
-                        "Creating terminal, back unavailable"
+                        "Leave while terminal creation continues"
                     } else {
                         "Cancel new terminal"
                     },
-                    tint = if (isCreating) TwTextMuted else TwTextSecondary,
+                    tint = TwTextSecondary,
                     modifier = Modifier.size(24.dp),
                 )
             }
@@ -288,6 +289,7 @@ private fun NewTerminalFormContent(
     onProjectSelected: (RelayProject) -> Unit,
     onWorkingDirectoryChange: (String) -> Unit,
     onLabelChange: (String) -> Unit,
+    onCreate: () -> Unit,
 ) {
     NewTerminalSelector(
         label = "Computer",
@@ -329,15 +331,11 @@ private fun NewTerminalFormContent(
     Spacer(Modifier.height(18.dp))
     if (projects.isNotEmpty()) {
         val selectedProject = projects.firstOrNull { it.path == form.workingDirectory }
-        NewTerminalSelector(
+        SavedProjectSelector(
             label = "Saved project directory",
-            selectedValue = selectedProject?.let { "${it.name} · ${it.path}" }.orEmpty(),
+            projects = projects,
+            selectedProject = selectedProject,
             placeholder = "Choose from Dashboard projects",
-            icon = Icons.Outlined.FolderOpen,
-            options = projects,
-            optionLabel = { "${it.name} · ${it.path}" },
-            optionId = { it.name },
-            error = null,
             enabled = enabled,
             testTag = "new_terminal_saved_project_selector",
             optionTagPrefix = "new_terminal_saved_project_option",
@@ -355,6 +353,7 @@ private fun NewTerminalFormContent(
         helper = "Required · the terminal starts in this directory",
         enabled = enabled,
         imeAction = ImeAction.Next,
+        onImeAction = null,
         testTag = "new_terminal_working_directory",
     )
     Spacer(Modifier.height(14.dp))
@@ -368,6 +367,7 @@ private fun NewTerminalFormContent(
         helper = "Optional · shown instead of the generated session name",
         enabled = enabled,
         imeAction = ImeAction.Done,
+        onImeAction = onCreate,
         testTag = "new_terminal_label",
     )
 }
@@ -483,6 +483,7 @@ private fun NewTerminalTextField(
     helper: String,
     enabled: Boolean,
     imeAction: ImeAction,
+    onImeAction: (() -> Unit)?,
     testTag: String,
 ) {
     OutlinedTextField(
@@ -518,6 +519,11 @@ private fun NewTerminalTextField(
         singleLine = true,
         shape = RoundedCornerShape(12.dp),
         keyboardOptions = KeyboardOptions(imeAction = imeAction),
+        keyboardActions = KeyboardActions(
+            onDone = onImeAction?.let { submit ->
+                { submit() }
+            },
+        ),
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = TwTextPrimary,
             unfocusedTextColor = TwTextPrimary,
@@ -675,78 +681,28 @@ private fun NewTerminalFieldError(error: String?) {
 private fun NewTerminalBottomBar(
     canCreate: Boolean,
     isCreating: Boolean,
+    creationStatus: String?,
     onBack: () -> Unit,
     onCreate: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(TwSurface)
-            .navigationBarsPadding(),
-    ) {
-        HorizontalDivider(color = TwBorder, thickness = 1.dp)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            OutlinedButton(
-                onClick = onBack,
-                enabled = !isCreating,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(48.dp)
-                    .testTag("new_terminal_cancel"),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, TwBorder),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = TwTextSecondary),
-            ) {
-                Text("Cancel")
-            }
-            Button(
-                onClick = onCreate,
-                enabled = canCreate,
-                modifier = Modifier
-                    .weight(1.5f)
-                    .height(48.dp)
-                    .testTag("new_terminal_create")
-                    .semantics {
-                        stateDescription = when {
-                            isCreating -> "Creating terminal"
-                            canCreate -> "Ready"
-                            else -> "Complete the required fields"
-                        }
-                    },
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TwAccent,
-                    contentColor = TwOnAccent,
-                    disabledContainerColor = TwSurfaceRaised,
-                    disabledContentColor = TwTextMuted,
-                ),
-            ) {
-                if (isCreating) {
-                    CircularProgressIndicator(
-                        color = TwTextSecondary,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(18.dp),
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Outlined.Terminal,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                    )
-                }
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = if (isCreating) "Creating…" else "Create terminal",
-                    style = MaterialTheme.typography.labelLarge,
-                )
-            }
-        }
-    }
+    CreationActionBar(
+        secondaryLabel = "Cancel",
+        primaryLabel = "Create terminal",
+        busyLabel = creationStatus ?: "Creating…",
+        primaryIcon = Icons.Outlined.Terminal,
+        secondaryEnabled = true,
+        primaryEnabled = canCreate,
+        isBusy = isCreating,
+        secondaryTestTag = "new_terminal_cancel",
+        primaryTestTag = "new_terminal_create",
+        primaryStateDescription = when {
+            isCreating -> "Creating terminal"
+            canCreate -> "Ready"
+            else -> "Complete the required fields"
+        },
+        onSecondary = onBack,
+        onPrimary = onCreate,
+    )
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF070A0E, widthDp = 390, heightDp = 844)

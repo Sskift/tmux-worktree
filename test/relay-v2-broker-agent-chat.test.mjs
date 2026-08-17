@@ -238,7 +238,7 @@ function hostWelcome(requestId, host, capabilities) {
 
 // --- agent.chat frame builders -------------------------------------------------
 
-function chatSend(requestId, hostEpoch, sessionId, message) {
+function chatSend(requestId, hostEpoch, sessionId, message, settings) {
   return {
     protocolVersion: 2,
     kind: "request",
@@ -248,7 +248,11 @@ function chatSend(requestId, hostEpoch, sessionId, message) {
     expectedHostEpoch: hostEpoch,
     scopeId: "scope-local",
     sessionId,
-    payload: { session: sessionId, message },
+    payload: {
+      session: sessionId,
+      message,
+      ...(settings === undefined ? {} : { settings }),
+    },
   };
 }
 
@@ -598,6 +602,22 @@ test("agent.chat.v2 is a three-party route intersection with isolated withdrawal
 
   const hostEpoch = host.hello.payload.hostEpoch;
 
+  // A new client cannot smuggle configured sends through a legacy chat-only
+  // intersection, and the ordinary agent.chat.v2 lane remains usable.
+  const configuredWithoutMarker = chatSend(
+    "chat-send-configured-old-host",
+    hostEpoch,
+    SESSION_ID,
+    "plan this",
+    { model: "gpt-5.6-sol", reasoningEffort: "high", mode: "plan" },
+  );
+  const rejectedConfigured = core.forwardClientFrame(
+    route.connectionId,
+    chatBytes(configuredWithoutMarker),
+  );
+  assert.equal(rejectedConfigured.accepted, false);
+  assert.equal(rejectedConfigured.error.code, "INVALID_ENVELOPE");
+
   // agent.chat.send client→host is relayed through the extension lane.
   const sendFrame = chatSend("chat-send-1", hostEpoch, SESSION_ID, "list current worktrees");
   assert.equal(core.forwardClientFrame(route.connectionId, chatBytes(sendFrame)).accepted, true);
@@ -788,4 +808,59 @@ test("agent.chat.v2 is a three-party route intersection with isolated withdrawal
   assert.equal(unavailable.error.commandDisposition, "not_applicable");
   assert.equal(unavailable.error.retryable, true);
   core.acknowledgeClientDelivery(route.connectionId, unavailableDelivery.deliveryId);
+});
+
+test("configured agent chat send requires and honors the runtime-settings marker", async () => {
+  const baseCapabilities = [...broker.RELAY_V2_REQUIRED_CAPABILITIES];
+  const chatCapability = chatCodec.RELAY_AGENT_CHAT_CAPABILITY;
+  const runtimeCapability = chatCodec.RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY;
+  const capabilities = [...baseCapabilities, chatCapability, runtimeCapability];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    baseCapabilityReadiness: baseCapabilities,
+    optionalCapabilityReadiness: [chatCapability, runtimeCapability],
+  });
+  const host = await registerHost(core, "configured-chat-host", hostHello({ capabilities }));
+  const route = await openRoute(
+    core,
+    "configured-chat-host",
+    "configured-chat-client",
+    1_048_576,
+    HOST_ID,
+    {},
+    randomUUID(),
+    capabilities,
+  );
+  const hello = clientHello("hello-configured-chat");
+  hello.payload.capabilities = capabilities;
+  hello.payload.requiredCapabilities = baseCapabilities;
+  assert.equal(core.forwardClientFrame(route.connectionId, publicBytes(hello)).accepted, true);
+  const [helloDelivery] = core.drainHostCarrier("configured-chat-host", { maxFrames: 1 });
+  core.acknowledgeHostDelivery("configured-chat-host", helloDelivery.deliveryId);
+  assert.equal((await core.receiveHostFrame(
+    "configured-chat-host",
+    carrierBytes(hostRouteDataBytes(
+      route.routeOpen,
+      "1",
+      publicBytes(hostWelcome("hello-configured-chat", host, capabilities)),
+    )),
+  )).accepted, true);
+  const [welcomeDelivery] = core.drainClient(route.connectionId, { maxFrames: 1 });
+  core.acknowledgeClientDelivery(route.connectionId, welcomeDelivery.deliveryId);
+
+  const configured = chatSend(
+    "configured-send-1",
+    host.hello.payload.hostEpoch,
+    SESSION_ID,
+    "plan this",
+    { model: "gpt-5.6-terra", reasoningEffort: "high", mode: "plan" },
+  );
+  assert.equal(core.forwardClientFrame(route.connectionId, chatBytes(configured)).accepted, true);
+  const [configuredDelivery] = core.drainHostCarrier("configured-chat-host", { maxFrames: 1 });
+  assert.deepEqual(
+    JSON.parse(chatCodec.decodeRelayAgentChatFrame(
+      Buffer.from(configuredDelivery.frame.payload.data, "base64"),
+    ).canonicalWire),
+    configured,
+  );
 });

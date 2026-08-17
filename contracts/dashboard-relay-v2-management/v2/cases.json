@@ -129,6 +129,7 @@
             "terminal.stream.resume.v1",
             "agent.transcript-lifecycle.v1",
             "agent.chat.v2",
+            "agent.chat.runtime-settings.v1",
             "lark.bindings.v2"
           ]
         },

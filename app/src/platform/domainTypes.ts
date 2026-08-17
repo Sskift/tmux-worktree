@@ -248,6 +248,7 @@ export const MOBILE_RELAY_V2_REQUIRED_CAPABILITIES = [
 export const MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES = [
   "agent.transcript-lifecycle.v1",
   "agent.chat.v2",
+  "agent.chat.runtime-settings.v1",
   "lark.bindings.v2",
 ] as const;
 export const MOBILE_RELAY_V2_KNOWN_CAPABILITIES = [

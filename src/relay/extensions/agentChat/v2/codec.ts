@@ -15,6 +15,8 @@ import {
 } from "../../../v2/strictJson.js";
 
 export const RELAY_AGENT_CHAT_CAPABILITY = "agent.chat.v2" as const;
+export const RELAY_AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY =
+  "agent.chat.runtime-settings.v1" as const;
 export const RELAY_AGENT_CHAT_MAX_MESSAGE_UTF8_BYTES = 65_536;
 export const RELAY_AGENT_CHAT_MAX_TURN_UTF8_BYTES = 262_144;
 export const RELAY_AGENT_CHAT_MAX_CONTENT_PARTS = 16;
@@ -25,6 +27,23 @@ export const RELAY_AGENT_CHAT_MAX_STEERED_MESSAGES = 64;
 export const RELAY_AGENT_CHAT_MAX_PROGRESS_STEPS = 16;
 export const RELAY_AGENT_CHAT_CODEC_ERROR_DOMAIN =
   "relay-agent-chat-codec-v2" as const;
+
+export interface RelayAgentChatRuntimeSettings {
+  model: string | null;
+  reasoningEffort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
+  mode: "default" | "plan";
+}
+
+export interface RelayAgentChatRuntimeSettingsStatus {
+  available: boolean;
+  provider: "claude" | "codex" | null;
+  reason:
+    | "available"
+    | "agent_unsupported"
+    | "provider_unsupported"
+    | "target_update_required"
+    | "temporarily_unavailable";
+}
 
 export type RelayAgentChatCodecErrorCode = "INVALID_ENVELOPE" | "PROTOCOL_UNSUPPORTED";
 
@@ -361,17 +380,60 @@ function validateTurn(value: RelayV2JsonValue): void {
 
 function validateSendPayload(value: RelayV2JsonValue): void {
   const payload = object(value);
-  exact(payload, ["session", "message"]);
+  exact(payload, ["session", "message"], ["settings"]);
   id(field(payload, "session"));
   text(field(payload, "message"), RELAY_AGENT_CHAT_MAX_MESSAGE_UTF8_BYTES);
+  if (Object.hasOwn(payload, "settings")) validateRuntimeSettings(field(payload, "settings"));
+}
+
+function validateRuntimeSettings(value: RelayV2JsonValue): RelayAgentChatRuntimeSettings {
+  const settings = object(value);
+  exact(settings, ["model", "reasoningEffort", "mode"]);
+  const model = nullable(field(settings, "model"), (item) => {
+    const candidate = id(item);
+    if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(candidate)) reject("invalid-argument");
+    return candidate;
+  });
+  const reasoningEffort = nullable(field(settings, "reasoningEffort"), (item) => (
+    oneOf(item, ["low", "medium", "high", "xhigh", "max", "ultra"] as const)
+  ));
+  const mode = oneOf(field(settings, "mode"), ["default", "plan"] as const);
+  if (model === "gpt-5.6-luna" && reasoningEffort === "ultra") reject("invalid-argument");
+  return { model, reasoningEffort, mode };
 }
 
 function validateHistoryPayload(value: RelayV2JsonValue): void {
   const payload = object(value);
-  exact(payload, ["session"], ["limit"]);
+  exact(payload, ["session"], ["limit", "includeRuntimeSettingsStatus"]);
   id(field(payload, "session"));
   if (Object.hasOwn(payload, "limit")) {
     integer(field(payload, "limit"), 1, RELAY_AGENT_CHAT_MAX_HISTORY_TURNS);
+  }
+  if (Object.hasOwn(payload, "includeRuntimeSettingsStatus")) {
+    literal(field(payload, "includeRuntimeSettingsStatus"), true);
+  }
+}
+
+function validateRuntimeSettingsStatus(value: RelayV2JsonValue): void {
+  const status = object(value);
+  exact(status, ["available", "provider", "reason"]);
+  const available = booleanValue(field(status, "available"));
+  const provider = nullable(field(status, "provider"), (item) => (
+    oneOf(item, ["claude", "codex"] as const)
+  ));
+  const reason = oneOf(field(status, "reason"), [
+    "available",
+    "agent_unsupported",
+    "provider_unsupported",
+    "target_update_required",
+    "temporarily_unavailable",
+  ] as const);
+  if ((available && (provider !== "codex" || reason !== "available"))
+    || (!available && reason === "available")
+    || (reason === "provider_unsupported" && provider !== "claude")
+    || ((reason === "agent_unsupported" || reason === "target_update_required")
+      && provider !== null)) {
+    reject("schema-mismatch");
   }
 }
 
@@ -399,9 +461,12 @@ function validateEventPayload(value: RelayV2JsonValue): void {
 
 function validateHistoryResultPayload(value: RelayV2JsonValue): void {
   const payload = object(value);
-  exact(payload, ["session", "turns"]);
+  exact(payload, ["session", "turns"], ["runtimeSettingsStatus"]);
   id(field(payload, "session"));
   array(field(payload, "turns"), validateTurn, RELAY_AGENT_CHAT_MAX_HISTORY_TURNS);
+  if (Object.hasOwn(payload, "runtimeSettingsStatus")) {
+    validateRuntimeSettingsStatus(field(payload, "runtimeSettingsStatus"));
+  }
 }
 
 function validateImageChunkPayload(value: RelayV2JsonValue): void {

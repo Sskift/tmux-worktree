@@ -3,6 +3,7 @@ import { useDashboardBackend } from "../../platform";
 import type { MobileRelayV2SelfHostedStatus } from "../../platform/domainTypes";
 import {
   deriveRelayConnectionOverview,
+  relayRepairRequiresManagementRestart,
   selfHostedInfraReady,
   type RelayConnectionOverview,
 } from "./relayConnectionOverviewModel";
@@ -11,6 +12,8 @@ import type { useRelayV2EnrollmentController } from "./useRelayV2EnrollmentContr
 
 /** How long a "Fix connection" run may wait for the connector to register. */
 const REPAIR_POLL_TIMEOUT_MS = 30_000;
+/** A connector opening longer than this has outlived the Host WSS handshake deadline. */
+const CONNECTOR_STARTING_STALL_MS = 20_000;
 
 type RelayController = ReturnType<typeof useRelayV2EnrollmentController>;
 
@@ -41,6 +44,7 @@ export function useRelayConnectionOverview(
     headline: "",
   });
   const [repairError, setRepairError] = useState<string | null>(null);
+  const [connectorStartingStalled, setConnectorStartingStalled] = useState(false);
   const [qrBusy, setQrBusy] = useState(false);
   const [inlineQr, setInlineQr] = useState<{ handle: string; pngBase64: string } | null>(null);
   const repairRunningRef = useRef(false);
@@ -79,6 +83,18 @@ export function useRelayConnectionOverview(
     });
   }, [activeQrHandle]);
 
+  useEffect(() => {
+    if (controller.state.connector.status !== "starting") {
+      setConnectorStartingStalled(false);
+      return;
+    }
+    const timer = window.setTimeout(
+      () => setConnectorStartingStalled(true),
+      CONNECTOR_STARTING_STALL_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [controller.state.connector.status]);
+
   const inFlight = useMemo(() => {
     if (repair.running) return { active: true, headline: repair.headline };
     if (!controller.loaded) return { active: false, headline: "" };
@@ -86,14 +102,20 @@ export function useRelayConnectionOverview(
     if (s.enrollment.status === "creating") {
       return { active: true, headline: "Creating pairing code…" };
     }
-    if (s.connector.status === "starting") {
+    if (s.connector.status === "starting" && !connectorStartingStalled) {
       return { active: true, headline: "Connecting to the relay center…" };
     }
     if (s.hostCredential.status === "bootstrapping" || s.hostCredential.status === "refreshing") {
       return { active: true, headline: "Updating relay credentials…" };
     }
     return { active: false, headline: "" };
-  }, [repair.running, repair.headline, controller.loaded, controller.state]);
+  }, [
+    repair.running,
+    repair.headline,
+    controller.loaded,
+    controller.state,
+    connectorStartingStalled,
+  ]);
 
   const connectorStatus = controller.state.connector.status;
   const overview = useMemo<RelayConnectionOverview>(() => deriveRelayConnectionOverview({
@@ -172,8 +194,9 @@ export function useRelayConnectionOverview(
 
   /**
    * One-click "Fix connection". Sequences existing commands only:
-   *  - center/bundle/TLS not ready, or management unavailable → start the
-   *    center (which respawns the management child and sends start_connector);
+   *  - center/bundle/TLS not ready, management unavailable, or the connector
+   *    reached a terminal failure → start the center (which replaces the
+   *    management child and sends start_connector);
    *  - otherwise refresh an unhealthy host credential, then start the connector.
    * Afterwards the 2s status observer is watched until the connector registers
    * or the 30s timeout fires.
@@ -184,7 +207,12 @@ export function useRelayConnectionOverview(
     setRepairError(null);
 
     const { ready: infraReady } = selfHostedInfraReady(selfHosted);
-    const needsCenterStart = !infraReady || view?.adapterAvailable === false;
+    const needsCenterStart = relayRepairRequiresManagementRestart({
+      infraReady,
+      adapterAvailable: view?.adapterAvailable,
+      connectorStatus,
+      connectorStartingStalled,
+    });
 
     try {
       if (needsCenterStart) {
@@ -219,6 +247,7 @@ export function useRelayConnectionOverview(
     selfHosted,
     controller,
     connectorStatus,
+    connectorStartingStalled,
     onSelfHostedStatus,
     view?.adapterAvailable,
   ]);

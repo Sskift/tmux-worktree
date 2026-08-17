@@ -8,11 +8,13 @@ export type NativeDashboardCloseRequest = {
   preventDefault(): void;
 };
 
+export type NativeWindowCloseDisposition = "destroyed" | "hidden";
+
 export type WindowCloseBridgeDependencies = {
   onCloseRequested(
     handler: (event: NativeDashboardCloseRequest) => void,
   ): Promise<BackendUnlisten>;
-  destroy(): Promise<void>;
+  destroy(): Promise<void | NativeWindowCloseDisposition>;
   schedule?(callback: () => void, delayMs: number): BackendUnlisten;
 };
 
@@ -54,10 +56,13 @@ export function createWindowCloseBridge(
     }
   };
 
-  const settleDestroy = (candidate: CloseCycle, succeeded: boolean) => {
+  const settleDestroy = (
+    candidate: CloseCycle,
+    disposition: NativeWindowCloseDisposition | null,
+  ) => {
     if (cycle !== candidate) return;
     cycle = null;
-    if (succeeded) destroyed = true;
+    if (disposition !== null && disposition !== "hidden") destroyed = true;
   };
 
   const finishCycle = (candidate: CloseCycle) => {
@@ -66,20 +71,21 @@ export function createWindowCloseBridge(
     cancelDeadline(candidate);
     candidate.controller.abort();
 
-    let result: Promise<void>;
+    let result: Promise<void | NativeWindowCloseDisposition>;
     try {
       result = dependencies.destroy();
     } catch {
-      settleDestroy(candidate, false);
+      settleDestroy(candidate, null);
       return;
     }
     try {
       void result.then(
-        () => settleDestroy(candidate, true),
-        () => settleDestroy(candidate, false),
+        (disposition) =>
+          settleDestroy(candidate, disposition ?? "destroyed"),
+        () => settleDestroy(candidate, null),
       );
     } catch {
-      settleDestroy(candidate, false);
+      settleDestroy(candidate, null);
     }
   };
 

@@ -134,6 +134,7 @@ function observingBackend(calls, {
   onDataTailEnter,
 }) {
   let output = Buffer.alloc(0);
+  let outputGeneration = "output-generation-one";
   return {
     append(text) {
       output = Buffer.concat([output, Buffer.from(text, "utf8")]);
@@ -161,16 +162,19 @@ function observingBackend(calls, {
     },
     async assertCurrent() {},
     async prepareOutput() {
-      return { generation: "output-generation-one", cursor: output.byteLength };
+      return { generation: outputGeneration, cursor: output.byteLength };
     },
     async resetOutput() {
       calls.reset += 1;
-      output = Buffer.alloc(0);
-      return { generation: "output-generation-two", cursor: 0 };
+      // Production resetOutput seeds the replacement generation from the
+      // currently rendered pane. Preserve the fake pane snapshot while still
+      // rotating its output identity so stale observers remain fenced.
+      outputGeneration = `output-generation-${calls.reset + 1}`;
+      return { generation: outputGeneration, cursor: output.byteLength };
     },
     async tailOutput(_target, _session, _pane, generation, cursor, maxBytes) {
       if (failTail?.() === true
-        || generation !== "output-generation-one"
+        || generation !== outputGeneration
         || cursor > output.byteLength) {
         throw new terminalControl.TerminalControlProtocolError(
           "STALE_OUTPUT_CURSOR",
@@ -434,7 +438,7 @@ test("observed byte plane tails the exact observation and lazily reclaims the le
       terminalControl.loadTerminalControlState(statePath).targets[0].ownership.state,
       "FREE",
     );
-    assert.equal(calls.reset, 0, "release must not reset the observed output generation");
+    assert.equal(calls.reset, 1, "release must not reset the observed output generation");
 
     // The release returns the channel to observing and the tail continues.
     backend.append("xy");
@@ -443,7 +447,7 @@ test("observed byte plane tails the exact observation and lazily reclaims the le
     const closing = handle.close();
     assert.equal(handle.close(), closing, "handle close is idempotent");
     await closing;
-    assert.equal(calls.reset, 1, "close-observe runs the deferred reset exactly once");
+    assert.equal(calls.reset, 2, "close-observe runs the deferred reset exactly once");
     const framesAfterClose = protocolFrames.length;
     const eventsAfterClose = events.length;
     await new Promise((resolve) => setTimeout(resolve, 30));

@@ -228,6 +228,10 @@ test("incomplete registration or any missing required capability cannot expose e
 });
 
 test("management projection preserves the negotiated Agent optional capability", async () => {
+  assert.equal(
+    MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES.includes("agent.chat.runtime-settings.v1"),
+    true,
+  );
   const capabilities = [
     ...MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
     ...MOBILE_RELAY_V2_OPTIONAL_CAPABILITIES,

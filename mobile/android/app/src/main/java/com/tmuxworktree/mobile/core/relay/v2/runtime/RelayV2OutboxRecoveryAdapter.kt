@@ -32,6 +32,7 @@ internal sealed interface RelayV2OutboxRecoveryCommit {
 
     data class CommandStatuses(
         val receipt: RelayV2RecoveryReceipt.CommandStatusesApplied,
+        val evidence: List<RelayV2OutboxEvidenceApplied>,
         override val effects: List<RelayV2OutboxEffect>,
     ) : RelayV2OutboxRecoveryCommit
 
@@ -51,6 +52,9 @@ internal data class RelayV2OutboxEvidenceApplied(
     val source: RelayV2CommandStatusSource,
     val state: RelayV2CommandStatusState,
     val attemptRequestId: String?,
+    val result: RelayV2CommandResult?,
+    val errorCode: String?,
+    val errorMessage: String?,
 )
 
 internal sealed interface RelayV2OutboxRecoveryApplyResult {
@@ -212,8 +216,11 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
             effect.repositoryAuthority.principalId,
             effect.repositoryAuthority.clientInstanceId,
         )
+        var appliedEvidence: List<RelayV2OutboxEvidenceApplied>? = null
         val result = outbox.reduceOutboxBatchUnderApplyLease(namespace) { current ->
-            buildActions(effect, current, expected, statusByCommand)
+            buildActions(effect, current, expected, statusByCommand)?.also {
+                appliedEvidence = it.evidence
+            }?.actions
         }
         return when (result) {
             is RelayV2OutboxBatchResult.Applied -> committed(
@@ -225,6 +232,7 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
                         effect.context.hostEpoch,
                         expected,
                     ),
+                    evidence = requireNotNull(appliedEvidence),
                     effects = result.effects,
                 ),
             )
@@ -386,13 +394,19 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
         }
     }
 
+    private data class RecoveredStatusActions(
+        val actions: List<RelayV2OutboxAction>,
+        val evidence: List<RelayV2OutboxEvidenceApplied>,
+    )
+
     private fun buildActions(
         effect: RelayV2RuntimeEffect.ApplyCommandStatuses,
         state: RelayV2OutboxState,
         expected: List<RelayV2PendingCommand>,
         statusByCommand: Map<String, Map<String, Any?>>,
-    ): List<RelayV2OutboxAction>? {
+    ): RecoveredStatusActions? {
         val actions = ArrayList<RelayV2OutboxAction>(expected.size)
+        val evidenceReceipts = ArrayList<RelayV2OutboxEvidenceApplied>(expected.size)
         expected.forEach { pending ->
             val entryId = RelayV2OutboxEntryId(
                 effect.repositoryAuthority.profileId,
@@ -406,12 +420,13 @@ internal class RelayV2OutboxRecoveryAdapter private constructor(
             val item = statusByCommand.getValue(pending.commandId)
             if (item.stringValue("dedupeWindowId") != entry.dedupeWindowId) return null
             val evidence = item.toEvidence(entry, effect.recovery.requestId)
+            evidenceReceipts += evidence.toAppliedReceipt(effect.generation)
             actions += RelayV2OutboxAction.ReconcileStatus(
                 evidence,
                 item.toRecovery(effect.context),
             )
         }
-        return actions
+        return RecoveredStatusActions(actions, evidenceReceipts)
     }
 
     private fun Map<String, Any?>.toEvidence(
@@ -649,6 +664,9 @@ private fun RelayV2CommandStatusEvidence.toAppliedReceipt(
     source = source,
     state = state,
     attemptRequestId = attemptRequestId,
+    result = result,
+    errorCode = errorCode,
+    errorMessage = errorMessage,
 )
 
 private fun RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult>.toApplyResult(

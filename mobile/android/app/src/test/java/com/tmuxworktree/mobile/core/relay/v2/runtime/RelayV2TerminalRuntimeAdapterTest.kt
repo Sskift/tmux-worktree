@@ -257,10 +257,12 @@ class RelayV2TerminalRuntimeAdapterTest {
             activationFixture.parser.writes.single().completion(true)
         }
 
-        assertSame(activationCancellation, activationFailure)
+        assertTrue(activationFailure is CancellationException)
+        assertEquals(activationCancellation.message, activationFailure?.message)
+        assertSame(activationCancellation, activationFailure?.cause)
         assertEquals(
             listOf(withdrawalFailure, teardownFailure),
-            activationFailure?.suppressed?.toList(),
+            activationFailure?.cause?.suppressed?.toList(),
         )
         assertEquals(1, activationFixture.sink.reservations.single().activationCalls)
         assertNotNull(activationFixture.checkpoint().pendingParserEffectActivation)
@@ -284,7 +286,7 @@ class RelayV2TerminalRuntimeAdapterTest {
     }
 
     @Test
-    fun `cancelled callback waiter poisons once and late sink teardown stays exact once`() =
+    fun `cancelled callback waiter settles noncancellably and sink teardown stays exact once`() =
         runBlocking {
             val fixture = fixture()
             val firstWrite = fixture.enqueueOutput("0", "first")
@@ -328,14 +330,15 @@ class RelayV2TerminalRuntimeAdapterTest {
             }
             assertTrue(cancelledWaiter.isActive)
             cancelledWaiter.cancel(CancellationException("cancel keyed-gate waiter"))
-            invalidationEntered.await()
-
+            // Callback settlement owns a durable parser claim, so cancellation cannot strand it
+            // while it waits behind the current terminal gate owner.
             allowFirstOwnerToReturn.complete(Unit)
-            firstSettlement.await()
+            invalidationEntered.await()
             assertEquals(1, fixture.fatalInvalidation.calls.size)
             assertTrue(fixture.sink.teardownCalls.isEmpty())
 
             allowInvalidation.complete(Unit)
+            firstSettlement.await()
             assertTrue(captureFailure { cancelledWaiter.await() } is CancellationException)
             assertEquals(1, fixture.fatalInvalidation.calls.size)
             assertEquals(

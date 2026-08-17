@@ -298,7 +298,9 @@ class RelayV2OutboxAuthorityCoreTest {
         val source = sourceState(RelayV2OutboxStateTag.CONFIRMING, durableAccepted = false)
         val entry = source.entries.first { it.commandId == "command-a" }
         val evidence = retryableNotAccepted(entry).copy(
+            errorCode = "BUSY",
             errorMessage = "arbitrary localized text that is never parsed",
+            retryAfterMs = null,
         )
         val result = applied(
             core.reduce(
@@ -318,7 +320,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val effect = result.effects.single() as RelayV2OutboxEffect.ExecuteCommand
         assertEquals(entry.commandId, effect.command.entryId.commandId)
         assertEquals(entry.dedupeWindowId, effect.command.dedupeWindowId)
-        assertEquals(0L, effect.retryAfterMs)
+        assertEquals(null, effect.retryAfterMs)
         assertEquals(
             listOf(RelayV2OutboxAttemptKind.EXECUTE, RelayV2OutboxAttemptKind.EXECUTE),
             retried.attempts.map { it.kind },
@@ -365,14 +367,8 @@ class RelayV2OutboxAuthorityCoreTest {
             oldAttemptFinal.state.entry(entry.id)?.state,
         )
 
-        val misleadingMessage = retryableNotAccepted(entry).copy(
-            errorCode = "BUSY",
-            errorMessage = "Command was not durably accepted",
-        )
         val invalidShapes = listOf(
-            misleadingMessage,
             retryableNotAccepted(entry).copy(retryable = false),
-            retryableNotAccepted(entry).copy(retryAfterMs = null),
             retryableNotAccepted(entry).copy(reissueRequired = true),
             retryableNotAccepted(entry).copy(
                 commandDisposition = RelayV2CommandDisposition.IN_DOUBT,

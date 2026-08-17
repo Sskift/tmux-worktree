@@ -2,8 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, type Stats } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import type { TerminalControlRequestInput } from "../../terminalControl/client.js";
+import { dirname, isAbsolute, join } from "node:path";
+import {
+  requestTerminalControl,
+  type TerminalControlAutoStartCliTarget,
+  type TerminalControlRequestInput,
+} from "../../terminalControl/client.js";
 import {
   TERMINAL_CONTROL_PROTOCOL_VERSION,
   TERMINAL_CONTROL_ERROR_CODES,
@@ -18,8 +22,13 @@ import type {
   TerminalControlRelayV2ExactTargetAuthorityPort,
 } from "../../terminalControl/authority.js";
 import {
+  acquireTerminalControlStoreLock,
   isTerminalControlStoreLockAuthorityCurrent,
+  loadTerminalControlState,
+  releaseTerminalControlStoreLock,
   terminalControlSocketPath,
+  terminalControlStatePath,
+  terminalControlStoreLockOwnerProcessId,
   type TerminalControlStoreLock,
 } from "../../terminalControl/store.js";
 import type {
@@ -40,6 +49,7 @@ export const RELAY_V2_REMOTE_EXACT_COMPOUND_ENTRYPOINT = "rpc-v2-remote-exact-v1
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES = 384 * 1024;
 
 const MAX_ACTIVE_CHANNELS = 256;
+const DAEMON_UPGRADE_TIMEOUT_MS = 5_000;
 const JSON_LIMITS = Object.freeze({
   maxDepth: 20,
   maxDirectKeys: 64,
@@ -723,6 +733,137 @@ function socketIsLive(socketPath: string): Promise<boolean> {
   });
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForLiveSocket(socketPath: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (await socketIsLive(socketPath)) return true;
+    await delay(25);
+  } while (Date.now() < deadline);
+  return socketIsLive(socketPath);
+}
+
+async function waitForStoppedDaemon(
+  daemonSocketPath: string,
+  serverLockPath: string,
+): Promise<boolean> {
+  const deadline = Date.now() + DAEMON_UPGRADE_TIMEOUT_MS;
+  do {
+    if (!existsSync(serverLockPath) && !(await socketIsLive(daemonSocketPath))) return true;
+    await delay(25);
+  } while (Date.now() < deadline);
+  return !existsSync(serverLockPath) && !(await socketIsLive(daemonSocketPath));
+}
+
+function exactDaemonUpgradePath(value: string, label: string): string {
+  if (!isAbsolute(value) || value.includes("\0")) {
+    throw new Error(`Relay v2 exact daemon ingress cannot safely use ${label}`);
+  }
+  return value;
+}
+
+function daemonRestartIsIdle(state: ReturnType<typeof loadTerminalControlState>): boolean {
+  return state.targets.every((target) => (
+    target.ownership.state === "FREE" && target.inFlight === undefined
+  ));
+}
+
+/**
+ * Upgrades an already-running pre-compound terminal-control daemon in place.
+ * The durable state lock fences new effects while the daemon is signalled,
+ * and a restart is allowed only when every target is idle. Concurrent SSH
+ * children serialize through a separate upgrade lock.
+ */
+export async function ensureRelayV2RemoteExactCompoundDaemonV1(options: {
+  daemonSocketPath?: string;
+  statePath?: string;
+  autoStartCliTarget?: Readonly<TerminalControlAutoStartCliTarget>;
+} = {}): Promise<void> {
+  const daemonSocketPath = exactDaemonUpgradePath(
+    options.daemonSocketPath ?? terminalControlSocketPath(),
+    "terminal-control socket path",
+  );
+  const statePath = exactDaemonUpgradePath(
+    options.statePath ?? terminalControlStatePath(),
+    "terminal-control state path",
+  );
+  const exactSocketPath = relayV2RemoteExactCompoundSocketPathV1(daemonSocketPath);
+  if (await socketIsLive(exactSocketPath)) return;
+
+  let upgradeLock: TerminalControlStoreLock;
+  try {
+    upgradeLock = await acquireTerminalControlStoreLock(
+      `${daemonSocketPath}.relay-v2-upgrade.lock`,
+    );
+  } catch (error) {
+    if (await waitForLiveSocket(exactSocketPath, DAEMON_UPGRADE_TIMEOUT_MS)) return;
+    throw error;
+  }
+  try {
+    if (await socketIsLive(exactSocketPath)) return;
+    const serverLockPath = `${daemonSocketPath}.server.lock`;
+    if (await socketIsLive(daemonSocketPath)) {
+      const observedPid = terminalControlStoreLockOwnerProcessId(serverLockPath);
+      if (observedPid === undefined || observedPid === process.pid) {
+        throw new Error(
+          "Relay v2 exact daemon ingress is unavailable and the existing daemon cannot be safely identified",
+        );
+      }
+      const stateLock = await acquireTerminalControlStoreLock(`${statePath}.lock`);
+      let signalled = false;
+      try {
+        if (await socketIsLive(exactSocketPath)) return;
+        const currentPid = terminalControlStoreLockOwnerProcessId(serverLockPath);
+        if (!(await socketIsLive(daemonSocketPath)) || currentPid !== observedPid) {
+          throw new Error(
+            "Relay v2 exact daemon ingress changed while its upgrade was being fenced",
+          );
+        }
+        if (!daemonRestartIsIdle(loadTerminalControlState(statePath))) {
+          throw new Error(
+            "Relay v2 exact daemon ingress needs an upgrade, but terminal input is currently active; retry when it is idle",
+          );
+        }
+        try {
+          process.kill(observedPid, "SIGTERM");
+          signalled = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+      } finally {
+        releaseTerminalControlStoreLock(stateLock);
+      }
+      if (signalled && !(await waitForStoppedDaemon(daemonSocketPath, serverLockPath))) {
+        throw new Error(
+          "Relay v2 exact daemon ingress upgrade timed out while stopping the previous daemon",
+        );
+      }
+    }
+
+    await requestTerminalControl(
+      { type: "ping" },
+      {
+        socketPath: daemonSocketPath,
+        autoStart: true,
+        autoStartStatePath: statePath,
+        ...(options.autoStartCliTarget === undefined
+          ? {}
+          : { autoStartCliTarget: options.autoStartCliTarget }),
+      },
+    );
+    if (!(await waitForLiveSocket(exactSocketPath, DAEMON_UPGRADE_TIMEOUT_MS))) {
+      throw new Error(
+        "Relay v2 exact daemon ingress is unavailable after terminal-control startup",
+      );
+    }
+  } finally {
+    releaseTerminalControlStoreLock(upgradeLock);
+  }
+}
+
 async function retireVerifiedStaleSocket(
   socketPath: string,
   primaryLock: TerminalControlStoreLock,
@@ -1106,6 +1247,7 @@ async function proxyBoundedFrames(
 
 /** Hidden SSH child: bounded stdio-to-existing-daemon proxy, and nothing else. */
 export async function runRelayV2RemoteExactCompoundStdioV1(): Promise<void> {
+  await ensureRelayV2RemoteExactCompoundDaemonV1();
   const socket = await connectUnix(
     relayV2RemoteExactCompoundSocketPathV1(terminalControlSocketPath()),
   );

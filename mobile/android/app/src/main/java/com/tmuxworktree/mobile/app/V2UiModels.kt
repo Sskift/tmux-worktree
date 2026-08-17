@@ -67,6 +67,8 @@ data class V2UiState(
     val selectedScopeId: String? = null,
     val creatingWorktree: Boolean = false,
     val creatingTerminal: Boolean = false,
+    val worktreeCreationStatus: String? = null,
+    val terminalCreationStatus: String? = null,
     val actionError: String? = null,
     val demoTimelines: Map<String, List<TimelineEvent>> = emptyMap(),
 ) {
@@ -264,6 +266,12 @@ sealed interface V2UiEffect {
     data class CreationQueued(
         val target: CreationTarget,
         val message: String,
+    ) : V2UiEffect
+    data class CreationCompleted(
+        val target: CreationTarget,
+        val message: String,
+        /** UI-stable identity of the exact Host-created Session once it is materialized locally. */
+        val sessionStableId: String? = null,
     ) : V2UiEffect
     data class TerminalReset(val message: String = "") : V2UiEffect
     data class TerminalWrite(val data: String, val droppedFrames: Int = 0) : V2UiEffect

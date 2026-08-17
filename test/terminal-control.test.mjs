@@ -21,6 +21,7 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
+const managedSessions = await import("../dist/session.js");
 const terminalControlCli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const exactCompound = await import(
   "../dist/relay/v2/remoteExactTerminalControlCompoundV1.js"
@@ -171,7 +172,7 @@ async function persistedLegacyRecovery(harness, previousOwnerKind) {
   };
 }
 
-function isolatedManagedTmux(t, sessionName) {
+function isolatedManagedTmux(t, sessionName, options = {}) {
   const probe = spawnSync("tmux", ["-V"], { encoding: "utf8" });
   if (probe.status !== 0) {
     t.skip("tmux is unavailable");
@@ -194,24 +195,50 @@ function isolatedManagedTmux(t, sessionName) {
   process.env.TW_TMUX = wrapper;
   process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR = outputRoot;
   const createdAt = "2026-07-13T00:00:00.000Z";
-  const created = spawnSync(wrapper, ["new-session", "-d", "-s", sessionName, "-c", temp.root], {
-    encoding: "utf8",
-  });
-  if (created.status !== 0) {
-    restore();
-    temp.cleanup();
-    throw new Error(created.stderr || `could not create isolated tmux session: ${sessionName}`);
+  if (options.lifecycleV2 === true) {
+    const prefix = "tw-term-";
+    if (!sessionName.startsWith(prefix)) throw new Error("lifecycle fixture requires a terminal name");
+    try {
+      const created = managedSessions.createManagedTerminalSession({
+        cwd: temp.root,
+        profile: "dashboard",
+        quiet: true,
+        lifecycleV2: {
+          reservationCorrelation: null,
+          displayLabel: sessionName,
+        },
+      }, {
+        tmuxBin: () => wrapper,
+        randomId: () => sessionName.slice(prefix.length),
+        now: () => new Date(createdAt),
+        setupClipboardBindings: () => {},
+      });
+      assert.equal(created.session, sessionName);
+    } catch (error) {
+      restore();
+      temp.cleanup();
+      throw error;
+    }
+  } else {
+    const created = spawnSync(wrapper, ["new-session", "-d", "-s", sessionName, "-c", temp.root], {
+      encoding: "utf8",
+    });
+    if (created.status !== 0) {
+      restore();
+      temp.cleanup();
+      throw new Error(created.stderr || `could not create isolated tmux session: ${sessionName}`);
+    }
+    writeFileSync(join(twHome, "state.json"), `${JSON.stringify({
+      version: 1,
+      sessions: [{
+        name: sessionName,
+        kind: "terminal",
+        profile: "dashboard",
+        cwd: temp.root,
+        createdAt,
+      }],
+    })}\n`, { mode: 0o600 });
   }
-  writeFileSync(join(twHome, "state.json"), `${JSON.stringify({
-    version: 1,
-    sessions: [{
-      name: sessionName,
-      kind: "terminal",
-      profile: "dashboard",
-      cwd: temp.root,
-      createdAt,
-    }],
-  })}\n`, { mode: 0o600 });
 
   function restore() {
     if (previous.HOME === undefined) delete process.env.HOME;
@@ -810,8 +837,8 @@ test("exact auto-start hands the bound socket and state paths to one terminal-co
 });
 
 test("local-development exact auto-start binds the child to its validated managed-state home", async (t) => {
-  const sessionName = `isolated-auto-start-${process.pid}`;
-  const harness = isolatedManagedTmux(t, sessionName);
+  const sessionName = `tw-term-isolated-auto-start-${process.pid}`;
+  const harness = isolatedManagedTmux(t, sessionName, { lifecycleV2: true });
   if (harness === undefined) return;
   const socketPath = join(
     tmpdir(),
@@ -930,22 +957,28 @@ test("local-development exact auto-start binds the child to its validated manage
       { encoding: "utf8" },
     );
     assert.equal(killed.status, 0, killed.stderr);
-    const recreated = spawnSync(
-      harness.wrapper,
-      ["new-session", "-d", "-s", sessionName, "-c", harness.temp.root],
-      { encoding: "utf8" },
-    );
-    assert.equal(recreated.status, 0, recreated.stderr);
-    writeFileSync(join(harness.twHome, "state.json"), `${JSON.stringify({
-      version: 1,
-      sessions: [{
-        name: sessionName,
-        kind: "terminal",
-        profile: "dashboard",
+    const parentHome = process.env.HOME;
+    process.env.HOME = isolatedHome;
+    try {
+      const recreated = managedSessions.createManagedTerminalSession({
         cwd: harness.temp.root,
-        createdAt: "2026-07-14T00:00:00.000Z",
-      }],
-    })}\n`, { mode: 0o600 });
+        profile: "dashboard",
+        quiet: true,
+        lifecycleV2: {
+          reservationCorrelation: null,
+          displayLabel: sessionName,
+        },
+      }, {
+        tmuxBin: () => harness.wrapper,
+        randomId: () => sessionName.slice("tw-term-".length),
+        now: () => new Date("2026-07-14T00:00:00.000Z"),
+        setupClipboardBindings: () => {},
+      });
+      assert.equal(recreated.session, sessionName);
+    } finally {
+      if (parentHome === undefined) delete process.env.HOME;
+      else process.env.HOME = parentHome;
+    }
     const replacementSession = listExactSession();
     assert.notEqual(replacementSession.incarnation, session.incarnation);
 
@@ -1164,6 +1197,10 @@ test("structured Claude and Codex transcripts yield only the exact final assista
     ), codexSessionId);
     assert.equal(terminalControl.resumedAgentSessionIdFromStartCommand(
       `export PATH='/bin'; codex -c check_for_update_on_startup=false resume '${codexSessionId}'; exec /bin/zsh -l`,
+      "codex",
+    ), codexSessionId);
+    assert.equal(terminalControl.resumedAgentSessionIdFromStartCommand(
+      `export PATH='/bin'; codex -c 'check_for_update_on_startup=false' -m 'gpt-5.6-terra' -c 'model_reasoning_effort="high"' -c 'plan_mode_reasoning_effort="high"' resume '${codexSessionId}'; exec /bin/zsh -l`,
       "codex",
     ), codexSessionId);
     const preBoundaryTurnId = "019f3333-3333-7333-8333-333333333333";
@@ -1523,6 +1560,58 @@ test("handoff waits behind an accepted backend write and cannot split agent body
       kind: "agent-message",
       value: { pane: "0", message: "do the work", submit: true },
     }]);
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test("proved-unapplied agent runtime failure clears in-flight state and permits exact retry", async () => {
+  const temp = tempState();
+  class RuntimeBackend extends FakeBackend {
+    attempts = 0;
+
+    async sendAgentMessageFenced(_session, _instance, _generation, pane, message, submit, runtime) {
+      this.attempts += 1;
+      if (this.attempts === 1) {
+        throw new terminalControl.TerminalControlAgentMessageNotAppliedError(
+          "INVALID_REQUEST",
+          "runtime settings unsupported",
+        );
+      }
+      await this.beforeWrite("agent-message", { pane, message, submit, runtime });
+    }
+  }
+  const backend = new RuntimeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
+  try {
+    const target = await resolved(authority);
+    const dashboard = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("dashboard", "runtime-settings"),
+    );
+    const request = {
+      protocolVersion: 1,
+      requestId: "runtime-failed",
+      type: "input.agent-message",
+      lease: dashboard.lease,
+      operationId: "runtime-failed",
+      pane: "0",
+      message: "do the work",
+      submit: true,
+      runtime: { model: "gpt-5.6-sol", reasoningEffort: "high", mode: "default" },
+    };
+    await assert.rejects(authority.handle(request), (error) => (
+      error.code === "INVALID_REQUEST" && error.message === "runtime settings unsupported"
+    ));
+    assert.equal((await authority.handle({
+      protocolVersion: 1,
+      requestId: "runtime-status",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    })).state, "HELD");
+    await authority.handle({ ...request, requestId: "runtime-retry" });
+    assert.equal(backend.writes.length, 1);
   } finally {
     temp.cleanup();
   }
@@ -2593,20 +2682,34 @@ test("production backend seeds an existing pane before live Relay v2 input", asy
     const resolvedBackend = await backend.resolveManagedSession(harness.sessionName);
     const controlTargetId = randomUUID();
     const generation = randomUUID();
+    const emptyGeneration = await backend.prepareOutput(
+      controlTargetId,
+      harness.sessionName,
+      "0",
+      generation,
+      false,
+    );
+    assert.equal(emptyGeneration.generation, generation);
+    assert.equal(emptyGeneration.cursor, 0);
+
+    // A previous controller can leave a valid live pipe whose generation is
+    // nevertheless empty.  Opening an exact phone observation explicitly
+    // requests a pane capture and must repair that state immediately.
     const opened = await backend.prepareOutput(
       controlTargetId,
       harness.sessionName,
       "0",
       generation,
+      true,
     );
-    assert.equal(opened.generation, generation);
+    assert.notEqual(opened.generation, generation);
     assert.equal(opened.retainedStartCursor, 0);
     assert.ok(opened.cursor > 0, "the initial generation must contain the rendered pane");
     const initial = await backend.tailOutput(
       controlTargetId,
       harness.sessionName,
       "0",
-      generation,
+      opened.generation,
       opened.retainedStartCursor,
       64 * 1024,
     );
@@ -2618,7 +2721,7 @@ test("production backend seeds an existing pane before live Relay v2 input", asy
     await backend.writeRawFenced(
       resolvedBackend.managedSession,
       resolvedBackend.tmuxInstanceId,
-      generation,
+      opened.generation,
       "0",
       Buffer.from(`printf '${inputMarker}\\n'\r`, "utf8"),
     );
@@ -2630,7 +2733,7 @@ test("production backend seeds an existing pane before live Relay v2 input", asy
         controlTargetId,
         harness.sessionName,
         "0",
-        generation,
+        opened.generation,
         cursor,
         64 * 1024,
       );
@@ -2639,6 +2742,31 @@ test("production backend seeds an existing pane before live Relay v2 input", asy
       if (!chunk.dataBase64) await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.match(live, new RegExp(inputMarker));
+
+    // Relay v2 closes the last observation by rotating the output generation. A phone that
+    // re-enters the same terminal must receive the current pane again instead of observing an
+    // empty generation until the next command happens to produce output.
+    const reset = await backend.resetOutput(
+      controlTargetId,
+      harness.sessionName,
+      "0",
+      opened.generation,
+    );
+    assert.notEqual(reset.generation, opened.generation);
+    assert.equal(reset.retainedStartCursor, 0);
+    assert.ok(reset.cursor > 0, "the reset generation must contain the rendered pane");
+    const resetInitial = await backend.tailOutput(
+      controlTargetId,
+      harness.sessionName,
+      "0",
+      reset.generation,
+      reset.retainedStartCursor,
+      64 * 1024,
+    );
+    assert.match(
+      Buffer.from(resetInitial.dataBase64, "base64").toString("utf8"),
+      new RegExp(inputMarker),
+    );
   } finally {
     await harness.cleanup();
   }
@@ -2693,7 +2821,7 @@ test("production backend resumes a full legacy capture without explicit recovery
     });
     assert.equal(opened.state, "FREE");
     assert.notEqual(opened.outputGeneration, outputGeneration);
-    assert.equal(opened.outputCursor, 0);
+    assert.ok(opened.outputCursor > 0, "legacy rotation must seed the current pane");
     const currentGeneration = opened.outputGeneration;
 
     const dashboard = await acquired(
@@ -2754,7 +2882,7 @@ test("production backend auto-recovers a persisted full legacy capture with no p
     });
     assert.equal(opened.state, "FREE");
     assert.notEqual(opened.outputGeneration, recovery.outputGeneration);
-    assert.equal(opened.outputCursor, 0);
+    assert.ok(opened.outputCursor > 0, "ownerless recovery must seed the current pane");
     const persisted = terminalControl.loadTerminalControlState(harness.temp.path).targets[0];
     assert.equal(persisted.lifecycle, "ACTIVE");
     assert.equal(persisted.recovery, undefined);
@@ -3671,7 +3799,7 @@ test("exact claims survive ping and foreign status while same-target status stil
   }
 });
 
-test("exact read observation consumes the admitted claim without input ownership or generation reset", async () => {
+test("exact read observation consumes the admitted claim into a freshly seeded generation", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
   const prepareOutput = backend.prepareOutput.bind(backend);
@@ -3679,6 +3807,15 @@ test("exact read observation consumes the admitted claim without input ownership
     ...await prepareOutput(...args),
     retainedStartCursor: 0,
   });
+  const resetOutput = backend.resetOutput.bind(backend);
+  backend.resetOutput = async (controlTargetId, ...args) => {
+    const previous = Buffer.from(
+      backend.outputs.get(`${controlTargetId}:${backend.outputGeneration}`) ?? Buffer.alloc(0),
+    );
+    const reset = await resetOutput(controlTargetId, ...args);
+    backend.outputs.set(`${controlTargetId}:${reset.generation}`, previous);
+    return { ...reset, cursor: previous.byteLength, retainedStartCursor: 0 };
+  };
   const incarnation = `twinc2.${"A".repeat(43)}`;
   backend.inspectExactTarget = async (input) => {
     assert.deepEqual(input, {
@@ -3767,7 +3904,7 @@ test("exact read observation consumes the admitted claim without input ownership
     });
     assert.equal(released.state, "FREE");
     assert.equal(released.outputGeneration, opened.binding.outputGeneration);
-    assert.equal(backend.resetCalls, 0, "release must not reset output generation while observed");
+    assert.equal(backend.resetCalls, 1, "release must not reset output generation while observed");
     const continued = await authority.tailRelayV2ExactObservation(
       opened.observation,
       firstTail.nextCursor,
@@ -3777,7 +3914,7 @@ test("exact read observation consumes the admitted claim without input ownership
     // Closing the observation is idempotent and runs the deferred reset.
     await authority.closeRelayV2ExactObservation(opened.observation);
     await authority.closeRelayV2ExactObservation(opened.observation);
-    assert.equal(backend.resetCalls, 1);
+    assert.equal(backend.resetCalls, 2);
     await assert.rejects(
       authority.tailRelayV2ExactObservation(opened.observation, continued.nextCursor),
       (error) => error.code === "PERMISSION_DENIED",
@@ -3864,7 +4001,7 @@ test("exact observation consume is single-use, failed deferred reset stays retry
       authority.tailRelayV2ExactObservation(opened.observation, 0),
       (error) => error.code === "STALE_OUTPUT_CURSOR",
     );
-    assert.equal(backend.resetCalls, 1);
+    assert.equal(backend.resetCalls, 2);
 
     // The stale observer must not suppress the reset of a later release.
     const interactive = await acquired(
@@ -3879,13 +4016,13 @@ test("exact observation consume is single-use, failed deferred reset stays retry
       lease: interactive.lease,
     });
     assert.equal(released.state, "FREE");
-    assert.equal(backend.resetCalls, 2);
+    assert.equal(backend.resetCalls, 3);
     assert.notEqual(released.outputGeneration, opened.binding.outputGeneration);
 
     // Closing the fenced observation is an idempotent no-op.
     await authority.closeRelayV2ExactObservation(opened.observation);
     await authority.closeRelayV2ExactObservation(opened.observation);
-    assert.equal(backend.resetCalls, 2);
+    assert.equal(backend.resetCalls, 3);
   } finally {
     await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
     temp.cleanup();

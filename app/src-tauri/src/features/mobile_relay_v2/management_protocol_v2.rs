@@ -25,7 +25,7 @@ pub(crate) const REQUIRED_CAPABILITIES: [&str; 6] = [
     "event.sequence.v1",
     "terminal.stream.resume.v1",
 ];
-const KNOWN_CAPABILITIES: [&str; 9] = [
+const KNOWN_CAPABILITIES: [&str; 10] = [
     "error.structured.v1",
     "command.ledger.v1",
     "command.query.v1",
@@ -34,6 +34,7 @@ const KNOWN_CAPABILITIES: [&str; 9] = [
     "terminal.stream.resume.v1",
     "agent.transcript-lifecycle.v1",
     "agent.chat.v2",
+    "agent.chat.runtime-settings.v1",
     "lark.bindings.v2",
 ];
 
