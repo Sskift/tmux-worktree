@@ -398,13 +398,10 @@ test("structural port splicing and conflicting durable bindings close before net
     assert.equal(h.networkCalls.length, 0);
   });
 
-  await t.test("ready credential rejects bootstrap as NOT_READY then admits refresh", async () => {
+  await t.test("ready credential treats bootstrap as idempotent then admits refresh", async () => {
     const h = harness();
     installReady(h);
-    await assert.rejects(
-      h.adapter.bootstrap(BOOTSTRAP_REQUEST),
-      assertManagementFailure("NOT_READY"),
-    );
+    assert.equal(await h.adapter.bootstrap(BOOTSTRAP_REQUEST), undefined);
     assert.equal(h.networkCalls.length, 0);
     await h.adapter.refresh(REFRESH_REQUEST);
     assert.equal(h.networkCalls.length, 1);

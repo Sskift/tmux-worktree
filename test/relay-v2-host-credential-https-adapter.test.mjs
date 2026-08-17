@@ -171,20 +171,26 @@ const CERTIFICATE_PATH = join(TLS_DIRECTORY, "localhost-cert.pem");
 execFileSync(
   join(REPOSITORY, "node_modules", ".bin", "tsup"),
   [
-    "src/relay/v2/brokerCore.ts",
-    "src/relay/v2/hostCredentialHttpsAdapter.ts",
-    "src/relay/v2/hostCarrier.ts",
-    "src/relay/v2/hostCredentialAuthority.ts",
-    "src/relay/v2/hostTlsTrustMaterial.ts",
-    "src/relay/v2/hostWssTransportLifecycle.ts",
-    "src/relay/v2/issuer.ts",
-    "src/relay/v2/singleExchangeHttpsTransport.ts",
+    "--entry.v2/brokerCore", "src/relay/v2/brokerCore.ts",
+    "--entry.v2/hostCredentialHttpsAdapter", "src/relay/v2/hostCredentialHttpsAdapter.ts",
+    "--entry.v2/hostCarrier", "src/relay/v2/hostCarrier.ts",
+    "--entry.v2/hostCredentialAuthority", "src/relay/v2/hostCredentialAuthority.ts",
+    "--entry.v2/hostTlsTrustMaterial", "src/relay/v2/hostTlsTrustMaterial.ts",
+    "--entry.v2/hostWssTransportLifecycle", "src/relay/v2/hostWssTransportLifecycle.ts",
+    "--entry.v2/issuer", "src/relay/v2/issuer.ts",
+    "--entry.v2/singleExchangeHttpsTransport", "src/relay/v2/singleExchangeHttpsTransport.ts",
+    "--entry.extensions/agentTranscriptLifecycle/v1/codec",
+    "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",
+    "--entry.extensions/agentChat/v2/codec",
+    "src/relay/extensions/agentChat/v2/codec.ts",
+    "--entry.extensions/larkBindings/v2/codec",
+    "src/relay/extensions/larkBindings/v2/codec.ts",
     "--format", "esm",
     "--target", "node20",
     "--platform", "node",
     "--out-dir", BUILD_DIRECTORY,
     "--clean",
-    "--splitting", "true",
+    "--no-splitting",
   ],
   { cwd: REPOSITORY, stdio: "pipe" },
 );
@@ -202,22 +208,22 @@ execFileSync(
 );
 
 const adapterModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "hostCredentialHttpsAdapter.js"),
+  join(BUILD_DIRECTORY, "v2", "hostCredentialHttpsAdapter.js"),
 ).href);
 const trustMaterialModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "hostTlsTrustMaterial.js"),
+  join(BUILD_DIRECTORY, "v2", "hostTlsTrustMaterial.js"),
 ).href);
 const carrierModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "hostCarrier.js"),
+  join(BUILD_DIRECTORY, "v2", "hostCarrier.js"),
 ).href);
 const credentialModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "hostCredentialAuthority.js"),
+  join(BUILD_DIRECTORY, "v2", "hostCredentialAuthority.js"),
 ).href);
 const issuerModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "issuer.js"),
+  join(BUILD_DIRECTORY, "v2", "issuer.js"),
 ).href);
 const wssModule = await import(pathToFileURL(
-  join(BUILD_DIRECTORY, "hostWssTransportLifecycle.js"),
+  join(BUILD_DIRECTORY, "v2", "hostWssTransportLifecycle.js"),
 ).href);
 const PRIVATE_KEY = await readFile(PRIVATE_KEY_PATH);
 const CERTIFICATE = await readFile(CERTIFICATE_PATH);

@@ -9,6 +9,7 @@ import { buildSync } from "esbuild";
 
 const {
   acquireManagedStateLock,
+  buildManagedSessionLifecycleExtension,
   emptyManagedState,
   loadManagedState,
   recordManagedSession,
@@ -274,6 +275,16 @@ test("tw rm closes managed sessions through the state-aware lifecycle", async (t
   const statePath = join(stateDir, "state.json");
   const fakeTmux = join(root, "tmux");
   const tmuxLog = join(root, "tmux.log");
+  const tmuxIdentity = {
+    serverSocketPath: "/tmp/tmux-managed-rm.sock",
+    serverPid: "1234",
+    serverStarted: "1760000000",
+    sessionId: "$0",
+    rawName: "tw-term-abc12",
+    sessionCreated: "1760000000",
+    birthMarker: "twbirth2.abcdefghijklmnopqrstuv",
+  };
+  const lifecycleV2 = buildManagedSessionLifecycleExtension(tmuxIdentity, null, null);
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(statePath, `${JSON.stringify({
     version: 1,
@@ -283,6 +294,7 @@ test("tw rm closes managed sessions through the state-aware lifecycle", async (t
       profile: "dashboard",
       cwd: "/repo/app",
       createdAt: "2026-07-12T00:00:00.000Z",
+      extensions: { "tw.rpc-v2.lifecycle.v1": lifecycleV2 },
     }],
   })}\n`);
   writeFileSync(fakeTmux, `#!/bin/sh
@@ -290,6 +302,7 @@ printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
 case "$1" in
   list-sessions)
     case "$3" in
+      *socket_path*) printf '/tmp/tmux-managed-rm.sock\\0371234\\0371760000000\\037$0\\037tw-term-abc12\\0371760000000\\037twbirth2.abcdefghijklmnopqrstuv\\037bnVsbA\\0370\\0371\\0371760000100\\037/repo/app\\n' ;;
       *session_id*) printf 'tw-term-abc12\\037$0\\n' ;;
       *) printf 'tw-term-abc12\\0370\\0371\\0371760000000\\0371760000100\\037/repo/app\\n' ;;
     esac
@@ -337,6 +350,9 @@ case "$1" in
       rm -f "$TW_TEST_TMUX_LOG.output-pipe"
     fi
     ;;
+  if-shell)
+    printf 'tw_rpc_v2_killed\\n'
+    ;;
 esac
 exit 0
 `);
@@ -375,7 +391,7 @@ exit 0
   });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")).sessions, []);
-  assert.match(readFileSync(tmuxLog, "utf8"), /kill-session -t =tw-term-abc12/);
+  assert.match(readFileSync(tmuxLog, "utf8"), /if-shell -F -t =tw-term-abc12:/);
 });
 
 test("canonical worktree base expands on the target host and host paths retain remote tilde", () => {
