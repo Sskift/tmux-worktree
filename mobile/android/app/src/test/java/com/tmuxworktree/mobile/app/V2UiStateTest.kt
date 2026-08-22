@@ -10,6 +10,7 @@ import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.model.TerminalStreamState
 import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateCommandReadState
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
@@ -28,6 +29,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -416,6 +418,57 @@ class V2UiStateTest {
     }
 
     @Test
+    fun relayV2ColdTerminalRouteConnectsWithoutRegressingItsOnlineAttachment() {
+        val cut = object : RelayV2SessionReplyCut {}
+        val exactFence = RelayV2TerminalUiAttachmentFence("session-a", "route-a", cut)
+        val stale = V2UiState(
+            terminal = TerminalStreamState(
+                streamId = "old-stream",
+                sessionId = "session-old",
+                status = ConnectionStatus.OFFLINE,
+                resetReason = "old failure",
+            ),
+            actionError = "old failure",
+        )
+
+        val pending = markRelayV2TerminalRendererPending(
+            state = stale,
+            sessionStableId = "session-a",
+            attachmentId = "route-a",
+            activeFence = null,
+        )
+        assertEquals(ConnectionStatus.CONNECTING, pending.terminal.status)
+        assertEquals("session-a", pending.terminal.sessionId)
+        assertNull(pending.terminal.streamId)
+        assertNull(pending.actionError)
+
+        val online = pending.copy(
+            terminal = pending.terminal.copy(
+                streamId = "stream-a",
+                status = ConnectionStatus.ONLINE,
+            ),
+        )
+        assertSame(
+            online,
+            markRelayV2TerminalRendererPending(
+                state = online,
+                sessionStableId = "session-a",
+                attachmentId = "route-a",
+                activeFence = exactFence,
+            ),
+        )
+
+        val replacement = markRelayV2TerminalRendererPending(
+            state = online,
+            sessionStableId = "session-a",
+            attachmentId = "route-new",
+            activeFence = exactFence,
+        )
+        assertEquals(ConnectionStatus.CONNECTING, replacement.terminal.status)
+        assertNull(replacement.terminal.streamId)
+    }
+
+    @Test
     fun createdSessionBecomesRoutableOnlyAfterUiAndExactCutConverge() {
         val created = RelaySession(
             hostId = "host-a",
@@ -465,5 +518,29 @@ class V2UiStateTest {
         assertEquals(RELAY_V2_TRANSPORT_LABEL, projected.health.protocolLabel)
         assertEquals(ConnectionStatus.ONLINE, projected.hosts.single().status)
         assertFalse(projected.health.protocolLabel.contains("ready", ignoreCase = true))
+    }
+
+    @Test
+    fun relayV2FailureProjectsItsExactRuntimeCodeInsteadOfAReadinessGuess() {
+        val projected = projectRelayV2RuntimeState(
+            state = V2UiState(
+                relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2,
+                hosts = listOf(RelayHost("host-a", status = ConnectionStatus.ONLINE)),
+            ),
+            runtime = RelayV2BaseRuntimeState(
+                phase = RelayV2BaseRuntimePhase.FAILED,
+                failure = RelayV2BaseRuntimeFailure.RuntimeIncomplete(
+                    "TERMINAL_RUNTIME_INVALIDATED",
+                ),
+            ),
+            nowMillis = 1234,
+        )
+
+        assertEquals("TERMINAL_RUNTIME_INVALIDATED", projected.health.errorCode)
+        assertEquals(
+            "Relay v2 stopped (TERMINAL_RUNTIME_INVALIDATED).",
+            projected.health.errorMessage,
+        )
+        assertFalse(projected.health.errorMessage.contains("capability", ignoreCase = true))
     }
 }

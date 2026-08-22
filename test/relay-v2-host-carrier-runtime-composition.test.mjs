@@ -786,7 +786,7 @@ test("request-scoped terminal target failure stays correlated without dropping t
   }
 });
 
-test("fatal H3 authority failure withdraws readiness and fences the route with 4406 first", async () => {
+test("fatal H3 authority failure is isolated to terminal and keeps Mobile Session alive", async () => {
   const h = await createHarness({
     terminalLineageOverrides: {
       async claimOpen() {
@@ -808,12 +808,17 @@ test("fatal H3 authority failure withdraws readiness and fences the route with 4
     sendClientFrame(route, terminalOpen);
     await settle();
 
+    const response = publicFramesFor(route).find((frame) => (
+      frame.requestId === terminalOpen.requestId
+    ));
+    assert.equal(response.type, "error");
+    assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
     const close = route.transport.sent.map(decodeCarrier).findLast((frame) => (
       frame.type === "route.close"
     ));
-    assert.equal(close.payload.closeCode, 4406);
-    assert.equal(close.payload.error.code, "CAPABILITY_UNAVAILABLE");
-    assert.equal(readinessReady(h.composition.readiness.current()), false);
+    assert.equal(close, undefined);
+    assert.equal(readinessReady(h.composition.readiness.current()), true);
+    assert.equal(h.composition.carrier.status().phase, "registered");
   } finally {
     await h.cleanup();
   }

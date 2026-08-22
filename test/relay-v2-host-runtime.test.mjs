@@ -658,6 +658,147 @@ test("host runtime dispatches strict public requests only to their H1, H2, and H
   assert.deepEqual(h.state.closes, []);
 });
 
+test("a hung terminal.open expires before Android and cannot block same-route Agent chat", async () => {
+  const capability = "agent.chat.v2";
+  const descriptor = Object.freeze({
+    requestId: "agent-after-hung-terminal-open",
+    hostId: HOST_ID,
+    expectedHostEpoch: HOST_EPOCH,
+    scopeId: "scope-local",
+    sessionId: "ses_01JOPAQUE",
+  });
+  const agentRequest = Buffer.from(JSON.stringify({
+    protocolVersion: 2,
+    kind: "request",
+    type: "agent.chat.send",
+    ...descriptor,
+    payload: { text: "reply after terminal deadline" },
+  }), "utf8");
+  let extensionSink;
+  let extensionCalls = 0;
+  let finishOpen;
+  const hungOpen = new Promise((resolve) => { finishOpen = resolve; });
+  let timedOutAuthorityRoute;
+  const optionalExtension = {
+    capability,
+    subscribe(sink) {
+      extensionSink = sink;
+      assert.equal(sink.apply(true), true);
+      return { unsubscribe() {} };
+    },
+    inspectRequest(bytes) {
+      assert.equal(Buffer.from(bytes).equals(agentRequest), true);
+      return descriptor;
+    },
+    async authorize(context) {
+      assert.equal(context.scopeId, descriptor.scopeId);
+      assert.equal(context.sessionId, descriptor.sessionId);
+      return true;
+    },
+    async handleRequest(_bytes, _metadata, context) {
+      extensionCalls += 1;
+      const frame = {
+        protocolVersion: 2,
+        kind: "response",
+        type: "agent.chat.sent",
+        requestId: descriptor.requestId,
+        hostId: context.hostId,
+        hostEpoch: context.hostEpoch,
+        scopeId: context.scopeId,
+        sessionId: context.sessionId,
+        payload: { accepted: true },
+      };
+      return { frame, bytes: Buffer.from(JSON.stringify(frame), "utf8") };
+    },
+    handleUnavailableRequest() {
+      throw new Error("the ready Agent extension must handle this request");
+    },
+    isolateFailure(error) {
+      assert.fail(error);
+    },
+    async closeAndDrain() {},
+  };
+  const h = createHarness({
+    optionalExtension,
+    decodeOutbound: (bytes) => JSON.parse(Buffer.from(bytes).toString("utf8")),
+    testLimits: { terminalAuthorityTimeoutMs: 10 },
+    terminal: async (method, request) => {
+      if (method === "open") {
+        timedOutAuthorityRoute = request.route;
+        return hungOpen;
+      }
+    },
+  });
+  assert.ok(extensionSink);
+  assert.equal(runtimeModule.RELAY_V2_HOST_RUNTIME_LIMITS.terminalAuthorityTimeoutMs, 10_000);
+
+  const routeBinding = binding();
+  h.runtime.onRouteBound(routeBinding);
+  const hello = fixture("client-hello-fresh");
+  hello.hostId = HOST_ID;
+  hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
+  hello.payload.capabilities.push(capability);
+  send(h.runtime, routeBinding, hello);
+  await settle(6);
+  assert.equal(h.state.sent.at(-1).frame.type, "host.welcome");
+  assert.equal(h.state.sent.at(-1).frame.payload.capabilities.includes(capability), true);
+
+  const open = fixture("terminal-open-new");
+  open.requestId = "hung-terminal-open";
+  open.hostId = HOST_ID;
+  open.expectedHostEpoch = HOST_EPOCH;
+  send(h.runtime, routeBinding, open);
+  h.runtime.onClientFrame(routeBinding, agentRequest);
+
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  await settle(8);
+
+  const timeout = h.state.sent.find(({ frame }) => frame.requestId === open.requestId)?.frame;
+  assert.ok(timeout, JSON.stringify({ sent: h.state.sent, calls: h.state.calls, closes: h.state.closes }));
+  assert.equal(timeout.type, "error");
+  assert.equal(timeout.error.code, "BUSY");
+  assert.equal(timeout.error.retryable, true);
+  assert.match(timeout.error.message, /did not respond before its deadline/);
+  const agentResponse = h.state.sent
+    .find(({ frame }) => frame.requestId === descriptor.requestId)?.frame;
+  assert.equal(agentResponse.type, "agent.chat.sent");
+  assert.equal(agentResponse.payload.accepted, true);
+  assert.equal(extensionCalls, 1);
+  assert.deepEqual(h.state.closes, []);
+  assert.equal(h.state.calls.unbind.length, 1);
+
+  const successorOpen = structuredClone(open);
+  successorOpen.requestId = "successor-open-after-hard-deadline";
+  successorOpen.payload.openId = "successor-open-id";
+  send(h.runtime, routeBinding, successorOpen);
+  await settle(6);
+  const successorError = h.state.sent
+    .find(({ frame }) => frame.requestId === successorOpen.requestId)?.frame;
+  assert.equal(successorError.type, "error");
+  assert.equal(successorError.error.code, "BUSY");
+  assert.equal(successorError.error.retryable, true);
+  assert.equal(
+    h.state.calls.terminal.filter(({ method }) => method === "open").length,
+    1,
+    "the uncancellable timed-out open must not overlap a successor terminal mutation",
+  );
+
+  const opened = correlatedTerminalFixture("terminal-opened", open);
+  await assert.rejects(
+    h.runtime.sendTerminalFrame(timedOutAuthorityRoute, opened),
+    /stale route binding/,
+  );
+  const sentBeforeLateCompletion = h.state.sent.length;
+  finishOpen();
+  await settle(8);
+  assert.equal(h.state.sent.length, sentBeforeLateCompletion);
+  assert.equal(h.state.sent.some(({ frame }) => frame.type === "terminal.opened"), false);
+  assert.deepEqual(h.state.closes, []);
+  h.runtime.onRouteUnbound(routeBinding, "client_closed");
+  await settle(4);
+  h.runtime.dispose();
+});
+
 test("auth, current host epoch, and exact carrier binding reject stale frames before side effects", async (t) => {
   await t.test("binding auth and connector generation are immutable", async () => {
     const h = createHarness();
@@ -2209,6 +2350,12 @@ test("typed H3 negative outcomes become correlated redacted not_applicable error
       assert.equal(response.error.code, code);
       assert.equal(response.error.commandDisposition, "not_applicable");
       assert.equal(response.error.retryable, code === "BUSY");
+      if (code === "BUSY") {
+        assert.equal(
+          response.error.message,
+          "Terminal input is temporarily owned by another client; retrying is safe",
+        );
+      }
       assert.equal(response.scopeId, open.scopeId);
       assert.equal(response.sessionId, open.sessionId);
       assert.equal(response.streamId, open.streamId);
@@ -2216,6 +2363,40 @@ test("typed H3 negative outcomes become correlated redacted not_applicable error
       assert.equal(h.state.closes.some((close) => close.code === 1013), false);
     });
   }
+});
+
+test("typed terminal open deadline keeps its retry-safe timeout reason", async () => {
+  const h = createHarness({
+    terminal: async (method) => {
+      if (method === "open") {
+        throw new terminalManager.RelayV2TerminalManagerError(
+          "BUSY",
+          "internal manager timeout detail",
+          { reason: "terminal_open_timeout" },
+        );
+      }
+    },
+  });
+  const routeBinding = await ready(h);
+  const open = fixture("terminal-open-new");
+  open.expectedHostEpoch = HOST_EPOCH;
+  send(h.runtime, routeBinding, open);
+  await settle(8);
+
+  const response = h.state.sent.find(({ frame }) => frame.requestId === open.requestId)?.frame;
+  assert.equal(response.type, "error");
+  assert.equal(response.error.code, "BUSY");
+  assert.equal(response.error.retryable, true);
+  assert.equal(
+    response.error.message,
+    "Terminal authority did not respond before its deadline; reconnecting and retrying is safe",
+  );
+  // BUSY.details is intentionally null: the v2 public error schema only
+  // admits typed details for a small allowlist of error codes. The manager's
+  // reason is process-local and is used solely to select this stable message.
+  assert.equal(response.error.details, null);
+  assert.equal(JSON.stringify(response).includes("internal manager timeout detail"), false);
+  assert.equal(h.state.closes.length, 0);
 });
 
 test("raw frame and transport-owned outbound capacity are hard bounded", async (t) => {

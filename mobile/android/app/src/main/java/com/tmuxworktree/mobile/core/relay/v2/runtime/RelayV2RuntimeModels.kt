@@ -10,6 +10,11 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialSecretValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.session.MobileSessionTransport
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportAdapter
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportFailure
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportFailureKind
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportListener
 import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.Base64
@@ -1174,46 +1179,13 @@ internal data class RelayV2TransportOpenRequest(
             "offeredSubprotocols=$offeredSubprotocols, accessToken=<redacted>)"
 }
 
-internal enum class RelayV2TransportFailureKind {
-    NETWORK,
-    UPGRADE,
-    PROTOCOL,
-    TLS_VALIDATION,
-}
-
-internal data class RelayV2TransportFailure(
-    val kind: RelayV2TransportFailureKind,
-    val httpStatus: Int? = null,
-)
-
-internal interface RelayV2Transport {
-    fun send(bytes: ByteArray): Boolean
-    fun close(code: Int, reason: String)
-    fun cancel()
-
-    /** Returns only after resources are fenced, or false at the transport-owned hard deadline. */
-    suspend fun awaitTermination(): Boolean
-}
-
-internal interface RelayV2TransportListener {
-    fun onOpen(source: RelayV2Transport, selectedSubprotocol: String?)
-
-    fun onFrame(
-        source: RelayV2Transport,
-        bytes: ByteArray,
-        metadata: RelayV2FrameMetadata = RelayV2FrameMetadata(),
-    )
-
-    fun onClosed(source: RelayV2Transport, code: Int)
-    fun onFailure(source: RelayV2Transport, failure: RelayV2TransportFailure)
-}
-
-internal fun interface RelayV2TransportFactory {
-    fun open(
-        request: RelayV2TransportOpenRequest,
-        listener: RelayV2TransportListener,
-    ): RelayV2Transport
-}
+/** Compatibility names kept only at the Relay Adapter edge while callers migrate to Session. */
+internal typealias RelayV2Transport = MobileSessionTransport
+internal typealias RelayV2TransportListener = MobileSessionTransportListener
+internal typealias RelayV2TransportFailure = MobileSessionTransportFailure
+internal typealias RelayV2TransportFailureKind = MobileSessionTransportFailureKind
+internal typealias RelayV2TransportFactory =
+    MobileSessionTransportAdapter<RelayV2TransportOpenRequest>
 
 private fun requireRelayV2RuntimeId(value: String, label: String) {
     require(value.isNotBlank()) { "$label is required" }

@@ -884,12 +884,10 @@ export async function openRelayV2HostCanonicalProductionComposition(
         "Recovered H0 authority could not activate readiness",
       );
     }
-    if (managed.readiness.h3.activate() !== true) {
-      throw new RelayV2TerminalManagerError(
-        "CAPABILITY_UNAVAILABLE",
-        "Recovered H3 authority could not activate readiness",
-      );
-    }
+    // H3 is a Terminal Adapter, not Mobile Session readiness. A missing/stale tmux authority
+    // leaves terminal.open unavailable until the next Host recovery, but must not prevent the
+    // Worktree/Agent route and its reconnect state from coming online.
+    managed.readiness.h3.activate();
     if (reauthentication !== undefined) {
       const automaticReauthentication = claimRelayV2HostAutomaticReauthenticationPort(
         managed.automaticReauthenticationClaim,

@@ -382,7 +382,7 @@ function createManagedWssCredentialAuthority() {
   return { authority, accessToken, activity };
 }
 
-function createManagedWssConstructor(records, effects) {
+function createManagedWssConstructor(records, effects, harnessOptions) {
   return class FakeManagedWss {
     readyState = 1;
     protocol = "tw-relay.host.v2";
@@ -391,6 +391,9 @@ function createManagedWssConstructor(records, effects) {
 
     constructor(address, protocols, options) {
       effects.socketConstructions += 1;
+      if (harnessOptions.managedWssConstructorThrows === true) {
+        throw new Error("injected malformed managed WSS constructor");
+      }
       const record = {
         sequence: records.length + 1,
         address,
@@ -578,7 +581,7 @@ async function createHarness(options = {}) {
     timerSchedules: 0,
   };
   const managedWssConstructor = options.managedWss
-    ? createManagedWssConstructor(records, managedWssEffects)
+    ? createManagedWssConstructor(records, managedWssEffects, options)
     : null;
   let helloSequence = 0;
   let credentialReadCount = 0;
@@ -1344,6 +1347,8 @@ test("Dashboard-owned full-cap retry outlives its promoted H2 client lease and g
     assert.equal(h.composition.inspect().status, "registered_incomplete");
     assert.deepEqual(owner.exchanges, { bootstrap: 0, refresh: 0 });
 
+    const staleCloseCallbacks = [...(first.socket.listeners.get("close") ?? [])];
+    const staleMessageCallbacks = [...(first.socket.listeners.get("message") ?? [])];
     first.socket.terminate();
     await settle();
     assert.deepEqual(h.composition.inspect(), {
@@ -1373,6 +1378,19 @@ test("Dashboard-owned full-cap retry outlives its promoted H2 client lease and g
       negotiatedCapabilityIntersection: [],
     });
     assert.equal(readinessReady(h.composition.readiness.current()), true);
+
+    for (const callback of staleMessageCallbacks) {
+      callback(Buffer.from(registeredFrame(first)).toString("utf8"), false);
+    }
+    for (const callback of staleCloseCallbacks) callback(1006);
+    await settle();
+    assert.deepEqual(h.composition.inspect(), {
+      status: "registered_incomplete",
+      controllerGeneration: "2",
+      connectorId: "managed-connector-2",
+      acknowledgement: "host.registered",
+      negotiatedCapabilityIntersection: [],
+    }, "late generation-one carrier callbacks must not contaminate the successor");
 
     h.composition.readiness.h0.close();
     assert.equal(readinessReady(h.composition.readiness.current()), false);
@@ -1513,6 +1531,83 @@ test("fresh H2 release failure permanently fences authoritative successors", asy
   }
 });
 
+test("Dashboard desired state survives a retryable first open that publishes no socket", async () => {
+  const h = await createHarness({ managedWss: true });
+  try {
+    const owner = createDashboardManagementOwner(h);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    h.composition.readiness.h0.close();
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    await settle();
+    assert.deepEqual(h.composition.inspect(), {
+      status: "failed",
+      controllerGeneration: "1",
+      connectorId: null,
+      retryable: true,
+    });
+    assert.equal(h.records.length, 0, "the rejected first open must not publish a socket");
+
+    await delay(300);
+    assert.equal(h.records.length, 0, "the first successor must respect capped backoff");
+    assert.equal(await h.composition.readiness.h0.activate(), true);
+    await waitForRecordCount(
+      h,
+      1,
+      "desired running was lost when the first open rejected before socket publication",
+    );
+    const successor = await registerPendingManagedWss(h);
+    await settle();
+    assert.equal(successor.sequence, 1, "only the generation-two attempt may publish a socket");
+    assert.deepEqual(h.composition.inspect(), {
+      status: "registered_incomplete",
+      controllerGeneration: "2",
+      connectorId: "managed-connector-1",
+      acknowledgement: "host.registered",
+      negotiatedCapabilityIntersection: [],
+    });
+
+    owner.input.end();
+    assert.equal(await run, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("Dashboard desired state does not hot-loop a non-retryable open configuration failure", async () => {
+  const h = await createHarness({
+    managedWss: true,
+    managedWssConstructorThrows: true,
+  });
+  try {
+    const owner = createDashboardManagementOwner(h);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    await settle();
+    assert.deepEqual(h.composition.inspect(), {
+      status: "failed",
+      controllerGeneration: "1",
+      connectorId: null,
+      retryable: false,
+    });
+    assert.equal(h.managedWssEffects.socketConstructions, 1);
+    await delay(1_250);
+    assert.equal(
+      h.managedWssEffects.socketConstructions,
+      1,
+      "non-retryable configuration/auth classification must require explicit repair",
+    );
+
+    owner.input.end();
+    assert.equal(await run, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("Dashboard retry stays socket-free after promoted H2 owner withdrawal", async () => {
   const h = await createHarness({ managedWss: true });
   try {
@@ -1586,6 +1681,43 @@ test("Dashboard stop and composition close fence a pending desired-state retry",
         await h.cleanup();
       }
     });
+  }
+});
+
+test("Dashboard stop fences an in-flight successor before a third socket can publish", async () => {
+  const h = await createHarness({ managedWss: true });
+  try {
+    const owner = createDashboardManagementOwner(h);
+    const session = dashboardManagementSessionModule
+      .createRelayV2DashboardManagementProtocolV2CompositionSession(owner.options);
+    owner.input.push(Buffer.from(dashboardManagementStartFrame));
+    const run = session.run();
+    const first = await registerPendingManagedWss(h);
+    await settle();
+    first.socket.terminate();
+    await waitForRecordCount(h, 2, "retry did not publish the in-flight successor seam");
+    const successor = h.records.at(-1);
+    await settle();
+    assert.equal(successor.sequence, 2);
+    assert.equal(h.composition.inspect().status, "starting");
+
+    owner.input.push(Buffer.from(dashboardManagementStopFrame));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (h.composition.inspect().status === "stopped") break;
+      await settle(1);
+    }
+    assert.deepEqual(h.composition.inspect(), {
+      status: "stopped",
+      controllerGeneration: "2",
+    });
+    assert.deepEqual(successor.closes, [{ code: 1000, reason: "host_shutdown" }]);
+    await delay(1_100);
+    assert.equal(h.records.length, 2, "stop allowed a generation-three socket to publish");
+
+    owner.input.end();
+    assert.equal(await run, 0);
+  } finally {
+    await h.cleanup();
   }
 });
 

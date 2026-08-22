@@ -17,6 +17,7 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryTok
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserRestoreProof
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPendingClose
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 
@@ -220,6 +221,106 @@ internal class RelayV2StateRepository(
         authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2TerminalReduction? = durableCore.recoverPostCommitUnknown(authority, key)
+
+    override suspend fun recoverPostCommitUnknownWithContinuity(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        currentParserContinuityId: String,
+    ): RelayV2TerminalReduction? = durableCore.recoverPostCommitUnknownWithContinuity(
+        authority,
+        key,
+        currentParserContinuityId,
+    )
+
+    override suspend fun correlateDetachedTerminalErrorUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.CorrelatedError,
+    ): RelayV2DetachedTerminalErrorResult =
+        durableCore.correlateDetachedTerminalErrorUnderApplyLease(
+            authority,
+            key,
+            action,
+        )
+
+    override suspend fun correlateDetachedTerminalOpenedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Opened,
+    ): RelayV2DetachedTerminalOpenedResult =
+        durableCore.correlateDetachedTerminalOpenedUnderApplyLease(
+            authority,
+            key,
+            action,
+        )
+
+    override suspend fun ensureTerminalCloseWhenOpenedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction? =
+        durableCore.ensureTerminalCloseWhenOpenedUnderApplyLease(
+            authority,
+            key,
+            pendingClose,
+        )
+
+    override suspend fun adoptDetachedTerminalOpenedForCloseUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Opened,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction? =
+        durableCore.adoptDetachedTerminalOpenedForCloseUnderApplyLease(
+            authority,
+            key,
+            action,
+            pendingClose,
+        )
+
+    override suspend fun consumeDetachedTerminalClosedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Closed,
+    ): RelayV2TerminalReduction? =
+        durableCore.consumeDetachedTerminalClosedUnderApplyLease(
+            authority,
+            key,
+            action,
+        )
+
+    override suspend fun consumeRendererFreeTerminalOutputUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Output,
+    ): RelayV2TerminalReduction? =
+        durableCore.consumeRendererFreeTerminalOutputUnderApplyLease(
+            authority,
+            key,
+            action,
+        )
+
+    override suspend fun consumeRendererFreeTerminalResetUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction? =
+        durableCore.consumeRendererFreeTerminalResetUnderApplyLease(
+            authority,
+            key,
+            action,
+        )
+
+    override suspend fun claimTerminalCloseUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalResumeClaim? =
+        durableCore.claimTerminalCloseUnderApplyLease(
+            authority,
+            key,
+            pendingClose,
+        )
 
     suspend fun clearProfileAfterDisconnect(receipt: RelayProfileDisconnectReceipt) {
         core.clearProfileAfterDisconnect(receipt)

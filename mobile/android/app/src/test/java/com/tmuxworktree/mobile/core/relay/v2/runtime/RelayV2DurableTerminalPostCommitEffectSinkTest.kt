@@ -280,6 +280,58 @@ class RelayV2DurableTerminalPostCommitEffectSinkTest {
             assertNull(store.batch(successorReservation.identity.reservationId))
         }
 
+    @Test
+    fun `committed reservation row without a published handle is not reusable`() = runBlocking {
+        val store = MemoryJournalStore()
+        val exact = batch("orphan-reservation")
+        val runner = sink(store, "process-orphan") {
+            error("orphan reservation must never execute")
+        }
+        // Keep the injected ambiguous commit on reserve's insert transaction, not initial
+        // recovery. The DB commit survives, but reserve() never reaches handle publication.
+        assertTrue(runner.recover().recoveredLineages.isEmpty())
+        store.throwAfterCommittedTransactions = 1
+
+        val reserveFailure = try {
+            runner.reserve("reservation-orphan", exact)
+            null
+        } catch (failure: Throwable) {
+            failure
+        }
+
+        assertNotNull(reserveFailure)
+        assertEquals(
+            RelayV2TerminalPostCommitJournalState.RESERVED.name,
+            store.batch("reservation-orphan")?.state,
+        )
+        // Exact abort cannot address a handle that was never published. The durable row itself is
+        // therefore part of the proof and must prevent terminal-local same-generation recovery.
+        runner.abort("reservation-orphan")
+        assertNotNull(store.batch("reservation-orphan"))
+        assertFalse(runner.isAuthorityReusable(exact.authority, exact.key))
+    }
+
+    @Test
+    fun `unowned terminal receipt is pruned before authority reuse proof`() = runBlocking {
+        val store = MemoryJournalStore()
+        val exact = batch("prunable-receipt")
+        val runner = sink(store, "process-prune") {
+            RelayV2TerminalSynchronousEffectExecutionReceipt.COMPLETED
+        }
+        val reserved = runner.reserve("reservation-prunable", exact).reserved()
+        assertEquals(
+            RelayV2TerminalPostCommitEffectActivationReceipt.ACCEPTED,
+            reserved.reservation.activate(),
+        )
+        assertEquals(
+            RelayV2TerminalPostCommitJournalState.ACCEPTED.name,
+            store.batch("reservation-prunable")?.state,
+        )
+
+        assertTrue(runner.isAuthorityReusable(exact.authority, exact.key))
+        assertNull(store.batch("reservation-prunable"))
+    }
+
     private fun sink(
         store: MemoryJournalStore,
         incarnation: String,
@@ -386,28 +438,38 @@ class RelayV2DurableTerminalPostCommitEffectSinkTest {
         private var checkpoints = linkedMapOf<RelayV2TerminalCheckpointKey, RelayV2TerminalCheckpointEntity>()
         private var closed = false
         var failCommitsAfterBlock = 0
+        var throwAfterCommittedTransactions = 0
 
         override suspend fun <T> transaction(
             block: RelayV2TerminalPostCommitJournalTransaction.() -> T,
-        ): T = synchronized(lock) {
-            val beforeRows = LinkedHashMap(rows)
-            val beforeFences = LinkedHashMap(fences)
-            val beforeClosed = closed
-            val beforeOrder = nextOrder
-            try {
-                val result = block()
-                if (failCommitsAfterBlock > 0) {
-                    failCommitsAfterBlock -= 1
-                    error("injected journal commit failure after block")
+        ): T {
+            var throwAfterCommit = false
+            val result = synchronized(lock) {
+                val beforeRows = LinkedHashMap(rows)
+                val beforeFences = LinkedHashMap(fences)
+                val beforeClosed = closed
+                val beforeOrder = nextOrder
+                try {
+                    val committed = block()
+                    if (failCommitsAfterBlock > 0) {
+                        failCommitsAfterBlock -= 1
+                        error("injected journal commit failure after block")
+                    }
+                    if (throwAfterCommittedTransactions > 0) {
+                        throwAfterCommittedTransactions -= 1
+                        throwAfterCommit = true
+                    }
+                    committed
+                } catch (failure: Throwable) {
+                    rows = beforeRows
+                    fences = beforeFences
+                    closed = beforeClosed
+                    nextOrder = beforeOrder
+                    throw failure
                 }
-                result
-            } catch (failure: Throwable) {
-                rows = beforeRows
-                fences = beforeFences
-                closed = beforeClosed
-                nextOrder = beforeOrder
-                throw failure
             }
+            if (throwAfterCommit) error("injected journal result loss after commit")
+            return result
         }
 
         fun markRunning(reservationId: String, index: Int) = synchronized(lock) {

@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import android.util.Log
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatImagePart
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
@@ -74,6 +75,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialSecretVali
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.matchesCredentialBinding
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportAdapter
 import java.io.Closeable
 import java.math.BigInteger
 import java.security.MessageDigest
@@ -87,6 +89,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
@@ -111,6 +114,12 @@ internal sealed interface RelayV2AgentCapabilityAvailability {
     ) : RelayV2AgentCapabilityAvailability
 }
 
+internal enum class RelayV2ExactAuthorityRetirementResult {
+    RETIRED,
+    ALREADY_WITHDRAWN,
+    AUTHORITY_MISMATCH,
+}
+
 /**
  * Serialized Relay v2 client runtime seam.
  *
@@ -119,7 +128,7 @@ internal sealed interface RelayV2AgentCapabilityAvailability {
  */
 internal class RelayV2ConnectionActor(
     parentScope: CoroutineScope,
-    private val transportFactory: RelayV2TransportFactory,
+    private val transportFactory: MobileSessionTransportAdapter<RelayV2TransportOpenRequest>,
     private val credentialStore: RelayV2CredentialStore,
     private val connectPlanSource: RelayV2ConnectPlanSource,
     private val codec: RelayV2Codec = RelayV2Codec(),
@@ -504,6 +513,66 @@ internal class RelayV2ConnectionActor(
     }
 
     /**
+     * Withdraws the exact terminal runtime generation without depending on command-Outbox
+     * readiness. A superseded/already failed generation is already safe. If the actor still
+     * advertises the same generation but its complete authority does not match, callers must
+     * fail-close instead of retiring an inferred owner.
+     */
+    fun retireCurrentTerminalRuntime(
+        authority: RelayV2RepositoryEffectAuthority,
+        failureCode: String,
+    ): RelayV2ExactAuthorityRetirementResult {
+        val cause = TerminalIntentCause.DirectFailure(
+            failure = RelayV2ConnectionFailure(
+                kind = RelayV2FailureKind.TRANSPORT,
+                code = failureCode,
+                retryable = true,
+            ),
+            closeCode = 1013,
+            rawBytes = 0,
+        )
+        beforeTerminalClaim()
+        var authorityMismatch = false
+        val claim = synchronized(lifecycleLock) {
+            if (publishedEffectGeneration.get() != authority.generation) {
+                return@synchronized null
+            }
+            val committed = committedCallbackOwner
+            val source = activeTransport
+            val context = onlineContext
+            val currentProfile = activeProfile
+            if (lifecycleState != LifecycleState.OPEN ||
+                _state.value.phase != RelayV2ConnectionPhase.ONLINE ||
+                committed == null || source == null || context == null || currentProfile == null ||
+                committed.effectGeneration != authority.generation ||
+                committed.source !== source ||
+                !isCurrentCallbackLocked(committed.key, source) ||
+                currentProfile.identity != context.profile ||
+                currentProfile.principalId != context.principalId ||
+                currentProfile.clientInstanceId != context.clientInstanceId ||
+                currentProfile.hostId != context.hostId ||
+                context.repositoryEffectAuthority(authority.generation) != authority
+            ) {
+                authorityMismatch = true
+                return@synchronized null
+            }
+            recordTerminalIntentLocked(committed.key, cause)
+            claimPendingTerminalLocked(committed.key, source).also {
+                if (it == null) authorityMismatch = true
+            }
+        }
+        if (claim == null) {
+            return if (authorityMismatch) {
+                RelayV2ExactAuthorityRetirementResult.AUTHORITY_MISMATCH
+            } else {
+                RelayV2ExactAuthorityRetirementResult.ALREADY_WITHDRAWN
+            }
+        }
+        completeTerminalClaim(claim)
+        return RelayV2ExactAuthorityRetirementResult.RETIRED
+    }
+
+    /**
      * Atomically validates the terminal effect authority against this actor's current ONLINE
      * transport owner, then makes exactly one synchronous transport attempt. Terminal dispatch
      * intentionally has no dependency on command/Outbox execute readiness.
@@ -515,6 +584,7 @@ internal class RelayV2ConnectionActor(
         if (canonicalWireBytes.isEmpty() ||
             canonicalWireBytes.size > RelayV2Codec.PUBLIC_FRAME_BYTES
         ) {
+            logTerminalSendRejected("frame_bounds")
             return RelayV2TerminalExactGenerationSendResult.Stale
         }
         val detachedWireBytes = canonicalWireBytes.copyOf()
@@ -522,36 +592,62 @@ internal class RelayV2ConnectionActor(
             if (lifecycleState != LifecycleState.OPEN ||
                 _state.value.phase != RelayV2ConnectionPhase.ONLINE
             ) {
+                logTerminalSendRejected("actor_not_online")
                 return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
             }
             val profile = activeProfile
-                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+                ?: return@synchronized staleTerminalSend("missing_profile")
             val context = onlineContext
-                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+                ?: return@synchronized staleTerminalSend("missing_online_context")
             val source = activeTransport
-                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+                ?: return@synchronized staleTerminalSend("missing_transport")
             val committed = committedCallbackOwner
-                ?: return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+                ?: return@synchronized staleTerminalSend("missing_callback_owner")
             if (detachedWireBytes.size.toLong() > context.negotiatedLimits.maxPublicFrameBytes ||
-                detachedWireBytes.size.toLong() >
-                context.negotiatedLimits.terminalMaxFrameBytes ||
-                committed.source !== source ||
-                committed.effectGeneration != authority.generation ||
-                publishedEffectGeneration.get() != authority.generation ||
-                !isCurrentCallbackLocked(committed.key, source) ||
-                profile.identity != context.profile ||
+                detachedWireBytes.size.toLong() > context.negotiatedLimits.terminalMaxFrameBytes
+            ) {
+                return@synchronized staleTerminalSend("negotiated_frame_bounds")
+            }
+            if (committed.source !== source) {
+                return@synchronized staleTerminalSend("callback_source")
+            }
+            if (committed.effectGeneration != authority.generation) {
+                return@synchronized staleTerminalSend("committed_effect_generation")
+            }
+            if (publishedEffectGeneration.get() != authority.generation) {
+                return@synchronized staleTerminalSend("published_effect_generation")
+            }
+            if (!isCurrentCallbackLocked(committed.key, source)) {
+                return@synchronized staleTerminalSend("callback_key")
+            }
+            if (profile.identity != context.profile ||
                 profile.principalId != context.principalId ||
                 profile.clientInstanceId != context.clientInstanceId ||
-                profile.hostId != context.hostId ||
-                context.repositoryEffectAuthority(authority.generation) != authority
+                profile.hostId != context.hostId
             ) {
-                return@synchronized RelayV2TerminalExactGenerationSendResult.Stale
+                return@synchronized staleTerminalSend("profile_context")
+            }
+            if (context.repositoryEffectAuthority(authority.generation) != authority) {
+                return@synchronized staleTerminalSend("repository_authority")
             }
             if (source.send(detachedWireBytes)) {
                 RelayV2TerminalExactGenerationSendResult.Sent
             } else {
+                logTerminalSendRejected("transport_not_sent")
                 RelayV2TerminalExactGenerationSendResult.NotSent
             }
+        }
+    }
+
+    private fun staleTerminalSend(reason: String): RelayV2TerminalExactGenerationSendResult {
+        logTerminalSendRejected(reason)
+        return RelayV2TerminalExactGenerationSendResult.Stale
+    }
+
+    private fun logTerminalSendRejected(reason: String) {
+        // android.jar stubs throw from Log in local JVM tests; this diagnostic is best-effort.
+        runCatching {
+            Log.w(TERMINAL_DIAGNOSTIC_TAG, "terminal send rejected reason=$reason")
         }
     }
 
@@ -684,6 +780,10 @@ internal class RelayV2ConnectionActor(
     private val pendingAgentChatImageRequests =
         linkedMapOf<String, PendingAgentChatImageRequest>()
     private val agentChatImageScopeBySession = linkedMapOf<String, String>()
+    private val pendingAgentChatSendRequests =
+        linkedMapOf<String, PendingAgentChatSendRequest>()
+    private val retiredAgentChatSendRequests =
+        linkedMapOf<String, RetiredAgentChatSendRequest>()
     private var nextAgentExtensionAdmissionSequence = 0L
 
     init {
@@ -2693,27 +2793,39 @@ internal class RelayV2ConnectionActor(
      * schema violation.
      */
     private fun deliverAgentChatFrame(frame: AgentChatV2Frame) {
-        val context = synchronized(lifecycleLock) {
+        val inboundGeneration = synchronized(lifecycleLock) {
             val fence = agentExtensionSendFence.get()
             onlineContext?.takeIf {
                 _state.value.phase in AGENT_EXTENSION_INBOUND_PHASES &&
                     fence != null &&
                     AGENT_CHAT_V2_CAPABILITY in fence.negotiatedCapabilities &&
                     AGENT_CHAT_V2_CAPABILITY in it.negotiatedCapabilities
-            }
+            }?.let { fence?.authority?.generation }
         } ?: run {
             failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             return
         }
         when (frame) {
-            is AgentChatV2Sent -> mutateAgentChat(
-                RelayChatMutation.Sent(
-                    requestId = frame.requestId,
-                    session = frame.session,
-                    turnId = frame.turnId,
-                    nowMillis = clock(),
-                ),
-            )
+            is AgentChatV2Sent -> {
+                val disposition = synchronized(lifecycleLock) {
+                    consumeAgentChatSentLocked(frame, inboundGeneration)
+                }
+                when (disposition) {
+                    AgentChatAckDisposition.Apply -> mutateAgentChat(
+                        RelayChatMutation.Sent(
+                            requestId = frame.requestId,
+                            session = frame.session,
+                            turnId = frame.turnId,
+                            nowMillis = clock(),
+                        ),
+                    )
+                    AgentChatAckDisposition.Duplicate -> Unit
+                    AgentChatAckDisposition.Invalid -> {
+                        failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+                        return
+                    }
+                }
+            }
             is AgentChatV2Event -> {
                 mutateAgentChat(RelayChatMutation.TurnUpdated(frame.session, frame.turn.toView()))
                 synchronized(lifecycleLock) {
@@ -2766,14 +2878,16 @@ internal class RelayV2ConnectionActor(
                 requestNextAgentChatImage()
             }
             is AgentChatV2Error -> {
-                val image = synchronized(lifecycleLock) {
-                    pendingAgentChatImageRequests.remove(frame.requestId)
-                }
-                if (image != null) {
-                    mutateAgentChat(RelayChatMutation.ImageFailed(image.imageId, frame.message))
-                    requestNextAgentChatImage()
-                } else {
-                    mutateAgentChat(
+                when (val owner = synchronized(lifecycleLock) {
+                    consumeAgentChatErrorLocked(frame, inboundGeneration)
+                }) {
+                    is AgentChatErrorOwner.Image -> {
+                        mutateAgentChat(
+                            RelayChatMutation.ImageFailed(owner.request.imageId, frame.message),
+                        )
+                        requestNextAgentChatImage()
+                    }
+                    AgentChatErrorOwner.SendApply -> mutateAgentChat(
                         RelayChatMutation.SendFailed(
                             requestId = frame.requestId,
                             session = frame.sessionId,
@@ -2782,6 +2896,12 @@ internal class RelayV2ConnectionActor(
                             retryable = frame.retryable,
                         ),
                     )
+                    AgentChatErrorOwner.SendDuplicate -> Unit
+                    AgentChatErrorOwner.Unknown -> Unit
+                    AgentChatErrorOwner.Invalid -> {
+                        failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+                        return
+                    }
                 }
             }
             else -> {
@@ -3043,6 +3163,11 @@ internal class RelayV2ConnectionActor(
         data class Ready(
             val bytes: ByteArray,
             val source: RelayV2Transport,
+            val generation: RelayV2EffectGeneration,
+            val hostId: String,
+            val hostEpoch: String,
+            val scopeId: String,
+            val sessionId: String,
         ) : AgentChatSendPreparation
 
         data class Rejected(
@@ -3167,6 +3292,12 @@ internal class RelayV2ConnectionActor(
             code = "CLIENT_TRANSPORT_UNAVAILABLE",
             retryable = true,
         )
+        val fence = agentExtensionSendFence.get()
+            ?: return unavailableAgentChatSendLocked()
+        val generation = fence.authority.generation
+        if (context.repositoryEffectAuthority(generation) != fence.authority) {
+            return unavailableAgentChatSendLocked()
+        }
         val frame = AgentChatV2SendRequest(
             session = sessionId,
             message = message,
@@ -3181,6 +3312,11 @@ internal class RelayV2ConnectionActor(
             AgentChatSendPreparation.Ready(
                 bytes = agentChatCodec.encodePublicFrame(frame),
                 source = source,
+                generation = generation,
+                hostId = context.hostId,
+                hostEpoch = context.hostEpoch,
+                scopeId = scopeId,
+                sessionId = sessionId,
             )
         } catch (_: AgentChatV2CodecException) {
             AgentChatSendPreparation.Rejected(
@@ -3240,24 +3376,334 @@ internal class RelayV2ConnectionActor(
             return false
         }
         preparation as AgentChatSendPreparation.Ready
-        val sent = try {
-            preparation.source.send(preparation.bytes)
-        } catch (_: RuntimeException) {
-            false
+        val outcome = synchronized(lifecycleLock) {
+            when {
+                !isCurrentAgentChatSendLocked(preparation) -> AgentChatDispatchOutcome.Failed(
+                    AgentChatSendFailure(
+                        message = "Message was not sent because the Relay connection changed. " +
+                            "Reconnect and retry.",
+                        code = "CLIENT_AGENT_CHAT_GENERATION_CHANGED",
+                        retryable = true,
+                    ),
+                )
+                pendingAgentChatSendRequests.size >= MAX_PENDING_AGENT_CHAT_SEND_REQUESTS ||
+                    requestId in pendingAgentChatSendRequests ||
+                    requestId in retiredAgentChatSendRequests -> AgentChatDispatchOutcome.Failed(
+                    AgentChatSendFailure(
+                        message = "Message was not sent because too many Agent chat messages are " +
+                            "waiting for confirmation. Wait and retry.",
+                        code = "CLIENT_AGENT_CHAT_BUSY",
+                        retryable = true,
+                    ),
+                )
+                else -> {
+                    val pending = PendingAgentChatSendRequest(
+                        requestId = requestId,
+                        hostId = preparation.hostId,
+                        hostEpoch = preparation.hostEpoch,
+                        scopeId = preparation.scopeId,
+                        sessionId = preparation.sessionId,
+                        generation = preparation.generation,
+                        source = preparation.source,
+                        bytes = preparation.bytes,
+                    )
+                    pendingAgentChatSendRequests[requestId] = pending
+                    val sent = try {
+                        preparation.source.send(preparation.bytes)
+                    } catch (_: RuntimeException) {
+                        false
+                    }
+                    if (sent) {
+                        AgentChatDispatchOutcome.Accepted(
+                            generation = preparation.generation,
+                            attempt = pending.sendAttempt,
+                        )
+                    } else {
+                        pendingAgentChatSendRequests.remove(requestId)
+                        AgentChatDispatchOutcome.Failed(
+                            AgentChatSendFailure(
+                                message = "Message was not sent because the Relay connection was " +
+                                    "interrupted. Reconnect and retry.",
+                                code = "CLIENT_TRANSPORT_SEND_FAILED",
+                                retryable = true,
+                            ),
+                        )
+                    }
+                }
+            }
         }
-        if (sent) return true
-        mutateAgentChat(
-            RelayChatMutation.SendFailed(
-                requestId = requestId,
-                session = sessionId,
-                error = "Message was not sent because the Relay connection was interrupted. " +
-                    "Reconnect and retry.",
-                errorCode = "CLIENT_TRANSPORT_SEND_FAILED",
-                retryable = true,
+        return when (outcome) {
+            is AgentChatDispatchOutcome.Accepted -> {
+                scheduleAgentChatSendWatchdog(
+                    requestId = requestId,
+                    generation = outcome.generation,
+                    expectedAttempt = outcome.attempt,
+                )
+                true
+            }
+            is AgentChatDispatchOutcome.Failed -> {
+                mutateAgentChat(
+                    RelayChatMutation.SendFailed(
+                        requestId = requestId,
+                        session = sessionId,
+                        error = outcome.failure.message,
+                        errorCode = outcome.failure.code,
+                        retryable = outcome.failure.retryable,
+                    ),
+                )
+                false
+            }
+        }
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun isCurrentAgentChatSendLocked(
+        preparation: AgentChatSendPreparation.Ready,
+    ): Boolean {
+        val context = onlineContext ?: return false
+        val fence = agentExtensionSendFence.get() ?: return false
+        return lifecycleState == LifecycleState.OPEN &&
+            _state.value.phase == RelayV2ConnectionPhase.ONLINE &&
+            activeTransport === preparation.source &&
+            publishedEffectGeneration.get() == preparation.generation &&
+            fence.authority.generation == preparation.generation &&
+            context.repositoryEffectAuthority(preparation.generation) == fence.authority &&
+            context.hostId == preparation.hostId &&
+            context.hostEpoch == preparation.hostEpoch &&
+            AGENT_CHAT_V2_CAPABILITY in fence.negotiatedCapabilities &&
+            AGENT_CHAT_V2_CAPABILITY in context.negotiatedCapabilities
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun isCurrentAgentChatSendLocked(pending: PendingAgentChatSendRequest): Boolean =
+        isCurrentAgentChatSendLocked(
+            AgentChatSendPreparation.Ready(
+                bytes = pending.bytes,
+                source = pending.source,
+                generation = pending.generation,
+                hostId = pending.hostId,
+                hostEpoch = pending.hostEpoch,
+                scopeId = pending.scopeId,
+                sessionId = pending.sessionId,
             ),
         )
-        return false
+
+    private fun scheduleAgentChatSendWatchdog(
+        requestId: String,
+        generation: RelayV2EffectGeneration,
+        expectedAttempt: Int,
+    ) {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            extensionRequestWatchdogDelay(extensionRequestTimeoutMs)
+            handleAgentChatSendTimeout(requestId, generation, expectedAttempt)
+        }
+        val armed = synchronized(lifecycleLock) {
+            val pending = pendingAgentChatSendRequests[requestId]
+            if (pending?.generation == generation && pending.sendAttempt == expectedAttempt) {
+                pending.watchdog?.cancel()
+                pending.watchdog = job
+                true
+            } else {
+                false
+            }
+        }
+        if (armed) job.start() else job.cancel()
     }
+
+    private fun handleAgentChatSendTimeout(
+        requestId: String,
+        generation: RelayV2EffectGeneration,
+        expectedAttempt: Int,
+    ) {
+        val outcome = synchronized(lifecycleLock) {
+            val pending = pendingAgentChatSendRequests[requestId]
+                ?.takeIf {
+                    it.generation == generation && it.sendAttempt == expectedAttempt
+                }
+                ?: return@synchronized AgentChatWatchdogOutcome.Ignored
+            pending.watchdog = null
+            if (!isCurrentAgentChatSendLocked(pending)) {
+                pendingAgentChatSendRequests.remove(requestId)
+                retireAgentChatSendLocked(pending)
+                return@synchronized AgentChatWatchdogOutcome.Failed(
+                    pending.sessionId,
+                    AgentChatSendFailure(
+                        message = "Message delivery could not be confirmed because the Relay " +
+                            "connection changed. Reopen the chat and check history before sending " +
+                            "it again.",
+                        code = "CLIENT_AGENT_CHAT_CONNECTION_INTERRUPTED",
+                        retryable = false,
+                    ),
+                )
+            }
+            if (pending.sendAttempt < MAX_AGENT_CHAT_SEND_ATTEMPTS) {
+                val sent = try {
+                    pending.source.send(pending.bytes)
+                } catch (_: RuntimeException) {
+                    false
+                }
+                if (sent) {
+                    pending.sendAttempt += 1
+                    return@synchronized AgentChatWatchdogOutcome.Redriven(
+                        generation = pending.generation,
+                        attempt = pending.sendAttempt,
+                    )
+                }
+                pendingAgentChatSendRequests.remove(requestId)
+                retireAgentChatSendLocked(pending)
+                return@synchronized AgentChatWatchdogOutcome.Failed(
+                    pending.sessionId,
+                    AgentChatSendFailure(
+                        message = "Message delivery could not be confirmed because the Relay " +
+                            "connection was interrupted. Reopen the chat and check history before " +
+                            "sending it again.",
+                        code = "CLIENT_AGENT_CHAT_REDRIVE_SEND_FAILED",
+                        retryable = false,
+                    ),
+                )
+            }
+            pendingAgentChatSendRequests.remove(requestId)
+            retireAgentChatSendLocked(pending)
+            AgentChatWatchdogOutcome.Failed(
+                pending.sessionId,
+                AgentChatSendFailure(
+                    message = "Message delivery was not confirmed in time. Reopen the chat and " +
+                        "check history before sending it again.",
+                    code = "CLIENT_AGENT_CHAT_ACK_TIMEOUT",
+                    retryable = false,
+                ),
+            )
+        }
+        when (outcome) {
+            AgentChatWatchdogOutcome.Ignored -> Unit
+            is AgentChatWatchdogOutcome.Redriven -> scheduleAgentChatSendWatchdog(
+                requestId = requestId,
+                generation = outcome.generation,
+                expectedAttempt = outcome.attempt,
+            )
+            is AgentChatWatchdogOutcome.Failed -> mutateAgentChat(
+                RelayChatMutation.SendFailed(
+                    requestId = requestId,
+                    session = outcome.sessionId,
+                    error = outcome.failure.message,
+                    errorCode = outcome.failure.code,
+                    retryable = outcome.failure.retryable,
+                ),
+            )
+        }
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun retireAgentChatSendLocked(
+        pending: PendingAgentChatSendRequest,
+        outcome: AgentChatAckOutcome = AgentChatAckOutcome.AwaitingLateAck,
+    ) {
+        retiredAgentChatSendRequests[pending.requestId] = pending.retired(outcome)
+        while (retiredAgentChatSendRequests.size > MAX_RETIRED_AGENT_CHAT_SEND_REQUESTS) {
+            retiredAgentChatSendRequests.remove(retiredAgentChatSendRequests.keys.first())
+        }
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun consumeAgentChatSentLocked(
+        frame: AgentChatV2Sent,
+        generation: RelayV2EffectGeneration,
+    ): AgentChatAckDisposition {
+        val outcome = AgentChatAckOutcome.Sent(frame.turnId)
+        val pending = pendingAgentChatSendRequests[frame.requestId]
+        if (pending != null) {
+            if (!pending.matches(frame, generation)) return AgentChatAckDisposition.Invalid
+            pendingAgentChatSendRequests.remove(frame.requestId)
+            pending.watchdog?.cancel()
+            retireAgentChatSendLocked(pending, outcome)
+            return AgentChatAckDisposition.Apply
+        }
+        val retired = retiredAgentChatSendRequests[frame.requestId]
+            ?: return AgentChatAckDisposition.Invalid
+        if (!retired.matches(frame, generation)) return AgentChatAckDisposition.Invalid
+        return when (retired.outcome) {
+            AgentChatAckOutcome.AwaitingLateAck -> {
+                retiredAgentChatSendRequests[frame.requestId] = retired.copy(outcome = outcome)
+                AgentChatAckDisposition.Apply
+            }
+            outcome -> AgentChatAckDisposition.Duplicate
+            else -> AgentChatAckDisposition.Invalid
+        }
+    }
+
+    /** Guarded by [lifecycleLock]. */
+    private fun consumeAgentChatErrorLocked(
+        frame: AgentChatV2Error,
+        generation: RelayV2EffectGeneration,
+    ): AgentChatErrorOwner {
+        val image = pendingAgentChatImageRequests[frame.requestId]
+        if (image != null) {
+            if (image.hostId != frame.hostId || image.hostEpoch != frame.hostEpoch ||
+                image.scopeId != frame.scopeId || image.sessionId != frame.sessionId
+            ) return AgentChatErrorOwner.Invalid
+            pendingAgentChatImageRequests.remove(frame.requestId)
+            return AgentChatErrorOwner.Image(image)
+        }
+        val pending = pendingAgentChatSendRequests[frame.requestId]
+        if (pending != null) {
+            if (!pending.matches(frame, generation)) return AgentChatErrorOwner.Invalid
+            pendingAgentChatSendRequests.remove(frame.requestId)
+            pending.watchdog?.cancel()
+            retireAgentChatSendLocked(pending, frame.ackOutcome())
+            return AgentChatErrorOwner.SendApply
+        }
+        val retired = retiredAgentChatSendRequests[frame.requestId]
+        if (retired != null) {
+            if (!retired.matches(frame, generation)) return AgentChatErrorOwner.Invalid
+            val outcome = frame.ackOutcome()
+            return when (retired.outcome) {
+                AgentChatAckOutcome.AwaitingLateAck -> {
+                    retiredAgentChatSendRequests[frame.requestId] = retired.copy(outcome = outcome)
+                    AgentChatErrorOwner.SendApply
+                }
+                outcome -> AgentChatErrorOwner.SendDuplicate
+                else -> AgentChatErrorOwner.Invalid
+            }
+        }
+        // History requests intentionally do not create optimistic send bubbles. Their errors share
+        // the same wire shape and therefore remain outside the send ACK registry.
+        return AgentChatErrorOwner.Unknown
+    }
+
+    private fun PendingAgentChatSendRequest.matches(
+        frame: AgentChatV2Sent,
+        generation: RelayV2EffectGeneration,
+    ): Boolean = this.generation == generation &&
+        hostId == frame.hostId && hostEpoch == frame.hostEpoch &&
+        scopeId == frame.scopeId && sessionId == frame.sessionId && sessionId == frame.session
+
+    private fun PendingAgentChatSendRequest.matches(
+        frame: AgentChatV2Error,
+        generation: RelayV2EffectGeneration,
+    ): Boolean = this.generation == generation &&
+        hostId == frame.hostId && hostEpoch == frame.hostEpoch &&
+        scopeId == frame.scopeId && sessionId == frame.sessionId
+
+    private fun RetiredAgentChatSendRequest.matches(
+        frame: AgentChatV2Sent,
+        generation: RelayV2EffectGeneration,
+    ): Boolean = this.generation == generation &&
+        hostId == frame.hostId && hostEpoch == frame.hostEpoch &&
+        scopeId == frame.scopeId && sessionId == frame.sessionId && sessionId == frame.session
+
+    private fun RetiredAgentChatSendRequest.matches(
+        frame: AgentChatV2Error,
+        generation: RelayV2EffectGeneration,
+    ): Boolean = this.generation == generation &&
+        hostId == frame.hostId && hostEpoch == frame.hostEpoch &&
+        scopeId == frame.scopeId && sessionId == frame.sessionId
+
+    private fun AgentChatV2Error.ackOutcome(): AgentChatAckOutcome.Error =
+        AgentChatAckOutcome.Error(
+            code = code,
+            message = message,
+            retryable = retryable,
+        )
 
     /** Sends an `agent.chat.history` request over the current ONLINE transport. */
     fun fetchAgentChatHistory(scopeId: String, sessionId: String, limit: Int? = null): Boolean {
@@ -3567,6 +4013,21 @@ internal class RelayV2ConnectionActor(
         pendingLarkBindingRequests.values.forEach { it.watchdog?.cancel() }
         pendingLarkBindingRequests.clear()
         retiredLarkBindingRequests.clear()
+        pendingAgentChatSendRequests.values.forEach { pending ->
+            pending.watchdog?.cancel()
+            mutateAgentChat(
+                RelayChatMutation.SendFailed(
+                    requestId = pending.requestId,
+                    session = pending.sessionId,
+                    error = "Message delivery could not be confirmed because the Relay connection " +
+                        "ended. Reopen the chat and check history before sending it again.",
+                    errorCode = "CLIENT_AGENT_CHAT_CONNECTION_INTERRUPTED",
+                    retryable = false,
+                ),
+            )
+        }
+        pendingAgentChatSendRequests.clear()
+        retiredAgentChatSendRequests.clear()
         pendingAgentChatImageRequests.clear()
         agentChatImageScopeBySession.clear()
         _larkBindingsState.value = _larkBindingsState.value.copy(
@@ -6827,6 +7288,89 @@ internal class RelayV2ConnectionActor(
         val offset: Int,
     )
 
+    private data class PendingAgentChatSendRequest(
+        val requestId: String,
+        val hostId: String,
+        val hostEpoch: String,
+        val scopeId: String,
+        val sessionId: String,
+        val generation: RelayV2EffectGeneration,
+        val source: RelayV2Transport,
+        val bytes: ByteArray,
+        var sendAttempt: Int = 1,
+        var watchdog: Job? = null,
+    ) {
+        fun retired(outcome: AgentChatAckOutcome) = RetiredAgentChatSendRequest(
+            hostId = hostId,
+            hostEpoch = hostEpoch,
+            scopeId = scopeId,
+            sessionId = sessionId,
+            generation = generation,
+            outcome = outcome,
+        )
+    }
+
+    private data class RetiredAgentChatSendRequest(
+        val hostId: String,
+        val hostEpoch: String,
+        val scopeId: String,
+        val sessionId: String,
+        val generation: RelayV2EffectGeneration,
+        val outcome: AgentChatAckOutcome,
+    )
+
+    private sealed interface AgentChatAckOutcome {
+        data object AwaitingLateAck : AgentChatAckOutcome
+        data class Sent(val turnId: String) : AgentChatAckOutcome
+        data class Error(
+            val code: String,
+            val message: String,
+            val retryable: Boolean,
+        ) : AgentChatAckOutcome
+    }
+
+    private enum class AgentChatAckDisposition {
+        Apply,
+        Duplicate,
+        Invalid,
+    }
+
+    private sealed interface AgentChatErrorOwner {
+        data class Image(val request: PendingAgentChatImageRequest) : AgentChatErrorOwner
+        data object SendApply : AgentChatErrorOwner
+        data object SendDuplicate : AgentChatErrorOwner
+        data object Unknown : AgentChatErrorOwner
+        data object Invalid : AgentChatErrorOwner
+    }
+
+    private data class AgentChatSendFailure(
+        val message: String,
+        val code: String,
+        val retryable: Boolean,
+    )
+
+    private sealed interface AgentChatDispatchOutcome {
+        data class Accepted(
+            val generation: RelayV2EffectGeneration,
+            val attempt: Int,
+        ) : AgentChatDispatchOutcome
+
+        data class Failed(val failure: AgentChatSendFailure) : AgentChatDispatchOutcome
+    }
+
+    private sealed interface AgentChatWatchdogOutcome {
+        data object Ignored : AgentChatWatchdogOutcome
+        data class Redriven(
+            val generation: RelayV2EffectGeneration,
+            val attempt: Int,
+        ) : AgentChatWatchdogOutcome
+
+        data class Failed(
+            val sessionId: String,
+            val failure: AgentChatSendFailure,
+        ) : AgentChatWatchdogOutcome
+    }
+
     private enum class LarkBindingRequestKind {
         LIST,
         UPDATE_REPLY_MODE,
@@ -7423,6 +7967,8 @@ internal class RelayV2ConnectionActor(
         (normalized as com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2NormalizedPublicFrame).type
 
     companion object {
+        private const val TERMINAL_DIAGNOSTIC_TAG = "TwRelayV2Terminal"
+
         internal val REQUIRED_CAPABILITIES = listOf(
             "error.structured.v1",
             "command.ledger.v1",
@@ -7458,6 +8004,9 @@ internal class RelayV2ConnectionActor(
         private const val MAX_PENDING_AGENT_EXTENSION_REQUESTS = 64
         private const val MAX_TRACKED_AGENT_EXTENSION_REQUESTS = 1_024
         private const val MAX_RETIRED_LARK_BINDING_REQUESTS = 8
+        private const val MAX_PENDING_AGENT_CHAT_SEND_REQUESTS = 64
+        private const val MAX_RETIRED_AGENT_CHAT_SEND_REQUESTS = 128
+        private const val MAX_AGENT_CHAT_SEND_ATTEMPTS = 2
         private const val MAX_MANUAL_RESYNC_PENDING_COMMANDS = 4_096
 
         private val AGENT_EXTENSION_INBOUND_PHASES = setOf(

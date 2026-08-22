@@ -1,14 +1,13 @@
 package com.tmuxworktree.mobile.core.relay.v2.codec
 
+import com.tmuxworktree.mobile.core.session.MobileSessionFrameMetadata
+
 enum class RelayV2WebSocketChannel(val wireName: String) {
     PUBLIC("public"),
     CARRIER("carrier"),
 }
 
-data class RelayV2FrameMetadata(
-    val opcode: String = "text",
-    val compressed: Boolean = false,
-)
+typealias RelayV2FrameMetadata = MobileSessionFrameMetadata
 
 enum class RelayV2HttpsSchema(val wireName: String) {
     ENROLLMENT_REDEEM_REQUEST("enrollment.redeem.request"),

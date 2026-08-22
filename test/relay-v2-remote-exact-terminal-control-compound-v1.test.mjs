@@ -8,7 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createConnection } from "node:net";
+import { createConnection, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -112,6 +112,119 @@ async function waitForLong(predicate, message) {
   }
   assert.fail(message);
 }
+
+test("local exact compound connect is bounded and destroys a hung socket", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const socket = new Socket();
+  const target = Object.freeze({ kind: "local", targetId: "local-connect-hang" });
+  const factory = compound.captureRelayV2LocalExactCompoundChannelFactoryV1({
+    daemonSocketPath: "/tmp/tw-local-connect-hang.sock",
+    processTarget: target,
+    socketFactory() { return socket; },
+  });
+
+  const pending = factory.open(target);
+  await Promise.resolve();
+  t.mock.timers.tick(compound.RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS);
+  await assert.rejects(
+    pending,
+    (error) => error?.code === "CAPABILITY_UNAVAILABLE" && /timed out/.test(error.message),
+  );
+  assert.equal(socket.destroyed, true, "deadline fail-closes the connecting socket");
+});
+
+test("local exact compound shares one connect, write, and response deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const socket = new Socket();
+  const target = Object.freeze({ kind: "local", targetId: "local-write-hang" });
+  const factory = compound.captureRelayV2LocalExactCompoundChannelFactoryV1({
+    daemonSocketPath: "/tmp/tw-local-write-hang.sock",
+    processTarget: target,
+    socketFactory() { return socket; },
+  });
+
+  const opened = factory.open(target);
+  await Promise.resolve();
+  t.mock.timers.tick(20_000);
+  socket.emit("connect");
+  const channel = await opened;
+  let writes = 0;
+  socket.write = () => {
+    writes += 1;
+    return true;
+  };
+  const pending = channel.request({ protocolVersion: 1, type: "hello" });
+  let settled = false;
+  void pending.finally(() => { settled = true; }).catch(() => undefined);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(writes, 1, "the injected write remains permanently backpressured");
+
+  t.mock.timers.tick(9_999);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  await assert.rejects(
+    pending,
+    (error) => error?.code === "CAPABILITY_UNAVAILABLE" && /timed out/.test(error.message),
+  );
+  assert.equal(
+    socket.destroyed,
+    true,
+    "write receives only the 10s left after connect consumed 20s of the shared deadline",
+  );
+});
+
+test("remote exact compound bounds a hung SSH stdin write and retires the child", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const stdout = new ByteQueue();
+  const stderr = new ByteQueue();
+  let resolveExit;
+  const exited = new Promise((resolve) => { resolveExit = resolve; });
+  let writes = 0;
+  let kills = 0;
+  const transport = new transportModule.RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [sshTarget()],
+    runner: { spawn() { throw new Error("unexpected query"); } },
+  });
+  const channel = await transport.captureRemoteExactCompoundChannelFactory({
+    spawnCompound() {
+      return {
+        stdin: {
+          write() {
+            writes += 1;
+            return new Promise(() => undefined);
+          },
+          end() {},
+        },
+        stdout,
+        stderr,
+        exited,
+        kill(signal) {
+          kills += 1;
+          stdout.end();
+          stderr.end();
+          resolveExit({ exitCode: null, signal });
+        },
+      };
+    },
+  }).open(PROCESS_TARGET);
+
+  const pending = channel.request({ protocolVersion: 1, type: "prepare" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(writes, 1);
+  t.mock.timers.tick(compound.RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS);
+  await assert.rejects(pending, assertTransportCode("TIMED_OUT"));
+  assert.equal(kills, 1, "timeout fail-closes the SSH child exactly once");
+  await assert.rejects(
+    channel.request({ protocolVersion: 1, type: "prepare" }),
+    assertTransportCode("TIMED_OUT"),
+  );
+  assert.equal(writes, 1, "a timed-out child is never reused for another write");
+  await channel.close();
+  await transport.closeAndDrain();
+});
 
 test("compound framing is allocation-bounded and injected handles are closed before activation", async () => {
   const { manifest, cases } = readContract();

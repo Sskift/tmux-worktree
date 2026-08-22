@@ -19,7 +19,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarri
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshCoordinator
-import com.tmuxworktree.mobile.core.relay.v2.runtime.BoundedRelayV2TransportFactory
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2WebSocketTransportAdapter
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ActivationOutboxReadPort
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeComposition
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CredentialRolloverPort
@@ -136,6 +136,6 @@ class AppContainer internal constructor(
             AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY,
             LARK_BINDINGS_V2_CAPABILITY,
         ),
-        transportFactory = BoundedRelayV2TransportFactory(),
+        transportFactory = RelayV2WebSocketTransportAdapter(),
     )
 }

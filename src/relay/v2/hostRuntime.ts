@@ -64,6 +64,8 @@ export const RELAY_V2_HOST_RUNTIME_LIMITS = Object.freeze({
   maxOutboundBytesPerRoute: 1_048_576,
   maxTerminalLineagesPerRoute: 256,
   maxConnectorFences: 1_024,
+  /** Must expire before the Android terminal-open watchdog (15 seconds). */
+  terminalAuthorityTimeoutMs: 10_000,
   outboundReceiptTimeoutMs: 5_000,
 } as const);
 
@@ -575,6 +577,12 @@ const AUTHORITY_ERROR_MESSAGES: Readonly<Record<RelayV2HostRuntimeAuthorityError
   TERMINAL_RESIZE_CONFLICT: "Relay v2 terminal resize conflicts with retained state",
 };
 
+const TERMINAL_BUSY_MESSAGE =
+  "Terminal input is temporarily owned by another client; retrying is safe";
+
+const TERMINAL_AUTHORITY_TIMEOUT_MESSAGE =
+  "Terminal authority did not respond before its deadline; reconnecting and retrying is safe";
+
 function positiveLimit(value: number | undefined, production: number, name: string): number {
   const selected = value ?? production;
   if (!Number.isSafeInteger(selected) || selected <= 0 || selected > production) {
@@ -615,6 +623,11 @@ function resolveLimits(input: Partial<RuntimeLimits> = {}): RuntimeLimits {
       input.maxConnectorFences,
       RELAY_V2_HOST_RUNTIME_LIMITS.maxConnectorFences,
       "maxConnectorFences",
+    ),
+    terminalAuthorityTimeoutMs: positiveLimit(
+      input.terminalAuthorityTimeoutMs,
+      RELAY_V2_HOST_RUNTIME_LIMITS.terminalAuthorityTimeoutMs,
+      "terminalAuthorityTimeoutMs",
     ),
     outboundReceiptTimeoutMs: positiveLimit(
       input.outboundReceiptTimeoutMs,
@@ -1416,6 +1429,11 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       }
       const identity = await this.verifyCurrentIdentity(route, null, true);
       if (!identity) throw new Error("Relay v2 terminal callback lost its route fence");
+      // Identity verification is asynchronous. A hard terminal deadline may
+      // rotate the process-local H3 token while that await is pending.
+      if (this.exactAuthorityRoute(authorityRoute) !== route) {
+        throw new Error("Relay v2 terminal callback targets a stale route binding");
+      }
       this.assertPublicFrameSchema(frame);
       let pending: PendingRequest | undefined;
       if (frame.kind === "response") {
@@ -1626,7 +1644,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
           this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
           return;
         }
-        await this.dispatchTerminal(route, frame);
+        await this.dispatchTerminal(route, frame, pending);
         await this.verifyCurrentIdentity(route, pending, true);
     }
   }
@@ -1820,13 +1838,23 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     return { completion, reservation };
   }
 
-  private async dispatchTerminal(route: RouteState, frame: RelayV2JsonObject): Promise<void> {
+  private async dispatchTerminal(
+    route: RouteState,
+    frame: RelayV2JsonObject,
+    pending: PendingRequest | null,
+  ): Promise<void> {
     if (!route.terminalAdmissionReady) {
-      throw new RelayV2HostRuntimeAuthorityError("BUSY");
+      this.rejectTerminalDispatch(
+        route,
+        pending,
+        TERMINAL_BUSY_MESSAGE,
+      );
+      return;
     }
+    const authorityRoute = route.authorityRoute;
     const common = {
       auth: terminalAuth(route),
-      route: route.authorityRoute,
+      route: authorityRoute,
       streamId: stringField(frame, "streamId"),
     };
     const type = stringField(frame, "type");
@@ -1835,72 +1863,158 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       case "terminal.open": {
         const resume = Object.hasOwn(payload, "resume") ? objectField(payload, "resume") : undefined;
         const mode = stringField(payload, "mode") as "new" | "resume" | "reset";
-        await this.options.terminals.open({
-          ...common,
-          requestId: stringField(frame, "requestId"),
-          expectedHostEpoch: stringField(frame, "expectedHostEpoch"),
-          target: terminalTarget(frame),
-          openId: stringField(payload, "openId"),
-          pane: payload.pane as number,
-          cols: payload.cols as number,
-          rows: payload.rows as number,
-          mode,
-          ...(resume === undefined ? {} : {
-            resume: {
-              generation: stringField(resume, "generation"),
-              ...(mode === "resume"
-                ? { nextOffset: stringField(resume, "nextOffset") }
-                : {}),
-              resumeToken: stringField(resume, "resumeToken"),
-            },
-          }),
-        });
+        await this.dispatchTerminalAuthority(route, authorityRoute, pending, () => (
+          this.options.terminals.open({
+            ...common,
+            requestId: stringField(frame, "requestId"),
+            expectedHostEpoch: stringField(frame, "expectedHostEpoch"),
+            target: terminalTarget(frame),
+            openId: stringField(payload, "openId"),
+            pane: payload.pane as number,
+            cols: payload.cols as number,
+            rows: payload.rows as number,
+            mode,
+            ...(resume === undefined ? {} : {
+              resume: {
+                generation: stringField(resume, "generation"),
+                ...(mode === "resume"
+                  ? { nextOffset: stringField(resume, "nextOffset") }
+                  : {}),
+                resumeToken: stringField(resume, "resumeToken"),
+              },
+            }),
+          })
+        ));
         return;
       }
       case "terminal.replay_request":
-        await this.options.terminals.requestReplay({
-          ...common,
-          requestId: stringField(frame, "requestId"),
-          expectedHostEpoch: stringField(frame, "expectedHostEpoch"),
-          target: terminalTarget(frame),
-          generation: stringField(payload, "generation"),
-          fromOffset: stringField(payload, "fromOffset"),
-        });
+        await this.dispatchTerminalAuthority(route, authorityRoute, pending, () => (
+          this.options.terminals.requestReplay({
+            ...common,
+            requestId: stringField(frame, "requestId"),
+            expectedHostEpoch: stringField(frame, "expectedHostEpoch"),
+            target: terminalTarget(frame),
+            generation: stringField(payload, "generation"),
+            fromOffset: stringField(payload, "fromOffset"),
+          })
+        ));
         return;
       case "terminal.close":
-        await this.options.terminals.close({
-          ...common,
-          requestId: stringField(frame, "requestId"),
-          expectedHostEpoch: stringField(frame, "expectedHostEpoch"),
-          target: terminalTarget(frame),
-          closeId: stringField(payload, "closeId"),
-          generation: stringField(payload, "generation"),
-          resumeToken: stringField(payload, "resumeToken"),
-        });
+        await this.dispatchTerminalAuthority(route, authorityRoute, pending, () => (
+          this.options.terminals.close({
+            ...common,
+            requestId: stringField(frame, "requestId"),
+            expectedHostEpoch: stringField(frame, "expectedHostEpoch"),
+            target: terminalTarget(frame),
+            closeId: stringField(payload, "closeId"),
+            generation: stringField(payload, "generation"),
+            resumeToken: stringField(payload, "resumeToken"),
+          })
+        ));
         return;
       case "terminal.output_ack":
-        await this.options.terminals.acknowledgeOutput({
-          ...common,
-          generation: stringField(payload, "generation"),
-          nextOffset: stringField(payload, "nextOffset"),
-        });
+        await this.dispatchTerminalAuthority(route, authorityRoute, pending, () => (
+          this.options.terminals.acknowledgeOutput({
+            ...common,
+            generation: stringField(payload, "generation"),
+            nextOffset: stringField(payload, "nextOffset"),
+          })
+        ));
         return;
       case "terminal.input":
-        await this.options.terminals.input({
-          ...common,
-          generation: stringField(payload, "generation"),
-          inputSeq: stringField(payload, "inputSeq"),
-          data: Uint8Array.from(Buffer.from(stringField(payload, "data"), "base64")),
-        });
+        await this.dispatchTerminalAuthority(route, authorityRoute, pending, () => (
+          this.options.terminals.input({
+            ...common,
+            generation: stringField(payload, "generation"),
+            inputSeq: stringField(payload, "inputSeq"),
+            data: Uint8Array.from(Buffer.from(stringField(payload, "data"), "base64")),
+          })
+        ));
         return;
       case "terminal.resize":
-        await this.options.terminals.resize({
-          ...common,
-          generation: stringField(payload, "generation"),
-          resizeSeq: stringField(payload, "resizeSeq"),
-          cols: payload.cols as number,
-          rows: payload.rows as number,
-        });
+        await this.dispatchTerminalAuthority(route, authorityRoute, pending, () => (
+          this.options.terminals.resize({
+            ...common,
+            generation: stringField(payload, "generation"),
+            resizeSeq: stringField(payload, "resizeSeq"),
+            cols: payload.cols as number,
+            rows: payload.rows as number,
+          })
+        ));
+    }
+  }
+
+  private async dispatchTerminalAuthority(
+    route: RouteState,
+    authorityRoute: RelayV2HostRuntimeAuthorityRoute,
+    pending: PendingRequest | null,
+    invoke: () => Promise<void>,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const completed = await Promise.race([
+      Promise.resolve().then(invoke).then(() => true as const),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), this.limits.terminalAuthorityTimeoutMs);
+      }),
+    ]).finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+    if (completed) return;
+
+    // H3 exposes no cancellation primitive. Permanently fence this route's
+    // terminal lane before releasing operationTail: late callbacks lose their
+    // exact token, and no successor terminal mutation can overlap the timed-out
+    // authority. Optional extensions remain admitted on the carrier route.
+    this.fenceTimedOutTerminalAuthority(route, authorityRoute);
+    this.rejectTerminalDispatch(route, pending, TERMINAL_AUTHORITY_TIMEOUT_MESSAGE);
+  }
+
+  private rejectTerminalDispatch(
+    route: RouteState,
+    pending: PendingRequest | null,
+    message: string,
+  ): void {
+    if (!pending || route.pendingRequests.get(pending.requestId) !== pending) return;
+    if (!this.enqueueError(route, pending, "BUSY", message, true)) {
+      this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      return;
+    }
+    this.consumePending(route, pending);
+  }
+
+  private fenceTimedOutTerminalAuthority(
+    route: RouteState,
+    authorityRoute: RelayV2HostRuntimeAuthorityRoute,
+  ): void {
+    if (this.exactAuthorityRoute(authorityRoute) !== route) return;
+    const replaceBinding = this.isAdmitted(route) && !route.terminalUnbound;
+    this.routesByRuntimeToken.delete(authorityRoute.runtimeBindingToken);
+    route.terminalLineages.clear();
+    route.terminalAdmissionReady = false;
+    if (!replaceBinding) return;
+
+    // Keep a fresh token solely for exact route lifecycle teardown. It is not
+    // admitted to H3 on this carrier route after a hard deadline.
+    const replacement = createRelayV2TerminalRuntimeBinding(
+      route.binding,
+      randomBytes(32).toString("base64url"),
+    );
+    route.authorityRoute = replacement;
+    this.routesByRuntimeToken.set(replacement.runtimeBindingToken, route);
+    route.terminalDetachPending += 1;
+    const detached = () => {
+      route.terminalDetachPending = Math.max(0, route.terminalDetachPending - 1);
+      // Deliberately do not restore terminalAdmissionReady. Since the timed-out
+      // mutation cannot be cancelled, only a new carrier route may open a new
+      // terminal authority without overlapping it.
+      this.maybeRetireRoute(route);
+    };
+    try {
+      void Promise.resolve(
+        this.options.terminals.unbind(terminalAuth(route), authorityRoute),
+      ).then(detached, detached);
+    } catch {
+      detached();
     }
   }
 
@@ -2214,6 +2328,9 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     const identity = await this.verifyCurrentIdentity(route, pending, true);
     if (!identity || !this.isAdmitted(route)) return;
     if (pending.owner === "terminal") {
+      const terminalOpenTimedOut = structured.code === "BUSY"
+        && structured.details?.reason === "terminal_open_timeout"
+        && Object.keys(structured.details).length === 1;
       const details = structured.code === "HOST_EPOCH_MISMATCH"
         ? {
             expectedHostEpoch: this.options.hostEpoch,
@@ -2224,7 +2341,11 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         route,
         pending,
         structured.code,
-        AUTHORITY_ERROR_MESSAGES[structured.code],
+        terminalOpenTimedOut
+          ? TERMINAL_AUTHORITY_TIMEOUT_MESSAGE
+          : structured.code === "BUSY"
+          ? TERMINAL_BUSY_MESSAGE
+          : AUTHORITY_ERROR_MESSAGES[structured.code],
         structured.code === "BUSY",
         false,
         details,

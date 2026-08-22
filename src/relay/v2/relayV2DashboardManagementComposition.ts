@@ -269,7 +269,8 @@ function activateComposition(
           );
           continue;
         }
-        if (cut.status !== "failed" || cut.retryable !== true) return;
+        if (cut.status !== "stopped"
+          && (cut.status !== "failed" || cut.retryable !== true)) return;
         await waitForRelayV2HostReconnectDelay(reconnectDelayMs, abort.signal);
         if (!retryIsCurrent(abort)) return;
         const retryCut = await connectorAdapter.inspectCut();
@@ -279,7 +280,8 @@ function activateComposition(
           continue;
         }
         if (retryCut.status === "starting") continue;
-        if (retryCut.status !== "failed" || retryCut.retryable !== true) return;
+        if (retryCut.status !== "stopped"
+          && (retryCut.status !== "failed" || retryCut.retryable !== true)) return;
         reconnectDelayMs = nextRelayV2HostReconnectDelayMs(
           reconnectDelayMs,
           RELAY_V2_HOST_RECONNECT_MAXIMUM_DELAY_MS,
@@ -314,13 +316,27 @@ function activateComposition(
     const connector: RelayV2DashboardManagementConnectorPort = Object.freeze({
       inspectCut: () => connectorAdapter.inspectCut(),
       async start(input) {
-        await connectorAdapter.start(input);
-        armRetry();
+        try {
+          await connectorAdapter.start(input);
+        } finally {
+          // A transient first attempt can fail before a connector handle is
+          // published. The user intent is still running, so publish the
+          // desired-state owner even when that first acceptance rejects. A
+          // non-retryable cut is observed once and terminates the owner
+          // without a timer or hot loop.
+          armRetry();
+        }
       },
       async stop(input) {
         const retry = disarmRetry();
-        if (retry !== null) await retry;
-        await connectorAdapter.stop(input);
+        try {
+          // Fence and drain a successor that already left its retry sleep
+          // before waiting for the retry task itself. Otherwise a connecting
+          // attempt could keep stop/disable waiting on its own completion.
+          await connectorAdapter.stop(input);
+        } finally {
+          if (retry !== null) await retry;
+        }
       },
     });
     const authority = new RelayV2DashboardManagementAuthority({
@@ -354,13 +370,13 @@ function activateComposition(
       const retry = disarmRetry();
       closePromise = (async () => {
         await Promise.allSettled([...pending]);
-        if (retry !== null) await retry;
         const cut = await connectorAdapter.inspectCut();
         if (cut.status !== "stopped") {
           await connectorAdapter.stop({ requestId: COMPOSITION_CLOSE_REQUEST_ID });
           const drained = await connectorAdapter.inspectCut();
           if (drained.status !== "stopped") return closed();
         }
+        if (retry !== null) await retry;
       })().catch(() => {
         throw new RelayV2DashboardManagementCompositionClosedError();
       });

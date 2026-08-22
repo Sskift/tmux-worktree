@@ -780,7 +780,9 @@ export async function completeRelayV2HostRuntimeCompositionFromRecoveredH2(
   if (capturedAuthorities === null) {
     throw new Error("invalid Relay v2 host composition authority input");
   }
-  const readinessOwner = new RelayV2HostCapabilityReadiness();
+  const readinessOwner = new RelayV2HostCapabilityReadiness({
+    terminalAuthorityAffectsBaseReadiness: false,
+  });
   const rawSources = Object.freeze({
     codec: readinessOwner.source("codec"),
     carrier: readinessOwner.source("carrier"),

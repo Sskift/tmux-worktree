@@ -122,6 +122,53 @@ test("six typed sources default false and publish only the atomic frozen base se
   assert.equal(observed.length, beforeDuplicate, "unsubscribe must release the bounded slot");
 });
 
+test("production Mobile Session readiness survives H3 terminal authority loss", () => {
+  const owner = new readinessModule.RelayV2HostCapabilityReadiness({
+    terminalAuthorityAffectsBaseReadiness: false,
+  });
+  const sources = Object.fromEntries(
+    EXPECTED_SOURCES.map((source) => [source, owner.source(source)]),
+  );
+  const observed = [];
+  owner.subscribe({
+    apply(snapshot) {
+      observed.push(CAPABILITIES.every(
+        (capability) => snapshot.capabilities[capability] === true,
+      ));
+      return true;
+    },
+    close() { assert.fail("terminal loss must not close Mobile Session readiness"); },
+  });
+
+  for (const source of EXPECTED_SOURCES.filter((candidate) => candidate !== "h3")) {
+    assert.equal(sources[source].apply(sourceSnapshot(source, "1", true)), true);
+  }
+  assertExactIntersection(owner.current(), true);
+  const publicationBeforeH3 = owner.current().generation;
+
+  assert.equal(sources.h3.apply(sourceSnapshot("h3", "1", true)), true);
+  assert.equal(owner.current().generation, publicationBeforeH3);
+  let trapped = false;
+  const codecRefresh = new Proxy(sourceSnapshot("codec", "2", true), {
+    getOwnPropertyDescriptor(target, property) {
+      if (!trapped) {
+        trapped = true;
+        sources.h3.close();
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  assert.equal(sources.codec.apply(codecRefresh), true);
+  assert.equal(trapped, true);
+  assertExactIntersection(owner.current(), true);
+  assert.ok(BigInt(owner.current().generation) > BigInt(publicationBeforeH3));
+  assert.equal(observed.at(-1), true);
+
+  sources.h2.close();
+  assertExactIntersection(owner.current(), false);
+  assert.equal(observed.at(-1), false);
+});
+
 test("pre-carrier offers are opaque one-shot exact bindings and stale cuts require a new offer", () => {
   const { owner, sources } = makePreCarrierReady();
   const bindings = [];

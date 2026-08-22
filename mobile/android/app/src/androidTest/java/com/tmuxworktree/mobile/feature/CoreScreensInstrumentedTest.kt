@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.feature
 
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -270,6 +271,11 @@ class CoreScreensInstrumentedTest {
         }
 
         composeRule.onNodeWithTag("terminal_font_decrease")
+            .assertDoesNotExist()
+        composeRule.onNodeWithTag("terminal_options")
+            .assertIsDisplayed()
+            .performClick()
+        composeRule.onNodeWithTag("terminal_font_decrease")
             .assertIsNotEnabled()
         composeRule.onNodeWithTag("terminal_font_increase")
             .assertIsEnabled()
@@ -314,6 +320,8 @@ class CoreScreensInstrumentedTest {
         composeRule.onNodeWithTag("terminal_retry_input")
             .assertIsDisplayed()
             .performClick()
+        composeRule.onNodeWithTag("terminal_options")
+            .performClick()
         composeRule.onNodeWithTag("terminal_read_only")
             .assertContentDescriptionEquals("Retry terminal input")
             .performClick()
@@ -321,6 +329,63 @@ class CoreScreensInstrumentedTest {
         composeRule.runOnIdle {
             assertEquals(2, retryCount)
             assertEquals(0, toggleCount)
+        }
+    }
+
+    @Test
+    fun localInputLockDoesNotDisposeTerminalContentOrInvokeLifecycleCallbacks() {
+        var readOnly by mutableStateOf(false)
+        var toggleCount = 0
+        var retryCount = 0
+        var reconnectCount = 0
+        var contentMountCount = 0
+        var contentDisposeCount = 0
+        composeRule.setContent {
+            TwTheme {
+                TerminalScreen(
+                    sessionTitle = "stable terminal",
+                    connectionStatus = ConnectionStatus.ONLINE,
+                    isReadOnly = readOnly,
+                    ownershipReadOnly = false,
+                    keyboardVisible = false,
+                    terminalFontSizeSp = 14,
+                    disconnectReason = null,
+                    onBack = {},
+                    onConnectionStatusClick = {},
+                    onReconnect = { reconnectCount++ },
+                    onToggleKeyboard = {},
+                    onDecreaseFont = {},
+                    onIncreaseFont = {},
+                    onToggleReadOnly = {
+                        toggleCount++
+                        readOnly = !readOnly
+                    },
+                    onRetryInput = { retryCount++ },
+                    terminalContent = {
+                        DisposableEffect(Unit) {
+                            contentMountCount++
+                            onDispose { contentDisposeCount++ }
+                        }
+                    },
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("terminal_options").performClick()
+        composeRule.onNodeWithTag("terminal_read_only")
+            .assertContentDescriptionEquals("Switch terminal to read-only")
+            .performClick()
+        composeRule.onNodeWithTag("terminal_options").performClick()
+        composeRule.onNodeWithTag("terminal_read_only")
+            .assertContentDescriptionEquals("Enable terminal input")
+            .performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(2, toggleCount)
+            assertEquals(0, retryCount)
+            assertEquals(0, reconnectCount)
+            assertEquals(1, contentMountCount)
+            assertEquals(0, contentDisposeCount)
         }
     }
 

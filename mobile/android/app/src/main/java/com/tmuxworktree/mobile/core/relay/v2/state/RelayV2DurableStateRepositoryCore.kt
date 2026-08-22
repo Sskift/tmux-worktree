@@ -19,10 +19,16 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuth
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpoint
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpointReducer
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCorrelatedError
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalEffect
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIgnoredReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenMode
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPendingOpen
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPendingClose
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenTarget
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenResume
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOutcome
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserRestoreProof
@@ -263,6 +269,44 @@ internal interface RelayV2TerminalRuntimeAuthority {
     ): RelayV2TerminalReduction
 }
 
+/**
+ * Result of correlating a generic terminal error after presentation has released its attachment.
+ *
+ * This is deliberately narrower than a normal terminal reduction. It can prove that an issued
+ * request owns the error, but it never retires or rewrites the live Host lineage: doing that
+ * requires an acknowledged, route-bound abandon protocol rather than a local Room deletion.
+ */
+internal sealed interface RelayV2DetachedTerminalErrorResult {
+    data class Consumed(
+        /** Non-null only when the error rejects the checkpoint's exact current open request. */
+        val currentOpenError: RelayV2TerminalCorrelatedError?,
+        /** Non-null only when the error rejects the checkpoint's exact current close request. */
+        val currentCloseError: RelayV2TerminalCorrelatedError? = null,
+    ) : RelayV2DetachedTerminalErrorResult
+
+    data object NotOwned : RelayV2DetachedTerminalErrorResult
+
+    data class ProtocolViolation(
+        val code: String,
+    ) : RelayV2DetachedTerminalErrorResult
+}
+
+/**
+ * Correlation of terminal.opened after presentation released its parser attachment. CURRENT has
+ * been durably adopted into a renderer-free RESET_REQUIRED checkpoint before it is returned.
+ */
+internal sealed interface RelayV2DetachedTerminalOpenedResult {
+    data object Current : RelayV2DetachedTerminalOpenedResult
+
+    data object IssuedOld : RelayV2DetachedTerminalOpenedResult
+
+    data object NotOwned : RelayV2DetachedTerminalOpenedResult
+
+    data class ProtocolViolation(
+        val code: String,
+    ) : RelayV2DetachedTerminalOpenedResult
+}
+
 /** Startup-only recovery port paired with the durable post-commit journal owner. */
 internal interface RelayV2TerminalRecoveryAuthority : RelayV2TerminalRuntimeAuthority {
     suspend fun claimResumableTerminalUnderApplyLease(
@@ -278,6 +322,67 @@ internal interface RelayV2TerminalRecoveryAuthority : RelayV2TerminalRuntimeAuth
         authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2TerminalReduction?
+
+    suspend fun recoverPostCommitUnknownWithContinuity(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        currentParserContinuityId: String,
+    ): RelayV2TerminalReduction? = recoverPostCommitUnknown(authority, key)
+
+    suspend fun correlateDetachedTerminalErrorUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.CorrelatedError,
+    ): RelayV2DetachedTerminalErrorResult = RelayV2DetachedTerminalErrorResult.NotOwned
+
+    suspend fun correlateDetachedTerminalOpenedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Opened,
+    ): RelayV2DetachedTerminalOpenedResult = RelayV2DetachedTerminalOpenedResult.NotOwned
+
+    /** Atomically records disposal before an exact pre-open owner is released. */
+    suspend fun ensureTerminalCloseWhenOpenedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction? = null
+
+    /** Atomically adopts an exact detached pre-open response directly into pending close. */
+    suspend fun adoptDetachedTerminalOpenedForCloseUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Opened,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction? = null
+
+    /** Atomically finalizes the exact close-only/detached owner without parser replay. */
+    suspend fun consumeDetachedTerminalClosedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Closed,
+    ): RelayV2TerminalReduction? = null
+
+    /** Atomically advances a renderer-free discard cursor before its exact OutputAck is sent. */
+    suspend fun consumeRendererFreeTerminalOutputUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Output,
+    ): RelayV2TerminalReduction? = null
+
+    /** Atomically correlates a renderer-free reset without granting parser/UI authority. */
+    suspend fun consumeRendererFreeTerminalResetUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction? = null
+
+    /** Rebinds one durable detached owner to the current actor and atomically requests close. */
+    suspend fun claimTerminalCloseUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalResumeClaim? = null
 }
 
 /** UI-free exact Session selector used only to locate a durable terminal checkpoint. */
@@ -689,7 +794,10 @@ internal class RelayV2DurableStateRepositoryCore(
             }
             decoded.filter { (_, stored) ->
                 (stored as? RelayV2TerminalStoredCheckpoint.Present)
-                    ?.checkpoint?.phase == RelayV2TerminalPhase.FINALIZED
+                    ?.checkpoint?.phase in setOf(
+                    RelayV2TerminalPhase.FINALIZED,
+                    RelayV2TerminalPhase.LOST,
+                )
             }.forEach { (key, stored) ->
                 val checkpoint = (stored as RelayV2TerminalStoredCheckpoint.Present).checkpoint
                 check(finalizedCheckpointIsPrunable(checkpoint)) {
@@ -703,7 +811,11 @@ internal class RelayV2DurableStateRepositoryCore(
                 when (stored) {
                     is RelayV2TerminalStoredCheckpoint.PreOpen -> key to stored
                     is RelayV2TerminalStoredCheckpoint.Present ->
-                        if (stored.checkpoint.phase == RelayV2TerminalPhase.FINALIZED) null
+                        if (stored.checkpoint.phase in setOf(
+                                RelayV2TerminalPhase.FINALIZED,
+                                RelayV2TerminalPhase.LOST,
+                            )
+                        ) null
                         else key to stored
                     is RelayV2TerminalStoredCheckpoint.Invalid -> error("Handled above")
                     RelayV2TerminalStoredCheckpoint.Missing -> null
@@ -802,7 +914,12 @@ internal class RelayV2DurableStateRepositoryCore(
                     val resetRequired =
                         restored.outcome is RelayV2TerminalOutcome.ResetRequired &&
                             current?.phase == RelayV2TerminalPhase.RESET_REQUIRED
-                    if (restored.outcome is RelayV2TerminalOutcome.Restored ||
+                    if (current?.pendingClose != null) {
+                        // A previous actor may have crashed after committing terminal.opened into
+                        // pending-close but before the idempotent wire close was accepted. Closing
+                        // wins over presentation recovery; never mint a RESUME open for this row.
+                        RelayV2TerminalCheckpointReducer.redeliverPendingClose(current)
+                    } else if (restored.outcome is RelayV2TerminalOutcome.Restored ||
                         resetRequired
                     ) {
                         checkNotNull(current)
@@ -916,6 +1033,485 @@ internal class RelayV2DurableStateRepositoryCore(
     override suspend fun recoverPostCommitUnknown(
         authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalReduction? = recoverPostCommitUnknown(
+        authority,
+        key,
+        currentParserContinuityId = null,
+    )
+
+    override suspend fun recoverPostCommitUnknownWithContinuity(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        currentParserContinuityId: String,
+    ): RelayV2TerminalReduction? = recoverPostCommitUnknown(
+        authority,
+        key,
+        currentParserContinuityId,
+    )
+
+    override suspend fun correlateDetachedTerminalErrorUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.CorrelatedError,
+    ): RelayV2DetachedTerminalErrorResult {
+        if (authority.profileId != key.profileId ||
+            authority.profileActivationGeneration != key.profileActivationGeneration ||
+            authority.principalId != key.principalId ||
+            authority.clientInstanceId != key.clientInstanceId ||
+            authority.hostId != key.hostId ||
+            authority.hostEpoch != key.hostEpoch
+        ) {
+            return RelayV2DetachedTerminalErrorResult.NotOwned
+        }
+        val result = store.transaction {
+            val stored = decodeTerminal(key)
+            if (stored is RelayV2TerminalStoredCheckpoint.Invalid) {
+                return@transaction RelayV2DetachedTerminalErrorResult.ProtocolViolation(
+                    "INVALID_TERMINAL_CHECKPOINT",
+                )
+            }
+            if (stored is RelayV2TerminalStoredCheckpoint.Missing) {
+                return@transaction RelayV2DetachedTerminalErrorResult.NotOwned
+            }
+            val target: RelayV2TerminalOpenTarget
+            val deliveryToken: RelayV2TerminalDeliveryToken
+            val currentOpenRequestId: String?
+            val currentCloseRequestId: String?
+            val reduction = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+                    target = stored.checkpoint.target
+                    deliveryToken = stored.checkpoint.deliveryToken
+                    currentOpenRequestId = stored.checkpoint.pendingOpen?.requestId
+                    currentCloseRequestId = null
+                    RelayV2TerminalCheckpointReducer.reduce(stored.checkpoint, action)
+                }
+                is RelayV2TerminalStoredCheckpoint.Present -> {
+                    target = stored.checkpoint.identity.target()
+                    deliveryToken = stored.checkpoint.deliveryToken
+                    currentOpenRequestId = stored.checkpoint.pendingOpen?.requestId
+                    currentCloseRequestId = stored.checkpoint.pendingClose?.requestId
+                    RelayV2TerminalCheckpointReducer.reduce(stored.checkpoint, action)
+                }
+                is RelayV2TerminalStoredCheckpoint.Invalid,
+                RelayV2TerminalStoredCheckpoint.Missing,
+                -> error("Handled above")
+            }
+            if (target != key.toTarget()) {
+                return@transaction RelayV2DetachedTerminalErrorResult.ProtocolViolation(
+                    "TERMINAL_CHECKPOINT_IDENTITY_MISMATCH",
+                )
+            }
+            if (deliveryToken.actorGeneration != authority.generation) {
+                return@transaction RelayV2DetachedTerminalErrorResult.NotOwned
+            }
+            when (val outcome = reduction.outcome) {
+                is RelayV2TerminalOutcome.CorrelatedErrorRejected -> {
+                    // Re-persist the reducer result even though correlation currently has no state
+                    // delta. This keeps the durable reducer as the sole normalization boundary if
+                    // that outcome later gains bookkeeping. In particular, never delete a stream
+                    // conflict locally: the Host may still own its backend, lease and close slot.
+                    persistTerminalReduction(key, reduction)
+                    RelayV2DetachedTerminalErrorResult.Consumed(
+                        currentOpenError = action.error.takeIf {
+                            action.requestId == currentOpenRequestId
+                        },
+                        currentCloseError = action.error.takeIf {
+                            action.requestId == currentCloseRequestId
+                        },
+                    )
+                }
+                is RelayV2TerminalOutcome.ProtocolViolation ->
+                    RelayV2DetachedTerminalErrorResult.ProtocolViolation(outcome.code)
+                is RelayV2TerminalOutcome.Ignored ->
+                    RelayV2DetachedTerminalErrorResult.NotOwned
+                else -> RelayV2DetachedTerminalErrorResult.ProtocolViolation(
+                    "UNEXPECTED_DETACHED_TERMINAL_ERROR_REDUCTION",
+                )
+            }
+        }
+        return result
+    }
+
+    override suspend fun correlateDetachedTerminalOpenedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Opened,
+    ): RelayV2DetachedTerminalOpenedResult {
+        if (authority.profileId != key.profileId ||
+            authority.profileActivationGeneration != key.profileActivationGeneration ||
+            authority.principalId != key.principalId ||
+            authority.clientInstanceId != key.clientInstanceId ||
+            authority.hostId != key.hostId ||
+            authority.hostEpoch != key.hostEpoch
+        ) {
+            return RelayV2DetachedTerminalOpenedResult.NotOwned
+        }
+        return store.transaction {
+            val stored = decodeTerminal(key)
+            if (stored is RelayV2TerminalStoredCheckpoint.Invalid) {
+                return@transaction RelayV2DetachedTerminalOpenedResult.ProtocolViolation(
+                    "INVALID_TERMINAL_CHECKPOINT",
+                )
+            }
+            if (stored is RelayV2TerminalStoredCheckpoint.Missing) {
+                return@transaction RelayV2DetachedTerminalOpenedResult.NotOwned
+            }
+            val target: RelayV2TerminalOpenTarget
+            val deliveryToken: RelayV2TerminalDeliveryToken
+            val pendingOpen: RelayV2TerminalPendingOpen?
+            val reduction = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+                    target = stored.checkpoint.target
+                    deliveryToken = stored.checkpoint.deliveryToken
+                    pendingOpen = stored.checkpoint.pendingOpen
+                    RelayV2TerminalCheckpointReducer.reduceDetachedOpened(
+                        stored.checkpoint,
+                        action,
+                    )
+                }
+                is RelayV2TerminalStoredCheckpoint.Present -> {
+                    target = stored.checkpoint.identity.target()
+                    deliveryToken = stored.checkpoint.deliveryToken
+                    pendingOpen = stored.checkpoint.pendingOpen
+                    RelayV2TerminalCheckpointReducer.reduceDetachedOpened(
+                        stored.checkpoint,
+                        action,
+                    )
+                }
+                is RelayV2TerminalStoredCheckpoint.Invalid,
+                RelayV2TerminalStoredCheckpoint.Missing,
+                -> error("Handled above")
+            }
+            if (target != key.toTarget() || action.identity.target() != key.toTarget()) {
+                return@transaction RelayV2DetachedTerminalOpenedResult.ProtocolViolation(
+                    "TERMINAL_OPENED_IDENTITY_MISMATCH",
+                )
+            }
+            if (deliveryToken.actorGeneration != authority.generation) {
+                return@transaction RelayV2DetachedTerminalOpenedResult.NotOwned
+            }
+            when (val outcome = reduction.outcome) {
+                is RelayV2TerminalOutcome.ResetRequired -> if (
+                    outcome.reason == RelayV2TerminalResetReason.STREAM_LOST &&
+                    pendingOpen != null && action.requestId == pendingOpen.requestId
+                ) {
+                    val adopted = reduction.checkpoint
+                    if (adopted?.phase != RelayV2TerminalPhase.RESET_REQUIRED ||
+                        adopted.pendingClose != null || reduction.effects.isNotEmpty()
+                    ) {
+                        return@transaction RelayV2DetachedTerminalOpenedResult.ProtocolViolation(
+                            "INVALID_DETACHED_TERMINAL_ADOPTION",
+                        )
+                    }
+                    persistTerminalReduction(key, reduction)
+                    RelayV2DetachedTerminalOpenedResult.Current
+                } else {
+                    RelayV2DetachedTerminalOpenedResult.ProtocolViolation(
+                        "UNEXPECTED_DETACHED_TERMINAL_OPENED_OWNER",
+                    )
+                }
+                is RelayV2TerminalOutcome.Ignored -> if (
+                    outcome.reason == RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE &&
+                    pendingOpen != null &&
+                    action.requestId != pendingOpen.requestId &&
+                    action.requestId in pendingOpen.issuedRequestIds
+                ) {
+                    RelayV2DetachedTerminalOpenedResult.IssuedOld
+                } else {
+                    RelayV2DetachedTerminalOpenedResult.NotOwned
+                }
+                is RelayV2TerminalOutcome.ProtocolViolation ->
+                    RelayV2DetachedTerminalOpenedResult.ProtocolViolation(outcome.code)
+                else -> RelayV2DetachedTerminalOpenedResult.ProtocolViolation(
+                    "INVALID_DETACHED_TERMINAL_OPENED",
+                )
+            }
+        }
+    }
+
+    override suspend fun adoptDetachedTerminalOpenedForCloseUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Opened,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction? {
+        if (authority.profileId != key.profileId ||
+            authority.profileActivationGeneration != key.profileActivationGeneration ||
+            authority.principalId != key.principalId ||
+            authority.clientInstanceId != key.clientInstanceId ||
+            authority.hostId != key.hostId ||
+            authority.hostEpoch != key.hostEpoch
+        ) return null
+        val reduction = store.transaction {
+            val stored = decodeTerminal(key)
+            val reduction = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+                    val checkpoint = stored.checkpoint
+                    if (checkpoint.target != key.toTarget() ||
+                        action.identity.target() != key.toTarget() ||
+                        checkpoint.deliveryToken.actorGeneration != authority.generation ||
+                        checkpoint.pendingClose != pendingClose
+                    ) return@transaction null
+                    RelayV2TerminalCheckpointReducer.reduceDetachedOpened(
+                        checkpoint = checkpoint,
+                        action = action,
+                        pendingClose = pendingClose,
+                    )
+                }
+                is RelayV2TerminalStoredCheckpoint.Present -> {
+                    val checkpoint = stored.checkpoint
+                    if (checkpoint.identity.target() != key.toTarget() ||
+                        action.identity.target() != key.toTarget() ||
+                        checkpoint.deliveryToken.actorGeneration != authority.generation ||
+                        checkpoint.pendingOpen == null ||
+                        checkpoint.pendingCloseWhenOpened != pendingClose
+                    ) return@transaction null
+                    RelayV2TerminalCheckpointReducer.reduceDetachedOpened(
+                        checkpoint = checkpoint,
+                        action = action,
+                    )
+                }
+                RelayV2TerminalStoredCheckpoint.Missing,
+                is RelayV2TerminalStoredCheckpoint.Invalid,
+                -> return@transaction null
+            }
+            reduction.takeIf { result ->
+                result.outcome == RelayV2TerminalOutcome.Applied &&
+                    result.checkpoint?.pendingClose == pendingClose &&
+                    result.checkpoint.pendingCloseWhenOpened == null &&
+                    result.effects.singleOrNull() is RelayV2TerminalEffect.SendClose
+            }?.also { persistTerminalReduction(key, it) }
+        }
+        reduction?.rememberReducedKey(key)
+        return reduction
+    }
+
+    override suspend fun consumeDetachedTerminalClosedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Closed,
+    ): RelayV2TerminalReduction? {
+        if (!authorityOwnsKey(authority, key)) return null
+        val reduction = store.transaction {
+            val stored = decodeTerminal(key) as? RelayV2TerminalStoredCheckpoint.Present
+                ?: return@transaction null
+            val checkpoint = stored.checkpoint
+            if (checkpoint.identity.target() != key.toTarget() ||
+                checkpoint.deliveryToken.actorGeneration != authority.generation
+            ) return@transaction null
+            RelayV2TerminalCheckpointReducer.reduceDetachedClosed(
+                checkpoint,
+                action,
+            ).also { result ->
+                if (result.outcome == RelayV2TerminalOutcome.ClosedFinalized) {
+                    persistTerminalReduction(key, result)
+                }
+            }
+        }
+        if (reduction?.outcome == RelayV2TerminalOutcome.ClosedFinalized) {
+            reduction.rememberReducedKey(key)
+        }
+        return reduction
+    }
+
+    override suspend fun consumeRendererFreeTerminalOutputUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction.Output,
+    ): RelayV2TerminalReduction? {
+        if (!authorityOwnsKey(authority, key)) return null
+        val reduction = store.transaction {
+            val stored = decodeTerminal(key) as? RelayV2TerminalStoredCheckpoint.Present
+                ?: return@transaction null
+            val checkpoint = stored.checkpoint
+            if (checkpoint.identity.target() != key.toTarget() ||
+                checkpoint.deliveryToken.actorGeneration != authority.generation
+            ) return@transaction null
+            RelayV2TerminalCheckpointReducer.discardRendererFreeOutput(
+                checkpoint,
+                action,
+            ).also { result ->
+                if (result.outcome == RelayV2TerminalOutcome.Applied) {
+                    persistTerminalReduction(key, result)
+                }
+            }
+        }
+        if (reduction?.outcome == RelayV2TerminalOutcome.Applied) {
+            reduction.rememberReducedKey(key)
+        }
+        return reduction
+    }
+
+    override suspend fun consumeRendererFreeTerminalResetUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction? {
+        if (!authorityOwnsKey(authority, key) ||
+            action !is RelayV2TerminalAction.CorrelatedResetRequired &&
+            action !is RelayV2TerminalAction.AsyncResetRequired
+        ) return null
+        val reduction = store.transaction {
+            val stored = decodeTerminal(key) as? RelayV2TerminalStoredCheckpoint.Present
+                ?: return@transaction null
+            val checkpoint = stored.checkpoint
+            if (checkpoint.identity.target() != key.toTarget() ||
+                checkpoint.deliveryToken.actorGeneration != authority.generation
+            ) return@transaction null
+            RelayV2TerminalCheckpointReducer.reduceRendererFreeReset(
+                checkpoint,
+                action,
+            ).also { result ->
+                if (result.outcome is RelayV2TerminalOutcome.ResetRequired ||
+                    result.outcome == RelayV2TerminalOutcome.LostFinalized ||
+                    result.outcome == RelayV2TerminalOutcome.Applied
+                ) {
+                    persistTerminalReduction(key, result)
+                }
+            }
+        }
+        if (reduction != null &&
+            (reduction.outcome is RelayV2TerminalOutcome.ResetRequired ||
+                reduction.outcome == RelayV2TerminalOutcome.LostFinalized ||
+                reduction.outcome == RelayV2TerminalOutcome.Applied)
+        ) {
+            reduction.rememberReducedKey(key)
+        }
+        return reduction
+    }
+
+    override suspend fun claimTerminalCloseUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalResumeClaim? {
+        if (!authorityOwnsKey(authority, key)) return null
+        val claim = store.transaction {
+            val stored = decodeTerminal(key) as? RelayV2TerminalStoredCheckpoint.Present
+                ?: return@transaction null
+            val checkpoint = stored.checkpoint
+            if (checkpoint.identity.target() != key.toTarget() ||
+                checkpoint.closed != null ||
+                checkpoint.deliveryToken.authorityGeneration == Long.MAX_VALUE
+            ) return@transaction null
+            val rebound = if (checkpoint.deliveryToken.actorGeneration == authority.generation) {
+                checkpoint
+            } else {
+                val delivery = RelayV2TerminalDeliveryToken(
+                    actorGeneration = authority.generation,
+                    authorityGeneration = checkpoint.deliveryToken.authorityGeneration + 1,
+                    localDispatchToken = 1,
+                )
+                val reboundReduction = RelayV2TerminalCheckpointReducer.reduce(
+                    checkpoint,
+                    RelayV2TerminalAction.RebindDelivery(
+                        identity = checkpoint.identity,
+                        currentDeliveryToken = checkpoint.deliveryToken,
+                        newDeliveryToken = delivery,
+                        parserContinuityId = checkpoint.parserContinuityId,
+                    ),
+                )
+                reboundReduction.checkpoint?.takeIf {
+                    it.deliveryToken == delivery
+                } ?: return@transaction null
+            }
+            val requested = if (rebound.pendingOpen != null ||
+                rebound.pendingCloseWhenOpened != null
+            ) {
+                RelayV2TerminalCheckpointReducer.ensureCloseWhenOpened(
+                    rebound,
+                    pendingClose,
+                ).takeIf { result ->
+                    result.outcome == RelayV2TerminalOutcome.Applied &&
+                        result.checkpoint?.pendingCloseWhenOpened == pendingClose &&
+                        result.effects.none {
+                            it is RelayV2TerminalEffect.SendClose ||
+                                it is RelayV2TerminalEffect.WriteParser ||
+                                it is RelayV2TerminalEffect.ResetParser
+                        }
+                }
+            } else {
+                RelayV2TerminalCheckpointReducer.requestDetachedClose(
+                    rebound,
+                    pendingClose,
+                ).takeIf { result ->
+                    result.outcome == RelayV2TerminalOutcome.Applied &&
+                        result.checkpoint?.pendingClose == pendingClose &&
+                        result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>()
+                            .size == 1 &&
+                        result.effects.none {
+                            it is RelayV2TerminalEffect.WriteParser ||
+                                it is RelayV2TerminalEffect.ResetParser
+                        }
+                }
+            } ?: return@transaction null
+            persistTerminalReduction(key, requested)
+            RelayV2TerminalResumeClaim(key, requested)
+        }
+        claim?.reduction?.rememberRestoreOutcome(claim.key)
+        return claim
+    }
+
+    override suspend fun ensureTerminalCloseWhenOpenedUnderApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction? {
+        if (authority.profileId != key.profileId ||
+            authority.profileActivationGeneration != key.profileActivationGeneration ||
+            authority.principalId != key.principalId ||
+            authority.clientInstanceId != key.clientInstanceId ||
+            authority.hostId != key.hostId ||
+            authority.hostEpoch != key.hostEpoch
+        ) return null
+        val reduction = store.transaction {
+            val stored = decodeTerminal(key)
+            val reduction = when (stored) {
+                is RelayV2TerminalStoredCheckpoint.PreOpen -> {
+                    val checkpoint = stored.checkpoint
+                    if (checkpoint.target != key.toTarget() ||
+                        checkpoint.deliveryToken.actorGeneration != authority.generation
+                    ) return@transaction null
+                    RelayV2TerminalCheckpointReducer.ensureCloseWhenOpened(
+                        checkpoint = checkpoint,
+                        pendingClose = pendingClose,
+                    )
+                }
+                is RelayV2TerminalStoredCheckpoint.Present -> {
+                    val checkpoint = stored.checkpoint
+                    if (checkpoint.identity.target() != key.toTarget() ||
+                        checkpoint.deliveryToken.actorGeneration != authority.generation ||
+                        (checkpoint.pendingOpen == null &&
+                            checkpoint.pendingCloseWhenOpened == null)
+                    ) return@transaction null
+                    RelayV2TerminalCheckpointReducer.ensureCloseWhenOpened(
+                        checkpoint = checkpoint,
+                        pendingClose = pendingClose,
+                    )
+                }
+                RelayV2TerminalStoredCheckpoint.Missing,
+                is RelayV2TerminalStoredCheckpoint.Invalid,
+                -> return@transaction null
+            }
+            reduction.takeIf { result ->
+                result.outcome == RelayV2TerminalOutcome.Applied &&
+                    result.effects.none {
+                        it is RelayV2TerminalEffect.SendClose ||
+                            it is RelayV2TerminalEffect.WriteParser ||
+                            it is RelayV2TerminalEffect.ResetParser
+                    } &&
+                    (result.preOpenCheckpoint?.pendingClose == pendingClose ||
+                        result.checkpoint?.pendingCloseWhenOpened == pendingClose)
+            }?.also { persistTerminalReduction(key, it) }
+        }
+        reduction?.rememberReducedKey(key)
+        return reduction
+    }
+
+    private suspend fun recoverPostCommitUnknown(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        currentParserContinuityId: String?,
     ): RelayV2TerminalReduction? {
         require(authority.profileId == key.profileId)
         require(authority.profileActivationGeneration == key.profileActivationGeneration)
@@ -935,7 +1531,7 @@ internal class RelayV2DurableStateRepositoryCore(
                 expectedIdentity = checkpoint.identity,
                 expectedOpenAttempt = checkpoint.openAttempt,
                 currentDeliveryToken = checkpoint.deliveryToken,
-                currentParserContinuityId = null,
+                currentParserContinuityId = currentParserContinuityId,
                 parserOperationProof = null,
             )
             if (reduction.outcome !is RelayV2TerminalOutcome.ResetRequired) {
@@ -947,6 +1543,16 @@ internal class RelayV2DurableStateRepositoryCore(
         result?.rememberRestoreOutcome(key)
         return result
     }
+
+    private fun authorityOwnsKey(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): Boolean = authority.profileId == key.profileId &&
+        authority.profileActivationGeneration == key.profileActivationGeneration &&
+        authority.principalId == key.principalId &&
+        authority.clientInstanceId == key.clientInstanceId &&
+        authority.hostId == key.hostId &&
+        authority.hostEpoch == key.hostEpoch
 
     fun forgetProfileAfterDisconnect(profileId: String) {
         restoredTerminalKeys.removeIf { it.profileId == profileId }

@@ -535,6 +535,14 @@ function sameResetReplacementBinding(
   left: RelayV2TerminalCanonicalTargetBindingV1,
   right: RelayV2TerminalCanonicalTargetBindingV1,
 ): boolean {
+  // RESET is the only operation allowed to cross a terminal-control process
+  // restart.  initializeContinuity() rotates controlEpoch, and the exact
+  // target proof is deliberately derived from that epoch, even when the H2
+  // canonical target and the persisted controlTargetId still identify the
+  // same tmux incarnation.  The current resolution is still synchronously
+  // fenced below before this prepared binding can become executable.  Keep
+  // every stable target/incarnation field exact; only the controller-local
+  // epoch/proof pair may be refreshed by a RESET replacement.
   return left.schemaVersion === right.schemaVersion
     && sameTarget(left, right)
     && left.pane === right.pane
@@ -545,8 +553,7 @@ function sameResetReplacementBinding(
     && left.managedTarget.kind === right.managedTarget.kind
     && left.managedTarget.incarnation === right.managedTarget.incarnation
     && left.exactControlIdentity.schemaVersion === right.exactControlIdentity.schemaVersion
-    && left.exactControlIdentity.controlTargetId === right.exactControlIdentity.controlTargetId
-    && left.exactControlIdentity.controlEpoch === right.exactControlIdentity.controlEpoch;
+    && left.exactControlIdentity.controlTargetId === right.exactControlIdentity.controlTargetId;
 }
 
 function sameCanonicalBinding(
@@ -554,6 +561,8 @@ function sameCanonicalBinding(
   right: RelayV2TerminalCanonicalTargetBindingV1,
 ): boolean {
   return sameResetReplacementBinding(left, right)
+    && left.exactControlIdentity.controlEpoch
+      === right.exactControlIdentity.controlEpoch
     && left.exactControlIdentity.targetIncarnationProof
       === right.exactControlIdentity.targetIncarnationProof;
 }
@@ -947,6 +956,37 @@ function controlSlots(state: PersistedTerminalLineageState): number {
     + state.lostAuthorities.length
     + state.streamAuthorities.filter((stream) => stream.closeSlotReserved).length
     + state.openRecords.filter((record) => record.reservesStreamSlot).length;
+}
+
+/**
+ * The generation-creating open is the sole durable idempotency anchor for a live stream.
+ *
+ * RESUME records deliberately do not qualify: many different resume openIds may bind one
+ * generation, so retaining all of them would turn a live stream into an unbounded control-record
+ * owner. The complete match below mirrors the executable lineage proof without persisting the
+ * process-local plaintext resume token.
+ */
+function isCurrentLiveOpenedAnchor(
+  state: PersistedTerminalLineageState,
+  record: PersistedOpenRecord,
+): boolean {
+  const outcome = record.status === "final" && record.outcome?.kind === "opened"
+    ? record.outcome
+    : null;
+  if (outcome === null
+    || record.issuedGeneration !== outcome.generation
+    || record.preparedBinding === null) return false;
+  const stream = state.streamAuthorities.find((candidate) => (
+    candidate.status === "live"
+    && candidate.streamKey === record.streamKey
+    && candidate.generation === outcome.generation
+  ));
+  return stream !== undefined
+    && stream.hostInstanceId === record.ownerHostInstanceId
+    && sameTarget(stream.target, record.target)
+    && stream.pane === record.pane
+    && stream.resumeTokenHash === outcome.resumeTokenHash
+    && sameCanonicalBinding(stream.canonicalBinding, record.preparedBinding);
 }
 
 function liveStreamSlots(
@@ -2463,9 +2503,12 @@ export class RelayV2TerminalDurableLineageAuthority
     if (claim.mode === "reset"
       && !stream
       && claim.previousGeneration !== null
-      && !exactLost) {
+      && !exactLost
+      && (lostForStream.length > 0 || retainedCloseForStream)) {
       return { kind: "conflict", reason: "stream_conflict" };
     }
+    // The generation high-water mark prevents reuse but is not predecessor authority.
+    // Once every same-stream authority row expires, RESET may create an absent successor.
     const streamAuthority = stream
       ? claimAuthorityFromStream(stream, claim.requestedOffset)
       : claimAuthorityFromLost(exactLost, claim.requestedOffset);
@@ -2667,7 +2710,9 @@ export class RelayV2TerminalDurableLineageAuthority
         this.settlePendingAsStreamLost(state, record);
       }
     }
-    state.openRecords = state.openRecords.filter((record) => record.expiresAtMs > now);
+    state.openRecords = state.openRecords.filter((record) => (
+      record.expiresAtMs > now || isCurrentLiveOpenedAnchor(state, record)
+    ));
     const expiredCloseBindings = new Set(state.closeRecords
       .filter((record) => record.value.expiresAtMs <= now)
       .map((record) => `${record.value.streamKey}\0${record.value.generation}`));

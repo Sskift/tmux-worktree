@@ -131,6 +131,16 @@ internal interface RelayV2TerminalPostCommitEffectSink {
     /** Exact and idempotent; it is valid even when [reserve] threw after partial acquisition. */
     suspend fun abort(reservationId: String)
 
+    /**
+     * True only when the exact authority has no durable uncertainty fence and can accept a later
+     * RESET lineage. This is the post-abort proof used by terminal-scoped recovery; the default is
+     * deliberately fail-closed for test/custom sinks that cannot prove it.
+     */
+    suspend fun isAuthorityReusable(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): Boolean = false
+
     /** Rebuilds only this authority's FIFO after ownership became unknown. */
     suspend fun teardownAuthority(
         authority: RelayV2RepositoryEffectAuthority,
@@ -150,6 +160,7 @@ internal interface RelayV2TerminalPostCommitEffectSink {
 internal enum class RelayV2TerminalFatalInvalidationReason {
     PARSER_EFFECT_ACTIVATION_UNCERTAIN,
     EXTERNAL_SIDE_EFFECT_CANCELLED,
+    DETACHED_OPEN_RESPONSE,
 }
 
 /**
@@ -164,6 +175,26 @@ internal interface RelayV2TerminalFatalInvalidationPort {
         key: RelayV2TerminalCheckpointKey,
         reason: RelayV2TerminalFatalInvalidationReason,
     )
+}
+
+/**
+ * Consumes a pre-activation parser handoff only after the sink proves that no external effect can
+ * execute. A true receipt means the durable H/A/parser-operation markers were atomically
+ * normalized to a terminal-scoped reset and the current attachment was notified when still owned.
+ * False or an exception is uncertainty and must fall back to fatal authority invalidation.
+ */
+internal fun interface RelayV2TerminalScopedResetPort {
+    suspend fun normalizePreActivationFailure(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): Boolean
+}
+
+internal object RelayV2TerminalUnavailableScopedResetPort : RelayV2TerminalScopedResetPort {
+    override suspend fun normalizePreActivationFailure(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): Boolean = false
 }
 
 internal enum class RelayV2TerminalRuntimeRejection {
@@ -651,6 +682,7 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
     private val parserRuntime: RelayV2TerminalParserRuntimePorts?,
     private val control: RelayV2TerminalControlTransportPort,
     private val fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
+    private val terminalScopedReset: RelayV2TerminalScopedResetPort,
 ) : RelayV2TerminalControlRuntimeEntry {
     internal constructor(
         applyLease: RelayV2RepositoryEffectApplyLeasePort,
@@ -659,12 +691,15 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
         control: RelayV2TerminalControlTransportPort,
         postCommitEffects: RelayV2TerminalPostCommitEffectSink,
         fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
+        terminalScopedReset: RelayV2TerminalScopedResetPort =
+            RelayV2TerminalUnavailableScopedResetPort,
     ) : this(
         applyLease = applyLease,
         terminal = terminal,
         parserRuntime = RelayV2TerminalParserRuntimePorts(parser, postCommitEffects),
         control = control,
         fatalInvalidation = fatalInvalidation,
+        terminalScopedReset = terminalScopedReset,
     )
 
     private val runtimeAdmission = RelayV2TerminalRuntimeAdmissionFence()
@@ -1038,21 +1073,21 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
             )
         } catch (failure: Exception) {
             val abortFailure = abortReservation(reservationId)
-            val resetFailure = captureParserEffectReservationFailure(admission, key, token)
-            return RelayV2TerminalEffectPreparation.Invalidate(
-                teardownSink = true,
-                failure = combineFailuresPreservingCancellation(
-                    failure,
-                    abortFailure,
-                    resetFailure,
-                ),
+            return recoverKnownPreActivationFailure(
+                admission = admission,
+                authority = authority,
+                key = key,
+                callbackToken = token,
+                primaryFailure = failure,
+                abortFailure = abortFailure,
             )
         }
         if (reserveResult is RelayV2TerminalPostCommitEffectReservationResult.Rejected) {
-            val resetFailure = captureParserEffectReservationFailure(admission, key, token)
-            return RelayV2TerminalEffectPreparation.Invalidate(
-                teardownSink = false,
-                failure = resetFailure,
+            return recoverKnownPreActivationFailure(
+                admission = admission,
+                authority = authority,
+                key = key,
+                callbackToken = token,
             )
         }
         val reservedResult =
@@ -1088,16 +1123,13 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
             )
         } catch (failure: Exception) {
             val abortFailure = abortReservation(reservationId)
-            val resetFailure = captureParserEffectReservationFailure(admission, key, token)
-            return RelayV2TerminalEffectPreparation.Invalidate(
-                // A mismatched result/handle proves that this authority's sink contract is no
-                // longer trustworthy even when exact abort reports success.
-                teardownSink = true,
-                failure = combineFailuresPreservingCancellation(
-                    failure,
-                    abortFailure,
-                    resetFailure,
-                ),
+            return recoverKnownPreActivationFailure(
+                admission = admission,
+                authority = authority,
+                key = key,
+                callbackToken = token,
+                primaryFailure = failure,
+                abortFailure = abortFailure,
             )
         }
 
@@ -1122,14 +1154,13 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
             )
         } catch (failure: Exception) {
             val abortFailure = abortReservation(reservationId)
-            val resetFailure = captureParserEffectReservationFailure(admission, key, token)
-            return RelayV2TerminalEffectPreparation.Invalidate(
-                teardownSink = abortFailure != null,
-                failure = combineFailuresPreservingCancellation(
-                    failure,
-                    abortFailure,
-                    resetFailure,
-                ),
+            return recoverKnownPreActivationFailure(
+                admission = admission,
+                authority = authority,
+                key = key,
+                callbackToken = token,
+                primaryFailure = failure,
+                abortFailure = abortFailure,
             )
         }
         val reservedCheckpoint = reserved.checkpoint
@@ -1140,14 +1171,13 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
         ) {
             val abortFailure = abortReservation(reservationId)
             val failure = IllegalStateException("H to A transition was not exact")
-            val resetFailure = captureParserEffectReservationFailure(admission, key, token)
-            return RelayV2TerminalEffectPreparation.Invalidate(
-                teardownSink = abortFailure != null,
-                failure = combineFailuresPreservingCancellation(
-                    failure,
-                    abortFailure,
-                    resetFailure,
-                ),
+            return recoverKnownPreActivationFailure(
+                admission = admission,
+                authority = authority,
+                key = key,
+                callbackToken = token,
+                primaryFailure = failure,
+                abortFailure = abortFailure,
             )
         }
         return RelayV2TerminalEffectPreparation.Ready(
@@ -1404,6 +1434,65 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
         }
     }
 
+    /**
+     * A pre-activation failure is terminal-local only after all three independent owners agree:
+     * exact sink abort (when a reservation may exist), exact H -> RESET_REQUIRED commit, and the
+     * production composition's durable marker normalization plus attachment notification. No
+     * runtime admission poison is installed on that proven path, so the same Base generation can
+     * accept the replacement terminal RESET.
+     */
+    private suspend fun recoverKnownPreActivationFailure(
+        admission: RelayV2TerminalRuntimeAdmissionFence.Admission,
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+        callbackToken: RelayV2TerminalParserCallbackToken,
+        primaryFailure: Exception? = null,
+        abortFailure: Exception? = null,
+    ): RelayV2TerminalEffectPreparation {
+        val resetFailure = if (abortFailure == null) {
+            captureParserEffectReservationFailure(admission, key, callbackToken)
+        } else {
+            null
+        }
+        val normalizationFailure = if (abortFailure == null && resetFailure == null) {
+            captureTerminalScopedNormalization(admission, authority, key)
+        } else {
+            null
+        }
+        if (abortFailure == null && resetFailure == null && normalizationFailure == null) {
+            return RelayV2TerminalEffectPreparation.SafeNone
+        }
+        return RelayV2TerminalEffectPreparation.Invalidate(
+            teardownSink = abortFailure != null,
+            failure = combineFailuresPreservingCancellation(
+                primaryFailure,
+                abortFailure,
+                resetFailure,
+                normalizationFailure,
+            ),
+        )
+    }
+
+    private suspend fun captureTerminalScopedNormalization(
+        admission: RelayV2TerminalRuntimeAdmissionFence.Admission,
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): Exception? {
+        if (!admission.isOpen()) {
+            return IllegalStateException("Terminal runtime admission closed before local reset")
+        }
+        return try {
+            check(terminalScopedReset.normalizePreActivationFailure(authority, key)) {
+                "Terminal pre-activation failure could not be normalized locally"
+            }
+            null
+        } catch (cancelled: CancellationException) {
+            cancelled
+        } catch (failure: Exception) {
+            failure
+        }
+    }
+
     private suspend fun failParserEffectReservation(
         key: RelayV2TerminalCheckpointKey,
         callbackToken: RelayV2TerminalParserCallbackToken,
@@ -1496,6 +1585,7 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
             parserRuntime = null,
             control = control,
             fatalInvalidation = fatalInvalidation,
+            terminalScopedReset = RelayV2TerminalUnavailableScopedResetPort,
         )
     }
 

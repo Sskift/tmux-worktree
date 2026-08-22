@@ -35,6 +35,8 @@ internal class RelayV2TerminalUiAttachmentLifecycle<AttachmentT : Any> {
 
     private val lock = Any()
     private var state: State<AttachmentT> = State.Opening
+    /** Exact attachment identity retained for close-after-detach coordination. */
+    private var issuedAttachment: AttachmentT? = null
     private val detached = CompletableDeferred<Unit>()
 
     fun detachRequested(): Boolean = synchronized(lock) {
@@ -48,15 +50,19 @@ internal class RelayV2TerminalUiAttachmentLifecycle<AttachmentT : Any> {
         (state as? State.Attached)?.attachment
     }
 
+    fun issuedAttachment(): AttachmentT? = synchronized(lock) { issuedAttachment }
+
     fun install(
         attachment: AttachmentT,
     ): RelayV2TerminalAttachmentInstall<AttachmentT> = synchronized(lock) {
         when (state) {
             State.Opening -> {
+                issuedAttachment = attachment
                 state = State.Attached(attachment)
                 RelayV2TerminalAttachmentInstall.Current
             }
             State.OpeningDetachRequested -> {
+                issuedAttachment = attachment
                 state = State.Detaching(attachment)
                 RelayV2TerminalAttachmentInstall.Detach(attachment)
             }

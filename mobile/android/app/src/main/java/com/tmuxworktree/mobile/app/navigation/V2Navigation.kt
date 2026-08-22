@@ -5,6 +5,7 @@ package com.tmuxworktree.mobile.app.navigation
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Rect
 import android.net.Uri
 import android.util.Base64
 import androidx.activity.compose.BackHandler
@@ -77,6 +78,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -130,8 +132,6 @@ import com.tmuxworktree.mobile.feature.pairing.PairingScreen
 import com.tmuxworktree.mobile.feature.pairing.RelayV2EnrollmentReviewScreen
 import com.tmuxworktree.mobile.feature.session.SessionDetailScreen
 import com.tmuxworktree.mobile.feature.chat.AgentChatScreen
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.runtimeSettingsUnavailableMessage
 import com.tmuxworktree.mobile.feature.settings.SettingsScreen
 import com.tmuxworktree.mobile.feature.settings.LarkBindingsScreen
 import com.tmuxworktree.mobile.feature.terminal.TerminalScreen
@@ -410,7 +410,14 @@ private fun MainNavigation(
     val context = LocalContext.current
     val latestState by rememberUpdatedState(state)
     val currentEntry by navController.currentBackStackEntryAsState()
-    val rootDestination = currentEntry?.destination?.route.toRootDestination()
+    val currentRoute = currentEntry?.destination?.route
+    val rootDestination = currentRoute.toRootDestination()
+    val drawerGesturesEnabled = deviceDrawerGesturesEnabled(currentRoute)
+    LaunchedEffect(drawerGesturesEnabled) {
+        // A terminal owns the entire horizontal gesture surface. Close any drawer that was
+        // mid-transition and keep the left edge available for TUI touches / Android back.
+        if (!drawerGesturesEnabled) drawerState.close()
+    }
     val navigateRoot: (RootDestination) -> Unit = { destination ->
         val route = destination.route()
         navController.navigate(route) {
@@ -421,6 +428,7 @@ private fun MainNavigation(
     }
     ModalNavigationDrawer(
         drawerState = drawerState,
+        gesturesEnabled = drawerGesturesEnabled,
         drawerContent = {
             DeviceDrawer(
                 state = state,
@@ -1105,15 +1113,34 @@ private fun TerminalRoute(
 ) {
     val attachmentId = remember(session.stableId) { UUID.randomUUID().toString() }
     var userReadOnly by rememberSaveable(session.stableId) { mutableStateOf(false) }
-    var keyboardVisible by rememberSaveable(session.stableId) { mutableStateOf(true) }
     var fontSize by rememberSaveable(session.stableId) { mutableIntStateOf(14) }
     val connectionStatus = state.terminal.status
     val ownershipReadOnly = state.terminal.inputReadOnly
     val readOnly = userReadOnly || ownershipReadOnly
+    val rendererInputEnabled = terminalRendererInputEnabled(connectionStatus, readOnly)
+    val rendererResizeEnabled = terminalRendererResizeEnabled(connectionStatus)
+    val keyboardVisible = rememberImeVisible()
     val currentRelayAdmission = rememberUpdatedState(state.relayStartupAdmission)
 
     LaunchedEffect(session.stableId, attachmentId) { viewModel.openTerminal(session, attachmentId) }
-    LaunchedEffect(readOnly) { controller.setReadOnly(readOnly) }
+    LaunchedEffect(readOnly, connectionStatus) {
+        controller.setReadOnly(!rendererInputEnabled)
+        if (!rendererInputEnabled) {
+            // CONNECTING/RECOVERING/OFFLINE renderers must not expose an input surface whose
+            // keystrokes cannot yet be attributed to a durable terminal generation.
+            controller.blur()
+        }
+    }
+    LaunchedEffect(connectionStatus) {
+        if (connectionStatus == ConnectionStatus.ONLINE) {
+            // The pending-open resize is intentionally ignored by Relay. Redrive the fitted
+            // viewport exactly when terminal.opened makes input authoritative, then focus once;
+            // the IME animation's trailing ResizeObserver fit supplies its final height. This
+            // effect deliberately does not key on readOnly, so unlocking stays passive.
+            controller.fit()
+            if (!readOnly) controller.focus()
+        }
+    }
     LaunchedEffect(fontSize) { controller.setFontSize(fontSize) }
     DisposableEffect(session.stableId, attachmentId) {
         onDispose {
@@ -1143,7 +1170,7 @@ private fun TerminalRoute(
             if (state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
                 val rendererBinding = controller.currentParserBinding()
                 if (rendererBinding != null) {
-                    viewModel.openTerminal(session, attachmentId, rendererBinding)
+                    viewModel.reconnectTerminal(session, attachmentId, rendererBinding)
                 } else {
                     // A WebView crash can intentionally exhaust automatic recovery. Recreate the
                     // renderer first; its ready callback will attach a fresh parser generation.
@@ -1154,34 +1181,85 @@ private fun TerminalRoute(
             }
         },
         onToggleKeyboard = {
-            keyboardVisible = !keyboardVisible
-            if (keyboardVisible) controller.focus() else controller.blur()
+            if (keyboardVisible) controller.blur() else controller.focus()
         },
         onDecreaseFont = { fontSize = (fontSize - 1).coerceAtLeast(10) },
         onIncreaseFont = { fontSize = (fontSize + 1).coerceAtMost(24) },
         onToggleReadOnly = { userReadOnly = !userReadOnly },
-        onRetryInput = { viewModel.retryTerminalInput(session, attachmentId) },
+        onRetryInput = {
+            val rendererBinding = controller.currentParserBinding()
+            if (rendererBinding != null) {
+                viewModel.retryTerminalInput(session, attachmentId, rendererBinding)
+            } else {
+                controller.requestRendererRebuild()
+            }
+        },
         terminalContent = {
             TerminalWebView(
                 controller = controller,
                 onReady = { rendererBinding ->
-                    controller.setReadOnly(readOnly)
-                    controller.setFontSize(fontSize)
-                    controller.fit()
-                    if (keyboardVisible) controller.focus()
+                    // Admit the Relay owner before posting any WebView layout work. The renderer
+                    // stays locally fenced until the exact terminal.opened callback publishes
+                    // ONLINE and the effect above performs the single fit/focus transition.
                     viewModel.openTerminal(session, attachmentId, rendererBinding)
+                    controller.setReadOnly(!rendererInputEnabled)
+                    controller.setFontSize(fontSize)
+                    if (!rendererInputEnabled) controller.blur()
                 },
                 onViewLoss = {
                     viewModel.recoverTerminalRendererLoss(attachmentId, it)
                 },
                 onFailure = viewModel::reportTerminalError,
-                onInput = { if (!readOnly) viewModel.sendTerminalInput(it, attachmentId) },
-                onResize = { cols, rows -> viewModel.resizeTerminal(cols, rows, attachmentId) },
+                onInput = {
+                    if (rendererInputEnabled) viewModel.sendTerminalInput(it, attachmentId)
+                },
+                onResize = { cols, rows ->
+                    if (rendererResizeEnabled) {
+                        viewModel.resizeTerminal(cols, rows, attachmentId)
+                    }
+                },
                 modifier = Modifier.fillMaxSize().focusRequester(remember { FocusRequester() }),
             )
         },
     )
 }
+
+@Composable
+private fun rememberImeVisible(): Boolean {
+    val view = LocalView.current
+    var visible by remember(view) { mutableStateOf(false) }
+    DisposableEffect(view) {
+        val root = view.rootView
+        val visibleFrame = Rect()
+        val update = {
+            root.getWindowVisibleDisplayFrame(visibleFrame)
+            // The hidden navigation/status areas are much smaller than an IME. Reading the
+            // actual visible frame remains reliable when edge-to-edge consumes the platform
+            // IME visibility flag before descendants can observe it.
+            visible = isImeVisibleFromVisibleFrame(root.height, visibleFrame.bottom)
+        }
+        val listener = android.view.ViewTreeObserver.OnGlobalLayoutListener(update)
+        root.viewTreeObserver.addOnGlobalLayoutListener(listener)
+        root.post(update)
+        onDispose {
+            if (root.viewTreeObserver.isAlive) {
+                root.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            }
+        }
+    }
+    return visible
+}
+
+internal fun isImeVisibleFromVisibleFrame(rootHeight: Int, visibleBottom: Int): Boolean =
+    rootHeight > 0 && rootHeight - visibleBottom > rootHeight * 0.15f
+
+internal fun terminalRendererInputEnabled(
+    connectionStatus: ConnectionStatus,
+    readOnly: Boolean,
+): Boolean = connectionStatus == ConnectionStatus.ONLINE && !readOnly
+
+internal fun terminalRendererResizeEnabled(connectionStatus: ConnectionStatus): Boolean =
+    connectionStatus == ConnectionStatus.ONLINE
 
 @Composable
 private fun ChatRoute(
@@ -1193,30 +1271,24 @@ private fun ChatRoute(
     onTerminal: () -> Unit,
 ) {
     val chatState by viewModel.agentChat.collectAsStateWithLifecycle()
-    val runtimeSettingsStatuses by
-        viewModel.agentChatRuntimeSettingsStatuses.collectAsStateWithLifecycle()
     var draft by rememberSaveable(session.stableId) { mutableStateOf("") }
-    var selectedModel by rememberSaveable(session.stableId) { mutableStateOf<String?>(null) }
-    var selectedEffort by rememberSaveable(session.stableId) { mutableStateOf<String?>(null) }
-    var selectedMode by rememberSaveable(session.stableId) { mutableStateOf("default") }
-    var settingsTouched by rememberSaveable(session.stableId) { mutableStateOf(false) }
-    val runtimeSettings = AgentChatRuntimeSettings(
-        model = selectedModel,
-        reasoningEffort = selectedEffort,
-        mode = selectedMode,
-    )
-    val hostSupportsRuntimeSettings = viewModel.supportsAgentChatRuntimeSettings()
-    val runtimeSettingsStatus = runtimeSettingsStatuses[session.protocolSessionId]
-    val runtimeSettingsAvailable =
-        hostSupportsRuntimeSettings && runtimeSettingsStatus?.available == true
-    val runtimeSettingsUnavailableMessage = if (hostSupportsRuntimeSettings) {
-        runtimeSettingsStatus.runtimeSettingsUnavailableMessage()
-    } else {
-        null
-    }
 
     LaunchedEffect(session.stableId) {
         viewModel.fetchAgentChatHistory(session)
+    }
+
+    val needsHistoryReconciliation =
+        chatState.needsHistoryReconciliation(session.protocolSessionId)
+    LaunchedEffect(session.stableId, needsHistoryReconciliation) {
+        if (!needsHistoryReconciliation) return@LaunchedEffect
+        var delayMillis = AGENT_CHAT_RECONCILE_INITIAL_DELAY_MS
+        while (true) {
+            delay(delayMillis)
+            // Live events are intentionally best-effort. Reconcile only the recent page while a
+            // send/turn is active so a route switch is never required to reveal the reply.
+            viewModel.fetchAgentChatHistory(session, AGENT_CHAT_RECONCILE_HISTORY_LIMIT)
+            delayMillis = (delayMillis * 2).coerceAtMost(AGENT_CHAT_RECONCILE_MAX_DELAY_MS)
+        }
     }
 
     AgentChatScreen(
@@ -1228,18 +1300,8 @@ private fun ChatRoute(
         onBack = onBack,
         onOpenDetails = onDetails,
         onOpenTerminal = onTerminal,
-        runtimeSettings = runtimeSettings,
-        onRuntimeSettingsChange = { settings ->
-            settingsTouched = true
-            selectedModel = settings.model
-            selectedEffort = settings.reasoningEffort
-            selectedMode = settings.mode
-        },
-        runtimeSettingsAvailable = runtimeSettingsAvailable,
-        runtimeSettingsUnavailableMessage = runtimeSettingsUnavailableMessage,
-        onSend = { message, settings ->
-            val requestedSettings = settings.takeIf { settingsTouched }
-            if (viewModel.sendAgentChatMessage(session, message, requestedSettings)) {
+        onSend = { message ->
+            if (viewModel.sendAgentChatMessage(session, message, null)) {
                 draft = ""
             }
         },
@@ -1248,6 +1310,10 @@ private fun ChatRoute(
         },
     )
 }
+
+private const val AGENT_CHAT_RECONCILE_INITIAL_DELAY_MS = 1_000L
+private const val AGENT_CHAT_RECONCILE_MAX_DELAY_MS = 4_000L
+private const val AGENT_CHAT_RECONCILE_HISTORY_LIMIT = 32
 
 @Composable
 private fun MissingSession(onBack: () -> Unit) {
@@ -1292,6 +1358,9 @@ private fun String?.toRootDestination(): RootDestination? = when (this) {
     V2Routes.SETTINGS -> RootDestination.SETTINGS
     else -> null
 }
+
+internal fun deviceDrawerGesturesEnabled(route: String?): Boolean =
+    route != V2Routes.TERMINAL && route?.startsWith("terminal/") != true
 
 private fun encodeRouteValue(value: String): String = Base64.encodeToString(
     value.toByteArray(Charsets.UTF_8),

@@ -6,9 +6,11 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
@@ -34,6 +36,8 @@ internal class RelayV2TerminalWebViewParserAdapter(
     private val callbackScope: CoroutineScope,
     private val writePort: RelayV2TerminalWebViewWritePort,
     private val resetPort: RelayV2TerminalWebViewResetPort,
+    private val callbackDispatcher: CoroutineDispatcher =
+        Dispatchers.IO.limitedParallelism(1),
     private val newCallbackNonce: () -> String = { UUID.randomUUID().toString() },
 ) : RelayV2TerminalParserPort {
     private val attachmentCallbacks = ParserAttachmentCallbackOwner()
@@ -48,11 +52,11 @@ internal class RelayV2TerminalWebViewParserAdapter(
     )
 
     /**
-     * Synchronously rejects new callbacks and returns the exact drain barrier for callbacks that
-     * were already admitted. Runtime detach must await this barrier.
+     * Synchronously rejects new registrations and returns the exact drain barrier for parser
+     * mutations already owned by this attachment. Runtime detach must await this barrier.
      */
     internal fun fenceAttachment(): RelayV2TerminalParserCallbackBarrier =
-        attachmentCallbacks.fenceNewCallbacks()
+        attachmentCallbacks.fenceNewRegistrations()
 
     override suspend fun write(
         callbackToken: RelayV2TerminalParserCallbackToken,
@@ -75,23 +79,39 @@ internal class RelayV2TerminalWebViewParserAdapter(
         completion: suspend (Boolean) -> Unit,
         platformRegister: (String, (Boolean) -> Unit) -> Boolean,
     ): Boolean {
-        if (!attachmentCallbacks.acceptingCallbacks()) return false
         val callbackId = "${callbackToken.operationId}.${newCallbackNonce()}"
         require(callbackId.length <= MAX_CALLBACK_ID_CHARS)
-        val gate = ParserCompletionGate { applied ->
-            val admission = attachmentCallbacks.admitCallback() ?: return@ParserCompletionGate
-            try {
-                callbackScope.launch(start = CoroutineStart.ATOMIC) {
-                    withContext(NonCancellable) { completion(applied) }
-                }.invokeOnCompletion {
-                    admission.complete()
+        val registration = attachmentCallbacks.beginRegistration() ?: return false
+        val gate = ParserCompletionGate(
+            completion = { applied ->
+                try {
+                    // A WebView acknowledgement only needs Main long enough to cross the
+                    // Javascript bridge. The durable callback performs Room transitions, sink
+                    // journaling and may synchronously dispatch the next replay slice; keeping
+                    // that work on viewModelScope/Main starves Compose and the next bridge ACK.
+                    // One IO lane per attachment preserves bounded CPU pressure, while the
+                    // runtime's keyed handoff gate remains the full suspend-level serializer.
+                    callbackScope.launch(
+                        context = callbackDispatcher,
+                        start = CoroutineStart.ATOMIC,
+                    ) {
+                        withContext(NonCancellable) { completion(applied) }
+                    }.invokeOnCompletion {
+                        registration.complete()
+                    }
+                } catch (failure: Throwable) {
+                    registration.complete()
+                    throw failure
                 }
-            } catch (failure: Throwable) {
-                admission.complete()
-                throw failure
-            }
+            },
+            registrationRejected = registration::complete,
+        )
+        val accepted = try {
+            platformRegister(callbackId, gate::platformCallback)
+        } catch (failure: Throwable) {
+            gate.registrationReturned(false)
+            throw failure
         }
-        val accepted = platformRegister(callbackId, gate::platformCallback)
         return gate.registrationReturned(accepted)
     }
 
@@ -112,34 +132,32 @@ internal class RelayV2TerminalParserCallbackBarrier internal constructor(
 }
 
 private class ParserAttachmentCallbackOwner {
-    internal class Admission(
+    internal class Registration(
         private val owner: ParserAttachmentCallbackOwner,
     ) {
         private val completed = AtomicBoolean(false)
 
         fun complete() {
-            if (completed.compareAndSet(false, true)) owner.completeAdmission()
+            if (completed.compareAndSet(false, true)) owner.completeRegistration()
         }
     }
 
     private val lock = Any()
     private var accepting = true
-    private var admitted = 0
+    private var registrations = 0
     private var drainCompletionClaimed = false
     private val drained = CompletableDeferred<Unit>()
 
-    fun acceptingCallbacks(): Boolean = synchronized(lock) { accepting }
-
-    fun admitCallback(): Admission? = synchronized(lock) {
+    fun beginRegistration(): Registration? = synchronized(lock) {
         if (!accepting) return@synchronized null
-        admitted += 1
-        Admission(this)
+        registrations += 1
+        Registration(this)
     }
 
-    fun fenceNewCallbacks(): RelayV2TerminalParserCallbackBarrier {
+    fun fenceNewRegistrations(): RelayV2TerminalParserCallbackBarrier {
         val completeNow = synchronized(lock) {
             accepting = false
-            if (admitted == 0 && !drainCompletionClaimed) {
+            if (registrations == 0 && !drainCompletionClaimed) {
                 drainCompletionClaimed = true
                 true
             } else {
@@ -150,11 +168,11 @@ private class ParserAttachmentCallbackOwner {
         return RelayV2TerminalParserCallbackBarrier(drained)
     }
 
-    private fun completeAdmission() {
+    private fun completeRegistration() {
         val completeNow = synchronized(lock) {
-            check(admitted > 0) { "Parser callback admission was not owned" }
-            admitted -= 1
-            if (!accepting && admitted == 0 && !drainCompletionClaimed) {
+            check(registrations > 0) { "Parser registration was not owned" }
+            registrations -= 1
+            if (!accepting && registrations == 0 && !drainCompletionClaimed) {
                 drainCompletionClaimed = true
                 true
             } else {
@@ -167,6 +185,7 @@ private class ParserAttachmentCallbackOwner {
 
 private class ParserCompletionGate(
     private val completion: (Boolean) -> Unit,
+    private val registrationRejected: () -> Unit,
 ) {
     private sealed interface State {
         data object Registering : State
@@ -199,12 +218,19 @@ private class ParserCompletionGate(
             when (val current = state.get()) {
                 State.Registering -> {
                     val next = if (accepted) State.Accepted else State.Rejected
-                    if (state.compareAndSet(current, next)) return accepted
+                    if (state.compareAndSet(current, next)) {
+                        if (!accepted) registrationRejected()
+                        return accepted
+                    }
                 }
                 is State.Early -> {
                     val next = if (accepted) State.Settled else State.Rejected
                     if (state.compareAndSet(current, next)) {
-                        if (accepted) completion(current.applied)
+                        if (accepted) {
+                            completion(current.applied)
+                        } else {
+                            registrationRejected()
+                        }
                         return accepted
                     }
                 }

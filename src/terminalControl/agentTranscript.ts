@@ -535,6 +535,37 @@ function codexHasUserMessageAtOrAfter(
   });
 }
 
+function submittedCodexSource(
+  records: JsonRecord[],
+  cwd: string,
+  startedAtNotBefore: string,
+  expectedUserMessage: string,
+): TerminalControlAgentSource | undefined {
+  const sessionId = codexSessionId(records);
+  if (!sessionId || !records.some((record) =>
+    record.type === "session_meta" && isRecord(record.payload)
+    && record.payload.id === sessionId && record.payload.cwd === cwd)) return undefined;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record.type !== "event_msg" || !isRecord(record.payload)
+      || record.payload.type !== "task_started") continue;
+    const turnId = safeText(record.payload.turn_id, 128);
+    const startedAt = exactTimestamp(record.timestamp);
+    if (!turnId || !startedAt
+      || !codexHasUserMessageAtOrAfter(
+        records,
+        turnId,
+        startedAtNotBefore,
+        expectedUserMessage,
+      )) continue;
+    // A fast Codex turn can finish before the first transcript poll. The exact
+    // submitted user message is the durable fence in that case; the returned
+    // source remains valid for both active progress and completed-result reads.
+    return source("codex", "exact", sessionId, turnId, startedAt);
+  }
+  return undefined;
+}
+
 function codexResult(
   records: JsonRecord[],
   cwd: string,
@@ -836,7 +867,14 @@ export function discoverActiveAgentActivity(input: {
       : readJsonLines(candidate.path);
     const found = input.provider === "claude"
       ? activeClaudeSource(records, input.cwd)
-      : activeCodexSource(records, input.cwd);
+      : startedAtNotBefore !== undefined && input.expectedUserMessage !== undefined
+        ? submittedCodexSource(
+          records,
+          input.cwd,
+          startedAtNotBefore,
+          input.expectedUserMessage,
+        )
+        : activeCodexSource(records, input.cwd);
     if (found
       && (input.sessionId === undefined || found.sessionId === input.sessionId)
       && (startedAtNotBefore === undefined

@@ -26,6 +26,20 @@ export const RELAY_V2_TERMINAL_INPUT_DEDUPE_ENTRIES = 512;
 export const RELAY_V2_TERMINAL_RESIZE_DEDUPE_ENTRIES = 256;
 export const RELAY_V2_TERMINAL_MAX_STREAMS = 256;
 export const RELAY_V2_TERMINAL_MAX_CONTROL_RECORDS = 4_096;
+/**
+ * Production is intentionally stop-and-wait at one maximum-sized output frame. The frozen
+ * 512 KiB value above remains the advertised hard ceiling for explicit deployments that have a
+ * faster parser, while the default prevents a mobile parser from durably queueing eight frames
+ * before its first xterm/post-commit ACK can apply backpressure.
+ */
+export const RELAY_V2_TERMINAL_DEFAULT_MAX_UNACKED_BYTES =
+  RELAY_V2_TERMINAL_MAX_FRAME_BYTES;
+/**
+ * Must settle before the Host/runtime and Android open watchdogs. A hung
+ * resolver/preparation/backend attachment must never retain the manager-wide
+ * serializer indefinitely.
+ */
+export const RELAY_V2_TERMINAL_OPEN_OPERATION_TIMEOUT_MS = 8_000;
 
 const MAX_COUNTER = 18_446_744_073_709_551_615n;
 
@@ -55,6 +69,11 @@ export const RELAY_V2_TERMINAL_LIMITS: Readonly<RelayV2TerminalLimits> = Object.
   maxControlRecords: RELAY_V2_TERMINAL_MAX_CONTROL_RECORDS,
 });
 
+const RELAY_V2_TERMINAL_DEFAULT_LIMITS: Readonly<RelayV2TerminalLimits> = Object.freeze({
+  ...RELAY_V2_TERMINAL_LIMITS,
+  maxUnackedBytes: RELAY_V2_TERMINAL_DEFAULT_MAX_UNACKED_BYTES,
+});
+
 export type RelayV2TerminalErrorCode =
   | "BUSY"
   | "CAPABILITY_UNAVAILABLE"
@@ -81,13 +100,16 @@ const RELAY_V2_TERMINAL_MANAGER_ERROR = Symbol.for(
 
 export class RelayV2TerminalManagerError extends Error {
   readonly [RELAY_V2_TERMINAL_MANAGER_ERROR] = true;
+  readonly details: Readonly<Record<string, unknown>> | null;
 
   constructor(
     readonly code: RelayV2TerminalErrorCode,
     message: string,
+    details: Readonly<Record<string, unknown>> | null = null,
   ) {
     super(message);
     this.name = "RelayV2TerminalManagerError";
+    this.details = details === null ? null : Object.freeze({ ...details });
   }
 }
 
@@ -96,9 +118,15 @@ export class RelayV2TerminalManagerError extends Error {
 // correlated terminal response; it is not evidence that the recovered H3
 // manager/lineage authority itself was lost.
 const relayV2TerminalRequestScopedErrors = new WeakSet<RelayV2TerminalManagerError>();
+const relayV2TerminalOpenDeadlineErrors = new WeakSet<RelayV2TerminalManagerError>();
 
 const CANONICAL_RESOLVER_REFRESH_RETRY_DELAY_MS = 100;
 const CANONICAL_RESOLVER_REFRESH_RETRY_ATTEMPTS = 50;
+const PRODUCER_CONTROL_RETRY_BASE_MS = 250;
+const PRODUCER_CONTROL_RETRY_MAX_MS = 2_000;
+const TERMINAL_OPEN_TIMEOUT_MESSAGE =
+  "terminal open operation timed out; retrying with a fresh open request is safe";
+const TERMINAL_OPEN_TIMEOUT_DETAILS = Object.freeze({ reason: "terminal_open_timeout" });
 
 function canonicalResolverCutIsRefreshing(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -111,6 +139,17 @@ function waitForCanonicalResolverRefresh(): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, CANONICAL_RESOLVER_REFRESH_RETRY_DELAY_MS);
   });
+}
+
+function retryableExactTargetPressure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown; retryable?: unknown };
+  if (candidate.code === "RESOURCE_EXHAUSTED" && candidate.retryable === true) return true;
+  // Compatibility with terminal-control daemons from before ownership contention was
+  // classified as retryable pressure. Do not durably cache that legacy rejection: the
+  // current owner can release at any moment and the exact same openId must remain usable.
+  return candidate.code === "PERMISSION_DENIED"
+    && candidate.message === "exact terminal-control target already has an input owner";
 }
 
 export function isRelayV2TerminalManagerError(
@@ -746,6 +785,8 @@ export interface RelayV2TerminalManagerOptions {
   issueToken?: () => string;
   /** Injectable only so the producer-lease half-life owner is deterministic in tests. */
   schedule?: (delayMs: number, callback: () => void) => () => void;
+  /** Stricter only in tests; production callers may not widen the open deadline. */
+  openOperationTimeoutMs?: number;
   /** Stricter limits for bounded simulators; values may never exceed the contract. */
   limits?: Partial<RelayV2TerminalLimits>;
 }
@@ -926,10 +967,14 @@ interface TerminalStream {
   inputFloor: bigint;
   inputHashes: Map<string, SequenceHashRecord>;
   pendingInput?: PendingSequence;
+  inputRetry?: ProducerControlRetry;
+  inputRetryAttempt: number;
   resizeAcked: bigint;
   resizeFloor: bigint;
   resizes: Map<string, ResizeRecord>;
   pendingResize?: PendingSequence;
+  resizeRetry?: ProducerControlRetry;
+  resizeRetryAttempt: number;
   controlInDoubt?: RelayV2TerminalStructuredError;
   lastUsedAt: number;
 }
@@ -937,6 +982,12 @@ interface TerminalStream {
 interface ProducerLeaseMaintenance {
   active: boolean;
   deadlineMs: number;
+  cancel(): void;
+}
+
+interface ProducerControlRetry {
+  active: boolean;
+  sequence: bigint;
   cancel(): void;
 }
 
@@ -1005,6 +1056,10 @@ interface ProvisionalGeneration {
   key: string;
   openRecordKey: string;
   stream: TerminalStream;
+}
+
+interface TerminalOpenOperationDeadline {
+  readonly expiresAtMs: number;
 }
 
 interface QuarantinedBackend {
@@ -1164,7 +1219,7 @@ function positiveInteger(value: number, label: string): number {
 }
 
 function resolveLimits(overrides: Partial<RelayV2TerminalLimits> = {}): RelayV2TerminalLimits {
-  const limits = { ...RELAY_V2_TERMINAL_LIMITS, ...overrides };
+  const limits = { ...RELAY_V2_TERMINAL_DEFAULT_LIMITS, ...overrides };
   for (const [key, ceiling] of Object.entries(RELAY_V2_TERMINAL_LIMITS)) {
     const value = positiveInteger(limits[key as keyof RelayV2TerminalLimits], key);
     if (value > ceiling) {
@@ -1865,6 +1920,7 @@ export class RelayV2TerminalManager {
   private readonly now: () => number;
   private readonly issueToken: () => string;
   private readonly schedule: NonNullable<RelayV2TerminalManagerOptions["schedule"]>;
+  private readonly openOperationTimeoutMs: number;
 
   constructor(options: RelayV2TerminalManagerOptions) {
     this.hostId = options.hostId;
@@ -1883,6 +1939,13 @@ export class RelayV2TerminalManager {
       timer.unref?.();
       return () => clearTimeout(timer);
     });
+    this.openOperationTimeoutMs = options.openOperationTimeoutMs
+      ?? RELAY_V2_TERMINAL_OPEN_OPERATION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.openOperationTimeoutMs)
+      || this.openOperationTimeoutMs < 1
+      || this.openOperationTimeoutMs > RELAY_V2_TERMINAL_OPEN_OPERATION_TIMEOUT_MS) {
+      throw new TypeError("Relay v2 terminal open operation timeout is invalid or widened");
+    }
     this.limits = Object.freeze(resolveLimits(options.limits));
 
     const manager = this;
@@ -1908,7 +1971,11 @@ export class RelayV2TerminalManager {
   }
 
   open(request: RelayV2TerminalOpenRequest): Promise<void> {
-    return this.enqueue(() => this.openInternal(request));
+    return this.enqueue(() => this.openInternal(request, {
+      // Start only after this operation owns the serializer; queueing behind a
+      // healthy preceding operation does not consume this request's budget.
+      expiresAtMs: Date.now() + this.openOperationTimeoutMs,
+    }));
   }
 
   requestReplay(request: RelayV2TerminalReplayRequest): Promise<void> {
@@ -2021,6 +2088,138 @@ export class RelayV2TerminalManager {
     });
     this.serialized = observed.then(() => undefined, () => undefined);
     return observed;
+  }
+
+  private openDeadlineError(stage: string): RelayV2TerminalManagerError {
+    const error = new RelayV2TerminalManagerError(
+      "BUSY",
+      `terminal open ${stage} timed out; retrying with a fresh open request is safe`,
+      TERMINAL_OPEN_TIMEOUT_DETAILS,
+    );
+    relayV2TerminalRequestScopedErrors.add(error);
+    relayV2TerminalOpenDeadlineErrors.add(error);
+    return error;
+  }
+
+  private isOpenDeadlineError(error: unknown): error is RelayV2TerminalManagerError {
+    return error instanceof RelayV2TerminalManagerError
+      && relayV2TerminalOpenDeadlineErrors.has(error);
+  }
+
+  /**
+   * Bounds only the currently serialized open step. Once the timer wins, this
+   * promise rejects and therefore releases `serialized`; the original result
+   * is observed solely by the supplied late-result fence and can never resume
+   * the timed-out open continuation.
+   */
+  private runOpenStep<T>(
+    deadline: TerminalOpenOperationDeadline,
+    stage: string,
+    operation: () => Promise<T> | T,
+    onLateFulfilled?: (value: T) => Promise<void> | void,
+    onLateRejected?: () => Promise<void> | void,
+  ): Promise<T> {
+    const remainingMs = deadline.expiresAtMs - Date.now();
+    if (remainingMs <= 0) return Promise.reject(this.openDeadlineError(stage));
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(this.openDeadlineError(stage));
+      }, remainingMs);
+      const observeLate = (callback: (() => Promise<void> | void) | undefined): void => {
+        if (!callback) return;
+        try {
+          void Promise.resolve(callback()).catch(() => undefined);
+        } catch {
+          // A late cleanup failure leaves the exact durable claim for normal
+          // recovery/retry. It must not re-enter or poison the live serializer.
+        }
+      };
+      let execution: Promise<T>;
+      try {
+        execution = Promise.resolve(operation());
+      } catch (error) {
+        clearTimeout(timer);
+        settled = true;
+        reject(error);
+        return;
+      }
+      void execution.then(
+        (value) => {
+          if (settled) {
+            observeLate(onLateFulfilled ? () => onLateFulfilled(value) : undefined);
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          if (settled) {
+            observeLate(onLateRejected);
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private releaseTimedOutUnpreparedOpenClaim(
+    recordKey: string,
+    requestFingerprint: string,
+    claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
+  ): void {
+    void this.lineage.releaseUnpreparedOpenClaim({
+      key: recordKey,
+      fingerprint: requestFingerprint,
+      hostInstanceId: this.hostInstanceId,
+      claimToken: claimAuthority.claimToken,
+      fence: claimAuthority.fence,
+    }).catch(() => undefined);
+  }
+
+  private releaseLateOpenClaim(
+    value: RelayV2TerminalDurableOpenClaimResult,
+    recordKey: string,
+    requestFingerprint: string,
+  ): void {
+    if (!value || value.status !== "claimed") return;
+    let authority: RelayV2TerminalDurableOpenClaimAuthority;
+    try {
+      authority = this.openClaimAuthority(value);
+    } catch {
+      return;
+    }
+    this.releaseTimedOutUnpreparedOpenClaim(recordKey, requestFingerprint, authority);
+  }
+
+  private settleTimedOutPreparedOpenClaim(
+    recordKey: string,
+    requestFingerprint: string,
+    claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
+    streamEffect: RelayV2TerminalOpenFailureStreamEffect = { kind: "preserve" },
+  ): void {
+    // The durable owner decides whether preparation already won or another
+    // caller settled the claim. Never synthesize local opened/reset state from
+    // this best-effort, exact-CAS reconciliation.
+    void this.lineage.failOpen({
+      key: recordKey,
+      fingerprint: requestFingerprint,
+      hostInstanceId: this.hostInstanceId,
+      claimToken: claimAuthority.claimToken,
+      fence: claimAuthority.fence,
+      outcome: {
+        kind: "error",
+        code: "BUSY",
+        message: TERMINAL_OPEN_TIMEOUT_MESSAGE,
+      },
+      streamEffect,
+    }).catch(() => undefined);
   }
 
   private isFatalAuthorityFailure(error: unknown): boolean {
@@ -2153,7 +2352,10 @@ export class RelayV2TerminalManager {
     return count;
   }
 
-  private async openInternal(request: RelayV2TerminalOpenRequest): Promise<void> {
+  private async openInternal(
+    request: RelayV2TerminalOpenRequest,
+    deadline: TerminalOpenOperationDeadline,
+  ): Promise<void> {
     this.assertRunning();
     this.assertHost(request);
     validateSize(request.cols, request.rows);
@@ -2168,19 +2370,24 @@ export class RelayV2TerminalManager {
     const requestResumeTokenHash = request.resume
       ? tokenHash(request.resume.resumeToken)
       : null;
-    const claim = await this.lineage.claimOpen({
-      key: recordKey,
-      streamKey: key,
-      fingerprint: requestFingerprint,
-      hostInstanceId: this.hostInstanceId,
-      target: { ...request.target },
-      pane: request.pane,
-      resumeTokenHash: requestResumeTokenHash,
-      mode: request.mode,
-      previousGeneration: request.resume?.generation ?? null,
-      requestedOffset: request.mode === "resume" ? request.resume?.nextOffset ?? null : null,
-      expiresAtMs: this.now() + this.limits.controlRetentionMs,
-    });
+    const claim = await this.runOpenStep(
+      deadline,
+      "durable claim",
+      () => this.lineage.claimOpen({
+        key: recordKey,
+        streamKey: key,
+        fingerprint: requestFingerprint,
+        hostInstanceId: this.hostInstanceId,
+        target: { ...request.target },
+        pane: request.pane,
+        resumeTokenHash: requestResumeTokenHash,
+        mode: request.mode,
+        previousGeneration: request.resume?.generation ?? null,
+        requestedOffset: request.mode === "resume" ? request.resume?.nextOffset ?? null : null,
+        expiresAtMs: this.now() + this.limits.controlRetentionMs,
+      }),
+      (late) => this.releaseLateOpenClaim(late, recordKey, requestFingerprint),
+    );
     if (!claim || typeof claim !== "object" || typeof claim.status !== "string") {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid open claim");
     }
@@ -2339,7 +2546,15 @@ export class RelayV2TerminalManager {
       return;
     }
     if (request.mode === "new") {
-      await this.createGeneration(request, key, recordKey, requestFingerprint, "new", claimAuthority);
+      await this.createGeneration(
+        request,
+        key,
+        recordKey,
+        requestFingerprint,
+        "new",
+        claimAuthority,
+        deadline,
+      );
       return;
     }
 
@@ -2358,6 +2573,7 @@ export class RelayV2TerminalManager {
         requestFingerprint,
         claimAuthority,
         requestResumeTokenHash,
+        deadline,
       );
       return;
     }
@@ -2370,6 +2586,7 @@ export class RelayV2TerminalManager {
       requestFingerprint,
       claimAuthority,
       requestResumeTokenHash,
+      deadline,
       alreadyLostPrevious,
     );
   }
@@ -2950,7 +3167,13 @@ export class RelayV2TerminalManager {
     outcome: OpenRecordOutcome,
   ): asserts outcome is Exclude<OpenRecordOutcome, { kind: "error" }> {
     if (outcome.kind === "error") {
-      const error = new RelayV2TerminalManagerError(outcome.code, outcome.message);
+      const error = new RelayV2TerminalManagerError(
+        outcome.code,
+        outcome.message,
+        outcome.code === "BUSY" && outcome.message === TERMINAL_OPEN_TIMEOUT_MESSAGE
+          ? TERMINAL_OPEN_TIMEOUT_DETAILS
+          : null,
+      );
       relayV2TerminalRequestScopedErrors.add(error);
       throw error;
     }
@@ -3025,6 +3248,7 @@ export class RelayV2TerminalManager {
     requestFingerprint: string,
     disposition: "new" | "reset",
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
+    deadline: TerminalOpenOperationDeadline,
     previous?: TerminalStream,
     alreadyLostPrevious?: TerminalStream,
   ): Promise<void> {
@@ -3082,6 +3306,7 @@ export class RelayV2TerminalManager {
       recordKey,
       requestFingerprint,
       claimAuthority,
+      deadline,
     );
     if (resolution === null) return;
     const resumeToken = this.issueToken();
@@ -3107,35 +3332,65 @@ export class RelayV2TerminalManager {
 
     const stream = this.newStream(request, resolution, key, generation, resumeToken);
     try {
-      stream.backend = await this.backend.open(
-        stream.effectTarget,
-        {
-          maxChunkBytes: this.limits.maxFrameBytes,
-          displaySizeHint: { cols: request.cols, rows: request.rows },
-        },
-        {
-          onBytes: async (data) => {
-            if (
-              !Number.isSafeInteger(data.byteLength)
-              || data.byteLength < 0
-              || data.byteLength > this.limits.maxFrameBytes
-            ) {
-              await this.enqueue(() => this.rejectBackendChunk(key, generation));
-              return;
-            }
-            const copy = Buffer.from(data);
-            await this.enqueue(() => this.backendOutput(key, generation, copy));
+      stream.backend = await this.runOpenStep(
+        deadline,
+        "backend attachment",
+        () => this.backend.open(
+          stream.effectTarget,
+          {
+            maxChunkBytes: this.limits.maxFrameBytes,
+            displaySizeHint: { cols: request.cols, rows: request.rows },
           },
-          onClosed: async (result) => {
-            await this.enqueue(() => this.backendClosed(
-              key,
-              generation,
-              normalizeBackendClose(result),
-            ));
+          {
+            onBytes: async (data) => {
+              if (
+                !Number.isSafeInteger(data.byteLength)
+                || data.byteLength < 0
+                || data.byteLength > this.limits.maxFrameBytes
+              ) {
+                await this.enqueue(() => this.rejectBackendChunk(key, generation));
+                return;
+              }
+              const copy = Buffer.from(data);
+              await this.enqueue(() => this.backendOutput(key, generation, copy));
+            },
+            onClosed: async (result) => {
+              await this.enqueue(() => this.backendClosed(
+                key,
+                generation,
+                normalizeBackendClose(result),
+              ));
+            },
           },
+        ),
+        async (lateHandle) => {
+          // The exact generation was never published locally or durably. Its
+          // late attachment owns no route and may only be closed.
+          if (!lateHandle || typeof lateHandle.close !== "function") return;
+          try {
+            await lateHandle.close();
+          } catch {
+            // The key/generation observer fence still rejects every callback.
+          }
         },
       );
-    } catch {
+    } catch (error) {
+      if (this.isOpenDeadlineError(error)) {
+        stream.status = "lost";
+        stream.binding = undefined;
+        stream.reservedCloseRecord = false;
+        this.clearControlWindows(stream);
+        this.settleTimedOutPreparedOpenClaim(
+          recordKey,
+          requestFingerprint,
+          claimAuthority,
+          failureStreamEffect,
+        );
+        if (failureStreamEffect.kind === "retire_previous" && previous) {
+          previous.reservedCloseRecord = false;
+        }
+        throw error;
+      }
       await this.releaseProducerLease(stream);
       await this.disposeBackend(stream);
       const outcome: Exclude<OpenRecordOutcome, { kind: "opened" }> = {
@@ -3237,6 +3492,7 @@ export class RelayV2TerminalManager {
     requestFingerprint: string,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
     requestResumeTokenHash: string,
+    deadline: TerminalOpenOperationDeadline,
   ): Promise<void> {
     const resume = request.resume!;
     const requestedOffset = parseCounter(resume.nextOffset, "nextOffset");
@@ -3342,6 +3598,7 @@ export class RelayV2TerminalManager {
       requestFingerprint,
       claimAuthority,
       source.canonicalBinding,
+      deadline,
     );
     if (!retainedPrepared) return;
     if (!authoritativeStream!.close) {
@@ -3377,6 +3634,7 @@ export class RelayV2TerminalManager {
     requestFingerprint: string,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
     requestResumeTokenHash: string | null,
+    deadline: TerminalOpenOperationDeadline,
     alreadyLostPrevious?: TerminalStream,
   ): Promise<void> {
     const source = claimAuthority.streamAuthority;
@@ -3402,6 +3660,7 @@ export class RelayV2TerminalManager {
         requestFingerprint,
         "reset",
         claimAuthority,
+        deadline,
         undefined,
         alreadyLostPrevious,
       );
@@ -3435,6 +3694,7 @@ export class RelayV2TerminalManager {
       requestFingerprint,
       "reset",
       claimAuthority,
+      deadline,
       validExisting ? existing : undefined,
     );
   }
@@ -3478,9 +3738,11 @@ export class RelayV2TerminalManager {
       inputAcked: 0n,
       inputFloor: 0n,
       inputHashes: new Map(),
+      inputRetryAttempt: 0,
       resizeAcked: 0n,
       resizeFloor: 0n,
       resizes: new Map(),
+      resizeRetryAttempt: 0,
       lastUsedAt: this.now(),
     };
   }
@@ -3570,6 +3832,7 @@ export class RelayV2TerminalManager {
     recordKey: string,
     requestFingerprint: string,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
+    deadline: TerminalOpenOperationDeadline,
   ): Promise<RelayV2TerminalCanonicalResolution | null> {
     let resolution: RelayV2TerminalCanonicalResolution;
     let resolvingExactTarget = true;
@@ -3583,7 +3846,11 @@ export class RelayV2TerminalManager {
       let refreshAttempts = 0;
       while (true) {
         try {
-          resolution = await this.resolveTarget(request);
+          resolution = await this.runOpenStep(
+            deadline,
+            "target resolution",
+            () => this.resolveTarget(request),
+          );
           break;
         } catch (error) {
           if (!canonicalResolverCutIsRefreshing(error)
@@ -3591,19 +3858,41 @@ export class RelayV2TerminalManager {
             throw error;
           }
           refreshAttempts += 1;
-          await waitForCanonicalResolverRefresh();
+          await this.runOpenStep(
+            deadline,
+            "target resolver refresh",
+            waitForCanonicalResolverRefresh,
+          );
           this.assertRunning();
         }
       }
       resolvingExactTarget = false;
-      const prepared = await this.lineage.prepareOpen({
-        key: recordKey,
-        fingerprint: requestFingerprint,
-        hostInstanceId: this.hostInstanceId,
-        claimToken: claimAuthority.claimToken,
-        fence: claimAuthority.fence,
-        preparation: { kind: "current", resolution },
-      });
+      const prepared = await this.runOpenStep(
+        deadline,
+        "durable target preparation",
+        () => this.lineage.prepareOpen({
+          key: recordKey,
+          fingerprint: requestFingerprint,
+          hostInstanceId: this.hostInstanceId,
+          claimToken: claimAuthority.claimToken,
+          fence: claimAuthority.fence,
+          preparation: { kind: "current", resolution },
+        }),
+        (late) => {
+          if (late?.status !== "replay") {
+            this.settleTimedOutPreparedOpenClaim(
+              recordKey,
+              requestFingerprint,
+              claimAuthority,
+            );
+          }
+        },
+        () => this.releaseTimedOutUnpreparedOpenClaim(
+          recordKey,
+          requestFingerprint,
+          claimAuthority,
+        ),
+      );
       if (!prepared || typeof prepared !== "object") {
         throw new RelayV2TerminalManagerError(
           "CAPABILITY_UNAVAILABLE",
@@ -3636,12 +3925,17 @@ export class RelayV2TerminalManager {
       }
       return resolution;
     } catch (error) {
-      const targetError = error && typeof error === "object"
-        ? error as Record<string, unknown>
-        : null;
-      if (resolvingExactTarget
-        && targetError?.code === "RESOURCE_EXHAUSTED"
-        && targetError.retryable === true) {
+      if (this.isOpenDeadlineError(error)) {
+        if (resolvingExactTarget) {
+          this.releaseTimedOutUnpreparedOpenClaim(
+            recordKey,
+            requestFingerprint,
+            claimAuthority,
+          );
+        }
+        throw error;
+      }
+      if (resolvingExactTarget && retryableExactTargetPressure(error)) {
         const released = await this.lineage.releaseUnpreparedOpenClaim({
           key: recordKey,
           fingerprint: requestFingerprint,
@@ -3708,19 +4002,38 @@ export class RelayV2TerminalManager {
     requestFingerprint: string,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
     binding: RelayV2TerminalCanonicalTargetBindingV1,
+    deadline: TerminalOpenOperationDeadline,
   ): Promise<boolean> {
     try {
-      const prepared = await this.lineage.prepareOpen({
-        key: recordKey,
-        fingerprint: requestFingerprint,
-        hostInstanceId: this.hostInstanceId,
-        claimToken: claimAuthority.claimToken,
-        fence: claimAuthority.fence,
-        preparation: {
-          kind: "retained",
-          binding: cloneCanonicalBinding(binding),
+      const prepared = await this.runOpenStep(
+        deadline,
+        "durable retained-target preparation",
+        () => this.lineage.prepareOpen({
+          key: recordKey,
+          fingerprint: requestFingerprint,
+          hostInstanceId: this.hostInstanceId,
+          claimToken: claimAuthority.claimToken,
+          fence: claimAuthority.fence,
+          preparation: {
+            kind: "retained",
+            binding: cloneCanonicalBinding(binding),
+          },
+        }),
+        (late) => {
+          if (late?.status !== "replay") {
+            this.settleTimedOutPreparedOpenClaim(
+              recordKey,
+              requestFingerprint,
+              claimAuthority,
+            );
+          }
         },
-      });
+        () => this.releaseTimedOutUnpreparedOpenClaim(
+          recordKey,
+          requestFingerprint,
+          claimAuthority,
+        ),
+      );
       if (prepared.status === "replay") {
         await this.reconcileAndReplayDurableOpen(
           request,
@@ -3746,7 +4059,8 @@ export class RelayV2TerminalManager {
         );
       }
       return true;
-    } catch {
+    } catch (error) {
+      if (this.isOpenDeadlineError(error)) throw error;
       const reset: Extract<OpenRecordOutcome, { kind: "reset" }> = {
         kind: "reset",
         generation: request.resume?.generation ?? null,
@@ -4022,6 +4336,104 @@ export class RelayV2TerminalManager {
     }
   }
 
+  private cancelInputRetry(stream: TerminalStream): void {
+    const retry = stream.inputRetry;
+    stream.inputRetry = undefined;
+    stream.inputRetryAttempt = 0;
+    if (!retry) return;
+    retry.active = false;
+    retry.cancel();
+  }
+
+  private cancelResizeRetry(stream: TerminalStream): void {
+    const retry = stream.resizeRetry;
+    stream.resizeRetry = undefined;
+    stream.resizeRetryAttempt = 0;
+    if (!retry) return;
+    retry.active = false;
+    retry.cancel();
+  }
+
+  private scheduleInputRetry(
+    stream: TerminalStream,
+    input: RelayV2TerminalInput,
+    sequence: bigint,
+  ): void {
+    if (stream.inputRetry?.sequence === sequence) return;
+    const attempt = stream.inputRetryAttempt;
+    this.cancelInputRetry(stream);
+    const delayMs = Math.min(
+      PRODUCER_CONTROL_RETRY_MAX_MS,
+      PRODUCER_CONTROL_RETRY_BASE_MS * (2 ** Math.min(attempt, 3)),
+    );
+    stream.inputRetryAttempt = Math.min(attempt + 1, 4);
+    const copy = { ...input, data: Buffer.from(input.data) };
+    const retry: ProducerControlRetry = {
+      active: true,
+      sequence,
+      cancel: () => undefined,
+    };
+    stream.inputRetry = retry;
+    const callback = (): void => {
+      if (!retry.active || stream.inputRetry !== retry) return;
+      retry.active = false;
+      stream.inputRetry = undefined;
+      if (this.stopping
+        || this.streams.get(stream.key) !== stream
+        || stream.status !== "live"
+        || stream.binding === undefined) return;
+      void this.input(copy).catch(() => undefined);
+    };
+    const cancel = this.schedule(delayMs, callback);
+    if (typeof cancel !== "function") {
+      retry.active = false;
+      if (stream.inputRetry === retry) stream.inputRetry = undefined;
+      throw new TypeError("Relay v2 terminal input retry scheduler returned an invalid cancel handle");
+    }
+    retry.cancel = cancel;
+    if (!retry.active) cancel();
+  }
+
+  private scheduleResizeRetry(
+    stream: TerminalStream,
+    resize: RelayV2TerminalResize,
+    sequence: bigint,
+  ): void {
+    if (stream.resizeRetry?.sequence === sequence) return;
+    const attempt = stream.resizeRetryAttempt;
+    this.cancelResizeRetry(stream);
+    const delayMs = Math.min(
+      PRODUCER_CONTROL_RETRY_MAX_MS,
+      PRODUCER_CONTROL_RETRY_BASE_MS * (2 ** Math.min(attempt, 3)),
+    );
+    stream.resizeRetryAttempt = Math.min(attempt + 1, 4);
+    const copy = { ...resize };
+    const retry: ProducerControlRetry = {
+      active: true,
+      sequence,
+      cancel: () => undefined,
+    };
+    stream.resizeRetry = retry;
+    const callback = (): void => {
+      if (!retry.active || stream.resizeRetry !== retry) return;
+      retry.active = false;
+      stream.resizeRetry = undefined;
+      if (this.stopping
+        || this.streams.get(stream.key) !== stream
+        || stream.status !== "live"
+        || stream.binding === undefined) return;
+      void this.resize(copy).catch(() => undefined);
+    };
+    const cancel = this.schedule(delayMs, callback);
+    if (typeof cancel !== "function") {
+      retry.active = false;
+      if (stream.resizeRetry === retry) stream.resizeRetry = undefined;
+      throw new TypeError("Relay v2 terminal resize retry scheduler returned an invalid cancel handle");
+    }
+    retry.cancel = cancel;
+    if (!retry.active) cancel();
+  }
+
   private async reconcileRetiringLease(stream: TerminalStream): Promise<void> {
     const lease = stream.retiringLease;
     if (!lease) return;
@@ -4060,6 +4472,8 @@ export class RelayV2TerminalManager {
   }
 
   private clearControlWindows(stream: TerminalStream): void {
+    this.cancelInputRetry(stream);
+    this.cancelResizeRetry(stream);
     stream.inputHashes.clear();
     stream.inputFloor = stream.inputAcked;
     stream.pendingInput = undefined;
@@ -4403,10 +4817,12 @@ export class RelayV2TerminalManager {
     const seq = parsePositiveCounter(input.inputSeq, "inputSeq");
     const hash = payloadHash(input.data);
     if (seq <= stream.inputFloor) {
+      if (stream.inputRetry?.sequence === seq) this.cancelInputRetry(stream);
       await this.sendInputAck(stream);
       return;
     }
     if (seq <= stream.inputAcked) {
+      if (stream.inputRetry?.sequence === seq) this.cancelInputRetry(stream);
       const retained = stream.inputHashes.get(seq.toString(10));
       if (!retained || retained.hash !== hash) {
         await this.sendInputError(stream, seq, "TERMINAL_INPUT_CONFLICT", false);
@@ -4447,9 +4863,14 @@ export class RelayV2TerminalManager {
           state: "in_doubt",
           error: leaseResult.error,
         };
-      } else if (stream.pendingInput?.seq === seq) {
+      } else if (!leaseResult.error.retryable && stream.pendingInput?.seq === seq) {
         stream.pendingInput = undefined;
       }
+      if (leaseResult.status === "rejected" && leaseResult.error.retryable) {
+        this.scheduleInputRetry(stream, input, seq);
+        return;
+      }
+      this.cancelInputRetry(stream);
       await this.sendAuthorityError(stream, "input", seq, leaseResult.error);
       return;
     }
@@ -4486,11 +4907,17 @@ export class RelayV2TerminalManager {
           await this.releaseProducerLease(stream);
           this.clearControlWindows(stream);
         }
+        if (result.error.retryable) {
+          this.scheduleInputRetry(stream, input, seq);
+          return;
+        }
         if (stream.pendingInput?.seq === seq) stream.pendingInput = undefined;
       }
+      this.cancelInputRetry(stream);
       await this.sendAuthorityError(stream, "input", seq, result.error);
       return;
     }
+    this.cancelInputRetry(stream);
     stream.inputAcked = seq;
     stream.inputHashes.set(seq.toString(10), { hash });
     stream.pendingInput = undefined;
@@ -4511,10 +4938,12 @@ export class RelayV2TerminalManager {
     const seq = parsePositiveCounter(resize.resizeSeq, "resizeSeq");
     const sizeFingerprint = `${resize.cols}x${resize.rows}`;
     if (seq <= stream.resizeFloor) {
+      if (stream.resizeRetry?.sequence === seq) this.cancelResizeRetry(stream);
       await this.sendResizeAck(stream);
       return;
     }
     if (seq <= stream.resizeAcked) {
+      if (stream.resizeRetry?.sequence === seq) this.cancelResizeRetry(stream);
       const retained = stream.resizes.get(seq.toString(10));
       if (!retained || retained.cols !== resize.cols || retained.rows !== resize.rows) {
         await this.sendResizeError(stream, seq, "TERMINAL_RESIZE_CONFLICT", false);
@@ -4558,9 +4987,14 @@ export class RelayV2TerminalManager {
           state: "in_doubt",
           error: leaseResult.error,
         };
-      } else if (stream.pendingResize?.seq === seq) {
+      } else if (!leaseResult.error.retryable && stream.pendingResize?.seq === seq) {
         stream.pendingResize = undefined;
       }
+      if (leaseResult.status === "rejected" && leaseResult.error.retryable) {
+        this.scheduleResizeRetry(stream, resize, seq);
+        return;
+      }
+      this.cancelResizeRetry(stream);
       await this.sendAuthorityError(stream, "resize", seq, leaseResult.error);
       return;
     }
@@ -4598,11 +5032,17 @@ export class RelayV2TerminalManager {
           await this.releaseProducerLease(stream);
           this.clearControlWindows(stream);
         }
+        if (result.error.retryable) {
+          this.scheduleResizeRetry(stream, resize, seq);
+          return;
+        }
         if (stream.pendingResize?.seq === seq) stream.pendingResize = undefined;
       }
+      this.cancelResizeRetry(stream);
       await this.sendAuthorityError(stream, "resize", seq, result.error);
       return;
     }
+    this.cancelResizeRetry(stream);
     stream.resizeAcked = seq;
     stream.resizes.set(seq.toString(10), { cols: resize.cols, rows: resize.rows });
     stream.pendingResize = undefined;

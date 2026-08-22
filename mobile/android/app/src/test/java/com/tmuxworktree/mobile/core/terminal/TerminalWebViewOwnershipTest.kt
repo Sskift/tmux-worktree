@@ -53,8 +53,13 @@ class TerminalWebViewOwnershipTest {
         assertTrue(parserSettlements.isEmpty())
         assertEquals(0L, owner.rebuildGeneration.value)
 
-        assertTrue(loss.completeAfterAttachmentDetach())
+        assertFalse(loss.completeAfterAttachmentDetach())
+        assertFalse(owner.bind(replacementView))
+        assertTrue(loss.abortParserMutationBeforeAttachmentDetach())
         assertEquals(listOf(false), parserSettlements)
+        assertFalse(loss.abortParserMutationBeforeAttachmentDetach())
+        assertFalse(owner.bind(replacementView))
+        assertTrue(loss.completeAfterAttachmentDetach())
         assertEquals(1L, owner.rebuildGeneration.value)
         assertTrue(owner.bind(replacementView))
         assertSame(replacementView, owner.currentView())
@@ -65,7 +70,7 @@ class TerminalWebViewOwnershipTest {
     }
 
     @Test
-    fun `normal dispose stays false and only releases replacement after detach`() {
+    fun `normal dispose releases replacement only after its successful detach settlement`() {
         val owner = TerminalWebViewOwnership()
         val disposedView = Any()
         val replacementView = Any()
@@ -78,17 +83,55 @@ class TerminalWebViewOwnershipTest {
                 kind = TerminalWebViewLossKind.VIEW_DISPOSED,
                 didCrash = false,
                 allowAutomaticRebuild = false,
-            ) { parserSettlements += false },
+            ) {
+                parserSettlements += terminalParserMutationAppliedOnViewLoss(
+                    TerminalWebViewLossKind.VIEW_DISPOSED,
+                )
+            },
         )
 
         assertFalse(owner.bind(disposedView))
-        assertFalse(owner.bind(replacementView))
+        assertTrue(owner.acceptsDisposedParserSettlement(loss.generation))
         assertTrue(parserSettlements.isEmpty())
+        assertTrue(loss.closesRemoteStream)
+        assertTrue(loss.abortParserMutationBeforeAttachmentDetach())
+        assertEquals(listOf(true), parserSettlements)
         assertFalse(loss.completeAfterAttachmentDetach())
-        assertEquals(listOf(false), parserSettlements)
-        assertEquals(1L, owner.rebuildGeneration.value)
+        assertEquals(0L, owner.rebuildGeneration.value)
+        assertFalse(owner.acceptsDisposedParserSettlement(loss.generation))
         assertFalse(owner.bind(disposedView))
         assertTrue(owner.bind(replacementView))
+    }
+
+    @Test
+    fun `replacement bind racing normal dispose publishes one rebuild after detach`() {
+        val owner = TerminalWebViewOwnership()
+        val disposedView = Any()
+        val inertReplacement = Any()
+        assertTrue(owner.bind(disposedView))
+        val loss = requireNotNull(
+            owner.beginViewLoss(
+                view = disposedView,
+                kind = TerminalWebViewLossKind.VIEW_DISPOSED,
+                didCrash = false,
+                allowAutomaticRebuild = false,
+                settleParserFailure = {},
+            ),
+        )
+
+        // Compose may run the successor AndroidView factory before asynchronous attachment detach.
+        assertFalse(owner.bind(inertReplacement))
+        assertEquals(0L, owner.rebuildGeneration.value)
+
+        assertTrue(loss.abortParserMutationBeforeAttachmentDetach())
+        assertFalse(loss.completeAfterAttachmentDetach())
+        assertEquals(1L, owner.rebuildGeneration.value)
+        assertFalse(loss.completeAfterAttachmentDetach())
+        assertEquals(1L, owner.rebuildGeneration.value)
+
+        val rebuiltReplacement = Any()
+        assertTrue(owner.bind(rebuiltReplacement))
+        assertSame(rebuiltReplacement, owner.currentView())
     }
 
     @Test
@@ -104,11 +147,17 @@ class TerminalWebViewOwnershipTest {
                 kind = TerminalWebViewLossKind.RENDERER_GONE,
                 didCrash = true,
                 allowAutomaticRebuild = false,
-            ) { parserSettlements += false },
+            ) {
+                parserSettlements += terminalParserMutationAppliedOnViewLoss(
+                    TerminalWebViewLossKind.RENDERER_GONE,
+                )
+            },
         )
 
-        assertFalse(loss.completeAfterAttachmentDetach())
+        assertFalse(loss.closesRemoteStream)
+        assertTrue(loss.abortParserMutationBeforeAttachmentDetach())
         assertEquals(listOf(false), parserSettlements)
+        assertFalse(loss.completeAfterAttachmentDetach())
         assertEquals(0L, owner.rebuildGeneration.value)
     }
 
@@ -128,6 +177,7 @@ class TerminalWebViewOwnershipTest {
                 settleParserFailure = {},
             ),
         )
+        assertTrue(loss.abortParserMutationBeforeAttachmentDetach())
         assertFalse(loss.completeAfterAttachmentDetach())
         assertEquals(0L, owner.rebuildGeneration.value)
 
@@ -157,6 +207,7 @@ class TerminalWebViewOwnershipTest {
         assertEquals(0L, owner.rebuildGeneration.value)
         assertFalse(owner.bind(replacementView))
 
+        assertTrue(loss.abortParserMutationBeforeAttachmentDetach())
         assertFalse(loss.completeAfterAttachmentDetach())
         assertEquals(1L, owner.rebuildGeneration.value)
         assertTrue(owner.bind(replacementView))

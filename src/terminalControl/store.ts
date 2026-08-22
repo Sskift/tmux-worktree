@@ -26,6 +26,7 @@ import type {
 import { TerminalControlProtocolError } from "./protocol";
 
 export const TERMINAL_CONTROL_STATE_VERSION = 1 as const;
+export const TERMINAL_CONTROL_MAX_RETIRED_TARGETS = 64;
 const LOCK_OWNER_FILE = "owner.json";
 const LOCK_STALE_MS = 60_000;
 const LOCK_WAIT_MS = 5_000;
@@ -366,6 +367,31 @@ export function saveTerminalControlState(
   path = terminalControlStatePath(),
 ): void {
   const validated = parseTerminalControlState(state);
+  // Retired target identities remain useful for a bounded window so stale
+  // clients receive TARGET_GONE instead of TARGET_NOT_FOUND. Their operation
+  // journals are no longer needed: TARGET_GONE is checked before deduplication
+  // and the exact incarnation can never become writable again. Keeping only a
+  // bounded set prevents high-frequency terminal input from turning every
+  // later fsync into a multi-megabyte rewrite.
+  const retainedGoneIds = new Set(validated.targets
+    .filter((target) => target.lifecycle === "TARGET_GONE")
+    .sort((left, right) => (
+      Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+      || right.controlTargetId.localeCompare(left.controlTargetId)
+    ))
+    .slice(0, TERMINAL_CONTROL_MAX_RETIRED_TARGETS)
+    .map((target) => target.controlTargetId));
+  const compacted = parseTerminalControlState({
+    ...validated,
+    targets: validated.targets.flatMap((target) => {
+      if (target.lifecycle !== "TARGET_GONE") return [target];
+      if (!retainedGoneIds.has(target.controlTargetId)) return [];
+      return [{
+        ...target,
+        completedOperations: [],
+      }];
+    }),
+  });
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
   const temporary = join(
@@ -375,7 +401,7 @@ export function saveTerminalControlState(
   let fd = -1;
   try {
     fd = openSync(temporary, "wx", 0o600);
-    const contents = Buffer.from(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
+    const contents = Buffer.from(`${JSON.stringify(compacted)}\n`, "utf8");
     let offset = 0;
     while (offset < contents.byteLength) {
       offset += writeSync(fd, contents, offset, contents.byteLength - offset, offset);

@@ -61,6 +61,9 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalBytes
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalEffect
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialStore
+import com.tmuxworktree.mobile.core.session.ExponentialMobileSessionReconnectPolicy
+import com.tmuxworktree.mobile.core.session.MobileSessionReconnectPolicy
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportAdapter
 import java.io.Closeable
 import java.util.UUID
 import java.util.concurrent.CancellationException
@@ -370,7 +373,10 @@ internal class RelayV2BaseRuntimeComposition(
     agentRuntimeFactory: ((RelayV2RepositoryEffectApplyLeasePort) ->
         AgentTranscriptLifecycleRuntimeHandlePort)? = null,
     agentOptionalCapabilities: Set<String> = emptySet(),
-    transportFactory: RelayV2TransportFactory = BoundedRelayV2TransportFactory(),
+    transportFactory: MobileSessionTransportAdapter<RelayV2TransportOpenRequest> =
+        RelayV2WebSocketTransportAdapter(),
+    private val reconnectPolicy: MobileSessionReconnectPolicy =
+        ExponentialMobileSessionReconnectPolicy.production(),
     private val newCommandId: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = System::currentTimeMillis,
     private val retryDelay: suspend (Long) -> Unit = { delay(it) },
@@ -445,11 +451,33 @@ internal class RelayV2BaseRuntimeComposition(
                 key: RelayV2TerminalCheckpointKey,
                 reason: RelayV2TerminalFatalInvalidationReason,
             ) {
-                check(authority.profileId == profile.profileId)
-                check(authority.profileActivationGeneration == profile.activationGeneration)
-                check(key.profileId == authority.profileId)
-                check(key.profileActivationGeneration == authority.profileActivationGeneration)
-                failRuntimeIncomplete("TERMINAL_RUNTIME_INVALIDATED")
+                val structuralMatch = authority.profileId == profile.profileId &&
+                    authority.profileActivationGeneration == profile.activationGeneration &&
+                    key.profileId == authority.profileId &&
+                    key.profileActivationGeneration == authority.profileActivationGeneration &&
+                    key.principalId == authority.principalId &&
+                    key.clientInstanceId == authority.clientInstanceId &&
+                    key.hostId == authority.hostId && key.hostEpoch == authority.hostEpoch
+                if (!structuralMatch) {
+                    failRuntimeIncomplete("TERMINAL_RUNTIME_INVALIDATED")
+                    error("Terminal invalidation authority did not match its checkpoint")
+                }
+                val failureCode = if (
+                    reason == RelayV2TerminalFatalInvalidationReason.DETACHED_OPEN_RESPONSE
+                ) {
+                    "TERMINAL_DETACHED_OPEN_RESPONSE"
+                } else {
+                    "TERMINAL_RUNTIME_INVALIDATED"
+                }
+                when (actor.retireCurrentTerminalRuntime(authority, failureCode)) {
+                    RelayV2ExactAuthorityRetirementResult.RETIRED,
+                    RelayV2ExactAuthorityRetirementResult.ALREADY_WITHDRAWN,
+                    -> Unit
+                    RelayV2ExactAuthorityRetirementResult.AUTHORITY_MISMATCH -> {
+                        failRuntimeIncomplete("TERMINAL_RUNTIME_INVALIDATED")
+                        error("Terminal invalidation could not withdraw the exact authority")
+                    }
+                }
             }
         },
     )
@@ -685,6 +713,13 @@ internal class RelayV2BaseRuntimeComposition(
         withTerminalOnline(attachment) { issued, authority ->
             terminalRuntime.close(issued.runtimeAttachment, authority)
         }
+
+    /** Idempotent close intent that remains exact across parser detach and a late opened reply. */
+    internal suspend fun closeTerminalForDetach(
+        attachment: RelayV2TerminalAttachment,
+    ): Boolean = withTerminalOnline(attachment) { issued, authority ->
+        terminalRuntime.ensureCloseForDetach(issued.runtimeAttachment, authority)
+    }
 
     internal suspend fun detachTerminal(attachment: RelayV2TerminalAttachment) {
         val issued = attachment as? CompositionTerminalAttachment ?: return
@@ -1759,8 +1794,9 @@ internal class RelayV2BaseRuntimeComposition(
                 is RelayV2EffectApplyResult.Applied -> when (applied.value) {
                     RelayV2TerminalFrameResult.ProtocolViolation ->
                         failRuntimeIncomplete("TERMINAL_FRAME_PROTOCOL_VIOLATION")
-                    RelayV2TerminalFrameResult.NotOwned ->
+                    RelayV2TerminalFrameResult.NotOwned -> if (type != "terminal.closed") {
                         failRuntimeIncomplete("UNOWNED_EFFECT_$type")
+                    }
                     RelayV2TerminalFrameResult.EffectRejected ->
                         failRuntimeIncomplete("TERMINAL_FRAME_NOT_CURRENT")
                     RelayV2TerminalFrameResult.Applied -> Unit
@@ -1832,6 +1868,10 @@ internal class RelayV2BaseRuntimeComposition(
             ).also { credentialRolloverAdmission = it }
         }
         admission ?: return
+        startCredentialRollover(admission)
+    }
+
+    private fun startCredentialRollover(admission: CredentialRolloverAdmission) {
         pumpScope.launch {
             val result = try {
                 credentialRollover.rollover(admission.expectedProfile)
@@ -1863,7 +1903,7 @@ internal class RelayV2BaseRuntimeComposition(
                 refreshed == expected.copy(credentialVersion = expected.credentialVersion + 1)
             val bound = boundOutboxAdmission
             val pending = pendingOutboxAdmission
-            val ownsBound = bound?.generation == admission.generation &&
+            val ownsBound = bound != null && bound.generation == admission.generation &&
                 bound.connectionAttempt === admission.connectionAttempt
             val ownsPending = pending?.connectionAttempt === admission.connectionAttempt
             val ownsLostAdmission = admission.transportLost &&
@@ -2412,8 +2452,13 @@ internal class RelayV2BaseRuntimeComposition(
         effect: RelayV2OutboxEffect.ExecuteCommand,
     ): Long {
         val retryOrdinal = maxOf(0, effect.attempt.ordinal - 2)
-        val localBackoff = retryDelayMillis(retryOrdinal)
+        val localBackoff = commandLocalRetryDelayMillis(retryOrdinal)
         return maxOf(localBackoff, effect.retryAfterMs ?: 0L)
+    }
+
+    private fun commandLocalRetryDelayMillis(attempt: Int): Long {
+        val multiplier = 1L shl minOf(attempt, MAX_RETRY_EXPONENT)
+        return minOf(COMMAND_RETRY_BASE_DELAY_MS * multiplier, COMMAND_RETRY_MAX_DELAY_MS)
     }
 
     private suspend fun enqueueSessionCommandUnderLease(
@@ -2938,6 +2983,13 @@ internal class RelayV2BaseRuntimeComposition(
             clearRecoveredDispatch()
             return
         }
+        val expiredCredentialAdmission = claimExpiredCredentialRollover(effect)
+        if (expiredCredentialAdmission != null) {
+            cancelAgentRecoveryGeneration(effect.generation)
+            clearRecoveredDispatch()
+            startCredentialRollover(expiredCredentialAdmission)
+            return
+        }
         val connectionAttempt = effect.connectionAttempt
         if (connectionAttempt == null) {
             failConnection(effect.failure)
@@ -2960,6 +3012,37 @@ internal class RelayV2BaseRuntimeComposition(
         cancelAgentRecoveryGeneration(effect.generation)
         clearRecoveredDispatch()
         failConnection(effect.failure)
+    }
+
+    /**
+     * A process restart or a network outage can outlive the short-lived access token. In that
+     * case the actor rejects the connect locally, before the Broker handshake can publish
+     * `client.auth_expiring`. Claim the exact pending attempt and reuse the same durable refresh
+     * owner before opening the successor transport.
+     */
+    private fun claimExpiredCredentialRollover(
+        effect: RelayV2RuntimeEffect.ConnectionFailed,
+    ): CredentialRolloverAdmission? = synchronized(connectionLock) {
+        val connectionAttempt = effect.connectionAttempt ?: return@synchronized null
+        val generation = effect.generation ?: return@synchronized null
+        val currentProfile = profile
+        val pending = pendingOutboxAdmission
+        if (effect.failure.kind != RelayV2FailureKind.AUTH ||
+            effect.failure.code != "AUTH_REQUIRED" ||
+            !currentProfile.autoConnect ||
+            effect.profile != currentProfile.identity ||
+            credentialRolloverAdmission != null ||
+            pending?.connectionAttempt !== connectionAttempt ||
+            boundOutboxAdmission != null ||
+            closed.get() || terminalFailure.get() != null
+        ) return@synchronized null
+        pendingOutboxAdmission = null
+        CredentialRolloverAdmission(
+            expectedProfile = currentProfile,
+            generation = generation,
+            connectionAttempt = connectionAttempt,
+            transportLost = true,
+        ).also { credentialRolloverAdmission = it }
     }
 
     private fun claimCredentialRolloverTransportLoss(
@@ -3080,7 +3163,7 @@ internal class RelayV2BaseRuntimeComposition(
             check(connectionAttemptJob == null) { "Relay v2 connection attempt already exists" }
             check(pendingOutboxAdmission == null && boundOutboxAdmission == null)
             val fence = retryFence
-            val delayMs = retryDelayMillis(retryAttempt)
+            val delayMs = reconnectPolicy.delayMillis(retryAttempt)
             retryAttempt = minOf(retryAttempt + 1, MAX_RETRY_EXPONENT)
             retryStateFence = RetryStateFence(failedGeneration, failure)
             val scheduledTimer = pumpScope.launch(start = CoroutineStart.LAZY) {
@@ -3105,11 +3188,6 @@ internal class RelayV2BaseRuntimeComposition(
         }
         if (result == RetryScheduleResult.SCHEDULED) checkNotNull(timer).start()
         return result
-    }
-
-    private fun retryDelayMillis(attempt: Int): Long {
-        val multiplier = 1L shl minOf(attempt, MAX_RETRY_EXPONENT)
-        return minOf(RETRY_BASE_DELAY_MS * multiplier, RETRY_MAX_DELAY_MS)
     }
 
     private fun canConnectLocked(expectedFence: Any): Boolean =
@@ -3276,8 +3354,8 @@ internal class RelayV2BaseRuntimeComposition(
         const val MAX_RECOVERED_DISPATCH_CAPABILITIES = 4_096
         const val SELECTED_SESSION_PRESENTATION_PAGE_LIMIT = 64
         const val MAX_SELECTED_SESSION_REPLY_ROWS = 256
-        const val RETRY_BASE_DELAY_MS = 1_000L
-        const val RETRY_MAX_DELAY_MS = 30_000L
+        const val COMMAND_RETRY_BASE_DELAY_MS = 1_000L
+        const val COMMAND_RETRY_MAX_DELAY_MS = 30_000L
         const val MAX_RETRY_EXPONENT = 5
         const val COMMAND_DELIVERY_WATCHDOG_MS = 15_000L
         val CREATE_OPERATIONS = setOf(

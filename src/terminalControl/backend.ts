@@ -57,8 +57,14 @@ const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 const AGENT_RESUME_READY_TIMEOUT_MS = 5_000;
 const AGENT_RESUME_POLL_MS = 50;
 const AGENT_RESUME_SETTLE_MS = 500;
-const AGENT_RESUME_INPUT_TIMEOUT_MS = 8_000;
+// A cold Codex resume can accept the pasted input immediately while taking
+// several more seconds to persist the correlated UserMessage record (update
+// notices and provider startup both occur in this window). Keep the retry
+// cadence short, but allow enough total time to prove the exact submitted
+// turn before declaring the already-written input uncertain.
+const AGENT_RESUME_INPUT_TIMEOUT_MS = 20_000;
 const AGENT_RESUME_INITIAL_SOURCE_WAIT_MS = 2_000;
+const AGENT_RESUME_SUBMIT_RETRY_MS = 500;
 const MAX_RENDERED_SNAPSHOT_SOURCE_BYTES = 2 * 1024 * 1024;
 const RENDERED_SNAPSHOT_HISTORY_LINES = 1024;
 
@@ -932,9 +938,15 @@ async function pasteAgentMessage(
   }
   const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
   try {
+    // Agent TUIs such as Codex enable bracketed paste and treat the framed
+    // payload as one composer edit. Without `-p`, tmux emits a rapid stream of
+    // ordinary key events; Codex's paste-burst fallback can still be buffering
+    // the tail when the later submit key arrives, which can suppress Enter or
+    // submit a truncated message. Keep `-r` so normalized newlines remain
+    // literal inside the bracketed payload.
     await runTmux([
       "load-buffer", "-b", bufferName, "-",
-      ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
+      ";", "paste-buffer", "-b", bufferName, "-d", "-p", "-r", "-t", paneTarget,
     ], { input: normalized });
   } catch (error) {
     await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
@@ -2050,7 +2062,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
           Date.now() + AGENT_RESUME_INITIAL_SOURCE_WAIT_MS,
         );
         let freshSource = await waitForAgentSource(boundary, initialSourceDeadline);
-        if (freshSource === undefined && Date.now() < inputDeadline) {
+        while (freshSource === undefined && Date.now() < inputDeadline) {
           observed = await requireFencedTerminalPane(
             expected,
             tmuxInstanceId,
@@ -2071,7 +2083,10 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
             );
           }
           await pasteAgentMessage(observed.paneId, "", true);
-          freshSource = await waitForAgentSource(boundary, inputDeadline);
+          freshSource = await waitForAgentSource(
+            boundary,
+            Math.min(inputDeadline, Date.now() + AGENT_RESUME_SUBMIT_RETRY_MS),
+          );
         }
         if (freshSource === undefined) {
           throw new Error("managed Agent did not start a fresh transcript source before the input deadline");

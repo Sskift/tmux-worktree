@@ -561,6 +561,7 @@ class RelayV2TerminalRuntimeAdapterTest {
                     true
                 },
                 resetPort = RelayV2TerminalWebViewResetPort { _, _ -> false },
+                callbackDispatcher = callbackDispatcher,
                 newCallbackNonce = { "two-thread" },
             )
             val pausedParser = object : RelayV2TerminalParserPort {
@@ -995,44 +996,35 @@ class RelayV2TerminalRuntimeAdapterTest {
             }
 
             val afterCallback = fixture.checkpoint()
-            assertEquals(write.callbackToken, afterCallback.pendingParserEffectHandoff)
             assertEquals(null, afterCallback.pendingParserEffectActivation)
-            if (!callbackApplied) {
-                assertEquals(
-                    RelayV2TerminalResetReason.PARSER_FAILURE,
-                    afterCallback.pendingParserEffectHandoffResetReason,
-                )
-                assertEquals(RelayV2TerminalResetReason.STREAM_LOST, afterCallback.resetReason)
-                val forbiddenActivation = RelayV2TerminalParserEffectActivation(
-                    write.callbackToken,
-                    reservationId = "reservation-after-failed-handoff",
-                    batchFingerprint = "batch-after-failed-handoff",
-                )
-                val reservationAfterFailure = fixture.repository.reduceTerminalUnderApplyLease(
-                    fixture.key,
-                    RelayV2TerminalAction.ParserEffectsReserved(forbiddenActivation),
-                )
-                assertEquals(
-                    RelayV2TerminalIgnoredReason.OUT_OF_ORDER_PARSER_CALLBACK,
-                    (reservationAfterFailure.outcome as RelayV2TerminalOutcome.Ignored).reason,
-                )
-                assertEquals(afterCallback, reservationAfterFailure.checkpoint)
-            }
             assertTrue(fixture.sink.batches.isEmpty())
-            assertEquals(1, fixture.fatalInvalidation.calls.size)
-            assertEquals(null, fixture.lease.currentAuthority)
-            when (mode) {
-                SinkReservationFailureMode.REJECT -> assertEquals(null, callbackFailure)
-                SinkReservationFailureMode.THROW,
-                SinkReservationFailureMode.IDENTITY_MISMATCH,
-                SinkReservationFailureMode.REJECT_AND_RESET_COMMIT_FAIL,
-                -> assertNotNull(callbackFailure)
-            }
-            if (mode == SinkReservationFailureMode.REJECT_AND_RESET_COMMIT_FAIL) {
-                assertNotNull(callbackFailure)
-                assertEquals(RelayV2TerminalPhase.LIVE, afterCallback.phase)
-            } else {
+            val locallyRecovered = mode !=
+                SinkReservationFailureMode.REJECT_AND_RESET_COMMIT_FAIL
+            if (locallyRecovered) {
+                assertEquals(null, callbackFailure)
+                assertTrue(fixture.fatalInvalidation.calls.isEmpty())
+                assertEquals(fixture.authority, fixture.lease.currentAuthority)
+                assertEquals(null, afterCallback.pendingParserEffectHandoff)
+                assertEquals(null, afterCallback.pendingParserEffectHandoffResetReason)
+                assertEquals(null, afterCallback.parserInFlightCallbackToken)
+                assertEquals(null, afterCallback.parserResetCallbackToken)
                 assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, afterCallback.phase)
+                assertEquals(RelayV2TerminalResetReason.STREAM_LOST, afterCallback.resetReason)
+                assertEquals(
+                    TerminalScopedResetCall(
+                        fixture.authority,
+                        fixture.key,
+                        RelayV2TerminalResetReason.STREAM_LOST,
+                    ),
+                    fixture.terminalScopedReset.calls.single(),
+                )
+            } else {
+                assertNotNull(callbackFailure)
+                assertEquals(1, fixture.fatalInvalidation.calls.size)
+                assertEquals(null, fixture.lease.currentAuthority)
+                assertEquals(RelayV2TerminalPhase.LIVE, afterCallback.phase)
+                assertEquals(write.callbackToken, afterCallback.pendingParserEffectHandoff)
+                assertTrue(fixture.terminalScopedReset.calls.isEmpty())
             }
             val partiallyReserved = fixture.sink.reservations.singleOrNull()
             if (mode in setOf(
@@ -1047,18 +1039,7 @@ class RelayV2TerminalRuntimeAdapterTest {
             } else {
                 assertEquals(null, partiallyReserved)
             }
-            assertEquals(
-                if (mode in setOf(
-                        SinkReservationFailureMode.THROW,
-                        SinkReservationFailureMode.IDENTITY_MISMATCH,
-                    )
-                ) {
-                    listOf(fixture.authority to fixture.key)
-                } else {
-                    emptyList()
-                },
-                fixture.sink.teardownCalls,
-            )
+            assertTrue(fixture.sink.teardownCalls.isEmpty())
             val restarted = RelayV2DurableStateRepositoryCore(fixture.store)
             val restored = restarted.restoreTerminalUnderApplyLease(
                 fixture.key,
@@ -1090,7 +1071,29 @@ class RelayV2TerminalRuntimeAdapterTest {
     }
 
     @Test
-    fun `handoff to activation commit failure aborts inert reservation and restores closed`() =
+    fun `definitive reserve rejection with an existing sink fence remains fatal`() = runBlocking {
+        val fixture = fixture()
+        val write = fixture.enqueueOutput("0", "fenced-rejection")
+        fixture.sink.reserveMode = SinkReserveMode.REJECT
+        fixture.sink.authorityReusable = false
+        fixture.adapter.handle(fixture.authority, write)
+
+        val failure = captureFailure {
+            fixture.parser.writes.single().completion(true)
+        }
+
+        assertNotNull(failure)
+        val checkpoint = fixture.checkpoint()
+        assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, checkpoint.phase)
+        assertEquals(write.callbackToken, checkpoint.pendingParserEffectHandoff)
+        assertEquals(null, checkpoint.pendingParserEffectActivation)
+        assertTrue(fixture.terminalScopedReset.calls.isEmpty())
+        assertEquals(1, fixture.fatalInvalidation.calls.size)
+        assertEquals(null, fixture.lease.currentAuthority)
+    }
+
+    @Test
+    fun `handoff to activation commit failure aborts and normalizes terminal locally`() =
         runBlocking {
             val fixture = fixture()
             val write = fixture.enqueueOutput("0", "handoff-to-activation-failure")
@@ -1103,7 +1106,7 @@ class RelayV2TerminalRuntimeAdapterTest {
                 fixture.parser.writes.single().completion(true)
             }
 
-            assertNotNull(failure)
+            assertEquals(null, failure)
             val reservation = fixture.sink.reservations.single()
             assertEquals(SinkReservationState.ABORTED, reservation.state)
             assertEquals(0, reservation.activationCalls)
@@ -1111,9 +1114,15 @@ class RelayV2TerminalRuntimeAdapterTest {
             assertTrue(fixture.sink.batches.isEmpty())
             val afterCallback = fixture.checkpoint()
             assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, afterCallback.phase)
-            assertEquals(write.callbackToken, afterCallback.pendingParserEffectHandoff)
+            assertEquals(null, afterCallback.pendingParserEffectHandoff)
             assertEquals(null, afterCallback.pendingParserEffectActivation)
-            assertEquals(1, fixture.fatalInvalidation.calls.size)
+            assertEquals(null, afterCallback.parserInFlightCallbackToken)
+            assertTrue(fixture.fatalInvalidation.calls.isEmpty())
+            assertEquals(fixture.authority, fixture.lease.currentAuthority)
+            assertEquals(
+                RelayV2TerminalResetReason.STREAM_LOST,
+                fixture.terminalScopedReset.calls.single().reason,
+            )
 
             val restarted = RelayV2DurableStateRepositoryCore(fixture.store)
             val restored = restarted.restoreTerminalUnderApplyLease(
@@ -1323,6 +1332,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         val control = CapturingControl()
         val sink = CapturingSink()
         val fatalInvalidation = CapturingFatalInvalidation(lease)
+        val terminalScopedReset = CapturingTerminalScopedReset(repository, sink)
         return Fixture(
             store,
             repository,
@@ -1333,6 +1343,7 @@ class RelayV2TerminalRuntimeAdapterTest {
             control,
             sink,
             fatalInvalidation,
+            terminalScopedReset,
             TestRuntimeAdapter(
                 RelayV2TerminalRuntimeAdapter(
                     lease,
@@ -1341,6 +1352,7 @@ class RelayV2TerminalRuntimeAdapterTest {
                     control,
                     sink,
                     fatalInvalidation,
+                    terminalScopedReset,
                 ),
             ),
         )
@@ -1356,6 +1368,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         val control: CapturingControl,
         val sink: CapturingSink,
         val fatalInvalidation: CapturingFatalInvalidation,
+        val terminalScopedReset: CapturingTerminalScopedReset,
         val adapter: TestRuntimeAdapter,
     ) {
         suspend fun checkpoint(): RelayV2TerminalCheckpoint =
@@ -1658,6 +1671,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         var beforeActivate: (Reservation) -> Unit = {}
         var acceptOwner: (Reservation) -> Unit = {}
         var teardownFailureAfterRecord: RuntimeException? = null
+        var authorityReusable = true
 
         override suspend fun reserve(
             reservationId: String,
@@ -1703,6 +1717,18 @@ class RelayV2TerminalRuntimeAdapterTest {
             reservationsById[reservationId]?.abortBeforeActivation()
         }
 
+        override suspend fun isAuthorityReusable(
+            authority: RelayV2RepositoryEffectAuthority,
+            key: RelayV2TerminalCheckpointKey,
+        ): Boolean = authorityReusable && reservations.none {
+            it.batch.authority == authority && it.batch.key == key &&
+                it.state in setOf(
+                    SinkReservationState.RESERVED,
+                    SinkReservationState.ACTIVATING,
+                    SinkReservationState.UNKNOWN,
+                )
+        }
+
         override suspend fun teardownAuthority(
             authority: RelayV2RepositoryEffectAuthority,
             key: RelayV2TerminalCheckpointKey,
@@ -1725,6 +1751,45 @@ class RelayV2TerminalRuntimeAdapterTest {
         val key: RelayV2TerminalCheckpointKey,
         val reason: RelayV2TerminalFatalInvalidationReason,
     )
+
+    private data class TerminalScopedResetCall(
+        val authority: RelayV2RepositoryEffectAuthority,
+        val key: RelayV2TerminalCheckpointKey,
+        val reason: RelayV2TerminalResetReason,
+    )
+
+    private class CapturingTerminalScopedReset(
+        private val repository: RelayV2DurableStateRepositoryCore,
+        private val sink: CapturingSink,
+    ) : RelayV2TerminalScopedResetPort {
+        val calls = mutableListOf<TerminalScopedResetCall>()
+
+        override suspend fun normalizePreActivationFailure(
+            authority: RelayV2RepositoryEffectAuthority,
+            key: RelayV2TerminalCheckpointKey,
+        ): Boolean {
+            if (!sink.isAuthorityReusable(authority, key)) return false
+            val before = (repository.loadTerminal(key) as? RelayV2TerminalStoredCheckpoint.Present)
+                ?.checkpoint ?: return false
+            val normalized = repository.recoverPostCommitUnknownWithContinuity(
+                authority,
+                key,
+                before.parserContinuityId,
+            ) ?: return false
+            val reset = normalized.outcome as? RelayV2TerminalOutcome.ResetRequired ?: return false
+            val checkpoint = normalized.checkpoint ?: return false
+            if (checkpoint.phase != RelayV2TerminalPhase.RESET_REQUIRED ||
+                checkpoint.pendingParserDispatchClaim != null ||
+                checkpoint.pendingParserEffectHandoff != null ||
+                checkpoint.pendingParserEffectHandoffResetReason != null ||
+                checkpoint.pendingParserEffectActivation != null ||
+                checkpoint.parserInFlightCallbackToken != null ||
+                checkpoint.parserResetCallbackToken != null
+            ) return false
+            calls += TerminalScopedResetCall(authority, key, reset.reason)
+            return true
+        }
+    }
 
     private class CapturingFatalInvalidation(
         private val lease: TestApplyLease,

@@ -11,7 +11,6 @@ import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.relay.runtime.PendingChatSend
 import com.tmuxworktree.mobile.core.relay.runtime.RelayChatState
-import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.AgentChatRuntimeSettings
 import com.tmuxworktree.mobile.designsystem.TwTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -65,10 +64,7 @@ class AgentChatScreenInstrumentedTest {
                     onBack = {},
                     onOpenDetails = {},
                     onOpenTerminal = {},
-                    runtimeSettings = AgentChatRuntimeSettings(),
-                    onRuntimeSettingsChange = {},
-                    runtimeSettingsAvailable = true,
-                    onSend = { _, _ -> },
+                    onSend = {},
                     onRetryFailed = { retriedRequestId = it },
                 )
             }
@@ -95,7 +91,7 @@ class AgentChatScreenInstrumentedTest {
     }
 
     @Test
-    fun unavailableRuntimeControlsDoNotReserveSpaceForAnEmptyHint() {
+    fun composerDoesNotShowRuntimeControlsOrRuntimeHints() {
         val session = RelaySession(
             hostId = "host-1",
             name = "local:demo",
@@ -113,18 +109,23 @@ class AgentChatScreenInstrumentedTest {
                     onBack = {},
                     onOpenDetails = {},
                     onOpenTerminal = {},
-                    runtimeSettings = AgentChatRuntimeSettings(),
-                    onRuntimeSettingsChange = {},
-                    runtimeSettingsAvailable = false,
-                    runtimeSettingsUnavailableMessage = null,
-                    onSend = { _, _ -> },
+                    onSend = {},
                     onRetryFailed = {},
                 )
             }
         }
 
-        composeRule.onNodeWithTag("chat_runtime_settings").assertIsDisplayed()
+        composeRule.onNodeWithTag("chat_input").assertIsDisplayed()
+        composeRule.onNodeWithTag("chat_runtime_settings").assertDoesNotExist()
+        composeRule.onNodeWithTag("chat_model_selector").assertDoesNotExist()
+        composeRule.onNodeWithTag("chat_effort_selector").assertDoesNotExist()
+        composeRule.onNodeWithTag("chat_mode_selector").assertDoesNotExist()
         composeRule.onNodeWithTag("chat_runtime_settings_unavailable").assertDoesNotExist()
+        composeRule.onNodeWithTag("chat_runtime_settings_locked").assertDoesNotExist()
+        composeRule.onNodeWithTag("steering_hint").assertDoesNotExist()
+        composeRule.onNodeWithText(
+            "Model, effort and mode apply to the next new turn.",
+        ).assertDoesNotExist()
         composeRule.onNodeWithText(
             "Update the Host and reconnect to change model, effort or mode.",
         ).assertDoesNotExist()

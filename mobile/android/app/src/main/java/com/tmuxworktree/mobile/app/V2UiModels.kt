@@ -218,7 +218,9 @@ internal fun projectRelayV2RuntimeState(
         },
         errorCode = failureCode,
         errorMessage = if (connection == RelayV2ProfileConnectionState.FAILED) {
-            "Relay v2 transport failed; full v2 capability readiness is not advertised"
+            failureCode.takeIf(String::isNotBlank)?.let { code ->
+                "Relay v2 stopped ($code)."
+            } ?: "Relay v2 stopped."
         } else {
             ""
         },

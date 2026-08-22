@@ -489,15 +489,12 @@ internal object RelayV2TerminalCheckpointCodec {
             "pendingOpen" to value.pendingOpen?.let(::encodePendingOpen),
             "resetReason" to value.resetReason?.name,
             "resetFence" to value.resetFence?.let(::encodeOpenFence),
+            "pendingClose" to value.pendingClose?.let(::encodePendingClose),
         )
 
     private fun decodePreOpen(value: Map<String, Any?>): RelayV2TerminalPreOpenCheckpoint {
         val storedSchemaVersion = RelayV2StorageJson.int(value, "schemaVersion")
-        if (storedSchemaVersion !in setOf(7, RelayV2TerminalCheckpointLimits.SCHEMA_VERSION)) {
-            throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
-        }
-        RelayV2StorageJson.requireKeys(
-            value,
+        val legacyKeys = arrayOf(
             "schemaVersion",
             "target",
             "deliveryToken",
@@ -508,20 +505,37 @@ internal object RelayV2TerminalCheckpointCodec {
             "resetReason",
             "resetFence",
         )
+        when (storedSchemaVersion) {
+            7, 8 -> RelayV2StorageJson.requireKeys(value, *legacyKeys)
+            9, RelayV2TerminalCheckpointLimits.SCHEMA_VERSION ->
+                RelayV2StorageJson.requireKeys(value, *(legacyKeys + "pendingClose"))
+            else -> throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
         return RelayV2TerminalPreOpenCheckpoint(
-            RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
-            decodeTarget(RelayV2StorageJson.objectValue(value, "target")),
-            decodeDelivery(RelayV2StorageJson.objectValue(value, "deliveryToken")),
-            RelayV2StorageJson.string(value, "parserContinuityId"),
-            RelayV2StorageJson.stringList(
+            schemaVersion = RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
+            target = decodeTarget(RelayV2StorageJson.objectValue(value, "target")),
+            deliveryToken = decodeDelivery(RelayV2StorageJson.objectValue(value, "deliveryToken")),
+            parserContinuityId = RelayV2StorageJson.string(value, "parserContinuityId"),
+            openRequestIds = RelayV2StorageJson.stringList(
                 value,
                 "openRequestIds",
                 RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS,
             ),
-            RelayV2StorageJson.enum(value, "phase"),
-            RelayV2StorageJson.nullableObject(value, "pendingOpen")?.let(::decodePendingOpen),
-            RelayV2StorageJson.nullableEnum<RelayV2TerminalResetReason>(value, "resetReason"),
-            RelayV2StorageJson.nullableObject(value, "resetFence")?.let(::decodeOpenFence),
+            phase = RelayV2StorageJson.enum(value, "phase"),
+            pendingOpen = RelayV2StorageJson.nullableObject(value, "pendingOpen")
+                ?.let(::decodePendingOpen),
+            resetReason = RelayV2StorageJson.nullableEnum<RelayV2TerminalResetReason>(
+                value,
+                "resetReason",
+            ),
+            resetFence = RelayV2StorageJson.nullableObject(value, "resetFence")
+                ?.let(::decodeOpenFence),
+            pendingClose = if (storedSchemaVersion >= 9) {
+                RelayV2StorageJson.nullableObject(value, "pendingClose")
+                    ?.let(::decodePendingClose)
+            } else {
+                null
+            },
         )
     }
 
@@ -944,6 +958,7 @@ internal object RelayV2TerminalCheckpointCodec {
                 encodeControlLease(it)
             },
             "ambiguousInputs" to value.ambiguousInputs.map(::encodeAmbiguousInput),
+            "pendingCloseWhenOpened" to value.pendingCloseWhenOpened?.let(::encodePendingClose),
             "pendingClose" to value.pendingClose?.let(::encodePendingClose),
             "closed" to value.closed?.let(::encodeClosed),
             "resetReason" to value.resetReason?.name,
@@ -991,7 +1006,7 @@ internal object RelayV2TerminalCheckpointCodec {
         )
         when (storedSchemaVersion) {
             7 -> RelayV2StorageJson.requireKeys(value, *commonKeys)
-            RelayV2TerminalCheckpointLimits.SCHEMA_VERSION -> {
+            8, 9 -> {
                 val schemaEightKeys = commonKeys + arrayOf(
                     "nextControlDispatchAttemptSeq",
                     "pendingParserDispatchClaim",
@@ -1000,6 +1015,17 @@ internal object RelayV2TerminalCheckpointCodec {
                     "pendingParserEffectActivation",
                 )
                 RelayV2StorageJson.requireKeys(value, *schemaEightKeys)
+            }
+            RelayV2TerminalCheckpointLimits.SCHEMA_VERSION -> {
+                val currentKeys = commonKeys + arrayOf(
+                    "nextControlDispatchAttemptSeq",
+                    "pendingParserDispatchClaim",
+                    "pendingParserEffectHandoff",
+                    "pendingParserEffectHandoffResetReason",
+                    "pendingParserEffectActivation",
+                    "pendingCloseWhenOpened",
+                )
+                RelayV2StorageJson.requireKeys(value, *currentKeys)
             }
             else -> throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
         }
@@ -1127,6 +1153,12 @@ internal object RelayV2TerminalCheckpointCodec {
                 "ambiguousInputs",
                 RelayV2TerminalCheckpointLimits.MAX_INPUT_RECORDS,
             ).map { decodeAmbiguousInput(RelayV2StorageJson.objectValue(it)) },
+            pendingCloseWhenOpened = if (storedSchemaVersion >= 10) {
+                RelayV2StorageJson.nullableObject(value, "pendingCloseWhenOpened")
+                    ?.let(::decodePendingClose)
+            } else {
+                null
+            },
             pendingClose = RelayV2StorageJson.nullableObject(value, "pendingClose")
                 ?.let(::decodePendingClose),
             closed = RelayV2StorageJson.nullableObject(value, "closed")?.let(::decodeClosed),
@@ -1134,7 +1166,22 @@ internal object RelayV2TerminalCheckpointCodec {
                 value,
                 "resetReason",
             ),
-        )
+        ).let { decoded ->
+            // Schema 9 briefly encoded Present close-on-open with pendingClose even though no
+            // terminal.close had been sent yet. Normalize that exact legacy shape into the typed
+            // schema-10 marker so restart cannot close the predecessor generation by mistake.
+            if (storedSchemaVersion == 9 && decoded.pendingOpen != null &&
+                decoded.pendingClose != null
+            ) {
+                decoded.copy(
+                    closeRequestIds = emptyList(),
+                    pendingCloseWhenOpened = decoded.pendingClose,
+                    pendingClose = null,
+                )
+            } else {
+                decoded
+            }
+        }
     }
 
     private fun decodeBytes(value: String): RelayV2TerminalBytes {

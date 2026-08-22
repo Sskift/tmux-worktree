@@ -11,6 +11,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   truncateSync,
   utimesSync,
   writeFileSync,
@@ -665,6 +666,60 @@ test("terminal-control storage is private, atomic, and preserves malformed state
       (error) => error.code === "RECOVERY_REQUIRED",
     );
     assert.equal(readFileSync(temp.path, "utf8"), malformed);
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test("terminal-control storage bounds retired journals and uses compact durable JSON", () => {
+  const temp = tempState();
+  try {
+    const state = terminalControl.emptyTerminalControlState();
+    const operation = (suffix) => ({
+      operationId: `operation-${suffix}`,
+      ownerInstanceId: `owner-${suffix}`,
+      fence: "1",
+      payloadHash: "a".repeat(64),
+      kind: "raw",
+      disposition: "committed",
+      completedAt: "2026-07-13T00:00:00.000Z",
+    });
+    const target = (suffix, lifecycle, updatedAt) => ({
+      controlTargetId: `target-${suffix}`,
+      lifecycle,
+      managedSession: {
+        name: `managed-${suffix}`,
+        kind: "terminal",
+        createdAt: "2026-07-13T00:00:00.000Z",
+      },
+      backend: { kind: "tmux", tmuxInstanceId: `tmux-${suffix}` },
+      outputGeneration: `output-${suffix}`,
+      ownership: { state: "FREE", fence: "1" },
+      revision: "1",
+      completedOperations: [operation(suffix)],
+      updatedAt,
+    });
+    state.targets.push(target("active", "ACTIVE", "2026-07-14T00:00:00.000Z"));
+    for (let index = 0; index < 80; index += 1) {
+      state.targets.push(target(
+        `gone-${index}`,
+        "TARGET_GONE",
+        new Date(Date.UTC(2026, 6, 13, 0, index)).toISOString(),
+      ));
+    }
+
+    terminalControl.saveTerminalControlState(state, temp.path);
+
+    const persisted = terminalControl.loadTerminalControlState(temp.path);
+    const active = persisted.targets.find((candidate) => candidate.lifecycle === "ACTIVE");
+    const retired = persisted.targets.filter((candidate) => candidate.lifecycle === "TARGET_GONE");
+    assert.equal(retired.length, terminalControl.TERMINAL_CONTROL_MAX_RETIRED_TARGETS);
+    assert.equal(retired.every((candidate) => candidate.completedOperations.length === 0), true);
+    assert.equal(active.completedOperations.length, 1);
+    assert.equal(retired.some((candidate) => candidate.controlTargetId === "target-gone-79"), true);
+    assert.equal(retired.some((candidate) => candidate.controlTargetId === "target-gone-0"), false);
+    const wire = readFileSync(temp.path, "utf8");
+    assert.equal(wire.split("\n").length, 2, "durable state should be one compact JSON line");
   } finally {
     temp.cleanup();
   }
@@ -1688,7 +1743,7 @@ test("resize parser preserves exact Relay v2 dimensions and rejects invalid inpu
   }
 });
 
-test("Dashboard and Relay share interactive input without fencing each other", async () => {
+test("Dashboard and Relay serialize interactive input ownership", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
   const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
@@ -1699,28 +1754,31 @@ test("Dashboard and Relay share interactive input without fencing each other", a
       target.controlTargetId,
       owner("dashboard", "dashboard-window:pty-1"),
     );
+    await assert.rejects(
+      acquired(
+        authority,
+        target.controlTargetId,
+        owner("relay-v2", "connector:android-client:target"),
+      ),
+      (error) => error.code === "RESOURCE_EXHAUSTED" && error.retryable === true,
+    );
+    await authority.handle(rawRequest(dashboard.lease, "dashboard-input-1", "from-dashboard"));
+
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "dashboard-release-before-relay",
+      type: "lease.release",
+      lease: dashboard.lease,
+    });
     const relay = await acquired(
       authority,
       target.controlTargetId,
       owner("relay-v2", "connector:android-client:target"),
     );
-
-    assert.equal(relay.lease.leaseId, dashboard.lease.leaseId);
-    assert.equal(relay.lease.fence, dashboard.lease.fence);
-    await authority.handle(rawRequest(dashboard.lease, "dashboard-input-1", "from-dashboard"));
-    await authority.handle(rawRequest(relay.lease, "relay-input-1", "from-apk"));
-
-    await authority.handle({
-      protocolVersion: 1,
-      requestId: "dashboard-release-with-relay-active",
-      type: "lease.release",
-      lease: dashboard.lease,
-    });
     await authority.handle(rawRequest(relay.lease, "relay-input-2", "apk-still-writable"));
 
     assert.deepEqual(backend.writes, [
       { kind: "raw", value: { pane: "0", data: "from-dashboard" } },
-      { kind: "raw", value: { pane: "0", data: "from-apk" } },
       { kind: "raw", value: { pane: "0", data: "apk-still-writable" } },
     ]);
   } finally {
@@ -2772,6 +2830,276 @@ test("production backend seeds an existing pane before live Relay v2 input", asy
   }
 });
 
+test("production Agent paste brackets one complete composer edit before submit", async (t) => {
+  const harness = isolatedManagedTmux(t, "agent-bracketed-paste");
+  if (!harness) return;
+  const appPath = join(harness.temp.root, "fake-agent-paste.cjs");
+  const eventsPath = join(harness.temp.root, "agent-paste-events.jsonl");
+  const paneTarget = `=${harness.sessionName}:`;
+  const rawMessage = "reply ruby";
+  const bracketedMessage = "reply topaz";
+  const readEvents = () => {
+    if (!existsSync(eventsPath)) return [];
+    const contents = readFileSync(eventsPath, "utf8").trim();
+    return contents ? contents.split("\n").map((line) => JSON.parse(line)) : [];
+  };
+  const waitForEvents = async (count) => {
+    const deadline = Date.now() + 2_000;
+    let events = readEvents();
+    while (events.length < count && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      events = readEvents();
+    }
+    return events;
+  };
+  try {
+    writeFileSync(eventsPath, "", { mode: 0o600 });
+    writeFileSync(appPath, [
+      'const { appendFileSync } = require("node:fs")',
+      `const eventsPath = ${JSON.stringify(eventsPath)}`,
+      'const bracketStart = "\\x1b[200~"',
+      'const bracketEnd = "\\x1b[201~"',
+      'let wire = ""',
+      'let body = ""',
+      'let bracketed = false',
+      'let explicitPasteReady = false',
+      'let rawEnterSuppressed = false',
+      'const record = (event) => appendFileSync(eventsPath, `${JSON.stringify(event)}\\n`)',
+      'const resetBody = () => { body = ""; explicitPasteReady = false }',
+      'const consume = () => {',
+      '  while (wire.length > 0) {',
+      '    if (!bracketed && wire.startsWith(bracketStart)) {',
+      '      bracketed = true',
+      '      wire = wire.slice(bracketStart.length)',
+      '      continue',
+      '    }',
+      '    if (bracketed && wire.startsWith(bracketEnd)) {',
+      '      bracketed = false',
+      '      explicitPasteReady = true',
+      '      wire = wire.slice(bracketEnd.length)',
+      '      continue',
+      '    }',
+      '    if (wire.charCodeAt(0) === 27',
+      '      && (bracketStart.startsWith(wire) || bracketEnd.startsWith(wire))) return',
+      '    const ch = wire[0]',
+      '    wire = wire.slice(1)',
+      '    if (ch !== "\\r") { body += ch; continue }',
+      '    if (explicitPasteReady) {',
+      '      record({ kind: "submitted", mode: "bracketed", body })',
+      '      resetBody()',
+      '      continue',
+      '    }',
+      '    if (!rawEnterSuppressed) {',
+      '      rawEnterSuppressed = true',
+      '      record({ kind: "suppressed", mode: "raw", body })',
+      '      continue',
+      '    }',
+      '    record({ kind: "submitted", mode: "raw", body: body.slice(0, -1) })',
+      '    resetBody()',
+      '  }',
+      '}',
+      'process.stdin.setRawMode(true)',
+      'process.stdin.resume()',
+      'process.stdin.on("data", (chunk) => { wire += chunk.toString("latin1"); consume() })',
+      'process.stdout.write("\\x1b[?2004hFAKE_AGENT_READY\\n")',
+      'setInterval(() => {}, 1000)',
+    ].join("\n"), { mode: 0o600 });
+
+    const started = spawnSync(harness.wrapper, [
+      "respawn-pane",
+      "-k",
+      "-t", paneTarget,
+      `${shellSingleQuote(process.execPath)} ${shellSingleQuote(appPath)}`,
+    ], { encoding: "utf8" });
+    assert.equal(started.status, 0, started.stderr);
+    let ready = "";
+    const readyDeadline = Date.now() + 2_000;
+    while (!ready.includes("FAKE_AGENT_READY") && Date.now() < readyDeadline) {
+      const captured = spawnSync(
+        harness.wrapper,
+        ["capture-pane", "-p", "-t", paneTarget],
+        { encoding: "utf8" },
+      );
+      assert.equal(captured.status, 0, captured.stderr);
+      ready = captured.stdout;
+      if (!ready.includes("FAKE_AGENT_READY")) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    assert.match(ready, /FAKE_AGENT_READY/);
+
+    // Model the Codex fallback path that motivated this regression: without
+    // bracketed framing a rapid character stream can suppress the first Enter,
+    // then a later retry can submit a body whose tail was not committed.
+    const rawBuffer = `raw-agent-${randomUUID()}`;
+    const rawPaste = spawnSync(harness.wrapper, [
+      "load-buffer", "-b", rawBuffer, "-",
+      ";", "paste-buffer", "-b", rawBuffer, "-d", "-r", "-t", paneTarget,
+    ], { input: rawMessage, encoding: "utf8" });
+    assert.equal(rawPaste.status, 0, rawPaste.stderr);
+    const firstRawSubmit = spawnSync(
+      harness.wrapper,
+      ["send-keys", "-t", paneTarget, "C-m"],
+      { encoding: "utf8" },
+    );
+    assert.equal(firstRawSubmit.status, 0, firstRawSubmit.stderr);
+    let events = await waitForEvents(1);
+    assert.deepEqual(events[0], { kind: "suppressed", mode: "raw", body: rawMessage });
+    const retriedRawSubmit = spawnSync(
+      harness.wrapper,
+      ["send-keys", "-t", paneTarget, "C-m"],
+      { encoding: "utf8" },
+    );
+    assert.equal(retriedRawSubmit.status, 0, retriedRawSubmit.stderr);
+    events = await waitForEvents(2);
+    assert.deepEqual(events[1], {
+      kind: "submitted",
+      mode: "raw",
+      body: rawMessage.slice(0, -1),
+    });
+
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    await backend.sendAgentMessage(harness.sessionName, "0", bracketedMessage, true);
+    events = await waitForEvents(3);
+    assert.deepEqual(events[2], {
+      kind: "submitted",
+      mode: "bracketed",
+      body: bracketedMessage,
+    });
+    assert.equal(
+      events.filter((event) => event.kind === "submitted" && event.mode === "bracketed").length,
+      1,
+      "one Agent operation must produce one exact bracketed submission",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("cold-resumed Agent input accepts a turn that completes before transcript polling", async (t) => {
+  const harness = isolatedManagedTmux(t, "agent-submit-retry");
+  if (!harness) return;
+  const agentBin = join(harness.home, ".local", "bin");
+  const transcriptRoot = join(harness.home, ".codex", "sessions", "2026", "07", "13");
+  const sessionId = "019f5555-5555-7555-8555-555555555555";
+  const transcriptPath = join(
+    transcriptRoot,
+    `rollout-2026-07-13T00-00-00-${sessionId}.jsonl`,
+  );
+  const appPath = join(harness.temp.root, "fake-codex.cjs");
+  const paneCwd = realpathSync(harness.temp.root);
+  const message = "confirm submit after startup";
+  const paneTarget = `=${harness.sessionName}:`;
+  try {
+    mkdirSync(agentBin, { recursive: true, mode: 0o700 });
+    mkdirSync(transcriptRoot, { recursive: true, mode: 0o700 });
+    symlinkSync(process.execPath, join(agentBin, "codex-agent-marker"));
+    writeFileSync(transcriptPath, `${JSON.stringify({
+      timestamp: "2026-07-13T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: sessionId, cwd: paneCwd },
+    })}\n`, { mode: 0o600 });
+    writeFileSync(appPath, [
+      'const { appendFileSync } = require("node:fs")',
+      `const transcript = ${JSON.stringify(transcriptPath)}`,
+      `const expected = ${JSON.stringify(message)}`,
+      "let body = ''",
+      "let submits = 0",
+      "let accepted = false",
+      "process.stdin.setRawMode(true)",
+      "process.stdin.resume()",
+      'process.stdout.write("\\x1b]2;Codex\\x07FAKE_CODEX_READY\\n")',
+      "process.stdin.on('data', (chunk) => {",
+      "  for (const byte of chunk) {",
+      "    if (byte !== 13) { body += Buffer.from([byte]).toString('utf8'); continue }",
+      "    submits += 1",
+      "    if (accepted || submits < 3 || body !== expected) continue",
+      "    accepted = true",
+      "    const timestamp = new Date().toISOString()",
+      "    const turnId = '019f6666-6666-7666-8666-666666666666'",
+      "    const rows = [",
+      "      { timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },",
+      "      { timestamp, type: 'event_msg', payload: { type: 'item_completed', turn_id: turnId, item: { type: 'UserMessage', content: [{ type: 'text', text: expected }] } } },",
+      "      { timestamp, type: 'event_msg', payload: { type: 'item_completed', turn_id: turnId, item: { type: 'AgentMessage', content: [{ type: 'text', text: 'FAST-ACK' }] } } },",
+      "      { timestamp, type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'FAST-ACK' } },",
+      "    ]",
+      "    appendFileSync(transcript, rows.map(JSON.stringify).join('\\n') + '\\n')",
+      "    process.stdout.write('\\x1b]2;Codex\\x07AGENT_TURN_CONFIRMED\\n')",
+      "  }",
+      "})",
+      "setInterval(() => {}, 1000)",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(join(agentBin, "codex"), [
+      "#!/bin/sh",
+      `marker=${shellSingleQuote(join(agentBin, "codex-agent-marker"))}`,
+      `app=${shellSingleQuote(appPath)}`,
+      '"$marker" -e "setInterval(() => {}, 1000)" &',
+      "marker_pid=$!",
+      'trap \'kill "$marker_pid" >/dev/null 2>&1 || true\' EXIT INT TERM',
+      '"$marker" "$app"',
+    ].join("\n") + "\n", { mode: 0o700 });
+
+    const keepFailedPane = spawnSync(
+      harness.wrapper,
+      ["set-option", "-t", harness.sessionName, "remain-on-exit", "on"],
+      { encoding: "utf8" },
+    );
+    assert.equal(keepFailedPane.status, 0, keepFailedPane.stderr);
+    const started = spawnSync(harness.wrapper, [
+      "respawn-pane",
+      "-k",
+      "-t", paneTarget,
+      "-c", harness.temp.root,
+      `PATH=${shellSingleQuote(agentBin)}:$PATH codex`,
+    ], { encoding: "utf8" });
+    assert.equal(started.status, 0, started.stderr);
+    let ready = "";
+    const readyDeadline = Date.now() + 2_000;
+    while (!ready.includes("FAKE_CODEX_READY") && Date.now() < readyDeadline) {
+      const captured = spawnSync(
+        harness.wrapper,
+        ["capture-pane", "-p", "-t", paneTarget],
+        { encoding: "utf8" },
+      );
+      assert.equal(captured.status, 0, captured.stderr);
+      ready = captured.stdout;
+      if (!ready.includes("FAKE_CODEX_READY")) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    assert.match(ready, /FAKE_CODEX_READY/);
+
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    const resolvedBackend = await backend.resolveManagedSession(harness.sessionName);
+    const output = await backend.prepareOutput(
+      randomUUID(),
+      harness.sessionName,
+      "0",
+      randomUUID(),
+      true,
+    );
+    await backend.sendAgentMessageFenced(
+      resolvedBackend.managedSession,
+      resolvedBackend.tmuxInstanceId,
+      output.generation,
+      "0",
+      message,
+      true,
+    );
+    const records = readFileSync(transcriptPath, "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(records.filter((record) => record.payload?.type === "task_started").length, 1);
+    assert.equal(records.filter((record) => record.payload?.type === "task_complete").length, 1);
+    assert.equal(
+      records.find((record) => record.payload?.type === "item_completed")
+        ?.payload.item.content[0].text,
+      message,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("production backend resumes a full legacy capture without explicit recovery", async (t) => {
   const harness = isolatedManagedTmux(t, "legacy-capture");
   if (!harness) return;
@@ -3719,6 +4047,445 @@ test("production tmux backend captures bounded correlated output on an isolated 
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
     }
+  }
+});
+
+test("exact target ownership contention is retryable pressure, not missing capability", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"A".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-owner-pressure",
+    scopeId: "scope-owner-pressure",
+    sessionId: "session-owner-pressure",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-instance-owner-pressure",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:owner-pressure" },
+  };
+  try {
+    const target = await resolved(authority);
+    const dashboard = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("dashboard", "active-terminal"),
+    );
+
+    await assert.rejects(
+      authority.prepareRelayV2ExactTarget(exactInput),
+      (error) => error.code === "RESOURCE_EXHAUSTED"
+        && error.retryable === true
+        && error.message === "exact terminal-control target already has an input owner",
+    );
+    const held = await authority.handle({
+      protocolVersion: 1,
+      requestId: "owner-pressure-status",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    });
+    assert.equal(held.state, "HELD");
+    assert.equal(held.ownerKind, "dashboard");
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "owner-pressure-release",
+      type: "lease.release",
+      lease: dashboard.lease,
+    });
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
+test("exact target reservation safely recovers ownerless output uncertainty", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"R".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-ownerless-recovery",
+    scopeId: "scope-ownerless-recovery",
+    sessionId: "session-ownerless-recovery",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-ownerless-recovery",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:ownerless-recovery" },
+  };
+  try {
+    const target = await resolved(authority);
+    const state = terminalControl.loadTerminalControlState(temp.path);
+    const persisted = state.targets.find(
+      (candidate) => candidate.controlTargetId === target.controlTargetId,
+    );
+    persisted.lifecycle = "RECOVERY_REQUIRED";
+    persisted.ownership = { state: "FREE", fence: "1" };
+    persisted.recovery = {
+      reason: "OUTPUT_CONTINUITY_UNCERTAIN",
+      since: "2026-07-13T00:10:00.000Z",
+      previousControlEpoch: state.controlEpoch,
+    };
+    persisted.revision = "2";
+    persisted.updatedAt = "2026-07-13T00:10:00.000Z";
+    terminalControl.saveTerminalControlState(state, temp.path);
+
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    const recovered = terminalControl.loadTerminalControlState(temp.path).targets.find(
+      (candidate) => candidate.controlTargetId === target.controlTargetId,
+    );
+    assert.equal(recovered.lifecycle, "ACTIVE");
+    assert.equal(recovered.recovery, undefined);
+    assert.equal(recovered.ownership.state, "HELD");
+    assert.equal(recovered.ownership.owner.kind, "relay-v2");
+    assert.equal(recovered.outputGeneration, backend.outputGeneration);
+    assert.equal(backend.resetCalls, 1);
+
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    const lease = authority.consumeRelayV2ExactTarget(preparation.claim, exactInput);
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "ownerless-recovery-release",
+      type: "lease.release",
+      lease,
+    });
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
+test("exact Relay reservation recovers around but never replays an in-doubt Agent message", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"I".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-agent-in-doubt",
+    scopeId: "scope-agent-in-doubt",
+    sessionId: "session-agent-in-doubt",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-agent-in-doubt",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2:new-host-generation" },
+  };
+  const oldOperationId = "agent-chat-old-in-doubt";
+  const oldMessage = "possibly submitted old message";
+  try {
+    const target = await resolved(authority);
+    const oldOwner = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("relay-v2", "old-host-generation"),
+    );
+    backend.failWrite = true;
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: oldOperationId,
+        type: "input.agent-message",
+        lease: oldOwner.lease,
+        operationId: oldOperationId,
+        pane: "0",
+        message: oldMessage,
+        submit: true,
+      }),
+      (error) => error.code === "OPERATION_IN_DOUBT",
+    );
+    backend.failWrite = false;
+
+    const uncertain = terminalControl.loadTerminalControlState(temp.path).targets[0];
+    assert.equal(uncertain.lifecycle, "RECOVERY_REQUIRED");
+    assert.equal(uncertain.recovery.reason, "OPERATION_IN_DOUBT");
+    assert.equal(uncertain.recovery.operationId, oldOperationId);
+    assert.equal(uncertain.recovery.previousOwnerKind, "relay-v2");
+    assert.equal(uncertain.completedOperations.at(-1).disposition, "in-doubt");
+    assert.deepEqual(backend.writes, []);
+
+    // The ordinary v1 lane remains explicitly gated for every owner kind.
+    for (const blockedOwner of [
+      owner("relay-v2", "ordinary-v1-relay"),
+      owner("feishu", "ordinary-v1-feishu"),
+    ]) {
+      await assert.rejects(
+        acquired(authority, target.controlTargetId, blockedOwner),
+        (error) => error.code === "RECOVERY_REQUIRED",
+      );
+    }
+    assert.equal(backend.resetCalls, 0);
+
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    const recoveredLease = authority.consumeRelayV2ExactTarget(
+      preparation.claim,
+      exactInput,
+    );
+    assert.equal(backend.resetCalls, 1, "exact recovery uses one planned output generation");
+
+    // A redelivery of the uncertain request may cross a new owner/fence, but
+    // it must retain its old in-doubt disposition and never reach the backend.
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "old-agent-redelivery",
+        type: "input.agent-message",
+        lease: recoveredLease,
+        operationId: oldOperationId,
+        pane: "0",
+        message: oldMessage,
+        submit: true,
+      }),
+      (error) => error.code === "OPERATION_IN_DOUBT",
+    );
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "old-agent-payload-conflict",
+        type: "input.agent-message",
+        lease: recoveredLease,
+        operationId: oldOperationId,
+        pane: "0",
+        message: "different bytes under the old operation id",
+        submit: true,
+      }),
+      (error) => error.code === "INVALID_REQUEST",
+    );
+    assert.deepEqual(backend.writes, []);
+
+    const freshRequest = {
+      protocolVersion: 1,
+      requestId: "agent-chat-fresh-after-recovery",
+      type: "input.agent-message",
+      lease: recoveredLease,
+      operationId: "agent-chat-fresh-after-recovery",
+      pane: "0",
+      message: "fresh message after recovery",
+      submit: true,
+    };
+    const fresh = await authority.handle(freshRequest);
+    const freshDuplicate = await authority.handle({
+      ...freshRequest,
+      requestId: "agent-chat-fresh-redelivery",
+    });
+    assert.equal(fresh.deduplicated, false);
+    assert.equal(freshDuplicate.deduplicated, true);
+    assert.deepEqual(backend.writes, [{
+      kind: "agent-message",
+      value: { pane: "0", message: "fresh message after recovery", submit: true },
+    }]);
+
+    const active = terminalControl.loadTerminalControlState(temp.path).targets[0];
+    assert.equal(active.lifecycle, "ACTIVE");
+    assert.equal(active.recovery, undefined);
+    assert.equal(
+      active.completedOperations.find(({ operationId }) => operationId === oldOperationId)
+        .disposition,
+      "in-doubt",
+    );
+    assert.equal(
+      active.completedOperations.find(
+        ({ operationId }) => operationId === freshRequest.operationId,
+      ).disposition,
+      "committed",
+    );
+
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "agent-recovery-release",
+      type: "lease.release",
+      lease: recoveredLease,
+    });
+    const resetBaseline = backend.resetCalls;
+    const persistUnsafeRecovery = (reason, previousOwnerKind, operationId) => {
+      const state = terminalControl.loadTerminalControlState(temp.path);
+      const record = state.targets[0];
+      record.lifecycle = "RECOVERY_REQUIRED";
+      record.ownership = {
+        state: "FREE",
+        fence: terminalControl.nextDecimal(record.ownership.fence),
+      };
+      record.recovery = {
+        reason,
+        since: "2026-07-13T02:00:00.000Z",
+        previousControlEpoch: state.controlEpoch,
+        previousOwnerKind,
+        ...(operationId === undefined ? {} : { operationId }),
+      };
+      record.revision = terminalControl.nextDecimal(record.revision);
+      record.updatedAt = "2026-07-13T02:00:00.000Z";
+      terminalControl.saveTerminalControlState(state, temp.path);
+    };
+
+    persistUnsafeRecovery("DRAIN_UNCERTAIN", "relay-v2");
+    await assert.rejects(
+      authority.prepareRelayV2ExactTarget(exactInput),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    persistUnsafeRecovery("OPERATION_IN_DOUBT", "feishu", oldOperationId);
+    await assert.rejects(
+      authority.prepareRelayV2ExactTarget(exactInput),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    const rawState = terminalControl.loadTerminalControlState(temp.path);
+    const rawRecord = rawState.targets[0];
+    rawRecord.completedOperations.push({
+      operationId: "raw-in-doubt-must-stay-blocked",
+      ownerInstanceId: "relay-v2:raw-owner",
+      fence: rawRecord.ownership.fence,
+      payloadHash: "a".repeat(64),
+      kind: "raw",
+      disposition: "in-doubt",
+      completedAt: "2026-07-13T02:00:01.000Z",
+    });
+    rawRecord.recovery = {
+      reason: "OPERATION_IN_DOUBT",
+      since: "2026-07-13T02:00:01.000Z",
+      previousControlEpoch: rawState.controlEpoch,
+      previousOwnerKind: "relay-v2",
+      operationId: "raw-in-doubt-must-stay-blocked",
+    };
+    rawRecord.revision = terminalControl.nextDecimal(rawRecord.revision);
+    rawRecord.updatedAt = "2026-07-13T02:00:01.000Z";
+    terminalControl.saveTerminalControlState(rawState, temp.path);
+    await assert.rejects(
+      authority.prepareRelayV2ExactTarget(exactInput),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    assert.equal(
+      backend.resetCalls,
+      resetBaseline,
+      "drain, Feishu-owned, and raw-input uncertainty never enter Agent recovery",
+    );
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
+  }
+});
+
+test("one exact fence admits only one active interactive producer", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const incarnation = `twinc2.${"B".repeat(43)}`;
+  backend.inspectExactTarget = async () => ({
+    managedSession: {
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/tmp",
+      createdAt: backend.createdAt,
+    },
+    managedIncarnation: incarnation,
+    tmuxInstanceId: backend.instance,
+    paneIdentity: "%1",
+  });
+  const authority = new terminalControl.TerminalControlAuthority({
+    statePath: temp.path,
+    backend,
+    relayV2ProcessTarget: { kind: "local", targetId: "local" },
+  });
+  const exactInput = {
+    schemaVersion: 1,
+    hostId: "host-single-producer",
+    scopeId: "scope-single-producer",
+    sessionId: "session-single-producer",
+    pane: 0,
+    processTarget: { kind: "local", targetId: "local" },
+    backendInstanceKey: "backend-single-producer",
+    managedTarget: { name: "managed-terminal", kind: "terminal", incarnation },
+    owner: { kind: "relay-v2", instanceId: "relay-v2-host-reservation" },
+  };
+  try {
+    const target = await resolved(authority);
+    const preparation = await authority.prepareRelayV2ExactTarget(exactInput);
+    authority.fenceRelayV2ExactTarget(preparation.claim, exactInput);
+    const streamOwner = { kind: "relay-v2", instanceId: "relay-v2-stream-one" };
+    const streamLease = authority.consumeRelayV2ExactTarget(
+      preparation.claim,
+      exactInput,
+      streamOwner,
+    );
+    await authority.handle(rawRequest(streamLease, "single-producer-write", "stream-one"));
+
+    await assert.rejects(
+      acquired(
+        authority,
+        target.controlTargetId,
+        { kind: "relay-v2", instanceId: "relay-v2-agent-conversation" },
+      ),
+      (error) => error.code === "RESOURCE_EXHAUSTED"
+        && error.retryable === true
+        && error.message === "terminal input already has another active producer",
+    );
+    assert.equal(backend.writes.length, 1);
+
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "single-producer-release",
+      type: "lease.release",
+      lease: streamLease,
+    });
+    const agent = await acquired(
+      authority,
+      target.controlTargetId,
+      { kind: "relay-v2", instanceId: "relay-v2-agent-conversation" },
+    );
+    assert.equal(agent.ownership.state, "HELD");
+  } finally {
+    await authority.closeRelayV2ExactTargetAuthority().catch(() => undefined);
+    temp.cleanup();
   }
 });
 

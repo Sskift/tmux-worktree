@@ -26,6 +26,16 @@ data class RelayChatState(
 
     fun awaitingTurn(session: String): Boolean = awaitingTurnIdsBySession[session].orEmpty().isNotEmpty()
 
+    /**
+     * True while a visible chat route needs history reconciliation as a safety net for a lost
+     * best-effort `agent.chat.event`. The loop is deliberately inactive for settled history and
+     * actionable failures, so an idle chat does not poll the Host.
+     */
+    fun needsHistoryReconciliation(session: String): Boolean =
+        pending(session).any { !it.failed } ||
+            awaitingTurn(session) ||
+            turns(session).any { it.status == "working" }
+
     fun image(imageId: String): RelayChatImageState? = imagesById[imageId]
 }
 

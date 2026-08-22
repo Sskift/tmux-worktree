@@ -231,6 +231,39 @@ internal class RelayV2DurableTerminalPostCommitEffectSink(
         }
     }
 
+    override suspend fun isAuthorityReusable(
+        authority: RelayV2RepositoryEffectAuthority,
+        key: RelayV2TerminalCheckpointKey,
+    ): Boolean {
+        requireAuthorityMatchesKey(authority, key)
+        val fingerprint = RelayV2TerminalPostCommitBatchCodec.ownerFingerprint(authority, key)
+        return try {
+            mutex.withLock {
+                recoverLocked()
+                if (globallyClosed || handles.values.any {
+                        it.authorityFingerprint == fingerprint
+                    }
+                ) {
+                    return@withLock false
+                }
+                journal.transaction {
+                    // Drop only terminal receipts whose checkpoint barrier no longer owns them.
+                    // Any remaining row for this exact authority (including an orphan RESERVED
+                    // row committed before reserve() could publish its in-memory handle) makes a
+                    // same-generation RESET unsafe and can also retain the FIFO head forever.
+                    pruneTerminalOutcomesInTransaction()
+                    !globallyClosed() &&
+                        fence(fingerprint) == null &&
+                        batchesForAuthority(fingerprint).isEmpty() &&
+                        allBatches().size < outcomeCapacity &&
+                        unsettledBatchCount() < reservationCapacity
+                }
+            }
+        } finally {
+            settlePendingTransferredCallbackAborts()
+        }
+    }
+
     override suspend fun teardownAuthority(
         authority: RelayV2RepositoryEffectAuthority,
         key: RelayV2TerminalCheckpointKey,

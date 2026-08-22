@@ -367,6 +367,9 @@ function invalidateTarget(target: TerminalControlTargetRecord, now: () => Date):
   };
   target.inFlight = undefined;
   target.recovery = undefined;
+  // No operation can be replayed against a retired exact incarnation. Drop
+  // its journal immediately so dead targets never amplify future input fsyncs.
+  target.completedOperations = [];
   revision(target);
   target.updatedAt = isoNow(now);
 }
@@ -438,21 +441,27 @@ function existingOperation(
 ): TerminalControlOperationRecord | undefined {
   const existing = target.completedOperations.find((operation) => operation.operationId === operationId);
   if (!existing) return undefined;
-  if (
-    existing.ownerInstanceId !== ownerInstanceId
-    || existing.fence !== fence
-    || existing.payloadHash !== hash
-    || existing.kind !== kind
-  ) {
+  // Payload identity remains absolute across a recovery fence. In particular,
+  // a caller may not reuse an uncertain operationId for different bytes.
+  if (existing.payloadHash !== hash || existing.kind !== kind) {
     throw new TerminalControlProtocolError(
       "INVALID_REQUEST",
       "operationId was reused with different ownership or payload",
     );
   }
+  // Recovery deliberately changes the lease fence and may change the Relay
+  // process instance. The old operation is still uncertain under that fresh
+  // lease: never replay it merely because ownership was re-established.
   if (existing.disposition === "in-doubt") {
     throw new TerminalControlProtocolError(
       "OPERATION_IN_DOUBT",
       "operation was accepted previously but its backend disposition is uncertain",
+    );
+  }
+  if (existing.ownerInstanceId !== ownerInstanceId || existing.fence !== fence) {
+    throw new TerminalControlProtocolError(
+      "INVALID_REQUEST",
+      "operationId was reused with different ownership or payload",
     );
   }
   return existing;
@@ -628,7 +637,13 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
   private readonly statePath: string;
   private readonly backend: TerminalControlBackend;
   private readonly now: () => Date;
-  private readonly interactiveOwners = new Map<string, Map<string, TerminalControlOwner>>();
+  /**
+   * Persisted Relay v2 leases may be rebound from a short-lived reservation
+   * owner to the stream owner without changing their fence. This registry is
+   * the process-local producer cut: exactly one rebound owner may write that
+   * fence at a time, even though several Relay v2 aliases validate against it.
+   */
+  private readonly interactiveOwners = new Map<string, TerminalControlOwner>();
   private readonly relayV2ProcessTarget: Readonly<{ kind: "local" | "ssh"; targetId: string }> | null;
   private readonly relayV2ExactTargetTtlMs: number;
   private readonly relayV2ExactClaims = new WeakMap<object, RelayV2ExactClaimRecord>();
@@ -664,29 +679,27 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     this.relayV2ExactTargetTtlMs = ttl;
   }
 
-  private interactiveOwnerKey(owner: TerminalControlOwner): string {
-    return `${owner.kind}\0${owner.instanceId}`;
-  }
-
   private registerInteractiveOwner(controlTargetId: string, owner: TerminalControlOwner): void {
     if (!isInteractiveOwner(owner)) return;
-    let owners = this.interactiveOwners.get(controlTargetId);
-    if (!owners) {
-      owners = new Map();
-      this.interactiveOwners.set(controlTargetId, owners);
+    const active = this.interactiveOwners.get(controlTargetId);
+    if (active && !sameOwner(active, owner)) {
+      throw new TerminalControlProtocolError(
+        "RESOURCE_EXHAUSTED",
+        "terminal input already has another active producer",
+        true,
+      );
     }
-    owners.set(this.interactiveOwnerKey(owner), owner);
+    this.interactiveOwners.set(controlTargetId, owner);
   }
 
   private unregisterInteractiveOwner(
     controlTargetId: string,
     owner: TerminalControlOwner,
-  ): { registered: boolean; remaining?: TerminalControlOwner } {
-    const owners = this.interactiveOwners.get(controlTargetId);
-    if (!owners || !owners.delete(this.interactiveOwnerKey(owner))) return { registered: false };
-    const remaining = owners.values().next().value as TerminalControlOwner | undefined;
-    if (!remaining) this.interactiveOwners.delete(controlTargetId);
-    return { registered: true, remaining };
+  ): boolean {
+    const active = this.interactiveOwners.get(controlTargetId);
+    if (!active || !sameOwner(active, owner)) return false;
+    this.interactiveOwners.delete(controlTargetId);
+    return true;
   }
 
   private resetInteractiveOwners(controlTargetId: string): void {
@@ -1007,6 +1020,18 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         state.targets.push(target);
         await this.prepareOutput(state, target, true);
       }
+      // Relay v2 enters through the exact-target reservation path instead of
+      // target.resolve / ownership.status.  Reconcile the same safely
+      // abandonable non-Feishu states here before ensureOperable fences the
+      // reservation.  Without this, an ownerless OUTPUT_CONTINUITY_UNCERTAIN
+      // or a dead Relay lease can remain permanently unreachable even after
+      // the exact tmux incarnation has already been proved above.
+      await this.reconcileAbandonedOwnership(state, target);
+      // An uncertain Relay write is not generally auto-recoverable. This
+      // exact process/incarnation path may acknowledge it without replaying
+      // it: the in-doubt journal survives and fences that operationId, while
+      // only a later distinct operation can use the new reservation.
+      await this.reconcileRelayV2ExactInDoubtOperation(state, target);
       ensureOperable(target);
       // ownership.status is serialized by this same canonical lock, but it
       // publishes its target-scoped fence before waiting for the lock. Read
@@ -1023,8 +1048,9 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
       }
       if (target.ownership.state !== "FREE") {
         throw new TerminalControlProtocolError(
-          "PERMISSION_DENIED",
+          "RESOURCE_EXHAUSTED",
           "exact terminal-control target already has an input owner",
+          true,
         );
       }
       target.ownership = {
@@ -1629,6 +1655,68 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     return true;
   }
 
+  /**
+   * Reopens only the canonical Relay-v2 exact lane after an uncertain Agent
+   * message. The old operation journal is intentionally retained: retrying its
+   * operationId remains OPERATION_IN_DOUBT, while a distinct later operation
+   * may proceed on the fresh fence. Ordinary v1 acquisition, Feishu recovery,
+   * raw terminal input, and every other unsafe recovery reason remain
+   * explicitly gated.
+   *
+   * Exact target preparation has already inspected the full managed
+   * incarnation before calling this method. We still reassert the backend
+   * identity immediately before the deterministic recovery-generation cut so
+   * a target change can never be mistaken for acknowledgement.
+   */
+  private async reconcileRelayV2ExactInDoubtOperation(
+    state: TerminalControlState,
+    target: TerminalControlTargetRecord,
+  ): Promise<boolean> {
+    const recoveryOperationId = target.recovery?.operationId;
+    const recoveryOperation = recoveryOperationId === undefined
+      ? undefined
+      : target.completedOperations.find(
+          (operation) => operation.operationId === recoveryOperationId,
+        );
+    if (target.lifecycle !== "RECOVERY_REQUIRED"
+      || target.inFlight
+      || !target.recovery
+      || target.recovery.reason !== "OPERATION_IN_DOUBT"
+      || target.recovery.previousOwnerKind !== "relay-v2"
+      || !recoveryOperationId
+      || recoveryOperation?.disposition !== "in-doubt"
+      || recoveryOperation.kind !== "agent-message") {
+      return false;
+    }
+    try {
+      await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
+    } catch (error) {
+      if (error instanceof TerminalControlProtocolError
+        && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")) {
+        invalidateTarget(target, this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError("TARGET_GONE", error.message);
+      }
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `could not prove the exact terminal backend lifecycle: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    await this.recoverOutput(target);
+    this.resetInteractiveOwners(target.controlTargetId);
+    target.lifecycle = "ACTIVE";
+    target.recovery = undefined;
+    target.ownership = {
+      state: "FREE",
+      // markRecovery already advanced the fence before recording uncertainty.
+      fence: target.ownership.fence,
+    };
+    revision(target);
+    target.updatedAt = isoNow(this.now);
+    saveTerminalControlState(state, this.statePath);
+    return true;
+  }
+
   private async assertTargetCurrent(
     state: TerminalControlState,
     target: TerminalControlTargetRecord,
@@ -2069,25 +2157,8 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
         );
       }
       if (isInteractiveOwner(lease.owner)) {
-        const detached = this.unregisterInteractiveOwner(target.controlTargetId, lease.owner);
-        if (!detached.registered) {
+        if (!this.unregisterInteractiveOwner(target.controlTargetId, lease.owner)) {
           const output = await this.prepareOutput(state, target);
-          return ownershipView(state, target, output.cursor);
-        }
-        if (detached.remaining) {
-          const output = await this.prepareOutput(state, target);
-          if (target.ownership.state !== "HELD") {
-            throw new TerminalControlProtocolError(
-              "RECOVERY_REQUIRED",
-              "interactive ownership disappeared while another producer remained registered",
-            );
-          }
-          if (!sameOwner(target.ownership.owner, detached.remaining)) {
-            target.ownership.owner = detached.remaining;
-            revision(target);
-            target.updatedAt = isoNow(this.now);
-            saveTerminalControlState(state, this.statePath);
-          }
           return ownershipView(state, target, output.cursor);
         }
       }
@@ -2150,7 +2221,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "only a controlled local owner may request a lease-less graceful takeover from Feishu",
         );
       }
-      if (sameInputOwnerClass(target.ownership.owner, nextOwner)) {
+      if (sameOwner(target.ownership.owner, nextOwner)) {
         const output = await this.prepareOutput(state, target);
         this.registerInteractiveOwner(target.controlTargetId, nextOwner);
         return { lease: leaseForOwner(state, target, nextOwner), ownership: ownershipView(state, target, output.cursor) };

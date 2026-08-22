@@ -13,6 +13,45 @@ import org.junit.Test
 
 class RelayChatReducerTest {
     @Test
+    fun `history reconciliation runs only while a send or turn is unsettled`() {
+        val session = "local:demo"
+        val settledTurn = AgentChatTurnView(
+            turnId = "turn-settled",
+            session = session,
+            userMessage = "done",
+            status = "replied",
+            sentAt = "2026-01-01T00:00:00Z",
+        )
+        assertFalse(
+            RelayChatState(turnsBySession = mapOf(session to listOf(settledTurn)))
+                .needsHistoryReconciliation(session),
+        )
+
+        val pending = PendingChatSend("req-1", session, "hello", 100)
+        assertTrue(
+            RelayChatState(pendingBySession = mapOf(session to listOf(pending)))
+                .needsHistoryReconciliation(session),
+        )
+        assertFalse(
+            RelayChatState(
+                pendingBySession = mapOf(
+                    session to listOf(pending.copy(failed = true, error = "offline")),
+                ),
+            ).needsHistoryReconciliation(session),
+        )
+        assertTrue(
+            RelayChatState(
+                awaitingTurnIdsBySession = mapOf(session to setOf("turn-awaiting")),
+            ).needsHistoryReconciliation(session),
+        )
+        assertTrue(
+            RelayChatState(
+                turnsBySession = mapOf(session to listOf(settledTurn.copy(status = "working"))),
+            ).needsHistoryReconciliation(session),
+        )
+    }
+
+    @Test
     fun `sent keeps an active fence until its authoritative turn arrives`() {
         val session = "local:demo"
         val pending = RelayChatReducer.reduce(

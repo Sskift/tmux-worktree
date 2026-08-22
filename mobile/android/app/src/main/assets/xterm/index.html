@@ -24,6 +24,17 @@
       padding: 8px 6px;
     }
 
+    /*
+     * A terminal is useful from its prompt upwards. During the IME resize xterm's old
+     * canvas can briefly be taller than the new WebView, so top anchoring hides the prompt.
+     * Move both the renderer and IME helper by the live surplus (positive or negative) and
+     * keep the last terminal row pinned to the bottom edge of the available phone viewport.
+     */
+    #terminal .xterm-screen,
+    #terminal .xterm-helpers {
+      transform: translateY(var(--tw-terminal-bottom-offset, 0px));
+    }
+
     .xterm-viewport {
       background: #020509 !important;
     }
@@ -44,12 +55,60 @@
     let fontSize = 14;
     let fitTimer = 0;
     let fitFrame = 0;
+    let inputTimer = 0;
+    let inputBuffer = '';
+    let lastBottomOffset = Number.NaN;
     const pending = [];
+
+    function flushInput() {
+      if (inputTimer) {
+        clearTimeout(inputTimer);
+        inputTimer = 0;
+      }
+      if (!inputBuffer) return;
+      const data = inputBuffer;
+      inputBuffer = '';
+      TwBridge.input(data);
+    }
+
+    function queueInput(data) {
+      if (readOnly || !data) return;
+      inputBuffer += data;
+      // Submit/control keys must never sit behind a timer. Printable IME/key bursts can be
+      // coalesced briefly, cutting the two-fsync-per-frame host write amplification sharply.
+      if (inputBuffer.length >= 4096 || /[\x00-\x1f\x7f]/.test(data)) {
+        flushInput();
+        return;
+      }
+      if (!inputTimer) inputTimer = setTimeout(flushInput, 12);
+    }
+
+    function pinTerminalBottom() {
+      if (!terminal || !terminal.element) return;
+      const xterm = terminal.element;
+      const screen = xterm.querySelector('.xterm-screen');
+      if (!screen) return;
+      const style = window.getComputedStyle(xterm);
+      const paddingTop = Number.parseFloat(style.paddingTop) || 0;
+      const paddingBottom = Number.parseFloat(style.paddingBottom) || 0;
+      const availableHeight = Math.max(0, xterm.clientHeight - paddingTop - paddingBottom);
+      const screenHeight = screen.getBoundingClientRect().height;
+      const offset = availableHeight - screenHeight;
+      // Resize/fit signals can overlap. Avoid invalidating renderer style when its exact
+      // bottom position did not move; historical output itself never changes this geometry.
+      if (Number.isFinite(lastBottomOffset) && Math.abs(offset - lastBottomOffset) < 0.25) return;
+      lastBottomOffset = offset;
+      xterm.style.setProperty('--tw-terminal-bottom-offset', `${offset}px`);
+    }
 
     function fit() {
       if (!ready || !terminal || !fitAddon) return;
       try {
         fitAddon.fit();
+        // A resize may preserve a manually scrolled viewport. The phone input surface must
+        // instead follow the active prompt, including while the keyboard animates into place.
+        terminal.scrollToBottom();
+        pinTerminalBottom();
         if (terminal.cols && terminal.rows &&
             (terminal.cols !== lastCols || terminal.rows !== lastRows)) {
           lastCols = terminal.cols;
@@ -64,6 +123,9 @@
       // IME animation can fan out through window, visualViewport and three ResizeObservers.
       // Coalesce that burst into one trailing fit so xterm does not repeatedly discard and
       // recreate its renderer canvas while Android is still changing the WebView bounds.
+      // Pin the old canvas immediately. If it is taller than the newly exposed viewport this
+      // intentionally produces a negative offset, cropping from the top instead of the prompt.
+      pinTerminalBottom();
       if (fitTimer) clearTimeout(fitTimer);
       fitTimer = setTimeout(() => {
         fitTimer = 0;
@@ -162,12 +224,13 @@
       terminal.open(document.getElementById('terminal'));
       installTouchScroll();
       terminal.onData(data => {
-        if (!readOnly) TwBridge.input(data);
+        queueInput(data);
       });
       terminal.onResize(size => {
         lastCols = size.cols;
         lastRows = size.rows;
         TwBridge.resize(size.cols, size.rows);
+        pinTerminalBottom();
       });
       window.addEventListener('resize', fitBurst);
       if (window.visualViewport) {
@@ -181,8 +244,10 @@
         observer.observe(document.getElementById('terminal'));
       }
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) fitBurst();
+        if (document.hidden) flushInput();
+        else fitBurst();
       });
+      window.addEventListener('pagehide', flushInput);
       ready = true;
       fitBurst();
       pending.splice(0).forEach(data => terminal.write(data));
@@ -235,11 +300,11 @@
     window.twSendKey = data => {
       if (!ready || readOnly) return;
       terminal.write(data);
-      TwBridge.input(data);
+      queueInput(data);
     };
     window.twSetReadOnly = value => {
+      if (Boolean(value)) flushInput();
       readOnly = Boolean(value);
-      if (!readOnly && ready) terminal.focus();
     };
     window.twSetFontSize = value => {
       fontSize = Math.max(10, Math.min(24, Number(value) || 14));

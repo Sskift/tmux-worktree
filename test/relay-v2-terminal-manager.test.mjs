@@ -91,6 +91,21 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flushPromiseJobs() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
 function swapStreamEffectTarget(stream, suffix = "swapped") {
   const original = stream.effectTarget;
   const brand = Object.getOwnPropertySymbols(original)[0];
@@ -187,12 +202,22 @@ class FakeByteBackend {
 
   opens = [];
   openResults = [];
+  openWaits = [];
+  expectedBindings = [];
 
   async open(target, options, observer) {
+    const expectedBinding = this.expectedBindings.shift() ?? CANONICAL_BINDING;
+    const expectedResolvedTarget = {
+      ...RESOLVED_TARGET,
+      canonicalTargetId: expectedBinding.backendInstanceKey,
+      controlTargetId: expectedBinding.exactControlIdentity.controlTargetId,
+    };
     assert.equal(target.schemaVersion, 1);
-    assert.deepEqual(target.binding, CANONICAL_BINDING);
-    assert.deepEqual(target.resolvedTarget, RESOLVED_TARGET);
+    assert.deepEqual(target.binding, expectedBinding);
+    assert.deepEqual(target.resolvedTarget, expectedResolvedTarget);
     this.trace.push("backend.open");
+    const wait = this.openWaits.shift();
+    if (wait) await wait;
     const result = this.openResults.shift();
     if (result instanceof Error) throw result;
     const handle = new FakeByteHandle(observer, this.trace);
@@ -289,6 +314,7 @@ class FakeResolver {
 
   calls = [];
   fenceCalls = [];
+  fenceError = null;
   resolveResults = [];
   resolved = clone(CANONICAL_RESOLUTION);
 
@@ -303,6 +329,7 @@ class FakeResolver {
   fenceSessionForAdmission(transaction, resolution) {
     this.trace.push("resolver.fence");
     this.fenceCalls.push({ hostEpoch: transaction.hostEpoch, resolution: clone(resolution) });
+    if (this.fenceError) throw this.fenceError;
   }
 }
 
@@ -316,6 +343,7 @@ class FakeDurableLineage {
   closes = new Map();
   claimOpenCalls = [];
   prepareOpenCalls = [];
+  releaseUnpreparedOpenClaimCalls = [];
   completeOpenCalls = [];
   failOpenCalls = [];
   claimCloseCalls = [];
@@ -328,6 +356,7 @@ class FakeDurableLineage {
   failCompleteOpenOnce = false;
   failFailOpenOnce = false;
   failPrepareOpenOnce = false;
+  prepareOpenWaits = [];
   prepareOpenReplayOutcome = undefined;
   beforePrepareOpenReplay = undefined;
   busyClaimOpenOnce = false;
@@ -409,6 +438,8 @@ class FakeDurableLineage {
   async prepareOpen(input) {
     this.prepareOpenCalls.push(clone(input));
     this.trace.push("lineage.open.prepare");
+    const wait = this.prepareOpenWaits.shift();
+    if (wait) await wait;
     if (this.failPrepareOpenOnce) {
       this.failPrepareOpenOnce = false;
       throw new Error("injected exact preparation failure");
@@ -456,6 +487,29 @@ class FakeDurableLineage {
     }
     retained.preparedBinding = clone(binding);
     return { status: "prepared", binding: clone(binding) };
+  }
+
+  async releaseUnpreparedOpenClaim(input) {
+    this.releaseUnpreparedOpenClaimCalls.push(clone(input));
+    const retained = this.opens.get(input.key);
+    if (!retained || retained.fingerprint !== input.fingerprint) {
+      throw new Error("open claim lost before release");
+    }
+    if (retained.state === "final") {
+      return {
+        status: "replay",
+        outcome: clone(retained.outcome),
+        preparedBinding: retained.preparedBinding ? clone(retained.preparedBinding) : null,
+      };
+    }
+    if (retained.preparedBinding
+      || retained.hostInstanceId !== input.hostInstanceId
+      || retained.claimToken !== input.claimToken
+      || retained.fence !== input.fence) {
+      throw new Error("unprepared open claim release authority lost");
+    }
+    this.opens.delete(input.key);
+    return { status: "released" };
   }
 
   async completeOpen(input) {
@@ -646,6 +700,7 @@ function harness(options = {}) {
     now: () => now,
     issueToken: () => `resume-token-${++nextToken}`,
     schedule: options.schedule,
+    openOperationTimeoutMs: options.openOperationTimeoutMs,
     limits: options.limits,
     send: async (route, frame, responseLineage) => {
       // Every manager output must remain consumable by the frozen production codec.
@@ -719,6 +774,103 @@ test("open waits for the post-create canonical resolver cut instead of persistin
   assert.equal(h.lineage.failOpenCalls.length, 0);
   assert.equal(h.backend.opens.length, 1);
   assert.ok(opened(h.sent, request.requestId));
+});
+
+test("hung durable preparation reaches the open deadline without blocking another terminal stream", async () => {
+  const preparation = deferred();
+  const h = harness({ openOperationTimeoutMs: 30 });
+  h.lineage.prepareOpenWaits.push(preparation.promise);
+  const stalled = goldenOpen({
+    requestId: "deadline-prepare-stalled",
+    streamId: "deadline-prepare-stream",
+    openId: "deadline-prepare-open",
+  });
+
+  await assert.rejects(h.manager.open(stalled), (error) => {
+    assert.ok(managerError("BUSY")(error));
+    assert.match(error.message, /durable target preparation timed out/);
+    assert.deepEqual({ ...error.details }, { reason: "terminal_open_timeout" });
+    return true;
+  });
+
+  const following = goldenOpen({
+    requestId: "deadline-prepare-following",
+    streamId: "deadline-prepare-following-stream",
+    openId: "deadline-prepare-following-open",
+  });
+  await h.manager.open(following);
+  assert.ok(opened(h.sent, following.requestId));
+  assert.equal(h.backend.opens.length, 1);
+
+  preparation.resolve();
+  await flushPromiseJobs();
+  const stalledKey = h.lineage.claimOpenCalls.find(
+    ({ streamKey }) => streamKey.includes(stalled.streamId),
+  ).key;
+  const durable = h.lineage.opens.get(stalledKey);
+  assert.equal(durable.state, "final");
+  assert.equal(durable.outcome.kind, "error");
+  assert.equal(durable.outcome.code, "BUSY");
+  await assert.rejects(
+    h.manager.open({ ...stalled, requestId: "deadline-prepare-replay" }),
+    (error) => {
+      assert.ok(managerError("BUSY")(error));
+      assert.deepEqual({ ...error.details }, { reason: "terminal_open_timeout" });
+      return true;
+    },
+  );
+  assert.equal(
+    h.sent.some(({ frame }) => frame.requestId === stalled.requestId),
+    false,
+    "a late preparation must not manufacture a terminal response",
+  );
+});
+
+test("hung backend attachment releases the global lane and late handle is fenced closed", async () => {
+  const attachment = deferred();
+  const h = harness({ openOperationTimeoutMs: 30 });
+  h.backend.openWaits.push(attachment.promise);
+  const stalled = goldenOpen({
+    requestId: "deadline-backend-stalled",
+    streamId: "deadline-backend-stream",
+    openId: "deadline-backend-open",
+  });
+
+  await assert.rejects(h.manager.open(stalled), (error) => {
+    assert.ok(managerError("BUSY")(error));
+    assert.match(error.message, /backend attachment timed out/);
+    assert.deepEqual({ ...error.details }, { reason: "terminal_open_timeout" });
+    return true;
+  });
+
+  const following = goldenOpen({
+    requestId: "deadline-backend-following",
+    streamId: "deadline-backend-following-stream",
+    openId: "deadline-backend-following-open",
+  });
+  await h.manager.open(following);
+  assert.ok(opened(h.sent, following.requestId));
+  assert.equal(h.manager.stats().liveOrDetachedStreams, 1);
+  assert.equal(h.backend.opens.length, 1);
+
+  attachment.resolve();
+  await flushPromiseJobs();
+  assert.equal(h.backend.opens.length, 2);
+  const lateHandle = h.backend.opens.at(-1).handle;
+  assert.equal(lateHandle.closeCalls, 1);
+  const outputFramesBefore = h.sent.filter(({ frame }) => frame.type === "terminal.output").length;
+  await lateHandle.emit("late-stalled-output");
+  assert.equal(
+    h.sent.filter(({ frame }) => frame.type === "terminal.output").length,
+    outputFramesBefore,
+    "late callbacks must not attach to the following terminal stream",
+  );
+  assert.equal(h.manager.stats().liveOrDetachedStreams, 1);
+  assert.equal(
+    h.sent.some(({ frame }) => frame.requestId === stalled.requestId),
+    false,
+    "a late backend result must not manufacture terminal.opened",
+  );
 });
 
 function opened(sent, requestId) {
@@ -1596,6 +1748,30 @@ test("durable exact-target failure and replay do not retire recovered H3 authori
   assert.equal(h.backend.opens.length, 0);
 });
 
+test("legacy exact-owner contention returns uncached BUSY and the same openId recovers", async () => {
+  const resolver = new FakeResolver();
+  resolver.resolveResults.push(new terminalControl.TerminalControlProtocolError(
+    "PERMISSION_DENIED",
+    "exact terminal-control target already has an input owner",
+  ));
+  const h = harness({ resolver });
+  const request = goldenOpen({
+    requestId: "legacy-owner-pressure-first",
+    streamId: "legacy-owner-pressure-stream",
+    openId: "legacy-owner-pressure-open-id",
+  });
+
+  await assert.rejects(h.manager.open(request), managerError("BUSY"));
+  assert.equal(h.lineage.failOpenCalls.length, 0);
+  assert.equal(h.lineage.releaseUnpreparedOpenClaimCalls.length, 1);
+  assert.equal(h.backend.opens.length, 0);
+
+  await h.manager.open({ ...request, requestId: "legacy-owner-pressure-retry" });
+  assert.equal(h.resolver.calls.length, 2);
+  assert.equal(h.backend.opens.length, 1);
+  assert.ok(opened(h.sent, "legacy-owner-pressure-retry"));
+});
+
 test("retryable exact-target pressure releases RESET claim for same-openId recovery", async () => {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-reset-pressure-"));
   try {
@@ -1721,6 +1897,238 @@ test("RESET yields its own producer lease before exact target replacement", asyn
   assert.equal(resolver.calls.length, 2);
   assert.equal(h.backend.opens.length, 2);
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+});
+
+test("durable RESET refreshes only the exact controller epoch after terminal-control restart", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-terminal-control-restart-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ home });
+    const identity = await store.read();
+    const resolver = new FakeResolver();
+    const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+      store,
+      admissionFence: resolver,
+      now: () => 1_000_000,
+    });
+    const h = harness({
+      resolver,
+      lineage,
+      hostEpoch: identity.hostEpoch,
+      hostInstanceId: store.hostInstanceId,
+    });
+    const sourceRequest = goldenOpen({
+      requestId: "controller-restart-source",
+      streamId: "controller-restart-stream",
+      openId: "controller-restart-source-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+    });
+    await h.manager.open(sourceRequest);
+    const source = opened(h.sent, sourceRequest.requestId);
+
+    const restartedBinding = clone(CANONICAL_BINDING);
+    restartedBinding.exactControlIdentity.controlEpoch = "control-epoch-after-restart";
+    restartedBinding.exactControlIdentity.targetIncarnationProof =
+      "control-target-incarnation-proof-after-restart";
+    const restartedResolution = clone(h.resolver.resolved);
+    restartedResolution.binding = clone(restartedBinding);
+    restartedResolution.admission.exactControlToken = "exact-control-token-after-restart";
+    h.resolver.resolved = restartedResolution;
+    h.backend.expectedBindings.push(clone(restartedBinding));
+
+    const resetRequest = goldenOpen({
+      requestId: "controller-restart-reset",
+      streamId: sourceRequest.streamId,
+      openId: "controller-restart-reset-open-id",
+      expectedHostEpoch: identity.hostEpoch,
+      mode: "reset",
+      resume: {
+        generation: source.payload.generation,
+        resumeToken: source.payload.resumeToken,
+      },
+    });
+    await h.manager.open(resetRequest);
+
+    const replacement = opened(h.sent, resetRequest.requestId);
+    assert.equal(replacement.payload.disposition, "reset");
+    assert.notEqual(replacement.payload.generation, source.payload.generation);
+    assert.equal(h.backend.opens.length, 2);
+    assert.deepEqual(h.backend.opens[1].target.binding, restartedBinding);
+    assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+    assert.equal(h.resolver.fenceCalls.length, 2);
+    assert.equal(
+      h.resolver.fenceCalls[1].resolution.admission.exactControlToken,
+      "exact-control-token-after-restart",
+      "the refreshed binding is executable only after the new exact token is fenced",
+    );
+
+    const snapshot = await store.read();
+    const durableState = Object.values(snapshot.materialized).find((value) => (
+      value?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    assert.equal(durableState.streamAuthorities.length, 1);
+    assert.equal(durableState.streamAuthorities[0].generation, replacement.payload.generation);
+    assert.deepEqual(durableState.streamAuthorities[0].canonicalBinding, restartedBinding);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("terminal-control restart RESET rejects every stable target field and a stale token", async (t) => {
+  for (const scenario of [
+    {
+      name: "host",
+      mutate(resolution) {
+        resolution.target.hostId = "different-host";
+        resolution.binding.hostId = "different-host";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "scope",
+      mutate(resolution) {
+        resolution.target.scopeId = "different-scope";
+        resolution.binding.scopeId = "different-scope";
+        resolution.admission.resourceTarget.scopeId = "different-scope";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "session",
+      mutate(resolution) {
+        resolution.target.sessionId = "different-session";
+        resolution.binding.sessionId = "different-session";
+        resolution.admission.resourceTarget.sessionId = "different-session";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "pane",
+      mutate(resolution) {
+        resolution.target.pane = 1;
+        resolution.binding.pane = 1;
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "process-target",
+      mutate(resolution) {
+        resolution.binding.processTarget.targetId = "different-process-target";
+        resolution.admission.resourceTarget.processTarget.targetId = "different-process-target";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "backend-instance-key",
+      mutate(resolution) {
+        resolution.target.canonicalTargetId = "different-backend-instance-key";
+        resolution.binding.backendInstanceKey = "different-backend-instance-key";
+        resolution.admission.resourceTarget.backendInstanceKey = "different-backend-instance-key";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "managed-name",
+      mutate(resolution) {
+        resolution.binding.managedTarget.name = "different-managed-name";
+        resolution.admission.resourceTarget.managedTarget.name = "different-managed-name";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "managed-kind",
+      mutate(resolution) {
+        resolution.binding.managedTarget.kind = "worktree";
+        resolution.admission.resourceTarget.managedTarget.kind = "worktree";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "control-target",
+      mutate(resolution) {
+        resolution.target.controlTargetId = "different-control-target";
+        resolution.binding.exactControlIdentity.controlTargetId = "different-control-target";
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "managed-incarnation",
+      mutate(resolution) {
+        const differentIncarnation = `twinc2.${"b".repeat(43)}`;
+        resolution.binding.managedTarget.incarnation = differentIncarnation;
+        resolution.admission.resourceTarget.managedTarget.incarnation = differentIncarnation;
+      },
+      expectedFenceCalls: 1,
+    },
+    {
+      name: "stale-exact-token",
+      mutate(resolution, resolver) {
+        resolution.admission.exactControlToken = "stale-exact-control-token";
+        resolver.fenceError = new Error("new exact-control token was rejected");
+      },
+      expectedFenceCalls: 2,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const home = mkdtempSync(join(tmpdir(), `tw-relay-v2-restart-${scenario.name}-`));
+      try {
+        const store = await hostState.RelayV2HostStateStore.open({ home });
+        const identity = await store.read();
+        const resolver = new FakeResolver();
+        const lineage = new terminalDurable.RelayV2TerminalDurableLineageAuthority({
+          store,
+          admissionFence: resolver,
+          now: () => 1_000_000,
+        });
+        const h = harness({
+          resolver,
+          lineage,
+          hostEpoch: identity.hostEpoch,
+          hostInstanceId: store.hostInstanceId,
+        });
+        const sourceRequest = goldenOpen({
+          requestId: `restart-conflict-${scenario.name}-source`,
+          streamId: `restart-conflict-${scenario.name}-stream`,
+          openId: `restart-conflict-${scenario.name}-source-open-id`,
+          expectedHostEpoch: identity.hostEpoch,
+        });
+        await h.manager.open(sourceRequest);
+        const source = opened(h.sent, sourceRequest.requestId);
+
+        const resolution = clone(h.resolver.resolved);
+        resolution.binding.exactControlIdentity.controlEpoch =
+          `restart-conflict-${scenario.name}-new-epoch`;
+        resolution.binding.exactControlIdentity.targetIncarnationProof =
+          `restart-conflict-${scenario.name}-new-proof`;
+        scenario.mutate(resolution, resolver);
+        h.resolver.resolved = resolution;
+
+        await assert.rejects(h.manager.open(goldenOpen({
+          requestId: `restart-conflict-${scenario.name}-reset`,
+          streamId: sourceRequest.streamId,
+          openId: `restart-conflict-${scenario.name}-reset-open-id`,
+          expectedHostEpoch: identity.hostEpoch,
+          mode: "reset",
+          resume: {
+            generation: source.payload.generation,
+            resumeToken: source.payload.resumeToken,
+          },
+        })), managerError("CAPABILITY_UNAVAILABLE"));
+
+        assert.equal(h.backend.opens.length, 1);
+        assert.equal(h.backend.opens[0].handle.closeCalls, 0);
+        assert.equal(h.resolver.fenceCalls.length, scenario.expectedFenceCalls);
+        const snapshot = await store.read();
+        const durableState = Object.values(snapshot.materialized).find((value) => (
+          value?.authority === "relay_v2_terminal_durable_lineage"
+        ));
+        assert.equal(durableState.streamAuthorities.length, 1);
+        assert.equal(durableState.streamAuthorities[0].generation, source.payload.generation);
+        assert.deepEqual(durableState.streamAuthorities[0].canonicalBinding, CANONICAL_BINDING);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 test("divergent local cleanup waits for durable failure settlement", async () => {
@@ -3490,6 +3898,78 @@ test("credit-blocked close survives rebind and same close retry responds on the 
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
 });
 
+test("retryable producer contention is backpressured and retried without disconnect frames", async () => {
+  const scheduled = [];
+  const h = harness({
+    schedule(delayMs, callback) {
+      const task = { delayMs, callback, cancelled: false, fired: false };
+      scheduled.push(task);
+      return () => { task.cancelled = true; };
+    },
+  });
+  h.authority.acquireResults.push({
+    status: "rejected",
+    error: {
+      code: "BUSY",
+      message: "another exact producer is active",
+      retryable: true,
+      details: null,
+    },
+  });
+  const request = goldenOpen({ requestId: "producer-contention-open" });
+  await h.manager.open(request);
+  const frame = opened(h.sent, request.requestId);
+  await h.manager.input({
+    ...streamContext(frame),
+    inputSeq: "1",
+    data: Buffer.from("held-until-owner-release"),
+  });
+
+  assert.equal(h.authority.acquireCalls.length, 1);
+  assert.equal(h.authority.inputCalls.length, 0);
+  assert.equal(h.sent.some(({ frame: candidate }) => candidate.type === "terminal.input_error"), false);
+  const inputRetry = scheduled.find((task) => task.delayMs === 250 && !task.cancelled);
+  assert.ok(inputRetry, "retryable ownership pressure must schedule a bounded retry");
+  inputRetry.fired = true;
+  inputRetry.callback();
+  await h.manager.sweep();
+
+  assert.equal(h.authority.acquireCalls.length, 2);
+  assert.equal(h.authority.inputCalls.length, 1);
+  assert.equal(h.sent.at(-1).frame.type, "terminal.input_ack");
+  assert.equal(h.sent.at(-1).frame.payload.ackedThroughInputSeq, "1");
+
+  h.authority.resizeResults.push({
+    accepted: false,
+    uncertain: false,
+    error: {
+      code: "BUSY",
+      message: "agent turn still owns input",
+      retryable: true,
+      details: null,
+    },
+  });
+  await h.manager.resize({
+    ...streamContext(frame),
+    resizeSeq: "1",
+    cols: 100,
+    rows: 30,
+  });
+  assert.equal(h.authority.resizeCalls.length, 1);
+  assert.equal(h.sent.some(({ frame: candidate }) => candidate.type === "terminal.resize_error"), false);
+  const resizeRetry = [...scheduled].reverse().find((task) => (
+    task.delayMs === 250 && !task.cancelled && !task.fired
+  ));
+  assert.ok(resizeRetry, "retryable resize pressure must schedule a bounded retry");
+  resizeRetry.fired = true;
+  resizeRetry.callback();
+  await h.manager.sweep();
+
+  assert.equal(h.authority.resizeCalls.length, 2);
+  assert.equal(h.sent.at(-1).frame.type, "terminal.resize_ack");
+  assert.equal(h.sent.at(-1).frame.payload.ackedThroughResizeSeq, "1");
+});
+
 test("an uncertain input remains generation-bound and is never applied to a reset backend", async () => {
   const h = harness();
   h.authority.inputResults.push({
@@ -4020,6 +4500,64 @@ test("ACK reclaim and host high/low watermarks resume paused backends within har
   });
   assert.equal(firstHandle.resumeCalls, 1, "stream low water must recover from pause");
   assert.ok(h.manager.stats().ringBytes <= limits.hostRingBytes);
+});
+
+test("production output credit is one frame until ACK while explicit limits retain the hard ceiling", async () => {
+  assert.equal(
+    terminal.RELAY_V2_TERMINAL_DEFAULT_MAX_UNACKED_BYTES,
+    terminal.RELAY_V2_TERMINAL_MAX_FRAME_BYTES,
+  );
+  assert.equal(
+    terminal.RELAY_V2_TERMINAL_MAX_UNACKED_BYTES,
+    512 * 1024,
+    "the frozen explicit ceiling remains wire-compatible",
+  );
+
+  const h = harness();
+  const request = goldenOpen({
+    requestId: "production-output-credit-open",
+    streamId: "production-output-credit-stream",
+    openId: "production-output-credit-open-id",
+  });
+  await h.manager.open(request);
+  const frame = opened(h.sent, request.requestId);
+  assert.equal(
+    frame.payload.maxUnackedBytes,
+    terminal.RELAY_V2_TERMINAL_MAX_FRAME_BYTES,
+  );
+
+  const handle = h.backend.opens[0].handle;
+  const chunk = Buffer.alloc(terminal.RELAY_V2_TERMINAL_MAX_FRAME_BYTES, 0x61);
+  await handle.emit(chunk);
+  await handle.emit(chunk);
+  await handle.emit(chunk);
+
+  const output = () => h.sent.filter(({ frame: candidate }) => (
+    candidate.type === "terminal.output" && candidate.streamId === frame.streamId
+  ));
+  assert.equal(output().length, 1, "the default must not queue a second frame before ACK");
+  assert.equal(outputBytes(output()).byteLength, chunk.byteLength);
+
+  await h.manager.acknowledgeOutput({
+    ...streamContext(frame),
+    nextOffset: String(chunk.byteLength),
+  });
+  assert.equal(output().length, 2, "one ACK releases exactly one following frame");
+  assert.equal(outputBytes(output()).byteLength, chunk.byteLength * 2);
+
+  const widened = harness({
+    limits: { maxUnackedBytes: terminal.RELAY_V2_TERMINAL_MAX_UNACKED_BYTES },
+  });
+  assert.equal(
+    widened.manager.limits.maxUnackedBytes,
+    terminal.RELAY_V2_TERMINAL_MAX_UNACKED_BYTES,
+  );
+  assert.throws(
+    () => harness({
+      limits: { maxUnackedBytes: terminal.RELAY_V2_TERMINAL_MAX_UNACKED_BYTES + 1 },
+    }),
+    /maxUnackedBytes exceeds the frozen limit/,
+  );
 });
 
 test("oversize backend callback is rejected before byte copying and cannot grow the ring", async () => {

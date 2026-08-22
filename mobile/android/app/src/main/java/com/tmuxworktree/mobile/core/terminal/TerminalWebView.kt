@@ -3,7 +3,6 @@ package com.tmuxworktree.mobile.core.terminal
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Uri
-import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.view.ViewGroup
@@ -29,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.os.HandlerCompat
 import androidx.webkit.WebViewAssetLoader
 import java.util.Collections
 import java.util.WeakHashMap
@@ -68,6 +68,15 @@ internal enum class TerminalWebViewLossKind {
     VIEW_DISPOSED,
 }
 
+internal object TerminalParserMutationTimeoutPolicy {
+    const val SUBMISSION_MILLIS = 15_000L
+    const val CALLBACK_MILLIS = 30_000L
+}
+
+/** A normal route close intentionally discards its final view mutation after stream detach. */
+internal fun terminalParserMutationAppliedOnViewLoss(kind: TerminalWebViewLossKind): Boolean =
+    kind == TerminalWebViewLossKind.VIEW_DISPOSED
+
 internal class TerminalWebViewRendererLoss internal constructor(
     internal val owner: TerminalWebViewOwnership,
     internal val generation: Long,
@@ -75,6 +84,10 @@ internal class TerminalWebViewRendererLoss internal constructor(
     val didCrash: Boolean,
     internal val allowAutomaticRebuild: Boolean,
 ) {
+    /** Call after fencing new parser registrations and before awaiting attachment drain. */
+    internal fun abortParserMutationBeforeAttachmentDetach(): Boolean =
+        owner.abortParserMutation(this)
+
     /** Call only after the exact Relay v2 terminal attachment has been fenced and detached. */
     internal fun completeAfterAttachmentDetach(): Boolean = owner.completeRendererLoss(this)
 
@@ -83,14 +96,19 @@ internal class TerminalWebViewRendererLoss internal constructor(
 
     internal val isRendererLoss: Boolean
         get() = kind == TerminalWebViewLossKind.RENDERER_GONE
+
+    /** A route disposal ends the remote writer; a renderer crash keeps it resumable. */
+    internal val closesRemoteStream: Boolean
+        get() = kind == TerminalWebViewLossKind.VIEW_DISPOSED
 }
 
 /**
  * Exact in-process owner for one bound WebView generation.
  *
- * View loss removes the dead view immediately, blocks a successor bind, and holds the old parser
- * settlement until the upper attachment owner proves detach. It contains no Relay/session
- * authority and is used only by [TerminalWebViewController].
+ * View loss removes the dead view immediately and blocks a successor bind. The upper attachment
+ * owner first fences parser registrations, aborts the exact platform mutation while its durable
+ * runtime admission is still live, drains that callback, and only then completes detach/rebuild.
+ * This class contains no Relay/session authority and is used only by [TerminalWebViewController].
  */
 internal class TerminalWebViewOwnership {
     private data class Bound(
@@ -101,7 +119,9 @@ internal class TerminalWebViewOwnership {
     private data class PendingLoss(
         val receipt: TerminalWebViewRendererLoss,
         val settleParserFailure: () -> Unit,
+        var parserAbortClaimed: Boolean = false,
         var completionClaimed: Boolean = false,
+        var replacementBindAttempted: Boolean = false,
     )
 
     private val lock = Any()
@@ -114,8 +134,16 @@ internal class TerminalWebViewOwnership {
     val rebuildGeneration = _rebuildGeneration.asStateFlow()
 
     fun bind(view: Any): Boolean = synchronized(lock) {
-        if (pendingLoss != null) return@synchronized false
         if (view in deadViews) return@synchronized false
+        pendingLoss?.let { pending ->
+            // Compose can create the next route's AndroidView before the old attachment's
+            // asynchronous detach barrier completes. That genuinely new view cannot bind yet;
+            // remember it so completion publishes a key change that replaces the inert factory
+            // result. A late callback from the disposed/dead view is rejected above and does not
+            // cause an otherwise unnecessary route rebuild.
+            pending.replacementBindAttempted = true
+            return@synchronized false
+        }
         if (bound?.view === view) return@synchronized true
         nextGeneration += 1
         bound = Bound(view, nextGeneration)
@@ -148,6 +176,21 @@ internal class TerminalWebViewOwnership {
 
     fun owns(binding: TerminalWebViewParserBinding): Boolean = synchronized(lock) {
         binding.owner === this && bound?.generation == binding.generation
+    }
+
+    /**
+     * A route-owned renderer may disappear before the Host observes its terminal close request.
+     * Parser effects admitted during that short closing window are intentionally discarded: the
+     * route is gone, but acknowledging them keeps the durable terminal lane ordered until the
+     * correlated terminal.closed frame arrives. Renderer crashes are never admitted here.
+     */
+    fun acceptsDisposedParserSettlement(binding: TerminalWebViewParserBinding): Boolean =
+        binding.owner === this && acceptsDisposedParserSettlement(binding.generation)
+
+    internal fun acceptsDisposedParserSettlement(generation: Long): Boolean = synchronized(lock) {
+        val loss = pendingLoss?.receipt ?: return@synchronized false
+        generation == loss.generation &&
+            loss.kind == TerminalWebViewLossKind.VIEW_DISPOSED
     }
 
     fun view(binding: TerminalWebViewParserBinding): Any? = synchronized(lock) {
@@ -208,39 +251,50 @@ internal class TerminalWebViewOwnership {
         receipt
     }
 
-    internal fun completeRendererLoss(loss: TerminalWebViewRendererLoss): Boolean {
+    internal fun abortParserMutation(loss: TerminalWebViewRendererLoss): Boolean {
         val settlement = synchronized(lock) {
             val pending = pendingLoss
-                ?.takeIf { it.receipt === loss && !it.completionClaimed }
+                ?.takeIf { it.receipt === loss && !it.parserAbortClaimed }
                 ?: return false
-            pending.completionClaimed = true
+            pending.parserAbortClaimed = true
             pending.settleParserFailure
         }
-        try {
-            settlement()
-        } finally {
-            synchronized(lock) {
-                val pending = pendingLoss
-                if (pending?.receipt === loss) {
-                    pendingLoss = null
-                    val shouldRebuild = loss.allowAutomaticRebuild ||
-                        loss.kind == TerminalWebViewLossKind.VIEW_DISPOSED ||
-                        manualRebuildRequested
-                    manualRebuildRequested = false
-                    if (shouldRebuild) {
-                        _rebuildGeneration.value += 1
-                    }
-                }
+        settlement()
+        return true
+    }
+
+    internal fun completeRendererLoss(
+        loss: TerminalWebViewRendererLoss,
+    ): Boolean = synchronized(lock) {
+        val pending = pendingLoss
+            ?.takeIf {
+                it.receipt === loss &&
+                    it.parserAbortClaimed &&
+                    !it.completionClaimed
             }
+            ?: return false
+        pending.completionClaimed = true
+        pendingLoss = null
+        val shouldRebuild = loss.allowAutomaticRebuild ||
+            pending.replacementBindAttempted ||
+            manualRebuildRequested
+        manualRebuildRequested = false
+        if (shouldRebuild) {
+            _rebuildGeneration.value += 1
         }
-        return loss.allowAutomaticRebuild
+        loss.allowAutomaticRebuild
     }
 }
 
 @Stable
 class TerminalWebViewController internal constructor() {
     private val lock = Any()
-    private val parserCallbackHandler = Handler(Looper.getMainLooper())
+    // Parser ACK/timeout ownership must cross a WebView frame even while Chromium or Compose has
+    // installed a main-queue synchronization barrier. A regular Handler can be starved behind
+    // that barrier indefinitely while asynchronous vsync/input work keeps the UI superficially
+    // alive, leaving the durable checkpoint stuck on one parser write. The async Handler keeps
+    // both the bounded timeout and its exact settlement runnable live in that condition.
+    private val parserCallbackHandler = HandlerCompat.createAsync(Looper.getMainLooper())
     private val ownership = TerminalWebViewOwnership()
     private val pendingScripts = ArrayDeque<String>()
     private var pendingScriptBytes = 0
@@ -327,7 +381,14 @@ class TerminalWebViewController internal constructor() {
                 kind = kind,
                 didCrash = didCrash,
                 allowAutomaticRebuild = allowAutomaticRebuild,
-                settleParserFailure = { mutation?.completion?.invoke(false) },
+                settleParserFailure = {
+                    // Renderer loss holds its false until the upper owner fences registrations,
+                    // then aborts it into the callback drain before attachment detach. A normal
+                    // route disposal settles its final view mutation immediately below.
+                    if (kind == TerminalWebViewLossKind.RENDERER_GONE) {
+                        mutation?.completion?.invoke(false)
+                    }
+                },
             ) ?: return null
             isReady = false
             pendingScripts.clear()
@@ -340,6 +401,9 @@ class TerminalWebViewController internal constructor() {
             loss to mutation
         }
         mutation?.let { parserCallbackHandler.removeCallbacks(it.timeout) }
+        if (kind == TerminalWebViewLossKind.VIEW_DISPOSED) {
+            mutation?.completion?.invoke(terminalParserMutationAppliedOnViewLoss(kind))
+        }
         return loss
     }
 
@@ -537,6 +601,13 @@ class TerminalWebViewController internal constructor() {
             callbackId.length > MAX_CALLBACK_ID_CHARS ||
             script.length > MAX_ACKED_PARSER_SCRIPT_CHARS
         ) return false
+        // The renderer route is intentionally gone, while the terminal close handshake still
+        // owns this parser generation. Treat tail output/reset effects as applied-and-discarded;
+        // otherwise a perfectly normal terminal.closed race poisons the entire Relay runtime.
+        if (ownership.acceptsDisposedParserSettlement(binding)) {
+            completion(true)
+            return true
+        }
         val view = synchronized(lock) {
             val readyView = (ownership.view(binding) as? WebView)?.takeIf { isReady }
                 ?: return false
@@ -548,7 +619,11 @@ class TerminalWebViewController internal constructor() {
         val timeout = synchronized(lock) {
             parserMutation?.takeIf { it.callbackId == callbackId }?.timeout
         } ?: return false
-        if (!parserCallbackHandler.postDelayed(timeout, PARSER_SUBMISSION_TIMEOUT_MILLIS)) {
+        if (!parserCallbackHandler.postDelayed(
+                timeout,
+                TerminalParserMutationTimeoutPolicy.SUBMISSION_MILLIS,
+            )
+        ) {
             synchronized(lock) {
                 if (parserMutation?.callbackId == callbackId) parserMutation = null
             }
@@ -571,7 +646,7 @@ class TerminalWebViewController internal constructor() {
             parserCallbackHandler.removeCallbacks(timeout)
             if (!parserCallbackHandler.postDelayed(
                     timeout,
-                    PARSER_CALLBACK_TIMEOUT_MILLIS,
+                    TerminalParserMutationTimeoutPolicy.CALLBACK_MILLIS,
                 )
             ) {
                 failParserMutation(callbackId)
@@ -579,7 +654,7 @@ class TerminalWebViewController internal constructor() {
             }
             // evaluateJavascript submission failure is not itself a parser settlement. Keep the
             // exact mutation pending until TwBridge ACK, the existing bounded timeout, or a view
-            // loss cut that takes and holds its false.
+            // loss cut that takes and later aborts its false before attachment detach.
             runCatching {
                 view.evaluateJavascript(script) { _ ->
                     // Submission result is not the parser ACK. TwBridge or timeout settles it.
@@ -588,8 +663,8 @@ class TerminalWebViewController internal constructor() {
         }
         if (posted) return true
         // The longer submission deadline remains the bounded fail-closed owner. A renderer-loss
-        // callback already queued by Chromium can still claim and hold its false until the exact
-        // attachment detach barrier completes.
+        // cut can still claim the mutation and abort its false into the exact pre-detach callback
+        // barrier.
         return true
     }
 
@@ -724,8 +799,6 @@ class TerminalWebViewController internal constructor() {
         const val MAX_ACKED_PARSER_BYTES = 65_536
         const val MAX_CALLBACK_ID_CHARS = 256
         const val MAX_ACKED_PARSER_SCRIPT_CHARS = 96 * 1024
-        const val PARSER_SUBMISSION_TIMEOUT_MILLIS = 15_000L
-        const val PARSER_CALLBACK_TIMEOUT_MILLIS = 5_000L
         const val TERMINAL_TRUNCATION_MARKER =
             "\r\n[Terminal output truncated: client buffer limit reached]\r\n"
     }
@@ -836,8 +909,9 @@ internal fun TerminalWebView(
                 )
                 createdView[0] = view
                 // Route re-entry can create this AndroidView while the prior route's exact
-                // attachment detach is still pending. Leave it inert; the detach receipt
-                // publishes a new generation and replaces it without a main-thread exception.
+                // attachment detach is still pending. Leave it inert; that rejected replacement
+                // bind is recorded, so the detach receipt publishes a new generation and replaces
+                // it without a main-thread exception.
                 val bound = controller.bind(view)
                 if (bound) {
                     boundView[0] = view
@@ -931,7 +1005,10 @@ private class TerminalBridge(
     private val onResize: (Int, Int) -> Unit,
     private val onParserMutationApplied: (String, Boolean) -> Unit,
 ) {
-    private val mainHandler = Handler(Looper.getMainLooper())
+    // JavaScript bridge callbacks carry terminal input and durable parser acknowledgements. They
+    // must not sit behind a renderer synchronization barrier; ownership/fencing is still checked
+    // by TerminalWebViewController after delivery.
+    private val mainHandler = HandlerCompat.createAsync(Looper.getMainLooper())
 
     @JavascriptInterface
     fun ready() {

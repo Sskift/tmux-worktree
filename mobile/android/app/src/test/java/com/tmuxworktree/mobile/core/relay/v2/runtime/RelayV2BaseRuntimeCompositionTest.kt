@@ -123,18 +123,26 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalRecoveryAuthor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeClaim
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeSessionSelector
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalActionFence
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCorrelatedError
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenMode
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenResume
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserCallbackToken
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalPhase
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResetReason
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialInstall
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialOwner
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalResumeCredentialStore
+import com.tmuxworktree.mobile.core.session.ExponentialMobileSessionReconnectPolicy
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 import java.lang.reflect.Proxy
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -338,6 +346,634 @@ class RelayV2BaseRuntimeCompositionTest {
             )
             harness.composition.detachTerminal(replacement)
             assertEquals(2, harness.transport().framesOfType("terminal.input").size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `late issued opened is consumed without stopping base before reset successor opens`() =
+        runBlocking {
+            val terminalAuthority = RelayV2DurableStateRepositoryCore(TerminalMemoryStore())
+            val terminalCredentials = MemoryTerminalCredentials()
+            val harness = Harness(
+                autoConnect = true,
+                terminalRuntimeAuthority = terminalAuthority,
+                terminalResumeCredentials = terminalCredentials,
+            )
+            try {
+                harness.connectOnline()
+                val session = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { it.sessions.size == 1 }
+                }.sessions.single()
+                val opened = CompletableDeferred<String>()
+                val successorIssued = CompletableDeferred<RelayV2TerminalResetSuccessor>()
+                val ordinaryResets = AtomicInteger()
+                val attachment = checkNotNull(
+                    harness.composition.attachTerminal(
+                        session.replyCut,
+                        RejectingTerminalParser,
+                        object : RelayV2TerminalAttachmentObserver {
+                            override fun opened(streamId: String) {
+                                opened.complete(streamId)
+                            }
+
+                            override fun reset(reason: RelayV2TerminalResetReason) {
+                                ordinaryResets.incrementAndGet()
+                            }
+
+                            override fun resetSuccessorIssued(
+                                reason: RelayV2TerminalResetReason,
+                                successor: RelayV2TerminalResetSuccessor,
+                            ) {
+                                assertEquals(RelayV2TerminalResetReason.STREAM_LOST, reason)
+                                successorIssued.complete(successor)
+                            }
+
+                            override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+                        },
+                    ),
+                )
+                assertTrue(harness.composition.openTerminal(attachment, 120, 36))
+                val firstOpen = harness.transport().awaitSentType("terminal.open")
+                harness.transport().sendFrame(
+                    linkedMapOf(
+                        "protocolVersion" to 2L,
+                        "kind" to "response",
+                        "type" to "terminal.reset_required",
+                        "requestId" to firstOpen.stringValue("requestId"),
+                        "hostId" to firstOpen.stringValue("hostId"),
+                        "hostEpoch" to firstOpen.stringValue("expectedHostEpoch"),
+                        "scopeId" to firstOpen.stringValue("scopeId"),
+                        "sessionId" to firstOpen.stringValue("sessionId"),
+                        "streamId" to firstOpen.stringValue("streamId"),
+                        "payload" to linkedMapOf(
+                            "origin" to "open",
+                            "generation" to null,
+                            "reason" to "stream_lost",
+                            "requestedOffset" to null,
+                            "bufferStartOffset" to null,
+                            "tailOffset" to null,
+                        ),
+                    ),
+                )
+                val successorOpen = harness.transport().awaitSentType("terminal.open", index = 1)
+                assertEquals(
+                    RelayV2TerminalResetSuccessor(
+                        requestId = successorOpen.stringValue("requestId"),
+                        openId = successorOpen.payloadReadOnly().stringValue("openId"),
+                    ),
+                    withTimeout(TIMEOUT_MS) { successorIssued.await() },
+                )
+
+                // The first response is valid but late: its request remains in durable issued
+                // history while the reset successor owns the current request/open identifiers.
+                harness.transport().sendFrame(
+                    terminalOpenedFrame(
+                        open = firstOpen,
+                        generation = "late-terminal-generation",
+                        resumeToken = "late-terminal-resume-token",
+                        disposition = "new",
+                        hostInstanceId = "late-host-process",
+                    ),
+                )
+                harness.transport().sendFrame(
+                    terminalOpenedFrame(
+                        open = successorOpen,
+                        generation = "terminal-generation-after-reset",
+                        resumeToken = "terminal-resume-after-reset",
+                        disposition = "reset",
+                        hostInstanceId = "host-process-after-reset",
+                        resetReason = "stream_lost",
+                    ),
+                )
+
+                assertEquals(
+                    successorOpen.stringValue("streamId"),
+                    withTimeout(TIMEOUT_MS) { opened.await() },
+                )
+                assertEquals(1, terminalCredentials.installCount)
+                assertEquals(0, ordinaryResets.get())
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+                assertNull(harness.composition.state.value.failure)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `detached issued terminal errors stay scoped while unknown still fails closed`() =
+        runBlocking {
+            val terminalStore = TerminalMemoryStore()
+            val terminalAuthority = RelayV2DurableStateRepositoryCore(terminalStore)
+            val harness = Harness(
+                autoConnect = true,
+                terminalRuntimeAuthority = terminalAuthority,
+            )
+            try {
+                harness.connectOnline()
+                val session = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { it.sessions.size == 1 }
+                }.sessions.single()
+                val detachedCurrentError = CompletableDeferred<RelayV2TerminalCorrelatedError>()
+                val attachment = checkNotNull(
+                    harness.composition.attachTerminal(
+                        session.replyCut,
+                        RejectingTerminalParser,
+                        object : RelayV2TerminalAttachmentObserver {
+                            override fun opened(streamId: String) = Unit
+                            override fun reset(reason: RelayV2TerminalResetReason) = Unit
+                            override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+                            override fun detachedOpenRejected(
+                                error: RelayV2TerminalCorrelatedError,
+                            ) {
+                                detachedCurrentError.complete(error)
+                            }
+                        },
+                    ),
+                )
+                assertTrue(harness.composition.openTerminal(attachment, 120, 36))
+                val firstOpen = harness.transport().awaitSentType("terminal.open")
+                val key = RelayV2TerminalCheckpointKey(
+                    profileId = PROFILE_ID,
+                    profileActivationGeneration = 1,
+                    principalId = PRINCIPAL_ID,
+                    clientInstanceId = CLIENT_INSTANCE_ID,
+                    hostId = HOST_ID,
+                    hostEpoch = HOST_EPOCH,
+                    scopeId = firstOpen.stringValue("scopeId"),
+                    sessionId = firstOpen.stringValue("sessionId"),
+                    streamId = firstOpen.stringValue("streamId"),
+                    pane = 0,
+                )
+                val firstStored = terminalAuthority.loadTerminal(key)
+                    as RelayV2TerminalStoredCheckpoint.PreOpen
+                val firstPending = requireNotNull(firstStored.checkpoint.pendingOpen)
+                val currentRequestId = "detached-base-current-request"
+                val retried = terminalAuthority.reduceTerminalUnderApplyLease(
+                    key,
+                    RelayV2TerminalAction.BeginOpenAttempt(
+                        deliveryToken = firstPending.deliveryToken,
+                        requestId = currentRequestId,
+                        openAttempt = firstPending.openAttempt,
+                        mode = RelayV2TerminalOpenMode.NEW,
+                        cols = firstPending.cols,
+                        rows = firstPending.rows,
+                        target = firstPending.target,
+                        parserContinuityId = firstPending.parserContinuityId,
+                        resume = null,
+                    ),
+                )
+                val expectedCheckpoint = requireNotNull(retried.preOpenCheckpoint)
+                harness.composition.detachTerminalAfterParserCallbacksDrained(attachment)
+
+                fun terminalError(requestId: String, code: String) = linkedMapOf<String, Any?>(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "error",
+                    "requestId" to requestId,
+                    "hostId" to firstOpen.stringValue("hostId"),
+                    "hostEpoch" to firstOpen.stringValue("expectedHostEpoch"),
+                    "scopeId" to firstOpen.stringValue("scopeId"),
+                    "sessionId" to firstOpen.stringValue("sessionId"),
+                    "streamId" to firstOpen.stringValue("streamId"),
+                    "payload" to null,
+                    "error" to linkedMapOf(
+                        "code" to code,
+                        "message" to "terminal error $code",
+                        "retryable" to false,
+                        "retryAfterMs" to null,
+                        "commandDisposition" to "not_applicable",
+                        "details" to null,
+                    ),
+                )
+
+                // The superseded request remains in durable issued history and must be consumed
+                // without reviving presentation or stopping the Base actor.
+                harness.transport().sendFrame(
+                    terminalError(firstPending.requestId, "INTERNAL"),
+                )
+                harness.transport().sendFrame(
+                    terminalError(currentRequestId, "TERMINAL_STREAM_CONFLICT"),
+                )
+                assertEquals(
+                    RelayV2TerminalCorrelatedError(
+                        "TERMINAL_STREAM_CONFLICT",
+                        false,
+                        "terminal error TERMINAL_STREAM_CONFLICT",
+                    ),
+                    withTimeout(TIMEOUT_MS) { detachedCurrentError.await() },
+                )
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+                assertNull(harness.composition.state.value.failure)
+                assertEquals(
+                    RelayV2TerminalStoredCheckpoint.PreOpen(expectedCheckpoint),
+                    terminalAuthority.loadTerminal(key),
+                )
+                assertEquals(1, harness.transport().framesOfType("terminal.open").size)
+
+                // No durable issued owner exists for this request, so it remains fail-closed at
+                // the Base boundary instead of being hidden by the detached correlation path.
+                harness.transport().sendFrame(
+                    terminalError("unknown-detached-request", "INTERNAL"),
+                )
+                val failed = harness.awaitPhase(RelayV2BaseRuntimePhase.FAILED)
+                assertEquals(
+                    RelayV2BaseRuntimeFailure.RuntimeIncomplete("UNOWNED_EFFECT_error"),
+                    failed.failure,
+                )
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `detached reset-required conflict stays terminal-scoped and base remains online`() =
+        runBlocking {
+            val terminalStore = TerminalMemoryStore()
+            val terminalAuthority = RelayV2DurableStateRepositoryCore(terminalStore)
+            val harness = Harness(
+                autoConnect = true,
+                terminalRuntimeAuthority = terminalAuthority,
+            )
+            try {
+                harness.connectOnline()
+                val session = withTimeout(TIMEOUT_MS) {
+                    harness.composition.productProjection.first { it.sessions.size == 1 }
+                }.sessions.single()
+                val opened = CompletableDeferred<String>()
+                val detachedCurrentError = CompletableDeferred<RelayV2TerminalCorrelatedError>()
+                val attachment = checkNotNull(
+                    harness.composition.attachTerminal(
+                        session.replyCut,
+                        RejectingTerminalParser,
+                        object : RelayV2TerminalAttachmentObserver {
+                            override fun opened(streamId: String) {
+                                opened.complete(streamId)
+                            }
+
+                            override fun reset(reason: RelayV2TerminalResetReason) = Unit
+
+                            override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+
+                            override fun detachedOpenRejected(
+                                error: RelayV2TerminalCorrelatedError,
+                            ) {
+                                detachedCurrentError.complete(error)
+                            }
+                        },
+                    ),
+                )
+                assertTrue(harness.composition.openTerminal(attachment, 120, 36))
+                val initialOpen = harness.transport().awaitSentType("terminal.open")
+                harness.transport().sendFrame(
+                    terminalOpenedFrame(
+                        open = initialOpen,
+                        generation = "terminal-generation-before-detached-conflict",
+                        resumeToken = "terminal-resume-before-detached-conflict",
+                        disposition = "new",
+                        hostInstanceId = "host-process-before-detached-conflict",
+                    ),
+                )
+                assertEquals(
+                    initialOpen.stringValue("streamId"),
+                    withTimeout(TIMEOUT_MS) { opened.await() },
+                )
+
+                val key = RelayV2TerminalCheckpointKey(
+                    profileId = PROFILE_ID,
+                    profileActivationGeneration = 1,
+                    principalId = PRINCIPAL_ID,
+                    clientInstanceId = CLIENT_INSTANCE_ID,
+                    hostId = HOST_ID,
+                    hostEpoch = HOST_EPOCH,
+                    scopeId = initialOpen.stringValue("scopeId"),
+                    sessionId = initialOpen.stringValue("sessionId"),
+                    streamId = initialOpen.stringValue("streamId"),
+                    pane = 0,
+                )
+                val active = (terminalAuthority.loadTerminal(key)
+                    as RelayV2TerminalStoredCheckpoint.Present).checkpoint
+                val resetRequired = requireNotNull(
+                    terminalAuthority.reduceTerminalUnderApplyLease(
+                        key,
+                        RelayV2TerminalAction.AsyncResetRequired(
+                            fence = RelayV2TerminalActionFence(
+                                active.identity.binding(),
+                                active.deliveryToken,
+                                active.openAttempt.openId,
+                            ),
+                            correlationProofId = "detached-conflict-stream-lost",
+                            reason = RelayV2TerminalResetReason.STREAM_LOST,
+                            requestedOffset = null,
+                            bufferStartOffset = null,
+                            tailOffset = null,
+                        ),
+                    ).checkpoint,
+                )
+                val resetAttempt = RelayV2TerminalOpenAttempt(
+                    "detached-conflict-reset-open",
+                    "detached-conflict-reset-fingerprint",
+                )
+                val resume = RelayV2TerminalOpenResume(
+                    generation = resetRequired.identity.generation,
+                    nextOffset = null,
+                    resumeTokenCredentialReference =
+                    resetRequired.identity.resumeTokenCredentialReference,
+                    resumeTokenCredentialFingerprint =
+                    resetRequired.identity.resumeTokenCredentialFingerprint,
+                )
+                val firstResetRequestId = "detached-conflict-reset-request-1"
+                val firstBegin = RelayV2TerminalAction.BeginOpenAttempt(
+                    deliveryToken = resetRequired.deliveryToken,
+                    requestId = firstResetRequestId,
+                    openAttempt = resetAttempt,
+                    mode = RelayV2TerminalOpenMode.RESET,
+                    cols = 120,
+                    rows = 36,
+                    target = resetRequired.identity.target(),
+                    parserContinuityId = resetAttempt.openId,
+                    resume = resume,
+                )
+                val firstPending = requireNotNull(
+                    terminalAuthority.reduceTerminalUnderApplyLease(key, firstBegin).checkpoint,
+                )
+                val currentResetRequestId = "detached-conflict-reset-request-2"
+                val pending = requireNotNull(
+                    terminalAuthority.reduceTerminalUnderApplyLease(
+                        key,
+                        firstBegin.copy(requestId = currentResetRequestId),
+                    ).checkpoint,
+                )
+                assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, pending.phase)
+                assertEquals(
+                    listOf(firstResetRequestId, currentResetRequestId),
+                    pending.pendingOpen?.issuedRequestIds,
+                )
+                assertEquals(firstPending.identity, pending.identity)
+                harness.composition.detachTerminalAfterParserCallbacksDrained(attachment)
+
+                fun terminalError(requestId: String) = linkedMapOf<String, Any?>(
+                    "protocolVersion" to 2L,
+                    "kind" to "response",
+                    "type" to "error",
+                    "requestId" to requestId,
+                    "hostId" to initialOpen.stringValue("hostId"),
+                    "hostEpoch" to initialOpen.stringValue("expectedHostEpoch"),
+                    "scopeId" to initialOpen.stringValue("scopeId"),
+                    "sessionId" to initialOpen.stringValue("sessionId"),
+                    "streamId" to initialOpen.stringValue("streamId"),
+                    "payload" to null,
+                    "error" to linkedMapOf(
+                        "code" to "TERMINAL_STREAM_CONFLICT",
+                        "message" to "terminal stream is already owned",
+                        "retryable" to false,
+                        "retryAfterMs" to null,
+                        "commandDisposition" to "not_applicable",
+                        "details" to null,
+                    ),
+                )
+
+                // The superseded issued response is consumed silently. The current response is
+                // delivered once to terminal presentation, without terminating the Base actor.
+                harness.transport().sendFrame(terminalError(firstResetRequestId))
+                harness.transport().sendFrame(terminalError(currentResetRequestId))
+                assertEquals(
+                    RelayV2TerminalCorrelatedError(
+                        code = "TERMINAL_STREAM_CONFLICT",
+                        retryable = false,
+                        message = "terminal stream is already owned",
+                    ),
+                    withTimeout(TIMEOUT_MS) { detachedCurrentError.await() },
+                )
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+                assertNull(harness.composition.state.value.failure)
+                assertEquals(
+                    RelayV2TerminalStoredCheckpoint.Present(pending),
+                    terminalAuthority.loadTerminal(key),
+                )
+                assertEquals(1, harness.transport().framesOfType("terminal.open").size)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `process restart recovers parser failed checkpoint through reset open without failing base`() =
+        runBlocking {
+            val terminalStore = TerminalMemoryStore()
+            val terminalJournal = MemoryTerminalJournal()
+            val terminalCredentials = MemoryTerminalCredentials()
+            val firstAuthority = RelayV2DurableStateRepositoryCore(terminalStore)
+            val first = Harness(
+                autoConnect = true,
+                terminalRuntimeAuthority = firstAuthority,
+                terminalPostCommitJournal = terminalJournal,
+                terminalResumeCredentials = terminalCredentials,
+            )
+            try {
+                first.connectOnline()
+                val initialSession = withTimeout(TIMEOUT_MS) {
+                    first.composition.productProjection.first { it.sessions.size == 1 }
+                }.sessions.single()
+                val failedParser = DeferredTerminalParser()
+                val initialOpened = CompletableDeferred<String>()
+                val terminalReset = CompletableDeferred<RelayV2TerminalResetReason>()
+                val firstAttachment = checkNotNull(
+                    first.composition.attachTerminal(
+                        initialSession.replyCut,
+                        failedParser,
+                        object : RelayV2TerminalAttachmentObserver {
+                            override fun opened(streamId: String) {
+                                initialOpened.complete(streamId)
+                            }
+
+                            override fun reset(reason: RelayV2TerminalResetReason) {
+                                terminalReset.complete(reason)
+                            }
+
+                            override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+                        },
+                    ),
+                )
+                assertTrue(first.composition.openTerminal(firstAttachment, 120, 36))
+                val initialOpen = first.transport().awaitSentType("terminal.open")
+                val initialPayload = initialOpen.payloadReadOnly()
+                first.transport().sendFrame(
+                    terminalOpenedFrame(
+                        open = initialOpen,
+                        generation = "terminal-generation-before-restart",
+                        resumeToken = "terminal-resume-before-restart",
+                        disposition = "new",
+                        hostInstanceId = "host-process-before-restart",
+                    ),
+                )
+                assertEquals(
+                    initialOpen.stringValue("streamId"),
+                    withTimeout(TIMEOUT_MS) { initialOpened.await() },
+                )
+
+                val key = RelayV2TerminalCheckpointKey(
+                    profileId = PROFILE_ID,
+                    profileActivationGeneration = 1,
+                    principalId = PRINCIPAL_ID,
+                    clientInstanceId = CLIENT_INSTANCE_ID,
+                    hostId = HOST_ID,
+                    hostEpoch = HOST_EPOCH,
+                    scopeId = initialOpen.stringValue("scopeId"),
+                    sessionId = initialOpen.stringValue("sessionId"),
+                    streamId = initialOpen.stringValue("streamId"),
+                    pane = (initialPayload["pane"] as Long).toInt(),
+                )
+                first.transport().sendFrame(
+                    linkedMapOf(
+                        "protocolVersion" to 2L,
+                        "kind" to "event",
+                        "type" to "terminal.output",
+                        "streamId" to initialOpen.stringValue("streamId"),
+                        "payload" to linkedMapOf(
+                            "generation" to "terminal-generation-before-restart",
+                            "offset" to "0",
+                            "encoding" to "base64",
+                            "data" to "b2xkLXBlbmRpbmc=",
+                        ),
+                    ),
+                )
+                val failedWrite = withTimeout(TIMEOUT_MS) { failedParser.writeCompletion.await() }
+                failedWrite(false)
+
+                assertEquals(
+                    RelayV2TerminalResetReason.PARSER_FAILURE,
+                    withTimeout(TIMEOUT_MS) { terminalReset.await() },
+                )
+                val persistedReset = withTimeout(TIMEOUT_MS) {
+                    while (true) {
+                        val stored = firstAuthority.loadTerminal(key)
+                        val checkpoint = (stored as? RelayV2TerminalStoredCheckpoint.Present)
+                            ?.checkpoint
+                        if (checkpoint?.phase == RelayV2TerminalPhase.RESET_REQUIRED &&
+                            checkpoint.pendingParserEffectHandoff == null &&
+                            checkpoint.pendingParserEffectActivation == null
+                        ) {
+                            return@withTimeout checkpoint
+                        }
+                        delay(1)
+                    }
+                    error("unreachable")
+                }
+                assertTrue(persistedReset.pendingOutput.isNotEmpty())
+                assertEquals(RelayV2BaseRuntimePhase.ONLINE, first.composition.state.value.phase)
+                assertNull(first.composition.state.value.failure)
+
+                first.closeAndAwaitTransportDrain()
+                withTimeout(TIMEOUT_MS) {
+                    while (terminalJournal.fenceCount() == 0) delay(1)
+                }
+                first.close()
+
+                // A fresh repository core and base composition model process restart while the
+                // checkpoint, resume credential and post-commit fence remain durable.
+                val restartedAuthority = RelayV2DurableStateRepositoryCore(terminalStore)
+                val restarted = Harness(
+                    autoConnect = true,
+                    terminalRuntimeAuthority = restartedAuthority,
+                    terminalPostCommitJournal = terminalJournal,
+                    terminalResumeCredentials = terminalCredentials,
+                )
+                try {
+                    restarted.connectOnline()
+                    val restartedSession = withTimeout(TIMEOUT_MS) {
+                        restarted.composition.productProjection.first { it.sessions.size == 1 }
+                    }.sessions.single()
+                    val replacementParser = DeferredTerminalParser()
+                    val replacementOpened = CompletableDeferred<String>()
+                    val replacement = checkNotNull(
+                        restarted.composition.attachTerminal(
+                            restartedSession.replyCut,
+                            replacementParser,
+                            object : RelayV2TerminalAttachmentObserver {
+                                override fun opened(streamId: String) {
+                                    replacementOpened.complete(streamId)
+                                }
+
+                                override fun reset(reason: RelayV2TerminalResetReason) = Unit
+
+                                override fun closed(reason: RelayV2TerminalCloseReason) = Unit
+                            },
+                        ),
+                    )
+                    assertTrue(restarted.composition.openTerminal(replacement, 80, 24))
+                    val resetOpen = restarted.transport().awaitSentType("terminal.open")
+                    val resetPayload = resetOpen.payloadReadOnly()
+                    assertEquals("reset", resetPayload.stringValue("mode"))
+                    assertEquals(
+                        "terminal-generation-before-restart",
+                        resetPayload.objectValue("resume").stringValue("generation"),
+                    )
+                    assertEquals("terminal-resume-before-restart",
+                        resetPayload.objectValue("resume").stringValue("resumeToken"))
+
+                    restarted.transport().sendFrame(
+                        terminalOpenedFrame(
+                            open = resetOpen,
+                            generation = "terminal-generation-after-restart",
+                            resumeToken = "terminal-resume-after-restart",
+                            disposition = "reset",
+                            hostInstanceId = "host-process-after-restart",
+                            resetReason = "stream_lost",
+                        ),
+                    )
+                    assertEquals(
+                        resetOpen.stringValue("streamId"),
+                        withTimeout(TIMEOUT_MS) { replacementOpened.await() },
+                    )
+                    val resetCompletion = withTimeout(TIMEOUT_MS) {
+                        replacementParser.resetCompletion.await()
+                    }
+                    resetCompletion(true)
+
+                    val live = withTimeout(TIMEOUT_MS) {
+                        while (true) {
+                            val stored = restartedAuthority.loadTerminal(key)
+                            val checkpoint = (stored as? RelayV2TerminalStoredCheckpoint.Present)
+                                ?.checkpoint
+                            if (checkpoint?.phase == RelayV2TerminalPhase.LIVE) {
+                                return@withTimeout checkpoint
+                            }
+                            delay(1)
+                        }
+                        error("unreachable")
+                    }
+                    assertTrue(live.pendingOutput.isEmpty())
+                    assertEquals("0", live.parserAppliedNextOffset)
+                    assertEquals("0", live.networkReceivedThrough)
+                    assertNull(live.resetReason)
+                    assertEquals(RelayV2BaseRuntimePhase.ONLINE,
+                        restarted.composition.state.value.phase)
+                    assertNull(restarted.composition.state.value.failure)
+                } finally {
+                    restarted.close()
+                }
+            } finally {
+                first.close()
+            }
+        }
+
+    @Test
+    fun `late terminal closed after local view detach cannot fail the base connection`() = runBlocking {
+        val harness = Harness(autoConnect = true)
+        try {
+            harness.connectOnline()
+
+            // A normal route close can withdraw its parser owner just before the Host's already
+            // correlated close acknowledgement crosses the transport. The terminal lane may
+            // recover its durable pending-close checkpoint later; it must not poison Agent chat,
+            // snapshots, or the shared Relay connection in the meantime.
+            harness.transport().sendFixture("terminal-closed-event")
+            delay(50)
+
+            assertEquals(RelayV2BaseRuntimePhase.ONLINE, harness.composition.state.value.phase)
+            assertEquals(null, harness.composition.state.value.failure)
         } finally {
             harness.close()
         }
@@ -1557,6 +2193,95 @@ class RelayV2BaseRuntimeCompositionTest {
                 failed.close()
             }
         }
+
+    @Test
+    fun `expired credential refreshes before automatic cold reconnect opens a transport`() =
+        runBlocking {
+            val rolloverEntered = CompletableDeferred<RelayV2Profile>()
+            val rolloverResult = CompletableDeferred<RelayV2CredentialRolloverResult>()
+            val rolloverCalls = AtomicInteger()
+            val harness = Harness(
+                autoConnect = true,
+                accessExpiresAtMs = 0,
+                credentialRollover = RelayV2CredentialRolloverPort { expected ->
+                    rolloverCalls.incrementAndGet()
+                    rolloverEntered.complete(expected)
+                    rolloverResult.await()
+                },
+            )
+            try {
+                val observed = withTimeoutOrNull(TIMEOUT_MS) { rolloverEntered.await() }
+                assertTrue(
+                    "rollover was not claimed; state=${harness.composition.state.value}, " +
+                        "transportRequests=${harness.factory.requests.size}",
+                    observed != null,
+                )
+                val expected = checkNotNull(observed)
+                assertEquals(harness.profile, expected)
+                assertEquals(1, rolloverCalls.get())
+                assertTrue(harness.factory.requests.isEmpty())
+
+                harness.advanceCredentialVersion(2)
+                rolloverResult.complete(
+                    RelayV2CredentialRolloverResult.Refreshed(
+                        expected.copy(credentialVersion = 2),
+                    ),
+                )
+
+                harness.awaitTransport()
+                assertEquals(1, harness.factory.requests.size)
+                assertEquals("twcap2.test-access-v2", harness.factory.requests.single().accessToken)
+                delay(50)
+                assertEquals(1, rolloverCalls.get())
+                assertEquals(1, harness.factory.requests.size)
+            } finally {
+                rolloverResult.complete(RelayV2CredentialRolloverResult.Unavailable)
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `upgrade 401 refreshes credential before automatic reconnect`() = runBlocking {
+        val rolloverEntered = CompletableDeferred<RelayV2Profile>()
+        val rolloverResult = CompletableDeferred<RelayV2CredentialRolloverResult>()
+        val rolloverCalls = AtomicInteger()
+        val harness = Harness(
+            autoConnect = true,
+            credentialRollover = RelayV2CredentialRolloverPort { expected ->
+                rolloverCalls.incrementAndGet()
+                rolloverEntered.complete(expected)
+                rolloverResult.await()
+            },
+        )
+        try {
+            harness.awaitTransport().fail(
+                RelayV2TransportFailure(
+                    RelayV2TransportFailureKind.UPGRADE,
+                    httpStatus = 401,
+                ),
+            )
+            val expected = withTimeout(TIMEOUT_MS) { rolloverEntered.await() }
+            assertEquals(harness.profile, expected)
+            assertEquals(1, rolloverCalls.get())
+            assertEquals(1, harness.factory.requests.size)
+
+            harness.advanceCredentialVersion(2)
+            rolloverResult.complete(
+                RelayV2CredentialRolloverResult.Refreshed(
+                    expected.copy(credentialVersion = 2),
+                ),
+            )
+
+            harness.awaitTransport(1)
+            assertEquals(2, harness.factory.requests.size)
+            assertEquals("twcap2.test-access-v2", harness.factory.requests[1].accessToken)
+            assertFalse(harness.composition.isTerminalOrClosed())
+            assertEquals(1, rolloverCalls.get())
+        } finally {
+            rolloverResult.complete(RelayV2CredentialRolloverResult.Unavailable)
+            harness.close()
+        }
+    }
 
     @Test
     fun `retry now cannot steal transport loss admission from credential rollover`() = runBlocking {
@@ -3504,6 +4229,7 @@ class RelayV2BaseRuntimeCompositionTest {
 
     private inner class Harness(
         autoConnect: Boolean,
+        accessExpiresAtMs: Long = System.currentTimeMillis() + 60_000,
         outbox: RelayV2OutboxState = RelayV2OutboxState.empty(),
         createOutcomes: List<RelayV2CreateOutcome> = emptyList(),
         outboxReadFailure: Throwable? = null,
@@ -3532,6 +4258,8 @@ class RelayV2BaseRuntimeCompositionTest {
         terminalRuntimeAuthority: RelayV2TerminalRecoveryAuthority? = null,
         terminalPostCommitJournal: RelayV2TerminalPostCommitJournalStore =
             MemoryTerminalJournal(),
+        terminalResumeCredentials: RelayV2TerminalResumeCredentialStore =
+            MemoryTerminalCredentials(),
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -3571,7 +4299,7 @@ class RelayV2BaseRuntimeCompositionTest {
                         principalId = profile.principalId,
                         grantId = profile.grantId,
                         accessToken = "twcap2.test-access",
-                        accessExpiresAtMs = System.currentTimeMillis() + 60_000,
+                        accessExpiresAtMs = accessExpiresAtMs,
                         refreshToken = "twref2.test-refresh",
                         refreshExpiresAtMs = System.currentTimeMillis() + 120_000,
                     ),
@@ -3585,7 +4313,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 stateSyncAuthority = authority,
                 terminalRuntimeAuthority = terminalRuntimeAuthority ?: authority,
                 terminalPostCommitJournal = terminalPostCommitJournal,
-                terminalResumeCredentials = MemoryTerminalCredentials(),
+                terminalResumeCredentials = terminalResumeCredentials,
                 materializedSessions = authority,
                 activationOutbox = RelayV2ActivationOutboxReadPort(authority::readOutbox),
                 outboxAuthority = authority,
@@ -3594,6 +4322,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 agentRuntimeFactory = agentRuntimeFactory,
                 agentOptionalCapabilities = agentOptionalCapabilities,
                 transportFactory = factory,
+                reconnectPolicy = ExponentialMobileSessionReconnectPolicy.deterministic(),
                 newCommandId = newCommandId,
                 clock = { NOW_MS },
                 retryDelay = retryDelayBlock,
@@ -4749,6 +5478,28 @@ class RelayV2BaseRuntimeCompositionTest {
         ) = false
     }
 
+    private class DeferredTerminalParser : RelayV2TerminalParserPort {
+        val writeCompletion = CompletableDeferred<suspend (Boolean) -> Unit>()
+        val resetCompletion = CompletableDeferred<suspend (Boolean) -> Unit>()
+
+        override suspend fun write(
+            callbackToken: RelayV2TerminalParserCallbackToken,
+            bytes: ByteArray,
+            completion: suspend (Boolean) -> Unit,
+        ): Boolean {
+            check(writeCompletion.complete(completion))
+            return true
+        }
+
+        override suspend fun reset(
+            callbackToken: RelayV2TerminalParserCallbackToken,
+            completion: suspend (Boolean) -> Unit,
+        ): Boolean {
+            check(resetCompletion.complete(completion))
+            return true
+        }
+    }
+
     private class TerminalMemoryStore :
         RelayV2DurableStateStore,
         RelayV2DurableStateTransaction {
@@ -4814,6 +5565,8 @@ class RelayV2BaseRuntimeCompositionTest {
 
     private class MemoryTerminalCredentials : RelayV2TerminalResumeCredentialStore {
         private val values = mutableMapOf<String, String>()
+        var installCount = 0
+            private set
 
         override fun installExact(
             owner: RelayV2TerminalResumeCredentialOwner,
@@ -4824,7 +5577,14 @@ class RelayV2BaseRuntimeCompositionTest {
             val existing = values[key]
             if (existing != null && existing != resumeToken) return null
             values[key] = resumeToken
-            return RelayV2TerminalResumeCredentialInstall("test-fingerprint", existing == null)
+            installCount += 1
+            return RelayV2TerminalResumeCredentialInstall(
+                Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    MessageDigest.getInstance("SHA-256")
+                        .digest(resumeToken.toByteArray(Charsets.UTF_8)),
+                ),
+                existing == null,
+            )
         }
 
         override fun read(
@@ -5278,6 +6038,7 @@ class RelayV2BaseRuntimeCompositionTest {
                 values[reference] = current.copy(
                     credentialVersion = version,
                     accessToken = "twcap2.test-access-v$version",
+                    accessExpiresAtMs = System.currentTimeMillis() + 60_000,
                 )
                 true
             }
@@ -5563,6 +6324,38 @@ class RelayV2BaseRuntimeCompositionTest {
     private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied =
         result as RelayV2OutboxResult.Applied
 
+    private fun terminalOpenedFrame(
+        open: Map<String, Any?>,
+        generation: String,
+        resumeToken: String,
+        disposition: String,
+        hostInstanceId: String,
+        resetReason: String? = null,
+    ): Map<String, Any?> = linkedMapOf(
+        "protocolVersion" to 2L,
+        "kind" to "response",
+        "type" to "terminal.opened",
+        "requestId" to open.stringValue("requestId"),
+        "hostId" to open.stringValue("hostId"),
+        "hostEpoch" to open.stringValue("expectedHostEpoch"),
+        "scopeId" to open.stringValue("scopeId"),
+        "sessionId" to open.stringValue("sessionId"),
+        "streamId" to open.stringValue("streamId"),
+        "hostInstanceId" to hostInstanceId,
+        "payload" to linkedMapOf(
+            "openId" to open.payloadReadOnly().stringValue("openId"),
+            "deduplicated" to false,
+            "generation" to generation,
+            "resumeToken" to resumeToken,
+            "disposition" to disposition,
+            "replayFromOffset" to "0",
+            "bufferStartOffset" to "0",
+            "tailOffset" to "0",
+            "maxUnackedBytes" to 524_288L,
+            "resetReason" to resetReason,
+        ),
+    )
+
     @Suppress("UNCHECKED_CAST")
     private fun <T> deepClone(value: T): T = when (value) {
         is Map<*, *> -> LinkedHashMap<String, Any?>().apply {
@@ -5577,6 +6370,10 @@ class RelayV2BaseRuntimeCompositionTest {
         getValue("payload") as MutableMap<String, Any?>
 
     private fun Map<String, Any?>.stringValue(name: String): String = getValue(name) as String
+
+    @Suppress("UNCHECKED_CAST")
+    private fun Map<String, Any?>.objectValue(name: String): Map<String, Any?> =
+        getValue(name) as Map<String, Any?>
 
     @Suppress("UNCHECKED_CAST")
     private fun Map<String, Any?>.payloadReadOnly(): Map<String, Any?> =

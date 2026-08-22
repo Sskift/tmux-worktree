@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.runtime
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.tmuxworktree.mobile.R
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
@@ -32,6 +34,7 @@ class RelayConnectionService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob())
     private var healthCollectionJob: Job? = null
+    private var relayWakeLock: PowerManager.WakeLock? = null
 
     @OptIn(ExperimentalCoroutinesApi::class)
     override fun onCreate() {
@@ -39,6 +42,7 @@ class RelayConnectionService : Service() {
         ensureNotificationChannel()
         // Promote to foreground immediately; the notification text is updated from health.
         startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.relay_notification_connecting)))
+        acquireRelayWakeLock()
         healthCollectionJob = serviceScope.launch {
             // A present-but-not-yet-STOPPED composition is treated as active so the foreground
             // keep-alive survives the startup/recovery window between install and CONNECTING.
@@ -89,7 +93,27 @@ class RelayConnectionService : Service() {
     override fun onDestroy() {
         healthCollectionJob?.cancel()
         serviceScope.cancel()
+        relayWakeLock?.let { lock ->
+            if (lock.isHeld) runCatching { lock.release() }
+        }
+        relayWakeLock = null
         super.onDestroy()
+    }
+
+    /**
+     * The foreground notification makes the connection user-visible, but it does not guarantee
+     * CPU time after the display is locked on every Android build. Keep only a partial wake lock
+     * for the exact lifetime of the active Relay service so Broker heartbeats can be answered and
+     * a screen lock does not turn into an avoidable transport disconnect.
+     */
+    @SuppressLint("WakelockTimeout")
+    private fun acquireRelayWakeLock() {
+        val manager = getSystemService(PowerManager::class.java) ?: return
+        val lock = manager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "$packageName:relay-connection",
+        ).apply { setReferenceCounted(false) }
+        if (runCatching { lock.acquire() }.isSuccess) relayWakeLock = lock
     }
 
     private fun ensureNotificationChannel() {

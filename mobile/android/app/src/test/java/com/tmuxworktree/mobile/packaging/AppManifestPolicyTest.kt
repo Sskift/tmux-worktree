@@ -11,6 +11,16 @@ import org.w3c.dom.Element
 
 class AppManifestPolicyTest {
     @Test
+    fun `foreground relay can keep broker heartbeats alive while the display is locked`() {
+        val manifest = parseXml(appProjectDir.resolve("src/main/AndroidManifest.xml"))
+        val permissions = manifest.elements("uses-permission")
+            .map { it.androidAttribute("name") }
+
+        assertTrue(permissions.contains("android.permission.WAKE_LOCK"))
+        assertTrue(permissions.contains("android.permission.FOREGROUND_SERVICE_DATA_SYNC"))
+    }
+
+    @Test
     fun `V2Activity owns the launcher and the legacy activity remains internal`() {
         val manifest = parseXml(appProjectDir.resolve("src/main/AndroidManifest.xml"))
         val application = manifest.elements("application").single()

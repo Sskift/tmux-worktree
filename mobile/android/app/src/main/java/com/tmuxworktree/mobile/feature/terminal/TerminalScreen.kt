@@ -8,12 +8,13 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -27,12 +28,15 @@ import androidx.compose.material.icons.outlined.KeyboardHide
 import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.TextDecrease
 import androidx.compose.material.icons.outlined.TextIncrease
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -41,11 +45,15 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
@@ -82,6 +90,15 @@ fun TerminalScreen(
 ) {
     val terminalOnline = connectionStatus == ConnectionStatus.ONLINE
     val boundedFontSizeSp = terminalFontSizeSp.coerceIn(MIN_TERMINAL_FONT_SP, MAX_TERMINAL_FONT_SP)
+    val density = LocalDensity.current
+    val imeAboveNavigation = with(density) {
+        (
+            WindowInsets.ime.getBottom(this) -
+                WindowInsets.navigationBars.getBottom(this)
+            )
+            .coerceAtLeast(0)
+            .toDp()
+    }
     Scaffold(
         modifier = modifier
             .fillMaxSize()
@@ -91,17 +108,13 @@ fun TerminalScreen(
             TerminalTopBar(
                 sessionTitle = sessionTitle,
                 connectionStatus = connectionStatus,
-                onBack = onBack,
-                onConnectionStatusClick = onConnectionStatusClick,
-            )
-        },
-        bottomBar = {
-            TerminalControls(
                 terminalOnline = terminalOnline,
                 isReadOnly = isReadOnly,
                 ownershipReadOnly = ownershipReadOnly,
                 keyboardVisible = keyboardVisible,
                 fontSizeSp = boundedFontSizeSp,
+                onBack = onBack,
+                onConnectionStatusClick = onConnectionStatusClick,
                 onToggleKeyboard = onToggleKeyboard,
                 onDecreaseFont = onDecreaseFont,
                 onIncreaseFont = onIncreaseFont,
@@ -113,7 +126,11 @@ fun TerminalScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding),
+                // Scaffold already reserves the navigation-safe phone bottom. While typing,
+                // consume only the part of IME above that inset; the raw IME height includes
+                // the navigation bar and would otherwise leave a full system-bar gap.
+                .padding(innerPadding)
+                .padding(bottom = if (keyboardVisible) imeAboveNavigation else 0.dp),
         ) {
             Box(
                 modifier = Modifier
@@ -126,9 +143,8 @@ fun TerminalScreen(
                 content = terminalContent,
             )
 
-            if (isReadOnly && terminalOnline) {
-                ReadOnlyBanner(
-                    ownershipReadOnly = ownershipReadOnly,
+            if (ownershipReadOnly && terminalOnline) {
+                InputUnavailableBanner(
                     onRetryInput = onRetryInput,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -151,9 +167,20 @@ fun TerminalScreen(
 private fun TerminalTopBar(
     sessionTitle: String,
     connectionStatus: ConnectionStatus,
+    terminalOnline: Boolean,
+    isReadOnly: Boolean,
+    ownershipReadOnly: Boolean,
+    keyboardVisible: Boolean,
+    fontSizeSp: Int,
     onBack: () -> Unit,
     onConnectionStatusClick: () -> Unit,
+    onToggleKeyboard: () -> Unit,
+    onDecreaseFont: () -> Unit,
+    onIncreaseFont: () -> Unit,
+    onToggleReadOnly: () -> Unit,
+    onRetryInput: () -> Unit,
 ) {
+    var controlsExpanded by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -198,22 +225,54 @@ private fun TerminalTopBar(
                     onClick = onConnectionStatusClick,
                 )
             }
+            Box {
+                IconButton(
+                    onClick = { controlsExpanded = true },
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("terminal_options")
+                        .semantics {
+                            contentDescription = "Open terminal controls"
+                            stateDescription = when {
+                                ownershipReadOnly -> "Input unavailable"
+                                isReadOnly -> "Read-only enabled"
+                                else -> "Terminal input enabled"
+                            }
+                        },
+                ) {
+                    Icon(
+                        imageVector = if (isReadOnly) Icons.Outlined.Lock else Icons.Outlined.MoreVert,
+                        contentDescription = null,
+                        tint = if (isReadOnly) TwWarning else TwTextSecondary,
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
+                TerminalControlsMenu(
+                    expanded = controlsExpanded,
+                    terminalOnline = terminalOnline,
+                    isReadOnly = isReadOnly,
+                    ownershipReadOnly = ownershipReadOnly,
+                    keyboardVisible = keyboardVisible,
+                    fontSizeSp = fontSizeSp,
+                    onDismiss = { controlsExpanded = false },
+                    onToggleKeyboard = onToggleKeyboard,
+                    onDecreaseFont = onDecreaseFont,
+                    onIncreaseFont = onIncreaseFont,
+                    onToggleReadOnly = onToggleReadOnly,
+                    onRetryInput = onRetryInput,
+                )
+            }
         }
         HorizontalDivider(color = TwBorder, thickness = 1.dp)
     }
 }
 
 @Composable
-private fun ReadOnlyBanner(
-    ownershipReadOnly: Boolean,
+private fun InputUnavailableBanner(
     onRetryInput: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val description = if (ownershipReadOnly) {
-        "Terminal input is temporarily unavailable. Retry input to ask the controller again."
-    } else {
-        "Terminal is read-only. Terminal input is disabled."
-    }
+    val description = "Terminal input is temporarily unavailable. Retry input to ask the controller again."
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -232,30 +291,24 @@ private fun ReadOnlyBanner(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
-                imageVector = if (ownershipReadOnly) Icons.Outlined.LinkOff else Icons.Outlined.Lock,
+                imageVector = Icons.Outlined.LinkOff,
                 contentDescription = null,
                 tint = TwWarning,
                 modifier = Modifier.size(20.dp),
             )
             Spacer(Modifier.width(10.dp))
             Text(
-                text = if (ownershipReadOnly) {
-                    "Input unavailable · controller rejected input"
-                } else {
-                    "Read-only · terminal input is disabled"
-                },
+                text = "Input unavailable · controller rejected input",
                 color = TwTextPrimary,
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.weight(1f),
             )
-            if (ownershipReadOnly) {
-                Spacer(Modifier.width(8.dp))
-                TextButton(
-                    onClick = onRetryInput,
-                    modifier = Modifier.testTag("terminal_retry_input"),
-                ) {
-                    Text("Retry input")
-                }
+            Spacer(Modifier.width(8.dp))
+            TextButton(
+                onClick = onRetryInput,
+                modifier = Modifier.testTag("terminal_retry_input"),
+            ) {
+                Text("Retry input")
             }
         }
     }
@@ -370,7 +423,8 @@ private fun BoxScope.DisconnectedOverlay(
 }
 
 @Composable
-private fun TerminalControls(
+private fun TerminalControlsMenu(
+    expanded: Boolean,
     terminalOnline: Boolean,
     isReadOnly: Boolean,
     ownershipReadOnly: Boolean,
@@ -381,49 +435,67 @@ private fun TerminalControls(
     onIncreaseFont: () -> Unit,
     onToggleReadOnly: () -> Unit,
     onRetryInput: () -> Unit,
+    onDismiss: () -> Unit,
 ) {
-    Column(
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismiss,
         modifier = Modifier
-            .fillMaxWidth()
-            .background(TwSurface)
-            .imePadding()
-            .navigationBarsPadding()
-            .testTag("terminal_controls"),
+            .width(280.dp)
+            .testTag("terminal_controls_menu"),
     ) {
+        DropdownMenuItem(
+            text = {
+                Text(if (keyboardVisible) "Hide keyboard" else "Show keyboard")
+            },
+            onClick = {
+                onDismiss()
+                onToggleKeyboard()
+            },
+            enabled = terminalOnline && !isReadOnly,
+            leadingIcon = {
+                Icon(
+                    imageVector = if (keyboardVisible) {
+                        Icons.Outlined.KeyboardHide
+                    } else {
+                        Icons.Outlined.Keyboard
+                    },
+                    contentDescription = null,
+                )
+            },
+            modifier = Modifier
+                .testTag("terminal_keyboard")
+                .semantics {
+                    contentDescription = if (keyboardVisible) {
+                        "Hide terminal keyboard"
+                    } else {
+                        "Show terminal keyboard"
+                    }
+                    stateDescription = if (keyboardVisible) {
+                        "Keyboard visible"
+                    } else {
+                        "Keyboard hidden"
+                    }
+                },
+        )
+
         HorizontalDivider(color = TwBorder, thickness = 1.dp)
+
+        Text(
+            text = "Font size",
+            color = TwTextSecondary,
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(start = 16.dp, top = 12.dp),
+        )
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp)
-                .padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
+                .height(52.dp)
+                .padding(horizontal = 8.dp)
+                .testTag("terminal_font_controls"),
+            horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(
-                onClick = onToggleKeyboard,
-                enabled = terminalOnline && !isReadOnly,
-                modifier = Modifier
-                    .size(48.dp)
-                    .testTag("terminal_keyboard")
-                    .semantics {
-                        contentDescription = if (keyboardVisible) "Hide terminal keyboard" else "Show terminal keyboard"
-                        stateDescription = if (keyboardVisible) "Keyboard visible" else "Keyboard hidden"
-                    },
-            ) {
-                Icon(
-                    imageVector = if (keyboardVisible) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
-                    contentDescription = null,
-                    tint = if (terminalOnline && !isReadOnly) TwTextPrimary else TwTextMuted,
-                    modifier = Modifier.size(24.dp),
-                )
-            }
-
-            VerticalDivider(
-                modifier = Modifier.height(24.dp),
-                color = TwBorder,
-                thickness = 1.dp,
-            )
-
             IconButton(
                 onClick = onDecreaseFont,
                 enabled = fontSizeSp > MIN_TERMINAL_FONT_SP,
@@ -470,32 +542,26 @@ private fun TerminalControls(
                     modifier = Modifier.size(24.dp),
                 )
             }
+        }
 
-            VerticalDivider(
-                modifier = Modifier.height(24.dp),
-                color = TwBorder,
-                thickness = 1.dp,
-            )
+        HorizontalDivider(color = TwBorder, thickness = 1.dp)
 
-            IconButton(
-                onClick = if (ownershipReadOnly) onRetryInput else onToggleReadOnly,
-                enabled = terminalOnline,
-                modifier = Modifier
-                    .size(48.dp)
-                    .testTag("terminal_read_only")
-                    .semantics {
-                        contentDescription = when {
-                            ownershipReadOnly -> "Retry terminal input"
-                            isReadOnly -> "Enable terminal input"
-                            else -> "Switch terminal to read-only"
-                        }
-                        stateDescription = when {
-                            ownershipReadOnly -> "Input unavailable"
-                            isReadOnly -> "Read-only enabled"
-                            else -> "Terminal input enabled"
-                        }
+        DropdownMenuItem(
+            text = {
+                Text(
+                    when {
+                        ownershipReadOnly -> "Retry input"
+                        isReadOnly -> "Unlock terminal input"
+                        else -> "Lock terminal input"
                     },
-            ) {
+                )
+            },
+            onClick = {
+                onDismiss()
+                if (ownershipReadOnly) onRetryInput() else onToggleReadOnly()
+            },
+            enabled = terminalOnline,
+            leadingIcon = {
                 Icon(
                     imageVector = when {
                         ownershipReadOnly -> Icons.Outlined.Refresh
@@ -508,10 +574,23 @@ private fun TerminalControls(
                         ownershipReadOnly || isReadOnly -> TwWarning
                         else -> TwSuccess
                     },
-                    modifier = Modifier.size(24.dp),
                 )
-            }
-        }
+            },
+            modifier = Modifier
+                .testTag("terminal_read_only")
+                .semantics {
+                    contentDescription = when {
+                        ownershipReadOnly -> "Retry terminal input"
+                        isReadOnly -> "Enable terminal input"
+                        else -> "Switch terminal to read-only"
+                    }
+                    stateDescription = when {
+                        ownershipReadOnly -> "Input unavailable"
+                        isReadOnly -> "Read-only enabled"
+                        else -> "Terminal input enabled"
+                    }
+                },
+        )
     }
 }
 

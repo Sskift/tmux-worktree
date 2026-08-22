@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import android.util.Log
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalControlDispatchClaim
@@ -93,44 +94,24 @@ internal class RelayV2TerminalControlCodecBridge(
         authority: RelayV2RepositoryEffectAuthority,
         effect: RelayV2TerminalEffect,
         credentials: RelayV2TerminalResumeCredentialStore,
-    ): RelayV2TerminalExactGenerationSendResult = dispatchExact(authority) {
-        when (effect) {
-            is RelayV2TerminalEffect.SendOpen -> effect.openFrame(credentials)
-            is RelayV2TerminalEffect.OutputAck -> linkedMapOf(
-                "protocolVersion" to 2L,
-                "kind" to "event",
-                "type" to "terminal.output_ack",
-                "streamId" to effect.fence.identity.streamId,
-                "payload" to linkedMapOf(
-                    "generation" to effect.generation,
-                    "nextOffset" to effect.nextOffset,
-                ),
-            )
-            is RelayV2TerminalEffect.RequestReplay -> linkedMapOf(
-                "protocolVersion" to 2L,
-                "kind" to "request",
-                "type" to "terminal.replay_request",
-                "requestId" to effect.requestId,
-                "hostId" to effect.fence.identity.hostId,
-                "expectedHostEpoch" to effect.fence.identity.hostEpoch,
-                "scopeId" to effect.fence.identity.scopeId,
-                "sessionId" to effect.fence.identity.sessionId,
-                "streamId" to effect.fence.identity.streamId,
-                "payload" to linkedMapOf(
-                    "generation" to effect.generation,
-                    "fromOffset" to effect.fromOffset,
-                ),
-            )
-            is RelayV2TerminalEffect.SendClose -> {
-                val token = credentials.readExact(
-                    effect.fence.identity.target(),
-                    effect.resumeTokenCredentialReference,
-                    effect.fence.identity.resumeTokenCredentialFingerprint,
+    ): RelayV2TerminalExactGenerationSendResult = try {
+        dispatchExact(authority) {
+            when (effect) {
+                is RelayV2TerminalEffect.SendOpen -> effect.openFrame(credentials)
+                is RelayV2TerminalEffect.OutputAck -> linkedMapOf(
+                    "protocolVersion" to 2L,
+                    "kind" to "event",
+                    "type" to "terminal.output_ack",
+                    "streamId" to effect.fence.identity.streamId,
+                    "payload" to linkedMapOf(
+                        "generation" to effect.generation,
+                        "nextOffset" to effect.nextOffset,
+                    ),
                 )
-                linkedMapOf(
+                is RelayV2TerminalEffect.RequestReplay -> linkedMapOf(
                     "protocolVersion" to 2L,
                     "kind" to "request",
-                    "type" to "terminal.close",
+                    "type" to "terminal.replay_request",
                     "requestId" to effect.requestId,
                     "hostId" to effect.fence.identity.hostId,
                     "expectedHostEpoch" to effect.fence.identity.hostEpoch,
@@ -138,14 +119,43 @@ internal class RelayV2TerminalControlCodecBridge(
                     "sessionId" to effect.fence.identity.sessionId,
                     "streamId" to effect.fence.identity.streamId,
                     "payload" to linkedMapOf(
-                        "closeId" to effect.closeId,
                         "generation" to effect.generation,
-                        "resumeToken" to token,
+                        "fromOffset" to effect.fromOffset,
                     ),
                 )
+                is RelayV2TerminalEffect.SendClose -> {
+                    val token = credentials.readExact(
+                        effect.fence.identity.target(),
+                        effect.resumeTokenCredentialReference,
+                        effect.fence.identity.resumeTokenCredentialFingerprint,
+                    )
+                    linkedMapOf(
+                        "protocolVersion" to 2L,
+                        "kind" to "request",
+                        "type" to "terminal.close",
+                        "requestId" to effect.requestId,
+                        "hostId" to effect.fence.identity.hostId,
+                        "expectedHostEpoch" to effect.fence.identity.hostEpoch,
+                        "scopeId" to effect.fence.identity.scopeId,
+                        "sessionId" to effect.fence.identity.sessionId,
+                        "streamId" to effect.fence.identity.streamId,
+                        "payload" to linkedMapOf(
+                            "closeId" to effect.closeId,
+                            "generation" to effect.generation,
+                            "resumeToken" to token,
+                        ),
+                    )
+                }
+                else -> error("Terminal effect has no direct wire representation")
             }
-            else -> error("Terminal effect has no direct wire representation")
         }
+    } catch (failure: Exception) {
+        Log.w(
+            TERMINAL_DIAGNOSTIC_TAG,
+            "terminal effect encoding rejected effect=${effect::class.simpleName} " +
+                "cause=${failure::class.simpleName}",
+        )
+        throw failure
     }
 
     private fun dispatch(
@@ -271,5 +281,9 @@ internal class RelayV2TerminalControlCodecBridge(
         check(effect.resizeSeq == claim.resizeSeq)
         check(effect.cols == claim.cols)
         check(effect.rows == claim.rows)
+    }
+
+    private companion object {
+        const val TERMINAL_DIAGNOSTIC_TAG = "TwRelayV2Terminal"
     }
 }

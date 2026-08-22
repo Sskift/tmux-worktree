@@ -47,6 +47,7 @@ import {
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION = 1 as const;
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_ENTRYPOINT = "rpc-v2-remote-exact-v1" as const;
 export const RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES = 384 * 1024;
+export const RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS = 30_000;
 
 const MAX_ACTIVE_CHANNELS = 256;
 const DAEMON_UPGRADE_TIMEOUT_MS = 5_000;
@@ -703,6 +704,38 @@ function writeSocket(socket: Socket, frame: Uint8Array): Promise<void> {
   });
 }
 
+function compoundDeadline(): number {
+  return Date.now() + RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS;
+}
+
+async function withinCompoundDeadline<T>(
+  deadline: number,
+  onTimeout: () => void,
+  timeoutError: Error,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    try { onTimeout(); } catch {}
+    throw timeoutError;
+  }
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(timeoutError);
+      try { onTimeout(); } catch {}
+    }, remainingMs);
+    timer.unref?.();
+  });
+  try {
+    // Arm the deadline before invoking the transport. A connect/write
+    // implementation that never settles therefore cannot strand the Host.
+    return await Promise.race([timedOut, Promise.resolve().then(operation)]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 function ownedUnixSocket(value: Stats, label: string): void {
   const uid = process.getuid?.();
   if (uid === undefined
@@ -1009,22 +1042,44 @@ export async function openRelayV2RemoteExactCompoundDaemonIngressV1(options: {
   });
 }
 
-async function connectUnix(socketPath: string): Promise<Socket> {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    const onError = (error: Error) => {
-      socket.off("connect", onConnect);
-      socket.destroy();
-      reject(new Error(`Relay v2 exact daemon ingress is unavailable: ${error.message}`));
-    };
-    const onConnect = () => {
-      socket.off("error", onError);
-      socket.on("error", () => undefined);
-      resolve(socket);
-    };
-    socket.once("error", onError);
-    socket.once("connect", onConnect);
-  });
+async function connectUnix(
+  socketPath: string,
+  deadline = compoundDeadline(),
+  socketFactory: (path: string) => Socket = createConnection,
+): Promise<Socket> {
+  let socket: Socket | null = null;
+  return withinCompoundDeadline(
+    deadline,
+    () => socket?.destroy(),
+    new TerminalControlProtocolError(
+      "CAPABILITY_UNAVAILABLE",
+      "local exact compound daemon timed out",
+      true,
+    ),
+    () => new Promise<Socket>((resolve, reject) => {
+      try {
+        socket = socketFactory(socketPath);
+      } catch (error) {
+        reject(new Error(
+          `Relay v2 exact daemon ingress is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        ));
+        return;
+      }
+      const candidate = socket;
+      const onError = (error: Error) => {
+        candidate.off("connect", onConnect);
+        candidate.destroy();
+        reject(new Error(`Relay v2 exact daemon ingress is unavailable: ${error.message}`));
+      };
+      const onConnect = () => {
+        candidate.off("error", onError);
+        candidate.on("error", () => undefined);
+        resolve(candidate);
+      };
+      candidate.once("error", onError);
+      candidate.once("connect", onConnect);
+    }),
+  );
 }
 
 class LocalExactCompoundChannelV1 implements RelayV2RemoteExactCompoundChannelV1 {
@@ -1032,9 +1087,11 @@ class LocalExactCompoundChannelV1 implements RelayV2RemoteExactCompoundChannelV1
   private buffer = Buffer.alloc(0);
   private operation: Promise<void> = Promise.resolve();
   private closeBarrier: Promise<void> | null = null;
+  private firstRequestDeadline: number | null;
 
-  constructor(private readonly socket: Socket) {
+  constructor(private readonly socket: Socket, firstRequestDeadline: number) {
     this.iterator = socket[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
+    this.firstRequestDeadline = firstRequestDeadline;
   }
 
   private async nextFrame(): Promise<Record<string, unknown>> {
@@ -1082,7 +1139,10 @@ class LocalExactCompoundChannelV1 implements RelayV2RemoteExactCompoundChannelV1
     }
   }
 
-  private async requestOne(frame: Readonly<Record<string, unknown>>): Promise<unknown> {
+  private async requestOne(
+    frame: Readonly<Record<string, unknown>>,
+    deadline: number,
+  ): Promise<unknown> {
     if (this.closeBarrier !== null || this.socket.destroyed) {
       throw new TerminalControlProtocolError(
         "CAPABILITY_UNAVAILABLE",
@@ -1096,29 +1156,25 @@ class LocalExactCompoundChannelV1 implements RelayV2RemoteExactCompoundChannelV1
         "local exact compound request exceeds the limit",
       );
     }
-    await writeSocket(this.socket, encoded);
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    try {
-      return await Promise.race([
-        this.nextFrame(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            this.socket.destroy();
-            reject(new TerminalControlProtocolError(
-              "CAPABILITY_UNAVAILABLE",
-              "local exact compound daemon timed out",
-            ));
-          }, 30_000);
-          timer.unref?.();
-        }),
-      ]);
-    } finally {
-      if (timer !== null) clearTimeout(timer);
-    }
+    return withinCompoundDeadline(
+      deadline,
+      () => this.socket.destroy(),
+      new TerminalControlProtocolError(
+        "CAPABILITY_UNAVAILABLE",
+        "local exact compound daemon timed out",
+        true,
+      ),
+      async () => {
+        await writeSocket(this.socket, encoded);
+        return this.nextFrame();
+      },
+    );
   }
 
   request(frame: Readonly<Record<string, unknown>>): Promise<unknown> {
-    const result = this.operation.then(() => this.requestOne(frame));
+    const deadline = this.firstRequestDeadline ?? compoundDeadline();
+    this.firstRequestDeadline = null;
+    const result = this.operation.then(() => this.requestOne(frame, deadline));
     this.operation = result.then(() => undefined, () => undefined);
     return result;
   }
@@ -1147,12 +1203,15 @@ class LocalExactCompoundChannelV1 implements RelayV2RemoteExactCompoundChannelV1
 export function captureRelayV2LocalExactCompoundChannelFactoryV1(options: {
   daemonSocketPath: string;
   processTarget: RelayV2ExactCompoundProcessTargetV1;
+  /** Narrow socket construction seam; production callers should omit it. */
+  socketFactory?: (socketPath: string) => Socket;
 }): RelayV2RemoteExactCompoundChannelFactoryV1 {
   if (!isRecord(options)
     || typeof options.daemonSocketPath !== "string"
     || options.daemonSocketPath.length === 0
     || options.daemonSocketPath.trim() !== options.daemonSocketPath
-    || /[\0\r\n]/.test(options.daemonSocketPath)) {
+    || /[\0\r\n]/.test(options.daemonSocketPath)
+    || (options.socketFactory !== undefined && typeof options.socketFactory !== "function")) {
     throw new TypeError("invalid local exact compound channel options");
   }
   const exactTarget = processTarget(options.processTarget);
@@ -1160,6 +1219,7 @@ export function captureRelayV2LocalExactCompoundChannelFactoryV1(options: {
     throw new TypeError("local exact compound channel requires a local process target");
   }
   const socketPath = relayV2RemoteExactCompoundSocketPathV1(options.daemonSocketPath);
+  const socketFactory = options.socketFactory ?? createConnection;
   return Object.freeze({
     async open(rawTarget: RelayV2ExactCompoundProcessTargetV1) {
       const target = processTarget(rawTarget);
@@ -1170,7 +1230,11 @@ export function captureRelayV2LocalExactCompoundChannelFactoryV1(options: {
           "local exact compound process target is unavailable",
         );
       }
-      return new LocalExactCompoundChannelV1(await connectUnix(socketPath));
+      const deadline = compoundDeadline();
+      return new LocalExactCompoundChannelV1(
+        await connectUnix(socketPath, deadline, socketFactory),
+        deadline,
+      );
     },
   });
 }

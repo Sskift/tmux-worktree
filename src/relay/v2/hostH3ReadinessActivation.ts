@@ -6,6 +6,7 @@ import {
   type RelayV2HostH3RecoveryCandidateSink,
 } from "./terminalDurableLineage.js";
 import {
+  isRelayV2TerminalManagerError,
   RelayV2TerminalManagerError,
   type RelayV2TerminalManagerRecoveryBinding,
 } from "./terminalManager.js";
@@ -122,10 +123,14 @@ export function createRelayV2HostH3ReadinessActivation(
     let pending: Promise<void>;
     try {
       const member = active.manager[method] as (...input: unknown[]) => Promise<void>;
-      pending = Reflect.apply(member, active.manager, args);
+      pending = Promise.resolve(Reflect.apply(member, active.manager, args)).catch((error) => {
+        if (isRelayV2TerminalManagerError(error) && error.code !== "INTERNAL") throw error;
+        void beginClose().catch(() => undefined);
+        throw unavailable();
+      });
     } catch (error) {
       void beginClose().catch(() => undefined);
-      return Promise.reject(error);
+      return Promise.reject(unavailable());
     }
     inFlight.add(pending);
     void pending.then(

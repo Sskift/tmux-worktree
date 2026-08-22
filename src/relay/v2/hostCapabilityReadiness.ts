@@ -92,6 +92,12 @@ export interface RelayV2HostCapabilityReadinessSourceSink<
 export interface RelayV2HostCapabilityReadinessOptions {
   /** Tests may only make the production subscriber bound stricter. */
   testLimits?: { maxSubscribers?: number };
+  /**
+   * Compatibility switch for legacy compositions that treated H3/tmux availability as transport
+   * readiness. Production Mobile Sessions disable it: a terminal backend loss must not withdraw
+   * Worktree, Agent, or the physical phone route.
+   */
+  terminalAuthorityAffectsBaseReadiness?: boolean;
 }
 
 interface SourceState {
@@ -266,14 +272,15 @@ function maxSubscribers(options: RelayV2HostCapabilityReadinessOptions): number 
 /**
  * Process-local, unwired owner of the atomic base-v2 readiness intersection.
  *
- * Every source starts missing/false. Only an explicit, fresh ready generation
- * from all six sources yields the frozen six-capability set. Any malformed,
- * regressed, conflicting or closed source synchronously publishes the exact
+ * Every source starts missing/false. Legacy consumers may require all six sources; production
+ * Mobile Sessions require codec/carrier/H0/H1/H2 and track H3 only as Terminal Adapter health.
+ * Any malformed, regressed, conflicting or closed base source synchronously publishes the exact
  * empty set first and can recover only with a strictly newer source generation.
  */
 export class RelayV2HostCapabilityReadiness
 implements RelayV2HostCapabilityIntersectionPort {
   readonly maxSubscribers: number;
+  private readonly terminalAuthorityAffectsBaseReadiness: boolean;
 
   private readonly sources = new Map<RelayV2HostCapabilityReadinessSource, SourceState>();
   private readonly subscribers = new Map<number, Subscriber>();
@@ -294,6 +301,8 @@ implements RelayV2HostCapabilityIntersectionPort {
 
   constructor(options: RelayV2HostCapabilityReadinessOptions = {}) {
     this.maxSubscribers = maxSubscribers(options);
+    this.terminalAuthorityAffectsBaseReadiness =
+      options.terminalAuthorityAffectsBaseReadiness !== false;
     for (const source of RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES) {
       this.sources.set(source, {
         generation: null,
@@ -478,45 +487,46 @@ implements RelayV2HostCapabilityIntersectionPort {
     let publishRequired = false;
     let invalidateOffers = false;
     let advancePreCarrierCut = false;
+    const affectsBase = source !== "h3" || this.terminalAuthorityAffectsBaseReadiness;
     try {
       const snapshot = decodeSourceSnapshot(source, input);
       const generationCandidate = snapshot.valid
         ? snapshot.generation
         : snapshot.generationCandidate;
       if (this.faultSerial !== faultBeforeDecode) {
-        this.invalidateSource(source, generationCandidate);
-        publishRequired = !this.pendingWithdrawal;
-        invalidateOffers = true;
-        advancePreCarrierCut = source !== "carrier";
+        this.invalidateSource(source, generationCandidate, affectsBase);
+        publishRequired = affectsBase && !this.pendingWithdrawal;
+        invalidateOffers = affectsBase;
+        advancePreCarrierCut = affectsBase && source !== "carrier";
       } else if (!snapshot.valid) {
-        this.invalidateSource(source, snapshot.generationCandidate);
-        publishRequired = true;
-        invalidateOffers = true;
-        advancePreCarrierCut = source !== "carrier";
+        this.invalidateSource(source, snapshot.generationCandidate, affectsBase);
+        publishRequired = affectsBase;
+        invalidateOffers = affectsBase;
+        advancePreCarrierCut = affectsBase && source !== "carrier";
       } else {
         const state = this.sources.get(source)!;
         if (state.generation !== null && snapshot.generation < state.generation) {
-          this.invalidateSource(source, snapshot.generation);
-          publishRequired = true;
-          invalidateOffers = true;
-          advancePreCarrierCut = source !== "carrier";
+          this.invalidateSource(source, snapshot.generation, affectsBase);
+          publishRequired = affectsBase;
+          invalidateOffers = affectsBase;
+          advancePreCarrierCut = affectsBase && source !== "carrier";
         } else if (state.generation !== null && snapshot.generation === state.generation) {
           if (!state.requiresNewGeneration && state.ready === snapshot.ready) {
             accepted = true;
           } else {
-            this.invalidateSource(source, snapshot.generation);
-            publishRequired = true;
-            invalidateOffers = true;
-            advancePreCarrierCut = source !== "carrier";
+            this.invalidateSource(source, snapshot.generation, affectsBase);
+            publishRequired = affectsBase;
+            invalidateOffers = affectsBase;
+            advancePreCarrierCut = affectsBase && source !== "carrier";
           }
         } else {
           state.generation = snapshot.generation;
           state.ready = snapshot.ready;
           state.requiresNewGeneration = false;
           accepted = true;
-          publishRequired = true;
-          invalidateOffers = source !== "carrier" || !snapshot.ready;
-          advancePreCarrierCut = source !== "carrier";
+          publishRequired = affectsBase;
+          invalidateOffers = affectsBase && (source !== "carrier" || !snapshot.ready);
+          advancePreCarrierCut = affectsBase && source !== "carrier";
         }
       }
     } finally {
@@ -537,7 +547,12 @@ implements RelayV2HostCapabilityIntersectionPort {
       this.withdrawDuringCallback(source);
       return;
     }
-    this.invalidateSource(source, null);
+    this.invalidateSource(
+      source,
+      null,
+      source !== "h3" || this.terminalAuthorityAffectsBaseReadiness,
+    );
+    if (source === "h3" && !this.terminalAuthorityAffectsBaseReadiness) return;
     if (source !== "carrier") this.advancePreCarrierCut();
     this.invalidatePreCarrierOffers();
     this.publishState();
@@ -546,6 +561,7 @@ implements RelayV2HostCapabilityIntersectionPort {
   private invalidateSource(
     source: RelayV2HostCapabilityReadinessSource,
     candidate: bigint | null,
+    affectsBase = true,
   ): void {
     const state = this.sources.get(source)!;
     if (candidate !== null && (state.generation === null || candidate > state.generation)) {
@@ -553,12 +569,17 @@ implements RelayV2HostCapabilityIntersectionPort {
     }
     state.ready = false;
     state.requiresNewGeneration = true;
-    this.faultSerial += 1;
+    if (affectsBase) this.faultSerial += 1;
   }
 
   /** Caller callbacks may withdraw, but never recursively fan out. */
   private withdrawDuringCallback(source: RelayV2HostCapabilityReadinessSource): void {
-    this.invalidateSource(source, null);
+    this.invalidateSource(
+      source,
+      null,
+      source !== "h3" || this.terminalAuthorityAffectsBaseReadiness,
+    );
+    if (source === "h3" && !this.terminalAuthorityAffectsBaseReadiness) return;
     if (source !== "carrier") this.advancePreCarrierCut();
     this.invalidatePreCarrierOffers();
     if (this.intersectionReady(this.published)) {
@@ -622,6 +643,7 @@ implements RelayV2HostCapabilityIntersectionPort {
 
   private allSourcesReady(): boolean {
     return RELAY_V2_HOST_CAPABILITY_READINESS_SOURCES.every((source) => {
+      if (source === "h3" && !this.terminalAuthorityAffectsBaseReadiness) return true;
       const state = this.sources.get(source)!;
       return state.generation !== null && state.ready && !state.requiresNewGeneration;
     });
@@ -629,6 +651,7 @@ implements RelayV2HostCapabilityIntersectionPort {
 
   private allPreCarrierSourcesReady(): boolean {
     return PRE_CARRIER_SOURCES.every((source) => {
+      if (source === "h3" && !this.terminalAuthorityAffectsBaseReadiness) return true;
       const state = this.sources.get(source)!;
       return state.generation !== null && state.ready && !state.requiresNewGeneration;
     });

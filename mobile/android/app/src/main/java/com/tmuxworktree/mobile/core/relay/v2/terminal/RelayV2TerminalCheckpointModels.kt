@@ -4,7 +4,7 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
 
 /** Frozen and local bounds for the unwired Android terminal checkpoint core. */
 internal object RelayV2TerminalCheckpointLimits {
-    const val SCHEMA_VERSION = 8
+    const val SCHEMA_VERSION = 10
     const val IDENTITY_VERSION = 3
     const val MAX_ID_UTF8_BYTES = 128
     const val MAX_CREDENTIAL_REFERENCE_UTF8_BYTES = 256
@@ -298,6 +298,8 @@ internal enum class RelayV2TerminalPhase {
     CLOSED_WAITING_PARSER,
     CLOSED_WAITING_CLOSE,
     FINALIZED,
+    /** Host fenced this route/lineage without emitting a terminal.closed receipt. */
+    LOST,
     RESET_REQUIRED,
 }
 
@@ -521,6 +523,8 @@ internal data class RelayV2TerminalPreOpenCheckpoint(
     val pendingOpen: RelayV2TerminalPendingOpen?,
     val resetReason: RelayV2TerminalResetReason? = null,
     val resetFence: RelayV2TerminalOpenFence? = null,
+    /** Durable disposal intent consumed by the exact correlated opened response. */
+    val pendingClose: RelayV2TerminalPendingClose? = null,
 )
 
 /**
@@ -569,6 +573,12 @@ internal data class RelayV2TerminalCheckpoint(
     val pendingResizes: List<RelayV2PendingResize> = emptyList(),
     val activeControlDispatchLease: RelayV2TerminalControlDispatchLease? = null,
     val ambiguousInputs: List<RelayV2AmbiguousInput> = emptyList(),
+    /**
+     * Durable disposal intent that is not yet bound to a Host generation. This is deliberately
+     * distinct from [pendingClose]: the latter owns an already-addressable terminal.close wire
+     * request, while this marker must wait for an exact successor terminal.opened response.
+     */
+    val pendingCloseWhenOpened: RelayV2TerminalPendingClose? = null,
     val pendingClose: RelayV2TerminalPendingClose? = null,
     val closed: RelayV2TerminalClosedState? = null,
     val resetReason: RelayV2TerminalResetReason? = null,
@@ -800,6 +810,8 @@ internal sealed interface RelayV2TerminalAction {
         val requestedOffset: String?,
         val bufferStartOffset: String?,
         val tailOffset: String?,
+        /** Nullable wire claim; never synthesized from the persisted identity. */
+        val wireGeneration: String? = fence.binding.generation,
     ) : RelayV2TerminalAction
 
     data class AsyncResetRequired(
@@ -809,6 +821,8 @@ internal sealed interface RelayV2TerminalAction {
         val requestedOffset: String?,
         val bufferStartOffset: String?,
         val tailOffset: String?,
+        /** Nullable wire claim; never synthesized from the persisted identity. */
+        val wireGeneration: String? = fence.binding.generation,
     ) : RelayV2TerminalAction
 
     data class CorrelatedError(
@@ -1018,6 +1032,9 @@ internal sealed interface RelayV2TerminalOutcome {
     ) : RelayV2TerminalOutcome
 
     data object ClosedFinalized : RelayV2TerminalOutcome
+
+    /** Renderer-free Host loss is terminal locally but is not a synthetic close acknowledgement. */
+    data object LostFinalized : RelayV2TerminalOutcome
 
     data class CorrelatedErrorRejected(
         val requestId: String,

@@ -285,10 +285,12 @@ test("mismatch, stale authority restart, and handoff fail closed", async () => {
   const restarted = fixture();
   try {
     const evidence = await restarted.adapter.resolveExactTarget(restarted.input);
-    await restarted.authority.initializeContinuity();
+    const rotatedEpoch = await restarted.authority.initializeContinuity();
+    assert.notEqual(rotatedEpoch, evidence.exactControlIdentity.controlEpoch);
     assert.throws(
       () => restarted.adapter.fenceExactTargetForAdmission(restarted.input, evidence),
       /not owned|stale|mismatched/,
+      "an epoch rotation between resolve and the synchronous H0 fence must reject the stale token",
     );
   } finally {
     await restarted.adapter.close().catch(() => undefined);
@@ -312,6 +314,45 @@ test("mismatch, stale authority restart, and handoff fail closed", async () => {
   } finally {
     await handedOff.adapter.close().catch(() => undefined);
     handedOff.cleanup();
+  }
+});
+
+test("controller restart reissues the same exact target under a new epoch and proof", async () => {
+  const f = fixture();
+  let restartedAdapter;
+  try {
+    const before = await f.adapter.resolveExactTarget(f.input);
+    assert.equal(await f.adapter.rollbackPreparedTarget(f.input, before), true);
+    await f.adapter.close();
+    const beforeRestart = terminalControl.loadTerminalControlState(f.statePath).targets[0];
+    assert.equal(beforeRestart.lifecycle, "ACTIVE");
+    assert.equal(beforeRestart.ownership.state, "FREE");
+    assert.equal(beforeRestart.controlTargetId, before.exactControlIdentity.controlTargetId);
+
+    const restartedEpoch = await f.authority.initializeContinuity();
+    const afterRestart = terminalControl.loadTerminalControlState(f.statePath).targets[0];
+    assert.equal(afterRestart.lifecycle, "ACTIVE");
+    assert.equal(afterRestart.ownership.state, "FREE");
+    assert.equal(afterRestart.controlTargetId, before.exactControlIdentity.controlTargetId);
+    restartedAdapter = new adapterModule.RelayV2TerminalControlExactTargetAuthorityAdapter({
+      authority: f.authority,
+      owner: { kind: "relay-v2", instanceId: "relay-v2-owner-after-restart" },
+    });
+    const after = await restartedAdapter.resolveExactTarget(f.input);
+
+    assert.equal(after.exactControlIdentity.controlTargetId, before.exactControlIdentity.controlTargetId);
+    assert.equal(after.exactControlIdentity.controlEpoch, restartedEpoch);
+    assert.notEqual(after.exactControlIdentity.controlEpoch, before.exactControlIdentity.controlEpoch);
+    assert.notEqual(
+      after.exactControlIdentity.targetIncarnationProof,
+      before.exactControlIdentity.targetIncarnationProof,
+    );
+    restartedAdapter.fenceExactTargetForAdmission(f.input, after);
+    assert.equal(await restartedAdapter.rollbackPreparedTarget(f.input, after), true);
+  } finally {
+    await restartedAdapter?.close().catch(() => undefined);
+    await f.adapter.close().catch(() => undefined);
+    f.cleanup();
   }
 });
 

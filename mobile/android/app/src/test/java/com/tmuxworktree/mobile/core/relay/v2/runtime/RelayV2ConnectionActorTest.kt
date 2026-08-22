@@ -8,6 +8,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentCha
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Error
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2HistoryRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2HistoryResult
+import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2SendRequest
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AgentChatV2Sent
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLocalRequestFence
@@ -373,6 +374,68 @@ class RelayV2ConnectionActorTest {
         }
 
     @Test
+    fun `terminal fatal retires exact generation and emits retryable successor failure`() =
+        runBlocking {
+            val harness = Harness()
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val query = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first { it is RelayV2RuntimeEffect.QueryPendingCommands }
+                } as RelayV2RuntimeEffect.QueryPendingCommands
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        query,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = query.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+
+                val foreign = query.repositoryAuthority.copy(hostEpoch = "foreign-epoch")
+                assertEquals(
+                    RelayV2ExactAuthorityRetirementResult.AUTHORITY_MISMATCH,
+                    harness.actor.retireCurrentTerminalRuntime(foreign, "terminal-mismatch"),
+                )
+                assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+
+                assertEquals(
+                    RelayV2ExactAuthorityRetirementResult.RETIRED,
+                    harness.actor.retireCurrentTerminalRuntime(
+                        query.repositoryAuthority,
+                        "TERMINAL_RUNTIME_INVALIDATED",
+                    ),
+                )
+                val failure = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first { it is RelayV2RuntimeEffect.ConnectionFailed }
+                } as RelayV2RuntimeEffect.ConnectionFailed
+                assertEquals(query.generation, failure.generation)
+                assertEquals("TERMINAL_RUNTIME_INVALIDATED", failure.failure.code)
+                assertEquals(RelayV2FailureKind.TRANSPORT, failure.failure.kind)
+                assertTrue(failure.failure.retryable)
+                assertTrue(failure.connectionAttempt != null)
+                assertEquals(RelayV2ConnectionPhase.FAILED, harness.actor.state.value.phase)
+                assertEquals(
+                    RelayV2ExactAuthorityRetirementResult.ALREADY_WITHDRAWN,
+                    harness.actor.retireCurrentTerminalRuntime(
+                        query.repositoryAuthority,
+                        "duplicate-terminal-invalidation",
+                    ),
+                )
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
     fun `agent chat synchronous rejection leaves one actionable failed bubble`() = runBlocking {
         val harness = Harness(optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY))
         try {
@@ -604,6 +667,306 @@ class RelayV2ConnectionActorTest {
                 harness.close()
             }
         }
+
+    @Test
+    fun `agent chat ACK watchdog redrives exact request once then fails explicitly`() =
+        runBlocking {
+            val watchdog = ManualWatchdog()
+            val harness = Harness(
+                optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+                extensionRequestWatchdogDelay = watchdog::await,
+            )
+            try {
+                val transport = harness.negotiateAgentChatOnline()
+                val sendIndex = transport.sent.size
+                assertTrue(
+                    harness.actor.sendAgentChatMessage(
+                        scopeId = "local",
+                        sessionId = "session-watchdog",
+                        message = "deliver exactly once",
+                    ),
+                )
+                val firstBytes = withTimeout(TIMEOUT_MS) {
+                    while (transport.sent.size <= sendIndex) delay(1)
+                    transport.sent[sendIndex]
+                }
+                val first = agentChatCodec.decodePublicFrame(firstBytes)
+                    as AgentChatV2SendRequest
+
+                watchdog.fire(0)
+                val redrivenBytes = withTimeout(TIMEOUT_MS) {
+                    while (transport.sent.size <= sendIndex + 1) delay(1)
+                    transport.sent[sendIndex + 1]
+                }
+                val redriven = agentChatCodec.decodePublicFrame(redrivenBytes)
+                    as AgentChatV2SendRequest
+                assertTrue(firstBytes.contentEquals(redrivenBytes))
+                assertEquals(first.requestId, redriven.requestId)
+                assertEquals(first.message, redriven.message)
+
+                watchdog.fire(1)
+                val failed = withTimeout(TIMEOUT_MS) {
+                    while (true) {
+                        val candidate = harness.actor.agentChatState.value
+                            .pending("session-watchdog")
+                            .single()
+                        if (candidate.failed) return@withTimeout candidate
+                        delay(1)
+                    }
+                    error("unreachable")
+                }
+                assertEquals("CLIENT_AGENT_CHAT_ACK_TIMEOUT", failed.errorCode)
+                assertFalse(failed.retryable)
+                assertEquals(sendIndex + 2, transport.sent.size)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `agent chat sent and error consume exact ACK watchdogs`() = runBlocking {
+        val watchdog = ManualWatchdog()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+            extensionRequestWatchdogDelay = watchdog::await,
+        )
+        try {
+            val transport = harness.negotiateAgentChatOnline()
+            val sendIndex = transport.sent.size
+            assertTrue(harness.actor.sendAgentChatMessage("local", "session-acks", "accepted"))
+            assertTrue(harness.actor.sendAgentChatMessage("local", "session-acks", "rejected"))
+            val requests = withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex + 1) delay(1)
+                listOf(sendIndex, sendIndex + 1).map {
+                    agentChatCodec.decodePublicFrame(transport.sent[it]) as AgentChatV2SendRequest
+                }
+            }
+            transport.sendRaw(
+                agentChatCodec.encodePublicFrame(
+                    AgentChatV2Sent(
+                        session = "session-acks",
+                        turnId = "turn-accepted",
+                        requestId = requests[0].requestId,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        scopeId = "local",
+                        sessionId = "session-acks",
+                    ),
+                ),
+            )
+            transport.sendRaw(
+                agentChatCodec.encodePublicFrame(
+                    AgentChatV2Error(
+                        requestId = requests[1].requestId,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        scopeId = "local",
+                        sessionId = "session-acks",
+                        code = "AGENT_CHAT_UNAVAILABLE",
+                        message = "host rejected the send",
+                        retryable = true,
+                    ),
+                ),
+            )
+            withTimeout(TIMEOUT_MS) {
+                while (true) {
+                    val state = harness.actor.agentChatState.value
+                    val pending = state.pending("session-acks")
+                    if (state.awaitingTurn("session-acks") &&
+                        pending.size == 1 && pending.single().failed
+                    ) return@withTimeout
+                    delay(1)
+                }
+            }
+
+            watchdog.fire(0)
+            watchdog.fire(1)
+            delay(50)
+            assertEquals(sendIndex + 2, transport.sent.size)
+            assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `redriven agent chat accepts duplicate sent ACK idempotently`() = runBlocking {
+        val watchdog = ManualWatchdog()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+            extensionRequestWatchdogDelay = watchdog::await,
+        )
+        try {
+            val transport = harness.negotiateAgentChatOnline()
+            val sendIndex = transport.sent.size
+            assertTrue(harness.actor.sendAgentChatMessage("local", "session-sent-replay", "hello"))
+            val request = withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex) delay(1)
+                agentChatCodec.decodePublicFrame(transport.sent[sendIndex])
+                    as AgentChatV2SendRequest
+            }
+            watchdog.fire(0)
+            withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex + 1) delay(1)
+            }
+            watchdog.awaitArmed(2)
+            val sent = AgentChatV2Sent(
+                session = "session-sent-replay",
+                turnId = "turn-sent-replay",
+                requestId = request.requestId,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+                scopeId = "local",
+                sessionId = "session-sent-replay",
+            )
+            repeat(2) {
+                transport.sendRaw(agentChatCodec.encodePublicFrame(sent))
+            }
+            withTimeout(TIMEOUT_MS) {
+                while (!harness.actor.agentChatState.value.awaitingTurn("session-sent-replay")) {
+                    delay(1)
+                }
+            }
+
+            watchdog.fire(1)
+            delay(50)
+            assertTrue(harness.actor.agentChatState.value.pending("session-sent-replay").isEmpty())
+            assertEquals(sendIndex + 2, transport.sent.size)
+            assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `redriven agent chat accepts duplicate error ACK idempotently`() = runBlocking {
+        val watchdog = ManualWatchdog()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+            extensionRequestWatchdogDelay = watchdog::await,
+        )
+        try {
+            val transport = harness.negotiateAgentChatOnline()
+            val sendIndex = transport.sent.size
+            assertTrue(harness.actor.sendAgentChatMessage("local", "session-error-replay", "hello"))
+            val request = withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex) delay(1)
+                agentChatCodec.decodePublicFrame(transport.sent[sendIndex])
+                    as AgentChatV2SendRequest
+            }
+            watchdog.fire(0)
+            withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex + 1) delay(1)
+            }
+            watchdog.awaitArmed(2)
+            val error = AgentChatV2Error(
+                requestId = request.requestId,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+                scopeId = "local",
+                sessionId = "session-error-replay",
+                code = "AGENT_CHAT_UNAVAILABLE",
+                message = "host rejected the send",
+                retryable = true,
+            )
+            repeat(2) {
+                transport.sendRaw(agentChatCodec.encodePublicFrame(error))
+            }
+            withTimeout(TIMEOUT_MS) {
+                while (harness.actor.agentChatState.value
+                        .pending("session-error-replay")
+                        .single()
+                        .failed != true
+                ) {
+                    delay(1)
+                }
+            }
+
+            watchdog.fire(1)
+            delay(50)
+            assertEquals(sendIndex + 2, transport.sent.size)
+            assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `conflicting duplicate agent chat ACK remains a schema failure`() = runBlocking {
+        val watchdog = ManualWatchdog()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+            extensionRequestWatchdogDelay = watchdog::await,
+        )
+        try {
+            val transport = harness.negotiateAgentChatOnline()
+            val sendIndex = transport.sent.size
+            assertTrue(harness.actor.sendAgentChatMessage("local", "session-ack-conflict", "hello"))
+            val request = withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex) delay(1)
+                agentChatCodec.decodePublicFrame(transport.sent[sendIndex])
+                    as AgentChatV2SendRequest
+            }
+            watchdog.fire(0)
+            withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex + 1) delay(1)
+            }
+            watchdog.awaitArmed(2)
+            fun sent(turnId: String) = AgentChatV2Sent(
+                session = "session-ack-conflict",
+                turnId = turnId,
+                requestId = request.requestId,
+                hostId = HOST_ID,
+                hostEpoch = HOST_EPOCH,
+                scopeId = "local",
+                sessionId = "session-ack-conflict",
+            )
+            transport.sendRaw(agentChatCodec.encodePublicFrame(sent("turn-one")))
+            transport.sendRaw(agentChatCodec.encodePublicFrame(sent("turn-conflict")))
+
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.FAILED)
+            assertEquals("INVALID_ENVELOPE", harness.actor.state.value.failure?.code)
+            assertEquals(sendIndex + 2, transport.sent.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `agent chat disconnect fails pending send and cancels its ACK watchdog`() = runBlocking {
+        val watchdog = ManualWatchdog()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+            extensionRequestWatchdogDelay = watchdog::await,
+        )
+        try {
+            val transport = harness.negotiateAgentChatOnline()
+            val sendIndex = transport.sent.size
+            assertTrue(
+                harness.actor.sendAgentChatMessage(
+                    "local",
+                    "session-disconnect",
+                    "ambiguous delivery",
+                ),
+            )
+            withTimeout(TIMEOUT_MS) {
+                while (transport.sent.size <= sendIndex) delay(1)
+            }
+            harness.actor.disconnectAndDrain(harness.profile.identity, "agent-chat-test")
+            val failed = harness.actor.agentChatState.value
+                .pending("session-disconnect")
+                .single()
+            assertTrue(failed.failed)
+            assertEquals("CLIENT_AGENT_CHAT_CONNECTION_INTERRUPTED", failed.errorCode)
+            assertFalse(failed.retryable)
+
+            watchdog.fire(0)
+            delay(50)
+            assertEquals(sendIndex + 1, transport.sent.size)
+        } finally {
+            harness.close()
+        }
+    }
 
     @Test
     fun `negotiated agent frames use strict artifacts and isolate correlation faults`() =
@@ -7236,6 +7599,36 @@ class RelayV2ConnectionActorTest {
             return hello
         }
 
+        suspend fun negotiateAgentChatOnline(): FakeTransport {
+            val hello = connectThroughRelayWelcome(
+                resume = RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                brokerOptionalCapabilities = setOf(AGENT_CHAT_V2_CAPABILITY),
+            )
+            val welcome = fixture("host-welcome-caught-up")
+            welcome["requestId"] = hello.stringValue("requestId")
+            welcome.payload()["capabilities"] =
+                RelayV2ConnectionActor.REQUIRED_CAPABILITIES + AGENT_CHAT_V2_CAPABILITY
+            val transport = transport()
+            transport.sendFrame(welcome)
+            val query = withTimeout(TIMEOUT_MS) {
+                actor.effects.first { it is RelayV2RuntimeEffect.QueryPendingCommands }
+            } as RelayV2RuntimeEffect.QueryPendingCommands
+            assertTrue(
+                actor.commitRecoveryReceipt(
+                    query,
+                    RelayV2RecoveryReceipt.HelloApplied(
+                        binding = query.recovery,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        durableCursorEventSeq = "91",
+                        pendingCommands = emptyList(),
+                    ),
+                ),
+            )
+            actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+            return transport
+        }
+
         suspend fun negotiateAgentExtension(
             targetPhase: RelayV2ConnectionPhase,
             connectingProfile: RelayV2Profile = profile,
@@ -7753,6 +8146,10 @@ class RelayV2ConnectionActorTest {
         suspend fun fire(index: Int) = withTimeout(TIMEOUT_MS) {
             while (waits.size <= index) delay(1)
             waits[index].complete(Unit)
+        }
+
+        suspend fun awaitArmed(count: Int) = withTimeout(TIMEOUT_MS) {
+            while (waits.size < count) delay(1)
         }
     }
 

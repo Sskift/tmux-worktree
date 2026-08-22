@@ -56,6 +56,35 @@ import org.junit.Test
 
 class BoundedRelayV2TransportFactoryTest {
     @Test
+    fun inboundSilenceTerminatesHalfOpenMobilePath() = runBlocking {
+        RawTlsWebSocketServer().use { server ->
+            val upgraded = CountDownLatch(1)
+            val releaseServer = CountDownLatch(1)
+            server.start { socket ->
+                val request = server.readRequest(socket)
+                server.writeValidUpgrade(socket, request)
+                upgraded.countDown()
+                releaseServer.await(2, TimeUnit.SECONDS)
+            }
+
+            val listener = RecordingListener()
+            val transport = server.factory(inboundSilenceTimeoutMs = 150)
+                .open(openRequest(server.url()), listener)
+
+            try {
+                assertTrue(upgraded.await(3, TimeUnit.SECONDS))
+                assertTrue(listener.terminal.await(3, TimeUnit.SECONDS))
+                assertEquals(RelayV2TransportFailureKind.NETWORK, listener.failure?.kind)
+                assertEquals(1, listener.terminalCount.get())
+                assertSameTransportForEveryCallback(transport, listener)
+                assertTrue(transport.awaitTermination())
+            } finally {
+                releaseServer.countDown()
+            }
+        }
+    }
+
+    @Test
     fun exactOneMiBTextUsesExactUpgradeAndClosesOnce() {
         RawTlsWebSocketServer().use { server ->
             val closeReply = AtomicReference<ObservedClientFrame?>()
@@ -1223,6 +1252,7 @@ private class RawTlsWebSocketServer(
         addressResolver: RelayV2AddressResolver = RelayV2SystemAddressResolver,
         resolveTimeoutMs: Int = 2_000,
         rawSocketFactory: () -> Socket = ::Socket,
+        inboundSilenceTimeoutMs: Int = 60_000,
     ): BoundedRelayV2TransportFactory = BoundedRelayV2TransportFactory(
         sslSocketFactory = clientCertificates.sslSocketFactory(),
         addressResolver = addressResolver,
@@ -1230,6 +1260,7 @@ private class RawTlsWebSocketServer(
         resolveTimeoutMs = resolveTimeoutMs,
         connectTimeoutMs = 2_000,
         handshakeTimeoutMs = 2_000,
+        inboundSilenceTimeoutMs = inboundSilenceTimeoutMs,
     )
 
     fun readRequest(socket: SSLSocket): String {

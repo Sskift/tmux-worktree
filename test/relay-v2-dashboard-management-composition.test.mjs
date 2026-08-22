@@ -49,6 +49,7 @@ const IDS = Object.freeze({
   status: "dmgmt2.AquZUdkZ9FXG7OEIfRHmjw",
   bootstrap: "dmgmt2.wkHofchV36_U1sOtXF-hvA",
   start: "dmgmt2.GGg3IoUgDIXzfENx8QbHlw",
+  stop: "dmgmt2.lNxEij5RJxgsPFrGQ8SA2w",
   create: "dmgmt2.ocsJ9anwzHRz4iyXdA5cjA",
   revoke: "dmgmt2._rgZ2FBzDmkt9MwqnM3uDg",
 });
@@ -72,6 +73,7 @@ function request(operation, input = null) {
     status: IDS.status,
     bootstrap_host: IDS.bootstrap,
     start_connector: IDS.start,
+    stop_connector: IDS.stop,
     create_enrollment: IDS.create,
     revoke_client_grant: IDS.revoke,
   }[operation];
@@ -151,6 +153,62 @@ class FakeTransport {
   }
 }
 
+class UnexpectedStoppedController {
+  generation = 0;
+  startCalls = [];
+  cut = Object.freeze({ status: "stopped", controllerGeneration: "0" });
+
+  inspectCut() {
+    return this.cut;
+  }
+
+  async start(input) {
+    this.generation += 1;
+    const controllerGeneration = String(this.generation);
+    const connectorId = `unexpected-stopped-connector-${controllerGeneration}`;
+    this.startCalls.push({
+      requestId: input.requestId,
+      controllerGeneration,
+    });
+    this.cut = Object.freeze({
+      status: "registered",
+      controllerGeneration,
+      connectorId,
+      ...IDENTITY,
+      acknowledgement: "host.registered",
+      negotiatedCapabilityIntersection: Object.freeze([]),
+    });
+    return Object.freeze({
+      status: "started",
+      requestId: input.requestId,
+      controllerGeneration,
+      connectorId,
+      ...IDENTITY,
+    });
+  }
+
+  async stopAndDrain(input) {
+    this.cut = Object.freeze({
+      status: "stopped",
+      controllerGeneration: input.controllerGeneration,
+    });
+    return Object.freeze({
+      status: "stopped_and_drained",
+      requestId: input.requestId,
+      controllerGeneration: input.controllerGeneration,
+      connectorId: input.connectorId,
+      ...IDENTITY,
+    });
+  }
+
+  forceStopped() {
+    this.cut = Object.freeze({
+      status: "stopped",
+      controllerGeneration: String(this.generation),
+    });
+  }
+}
+
 function tokenIssuer() {
   let keyring = createRelayV2IssuerKeyring({
     issuerId: "relay-issuer-id",
@@ -187,7 +245,13 @@ function bootstrapResponse(input, access) {
   };
 }
 
-function createHostManagementBinding({ controller, actor, identity, credentialAuthority }) {
+function createHostManagementBinding({
+  controller,
+  actor,
+  identity,
+  credentialAuthority,
+  carrierControl = actor.createDashboardManagementCarrierControlAdapter(),
+}) {
   let consumed = false;
   let committed = false;
   const binding = function hostManagementBinding(
@@ -207,7 +271,7 @@ function createHostManagementBinding({ controller, actor, identity, credentialAu
       consumed = true;
       return Object.freeze({
         connectorLifecycle: controller,
-        carrierControl: actor.createDashboardManagementCarrierControlAdapter(),
+        carrierControl,
       });
     }
     if (operation === "commit") {
@@ -306,7 +370,7 @@ function harness(options = {}) {
       });
     },
   });
-  const controller = new RelayV2HostConnectorController({
+  const controller = options.controller ?? new RelayV2HostConnectorController({
     attempts: attemptFactory,
     ...IDENTITY,
   });
@@ -317,6 +381,9 @@ function harness(options = {}) {
     actor,
     identity: IDENTITY,
     credentialAuthority: authority,
+    ...(options.carrierControl === undefined
+      ? {}
+      : { carrierControl: options.carrierControl }),
   });
   const compositionOptions = {
     credentialAuthority: authority,
@@ -457,6 +524,54 @@ test("the real adapter composition projects stopped through registered_incomplet
     const serialized = JSON.stringify(response);
     for (const marker of SECRET_MARKERS) assert.equal(serialized.includes(marker), false);
   }
+  await h.composition.closeAndDrain();
+});
+
+test("desired running rebuilds an unexpected stopped cut with a new controller generation", async () => {
+  const controller = new UnexpectedStoppedController();
+  const h = harness({
+    ready: true,
+    controller,
+    carrierControl: {
+      inspectKnownClientGrant(input) {
+        return {
+          hostId: input.hostId,
+          connectorId: input.connectorId,
+          grantId: null,
+          connectedMobileDevices: [],
+        };
+      },
+      createEnrollment() { throw new Error("not used"); },
+      revokeGrant() { throw new Error("not used"); },
+    },
+  });
+  await h.composition.handleRequest(request("start_connector"));
+  assert.equal(controller.startCalls.length, 1);
+  assert.equal(controller.inspectCut().controllerGeneration, "1");
+
+  controller.forceStopped();
+  const deadline = Date.now() + 2_500;
+  while (controller.startCalls.length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(controller.startCalls.length, 2);
+  assert.match(controller.startCalls[1].requestId, /^dashboard-management-retry\./);
+  assert.deepEqual(controller.inspectCut(), {
+    status: "registered",
+    controllerGeneration: "2",
+    connectorId: "unexpected-stopped-connector-2",
+    ...IDENTITY,
+    acknowledgement: "host.registered",
+    negotiatedCapabilityIntersection: [],
+  });
+
+  await h.composition.handleRequest(request("stop_connector"));
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  assert.equal(controller.startCalls.length, 2, "stop must cancel the desired-state successor");
+  assert.deepEqual(controller.inspectCut(), {
+    status: "stopped",
+    controllerGeneration: "2",
+  });
   await h.composition.closeAndDrain();
 });
 

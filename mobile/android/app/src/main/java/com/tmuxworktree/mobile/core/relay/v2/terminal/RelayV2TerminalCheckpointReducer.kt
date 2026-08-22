@@ -65,6 +65,7 @@ internal object RelayV2TerminalCheckpointReducer {
         if (checkpoint.phase in setOf(
                 RelayV2TerminalPhase.RESET_REQUIRED,
                 RelayV2TerminalPhase.FINALIZED,
+                RelayV2TerminalPhase.LOST,
             ) || checkpoint.pendingParserDispatchClaim != null ||
             checkpoint.pendingParserEffectHandoff != null
         ) {
@@ -295,7 +296,10 @@ internal object RelayV2TerminalCheckpointReducer {
             }
         }
         val current = checkpoint
-        if (current.phase == RelayV2TerminalPhase.FINALIZED &&
+        if (current.phase in setOf(
+                RelayV2TerminalPhase.FINALIZED,
+                RelayV2TerminalPhase.LOST,
+            ) && action !is RelayV2TerminalAction.CorrelatedError &&
             action !is RelayV2TerminalAction.ParserEffectsReserved &&
             action !is RelayV2TerminalAction.ParserEffectsActivated &&
             action !is RelayV2TerminalAction.ParserEffectReservationFailed &&
@@ -311,6 +315,13 @@ internal object RelayV2TerminalCheckpointReducer {
             return beginOpenAttempt(current, action)
         }
         actionGuard(current, action)?.let { return it }
+        // Error ownership is independent of the stream phase. In particular, a detached error
+        // may race with a locally committed RESET_REQUIRED checkpoint while its exact open
+        // request remains issued. Preserve the correlation result (including fail-closed
+        // identity/disposition checks) instead of rewriting it as another reset effect.
+        if (action is RelayV2TerminalAction.CorrelatedError) {
+            return correlatedError(current, action)
+        }
         if (current.phase == RelayV2TerminalPhase.RESET_REQUIRED &&
             action !is RelayV2TerminalAction.VerifyContinuity &&
             action !is RelayV2TerminalAction.RebindDelivery &&
@@ -392,7 +403,7 @@ internal object RelayV2TerminalCheckpointReducer {
             is RelayV2TerminalAction.CorrelatedResetRequired ->
                 correlatedResetRequired(current, action)
             is RelayV2TerminalAction.AsyncResetRequired -> asyncResetRequired(current, action)
-            is RelayV2TerminalAction.CorrelatedError -> correlatedError(current, action)
+            is RelayV2TerminalAction.CorrelatedError -> error("Handled above")
             is RelayV2TerminalAction.PreOpenResetRequired ->
                 reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
@@ -464,6 +475,614 @@ internal object RelayV2TerminalCheckpointReducer {
         else -> preOpenReduction(
             checkpoint,
             RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_DELIVERY),
+        )
+    }
+
+    /**
+     * Adopts one exact pre-open response only to durably close it. Presentation is already gone,
+     * so this transition deliberately creates no parser/replay effects.
+     */
+    fun reduceOpenedForClose(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+        action: RelayV2TerminalAction.Opened,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction = openedPreOpen(
+        current = checkpoint,
+        action = action,
+        pendingClose = pendingClose,
+        detached = true,
+    )
+
+    /**
+     * Adopts a correlated opened response after its renderer owner has detached. The durable
+     * identity is retained so a later close can still address the Host stream, but the checkpoint
+     * is deliberately non-writable and produces no parser effects. A successor attachment may
+     * only recover it with RESET.
+     */
+    fun reduceDetachedOpened(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+        action: RelayV2TerminalAction.Opened,
+        pendingClose: RelayV2TerminalPendingClose? = null,
+    ): RelayV2TerminalReduction = openedPreOpen(
+        current = checkpoint,
+        action = action,
+        pendingClose = pendingClose,
+        detached = true,
+    )
+
+    /** Same renderer-free adoption for a RESET successor issued from a Present checkpoint. */
+    fun reduceDetachedOpened(
+        checkpoint: RelayV2TerminalCheckpoint,
+        action: RelayV2TerminalAction.Opened,
+    ): RelayV2TerminalReduction {
+        val reduced = opened(checkpoint, action)
+        if (reduced.outcome != RelayV2TerminalOutcome.Applied) return reduced
+        val adopted = reduced.checkpoint ?: return reduced
+        val pendingClose = checkpoint.pendingCloseWhenOpened
+        val suspended = abandonControlsForClosed(adopted).copy(
+            phase = RelayV2TerminalPhase.RESET_REQUIRED,
+            parserAppliedNextOffset = "0",
+            networkReceivedThrough = "0",
+            parserResetCallbackToken = null,
+            parserInFlightCallbackToken = null,
+            lastAppliedParserCallbackToken = null,
+            pendingParserDispatchClaim = null,
+            pendingParserEffectHandoff = null,
+            pendingParserEffectHandoffResetReason = null,
+            pendingParserEffectActivation = null,
+            pendingOutput = emptyList(),
+            pendingOpen = null,
+            pendingReplay = null,
+            replayTargetOffset = null,
+            activeControlDispatchLease = null,
+            closeRequestIds = pendingClose?.issuedRequestIds.orEmpty(),
+            pendingCloseWhenOpened = null,
+            pendingClose = pendingClose,
+            resetReason = RelayV2TerminalResetReason.STREAM_LOST,
+        )
+        return commit(
+            previous = checkpoint,
+            candidate = suspended,
+            outcome = if (pendingClose == null) {
+                RelayV2TerminalOutcome.ResetRequired(
+                    RelayV2TerminalResetReason.STREAM_LOST,
+                )
+            } else {
+                RelayV2TerminalOutcome.Applied
+            },
+            effects = pendingClose?.let { listOf(it.sendEffect(suspended)) }.orEmpty(),
+        )
+    }
+
+    /**
+     * Consumes the exact close response for a detached/close-only owner. No dead renderer may
+     * receive replay or reset work, so the retained Host tail is intentionally discarded and the
+     * checkpoint is finalized in the same durable transition.
+     */
+    fun reduceDetachedClosed(
+        checkpoint: RelayV2TerminalCheckpoint,
+        action: RelayV2TerminalAction.Closed,
+    ): RelayV2TerminalReduction {
+        fenceGuard(checkpoint, action.fence)?.let { return it }
+        if (checkpoint.phase in setOf(
+                RelayV2TerminalPhase.FINALIZED,
+                RelayV2TerminalPhase.LOST,
+            )
+        ) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
+                ),
+            )
+        }
+        if (checkpoint.phase != RelayV2TerminalPhase.RESET_REQUIRED) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation(
+                    "DETACHED_CLOSE_CHECKPOINT_NOT_SUSPENDED",
+                ),
+            )
+        }
+        val reduced = closedWhileResetRequired(checkpoint, action)
+        val candidate = reduced.checkpoint
+        val deferredCloseOnOpenNatural = checkpoint.pendingOpen != null &&
+            checkpoint.pendingCloseWhenOpened != null &&
+            action.requestId == null && action.closeId == null &&
+            candidate?.closed != null && candidate.closed != checkpoint.closed &&
+            reduced.outcome !is RelayV2TerminalOutcome.ProtocolViolation &&
+            reduced.outcome !is RelayV2TerminalOutcome.Ignored
+        if (deferredCloseOnOpenNatural) {
+            // This event closes the predecessor generation only. The already-issued successor may
+            // still open afterwards, so retain the deferred intent and consume the old event as a
+            // no-op; the exact successor opened response remains the sole close authority transfer.
+            return reduction(checkpoint, RelayV2TerminalOutcome.Applied)
+        }
+        if (candidate == null || candidate.pendingClose != null || candidate.closed == null) {
+            return reduced
+        }
+        if (reduced.outcome is RelayV2TerminalOutcome.ProtocolViolation ||
+            reduced.outcome is RelayV2TerminalOutcome.Ignored
+        ) {
+            return reduced
+        }
+        val finalOffset = candidate.closed.tombstone.finalOffset
+        val finalized = abandonControlsForClosed(candidate).copy(
+            phase = RelayV2TerminalPhase.FINALIZED,
+            parserAppliedNextOffset = finalOffset,
+            networkReceivedThrough = finalOffset,
+            pendingOpen = null,
+            pendingReplay = null,
+            replayTargetOffset = null,
+            parserResetCallbackToken = null,
+            parserInFlightCallbackToken = null,
+            pendingParserDispatchClaim = null,
+            pendingParserEffectHandoff = null,
+            pendingParserEffectHandoffResetReason = null,
+            pendingParserEffectActivation = null,
+            pendingOutput = emptyList(),
+            resetReason = null,
+        )
+        return commit(
+            previous = checkpoint,
+            candidate = finalized,
+            outcome = RelayV2TerminalOutcome.ClosedFinalized,
+            effects = listOf(finalized.closed!!.tombstone.finalizeEffect(finalized)),
+        )
+    }
+
+    /** Requests close for a renderer-free RESET_REQUIRED owner without projecting reset UI. */
+    fun requestDetachedClose(
+        checkpoint: RelayV2TerminalCheckpoint,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction {
+        if (checkpoint.phase in setOf(
+                RelayV2TerminalPhase.FINALIZED,
+                RelayV2TerminalPhase.LOST,
+            ) || checkpoint.closed != null || checkpoint.pendingOpen != null ||
+            checkpoint.pendingCloseWhenOpened != null
+        ) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation(
+                    "DETACHED_CLOSE_CHECKPOINT_NOT_ADDRESSABLE",
+                ),
+            )
+        }
+        checkpoint.pendingClose?.let { existing ->
+            return if (existing == pendingClose) {
+                val closing = rendererFreeClosingCheckpoint(checkpoint)
+                commit(
+                    previous = checkpoint,
+                    candidate = closing,
+                    outcome = RelayV2TerminalOutcome.Applied,
+                    effects = rendererFreeOutputAck(closing) +
+                        existing.deliveryEffect(closing),
+                )
+            } else {
+                reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.ProtocolViolation(
+                        "DETACHED_CLOSE_INTENT_CONFLICT",
+                    ),
+                )
+            }
+        }
+        val rendererFree = rendererFreeClosingCheckpoint(checkpoint)
+        val requested = requestClose(
+            rendererFree,
+            RelayV2TerminalAction.RequestClose(
+                deliveryToken = rendererFree.deliveryToken,
+                closeAttempt = pendingClose.closeAttempt,
+                requestId = pendingClose.requestId,
+            ),
+        )
+        val candidate = requested.checkpoint
+        return if (candidate?.pendingClose == pendingClose &&
+            requested.effects.singleOrNull() is RelayV2TerminalEffect.SendClose
+        ) {
+            commit(
+                previous = checkpoint,
+                candidate = candidate,
+                outcome = RelayV2TerminalOutcome.Applied,
+                effects = rendererFreeOutputAck(rendererFree) + requested.effects,
+            )
+        } else {
+            requested
+        }
+    }
+
+    /**
+     * Persists one exact close intent before presentation releases a pre-open owner. The intent
+     * has no wire effect until the correlated opened response establishes close authority.
+     */
+    fun ensureCloseWhenOpened(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction {
+        if (pendingClose.issuedRequestIds.size >
+            RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS
+        ) {
+            return preOpenReset(
+                checkpoint,
+                RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED,
+            )
+        }
+        if (!validOperationId(pendingClose.closeAttempt.closeId) ||
+            !validOperationId(pendingClose.closeAttempt.fingerprint) ||
+            !validOperationId(pendingClose.requestId) ||
+            !validRequestIdHistory(
+                pendingClose.issuedRequestIds,
+                pendingClose.requestId,
+            ) ||
+            pendingClose.issuedRequestIds.any { it in checkpoint.openRequestIds }
+        ) {
+            return preOpenReset(
+                checkpoint,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+        }
+        checkpoint.pendingClose?.let { existing ->
+            return if (existing == pendingClose) {
+                preOpenReduction(checkpoint, RelayV2TerminalOutcome.Applied)
+            } else {
+                preOpenReset(
+                    checkpoint,
+                    RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+                )
+            }
+        }
+        return preOpenReduction(
+            checkpoint.copy(pendingClose = pendingClose),
+            RelayV2TerminalOutcome.Applied,
+        )
+    }
+
+    /**
+     * Persists close-on-open while a successor request is already pending from a Present owner.
+     * Sending terminal.close for the predecessor generation would race the Host's serialized open
+     * and can never close the successor generation, so this transition intentionally has no wire
+     * effect until the exact opened response is durably adopted.
+     */
+    fun ensureCloseWhenOpened(
+        checkpoint: RelayV2TerminalCheckpoint,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction {
+        if (checkpoint.closed != null || checkpoint.pendingClose != null) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation(
+                    "TERMINAL_CLOSE_ON_OPEN_CONFLICTS_WITH_CURRENT_CLOSE",
+                ),
+            )
+        }
+        if (pendingClose.issuedRequestIds.size >
+            RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS ||
+            !validOperationId(pendingClose.closeAttempt.closeId) ||
+            !validOperationId(pendingClose.closeAttempt.fingerprint) ||
+            !validOperationId(pendingClose.requestId) ||
+            !validRequestIdHistory(pendingClose.issuedRequestIds, pendingClose.requestId) ||
+            pendingClose.issuedRequestIds.any {
+                it in checkpoint.openRequestIds || it in checkpoint.replayRequestIds ||
+                    it in checkpoint.closeRequestIds
+            }
+        ) {
+            return reset(checkpoint, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
+        }
+        checkpoint.pendingCloseWhenOpened?.let { existing ->
+            return if (existing == pendingClose) {
+                reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.Applied,
+                    rendererFreeOutputAck(checkpoint),
+                )
+            } else {
+                reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.ProtocolViolation(
+                        "TERMINAL_CLOSE_ON_OPEN_INTENT_CONFLICT",
+                    ),
+                )
+            }
+        }
+        val candidate = rendererFreeCheckpoint(checkpoint).copy(
+            pendingCloseWhenOpened = pendingClose,
+            activeControlDispatchLease = null,
+        )
+        return commit(
+            previous = checkpoint,
+            candidate = candidate,
+            outcome = RelayV2TerminalOutcome.Applied,
+            effects = rendererFreeOutputAck(candidate),
+        )
+    }
+
+    /**
+     * Discards one exact contiguous Host output frame after presentation has released its parser.
+     * Advancing both durable cursors before emitting OutputAck prevents the Host close pump from
+     * exhausting its credit while never granting parser authority to the renderer-free owner.
+     */
+    fun discardRendererFreeOutput(
+        checkpoint: RelayV2TerminalCheckpoint,
+        action: RelayV2TerminalAction.Output,
+    ): RelayV2TerminalReduction {
+        fenceGuard(checkpoint, action.fence)?.let { return it }
+        if (checkpoint.pendingClose == null && checkpoint.pendingCloseWhenOpened == null &&
+            checkpoint.phase != RelayV2TerminalPhase.RESET_REQUIRED
+        ) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation("RENDERER_FREE_OUTPUT_WITHOUT_CLOSE"),
+            )
+        }
+        if (checkpoint.parserAppliedNextOffset != checkpoint.networkReceivedThrough ||
+            checkpoint.pendingOutput.isNotEmpty() ||
+            checkpoint.parserResetCallbackToken != null ||
+            checkpoint.parserInFlightCallbackToken != null ||
+            checkpoint.pendingParserDispatchClaim != null ||
+            checkpoint.pendingParserEffectHandoff != null ||
+            checkpoint.pendingParserEffectHandoffResetReason != null ||
+            checkpoint.pendingParserEffectActivation != null ||
+            checkpoint.pendingReplay != null || checkpoint.replayTargetOffset != null
+        ) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation("RENDERER_FREE_OUTPUT_OWNER_NOT_DRAINED"),
+            )
+        }
+        if (action.bytes.size !in 1..RelayV2TerminalCheckpointLimits.MAX_FRAME_BYTES) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation("INVALID_RENDERER_FREE_OUTPUT"),
+            )
+        }
+        val offset = parseCounter(action.offset) ?: return reduction(
+            checkpoint,
+            RelayV2TerminalOutcome.ProtocolViolation("INVALID_RENDERER_FREE_OUTPUT_OFFSET"),
+        )
+        val end = addCounter(offset, action.bytes.size) ?: return reduction(
+            checkpoint,
+            RelayV2TerminalOutcome.ProtocolViolation("INVALID_RENDERER_FREE_OUTPUT_OFFSET"),
+        )
+        val expected = parseCounter(checkpoint.networkReceivedThrough) ?: return reduction(
+            checkpoint,
+            RelayV2TerminalOutcome.ProtocolViolation("INVALID_RENDERER_FREE_CURSOR"),
+        )
+        if (offset > expected) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation("RENDERER_FREE_OUTPUT_GAP"),
+            )
+        }
+        if (end <= expected) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.DUPLICATE_OUTPUT),
+                rendererFreeOutputAck(checkpoint),
+            )
+        }
+        val candidate = rendererFreeCheckpoint(checkpoint).copy(
+            parserAppliedNextOffset = end.toString(),
+            networkReceivedThrough = end.toString(),
+        )
+        return commit(
+            previous = checkpoint,
+            candidate = candidate,
+            outcome = RelayV2TerminalOutcome.Applied,
+            effects = rendererFreeOutputAck(candidate),
+        )
+    }
+
+    /**
+     * Consumes a reset while no renderer/parser owner exists. This path deliberately reuses the
+     * normal request correlation but strips every parser/UI effect. A Host loss can retire the
+     * local durable route without inventing a terminal.closed receipt; ambiguous correlated RESET
+     * responses retain the close-on-open marker so recovery can reclaim the exact open lineage.
+     */
+    fun reduceRendererFreeReset(
+        checkpoint: RelayV2TerminalCheckpoint,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction {
+        if (checkpoint.phase in setOf(
+                RelayV2TerminalPhase.FINALIZED,
+                RelayV2TerminalPhase.LOST,
+            )
+        ) {
+            return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
+                ),
+            )
+        }
+        val resetReason = when (action) {
+            is RelayV2TerminalAction.CorrelatedResetRequired -> validatedHostResetReason(
+                action.reason,
+                action.requestedOffset,
+                action.bufferStartOffset,
+                action.tailOffset,
+            )
+            is RelayV2TerminalAction.AsyncResetRequired -> validatedHostResetReason(
+                action.reason,
+                action.requestedOffset,
+                action.bufferStartOffset,
+                action.tailOffset,
+            )
+            else -> null
+        } ?: return reduction(
+            checkpoint,
+            RelayV2TerminalOutcome.ProtocolViolation("INVALID_RENDERER_FREE_RESET"),
+        )
+
+        val actionAuthorityFence = when (action) {
+            is RelayV2TerminalAction.CorrelatedResetRequired -> action.fence
+            is RelayV2TerminalAction.AsyncResetRequired -> action.fence
+            else -> error("Handled above")
+        }
+        val wireGeneration = when (action) {
+            is RelayV2TerminalAction.CorrelatedResetRequired -> action.wireGeneration
+            is RelayV2TerminalAction.AsyncResetRequired -> action.wireGeneration
+            else -> error("Handled above")
+        }
+        val normalizedFence = actionFence(checkpoint)
+        // Generation is interpreted below because a correlated RESET open may legitimately report
+        // either the preserved predecessor or a newly-issued successor. Every other authority
+        // component remains exact.
+        fenceGuard(checkpoint, actionAuthorityFence)?.let { return it }
+
+        if (action is RelayV2TerminalAction.AsyncResetRequired) {
+            if (resetReason !in setOf(
+                    RelayV2TerminalResetReason.SLOW_CONSUMER,
+                    RelayV2TerminalResetReason.HOST_BUFFER_PRESSURE,
+                    RelayV2TerminalResetReason.STREAM_LOST,
+                )
+            ) {
+                return reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.ProtocolViolation(
+                        "INVALID_ASYNC_RENDERER_FREE_RESET_REASON",
+                    ),
+                )
+            }
+            if (wireGeneration == null) {
+                return reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.ProtocolViolation(
+                        "MISSING_RENDERER_FREE_RESET_GENERATION",
+                    ),
+                )
+            }
+            if (wireGeneration != checkpoint.identity.generation) {
+                return reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.Ignored(
+                        RelayV2TerminalIgnoredReason.STALE_GENERATION,
+                    ),
+                )
+            }
+            if (!validOperationId(action.correlationProofId)) {
+                return reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.ProtocolViolation(
+                        "INVALID_RENDERER_FREE_RESET_PROOF",
+                    ),
+                )
+            }
+            if (checkpoint.pendingClose != null) {
+                return rendererFreeLost(checkpoint, resetReason)
+            }
+            val suspended = rendererFreeCheckpoint(checkpoint).copy(
+                phase = RelayV2TerminalPhase.RESET_REQUIRED,
+                // Keep an exact pending successor and its unbound close marker. The Host event
+                // fences the old route, but it is not proof that the serialized open never ran.
+                pendingOpen = checkpoint.pendingOpen,
+                pendingCloseWhenOpened = checkpoint.pendingCloseWhenOpened,
+                resetReason = resetReason,
+            )
+            return commit(
+                previous = checkpoint,
+                candidate = suspended,
+                outcome = RelayV2TerminalOutcome.ResetRequired(resetReason),
+            )
+        }
+
+        action as RelayV2TerminalAction.CorrelatedResetRequired
+        val pendingOpen = checkpoint.pendingOpen
+        when (action.origin) {
+            RelayV2TerminalResetOrigin.REPLAY -> if (
+                wireGeneration != checkpoint.identity.generation
+            ) {
+                return reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.Ignored(
+                        RelayV2TerminalIgnoredReason.STALE_GENERATION,
+                    ),
+                )
+            }
+            RelayV2TerminalResetOrigin.OPEN -> {
+                val resumeGeneration = pendingOpen?.resume?.generation
+                if (pendingOpen == null || wireGeneration?.isBlank() == true ||
+                    (pendingOpen.mode == RelayV2TerminalOpenMode.RESUME &&
+                        (resumeGeneration == null || wireGeneration != resumeGeneration))
+                ) {
+                    return reduction(
+                        checkpoint,
+                        RelayV2TerminalOutcome.ProtocolViolation(
+                            "INVALID_RENDERER_FREE_OPEN_RESET_GENERATION",
+                        ),
+                    )
+                }
+            }
+        }
+        val normalized = correlatedResetRequired(
+            checkpoint,
+            action.copy(fence = normalizedFence),
+        )
+        if (normalized.outcome is RelayV2TerminalOutcome.Ignored) return normalized
+        val correlated = normalized.checkpoint
+            ?.takeIf {
+                normalized.outcome == RelayV2TerminalOutcome.ResetRequired(resetReason) &&
+                    it.resetReason == resetReason
+            }
+            ?: return reduction(
+                checkpoint,
+                RelayV2TerminalOutcome.ProtocolViolation(
+                    "INVALID_RENDERER_FREE_RESET_CORRELATION",
+                ),
+            )
+        val marker = checkpoint.pendingCloseWhenOpened
+        if (action.origin == RelayV2TerminalResetOrigin.OPEN && marker != null) {
+            if (wireGeneration == null) {
+                val suspended = rendererFreeCheckpoint(correlated).copy(
+                    phase = RelayV2TerminalPhase.RESET_REQUIRED,
+                    pendingCloseWhenOpened = marker,
+                    resetReason = resetReason,
+                )
+                return commit(
+                    previous = checkpoint,
+                    candidate = suspended,
+                    outcome = RelayV2TerminalOutcome.ResetRequired(resetReason),
+                )
+            }
+            if (wireGeneration != checkpoint.identity.generation) {
+                // A fresh successor generation was issued but failed before terminal.opened. The
+                // Host retired the predecessor as part of RESET, so no addressable lease remains.
+                return rendererFreeLost(checkpoint, resetReason)
+            }
+            if (resetReason == RelayV2TerminalResetReason.OFFSET_EXPIRED) {
+                // OFFSET_EXPIRED preserves the exact predecessor generation, which is now the
+                // only safe close target. Promote the unbound intent and send ACK before close.
+                val addressable = rendererFreeCheckpoint(correlated).copy(
+                    pendingCloseWhenOpened = null,
+                )
+                return requestDetachedClose(addressable, marker)
+            }
+        }
+        val suspended = rendererFreeCheckpoint(correlated).copy(
+            phase = RelayV2TerminalPhase.RESET_REQUIRED,
+            pendingCloseWhenOpened = marker,
+            resetReason = resetReason,
+        )
+        return commit(
+            previous = checkpoint,
+            candidate = suspended,
+            outcome = RelayV2TerminalOutcome.ResetRequired(resetReason),
+        )
+    }
+
+    /** Replays the exact idempotent close after a crash between durable commit and wire send. */
+    fun redeliverPendingClose(
+        checkpoint: RelayV2TerminalCheckpoint,
+    ): RelayV2TerminalReduction {
+        val pending = checkpoint.pendingClose
+            ?: return reduction(checkpoint, RelayV2TerminalOutcome.Restored)
+        val rendererFree = rendererFreeClosingCheckpoint(checkpoint)
+        return commit(
+            previous = checkpoint,
+            candidate = rendererFree,
+            outcome = RelayV2TerminalOutcome.Restored,
+            effects = rendererFreeOutputAck(rendererFree) +
+                pending.deliveryEffect(rendererFree),
         )
     }
 
@@ -733,6 +1352,8 @@ internal object RelayV2TerminalCheckpointReducer {
     private fun openedPreOpen(
         current: RelayV2TerminalPreOpenCheckpoint,
         action: RelayV2TerminalAction.Opened,
+        pendingClose: RelayV2TerminalPendingClose? = null,
+        detached: Boolean = current.pendingClose != null,
     ): RelayV2TerminalReduction {
         val pending = current.pendingOpen
         when (networkResponseCorrelation(
@@ -772,7 +1393,8 @@ internal object RelayV2TerminalCheckpointReducer {
             action.parserContinuityId != pending.parserContinuityId ||
             action.cols != pending.cols || action.rows != pending.rows ||
             (pending.requiresDeduplicatedResponse && !action.deduplicated &&
-                pending.mode != RelayV2TerminalOpenMode.NEW) ||
+                pending.mode != RelayV2TerminalOpenMode.NEW &&
+                pending.mode != RelayV2TerminalOpenMode.RESET) ||
             !dispositionMatches(pending.mode, action.disposition) ||
             replayFrom != ZERO || tail == null || tail < ZERO ||
             (tail != ZERO &&
@@ -780,13 +1402,37 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return preOpenReset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
-        return newGenerationCheckpoint(
-            action,
-            emptyList(),
-            pending,
-            current.openRequestIds,
-            newlyAmbiguousCount = 0,
-        )
+        val effectivePendingClose = when {
+            pendingClose == null -> current.pendingClose
+            current.pendingClose == null || current.pendingClose == pendingClose -> pendingClose
+            else -> return preOpenReset(
+                current,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+        }
+        return if (detached) {
+            newDetachedGenerationCheckpoint(
+                action = action,
+                pendingOpen = pending,
+                openRequestIds = current.openRequestIds,
+                pendingClose = effectivePendingClose,
+            )
+        } else if (effectivePendingClose == null) {
+            newGenerationCheckpoint(
+                action,
+                emptyList(),
+                pending,
+                current.openRequestIds,
+                newlyAmbiguousCount = 0,
+            )
+        } else {
+            newClosingGenerationCheckpoint(
+                action = action,
+                pendingOpen = pending,
+                openRequestIds = current.openRequestIds,
+                pendingClose = effectivePendingClose,
+            )
+        }
     }
 
     private fun preOpenResetRequired(
@@ -853,13 +1499,17 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.Closed,
     ): RelayV2TerminalReduction {
-        val correlatedCloseAttempt = when (val correlation =
-            closedResponseCorrelation(current, action)
-        ) {
+        val correlation = closedResponseCorrelation(current, action)
+        val correlatedCloseAttempt = when (correlation) {
             is ClosedResponseCorrelation.Current -> correlation.closeAttempt
             ClosedResponseCorrelation.Natural -> null
             is ClosedResponseCorrelation.Rejected -> return correlation.reduction
         }
+        val naturalSatisfiesClose = correlation == ClosedResponseCorrelation.Natural &&
+            current.pendingOpen == null
+        val satisfiedCloseAttempt = correlatedCloseAttempt ?: current.pendingClose
+            ?.closeAttempt
+            ?.takeIf { naturalSatisfiesClose }
         val finalOffset = parseCounter(action.finalOffset)
         val bufferStart = action.bufferStartOffset?.let(::parseCounter)
         if (action.fence.openId != current.openAttempt.openId ||
@@ -870,7 +1520,7 @@ internal object RelayV2TerminalCheckpointReducer {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         val incoming = RelayV2TerminalClosedState(
-            tombstone = closedTombstone(current, action, correlatedCloseAttempt),
+            tombstone = closedTombstone(current, action, satisfiedCloseAttempt),
             retainedBuffer = RelayV2TerminalRetainedBuffer(
                 action.replayAvailable,
                 action.bufferStartOffset,
@@ -893,7 +1543,11 @@ internal object RelayV2TerminalCheckpointReducer {
                     ),
                     retainedBuffer = incoming.retainedBuffer,
                 ),
-                pendingClose = if (correlatedCloseAttempt != null) {
+                // A valid natural backend exit proves the remote stream is already gone, so it
+                // satisfies an in-flight client close even though it has no close correlation ID.
+                // Keeping the close intent here would strand a renderer-free owner forever.
+                pendingClose = if (satisfiedCloseAttempt != null || naturalSatisfiesClose
+                ) {
                     null
                 } else {
                     current.pendingClose
@@ -972,7 +1626,9 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return reset(previous, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
-        if (pendingOpen.requiresDeduplicatedResponse && !action.deduplicated) {
+        if (pendingOpen.requiresDeduplicatedResponse && !action.deduplicated &&
+            pendingOpen.mode != RelayV2TerminalOpenMode.RESET
+        ) {
             return reset(previous, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
 
@@ -1203,6 +1859,85 @@ internal object RelayV2TerminalCheckpointReducer {
             action.identity,
             action.deliveryToken,
             action.openAttempt,
+        )
+    }
+
+    private fun newClosingGenerationCheckpoint(
+        action: RelayV2TerminalAction.Opened,
+        pendingOpen: RelayV2TerminalPendingOpen,
+        openRequestIds: List<String>,
+        pendingClose: RelayV2TerminalPendingClose,
+    ): RelayV2TerminalReduction {
+        val checkpoint = RelayV2TerminalCheckpoint(
+            identity = action.identity,
+            openAttempt = action.openAttempt,
+            openMode = pendingOpen.mode,
+            openRequestResume = pendingOpen.resume,
+            openResult = action.openResult(),
+            openRequestIds = openRequestIds,
+            deliveryToken = action.deliveryToken,
+            parserContinuityId = action.parserContinuityId,
+            // Presentation has already closed. Do not mint parser/replay work for a renderer that
+            // cannot own it; the only admitted post-open effect is the durable close below.
+            phase = RelayV2TerminalPhase.LIVE,
+            openedCols = action.cols,
+            openedRows = action.rows,
+            parserAppliedNextOffset = "0",
+            networkReceivedThrough = "0",
+            nextParserOperationSeq = "1",
+            nextReplayRequestSeq = "1",
+            closeRequestIds = pendingClose.issuedRequestIds,
+            pendingClose = pendingClose,
+        )
+        return commit(
+            previous = null,
+            candidate = checkpoint,
+            outcome = RelayV2TerminalOutcome.Applied,
+            effects = listOf(pendingClose.sendEffect(checkpoint)),
+            identityWhenMissing = action.identity,
+            deliveryWhenMissing = action.deliveryToken,
+            openAttemptWhenMissing = action.openAttempt,
+        )
+    }
+
+    private fun newDetachedGenerationCheckpoint(
+        action: RelayV2TerminalAction.Opened,
+        pendingOpen: RelayV2TerminalPendingOpen,
+        openRequestIds: List<String>,
+        pendingClose: RelayV2TerminalPendingClose?,
+    ): RelayV2TerminalReduction {
+        val checkpoint = RelayV2TerminalCheckpoint(
+            identity = action.identity,
+            openAttempt = action.openAttempt,
+            openMode = pendingOpen.mode,
+            openRequestResume = pendingOpen.resume,
+            openResult = action.openResult(),
+            openRequestIds = openRequestIds,
+            deliveryToken = action.deliveryToken,
+            parserContinuityId = action.parserContinuityId,
+            phase = RelayV2TerminalPhase.RESET_REQUIRED,
+            openedCols = action.cols,
+            openedRows = action.rows,
+            parserAppliedNextOffset = "0",
+            networkReceivedThrough = "0",
+            nextParserOperationSeq = "1",
+            nextReplayRequestSeq = "1",
+            closeRequestIds = pendingClose?.issuedRequestIds.orEmpty(),
+            pendingClose = pendingClose,
+            resetReason = RelayV2TerminalResetReason.STREAM_LOST,
+        )
+        return commit(
+            previous = null,
+            candidate = checkpoint,
+            outcome = if (pendingClose == null) {
+                RelayV2TerminalOutcome.ResetRequired(RelayV2TerminalResetReason.STREAM_LOST)
+            } else {
+                RelayV2TerminalOutcome.Applied
+            },
+            effects = pendingClose?.let { listOf(it.sendEffect(checkpoint)) }.orEmpty(),
+            identityWhenMissing = action.identity,
+            deliveryWhenMissing = action.deliveryToken,
+            openAttemptWhenMissing = action.openAttempt,
         )
     }
 
@@ -2650,13 +3385,17 @@ internal object RelayV2TerminalCheckpointReducer {
                 RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT),
             )
         }
-        val correlatedCloseAttempt = when (val correlation =
-            closedResponseCorrelation(current, action)
-        ) {
+        val correlation = closedResponseCorrelation(current, action)
+        val correlatedCloseAttempt = when (correlation) {
             is ClosedResponseCorrelation.Current -> correlation.closeAttempt
             ClosedResponseCorrelation.Natural -> null
             is ClosedResponseCorrelation.Rejected -> return correlation.reduction
         }
+        val naturalSatisfiesClose = correlation == ClosedResponseCorrelation.Natural &&
+            current.pendingOpen == null
+        val satisfiedCloseAttempt = correlatedCloseAttempt ?: current.pendingClose
+            ?.closeAttempt
+            ?.takeIf { naturalSatisfiesClose }
         if (!validClose(action)) {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
@@ -2670,7 +3409,7 @@ internal object RelayV2TerminalCheckpointReducer {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         var incoming = RelayV2TerminalClosedState(
-            tombstone = closedTombstone(current, action, correlatedCloseAttempt),
+            tombstone = closedTombstone(current, action, satisfiedCloseAttempt),
             retainedBuffer = RelayV2TerminalRetainedBuffer(
                 action.replayAvailable,
                 action.bufferStartOffset,
@@ -2713,7 +3452,12 @@ internal object RelayV2TerminalCheckpointReducer {
         var candidate = abandonControlsForClosed(
             current.copy(
                 closed = incoming,
-                pendingClose = if (correlatedCloseAttempt != null) null else current.pendingClose,
+                pendingClose = if (satisfiedCloseAttempt != null || naturalSatisfiesClose
+                ) {
+                    null
+                } else {
+                    current.pendingClose
+                },
             ),
         )
         val closedControlEffects = ambiguousEffect(current, candidate)
@@ -2765,6 +3509,30 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.CorrelatedResetRequired,
     ): RelayV2TerminalReduction {
+        when (action.origin) {
+            RelayV2TerminalResetOrigin.REPLAY -> {
+                if (action.wireGeneration == null) {
+                    return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
+                }
+                if (action.wireGeneration != current.identity.generation) {
+                    return reduction(
+                        current,
+                        RelayV2TerminalOutcome.Ignored(
+                            RelayV2TerminalIgnoredReason.STALE_GENERATION,
+                        ),
+                    )
+                }
+            }
+            RelayV2TerminalResetOrigin.OPEN -> {
+                val pending = current.pendingOpen
+                if (action.wireGeneration?.isBlank() == true ||
+                    (pending?.mode == RelayV2TerminalOpenMode.RESUME &&
+                        action.wireGeneration != pending.resume?.generation)
+                ) {
+                    return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
+                }
+            }
+        }
         val correlation = when (action.origin) {
             RelayV2TerminalResetOrigin.OPEN -> networkResponseCorrelation(
                 action.requestId,
@@ -2809,8 +3577,23 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.AsyncResetRequired,
     ): RelayV2TerminalReduction {
-        if (!validOperationId(action.correlationProofId)) {
+        if (action.wireGeneration == null ||
+            !validOperationId(action.correlationProofId) ||
+            action.reason !in setOf(
+                RelayV2TerminalResetReason.SLOW_CONSUMER,
+                RelayV2TerminalResetReason.HOST_BUFFER_PRESSURE,
+                RelayV2TerminalResetReason.STREAM_LOST,
+            )
+        ) {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
+        }
+        if (action.wireGeneration != current.identity.generation) {
+            return reduction(
+                current,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.STALE_GENERATION,
+                ),
+            )
         }
         return applyHostReset(current, action.reason, action.requestedOffset,
             action.bufferStartOffset, action.tailOffset)
@@ -3137,7 +3920,7 @@ internal object RelayV2TerminalCheckpointReducer {
             deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.RetryReplay -> deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.RequestClose -> deliveryGuard(current, action.deliveryToken)
-        is RelayV2TerminalAction.Closed -> null
+        is RelayV2TerminalAction.Closed -> fenceGuard(current, action.fence)
         is RelayV2TerminalAction.CorrelatedError -> null
         is RelayV2TerminalAction.CorrelatedResetRequired -> null
         is RelayV2TerminalAction.AsyncResetRequired -> fenceGuard(current, action.fence)
@@ -3335,6 +4118,84 @@ internal object RelayV2TerminalCheckpointReducer {
         },
     )
 
+    /** Removes every parser/control owner after the UI callback barrier has drained. */
+    private fun rendererFreeCheckpoint(
+        current: RelayV2TerminalCheckpoint,
+    ): RelayV2TerminalCheckpoint {
+        val phase = when {
+            current.closed != null &&
+                current.closed.tombstone.finalOffset == current.networkReceivedThrough &&
+                current.pendingClose != null -> RelayV2TerminalPhase.CLOSED_WAITING_CLOSE
+            current.closed != null -> RelayV2TerminalPhase.RESET_REQUIRED
+            current.phase in setOf(
+                RelayV2TerminalPhase.RESET_REQUIRED,
+                RelayV2TerminalPhase.LOST,
+            ) -> current.phase
+            else -> RelayV2TerminalPhase.LIVE
+        }
+        return abandonControlsForClosed(current).copy(
+            phase = phase,
+            parserAppliedNextOffset = current.networkReceivedThrough,
+            parserResetCallbackToken = null,
+            parserInFlightCallbackToken = null,
+            lastAppliedParserCallbackToken = null,
+            pendingParserDispatchClaim = null,
+            pendingParserEffectHandoff = null,
+            pendingParserEffectHandoffResetReason = null,
+            pendingParserEffectActivation = null,
+            pendingOutput = emptyList(),
+            pendingReplay = null,
+            replayTargetOffset = null,
+            activeControlDispatchLease = null,
+            resetReason = when (phase) {
+                RelayV2TerminalPhase.RESET_REQUIRED -> current.resetReason
+                    ?: RelayV2TerminalResetReason.STREAM_LOST
+                RelayV2TerminalPhase.LOST -> current.resetReason
+                else -> null
+            },
+        )
+    }
+
+    private fun rendererFreeClosingCheckpoint(
+        current: RelayV2TerminalCheckpoint,
+    ): RelayV2TerminalCheckpoint = rendererFreeCheckpoint(current).copy(
+        phase = RelayV2TerminalPhase.RESET_REQUIRED,
+        resetReason = current.resetReason ?: RelayV2TerminalResetReason.STREAM_LOST,
+    )
+
+    /** Local terminal result for a Host-fenced route without a terminal.closed receipt. */
+    private fun rendererFreeLost(
+        current: RelayV2TerminalCheckpoint,
+        reason: RelayV2TerminalResetReason,
+    ): RelayV2TerminalReduction {
+        val lost = rendererFreeCheckpoint(current).copy(
+            phase = RelayV2TerminalPhase.LOST,
+            pendingOpen = null,
+            pendingReplay = null,
+            replayTargetOffset = null,
+            pendingCloseWhenOpened = null,
+            pendingClose = null,
+            closeRequestIds = emptyList(),
+            closed = null,
+            resetReason = reason,
+        )
+        return commit(
+            previous = current,
+            candidate = lost,
+            outcome = RelayV2TerminalOutcome.LostFinalized,
+        )
+    }
+
+    private fun rendererFreeOutputAck(
+        checkpoint: RelayV2TerminalCheckpoint,
+    ): List<RelayV2TerminalEffect> = listOf(
+        RelayV2TerminalEffect.OutputAck(
+            effectFence(checkpoint),
+            checkpoint.identity.generation,
+            checkpoint.networkReceivedThrough,
+        ),
+    )
+
     private fun finalizeClosed(current: RelayV2TerminalCheckpoint): ClosedRecovery {
         val closed = requireNotNull(current.closed)
         require(current.pendingClose == null)
@@ -3493,6 +4354,9 @@ internal object RelayV2TerminalCheckpointReducer {
         pendingOpen = checkpoint.pendingOpen?.copy(
             issuedRequestIds = checkpoint.pendingOpen.issuedRequestIds.toList(),
         ),
+        pendingCloseWhenOpened = checkpoint.pendingCloseWhenOpened?.copy(
+            issuedRequestIds = checkpoint.pendingCloseWhenOpened.issuedRequestIds.toList(),
+        ),
         pendingClose = checkpoint.pendingClose?.copy(
             issuedRequestIds = checkpoint.pendingClose.issuedRequestIds.toList(),
         ),
@@ -3504,6 +4368,9 @@ internal object RelayV2TerminalCheckpointReducer {
         openRequestIds = checkpoint.openRequestIds.toList(),
         pendingOpen = checkpoint.pendingOpen?.copy(
             issuedRequestIds = checkpoint.pendingOpen.issuedRequestIds.toList(),
+        ),
+        pendingClose = checkpoint.pendingClose?.copy(
+            issuedRequestIds = checkpoint.pendingClose.issuedRequestIds.toList(),
         ),
     )
 
@@ -3529,6 +4396,8 @@ internal object RelayV2TerminalCheckpointReducer {
         val replayRequestCount = checkpoint.replayRequestIds.size
         val closeRequestCount = checkpoint.closeRequestIds.size
         val pendingOpenRequestCount = checkpoint.pendingOpen?.issuedRequestIds?.size ?: 0
+        val deferredCloseRequestCount =
+            checkpoint.pendingCloseWhenOpened?.issuedRequestIds?.size ?: 0
         val pendingCloseRequestCount = checkpoint.pendingClose?.issuedRequestIds?.size ?: 0
         if (outputCount > RelayV2TerminalCheckpointLimits.MAX_PENDING_OUTPUT_FRAMES ||
             pendingInputCount.toLong() + ambiguousInputCount.toLong() >
@@ -3539,6 +4408,7 @@ internal object RelayV2TerminalCheckpointReducer {
                 replayRequestCount,
                 closeRequestCount,
                 pendingOpenRequestCount,
+                deferredCloseRequestCount,
                 pendingCloseRequestCount,
             ).any { it > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS }
         ) {
@@ -3654,6 +4524,9 @@ internal object RelayV2TerminalCheckpointReducer {
                 ),
             )
         }
+        if (checkpoint.phase == RelayV2TerminalPhase.LOST) {
+            return reduction(checkpoint, RelayV2TerminalOutcome.LostFinalized)
+        }
 
         if (storedOperation == null) {
             return reduction(checkpoint, RelayV2TerminalOutcome.Restored)
@@ -3746,6 +4619,16 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return false
         }
+        checkpoint.pendingClose?.let { pending ->
+            if (!validOperationId(pending.closeAttempt.closeId) ||
+                !validOperationId(pending.closeAttempt.fingerprint) ||
+                !validOperationId(pending.requestId) ||
+                !validRequestIdHistory(pending.issuedRequestIds, pending.requestId) ||
+                pending.issuedRequestIds.any { it in checkpoint.openRequestIds }
+            ) {
+                return false
+            }
+        }
         return when (checkpoint.phase) {
             RelayV2TerminalPreOpenPhase.PENDING_OPEN ->
                 checkpoint.pendingOpen?.let { pending ->
@@ -3790,8 +4673,10 @@ internal object RelayV2TerminalCheckpointReducer {
     ): Boolean {
         val openRequestCount = checkpoint.openRequestIds.size
         val pendingOpenRequestCount = checkpoint.pendingOpen?.issuedRequestIds?.size ?: 0
+        val pendingCloseRequestCount = checkpoint.pendingClose?.issuedRequestIds?.size ?: 0
         if (openRequestCount > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS ||
-            pendingOpenRequestCount > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS
+            pendingOpenRequestCount > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS ||
+            pendingCloseRequestCount > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS
         ) {
             return false
         }
@@ -4056,10 +4941,30 @@ internal object RelayV2TerminalCheckpointReducer {
             return CheckpointValidity.INVALID
         }
         checkpoint.pendingClose?.let {
-            if (!validOperationId(it.requestId) ||
+            if (!validOperationId(it.closeAttempt.closeId) ||
+                !validOperationId(it.closeAttempt.fingerprint) ||
+                !validOperationId(it.requestId) ||
                 !validRequestIdHistory(it.issuedRequestIds, it.requestId) ||
                 it.issuedRequestIds != checkpoint.closeRequestIds ||
-                checkpoint.closed?.tombstone?.closeAttempt != null
+                checkpoint.closed?.tombstone?.closeAttempt != null ||
+                checkpoint.pendingCloseWhenOpened != null || checkpoint.pendingOpen != null
+            ) {
+                return CheckpointValidity.INVALID
+            }
+        }
+        checkpoint.pendingCloseWhenOpened?.let {
+            if (!validOperationId(it.closeAttempt.closeId) ||
+                !validOperationId(it.closeAttempt.fingerprint) ||
+                !validOperationId(it.requestId) ||
+                !validRequestIdHistory(it.issuedRequestIds, it.requestId) ||
+                checkpoint.pendingClose != null || checkpoint.closed != null ||
+                (checkpoint.pendingOpen == null &&
+                    checkpoint.phase != RelayV2TerminalPhase.RESET_REQUIRED) ||
+                it.issuedRequestIds.any { requestId ->
+                    requestId in checkpoint.openRequestIds ||
+                        requestId in checkpoint.replayRequestIds ||
+                        requestId in checkpoint.closeRequestIds
+                }
             ) {
                 return CheckpointValidity.INVALID
             }
@@ -4141,7 +5046,10 @@ internal object RelayV2TerminalCheckpointReducer {
                 return CheckpointValidity.INVALID
             }
         }
-        if ((checkpoint.phase == RelayV2TerminalPhase.RESET_REQUIRED) !=
+        if ((checkpoint.phase in setOf(
+                RelayV2TerminalPhase.RESET_REQUIRED,
+                RelayV2TerminalPhase.LOST,
+            )) !=
             (checkpoint.resetReason != null)
         ) {
             return CheckpointValidity.INVALID
@@ -4152,7 +5060,26 @@ internal object RelayV2TerminalCheckpointReducer {
                 checkpoint.closed.tombstone.finalOffset != checkpoint.parserAppliedNextOffset ||
                 checkpoint.networkReceivedThrough != checkpoint.parserAppliedNextOffset ||
                 checkpoint.pendingInputs.isNotEmpty() || checkpoint.pendingResizes.isNotEmpty() ||
-                checkpoint.pendingClose != null || checkpoint.parserResetCallbackToken != null)
+                checkpoint.pendingCloseWhenOpened != null || checkpoint.pendingClose != null ||
+                checkpoint.parserResetCallbackToken != null)
+        ) {
+            return CheckpointValidity.INVALID
+        }
+        if (checkpoint.phase == RelayV2TerminalPhase.LOST &&
+            (checkpoint.closed != null || checkpoint.pendingOpen != null ||
+                checkpoint.pendingReplay != null || checkpoint.replayTargetOffset != null ||
+                checkpoint.pendingCloseWhenOpened != null || checkpoint.pendingClose != null ||
+                checkpoint.closeRequestIds.isNotEmpty() ||
+                checkpoint.pendingOutput.isNotEmpty() ||
+                checkpoint.parserAppliedNextOffset != checkpoint.networkReceivedThrough ||
+                checkpoint.parserResetCallbackToken != null ||
+                checkpoint.parserInFlightCallbackToken != null ||
+                checkpoint.pendingParserDispatchClaim != null ||
+                checkpoint.pendingParserEffectHandoff != null ||
+                checkpoint.pendingParserEffectHandoffResetReason != null ||
+                checkpoint.pendingParserEffectActivation != null ||
+                checkpoint.pendingInputs.isNotEmpty() || checkpoint.pendingResizes.isNotEmpty() ||
+                checkpoint.activeControlDispatchLease != null)
         ) {
             return CheckpointValidity.INVALID
         }
@@ -4304,6 +5231,7 @@ internal object RelayV2TerminalCheckpointReducer {
         if (checkpoint.phase in setOf(
                 RelayV2TerminalPhase.RESET_REQUIRED,
                 RelayV2TerminalPhase.FINALIZED,
+                RelayV2TerminalPhase.LOST,
             ) || claim.fence != effectFence(checkpoint) ||
             claim.callbackToken.fence != claim.fence ||
             !validCallbackToken(checkpoint, claim.callbackToken, requireCurrentDelivery = true)
@@ -4387,6 +5315,12 @@ internal object RelayV2TerminalCheckpointReducer {
         } ?: 0
         bytes += checkpoint.pendingReplay?.let {
             96L + it.requestId.toByteArray(Charsets.UTF_8).size + it.fromOffset.length
+        } ?: 0
+        bytes += checkpoint.pendingCloseWhenOpened?.let {
+            64L + attemptSize(it.closeAttempt) + it.requestId.length +
+                it.issuedRequestIds.sumOf { value ->
+                    value.toByteArray(Charsets.UTF_8).size.toLong()
+                }
         } ?: 0
         bytes += checkpoint.pendingClose?.let {
             64L + attemptSize(it.closeAttempt) + it.requestId.length +

@@ -1,6 +1,9 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
+import com.tmuxworktree.mobile.core.session.MobileSessionTransport
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportAdapter
+import com.tmuxworktree.mobile.core.session.MobileSessionTransportListener
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -36,7 +39,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * redirects, authenticates a challenge, reconnects, decodes Relay JSON, or owns an actor
  * generation/phase.
  */
-internal class BoundedRelayV2TransportFactory(
+internal class RelayV2WebSocketTransportAdapter(
     private val sslSocketFactory: SSLSocketFactory = systemTrustSocketFactory(),
     private val additionalHostnameVerifier: HostnameVerifier? = null,
     private val addressResolver: RelayV2AddressResolver = RelayV2SystemAddressResolver,
@@ -45,21 +48,23 @@ internal class BoundedRelayV2TransportFactory(
     private val resolveTimeoutMs: Int = DEFAULT_RESOLVE_TIMEOUT_MS,
     private val connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
     private val handshakeTimeoutMs: Int = DEFAULT_HANDSHAKE_TIMEOUT_MS,
-) : RelayV2TransportFactory {
+    private val inboundSilenceTimeoutMs: Int = DEFAULT_INBOUND_SILENCE_TIMEOUT_MS,
+) : MobileSessionTransportAdapter<RelayV2TransportOpenRequest> {
     init {
         require(resolveTimeoutMs > 0)
         require(connectTimeoutMs > 0)
         require(handshakeTimeoutMs > 0)
+        require(inboundSilenceTimeoutMs > 0)
     }
 
     override fun open(
-        request: RelayV2TransportOpenRequest,
-        listener: RelayV2TransportListener,
-    ): RelayV2Transport {
-        val endpoint = RelayV2WebSocketEndpoint.parse(request.relayUrl)
+        route: RelayV2TransportOpenRequest,
+        listener: MobileSessionTransportListener,
+    ): MobileSessionTransport {
+        val endpoint = RelayV2WebSocketEndpoint.parse(route.relayUrl)
         return BoundedRelayV2Transport(
             endpoint = endpoint,
-            accessToken = request.accessToken,
+            accessToken = route.accessToken,
             listener = listener,
             sslSocketFactory = sslSocketFactory,
             additionalHostnameVerifier = additionalHostnameVerifier,
@@ -69,6 +74,7 @@ internal class BoundedRelayV2TransportFactory(
             resolveTimeoutMs = resolveTimeoutMs,
             connectTimeoutMs = connectTimeoutMs,
             handshakeTimeoutMs = handshakeTimeoutMs,
+            inboundSilenceTimeoutMs = inboundSilenceTimeoutMs,
         ).also(BoundedRelayV2Transport::start)
     }
 
@@ -76,16 +82,22 @@ internal class BoundedRelayV2TransportFactory(
         const val DEFAULT_RESOLVE_TIMEOUT_MS = 10_000
         const val DEFAULT_CONNECT_TIMEOUT_MS = 10_000
         const val DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
+        // Broker sends a ping every 15s. Four quiet intervals detect a half-open mobile path while
+        // tolerating short radio/app scheduling stalls.
+        const val DEFAULT_INBOUND_SILENCE_TIMEOUT_MS = 60_000
 
         fun systemTrustSocketFactory(): SSLSocketFactory =
             SSLContext.getInstance("TLS").apply { init(null, null, null) }.socketFactory
     }
 }
 
+/** Temporary source-compatible name for tests and downstream Relay-only wiring. */
+internal typealias BoundedRelayV2TransportFactory = RelayV2WebSocketTransportAdapter
+
 private class BoundedRelayV2Transport(
     private val endpoint: RelayV2WebSocketEndpoint,
     private val accessToken: String,
-    private val listener: RelayV2TransportListener,
+    private val listener: MobileSessionTransportListener,
     private val sslSocketFactory: SSLSocketFactory,
     private val additionalHostnameVerifier: HostnameVerifier?,
     private val addressResolver: RelayV2AddressResolver,
@@ -94,7 +106,8 @@ private class BoundedRelayV2Transport(
     private val resolveTimeoutMs: Int,
     private val connectTimeoutMs: Int,
     private val handshakeTimeoutMs: Int,
-) : RelayV2Transport {
+    private val inboundSilenceTimeoutMs: Int,
+) : MobileSessionTransport {
     private val callbackLock = Any()
     private val terminal = AtomicBoolean(false)
     private val protocolFailureInProgress = AtomicBoolean(false)
@@ -212,7 +225,10 @@ private class BoundedRelayV2Transport(
                 random = random,
             )
             if (terminal.get()) return
-            tls.soTimeout = 0
+            // A server-side heartbeat cannot always deliver its close through a suspended or
+            // migrated phone network. Bound inbound silence locally so the Session reconnect
+            // owner sees a failed path instead of retaining a zombie socket indefinitely.
+            tls.soTimeout = inboundSilenceTimeoutMs
             val frameWriter = BoundedRfc6455Writer(
                 output = tls.outputStream,
                 random = random,
@@ -311,6 +327,10 @@ private class BoundedRelayV2Transport(
             val candidate = rawSocketFactory()
             if (!registerSocket(candidate)) return null
             try {
+                // Ask the kernel to probe a quiet socket as a second line of defense around
+                // display-off network policy. Broker WebSocket pings remain the primary liveness
+                // signal; SO_KEEPALIVE helps surface a dead radio path instead of leaving it stale.
+                candidate.keepAlive = true
                 candidate.connect(
                     InetSocketAddress(address, endpoint.port),
                     candidateTimeoutMs,

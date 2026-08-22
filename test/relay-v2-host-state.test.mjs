@@ -166,6 +166,42 @@ async function commitTerminalOpen(
   return { winner, committed, generation: winner.issuedGeneration };
 }
 
+async function commitTerminalResume(authority, claim, generation, resumeTokenHash) {
+  const winner = await authority.claimOpen(claim);
+  assert.equal(winner.status, "claimed");
+  assert.equal(winner.issuedGeneration, null);
+  assert.equal(winner.streamAuthority.status, "live");
+  assert.equal(winner.streamAuthority.generation, generation);
+  const prepared = await authority.prepareOpen({
+    key: claim.key,
+    fingerprint: claim.fingerprint,
+    hostInstanceId: claim.hostInstanceId,
+    claimToken: winner.claimToken,
+    fence: winner.fence,
+    preparation: {
+      kind: "retained",
+      binding: winner.streamAuthority.canonicalBinding,
+    },
+  });
+  assert.equal(prepared.status, "prepared");
+  const outcome = {
+    kind: "opened",
+    generation,
+    resumeTokenHash,
+    disposition: "resumed",
+    replayFromOffset: claim.requestedOffset,
+  };
+  assert.deepEqual(await authority.completeOpen({
+    key: claim.key,
+    fingerprint: claim.fingerprint,
+    hostInstanceId: claim.hostInstanceId,
+    claimToken: winner.claimToken,
+    fence: winner.fence,
+    outcome,
+  }), { status: "committed", outcome });
+  return outcome;
+}
+
 function harness() {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-state-"));
   const paths = hostState.relayV2HostStatePaths(home);
@@ -489,37 +525,62 @@ test("commit faults expose either the previous cut or the complete associated cu
   });
 });
 
-test("terminal durable lineage admits exact reset resume identity with a refreshed proof", async () => {
+test("terminal durable lineage admits exact reset identity after controller epoch refresh", async () => {
   const h = harness();
   try {
-    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
-    const authority = terminalAuthority(store);
-    const original = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
-    const opened = await commitTerminalOpen(authority, original);
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore);
+    const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+    const beforeRestart = terminalState(await firstStore.read());
+    assert.equal(beforeRestart.streamAuthorities.length, 1);
+    assert.equal(beforeRestart.streamAuthorities[0].generation, opened.generation);
+
+    // A Host/controller process replacement first retires the executable H0
+    // row into lostAuthorities. The RESET claim must capture that exact old
+    // generation/token/binding rather than treating it as absent.
+    const restartedStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    assert.notEqual(restartedStore.hostInstanceId, firstStore.hostInstanceId);
+    const restartedAuthority = terminalAuthority(restartedStore);
     const reset = terminalOpenClaim({
       key: "terminal-open:exact-reset-without-offset",
       fingerprint: "2".repeat(64),
-      hostInstanceId: store.hostInstanceId,
+      hostInstanceId: restartedStore.hostInstanceId,
       mode: "reset",
       previousGeneration: opened.generation,
       resumeTokenHash: TOKEN_HASH_ONE,
       requestedOffset: null,
     });
 
-    const winner = await authority.claimOpen(reset);
+    const winner = await restartedAuthority.claimOpen(reset);
     assert.equal(winner.status, "claimed");
-    assert.equal(winner.streamAuthority.status, "live");
-    assert.equal(winner.streamAuthority.generation, opened.generation);
+    // The public manager authority intentionally redacts a retired process as
+    // absent; the H0 claim record still retains the exact lost tuple used by
+    // prepare/commit below.
+    assert.deepEqual(winner.streamAuthority, { status: "absent" });
+    const claimed = terminalState(await restartedStore.read());
+    assert.deepEqual(claimed.streamAuthorities, []);
+    assert.equal(claimed.lostAuthorities.length, 1);
+    assert.equal(claimed.lostAuthorities[0].generation, opened.generation);
+    const capturedLost = claimed.openRecords.at(-1).streamAuthority;
+    assert.equal(capturedLost.status, "lost");
+    assert.equal(capturedLost.generation, opened.generation);
+    assert.equal(
+      capturedLost.canonicalBinding.exactControlIdentity.controlTargetId,
+      canonicalBinding().exactControlIdentity.controlTargetId,
+    );
+
     const replacementBinding = canonicalBinding(TERMINAL_TARGET, 0, {
       exactControlIdentity: {
         ...canonicalBinding().exactControlIdentity,
+        controlEpoch: "host-state-refreshed-control-epoch",
         targetIncarnationProof: "host-state-refreshed-target-incarnation-proof",
       },
     });
-    assert.equal((await authority.prepareOpen({
+    assert.equal((await restartedAuthority.prepareOpen({
       key: reset.key,
       fingerprint: reset.fingerprint,
-      hostInstanceId: store.hostInstanceId,
+      hostInstanceId: restartedStore.hostInstanceId,
       claimToken: winner.claimToken,
       fence: winner.fence,
       preparation: {
@@ -534,16 +595,22 @@ test("terminal durable lineage admits exact reset resume identity with a refresh
       disposition: "reset",
       replayFromOffset: "0",
     };
-    assert.deepEqual(await authority.completeOpen({
+    assert.deepEqual(await restartedAuthority.completeOpen({
       key: reset.key,
       fingerprint: reset.fingerprint,
-      hostInstanceId: store.hostInstanceId,
+      hostInstanceId: restartedStore.hostInstanceId,
       claimToken: winner.claimToken,
       fence: winner.fence,
       outcome,
     }), { status: "committed", outcome });
 
-    const record = terminalState(await store.read()).openRecords.find(
+    const completed = terminalState(await restartedStore.read());
+    assert.deepEqual(completed.lostAuthorities, []);
+    assert.equal(completed.streamAuthorities.length, 1);
+    assert.equal(completed.streamAuthorities[0].generation, winner.issuedGeneration);
+    assert.notEqual(completed.streamAuthorities[0].generation, opened.generation);
+    assert.deepEqual(completed.streamAuthorities[0].canonicalBinding, replacementBinding);
+    const record = completed.openRecords.find(
       ({ key }) => key === reset.key,
     );
     assert.equal(record.resumeTokenHash, TOKEN_HASH_ONE);
@@ -1402,6 +1469,99 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
   }
 });
 
+test("stale reset admits an absent successor only after every predecessor authority expires", async () => {
+  const h = harness();
+  try {
+    let now = 1_000_000;
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore, { now: () => now });
+    const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore, { now: () => now });
+    const wrongRetainedTuple = terminalOpenClaim({
+      key: "terminal-open:wrong-retained-reset-before-expiry",
+      fingerprint: "d".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: null,
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    assert.deepEqual(await secondAuthority.claimOpen(wrongRetainedTuple), {
+      status: "conflict",
+      reason: "stream_conflict",
+    });
+    let state = terminalState(await secondStore.read());
+    assert.deepEqual(state.streamAuthorities, []);
+    assert.equal(state.lostAuthorities.length, 1);
+    assert.equal(state.lostAuthorities[0].generation, opened.generation);
+    assert.equal(state.generationHighWater, "1");
+
+    now = 1_600_001;
+    assert.deepEqual(await secondAuthority.releaseStreamReservation({
+      streamKey: original.streamKey,
+      generation: opened.generation,
+      hostInstanceId: secondStore.hostInstanceId,
+    }), { status: "already_released" });
+    state = terminalState(await secondStore.read());
+    assert.deepEqual(state.openRecords, []);
+    assert.deepEqual(state.streamAuthorities, []);
+    assert.deepEqual(state.lostAuthorities, []);
+    assert.deepEqual(state.closeRecords, []);
+    assert.equal(state.generationHighWater, "1");
+
+    const staleReset = terminalOpenClaim({
+      key: "terminal-open:stale-reset-after-retention-gap",
+      fingerprint: "e".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: null,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      expiresAtMs: 2_200_001,
+    });
+    const successor = await secondAuthority.claimOpen(staleReset);
+    assert.equal(successor.status, "claimed");
+    assert.deepEqual(successor.streamAuthority, { status: "absent" });
+    assert.notEqual(successor.issuedGeneration, opened.generation);
+    assert.equal(successor.issuedGeneration, `terminal-gen-${(await secondStore.read()).hostEpoch}-2`);
+
+    assert.equal((await secondAuthority.prepareOpen({
+      key: staleReset.key,
+      fingerprint: staleReset.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: successor.claimToken,
+      fence: successor.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    })).status, "prepared");
+    const outcome = {
+      kind: "opened",
+      generation: successor.issuedGeneration,
+      resumeTokenHash: TOKEN_HASH_TWO,
+      disposition: "reset",
+      replayFromOffset: "0",
+    };
+    assert.deepEqual(await secondAuthority.completeOpen({
+      key: staleReset.key,
+      fingerprint: staleReset.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: successor.claimToken,
+      fence: successor.fence,
+      outcome,
+    }), { status: "committed", outcome });
+    state = terminalState(await secondStore.read());
+    assert.equal(state.generationHighWater, "2");
+    assert.equal(state.streamAuthorities.length, 1);
+    assert.equal(state.streamAuthorities[0].generation, successor.issuedGeneration);
+    assert.deepEqual(state.lostAuthorities, []);
+    assert.deepEqual(state.closeRecords, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("HostState terminal lineage admits one stream mutation, enforces quotas, and retires only exact reset binding", async (t) => {
   await t.test("pending stream owner and hard quotas are atomic", async () => {
     const h = harness();
@@ -1685,6 +1845,229 @@ test("terminal authority freezes ten-minute retention after entering the HostSta
     state = terminalState(await store.read());
     assert.equal(state.closeRecords[0].value.expiresAtMs, 1_700_000);
     assert.equal(state.streamAuthorities[0].closedExpiresAtMs, 1_700_000);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("current live generation pins only its exact generation-creating opened anchor", async () => {
+  const h = harness();
+  try {
+    let now = 1_000_000;
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store, { now: () => now });
+    const original = terminalOpenClaim({
+      key: "terminal-open:live-anchor-original",
+      streamKey: "terminal-stream:live-anchor",
+      fingerprint: "3".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      expiresAtMs: 1_600_000,
+    });
+    const first = await commitTerminalOpen(authority, original);
+    const replacement = terminalOpenClaim({
+      key: "terminal-open:live-anchor-reset",
+      streamKey: original.streamKey,
+      fingerprint: "4".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      mode: "reset",
+      previousGeneration: first.generation,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      requestedOffset: null,
+      expiresAtMs: 1_600_000,
+    });
+    const current = await commitTerminalOpen(authority, replacement, {
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    assert.notEqual(current.generation, first.generation);
+
+    for (let index = 1; index <= 2; index += 1) {
+      await commitTerminalResume(authority, terminalOpenClaim({
+        key: `terminal-open:live-anchor-resume-${index}`,
+        streamKey: original.streamKey,
+        fingerprint: String(4 + index).repeat(64),
+        hostInstanceId: store.hostInstanceId,
+        mode: "resume",
+        previousGeneration: current.generation,
+        resumeTokenHash: TOKEN_HASH_TWO,
+        requestedOffset: "0",
+        expiresAtMs: 1_600_000,
+      }), current.generation, TOKEN_HASH_TWO);
+    }
+    assert.equal(terminalState(await store.read()).openRecords.length, 4);
+
+    now = 1_600_001;
+    const exactReplay = await authority.claimOpen({
+      ...replacement,
+      expiresAtMs: 2_200_001,
+    });
+    assert.equal(exactReplay.status, "replay");
+    assert.equal(exactReplay.outcome.kind, "opened");
+    assert.equal(exactReplay.outcome.generation, current.generation);
+    assert.equal(exactReplay.outcome.resumeTokenHash, TOKEN_HASH_TWO);
+    assert.equal(exactReplay.outcome.disposition, "reset");
+    assert.deepEqual(exactReplay.preparedBinding, canonicalBinding());
+
+    let state = terminalState(await store.read());
+    assert.deepEqual(state.openRecords.map(({ key }) => key), [replacement.key]);
+    assert.equal(
+      state.openRecords[0].expiresAtMs,
+      1_600_000,
+      "pinning must not extend the original retention clock",
+    );
+    assert.equal(state.streamAuthorities[0].generation, current.generation);
+
+    const staleReset = terminalOpenClaim({
+      key: "terminal-open:live-anchor-stale-reset",
+      streamKey: original.streamKey,
+      fingerprint: "7".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      mode: "reset",
+      previousGeneration: first.generation,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      requestedOffset: null,
+      expiresAtMs: 2_200_001,
+    });
+    assert.deepEqual(await authority.claimOpen(staleReset), {
+      status: "conflict",
+      reason: "stream_conflict",
+    });
+    assert.deepEqual(
+      terminalState(await store.read()).openRecords.map(({ key }) => key),
+      [replacement.key],
+      "a stale tuple cannot displace or duplicate the exact anchor",
+    );
+
+    assert.deepEqual(await authority.markStreamClosed({
+      streamKey: original.streamKey,
+      generation: current.generation,
+      hostInstanceId: store.hostInstanceId,
+      expiresAtMs: 2_200_001,
+    }), { status: "closed" });
+    assert.deepEqual(await authority.releaseStreamReservation({
+      streamKey: original.streamKey,
+      generation: current.generation,
+      hostInstanceId: store.hostInstanceId,
+    }), { status: "released" });
+    state = terminalState(await store.read());
+    assert.deepEqual(state.openRecords, []);
+    assert.deepEqual(state.streamAuthorities, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("owner replacement retires an expired live anchor and the next cleanup cannot pin it", async () => {
+  const h = harness();
+  try {
+    let now = 1_000_000;
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore, { now: () => now });
+    const original = terminalOpenClaim({
+      key: "terminal-open:owner-replacement-anchor",
+      streamKey: "terminal-stream:owner-replacement-anchor",
+      fingerprint: "9".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+      expiresAtMs: 1_600_000,
+    });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+
+    now = 1_600_001;
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore, { now: () => now });
+    const replay = await secondAuthority.claimOpen({
+      ...original,
+      hostInstanceId: secondStore.hostInstanceId,
+      expiresAtMs: 2_200_001,
+    });
+    assert.equal(replay.status, "replay");
+    assert.equal(replay.outcome.kind, "opened");
+    assert.equal(replay.outcome.generation, opened.generation);
+
+    let state = terminalState(await secondStore.read());
+    assert.deepEqual(state.streamAuthorities, []);
+    assert.equal(state.lostAuthorities.length, 1);
+    assert.equal(state.openRecords.length, 1);
+    assert.equal(state.openRecords[0].expiresAtMs, 1_600_000);
+
+    assert.deepEqual(await secondAuthority.releaseStreamReservation({
+      streamKey: original.streamKey,
+      generation: opened.generation,
+      hostInstanceId: secondStore.hostInstanceId,
+    }), { status: "already_released" });
+    state = terminalState(await secondStore.read());
+    assert.deepEqual(state.openRecords, []);
+    assert.deepEqual(state.streamAuthorities, []);
+    assert.equal(state.lostAuthorities.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("live opened anchors remain bounded by the frozen stream and control quotas", async () => {
+  const h = harness();
+  try {
+    let now = 1_000_000;
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store, {
+      now: () => now,
+      testLimits: { maxStreams: 3, maxControlRecords: 6 },
+    });
+    const live = [];
+    for (let index = 1; index <= 3; index += 1) {
+      const claim = terminalOpenClaim({
+        key: `terminal-open:anchor-capacity-${index}`,
+        streamKey: `terminal-stream:anchor-capacity-${index}`,
+        fingerprint: String(index).repeat(64),
+        hostInstanceId: store.hostInstanceId,
+        expiresAtMs: 1_600_000,
+      });
+      live.push({ claim, opened: await commitTerminalOpen(authority, claim) });
+    }
+    now = 1_600_001;
+    const blocked = terminalOpenClaim({
+      key: "terminal-open:anchor-capacity-blocked",
+      streamKey: "terminal-stream:anchor-capacity-blocked",
+      fingerprint: "8".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      expiresAtMs: 2_200_001,
+    });
+    assert.deepEqual(await authority.claimOpen(blocked), {
+      status: "busy",
+      reason: "control_record_quota",
+    });
+    let state = terminalState(await store.read());
+    assert.equal(state.openRecords.length, 3);
+    assert.equal(state.streamAuthorities.length, 3);
+    assert.equal(
+      state.openRecords.filter((record) => record.outcome?.kind === "opened").length,
+      3,
+      "each live stream owns exactly one expired generation anchor",
+    );
+
+    const replay = await authority.claimOpen({
+      ...live[0].claim,
+      expiresAtMs: 2_200_001,
+    });
+    assert.equal(replay.status, "replay");
+    assert.equal(replay.outcome.generation, live[0].opened.generation);
+
+    assert.deepEqual(await authority.markStreamClosed({
+      streamKey: live[0].claim.streamKey,
+      generation: live[0].opened.generation,
+      hostInstanceId: store.hostInstanceId,
+      expiresAtMs: 2_200_001,
+    }), { status: "closed" });
+    assert.deepEqual(await authority.releaseStreamReservation({
+      streamKey: live[0].claim.streamKey,
+      generation: live[0].opened.generation,
+      hostInstanceId: store.hostInstanceId,
+    }), { status: "released" });
+    const admitted = await authority.claimOpen(blocked);
+    assert.equal(admitted.status, "claimed");
+    state = terminalState(await store.read());
+    assert.equal(state.openRecords.length, 3);
+    assert.equal(state.streamAuthorities.length, 2);
+    assert.equal(state.openRecords.filter(({ status }) => status === "pending").length, 1);
   } finally {
     h.cleanup();
   }

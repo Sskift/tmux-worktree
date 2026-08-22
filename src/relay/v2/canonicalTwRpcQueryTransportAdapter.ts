@@ -25,6 +25,7 @@ import {
 import {
   RELAY_V2_REMOTE_EXACT_COMPOUND_ENTRYPOINT,
   RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES,
+  RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS,
   type RelayV2ExactCompoundProcessTargetV1,
   type RelayV2RemoteExactCompoundChannelFactoryV1,
   type RelayV2RemoteExactCompoundChannelV1,
@@ -722,6 +723,38 @@ function compoundInvocationFor(
   });
 }
 
+function remoteCompoundDeadline(): number {
+  return Date.now() + RELAY_V2_REMOTE_EXACT_COMPOUND_REQUEST_TIMEOUT_MS;
+}
+
+async function withinRemoteCompoundDeadline<T>(
+  deadline: number,
+  onTimeout: (error: RelayV2CanonicalTwRpcQueryTransportError) => void,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const error = new RelayV2CanonicalTwRpcQueryTransportError("TIMED_OUT");
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    onTimeout(error);
+    throw error;
+  }
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(error);
+      onTimeout(error);
+    }, remainingMs);
+    timer.unref?.();
+  });
+  try {
+    // The timer is armed before invoking stdin.write, so SSH connection
+    // establishment, backpressured writes, and the response share one cap.
+    return await Promise.race([timedOut, Promise.resolve().then(operation)]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 class CanonicalRemoteExactCompoundChannel
 implements RelayV2RemoteExactCompoundChannelV1 {
   private readonly iterator: AsyncIterator<Uint8Array>;
@@ -813,7 +846,10 @@ implements RelayV2RemoteExactCompoundChannelV1 {
     }
   }
 
-  private async requestOne(frame: Readonly<Record<string, unknown>>): Promise<unknown> {
+  private async requestOne(
+    frame: Readonly<Record<string, unknown>>,
+    deadline: number,
+  ): Promise<unknown> {
     if (this.closeBarrier !== null || this.fatalError !== null) {
       throw this.fatalError ?? new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
     }
@@ -821,23 +857,25 @@ implements RelayV2RemoteExactCompoundChannelV1 {
     if (encoded.byteLength > RELAY_V2_REMOTE_EXACT_COMPOUND_MAX_FRAME_BYTES) {
       throw new RelayV2CanonicalTwRpcQueryTransportError("INVALID_REQUEST");
     }
-    await this.handle.stdin.write(encoded);
-    const timeout = new Promise<never>((_, reject) => {
-      const timer = setTimeout(() => {
-        this.kill();
-        reject(new RelayV2CanonicalTwRpcQueryTransportError("TIMED_OUT"));
-      }, 30_000);
-      timer.unref?.();
-      this.operation.finally(() => clearTimeout(timer)).catch(() => undefined);
-    });
     const fatal = this.fatalSignal.then(() => {
       throw this.fatalError ?? new RelayV2CanonicalTwRpcQueryTransportError("PROCESS_FAILED");
     });
-    return Promise.race([this.nextFrame(), fatal, timeout]);
+    return withinRemoteCompoundDeadline(
+      deadline,
+      (error) => this.fail(error),
+      () => Promise.race([
+        (async () => {
+          await this.handle.stdin.write(encoded);
+          return this.nextFrame();
+        })(),
+        fatal,
+      ]),
+    );
   }
 
   request(frame: Readonly<Record<string, unknown>>): Promise<unknown> {
-    const result = this.operation.then(() => this.requestOne(frame));
+    const deadline = remoteCompoundDeadline();
+    const result = this.operation.then(() => this.requestOne(frame, deadline));
     this.operation = result.then(() => undefined, () => undefined);
     return result;
   }
