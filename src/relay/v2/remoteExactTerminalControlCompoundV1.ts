@@ -337,10 +337,34 @@ function responseResult(value: unknown): unknown {
   return value.result;
 }
 
+function authorityProtocolError(error: unknown): TerminalControlProtocolError {
+  if (error instanceof TerminalControlProtocolError) return error;
+  if (!(error instanceof Error)
+    || error.name !== "TerminalControlProtocolError"
+    || !isRecord(error)
+    || typeof error.code !== "string"
+    || !(TERMINAL_CONTROL_ERROR_CODES as readonly string[]).includes(error.code)
+    || typeof error.retryable !== "boolean") {
+    return new TerminalControlProtocolError("INTERNAL", "remote exact compound authority failed");
+  }
+  let message: string;
+  try {
+    message = bounded(error.message, 512);
+  } catch {
+    return new TerminalControlProtocolError("INTERNAL", "remote exact compound authority failed");
+  }
+  return new TerminalControlProtocolError(
+    error.code as ConstructorParameters<typeof TerminalControlProtocolError>[0],
+    message,
+    error.retryable,
+  );
+}
+
 function errorPayload(error: unknown): Record<string, unknown> {
-  const normalized = error instanceof TerminalControlProtocolError
-    ? error
-    : new TerminalControlProtocolError("INTERNAL", "remote exact compound authority failed");
+  // These modules are also shipped as independent ESM entries, where a
+  // protocol error can have the right strict shape but a different bundled
+  // constructor identity.
+  const normalized = authorityProtocolError(error);
   return {
     protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
     ok: false,
@@ -428,6 +452,15 @@ function effectRequest(value: unknown, activeLease: TerminalControlLease): Termi
     throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound lease changed");
   }
   return request;
+}
+
+function retryableReadOnlyEffect(frame: Record<string, unknown>, error: unknown): boolean {
+  const failure = authorityProtocolError(error);
+  if (failure.retryable !== true
+    || frame.type !== "effect"
+    || !isRecord(frame.request)) return false;
+  return frame.request.type === "activity.agent-status"
+    || frame.request.type === "activity.agent-result";
 }
 
 /**
@@ -630,6 +663,12 @@ export async function runRelayV2RemoteExactCompoundServerV1(
         throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound operation is not allowed");
       } catch (error) {
         await writeJson(options.write, errorPayload(error));
+        // Agent transcript/status reads can race an Agent's final filesystem
+        // flush and intentionally return a retryable RESOURCE_EXHAUSTED. They
+        // are read-only and leave the exact lease valid, so keep this compound
+        // channel alive for the caller's next poll. Mutating and non-retryable
+        // failures still retire the channel fail-closed.
+        if (retryableReadOnlyEffect(frame, error)) continue;
         break;
       }
     }
@@ -1701,6 +1740,11 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
       }
       return result as T;
     } catch (error) {
+      if ((input.type === "activity.agent-status" || input.type === "activity.agent-result")
+        && error instanceof TerminalControlProtocolError
+        && error.retryable === true) {
+        throw error;
+      }
       this.records.delete(token);
       record.state = "closed";
       await record.channel.close().catch(() => undefined);

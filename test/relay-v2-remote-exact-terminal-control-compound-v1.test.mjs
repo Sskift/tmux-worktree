@@ -442,7 +442,15 @@ test("compound framing is allocation-bounded and injected handles are closed bef
 test("remote exact compound keeps prepare, admission, effect, and release in one canonical SSH child", async () => {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-v2-remote-exact-"));
   const statePath = join(root, "terminal-control-state-v1.json");
-  const calls = { ownerOpen: 0, inspect: 0, resolve: 0, acquire: 0, send: 0, reset: 0 };
+  const calls = {
+    ownerOpen: 0,
+    inspect: 0,
+    resolve: 0,
+    acquire: 0,
+    send: 0,
+    agentResult: 0,
+    reset: 0,
+  };
   const protocolFrames = [];
   const invocations = [];
   terminalControl.saveTerminalControlState({
@@ -492,7 +500,10 @@ test("remote exact compound keeps prepare, admission, effect, and release in one
     },
     async assertCurrent() {},
     async prepareOutput() {
-      return { generation: "output-generation-one", cursor: 0 };
+      return {
+        generation: calls.reset === 0 ? "output-generation-one" : "output-generation-two",
+        cursor: 0,
+      };
     },
     async resetOutput() {
       calls.reset += 1;
@@ -503,6 +514,22 @@ test("remote exact compound keeps prepare, admission, effect, and release in one
       assert.deepEqual({ name, pane, message, submit }, {
         name: "managed-one", pane: "0", message: "continue", submit: true,
       });
+    },
+    async agentResult(_expected, _tmuxInstanceId, _outputGeneration, _pane, source) {
+      calls.agentResult += 1;
+      if (calls.agentResult === 1) {
+        throw new terminalControl.TerminalControlProtocolError(
+          "RESOURCE_EXHAUSTED",
+          "Agent result transcript has an incomplete trailing record",
+          true,
+        );
+      }
+      return {
+        source,
+        completedAt: "2026-07-22T00:00:01.000Z",
+        text: "done",
+        truncated: false,
+      };
     },
   };
   const compoundRunner = {
@@ -655,6 +682,42 @@ test("remote exact compound keeps prepare, admission, effect, and release in one
     assert.equal(protocolFrames.some((frame) => frame.type === "admit" && "input" in frame), false,
       "admission consumes the claim already held by the same child");
 
+    const readEvidence = await remote.resolveExactTarget(input);
+    remote.fenceExactTargetForAdmission(input, readEvidence);
+    const readLease = await remote.consumePreparedLeaseForBinding({
+      ...input,
+      exactControlIdentity: structuredClone(readEvidence.exactControlIdentity),
+    }, OWNER);
+    const ownership = await remote.request({
+      type: "ownership.status",
+      controlTargetId: readLease.controlTargetId,
+    });
+    const resultRequest = {
+      type: "activity.agent-result",
+      lease: readLease,
+      outputGeneration: ownership.outputGeneration,
+      pane: "0",
+      source: {
+        provider: "claude",
+        boundary: "after",
+        sourceId: "c".repeat(64),
+        sessionId: "claude-session-one",
+        turnId: "claude-turn-one",
+        startedAt: "2026-07-22T00:00:00.000Z",
+      },
+    };
+    await assert.rejects(
+      remote.request(resultRequest),
+      (error) => error?.code === "RESOURCE_EXHAUSTED" && error.retryable === true,
+    );
+    assert.equal(
+      (await remote.request(resultRequest)).text,
+      "done",
+      "a retryable read keeps the same exact channel and lease usable",
+    );
+    assert.equal(calls.agentResult, 2);
+    await remote.request({ type: "lease.release", lease: readLease });
+
     await assert.rejects(
       remote.resolveExactTarget({
         ...input,
@@ -662,7 +725,7 @@ test("remote exact compound keeps prepare, admission, effect, and release in one
       }),
       assertTransportCode("TARGET_UNAVAILABLE"),
     );
-    assert.equal(invocations.length, 1, "remote unavailable never falls back to local");
+    assert.equal(invocations.length, 2, "remote unavailable never falls back to local");
   } finally {
     await remote.close().catch(() => undefined);
     rmSync(root, { recursive: true, force: true });

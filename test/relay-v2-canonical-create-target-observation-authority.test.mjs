@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -164,7 +173,10 @@ function fixtureDeps(overrides = {}) {
       worktreeBase: "/worktrees",
       hosts: [],
     }),
-    existsSync: (path) => path === "/repo/demo" || path === "/repo" || path === "/repo/demo-alias",
+    existsSync: (path) => path === "/"
+      || path === "/repo/demo"
+      || path === "/repo"
+      || path === "/repo/demo-alias",
     statSync: () => ({ isDirectory: () => true }),
     realpathSync: (path) => path,
     gitQuery: fixtureGitQuery,
@@ -923,8 +935,9 @@ test("target-side builder observes a closed-set execution with a stable revision
     assert.equal(execution.effectiveBaseBranch, "main");
     assert.equal(execution.rawSessionName, "demo-fix");
     assert.equal(execution.publicDisplayName, "fix");
-    assert.equal(execution.worktreeBase, base);
-    assert.equal(execution.worktreePath, join(base, "demo", execution.worktreeBranch));
+    const canonicalBase = join(realpathSync(root), "worktrees");
+    assert.equal(execution.worktreeBase, canonicalBase);
+    assert.equal(execution.worktreePath, join(canonicalBase, "demo", execution.worktreeBranch));
     const resolved = parseRpcV2CreateResolvedWorktreeRequest({
       arguments: first.observation.arguments,
       execution,
@@ -953,6 +966,42 @@ test("target-side builder observes a closed-set execution with a stable revision
       canonicalCwd: canonicalRepo,
       publicDisplayName: "demo",
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("target-side builder freezes a canonical worktree base behind a symlinked home", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-obs-v1-symlink-"));
+  try {
+    const actualHome = join(root, "actual-home");
+    const aliasHome = join(root, "alias-home");
+    const repo = join(actualHome, "demo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    symlinkSync(actualHome, aliasHome, "dir");
+    const configuredBase = join(aliasHome, "worktrees");
+    const canonicalBase = join(realpathSync(actualHome), "worktrees");
+    const result = buildCreateTargetObservationV1({
+      schemaVersion: 1,
+      operation: "create_worktree",
+      arguments: { project: "demo", name: "fix", aiCommand: "codex" },
+    }, {
+      loadConfig: () => ({
+        projects: { demo: { name: "demo", path: repo, branch: "main" } },
+        worktreeBase: configuredBase,
+        hosts: [],
+      }),
+      existsSync,
+      statSync,
+      realpathSync,
+      gitQuery: fixtureGitQuery,
+    });
+
+    assert.equal(result.observation.execution.worktreeBase, canonicalBase);
+    assert.equal(
+      result.observation.execution.worktreePath,
+      join(canonicalBase, "demo", result.observation.execution.worktreeBranch),
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

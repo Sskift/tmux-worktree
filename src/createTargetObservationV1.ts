@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { basename, isAbsolute, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, normalize, relative, resolve } from "node:path";
 import {
   canonicalWorktreePlacementSegment,
   parseCanonicalWorktreePlacement,
@@ -496,6 +496,37 @@ function canonicalDirectory(
   return normalizedAbsolutePath(deps.realpathSync(candidate), label);
 }
 
+/**
+ * Canonicalizes a path that may not exist yet by realpathing its nearest
+ * existing ancestor and then restoring the missing suffix. This keeps the
+ * resolver's frozen worktree placement usable on hosts whose home directory
+ * is exposed through a symlink (for example /home/user -> /data/home/user),
+ * while the mutation-side symlink fence can continue to reject aliases.
+ */
+function canonicalProspectivePath(
+  candidate: string,
+  deps: Required<CreateTargetObservationV1Deps>,
+  label: string,
+): string {
+  const normalized = normalizedAbsolutePath(candidate, label);
+  let ancestor = normalized;
+  while (!deps.existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) {
+      throw new Error(`create-target-observation ${label} has no existing ancestor`);
+    }
+    ancestor = parent;
+  }
+  if (!deps.statSync(ancestor).isDirectory()) {
+    throw new Error(`create-target-observation ${label} ancestor is not a directory`);
+  }
+  const canonicalAncestor = normalizedAbsolutePath(deps.realpathSync(ancestor), label);
+  return normalizedAbsolutePath(
+    resolve(canonicalAncestor, relative(ancestor, normalized)),
+    label,
+  );
+}
+
 /** Mirrors session.ts detectTargetBranch for the default (no explicit branch) case. */
 function detectDefaultBaseBranch(
   repoDir: string,
@@ -603,7 +634,11 @@ function buildWorktreeObservation(
     args.name ? `${effectiveProject}-${args.name}` : effectiveProject
   ).slice(0, SESSION_NAME_MAX_LEN);
   const publicDisplayName = args.name ?? effectiveProject;
-  const worktreeBase = resolveWorktreeBase(config?.worktreeBase);
+  const worktreeBase = canonicalProspectivePath(
+    resolveWorktreeBase(config?.worktreeBase),
+    deps,
+    "worktreeBase",
+  );
   const worktreeBranch = deterministicWorktreeBranch(rawSessionName);
   const worktreePath = resolve(
     worktreeBase,
