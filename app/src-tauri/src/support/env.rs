@@ -25,7 +25,11 @@ pub(crate) fn inherit_shell_env() {
     };
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let output = std::process::Command::new(&shell)
-        .args(["-l", "-c", "env -0"])
+        // GUI launches do not receive variables exported from the user's interactive
+        // shell configuration, where provider credentials commonly live. Ask the login
+        // shell for its interactive environment once at app startup; stderr remains
+        // isolated by Command::output and only the NUL-delimited env payload is imported.
+        .args(["-l", "-i", "-c", "env -0"])
         .output();
     if let Ok(output) = output {
         if output.status.success() {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
@@ -989,10 +989,12 @@ function shellQuote(value: string): string {
 export function buildCodexResumeCommand(
   sessionId?: string,
   runtime?: TerminalControlAgentRuntimeSettings,
+  inheritedModel?: string,
 ): string {
   const args = ["codex", "-c", shellQuote("check_for_update_on_startup=false")];
-  if (runtime?.model !== null && runtime?.model !== undefined) {
-    args.push("-m", shellQuote(runtime.model));
+  const model = runtime === undefined ? inheritedModel : runtime.model ?? undefined;
+  if (model !== undefined) {
+    args.push("-m", shellQuote(model));
   }
   if (runtime?.reasoningEffort !== null && runtime?.reasoningEffort !== undefined) {
     const effort = JSON.stringify(runtime.reasoningEffort);
@@ -1005,6 +1007,73 @@ export function buildCodexResumeCommand(
   }
   if (sessionId !== undefined) args.push("resume", shellQuote(sessionId));
   return args.join(" ");
+}
+
+/** Preserve the model selected by a managed Codex launch across an automatic idle resume. */
+export function codexModelFromStartCommand(command: string): string | undefined {
+  const segment = /(?:^|;)\s*codex\b([^;\r\n]*)/iu.exec(command)?.[1];
+  if (segment === undefined) return undefined;
+  const match = /(?:^|\s)(?:-m|--model)(?:\s+|=)(?:'([^'\r\n]*)'|"([^"\r\n]*)"|([^\s;'"\r\n]+))/iu
+    .exec(segment);
+  const model = match?.[1] ?? match?.[2] ?? match?.[3];
+  return model !== undefined && model.length > 0 && model.length <= 128
+      && /^[A-Za-z0-9._:-]+$/u.test(model)
+    ? model
+    : undefined;
+}
+
+const CODEX_RESUME_ENVIRONMENT = [
+  "ASTERGATE_CODEX_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+] as const;
+
+export function applyCodexResumeEnvironmentSnapshot(
+  snapshot: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): void {
+  for (const entry of snapshot.split("\0")) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) continue;
+    const name = entry.slice(0, separator);
+    if (!CODEX_RESUME_ENVIRONMENT.includes(
+      name as (typeof CODEX_RESUME_ENVIRONMENT)[number],
+    )) continue;
+    const value = entry.slice(separator + 1);
+    if (!value || Buffer.byteLength(value, "utf8") > 32 * 1024) continue;
+    environment[name] = value;
+  }
+}
+
+/** Hydrate only Codex provider settings inside the otherwise sealed terminal authority. */
+export function inheritCodexResumeEnvironmentFromLoginShell(): void {
+  const configuredShell = process.env.SHELL?.trim();
+  const shell = configuredShell?.startsWith("/") && !configuredShell.includes("\0")
+    ? configuredShell
+    : "/bin/zsh";
+  try {
+    const snapshot = execFileSync(
+      shell,
+      ["-l", "-i", "-c", "printf '\\0'; env -0"],
+      { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 10_000 },
+    );
+    applyCodexResumeEnvironmentSnapshot(snapshot);
+  } catch {
+    // The authority remains usable for providers that do not require shell-exported settings.
+  }
+}
+
+/** Pass provider credentials to the replacement pane without embedding them in its command. */
+export function codexResumeEnvironmentArguments(
+  environment: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const args: string[] = [];
+  for (const name of CODEX_RESUME_ENVIRONMENT) {
+    const value = environment[name];
+    if (!value || value.includes("\0") || Buffer.byteLength(value, "utf8") > 32 * 1024) continue;
+    args.push("-e", `${name}=${value}`);
+  }
+  return args;
 }
 
 export function codexModeFromRenderedSnapshot(snapshot: string): "default" | "plan" | null {
@@ -2009,17 +2078,24 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         true,
       );
     }
-    const codexCommand = buildCodexResumeCommand(sessionId, runtime);
+    const inheritedCodexModel = runtime === undefined && provider === "codex"
+      ? codexModelFromStartCommand(observed.paneStartCommand)
+      : undefined;
+    const codexCommand = buildCodexResumeCommand(sessionId, runtime, inheritedCodexModel);
     const command = sessionId === undefined
       ? provider === "codex" ? codexCommand : provider
       : provider === "codex"
         ? codexCommand
         : `claude --resume ${shellQuote(sessionId)}`;
+    const resumeEnvironment = provider === "codex"
+      ? codexResumeEnvironmentArguments()
+      : [];
     await runTmux([
       "respawn-pane",
       "-k",
       "-t", observed.paneId,
       "-c", observed.paneCurrentPath,
+      ...resumeEnvironment,
       commandThenLoginShell(command, expected.name),
     ]);
 

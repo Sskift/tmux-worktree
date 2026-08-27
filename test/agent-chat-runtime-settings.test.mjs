@@ -144,6 +144,44 @@ test("terminal runtime settings parse and form a resumable Codex command", () =>
   );
 });
 
+test("automatic Codex resume preserves the managed launch model", () => {
+  assert.equal(
+    terminalControl.codexModelFromStartCommand(
+      "export PATH='/bin'; codex --model deepseek-v4-pro; exec /bin/zsh -l",
+    ),
+    "deepseek-v4-pro",
+  );
+  assert.match(
+    terminalControl.buildCodexResumeCommand(
+      "12345678-1234-1234-1234-123456789abc",
+      undefined,
+      "deepseek-v4-pro",
+    ),
+    /-m 'deepseek-v4-pro'/,
+  );
+  assert.equal(
+    terminalControl.codexModelFromStartCommand("codex --model '../../unsafe'"),
+    undefined,
+  );
+  assert.deepEqual(
+    terminalControl.codexResumeEnvironmentArguments({
+      ASTERGATE_CODEX_KEY: "astergate-test-key",
+      OPENAI_API_KEY: "openai-test-key",
+      CODEX_SESSION_ID: "must-not-cross",
+    }),
+    [
+      "-e", "ASTERGATE_CODEX_KEY=astergate-test-key",
+      "-e", "OPENAI_API_KEY=openai-test-key",
+    ],
+  );
+  const inherited = {};
+  terminalControl.applyCodexResumeEnvironmentSnapshot(
+    "startup noise\0ASTERGATE_CODEX_KEY=from-login-shell\0CODEX_SESSION_ID=blocked\0",
+    inherited,
+  );
+  assert.deepEqual(inherited, { ASTERGATE_CODEX_KEY: "from-login-shell" });
+});
+
 test("Codex mode detection uses only the anchored status tail", () => {
   assert.equal(
     terminalControl.codexModeFromRenderedSnapshot("user wrote Plan mode\n\n› prompt\n  gpt-5.6-sol high · /tmp/project"),

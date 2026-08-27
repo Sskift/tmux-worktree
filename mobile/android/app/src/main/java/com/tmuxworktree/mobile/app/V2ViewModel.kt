@@ -347,6 +347,9 @@ internal fun relayV2TerminalOpeningRouteIntent(sessionStableId: String): Termina
     TerminalStreamState(
         sessionId = sessionStableId,
         status = ConnectionStatus.CONNECTING,
+        // Renderer-pending uses generation zero. A distinct value makes StateFlow publish this
+        // exact CAS token instead of suppressing it as data-class-equal to the pending projection.
+        generation = 1,
     )
 
 internal fun relayV2TerminalOpeningIntentIsCurrent(
@@ -654,7 +657,8 @@ internal class RelayV2TerminalUiAttachmentFence(
 
 /**
  * Publishes the local route while its WebView renderer is still loading. An exact live attachment
- * that is already online wins the race; a cold route must not regress it to CONNECTING.
+ * that is already opening or online wins the race; a cold route must not replace its exact
+ * identity token with an equal-looking CONNECTING projection.
  */
 internal fun markRelayV2TerminalRendererPending(
     state: V2UiState,
@@ -664,7 +668,7 @@ internal fun markRelayV2TerminalRendererPending(
 ): V2UiState {
     if (activeFence?.sessionStableId == sessionStableId &&
         activeFence.retainsActiveRoute(attachmentId, state.terminal) &&
-        state.terminal.status == ConnectionStatus.ONLINE
+        state.terminal.status in setOf(ConnectionStatus.CONNECTING, ConnectionStatus.ONLINE)
     ) {
         return state
     }

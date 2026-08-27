@@ -442,6 +442,20 @@ class V2UiStateTest {
         assertNull(pending.terminal.streamId)
         assertNull(pending.actionError)
 
+        val opening = relayV2TerminalOpeningRouteIntent("session-a")
+        assertNotEquals(pending.terminal, opening)
+        assertEquals(1, opening.generation)
+
+        assertSame(
+            pending,
+            markRelayV2TerminalRendererPending(
+                state = pending,
+                sessionStableId = "session-a",
+                attachmentId = "route-a",
+                activeFence = exactFence,
+            ),
+        )
+
         val online = pending.copy(
             terminal = pending.terminal.copy(
                 streamId = "stream-a",
