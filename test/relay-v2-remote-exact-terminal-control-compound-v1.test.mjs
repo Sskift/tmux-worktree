@@ -765,6 +765,7 @@ test("remote exact child safely upgrades an idle legacy terminal-control daemon"
         executable: process.execPath,
         entrypoint: terminalControlCli,
         home: root,
+        idleExitMs: 30_000,
       },
     });
 
@@ -851,6 +852,7 @@ test("remote exact child never restarts a legacy daemon with active input owners
           executable: process.execPath,
           entrypoint: terminalControlCli,
           home: root,
+          idleExitMs: 30_000,
         },
       }),
       /terminal input is currently active/,
@@ -1113,7 +1115,7 @@ test("running daemon owns remote compound claims and drains them on target retir
 test("a fresh exact target is established before one child carries observation and the full lease lifecycle", async () => {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-v2-remote-observe-"));
   const statePath = join(root, "terminal-control-state-v1.json");
-  const calls = { ownerOpen: 0, establish: 0, inspect: 0, send: 0, reset: 0 };
+  const calls = { ownerOpen: 0, establish: 0, inspect: 0, send: 0, reset: 0, resize: [] };
   const protocolFrames = [];
   const invocations = [];
   let output = Buffer.alloc(0);
@@ -1166,6 +1168,9 @@ test("a fresh exact target is established before one child carries observation a
       calls.reset += 1;
       output = Buffer.alloc(0);
       return { generation: "output-generation-two", cursor: 0 };
+    },
+    async resize(name, pane, cols, rows) {
+      calls.resize.push({ name, pane, cols, rows });
     },
     async tailOutput(_target, _session, _pane, generation, cursor, maxBytes) {
       if (generation !== "output-generation-two" || cursor > output.byteLength) {
@@ -1288,7 +1293,10 @@ test("a fresh exact target is established before one child carries observation a
       }),
       (error) => error?.code === "PERMISSION_DENIED",
     );
-    const observation = await remote.observePreparedTargetForBinding(binding);
+    const observation = await remote.observePreparedTargetForBinding(
+      binding,
+      { cols: 47, rows: 62 },
+    );
     assert.equal(observation.controlTargetId, evidence.exactControlIdentity.controlTargetId);
     assert.equal(observation.controlEpoch, evidence.exactControlIdentity.controlEpoch);
     assert.equal(
@@ -1297,6 +1305,16 @@ test("a fresh exact target is established before one child carries observation a
     );
     assert.equal(observation.outputGeneration, "output-generation-two");
     assert.equal(observation.outputCursor, 0);
+    assert.deepEqual(calls.resize, [{
+      name: "managed-observe",
+      pane: "0",
+      cols: 47,
+      rows: 62,
+    }]);
+    assert.deepEqual(
+      protocolFrames.find((frame) => frame.type === "observe")?.displaySizeHint,
+      { cols: 47, rows: 62 },
+    );
     assert.equal(
       terminalControl.loadTerminalControlState(statePath).targets[0].ownership.state,
       "FREE",

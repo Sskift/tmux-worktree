@@ -769,6 +769,9 @@ class V2ViewModel(
         val fence: RelayV2TerminalUiAttachmentFence,
         val parser: RelayV2TerminalWebViewParserAdapter,
         val rendererBinding: TerminalWebViewParserBinding,
+        /** Latest renderer dimensions, used before every fresh Host snapshot. */
+        var viewportCols: Int,
+        var viewportRows: Int,
         /** Exact CONNECTING projection atomically published when this intent wins admission. */
         val openingUiTerminal: TerminalStreamState,
         /** Current route projection token; guarded by [relayV2UiFenceLock]. */
@@ -1924,6 +1927,8 @@ class V2ViewModel(
         session: RelaySession,
         attachmentId: String,
         rendererBinding: TerminalWebViewParserBinding,
+        initialCols: Int = DEFAULT_TERMINAL_COLS,
+        initialRows: Int = DEFAULT_TERMINAL_ROWS,
         intent: RelayV2TerminalUiOpenIntent = RelayV2TerminalUiOpenIntent(),
     ) {
         if (demoMode || _uiState.value.relayStartupAdmission != RelayStartupAdmissionState.RELAY_V2) {
@@ -1979,6 +1984,8 @@ class V2ViewModel(
                     fence = fence,
                     parser = parser,
                     rendererBinding = rendererBinding,
+                    viewportCols = initialCols.coerceIn(1, MAX_TERMINAL_COLS),
+                    viewportRows = initialRows.coerceIn(1, MAX_TERMINAL_ROWS),
                     openingUiTerminal = openingUiTerminal,
                     uiTerminalToken = openingUiTerminal,
                     detachedCallbackDisposition =
@@ -2312,6 +2319,8 @@ class V2ViewModel(
                                 session = session,
                                 attachmentId = attachmentId,
                                 rendererBinding = issued.rendererBinding,
+                                initialCols = issued.viewportCols,
+                                initialRows = issued.viewportRows,
                                 intent = RelayV2TerminalUiOpenIntent(
                                     openRetryAttempt =
                                         if (issued.openRetryAttempt == Int.MAX_VALUE) {
@@ -2623,8 +2632,8 @@ class V2ViewModel(
                 }
                 if (!composition.openTerminal(
                         attachment,
-                        DEFAULT_TERMINAL_COLS,
-                        DEFAULT_TERMINAL_ROWS,
+                        issued.viewportCols,
+                        issued.viewportRows,
                     )
                 ) {
                     issued.parser.fenceAttachment()
@@ -2918,6 +2927,8 @@ class V2ViewModel(
                 session = session,
                 attachmentId = attachmentId,
                 rendererBinding = recovery.issued.rendererBinding,
+                initialCols = recovery.issued.viewportCols,
+                initialRows = recovery.issued.viewportRows,
                 intent = RelayV2TerminalUiOpenIntent(
                     resetRecoveryBudget = recovery.nextBudget,
                     resetRecoveryClaim = recovery.claim,
@@ -3254,6 +3265,8 @@ class V2ViewModel(
         session: RelaySession,
         attachmentId: String,
         rendererBinding: TerminalWebViewParserBinding,
+        cols: Int = DEFAULT_TERMINAL_COLS,
+        rows: Int = DEFAULT_TERMINAL_ROWS,
     ) {
         if (demoMode) {
             openTerminal(session, attachmentId)
@@ -3263,6 +3276,8 @@ class V2ViewModel(
             session = session,
             attachmentId = attachmentId,
             rendererBinding = rendererBinding,
+            initialCols = cols,
+            initialRows = rows,
             // A user click is a fresh recovery decision: replace even an exact retained owner,
             // restart the open retry counter, and use the default empty reset-recovery budget.
             intent = RelayV2TerminalUiOpenIntent.explicitReconnect(),
@@ -3273,7 +3288,9 @@ class V2ViewModel(
         session: RelaySession,
         attachmentId: String,
         rendererBinding: TerminalWebViewParserBinding,
-    ) = reconnectTerminal(session, attachmentId, rendererBinding)
+        cols: Int = DEFAULT_TERMINAL_COLS,
+        rows: Int = DEFAULT_TERMINAL_ROWS,
+    ) = reconnectTerminal(session, attachmentId, rendererBinding, cols, rows)
 
     /** Caller owns [relayV2UiFenceLock]. */
     private fun admitRelayV2TerminalCloseLocked(
@@ -3426,6 +3443,9 @@ class V2ViewModel(
             val current = synchronized(relayV2UiFenceLock) {
                 relayV2Terminal?.takeIf {
                     it.fence.ownsRoute(attachmentId)
+                }?.also {
+                    it.viewportCols = cols.coerceIn(1, MAX_TERMINAL_COLS)
+                    it.viewportRows = rows.coerceIn(1, MAX_TERMINAL_ROWS)
                 }
             } ?: return
             val attachment = current.lifecycle.attached() ?: return
@@ -3595,8 +3615,13 @@ class V2ViewModel(
             appendLine("network=${if (state.networkAvailable) "available" else "unavailable"}")
             appendLine("hosts=${state.hosts.size}, scopes=${state.scopes.size}, sessions=${state.sessions.size}")
             appendLine("attempt=${state.health.attempt}")
+            appendLine("retryAtMs=${state.health.retryAtMillis ?: "none"}")
+            appendLine("lastSyncedAtMs=${state.health.lastSyncedAtMillis}")
             appendLine("errorCode=${state.health.errorCode.ifBlank { "none" }}")
             appendLine("protocol=${state.health.protocolLabel}")
+            state.health.layers.forEach { layer ->
+                appendLine("layer.${layer.id}=${layer.status}")
+            }
             if (state.health.protocolLabel == RELAY_V2_TRANSPORT_LABEL) {
                 appendLine("capabilityReadiness=not-advertised")
             }
@@ -4718,7 +4743,19 @@ class V2ViewModel(
             else -> ConnectionStatus.OFFLINE
         }
         val hostStatus = when {
-            isRelayV2Transport && host != null -> host.status
+            !state.networkAvailable -> ConnectionStatus.PAUSED
+            isRelayV2Transport && base.overall == ConnectionStatus.ONLINE && host != null ->
+                ConnectionStatus.ONLINE
+            isRelayV2Transport && host != null &&
+                (base.overall == ConnectionStatus.RECOVERING ||
+                    base.overall == ConnectionStatus.CONNECTING) -> if (
+                host.lastSeenAtMillis > 0 || base.lastSyncedAtMillis > 0
+            ) {
+                ConnectionStatus.RECOVERING
+            } else {
+                ConnectionStatus.CONNECTING
+            }
+            isRelayV2Transport && host != null -> base.overall
             base.overall != ConnectionStatus.ONLINE -> ConnectionStatus.PAUSED
             host != null -> ConnectionStatus.ONLINE
             else -> ConnectionStatus.RECOVERING
@@ -4748,6 +4785,8 @@ class V2ViewModel(
                         base.errorMessage.isNotBlank() -> base.errorMessage
                         isRelayV2Transport && base.overall == ConnectionStatus.ONLINE ->
                             "Relay v2 transport online"
+                        isRelayV2Transport && base.phase == TransportPhase.BACKING_OFF ->
+                            "Relay v2 transport reconnecting (attempt ${base.attempt})"
                         isRelayV2Transport -> "Relay v2 transport ${relayStatus.label()}"
                         else -> relayStatus.label()
                     },
@@ -4757,7 +4796,15 @@ class V2ViewModel(
                     id = "host",
                     label = host?.displayName ?: hostId.ifBlank { "Paired host" },
                     status = hostStatus,
-                    detail = if (host != null) "Host visible" else hostStatus.label(),
+                    detail = when (hostStatus) {
+                        ConnectionStatus.ONLINE -> "Host registered"
+                        ConnectionStatus.RECOVERING ->
+                            "Host disconnected; waiting for automatic reconnect"
+                        ConnectionStatus.CONNECTING -> "Waiting for Host registration"
+                        ConnectionStatus.PAUSED -> "Waiting for phone network"
+                        ConnectionStatus.OFFLINE -> "Host offline"
+                        else -> hostStatus.label()
+                    },
                     lastSuccessAtMillis = host?.lastSeenAtMillis ?: 0,
                 ),
                 HealthLayer(
@@ -4826,6 +4873,8 @@ class V2ViewModel(
         private const val MAX_ACTIVATION_FAILURE_CAUSE = 200
         private const val DEFAULT_TERMINAL_COLS = 80
         private const val DEFAULT_TERMINAL_ROWS = 24
+        private const val MAX_TERMINAL_COLS = 1_000
+        private const val MAX_TERMINAL_ROWS = 500
         private const val TERMINAL_OPEN_RETRY_BASE_DELAY_MS = 250L
         private const val TERMINAL_OPEN_RETRY_MAX_DELAY_MS = 2_000L
         private const val DEFAULT_SCOPE_ID = "local"

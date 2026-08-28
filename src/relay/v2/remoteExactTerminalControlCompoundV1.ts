@@ -294,6 +294,26 @@ function observationMaxBytes(value: unknown): number | undefined {
   return value as number;
 }
 
+function observationDisplaySizeHint(
+  value: unknown,
+): Readonly<{ cols: number; rows: number }> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)
+    || !exactKeys(value, ["cols", "rows"])
+    || !Number.isSafeInteger(value.cols)
+    || (value.cols as number) < 1
+    || (value.cols as number) > 1_000
+    || !Number.isSafeInteger(value.rows)
+    || (value.rows as number) < 1
+    || (value.rows as number) > 500) {
+    throw new TerminalControlProtocolError(
+      "INVALID_REQUEST",
+      "remote exact compound observation display size is invalid",
+    );
+  }
+  return Object.freeze({ cols: value.cols as number, rows: value.rows as number });
+}
+
 function protocolError(value: unknown): TerminalControlProtocolError {
   if (!isRecord(value)
     || !exactKeys(value, ["code", "message", "retryable"])
@@ -492,7 +512,9 @@ export async function runRelayV2RemoteExactCompoundServerV1(
       if (next.done) break;
       const frame = next.value;
       try {
-        if (!exactKeys(frame, ["protocolVersion", "type"], ["processTarget", "owner", "input", "request", "cursor", "maxBytes"])
+        if (!exactKeys(frame, ["protocolVersion", "type"], [
+          "processTarget", "owner", "input", "request", "cursor", "maxBytes", "displaySizeHint",
+        ])
           || frame.protocolVersion !== RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION
           || typeof frame.type !== "string") {
           throw new TerminalControlProtocolError("INVALID_REQUEST", "remote exact compound frame shape is invalid");
@@ -575,13 +597,14 @@ export async function runRelayV2RemoteExactCompoundServerV1(
             || preparedEvidence === null
             || activeLease !== null
             || observationOpen
-            || !exactKeys(frame, ["protocolVersion", "type"])) {
+            || !exactKeys(frame, ["protocolVersion", "type"], ["displaySizeHint"])) {
             throw new TerminalControlProtocolError("PERMISSION_DENIED", "remote exact compound observation is unavailable");
           }
           const binding = await (async () => {
             exact.fenceExactTargetForAdmission(preparedInput, preparedEvidence);
             return exact.consumePreparedObservationForBinding(
               terminalBinding(preparedInput, preparedEvidence.exactControlIdentity),
+              observationDisplaySizeHint(frame.displaySizeHint),
             );
           })();
           preparedInput = null;
@@ -990,12 +1013,14 @@ export async function openRelayV2RemoteExactCompoundDaemonIngressV1(options: {
   daemonSocketPath: string;
   authority: TerminalControlAuthority;
   primaryServerLock: TerminalControlStoreLock;
+  onActivity?: () => void;
 }): Promise<RelayV2RemoteExactCompoundDaemonIngressV1> {
   if (!isRecord(options)
     || typeof options.daemonSocketPath !== "string"
     || !isRecord(options.authority)
     || typeof options.authority.handle !== "function"
-    || typeof options.authority.captureRelayV2ExactProcessTarget !== "function") {
+    || typeof options.authority.captureRelayV2ExactProcessTarget !== "function"
+    || (options.onActivity !== undefined && typeof options.onActivity !== "function")) {
     throw new TypeError("invalid remote exact compound daemon ingress options");
   }
   const primaryLockPath = `${options.daemonSocketPath}.server.lock`;
@@ -1010,11 +1035,13 @@ export async function openRelayV2RemoteExactCompoundDaemonIngressV1(options: {
   let admissionClosed = false;
   let ownedSocketIdentity: Readonly<{ dev: number; ino: number; uid: number }> | null = null;
   const server = createServer((socket) => {
+    options.onActivity?.();
     if (admissionClosed || sockets.size >= MAX_ACTIVE_CHANNELS) {
       socket.destroy();
       return;
     }
     sockets.add(socket);
+    socket.on("data", () => options.onActivity?.());
     socket.on("error", () => undefined);
     const handler = runRelayV2RemoteExactCompoundServerV1({
       source: socket,
@@ -1534,7 +1561,9 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
    */
   async observePreparedTargetForBinding(
     binding: RelayV2TerminalCanonicalTargetBindingV1,
+    displaySizeHint?: Readonly<{ cols: number; rows: number }>,
   ): Promise<RelayV2ExactCompoundObservationBindingV1> {
+    const size = observationDisplaySizeHint(displaySizeHint);
     const matches = [...this.records.entries()].filter(([, record]) => (
       record.state === "admitted"
       && canonicalJson(terminalBinding(record.input, record.evidence.exactControlIdentity))
@@ -1551,6 +1580,7 @@ implements RelayV2PreparedExactTerminalControlLeasePortV1, RelayV2TerminalContro
       const observed = observationBinding(responseResult(await record.channel.request({
         protocolVersion: RELAY_V2_REMOTE_EXACT_COMPOUND_PROTOCOL_VERSION,
         type: "observe",
+        ...(size === undefined ? {} : { displaySizeHint: size }),
       })));
       if (observed.controlTargetId !== record.evidence.exactControlIdentity.controlTargetId
         || observed.controlEpoch !== record.evidence.exactControlIdentity.controlEpoch

@@ -3659,10 +3659,10 @@ class RelayV2BaseRuntimeCompositionTest {
             first.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
             assertTrue(retry.awaitCount(1))
             delay(50)
-            assertEquals(
-                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
-                harness.composition.state.value,
-            )
+            assertEquals(RelayV2BaseRuntimePhase.CONNECTING, harness.composition.state.value.phase)
+            assertEquals(NOW_MS + 1_000L, harness.composition.state.value.retryAtMillis)
+            assertEquals(1, harness.composition.state.value.retryAttempt)
+            assertTrue(requireNotNull(harness.composition.state.value.lastConnectionFailure).retryable)
             assertEquals(listOf(1_000L), retry.delays)
             assertEquals(1, harness.factory.requests.size)
 
@@ -3672,10 +3672,9 @@ class RelayV2BaseRuntimeCompositionTest {
             second.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
             assertTrue(retry.awaitCount(2))
             delay(50)
-            assertEquals(
-                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
-                harness.composition.state.value,
-            )
+            assertEquals(RelayV2BaseRuntimePhase.CONNECTING, harness.composition.state.value.phase)
+            assertEquals(NOW_MS + 2_000L, harness.composition.state.value.retryAtMillis)
+            assertEquals(2, harness.composition.state.value.retryAttempt)
             assertEquals(listOf(1_000L, 2_000L), retry.delays)
 
             retry.release(1)
@@ -4060,9 +4059,10 @@ class RelayV2BaseRuntimeCompositionTest {
                 assertEquals(1, harness.factory.requests.size)
                 assertTrue(harness.factory.transports.isEmpty())
                 assertEquals(
-                    RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
-                    harness.composition.state.value,
+                    RelayV2BaseRuntimePhase.CONNECTING,
+                    harness.composition.state.value.phase,
                 )
+                assertEquals(1, harness.composition.state.value.retryAttempt)
             } finally {
                 actorHandoff.release.countDown()
                 harness.close()
@@ -4124,10 +4124,8 @@ class RelayV2BaseRuntimeCompositionTest {
             assertTrue(retry.awaitCount(1))
             delay(50)
             assertEquals(1, harness.authority.stateEventCommits.get())
-            assertEquals(
-                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING),
-                harness.composition.state.value,
-            )
+            assertEquals(RelayV2BaseRuntimePhase.CONNECTING, harness.composition.state.value.phase)
+            assertEquals(1, harness.composition.state.value.retryAttempt)
         } finally {
             harness.authority.releaseStateEventApply.complete(Unit)
             harness.close()

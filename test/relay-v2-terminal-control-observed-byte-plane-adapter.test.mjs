@@ -200,8 +200,9 @@ function observingBackend(calls, {
     async sendAgentMessage() {
       throw new Error("the byte plane must not send agent-message effects");
     },
-    async resize() {
-      throw new Error("the byte plane must not resize");
+    async resize(name, pane, cols, rows) {
+      if (!Array.isArray(calls.resize)) calls.resize = [];
+      calls.resize.push({ name, pane, cols, rows });
     },
     async scroll() {
       throw new Error("the byte plane must not scroll");
@@ -381,7 +382,7 @@ test("observed byte plane tails the exact observation and lazily reclaims the le
     const events = [];
     const handle = await bytePlane.open(
       target,
-      { maxChunkBytes: 4, displaySizeHint: { cols: 80, rows: 24 } },
+      { maxChunkBytes: 4, displaySizeHint: { cols: 47, rows: 62 } },
       {
         async onBytes(data) { events.push({ kind: "bytes", data: Buffer.from(data) }); },
         async onClosed(result) { events.push({ kind: "closed", result: { ...result } }); },
@@ -398,6 +399,16 @@ test("observed byte plane tails the exact observation and lazily reclaims the le
       "the observation holds no input ownership",
     );
     assert.equal(invocations.length, 1);
+    assert.deepEqual(calls.resize, [{
+      name: "managed-lifecycle",
+      pane: "0",
+      cols: 47,
+      rows: 62,
+    }]);
+    assert.deepEqual(
+      protocolFrames.find((frame) => frame.type === "observe")?.displaySizeHint,
+      { cols: 47, rows: 62 },
+    );
 
     backend.append("abcdef");
     await waitFor(() => delivered() === "abcdef", "observation tail did not deliver");

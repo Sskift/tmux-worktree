@@ -78,6 +78,12 @@ pub fn run() {
                     .publish_self_hosted_management_binding(binding.clone())
                     .is_ok()
                 {
+                    start_relay_v2_self_hosted_connector_desired_state_watchdog(
+                        app.handle().clone(),
+                        Arc::downgrade(&deployment),
+                        Arc::downgrade(&management),
+                        binding.clone(),
+                    );
                     tauri::async_runtime::spawn_blocking(move || {
                         let _ = restore_relay_v2_self_hosted_connector_desired_state(
                             deployment.as_ref(),

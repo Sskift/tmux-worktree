@@ -58,6 +58,7 @@ extends RelayV2PreparedExactTerminalControlLeasePortV1 {
 export interface RelayV2TerminalControlExactObservationPortV1 {
   consumePreparedObservationForBinding(
     binding: RelayV2TerminalCanonicalTargetBindingV1,
+    displaySizeHint?: Readonly<{ cols: number; rows: number }>,
   ): Promise<TerminalControlRelayV2ExactObservationBinding>;
   tailObservation(
     cursor: number,
@@ -385,6 +386,7 @@ implements RelayV2PreparedExactTerminalControlTargetPortV1, RelayV2TerminalContr
 
   async consumePreparedObservationForBinding(
     binding: RelayV2TerminalCanonicalTargetBindingV1,
+    displaySizeHint?: Readonly<{ cols: number; rows: number }>,
   ): Promise<TerminalControlRelayV2ExactObservationBinding> {
     if (!isRecord(binding.exactControlIdentity)) {
       throw new TypeError("Relay v2 exact terminal target binding is malformed");
@@ -411,6 +413,7 @@ implements RelayV2PreparedExactTerminalControlTargetPortV1, RelayV2TerminalContr
       record.claim,
       ownerInput(parsed, this.owner),
       record.evidence.exactControlIdentity,
+      displaySizeHint,
     );
     if (record.timer) clearTimeout(record.timer);
     this.records.delete(record.evidence.exactControlToken);

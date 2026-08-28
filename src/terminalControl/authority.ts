@@ -135,6 +135,7 @@ export interface TerminalControlRelayV2ExactTargetAuthorityPort {
     claim: TerminalControlRelayV2ExactTargetClaim,
     input: TerminalControlRelayV2ExactTargetInput,
     identity: TerminalControlRelayV2ExactTargetIdentity,
+    displaySizeHint?: Readonly<{ cols: number; rows: number }>,
   ): Promise<TerminalControlRelayV2ExactObservationOpen>;
   tailRelayV2ExactObservation(
     observation: TerminalControlRelayV2ExactObservation,
@@ -492,6 +493,27 @@ function relayV2ExactBoundedId(value: unknown, maxBytes = 128): string {
     throw new TerminalControlProtocolError("INVALID_REQUEST", "Relay v2 exact target identity is invalid");
   }
   return value;
+}
+
+function terminalDisplaySizeHint(value: unknown): Readonly<{ cols: number; rows: number }> {
+  if (value === null
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || !Object.hasOwn(value, "cols")
+    || !Object.hasOwn(value, "rows")
+    || Object.keys(value).length !== 2) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "terminal display size hint is invalid");
+  }
+  const { cols, rows } = value as { cols?: unknown; rows?: unknown };
+  if (!Number.isSafeInteger(cols)
+    || (cols as number) < 1
+    || (cols as number) > 1_000
+    || !Number.isSafeInteger(rows)
+    || (rows as number) < 1
+    || (rows as number) > 500) {
+    throw new TerminalControlProtocolError("INVALID_REQUEST", "terminal display size hint is invalid");
+  }
+  return Object.freeze({ cols: cols as number, rows: rows as number });
 }
 
 function relayV2ExactCanonicalJson(value: unknown): string {
@@ -1223,6 +1245,7 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     claim: TerminalControlRelayV2ExactTargetClaim,
     rawInput: TerminalControlRelayV2ExactTargetInput,
     rawIdentity: TerminalControlRelayV2ExactTargetIdentity,
+    rawDisplaySizeHint?: Readonly<{ cols: number; rows: number }>,
   ): Promise<TerminalControlRelayV2ExactObservationOpen> {
     if (this.backend.inspectExactTarget === undefined) {
       throw new TerminalControlProtocolError(
@@ -1233,6 +1256,9 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
     const inspectExactTarget = this.backend.inspectExactTarget;
     const input = relayV2ExactInput(rawInput);
     const identity = relayV2ExactIdentity(rawIdentity);
+    const displaySizeHint = rawDisplaySizeHint === undefined
+      ? undefined
+      : terminalDisplaySizeHint(rawDisplaySizeHint);
     const record = this.relayV2ExactClaimRecord(claim);
     if (record.state !== "admitted"
       || record.inputJson !== relayV2ExactCanonicalJson(input)
@@ -1338,6 +1364,34 @@ export class TerminalControlAuthority implements TerminalControlRelayV2ExactTarg
           "TARGET_GONE",
           "managed target changed before Relay v2 exact observation",
         );
+      }
+      if (displaySizeHint !== undefined) {
+        try {
+          // The admitted observation reservation is the only safe point where the Host can
+          // size tmux before resetOutput captures the phone's initial screen. Resizing after
+          // the snapshot makes cursor-positioned TUIs irreversibly reflow from 80 columns.
+          await this.backend.resize(
+            target.managedSession.name,
+            String(input.pane),
+            displaySizeHint.cols,
+            displaySizeHint.rows,
+          );
+        } catch (error) {
+          if (error instanceof TerminalControlProtocolError
+            && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")) {
+            invalidateTarget(target, this.now);
+            saveTerminalControlState(state, this.statePath);
+            throw new TerminalControlProtocolError("TARGET_GONE", error.message);
+          }
+          markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
+          saveTerminalControlState(state, this.statePath);
+          throw new TerminalControlProtocolError(
+            "RECOVERY_REQUIRED",
+            `could not size the exact terminal before observation: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
       // The first observer must start from a pane snapshot produced while the
       // Host is fully live.  A generation prepared during controller shutdown

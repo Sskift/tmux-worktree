@@ -537,8 +537,8 @@ implements RelayV2TerminalByteBackend {
       [...args],
     ) as T;
     const port: ExactTargetsPort = {
-      observePreparedTargetForBinding: (binding) => (
-        call("observePreparedTargetForBinding", [binding])
+      observePreparedTargetForBinding: (binding, size) => (
+        call("observePreparedTargetForBinding", [binding, size])
       ),
       tailObservedTarget: (observation, cursor, maxBytes) => (
         call("tailObservedTarget", [observation, cursor, maxBytes])
@@ -750,7 +750,10 @@ implements RelayV2TerminalByteBackend {
     // after this await. The returned cut is snapshotted and re-correlated
     // with the binding before any record is built from it.
     const observation = observationCut(
-      await this.exactTargets.observePreparedTargetForBinding(binding),
+      await this.exactTargets.observePreparedTargetForBinding(
+        binding,
+        openInput.displaySizeHint,
+      ),
       binding,
     );
     const record: ObservedHandleRecord = {

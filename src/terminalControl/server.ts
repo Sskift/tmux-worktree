@@ -30,12 +30,18 @@ function writeResponse(socket: Socket, response: TerminalControlResponse): void 
   socket.end(frame);
 }
 
-function handleSocket(socket: Socket, authority: TerminalControlAuthority): void {
+function handleSocket(
+  socket: Socket,
+  authority: TerminalControlAuthority,
+  onActivity: () => void = () => {},
+): void {
+  onActivity();
   socket.setEncoding("utf8");
   socket.setTimeout(15_000, () => socket.destroy());
   let buffer = "";
   let handled = false;
   socket.on("data", (chunk: string) => {
+    onActivity();
     if (handled) {
       socket.destroy();
       return;
@@ -130,9 +136,18 @@ export async function runTerminalControlServer(options: {
   signal?: AbortSignal;
   /** Explicit private sibling ingress; never advertised on terminal-control v1. */
   relayV2RemoteExactCompoundV1?: boolean;
+  /** Explicit ephemeral/test policy; production daemons have no idle exit. */
+  idleExitMs?: number;
 } = {}): Promise<void> {
   if (options.authority !== undefined && options.statePath !== undefined) {
     throw new TypeError("terminal-control server cannot split authority and state path");
+  }
+  if (options.idleExitMs !== undefined && (
+    !Number.isSafeInteger(options.idleExitMs)
+    || options.idleExitMs < 100
+    || options.idleExitMs > 3_600_000
+  )) {
+    throw new TypeError("terminal-control idle exit is unsafe");
   }
   const socketPath = options.socketPath ?? terminalControlSocketPath();
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
@@ -151,15 +166,35 @@ export async function runTerminalControlServer(options: {
   const authority = options.authority ?? new TerminalControlAuthority(
     options.statePath === undefined ? {} : { statePath: options.statePath },
   );
-  const server = createServer((socket) => handleSocket(socket, authority));
+  let closed = false;
+  let closeRequested = false;
+  let server: Server;
+  let idleTimer: NodeJS.Timeout | null = null;
+  const touchIdle = () => {
+    if (options.idleExitMs === undefined || closed || closeRequested) return;
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      closeRequested = true;
+      try { server.close(); } catch {}
+    }, options.idleExitMs);
+    idleTimer.unref();
+  };
+  server = createServer((socket) => handleSocket(socket, authority, touchIdle));
+  // Observe close before the first idle timer can fire. A cold compound-ingress
+  // import may outlive the minimum idle window; installing this listener later
+  // would miss Node's one-shot close event and strand an ephemeral daemon.
+  const serverClosed = new Promise<void>((resolve) => server.once("close", resolve));
   let compoundIngress: import(
     "../relay/v2/remoteExactTerminalControlCompoundV1.js"
   ).RelayV2RemoteExactCompoundDaemonIngressV1 | null = null;
-  let closed = false;
   let ownsSocket = false;
   const cleanup = () => {
     if (closed) return;
     closed = true;
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = null;
+    closeRequested = true;
     try { server.close(); } catch {}
     if (ownsSocket) rmSync(socketPath, { force: true });
     releaseTerminalControlStoreLock(serverLock);
@@ -175,6 +210,7 @@ export async function runTerminalControlServer(options: {
     await listen(server, socketPath);
     ownsSocket = true;
     chmodSync(socketPath, 0o600);
+    touchIdle();
     if (options.relayV2RemoteExactCompoundV1 === true) {
       const { openRelayV2RemoteExactCompoundDaemonIngressV1 } = await import(
         "../relay/v2/remoteExactTerminalControlCompoundV1.js"
@@ -183,20 +219,21 @@ export async function runTerminalControlServer(options: {
         daemonSocketPath: socketPath,
         authority,
         primaryServerLock: serverLock,
+        onActivity: touchIdle,
       });
     }
-    await new Promise<void>((resolve) => {
-      const stop = () => {
-        const primaryClosed = new Promise<void>((closed) => {
-          try { server.close(() => closed()); } catch { closed(); }
-        });
-        const compoundClosed = compoundIngress?.closeAndDrain() ?? Promise.resolve();
-        void Promise.allSettled([primaryClosed, compoundClosed]).then(() => resolve());
-      };
-      options.signal?.addEventListener("abort", stop, { once: true });
-      if (options.signal?.aborted) stop();
-      server.once("close", resolve);
-    });
+    const stop = () => {
+      closeRequested = true;
+      try { server.close(); } catch {}
+      void compoundIngress?.closeAndDrain();
+    };
+    options.signal?.addEventListener("abort", stop, { once: true });
+    if (options.signal?.aborted) stop();
+    try {
+      await serverClosed;
+    } finally {
+      options.signal?.removeEventListener("abort", stop);
+    }
   } finally {
     try {
       try {

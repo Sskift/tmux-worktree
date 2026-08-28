@@ -837,7 +837,7 @@ fun rememberTerminalWebViewController(): TerminalWebViewController = remember {
 @Composable
 internal fun TerminalWebView(
     controller: TerminalWebViewController,
-    onReady: (TerminalWebViewParserBinding) -> Unit,
+    onReady: (binding: TerminalWebViewParserBinding, cols: Int, rows: Int) -> Unit,
     onViewLoss: (TerminalWebViewRendererLoss) -> Unit,
     onFailure: (String) -> Unit,
     onInput: (String) -> Unit,
@@ -864,8 +864,14 @@ internal fun TerminalWebView(
             factory = {
                 lateinit var view: WebView
                 val bridge = TerminalBridge(
-                    onReady = {
-                        controller.markReady(view)?.let { currentOnReady.value(it) }
+                    onReady = { cols, rows ->
+                        if (cols !in 1..MAX_TERMINAL_COLS || rows !in 1..MAX_TERMINAL_ROWS) {
+                            currentOnFailure.value("Terminal view reported an invalid size")
+                        } else {
+                            controller.markReady(view)?.let {
+                                currentOnReady.value(it, cols, rows)
+                            }
+                        }
                     },
                     onFailure = {
                         if (controller.acceptsBridgeEvent(view)) currentOnFailure.value(it)
@@ -999,7 +1005,7 @@ private fun createTerminalWebView(
 }
 
 private class TerminalBridge(
-    private val onReady: () -> Unit,
+    private val onReady: (Int, Int) -> Unit,
     private val onFailure: (String) -> Unit,
     private val onInput: (String) -> Unit,
     private val onResize: (Int, Int) -> Unit,
@@ -1011,8 +1017,8 @@ private class TerminalBridge(
     private val mainHandler = HandlerCompat.createAsync(Looper.getMainLooper())
 
     @JavascriptInterface
-    fun ready() {
-        mainHandler.post { onReady() }
+    fun ready(cols: Int, rows: Int) {
+        mainHandler.post { onReady(cols, rows) }
     }
 
     @JavascriptInterface
@@ -1038,5 +1044,7 @@ private class TerminalBridge(
 
 private const val BRIDGE_NAME = "TwBridge"
 private const val MAX_AUTOMATIC_RENDERER_RECOVERIES = 1
+private const val MAX_TERMINAL_COLS = 1_000
+private const val MAX_TERMINAL_ROWS = 500
 private const val TERMINAL_URL =
     "https://${WebViewAssetLoader.DEFAULT_DOMAIN}/assets/xterm/index.html"

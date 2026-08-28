@@ -112,7 +112,7 @@ class TerminalImeInputInstrumentedTest {
         composeRule.setContent {
             TerminalWebView(
                 controller = controller,
-                onReady = { ready.set(true) },
+                onReady = { _, _, _ -> ready.set(true) },
                 onViewLoss = {},
                 onFailure = { error("Terminal WebView failed: $it") },
                 onInput = { forwarded += it },

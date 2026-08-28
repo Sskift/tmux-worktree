@@ -49,6 +49,7 @@
     let terminal;
     let fitAddon;
     let ready = false;
+    let bridgeReady = false;
     let readOnly = false;
     let lastCols = 0;
     let lastRows = 0;
@@ -113,7 +114,7 @@
             (terminal.cols !== lastCols || terminal.rows !== lastRows)) {
           lastCols = terminal.cols;
           lastRows = terminal.rows;
-          TwBridge.resize(lastCols, lastRows);
+          if (bridgeReady) TwBridge.resize(lastCols, lastRows);
         }
       } catch (_) {
       }
@@ -229,7 +230,7 @@
       terminal.onResize(size => {
         lastCols = size.cols;
         lastRows = size.rows;
-        TwBridge.resize(size.cols, size.rows);
+        if (bridgeReady) TwBridge.resize(size.cols, size.rows);
         pinTerminalBottom();
       });
       window.addEventListener('resize', fitBurst);
@@ -249,10 +250,14 @@
       });
       window.addEventListener('pagehide', flushInput);
       ready = true;
-      fitBurst();
+      // Fit synchronously before the native side opens the Host stream. The opening
+      // dimensions determine the tmux snapshot width; opening at xterm's 80x24 default and
+      // shrinking afterwards permanently corrupts cursor-positioned TUI snapshots.
+      fit();
       pending.splice(0).forEach(data => terminal.write(data));
       terminal.focus();
-      TwBridge.ready();
+      bridgeReady = true;
+      TwBridge.ready(lastCols || terminal.cols, lastRows || terminal.rows);
     }
 
     window.twWrite = data => {

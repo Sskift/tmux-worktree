@@ -23,6 +23,8 @@ export interface TerminalControlAutoStartCliTarget {
   readonly entrypoint: string;
   /** Exact local-development home; production callers must omit it. */
   readonly home?: string;
+  /** Explicit ephemeral/test daemon policy; production callers must omit it. */
+  readonly idleExitMs?: number;
 }
 
 interface TerminalControlAutoStartPaths {
@@ -102,6 +104,16 @@ function startServer(
   paths?: Readonly<TerminalControlAutoStartPaths>,
 ): void {
   const home = localDevelopmentHome(target);
+  const idleExitMs = target !== undefined && Object.hasOwn(target, "idleExitMs")
+    ? Object.getOwnPropertyDescriptor(target, "idleExitMs")?.value
+    : undefined;
+  if (idleExitMs !== undefined && (
+    !Number.isSafeInteger(idleExitMs)
+    || idleExitMs < 100
+    || idleExitMs > 3_600_000
+  )) {
+    throw new TypeError("terminal-control idle exit is unsafe");
+  }
   const cli = target?.entrypoint
     || process.env.TW_TERMINAL_CONTROL_CLI?.trim()
     || process.env.TW_DASHBOARD_CLI?.trim()
@@ -119,6 +131,7 @@ function startServer(
           "--state-path",
           paths.statePath,
         ]),
+    ...(idleExitMs === undefined ? [] : ["--idle-exit-ms", String(idleExitMs)]),
   ], {
     detached: true,
     stdio: "ignore",
@@ -230,7 +243,7 @@ export async function requestTerminalControl<T = unknown>(
       options.autoStartCliTarget,
       autoStartPaths,
     );
-    const deadline = Date.now() + Math.min(timeoutMs, 5_000);
+    const deadline = Date.now() + Math.min(timeoutMs, 10_000);
     while (true) {
       try {
         response = await sendRequest(socketPath, request, timeoutMs, options.signal);

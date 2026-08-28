@@ -11,6 +11,8 @@ class TerminalAssetLayoutPolicyTest {
         val html = asset("xterm/index.html")
 
         assertTrue(html.contains("function pinTerminalBottom()"))
+        assertTrue(html.contains("TwBridge.ready(lastCols || terminal.cols, lastRows || terminal.rows)"))
+        assertTrue(html.indexOf("fit();") < html.indexOf("TwBridge.ready(lastCols"))
         assertTrue(html.contains("terminal.scrollToBottom()"))
         assertTrue(html.contains("observer.observe(document.getElementById('terminal'))"))
         assertFalse(html.contains("terminal.onRender(pinTerminalBottom)"))

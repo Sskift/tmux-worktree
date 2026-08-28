@@ -12,7 +12,9 @@ import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimePhase
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2BaseRuntimeState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ConnectionFailure
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CreateCommandReadState
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2FailureKind
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2SessionReplyCut
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2ScopeCreateResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxStateTag
@@ -556,5 +558,43 @@ class V2UiStateTest {
             projected.health.errorMessage,
         )
         assertFalse(projected.health.errorMessage.contains("capability", ignoreCase = true))
+    }
+
+    @Test
+    fun relayV2RetryProjectsBackoffWithoutTreatingCachedHostAsOnline() {
+        val projected = projectRelayV2RuntimeState(
+            state = V2UiState(
+                relayStartupAdmission = RelayStartupAdmissionState.RELAY_V2,
+                hosts = listOf(
+                    RelayHost(
+                        "host-a",
+                        status = ConnectionStatus.ONLINE,
+                        lastSeenAtMillis = 800,
+                    ),
+                ),
+                health = ConnectionHealth(lastSyncedAtMillis = 900),
+            ),
+            runtime = RelayV2BaseRuntimeState(
+                phase = RelayV2BaseRuntimePhase.CONNECTING,
+                retryAtMillis = 2_000,
+                retryAttempt = 2,
+                lastConnectionFailure = RelayV2ConnectionFailure(
+                    kind = RelayV2FailureKind.TRANSPORT,
+                    code = "HOST_OFFLINE",
+                    retryable = true,
+                ),
+            ),
+            nowMillis = 1_000,
+        )
+
+        assertEquals(TransportPhase.BACKING_OFF, projected.health.phase)
+        assertEquals(ConnectionStatus.RECOVERING, projected.health.overall)
+        assertEquals(2_000L, projected.health.retryAtMillis)
+        assertEquals(2, projected.health.attempt)
+        assertEquals(900L, projected.health.lastSyncedAtMillis)
+        assertEquals("HOST_OFFLINE", projected.health.errorCode)
+        assertEquals(ConnectionStatus.RECOVERING, projected.hosts.single().status)
+        assertNull(projected.relayV2ProfileFailureCode)
+        assertNull(projected.pairingError)
     }
 }

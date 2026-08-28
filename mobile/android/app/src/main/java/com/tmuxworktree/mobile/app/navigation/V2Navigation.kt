@@ -1114,6 +1114,8 @@ private fun TerminalRoute(
     val attachmentId = remember(session.stableId) { UUID.randomUUID().toString() }
     var userReadOnly by rememberSaveable(session.stableId) { mutableStateOf(false) }
     var fontSize by rememberSaveable(session.stableId) { mutableIntStateOf(14) }
+    var terminalCols by rememberSaveable(session.stableId) { mutableIntStateOf(80) }
+    var terminalRows by rememberSaveable(session.stableId) { mutableIntStateOf(24) }
     val connectionStatus = state.terminal.status
     val ownershipReadOnly = state.terminal.inputReadOnly
     val readOnly = userReadOnly || ownershipReadOnly
@@ -1170,7 +1172,13 @@ private fun TerminalRoute(
             if (state.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
                 val rendererBinding = controller.currentParserBinding()
                 if (rendererBinding != null) {
-                    viewModel.reconnectTerminal(session, attachmentId, rendererBinding)
+                    viewModel.reconnectTerminal(
+                        session,
+                        attachmentId,
+                        rendererBinding,
+                        terminalCols,
+                        terminalRows,
+                    )
                 } else {
                     // A WebView crash can intentionally exhaust automatic recovery. Recreate the
                     // renderer first; its ready callback will attach a fresh parser generation.
@@ -1189,7 +1197,13 @@ private fun TerminalRoute(
         onRetryInput = {
             val rendererBinding = controller.currentParserBinding()
             if (rendererBinding != null) {
-                viewModel.retryTerminalInput(session, attachmentId, rendererBinding)
+                viewModel.retryTerminalInput(
+                    session,
+                    attachmentId,
+                    rendererBinding,
+                    terminalCols,
+                    terminalRows,
+                )
             } else {
                 controller.requestRendererRebuild()
             }
@@ -1197,11 +1211,13 @@ private fun TerminalRoute(
         terminalContent = {
             TerminalWebView(
                 controller = controller,
-                onReady = { rendererBinding ->
+                onReady = { rendererBinding, cols, rows ->
+                    terminalCols = cols
+                    terminalRows = rows
                     // Admit the Relay owner before posting any WebView layout work. The renderer
                     // stays locally fenced until the exact terminal.opened callback publishes
                     // ONLINE and the effect above performs the single fit/focus transition.
-                    viewModel.openTerminal(session, attachmentId, rendererBinding)
+                    viewModel.openTerminal(session, attachmentId, rendererBinding, cols, rows)
                     controller.setReadOnly(!rendererInputEnabled)
                     controller.setFontSize(fontSize)
                     if (!rendererInputEnabled) controller.blur()
@@ -1214,6 +1230,8 @@ private fun TerminalRoute(
                     if (rendererInputEnabled) viewModel.sendTerminalInput(it, attachmentId)
                 },
                 onResize = { cols, rows ->
+                    terminalCols = cols
+                    terminalRows = rows
                     if (rendererResizeEnabled) {
                         viewModel.resizeTerminal(cols, rows, attachmentId)
                     }

@@ -66,6 +66,7 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -429,7 +430,7 @@ private fun RecoverySummary(
                     .testTag("health_retry")
                     .semantics {
                         role = Role.Button
-                        contentDescription = "Retry connection now"
+                        contentDescription = "Retry phone connection now"
                     },
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
@@ -448,6 +449,14 @@ private fun RecoverySummary(
                     style = MaterialTheme.typography.labelMedium,
                 )
             }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Retries the phone transport immediately. The desktop Host reconnects automatically.",
+                color = TwTextSecondary,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.width(300.dp),
+            )
         }
 
         TextButton(

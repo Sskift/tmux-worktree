@@ -859,9 +859,10 @@ test("exact auto-start hands the bound socket and state paths to one terminal-co
           autoStartCliTarget: {
             executable: process.execPath,
             entrypoint: terminalControlCli,
+            idleExitMs: 30_000,
           },
           autoStartStatePath: exactStatePath,
-          timeoutMs: 4_000,
+          timeoutMs: 8_000,
         },
       ),
       {
@@ -887,6 +888,41 @@ test("exact auto-start hands the bound socket and state paths to one terminal-co
     else process.env.TW_TERMINAL_CONTROL_SOCKET = previousSocketPath;
     if (previousStatePath === undefined) delete process.env.TW_TERMINAL_CONTROL_STATE;
     else process.env.TW_TERMINAL_CONTROL_STATE = previousStatePath;
+    temp.cleanup();
+  }
+});
+
+test("explicit ephemeral auto-start exits after idle and removes its owned sockets", async () => {
+  const temp = tempState("tc-idle-");
+  const socketPath = join(temp.root, "ephemeral.sock");
+  const statePath = join(temp.root, "ephemeral-state.json");
+  const compoundSocketPath = exactCompound.relayV2RemoteExactCompoundSocketPathV1(socketPath);
+  try {
+    await terminalControl.requestTerminalControl(
+      { type: "ping" },
+      {
+        socketPath,
+        autoStart: true,
+        autoStartCliTarget: {
+          executable: process.execPath,
+          entrypoint: terminalControlCli,
+          idleExitMs: 150,
+        },
+        autoStartStatePath: statePath,
+        timeoutMs: 8_000,
+      },
+    );
+    assert.equal(existsSync(socketPath), true);
+    const deadline = Date.now() + 3_000;
+    while ((existsSync(socketPath) || existsSync(`${socketPath}.server.lock`))
+      && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(existsSync(socketPath), false);
+    assert.equal(existsSync(compoundSocketPath), false);
+    assert.equal(existsSync(`${socketPath}.server.lock`), false);
+  } finally {
+    await stopAutoStartedTerminalControl(socketPath);
     temp.cleanup();
   }
 });
@@ -935,9 +971,10 @@ test("local-development exact auto-start binds the child to its validated manage
             executable: process.execPath,
             entrypoint: terminalControlCli,
             home: isolatedHome,
+            idleExitMs: 30_000,
           },
           autoStartStatePath: statePath,
-          timeoutMs: 4_000,
+          timeoutMs: 8_000,
         },
       ),
       {
@@ -4569,6 +4606,7 @@ test("exact claims survive ping and foreign status while same-target status stil
 test("exact read observation consumes the admitted claim into a freshly seeded generation", async () => {
   const temp = tempState();
   const backend = new FakeBackend();
+  const openingOrder = [];
   const prepareOutput = backend.prepareOutput.bind(backend);
   backend.prepareOutput = async (...args) => ({
     ...await prepareOutput(...args),
@@ -4576,12 +4614,18 @@ test("exact read observation consumes the admitted claim into a freshly seeded g
   });
   const resetOutput = backend.resetOutput.bind(backend);
   backend.resetOutput = async (controlTargetId, ...args) => {
+    openingOrder.push("snapshot");
     const previous = Buffer.from(
       backend.outputs.get(`${controlTargetId}:${backend.outputGeneration}`) ?? Buffer.alloc(0),
     );
     const reset = await resetOutput(controlTargetId, ...args);
     backend.outputs.set(`${controlTargetId}:${reset.generation}`, previous);
     return { ...reset, cursor: previous.byteLength, retainedStartCursor: 0 };
+  };
+  const resize = backend.resize.bind(backend);
+  backend.resize = async (...args) => {
+    openingOrder.push("resize");
+    return resize(...args);
   };
   const incarnation = `twinc2.${"A".repeat(43)}`;
   backend.inspectExactTarget = async (input) => {
@@ -4637,7 +4681,13 @@ test("exact read observation consumes the admitted claim into a freshly seeded g
       preparation.claim,
       exactInput,
       preparation.identity,
+      { cols: 47, rows: 62 },
     );
+    assert.deepEqual(openingOrder.slice(0, 2), ["resize", "snapshot"]);
+    assert.deepEqual(backend.writes[0], {
+      kind: "resize",
+      value: { pane: "0", cols: 47, rows: 62 },
+    });
     assert.equal(opened.binding.controlTargetId, target.controlTargetId);
     assert.equal(opened.binding.controlEpoch, target.controlEpoch);
     assert.equal(opened.binding.targetIncarnationProof, preparation.identity.targetIncarnationProof);

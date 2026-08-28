@@ -186,41 +186,58 @@ internal fun projectRelayV2RuntimeState(
         RelayV2BaseRuntimePhase.SUSPENDED -> RelayV2ProfileConnectionState.SUSPENDED
         RelayV2BaseRuntimePhase.FAILED -> RelayV2ProfileConnectionState.FAILED
     }
+    val recovering = connection == RelayV2ProfileConnectionState.CONNECTING &&
+        runtime.retryAttempt > 0
     val hostStatus = when (connection) {
         RelayV2ProfileConnectionState.STOPPED,
         RelayV2ProfileConnectionState.FAILED,
         -> ConnectionStatus.OFFLINE
-        RelayV2ProfileConnectionState.CONNECTING -> ConnectionStatus.CONNECTING
+        RelayV2ProfileConnectionState.CONNECTING -> if (recovering) {
+            ConnectionStatus.RECOVERING
+        } else {
+            ConnectionStatus.CONNECTING
+        }
         RelayV2ProfileConnectionState.RESYNCING -> ConnectionStatus.RECOVERING
         RelayV2ProfileConnectionState.ONLINE -> ConnectionStatus.ONLINE
         RelayV2ProfileConnectionState.SUSPENDED -> ConnectionStatus.PAUSED
     }
-    val failureCode = when (val failure = runtime.failure) {
+    val terminalFailureCode = when (val failure = runtime.failure) {
         is RelayV2BaseRuntimeFailure.Connection -> failure.failure.code
         is RelayV2BaseRuntimeFailure.RuntimeIncomplete -> failure.code
         null -> ""
+    }
+    val recentFailureCode = terminalFailureCode.ifBlank {
+        runtime.lastConnectionFailure?.code.orEmpty()
     }
     val health = ConnectionHealth(
         phase = when (connection) {
             RelayV2ProfileConnectionState.STOPPED,
             RelayV2ProfileConnectionState.FAILED,
             -> TransportPhase.STOPPED
-            RelayV2ProfileConnectionState.CONNECTING -> TransportPhase.CONNECTING
+            RelayV2ProfileConnectionState.CONNECTING -> if (runtime.retryAtMillis != null) {
+                TransportPhase.BACKING_OFF
+            } else {
+                TransportPhase.CONNECTING
+            }
             RelayV2ProfileConnectionState.RESYNCING -> TransportPhase.HANDSHAKING
             RelayV2ProfileConnectionState.ONLINE -> TransportPhase.ONLINE
             RelayV2ProfileConnectionState.SUSPENDED -> TransportPhase.ONLINE
         },
         overall = hostStatus,
+        retryAtMillis = runtime.retryAtMillis,
+        attempt = runtime.retryAttempt,
         lastSyncedAtMillis = if (connection == RelayV2ProfileConnectionState.ONLINE) {
             nowMillis
         } else {
             state.health.lastSyncedAtMillis
         },
-        errorCode = failureCode,
+        errorCode = recentFailureCode,
         errorMessage = if (connection == RelayV2ProfileConnectionState.FAILED) {
-            failureCode.takeIf(String::isNotBlank)?.let { code ->
+            terminalFailureCode.takeIf(String::isNotBlank)?.let { code ->
                 "Relay v2 stopped ($code)."
             } ?: "Relay v2 stopped."
+        } else if (recovering) {
+            "Connection interrupted; retrying automatically."
         } else {
             ""
         },
@@ -228,9 +245,9 @@ internal fun projectRelayV2RuntimeState(
     )
     return state.copy(
         relayV2ProfileConnection = connection,
-        relayV2ProfileFailureCode = failureCode.ifBlank { null },
+        relayV2ProfileFailureCode = terminalFailureCode.ifBlank { null },
         isConnecting = connection == RelayV2ProfileConnectionState.CONNECTING,
-        pairingError = failureCode.takeIf(String::isNotBlank)?.let { code ->
+        pairingError = terminalFailureCode.takeIf(String::isNotBlank)?.let { code ->
             "Relay v2 transport failed ($code)."
         },
         hosts = state.hosts.map { host ->

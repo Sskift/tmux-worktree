@@ -29,16 +29,35 @@ async function readOneFrame(): Promise<string> {
 function servePaths(args: string[]): Readonly<{
   socketPath?: string;
   statePath?: string;
+  idleExitMs?: number;
 }> {
   if (args.length === 0) return Object.freeze({});
   let socketPath: string | undefined;
   let statePath: string | undefined;
+  let idleExitMs: number | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const option = args[index];
-    if (option !== "--socket-path" && option !== "--state-path") {
+    if (option !== "--socket-path"
+      && option !== "--state-path"
+      && option !== "--idle-exit-ms") {
       throw new Error("terminal-control serve received an unsupported option");
     }
     const value = args[index + 1];
+    if (option === "--idle-exit-ms") {
+      if (idleExitMs !== undefined) {
+        throw new Error("terminal-control serve --idle-exit-ms can only be specified once");
+      }
+      if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
+        throw new Error("terminal-control serve --idle-exit-ms requires milliseconds");
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < 100 || parsed > 3_600_000) {
+        throw new Error("terminal-control serve --idle-exit-ms is outside the safe range");
+      }
+      idleExitMs = parsed;
+      index += 1;
+      continue;
+    }
     if (value === undefined
       || value.length === 0
       || value.startsWith("--")
@@ -59,12 +78,12 @@ function servePaths(args: string[]): Readonly<{
       statePath = value;
     }
   }
-  if (socketPath === undefined || statePath === undefined) {
+  if ((socketPath === undefined) !== (statePath === undefined)) {
     throw new Error(
       "terminal-control serve requires --socket-path and --state-path together",
     );
   }
-  return Object.freeze({ socketPath, statePath });
+  return Object.freeze({ socketPath, statePath, idleExitMs });
 }
 
 export async function terminalControlCmd(args: string[]): Promise<void> {
@@ -136,6 +155,7 @@ export async function terminalControlCmd(args: string[]): Promise<void> {
   }
   throw new Error(
     "usage: tw terminal-control serve [--socket-path <absolute-path> --state-path <absolute-path>]"
+    + " [--idle-exit-ms <100..3600000>]"
     + "|request|proxy|resolve <session>|status <target>|acquire-local <target>",
   );
 }

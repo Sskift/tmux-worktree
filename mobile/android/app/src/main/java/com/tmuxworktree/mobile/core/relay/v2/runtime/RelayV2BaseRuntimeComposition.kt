@@ -167,6 +167,9 @@ internal sealed interface RelayV2BaseRuntimeFailure {
 internal data class RelayV2BaseRuntimeState(
     val phase: RelayV2BaseRuntimePhase = RelayV2BaseRuntimePhase.STOPPED,
     val failure: RelayV2BaseRuntimeFailure? = null,
+    val retryAtMillis: Long? = null,
+    val retryAttempt: Int = 0,
+    val lastConnectionFailure: RelayV2ConnectionFailure? = null,
 )
 
 /** Exact activation-scoped admission port; implementations must fail closed on corrupt state. */
@@ -1445,6 +1448,7 @@ internal class RelayV2BaseRuntimeComposition(
             }
             claimed
         }
+        if (previousBackoff != null) clearRetryCountdownProjection(resetAttempt = true)
         attempt?.start()
         return result
     }
@@ -1495,6 +1499,7 @@ internal class RelayV2BaseRuntimeComposition(
             }
             claimed
         }
+        if (previousBackoff != null) clearRetryCountdownProjection(resetAttempt = true)
         attempt?.start()
         return result
     }
@@ -1521,6 +1526,7 @@ internal class RelayV2BaseRuntimeComposition(
                 false
             }
         }
+        if (!fenced) clearRetryCountdownProjection(resetAttempt = false)
         return if (fenced) RelayV2NetworkHintResult.FENCED else RelayV2NetworkHintResult.PAUSED
     }
 
@@ -1588,8 +1594,12 @@ internal class RelayV2BaseRuntimeComposition(
                 } else {
                     synchronized(stateLock) {
                         if (!closed.get() && terminalFailure.get() == null) {
-                            _state.value =
-                                RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING)
+                            val previous = _state.value
+                            _state.value = RelayV2BaseRuntimeState(
+                                phase = RelayV2BaseRuntimePhase.CONNECTING,
+                                retryAttempt = previous.retryAttempt,
+                                lastConnectionFailure = previous.lastConnectionFailure,
+                            )
                         }
                     }
                     check(
@@ -3166,6 +3176,7 @@ internal class RelayV2BaseRuntimeComposition(
             val delayMs = reconnectPolicy.delayMillis(retryAttempt)
             retryAttempt = minOf(retryAttempt + 1, MAX_RETRY_EXPONENT)
             retryStateFence = RetryStateFence(failedGeneration, failure)
+            val retryAtMillis = saturatingAdd(clock(), delayMs)
             val scheduledTimer = pumpScope.launch(start = CoroutineStart.LAZY) {
                 try {
                     retryDelay(delayMs)
@@ -3181,7 +3192,12 @@ internal class RelayV2BaseRuntimeComposition(
             trackConnectionAttemptLocked(scheduledTimer)
             synchronized(stateLock) {
                 if (!closed.get() && terminalFailure.get() == null) {
-                    _state.value = RelayV2BaseRuntimeState(RelayV2BaseRuntimePhase.CONNECTING)
+                    _state.value = RelayV2BaseRuntimeState(
+                        phase = RelayV2BaseRuntimePhase.CONNECTING,
+                        retryAtMillis = retryAtMillis,
+                        retryAttempt = retryAttempt,
+                        lastConnectionFailure = failure,
+                    )
                 }
             }
             RetryScheduleResult.SCHEDULED
@@ -3209,6 +3225,19 @@ internal class RelayV2BaseRuntimeComposition(
             synchronized(connectionLock) {
                 if (connectionAttemptJob === job) connectionAttemptJob = null
             }
+        }
+    }
+
+    private fun clearRetryCountdownProjection(resetAttempt: Boolean) {
+        synchronized(stateLock) {
+            val current = _state.value
+            if (current.retryAtMillis == null && (!resetAttempt || current.retryAttempt == 0)) {
+                return
+            }
+            _state.value = current.copy(
+                retryAtMillis = null,
+                retryAttempt = if (resetAttempt) 0 else current.retryAttempt,
+            )
         }
     }
 
@@ -3311,7 +3340,20 @@ internal class RelayV2BaseRuntimeComposition(
                 actor.state.value != actorState
             ) return
             if (clearProjection) clearSessionProjection()
-            _state.value = RelayV2BaseRuntimeState(phase, failure)
+            val previous = _state.value
+            val preserveRetryContext = phase == RelayV2BaseRuntimePhase.CONNECTING &&
+                previous.retryAttempt > 0
+            _state.value = RelayV2BaseRuntimeState(
+                phase = phase,
+                failure = failure,
+                retryAtMillis = if (preserveRetryContext) previous.retryAtMillis else null,
+                retryAttempt = if (preserveRetryContext) previous.retryAttempt else 0,
+                lastConnectionFailure = if (preserveRetryContext) {
+                    previous.lastConnectionFailure
+                } else {
+                    null
+                },
+            )
         }
     }
 
@@ -3336,6 +3378,12 @@ internal class RelayV2BaseRuntimeComposition(
     }
 
     private companion object {
+        fun saturatingAdd(left: Long, right: Long): Long = when {
+            right > 0 && left > Long.MAX_VALUE - right -> Long.MAX_VALUE
+            right < 0 && left < Long.MIN_VALUE - right -> Long.MIN_VALUE
+            else -> left + right
+        }
+
         val TERMINAL_PUBLIC_TYPES = setOf(
             "error",
             "terminal.opened",

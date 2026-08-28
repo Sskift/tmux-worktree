@@ -3,7 +3,9 @@ use sha2::{Digest, Sha256};
 use std::ffi::{CStr, OsStr};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread;
+use std::time::Duration;
 use tauri::{Manager, State};
 
 use super::management_child::{
@@ -45,6 +47,9 @@ const LOCAL_READY_COMMIT_JOURNAL: &str = "management-ready-commit-journal-v1.jso
 const READY_COMMIT_JOURNAL_CONTRACT: &str =
     "tmux-worktree-dashboard-relay-v2-management-ready-commit";
 const READY_COMMIT_JOURNAL_SCHEMA_VERSION: u32 = 2;
+const CONNECTOR_WATCHDOG_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const CONNECTOR_WATCHDOG_HEALTHY_INTERVAL: Duration = Duration::from_secs(2);
+const CONNECTOR_WATCHDOG_MAX_RETRY_DELAY: Duration = Duration::from_secs(15);
 
 /// Public trust anchor: the self-signed ISRG Root X1 certificate.
 ///
@@ -2362,6 +2367,119 @@ pub(crate) fn restore_relay_v2_self_hosted_connector_desired_state(
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectorWatchdogReconcileOutcome {
+    Healthy,
+    Retry,
+    Superseded,
+}
+
+fn next_connector_watchdog_retry_delay(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(CONNECTOR_WATCHDOG_MAX_RETRY_DELAY)
+        .min(CONNECTOR_WATCHDOG_MAX_RETRY_DELAY)
+}
+
+fn reconcile_relay_v2_self_hosted_connector_desired_state(
+    app: &tauri::AppHandle,
+    state: &MobileRelayV2SelfHostedDeploymentState,
+    management: &MobileRelayV2ManagementCommandState,
+    expected_binding: &SelfHostedManagementBinding,
+) -> ConnectorWatchdogReconcileOutcome {
+    // The deployment owner mutex is intentionally held across the management
+    // request. Start, stop, replacement, and the watchdog therefore share one
+    // desired-state fence: a user-requested stop cannot race with a stale
+    // watchdog read and be undone after the stop returns.
+    let Ok(owner) = state.operation.lock() else {
+        return ConnectorWatchdogReconcileOutcome::Retry;
+    };
+    if owner.active_management.as_ref() != Some(expected_binding) {
+        return ConnectorWatchdogReconcileOutcome::Superseded;
+    }
+    let Ok(Some(config)) = load_config() else {
+        return ConnectorWatchdogReconcileOutcome::Retry;
+    };
+    if !expected_binding.matches_config(&config) {
+        return ConnectorWatchdogReconcileOutcome::Superseded;
+    }
+    if !config.connector_desired_running {
+        return ConnectorWatchdogReconcileOutcome::Healthy;
+    }
+    if !self_hosted_connector_prerequisites_are_complete(&config) {
+        return ConnectorWatchdogReconcileOutcome::Retry;
+    }
+    if management
+        .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
+        .is_ok()
+    {
+        return ConnectorWatchdogReconcileOutcome::Healthy;
+    }
+
+    // Connector failures are terminal inside one management composition.
+    // Rebuild that exact child only after the durable binding and desired-state
+    // fence above have both been revalidated.
+    let Ok(Some(prepared)) = prepare_relay_v2_self_hosted_management_prerequisites() else {
+        return ConnectorWatchdogReconcileOutcome::Retry;
+    };
+    let Ok(replacement_binding) = prepared.management_binding() else {
+        return ConnectorWatchdogReconcileOutcome::Retry;
+    };
+    if replacement_binding != *expected_binding {
+        return ConnectorWatchdogReconcileOutcome::Superseded;
+    }
+    let selection = prepared.selection();
+    if management
+        .restart_self_hosted(app, selection, move || prepared.commit_ready())
+        .is_err()
+    {
+        return ConnectorWatchdogReconcileOutcome::Retry;
+    }
+    match management
+        .ensure_self_hosted_connector_start_accepted(&expected_binding.steady_launch_key)
+    {
+        Ok(_) => ConnectorWatchdogReconcileOutcome::Healthy,
+        Err(_) => ConnectorWatchdogReconcileOutcome::Retry,
+    }
+}
+
+pub(crate) fn start_relay_v2_self_hosted_connector_desired_state_watchdog(
+    app: tauri::AppHandle,
+    state: Weak<MobileRelayV2SelfHostedDeploymentState>,
+    management: Weak<MobileRelayV2ManagementCommandState>,
+    expected_binding: SelfHostedManagementBinding,
+) {
+    let _ = thread::Builder::new()
+        .name("relay-v2-host-watchdog".to_string())
+        .spawn(move || {
+            let mut next_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+            let mut retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+            loop {
+                thread::sleep(next_delay);
+                let (Some(state), Some(management)) = (state.upgrade(), management.upgrade())
+                else {
+                    return;
+                };
+                match reconcile_relay_v2_self_hosted_connector_desired_state(
+                    &app,
+                    state.as_ref(),
+                    management.as_ref(),
+                    &expected_binding,
+                ) {
+                    ConnectorWatchdogReconcileOutcome::Healthy => {
+                        next_delay = CONNECTOR_WATCHDOG_HEALTHY_INTERVAL;
+                        retry_delay = CONNECTOR_WATCHDOG_INITIAL_DELAY;
+                    }
+                    ConnectorWatchdogReconcileOutcome::Retry => {
+                        next_delay = retry_delay;
+                        retry_delay = next_connector_watchdog_retry_delay(retry_delay);
+                    }
+                    ConnectorWatchdogReconcileOutcome::Superseded => return,
+                }
+            }
+        });
+}
+
 fn management_operation_failed_error() -> ManagementError {
     ManagementError {
         code: "OPERATION_FAILED".to_string(),
@@ -3774,10 +3892,10 @@ mod tests {
         consumed_local_private_file_path, deployment_fingerprint, ensure_host_profile_identity,
         ensure_ordinary_center_start_allowed, ensure_self_contained_ca_chain,
         finish_consuming_if_present, fresh_bootstrap_publication_correlation,
-        load_ready_commit_journal_at, normalize_issuer_url, persisted_management_config_identity,
-        read_local_private_file, ready_rotation_transfer_identity,
-        record_expired_bootstrap_rotation_intent, relay_url_from_issuer,
-        self_hosted_connector_should_be_running,
+        load_ready_commit_journal_at, next_connector_watchdog_retry_delay, normalize_issuer_url,
+        persisted_management_config_identity, read_local_private_file,
+        ready_rotation_transfer_identity, record_expired_bootstrap_rotation_intent,
+        relay_url_from_issuer, self_hosted_connector_should_be_running,
         self_hosted_connector_should_survive_dashboard_window_close,
         stop_center_and_active_connector, valid_bootstrap_publication_correlation,
         validate_bootstrap_bytes, validate_listen_host, verify_rotation_transfer_identity,
@@ -3786,11 +3904,29 @@ mod tests {
         LocalPrivateFileIdentity, PersistedSelfHostedConfig, ReadyCommitJournal,
         SelfHostedDeploymentOperationOwner, SelfHostedManagementBinding,
         BOOTSTRAP_CORRELATION_CONFIG_SCHEMA_VERSION, CONFIG_CONTRACT, CONFIG_SCHEMA_VERSION,
-        CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, HOST_PROFILE_CONFIG_SCHEMA_VERSION,
-        ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES, READY_COMMIT_JOURNAL_CONTRACT,
-        READY_COMMIT_JOURNAL_SCHEMA_VERSION, REMOTE_BOOTSTRAP_FD_READER,
-        ROTATION_PENDING_CONFIG_SCHEMA_VERSION, ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
+        CONNECTOR_DESIRED_STATE_CONFIG_SCHEMA_VERSION, CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
+        HOST_PROFILE_CONFIG_SCHEMA_VERSION, ISRG_ROOT_X1_PEM, NODE_TLS_CA_MAX_ENTRY_BYTES,
+        READY_COMMIT_JOURNAL_CONTRACT, READY_COMMIT_JOURNAL_SCHEMA_VERSION,
+        REMOTE_BOOTSTRAP_FD_READER, ROTATION_PENDING_CONFIG_SCHEMA_VERSION,
+        ROTATION_RECEIPT_CONFIG_SCHEMA_VERSION,
     };
+    use std::time::Duration;
+
+    #[test]
+    fn connector_watchdog_retry_delay_is_bounded() {
+        assert_eq!(
+            next_connector_watchdog_retry_delay(Duration::from_secs(1)),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            next_connector_watchdog_retry_delay(Duration::from_secs(8)),
+            CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
+        );
+        assert_eq!(
+            next_connector_watchdog_retry_delay(CONNECTOR_WATCHDOG_MAX_RETRY_DELAY),
+            CONNECTOR_WATCHDOG_MAX_RETRY_DELAY,
+        );
+    }
 
     fn config() -> PersistedSelfHostedConfig {
         PersistedSelfHostedConfig {
