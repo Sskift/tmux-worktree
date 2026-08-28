@@ -8,7 +8,7 @@ import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
-const activationModule = await import("../dist/relay/v2/hostRuntimeComposition.js");
+const activationModule = commandPlane;
 const hostState = await import("../dist/relay/v2/hostState.js");
 
 const corpus = loadRelayV2FixtureCorpus();

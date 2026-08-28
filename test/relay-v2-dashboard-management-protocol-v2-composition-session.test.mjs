@@ -8,7 +8,7 @@ import {
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2CompositionSession.js";
 import {
   RelayV2DashboardManagementCompositionClosedError,
-  createRelayV2DashboardManagementComposition,
+  claimRelayV2DashboardManagementCompositionForProtocolV2Session,
 } from "../dist/relay/v2/relayV2DashboardManagementComposition.js";
 import {
   RelayV2HostCarrierActor,
@@ -492,7 +492,7 @@ test("the real dist session constructs the canonical composition before v2 ready
     h.session,
   );
   assert.throws(
-    () => createRelayV2DashboardManagementComposition(
+    () => claimRelayV2DashboardManagementCompositionForProtocolV2Session(
       compositionOptionsOf(h.sessionOptions),
     ),
     RelayV2DashboardManagementCompositionClosedError,
@@ -521,7 +521,7 @@ test("the real dist session constructs the canonical composition before v2 ready
 
 test("an existing used and closed composition cannot be rebound into a stdio session", async () => {
   const h = harness({ create: false, ready: true });
-  const composition = createRelayV2DashboardManagementComposition(
+  const composition = claimRelayV2DashboardManagementCompositionForProtocolV2Session(
     compositionOptionsOf(h.sessionOptions),
   );
   const status = await composition.handleRequest(JSON.parse(STATUS_FRAME));

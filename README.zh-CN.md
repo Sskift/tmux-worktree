@@ -21,7 +21,7 @@
 
 <p align="center">
   <a href="docs/demo.md">
-    <img src="docs/assets/tw-dashboard-hero.png" alt="运行在桌面与 Android 手机上的 TW Mission Control" width="100%" />
+    <img src="docs/assets/tw-dashboard-hero.webp" alt="运行在桌面与 Android 手机上的 TW Mission Control" width="100%" />
   </a>
 </p>
 

@@ -678,16 +678,6 @@ class RelayV2BrokerHostWssAdapterImpl implements RelayV2BrokerHostWssAdapter {
   }
 }
 
-/** Capture-only native adapter. It installs no listener until `install`. */
-export function createRelayV2BrokerHostWssAdapter(
-  socket: RelayV2BrokerHostWssSocket,
-  trustedSocketPrototype: object,
-  trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
-): RelayV2BrokerHostWssAdapter {
-  const trusted = captureTrustedPrototype(trustedSocketPrototype, trustedSocketBrand);
-  return new RelayV2BrokerHostWssAdapterImpl(captureSocket(socket, trusted));
-}
-
 export function createRelayV2BrokerHostWssCaptureAuthority(
   trustedSocketPrototype: object,
   trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,

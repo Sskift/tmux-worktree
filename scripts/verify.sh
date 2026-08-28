@@ -62,8 +62,10 @@ run_android() {
     :app:testDebugUnitTest \
     :app:lintDebug \
     :app:lintRelease \
+    :app:verifyReleaseDependencyHygiene \
     :app:assembleDebug \
-    :app:assembleRelease
+    :app:assembleRelease \
+    :app:bundleRelease
 }
 
 run_device() {

@@ -9,8 +9,13 @@ import {
   Workflow,
   X,
 } from "lucide-react";
-import { useState, type ComponentProps, type ReactNode } from "react";
-import { FileEditor } from "../FileEditor";
+import {
+  lazy,
+  Suspense,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import { TerminalDeck } from "./TerminalDeck";
 import { WorkspaceDiffView } from "./WorkspaceContextViews";
 import type {
@@ -18,6 +23,10 @@ import type {
   WorkspacePrimaryContext,
 } from "./model/workspacePresentation";
 import { useRelayV2MissionControl } from "./hooks/useRelayV2MissionControl";
+
+const FileEditor = lazy(() => import("../FileEditor").then((module) => ({
+  default: module.FileEditor,
+})));
 
 export type WorkspaceHomeSummary = Readonly<{
   attentionAgents: number;
@@ -335,16 +344,24 @@ export function WorkspacePrimaryView({
 
       {context.kind === "editor" ? (
         <div className="dashboard-workspace__editor">
-          <FileEditor
-            filePath={context.file.path}
-            hostId={context.file.hostId ?? null}
-            initialLine={context.file.line}
-            initialColumn={context.file.column}
-            navigationRevision={editorNavigationRevision}
-            onClose={onCloseEditor}
-            onOpenFile={onOpenFile}
-            onDirtyChange={onEditorDirtyChange}
-          />
+          <Suspense
+            fallback={(
+              <div className="pane pane--empty" role="status">
+                Loading editor…
+              </div>
+            )}
+          >
+            <FileEditor
+              filePath={context.file.path}
+              hostId={context.file.hostId ?? null}
+              initialLine={context.file.line}
+              initialColumn={context.file.column}
+              navigationRevision={editorNavigationRevision}
+              onClose={onCloseEditor}
+              onOpenFile={onOpenFile}
+              onDirtyChange={onEditorDirtyChange}
+            />
+          </Suspense>
         </div>
       ) : context.kind === "diff" ? (
         <div className="dashboard-workspace__editor">

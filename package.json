@@ -10,8 +10,7 @@
   "license": "MIT",
   "files": [
     "dist",
-    "app/installer/installer.mjs",
-    "app/installer/dmg/"
+    "app/installer/installer.mjs"
   ],
   "bin": {
     "tmux-worktree": "dist/cli.cjs",
@@ -20,6 +19,8 @@
   },
   "scripts": {
     "build": "tsup && tsup --config tsup.standalone.config.ts",
+    "validate:package": "node scripts/validate-package.mjs",
+    "prepack": "npm run build && npm run validate:package",
     "demo": "npm --prefix app run demo",
     "test:cli": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
     "verify": "sh scripts/verify.sh core",

@@ -1,16 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac, randomBytes } from "node:crypto";
-import {
-  chmodSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { createHmac, randomBytes } from "node:crypto";
 import test from "node:test";
 
 const auth = await import("../dist/relay/v2/auth.js");
@@ -85,10 +74,6 @@ function mutatePayload(token, transform, currentKeyring, resign = true) {
   return resign
     ? signPayloadSegment(changedSegment, currentKeyring)
     : `twcap2.${changedSegment}.${mac}`;
-}
-
-function fileHash(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 test("twcap2 prepares and verifies closed client and host identities", () => {
@@ -332,55 +317,4 @@ test("key rotation retains verify-only keys, forbids kid reuse, and supports del
   });
   assert.equal(scheduledRemoval.verifyOnlyKeys.length, 0);
   assert.equal(scheduledRemoval.retiredKids[0], "key-old");
-});
-
-test("issuer keyring storage is strict, atomic, owner-private, and mode 0600", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-relay-v2-auth-"));
-  const path = join(root, "private", "issuer-keyring.json");
-  try {
-    const initial = keyring();
-    issuer.saveRelayV2IssuerKeyring(initial, path);
-    assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
-    assert.equal(statSync(path).mode & 0o777, 0o600);
-    assert.equal(issuer.loadRelayV2IssuerKeyring(path).activeKey.kid, "key-old");
-
-    const rotated = issuer.rotateRelayV2IssuerKeyring(initial, {
-      kid: "key-persisted",
-      secretBase64url: randomBytes(32).toString("base64url"),
-      nowSeconds: NOW + 1,
-    });
-    issuer.saveRelayV2IssuerKeyring(rotated, path);
-    const loaded = issuer.loadRelayV2IssuerKeyring(path);
-    assert.equal(loaded.activeKey.kid, "key-persisted");
-    assert.deepEqual(readdirSync(dirname(path)), [basename(path)]);
-
-    const beforeRejectedWrite = fileHash(path);
-    assert.throws(
-      () => issuer.saveRelayV2IssuerKeyring({ ...rotated, unknown: true }, path),
-      (error) => error.code === "AUTH_STATE_INVALID",
-    );
-    assert.equal(fileHash(path), beforeRejectedWrite);
-
-    chmodSync(path, 0o644);
-    assert.throws(
-      () => issuer.loadRelayV2IssuerKeyring(path),
-      (error) => error.code === "AUTH_STATE_INVALID",
-    );
-    chmodSync(path, 0o600);
-
-    const duplicate = readFileSync(path, "utf8")
-      .replace('"version": 1', '"version": 1, "version": 1');
-    writeFileSync(path, duplicate, { mode: 0o600 });
-    chmodSync(path, 0o600);
-    assert.throws(
-      () => issuer.loadRelayV2IssuerKeyring(path),
-      (error) => error.code === "AUTH_STATE_INVALID" && !error.message.includes(initial.activeKey.secretBase64url),
-    );
-    assert.throws(
-      () => issuer.saveRelayV2IssuerKeyring(rotated, path),
-      (error) => error.code === "AUTH_STATE_INVALID",
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
 });

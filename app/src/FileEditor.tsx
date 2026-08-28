@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   ChevronRight,
   Code2,
@@ -21,8 +29,6 @@ import {
 import { indentUnit } from "@codemirror/language";
 import { EditorView, keymap } from "@codemirror/view";
 import { gotoLine, openSearchPanel } from "@codemirror/search";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   detectEditorIndentation,
   getFileCategory,
@@ -51,6 +57,8 @@ import {
   markFileEditorSaved,
 } from "./fileEditorDirtyState";
 import "./FileEditor.css";
+
+const MarkdownPreview = lazy(() => import("./MarkdownPreview"));
 
 export type FileEditorProps = {
   filePath: string;
@@ -671,7 +679,15 @@ function CodeEditor({
             />
             {previewMode && (
               <div className="file-editor__markdown">
-                <Markdown remarkPlugins={[remarkGfm]}>{content}</Markdown>
+                <Suspense
+                  fallback={(
+                    <div className="file-editor__message" role="status">
+                      Rendering preview…
+                    </div>
+                  )}
+                >
+                  <MarkdownPreview content={content} />
+                </Suspense>
               </div>
             )}
           </>

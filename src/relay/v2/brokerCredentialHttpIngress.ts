@@ -27,9 +27,23 @@ export const RELAY_V2_BROKER_ENROLLMENT_REDEEM_PATH = "/v2/enrollments/redeem";
 export const RELAY_V2_BROKER_CLIENT_TOKEN_REFRESH_PATH = "/v2/tokens/refresh";
 export const RELAY_V2_BROKER_HOST_TOKEN_REFRESH_PATH = "/v2/hosts/tokens/refresh";
 export const RELAY_V2_BROKER_SELF_REVOKE_PATH = "/v2/grants/self/revoke";
+export const RELAY_V2_BROKER_HOST_BOOTSTRAP_PATH = "/v2/hosts/bootstrap";
+
+interface RelayV2BrokerHostBootstrapInput {
+  bootstrapAttemptId: string;
+  bootstrapToken: string;
+  hostId: string;
+  hostEpoch: string;
+  hostInstanceId: string;
+}
 
 export interface RelayV2BrokerCredentialHttpIngressAuthorityPort
 extends RelayV2BrokerCredentialHttpSourceAuthorityPort {
+  bootstrapHost(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    sourceKey: string,
+    input: RelayV2BrokerHostBootstrapInput,
+  ): Promise<RelayV2BrokerCredentialGrantCredential>;
   authorizeAccessToken(
     token: string,
     expectedRole: RelayV2AccessRole,
@@ -143,6 +157,22 @@ const ROUTES: readonly RelayV2BrokerCredentialHttpBoundaryRoute<
   RelayV2BrokerCredentialHttpIngressAuthorityPort
 >[] = Object.freeze([
   Object.freeze({
+    path: RELAY_V2_BROKER_HOST_BOOTSTRAP_PATH,
+    sourceEndpoint: "host_bootstrap",
+    requestSchema: "host.bootstrap.request",
+    responseSchema: "host.bootstrap.response",
+    async invoke(authority, admission, sourceKey, body) {
+      const result = await authority.bootstrapHost(admission, sourceKey, {
+        bootstrapAttemptId: body.bootstrapAttemptId as string,
+        bootstrapToken: body.bootstrapToken as string,
+        hostId: body.hostId as string,
+        hostEpoch: body.hostEpoch as string,
+        hostInstanceId: body.hostInstanceId as string,
+      });
+      return grantBody(result, "host_bootstrap");
+    },
+  }),
+  Object.freeze({
     path: RELAY_V2_BROKER_ENROLLMENT_REDEEM_PATH,
     sourceEndpoint: "enrollment_redeem",
     requestSchema: "enrollment.redeem.request",
@@ -232,7 +262,7 @@ const ROUTES: readonly RelayV2BrokerCredentialHttpBoundaryRoute<
 ]);
 
 /**
- * Strict, unwired ingress foundation for the four frozen B4 credential HTTPS
+ * Strict, unwired ingress foundation for the five credential HTTPS
  * endpoints. `sourceKey` is supplied only by a future trusted server adapter;
  * no listener, router, socket, readiness, or fallback is registered here.
  */

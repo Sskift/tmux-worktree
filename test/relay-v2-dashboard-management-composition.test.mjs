@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   RelayV2DashboardManagementCompositionClosedError,
   claimRelayV2DashboardManagementCompositionForProtocolV2Session,
-  createRelayV2DashboardManagementComposition,
 } from "../dist/relay/v2/relayV2DashboardManagementComposition.js";
 import {
   RelayV2HostCarrierActor,
@@ -30,6 +29,8 @@ import {
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2.js";
 
 const NOW_MS = 1_783_700_000_000;
+const activateComposition =
+  claimRelayV2DashboardManagementCompositionForProtocolV2Session;
 const IDENTITY = Object.freeze({
   hostId: "mac-admin",
   hostEpoch: "host-epoch-one",
@@ -415,7 +416,7 @@ function harness(options = {}) {
   if (options.ready) installReady();
   const composition = options.activate === false
     ? null
-    : createRelayV2DashboardManagementComposition(compositionOptions);
+    : activateComposition(compositionOptions);
   return {
     actor,
     attempts,
@@ -671,7 +672,7 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
       return null;
     };
     assert.throws(
-      () => createRelayV2DashboardManagementComposition({
+      () => activateComposition({
         ...h.compositionOptions,
         hostManagementBinding: structuralBinding,
       }),
@@ -690,7 +691,7 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
       httpsAdapter: { bootstrap: async () => {}, refresh: async () => {} },
     });
     assert.throws(
-      () => createRelayV2DashboardManagementComposition({
+      () => activateComposition({
         ...h.compositionOptions,
         credentialExchangeCoordinator: foreignCoordinator,
       }),
@@ -721,7 +722,7 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
       credentialAuthority: h.authority,
     });
     assert.throws(
-      () => createRelayV2DashboardManagementComposition({
+      () => activateComposition({
         ...h.compositionOptions,
         hostManagementBinding: foreignBinding,
       }),
@@ -761,7 +762,7 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
       return originalCommit(candidate, operation, consumedIdentity, consumedCredentialOwner);
     };
     assert.throws(
-      () => createRelayV2DashboardManagementComposition({
+      () => activateComposition({
         ...h.compositionOptions,
         hostManagementBinding: failingBinding,
       }),
@@ -769,11 +770,11 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
     );
   });
 
-  await t.test("duplicate activate is idempotent and replacement is rejected", () => {
+  await t.test("duplicate activation and replacement are rejected", () => {
     const h = harness();
-    assert.strictEqual(
-      createRelayV2DashboardManagementComposition(h.compositionOptions),
-      h.composition,
+    assert.throws(
+      () => activateComposition(h.compositionOptions),
+      RelayV2DashboardManagementCompositionClosedError,
     );
     const replacementActor = new RelayV2HostCarrierActor({
       ...IDENTITY,
@@ -789,20 +790,10 @@ test("activation rejects foreign lineages, structural ports, stale owners, and r
       credentialAuthority: h.authority,
     });
     assert.throws(
-      () => createRelayV2DashboardManagementComposition({
+      () => activateComposition({
         ...h.compositionOptions,
         hostManagementBinding: replacementBinding,
       }),
-      RelayV2DashboardManagementCompositionClosedError,
-    );
-  });
-
-  await t.test("exclusive protocol-v2 session claim rejects an existing activation", () => {
-    const h = harness();
-    assert.throws(
-      () => claimRelayV2DashboardManagementCompositionForProtocolV2Session(
-        h.compositionOptions,
-      ),
       RelayV2DashboardManagementCompositionClosedError,
     );
   });

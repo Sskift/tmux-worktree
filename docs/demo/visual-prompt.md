@@ -1,6 +1,6 @@
 # Launch visual prompt
 
-The checked-in hero at `docs/assets/tw-dashboard-hero.png` was produced with the built-in image generation tool from two project references:
+The checked-in hero at `docs/assets/tw-dashboard-hero.webp` was produced with the built-in image generation tool from two project references:
 
 - `docs/assets/tw-dashboard-overview.jpg` — real deterministic product UI.
 - `app/src-tauri/icons/icon.png` — TW brand mark.

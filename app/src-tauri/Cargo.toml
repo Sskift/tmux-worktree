@@ -34,3 +34,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+# Keep the shipped binary small without the cross-crate compatibility cost of
+# fat LTO. One codegen unit gives thin LTO the complete release crate graph.
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

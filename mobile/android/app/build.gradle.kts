@@ -29,6 +29,26 @@ android {
         buildConfig = true
     }
 
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+    }
+
+    // App Bundles let the store deliver only the native ABI required by each
+    // device. This deliberately does not set ndk.abiFilters or APK splits, so
+    // debug builds retain every emulator ABI supplied by their dependencies.
+    bundle {
+        abi {
+            enableSplit = true
+        }
+    }
+
     packaging {
         resources.excludes += setOf("META-INF/AL2.0", "META-INF/LGPL2.1")
     }
@@ -133,4 +153,29 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
+}
+
+// Keep release-only tooling out of the shipped runtime. The declarations above
+// already use debugImplementation; this verification task prevents a future
+// dependency edit from silently moving the large tooling artifacts to release.
+tasks.register("verifyReleaseDependencyHygiene") {
+    group = "verification"
+    description = "Fails when debug-only Compose tooling leaks into release."
+
+    doLast {
+        val forbidden = setOf(
+            "androidx.compose.ui:ui-tooling",
+            "androidx.compose.ui:ui-test-manifest",
+        )
+        val leaked = configurations.getByName("releaseRuntimeClasspath")
+            .resolvedConfiguration
+            .resolvedArtifacts
+            .map { "${it.moduleVersion.id.group}:${it.name}" }
+            .filter { it in forbidden }
+            .distinct()
+            .sorted()
+        check(leaked.isEmpty()) {
+            "Debug-only dependencies leaked into release: ${leaked.joinToString()}"
+        }
+    }
 }

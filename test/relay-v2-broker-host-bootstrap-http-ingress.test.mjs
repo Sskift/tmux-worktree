@@ -3,7 +3,7 @@ import test from "node:test";
 import { InMemoryRelayV2BrokerCredentialStateStore } from "./support/inMemoryRelayV2BrokerCredentialStateStore.mjs";
 
 const credential = await import("../dist/relay/v2/brokerCredentialAuthority.js");
-const ingress = await import("../dist/relay/v2/brokerHostBootstrapHttpIngress.js");
+const ingress = await import("../dist/relay/v2/brokerCredentialHttpIngress.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
 const continuity = await import("../dist/relay/v2/continuityAnchor.js");
 
@@ -154,7 +154,7 @@ async function handleWithFake(bytes, options = {}) {
   const authority = options.authority ?? new RecordingAuthority();
   const stream = options.stream ?? controlledBody([bytes]);
   const request = requestFor(bytes, stream.body, options.request ?? {});
-  const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+  const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
     authority,
     options.sourceKey ?? "trusted-server-source",
     request,
@@ -219,7 +219,7 @@ test("exact route and frozen request headers reject pre-body and abort without n
     await t.test(item.name, async () => {
       const authority = new RecordingAuthority();
       const stream = controlledBody([bytes]);
-      const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+      const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
         authority,
         "trusted-server-source",
         requestFor(bytes, stream.body, item.request),
@@ -261,7 +261,7 @@ test("pre-body and limit abort is one-shot, non-blocking, and absorbs throwing o
     };
     const authority = new RecordingAuthority();
     const response = await Promise.race([
-      ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+      ingress.handleRelayV2BrokerCredentialHttpIngress(
         authority,
         "trusted-server-source",
         requestFor(bytes, body, { contentLength: null }),
@@ -295,7 +295,7 @@ test("pre-body and limit abort is one-shot, non-blocking, and absorbs throwing o
       },
     };
     const authority = new RecordingAuthority();
-    const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+    const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
       authority,
       "trusted-server-source",
       requestFor(bytes, body, { contentLength: null }),
@@ -326,7 +326,7 @@ test("pre-body and limit abort is one-shot, non-blocking, and absorbs throwing o
         };
       },
     };
-    const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+    const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
       new RecordingAuthority(),
       "trusted-server-source",
       requestFor(bytes, body, { contentLength: null }),
@@ -350,7 +350,7 @@ test("pre-body and limit abort is one-shot, non-blocking, and absorbs throwing o
       },
     };
     const response = await Promise.race([
-      ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+      ingress.handleRelayV2BrokerCredentialHttpIngress(
         new RecordingAuthority(),
         "trusted-server-source",
         requestFor(bytes, body, { contentLength: "16385" }),
@@ -373,7 +373,7 @@ test("unknown-length counting stops at byte 16385 and read failures release admi
     await t.test(item.name, async () => {
       const authority = new RecordingAuthority();
       const stream = controlledBody(item.chunks);
-      const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+      const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
         authority,
         "trusted-server-source",
         requestFor(full, stream.body, { contentLength: null }),
@@ -389,7 +389,7 @@ test("unknown-length counting stops at byte 16385 and read failures release admi
   await t.test("reader error", async () => {
     const authority = new RecordingAuthority();
     const stream = controlledBody([jsonBytes("{}")], { throwOnNext: 1 });
-    const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+    const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
       authority,
       "trusted-server-source",
       requestFor(jsonBytes("{}"), stream.body, { contentLength: null }),
@@ -415,7 +415,7 @@ test("declared Content-Length is checked against the exact actual body length", 
     await t.test(item.name, async () => {
       const authority = new RecordingAuthority();
       const stream = controlledBody(item.chunks);
-      const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+      const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
         authority,
         "trusted-server-source",
         requestFor(bytes, stream.body, { contentLength: item.declared }),
@@ -433,7 +433,7 @@ test("durable source admission precedes reading and strict JSON/schema failures 
   const rateLimited = new RecordingAuthority();
   rateLimited.admitError = new credential.RelayV2BrokerCredentialAuthorityError("RATE_LIMITED");
   const unread = controlledBody([jsonBytes("not-json")]);
-  const limited = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+  const limited = await ingress.handleRelayV2BrokerCredentialHttpIngress(
     rateLimited,
     "rate-limited-source",
     requestFor(jsonBytes("not-json"), unread.body),
@@ -481,7 +481,7 @@ test("trusted sourceKey stays out of URL, body, and forwarding headers", async (
   const bytes = jsonBytes(VALID_INPUT);
   const authority = new RecordingAuthority();
   const stream = controlledBody([bytes]);
-  const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+  const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
     authority,
     "trusted-server-source",
     requestFor(bytes, stream.body, {
@@ -510,12 +510,12 @@ test("authority success and ACK-loss replay return the exact frozen credential b
     const created = await authority.adminCreateHostBootstrap();
     const input = { ...VALID_INPUT, bootstrapToken: created.bootstrapToken };
     const bytes = jsonBytes(input);
-    const first = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+    const first = await ingress.handleRelayV2BrokerCredentialHttpIngress(
       authority,
       "trusted-real-source",
       requestFor(bytes, controlledBody([bytes]).body),
     );
-    const replay = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+    const replay = await ingress.handleRelayV2BrokerCredentialHttpIngress(
       authority,
       "trusted-real-source",
       requestFor(bytes, controlledBody([bytes]).body),
@@ -561,7 +561,7 @@ test("authority taxonomy maps closed without reflecting secrets or collapsing fa
       authority.bootstrapError = new credential.RelayV2BrokerCredentialAuthorityError(
         authorityCode,
       );
-      const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+      const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
         authority,
         "trusted-server-source",
         requestFor(bytes, controlledBody([bytes]).body),
@@ -580,7 +580,7 @@ test("authority taxonomy maps closed without reflecting secrets or collapsing fa
 
   const unknown = new RecordingAuthority();
   unknown.bootstrapError = new Error(`unknown failure ${BOOTSTRAP_TOKEN}`);
-  const response = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+  const response = await ingress.handleRelayV2BrokerCredentialHttpIngress(
     unknown,
     "trusted-server-source",
     requestFor(bytes, controlledBody([bytes]).body),
@@ -594,7 +594,7 @@ test("authority taxonomy maps closed without reflecting secrets or collapsing fa
     new Error(`lookalike ${BOOTSTRAP_TOKEN}`),
     { name: "RelayV2BrokerCredentialAuthorityError", code: "AUTH_INVALID" },
   );
-  const lookalikeResponse = await ingress.handleRelayV2BrokerHostBootstrapHttpIngress(
+  const lookalikeResponse = await ingress.handleRelayV2BrokerCredentialHttpIngress(
     lookalike,
     "trusted-server-source",
     requestFor(bytes, controlledBody([bytes]).body),

@@ -613,7 +613,7 @@ test("composition burns mismatched recovered H1 and retires already-created owne
     await settle();
     assert.equal(shutdownCalls, 1);
     const readinessState = { applied: 0, closed: 0 };
-    assert.equal(compositionModule.createRelayV2HostH1ReadinessActivation({
+    assert.equal(commandPlane.createRelayV2HostH1ReadinessActivation({
       hostId: `${HOST_ID}-wrong`,
       hostEpoch: h.seeded.snapshot.hostEpoch,
       hostInstanceId: h.store.hostInstanceId,

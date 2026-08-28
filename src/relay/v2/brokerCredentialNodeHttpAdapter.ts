@@ -1,10 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   handleRelayV2BrokerCredentialHttpIngress,
-  RELAY_V2_BROKER_CLIENT_TOKEN_REFRESH_PATH,
-  RELAY_V2_BROKER_ENROLLMENT_REDEEM_PATH,
-  RELAY_V2_BROKER_HOST_TOKEN_REFRESH_PATH,
-  RELAY_V2_BROKER_SELF_REVOKE_PATH,
   type RelayV2BrokerCredentialHttpIngressAuthorityPort,
 } from "./brokerCredentialHttpIngress.js";
 import type {
@@ -12,15 +8,8 @@ import type {
   RelayV2BrokerCredentialHttpHeader,
   RelayV2BrokerCredentialHttpResponse,
 } from "./brokerCredentialHttpBoundary.js";
-import {
-  handleRelayV2BrokerHostBootstrapHttpIngress,
-  RELAY_V2_BROKER_HOST_BOOTSTRAP_PATH,
-  type RelayV2BrokerHostBootstrapAuthorityPort,
-} from "./brokerHostBootstrapHttpIngress.js";
-
-export interface RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort
-extends RelayV2BrokerCredentialHttpIngressAuthorityPort,
-  RelayV2BrokerHostBootstrapAuthorityPort {}
+export type RelayV2BrokerCredentialNodeHttpAdapterAuthorityPort =
+  RelayV2BrokerCredentialHttpIngressAuthorityPort;
 
 class IncomingMessageBody implements RelayV2BrokerCredentialHttpBody {
   private iterationStarted = false;
@@ -240,27 +229,13 @@ export async function handleRelayV2BrokerCredentialNodeHttpRequest(
     headers: rawRequestHeaders(request),
     body,
   };
-  let result: RelayV2BrokerCredentialHttpResponse;
-  switch (path) {
-    case RELAY_V2_BROKER_HOST_BOOTSTRAP_PATH:
-      result = await handleRelayV2BrokerHostBootstrapHttpIngress(
-        authority,
-        sourceKey,
-        adaptedRequest,
-      );
-      break;
-    case RELAY_V2_BROKER_ENROLLMENT_REDEEM_PATH:
-    case RELAY_V2_BROKER_CLIENT_TOKEN_REFRESH_PATH:
-    case RELAY_V2_BROKER_HOST_TOKEN_REFRESH_PATH:
-    case RELAY_V2_BROKER_SELF_REVOKE_PATH:
-    default:
-      // Unknown raw targets use the existing closed 404 mapping and never
-      // reach an authority method.
-      result = await handleRelayV2BrokerCredentialHttpIngress(
-        authority,
-        sourceKey,
-        adaptedRequest,
-      );
-  }
+  // The ingress owns all route selection. Unknown raw targets use its closed
+  // 404 mapping and never reach an authority method.
+  const result: RelayV2BrokerCredentialHttpResponse =
+    await handleRelayV2BrokerCredentialHttpIngress(
+      authority,
+      sourceKey,
+      adaptedRequest,
+    );
   await writeResponseOnce(response, result, body);
 }

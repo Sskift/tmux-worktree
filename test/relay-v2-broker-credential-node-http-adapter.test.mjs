@@ -8,7 +8,6 @@ import {
 import test from "node:test";
 
 const adapter = await import("../dist/relay/v2/brokerCredentialNodeHttpAdapter.js");
-const bootstrapIngress = await import("../dist/relay/v2/brokerHostBootstrapHttpIngress.js");
 const credentialIngress = await import("../dist/relay/v2/brokerCredentialHttpIngress.js");
 
 const NOW_MS = 1_800_000_000_000;
@@ -50,7 +49,7 @@ const HOST_GRANT_BODY = Object.freeze({
 
 const ROUTES = Object.freeze({
   host_bootstrap: Object.freeze({
-    path: bootstrapIngress.RELAY_V2_BROKER_HOST_BOOTSTRAP_PATH,
+    path: credentialIngress.RELAY_V2_BROKER_HOST_BOOTSTRAP_PATH,
     body: Object.freeze({
       bootstrapAttemptId: "bootstrap-attempt",
       bootstrapToken: "twhostboot2.bootstrap-secret",

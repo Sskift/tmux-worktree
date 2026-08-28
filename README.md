@@ -28,7 +28,7 @@
 
 <p align="center">
   <a href="docs/demo.md">
-    <img src="docs/assets/tw-dashboard-hero.png" alt="TW Mission Control running on a desktop and Android phone" width="100%" />
+    <img src="docs/assets/tw-dashboard-hero.webp" alt="TW Mission Control running on a desktop and Android phone" width="100%" />
   </a>
 </p>
 

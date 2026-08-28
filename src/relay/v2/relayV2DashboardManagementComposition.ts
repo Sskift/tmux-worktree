@@ -70,7 +70,6 @@ export class RelayV2DashboardManagementCompositionClosedError extends Error {
 interface ActivationSignature extends RelayV2DashboardManagementCompositionOptions {}
 
 interface ActivationRecord {
-  readonly ownership: "standalone" | "protocol_v2_session";
   readonly signature: ActivationSignature;
   readonly handle: RelayV2DashboardManagementComposition;
 }
@@ -193,7 +192,6 @@ function validateOwners(signature: ActivationSignature): void {
  */
 function activateComposition(
   signature: ActivationSignature,
-  ownership: ActivationRecord["ownership"],
 ): RelayV2DashboardManagementComposition {
   const hostIdentity = Object.freeze({
     hostId: signature.hostId,
@@ -386,7 +384,7 @@ function activateComposition(
       handleRequest,
       closeAndDrain,
     })) as RelayV2DashboardManagementComposition;
-    const record: ActivationRecord = Object.freeze({ ownership, signature, handle });
+    const record: ActivationRecord = Object.freeze({ signature, handle });
     if (!commitRelayV2HostDashboardManagementBinding(
       signature.hostManagementBinding,
       hostIdentity,
@@ -409,22 +407,9 @@ function activateComposition(
   }
 }
 
-export function createRelayV2DashboardManagementComposition(
-  options: RelayV2DashboardManagementCompositionOptions,
-): RelayV2DashboardManagementComposition {
-  const signature = captureOptions(options);
-  const existing = existingActivation(signature);
-  if (existing !== null) {
-    if (existing.ownership !== "standalone") return closed();
-    return existing.handle;
-  }
-  return activateComposition(signature, "standalone");
-}
-
 /**
  * Atomically reserves a fresh composition activation for the canonical
- * protocol-v2 session owner. Any prior activation, including an exact closed
- * standalone activation, is terminal; the public idempotent factory cannot
+ * protocol-v2 session owner. Any prior activation is terminal and cannot
  * reacquire the resulting handle.
  */
 export function claimRelayV2DashboardManagementCompositionForProtocolV2Session(
@@ -432,5 +417,5 @@ export function claimRelayV2DashboardManagementCompositionForProtocolV2Session(
 ): RelayV2DashboardManagementComposition {
   const signature = captureOptions(options);
   if (existingActivation(signature) !== null) return closed();
-  return activateComposition(signature, "protocol_v2_session");
+  return activateComposition(signature);
 }

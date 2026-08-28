@@ -65,18 +65,14 @@ import { createRelayV2HostH0ReadinessActivation } from "./hostH0ReadinessActivat
 import type {
   RelayV2HostH0ReadinessLifecycle,
 } from "./hostH0ReadinessActivation.js";
-import { createRelayV2HostH1ReadinessActivation } from "./hostH1ReadinessActivation.js";
 import type {
-  RelayV2HostH1ReadinessLifecycle,
-} from "./hostH1ReadinessActivation.js";
-import type {
-  RelayV2HostH2ReadinessActivation,
-  RelayV2HostH2ReadinessLifecycle,
-  RelayV2HostH2ReadinessSnapshotSpool,
-} from "./hostH2ReadinessActivation.js";
+  RelayV2HostH1ReadinessActivation,
+} from "./hostCommandPlane.js";
 import { createRelayV2HostH3ReadinessActivation } from "./hostH3ReadinessActivation.js";
 import type { RelayV2HostH3ReadinessLifecycle } from "./hostH3ReadinessActivation.js";
+import type { RelayV2MaterializedStateRuntimeH2Port } from "./resourceState.js";
 import type {
+  RelayV2RecoveredHostH2SnapshotSpoolPort,
   RelayV2HostH2RecoveryCandidate,
 } from "./stateSnapshotSpool.js";
 import type {
@@ -116,6 +112,34 @@ import {
   type RelayV2DashboardManagementCarrierControlPort,
 } from "./relayV2DashboardManagementAuthority.js";
 import { isRelayV2AuthIdentifier } from "./token.js";
+
+type HostCommandPlaneH1ActivationModule = Pick<
+  typeof import("./hostCommandPlane.js"),
+  "createRelayV2HostH1ReadinessActivation"
+>;
+
+// Independently bundled root entries must consume the canonical command-plane
+// owner so candidate issuance and one-shot capture share the same WeakMap.
+const HOST_COMMAND_PLANE_ENTRY_URL = new URL("./hostCommandPlane.js", import.meta.url).href;
+const hostCommandPlaneH1ActivationModule = await import(HOST_COMMAND_PLANE_ENTRY_URL) as
+  HostCommandPlaneH1ActivationModule;
+const createRelayV2HostH1ReadinessActivation =
+  hostCommandPlaneH1ActivationModule.createRelayV2HostH1ReadinessActivation;
+if (typeof createRelayV2HostH1ReadinessActivation !== "function") {
+  throw new Error("Relay v2 H1 recovery candidate capture seam is unavailable");
+}
+
+type RelayV2HostH1ReadinessLifecycle = Pick<RelayV2HostH1ReadinessActivation, "close">;
+interface RelayV2HostH2ReadinessLifecycle {
+  close(): void;
+}
+interface RelayV2HostH2ReadinessActivation {
+  readonly runtimeH2: RelayV2MaterializedStateRuntimeH2Port;
+  readonly snapshotSpool: RelayV2RecoveredHostH2SnapshotSpoolPort;
+  readonly lifecycle: RelayV2HostH2ReadinessLifecycle;
+  cancelConstruction(): void;
+  dispose(): void;
+}
 
 type ManualReadinessSource = Exclude<
   RelayV2HostCapabilityReadinessSource,
@@ -319,14 +343,12 @@ export function matchesRelayV2RecoveredHostH2CompositionReceiver(
   return recoveredHostH2CompositionPairs.get(pair)?.receiverIdentity === receiverIdentity;
 }
 
-export type RelayV2HostRuntimeCompositionH2ReadinessLifecycle =
+type RelayV2HostRuntimeCompositionH2ReadinessLifecycle =
   RelayV2HostH2ReadinessLifecycle;
 
-// Standalone construction is exported for authority-level behavior tests and
-// other internal composition roots; this composition never accepts an injected
-// activation instance and exposes only its lifecycle.
+// H0 remains the canonical test surface until its implementation has a
+// production seam outside this composition.
 export { createRelayV2HostH0ReadinessActivation };
-export { createRelayV2HostH1ReadinessActivation };
 
 export interface RelayV2HostRuntimeCompositionReadinessLifecycle {
   readonly codec: RelayV2HostCodecReadinessLifecycle;
@@ -348,9 +370,6 @@ export interface RelayV2HostRuntimeCompositionRouteSink
     responseLineage?: RelayV2TerminalOpenResponseLineage,
   ): Promise<void>;
 }
-
-export type RelayV2HostRuntimeCompositionSnapshotSpool =
-  RelayV2HostH2ReadinessSnapshotSpool;
 
 export type RelayV2HostRuntimeCompositionAuthorities = Omit<
   RelayV2HostRuntimeActualAuthorityInput,
@@ -380,7 +399,7 @@ export interface RelayV2HostRuntimeComposition {
   dispose(): Promise<void>;
 }
 
-export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
+type RelayV2HostManagedBaseCarrierOptions = Omit<
   RelayV2HostCarrierOptions,
   | "hostId"
   | "hostEpoch"
@@ -401,21 +420,7 @@ export type RelayV2HostCarrierRuntimeCompositionCarrierOptions = Omit<
   clientDialects?: never;
 }>;
 
-export interface RelayV2HostCarrierRuntimeCompositionOptions {
-  runtime: Omit<RelayV2HostRuntimeCompositionOptions, "outbound">;
-  carrier: RelayV2HostCarrierRuntimeCompositionCarrierOptions;
-}
-
-export interface RelayV2HostCarrierRuntimeFacade {
-  status(): RelayV2HostCarrierStatus | null;
-  connect(
-    transport: RelayV2HostCarrierTransport,
-    credentialReference: string,
-  ): RelayV2HostCarrierConnection;
-  requestReauthentication(requestId: string, credentialReference: string): boolean;
-}
-
-export interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
+interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
   readonly codec: RelayV2HostCodecReadinessLifecycle;
   readonly h0: RelayV2HostH0ReadinessLifecycle;
   readonly h1: RelayV2HostH1ReadinessLifecycle;
@@ -424,19 +429,8 @@ export interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
   current(): RelayV2HostReadinessSnapshot;
 }
 
-export interface RelayV2HostCarrierRuntimeComposition {
-  readonly carrier: RelayV2HostCarrierRuntimeFacade;
-  readonly readiness: RelayV2HostCarrierRuntimeCompositionReadinessLifecycle;
-  sendTerminalFrame(
-    route: RelayV2TerminalRuntimeBinding,
-    frame: RelayV2JsonObject,
-    responseLineage?: RelayV2TerminalOpenResponseLineage,
-  ): Promise<void>;
-  dispose(): Promise<void>;
-}
-
 export type RelayV2HostManagedConnectorCarrierOptions = Omit<
-  RelayV2HostCarrierRuntimeCompositionCarrierOptions,
+  RelayV2HostManagedBaseCarrierOptions,
   "onStatus"
 > & Readonly<{ onStatus?: never }>;
 
@@ -1033,7 +1027,6 @@ interface RelayV2HostCarrierRuntimeBridge {
     input: Readonly<RelayV2HostPreCarrierOfferIssueInput>,
   ): RelayV2HostPreCarrierOfferClaim | null;
   withdrawCarrierReadiness(): void;
-  fenceNewBindings(): void;
   beginManagedClose(): void;
   sendTerminalFrame(
     route: RelayV2TerminalRuntimeBinding,
@@ -1213,9 +1206,6 @@ async function openRelayV2HostCarrierRuntimeBridge(
     withdrawCarrierReadiness(): void {
       applyCarrierReadiness(false);
     },
-    fenceNewBindings(): void {
-      acceptingBindings = false;
-    },
     beginManagedClose(): void {
       acceptingBindings = false;
       outboundActive = false;
@@ -1248,87 +1238,6 @@ async function openRelayV2HostCarrierRuntimeBridge(
         } catch (error) {
           published.reject(synchronousFailure ?? error);
         }
-      })();
-      return published.promise;
-    },
-  });
-}
-
-/**
- * Default-off carrier/runtime composition. The public carrier is a frozen
- * transport lifecycle facade; route binding and outbound ownership remain
- * private so callers cannot bypass exact provenance or receipt accounting.
- */
-export async function openRelayV2HostCarrierRuntimeComposition(
-  options: RelayV2HostCarrierRuntimeCompositionOptions,
-): Promise<RelayV2HostCarrierRuntimeComposition> {
-  const runtimeOptions = captureRelayV2HostCarrierRuntimeOptions(options.runtime);
-  const bridge = await openRelayV2HostCarrierRuntimeBridge(runtimeOptions);
-  let actor: RelayV2HostCarrierActor;
-  try {
-    const {
-      onStatus: observedStatus,
-      ...carrierOptions
-    } = options.carrier;
-    actor = new RelayV2HostCarrierActor({
-      ...carrierOptions,
-      hostId: runtimeOptions.hostId,
-      hostEpoch: runtimeOptions.hostEpoch,
-      hostInstanceId: runtimeOptions.hostInstanceId,
-      routeSink: bridge.routeSink,
-      advertisedCapabilities: [],
-      preCarrierOfferClaim: undefined,
-      clientDialects: ["tw-relay.v2"],
-      onStatus(status): void {
-        bridge.observeCarrierStatus(actor, status);
-        observedStatus?.(status);
-      },
-    });
-    bridge.attachActor(actor);
-  } catch (error) {
-    await bridge.disposeRuntime().catch(() => undefined);
-    throw error;
-  }
-
-  const carrier: RelayV2HostCarrierRuntimeFacade = Object.freeze({
-    status: () => actor.status(),
-    connect: (transport, credentialReference) => actor.connect(
-      transport,
-      credentialReference,
-    ),
-    requestReauthentication: (requestId, credentialReference) => (
-      actor.requestReauthentication(requestId, credentialReference)
-    ),
-  });
-
-  let disposeBarrier: Promise<void> | null = null;
-  return Object.freeze({
-    carrier,
-    readiness: bridge.readiness,
-    sendTerminalFrame: (
-      route: RelayV2TerminalRuntimeBinding,
-      frame: RelayV2JsonObject,
-      responseLineage?: RelayV2TerminalOpenResponseLineage,
-    ) => bridge.sendTerminalFrame(route, frame, responseLineage),
-    dispose(): Promise<void> {
-      if (disposeBarrier !== null) return disposeBarrier;
-      const published = createDeferredBarrier();
-      disposeBarrier = published.promise;
-      bridge.fenceNewBindings();
-      const synchronousFailures: unknown[] = [];
-      const rememberFailure = (error: unknown): void => {
-        if (synchronousFailures.length === 0) synchronousFailures.push(error);
-      };
-      let runtimeBarrier: Promise<void> = Promise.resolve();
-      try { runtimeBarrier = bridge.disposeRuntime(); } catch (error) { rememberFailure(error); }
-      try { actor.dispose(); } catch (error) { rememberFailure(error); }
-      bridge.detachActor(actor);
-      void (async () => {
-        const asynchronousFailures: unknown[] = [];
-        try { await runtimeBarrier; } catch (error) { asynchronousFailures.push(error); }
-        const failures = [...synchronousFailures, ...asynchronousFailures];
-        if (failures.length === 0) published.resolve();
-        else published.reject(failures[0]);
       })();
       return published.promise;
     },

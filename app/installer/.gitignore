@@ -1,2 +1,3 @@
-dmg/*.dmg
+dmg/*
+!dmg/.gitkeep
 node_modules/

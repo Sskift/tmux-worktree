@@ -1,21 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeSync,
-} from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { decodeRelayV2AuthUtf8, parseRelayV2AuthJson } from "./authJson.js";
-import {
   decodeCanonicalRelayV2Base64Url,
   encodeRelayV2AccessToken,
   isRelayV2AuthIdentifier,
@@ -28,7 +12,6 @@ import {
 } from "./token.js";
 
 export const RELAY_V2_ISSUER_KEYRING_VERSION = 1 as const;
-const MAX_KEYRING_BYTES = 1 * 1024 * 1024;
 const MIN_SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 64;
 
@@ -393,101 +376,4 @@ export function removeRelayV2VerifyOnlyKey(
     verifyOnlyKeys: keyring.verifyOnlyKeys.filter((candidate) => candidate.kid !== kid),
     retiredKids: [...keyring.retiredKids, kid],
   });
-}
-
-export function relayV2IssuerKeyringPath(home = homedir()): string {
-  return join(home, ".tmux-worktree", "relay-v2-issuer-keyring.json");
-}
-
-function validatePrivateDirectory(path: string): void {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(path);
-  const uid = process.getuid?.();
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid)) {
-    stateError("Relay v2 issuer state directory is unsafe");
-  }
-  if ((stat.mode & 0o077) !== 0) chmodSync(path, 0o700);
-}
-
-function validatePrivateFile(path: string): void {
-  const stat = lstatSync(path);
-  const uid = process.getuid?.();
-  if (
-    !stat.isFile()
-    || stat.isSymbolicLink()
-    || (uid !== undefined && stat.uid !== uid)
-    || (stat.mode & 0o777) !== 0o600
-  ) {
-    stateError("Relay v2 issuer state file is unsafe");
-  }
-}
-
-function fsyncDirectory(path: string): void {
-  let fd = -1;
-  try {
-    fd = openSync(path, "r");
-    fsyncSync(fd);
-  } finally {
-    if (fd >= 0) closeSync(fd);
-  }
-}
-
-/**
- * Atomically replaces one prepared keyring file. This filesystem seam does not
- * serialize a read-modify-write transition and is not a durable issuance owner.
- */
-export function saveRelayV2IssuerKeyring(
-  keyringValue: RelayV2IssuerKeyring,
-  path = relayV2IssuerKeyringPath(),
-): void {
-  const keyring = parseRelayV2IssuerKeyring(keyringValue);
-  const directory = dirname(path);
-  validatePrivateDirectory(directory);
-  if (existsSync(path)) {
-    const current = loadRelayV2IssuerKeyring(path);
-    if (current.issuerId !== keyring.issuerId) stateError();
-  }
-  const temporary = join(
-    directory,
-    `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`,
-  );
-  let fd = -1;
-  try {
-    fd = openSync(temporary, "wx", 0o600);
-    const contents = Buffer.from(`${JSON.stringify(keyring, null, 2)}\n`, "utf8");
-    let offset = 0;
-    while (offset < contents.byteLength) {
-      offset += writeSync(fd, contents, offset, contents.byteLength - offset, offset);
-    }
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = -1;
-    renameSync(temporary, path);
-    chmodSync(path, 0o600);
-    fsyncDirectory(directory);
-  } finally {
-    if (fd >= 0) {
-      try { closeSync(fd); } catch {}
-    }
-    rmSync(temporary, { force: true });
-  }
-}
-
-export function loadRelayV2IssuerKeyring(
-  path = relayV2IssuerKeyringPath(),
-): RelayV2IssuerKeyring {
-  try {
-    validatePrivateFile(path);
-    const contents = readFileSync(path);
-    if (contents.byteLength > MAX_KEYRING_BYTES) stateError();
-    const value = parseRelayV2AuthJson(decodeRelayV2AuthUtf8(contents), {
-      maxDepth: 5,
-      maxKeys: 4_096,
-      maxNodes: 8_192,
-    });
-    return parseRelayV2IssuerKeyring(value);
-  } catch (error) {
-    if (error instanceof RelayV2IssuerStateError) throw error;
-    throw new RelayV2IssuerStateError();
-  }
 }

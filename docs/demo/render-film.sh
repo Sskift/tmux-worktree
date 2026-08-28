@@ -105,7 +105,7 @@ magick \
   "$BUILD_DIR/scene-01.png"
 
 magick \
-  "$ASSET_DIR/tw-dashboard-hero.png" \
+  "$ASSET_DIR/tw-dashboard-hero.webp" \
   -resize '1920x1080^' -gravity center -extent 1920x1080 \
   -fill 'rgba(3,4,7,0.63)' -draw 'rectangle 0,0 1920,260' \
   -font "$MONO_FONT" -fill '#FFBE40' -pointsize 22 -kerning 2 \
