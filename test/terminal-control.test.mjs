@@ -892,6 +892,38 @@ test("exact auto-start hands the bound socket and state paths to one terminal-co
   }
 });
 
+test("auto-start accepts ping before a slow login shell finishes", async () => {
+  const temp = tempState("tc-slow-shell-");
+  const socketPath = join(temp.root, "slow-shell.sock");
+  const statePath = join(temp.root, "slow-shell-state.json");
+  const slowShell = join(temp.root, "slow-login-shell");
+  writeFileSync(slowShell, "#!/bin/sh\nexec /bin/sleep 4\n", { mode: 0o700 });
+  const previousShell = process.env.SHELL;
+  process.env.SHELL = slowShell;
+  try {
+    const result = await terminalControl.requestTerminalControl(
+      { type: "ping" },
+      {
+        socketPath,
+        autoStart: true,
+        autoStartCliTarget: {
+          executable: process.execPath,
+          entrypoint: terminalControlCli,
+          idleExitMs: 30_000,
+        },
+        autoStartStatePath: statePath,
+        timeoutMs: 2_000,
+      },
+    );
+    assert.equal(result.authority, "local-terminal-control");
+  } finally {
+    await stopAutoStartedTerminalControl(socketPath);
+    if (previousShell === undefined) delete process.env.SHELL;
+    else process.env.SHELL = previousShell;
+    temp.cleanup();
+  }
+});
+
 test("explicit ephemeral auto-start exits after idle and removes its owned sockets", async () => {
   const temp = tempState("tc-idle-");
   const socketPath = join(temp.root, "ephemeral.sock");

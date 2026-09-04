@@ -274,6 +274,23 @@ data class NewWorktreeRequest(
     val aiCommand: String,
 )
 
+internal const val NEW_WORKTREE_NAME_MAX_CODE_POINTS = 20
+
+internal fun normalizedNewWorktreeName(value: String): String = value.trim()
+
+internal fun newWorktreeNameValidationError(
+    value: String,
+    requireValue: Boolean,
+): String? {
+    val normalized = normalizedNewWorktreeName(value)
+    return when {
+        normalized.isEmpty() -> "Worktree name is required".takeIf { requireValue }
+        normalized.codePointCount(0, normalized.length) > NEW_WORKTREE_NAME_MAX_CODE_POINTS ->
+            "Worktree name must be 20 characters or fewer"
+        else -> null
+    }
+}
+
 enum class CreationTarget {
     WORKTREE,
     TERMINAL,

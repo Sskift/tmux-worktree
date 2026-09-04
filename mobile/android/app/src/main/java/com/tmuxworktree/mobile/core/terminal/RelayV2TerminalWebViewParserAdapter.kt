@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.terminal
 
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2TerminalParserPort
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserCallbackToken
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -41,6 +42,7 @@ internal class RelayV2TerminalWebViewParserAdapter(
     private val newCallbackNonce: () -> String = { UUID.randomUUID().toString() },
 ) : RelayV2TerminalParserPort {
     private val attachmentCallbacks = ParserAttachmentCallbackOwner()
+    private val outputFilter = LegacyScreenTitleOutputFilter()
 
     constructor(
         binding: TerminalWebViewParserBinding,
@@ -62,15 +64,29 @@ internal class RelayV2TerminalWebViewParserAdapter(
         callbackToken: RelayV2TerminalParserCallbackToken,
         bytes: ByteArray,
         completion: suspend (applied: Boolean) -> Unit,
-    ): Boolean = register(callbackToken, completion) { callbackId, callback ->
-        writePort.register(callbackId, bytes, callback)
+    ): Boolean {
+        val filteredBytes = outputFilter.push(bytes)
+        return register(callbackToken, completion) { callbackId, callback ->
+            if (filteredBytes.isEmpty()) {
+                // A complete legacy title sequence mutates only filter state. Settle it through
+                // the same registration gate so attachment fencing and callback ordering remain
+                // identical to an acknowledged WebView parser mutation.
+                callback(true)
+                true
+            } else {
+                writePort.register(callbackId, filteredBytes, callback)
+            }
+        }
     }
 
     override suspend fun reset(
         callbackToken: RelayV2TerminalParserCallbackToken,
         completion: suspend (applied: Boolean) -> Unit,
-    ): Boolean = register(callbackToken, completion) { callbackId, callback ->
-        resetPort.register(callbackId, callback)
+    ): Boolean {
+        outputFilter.reset()
+        return register(callbackToken, completion) { callbackId, callback ->
+            resetPort.register(callbackId, callback)
+        }
     }
 
     @OptIn(DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
@@ -117,6 +133,106 @@ internal class RelayV2TerminalWebViewParserAdapter(
 
     private companion object {
         const val MAX_CALLBACK_ID_CHARS = 256
+    }
+}
+
+/**
+ * tmux/zsh can emit the screen-compatible title form `ESC k title ESC \\`. The vendored xterm
+ * parser does not implement that private sequence and renders `title` as terminal text. Remove
+ * only that metadata sequence while preserving every other byte, including sequences split at
+ * arbitrary Relay frame boundaries.
+ */
+internal class LegacyScreenTitleOutputFilter(
+    private val maxSequenceBytes: Int = 4_096,
+) {
+    private enum class State {
+        TEXT,
+        ESCAPE,
+        TITLE,
+        TITLE_ESCAPE,
+    }
+
+    private var state = State.TEXT
+    private val held = ByteArrayOutputStream()
+
+    @Synchronized
+    fun push(bytes: ByteArray): ByteArray {
+        if (bytes.isEmpty()) return bytes
+        val output = ByteArrayOutputStream(bytes.size)
+        bytes.forEach { signedByte ->
+            val byte = signedByte.toInt() and 0xff
+            when (state) {
+                State.TEXT -> {
+                    if (byte == ESCAPE_BYTE) {
+                        held.write(byte)
+                        state = State.ESCAPE
+                    } else {
+                        output.write(byte)
+                    }
+                }
+                State.ESCAPE -> {
+                    if (byte == LEGACY_TITLE_FINAL_BYTE) {
+                        held.write(byte)
+                        state = State.TITLE
+                    } else {
+                        output.write(held.toByteArray())
+                        held.reset()
+                        if (byte == ESCAPE_BYTE) {
+                            held.write(byte)
+                            state = State.ESCAPE
+                        } else {
+                            output.write(byte)
+                            state = State.TEXT
+                        }
+                    }
+                }
+                State.TITLE -> {
+                    held.write(byte)
+                    when (byte) {
+                        BELL_BYTE -> discardTitle()
+                        ESCAPE_BYTE -> state = State.TITLE_ESCAPE
+                        else -> flushOversizedTitleTo(output)
+                    }
+                }
+                State.TITLE_ESCAPE -> {
+                    held.write(byte)
+                    when (byte) {
+                        STRING_TERMINATOR_FINAL_BYTE -> discardTitle()
+                        ESCAPE_BYTE -> flushOversizedTitleTo(output)
+                        else -> {
+                            state = State.TITLE
+                            flushOversizedTitleTo(output)
+                        }
+                    }
+                }
+            }
+        }
+        return output.toByteArray()
+    }
+
+    @Synchronized
+    fun reset() {
+        held.reset()
+        state = State.TEXT
+    }
+
+    private fun discardTitle() {
+        held.reset()
+        state = State.TEXT
+    }
+
+    private fun flushOversizedTitleTo(output: ByteArrayOutputStream) {
+        if (held.size() <= maxSequenceBytes) return
+        output.write(held.toByteArray())
+        held.reset()
+        state = State.TEXT
+    }
+
+    private companion object {
+        const val ESCAPE_BYTE = 0x1b
+        const val BELL_BYTE = 0x07
+        const val LEGACY_TITLE_FINAL_BYTE = 0x6b
+        const val STRING_TERMINATOR_FINAL_BYTE = 0x5c
     }
 }
 

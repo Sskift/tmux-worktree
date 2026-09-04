@@ -201,6 +201,10 @@
         // Relay owns durable output. Keep only a bounded local viewing window so a constrained
         // Android WebView renderer cannot be evicted while the keyboard changes the canvas size.
         scrollback: 1000,
+        // The Host's tmux capture plane emits LF-delimited terminal rows. Treat each LF as
+        // a new line from column zero; otherwise xterm preserves the previous cursor column and
+        // stale command text is left in front of the next output line (for example `echoMARKER`).
+        convertEol: true,
         allowTransparency: false,
         // Keep Android IME composition on xterm's insertText path. In screen-reader
         // mode Gboard's composing textarea replacements are emitted as cumulative data.

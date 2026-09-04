@@ -1,6 +1,6 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-  "version": "1.0.20",
+  "version": "1.0.21",
   "type": "module",
   "description": "AI + tmux + git worktree workspace manager with a macOS Dashboard, local sessions, automations, and SSH remote TW-managed worktrees",
   "repository": {
@@ -23,7 +23,9 @@
     "prepack": "npm run build && npm run validate:package",
     "demo": "npm --prefix app run demo",
     "test:cli": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
+    "test:interop": "npm run build && node scripts/relay-v2-interop.mjs",
     "verify": "sh scripts/verify.sh core",
+    "verify:interop": "sh scripts/verify.sh interop",
     "verify:android": "sh scripts/verify.sh android",
     "verify:all": "sh scripts/verify.sh all",
     "verify:device": "sh scripts/verify.sh device"

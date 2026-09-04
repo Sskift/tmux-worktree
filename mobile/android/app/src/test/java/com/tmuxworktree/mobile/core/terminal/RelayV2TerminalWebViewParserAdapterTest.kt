@@ -24,6 +24,31 @@ import org.junit.Test
 
 class RelayV2TerminalWebViewParserAdapterTest {
     @Test
+    fun `legacy screen titles never render even across arbitrary Relay frame boundaries`() {
+        val input = (
+            "\r\n\u001Bk" +
+                "echo" +
+                "\u001B\\" +
+                "render_fix_e2e_0904_d73a\r\n"
+            ).toByteArray(Charsets.UTF_8)
+        val expected = "\r\nrender_fix_e2e_0904_d73a\r\n".toByteArray(Charsets.UTF_8)
+        val filter = LegacyScreenTitleOutputFilter()
+        val output = input.flatMap { byte -> filter.push(byteArrayOf(byte)).asIterable() }.toByteArray()
+
+        assertArrayEquals(expected, output)
+    }
+
+    @Test
+    fun `legacy title filter preserves unrelated terminal control sequences`() {
+        val filter = LegacyScreenTitleOutputFilter()
+        val first = filter.push("before\u001B".toByteArray(Charsets.UTF_8))
+        val second = filter.push("[32mgreen\u001B[0m".toByteArray(Charsets.UTF_8))
+
+        assertArrayEquals("before".toByteArray(Charsets.UTF_8), first)
+        assertArrayEquals("\u001B[32mgreen\u001B[0m".toByteArray(Charsets.UTF_8), second)
+    }
+
+    @Test
     fun `default callback dispatcher keeps durable completions off caller and serial`() =
         runBlocking {
             lateinit var firstPlatformCompletion: (Boolean) -> Unit

@@ -1313,12 +1313,26 @@ class V2ViewModel(
     }
 
     fun createWorktree(request: NewWorktreeRequest) {
-        val hostId = request.hostId.ifBlank { selectedHostId() }
+        val hostId = request.hostId.trim().ifBlank { selectedHostId() }
+        val scopeId = request.scopeId.trim()
+        val project = request.project.trim()
+        val path = request.path.trim()
+        val name = normalizedNewWorktreeName(request.name)
+        val branch = request.branch.trim()
+        val aiCommand = request.aiCommand.trim()
         if (hostId.isBlank()) {
             _uiState.update { it.copy(actionError = "No connected host is available") }
             return
         }
-        if (request.aiCommand.isBlank()) {
+        if (project.isBlank() && path.isBlank()) {
+            _uiState.update { it.copy(actionError = "Repository is required") }
+            return
+        }
+        newWorktreeNameValidationError(name, requireValue = true)?.let { validationError ->
+            _uiState.update { it.copy(actionError = validationError) }
+            return
+        }
+        if (aiCommand.isBlank()) {
             _uiState.update { it.copy(actionError = "Choose an agent command") }
             return
         }
@@ -1326,14 +1340,14 @@ class V2ViewModel(
             val session = RelaySession(
                 hostId = hostId,
                 hostName = _uiState.value.hosts.firstOrNull { it.hostId == hostId }?.displayName ?: hostId,
-                name = request.name.ifBlank { "new-worktree" },
-                rawName = request.name.ifBlank { "new-worktree" },
-                scopeId = request.scopeId.ifBlank { "local" },
-                scopeLabel = request.scopeId.ifBlank { "local" },
-                project = request.project,
-                branch = request.branch,
+                name = name,
+                rawName = name,
+                scopeId = scopeId.ifBlank { "local" },
+                scopeLabel = scopeId.ifBlank { "local" },
+                project = project,
+                branch = branch,
                 agentState = AgentState.RUNNING,
-                summary = "Starting ${request.aiCommand}",
+                summary = "Starting $aiCommand",
                 activityAtSeconds = System.currentTimeMillis() / 1_000,
             )
             _uiState.update { it.copy(sessions = listOf(session) + it.sessions, creatingWorktree = false) }
@@ -1342,7 +1356,7 @@ class V2ViewModel(
         }
 
         if (_uiState.value.relayStartupAdmission == RelayStartupAdmissionState.RELAY_V2) {
-            if (request.scopeId.isBlank()) {
+            if (scopeId.isBlank()) {
                 _uiState.update {
                     it.copy(actionError = "Choose a visible Relay v2 Scope")
                 }
@@ -1351,7 +1365,7 @@ class V2ViewModel(
             var submissionAlreadyInFlight = false
             val admittedCreate = synchronized(relayV2UiFenceLock) {
                 val composition = relayV2Composition
-                val scopeCut = relayV2ScopeCreateCuts.value[hostId to request.scopeId]
+                val scopeCut = relayV2ScopeCreateCuts.value[hostId to scopeId]
                 if (_uiState.value.relayStartupAdmission !=
                     RelayStartupAdmissionState.RELAY_V2 ||
                     composition == null || scopeCut == null
@@ -1382,11 +1396,11 @@ class V2ViewModel(
                 val result = composition.submitCreateWorktree(
                     scopeCut = scopeCut,
                     inputs = RelayV2CreateWorktreeInputs(
-                        project = request.project.takeIf(String::isNotBlank),
-                        path = request.path.takeIf(String::isNotBlank),
-                        name = request.name.takeIf(String::isNotBlank),
-                        branch = request.branch.takeIf(String::isNotBlank),
-                        aiCommand = request.aiCommand,
+                        project = project.takeIf(String::isNotBlank),
+                        path = path.takeIf(String::isNotBlank),
+                        name = name,
+                        branch = branch.takeIf(String::isNotBlank),
+                        aiCommand = aiCommand,
                     ),
                 )
                 val transition = synchronized(relayV2UiFenceLock) {
@@ -1414,7 +1428,7 @@ class V2ViewModel(
                         composition = composition,
                         target = CreationTarget.WORKTREE,
                         receipt = result.receipt,
-                        scopeId = request.scopeId,
+                        scopeId = scopeId,
                         operation = RelayV2OutboxOperation.CREATE_WORKTREE,
                     )
                 }
@@ -4622,7 +4636,13 @@ class V2ViewModel(
                     relayV2SessionReplyCuts.value = cuts
                     relayV2ScopeCreateCuts.value = scopeCreateCuts
                     if (projection.available) {
-                        _uiState.value = _uiState.value.copy(scopes = scopes, sessions = sessions)
+                        val projectedState = _uiState.value.copy(
+                            scopes = scopes,
+                            sessions = sessions,
+                        )
+                        _uiState.value = projectedState.copy(
+                            health = decorateHealth(rawHealth, projectedState),
+                        )
                     }
                     true
                 }

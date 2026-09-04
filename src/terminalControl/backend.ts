@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
@@ -1028,6 +1028,8 @@ const CODEX_RESUME_ENVIRONMENT = [
   "OPENAI_BASE_URL",
 ] as const;
 
+let codexResumeEnvironmentHydration: Promise<void> = Promise.resolve();
+
 export function applyCodexResumeEnvironmentSnapshot(
   snapshot: string,
   environment: NodeJS.ProcessEnv = process.env,
@@ -1061,6 +1063,43 @@ export function inheritCodexResumeEnvironmentFromLoginShell(): void {
   } catch {
     // The authority remains usable for providers that do not require shell-exported settings.
   }
+}
+
+/**
+ * Start the optional login-shell credential hydration without delaying the
+ * terminal-control listener. Cold Codex resume awaits the latest hydration;
+ * all other terminal-control operations remain independent of user shell
+ * startup latency.
+ */
+export function inheritCodexResumeEnvironmentFromLoginShellAsync(
+  options: Readonly<{ signal?: AbortSignal }> = {},
+): Promise<void> {
+  const configuredShell = process.env.SHELL?.trim();
+  const shell = configuredShell?.startsWith("/") && !configuredShell.includes("\0")
+    ? configuredShell
+    : "/bin/zsh";
+  const hydration = new Promise<void>((resolve) => {
+    execFile(
+      shell,
+      ["-l", "-i", "-c", "printf '\\0'; env -0"],
+      {
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+        timeout: 10_000,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
+      (error, snapshot) => {
+        if (error === null) applyCodexResumeEnvironmentSnapshot(snapshot);
+        resolve();
+      },
+    );
+  });
+  codexResumeEnvironmentHydration = hydration;
+  return hydration;
+}
+
+async function waitForCodexResumeEnvironmentHydration(): Promise<void> {
+  await codexResumeEnvironmentHydration;
 }
 
 /** Pass provider credentials to the replacement pane without embedding them in its command. */
@@ -2067,6 +2106,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     }
 
     const inputDeadline = Date.now() + AGENT_RESUME_INPUT_TIMEOUT_MS;
+    if (provider === "codex") await waitForCodexResumeEnvironmentHydration();
     const sessionId = resumedAgentSessionIdFromStartCommand(
       observed.paneStartCommand,
       provider,

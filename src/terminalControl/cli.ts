@@ -10,7 +10,7 @@ import {
 } from "./protocol";
 import { runTerminalControlServer } from "./server";
 import { runTerminalControlProxy } from "./proxy";
-import { inheritCodexResumeEnvironmentFromLoginShell } from "./backend";
+import { inheritCodexResumeEnvironmentFromLoginShellAsync } from "./backend";
 
 async function readOneFrame(): Promise<string> {
   stdin.setEncoding("utf8");
@@ -90,8 +90,8 @@ export async function terminalControlCmd(args: string[]): Promise<void> {
   const command = args[0];
   if (command === "serve") {
     const paths = servePaths(args.slice(1));
-    inheritCodexResumeEnvironmentFromLoginShell();
     const controller = new AbortController();
+    void inheritCodexResumeEnvironmentFromLoginShellAsync({ signal: controller.signal });
     const stop = () => controller.abort();
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);

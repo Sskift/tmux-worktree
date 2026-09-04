@@ -28,6 +28,16 @@ class TerminalAssetLayoutPolicyTest {
     }
 
     @Test
+    fun `terminal output starts LF delimited Host rows at column zero`() {
+        val html = asset("xterm/index.html")
+
+        assertTrue(html.contains("convertEol: true"))
+        val adapter = source("core/terminal/RelayV2TerminalWebViewParserAdapter.kt")
+        assertTrue(adapter.contains("LegacyScreenTitleOutputFilter"))
+        assertTrue(adapter.contains("LEGACY_TITLE_FINAL_BYTE = 0x6b"))
+    }
+
+    @Test
     fun `vendored xterm retains the bounded Android 229 input state machine`() {
         val bundle = asset("xterm/xterm.js")
 

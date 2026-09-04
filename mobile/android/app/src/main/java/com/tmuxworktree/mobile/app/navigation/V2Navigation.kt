@@ -103,6 +103,8 @@ import com.tmuxworktree.mobile.app.RelayStartupAdmissionState
 import com.tmuxworktree.mobile.app.V2UiEffect
 import com.tmuxworktree.mobile.app.V2UiState
 import com.tmuxworktree.mobile.app.V2ViewModel
+import com.tmuxworktree.mobile.app.newWorktreeNameValidationError
+import com.tmuxworktree.mobile.app.normalizedNewWorktreeName
 import com.tmuxworktree.mobile.app.shouldShowTargetLoading
 import com.tmuxworktree.mobile.core.model.AgentEvidenceAvailability
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
@@ -932,12 +934,27 @@ private fun NewWorktreeRoute(
                     if (errors.host == null && errors.scope == null) stepName = NewWorktreeStep.CONFIGURE.name
                 }
                 NewWorktreeStep.CONFIGURE -> {
+                    val normalizedRepositoryPath = repositoryPath.trim()
+                    val normalizedBaseBranch = baseBranch.trim()
+                    val normalizedAiCommand = aiCommand.trim()
+                    val normalizedWorktreeName = normalizedNewWorktreeName(worktreeName)
                     errors = NewWorktreeValidationErrors(
-                        repositoryPath = "Repository is required".takeIf { repositoryPath.isBlank() },
-                        aiCommand = "Agent command is required".takeIf { aiCommand.isBlank() },
-                        worktreeName = "Worktree name is required".takeIf { worktreeName.isBlank() },
+                        repositoryPath = "Repository is required"
+                            .takeIf { normalizedRepositoryPath.isBlank() },
+                        aiCommand = "Agent command is required"
+                            .takeIf { normalizedAiCommand.isBlank() },
+                        worktreeName = newWorktreeNameValidationError(
+                            normalizedWorktreeName,
+                            requireValue = true,
+                        ),
                     )
-                    if (!errors.hasConfigurationError()) stepName = NewWorktreeStep.REVIEW.name
+                    if (!errors.hasConfigurationError()) {
+                        repositoryPath = normalizedRepositoryPath
+                        baseBranch = normalizedBaseBranch
+                        aiCommand = normalizedAiCommand
+                        worktreeName = normalizedWorktreeName
+                        stepName = NewWorktreeStep.REVIEW.name
+                    }
                 }
                 NewWorktreeStep.REVIEW -> Unit
             }
@@ -970,22 +987,29 @@ private fun NewWorktreeRoute(
         },
         onWorktreeNameChange = {
             worktreeName = it
-            errors = errors.copy(worktreeName = null)
+            errors = errors.copy(
+                worktreeName = newWorktreeNameValidationError(it, requireValue = false),
+            )
         },
         onRetryLoadTargets = viewModel::refresh,
         creationStatus = state.worktreeCreationStatus,
         onCreate = {
-            val looksLikePath = repositoryPath.startsWith("/") || repositoryPath.startsWith("~") ||
-                repositoryPath.startsWith(".")
+            val normalizedRepositoryPath = repositoryPath.trim()
+            val normalizedBaseBranch = baseBranch.trim()
+            val normalizedAiCommand = aiCommand.trim()
+            val normalizedWorktreeName = normalizedNewWorktreeName(worktreeName)
+            val looksLikePath = normalizedRepositoryPath.startsWith("/") ||
+                normalizedRepositoryPath.startsWith("~") ||
+                normalizedRepositoryPath.startsWith(".")
             viewModel.createWorktree(
                 NewWorktreeRequest(
-                    hostId = hostId,
-                    scopeId = scopeId,
-                    project = repositoryPath.takeUnless { looksLikePath }.orEmpty(),
-                    path = repositoryPath.takeIf { looksLikePath }.orEmpty(),
-                    name = worktreeName,
-                    branch = baseBranch,
-                    aiCommand = aiCommand,
+                    hostId = hostId.trim(),
+                    scopeId = scopeId.trim(),
+                    project = normalizedRepositoryPath.takeUnless { looksLikePath }.orEmpty(),
+                    path = normalizedRepositoryPath.takeIf { looksLikePath }.orEmpty(),
+                    name = normalizedWorktreeName,
+                    branch = normalizedBaseBranch,
+                    aiCommand = normalizedAiCommand,
                 ),
             )
         },

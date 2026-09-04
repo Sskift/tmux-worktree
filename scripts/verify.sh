@@ -38,6 +38,22 @@ run_rust() {
   )
 }
 
+run_interop() {
+  echo "==> Relay v2 WSS interop and terminal resume"
+  (
+    cd "$ROOT"
+    node scripts/relay-v2-interop.mjs
+  )
+}
+
+build_and_run_interop() {
+  (
+    cd "$ROOT"
+    npm run build
+  )
+  run_interop
+}
+
 prepare_android_sdk() {
   if [ -n "${ANDROID_HOME:-}" ] || [ -n "${ANDROID_SDK_ROOT:-}" ] || \
     [ -f "$ROOT/mobile/android/local.properties" ]; then
@@ -78,6 +94,7 @@ run_device() {
 case "$MODE" in
   core)
     run_cli
+    run_interop
     run_dashboard
     run_rust
     run_repository_hygiene
@@ -86,8 +103,13 @@ case "$MODE" in
     run_android
     run_repository_hygiene
     ;;
+  interop)
+    build_and_run_interop
+    run_repository_hygiene
+    ;;
   all)
     run_cli
+    run_interop
     run_dashboard
     run_rust
     run_android
@@ -95,6 +117,7 @@ case "$MODE" in
     ;;
   device)
     run_cli
+    run_interop
     run_dashboard
     run_rust
     run_android
@@ -102,7 +125,7 @@ case "$MODE" in
     run_repository_hygiene
     ;;
   *)
-    echo "usage: $0 [core|android|all|device]" >&2
+    echo "usage: $0 [core|interop|android|all|device]" >&2
     exit 2
     ;;
 esac

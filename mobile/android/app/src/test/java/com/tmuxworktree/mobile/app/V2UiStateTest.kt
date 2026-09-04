@@ -37,6 +37,22 @@ import org.junit.Test
 
 class V2UiStateTest {
     @Test
+    fun worktreeNameValidationTrimsImeWhitespaceAndCountsUnicodeCodePoints() {
+        assertEquals("mobile-v2", normalizedNewWorktreeName("  mobile-v2  "))
+        assertNull(newWorktreeNameValidationError("  mobile-v2  ", requireValue = true))
+        assertNull(newWorktreeNameValidationError("🧰".repeat(20), requireValue = true))
+        assertEquals(
+            "Worktree name must be 20 characters or fewer",
+            newWorktreeNameValidationError("🧰".repeat(21), requireValue = true),
+        )
+        assertEquals(
+            "Worktree name is required",
+            newWorktreeNameValidationError("   ", requireValue = true),
+        )
+        assertNull(newWorktreeNameValidationError("   ", requireValue = false))
+    }
+
+    @Test
     fun terminalCreationKeepsTheScopeSelectedOnWorkspaces() {
         val state = V2UiState(
             preferences = AppPreferences(
