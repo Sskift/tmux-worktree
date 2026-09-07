@@ -158,7 +158,6 @@ internal fun relayV2SessionUiStableId(vararg opaqueParts: String): String = buil
 }
 
 internal const val RELAY_V2_TRANSPORT_LABEL = "Relay v2 transport"
-private const val DASHBOARD_HOST_DISPLAY_NAME = "D2N6M7MMCX"
 
 internal fun relayHostDisplayName(hostId: String): String {
     val normalized = hostId.trim()
@@ -167,7 +166,7 @@ internal fun relayHostDisplayName(hostId: String): String {
         dashboardIdentity.length == 32 &&
         dashboardIdentity.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
     ) {
-        DASHBOARD_HOST_DISPLAY_NAME
+        "Dashboard · " + dashboardIdentity.take(6)
     } else {
         normalized
     }

@@ -142,9 +142,9 @@ class V2UiStateTest {
     }
 
     @Test
-    fun dashboardHostUsesTheMacDeviceName() {
+    fun dashboardHostUsesAGenericLabel() {
         assertEquals(
-            "D2N6M7MMCX",
+            "Dashboard · c67776",
             relayHostDisplayName("dashboard-c6777640f11d1abb6e6e83afa8d6e911"),
         )
         assertEquals("devbox", relayHostDisplayName("devbox"))
