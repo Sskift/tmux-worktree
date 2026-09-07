@@ -1,22 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { build } from "esbuild";
 import { InMemoryDurableCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
 import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
-const compiled = await build({
-  entryPoints: [new URL("../src/relay/v2/hostCredentialAuthority.ts", import.meta.url).pathname],
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  target: "node20",
-  write: false,
-});
-const compiledSource = compiled.outputFiles[0].text;
-const credential = await import(
-  `data:text/javascript;base64,${Buffer.from(compiledSource).toString("base64")}`
-);
+const credential = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
 
 const NOW_SECONDS = 1_783_700_000;

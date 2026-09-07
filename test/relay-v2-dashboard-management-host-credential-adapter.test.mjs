@@ -1,28 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { build } from "esbuild";
 import { InMemoryDurableCredentialStorage as InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
 import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
-const compiled = await build({
-  stdin: {
-    contents: [
-      'export * from "./hostCredentialAuthority.ts";',
-      'export * from "./hostCredentialExchangeCoordinator.ts";',
-      'export * from "./relayV2DashboardManagementHostCredentialAdapter.ts";',
-    ].join("\n"),
-    resolveDir: new URL("../src/relay/v2/", import.meta.url).pathname,
-    sourcefile: "dashboard-management-host-credential-test-entry.ts",
-  },
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  target: "node20",
-  write: false,
-});
-const credential = await import(
-  `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
-);
+const credential = {
+  ...await import("../dist/relay/v2/hostCredentialAuthority.js"),
+  ...await import("../dist/relay/v2/hostCredentialExchangeCoordinator.js"),
+  ...await import("../dist/relay/v2/relayV2DashboardManagementHostCredentialAdapter.js"),
+};
 const issuer = await import("../dist/relay/v2/issuer.js");
 
 const NOW_SECONDS = 1_783_700_000;

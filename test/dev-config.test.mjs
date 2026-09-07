@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -11,6 +11,7 @@ import {
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { build } from "esbuild";
 import { waitForFile } from "./support/async.mjs";
 import { tmpDir } from "./support/tmpDirs.mjs";
 
@@ -20,11 +21,15 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 // Build a temporary test-only entry so the persistence boundary can be driven
 // directly without opening the interactive readline wizard.
 const bundleRoot = tmpDir("tw-dev-config-bundle-");
-execFileSync(
-  join(repositoryRoot, "node_modules", ".bin", "tsup"),
-  ["src/dev.ts", "--format", "esm", "--target", "node20", "--out-dir", bundleRoot, "--splitting", "false"],
-  { cwd: repositoryRoot, stdio: "ignore" },
-);
+await build({
+  entryPoints: { dev: join(repositoryRoot, "src/dev.ts") },
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  outdir: bundleRoot,
+  loader: { ".md": "text", ".yaml": "text" },
+});
 const devModuleUrl = pathToFileURL(join(bundleRoot, "dev.js")).href;
 const { persistInitialConfig } = await import(devModuleUrl);
 const { acquireConfigFileLock, releaseConfigFileLock } = await import("../dist/hosts.js");

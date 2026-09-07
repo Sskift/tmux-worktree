@@ -1,26 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { build } from "esbuild";
 import { deferred } from "./support/async.mjs";
 
-const compiled = await build({
-  stdin: {
-    contents: [
-      'export * from "./hostCredentialAuthority.ts";',
-      'export * from "./hostCredentialExchangeCoordinator.ts";',
-    ].join("\n"),
-    resolveDir: new URL("../src/relay/v2/", import.meta.url).pathname,
-    sourcefile: "host-credential-owner-bound-test-entry.ts",
-  },
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  target: "node20",
-  write: false,
-});
-const coordinatorModule = await import(
-  `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
-);
+const coordinatorModule = {
+  ...await import("../dist/relay/v2/hostCredentialAuthority.js"),
+  ...await import("../dist/relay/v2/hostCredentialExchangeCoordinator.js"),
+};
 
 const BOOTSTRAP_INPUT = Object.freeze({
   credentialReference: "relay-v2-host-credential-ref:primary",
