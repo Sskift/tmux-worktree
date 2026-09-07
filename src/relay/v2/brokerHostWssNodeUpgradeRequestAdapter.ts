@@ -13,6 +13,14 @@ import type {
   RelayV2BrokerHostWssListenerFreeComposition,
   RelayV2BrokerHostWssListenerFreeUpgradeResult,
 } from "./brokerHostWssListenerFreeComposition.js";
+import {
+  isRejectedProxy as rejectedProxy,
+  captureExactDataRecord,
+} from "./untrustedSnapshot.js";
+import {
+  splitRawRequestTarget,
+  trimHttpOws,
+} from "./brokerNodeUpgradePlumbing.js";
 
 const REQUEST_INPUT_KEYS = Object.freeze([
   "request",
@@ -75,17 +83,6 @@ type DelegatedOutcome =
   | Readonly<{ outcome: "upgraded" }>
   | Readonly<{ outcome: "reject"; status: (typeof REJECT_STATUSES)[number] }>;
 
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
-
 function failure(): Error {
   return new Error("Relay v2 Broker Host Node Upgrade request adapter failed");
 }
@@ -94,30 +91,6 @@ function rejectedFailure<T>(): Promise<T> {
   const rejected = Promise.reject<T>(failure());
   void rejected.catch(() => undefined);
   return rejected;
-}
-
-function captureExactDataRecord(
-  value: unknown,
-  exactKeys: readonly string[],
-): Readonly<Record<string, unknown>> | null {
-  if (value === null || typeof value !== "object" || rejectedProxy(value)) return null;
-  try {
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Reflect.ownKeys(descriptors);
-    if (
-      keys.length !== exactKeys.length
-      || keys.some((key) => typeof key !== "string" || !exactKeys.includes(key))
-    ) return null;
-    const captured = Object.create(null) as Record<string, unknown>;
-    for (const key of exactKeys) {
-      const descriptor = descriptors[key];
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
-      captured[key] = descriptor.value;
-    }
-    return Object.freeze(captured);
-  } catch {
-    return null;
-  }
 }
 
 function captureFrozenNullPrototypeFacade(
@@ -188,37 +161,6 @@ function captureRejectSocket(value: unknown): CapturedRejectSocket | null {
   const destroy = captureMethod(value, "destroy");
   if (!end || !destroy) return null;
   return Object.freeze({ receiver: value, end, destroy });
-}
-
-function splitRawRequestTarget(value: unknown): Readonly<{
-  pathname: string;
-  search: string;
-}> | null {
-  if (typeof value !== "string" || value.length === 0 || value[0] !== "/") return null;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x20 || code >= 0x7f || code === 0x23) return null;
-  }
-  const query = value.indexOf("?");
-  return Object.freeze({
-    pathname: query === -1 ? value : value.slice(0, query),
-    search: query === -1 ? "" : value.slice(query),
-  });
-}
-
-function trimHttpOws(value: string): string {
-  let start = 0;
-  let end = value.length;
-  while (start < end && (value.charCodeAt(start) === 0x20 || value.charCodeAt(start) === 0x09)) {
-    start += 1;
-  }
-  while (end > start && (
-    value.charCodeAt(end - 1) === 0x20
-    || value.charCodeAt(end - 1) === 0x09
-  )) {
-    end -= 1;
-  }
-  return value.slice(start, end);
 }
 
 function captureRawHeaderMetadata(value: unknown): Readonly<{

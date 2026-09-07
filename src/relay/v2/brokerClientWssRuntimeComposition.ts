@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { types as nodeUtilTypes } from "node:util";
 
 import {
   RelayV2BrokerAuthorizationExpiryDeadlineOwner,
@@ -53,6 +52,7 @@ import {
   bindRelayV2BrokerHostWssRuntimeFacade,
   type RelayV2BrokerHostWssRuntimeFacade,
   type RelayV2BrokerHostWssRuntimeOwnerBinding,
+  type RelayV2BrokerHostWssOwnerSession,
 } from "./brokerHostWssRuntimeComposition.js";
 import type { RelayV2CarrierPumpBrokerPort } from "./carrierPump.js";
 import {
@@ -61,6 +61,8 @@ import {
   type RelayV2BrokerTransportCloseLease,
   type RelayV2BrokerTransportSocketRegistration,
 } from "./brokerTransportCloseCoordinator.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 type RelayV2BrokerCoreOptions = NonNullable<
   ConstructorParameters<typeof RelayV2BrokerCore>[0]
@@ -270,15 +272,6 @@ function deferred(): Deferred {
   return Object.freeze({ promise, resolve, reject });
 }
 
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
-
 function captureMethod(value: object, name: string): Function | null {
   let owner: object | null = value;
   try {
@@ -429,14 +422,6 @@ function captureNativeTerminalSocket(socket: unknown): NativeTerminalSocket {
     on: captureMethod("on"),
     removeListener: captureMethod("removeListener"),
   });
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
 }
 
 function invalidAuthorizationSnapshot(): RelayV2BrokerConnectionAuthorization {
@@ -804,27 +789,6 @@ function relayV2HostProducerAction(action: RelayV2BrokerAction): boolean {
     || action.kind === "close_host"
     || action.kind === "pause_host_route"
     || action.kind === "resume_host_route";
-}
-
-interface RelayV2BrokerHostWssOwnerSession {
-  readonly transportId: string;
-  readonly connectionIncarnation: string;
-  readonly producerGeneration: string;
-  attach(authContext: RelayV2BrokerConnectionAuthorization): void;
-  registerExpiry(): void;
-  receiveHostFrame(bytes: Uint8Array, signal: AbortSignal): Promise<RelayV2BrokerProducerReceipt>;
-  drainHostCarrier(options: Readonly<{
-    maxFrames: number;
-    maxBytes: number;
-    controlOnly?: boolean;
-  }>): readonly import("./brokerCore.js").RelayV2CarrierDelivery[];
-  acknowledgeHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
-  rejectHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
-  acknowledgeHostDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
-  disconnectHost(): RelayV2BrokerProducerReceipt;
-  beginProducerClose(barrier: Promise<unknown>): void;
-  terminalAndUnregister(): Promise<void>;
-  rollbackConstruction(): Promise<void>;
 }
 
 class RelayV2BrokerHostWssOwnerSessionImpl

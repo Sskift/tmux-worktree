@@ -1,6 +1,5 @@
-import { types as nodeUtilTypes } from "node:util";
-
 import type { RelayBrokerUpgradeRequest } from "./brokerCore.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 const UPGRADE_METADATA_KEYS = Object.freeze([
   "pathname",
@@ -10,17 +9,6 @@ const UPGRADE_METADATA_KEYS = Object.freeze([
 ] as const);
 
 export type RelayV2BrokerUpgradeMetadata = RelayBrokerUpgradeRequest;
-
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function captureStringArray(value: unknown): readonly string[] | null {
   if (!Array.isArray(value) || isRejectedProxy(value)) return null;

@@ -1,5 +1,3 @@
-import { types as NODE_TYPES } from "node:util";
-
 import {
   RELAY_V2_BROKER_LIMITS,
   type RelayV2BrokerAction,
@@ -26,6 +24,7 @@ import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
 } from "./codec.js";
+import { isRejectedProxy as rejectedProxy } from "./untrustedSnapshot.js";
 
 const MAX_INGRESS_BYTES = 16 * 1_048_576;
 const MAX_INGRESS_FRAMES = 1_024;
@@ -82,7 +81,7 @@ type CarrierSend = Readonly<{
 
 type OutboundSend = DirectSend | CarrierSend;
 
-interface RelayV2BrokerHostWssOwnerSession {
+export interface RelayV2BrokerHostWssOwnerSession {
   readonly transportId: string;
   readonly connectionIncarnation: string;
   readonly producerGeneration: string;
@@ -221,15 +220,6 @@ type HandshakeDeadline = {
   armed: boolean;
   firedEarly: boolean;
 };
-
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
-  try {
-    return NODE_TYPES.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function ownDataValues(
   value: unknown,

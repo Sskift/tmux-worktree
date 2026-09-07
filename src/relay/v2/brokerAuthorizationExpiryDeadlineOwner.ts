@@ -1,8 +1,8 @@
-import { types as nodeUtilTypes } from "node:util";
-
 import type {
   RelayV2BrokerConnectionAccessExpiryResult,
 } from "./brokerCore.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 export type RelayV2BrokerAuthorizationExpiryConnectionKind = "client" | "host";
 
@@ -109,25 +109,6 @@ const WARNING_CUT_OUTCOMES = new Set([
 
 function parseWarningCutOutcome(value: unknown): string | null {
   return typeof value === "string" && WARNING_CUT_OUTCOMES.has(value) ? value : null;
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
-}
-
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
 }
 
 function captureCutPort(

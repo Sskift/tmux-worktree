@@ -25,6 +25,7 @@ import {
   resolveRelayV2RouteDialect,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 
 export const RELAY_V2_REQUIRED_CAPABILITIES = Object.freeze([
   "error.structured.v1",
@@ -895,14 +896,6 @@ function structuredError(
     commandDisposition,
     details: null,
   };
-}
-
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= 128
-    && value.trim() === value
-    && !/[\0\r\n]/.test(value);
 }
 
 function readOwnDataRecord(source: unknown): {

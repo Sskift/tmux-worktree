@@ -10,6 +10,7 @@ import {
   type RelayV2FrameMetadata,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import { stringField, objectField } from "./hostFrameFields.js";
 import {
   consumeRelayV2HostCredentialConnectionAdmissionForCarrier,
   reconcileRelayV2HostCredentialRegisteredConnection,
@@ -635,14 +636,6 @@ function safeNow(clock: () => number): number {
     throw new Error("Relay v2 host carrier clock returned an invalid timestamp");
   }
   return value;
-}
-
-function stringField(object: RelayV2JsonObject, name: string): string {
-  return object[name] as string;
-}
-
-function objectField(object: RelayV2JsonObject, name: string): RelayV2JsonObject {
-  return object[name] as RelayV2JsonObject;
 }
 
 function counterField(object: RelayV2JsonObject, name: string): bigint {

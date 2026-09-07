@@ -9,6 +9,11 @@ import type {
   RelayV2BrokerHostNativeUpgradePort,
   RelayV2BrokerHostPendingUpgradeSocket,
 } from "./brokerHostWssUpgradeAuthority.js";
+import {
+  equivalentBufferView,
+  positiveHeartbeatValue,
+  attachSocketHeartbeat,
+} from "./brokerNodeUpgradePlumbing.js";
 
 const HOST_SUBPROTOCOL = "tw-relay.host.v2";
 
@@ -42,65 +47,6 @@ function hasExactHostProtocol(request: object): boolean {
   }
 }
 
-function equivalentBufferView(head: Uint8Array): Buffer {
-  return Buffer.isBuffer(head)
-    ? head
-    : Buffer.from(head.buffer, head.byteOffset, head.byteLength);
-}
-
-function positiveHeartbeatValue(
-  value: unknown,
-  fallback: number,
-): number {
-  const selected = value ?? fallback;
-  if (
-    !Number.isSafeInteger(selected)
-    || (selected as number) <= 0
-  ) throw failure();
-  return selected as number;
-}
-
-function attachHostSocketHeartbeat(
-  socket: WebSocket,
-  intervalMs: number,
-  missedPongLimit: number,
-): void {
-  let missedPongs = 0;
-  let stopped = false;
-  let timer: ReturnType<typeof setInterval> | null = null;
-  const tick = (): void => {
-    if (stopped) return;
-    missedPongs += 1;
-    if (missedPongs > missedPongLimit) {
-      stopped = true;
-      if (timer !== null) {
-        clearInterval(timer);
-        timer = null;
-      }
-      try { socket.terminate(); } catch {}
-      return;
-    }
-    try { socket.ping(); } catch {}
-  };
-  const onPong = (): void => {
-    missedPongs = 0;
-  };
-  const cleanup = (): void => {
-    if (stopped) return;
-    stopped = true;
-    if (timer !== null) {
-      clearInterval(timer);
-      timer = null;
-    }
-    try { socket.removeListener("pong", onPong); } catch {}
-    try { socket.removeListener("close", cleanup); } catch {}
-  };
-  socket.on("pong", onPong);
-  socket.once("close", cleanup);
-  tick();
-  timer = setInterval(tick, intervalMs);
-}
-
 /**
  * Default-off Node `ws` noServer adapter for the B7h native Upgrade port.
  * It creates no listener and owns neither raw-socket cleanup nor accepted sockets.
@@ -112,10 +58,12 @@ RelayV2BrokerHostWssNodeNoServerAdapter {
   const heartbeatIntervalMs = positiveHeartbeatValue(
     options?.heartbeatIntervalMs,
     DEFAULT_HEARTBEAT_INTERVAL_MS,
+    failure,
   );
   const heartbeatMissedPongLimit = positiveHeartbeatValue(
     options?.heartbeatMissedPongLimit,
     DEFAULT_HEARTBEAT_MISSED_PONG_LIMIT,
+    failure,
   );
 
   const handleProtocols = (protocols: Set<string>): string => {
@@ -187,7 +135,7 @@ RelayV2BrokerHostWssNodeNoServerAdapter {
           equivalentBufferView(head),
           (webSocket, callbackRequest) => {
             if (callbackRequest !== request) throw failure();
-            attachHostSocketHeartbeat(
+            attachSocketHeartbeat(
               webSocket,
               heartbeatIntervalMs,
               heartbeatMissedPongLimit,

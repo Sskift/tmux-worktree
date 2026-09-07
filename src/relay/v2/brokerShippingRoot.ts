@@ -12,7 +12,6 @@ import {
   type Server as NodeHttpsServer,
 } from "node:https";
 import type { Socket } from "node:net";
-import { types as nodeUtilTypes } from "node:util";
 
 import {
   createActivatedRelayV2BrokerServerRuntime,
@@ -34,6 +33,7 @@ import type {
   RelayV2ExternalContinuityAuthorityConfig,
 } from "./externalContinuityAuthorityConfig.js";
 import { isRelayV2AuthIdentifier } from "./token.js";
+import { isRejectedProxy as rejectedProxy } from "./untrustedSnapshot.js";
 import {
   type RelayV2BrokerCredentialStateStoreNativeLoader,
 } from "./brokerCredentialStateStoreLoader.js";
@@ -199,17 +199,6 @@ const ADMIN_UNAVAILABLE = "Relay v2 broker shipping admin is unavailable";
 const ADMIN_SINK_FAILED = "Relay v2 broker shipping admin secret sink failed";
 const ADMIN_SURFACE_MISSING = "Relay v2 broker credential authority admin surface is unavailable";
 const PROFILE_FILE_MAX_BYTES = 16_384;
-
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function captureOwnDataRecord(
   value: unknown,

@@ -1,5 +1,3 @@
-import { types as nodeUtilTypes } from "node:util";
-
 import {
   dispatchRelayBrokerUpgrade,
   type RelayBrokerUpgradeDependencies,
@@ -14,6 +12,7 @@ import {
   captureRelayV2BrokerUpgradeMetadata,
   type RelayV2BrokerUpgradeMetadata,
 } from "./brokerUpgradeBoundary.js";
+import { isRejectedProxy } from "./untrustedSnapshot.js";
 
 export interface RelayV2BrokerHostUpgradeMetadata extends RelayV2BrokerUpgradeMetadata {}
 
@@ -35,17 +34,6 @@ export type RelayV2BrokerHostUpgradeDispatchResult =
       selectedProtocol: "tw-relay.host.v2";
       admissionReceipt: RelayV2BrokerHostWssAdmissionReceipt;
     }>;
-
-function isRejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function roleMismatch(): Error {
   return Object.assign(new Error("Relay v2 Broker Host Upgrade requires host role"), {

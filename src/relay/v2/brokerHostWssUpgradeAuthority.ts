@@ -10,6 +10,7 @@ import type {
   RelayV2BrokerHostWssConnectionHandle,
   RelayV2BrokerHostWssRuntimeFacade,
 } from "./brokerHostWssRuntimeComposition.js";
+import { isRejectedProxy as rejectedProxy } from "./untrustedSnapshot.js";
 
 const UPGRADE_INPUT_KEYS = Object.freeze([
   "admissionReceipt",
@@ -100,17 +101,6 @@ type ConnectionRecord = {
   readonly socket: CapturedUpgradedSocket;
   readonly drained: Promise<void>;
 };
-
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeUtilTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
 
 function failure(): Error {
   return new Error("Relay v2 Broker Host native Upgrade failed");
