@@ -648,18 +648,6 @@ private sealed interface RelayV2TerminalControlAdmission {
     data object Poisoned : RelayV2TerminalControlAdmission
 }
 
-internal interface RelayV2TerminalControlRuntimeEntry {
-    suspend fun admit(
-        authority: RelayV2RepositoryEffectAuthority,
-        effect: RelayV2TerminalEffect.SendInput,
-    ): RelayV2TerminalRuntimeApplyResult
-
-    suspend fun admit(
-        authority: RelayV2RepositoryEffectAuthority,
-        effect: RelayV2TerminalEffect.SendResize,
-    ): RelayV2TerminalRuntimeApplyResult
-}
-
 private data class RelayV2TerminalParserRuntimePorts(
     val parser: RelayV2TerminalParserPort,
     val postCommitEffects: RelayV2TerminalPostCommitEffectSink,
@@ -683,7 +671,7 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
     private val control: RelayV2TerminalControlTransportPort,
     private val fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
     private val terminalScopedReset: RelayV2TerminalScopedResetPort,
-) : RelayV2TerminalControlRuntimeEntry {
+) {
     internal constructor(
         applyLease: RelayV2RepositoryEffectApplyLeasePort,
         terminal: RelayV2TerminalRuntimeAuthority,
@@ -704,16 +692,6 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
 
     private val runtimeAdmission = RelayV2TerminalRuntimeAdmissionFence()
     private val parserHandoffSerial = RelayV2TerminalParserHandoffSerialGate()
-
-    override suspend fun admit(
-        authority: RelayV2RepositoryEffectAuthority,
-        effect: RelayV2TerminalEffect.SendInput,
-    ): RelayV2TerminalRuntimeApplyResult = handleControl(authority, effect)
-
-    override suspend fun admit(
-        authority: RelayV2RepositoryEffectAuthority,
-        effect: RelayV2TerminalEffect.SendResize,
-    ): RelayV2TerminalRuntimeApplyResult = handleControl(authority, effect)
 
     suspend fun handle(
         authority: RelayV2RepositoryEffectAuthority,
@@ -1572,22 +1550,6 @@ internal class RelayV2TerminalRuntimeAdapter private constructor(
         checkNotNull(parserRuntime) {
             "Parser runtime is unavailable in the terminal control-only composition"
         }
-
-    companion object {
-        fun controlOnly(
-            applyLease: RelayV2RepositoryEffectApplyLeasePort,
-            terminal: RelayV2TerminalRuntimeAuthority,
-            control: RelayV2TerminalControlTransportPort,
-            fatalInvalidation: RelayV2TerminalFatalInvalidationPort,
-        ): RelayV2TerminalControlRuntimeEntry = RelayV2TerminalRuntimeAdapter(
-            applyLease = applyLease,
-            terminal = terminal,
-            parserRuntime = null,
-            control = control,
-            fatalInvalidation = fatalInvalidation,
-            terminalScopedReset = RelayV2TerminalUnavailableScopedResetPort,
-        )
-    }
 
     private suspend fun handleControl(
         authority: RelayV2RepositoryEffectAuthority,
