@@ -1,5 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.v2.outbox
 
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2CanonicalJson
+
 import java.security.MessageDigest
 import java.util.Collections
 
@@ -186,7 +188,7 @@ internal data class RelayV2CanonicalRequestArguments(
         fun from(value: RelayV2OutboxArguments): RelayV2CanonicalRequestArguments =
             RelayV2CanonicalRequestArguments(
                 value = value,
-                canonicalJson = RelayV2OutboxCanonicalJson.stringify(value.canonicalMap()),
+                canonicalJson = RelayV2CanonicalJson.stringify(value.canonicalMap()),
             )
     }
 }
@@ -442,7 +444,7 @@ internal data class RelayV2OutboxEntry(
     val targetProvenanceCanonicalByteCount: Int by lazy(
         LazyThreadSafetyMode.NONE,
     ) {
-        RelayV2OutboxCanonicalJson.stringify(
+        RelayV2CanonicalJson.stringify(
             targetProvenance.canonicalValue(),
         ).toByteArray(Charsets.UTF_8).size
     }
@@ -532,7 +534,7 @@ internal data class RelayV2OutboxEntry(
     override fun toString(): String =
         "RelayV2OutboxEntry(id=$id, state=$state, attempts=${attempts.size}, <redacted>)"
 
-    private fun canonicalEntryJson(): String = RelayV2OutboxCanonicalJson.stringify(
+    private fun canonicalEntryJson(): String = RelayV2CanonicalJson.stringify(
         mapOf(
             "acceptanceEvidence" to acceptanceEvidence.persistedTag,
             "arguments" to canonicalRequestArguments.value.canonicalMap(),
@@ -2181,7 +2183,7 @@ internal fun canonicalRelayV2FingerprintRequest(
     scopeId: String,
     sessionId: String?,
     arguments: RelayV2CanonicalRequestArguments,
-): String = RelayV2OutboxCanonicalJson.stringify(
+): String = RelayV2CanonicalJson.stringify(
     buildMap {
         put("arguments", arguments.value.canonicalMap())
         put("dedupeWindowId", dedupeWindowId)
@@ -2490,73 +2492,6 @@ private fun normalizeRelayV2Message(value: String): String = value
     .replace("\r\n", "\n")
     .replace('\r', '\n')
 
-private object RelayV2OutboxCanonicalJson {
-    fun stringify(value: Any?): String = buildString { appendValue(value) }
-
-    private fun StringBuilder.appendValue(value: Any?) {
-        when (value) {
-            null -> append("null")
-            is Boolean -> append(if (value) "true" else "false")
-            is Byte, is Short, is Int, is Long -> append((value as Number).toLong())
-            is String -> appendString(value)
-            is List<*> -> {
-                append('[')
-                value.forEachIndexed { index, item ->
-                    if (index > 0) append(',')
-                    appendValue(item)
-                }
-                append(']')
-            }
-            is Map<*, *> -> {
-                val entries = value.entries.map {
-                    require(it.key is String)
-                    (it.key as String) to it.value
-                }.sortedBy { it.first }
-                append('{')
-                entries.forEachIndexed { index, (key, item) ->
-                    if (index > 0) append(',')
-                    appendString(key)
-                    append(':')
-                    appendValue(item)
-                }
-                append('}')
-            }
-            else -> error("unsupported canonical JSON value")
-        }
-    }
-
-    private fun StringBuilder.appendString(value: String) {
-        append('"')
-        var index = 0
-        while (index < value.length) {
-            val character = value[index]
-            when (character) {
-                '"' -> append("\\\"")
-                '\\' -> append("\\\\")
-                '\b' -> append("\\b")
-                '\t' -> append("\\t")
-                '\n' -> append("\\n")
-                '\u000C' -> append("\\f")
-                '\r' -> append("\\r")
-                else -> when {
-                    character.code < 0x20 -> append(
-                        "\\u" + character.code.toString(16).padStart(4, '0'),
-                    )
-                    character.isHighSurrogate() -> {
-                        require(index + 1 < value.length && value[index + 1].isLowSurrogate())
-                        append(character)
-                        append(value[index + 1])
-                        index += 1
-                    }
-                    character.isLowSurrogate() -> error("unpaired low surrogate")
-                    else -> append(character)
-                }
-            }
-            index += 1
-        }
-        append('"')
-    }
-}
 
 private const val MAX_JSON_INTEGER = 9_007_199_254_740_991L
 private val FINAL_COMMAND_FAILURE_CODES = setOf(

@@ -339,6 +339,26 @@ internal fun validateTopLevelIdentifiers(frame: RelayV2JsonObject) {
     if (frame.containsKey("eventSeq")) jsonCounter(frame["eventSeq"])
 }
 
+/**
+ * Validates the common relay-v2 envelope triple (protocolVersion/kind/type) and the
+ * caller-supplied identifier set for one decoded frame. [validateId] applies the codec's
+ * own identifier rules (byte-bounded string vs opaque extension id); [validateProtocolVersion]
+ * defaults to the literal-2 check but codecs with stricter integer rules can override it.
+ */
+internal fun validateRelayV2Envelope(
+    frame: RelayV2JsonObject,
+    expectedKind: String,
+    expectedType: String,
+    idFields: List<String>,
+    validateId: (Any?) -> Unit,
+    validateProtocolVersion: (Any?) -> Unit = { jsonLiteral(it, 2) },
+) {
+    validateProtocolVersion(required(frame, "protocolVersion"))
+    jsonLiteral(required(frame, "kind"), expectedKind)
+    jsonLiteral(required(frame, "type"), expectedType)
+    idFields.forEach { validateId(required(frame, it)) }
+}
+
 internal fun jsonSecret(value: Any?): String = jsonString(value, maxBytes = 8_192)
 
 internal fun jsonExactUrl(value: Any?, scheme: String): String {

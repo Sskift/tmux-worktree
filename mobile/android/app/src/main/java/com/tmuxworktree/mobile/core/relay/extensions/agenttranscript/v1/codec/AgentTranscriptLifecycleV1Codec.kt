@@ -16,6 +16,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.jsonObject
 import com.tmuxworktree.mobile.core.relay.v2.codec.jsonOneOf
 import com.tmuxworktree.mobile.core.relay.v2.codec.required
 import com.tmuxworktree.mobile.core.relay.v2.codec.schemaFailure
+import com.tmuxworktree.mobile.core.relay.v2.codec.validateRelayV2Envelope
 import java.math.BigInteger
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
@@ -1018,9 +1019,14 @@ class AgentTranscriptLifecycleV1Codec {
                 "payload",
             ),
         )
-        fixedRoot(frame, AgentTranscriptLifecycleV1FrameKind.REQUEST, type)
-        listOf("requestId", "hostId", "expectedHostEpoch", "scopeId", "sessionId")
-            .forEach { opaqueId(required(frame, it)) }
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = AgentTranscriptLifecycleV1FrameKind.REQUEST.wireValue,
+            expectedType = type,
+            idFields = listOf("requestId", "hostId", "expectedHostEpoch", "scopeId", "sessionId"),
+            validateId = ::opaqueId,
+            validateProtocolVersion = { strictInteger(it, minimum = 2, maximum = 2) },
+        )
     }
 
     private fun responseRoot(frame: RelayV2JsonObject, type: String) {
@@ -1038,9 +1044,14 @@ class AgentTranscriptLifecycleV1Codec {
                 "payload",
             ),
         )
-        fixedRoot(frame, AgentTranscriptLifecycleV1FrameKind.RESPONSE, type)
-        listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId")
-            .forEach { opaqueId(required(frame, it)) }
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = AgentTranscriptLifecycleV1FrameKind.RESPONSE.wireValue,
+            expectedType = type,
+            idFields = listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId"),
+            validateId = ::opaqueId,
+            validateProtocolVersion = { strictInteger(it, minimum = 2, maximum = 2) },
+        )
     }
 
     private fun errorRoot(frame: RelayV2JsonObject) {
@@ -1059,9 +1070,14 @@ class AgentTranscriptLifecycleV1Codec {
                 "error",
             ),
         )
-        fixedRoot(frame, AgentTranscriptLifecycleV1FrameKind.RESPONSE, "error")
-        listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId")
-            .forEach { opaqueId(required(frame, it)) }
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = AgentTranscriptLifecycleV1FrameKind.RESPONSE.wireValue,
+            expectedType = "error",
+            idFields = listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId"),
+            validateId = ::opaqueId,
+            validateProtocolVersion = { strictInteger(it, minimum = 2, maximum = 2) },
+        )
     }
 
     private fun eventRoot(frame: RelayV2JsonObject, type: String) {
@@ -1078,19 +1094,14 @@ class AgentTranscriptLifecycleV1Codec {
                 "payload",
             ),
         )
-        fixedRoot(frame, AgentTranscriptLifecycleV1FrameKind.EVENT, type)
-        listOf("hostId", "hostEpoch", "scopeId", "sessionId")
-            .forEach { opaqueId(required(frame, it)) }
-    }
-
-    private fun fixedRoot(
-        frame: RelayV2JsonObject,
-        kind: AgentTranscriptLifecycleV1FrameKind,
-        type: String,
-    ) {
-        strictInteger(required(frame, "protocolVersion"), minimum = 2, maximum = 2)
-        jsonLiteral(required(frame, "kind"), kind.wireValue)
-        jsonLiteral(required(frame, "type"), type)
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = AgentTranscriptLifecycleV1FrameKind.EVENT.wireValue,
+            expectedType = type,
+            idFields = listOf("hostId", "hostEpoch", "scopeId", "sessionId"),
+            validateId = ::opaqueId,
+            validateProtocolVersion = { strictInteger(it, minimum = 2, maximum = 2) },
+        )
     }
 
     private fun validatePageCursor(isLast: Boolean, nextCursor: String?) {

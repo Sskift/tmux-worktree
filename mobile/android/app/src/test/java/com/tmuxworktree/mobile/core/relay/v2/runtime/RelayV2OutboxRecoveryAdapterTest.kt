@@ -409,7 +409,6 @@ class RelayV2OutboxRecoveryAdapterTest {
             fixture.context.profile,
             "not-owned",
             generation,
-            generation.connectionGeneration,
         )
         val transactions = fixture.store.transactionCount
         val writes = fixture.store.writeCount

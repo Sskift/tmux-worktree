@@ -489,7 +489,6 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
                 context.profile,
                 "not-agent-owned",
                 generation,
-                generation.connectionGeneration,
             ),
         )
         val unavailable = RelayV2RuntimeEffect.AgentExtensionUnavailable(

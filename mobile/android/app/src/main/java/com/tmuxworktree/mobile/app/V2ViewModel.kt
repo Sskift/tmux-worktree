@@ -25,7 +25,6 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialExchangeEx
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EnrollmentResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2StartupAdmissionResult
-import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshApplyResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2RefreshRequirement
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2SelfRevokeResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2AgentCapabilityAvailability
@@ -112,14 +111,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
-
-internal fun shouldPersistRelaySelectedHost(
-    preferredHostId: String,
-    availableHostIds: Set<String>,
-    selectedHostId: String,
-): Boolean = selectedHostId.isNotBlank() &&
-    selectedHostId != preferredHostId &&
-    preferredHostId !in availableHostIds
 
 private const val RELAY_V2_TERMINAL_OPEN_RETRY_LIMIT = 5
 private const val RELAY_V2_TERMINAL_OPEN_ACK_TIMEOUT_MS = 15_000L
@@ -4131,12 +4122,6 @@ class V2ViewModel(
         }
         emit(V2UiEffect.Notice(message))
     }
-
-    /** Explicit credential maintenance; this does not start or replace a socket. */
-    internal suspend fun refreshRelayV2Credential(): RelayV2RefreshApplyResult =
-        trackProfileMutation {
-            requireRelayV2ProfileRuntime().refreshCredential()
-        }
 
     private fun requireRelayV2ProfileRuntime(): RelayV2ProfileRuntimeAdapter =
         checkNotNull(relayV2ProfileRuntime) {

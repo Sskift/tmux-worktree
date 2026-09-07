@@ -212,12 +212,10 @@ private sealed interface ValidatedAgentTranscriptEntry {
     sealed interface Deleted : ValidatedAgentTranscriptEntry {
         data class Wire(
             override val entity: RelayV2AgentTranscriptEntryEntity,
-            val reason: AgentTimelineRedactionReason,
         ) : Deleted
 
         data class SnapshotAbsence(
             override val entity: RelayV2AgentTranscriptEntryEntity,
-            val evidenceThroughAgentSeq: String,
         ) : Deleted
     }
 }
@@ -4171,13 +4169,13 @@ private fun validateEntry(
         }
         ENTRY_STATE_DELETED -> when (row.tombstoneOrigin) {
             AgentTranscriptEntryTombstoneOrigin.WIRE_DELETE.storageValue -> {
-                val reason = decodeStorageRedactionReason(row.redactionReason)
+                decodeStorageRedactionReason(row.redactionReason)
                 if (row.text != null ||
                     compareStorageCounters(row.createdAgentSeq, row.lastModifiedAgentSeq) >= 0 ||
                     row.tombstoneEvidenceThroughAgentSeq != null ||
                     row.tombstoneEvidenceThroughAgentSeqOrder != null
                 ) storageMalformed()
-                ValidatedAgentTranscriptEntry.Deleted.Wire(row, reason)
+                ValidatedAgentTranscriptEntry.Deleted.Wire(row)
             }
             AgentTranscriptEntryTombstoneOrigin.SNAPSHOT_ABSENCE.storageValue -> {
                 val evidence = row.tombstoneEvidenceThroughAgentSeq ?: storageMalformed()
@@ -4187,7 +4185,7 @@ private fun validateEntry(
                 if (row.text != null || row.redactionReason != null ||
                     compareStorageCounters(row.lastModifiedAgentSeq, evidence) > 0
                 ) storageMalformed()
-                ValidatedAgentTranscriptEntry.Deleted.SnapshotAbsence(row, evidence)
+                ValidatedAgentTranscriptEntry.Deleted.SnapshotAbsence(row)
             }
             else -> storageMalformed()
         }

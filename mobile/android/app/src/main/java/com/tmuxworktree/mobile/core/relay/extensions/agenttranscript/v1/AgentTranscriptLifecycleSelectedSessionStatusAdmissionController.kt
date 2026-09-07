@@ -36,9 +36,7 @@ internal fun interface AgentTranscriptLifecycleStatusRequestPort {
 internal sealed interface AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult {
     data object Unavailable : AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
 
-    data class Requested(
-        val syncResult: AgentTranscriptLifecycleRequestSyncResult,
-    ) : AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
+    data object Requested : AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
 }
 
 /**
@@ -144,12 +142,10 @@ internal class AgentTranscriptLifecycleSelectedSessionStatusAdmissionController(
                 AgentTranscriptLifecycleDurableLoadOrInitializeResult.Unavailable ->
                     AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Unavailable
                 AgentTranscriptLifecycleDurableLoadOrInitializeResult.Ready -> when (
-                    val synced = requestSync.requestStatus(claim.context)
+                    requestSync.requestStatus(claim.context)
                 ) {
                     is AgentTranscriptLifecycleRequestSyncResult.Dispatched ->
-                        AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Requested(
-                            synced,
-                        )
+                        AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult.Requested
                     AgentTranscriptLifecycleRequestSyncResult.ExtensionNotNegotiated,
                     AgentTranscriptLifecycleRequestSyncResult.NoRequest,
                     is AgentTranscriptLifecycleRequestSyncResult.NotificationReady,

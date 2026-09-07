@@ -1144,7 +1144,6 @@ internal sealed interface RelayV2RuntimeEffect {
         val profile: RelayActiveProfileIdentity,
         val barrierId: String,
         val fencedGeneration: RelayV2EffectGeneration?,
-        val barrierConnectionGeneration: Long,
     ) : RelayV2RuntimeEffect
 }
 

@@ -1,7 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
-    id("com.android.legacy-kapt")
+    id("com.google.devtools.ksp")
     id("androidx.room")
 }
 
@@ -85,12 +85,6 @@ android {
     }
 }
 
-kapt {
-    arguments {
-        arg("room.schemaLocation", "$projectDir/schemas")
-    }
-}
-
 // Room 2.8.4's migration schema codecs are built against serialization 1.8.1.
 // Override only the instrumentation runtime because AGP's consistent resolution
 // otherwise constrains these modules to the tested app's 1.7.3 runtime ABI.
@@ -137,7 +131,7 @@ dependencies {
     // which would reintroduce an optional runtime module download.
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
-    kapt("androidx.room:room-compiler:2.8.4")
+    ksp("androidx.room:room-compiler:2.8.4")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
