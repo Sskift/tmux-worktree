@@ -21,6 +21,7 @@ import {
   type CanonicalTerminalOwner,
   type CanonicalTerminalOwnerKind,
 } from "./canonicalTerminalControlClient.js";
+import { TERMINAL_CONTROL_OWNER_KINDS } from "./terminalControl/protocol.js";
 
 const PROTOCOL_VERSION = 1;
 const MAX_FRAME_BYTES = 1024 * 1024;
@@ -90,10 +91,7 @@ function canonicalOwner(value: unknown, name: string): CanonicalTerminalOwner {
   if (!isRecord(value) || !exactKeys(value, ["kind", "instanceId"])) {
     throw new Error(`invalid ${name}`);
   }
-  const kinds: CanonicalTerminalOwnerKind[] = [
-    "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
-  ];
-  if (!kinds.includes(value.kind as CanonicalTerminalOwnerKind)) throw new Error(`invalid ${name}.kind`);
+  if (!TERMINAL_CONTROL_OWNER_KINDS.includes(value.kind as CanonicalTerminalOwnerKind)) throw new Error(`invalid ${name}.kind`);
   return {
     kind: value.kind as CanonicalTerminalOwnerKind,
     instanceId: text(value.instanceId, `${name}.instanceId`),

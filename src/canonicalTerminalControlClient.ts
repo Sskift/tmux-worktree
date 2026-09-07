@@ -19,6 +19,7 @@ import {
   type TerminalControlOwnershipView,
   type TerminalControlAgentProgressStep,
   type TerminalControlAgentSource,
+  TERMINAL_CONTROL_OWNER_KINDS,
 } from "./terminalControl/protocol.js";
 import { terminalControlSocketPath } from "./terminalControl/store.js";
 
@@ -292,10 +293,7 @@ function owner(value: unknown, field = "owner"): CanonicalTerminalOwner {
   if (!isRecord(value)) {
     throw new CanonicalTerminalControlError("CONTROLLER_UNAVAILABLE", `canonical terminal-control returned invalid ${field}`);
   }
-  const kinds: CanonicalTerminalOwnerKind[] = [
-    "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
-  ];
-  if (!kinds.includes(value.kind as CanonicalTerminalOwnerKind)) {
+  if (!TERMINAL_CONTROL_OWNER_KINDS.includes(value.kind as CanonicalTerminalOwnerKind)) {
     throw new CanonicalTerminalControlError("CONTROLLER_UNAVAILABLE", `canonical terminal-control returned invalid ${field}.kind`);
   }
   return {
@@ -321,10 +319,7 @@ function lease(value: unknown): CanonicalTerminalLease {
 
 function ownerKind(value: unknown, field: string): CanonicalTerminalOwnerKind | undefined {
   if (value === undefined) return undefined;
-  const kinds: CanonicalTerminalOwnerKind[] = [
-    "feishu", "dashboard", "local-cli", "relay-v2", "tw-serve",
-  ];
-  if (!kinds.includes(value as CanonicalTerminalOwnerKind)) {
+  if (!TERMINAL_CONTROL_OWNER_KINDS.includes(value as CanonicalTerminalOwnerKind)) {
     throw new CanonicalTerminalControlError("CONTROLLER_UNAVAILABLE", `canonical terminal-control returned invalid ${field}`);
   }
   return value as CanonicalTerminalOwnerKind;

@@ -23,7 +23,7 @@ import type {
   TerminalControlLease,
   TerminalControlOwner,
 } from "./protocol";
-import { TerminalControlProtocolError } from "./protocol";
+import { TerminalControlProtocolError, TERMINAL_CONTROL_OWNER_KINDS } from "./protocol";
 
 export const TERMINAL_CONTROL_STATE_VERSION = 1 as const;
 export const TERMINAL_CONTROL_MAX_RETIRED_TARGETS = 64;
@@ -200,7 +200,7 @@ function isCanonicalTimestamp(value: unknown): value is string {
 
 function isOwner(value: unknown): value is TerminalControlOwner {
   if (!isRecord(value) || !exactKeys(value, ["kind", "instanceId"])) return false;
-  return ["feishu", "dashboard", "local-cli", "relay-v2", "tw-serve"].includes(String(value.kind))
+  return (TERMINAL_CONTROL_OWNER_KINDS as readonly string[]).includes(String(value.kind))
     && isStoredString(value.instanceId, 256);
 }
 
@@ -273,7 +273,7 @@ function isRecovery(value: unknown): value is TerminalControlRecoveryRecord {
   ].includes(String(value.reason))
     && isCanonicalTimestamp(value.since)
     && isStoredString(value.previousControlEpoch, 128)
-    && (value.previousOwnerKind === undefined || ["feishu", "dashboard", "local-cli", "relay-v2", "tw-serve"].includes(String(value.previousOwnerKind)))
+    && (value.previousOwnerKind === undefined || (TERMINAL_CONTROL_OWNER_KINDS as readonly string[]).includes(String(value.previousOwnerKind)))
     && (value.operationId === undefined || isStoredString(value.operationId, 192));
 }
 
