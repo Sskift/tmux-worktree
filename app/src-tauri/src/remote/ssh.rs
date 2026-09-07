@@ -192,40 +192,6 @@ fn has_custom_tw_path(host: &HostConfig) -> bool {
         .is_some_and(|path| !path.trim().is_empty())
 }
 
-/// Build an SSH command for interactive PTY use (no BatchMode, force TTY with -tt).
-#[allow(dead_code)]
-pub(crate) fn ssh_command_interactive(
-    host: &HostConfig,
-    remote_cmd: &[&str],
-) -> Result<std::process::Command, String> {
-    validate_ssh_host_fields(host)?;
-    let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-tt")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3");
-    apply_ssh_multiplex_options(&mut cmd);
-    if let Some(port) = host.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    if let Some(key) = &host.identity_file {
-        cmd.arg("-i").arg(key);
-    }
-    if let Some(user) = &host.user {
-        cmd.arg("-l").arg(user);
-    }
-    cmd.arg("--").arg(&host.host);
-    if !remote_cmd.is_empty() {
-        cmd.arg(shell_join(remote_cmd));
-    }
-    Ok(cmd)
-}
-
 /// Run a command on a remote host and return stdout.
 pub(crate) fn run_remote_cmd_output(
     host: &HostConfig,
