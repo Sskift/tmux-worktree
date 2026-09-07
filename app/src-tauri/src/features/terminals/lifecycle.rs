@@ -4,7 +4,7 @@ use crate::features::control_plane::{
     resolve_local_tw_rpc_runtime, run_local_tw_rpc_runtime, LocalTwRpcRuntime,
 };
 use crate::features::sessions::{setup_clipboard_bindings, tmux_session_is_missing_error};
-use crate::features::{kill_managed_session_with_control, PtyState, TerminalControlState};
+use crate::features::{kill_with_managed_fallback, PtyState, TerminalControlState};
 use crate::ipc::{CreateTerminalArgs, CreatedTerminal, EnsureTerminalArgs};
 use crate::remote::{
     run_remote_tmux_check, run_remote_tmux_quiet, run_remote_tw_check, HostConfig,
@@ -206,22 +206,14 @@ pub(crate) async fn kill_plain_terminal(
     name: String,
     managed: Option<bool>,
 ) -> Result<(), String> {
-    let pty_state = std::sync::Arc::clone(pty_state.inner());
-    let control_state = std::sync::Arc::clone(control_state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        let (host_id, raw_name) = parse_session_key(&name);
-        if managed.unwrap_or(false) {
-            kill_managed_session_with_control(
-                &app,
-                pty_state.as_ref(),
-                control_state.as_ref(),
-                raw_name,
-                host_id,
-            )
-        } else {
-            kill_legacy_plain_terminal(&name)
-        }
-    })
+    kill_with_managed_fallback(
+        app,
+        pty_state.inner(),
+        control_state.inner(),
+        name,
+        managed,
+        "terminal",
+        kill_legacy_plain_terminal,
+    )
     .await
-    .map_err(|error| format!("terminal kill task failed: {error}"))?
 }

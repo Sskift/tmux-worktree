@@ -1,5 +1,7 @@
 use super::{bundled_cli_path, installed_tw_command, node_bin};
-use crate::ipc::{TwRpcCapabilitiesResponse, TwRpcCreateResponse, TwRpcSession};
+use crate::ipc::{
+    tw_rpc_capabilities_compatible, TwRpcCapabilitiesResponse, TwRpcCreateResponse, TwRpcSession,
+};
 use crate::support::app_home_dir;
 use std::path::{Path, PathBuf};
 
@@ -51,25 +53,7 @@ fn validate_installed_tw_rpc(program: &str, home: &Path) -> Result<(), String> {
     }
     let response: TwRpcCapabilitiesResponse = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("parse {program} rpc-v2 capabilities: {error}"))?;
-    let required = [
-        "incarnation-list.v1",
-        "reservation-correlation.v1",
-        "correlated-create-worktree.v1",
-        "resolved-create-worktree.v1",
-        "correlated-create-terminal.v1",
-        "expected-incarnation-kill-session.v1",
-        "hard-timeout.v1",
-        "dashboard-lifecycle.v2",
-        "project-catalog.v2",
-    ];
-    if response.protocol_version != 2
-        || required.iter().any(|required| {
-            !response
-                .capabilities
-                .iter()
-                .any(|capability| capability == required)
-        })
-    {
+    if !tw_rpc_capabilities_compatible(response.protocol_version, &response.capabilities) {
         return Err(format!(
             "{program} does not provide the complete Dashboard TW RPC v2 contract"
         ));

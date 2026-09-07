@@ -406,7 +406,7 @@ impl ExactChildAuthority {
             Some(status) => {
                 let exit = child_exit(status);
                 let stderr_log = self.stderr_log.clone();
-                state.exit = Some(exit.clone());
+                state.exit = Some(exit);
                 drop(state);
                 if let Some(path) = stderr_log {
                     append_management_child_exit_line(&path, &status);
@@ -458,7 +458,7 @@ impl ChildLifecycle for ExactChildAuthority {
             }
         };
         let stderr_log = self.stderr_log.clone();
-        state.exit = Some(exit.clone());
+        state.exit = Some(exit);
         drop(state);
         if let Some(path) = stderr_log {
             append_management_child_exit_line(&path, &status);
@@ -549,6 +549,10 @@ impl BoundedObservationQueue {
         true
     }
 
+    // In production builds the loop body always returns on the first
+    // iteration; the `continue` path behind `#[cfg(test)]` makes it a real
+    // loop when the unsolicited-drain pause hook is active.
+    #[cfg_attr(not(test), allow(clippy::never_loop))]
     fn begin_drain(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         loop {
@@ -574,8 +578,12 @@ impl BoundedObservationQueue {
         self.changed.notify_all();
     }
 
+    // See begin_drain: the loop is single-iteration in production builds and
+    // only genuinely loops under cfg(test). `mut` is unused in production
+    // because the reassignment is test-only.
+    #[cfg_attr(not(test), allow(clippy::never_loop))]
+    #[cfg_attr(not(test), allow(unused_mut))]
     fn wait_for_next_drain(&self) -> bool {
-        #[allow(unused_mut)]
         let mut state = self.state.lock().unwrap();
         loop {
             if state.discarded {
@@ -1936,10 +1944,10 @@ fn supervise_child(manager: std::sync::Weak<ManagerInner>) {
         }
         if !manager.in_flight.load(Ordering::Acquire) {
             if let Ok(_observation) = manager.observation.try_lock() {
-                if !manager.in_flight.load(Ordering::Acquire) {
-                    if manager.observe_idle_child().is_some() {
-                        return;
-                    }
+                if !manager.in_flight.load(Ordering::Acquire)
+                    && manager.observe_idle_child().is_some()
+                {
+                    return;
                 }
             }
         }
@@ -2039,20 +2047,16 @@ fn encode_request(
     Ok(frame)
 }
 
+/// Decode a child-process response frame into a [`ManagementOutcome`].
+///
+/// This is the child-process frame mapping; the wire-level parsing lives in
+/// `management_protocol_v2::decode_response`.
 fn decode_response(
     payload: &[u8],
     expected_request_id: &str,
     operation: ManagementOperation,
 ) -> Result<ManagementOutcome, ()> {
     closed_object_payload(payload)?;
-    decode_v2_response(payload, expected_request_id, operation)
-}
-
-fn decode_v2_response(
-    payload: &[u8],
-    expected_request_id: &str,
-    operation: ManagementOperation,
-) -> Result<ManagementOutcome, ()> {
     let response =
         management_protocol_v2::decode_response(payload, expected_request_id, operation)?;
     Ok(ManagementOutcome {
@@ -2135,7 +2139,7 @@ fn valid_dot_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool
     })
 }
 
-fn fixed_error(code: &str, message: &str) -> ManagementError {
+pub(crate) fn fixed_error(code: &str, message: &str) -> ManagementError {
     ManagementError {
         code: code.to_string(),
         message: message.to_string(),

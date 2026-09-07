@@ -1189,8 +1189,7 @@ fn validated_config_with_persisted_state(
         config.connector_desired_running = persisted.connector_desired_running;
         config.management_recovery_required = persisted.management_recovery_required;
         config.bootstrap_rotation_pending = persisted.bootstrap_rotation_pending;
-        config.bootstrap_rotation_request_phase =
-            persisted.bootstrap_rotation_request_phase.clone();
+        config.bootstrap_rotation_request_phase = persisted.bootstrap_rotation_request_phase;
         config.bootstrap_rotation_transfer_receipt =
             persisted.bootstrap_rotation_transfer_receipt.clone();
         config.bootstrap_file_name = persisted.bootstrap_file_name.clone();
@@ -2242,23 +2241,22 @@ if {} has-session -t {CENTER_SESSION} 2>/dev/null; then printf 'center=running\n
                     "bundle=missing" => status.bundle_status = DeploymentProbeStatus::Missing,
                     "tls=ready" => status.tls_status = DeploymentProbeStatus::Ready,
                     "tls=missing" => status.tls_status = DeploymentProbeStatus::Missing,
-                    "tls-expiring-soon" => {
+                    "tls-expiring-soon"
                         if status.tls_status == DeploymentProbeStatus::Ready
-                            && status.error.is_none()
-                        {
-                            status.error = Some(
+                            && status.error.is_none() =>
+                    {
+                        status.error = Some(
                                 "Relay v2 TLS certificate expires within 30 days; Let's Encrypt renewal should refresh it automatically"
                                     .to_string(),
                             );
-                        }
                     }
-                    "external-tls-san-mismatch" => {
-                        if status.tls_status != DeploymentProbeStatus::Ready {
-                            status.error = Some(
+                    "external-tls-san-mismatch"
+                        if status.tls_status != DeploymentProbeStatus::Ready =>
+                    {
+                        status.error = Some(
                                 "Relay v2 TLS certificate SAN does not match the advertised origin hostname"
                                     .to_string(),
                             );
-                        }
                     }
                     "center=running" => status.center_status = DeploymentProbeStatus::Running,
                     "center=stopped" => status.center_status = DeploymentProbeStatus::Stopped,
@@ -4074,37 +4072,37 @@ mod tests {
     #[test]
     fn status_projection_exposes_the_v2_primary_flip_condition() {
         let unprovisioned = base_status(Some(&config()), None);
-        assert_eq!(unprovisioned.configured, true);
-        assert_eq!(unprovisioned.profile_provisioned, false);
-        assert_eq!(unprovisioned.connector_desired_running, false);
-        assert_eq!(unprovisioned.effective, false);
+        assert!(unprovisioned.configured);
+        assert!(!unprovisioned.profile_provisioned);
+        assert!(!unprovisioned.connector_desired_running);
+        assert!(!unprovisioned.effective);
 
         let mut provisioned = config();
         provisioned.profile_provisioned = true;
         provisioned.host_credential_provisioned = true;
         provisioned.connector_desired_running = true;
         let projected = base_status(Some(&provisioned), None);
-        assert_eq!(projected.profile_provisioned, true);
-        assert_eq!(projected.connector_desired_running, true);
-        assert_eq!(projected.effective, true);
+        assert!(projected.profile_provisioned);
+        assert!(projected.connector_desired_running);
+        assert!(projected.effective);
 
         let mut disabled = provisioned.clone();
         disabled.enabled = false;
-        assert_eq!(base_status(Some(&disabled), None).effective, false);
+        assert!(!base_status(Some(&disabled), None).effective);
 
         let mut incomplete = provisioned.clone();
         incomplete.host_credential_provisioned = false;
-        assert_eq!(base_status(Some(&incomplete), None).effective, false);
+        assert!(!base_status(Some(&incomplete), None).effective);
 
         let mut rotating = provisioned.clone();
         rotating.bootstrap_rotation_pending = true;
-        assert_eq!(base_status(Some(&rotating), None).effective, false);
+        assert!(!base_status(Some(&rotating), None).effective);
 
         let absent = base_status(None, None);
-        assert_eq!(absent.configured, false);
-        assert_eq!(absent.profile_provisioned, false);
-        assert_eq!(absent.connector_desired_running, false);
-        assert_eq!(absent.effective, false);
+        assert!(!absent.configured);
+        assert!(!absent.profile_provisioned);
+        assert!(!absent.connector_desired_running);
+        assert!(!absent.effective);
     }
 
     #[test]
@@ -4832,7 +4830,7 @@ mod tests {
         for out in [&result, &result_no_nl] {
             assert!(out.ends_with(&format!("{ISRG_ROOT_X1_PEM}\n")));
             assert_eq!(
-                out.matches(&format!("{ISRG_ROOT_X1_PEM}")).count(),
+                out.matches(&ISRG_ROOT_X1_PEM.to_string()).count(),
                 1,
                 "root PEM should appear exactly once"
             );

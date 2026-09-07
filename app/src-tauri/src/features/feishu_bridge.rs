@@ -182,7 +182,7 @@ struct FeishuBridgeInstanceLock {
 fn socket_path() -> Result<PathBuf, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let preferred = home.join(".tmux-worktree").join("feishu-bridge-v1.sock");
-    if preferred.to_string_lossy().as_bytes().len() <= 100 {
+    if preferred.to_string_lossy().len() <= 100 {
         return Ok(preferred);
     }
     let digest = Sha256::digest(home.to_string_lossy().as_bytes());
@@ -771,6 +771,14 @@ fn require_hardened_delivery_capabilities(probe: &BridgeProbe) -> Result<(), Str
         "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capabilities: {}",
         missing.join(", ")
     ))
+}
+
+/// Capability gate shared by the turn-level binding commands
+/// (create / resume / repair / return).
+fn require_turn_capabilities(probe: &BridgeProbe) -> Result<(), String> {
+    require_activity_completion_capability(probe)?;
+    require_steering_capability(probe)?;
+    require_hardened_delivery_capabilities(probe)
 }
 
 fn should_upgrade_empty_bridge(probe: &BridgeProbe) -> Result<bool, String> {
@@ -1401,9 +1409,7 @@ pub(crate) fn feishu_binding_create(
                 .to_string(),
         );
     }
-    require_activity_completion_capability(&probe)?;
-    require_steering_capability(&probe)?;
-    require_hardened_delivery_capabilities(&probe)?;
+    require_turn_capabilities(&probe)?;
     let reply_mode_param = reply_mode_create_param(&probe, reply_mode)?;
     let mut params = json!({
         "chatId": args.chat_id,
@@ -1489,9 +1495,7 @@ pub(crate) fn feishu_binding_resume(
     binding_id: String,
 ) -> Result<Value, String> {
     let probe = ensure_server(&app, state.inner().as_ref())?;
-    require_activity_completion_capability(&probe)?;
-    require_steering_capability(&probe)?;
-    require_hardened_delivery_capabilities(&probe)?;
+    require_turn_capabilities(&probe)?;
     request("binding.resume", json!({ "bindingId": binding_id }))
 }
 
@@ -1502,9 +1506,7 @@ pub(crate) fn feishu_binding_repair(
     binding_id: String,
 ) -> Result<Value, String> {
     let probe = ensure_server(&app, state.inner().as_ref())?;
-    require_activity_completion_capability(&probe)?;
-    require_steering_capability(&probe)?;
-    require_hardened_delivery_capabilities(&probe)?;
+    require_turn_capabilities(&probe)?;
     request("binding.repair", json!({ "bindingId": binding_id }))
 }
 
@@ -1588,9 +1590,7 @@ pub(crate) fn feishu_binding_return(
     pty_id: String,
 ) -> Result<Value, String> {
     let probe = ensure_server(&app, bridge_state.inner().as_ref())?;
-    require_activity_completion_capability(&probe)?;
-    require_steering_capability(&probe)?;
-    require_hardened_delivery_capabilities(&probe)?;
+    require_turn_capabilities(&probe)?;
     with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
         let target = binding_target(&request("bridge.snapshot", json!({}))?, &binding_id)?;
         ensure_binding_matches_pty(control, &target)?;

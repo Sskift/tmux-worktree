@@ -20,8 +20,8 @@ pub(crate) fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> 
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn trimmed_non_empty_string(value: &str) -> Option<String> {
-    let trimmed = value.trim();
+pub(crate) fn trimmed_non_empty_string(value: impl AsRef<str>) -> Option<String> {
+    let trimmed = value.as_ref().trim();
     if trimmed.is_empty() {
         None
     } else {

@@ -33,6 +33,7 @@ use super::{
     GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
     Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
     AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+    REQUIRED_TW_RPC_CAPABILITIES,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -3216,18 +3217,7 @@ fn ssh_host_validation_blocks_option_injection_and_control_characters() {
 
 #[test]
 fn host_compatibility_requires_hard_bounded_mutation_capabilities() {
-    let complete = [
-        "incarnation-list.v1",
-        "reservation-correlation.v1",
-        "correlated-create-worktree.v1",
-        "resolved-create-worktree.v1",
-        "correlated-create-terminal.v1",
-        "expected-incarnation-kill-session.v1",
-        "hard-timeout.v1",
-        "dashboard-lifecycle.v2",
-        "project-catalog.v2",
-    ]
-    .map(str::to_string);
+    let complete = REQUIRED_TW_RPC_CAPABILITIES.map(str::to_string);
     assert!(tw_rpc_capabilities_compatible(2, &complete));
     assert!(!tw_rpc_capabilities_compatible(1, &complete));
     assert!(!tw_rpc_capabilities_compatible(

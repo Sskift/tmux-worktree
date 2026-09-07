@@ -137,7 +137,7 @@ fn terminal_control_ssh_bind_path_len(control_path: &str) -> usize {
     // OpenSSH expands %C to its 40-character connection hash (including %j).
     // A new master first binds the expanded path plus "." and 16 random
     // characters before atomically moving the socket into place.
-    control_path.as_bytes().len() - "%C".len() + 40 + 17
+    control_path.len() - "%C".len() + 40 + 17
 }
 
 fn terminal_control_ssh_digest(host: &HostConfig, domain: &[u8]) -> Vec<u8> {
@@ -190,40 +190,6 @@ fn has_custom_tw_path(host: &HostConfig) -> bool {
     host.tw_path
         .as_deref()
         .is_some_and(|path| !path.trim().is_empty())
-}
-
-/// Build an SSH command for interactive PTY use (no BatchMode, force TTY with -tt).
-#[allow(dead_code)]
-pub(crate) fn ssh_command_interactive(
-    host: &HostConfig,
-    remote_cmd: &[&str],
-) -> Result<std::process::Command, String> {
-    validate_ssh_host_fields(host)?;
-    let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-tt")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3");
-    apply_ssh_multiplex_options(&mut cmd);
-    if let Some(port) = host.port {
-        cmd.arg("-p").arg(port.to_string());
-    }
-    if let Some(key) = &host.identity_file {
-        cmd.arg("-i").arg(key);
-    }
-    if let Some(user) = &host.user {
-        cmd.arg("-l").arg(user);
-    }
-    cmd.arg("--").arg(&host.host);
-    if !remote_cmd.is_empty() {
-        cmd.arg(shell_join(remote_cmd));
-    }
-    Ok(cmd)
 }
 
 /// Run a command on a remote host and return stdout.
@@ -827,6 +793,9 @@ mod tests {
 
     #[test]
     fn terminal_control_path_avoids_legacy_directory_and_fits_real_home() {
+        // Other tests mutate HOME for the duration of their assertions; take
+        // the shared env lock so dirs::home_dir() observes the restored value.
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
         let temp = tempfile::Builder::new()
             .prefix("twc")
             .tempdir_in("/tmp")
@@ -853,10 +822,10 @@ mod tests {
             .expect("legacy directory must not prevent opening the v2 control socket");
         drop(listener);
 
-        let actual_directory =
-            Path::new(option_env!("HOME").expect("HOME from the Rust build environment"))
-                .join(".tmux-worktree")
-                .join("c");
+        let actual_directory = dirs::home_dir()
+            .expect("home dir for control path length test")
+            .join(".tmux-worktree")
+            .join("c");
         let actual = terminal_control_ssh_path_for_directory(&actual_directory, &host());
         assert!(
             terminal_control_ssh_bind_path_len(&actual) <= 103,

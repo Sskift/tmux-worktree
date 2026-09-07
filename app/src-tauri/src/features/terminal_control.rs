@@ -341,7 +341,7 @@ fn socket_path() -> PathBuf {
     }
     let home = app_home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let preferred = home.join(".tmux-worktree").join("terminal-control-v1.sock");
-    if preferred.to_string_lossy().as_bytes().len() <= 100 {
+    if preferred.to_string_lossy().len() <= 100 {
         return preferred;
     }
     let digest = Sha256::digest(home.to_string_lossy().as_bytes());
@@ -485,7 +485,7 @@ fn remote_terminal_control_command(host: &HostConfig, mode: &str) -> String {
         .is_some_and(|path| !path.trim().is_empty())
     {
         command.push_str("TW_TMUX=");
-        command.push_str(&remote_tmux_cmd(&host));
+        command.push_str(&remote_tmux_cmd(host));
         command.push(' ');
     }
     command.push_str(&remote_tw_cmd(host));
@@ -960,6 +960,33 @@ pub(crate) fn release_pty_control(
     }
 }
 
+/// Apply the standard terminal-control error classification: clear the lease
+/// on ownership/handoff failures, mark recovery-required states, and record
+/// the last error for observers.
+fn classify_control_error(control: &mut PtyControl, error: &TerminalControlCallError) {
+    if matches!(
+        error.code.as_str(),
+        "PERMISSION_DENIED"
+            | "HANDOFF_PENDING"
+            | "TARGET_GONE"
+            | "RECOVERY_REQUIRED"
+            | "OPERATION_IN_DOUBT"
+            | "UNAVAILABLE"
+            | "INTERNAL"
+    ) {
+        control.lease = None;
+        control.applied_size = None;
+    }
+    if matches!(
+        error.code.as_str(),
+        "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
+    ) {
+        control.last_state = "RECOVERY_REQUIRED".to_string();
+        control.last_owner_kind = None;
+    }
+    control.last_error = Some(error.to_string());
+}
+
 pub(crate) fn write_pty_control(
     app: &tauri::AppHandle,
     state: &TerminalControlState,
@@ -982,27 +1009,7 @@ pub(crate) fn write_pty_control(
         }),
     );
     if let Err(error) = &result {
-        if matches!(
-            error.code.as_str(),
-            "PERMISSION_DENIED"
-                | "HANDOFF_PENDING"
-                | "TARGET_GONE"
-                | "RECOVERY_REQUIRED"
-                | "OPERATION_IN_DOUBT"
-                | "UNAVAILABLE"
-                | "INTERNAL"
-        ) {
-            control.lease = None;
-            control.applied_size = None;
-        }
-        if matches!(
-            error.code.as_str(),
-            "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
-        ) {
-            control.last_state = "RECOVERY_REQUIRED".to_string();
-            control.last_owner_kind = None;
-        }
-        control.last_error = Some(error.to_string());
+        classify_control_error(control, error);
     }
     result.map(|_| ())
 }
@@ -1037,27 +1044,7 @@ pub(crate) fn scroll_pty_control(
         }),
     );
     if let Err(error) = &result {
-        if matches!(
-            error.code.as_str(),
-            "PERMISSION_DENIED"
-                | "HANDOFF_PENDING"
-                | "TARGET_GONE"
-                | "RECOVERY_REQUIRED"
-                | "OPERATION_IN_DOUBT"
-                | "UNAVAILABLE"
-                | "INTERNAL"
-        ) {
-            control.lease = None;
-            control.applied_size = None;
-        }
-        if matches!(
-            error.code.as_str(),
-            "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
-        ) {
-            control.last_state = "RECOVERY_REQUIRED".to_string();
-            control.last_owner_kind = None;
-        }
-        control.last_error = Some(error.to_string());
+        classify_control_error(control, error);
     }
     result.map(|_| ())
 }
@@ -1468,7 +1455,7 @@ mod tests {
             .join(format!("tw-terminal-control-{suffix}"))
             .join("v1.sock");
         assert_eq!(socket_path(), expected_hashed_socket);
-        assert!(socket_path().to_string_lossy().as_bytes().len() <= 100);
+        assert!(socket_path().to_string_lossy().len() <= 100);
         unsafe {
             std::env::set_var("TW_DASHBOARD_HOME", &dashboard_home);
         }

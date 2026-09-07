@@ -327,7 +327,6 @@ fn walk_search(
     dir: &std::path::Path,
     query_lower: &str,
     mode: &str,
-    root: &std::path::Path,
     results: &mut Vec<SearchResult>,
     limit: usize,
 ) {
@@ -401,7 +400,7 @@ fn walk_search(
         if results.len() >= limit {
             return;
         }
-        walk_search(&directory, query_lower, mode, root, results, limit);
+        walk_search(&directory, query_lower, mode, results, limit);
     }
 }
 
@@ -420,6 +419,6 @@ pub(crate) fn search_files(
     }
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
-    walk_search(root_path, &query_lower, &mode, root_path, &mut results, 100);
+    walk_search(root_path, &query_lower, &mode, &mut results, 100);
     Ok(results)
 }

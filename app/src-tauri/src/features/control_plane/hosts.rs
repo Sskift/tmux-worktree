@@ -1,12 +1,9 @@
-use super::{
-    bundled_cli_path, remote_tw_capabilities, remote_tw_version, scp_cli_to_host,
-    tw_rpc_capabilities_compatible,
-};
+use super::{bundled_cli_path, remote_tw_capabilities, remote_tw_version, scp_cli_to_host};
 use crate::config::{
     add_host_config, find_host, load_hosts, remove_host_config, trimmed_non_empty_string,
     update_host_config, AddHostArgs, UpdateHostArgs,
 };
-use crate::ipc::HostStatus;
+use crate::ipc::{tw_rpc_capabilities_compatible, HostStatus};
 use crate::remote::{
     run_remote_cmd_check, run_remote_tmux_check, validate_ssh_host_fields, HostConfig,
 };

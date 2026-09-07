@@ -10,10 +10,11 @@ use super::enrollment_artifact::{
     EnrollmentArtifactCopyField, EnrollmentArtifactRegistry, EnrollmentArtifactWindowClaim,
 };
 use super::management_child::{
-    ManagementCallError, ManagementChildManager, ManagementChildSelection,
+    fixed_error, ManagementCallError, ManagementChildManager, ManagementChildSelection,
     ManagementCleanupOutcome, ManagementError, ManagementInput, ManagementLaunchKey,
     ManagementOperation, ManagementOutcome, ManagementStartError,
 };
+use super::management_protocol_v2::{valid_device_label, valid_identifier};
 
 const UNAVAILABLE_CODE: &str = "UNAVAILABLE";
 const UNAVAILABLE_MESSAGE: &str = "Relay v2 management is unavailable";
@@ -959,7 +960,9 @@ fn decode_command_input(
             }
             let device_label = match &object["deviceLabel"] {
                 serde_json::Value::Null => None,
-                serde_json::Value::String(label) if valid_opaque(label, 128) => Some(label.clone()),
+                serde_json::Value::String(label) if valid_device_label(label).is_ok() => {
+                    Some(label.clone())
+                }
                 _ => return Err(invalid_argument_error()),
             };
             Ok(ManagementInput::CreateEnrollment { device_label })
@@ -974,25 +977,13 @@ fn decode_command_input(
             }
             let grant_id = object["grantId"]
                 .as_str()
-                .filter(|grant_id| valid_opaque(grant_id, 128))
+                .filter(|grant_id| valid_identifier(grant_id).is_ok())
                 .ok_or_else(invalid_argument_error)?;
             Ok(ManagementInput::RevokeClientGrant {
                 grant_id: grant_id.to_string(),
             })
         }
     }
-}
-
-fn valid_opaque(value: &str, max_bytes: usize) -> bool {
-    !value.is_empty()
-        && value.len() <= max_bytes
-        && value.trim() == value
-        && !['\0', '\r', '\n']
-            .iter()
-            .any(|forbidden| value.contains(*forbidden))
-        && !["twcap2.", "twref2.", "twenroll2.", "twhostboot2."]
-            .iter()
-            .any(|prefix| value.to_ascii_lowercase().contains(prefix))
 }
 
 fn valid_artifact_handle(value: &str) -> bool {
@@ -1003,14 +994,6 @@ fn valid_artifact_handle(value: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
-
-fn fixed_error(code: &str, message: &str) -> ManagementError {
-    ManagementError {
-        code: code.to_string(),
-        message: message.to_string(),
-        retryable: false,
-    }
 }
 
 fn unavailable_error() -> ManagementError {
