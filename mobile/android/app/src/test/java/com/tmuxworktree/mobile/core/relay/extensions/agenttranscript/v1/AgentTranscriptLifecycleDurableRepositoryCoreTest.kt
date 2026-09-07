@@ -2698,4 +2698,3 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         }
     }
 }
-
