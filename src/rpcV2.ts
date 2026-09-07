@@ -45,6 +45,33 @@ export const RPC_V2_CAPABILITIES = Object.freeze([
   "project-catalog.v2",
 ] as const);
 
+/**
+ * The closed set of keys in a TW RPC v2 Session payload. Shared with the
+ * canonical discovery resolver so the CLI and relay trust boundaries cannot
+ * drift on the Session schema; each parser keeps its own strictness policy
+ * (error class, lifecycleMarked handling) around this list.
+ */
+export const RPC_V2_SESSION_KEYS = [
+  "name",
+  "kind",
+  "profile",
+  "project",
+  "label",
+  "repoPath",
+  "worktreePath",
+  "branch",
+  "baseBranch",
+  "cwd",
+  "createdAt",
+  "attached",
+  "windows",
+  "created",
+  "activity",
+  "incarnation",
+  "lifecycleMarked",
+  "reservationCorrelation",
+] as const;
+
 export interface RpcV2CapabilitiesResponse {
   protocolVersion: 2;
   app: "tmux-worktree";
@@ -167,7 +194,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function exactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
   return required.every((key) => Object.hasOwn(value, key))
     && Object.keys(value).every((key) => allowed.has(key));
@@ -401,26 +428,7 @@ function nonNegativeSafeInteger(value: unknown, label: string): number {
 }
 
 function parseRpcV2Session(value: unknown): RpcV2Session {
-  if (!isRecord(value) || !exactKeys(value, [
-    "name",
-    "kind",
-    "profile",
-    "project",
-    "label",
-    "repoPath",
-    "worktreePath",
-    "branch",
-    "baseBranch",
-    "cwd",
-    "createdAt",
-    "attached",
-    "windows",
-    "created",
-    "activity",
-    "incarnation",
-    "lifecycleMarked",
-    "reservationCorrelation",
-  ])) {
+  if (!isRecord(value) || !exactKeys(value, RPC_V2_SESSION_KEYS)) {
     throw new Error("invalid RPC v2 Session response");
   }
   if ((value.kind !== "worktree" && value.kind !== "terminal")

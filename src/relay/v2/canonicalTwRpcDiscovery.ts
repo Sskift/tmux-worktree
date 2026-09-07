@@ -1,5 +1,6 @@
 import {
   RPC_V2_CAPABILITIES,
+  RPC_V2_SESSION_KEYS,
   type RpcV2Project,
   type RpcV2CapabilitiesResponse,
   type RpcV2ListResponse,
@@ -302,26 +303,7 @@ function parseCapabilitiesResponse(value: unknown): RpcV2CapabilitiesResponse {
 }
 
 function parseSession(value: unknown): RpcV2Session {
-  if (!isRecord(value) || !hasExactKeys(value, [
-    "name",
-    "kind",
-    "profile",
-    "project",
-    "label",
-    "repoPath",
-    "worktreePath",
-    "branch",
-    "baseBranch",
-    "cwd",
-    "createdAt",
-    "attached",
-    "windows",
-    "created",
-    "activity",
-    "incarnation",
-    "lifecycleMarked",
-    "reservationCorrelation",
-  ])) {
+  if (!isRecord(value) || !hasExactKeys(value, RPC_V2_SESSION_KEYS)) {
     throw new TypeError("invalid canonical TW RPC v2 Session response");
   }
   if ((value.kind !== "worktree" && value.kind !== "terminal")
