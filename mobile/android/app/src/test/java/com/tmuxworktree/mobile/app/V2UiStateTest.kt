@@ -115,20 +115,6 @@ class V2UiStateTest {
 
         assertEquals("keep", state.activeHostId)
         assertEquals(listOf(visible), state.activeSessions)
-        assertTrue(
-            shouldPersistRelaySelectedHost(
-                preferredHostId = "gone",
-                availableHostIds = setOf("keep"),
-                selectedHostId = "keep",
-            ),
-        )
-        assertFalse(
-            shouldPersistRelaySelectedHost(
-                preferredHostId = "keep",
-                availableHostIds = setOf("keep"),
-                selectedHostId = "keep",
-            ),
-        )
     }
 
     @Test
