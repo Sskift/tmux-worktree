@@ -115,7 +115,7 @@ function boundedUtf8Tail(value: string, maxBytes: number): string {
   return characters.slice(start).join("");
 }
 
-export function sanitizeTerminalText(value: string): string {
+function sanitizeTerminalText(value: string): string {
   return value
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, "")
@@ -278,10 +278,6 @@ export class FeishuBridge {
   initializeAfterRestart(): void {
     let changed = false;
     for (const binding of this.state.bindings) {
-      if (!binding.options.replyAsCard) {
-        binding.options.replyAsCard = true;
-        changed = true;
-      }
       if (binding.status === "active" || binding.status === "pausing") {
         binding.status = "stale";
         binding.staleReason = "bridge restarted; ownership was not recreated automatically";
@@ -370,8 +366,6 @@ export class FeishuBridge {
         status: input.dashboardLease ? "pausing" : "active",
         options: {
           mentionOnly: input.mentionOnly !== false,
-          replyAsCard: true,
-          includeQuotedContext: false,
           replyMode: input.replyMode ?? "topic",
         },
         allowedSenderIds,

@@ -38,7 +38,8 @@ const C = {
   red: (s: string) => `\x1b[31m${s}\x1b[0m`,
 };
 
-function homeShort(p: string): string {
+export function homeShort(p: string | null): string {
+  if (!p) return "";
   const h = homedir();
   return p.startsWith(h) ? "~" + p.slice(h.length) : p;
 }
@@ -103,7 +104,7 @@ function collectWorktrees(config: Config | null): WorktreeRow[] {
 function hasFlag(args: string[], ...names: string[]): boolean {
   return args.some((a) => names.includes(a));
 }
-function positional(args: string[]): string[] {
+function nonFlagArgs(args: string[]): string[] {
   return args.filter((a) => !a.startsWith("-"));
 }
 
@@ -144,7 +145,7 @@ export async function listCmd(): Promise<void> {
 // tw attach <session> — 接入 / 切换
 // ============================================
 export async function attachCmd(args: string[]): Promise<void> {
-  const [name] = positional(args);
+  const [name] = nonFlagArgs(args);
   const privilegedBypass = hasFlag(args, "--privileged-bypass");
   const takeover = hasFlag(args, "--take-over");
   if (!name) {
@@ -187,7 +188,7 @@ function sessionNamesHint(): string {
 // tw rm <session> [--worktree] — 杀 session，可连带删 worktree
 // ============================================
 export async function rmSessionCmd(args: string[]): Promise<void> {
-  const [name] = positional(args);
+  const [name] = nonFlagArgs(args);
   const alsoWorktree = hasFlag(args, "--worktree", "-w");
   const force = hasFlag(args, "--force", "-f");
   if (!name) {
@@ -307,7 +308,7 @@ function worktreeLs(): void {
 }
 
 function worktreeRm(args: string[]): void {
-  const [target] = positional(args);
+  const [target] = nonFlagArgs(args);
   const force = hasFlag(args, "--force", "-f");
   if (!target) {
     throw new CliError("用法: tw worktree rm <name|path> [--force]");

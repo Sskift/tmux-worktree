@@ -15,8 +15,6 @@ const binding: FeishuBinding = {
   status: "stale",
   options: {
     mentionOnly: true,
-    replyAsCard: true,
-    includeQuotedContext: true,
   },
   allowedSenderIds: [],
   createdAt: "2026-07-16T09:00:00.000Z",

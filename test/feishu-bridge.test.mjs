@@ -1740,7 +1740,6 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       createdBy: "ou-owner",
     });
     assert.equal(binding.status, "active");
-    assert.equal(binding.options.replyAsCard, true);
     assert.equal(binding.options.replyMode, "topic");
     assert.equal(h.control.target.owner.kind, "feishu");
 
@@ -3265,9 +3264,14 @@ test("legacy binding reply mode defaults to topic while unknown modes remain fai
 
     const normalized = h.store.read();
     assert.equal(normalized.bindings[0].options.replyMode, "topic");
+    // Legacy persistence options are accepted on read but discarded.
+    assert.equal(normalized.bindings[0].options.replyAsCard, undefined);
+    assert.equal(normalized.bindings[0].options.includeQuotedContext, undefined);
     h.store.write(normalized);
     const persisted = JSON.parse(readFileSync(h.paths.bindings, "utf8"));
     assert.equal(persisted.bindings[0].options.replyMode, "topic");
+    assert.equal(persisted.bindings[0].options.replyAsCard, undefined);
+    assert.equal(persisted.bindings[0].options.includeQuotedContext, undefined);
 
     persisted.bindings[0].options.replyMode = "future-mode";
     writeFileSync(h.paths.bindings, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
@@ -3286,5 +3290,33 @@ test("corrupt Feishu bridge storage is preserved and refused", () => {
     assert.match(readFileSync(h.paths.bindings, "utf8"), /future/);
   } finally {
     rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("store write skips collections whose serialized content did not change", () => {
+  const root = mkdtempSync(join("/tmp", "tw-fb-dirty-"));
+  try {
+    const store = new FeishuBridgeStore(feishuBridgePaths(root));
+    const state = { bindings: [], eventIds: [], turns: [], replies: [] };
+    store.write(state);
+    const inodes = () => ({
+      bindings: statSync(store.paths.bindings).ino,
+      dedup: statSync(store.paths.dedup).ino,
+      turns: statSync(store.paths.turns).ino,
+      replies: statSync(store.paths.replies).ino,
+    });
+    const first = inodes();
+    // A second write with identical content must not rewrite any file.
+    store.write(state);
+    assert.deepEqual(inodes(), first, "unchanged collections must not be rewritten");
+    // Mutating only the dedup collection must rewrite just the dedup file.
+    store.write({ ...state, eventIds: ["evt-new"] });
+    const second = inodes();
+    assert.notEqual(second.dedup, first.dedup, "changed dedup file must be rewritten");
+    assert.equal(second.bindings, first.bindings, "unchanged bindings file must be left alone");
+    assert.equal(second.turns, first.turns, "unchanged turns file must be left alone");
+    assert.equal(second.replies, first.replies, "unchanged replies file must be left alone");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

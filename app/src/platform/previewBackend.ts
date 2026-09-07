@@ -518,8 +518,6 @@ transport.handlers.set("feishu_binding_create", (payload) => {
     status: "active",
     options: {
       mentionOnly: args.mentionOnly !== false,
-      replyAsCard: true,
-      includeQuotedContext: false,
       replyMode: args.replyMode,
     },
     allowedSenderIds: [],

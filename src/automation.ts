@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { expandHomePath, loadConfigFile, type Config } from "./config.js";
+import { homeShort } from "./commands.js";
 
 export type AutomationTriggerType = "manual" | "schedule";
 export type AutomationOverlap = "queue" | "skip";
@@ -261,12 +262,6 @@ function writeAutomations(records: AutomationRecord[], path = automationStatePat
   writeFileSync(path, JSON.stringify(records, null, 2) + "\n");
 }
 
-function homeShort(path: string | null): string {
-  if (!path) return "";
-  const home = homedir();
-  return path.startsWith(home) ? `~${path.slice(home.length)}` : path;
-}
-
 function targetLabel(record: AutomationRecord): string {
   return record.project || homeShort(record.path) || "-";
 }
@@ -303,7 +298,7 @@ function deleteAutomation(records: AutomationRecord[], target: string): Automati
   return records.filter((record) => record.id !== matches[0].id);
 }
 
-function positional(args: string[]): string[] {
+function extractPositionalArgs(args: string[]): string[] {
   const values: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -343,7 +338,7 @@ export async function automationCmd(args: string[]): Promise<void> {
     }
     case "rm":
     case "delete": {
-      const [target] = positional(rest);
+      const [target] = extractPositionalArgs(rest);
       if (!target) throw new Error(`用法: tw automation rm <id|name>`);
       const records = readAutomations();
       const next = deleteAutomation(records, target);

@@ -1,3 +1,5 @@
+import { isRecord } from "./feishuBridgeStorage.js";
+
 export type FeishuReplyCardTone = "answer" | "status";
 
 export type FeishuReplyCard = Record<string, unknown>;
@@ -29,10 +31,6 @@ export interface FeishuLocalTaskResultCardInput {
 
 function neutralizeCardMentions(value: string): string {
   return value.replace(/<\/?at\b/gi, (tag) => `<\u200b${tag.slice(1)}`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function jsonObjectEnd(value: string, start: number): number | undefined {
@@ -135,6 +133,41 @@ function conciseCardContext(value: string): string {
   return `${characters.slice(0, 47).join("")}…`;
 }
 
+function plainTitle(content: string): Record<string, unknown> {
+  return { tag: "plain_text", content, text_align: "left" };
+}
+
+/**
+ * Wrap per-builder header/elements in the shared Card JSON 2.0 envelope
+ * (config + body layout) used by every card this module emits.
+ */
+function cardEnvelope(
+  header: Record<string, unknown>,
+  summary: string,
+  elements: Record<string, unknown>[],
+): FeishuReplyCard {
+  return {
+    schema: "2.0",
+    config: {
+      update_multi: true,
+      width_mode: "default",
+      enable_forward: true,
+      streaming_mode: false,
+      summary: { content: summary },
+    },
+    header,
+    body: {
+      direction: "vertical",
+      horizontal_spacing: "8px",
+      vertical_spacing: "8px",
+      horizontal_align: "left",
+      vertical_align: "top",
+      padding: "16px 20px 16px 20px",
+      elements,
+    },
+  };
+}
+
 /**
  * Build the final, non-streaming Card JSON 2.0 payload used by the Bridge.
  * A complete read-only Agent card is preserved; other text is kept inside one
@@ -151,38 +184,19 @@ export function buildFeishuReplyCard(
     if (structuredCard) return structuredCard;
   }
   const title = `tw agent on ${conciseCardContext(sessionName)}`;
-  return {
-    schema: "2.0",
-    config: {
-      update_multi: true,
-      width_mode: "default",
-      enable_forward: true,
-      streaming_mode: false,
-      summary: { content: status ? "TW Agent 状态" : "TW Agent 回复" },
-    },
-    header: {
+  return cardEnvelope(
+    {
       template: status ? "orange" : "blue",
-      title: {
-        tag: "plain_text",
-        content: title,
-        text_align: "left",
-      },
+      title: plainTitle(title),
     },
-    body: {
-      direction: "vertical",
-      horizontal_spacing: "8px",
-      vertical_spacing: "8px",
-      horizontal_align: "left",
-      vertical_align: "top",
-      padding: "16px 20px 16px 20px",
-      elements: [{
-        tag: "markdown",
-        content: neutralizeCardMentions(text),
-        text_align: "left",
-        text_size: "normal",
-      }],
-    },
-  };
+    status ? "TW Agent 状态" : "TW Agent 回复",
+    [{
+      tag: "markdown",
+      content: neutralizeCardMentions(text),
+      text_align: "left",
+      text_size: "normal",
+    }],
+  );
 }
 
 /**
@@ -216,38 +230,19 @@ export function buildFeishuLocalTaskResultCard(
       },
     });
   }
-  return {
-    schema: "2.0",
-    config: {
-      update_multi: true,
-      width_mode: "default",
-      enable_forward: true,
-      streaming_mode: false,
-      summary: { content: "TW Agent 回复" },
-    },
-    header: {
+  return cardEnvelope(
+    {
       template: "green",
       icon: {
         tag: "standard_icon",
         token: "done_outlined",
         color: "green",
       },
-      title: {
-        tag: "plain_text",
-        content: `tw agent on ${conciseCardContext(titleContext)}`,
-        text_align: "left",
-      },
+      title: plainTitle(`tw agent on ${conciseCardContext(titleContext)}`),
     },
-    body: {
-      direction: "vertical",
-      horizontal_spacing: "8px",
-      vertical_spacing: "8px",
-      horizontal_align: "left",
-      vertical_align: "top",
-      padding: "16px 20px 16px 20px",
-      elements,
-    },
-  };
+    "TW Agent 回复",
+    elements,
+  );
 }
 
 function lifecyclePresentation(kind: FeishuBindingLifecycleCardKind): {
@@ -409,22 +404,10 @@ export function buildFeishuBindingLifecycleCard(
       },
     });
   }
-  return {
-    schema: "2.0",
-    config: {
-      update_multi: true,
-      width_mode: "default",
-      enable_forward: true,
-      streaming_mode: false,
-      summary: { content: presentation.summary },
-    },
-    header: {
+  return cardEnvelope(
+    {
       template: presentation.template,
-      title: {
-        tag: "plain_text",
-        content: presentation.title,
-        text_align: "left",
-      },
+      title: plainTitle(presentation.title),
       icon: {
         tag: "standard_icon",
         token: "connect_outlined",
@@ -436,14 +419,7 @@ export function buildFeishuBindingLifecycleCard(
         color: presentation.template === "grey" ? "neutral" : presentation.template,
       }],
     },
-    body: {
-      direction: "vertical",
-      horizontal_spacing: "8px",
-      vertical_spacing: "8px",
-      horizontal_align: "left",
-      vertical_align: "top",
-      padding: "16px 20px 16px 20px",
-      elements,
-    },
-  };
+    presentation.summary,
+    elements,
+  );
 }
