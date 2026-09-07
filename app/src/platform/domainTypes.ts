@@ -520,8 +520,6 @@ export type FeishuBinding = {
   status: FeishuBindingStatus;
   options: {
     mentionOnly: boolean;
-    replyAsCard: boolean;
-    includeQuotedContext: boolean;
     replyMode?: FeishuReplyMode;
   };
   allowedSenderIds: string[];

@@ -278,10 +278,6 @@ export class FeishuBridge {
   initializeAfterRestart(): void {
     let changed = false;
     for (const binding of this.state.bindings) {
-      if (!binding.options.replyAsCard) {
-        binding.options.replyAsCard = true;
-        changed = true;
-      }
       if (binding.status === "active" || binding.status === "pausing") {
         binding.status = "stale";
         binding.staleReason = "bridge restarted; ownership was not recreated automatically";
@@ -370,8 +366,6 @@ export class FeishuBridge {
         status: input.dashboardLease ? "pausing" : "active",
         options: {
           mentionOnly: input.mentionOnly !== false,
-          replyAsCard: true,
-          includeQuotedContext: false,
           replyMode: input.replyMode ?? "topic",
         },
         allowedSenderIds,

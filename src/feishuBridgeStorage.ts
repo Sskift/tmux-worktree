@@ -77,8 +77,6 @@ export interface FeishuBinding {
   status: FeishuBindingStatus;
   options: {
     mentionOnly: boolean;
-    replyAsCard: boolean;
-    includeQuotedContext: boolean;
     replyMode: FeishuReplyMode;
   };
   allowedSenderIds: string[];
@@ -150,6 +148,10 @@ export interface FeishuOutboundReply {
 type StoredFeishuBinding = Omit<FeishuBinding, "options"> & {
   options: Omit<FeishuBinding["options"], "replyMode"> & {
     replyMode?: FeishuReplyMode;
+    // Legacy persistence options, accepted on read and discarded. New writes
+    // never emit them; they exist only so pre-removal bridge state stays valid.
+    replyAsCard?: boolean;
+    includeQuotedContext?: boolean;
   };
 };
 
@@ -245,10 +247,13 @@ function isBinding(value: unknown): value is StoredFeishuBinding {
   if (value.status !== "active" && value.status !== "pausing"
     && value.status !== "paused" && value.status !== "stale") return false;
   if (!isRecord(value.options) || !exactKeys(value.options, [
-    "mentionOnly", "replyAsCard", "includeQuotedContext",
-  ], ["replyMode"]) || typeof value.options.mentionOnly !== "boolean"
-    || typeof value.options.replyAsCard !== "boolean"
-    || typeof value.options.includeQuotedContext !== "boolean"
+    "mentionOnly",
+  ], ["replyMode", "replyAsCard", "includeQuotedContext"])
+    || typeof value.options.mentionOnly !== "boolean"
+    || (value.options.replyAsCard !== undefined
+      && typeof value.options.replyAsCard !== "boolean")
+    || (value.options.includeQuotedContext !== undefined
+      && typeof value.options.includeQuotedContext !== "boolean")
     || (value.options.replyMode !== undefined
       && value.options.replyMode !== "topic"
       && value.options.replyMode !== "direct")) return false;
@@ -583,7 +588,7 @@ export class FeishuBridgeStore {
         ).bindings.map((binding): FeishuBinding => ({
           ...binding,
           options: {
-            ...binding.options,
+            mentionOnly: binding.options.mentionOnly,
             replyMode: binding.options.replyMode ?? "topic",
           },
         })),

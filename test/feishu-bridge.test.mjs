@@ -1740,7 +1740,6 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       createdBy: "ou-owner",
     });
     assert.equal(binding.status, "active");
-    assert.equal(binding.options.replyAsCard, true);
     assert.equal(binding.options.replyMode, "topic");
     assert.equal(h.control.target.owner.kind, "feishu");
 
@@ -3266,9 +3265,14 @@ test("legacy binding reply mode defaults to topic while unknown modes remain fai
 
     const normalized = h.store.read();
     assert.equal(normalized.bindings[0].options.replyMode, "topic");
+    // Legacy persistence options are accepted on read but discarded.
+    assert.equal(normalized.bindings[0].options.replyAsCard, undefined);
+    assert.equal(normalized.bindings[0].options.includeQuotedContext, undefined);
     h.store.write(normalized);
     const persisted = JSON.parse(readFileSync(h.paths.bindings, "utf8"));
     assert.equal(persisted.bindings[0].options.replyMode, "topic");
+    assert.equal(persisted.bindings[0].options.replyAsCard, undefined);
+    assert.equal(persisted.bindings[0].options.includeQuotedContext, undefined);
 
     persisted.bindings[0].options.replyMode = "future-mode";
     writeFileSync(h.paths.bindings, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
