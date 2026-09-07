@@ -62,6 +62,7 @@ import {
 import { RelayV2SelfHostedPanel } from "./RelayV2SelfHostedPanel";
 import { useRelayConnectionOverview } from "./useRelayConnectionOverview";
 import { useRelayV2EnrollmentController } from "./useRelayV2EnrollmentController";
+import { useVisibilityAwarePolling } from "../hooks/useVisibilityAwarePolling";
 
 type HostEditorMode = "view" | "add" | "edit";
 export type ConnectionTab = "hosts" | "relay";
@@ -110,8 +111,10 @@ const HOST_FIELDS: readonly HostFieldDefinition[] = [
 
 // The underlying Rust status command runs load_config + probe per call, and
 // probe_status shells out over SSH to the devbox. Poll coarsely (15s) so the
-// relay tab does not hammer the remote host while it stays open.
+// relay tab does not hammer the remote host while it stays open, and back off
+// further when the window is hidden.
 const RELAY_V2_STATUS_POLL_MS = 15_000;
+const RELAY_V2_STATUS_HIDDEN_POLL_MS = 60_000;
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -194,32 +197,26 @@ export function ConnectionsSettings({
     asyncCoordinatorRef.current.invalidateAll();
   }, []);
 
-  // Immediate fetch on mount; the interval below keeps it fresh while the
-  // Relay tab is visible so the overview is never stuck on a mount-time
-  // snapshot (e.g. "Relay center is not running" after a repair fixed it).
-  useEffect(() => {
-    let active = true;
-    void dashboardBackend.relay.v2Deployment.status().then((next) => {
-      if (active) setRelayV2Status(next);
-    }).catch(() => {
-      if (active) setRelayV2Status(null);
-    });
-    return () => {
-      active = false;
-    };
-  }, [dashboardBackend]);
-
-  useEffect(() => {
-    if (activeTab !== "relay") return;
-    const timer = window.setInterval(() => {
-      void dashboardBackend.relay.v2Deployment.status().then((next) => {
+  // Poll deployment status only while the Relay tab is active. The hook
+  // triggers immediately when enabled (covering mount and tab switches, so
+  // the overview is never stuck on a stale snapshot) and backs off to a
+  // slower cadence while the window is hidden. relayV2Status only feeds the
+  // Relay tab panel, so skipping the fetch on other tabs is invisible.
+  useVisibilityAwarePolling(
+    async () => {
+      try {
+        const next = await dashboardBackend.relay.v2Deployment.status();
         setRelayV2Status(next);
-      }).catch(() => {
+      } catch {
         setRelayV2Status(null);
-      });
-    }, RELAY_V2_STATUS_POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [dashboardBackend, activeTab]);
+      }
+    },
+    {
+      enabled: activeTab === "relay",
+      visibleIntervalMs: RELAY_V2_STATUS_POLL_MS,
+      hiddenIntervalMs: RELAY_V2_STATUS_HIDDEN_POLL_MS,
+    },
+  );
 
   // One shared Relay v2 management controller drives both the overview card and
   // the Advanced enrollment panel, so both stay in sync on the same polled state.

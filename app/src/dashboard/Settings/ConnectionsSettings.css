@@ -461,36 +461,6 @@
   background: var(--shell-surface-1);
 }
 
-.connections-relay-stages {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.connections-relay-stages .connections-relay-summary {
-  align-items: flex-start;
-}
-
-.connections-relay-summary--success {
-  color: var(--shell-success);
-  border-color: #315f39;
-}
-
-.connections-relay-summary--danger {
-  color: var(--shell-danger);
-  border-color: #6f3734;
-}
-
-.connections-relay-summary--warning {
-  color: var(--shell-warning);
-  border-color: #665322;
-}
-
-.connections-relay-summary--progress {
-  color: var(--shell-focus);
-  border-color: #305681;
-}
-
 .connections-relay-stack {
   align-items: center;
   background: var(--shell-surface-1);
@@ -725,10 +695,6 @@
   margin-top: 0;
 }
 
-.connections-fields--relay {
-  grid-template-columns: minmax(0, 1fr);
-}
-
 .connections-relay-manual {
   margin-top: 13px;
   background: var(--shell-surface-2);
@@ -782,14 +748,6 @@
   color: var(--shell-text-muted);
   background: var(--shell-surface-3);
   border-radius: var(--shell-radius-sm);
-}
-
-.connections-relay-manual__fields {
-  padding: 4px 11px 0;
-}
-
-.connections-actions--relay-manual {
-  margin: 10px 11px 11px;
 }
 
 .connections-relay-pairing {
@@ -959,17 +917,6 @@
   border-radius: var(--shell-radius-sm);
 }
 
-.connections-relay-pairing__qr {
-  width: 156px;
-  height: 156px;
-  flex: 0 0 auto;
-  box-sizing: content-box;
-  padding: 6px;
-  background: #fff;
-  border: 1px solid var(--shell-border-strong);
-  border-radius: var(--shell-radius-sm);
-}
-
 .connections-copy-field {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 30px;
@@ -997,10 +944,6 @@
 }
 
 @media (max-width: 720px) {
-  .connections-relay-stages {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   .connections-fields {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1030,10 +973,6 @@
   .connections-relay-pairing {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .connections-relay-pairing__qr {
-    align-self: center;
   }
 
   .connections-relay-overview__main {

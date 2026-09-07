@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   type FeishuBinding,
   type FeishuBridgeSnapshot,
@@ -18,17 +18,7 @@ import {
   terminalSessionKey,
 } from "./model/terminalIdentity";
 import { buildSshAttachArgs } from "../terminal/attach";
-
-export {
-  sessionDisplayName,
-  terminalRawName,
-  terminalSessionKey,
-} from "./model/terminalIdentity";
-export {
-  buildSshAttachArgs,
-  shellQuoteArg,
-  sharedSshConnectionArgs,
-} from "../terminal/attach";
+import { useVisibilityAwarePolling } from "./hooks/useVisibilityAwarePolling";
 
 type OpenFileHandler = (
   path: string,
@@ -108,26 +98,10 @@ export function TerminalDeck({
     }
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const snapshot = await dashboardBackend.feishu.status();
-        if (!cancelled) {
-          setFeishuSnapshot(snapshot);
-          setFeishuError(null);
-        }
-      } catch (error) {
-        if (!cancelled) setFeishuError(error instanceof Error ? error.message : String(error));
-      }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 2_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [dashboardBackend]);
+  useVisibilityAwarePolling(refreshFeishu, {
+    visibleIntervalMs: 2_000,
+    hiddenIntervalMs: 10_000,
+  });
 
   const bindingFor = (sessionName: string): FeishuBinding | undefined =>
     feishuSnapshot?.bindings.find((binding) => binding.sessionName === sessionName);
