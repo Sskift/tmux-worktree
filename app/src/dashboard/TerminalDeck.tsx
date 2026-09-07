@@ -19,17 +19,6 @@ import {
 } from "./model/terminalIdentity";
 import { buildSshAttachArgs } from "../terminal/attach";
 
-export {
-  sessionDisplayName,
-  terminalRawName,
-  terminalSessionKey,
-} from "./model/terminalIdentity";
-export {
-  buildSshAttachArgs,
-  shellQuoteArg,
-  sharedSshConnectionArgs,
-} from "../terminal/attach";
-
 type OpenFileHandler = (
   path: string,
   line?: number,
