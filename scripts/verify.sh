@@ -8,6 +8,10 @@ run_repository_hygiene() {
   echo "==> repository hygiene"
   git -C "$ROOT" diff --check
   git -C "$ROOT" diff --cached --check
+  (
+    cd "$ROOT"
+    npm run check:contracts
+  )
 }
 
 run_cli() {
