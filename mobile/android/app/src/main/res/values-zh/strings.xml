@@ -1,0 +1,6 @@
+<resources>
+    <string name="relay_notification_connected">tmux-worktree 已连接</string>
+    <string name="relay_notification_connecting">tmux-worktree 连接中…</string>
+    <string name="relay_notification_reconnecting">tmux-worktree 重连中…</string>
+    <string name="relay_notification_waiting_network">tmux-worktree 等待网络…</string>
+</resources>

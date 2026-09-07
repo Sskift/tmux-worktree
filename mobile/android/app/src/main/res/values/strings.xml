@@ -7,8 +7,8 @@
     <string name="agent_lifecycle_notification_completed_title">Agent completed</string>
     <string name="relay_notification_channel_name">Relay connection</string>
     <string name="relay_notification_channel_description">Keeps the relay connection alive in the background</string>
-    <string name="relay_notification_connected">tmux-worktree 已连接</string>
-    <string name="relay_notification_connecting">tmux-worktree 连接中…</string>
-    <string name="relay_notification_reconnecting">tmux-worktree 重连中…</string>
-    <string name="relay_notification_waiting_network">tmux-worktree 等待网络…</string>
+    <string name="relay_notification_connected">tmux-worktree connected</string>
+    <string name="relay_notification_connecting">tmux-worktree connecting…</string>
+    <string name="relay_notification_reconnecting">tmux-worktree reconnecting…</string>
+    <string name="relay_notification_waiting_network">tmux-worktree waiting for network…</string>
 </resources>
