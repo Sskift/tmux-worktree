@@ -282,6 +282,25 @@ export class TerminalControlProtocolError extends Error {
   }
 }
 
+export class TerminalControlAgentMessageNotAppliedError extends TerminalControlProtocolError {
+  constructor(code: TerminalControlErrorCode, message: string, retryable = false) {
+    super(code, message, retryable);
+    this.name = "TerminalControlAgentMessageNotAppliedError";
+  }
+}
+
+export interface TerminalControlOutputPosition {
+  generation: string;
+  cursor: number;
+  /** Earliest byte cursor retained for a fresh read observation, when known. */
+  retainedStartCursor?: number;
+}
+
+export interface TerminalControlOutputChunk extends TerminalControlOutputPosition {
+  dataBase64: string;
+  nextCursor: number;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
