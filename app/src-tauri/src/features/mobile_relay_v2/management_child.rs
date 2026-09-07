@@ -549,6 +549,10 @@ impl BoundedObservationQueue {
         true
     }
 
+    // In production builds the loop body always returns on the first
+    // iteration; the `continue` path behind `#[cfg(test)]` makes it a real
+    // loop when the unsolicited-drain pause hook is active.
+    #[cfg_attr(not(test), allow(clippy::never_loop))]
     fn begin_drain(&self) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         loop {
@@ -574,8 +578,12 @@ impl BoundedObservationQueue {
         self.changed.notify_all();
     }
 
+    // See begin_drain: the loop is single-iteration in production builds and
+    // only genuinely loops under cfg(test). `mut` is unused in production
+    // because the reassignment is test-only.
+    #[cfg_attr(not(test), allow(clippy::never_loop))]
+    #[cfg_attr(not(test), allow(unused_mut))]
     fn wait_for_next_drain(&self) -> bool {
-        #[allow(unused_mut)]
         let mut state = self.state.lock().unwrap();
         loop {
             if state.discarded {
