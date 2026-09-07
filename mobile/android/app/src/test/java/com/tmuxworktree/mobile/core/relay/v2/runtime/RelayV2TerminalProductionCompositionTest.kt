@@ -2850,7 +2850,7 @@ class RelayV2TerminalProductionCompositionTest {
             if (stored.checkpoint.deliveryToken.actorGeneration != authority.generation ||
                 stored.checkpoint.target != key.toTarget()
             ) return null
-            val reduced = RelayV2TerminalCheckpointReducer.reduceOpenedForClose(
+            val reduced = RelayV2TerminalCheckpointReducer.reduceDetachedOpened(
                 stored.checkpoint,
                 action,
                 pendingClose,

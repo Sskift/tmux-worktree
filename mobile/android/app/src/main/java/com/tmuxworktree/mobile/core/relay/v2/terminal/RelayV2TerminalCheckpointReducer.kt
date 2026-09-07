@@ -479,21 +479,6 @@ internal object RelayV2TerminalCheckpointReducer {
     }
 
     /**
-     * Adopts one exact pre-open response only to durably close it. Presentation is already gone,
-     * so this transition deliberately creates no parser/replay effects.
-     */
-    fun reduceOpenedForClose(
-        checkpoint: RelayV2TerminalPreOpenCheckpoint,
-        action: RelayV2TerminalAction.Opened,
-        pendingClose: RelayV2TerminalPendingClose,
-    ): RelayV2TerminalReduction = openedPreOpen(
-        current = checkpoint,
-        action = action,
-        pendingClose = pendingClose,
-        detached = true,
-    )
-
-    /**
      * Adopts a correlated opened response after its renderer owner has detached. The durable
      * identity is retained so a later close can still address the Host stream, but the checkpoint
      * is deliberately non-writable and produces no parser effects. A successor attachment may
