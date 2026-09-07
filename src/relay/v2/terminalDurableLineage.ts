@@ -34,6 +34,10 @@ import {
   type RelayV2TerminalRoute,
   type RelayV2TerminalWireTarget,
 } from "./terminalManager.js";
+import {
+  cloneCanonicalBinding,
+  sameDurableOpenOutcome as sameOutcome,
+} from "./terminalBindingHelpers.js";
 
 const RELAY_V2_HOST_H3_RECOVERY_CANDIDATE_ISSUER = Symbol.for(
   "tmux-worktree.relay-v2.host-h3-recovery-candidate-issuer",
@@ -520,17 +524,6 @@ function parseCanonicalBinding(
   };
 }
 
-function cloneCanonicalBinding(
-  value: RelayV2TerminalCanonicalTargetBindingV1,
-): RelayV2TerminalCanonicalTargetBindingV1 {
-  return {
-    ...value,
-    processTarget: { ...value.processTarget },
-    managedTarget: { ...value.managedTarget },
-    exactControlIdentity: { ...value.exactControlIdentity },
-  };
-}
-
 function sameResetReplacementBinding(
   left: RelayV2TerminalCanonicalTargetBindingV1,
   right: RelayV2TerminalCanonicalTargetBindingV1,
@@ -666,30 +659,6 @@ function parseOpenOutcome(value: unknown): RelayV2TerminalDurableOpenOutcome {
     "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
     "Relay v2 terminal durable open outcome has an unsupported kind",
   );
-}
-
-function sameOutcome(
-  left: RelayV2TerminalDurableOpenOutcome,
-  right: RelayV2TerminalDurableOpenOutcome,
-): boolean {
-  if (left.kind !== right.kind) return false;
-  if (left.kind === "opened" && right.kind === "opened") {
-    return left.generation === right.generation
-      && left.resumeTokenHash === right.resumeTokenHash
-      && left.disposition === right.disposition
-      && left.replayFromOffset === right.replayFromOffset;
-  }
-  if (left.kind === "reset" && right.kind === "reset") {
-    return left.generation === right.generation
-      && left.reason === right.reason
-      && left.requestedOffset === right.requestedOffset
-      && left.bufferStartOffset === right.bufferStartOffset
-      && left.tailOffset === right.tailOffset;
-  }
-  return left.kind === "error"
-    && right.kind === "error"
-    && left.code === right.code
-    && left.message === right.message;
 }
 
 function parseClaimAuthority(value: unknown): PersistedClaimStreamAuthority {

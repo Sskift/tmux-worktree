@@ -15,6 +15,10 @@ import type {
 } from "./resourceState.js";
 import type { RelayV2HostStateTransaction } from "./hostState.js";
 import type { RelayV2JsonValue } from "./strictJson.js";
+import {
+  cloneCanonicalBinding,
+  sameDurableOpenOutcome,
+} from "./terminalBindingHelpers.js";
 
 export const RELAY_V2_TERMINAL_STREAM_RING_BYTES = 4 * 1024 * 1024;
 export const RELAY_V2_TERMINAL_HOST_RING_BYTES = 64 * 1024 * 1024;
@@ -1470,17 +1474,6 @@ function parseCanonicalBinding(
   };
 }
 
-function cloneCanonicalBinding(
-  value: RelayV2TerminalCanonicalTargetBindingV1,
-): RelayV2TerminalCanonicalTargetBindingV1 {
-  return {
-    ...value,
-    processTarget: { ...value.processTarget },
-    managedTarget: { ...value.managedTarget },
-    exactControlIdentity: { ...value.exactControlIdentity },
-  };
-}
-
 function sameCanonicalBinding(
   left: RelayV2TerminalCanonicalTargetBindingV1,
   right: RelayV2TerminalCanonicalTargetBindingV1,
@@ -1575,30 +1568,6 @@ function exactEffectTarget(
     }),
     [RELAY_V2_TERMINAL_EXACT_EFFECT_TARGET]: true as const,
   });
-}
-
-function sameDurableOpenOutcome(
-  left: RelayV2TerminalDurableOpenOutcome,
-  right: RelayV2TerminalDurableOpenOutcome,
-): boolean {
-  if (left.kind !== right.kind) return false;
-  if (left.kind === "opened" && right.kind === "opened") {
-    return left.generation === right.generation
-      && left.resumeTokenHash === right.resumeTokenHash
-      && left.disposition === right.disposition
-      && left.replayFromOffset === right.replayFromOffset;
-  }
-  if (left.kind === "reset" && right.kind === "reset") {
-    return left.generation === right.generation
-      && left.reason === right.reason
-      && left.requestedOffset === right.requestedOffset
-      && left.bufferStartOffset === right.bufferStartOffset
-      && left.tailOffset === right.tailOffset;
-  }
-  return left.kind === "error"
-    && right.kind === "error"
-    && left.code === right.code
-    && left.message === right.message;
 }
 
 function sameDurableClose(
