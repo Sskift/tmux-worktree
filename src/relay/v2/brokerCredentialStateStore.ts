@@ -377,22 +377,6 @@ function snapshotOpenOptions(
   });
 }
 
-export function isRelayV2BrokerCredentialStateStoreOpenOptions(
-  value: unknown,
-): value is RelayV2BrokerCredentialStateStoreOpenOptions {
-  return snapshotOpenOptions(value) !== null;
-}
-
-export function parseRelayV2BrokerCredentialStateStoreFailure(
-  value: unknown,
-): RelayV2BrokerCredentialStateStoreFailure {
-  try {
-    return parseFailure(value) ?? invalidFailure();
-  } catch {
-    return invalidFailure();
-  }
-}
-
 function parseCapability(
   value: unknown,
 ): RelayV2BrokerCredentialStateStoreCapability {

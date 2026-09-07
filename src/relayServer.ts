@@ -12,23 +12,6 @@ import type { Server as NodeHttpsServer } from "node:https";
 import type { RelayServerOptions } from "./relay/broker/options.js";
 import { createRelayV2HostBootstrapOutputSink } from "./relay/broker/hostBootstrapOutput.js";
 
-export type {
-  RelayV2BrokerServerAgentCapabilityReadinessReceipt,
-  RelayV2BrokerServerComposition,
-  RelayV2BrokerServerCredentialAuthority,
-} from "./relay/v2/brokerServerRuntime.js";
-export type {
-  RelayV2BrokerPublicHttpsListenOptions,
-  RelayV2BrokerPublicHttpsServerHandle,
-} from "./relay/v2/brokerPublicHttpsServer.js";
-export type {
-  RelayV2BrokerLocalAdminPort,
-  RelayV2BrokerShippingDeploymentInputs,
-  RelayV2BrokerShippingPrivilegedResolver,
-  RelayV2BrokerShippingProfile,
-  RelayV2BrokerShippingRootHandle,
-} from "./relay/v2/brokerShippingRoot.js";
-
 /**
  * Explicit default-off Relay v2 public transport root. The caller supplies an
  * already TLS-configured, otherwise unowned node:https Server; this function

@@ -94,13 +94,3 @@ export function selectRelayV2BrokerCredentialStateStoreNativeTargetDescriptor(
       ]
     : null;
 }
-
-export function getRelayV2BrokerCredentialStateStoreNativeTargetDescriptor(
-  target: string,
-): RelayV2BrokerCredentialStateStoreNativeTargetDescriptor | null {
-  return Object.hasOwn(TARGET_DESCRIPTORS, target)
-    ? TARGET_DESCRIPTORS[
-        target as RelayV2BrokerCredentialStateStoreSupportedNativeTarget
-      ]
-    : null;
-}

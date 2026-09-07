@@ -75,8 +75,8 @@ test("bundled CLI runs version and RPC v2 without a runtime package or node_modu
 });
 
 describe("tw update", () => {
-  test("dry-run prints GitHub release update instructions", () => {
-    const result = spawnSync(process.execPath, [cli, "update", "--dry-run"], {
+  test("prints GitHub release update instructions", () => {
+    const result = spawnSync(process.execPath, [cli, "update"], {
       encoding: "utf8",
     });
 

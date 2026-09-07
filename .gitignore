@@ -10,3 +10,11 @@ mobile/android/local.properties
 docs/demo/build/
 docs/assets/*.mp4
 /docs/assets/tw-dashboard-film-poster.png
+
+# Local IDE / tooling state (F006/F111/F112)
+.idea/
+**/gradle-daemon-jvm.properties
+.DS_Store
+.claude/
+# Local agent artifacts; .codex/skills stays tracked
+.codex/*.png

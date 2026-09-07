@@ -4,7 +4,6 @@ const RELEASES_URL = "https://github.com/Sskift/tmux-worktree/releases/latest";
 const REPO_URL = "https://github.com/Sskift/tmux-worktree";
 
 type UpdateOptions = {
-  dryRun: boolean;
   cliOnly: boolean;
   dashboardOnly: boolean;
 };
@@ -13,7 +12,7 @@ function printHelp(): void {
   console.log(`tw update — show GitHub release update instructions
 
 Usage:
-  tw update [--dry-run] [--cli-only | --dashboard-only]
+  tw update [--cli-only | --dashboard-only]
 
 Updates are published through GitHub Releases:
   ${RELEASES_URL}`);
@@ -21,7 +20,6 @@ Updates are published through GitHub Releases:
 
 function parseArgs(args: string[]): UpdateOptions {
   const opts: UpdateOptions = {
-    dryRun: false,
     cliOnly: false,
     dashboardOnly: false,
   };
@@ -30,10 +28,6 @@ function parseArgs(args: string[]): UpdateOptions {
     if (arg === "-h" || arg === "--help") {
       printHelp();
       process.exit(0);
-    }
-    if (arg === "-n" || arg === "--dry-run") {
-      opts.dryRun = true;
-      continue;
     }
     if (arg === "--cli-only") {
       opts.cliOnly = true;
@@ -53,10 +47,6 @@ function parseArgs(args: string[]): UpdateOptions {
 }
 
 function printUpdateInstructions(opts: UpdateOptions): void {
-  if (opts.dryRun) {
-    console.log("dry run: no local changes will be made");
-  }
-
   if (!opts.cliOnly) {
     console.log(`Dashboard: download the latest DMG from ${RELEASES_URL}`);
   }

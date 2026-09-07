@@ -25,10 +25,6 @@ const TRUSTED_FACTORY_METHOD =
 const SELF_HOSTED_DARWIN_ARM64_FACTORY_METHOD =
   "createRelayV2HostCredentialAtomicFileCellSelfHostedDarwinArm64FactoryV1" as const;
 
-function fixedLoaderFailure(message: string): Error {
-  return new Error(`Relay v2 Host credential native module fixed loader: ${message}`);
-}
-
 function isModuleNotFound(error: unknown): boolean {
   return error !== null
     && typeof error === "object"
@@ -76,60 +72,7 @@ function snapshotDescriptor(value: unknown): Readonly<{
   }>;
 }
 
-/**
- * Fixed-mapping module-runtime adapter for the frozen Host credential native
- * artifact identity. It accepts only the holder-issued exact target
- * descriptor, maps its target through the frozen descriptor table to the one
- * fixed loader-relative module specifier, and resolves/loads through the
- * caller-supplied module runtime. Only a MODULE_NOT_FOUND raised while
- * resolving that exact fixed artifact is optional ("missing"); every other
- * resolve failure and every load failure propagates so the holder redacts it
- * to invalid. There is no dynamic scan, alternate candidate, N-API version
- * decision (the holder is its only owner), or env/HOME/JSON/BAU alternate source.
- */
-export function createRelayV2HostCredentialNativeModuleFixedLoader(
-  resolveArtifact: (fixedModuleSpecifier: string) => string,
-  loadResolvedArtifact: (resolvedArtifact: string) => unknown,
-): RelayV2HostCredentialNativeModuleLoader {
-  if (typeof resolveArtifact !== "function" || typeof loadResolvedArtifact !== "function") {
-    throw fixedLoaderFailure("module runtime is invalid");
-  }
-  return (descriptor) => {
-    const snapshot = snapshotDescriptor(descriptor);
-    if (snapshot === null) throw fixedLoaderFailure("target descriptor is invalid");
-    const fixed = getRelayV2HostCredentialNativeTargetDescriptor(snapshot.target);
-    if (fixed === null) throw fixedLoaderFailure("target is unsupported");
-    let resolved: string;
-    try {
-      resolved = resolveArtifact(fixed.loaderModuleSpecifier);
-    } catch (error) {
-      // Resolution happens before evaluation. Only absence of this exact,
-      // fixed mapped artifact is optional; every failure after resolution is
-      // an invalid native boundary and must not be disguised as missing.
-      if (isModuleNotFound(error)) return Object.freeze({ status: "missing" });
-      throw error;
-    }
-    if (typeof resolved !== "string" || resolved.length === 0) {
-      throw fixedLoaderFailure("module runtime returned an invalid artifact identity");
-    }
-    return Object.freeze({ status: "loaded", binding: loadResolvedArtifact(resolved) });
-  };
-}
-
 const nativeRequire = createNodeRequire(import.meta.url);
-
-/**
- * Default fixed loader over this module's own Node module runtime. It resolves
- * the one frozen loader-relative specifier next to this dist entry; it is a
- * narrow source a trusted deployment may explicitly select, never a
- * qualification, readiness, or capability claim.
- */
-export const relayV2HostCredentialNativeModuleFixedLoader:
-  RelayV2HostCredentialNativeModuleLoader =
-  createRelayV2HostCredentialNativeModuleFixedLoader(
-    (fixedModuleSpecifier) => nativeRequire.resolve(fixedModuleSpecifier),
-    (resolvedArtifact) => nativeRequire(resolvedArtifact),
-  );
 
 function trustedLoaderFailure(message: string): Error {
   return new Error(`Relay v2 Host credential native module trusted loader: ${message}`);
