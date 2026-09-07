@@ -11,7 +11,9 @@ import {
 } from "./domainTypes";
 import {
   MobileRelayV2BackendOperationError,
+  NATIVE_QR_HANDLE_PATTERN,
   normalizeMobileRelayV2DashboardState,
+  record,
 } from "./relayV2Domain";
 
 const COMMAND = "mobile_relay_v2_management_call";
@@ -19,7 +21,6 @@ const SHOW_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_show";
 const COPY_ARTIFACT_COMMAND = "mobile_relay_v2_enrollment_artifact_copy";
 const INLINE_PNG_COMMAND = "mobile_relay_v2_enrollment_artifact_inline_png";
 const REQUEST_ID_PATTERN = /^dmgmt2\.[A-Za-z0-9_-]{21}[AQgw]$/;
-const NATIVE_QR_HANDLE_PATTERN = /^dqart1\.[A-Za-z0-9_-]{32}$/;
 
 const MANAGEMENT_ERRORS = {
   UNAVAILABLE: {
@@ -73,12 +74,6 @@ type ManagementInvoke = (command: string, args?: unknown) => Promise<unknown>;
 type DecodedOutcome =
   | { kind: "state"; state: MobileRelayV2DashboardState }
   | { kind: "error"; code: ManagementErrorCode };
-
-function record(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
 
 function exactObject(
   value: unknown,

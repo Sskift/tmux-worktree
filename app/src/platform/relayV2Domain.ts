@@ -15,11 +15,11 @@ const HIDDEN_ENROLLMENT_ERROR =
 const REDACTED_CREDENTIAL = "[redacted Relay v2 credential]";
 const CREDENTIAL_LIKE_SOURCE =
   String.raw`(?:twcap2|twref2|twenroll2|twhostboot2)\.[^\s"'<>]+`;
-const NATIVE_QR_HANDLE_PATTERN = /^dqart1\.[A-Za-z0-9_-]{32}$/;
+export const NATIVE_QR_HANDLE_PATTERN = /^dqart1\.[A-Za-z0-9_-]{32}$/;
 
 type Parsed<T> = { valid: true; value: T } | { valid: false };
 
-function record(value: unknown): Record<string, unknown> | null {
+export function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
