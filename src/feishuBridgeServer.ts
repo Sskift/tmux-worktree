@@ -31,7 +31,6 @@ export const FEISHU_BRIDGE_CAPABILITIES = [
   "binding.create.session-summary.v1",
   "binding.target-reconciliation.v1",
   "binding.reply-mode.v1",
-  "binding.activity-completion.v1",
   "binding.structured-agent-result.v1",
   "binding.steering.v1",
   "binding.remove-origin.v1",
