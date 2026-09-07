@@ -12,16 +12,3 @@ enum class DeliveryState {
     CANCELLED,
     AMBIGUOUS,
 }
-
-data class OutboxMessage(
-    val commandId: String,
-    val requestId: String,
-    val hostId: String,
-    val sessionName: String,
-    val body: String,
-    val createdAtMillis: Long,
-    val expiresAtMillis: Long,
-    val state: DeliveryState = DeliveryState.QUEUED,
-    val attemptCount: Int = 0,
-    val lastError: String = "",
-)

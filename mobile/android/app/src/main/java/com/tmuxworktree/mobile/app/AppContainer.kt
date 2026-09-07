@@ -4,8 +4,6 @@ import android.content.Context
 import com.tmuxworktree.mobile.core.data.AndroidKeystoreRelayV2CredentialStore
 import com.tmuxworktree.mobile.core.data.AndroidKeystoreRelayV2TerminalResumeCredentialStore
 import com.tmuxworktree.mobile.core.data.PreferencesStore
-import com.tmuxworktree.mobile.core.data.TwDatabase
-import com.tmuxworktree.mobile.core.data.TwRepository
 import com.tmuxworktree.mobile.core.network.NetworkMonitor
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_V2_CAPABILITY
 import com.tmuxworktree.mobile.core.relay.extensions.agentchat.v2.codec.AGENT_CHAT_RUNTIME_SETTINGS_CAPABILITY
@@ -49,8 +47,6 @@ class AppContainer internal constructor(
         relayV2EnrollmentDeviceLabelSource.readDeviceModel(),
     )
 
-    val database: TwDatabase by lazy { TwDatabase.get(appContext) }
-    val repository: TwRepository by lazy { TwRepository(database) }
     val preferences: PreferencesStore by lazy { PreferencesStore(appContext) }
     private val relayV2Credentials: AndroidKeystoreRelayV2CredentialStore by lazy {
         AndroidKeystoreRelayV2CredentialStore(appContext)
