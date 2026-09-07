@@ -8136,10 +8136,12 @@ class RelayV2ConnectionActorTest {
     private class ManualWatchdog {
         private val waits = CopyOnWriteArrayList<CompletableDeferred<Unit>>()
 
-        suspend fun await(@Suppress("UNUSED_PARAMETER") timeoutMs: Long) {
+        suspend fun await(timeoutMs: Long) {
             val completion = CompletableDeferred<Unit>()
             waits += completion
-            completion.await()
+            withTimeout(timeoutMs) {
+                completion.await()
+            }
         }
 
         suspend fun fire(index: Int) = withTimeout(TIMEOUT_MS) {
