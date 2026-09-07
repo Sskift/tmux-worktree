@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { tmpDir } from "./support/tmpDirs.mjs";
 
 const {
   buildAutomationRecord,
@@ -44,7 +43,7 @@ test("parseAutomationCreateArgs reads create flags and aliases", () => {
 });
 
 test("resolveAutomationTarget validates explicit projects and infers from cwd", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-auto-target-"));
+  const root = tmpDir("tw-auto-target-");
   const repo = join(root, "web");
   const nested = join(repo, "packages", "ui");
   const other = join(root, "scratch");
@@ -73,7 +72,7 @@ test("resolveAutomationTarget validates explicit projects and infers from cwd", 
 });
 
 test("buildAutomationRecord writes the App/Rust JSON contract", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-auto-record-"));
+  const root = tmpDir("tw-auto-record-");
   const repo = join(root, "repo");
   const config = {
     projects: {

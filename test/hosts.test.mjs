@@ -4,16 +4,15 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { waitForFile } from "./support/async.mjs";
+import { tmpDir } from "./support/tmpDirs.mjs";
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const hostsModuleUrl = new URL("../dist/hosts.js", import.meta.url);
 const { acquireConfigFileLock, releaseConfigFileLock } = await import(hostsModuleUrl.href);
@@ -27,7 +26,7 @@ function runCli(home, args, extraEnv = {}) {
 }
 
 test("tw host CRUD preserves unrelated config, remote tilde paths, and private file mode", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-crud-"));
+  const root = tmpDir("tw-host-crud-");
   const home = join(root, "home");
   mkdirSync(home, { recursive: true });
   const configPath = join(home, ".tmux-worktree.json");
@@ -75,7 +74,7 @@ test("tw host CRUD preserves unrelated config, remote tilde paths, and private f
 });
 
 test("tw host rejects the reserved local ID from commands and config", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-reserved-local-"));
+  const root = tmpDir("tw-host-reserved-local-");
   const home = join(root, "home");
   const sshLog = join(root, "ssh.log");
   mkdirSync(home, { recursive: true });
@@ -101,7 +100,7 @@ test("tw host rejects the reserved local ID from commands and config", () => {
 });
 
 test("tw host shares Dashboard SSH target and identity validation", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-shared-validation-"));
+  const root = tmpDir("tw-host-shared-validation-");
   const home = join(root, "home");
   mkdirSync(home, { recursive: true });
 
@@ -120,7 +119,7 @@ test("tw host shares Dashboard SSH target and identity validation", () => {
 });
 
 test("stale config lock owner cannot remove the replacement lock", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-lock-takeover-"));
+  const root = tmpDir("tw-host-lock-takeover-");
   const lockPath = join(root, "config.lock");
   const first = acquireConfigFileLock(lockPath);
   const ownerPath = join(lockPath, "owner.json");
@@ -138,7 +137,7 @@ test("stale config lock owner cannot remove the replacement lock", () => {
 });
 
 test("tw host mutation waits for a concurrent config lock owner", async () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-lock-concurrent-"));
+  const root = tmpDir("tw-host-lock-concurrent-");
   const home = join(root, "home");
   mkdirSync(home, { recursive: true });
   const configPath = join(home, ".tmux-worktree.json");
@@ -173,7 +172,7 @@ test("tw host mutation waits for a concurrent config lock owner", async () => {
 });
 
 test("tw host probe separates SSH, tmux, and TW capability status and host rpc-v2 stays structured", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-probe-"));
+  const root = tmpDir("tw-host-probe-");
   const home = join(root, "home");
   const bin = join(root, "bin");
   const log = join(root, "ssh.log");
@@ -272,7 +271,7 @@ exit 12
 });
 
 test("tw host attach uses the remote terminal-control authority and never silently falls back", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-controlled-attach-"));
+  const root = tmpDir("tw-host-controlled-attach-");
   const home = join(root, "home");
   const bin = join(root, "bin");
   const log = join(root, "ssh.log");
@@ -354,7 +353,7 @@ exit 12
 });
 
 test("tw host owns an isolated SSH ControlMaster lifecycle", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-host-control-"));
+  const root = tmpDir("tw-host-control-");
   const home = join(root, "home");
   const bin = join(root, "bin");
   const log = join(root, "ssh.log");
