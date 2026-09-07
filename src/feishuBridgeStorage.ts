@@ -517,15 +517,15 @@ function loadFile<T>(path: string, empty: T, validate: (value: unknown) => value
   return parsed;
 }
 
-function atomicWrite(path: string, value: unknown): void {
+function atomicWriteSerialized(path: string, contents: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   chmodSync(dirname(path), 0o700);
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   let fd = -1;
   try {
     fd = openSync(temporary, "wx", 0o600);
-    const contents = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
-    writeSync(fd, contents, 0, contents.length, 0);
+    const buffer = Buffer.from(contents, "utf8");
+    writeSync(fd, buffer, 0, buffer.length, 0);
     fsyncSync(fd);
     closeSync(fd);
     fd = -1;
@@ -565,8 +565,18 @@ function validateReplies(value: unknown): value is RepliesFile {
     && value.replies.length <= FEISHU_REPLY_HISTORY_LIMIT && value.replies.every(isReply);
 }
 
+type StorageRole = "bindings" | "dedup" | "turns" | "replies";
+
 export class FeishuBridgeStore {
   readonly paths: FeishuBridgePaths;
+
+  // Serialized form of the last content written per collection. write()
+  // skips files whose current serialization matches, so the poll-turn hot
+  // path (which only appends turn output) rewrites just the turns file
+  // instead of all four. The cache is populated only by write(); the first
+  // write after process start always rewrites every file, which also
+  // self-heals any drift or externally-deleted state files.
+  private readonly lastSerialized = new Map<StorageRole, string>();
 
   constructor(paths = feishuBridgePaths()) {
     this.paths = paths;
@@ -617,12 +627,21 @@ export class FeishuBridgeStore {
     }
     const lock = acquireFeishuBridgeStorageLock(this.paths.lock);
     try {
-      atomicWrite(this.paths.bindings, bindings);
-      atomicWrite(this.paths.dedup, dedup);
-      atomicWrite(this.paths.turns, turns);
-      atomicWrite(this.paths.replies, replies);
+      this.writeIfChanged("bindings", this.paths.bindings, bindings);
+      this.writeIfChanged("dedup", this.paths.dedup, dedup);
+      this.writeIfChanged("turns", this.paths.turns, turns);
+      this.writeIfChanged("replies", this.paths.replies, replies);
     } finally {
       releaseFeishuBridgeStorageLock(lock);
     }
+  }
+
+  private writeIfChanged(role: StorageRole, path: string, value: unknown): void {
+    const serialized = `${JSON.stringify(value, null, 2)}\n`;
+    // Rewrite when the content changed, when this is the first write in this
+    // process (no cache entry), or when the file was removed externally.
+    if (this.lastSerialized.get(role) === serialized && existsSync(path)) return;
+    atomicWriteSerialized(path, serialized);
+    this.lastSerialized.set(role, serialized);
   }
 }
