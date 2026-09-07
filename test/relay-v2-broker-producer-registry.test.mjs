@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
 
 const producerModule = await import("../dist/relay/v2/brokerProducerRegistry.js");
 
@@ -22,16 +23,6 @@ function sendHostAction(transportId, frame) {
     transportId,
     frame,
   };
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 async function settlePromises() {

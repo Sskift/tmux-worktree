@@ -27,6 +27,9 @@ import {
 import {
   decodeRelayV2DashboardManagementProtocolV2Request,
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2.js";
+import { deferred, nextTurn } from "./support/async.mjs";
+import { InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
+import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
 const NOW_MS = 1_783_700_000_000;
 const activateComposition =
@@ -55,20 +58,6 @@ const IDS = Object.freeze({
   revoke: "dmgmt2._rgZ2FBzDmkt9MwqnM3uDg",
 });
 
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
-
 function request(operation, input = null) {
   const requestId = {
     status: IDS.status,
@@ -92,36 +81,6 @@ function wire(frame) {
 
 function decoded(frames) {
   return frames.map((frame) => decodeRelayV2WebSocketFrame("carrier", frame).frame);
-}
-
-class InMemoryCredentialStorage {
-  state = null;
-  revision = 0;
-  revisions = new WeakMap();
-  failed = false;
-
-  runExclusive(_reference, operation) {
-    if (this.failed) throw new Error("twref2.storage-secret-must-not-reflect");
-    const read = () => {
-      const revision = Object.freeze({ revision: true });
-      this.revisions.set(revision, this.revision);
-      return {
-        state: this.state === null ? null : structuredClone(this.state),
-        revision,
-      };
-    };
-    return operation({
-      read,
-      compareAndSwap: (expected, replacement) => {
-        if (this.revisions.get(expected) !== this.revision) {
-          return { status: "conflict", current: read() };
-        }
-        this.state = structuredClone(replacement);
-        this.revision += 1;
-        return { status: "swapped" };
-      },
-    });
-  }
 }
 
 class FakeTransport {
@@ -210,28 +169,14 @@ class UnexpectedStoppedController {
   }
 }
 
-function tokenIssuer() {
-  let keyring = createRelayV2IssuerKeyring({
-    issuerId: "relay-issuer-id",
-    kid: "composition-key-one",
-    secretBase64url: Buffer.alloc(32, 0x63).toString("base64url"),
-    nowSeconds: NOW_MS / 1_000,
-  });
-  let sequence = 0;
-  return (hostId) => {
-    sequence += 1;
-    const prepared = prepareRelayV2AccessTokenIssuance(keyring, {
-      role: "host",
-      hostId,
-      principalId: "host-principal-one",
-      grantId: "host-grant-one",
-      nowSeconds: NOW_MS / 1_000 + sequence,
-      jti: `host-access-jti-${sequence}`,
-    });
-    keyring = prepared.nextKeyring;
-    return prepared;
-  };
-}
+const tokenIssuer = () => createTokenIssuer({
+  kid: "composition-key-one",
+  secretByte: 0x63,
+  baseTime: NOW_MS / 1_000,
+  principalId: "host-principal-one",
+  grantId: "host-grant-one",
+  shape: "raw",
+});
 
 function bootstrapResponse(input, access) {
   return {

@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { getEventListeners } from "node:events";
 import {
   mkdtemp,
-  readFile,
   rm,
 } from "node:fs/promises";
 import {
@@ -17,6 +15,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { build } from "esbuild";
+import { deferred, nextTurn } from "./support/async.mjs";
+import { InMemoryReentrantCredentialStorage as InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
+import { TEST_LOOPBACK_KEY_PEM, TEST_LOOPBACK_CERT_PEM } from "./support/relayV2LoopbackTls.mjs";
 
 const require = createRequire(import.meta.url);
 const mutableNodeHttps = require("node:https");
@@ -164,48 +166,31 @@ function fixTestBufferSlots(value) {
 }
 const REPOSITORY = fileURLToPath(new URL("../", import.meta.url));
 const BUILD_DIRECTORY = await mkdtemp(join(tmpdir(), "tw-host-credential-https-build-"));
-const TLS_DIRECTORY = await mkdtemp(join(tmpdir(), "tw-host-credential-https-tls-"));
-const PRIVATE_KEY_PATH = join(TLS_DIRECTORY, "localhost-key.pem");
-const CERTIFICATE_PATH = join(TLS_DIRECTORY, "localhost-cert.pem");
 
-execFileSync(
-  join(REPOSITORY, "node_modules", ".bin", "tsup"),
-  [
-    "--entry.v2/brokerCore", "src/relay/v2/brokerCore.ts",
-    "--entry.v2/hostCredentialHttpsAdapter", "src/relay/v2/hostCredentialHttpsAdapter.ts",
-    "--entry.v2/hostCarrier", "src/relay/v2/hostCarrier.ts",
-    "--entry.v2/hostCredentialAuthority", "src/relay/v2/hostCredentialAuthority.ts",
-    "--entry.v2/hostTlsTrustMaterial", "src/relay/v2/hostTlsTrustMaterial.ts",
-    "--entry.v2/hostWssTransportLifecycle", "src/relay/v2/hostWssTransportLifecycle.ts",
-    "--entry.v2/issuer", "src/relay/v2/issuer.ts",
-    "--entry.v2/singleExchangeHttpsTransport", "src/relay/v2/singleExchangeHttpsTransport.ts",
-    "--entry.extensions/agentTranscriptLifecycle/v1/codec",
-    "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",
-    "--entry.extensions/agentChat/v2/codec",
-    "src/relay/extensions/agentChat/v2/codec.ts",
-    "--entry.extensions/larkBindings/v2/codec",
-    "src/relay/extensions/larkBindings/v2/codec.ts",
-    "--format", "esm",
-    "--target", "node20",
-    "--platform", "node",
-    "--out-dir", BUILD_DIRECTORY,
-    "--clean",
-    "--no-splitting",
-  ],
-  { cwd: REPOSITORY, stdio: "pipe" },
-);
-execFileSync(
-  "openssl",
-  [
-    "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
-    "-subj", "/CN=localhost",
-    "-addext", "subjectAltName=DNS:localhost",
-    "-days", "1",
-    "-keyout", PRIVATE_KEY_PATH,
-    "-out", CERTIFICATE_PATH,
-  ],
-  { stdio: "pipe" },
-);
+await build({
+  entryPoints: {
+    "v2/brokerCore": join(REPOSITORY, "src/relay/v2/brokerCore.ts"),
+    "v2/hostCredentialHttpsAdapter": join(REPOSITORY, "src/relay/v2/hostCredentialHttpsAdapter.ts"),
+    "v2/hostCarrier": join(REPOSITORY, "src/relay/v2/hostCarrier.ts"),
+    "v2/hostCredentialAuthority": join(REPOSITORY, "src/relay/v2/hostCredentialAuthority.ts"),
+    "v2/hostTlsTrustMaterial": join(REPOSITORY, "src/relay/v2/hostTlsTrustMaterial.ts"),
+    "v2/hostWssTransportLifecycle": join(REPOSITORY, "src/relay/v2/hostWssTransportLifecycle.ts"),
+    "v2/issuer": join(REPOSITORY, "src/relay/v2/issuer.ts"),
+    "v2/singleExchangeHttpsTransport": join(REPOSITORY, "src/relay/v2/singleExchangeHttpsTransport.ts"),
+    "extensions/agentTranscriptLifecycle/v1/codec": join(REPOSITORY, "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts"),
+    "extensions/agentChat/v2/codec": join(REPOSITORY, "src/relay/extensions/agentChat/v2/codec.ts"),
+    "extensions/larkBindings/v2/codec": join(REPOSITORY, "src/relay/extensions/larkBindings/v2/codec.ts"),
+  },
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  outdir: BUILD_DIRECTORY,
+  splitting: true,
+  banner: {
+    js: "import { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);",
+  },
+});
 
 const adapterModule = await import(pathToFileURL(
   join(BUILD_DIRECTORY, "v2", "hostCredentialHttpsAdapter.js"),
@@ -225,14 +210,11 @@ const issuerModule = await import(pathToFileURL(
 const wssModule = await import(pathToFileURL(
   join(BUILD_DIRECTORY, "v2", "hostWssTransportLifecycle.js"),
 ).href);
-const PRIVATE_KEY = await readFile(PRIVATE_KEY_PATH);
-const CERTIFICATE = await readFile(CERTIFICATE_PATH);
+const PRIVATE_KEY = Buffer.from(TEST_LOOPBACK_KEY_PEM, "utf8");
+const CERTIFICATE = Buffer.from(TEST_LOOPBACK_CERT_PEM, "utf8");
 
 test.after(async () => {
-  await Promise.all([
-    rm(BUILD_DIRECTORY, { recursive: true, force: true }),
-    rm(TLS_DIRECTORY, { recursive: true, force: true }),
-  ]);
+  await rm(BUILD_DIRECTORY, { recursive: true, force: true });
 });
 
 const BOOTSTRAP_SECRET = "twhostboot2.bootstrap-secret-never-reflect";
@@ -276,20 +258,6 @@ const REFRESH_RESPONSE = Object.freeze({
   refreshAttemptId: REFRESH_REQUEST.refreshAttemptId,
   ...CREDENTIAL_FIELDS,
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
 
 function jsonBytes(value) {
   return Buffer.from(
@@ -383,38 +351,8 @@ const WSS_HOST_EPOCH = "host-epoch-one";
 const WSS_HOST_INSTANCE_ID = "host-instance-one";
 const WSS_CREDENTIAL_REFERENCE = "relay-v2-host-credential-ref:primary";
 
-class InMemoryCredentialStorage {
-  slots = new Map();
-  exclusiveDepth = 0;
-
-  runExclusive(reference, operation) {
-    if (this.exclusiveDepth !== 0) throw new Error("non-reentrant storage");
-    let slot = this.slots.get(reference);
-    if (slot === undefined) {
-      slot = { state: null, revision: 0 };
-      this.slots.set(reference, slot);
-    }
-    this.exclusiveDepth += 1;
-    try {
-      return operation({
-        read: () => ({
-          state: slot.state === null ? null : structuredClone(slot.state),
-          revision: TEST_OBJECT_FREEZE({ revision: slot.revision }),
-        }),
-        compareAndSwap: (_expected, replacement) => {
-          slot.state = replacement === null ? null : structuredClone(replacement);
-          slot.revision += 1;
-          return { status: "swapped" };
-        },
-      });
-    } finally {
-      this.exclusiveDepth -= 1;
-    }
-  }
-}
-
 function wssCredentialHarness() {
-  const storage = new InMemoryCredentialStorage();
+  const storage = new InMemoryCredentialStorage({ reentryMessage: "non-reentrant storage" });
   const authority = new credentialModule.RelayV2HostCredentialAuthority({
     storage,
     secretResolver: {

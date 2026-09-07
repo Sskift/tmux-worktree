@@ -13,6 +13,7 @@ import {
   RELAY_V2_DASHBOARD_MANAGEMENT_OPTIONAL_CAPABILITIES,
   RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2.js";
+import { deferred } from "./support/async.mjs";
 
 const REQUIRED = Object.freeze([
   ...RELAY_V2_DASHBOARD_MANAGEMENT_REQUIRED_CAPABILITIES,
@@ -32,16 +33,6 @@ const BINDING = Object.freeze({
 const START_ONE = Object.freeze({ requestId: "dmgmt2.start-one" });
 const START_TWO = Object.freeze({ requestId: "dmgmt2.start-two" });
 const STOP_ONE = Object.freeze({ requestId: "dmgmt2.stop-one" });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 
 function binding(controllerGeneration = "1", connectorId = "connector-one") {
   return { controllerGeneration, connectorId, ...BINDING };

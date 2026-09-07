@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deferred, nextTurn } from "./support/async.mjs";
 
 const continuity = await import("../dist/relay/v2/continuityAnchor.js");
 
@@ -23,20 +24,6 @@ function checkpoint(sequence, commitId, parentCommitId, digestCharacter) {
     parentCommitId,
     stateDigest: digestCharacter.repeat(64),
   };
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
 }
 
 class MemoryMonotonicCasAuthority {

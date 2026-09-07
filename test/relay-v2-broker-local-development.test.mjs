@@ -8,8 +8,6 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { request as httpsRequest } from "node:https";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,17 +16,7 @@ import {
   TEST_LOOPBACK_CERT_PEM,
   TEST_LOOPBACK_KEY_PEM,
 } from "./support/relayV2LoopbackTls.mjs";
-
-function reserveFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolve(port));
-    });
-  });
-}
+import { reserveFreePort, postJson } from "./support/async.mjs";
 
 async function waitFor(predicate, child, output, timeoutMs = 5_000) {
   const started = Date.now();
@@ -41,39 +29,6 @@ async function waitFor(predicate, child, output, timeoutMs = 5_000) {
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-}
-
-function postJson(port, requestPath, body) {
-  return new Promise((resolve, reject) => {
-    const payload = Buffer.from(JSON.stringify(body), "utf8");
-    const request = httpsRequest({
-      host: "127.0.0.1",
-      servername: "localhost",
-      port,
-      path: requestPath,
-      method: "POST",
-      ca: TEST_LOOPBACK_CERT_PEM,
-      rejectUnauthorized: true,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        "Content-Length": String(payload.byteLength),
-      },
-    }, (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.once("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
-        resolve({
-          status: response.statusCode,
-          json: text === "" ? null : JSON.parse(text),
-        });
-      });
-    });
-    request.once("error", reject);
-    request.write(payload);
-    request.end();
-  });
 }
 
 function waitForExit(child) {

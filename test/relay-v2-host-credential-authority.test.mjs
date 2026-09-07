@@ -1,20 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { build } from "esbuild";
+import { InMemoryDurableCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
+import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
-const compiled = await build({
-  entryPoints: [new URL("../src/relay/v2/hostCredentialAuthority.ts", import.meta.url).pathname],
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  target: "node20",
-  write: false,
-});
-const compiledSource = compiled.outputFiles[0].text;
-const credential = await import(
-  `data:text/javascript;base64,${Buffer.from(compiledSource).toString("base64")}`
-);
+const credential = await import("../dist/relay/v2/hostCredentialAuthority.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
 
 const NOW_SECONDS = 1_783_700_000;
@@ -26,83 +16,6 @@ const BOOTSTRAP_TOKEN = "twhostboot2.bootstrap-secret-material";
 
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
-  }
-  return value;
-}
-
-class InMemoryDurableCredentialStorage {
-  slots = new Map();
-  revisions = new WeakMap();
-  compareAttempts = 0;
-  conflictsRemaining = 0;
-  uncertainNext = null;
-
-  runExclusive(reference, operation) {
-    const transaction = {
-      read: () => this.readCut(reference),
-      compareAndSwap: (expected, replacement) => {
-        this.compareAttempts += 1;
-        const identity = this.revisions.get(expected);
-        const slot = this.slot(reference);
-        if (!identity || identity.reference !== reference || identity.revision !== slot.revision) {
-          return { status: "conflict", current: this.readCut(reference) };
-        }
-        if (this.conflictsRemaining > 0) {
-          this.conflictsRemaining -= 1;
-          slot.revision += 1;
-          return { status: "conflict", current: this.readCut(reference) };
-        }
-        const uncertainty = this.uncertainNext;
-        this.uncertainNext = null;
-        if (uncertainty === "before") return { status: "uncertain" };
-        if (uncertainty === "after") {
-          slot.state = structuredClone(replacement);
-          slot.revision += 1;
-          return { status: "uncertain" };
-        }
-        slot.state = structuredClone(replacement);
-        slot.revision += 1;
-        return { status: "swapped" };
-      },
-    };
-    return operation(transaction);
-  }
-
-  snapshot(reference) {
-    const state = this.slot(reference).state;
-    return state === null ? null : structuredClone(state);
-  }
-
-  replace(reference, state) {
-    const slot = this.slot(reference);
-    slot.state = structuredClone(state);
-    slot.revision += 1;
-  }
-
-  slot(reference) {
-    let slot = this.slots.get(reference);
-    if (!slot) {
-      slot = { state: null, revision: 0 };
-      this.slots.set(reference, slot);
-    }
-    return slot;
-  }
-
-  readCut(reference) {
-    const slot = this.slot(reference);
-    const revision = Object.freeze({ opaque: true });
-    this.revisions.set(revision, { reference, revision: slot.revision });
-    return {
-      state: slot.state === null ? null : deepFreeze(structuredClone(slot.state)),
-      revision,
-    };
-  }
 }
 
 class RecordingSecretResolver {
@@ -135,32 +48,14 @@ function authority(storage = new InMemoryDurableCredentialStorage(), secrets = n
   };
 }
 
-function tokenIssuer() {
-  let keyring = issuer.createRelayV2IssuerKeyring({
-    issuerId: "relay-issuer-id",
-    kid: "host-credential-test-key",
-    secretBase64url: Buffer.alloc(32, 0x71).toString("base64url"),
-    nowSeconds: NOW_SECONDS,
-  });
-  let issued = 0;
-  return () => {
-    issued += 1;
-    const prepared = issuer.prepareRelayV2AccessTokenIssuance(keyring, {
-      role: "host",
-      hostId: HOST_ID,
-      principalId: "host-principal-uuid",
-      grantId: "host-grant-uuid",
-      nowSeconds: NOW_SECONDS + issued,
-      jti: `host-access-jti-${issued}`,
-    });
-    keyring = prepared.nextKeyring;
-    return {
-      token: prepared.token,
-      jti: prepared.claims.jti,
-      expiresAtMs: prepared.claims.exp * 1_000,
-    };
-  };
-}
+const tokenIssuer = () => createTokenIssuer({
+  kid: "host-credential-test-key",
+  secretByte: 0x71,
+  baseTime: NOW_SECONDS,
+  hostId: HOST_ID,
+  principalId: "host-principal-uuid",
+  grantId: "host-grant-uuid",
+});
 
 function bootstrapPreparation(overrides = {}) {
   return {

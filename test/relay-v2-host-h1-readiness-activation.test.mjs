@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
 
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const activationModule = commandPlane;
@@ -14,10 +14,6 @@ const hostState = await import("../dist/relay/v2/hostState.js");
 const corpus = loadRelayV2FixtureCorpus();
 const HOST_ID = "mac-admin";
 const BASE_TIME = 1_783_700_200_000;
-
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
-}
 
 function auth() {
   return {

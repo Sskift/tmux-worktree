@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { deferred } from "./support/async.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
 const canonicalBackendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
@@ -89,16 +90,6 @@ const ROUTE_ONE = {
 
 function clone(value) {
   return structuredClone(value);
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 async function flushPromiseJobs() {

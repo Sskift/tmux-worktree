@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { waitFor } from "./support/async.mjs";
 
 const { build } = createRequire(import.meta.url)("esbuild");
 const sourcePath = new URL(
@@ -74,14 +75,6 @@ const RUNTIME_VERSION = "0.0.0-child-test";
 const CONTRACT = "tmux-worktree-dashboard-relay-v2-management-ipc";
 const RID = { status: `dmgmt2.${"a".repeat(21)}A` };
 
-async function waitFor(condition, label) {
-  const deadline = Date.now() + 5_000;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
 function makeIo() {
   const frames = [];
   const queue = [];
@@ -137,7 +130,7 @@ function makeIo() {
 }
 
 async function assertUnavailableSession(channel, run) {
-  await waitFor(() => channel.lines().length === 1, "ready frame");
+  await waitFor(() => channel.lines().length === 1, { message: "timed out waiting for ready frame" });
   const ready = channel.lines()[0];
   assert.equal(ready.contract, CONTRACT);
   assert.equal(ready.protocolVersion, 2);
@@ -148,7 +141,7 @@ async function assertUnavailableSession(channel, run) {
     operation: "status",
     input: null,
   })}\n`);
-  await waitFor(() => channel.lines().length === 2, "status response");
+  await waitFor(() => channel.lines().length === 2, { message: "timed out waiting for status response" });
   const response = channel.lines()[1];
   assert.equal(response.requestId, RID.status);
   assert.equal(response.ok, false);

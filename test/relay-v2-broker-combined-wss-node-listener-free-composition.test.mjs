@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import WebSocket from "ws";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
 
 const broker = await import("../dist/relay/v2/brokerCore.js");
 const codec = await import("../dist/relay/v2/codec.js");
@@ -30,10 +30,6 @@ function auth(role) {
 
 function sharedRuntimeOptions() {
   return { brokerOptions: { now: () => NOW_MS, baseCapabilityReadiness: [...broker.RELAY_V2_REQUIRED_CAPABILITIES] }, authorizationExpiryScheduleAt: () => () => {} };
-}
-
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
 }
 
 function hostHello(identity) {

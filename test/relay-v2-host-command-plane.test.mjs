@@ -4,7 +4,7 @@ import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
 
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
@@ -27,10 +27,6 @@ function harness() {
 
 function auth(principalId = "principal-one", clientInstanceId = "android-one") {
   return { principalId, clientInstanceId, hostId: HOST_ID };
-}
-
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
 }
 
 function commandFrame(name, hostEpoch, windowId) {

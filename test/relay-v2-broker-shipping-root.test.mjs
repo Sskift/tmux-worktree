@@ -11,13 +11,15 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
+import { createServer as createHttpsServer } from "node:https";
 import { request as httpRequest } from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import tls from "node:tls";
+import { deferred, reserveFreePort, waitFor, postJson } from "./support/async.mjs";
+import { TEST_LOOPBACK_KEY_PEM as TEST_KEY_PEM, TEST_LOOPBACK_CERT_PEM as TEST_CERT_PEM } from "./support/relayV2LoopbackTls.mjs";
 
 const relayServer = await import("../dist/relayServer.js");
 const hostBootstrapOutput = await import("../dist/relay/broker/hostBootstrapOutput.js");
@@ -32,87 +34,8 @@ const TEST_BOOTSTRAP_TOKEN = [
   Buffer.alloc(32, 29).toString("base64url"),
 ].join(".");
 
-// Test-only throwaway self-signed pair for loopback TLS; it protects nothing
-// and is committed deliberately so no certificate generation runs in tests.
-const TEST_KEY_PEM = `-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCWAhVz+QTOulz7
-JCZHwcTIn7vTXZZwJ+ukgWPTBYvA+mMwaGu3aEhizsTb2I5cZLV+LG7GM3I+Mpd+
-Bdqe0vIgZZIqz4P+WxljISRMBEaJiKa1zGl5Oq6XIECgv1AadxCnnPHXrbNNmYCz
-X3FOkI2thJBXXNFYrHgPXW9vxOqaRvntU2/y66WoXyUpS3LBAW+CJ8FGhZeTWeRM
-D4/3OjbQMvz89ZUQqXTuA4UQrGCmDntO9iUMdoJV0vuxSzQz5DgZVbkJcefmDKgd
-EGUhBThE3xCamBRogjmgsJ/BbY8tMFTSG5uPwJqmlt0iQ+RXqwAcphAX3am0zj08
-MZpAw+PJAgMBAAECggEAF6+di+cykKKRovV1dpgh29yI+loeh81t4lcB7aSZtBof
-266+mhevx6ucHutF/fsdmJ4odvL8TiuL4HzJJTyWuccqpMgz2yUEUF2VJHb6XPtu
-+L7IRWRJhBhgzAuuo3clxz7mBacU7E2u1OPe+XJOxKrCuzYEjPVdVxkVoEwzZQej
-vL/tkUsu3SFRzfrw2gB/wJxeZ6hOI4s14QXG2MMiYIgc2Hy7TSpo9RqsjQeRYD2m
-hWzLwO65Y979x9J/xdve9d40aFs1bhBT1AJntqK7AoVsln8QZfWhKA1oMgRSMZcd
-GB66Or/cIcPlEOzQ1uV7JCQzk/h3E5Ft3P4hY2eppwKBgQDMVkIa4xYS2a5Q4NQD
-K2ArJZyXfihmBinEEGxIDjIF0mS9Fzgz/HOs+t0I3vr9VK0GG0rJMubnDVEt6to5
-bhp6OHwkfRh+brruzxNJIfGPkiFoja9niKITEdQZm9FboEZmQFJE7oiEuXpVpB7G
-bpWzRVQnK0fZsGcVYtLMuLS5GwKBgQC772KES31RhcK8zpCTFPBbyln7ea+KksIH
-P9bsCLKuy79IF3mXmwSvINkA/Y2fTkE1Zh7EwLDeNQ6gADc5itLvxTRZERLTT+Iv
-Fd4LYAdxVcZGcigLyKyUeL1F3pS0V5tQ6Y40TSFN4+hyNrTrnZj5mLXS73qDJBOa
-OvbupLFo6wKBgH6fpW9L8c3UnzT3Xepo4rtaH2Oxhg9TGmapVrCAO3doHY0f6nAs
-rPIwsvBgXWDHLEFwgDOWG4hqtDekJX8ZP8clYaiq7JbMv4JlSCo1op+5ioJj6qJa
-BTWUAr+r01zYQUfz7AdTWb4Fwk132qpUtOfWuoNbSrcXnYmfJ8o9W6CpAoGAfgyN
-ExZeszL37hLNvRiqLaaGu7heGJ9eK+aRjDY5Qiu92+iC0UBT3/I0Ggn11wdxjRM1
-R9nFxwPnD0GVyK5n1BF8jtB4w+osVlBgYVjDJSzWk6E1YtHxjpN8v0QOkPbBYX+E
-tWeWEtvtp80xg2Zsl9vo99VPYm3sB+HMhTtJEokCgYEAvKVTaHhUhR6mn3cD4syF
-jn5ENZyTzpkVTZO4Z0osXbgP/bCn8Jp6Agz4oV87MwRBWtVYpun/s+dJ+SjU2WNT
-hafDW8YEVS9LEsDCPGeU1IltmrzBqffzT0VucdHxsgXVunH6nwsvgdId793jnpdJ
-fKNC6/Ymql9g09UWVtx7bmg=
------END PRIVATE KEY-----`;
-const TEST_CERT_PEM = `-----BEGIN CERTIFICATE-----
-MIIDJTCCAg2gAwIBAgIUS4hHFMkDcdFVxR/09jXKM4jyQN0wDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcyMzE0MjQzMFoXDTM2MDcy
-MDE0MjQzMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAlgIVc/kEzrpc+yQmR8HEyJ+7012WcCfrpIFj0wWLwPpj
-MGhrt2hIYs7E29iOXGS1fixuxjNyPjKXfgXantLyIGWSKs+D/lsZYyEkTARGiYim
-tcxpeTqulyBAoL9QGncQp5zx162zTZmAs19xTpCNrYSQV1zRWKx4D11vb8Tqmkb5
-7VNv8uulqF8lKUtywQFvgifBRoWXk1nkTA+P9zo20DL8/PWVEKl07gOFEKxgpg57
-TvYlDHaCVdL7sUs0M+Q4GVW5CXHn5gyoHRBlIQU4RN8QmpgUaII5oLCfwW2PLTBU
-0hubj8CappbdIkPkV6sAHKYQF92ptM49PDGaQMPjyQIDAQABo28wbTAdBgNVHQ4E
-FgQUSHthKYzzgJ9w7QBEBXS/DIeNs48wHwYDVR0jBBgwFoAUSHthKYzzgJ9w7QBE
-BXS/DIeNs48wDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
-BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAEaXqhKdXxMYHLSbUHsw5bAd2D555ktR
-mEi5cF83u1CO5201MDfSNQO7f0JNjKa7MTdkza4b7QjSgruKmVphJX3aOpD6Zz1w
-ejLMF1nE4YDyO9viIk5rjqRGLkHd5ITTtFDJDVgu3IayEv3sOAy6FmzG6w3uTW77
-h9a8SWTGfp+ULB9bvABnmUTtD9zw6mDTwTPpZiR9C6vCzkBFapT+TYvOuNBttF/W
-35PIn+D/6naRNT1rkq5Nqv/ifgs+MDf1hom73x24X2+3YGR594HQAhG8Ou8vxpjY
-uA137IKJfJTsWJ9kfbi/blRYjhwLtRYjiOMg3hFcPGOBJq9HBY8SK70=
------END CERTIFICATE-----`;
-
 function copy(value) {
   return structuredClone(value);
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
-async function waitFor(predicate, timeoutMs = 5_000) {
-  const started = Date.now();
-  while (!predicate()) {
-    if (Date.now() - started > timeoutMs) throw new Error("waitFor timed out");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function reserveFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolve(port));
-    });
-  });
 }
 
 function connectRefused(port) {
@@ -459,40 +382,6 @@ function startableSingleNodeShipping(
   });
 }
 
-function postJson(port, requestPath, body, { method = "POST" } = {}) {
-  return new Promise((resolve, reject) => {
-    const payload = body === null ? null : Buffer.from(JSON.stringify(body), "utf8");
-    const request = httpsRequest({
-      host: "127.0.0.1",
-      port,
-      path: requestPath,
-      method,
-      rejectUnauthorized: false,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        ...(payload === null ? {} : { "Content-Length": String(payload.byteLength) }),
-      },
-    }, (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.once("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
-        let json = null;
-        try {
-          json = text === "" ? null : JSON.parse(text);
-        } catch {
-          // keep raw text only
-        }
-        resolve({ status: response.statusCode, json, text });
-      });
-    });
-    request.once("error", reject);
-    if (payload !== null) request.write(payload);
-    request.end();
-  });
-}
-
 function plainHttpGet(port) {
   return new Promise((resolve, reject) => {
     const request = httpRequest({ host: "127.0.0.1", port, path: "/health", method: "GET" }, (response) => {
@@ -740,9 +629,9 @@ test("durable authorities open before listen and only the frozen public surface 
     await assert.rejects(plainHttpGet(handle.port));
 
     // The public route carries no admin issuance surface at all.
-    const unknownAdmin = await postJson(handle.port, "/v2/admin/bootstrap", {});
+    const unknownAdmin = await postJson(handle.port, "/v2/admin/bootstrap", {}, { rejectUnauthorized: false });
     assert.equal(unknownAdmin.status, 404);
-    const getBootstrap = await postJson(handle.port, "/v2/hosts/bootstrap", null, { method: "GET" });
+    const getBootstrap = await postJson(handle.port, "/v2/hosts/bootstrap", null, { method: "GET", rejectUnauthorized: false });
     assert.equal(getBootstrap.status, 404);
   } finally {
     await handle.shutdown();
@@ -816,7 +705,7 @@ test("privileged admin seam delivers bootstrap secret only to the sink and reuse
       hostId: "shipping-host",
       hostEpoch: "shipping-epoch",
       hostInstanceId: "shipping-instance",
-    });
+    }, { rejectUnauthorized: false });
     assert.equal(redeemed.status, 200);
     assert.match(redeemed.json?.accessToken ?? "", /^twcap2\./);
     assert.match(redeemed.json?.refreshToken ?? "", /^twref2\./);
@@ -828,7 +717,7 @@ test("privileged admin seam delivers bootstrap secret only to the sink and reuse
       hostId: "shipping-host",
       hostEpoch: "shipping-epoch",
       hostInstanceId: "shipping-instance",
-    });
+    }, { rejectUnauthorized: false });
     assert.equal(replayed.status, 401);
 
     // A throwing or async sink fails closed and the token never leaves.
@@ -1016,7 +905,7 @@ test("shutdown fences public admission synchronously, then drains admin in-fligh
   const bootstrap = handle.admin.createHostBootstrap({}, (secret) => sinkSecrets.push(secret));
   await waitFor(() => shipping.events.filter((event) => (
     event === "transport.start:broker-credential.v1:compare_and_swap"
-  )).length > casEventsBefore);
+  )).length > casEventsBefore, { message: "waitFor timed out" });
 
   const shutdown = handle.shutdown();
   // Public admission is fenced synchronously before the admin drain finishes:
@@ -1028,7 +917,7 @@ test("shutdown fences public admission synchronously, then drains admin in-fligh
     hostId: "shipping-host",
     hostEpoch: "shipping-epoch",
     hostInstanceId: "shipping-instance",
-  });
+  }, { rejectUnauthorized: false });
   assert.equal(rejectedHttp.status, 503);
   assert.match(await probeUpgrade(handle.port, "/client"), /^HTTP\/1\.1 503/);
   assert.match(await probeUpgrade(handle.port, "/host"), /^HTTP\/1\.1 503/);

@@ -1,26 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { build } from "esbuild";
+import { InMemoryDurableCredentialStorage as InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
+import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
-const compiled = await build({
-  stdin: {
-    contents: [
-      'export * from "./hostCredentialAuthority.ts";',
-      'export * from "./hostCredentialExchangeCoordinator.ts";',
-      'export * from "./relayV2DashboardManagementHostCredentialAdapter.ts";',
-    ].join("\n"),
-    resolveDir: new URL("../src/relay/v2/", import.meta.url).pathname,
-    sourcefile: "dashboard-management-host-credential-test-entry.ts",
-  },
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  target: "node20",
-  write: false,
-});
-const credential = await import(
-  `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
-);
+const credential = {
+  ...await import("../dist/relay/v2/hostCredentialAuthority.js"),
+  ...await import("../dist/relay/v2/hostCredentialExchangeCoordinator.js"),
+  ...await import("../dist/relay/v2/relayV2DashboardManagementHostCredentialAdapter.js"),
+};
 const issuer = await import("../dist/relay/v2/issuer.js");
 
 const NOW_SECONDS = 1_783_700_000;
@@ -43,68 +30,6 @@ const SECRET_MARKERS = Object.freeze([
   "twhostboot2.bootstrap-secret-marker",
 ]);
 
-class InMemoryCredentialStorage {
-  slots = new Map();
-  revisions = new WeakMap();
-  compareAttempts = 0;
-  uncertainCompareAttempt = null;
-  beforeExclusive = null;
-
-  runExclusive(reference, operation) {
-    this.beforeExclusive?.(reference);
-    const transaction = {
-      read: () => this.readCut(reference),
-      compareAndSwap: (expected, replacement) => {
-        this.compareAttempts += 1;
-        const identity = this.revisions.get(expected);
-        const slot = this.slot(reference);
-        if (!identity
-          || identity.reference !== reference
-          || identity.revision !== slot.revision) {
-          return { status: "conflict", current: this.readCut(reference) };
-        }
-        if (this.uncertainCompareAttempt === this.compareAttempts) {
-          return { status: "uncertain" };
-        }
-        slot.state = structuredClone(replacement);
-        slot.revision += 1;
-        return { status: "swapped" };
-      },
-    };
-    return operation(transaction);
-  }
-
-  snapshot(reference = BINDING.credentialReference) {
-    const state = this.slot(reference).state;
-    return state === null ? null : structuredClone(state);
-  }
-
-  replace(state, reference = BINDING.credentialReference) {
-    const slot = this.slot(reference);
-    slot.state = structuredClone(state);
-    slot.revision += 1;
-  }
-
-  slot(reference) {
-    let slot = this.slots.get(reference);
-    if (!slot) {
-      slot = { state: null, revision: 0 };
-      this.slots.set(reference, slot);
-    }
-    return slot;
-  }
-
-  readCut(reference) {
-    const slot = this.slot(reference);
-    const revision = Object.freeze({ credentialRevision: true });
-    this.revisions.set(revision, { reference, revision: slot.revision });
-    return {
-      state: slot.state === null ? null : structuredClone(slot.state),
-      revision,
-    };
-  }
-}
-
 class RecordingSecretResolver {
   values = new Map([
     [BINDING.bootstrapSecretReference, BOOTSTRAP_TOKEN],
@@ -122,28 +47,15 @@ class RecordingSecretResolver {
   }
 }
 
-function tokenIssuer() {
-  let keyring = issuer.createRelayV2IssuerKeyring({
-    issuerId: "relay-issuer-id",
-    kid: "dashboard-host-credential-test-key",
-    secretBase64url: Buffer.alloc(32, 0x62).toString("base64url"),
-    nowSeconds: NOW_SECONDS,
-  });
-  let issued = 0;
-  return (hostId, overrides = {}) => {
-    issued += 1;
-    const prepared = issuer.prepareRelayV2AccessTokenIssuance(keyring, {
-      role: "host",
-      hostId,
-      principalId: overrides.principalId ?? "host-principal-one",
-      grantId: overrides.grantId ?? "host-grant-one",
-      nowSeconds: NOW_SECONDS + issued,
-      jti: `host-access-jti-${issued}`,
-    });
-    keyring = prepared.nextKeyring;
-    return prepared;
-  };
-}
+const tokenIssuer = () => createTokenIssuer({
+  kid: "dashboard-host-credential-test-key",
+  secretByte: 0x62,
+  baseTime: NOW_SECONDS,
+  principalId: "host-principal-one",
+  grantId: "host-grant-one",
+  shape: "raw",
+  overrides: true,
+});
 
 function bootstrapResponse(input, access, overrides = {}) {
   return {
@@ -182,7 +94,10 @@ function assertManagementFailure(code) {
 }
 
 function harness(options = {}) {
-  const storage = options.storage ?? new InMemoryCredentialStorage();
+  const storage = options.storage ?? new InMemoryCredentialStorage({
+      freezeRead: false,
+      revisionShape: { credentialRevision: true },
+    });
   const secrets = options.secrets ?? new RecordingSecretResolver();
   const issueToken = tokenIssuer();
   const authority = new credential.RelayV2HostCredentialAuthority({
@@ -245,14 +160,14 @@ function installReady(h, overrides = {}) {
 }
 
 function restoreAdapterValidReadyInspection(h) {
-  const state = h.storage.snapshot();
+  const state = h.storage.snapshot(BINDING.credentialReference);
   const access = h.issueToken(BINDING.hostId);
   state.principalId = "host-principal-one";
   state.grantId = "host-grant-one";
   state.accessToken = access.token;
   state.accessExpiresAtMs = access.claims.exp * 1_000;
   state.accessJti = access.claims.jti;
-  h.storage.replace(state);
+  h.storage.replace(BINDING.credentialReference, state);
 }
 
 test("inspect exposes only closed missing, ready, and failed NDM1 projections", () => {
@@ -431,7 +346,7 @@ test("pre-consume validation failure releases its genuine cut for a fresh succes
   assert.equal(h.storage.compareAttempts, comparesBefore);
   assert.equal(h.secrets.resolutions.length, secretsBefore);
   assert.equal(h.networkCalls.length, 0);
-  assert.equal(h.storage.snapshot(), null);
+  assert.equal(h.storage.snapshot(BINDING.credentialReference), null);
 
   const fresh = h.owner.capture({
     credentialReference: BINDING.credentialReference,
@@ -514,7 +429,7 @@ test("stale cut after a concurrent pending advance performs zero second mutation
   assert.equal(h.secrets.resolutions.length, secretsBefore + 1);
   assert.equal(h.networkCalls.length, 0);
   assert.equal(
-    h.storage.snapshot().pendingCredentialAttempt.attemptId,
+    h.storage.snapshot(BINDING.credentialReference).pendingCredentialAttempt.attemptId,
     "concurrent-durable-winner",
   );
 });
@@ -572,7 +487,7 @@ test("fixed typed failures never retry, replay, clean up, or expose a secret", a
       assertManagementFailure("UNAVAILABLE"),
     );
     assert.equal(h.networkCalls.length, 1);
-    assert.equal(h.storage.snapshot().pendingCredentialAttempt.attemptId,
+    assert.equal(h.storage.snapshot(BINDING.credentialReference).pendingCredentialAttempt.attemptId,
       REFRESH_REQUEST.requestId);
   });
 
@@ -585,7 +500,7 @@ test("fixed typed failures never retry, replay, clean up, or expose a secret", a
       assertManagementFailure("OPERATION_FAILED"),
     );
     assert.equal(h.networkCalls.length, 1);
-    assert.equal(h.storage.snapshot().credentialVersion, "1");
+    assert.equal(h.storage.snapshot(BINDING.credentialReference).credentialVersion, "1");
   });
 });
 
@@ -614,15 +529,15 @@ test("caller AbortSignal is passed unchanged without timeout or fallback", async
 test("corrupt owner state fails closed without repair or credential reflection", async () => {
   const h = harness();
   installReady(h);
-  const corrupt = h.storage.snapshot();
+  const corrupt = h.storage.snapshot(BINDING.credentialReference);
   corrupt.accessTokenReflection = SECRET_MARKERS[0];
-  h.storage.replace(corrupt);
+  h.storage.replace(BINDING.credentialReference, corrupt);
   assert.deepEqual(h.adapter.inspect(), { status: "failed", retryable: false });
-  const before = h.storage.snapshot();
+  const before = h.storage.snapshot(BINDING.credentialReference);
   await assert.rejects(
     h.adapter.refresh(REFRESH_REQUEST),
     assertManagementFailure("OPERATION_FAILED"),
   );
-  assert.deepEqual(h.storage.snapshot(), before);
+  assert.deepEqual(h.storage.snapshot(BINDING.credentialReference), before);
   assert.equal(h.networkCalls.length, 0);
 });

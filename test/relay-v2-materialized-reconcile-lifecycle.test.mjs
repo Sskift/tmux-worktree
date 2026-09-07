@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { waitFor } from "./support/async.mjs";
 
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
@@ -18,14 +19,6 @@ function settledFlag(promise) {
   const flag = { settled: false };
   promise.then(() => { flag.settled = true; }, () => { flag.settled = true; });
   return flag;
-}
-
-async function waitFor(condition, label, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
 }
 
 class QueueDiscovery {
@@ -200,7 +193,7 @@ test("start scans immediately, explicit trigger applies changes, periodic trigge
       .payload.scopes[0];
     assert.equal(sessions.items.length, 2);
 
-    await waitFor(() => h.reconcilePort.calls >= 3, "periodic scan");
+    await waitFor(() => h.reconcilePort.calls >= 3, { message: "timed out waiting for periodic scan" });
   } finally {
     await h.owner.close();
     h.cleanup();
@@ -261,7 +254,7 @@ test("slow scans never overlap and coalesced triggers share one bounded successo
     });
 
     const startup = h.owner.start();
-    await waitFor(() => h.events.includes("scan:start"), "first scan start");
+    await waitFor(() => h.events.includes("scan:start"), { message: "timed out waiting for first scan start" });
 
     const triggers = [
       h.owner.triggerScan(),
@@ -276,7 +269,7 @@ test("slow scans never overlap and coalesced triggers share one bounded successo
     assert.equal(secondScanStarted, false);
     first.release();
     assert.equal(await startup, "reconciled");
-    await waitFor(() => secondScanStarted, "coalesced successor start");
+    await waitFor(() => secondScanStarted, { message: "timed out waiting for coalesced successor start" });
     assert.equal(h.reconcilePort.calls, 2);
     second.release();
     assert.deepEqual(await Promise.all(triggers), Array(5).fill("reconciled"));
@@ -306,7 +299,7 @@ test("reconfigure drains the old generation before applying and issues exactly o
       ],
     });
     const startup = h.owner.start();
-    await waitFor(() => h.events.includes("scan:start"), "old-generation scan start");
+    await waitFor(() => h.events.includes("scan:start"), { message: "timed out waiting for old-generation scan start" });
 
     const reconfigured = h.owner.reconfigure({ scanIntervalMs: 5_000 });
     const coalescedA = h.owner.triggerScan();
@@ -350,7 +343,7 @@ test("reconfigure snapshots the closed input and a failing swap rejects after sc
     configuration.scanIntervalMs = 1;
     await waitFor(
       () => h.events.filter((event) => event === "scan:settle").length === 2,
-      "fail-closed follow-up scan",
+      { message: "timed out waiting for fail-closed follow-up scan" },
     );
     assert.deepEqual(h.events, ["scan:start", "scan:settle", "scan:start", "scan:settle"]);
 
@@ -369,7 +362,7 @@ test("close stops the timer, refuses triggers, and drains the started scan", asy
     const blocked = barrier();
     h.discovery.pushDeferred(blocked.promise.then(() => completeScan("scope:one")));
     const startup = h.owner.start();
-    await waitFor(() => h.events.includes("scan:start"), "in-flight scan start");
+    await waitFor(() => h.events.includes("scan:start"), { message: "timed out waiting for in-flight scan start" });
 
     const coalesced = h.owner.triggerScan();
     const closing = h.owner.close();

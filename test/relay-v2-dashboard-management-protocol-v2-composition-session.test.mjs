@@ -33,6 +33,9 @@ import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
 } from "../dist/relay/v2/codec.js";
+import { nextTurn } from "./support/async.mjs";
+import { InMemoryCredentialStorage } from "./support/inMemoryHostCredentialStorage.mjs";
+import { createTokenIssuer } from "./support/relayV2TokenIssuer.mjs";
 
 const cases = JSON.parse(readFileSync(new URL(
   "../contracts/dashboard-relay-v2-management/v2/cases.json",
@@ -59,10 +62,6 @@ const STATUS_FRAME = cases.goldenExchanges.find(
 const REFRESH_FRAME = cases.goldenExchanges.find(
   ({ operation }) => operation === "refresh_host",
 ).requestFrame;
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
 
 async function waitFor(predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -115,34 +114,6 @@ class ControlledInput {
   }
 }
 
-class InMemoryCredentialStorage {
-  state = null;
-  revision = 0;
-  revisions = new WeakMap();
-
-  runExclusive(_reference, operation) {
-    const read = () => {
-      const revision = Object.freeze({ revision: true });
-      this.revisions.set(revision, this.revision);
-      return {
-        state: this.state === null ? null : structuredClone(this.state),
-        revision,
-      };
-    };
-    return operation({
-      read,
-      compareAndSwap: (expected, replacement) => {
-        if (this.revisions.get(expected) !== this.revision) {
-          return { status: "conflict", current: read() };
-        }
-        this.state = structuredClone(replacement);
-        this.revision += 1;
-        return { status: "swapped" };
-      },
-    });
-  }
-}
-
 class FakeTransport {
   sent = [];
   pending = [];
@@ -173,28 +144,14 @@ class FakeTransport {
   }
 }
 
-function tokenIssuer() {
-  let keyring = createRelayV2IssuerKeyring({
-    issuerId: "relay-issuer-id",
-    kid: "composition-session-key-one",
-    secretBase64url: Buffer.alloc(32, 0x64).toString("base64url"),
-    nowSeconds: NOW_MS / 1_000,
-  });
-  let sequence = 0;
-  return (hostId) => {
-    sequence += 1;
-    const prepared = prepareRelayV2AccessTokenIssuance(keyring, {
-      role: "host",
-      hostId,
-      principalId: "host-principal-one",
-      grantId: "host-grant-one",
-      nowSeconds: NOW_MS / 1_000 + sequence,
-      jti: `host-access-jti-${sequence}`,
-    });
-    keyring = prepared.nextKeyring;
-    return prepared;
-  };
-}
+const tokenIssuer = () => createTokenIssuer({
+  kid: "composition-session-key-one",
+  secretByte: 0x64,
+  baseTime: NOW_MS / 1_000,
+  principalId: "host-principal-one",
+  grantId: "host-grant-one",
+  shape: "raw",
+});
 
 function bootstrapResponse(input, access) {
   return {

@@ -1,22 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import { deferred as deferredValue } from "./support/async.mjs";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const pumpModule = await import("../dist/relay/v2/carrierPump.js");
 
 const NOW_MS = 1_783_700_000_000;
-
-function deferredValue() {
-  let resolve;
-  let reject;
-  const promise = new Promise((settle, fail) => {
-    resolve = settle;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
 
 function authContext(role, hostId) {
   return {

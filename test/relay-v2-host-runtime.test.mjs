@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
 
 const broker = await import("../dist/relay/v2/brokerCore.js");
 const canonicalBackendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
@@ -23,10 +23,6 @@ const corpus = loadRelayV2FixtureCorpus();
 const HOST_ID = "mac-admin";
 const HOST_EPOCH = "authority-uuid";
 const HOST_INSTANCE_ID = "host-process-uuid";
-
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
-}
 
 function capabilityIntersection(overrides = {}) {
   return Object.fromEntries(broker.RELAY_V2_REQUIRED_CAPABILITIES.map((capability) => [

@@ -1,41 +1,38 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { build } from "esbuild";
+import { waitForFile } from "./support/async.mjs";
+import { tmpDir } from "./support/tmpDirs.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
 // dev.ts is bundled into the CLI rather than emitted as a standalone module.
 // Build a temporary test-only entry so the persistence boundary can be driven
 // directly without opening the interactive readline wizard.
-const bundleRoot = mkdtempSync(join(tmpdir(), "tw-dev-config-bundle-"));
-execFileSync(
-  join(repositoryRoot, "node_modules", ".bin", "tsup"),
-  ["src/dev.ts", "--format", "esm", "--target", "node20", "--out-dir", bundleRoot, "--splitting", "false"],
-  { cwd: repositoryRoot, stdio: "ignore" },
-);
+const bundleRoot = tmpDir("tw-dev-config-bundle-");
+await build({
+  entryPoints: { dev: join(repositoryRoot, "src/dev.ts") },
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  outdir: bundleRoot,
+  loader: { ".md": "text", ".yaml": "text" },
+});
 const devModuleUrl = pathToFileURL(join(bundleRoot, "dev.js")).href;
 const { persistInitialConfig } = await import(devModuleUrl);
 const { acquireConfigFileLock, releaseConfigFileLock } = await import("../dist/hosts.js");
-
-async function waitForFile(path, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!existsSync(path)) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
 
 function childResult(child) {
   return new Promise((resolve) => {
@@ -48,7 +45,7 @@ function childResult(child) {
 }
 
 test("interactive config persistence atomically creates a private file", () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-dev-config-create-"));
+  const root = tmpDir("tw-dev-config-create-");
   const configPath = join(root, "nested", ".tmux-worktree.json");
   const raw = { projects: { app: "/repo/app" }, worktreeBase: "/worktrees" };
 
@@ -64,7 +61,7 @@ test("interactive config persistence atomically creates a private file", () => {
 });
 
 test("interactive config persistence aborts when config appears while prompting", async () => {
-  const root = mkdtempSync(join(tmpdir(), "tw-dev-config-race-"));
+  const root = tmpDir("tw-dev-config-race-");
   const configPath = join(root, ".tmux-worktree.json");
   const readyPath = join(root, "writer-ready");
   const lock = acquireConfigFileLock(`${configPath}.lock`);

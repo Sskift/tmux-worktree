@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
 
 const handoffModule = await import(
   "../dist/relay/v2/hostBootstrapSecretHandoff.js"
@@ -13,16 +14,6 @@ const sourceModule = await import(
 );
 
 const BOOTSTRAP_SECRET = "twhostboot2.node-readable-secret";
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((settle, fail) => {
-    resolve = settle;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
 
 function assertRedacted(error) {
   return error?.cause === undefined
