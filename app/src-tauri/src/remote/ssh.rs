@@ -819,10 +819,10 @@ mod tests {
             .expect("legacy directory must not prevent opening the v2 control socket");
         drop(listener);
 
-        let actual_directory =
-            Path::new(option_env!("HOME").expect("HOME from the Rust build environment"))
-                .join(".tmux-worktree")
-                .join("c");
+        let actual_directory = dirs::home_dir()
+            .expect("home dir for control path length test")
+            .join(".tmux-worktree")
+            .join("c");
         let actual = terminal_control_ssh_path_for_directory(&actual_directory, &host());
         assert!(
             terminal_control_ssh_bind_path_len(&actual) <= 103,
