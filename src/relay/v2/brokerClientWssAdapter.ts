@@ -15,6 +15,10 @@ import type {
 } from "./brokerClientSocketTransport.js";
 import { isRelayV2AuthIdentifier as isIdentifier } from "./token.js";
 import { isRejectedProxy } from "./untrustedSnapshot.js";
+import {
+  createTrustedSocketPrototypeCapture,
+  type CapturedSocketPrototype,
+} from "./brokerTrustedSocketCapture.js";
 
 const CLIENT_PROTOCOL = "tw-relay.v2";
 const OPEN = 1;
@@ -130,22 +134,6 @@ type CapturedSocket = Readonly<{
   readProtocol(): unknown;
   readExtensions(): unknown;
   readBufferedAmount(): unknown;
-}>;
-
-type CapturedSocketPrototype = Readonly<{
-  prototype: object;
-  brand: Function;
-  on: Function;
-  removeListener: Function;
-  send: Function;
-  pause: Function;
-  resume: Function;
-  close: Function;
-  terminate: Function;
-  readyState: PropertyDescriptor;
-  protocol: PropertyDescriptor;
-  extensions: PropertyDescriptor;
-  bufferedAmount: PropertyDescriptor;
 }>;
 
 type CapturedRegistration = Readonly<{
@@ -335,80 +323,18 @@ const SOCKET_METHOD_NAMES = Object.freeze([
   "terminate",
 ] as const);
 
-function captureTrustedDescriptor(
-  trustedPrototype: object,
-  name: string,
-): PropertyDescriptor {
-  let owner: object | null = trustedPrototype;
-  while (owner !== null) {
-    if (isRejectedProxy(owner)) throw failure();
-    const descriptor = Reflect.getOwnPropertyDescriptor(owner, name);
-    if (descriptor !== undefined) return Object.freeze({ ...descriptor });
-    owner = Reflect.getPrototypeOf(owner);
-  }
-  throw failure();
-}
-
-function captureTrustedMethod(trustedPrototype: object, name: string): Function {
-  const descriptor = captureTrustedDescriptor(trustedPrototype, name);
-  if (
-    !Object.hasOwn(descriptor, "value")
-    || typeof descriptor.value !== "function"
-    || isRejectedProxy(descriptor.value)
-  ) throw failure();
-  return descriptor.value;
-}
-
-function captureTrustedFact(
-  trustedPrototype: object,
-  name: string,
-): PropertyDescriptor {
-  const descriptor = captureTrustedDescriptor(trustedPrototype, name);
-  if (Object.hasOwn(descriptor, "value")) return descriptor;
-  if (
-    typeof descriptor.get !== "function"
-    || descriptor.set !== undefined
-    || isRejectedProxy(descriptor.get)
-  ) throw failure();
-  return descriptor;
-}
-
-function captureTrustedPrototype(
-  trustedPrototype: unknown,
-  trustedSocketBrand: unknown,
-): CapturedSocketPrototype {
-  if (
-    trustedPrototype === null
-    || typeof trustedPrototype !== "object"
-    || isRejectedProxy(trustedPrototype)
-    || typeof trustedSocketBrand !== "function"
-    || isRejectedProxy(trustedSocketBrand)
-  ) throw failure();
-  const methods = Object.create(null) as Record<string, Function>;
-  for (const name of SOCKET_METHOD_NAMES) {
-    methods[name] = captureTrustedMethod(trustedPrototype, name);
-  }
-  return Object.freeze({
-    prototype: trustedPrototype,
-    brand: trustedSocketBrand,
-    on: methods.on,
-    removeListener: methods.removeListener,
-    send: methods.send,
-    pause: methods.pause,
-    resume: methods.resume,
-    close: methods.close,
-    terminate: methods.terminate,
-    readyState: captureTrustedFact(trustedPrototype, "readyState"),
-    protocol: captureTrustedFact(trustedPrototype, "protocol"),
-    extensions: captureTrustedFact(trustedPrototype, "extensions"),
-    bufferedAmount: captureTrustedFact(trustedPrototype, "bufferedAmount"),
-  });
-}
-
-function readTrustedFact(socket: object, descriptor: PropertyDescriptor): unknown {
-  if (Object.hasOwn(descriptor, "value")) return descriptor.value;
-  return Reflect.apply(descriptor.get as Function, socket, []);
-}
+const trustedSocketCapture = createTrustedSocketPrototypeCapture({
+  methodNames: SOCKET_METHOD_NAMES,
+  trapHardening: false,
+  errors: {
+    descriptorOwner: () => failure(),
+    missingDescriptor: () => failure(),
+    invalidMethod: () => failure(),
+    invalidFact: () => failure(),
+    invalidPrototype: () => failure(),
+    invalidBrand: () => failure(),
+  },
+});
 
 function captureTrustedSocket(
   value: unknown,
@@ -430,10 +356,10 @@ function captureTrustedSocket(
     resume: trusted.resume,
     close: trusted.close,
     terminate: trusted.terminate,
-    readReadyState: () => readTrustedFact(value, trusted.readyState),
-    readProtocol: () => readTrustedFact(value, trusted.protocol),
-    readExtensions: () => readTrustedFact(value, trusted.extensions),
-    readBufferedAmount: () => readTrustedFact(value, trusted.bufferedAmount),
+    readReadyState: () => trustedSocketCapture.readTrustedFact(value, trusted.readyState),
+    readProtocol: () => trustedSocketCapture.readTrustedFact(value, trusted.protocol),
+    readExtensions: () => trustedSocketCapture.readTrustedFact(value, trusted.extensions),
+    readBufferedAmount: () => trustedSocketCapture.readTrustedFact(value, trusted.bufferedAmount),
   });
 }
 
@@ -936,7 +862,7 @@ export function createRelayV2BrokerClientWssCaptureAuthority(
   trustedSocketPrototype: object,
   trustedSocketBrand: RelayV2BrokerClientWssTrustedSocketBrand,
 ): RelayV2BrokerClientWssCaptureAuthority {
-  const trusted = captureTrustedPrototype(trustedSocketPrototype, trustedSocketBrand);
+  const trusted = trustedSocketCapture.captureTrustedPrototype(trustedSocketPrototype, trustedSocketBrand);
   return Object.freeze({
     create: (input: RelayV2BrokerClientWssAdapterInput) => (
       createRelayV2BrokerClientWssAdapterWithCapture(input, trusted)

@@ -1,4 +1,8 @@
 import { isRejectedProxy as rejectedProxy } from "./untrustedSnapshot.js";
+import {
+  createTrustedSocketPrototypeCapture,
+  type CapturedSocketPrototype,
+} from "./brokerTrustedSocketCapture.js";
 
 export const RELAY_V2_BROKER_HOST_WSS_MAX_FRAME_BYTES = 1_500_000;
 
@@ -73,22 +77,6 @@ type CapturedSocket = Readonly<{
   readBufferedAmount(): unknown;
 }>;
 
-type CapturedSocketPrototype = Readonly<{
-  prototype: object;
-  brand: Function;
-  on: Function;
-  removeListener: Function;
-  send: Function;
-  pause: Function;
-  resume: Function;
-  close: Function;
-  terminate: Function;
-  readyState: PropertyDescriptor;
-  protocol: PropertyDescriptor;
-  extensions: PropertyDescriptor;
-  bufferedAmount: PropertyDescriptor;
-}>;
-
 function closedError(): Error {
   return new Error("Relay v2 Broker Host WSS closed");
 }
@@ -140,98 +128,18 @@ const METHOD_NAMES = Object.freeze([
   "terminate",
 ] as const);
 
-function captureTrustedDescriptor(
-  trustedPrototype: object,
-  name: string,
-): PropertyDescriptor {
-  let owner: object | null = trustedPrototype;
-  while (owner !== null) {
-    if (rejectedProxy(owner)) {
-      throw new Error(`invalid Relay v2 Broker Host WSS ${name} descriptor owner`);
-    }
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Reflect.getOwnPropertyDescriptor(owner, name);
-    } catch {
-      descriptor = undefined;
-    }
-    if (descriptor !== undefined) {
-      return Object.freeze({ ...descriptor });
-    }
-    try {
-      owner = Reflect.getPrototypeOf(owner);
-    } catch {
-      owner = null;
-    }
-  }
-  throw new Error(`missing Relay v2 Broker Host WSS ${name} descriptor`);
-}
-
-function captureTrustedMethod(
-  trustedPrototype: object,
-  name: typeof METHOD_NAMES[number],
-): Function {
-  const descriptor = captureTrustedDescriptor(trustedPrototype, name);
-  if (
-    !Object.hasOwn(descriptor, "value")
-    || typeof descriptor.value !== "function"
-    || rejectedProxy(descriptor.value)
-  ) {
-    throw new Error(`invalid Relay v2 Broker Host WSS ${name} method`);
-  }
-  return descriptor.value;
-}
-
-function captureTrustedFact(
-  trustedPrototype: object,
-  name: string,
-): PropertyDescriptor {
-  const descriptor = captureTrustedDescriptor(trustedPrototype, name);
-  if (Object.hasOwn(descriptor, "value")) return descriptor;
-  if (
-    typeof descriptor.get !== "function"
-    || descriptor.set !== undefined
-    || rejectedProxy(descriptor.get)
-  ) {
-    throw new Error(`invalid Relay v2 Broker Host WSS ${name} fact`);
-  }
-  return descriptor;
-}
-
-function captureTrustedPrototype(
-  trustedPrototype: unknown,
-  trustedSocketBrand: unknown,
-): CapturedSocketPrototype {
-  if (
-    trustedPrototype === null
-    || typeof trustedPrototype !== "object"
-    || rejectedProxy(trustedPrototype)
-  ) {
-    throw new Error("invalid Relay v2 Broker Host WSS trusted prototype");
-  }
-  if (typeof trustedSocketBrand !== "function" || rejectedProxy(trustedSocketBrand)) {
-    throw new Error("invalid Relay v2 Broker Host WSS trusted socket brand");
-  }
-  const methods = Object.create(null) as Record<typeof METHOD_NAMES[number], Function>;
-  for (const name of METHOD_NAMES) methods[name] = captureTrustedMethod(trustedPrototype, name);
-  return Object.freeze({
-    prototype: trustedPrototype,
-    brand: trustedSocketBrand,
-    ...methods,
-    readyState: captureTrustedFact(trustedPrototype, "readyState"),
-    protocol: captureTrustedFact(trustedPrototype, "protocol"),
-    extensions: captureTrustedFact(trustedPrototype, "extensions"),
-    bufferedAmount: captureTrustedFact(trustedPrototype, "bufferedAmount"),
-  });
-}
-
-function readTrustedFact(
-  socket: object,
-  descriptor: PropertyDescriptor,
-): unknown {
-  if (Object.hasOwn(descriptor, "value")) return descriptor.value;
-  return Reflect.apply(descriptor.get as Function, socket, []);
-}
+const trustedSocketCapture = createTrustedSocketPrototypeCapture({
+  methodNames: METHOD_NAMES,
+  trapHardening: true,
+  errors: {
+    descriptorOwner: (name) => new Error(`invalid Relay v2 Broker Host WSS ${name} descriptor owner`),
+    missingDescriptor: (name) => new Error(`missing Relay v2 Broker Host WSS ${name} descriptor`),
+    invalidMethod: (name) => new Error(`invalid Relay v2 Broker Host WSS ${name} method`),
+    invalidFact: (name) => new Error(`invalid Relay v2 Broker Host WSS ${name} fact`),
+    invalidPrototype: () => new Error("invalid Relay v2 Broker Host WSS trusted prototype"),
+    invalidBrand: () => new Error("invalid Relay v2 Broker Host WSS trusted socket brand"),
+  },
+});
 
 function captureSocket(
   socket: unknown,
@@ -258,10 +166,10 @@ function captureSocket(
   if (!branded) {
     throw closedError();
   }
-  const readReadyState = () => readTrustedFact(socket, trusted.readyState);
-  const readProtocol = () => readTrustedFact(socket, trusted.protocol);
-  const readExtensions = () => readTrustedFact(socket, trusted.extensions);
-  const readBufferedAmount = () => readTrustedFact(socket, trusted.bufferedAmount);
+  const readReadyState = () => trustedSocketCapture.readTrustedFact(socket, trusted.readyState);
+  const readProtocol = () => trustedSocketCapture.readTrustedFact(socket, trusted.protocol);
+  const readExtensions = () => trustedSocketCapture.readTrustedFact(socket, trusted.extensions);
+  const readBufferedAmount = () => trustedSocketCapture.readTrustedFact(socket, trusted.bufferedAmount);
   return Object.freeze({
     receiver: socket,
     on: trusted.on,
@@ -671,7 +579,7 @@ export function createRelayV2BrokerHostWssCaptureAuthority(
   trustedSocketPrototype: object,
   trustedSocketBrand: RelayV2BrokerHostWssTrustedSocketBrand,
 ): RelayV2BrokerHostWssCaptureAuthority {
-  const trusted = captureTrustedPrototype(trustedSocketPrototype, trustedSocketBrand);
+  const trusted = trustedSocketCapture.captureTrustedPrototype(trustedSocketPrototype, trustedSocketBrand);
   return Object.freeze({
     capture: (socket: RelayV2BrokerHostWssSocket) => (
       new RelayV2BrokerHostWssAdapterImpl(captureSocket(socket, trusted))
