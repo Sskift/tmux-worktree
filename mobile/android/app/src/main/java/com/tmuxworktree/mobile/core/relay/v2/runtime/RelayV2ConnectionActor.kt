@@ -7424,7 +7424,6 @@ internal class RelayV2ConnectionActor(
         val pendingCommands: List<RelayV2PendingCommand>,
     ) {
         fun estimatedRawBytes(): Int {
-            fun String.bytes(): Long = toByteArray(Charsets.UTF_8).size.toLong()
             val total = generation.profileId.bytes() +
                 pendingCommands.sumOf {
                     it.commandId.bytes() + it.dedupeWindowId.bytes()
@@ -8137,8 +8136,9 @@ private fun Map<String, Any?>.listValue(name: String): List<*> = getValue(name) 
 private fun Map<String, Any?>.longMap(): Map<String, Long> =
     entries.associate { (key, value) -> key to (value as Number).toLong() }
 
+private fun String.bytes(): Long = toByteArray(Charsets.UTF_8).size.toLong()
+
 private fun RelayV2RecoveryReceipt.estimatedRawBytes(): Int {
-    fun String.bytes(): Long = toByteArray(Charsets.UTF_8).size.toLong()
     fun RelayV2PendingCommand.bytes(): Long = commandId.bytes() + dedupeWindowId.bytes()
 
     var total = binding.requestId.bytes() +
@@ -8198,7 +8198,6 @@ private fun RelayV2RecoveryReceipt.estimatedRawBytes(): Int {
 }
 
 private fun RelayV2OnlineResyncRequired.estimatedRawBytes(): Int {
-    fun String.bytes(): Long = toByteArray(Charsets.UTF_8).size.toLong()
     var total = generation.profileId.bytes() + hostId.bytes() + hostEpoch.bytes() + 64L
     total += durableCursorEventSeq?.bytes() ?: 0L
     total += pendingCommands.sumOf {
@@ -8209,7 +8208,6 @@ private fun RelayV2OnlineResyncRequired.estimatedRawBytes(): Int {
 }
 
 private fun RelayV2RecoveryReleaseDirective.estimatedRawBytes(): Long {
-    fun String.bytes(): Long = toByteArray(Charsets.UTF_8).size.toLong()
     return obligationToken.bytes() +
         profileId.bytes() +
         principalId.bytes() +
