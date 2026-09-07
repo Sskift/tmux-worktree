@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import type { FeishuReplyMode } from "./feishuBridgeStorage.js";
+import { isRecord } from "./feishuBridgeStorage.js";
 import type { FeishuReplyCard } from "./feishuReplyCard.js";
 
 const MAX_LARK_OUTPUT_BYTES = 1024 * 1024;
@@ -71,10 +72,6 @@ export interface FeishuLarkAdapter {
   listGroups(): Promise<FeishuChat[]>;
   botOpenId(): Promise<string>;
   botMentionIds?(): Promise<string[]>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function pickString(...values: unknown[]): string | undefined {

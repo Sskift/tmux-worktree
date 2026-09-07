@@ -1,3 +1,5 @@
+import { isRecord } from "./feishuBridgeStorage.js";
+
 export type FeishuReplyCardTone = "answer" | "status";
 
 export type FeishuReplyCard = Record<string, unknown>;
@@ -29,10 +31,6 @@ export interface FeishuLocalTaskResultCardInput {
 
 function neutralizeCardMentions(value: string): string {
   return value.replace(/<\/?at\b/gi, (tag) => `<\u200b${tag.slice(1)}`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function jsonObjectEnd(value: string, start: number): number | undefined {

@@ -205,11 +205,11 @@ export function feishuBridgeSocketPath(home = homedir()): string {
   return join(tmpdir(), `tw-feishu-bridge-${homeHash}`, "v1.sock");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function exactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+export function exactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
   return required.every((key) => Object.hasOwn(value, key))
     && Object.keys(value).every((key) => allowed.has(key));
@@ -397,7 +397,7 @@ function readStorageLockOwner(lockPath: string): FeishuBridgeStorageLockOwner | 
   }
 }
 
-function processExists(pid: number): boolean {
+export function processExists(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);

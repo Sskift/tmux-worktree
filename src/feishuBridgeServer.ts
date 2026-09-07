@@ -12,7 +12,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname } from "node:path";
 import packageMetadata from "../package.json";
 import { FeishuBridge, type CreateFeishuBindingInput } from "./feishuBridge.js";
-import { FeishuBridgeStore, feishuBridgePaths, type FeishuBridgePaths } from "./feishuBridgeStorage.js";
+import { FeishuBridgeStore, exactKeys, feishuBridgePaths, isRecord, processExists, type FeishuBridgePaths } from "./feishuBridgeStorage.js";
 import { LarkCliBridgeAdapter, type FeishuEventSubscription, type FeishuLarkAdapter } from "./larkCliBridge.js";
 import {
   CanonicalTerminalControlSocketClient,
@@ -69,16 +69,6 @@ interface FeishuBridgeInfo {
 type BridgeResponse =
   | { protocolVersion: 1; requestId: string; ok: true; result: unknown }
   | { protocolVersion: 1; requestId: string; ok: false; error: { code: string; message: string } };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function exactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
-  const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.hasOwn(value, key))
-    && Object.keys(value).every((key) => allowed.has(key));
-}
 
 function text(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")
@@ -317,15 +307,6 @@ function attachSocket(
     }
   });
   socket.on("error", () => {});
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
 }
 
 function claimInstance(path: string): void {
