@@ -1811,11 +1811,7 @@ class RelayV2TerminalRuntimeAdapterTest {
         }
     }
 
-    private class TerminalStore : RelayV2DurableStateStore, RelayV2DurableStateTransaction {
-        private var terminals = linkedMapOf<
-            RelayV2TerminalCheckpointKey,
-            RelayV2PersistedTerminalCheckpoint
-            >()
+    private class TerminalStore : RelayV2TerminalMemoryStoreBase() {
         var transactionCount = 0
             private set
         var terminalWriteCount = 0
@@ -1824,7 +1820,9 @@ class RelayV2TerminalRuntimeAdapterTest {
             private set
         var failNextCommitAfterBlock = false
 
-        override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T {
+        override suspend fun <T> transaction(
+            block: RelayV2DurableStateTransaction.() -> T,
+        ): T {
             check(!inTransaction) { "Test store does not permit transaction re-entry" }
             val before = LinkedHashMap(terminals)
             val writesBefore = terminalWriteCount
@@ -1858,33 +1856,9 @@ class RelayV2TerminalRuntimeAdapterTest {
             )
         }
 
-        override fun outboxMeta(
-            namespace: RelayV2OutboxAuthorityNamespace,
-        ): RelayV2PersistedOutboxMeta? = null
-
-        override fun outboxEntries(
-            namespace: RelayV2OutboxAuthorityNamespace,
-        ): List<RelayV2PersistedOutboxEntry> = emptyList()
-
-        override fun putOutboxMeta(meta: RelayV2PersistedOutboxMeta) =
-            error("Outbox is outside this test")
-
-        override fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry) =
-            error("Outbox is outside this test")
-
-        override fun replaceOutboxEntry(
-            namespace: RelayV2OutboxAuthorityNamespace,
-            previousId: RelayV2OutboxEntryId,
-            replacement: RelayV2PersistedOutboxEntry,
-        ): Boolean = error("Outbox is outside this test")
-
-        override fun terminalCheckpoint(
-            key: RelayV2TerminalCheckpointKey,
-        ): RelayV2PersistedTerminalCheckpoint? = terminals[key]
-
         override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) {
             terminalWriteCount += 1
-            terminals[checkpoint.key] = checkpoint
+            super.putTerminalCheckpoint(checkpoint)
         }
     }
 

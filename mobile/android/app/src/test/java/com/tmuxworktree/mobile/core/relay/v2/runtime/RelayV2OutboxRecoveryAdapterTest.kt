@@ -795,16 +795,7 @@ class RelayV2OutboxRecoveryAdapterTest {
         }
     }
 
-    private class MemoryStore : RelayV2DurableStateStore, RelayV2DurableStateTransaction {
-        private data class EntryKey(
-            val namespace: RelayV2OutboxAuthorityNamespace,
-            val hostId: String,
-            val hostEpoch: String,
-            val commandId: String,
-        )
-
-        private var metas = linkedMapOf<RelayV2OutboxAuthorityNamespace, RelayV2PersistedOutboxMeta>()
-        private var entries = linkedMapOf<EntryKey, RelayV2PersistedOutboxEntry>()
+    private class MemoryStore : RelayV2OutboxMemoryStoreBase() {
         var failNextReplaceCommandId: String? = null
         var beforeNextTransaction: (() -> Unit)? = null
         var transactionCount = 0
@@ -812,45 +803,31 @@ class RelayV2OutboxRecoveryAdapterTest {
         var writeCount = 0
             private set
 
-        override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T {
+        override suspend fun <T> transaction(
+            block: RelayV2DurableStateTransaction.() -> T,
+        ): T {
             transactionCount += 1
             beforeNextTransaction?.also {
                 beforeNextTransaction = null
                 it()
             }
-            val metasBefore = LinkedHashMap(metas)
-            val entriesBefore = LinkedHashMap(entries)
             val writesBefore = writeCount
             return try {
-                block(this)
+                super.transaction(block)
             } catch (failure: Throwable) {
-                metas = metasBefore
-                entries = entriesBefore
                 writeCount = writesBefore
                 throw failure
             }
         }
 
-        override fun outboxMeta(
-            namespace: RelayV2OutboxAuthorityNamespace,
-        ): RelayV2PersistedOutboxMeta? = metas[namespace]
-
-        override fun outboxEntries(
-            namespace: RelayV2OutboxAuthorityNamespace,
-        ): List<RelayV2PersistedOutboxEntry> = entries.values
-            .filter { it.namespace == namespace }
-            .sortedWith(compareBy({ it.createdOrder }, { it.commandId }))
-
         override fun putOutboxMeta(meta: RelayV2PersistedOutboxMeta) {
             writeCount += 1
-            metas[meta.namespace] = meta
+            super.putOutboxMeta(meta)
         }
 
         override fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry) {
-            val key = entry.key()
-            check(key !in entries)
             writeCount += 1
-            entries[key] = entry
+            super.insertOutboxEntry(entry)
         }
 
         override fun replaceOutboxEntry(
@@ -862,35 +839,8 @@ class RelayV2OutboxRecoveryAdapterTest {
                 failNextReplaceCommandId = null
                 error("injected replace failure")
             }
-            val previousKey = EntryKey(
-                namespace,
-                previousId.hostId,
-                previousId.expectedHostEpoch,
-                previousId.commandId,
-            )
-            val previous = entries.remove(previousKey) ?: return false
-            return try {
-                insertOutboxEntry(replacement)
-                true
-            } catch (failure: Throwable) {
-                entries[previousKey] = previous
-                throw failure
-            }
+            return super.replaceOutboxEntry(namespace, previousId, replacement)
         }
-
-        override fun terminalCheckpoint(
-            key: RelayV2TerminalCheckpointKey,
-        ): RelayV2PersistedTerminalCheckpoint? = null
-
-        override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) =
-            error("terminal storage is outside this test")
-
-        private fun RelayV2PersistedOutboxEntry.key() = EntryKey(
-            namespace,
-            hostId,
-            expectedHostEpoch,
-            commandId,
-        )
     }
 
     private data class TestCommand(

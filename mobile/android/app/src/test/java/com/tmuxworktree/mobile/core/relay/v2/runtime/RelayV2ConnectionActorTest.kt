@@ -8634,14 +8634,6 @@ class RelayV2ConnectionActorTest {
         BEFORE_COMMIT,
         AFTER_COMMIT,
     }
-
-    private companion object {
-        const val TIMEOUT_MS = 5_000L
-        const val NOW_MS = 1_000_000L
-        const val HOST_ID = "mac-admin"
-        const val PRINCIPAL_ID = "principal-opaque-id"
-        const val HOST_EPOCH = "authority-uuid"
-    }
 }
 
 @Suppress("UNCHECKED_CAST")

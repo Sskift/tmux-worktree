@@ -122,6 +122,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalPostCommitJour
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalRecoveryAuthority
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeClaim
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalResumeSessionSelector
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2TerminalMemoryStoreBase
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalActionFence
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCloseReason
@@ -5495,46 +5496,18 @@ class RelayV2BaseRuntimeCompositionTest {
         }
     }
 
-    private class TerminalMemoryStore :
-        RelayV2DurableStateStore,
-        RelayV2DurableStateTransaction {
-        private var terminals =
-            linkedMapOf<RelayV2TerminalCheckpointKey, RelayV2PersistedTerminalCheckpoint>()
-
-        override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T =
-            synchronized(this) {
-                val before = LinkedHashMap(terminals)
-                try {
-                    block(this)
-                } catch (failure: Throwable) {
-                    terminals = before
-                    throw failure
-                }
+    private class TerminalMemoryStore : RelayV2TerminalMemoryStoreBase() {
+        override suspend fun <T> transaction(
+            block: RelayV2DurableStateTransaction.() -> T,
+        ): T = synchronized(this) {
+            val before = LinkedHashMap(terminals)
+            try {
+                block(this)
+            } catch (failure: Throwable) {
+                terminals = before
+                throw failure
             }
-
-        override fun outboxMeta(
-            namespace: RelayV2OutboxAuthorityNamespace,
-        ): RelayV2PersistedOutboxMeta? = null
-
-        override fun outboxEntries(
-            namespace: RelayV2OutboxAuthorityNamespace,
-        ): List<RelayV2PersistedOutboxEntry> = emptyList()
-
-        override fun putOutboxMeta(meta: RelayV2PersistedOutboxMeta) =
-            error("outbox is outside the terminal attachment test")
-
-        override fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry) =
-            error("outbox is outside the terminal attachment test")
-
-        override fun replaceOutboxEntry(
-            namespace: RelayV2OutboxAuthorityNamespace,
-            previousId: RelayV2OutboxEntryId,
-            replacement: RelayV2PersistedOutboxEntry,
-        ): Boolean = error("outbox is outside the terminal attachment test")
-
-        override fun terminalCheckpoint(
-            key: RelayV2TerminalCheckpointKey,
-        ): RelayV2PersistedTerminalCheckpoint? = terminals[key]
+        }
 
         override fun terminalCheckpointsForSession(
             selector: RelayV2TerminalResumeSessionSelector,
@@ -5552,10 +5525,6 @@ class RelayV2BaseRuntimeCompositionTest {
 
         override fun deleteTerminalCheckpoint(key: RelayV2TerminalCheckpointKey): Boolean =
             terminals.remove(key) != null
-
-        override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) {
-            terminals[checkpoint.key] = checkpoint
-        }
     }
 
     private class MemoryTerminalCredentials : RelayV2TerminalResumeCredentialStore {
