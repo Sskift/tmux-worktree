@@ -29,7 +29,14 @@ internal data class RelayV2DialectFixture(
     val expected: Map<String, Any?>,
 )
 
-internal class RelayV2ContractFixtures {
+internal object RelayV2ContractFixtures {
+    private val FIXTURE_LIMITS = RelayV2JsonLimits(
+        maxDepth = 64,
+        maxDirectKeys = 1_024,
+        maxTotalKeys = 100_000,
+        maxNodes = 200_000,
+    )
+
     val manifest: Map<String, Any?> = readObject("v2/manifest.json")
     val golden: List<RelayV2GoldenFixture>
     val invalid: List<Map<String, Any?>> = readArray("v2/invalid-vectors.json")
@@ -272,14 +279,9 @@ internal class RelayV2ContractFixtures {
             "Missing required repo Relay v2 fixture " + path
         }.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
 
-    companion object {
-        private val FIXTURE_LIMITS = RelayV2JsonLimits(
-            maxDepth = 64,
-            maxDirectKeys = 1_024,
-            maxTotalKeys = 100_000,
-            maxNodes = 200_000,
-        )
-    }
+    /** F048/F049: O(1) named golden frame, deep-cloned so callers can mutate freely. */
+    fun goldenFrame(name: String): MutableMap<String, Any?> =
+        deepObjectClone(goldenByName.getValue(name).frame)
 }
 
 private fun jsonPointerSegments(pointer: String): List<String> {

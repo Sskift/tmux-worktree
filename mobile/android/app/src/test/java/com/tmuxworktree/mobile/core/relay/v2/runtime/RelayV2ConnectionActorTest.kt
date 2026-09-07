@@ -104,7 +104,6 @@ class RelayV2ConnectionActorTest {
     private val codec = RelayV2Codec()
     private val agentChatCodec = AgentChatV2Codec()
     private val agentExtensionCodec = AgentTranscriptLifecycleV1Codec()
-    private val fixtures = RelayV2ContractFixtures()
 
     @Test
     fun `five hello outcomes produce query resync or continuity rejection effects`() = runBlocking {
@@ -8153,9 +8152,8 @@ class RelayV2ConnectionActorTest {
         }
     }
 
-    private fun fixture(name: String): MutableMap<String, Any?> = deepClone(
-        fixtures.golden.single { it.name == name }.frame,
-    )
+    private fun fixture(name: String): MutableMap<String, Any?> =
+        RelayV2ContractFixtures.goldenFrame(name)
 
     private fun sessionUpsertFrame(
         eventSeq: String,
@@ -8645,38 +8643,12 @@ class RelayV2ConnectionActorTest {
 }
 
 @Suppress("UNCHECKED_CAST")
-private fun deepClone(source: Map<String, Any?>): MutableMap<String, Any?> =
-    linkedMapOf<String, Any?>().apply {
-        source.forEach { (key, value) ->
-            put(
-                key,
-                when (value) {
-                    is Map<*, *> -> deepClone(value as Map<String, Any?>)
-                    is List<*> -> value.map { item ->
-                        if (item is Map<*, *>) deepClone(item as Map<String, Any?>) else item
-                    }.toMutableList()
-                    else -> value
-                },
-            )
-        }
-    }
-
-@Suppress("UNCHECKED_CAST")
-private fun MutableMap<String, Any?>.payload(): MutableMap<String, Any?> =
-    getValue("payload") as MutableMap<String, Any?>
-
-@Suppress("UNCHECKED_CAST")
 private fun MutableMap<String, Any?>.mutableObject(name: String): MutableMap<String, Any?> =
     getValue(name) as MutableMap<String, Any?>
-
-private fun Map<String, Any?>.stringValue(name: String): String = getValue(name) as String
 
 @Suppress("UNCHECKED_CAST")
 private fun Map<String, Any?>.objectValue(name: String): Map<String, Any?> =
     getValue(name) as Map<String, Any?>
-
-private fun Map<String, Any?>.stringList(name: String): List<String> =
-    (getValue(name) as List<*>).map { it as String }
 
 @Suppress("UNCHECKED_CAST")
 private fun Map<String, Any?>.commandItems(): List<RelayV2PendingCommand> =

@@ -1,5 +1,8 @@
 package com.tmuxworktree.mobile.core.relay.v2.codec
 
+import com.tmuxworktree.mobile.core.relay.v2.runtime.payload
+import com.tmuxworktree.mobile.core.relay.v2.runtime.stringList
+import com.tmuxworktree.mobile.core.relay.v2.runtime.stringValue
 import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -8,7 +11,7 @@ import org.junit.Test
 
 class RelayV2CodecContractTest {
     private val codec = RelayV2Codec()
-    private val fixtures = RelayV2ContractFixtures()
+    private val fixtures = RelayV2ContractFixtures
 
     @Test
     fun androidCodecConsumesEverySharedGoldenFixture() {
@@ -187,9 +190,8 @@ class RelayV2CodecContractTest {
         }
     }
 
-    private fun fixture(name: String): MutableMap<String, Any?> = deepClone(
-        fixtures.golden.single { it.name == name }.frame,
-    )
+    private fun fixture(name: String): MutableMap<String, Any?> =
+        RelayV2ContractFixtures.goldenFrame(name)
 
     private fun decodePublic(frame: Map<String, Any?>): RelayV2DecodedMessage =
         codec.decodeWebSocketFrame(
@@ -202,32 +204,3 @@ class RelayV2CodecContractTest {
 private fun MutableMap<String, Any?>.commandArguments(): MutableMap<String, Any?> =
     payload()
         .getValue("arguments") as MutableMap<String, Any?>
-
-@Suppress("UNCHECKED_CAST")
-private fun MutableMap<String, Any?>.payload(): MutableMap<String, Any?> =
-    getValue("payload") as MutableMap<String, Any?>
-
-@Suppress("UNCHECKED_CAST")
-private fun deepClone(source: Map<String, Any?>): MutableMap<String, Any?> =
-    linkedMapOf<String, Any?>().apply {
-        source.forEach { (key, value) ->
-            put(
-                key,
-                when (value) {
-                    is Map<*, *> -> deepClone(value as Map<String, Any?>)
-                    is List<*> -> value.map { item ->
-                        if (item is Map<*, *>) deepClone(item as Map<String, Any?>) else item
-                    }.toMutableList()
-                    else -> value
-                },
-            )
-        }
-    }
-
-private fun Map<String, Any?>.stringValue(name: String): String =
-    this[name] as? String ?: error("Fixture field must be a string: " + name)
-
-private fun Map<String, Any?>.stringList(name: String): List<String> =
-    (this[name] as? List<*>)?.map {
-        it as? String ?: error("Fixture list item must be a string: " + name)
-    } ?: error("Fixture field must be an array: " + name)

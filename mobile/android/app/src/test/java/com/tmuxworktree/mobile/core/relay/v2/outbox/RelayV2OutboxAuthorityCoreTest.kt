@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.outbox
 
+import com.tmuxworktree.mobile.core.relay.v2.runtime.expectApplied
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -2622,10 +2623,8 @@ class RelayV2OutboxAuthorityCoreTest {
         ),
     )
 
-    private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied {
-        assertTrue("Expected applied Outbox result", result is RelayV2OutboxResult.Applied)
-        return result as RelayV2OutboxResult.Applied
-    }
+    private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied =
+        result.expectApplied()
 
     private fun rejected(result: RelayV2OutboxResult): RelayV2OutboxResult.Rejected {
         assertTrue("Expected rejected Outbox result", result is RelayV2OutboxResult.Rejected)

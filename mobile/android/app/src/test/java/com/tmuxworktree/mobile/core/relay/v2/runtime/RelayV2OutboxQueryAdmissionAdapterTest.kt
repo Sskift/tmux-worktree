@@ -221,10 +221,8 @@ class RelayV2OutboxQueryAdmissionAdapterTest {
         )
     }
 
-    private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied {
-        check(result is RelayV2OutboxResult.Applied)
-        return result
-    }
+    private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied =
+        result.expectApplied()
 
     private class FakeApplyLease(
         var stale: Boolean = false,

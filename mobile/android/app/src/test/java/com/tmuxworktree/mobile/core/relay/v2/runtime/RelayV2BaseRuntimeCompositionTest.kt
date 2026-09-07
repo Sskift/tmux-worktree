@@ -40,13 +40,13 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTra
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleSelectedSessionStatusAdmissionResult
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Fixtures
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStatusGetFrame
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.runtime.RelayV2ConnectionRegistry
-import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
-import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
+
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAcceptanceEvidence
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
@@ -141,8 +141,6 @@ import com.tmuxworktree.mobile.core.session.ExponentialMobileSessionReconnectPol
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 import java.lang.reflect.Proxy
 import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -171,7 +169,6 @@ import org.junit.Test
 
 class RelayV2BaseRuntimeCompositionTest {
     private val codec = RelayV2Codec()
-    private val fixtures = RelayV2ContractFixtures()
 
     @Test
     fun `cold start installs durable terminal fence floor before first connection`() = runBlocking {
@@ -5577,10 +5574,7 @@ class RelayV2BaseRuntimeCompositionTest {
             values[key] = resumeToken
             installCount += 1
             return RelayV2TerminalResumeCredentialInstall(
-                Base64.getUrlEncoder().withoutPadding().encodeToString(
-                    MessageDigest.getInstance("SHA-256")
-                        .digest(resumeToken.toByteArray(Charsets.UTF_8)),
-                ),
+                fingerprint(resumeToken),
                 existing == null,
             )
         }
@@ -6042,28 +6036,15 @@ class RelayV2BaseRuntimeCompositionTest {
             }
     }
 
-    private fun fixture(name: String): MutableMap<String, Any?> = deepClone(
-        fixtures.golden.single { it.name == name }.frame,
-    )
+    private fun fixture(name: String): MutableMap<String, Any?> =
+        RelayV2ContractFixtures.goldenFrame(name)
 
     private fun agentArtifact() = AgentTranscriptLifecycleV1Codec().decodePublicFrameArtifact(
         agentFixtureWire("live-entry-redacted"),
     )
 
     private fun agentFixtureWire(name: String): ByteArray {
-        val resource = "extensions/agent-transcript-lifecycle/v1/golden-frames.json"
-        val source = requireNotNull(
-            RelayV2BaseRuntimeCompositionTest::class.java.classLoader
-                ?.getResourceAsStream(resource),
-        ).bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
-        val wrapper = RelayV2StrictJson.parseObject(
-            "{\"fixtures\":$source}",
-            RelayV2JsonLimits(64, 1_024, 100_000, 200_000),
-        )
-        val fixture = (wrapper["fixtures"] as List<*>)
-            .filterIsInstance<Map<String, Any?>>()
-            .single { it["name"] == name }
-        val wire = fixture["wire"] as String
+        val wire = AgentTranscriptLifecycleV1Fixtures.wire(name).toString(StandardCharsets.UTF_8)
         val oldEpoch = "\"hostEpoch\":\"host-epoch-1\""
         check(wire.indexOf(oldEpoch) >= 0 && wire.indexOf(oldEpoch) == wire.lastIndexOf(oldEpoch))
         return wire.replace(
@@ -6320,7 +6301,7 @@ class RelayV2BaseRuntimeCompositionTest {
     }
 
     private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied =
-        result as RelayV2OutboxResult.Applied
+        result.expectApplied()
 
     private fun terminalOpenedFrame(
         open: Map<String, Any?>,
@@ -6355,21 +6336,6 @@ class RelayV2BaseRuntimeCompositionTest {
     )
 
     @Suppress("UNCHECKED_CAST")
-    private fun <T> deepClone(value: T): T = when (value) {
-        is Map<*, *> -> LinkedHashMap<String, Any?>().apply {
-            value.forEach { (key, item) -> put(key as String, deepClone(item)) }
-        } as T
-        is List<*> -> value.map(::deepClone) as T
-        else -> value
-    }
-
-    @Suppress("UNCHECKED_CAST")
-    private fun MutableMap<String, Any?>.payload(): MutableMap<String, Any?> =
-        getValue("payload") as MutableMap<String, Any?>
-
-    private fun Map<String, Any?>.stringValue(name: String): String = getValue(name) as String
-
-    @Suppress("UNCHECKED_CAST")
     private fun Map<String, Any?>.objectValue(name: String): Map<String, Any?> =
         getValue(name) as Map<String, Any?>
 
@@ -6380,10 +6346,6 @@ class RelayV2BaseRuntimeCompositionTest {
     @Suppress("UNCHECKED_CAST")
     private fun Map<String, Any?>.objectList(name: String): List<Map<String, Any?>> =
         getValue(name) as List<Map<String, Any?>>
-
-    @Suppress("UNCHECKED_CAST")
-    private fun Map<String, Any?>.stringList(name: String): List<String> =
-        getValue(name) as List<String>
 
     private enum class StatusMode {
         ACCEPTED,
