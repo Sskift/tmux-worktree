@@ -101,12 +101,15 @@ function hasUnpairedSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = REFLECT_APPLY(STRING_CHAR_CODE_AT, value, [index]) as number;
     if (code >= 0xd800 && code <= 0xdbff) {
+      // A high surrogate at the string end is unpaired: charCodeAt past the
+      // end yields NaN, which is neither < 0xdc00 nor > 0xdfff, so it must
+      // be checked explicitly.
       const next = REFLECT_APPLY(
         STRING_CHAR_CODE_AT,
         value,
         [index + 1],
       ) as number;
-      if (next < 0xdc00 || next > 0xdfff) return true;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
       index += 1;
     } else if (code >= 0xdc00 && code <= 0xdfff) {
       return true;
