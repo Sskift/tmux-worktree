@@ -6398,7 +6398,6 @@ internal class RelayV2ConnectionActor(
                 action.profile,
                 action.barrierId,
                 fencedGeneration,
-                connectionGeneration,
             ),
         )
         synchronized(lifecycleLock) {
