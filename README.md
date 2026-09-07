@@ -115,6 +115,12 @@ brew install git tmux node
 open -a tw-dashboard
 ```
 
+Or install the Dashboard straight from npm — the installer downloads the DMG matching the package version, verifies its SHA-256 and code-signing seal, and installs it. Always use `@latest` so a stale global package cannot pin an old build:
+
+```bash
+npx tw-dashboard-install@latest
+```
+
 ### CLI from source
 
 Install `tw` on each local or remote machine that will create managed sessions:

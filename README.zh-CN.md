@@ -108,6 +108,12 @@ brew install git tmux node
 open -a tw-dashboard
 ```
 
+也可以直接用 npm 安装 Dashboard——安装器会下载与包版本匹配的 DMG，校验 SHA-256 与代码签名后安装。请始终使用 `@latest`，避免陈旧的全局包锁定旧版本：
+
+```bash
+npx tw-dashboard-install@latest
+```
+
 ### 从源码安装 CLI
 
 每一台需要创建 managed session 的本机或远程机器都要安装 `tw`：
