@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, normalize, relative, resolve } from "node:path";
+import { canonicalJson } from "./canonicalJson";
 import {
   canonicalWorktreePlacementSegment,
   parseCanonicalWorktreePlacement,
@@ -214,15 +215,6 @@ function normalizedAbsolutePath(value: unknown, label: string): string {
     throw new Error(`invalid create-target-observation ${label}`);
   }
   return parsed;
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => (
-    `${JSON.stringify(key)}:${canonicalJson(record[key])}`
-  )).join(",")}}`;
 }
 
 /** Fixed-shape probe; the parser only validates the correlation envelope. */

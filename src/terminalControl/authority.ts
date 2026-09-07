@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { canonicalJson as relayV2ExactCanonicalJson } from "../canonicalJson";
 import type {
   TerminalControlDrainProof,
   TerminalControlLease,
@@ -514,15 +515,6 @@ function terminalDisplaySizeHint(value: unknown): Readonly<{ cols: number; rows:
     throw new TerminalControlProtocolError("INVALID_REQUEST", "terminal display size hint is invalid");
   }
   return Object.freeze({ cols: cols as number, rows: rows as number });
-}
-
-function relayV2ExactCanonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(relayV2ExactCanonicalJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => (
-    `${JSON.stringify(key)}:${relayV2ExactCanonicalJson(record[key])}`
-  )).join(",")}}`;
 }
 
 function relayV2ExactInput(value: TerminalControlRelayV2ExactTargetInput): TerminalControlRelayV2ExactTargetInput {

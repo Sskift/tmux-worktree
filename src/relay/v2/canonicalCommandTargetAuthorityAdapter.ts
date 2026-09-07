@@ -1,3 +1,4 @@
+import { canonicalJson } from "../../canonicalJson.js";
 import type {
   CanonicalAgentMessageResult,
   CanonicalTerminalLease,
@@ -144,15 +145,6 @@ function bounded(value: unknown, maxBytes = 128): string {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => (
-    `${JSON.stringify(key)}:${canonicalJson(record[key])}`
-  )).join(",")}}`;
 }
 
 function same(left: unknown, right: unknown): boolean {
