@@ -5,6 +5,7 @@ import {
   type RelayV2FrameMetadata,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
+import { stringField, objectField } from "./hostFrameFields.js";
 import { RELAY_V2_REQUIRED_CAPABILITIES } from "./brokerCore.js";
 import type {
   RelayV2HostCarrierRouteSink,
@@ -648,14 +649,6 @@ function immutableBinding(binding: RelayV2HostRouteBinding): RelayV2HostRouteBin
     maxFrameBytes: binding.maxFrameBytes,
     authContext: Object.freeze({ ...binding.authContext }),
   });
-}
-
-function objectField(frame: RelayV2JsonObject, name: string): RelayV2JsonObject {
-  return frame[name] as RelayV2JsonObject;
-}
-
-function stringField(frame: RelayV2JsonObject, name: string): string {
-  return frame[name] as string;
 }
 
 function optionalString(frame: RelayV2JsonObject, name: string): string | null {
