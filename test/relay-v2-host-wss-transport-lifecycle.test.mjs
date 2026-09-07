@@ -7,7 +7,7 @@ import {
 import { checkServerIdentity } from "node:tls";
 import test from "node:test";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
 
 const require = createRequire(import.meta.url);
 const mutableNodeTls = require("node:tls");
@@ -26,10 +26,6 @@ const HOST_EPOCH = "host-epoch-one";
 const HOST_INSTANCE_ID = "host-instance-one";
 const REFERENCE = "relay-v2-host-credential-ref:primary";
 const corpus = loadRelayV2FixtureCorpus();
-
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
-}
 
 function carrierWire(frame) {
   return codec.encodeRelayV2WebSocketFrame("carrier", frame);

@@ -33,6 +33,7 @@ import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
 } from "../dist/relay/v2/codec.js";
+import { nextTurn } from "./support/async.mjs";
 
 const cases = JSON.parse(readFileSync(new URL(
   "../contracts/dashboard-relay-v2-management/v2/cases.json",
@@ -59,10 +60,6 @@ const STATUS_FRAME = cases.goldenExchanges.find(
 const REFRESH_FRAME = cases.goldenExchanges.find(
   ({ operation }) => operation === "refresh_host",
 ).requestFrame;
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
 
 async function waitFor(predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {

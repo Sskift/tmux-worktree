@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { IncomingMessage } from "node:http";
 import { Duplex } from "node:stream";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
 
 const adapterModule = await import(
   "../dist/relay/v2/brokerHostWssNodeUpgradeRequestAdapter.js"
@@ -17,16 +18,6 @@ const STATUS_LINES = Object.freeze({
   426: "HTTP/1.1 426 Upgrade Required",
   503: "HTTP/1.1 503 Service Unavailable",
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((settle, fail) => {
-    resolve = settle;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
 
 class MemoryDuplex extends Duplex {
   constructor() {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
 
 const broker = await import("../dist/relay/v2/brokerCore.js");
 const dispatchModule = await import("../dist/relay/v2/brokerHostUpgradeDispatch.js");
@@ -38,16 +39,6 @@ function metadata() {
 
 function receipt() {
   return Object.freeze(Object.create(null));
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 function connectionHandle(drained = Promise.resolve()) {

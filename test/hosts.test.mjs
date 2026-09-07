@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { waitForFile } from "./support/async.mjs";
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const hostsModuleUrl = new URL("../dist/hosts.js", import.meta.url);
 const { acquireConfigFileLock, releaseConfigFileLock } = await import(hostsModuleUrl.href);
@@ -23,14 +24,6 @@ function runCli(home, args, extraEnv = {}) {
     env: { ...process.env, HOME: home, ...extraEnv },
     timeout: 10_000,
   });
-}
-
-async function waitForFile(path, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!existsSync(path)) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
 }
 
 test("tw host CRUD preserves unrelated config, remote tilde paths, and private file mode", () => {

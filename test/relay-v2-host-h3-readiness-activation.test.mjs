@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
 
 const backendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
 const activationModule = await import("../dist/relay/v2/hostH3ReadinessActivation.js");
@@ -25,16 +26,6 @@ const BACKEND_KEY = backendIdentity.issueRelayV2CanonicalBackendInstanceKey({
   processTarget: PROCESS_TARGET,
   incarnation: INCARNATION,
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((accept, deny) => {
-    resolve = accept;
-    reject = deny;
-  });
-  return { promise, resolve, reject };
-}
 
 function readinessSink() {
   const applied = [];

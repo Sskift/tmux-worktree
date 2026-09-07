@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { waitForFile } from "./support/async.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -28,14 +29,6 @@ execFileSync(
 const devModuleUrl = pathToFileURL(join(bundleRoot, "dev.js")).href;
 const { persistInitialConfig } = await import(devModuleUrl);
 const { acquireConfigFileLock, releaseConfigFileLock } = await import("../dist/hosts.js");
-
-async function waitForFile(path, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!existsSync(path)) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
 
 function childResult(child) {
   return new Promise((resolve) => {

@@ -11,6 +11,7 @@ import {
 import {
   RelayV2DashboardManagementAuthority,
 } from "../dist/relay/v2/relayV2DashboardManagementAuthority.js";
+import { deferred, nextTurn } from "./support/async.mjs";
 
 const IDENTITY = Object.freeze({
   hostId: "mac-admin",
@@ -18,20 +19,6 @@ const IDENTITY = Object.freeze({
   hostInstanceId: "host-instance-one",
   credentialReference: "relay-v2-host-credential-ref:primary",
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
 
 function startInput(requestId, signal = new AbortController().signal) {
   return { requestId, ...IDENTITY, signal };

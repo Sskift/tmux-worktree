@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
+import { deferred } from "./support/async.mjs";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
 const managedSessions = await import("../dist/session.js");
@@ -97,16 +98,6 @@ async function stopAutoStartedTerminalControl(socketPath) {
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
   }
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
 }
 
 function sha256Hex(value) {

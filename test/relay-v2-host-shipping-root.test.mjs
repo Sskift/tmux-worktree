@@ -12,7 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
+import { waitFor } from "./support/async.mjs";
 
 const shippingRoot = await import("../dist/relay/v2/hostShippingRoot.js");
 const profileStore = await import("../dist/relay/v2/hostProductionProfileStore.js");
@@ -46,10 +47,6 @@ const MINT_REAUTH_REQUEST_ID = "mint-reauth-request-shipping-01";
 const ACCESS_EXP_S = Math.floor(Date.now() / 1_000) + 3_600;
 const ACCESS_EXPIRES_AT_MS = ACCESS_EXP_S * 1_000;
 
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
-}
-
 function carrierWire(frame) {
   return codec.encodeRelayV2WebSocketFrame("carrier", frame);
 }
@@ -66,14 +63,6 @@ function settle(turns = 12) {
     (tail) => tail.then(() => new Promise((resolve) => setImmediate(resolve))),
     Promise.resolve(),
   );
-}
-
-async function waitFor(condition, label) {
-  const deadline = Date.now() + 5_000;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
 }
 
 function privateHome(prefix) {
@@ -636,7 +625,7 @@ test("full chain reconciles registered credential orphan without replaying it to
     // 首轮 reconcile 是 open 的前置；周期 scan 由 lifecycle owner 自己的 timer 驱动。
     const startupCalls = h.discovery.state.calls;
     assert.ok(startupCalls >= 1);
-    await waitFor(() => h.discovery.state.calls > startupCalls, "periodic reconcile");
+    await waitFor(() => h.discovery.state.calls > startupCalls, { message: "timed out waiting for periodic reconcile" });
     assert.equal(h.native.state.openCalls, 1, "real native wrapper opened the cell once");
 
     // signal-before-start fails closed before any socket。

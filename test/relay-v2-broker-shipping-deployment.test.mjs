@@ -12,12 +12,13 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
+import { createServer as createHttpsServer } from "node:https";
 import { request as httpRequest } from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { reserveFreePort, postJson } from "./support/async.mjs";
 
 const relayServer = await import("../dist/relayServer.js");
 const deploymentSource = await import("../dist/relay/v2/brokerShippingDeploymentSource.js");
@@ -91,17 +92,6 @@ function makeHome(tag) {
   // The source requires trustedHome to equal its own canonical realpath; on
   // macOS the temp root itself is a symlink, so canonicalize the fresh home.
   return realpathSync.native(mkdtempSync(path.join(os.tmpdir(), tag)));
-}
-
-function reserveFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolve(port));
-    });
-  });
 }
 
 function connectRefused(port) {
@@ -372,40 +362,6 @@ function namespaceSnapshot(home) {
   return snapshot;
 }
 
-function postJson(port, requestPath, body) {
-  return new Promise((resolve, reject) => {
-    const payload = Buffer.from(JSON.stringify(body), "utf8");
-    const request = httpsRequest({
-      host: "127.0.0.1",
-      port,
-      path: requestPath,
-      method: "POST",
-      rejectUnauthorized: false,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        "Content-Length": String(payload.byteLength),
-      },
-    }, (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.once("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
-        let json = null;
-        try {
-          json = text === "" ? null : JSON.parse(text);
-        } catch {
-          // keep raw text only
-        }
-        resolve({ status: response.statusCode, json, text });
-      });
-    });
-    request.once("error", reject);
-    request.write(payload);
-    request.end();
-  });
-}
-
 function plainHttpGet(port) {
   return new Promise((resolve, reject) => {
     const request = httpRequest({ host: "127.0.0.1", port, path: "/health", method: "GET" }, (response) => {
@@ -542,7 +498,7 @@ test("fully provisioned trusted deployment starts the shipping root and closes c
         hostId: "deployment-host",
         hostEpoch: "deployment-epoch",
         hostInstanceId: "deployment-instance",
-      });
+      }, { rejectUnauthorized: false });
       assert.equal(redeemed.status, 200);
       assert.match(redeemed.json?.accessToken ?? "", /^twcap2\./);
     } finally {

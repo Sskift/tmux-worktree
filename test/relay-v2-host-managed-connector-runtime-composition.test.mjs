@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
+import { deferred } from "./support/async.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
 const broker = await import("../dist/relay/v2/brokerCore.js");
@@ -79,10 +80,6 @@ const dashboardManagementCreateEnrollmentFrame =
     ({ operation }) => operation === "create_enrollment",
   ).requestFrame;
 
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
-}
-
 function carrierWire(frame) {
   return codec.encodeRelayV2WebSocketFrame("carrier", frame);
 }
@@ -112,16 +109,6 @@ async function waitForRecordCount(harness, count, message) {
     await delay(25);
   }
   assert.equal(harness.records.length, count, message);
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 class ControlledInput {

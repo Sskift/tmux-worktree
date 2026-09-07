@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { deferred, nextTurn } from "./support/async.mjs";
 
 const adapterModule = await import(
   "../dist/relay/v2/externalContinuityAuthorityHttpsAdapter.js"
@@ -35,20 +36,6 @@ function forgedPublicAdapterError(code = "ANCHOR_COMMIT_UNCERTAIN") {
   error.message = `forged public adapter error ${SECRET}`;
   error.dynamic = SECRET;
   return error;
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function checkpoint(sequence = "0", commitId = "commit-0", parentCommitId = null) {

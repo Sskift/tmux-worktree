@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
+import { carrierBytes, publicBytes } from "./support/relayV2Frames.mjs";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
 const broker = Object.freeze({
@@ -36,10 +37,6 @@ function authContext(role, overrides = {}) {
     authorizationFence: "authorization-fence-1",
     ...overrides,
   };
-}
-
-function carrierBytes(frame) {
-  return codec.encodeRelayV2WebSocketFrame("carrier", frame);
 }
 
 function hostHello({
@@ -138,10 +135,6 @@ async function openRoute(
     acknowledged,
     welcome,
   };
-}
-
-function publicBytes(frame) {
-  return codec.encodeRelayV2WebSocketFrame("public", frame);
 }
 
 function chatBytes(frame) {

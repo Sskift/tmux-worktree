@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createCipheriv, createHash } from "node:crypto";
 import test from "node:test";
 import { InMemoryRelayV2BrokerCredentialStateStore } from "./support/inMemoryRelayV2BrokerCredentialStateStore.mjs";
+import { deferred } from "./support/async.mjs";
 
 const credential = await import("../dist/relay/v2/brokerCredentialAuthority.js");
 const issuer = await import("../dist/relay/v2/issuer.js");
@@ -103,12 +104,6 @@ function authorityOptions(store, external, overrides = {}) {
 function errorCode(code) {
   return (error) => error instanceof credential.RelayV2BrokerCredentialAuthorityError
     && error.code === code;
-}
-
-function deferred() {
-  let resolve;
-  const promise = new Promise((settle) => { resolve = settle; });
-  return { promise, resolve };
 }
 
 function hostContext(overrides = {}) {

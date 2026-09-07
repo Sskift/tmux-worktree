@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { build } from "esbuild";
+import { deferred } from "./support/async.mjs";
 
 const compiled = await build({
   stdin: {
@@ -104,16 +105,6 @@ function coordinator(authority, httpsAdapter) {
     authority,
     httpsAdapter,
   });
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 class OwnerBoundStorage {

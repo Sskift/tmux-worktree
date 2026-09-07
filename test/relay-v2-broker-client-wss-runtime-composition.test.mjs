@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { IncomingMessage } from "node:http";
 import { Duplex } from "node:stream";
 import test from "node:test";
+import { carrierBytes } from "./support/relayV2Frames.mjs";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
 const codec = await import("../dist/relay/v2/codec.js");
@@ -32,10 +33,6 @@ function authContext(role, overrides = {}) {
     authorizationFence: "authorization-fence-1",
     ...overrides,
   };
-}
-
-function carrierBytes(frame) {
-  return codec.encodeRelayV2WebSocketFrame("carrier", frame);
 }
 
 function publicBytes(streamId = randomUUID()) {

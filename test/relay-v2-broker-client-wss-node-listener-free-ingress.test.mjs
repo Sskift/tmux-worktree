@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { IncomingMessage } from "node:http";
 import { Duplex } from "node:stream";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
+import { carrierBytes } from "./support/relayV2Frames.mjs";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
-const codec = await import("../dist/relay/v2/codec.js");
 const compositionModule = await import(
   "../dist/relay/v2/brokerClientWssRuntimeComposition.js"
 );
@@ -26,16 +27,6 @@ const STATUS_LINES = Object.freeze({
   426: "HTTP/1.1 426 Upgrade Required",
   503: "HTTP/1.1 503 Service Unavailable",
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((settle, fail) => {
-    resolve = settle;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
 
 async function settle(turns = 8) {
   for (let index = 0; index < turns; index += 1) await Promise.resolve();
@@ -129,10 +120,6 @@ function hostHello() {
       limits: { maxFrameBytes: 1_048_576, terminalMaxFrameBytes: 65_536 },
     },
   };
-}
-
-function carrierBytes(frame) {
-  return codec.encodeRelayV2WebSocketFrame("carrier", frame);
 }
 
 function clientScheduler() {

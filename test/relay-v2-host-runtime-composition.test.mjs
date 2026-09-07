@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
+import { loadRelayV2FixtureCorpus, fixture } from "./support/relayV2Fixtures.mjs";
 
 const codec = await import("../dist/relay/v2/codec.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
@@ -17,10 +17,6 @@ const terminalManagerModule = await import("../dist/relay/v2/terminalManager.js"
 
 const HOST_ID = "mac-admin";
 const corpus = loadRelayV2FixtureCorpus();
-
-function fixture(name) {
-  return structuredClone(corpus.goldenByName.get(name).frame);
-}
 
 function binding(overrides = {}) {
   return Object.freeze({

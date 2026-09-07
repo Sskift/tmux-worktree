@@ -27,6 +27,7 @@ import {
 import {
   decodeRelayV2DashboardManagementProtocolV2Request,
 } from "../dist/relay/v2/relayV2DashboardManagementProtocolV2.js";
+import { deferred, nextTurn } from "./support/async.mjs";
 
 const NOW_MS = 1_783_700_000_000;
 const activateComposition =
@@ -54,20 +55,6 @@ const IDS = Object.freeze({
   create: "dmgmt2.ocsJ9anwzHRz4iyXdA5cjA",
   revoke: "dmgmt2._rgZ2FBzDmkt9MwqnM3uDg",
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
 
 function request(operation, input = null) {
   const requestId = {

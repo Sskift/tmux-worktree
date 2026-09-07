@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { deferred } from "./support/async.mjs";
 
 const handoffModule = await import(
   "../dist/relay/v2/hostBootstrapSecretHandoff.js"
@@ -13,16 +14,6 @@ const MAX_BOOTSTRAP_SECRET = `twhostboot2.${"a".repeat(8_192 - 12)}`;
 
 function bytes(value) {
   return Uint8Array.from(Buffer.from(value, "utf8"));
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((settle, fail) => {
-    resolve = settle;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
 }
 
 function recordedIntake(handoff) {

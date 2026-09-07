@@ -6,6 +6,18 @@ export function readRelayV2ContractJson(path) {
   return JSON.parse(readFileSync(new URL(path, contractRoot), "utf8"));
 }
 
+let goldenCorpus;
+
+// Convenience accessor: a structuredClone'd golden frame by name.
+// Uses a lazily-loaded corpus; tests that need the full corpus (golden list,
+// invalid cases, dialect outcomes) should still call loadRelayV2FixtureCorpus().
+export function fixture(name) {
+  goldenCorpus ??= loadRelayV2FixtureCorpus();
+  const entry = goldenCorpus.goldenByName.get(name);
+  if (!entry) throw new Error("unknown Relay v2 golden fixture " + name);
+  return structuredClone(entry.frame);
+}
+
 export function loadRelayV2FixtureCorpus() {
   const manifest = readRelayV2ContractJson("manifest.json");
   const golden = manifest.files

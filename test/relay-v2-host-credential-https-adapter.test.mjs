@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { deferred, nextTurn } from "./support/async.mjs";
 
 const require = createRequire(import.meta.url);
 const mutableNodeHttps = require("node:https");
@@ -276,20 +277,6 @@ const REFRESH_RESPONSE = Object.freeze({
   refreshAttemptId: REFRESH_REQUEST.refreshAttemptId,
   ...CREDENTIAL_FIELDS,
 });
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-function nextTurn() {
-  return new Promise((resolve) => setImmediate(resolve));
-}
 
 function jsonBytes(value) {
   return Buffer.from(

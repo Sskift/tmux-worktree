@@ -11,13 +11,14 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
+import { createServer as createHttpsServer } from "node:https";
 import { request as httpRequest } from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import tls from "node:tls";
+import { deferred, reserveFreePort, waitFor, postJson } from "./support/async.mjs";
 
 const relayServer = await import("../dist/relayServer.js");
 const hostBootstrapOutput = await import("../dist/relay/broker/hostBootstrapOutput.js");
@@ -84,35 +85,6 @@ uA137IKJfJTsWJ9kfbi/blRYjhwLtRYjiOMg3hFcPGOBJq9HBY8SK70=
 
 function copy(value) {
   return structuredClone(value);
-}
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
-async function waitFor(predicate, timeoutMs = 5_000) {
-  const started = Date.now();
-  while (!predicate()) {
-    if (Date.now() - started > timeoutMs) throw new Error("waitFor timed out");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function reserveFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolve(port));
-    });
-  });
 }
 
 function connectRefused(port) {
@@ -459,40 +431,6 @@ function startableSingleNodeShipping(
   });
 }
 
-function postJson(port, requestPath, body, { method = "POST" } = {}) {
-  return new Promise((resolve, reject) => {
-    const payload = body === null ? null : Buffer.from(JSON.stringify(body), "utf8");
-    const request = httpsRequest({
-      host: "127.0.0.1",
-      port,
-      path: requestPath,
-      method,
-      rejectUnauthorized: false,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        ...(payload === null ? {} : { "Content-Length": String(payload.byteLength) }),
-      },
-    }, (response) => {
-      const chunks = [];
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.once("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
-        let json = null;
-        try {
-          json = text === "" ? null : JSON.parse(text);
-        } catch {
-          // keep raw text only
-        }
-        resolve({ status: response.statusCode, json, text });
-      });
-    });
-    request.once("error", reject);
-    if (payload !== null) request.write(payload);
-    request.end();
-  });
-}
-
 function plainHttpGet(port) {
   return new Promise((resolve, reject) => {
     const request = httpRequest({ host: "127.0.0.1", port, path: "/health", method: "GET" }, (response) => {
@@ -740,9 +678,9 @@ test("durable authorities open before listen and only the frozen public surface 
     await assert.rejects(plainHttpGet(handle.port));
 
     // The public route carries no admin issuance surface at all.
-    const unknownAdmin = await postJson(handle.port, "/v2/admin/bootstrap", {});
+    const unknownAdmin = await postJson(handle.port, "/v2/admin/bootstrap", {}, { rejectUnauthorized: false });
     assert.equal(unknownAdmin.status, 404);
-    const getBootstrap = await postJson(handle.port, "/v2/hosts/bootstrap", null, { method: "GET" });
+    const getBootstrap = await postJson(handle.port, "/v2/hosts/bootstrap", null, { method: "GET", rejectUnauthorized: false });
     assert.equal(getBootstrap.status, 404);
   } finally {
     await handle.shutdown();
@@ -816,7 +754,7 @@ test("privileged admin seam delivers bootstrap secret only to the sink and reuse
       hostId: "shipping-host",
       hostEpoch: "shipping-epoch",
       hostInstanceId: "shipping-instance",
-    });
+    }, { rejectUnauthorized: false });
     assert.equal(redeemed.status, 200);
     assert.match(redeemed.json?.accessToken ?? "", /^twcap2\./);
     assert.match(redeemed.json?.refreshToken ?? "", /^twref2\./);
@@ -828,7 +766,7 @@ test("privileged admin seam delivers bootstrap secret only to the sink and reuse
       hostId: "shipping-host",
       hostEpoch: "shipping-epoch",
       hostInstanceId: "shipping-instance",
-    });
+    }, { rejectUnauthorized: false });
     assert.equal(replayed.status, 401);
 
     // A throwing or async sink fails closed and the token never leaves.
@@ -1016,7 +954,7 @@ test("shutdown fences public admission synchronously, then drains admin in-fligh
   const bootstrap = handle.admin.createHostBootstrap({}, (secret) => sinkSecrets.push(secret));
   await waitFor(() => shipping.events.filter((event) => (
     event === "transport.start:broker-credential.v1:compare_and_swap"
-  )).length > casEventsBefore);
+  )).length > casEventsBefore, { message: "waitFor timed out" });
 
   const shutdown = handle.shutdown();
   // Public admission is fenced synchronously before the admin drain finishes:
@@ -1028,7 +966,7 @@ test("shutdown fences public admission synchronously, then drains admin in-fligh
     hostId: "shipping-host",
     hostEpoch: "shipping-epoch",
     hostInstanceId: "shipping-instance",
-  });
+  }, { rejectUnauthorized: false });
   assert.equal(rejectedHttp.status, 503);
   assert.match(await probeUpgrade(handle.port, "/client"), /^HTTP\/1\.1 503/);
   assert.match(await probeUpgrade(handle.port, "/host"), /^HTTP\/1\.1 503/);
