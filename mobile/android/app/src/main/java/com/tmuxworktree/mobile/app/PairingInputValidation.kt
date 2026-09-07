@@ -3,8 +3,6 @@ package com.tmuxworktree.mobile.app
 import java.net.URI
 
 internal object PairingInputValidator {
-    fun normalizeRelayUrl(value: String): String = value.trim().removeSuffix("/")
-
     fun relayUrlError(
         relayUrl: String,
         allowDebugLoopbackCleartext: Boolean,
