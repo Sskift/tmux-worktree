@@ -81,7 +81,7 @@ type CarrierSend = Readonly<{
 
 type OutboundSend = DirectSend | CarrierSend;
 
-interface RelayV2BrokerHostWssOwnerSession {
+export interface RelayV2BrokerHostWssOwnerSession {
   readonly transportId: string;
   readonly connectionIncarnation: string;
   readonly producerGeneration: string;

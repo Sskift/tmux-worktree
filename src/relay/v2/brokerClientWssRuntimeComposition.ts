@@ -52,6 +52,7 @@ import {
   bindRelayV2BrokerHostWssRuntimeFacade,
   type RelayV2BrokerHostWssRuntimeFacade,
   type RelayV2BrokerHostWssRuntimeOwnerBinding,
+  type RelayV2BrokerHostWssOwnerSession,
 } from "./brokerHostWssRuntimeComposition.js";
 import type { RelayV2CarrierPumpBrokerPort } from "./carrierPump.js";
 import {
@@ -788,27 +789,6 @@ function relayV2HostProducerAction(action: RelayV2BrokerAction): boolean {
     || action.kind === "close_host"
     || action.kind === "pause_host_route"
     || action.kind === "resume_host_route";
-}
-
-interface RelayV2BrokerHostWssOwnerSession {
-  readonly transportId: string;
-  readonly connectionIncarnation: string;
-  readonly producerGeneration: string;
-  attach(authContext: RelayV2BrokerConnectionAuthorization): void;
-  registerExpiry(): void;
-  receiveHostFrame(bytes: Uint8Array, signal: AbortSignal): Promise<RelayV2BrokerProducerReceipt>;
-  drainHostCarrier(options: Readonly<{
-    maxFrames: number;
-    maxBytes: number;
-    controlOnly?: boolean;
-  }>): readonly import("./brokerCore.js").RelayV2CarrierDelivery[];
-  acknowledgeHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
-  rejectHostControlDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
-  acknowledgeHostDelivery(deliveryId: string): RelayV2BrokerProducerReceipt;
-  disconnectHost(): RelayV2BrokerProducerReceipt;
-  beginProducerClose(barrier: Promise<unknown>): void;
-  terminalAndUnregister(): Promise<void>;
-  rollbackConstruction(): Promise<void>;
 }
 
 class RelayV2BrokerHostWssOwnerSessionImpl
