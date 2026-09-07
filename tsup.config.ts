@@ -56,6 +56,9 @@ export default defineConfig({
     "src/relay/v2/resourceState.ts",
     "src/relay/v2/stateSnapshotSpool.ts",
     "src/relay/v2/issuer.ts",
+    // Test seam: test/relay-v2-broker-identifier-hardening.test.mjs pins the
+    // identifier hardening against this pure helper directly.
+    "src/relay/v2/token.ts",
     "src/relay/v2/auth.ts",
     "src/relay/v2/continuityAnchor.ts",
     "src/relay/v2/externalContinuityAuthorityHttpsAdapter.ts",
@@ -69,6 +72,9 @@ export default defineConfig({
     "src/relay/v2/relayV2DashboardManagementProtocolV2.ts",
     "src/relay/v2/relayV2DashboardManagementAuthority.ts",
     "src/relay/v2/relayV2DashboardManagementHostConnectorAdapter.ts",
+    // Test seam: test/relay-v2-dashboard-management-host-credential-adapter.test.mjs
+    // imports the built adapter instead of compiling src at test time.
+    "src/relay/v2/relayV2DashboardManagementHostCredentialAdapter.ts",
     "src/relay/v2/relayV2DashboardManagementComposition.ts",
     "src/relay/v2/relayV2DashboardManagementStdio.ts",
     "src/relay/v2/relayV2DashboardManagementProtocolV2CompositionSession.ts",
