@@ -7,7 +7,7 @@ use super::{
 use crate::config::{find_host, load_hosts};
 use crate::ipc::{OpenArgs, PtyChunk, PtyExit};
 use crate::remote::HostConfig;
-use crate::support::{app_home_dir, resolve_cmd};
+use crate::support::{app_home_dir, remote_path_expr, resolve_cmd, shell_quote};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -68,33 +68,6 @@ fn ssh_destination(args: &[String]) -> Option<&str> {
     args.get(marker + 1).map(String::as_str)
 }
 
-fn shell_quote_arg(value: &str) -> String {
-    if value.is_empty() {
-        "''".to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-fn remote_shell_path_expr(value: &str) -> String {
-    let trimmed = value.trim();
-    let trimmed = if trimmed.is_empty() { "tmux" } else { trimmed };
-    if trimmed == "~" {
-        return "\"$HOME\"".to_string();
-    }
-    if let Some(path) = trimmed.strip_prefix("~/") {
-        let mut escaped = String::new();
-        for character in path.chars() {
-            if matches!(character, '"' | '\\' | '$' | '`') {
-                escaped.push('\\');
-            }
-            escaped.push(character);
-        }
-        return format!("\"$HOME/{escaped}\"");
-    }
-    shell_quote_arg(trimmed)
-}
-
 fn managed_ssh_attach_args(host: &HostConfig, session: &str) -> Vec<String> {
     let mut args = vec![
         "-tt".to_string(),
@@ -122,8 +95,13 @@ fn managed_ssh_attach_args(host: &HostConfig, session: &str) -> Vec<String> {
     if let Some(user) = host.user.as_deref() {
         args.extend(["-l".to_string(), user.to_string()]);
     }
-    let exact = shell_quote_arg(&format!("={session}"));
-    let tmux = remote_shell_path_expr(host.tmux_path.as_deref().unwrap_or("tmux"));
+    let exact = shell_quote(&format!("={session}"));
+    let tmux_path = host.tmux_path.as_deref().unwrap_or("tmux");
+    let tmux = remote_path_expr(if tmux_path.trim().is_empty() {
+        "tmux"
+    } else {
+        tmux_path
+    });
     args.extend([
         "--".to_string(),
         host.host.clone(),
