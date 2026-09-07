@@ -1,5 +1,3 @@
-import { types as nodeTypes } from "node:util";
-
 import {
   RELAY_V2_HOST_CREDENTIAL_VAULT_MAX_ENVELOPE_BYTES,
   type RelayV2HostCredentialAtomicByteCellCasResult,
@@ -10,8 +8,12 @@ import {
 import type {
   RelayV2HostCredentialAtomicByteCellOwner,
 } from "./hostPrivilegedProductionIntakeComposition.js";
-
-const promisePrototypeThen = Promise.prototype.then;
+import {
+  rejectedProxy,
+  copyReplacement,
+  isAsynchronousResultWithoutAssimilation,
+  runCredentialCellExclusive,
+} from "./hostCredentialCellGuards.js";
 
 export type RelayV2HostLocalDevelopmentCredentialCellErrorCode =
   | "OPERATION_INVALID"
@@ -54,53 +56,6 @@ function failure(
   return new RelayV2HostLocalDevelopmentCredentialCellError(code);
 }
 
-function rejectedProxy(value: unknown): boolean {
-  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
-    return false;
-  }
-  try {
-    return nodeTypes.isProxy(value);
-  } catch {
-    return true;
-  }
-}
-
-function copyReplacement(value: unknown): Uint8Array {
-  if (!(value instanceof Uint8Array)
-    || rejectedProxy(value)
-    || value.byteLength > RELAY_V2_HOST_CREDENTIAL_VAULT_MAX_ENVELOPE_BYTES) {
-    throw failure("REPLACEMENT_INVALID");
-  }
-  return Uint8Array.from(value);
-}
-
-function isAsynchronousResultWithoutAssimilation(value: unknown): boolean {
-  if (nodeTypes.isPromise(value)) {
-    try {
-      void promisePrototypeThen.call(value, undefined, () => undefined);
-    } catch {
-      return true;
-    }
-    return true;
-  }
-  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
-    return false;
-  }
-  let current: object | null = value as object;
-  try {
-    while (current !== null) {
-      if (nodeTypes.isProxy(current)) return true;
-      const descriptor = Object.getOwnPropertyDescriptor(current, "then");
-      if (descriptor !== undefined) {
-        return descriptor.get !== undefined || typeof descriptor.value === "function";
-      }
-      current = Object.getPrototypeOf(current) as object | null;
-    }
-  } catch {
-    return true;
-  }
-  return false;
-}
 
 /**
  * Process-local, non-durable atomic cell used only by the explicit
@@ -145,7 +100,7 @@ export function createRelayV2HostLocalDevelopmentCredentialCell(
       throw failure("REVISION_INVALID");
     }
     revision.consumed = true;
-    const copied = copyReplacement(replacement);
+    const copied = copyReplacement(replacement, () => failure("REPLACEMENT_INVALID"));
     if (revision.generation !== generation) {
       return Object.freeze({ status: "conflict", current: read() });
     }
@@ -160,23 +115,14 @@ export function createRelayV2HostLocalDevelopmentCredentialCell(
 
   const runExclusive = <T>(
     operation: (value: RelayV2HostCredentialAtomicByteCellTransaction) => T,
-  ): T => {
-    if (lifecycle !== "open") throw failure("CLOSED");
-    if (active) throw failure("REENTRANT");
-    if (typeof operation !== "function"
-      || rejectedProxy(operation)
-      || nodeTypes.isAsyncFunction(operation)) throw failure("OPERATION_INVALID");
-    active = true;
-    try {
-      const result = Reflect.apply(operation, undefined, [transaction]) as T;
-      if (isAsynchronousResultWithoutAssimilation(result)) {
-        throw failure("ASYNC_OPERATION_UNSUPPORTED");
-      }
-      return result;
-    } finally {
-      active = false;
-    }
-  };
+  ): T => runCredentialCellExclusive({
+    lifecycle,
+    active,
+    transaction,
+    operation,
+    failure,
+    setActive: (value) => { active = value; },
+  });
   const closeAndDrain = (): Promise<void> => {
     if (closePromise !== null) return closePromise;
     lifecycle = "closed";
