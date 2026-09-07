@@ -46,8 +46,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -443,5 +445,125 @@ private fun CreationPrimaryButton(
             textAlign = TextAlign.Center,
             modifier = Modifier.testTag("${testTag}_label"),
         )
+    }
+}
+
+/**
+ * Labeled dropdown selector shared by the terminal and worktree creation forms.
+ *
+ * [optionEnabled] only dims and disables individual menu items; the field itself stays
+ * clickable so the user can still inspect the options.
+ */
+@Composable
+internal fun <T> SelectorField(
+    label: String,
+    selectedValue: String,
+    placeholder: String,
+    icon: ImageVector,
+    options: List<T>,
+    optionLabel: @Composable (T) -> String,
+    optionId: (T) -> String,
+    error: String?,
+    testTag: String,
+    optionTagPrefix: String,
+    onSelected: (T) -> Unit,
+    enabled: Boolean = true,
+    optionEnabled: (T) -> Boolean = { true },
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = label,
+            color = TwTextSecondary,
+            style = MaterialTheme.typography.labelMedium,
+        )
+        Spacer(Modifier.height(6.dp))
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            Surface(
+                onClick = { expanded = true },
+                enabled = enabled,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .testTag(testTag)
+                    .semantics {
+                        role = Role.Button
+                        contentDescription = "$label, ${selectedValue.ifBlank { placeholder }}"
+                        stateDescription = if (expanded) "Expanded" else "Collapsed"
+                    },
+                shape = RoundedCornerShape(12.dp),
+                color = Color.Transparent,
+                border = BorderStroke(1.dp, if (error == null) TwBorder else TwError),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = if (enabled) TwTextSecondary else TwTextMuted,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = selectedValue.ifBlank { placeholder },
+                        color = when {
+                            !enabled -> TwTextMuted
+                            selectedValue.isBlank() -> TwTextSecondary
+                            else -> TwTextPrimary
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        imageVector = Icons.Outlined.ExpandMore,
+                        contentDescription = null,
+                        tint = if (enabled) TwTextSecondary else TwTextMuted,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier
+                    .width(maxWidth)
+                    .background(TwSurfaceRaised),
+            ) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = optionLabel(option),
+                                color = if (optionEnabled(option)) TwTextPrimary else TwTextMuted,
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
+                        },
+                        onClick = {
+                            expanded = false
+                            onSelected(option)
+                        },
+                        enabled = optionEnabled(option),
+                        modifier = Modifier.testTag("${optionTagPrefix}_${optionId(option)}"),
+                    )
+                }
+            }
+        }
+        if (error != null) {
+            Text(
+                text = error,
+                color = TwError,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier
+                    .padding(start = 12.dp, top = 4.dp)
+                    .semantics {
+                        liveRegion = LiveRegionMode.Assertive
+                        contentDescription = "Field error: $error"
+                    },
+            )
+        }
     }
 }

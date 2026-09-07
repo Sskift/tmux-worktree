@@ -291,7 +291,7 @@ private fun NewTerminalFormContent(
     onLabelChange: (String) -> Unit,
     onCreate: () -> Unit,
 ) {
-    NewTerminalSelector(
+    SelectorField(
         label = "Computer",
         selectedValue = selectedHost?.displayName.orEmpty(),
         placeholder = "Choose an online computer",
@@ -306,7 +306,7 @@ private fun NewTerminalFormContent(
         onSelected = onHostSelected,
     )
     Spacer(Modifier.height(16.dp))
-    NewTerminalSelector(
+    SelectorField(
         label = "Scope",
         selectedValue = selectedScope?.label.orEmpty(),
         placeholder = if (form.hostId.isBlank()) {
@@ -370,106 +370,6 @@ private fun NewTerminalFormContent(
         onImeAction = onCreate,
         testTag = "new_terminal_label",
     )
-}
-
-@Composable
-private fun <T> NewTerminalSelector(
-    label: String,
-    selectedValue: String,
-    placeholder: String,
-    icon: ImageVector,
-    options: List<T>,
-    optionLabel: (T) -> String,
-    optionId: (T) -> String,
-    error: String?,
-    enabled: Boolean,
-    testTag: String,
-    optionTagPrefix: String,
-    onSelected: (T) -> Unit,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Text(
-            text = label,
-            color = TwTextSecondary,
-            style = MaterialTheme.typography.labelMedium,
-        )
-        Spacer(Modifier.height(6.dp))
-        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-            Surface(
-                onClick = { expanded = true },
-                enabled = enabled,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 56.dp)
-                    .testTag(testTag)
-                    .semantics {
-                        role = Role.Button
-                        contentDescription = "$label, ${selectedValue.ifBlank { placeholder }}"
-                        stateDescription = if (expanded) "Expanded" else "Collapsed"
-                    },
-                shape = RoundedCornerShape(12.dp),
-                color = Color.Transparent,
-                border = BorderStroke(1.dp, if (error == null) TwBorder else TwError),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        imageVector = icon,
-                        contentDescription = null,
-                        tint = if (enabled) TwTextSecondary else TwTextMuted,
-                        modifier = Modifier.size(22.dp),
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        text = selectedValue.ifBlank { placeholder },
-                        color = when {
-                            !enabled -> TwTextMuted
-                            selectedValue.isBlank() -> TwTextSecondary
-                            else -> TwTextPrimary
-                        },
-                        style = MaterialTheme.typography.bodyLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Icon(
-                        imageVector = Icons.Outlined.ExpandMore,
-                        contentDescription = null,
-                        tint = if (enabled) TwTextSecondary else TwTextMuted,
-                        modifier = Modifier.size(22.dp),
-                    )
-                }
-            }
-            DropdownMenu(
-                expanded = expanded,
-                onDismissRequest = { expanded = false },
-                modifier = Modifier
-                    .width(maxWidth)
-                    .background(TwSurfaceRaised),
-            ) {
-                options.forEach { option ->
-                    DropdownMenuItem(
-                        text = {
-                            Text(
-                                text = optionLabel(option),
-                                color = TwTextPrimary,
-                                style = MaterialTheme.typography.bodyLarge,
-                            )
-                        },
-                        onClick = {
-                            expanded = false
-                            onSelected(option)
-                        },
-                        modifier = Modifier.testTag("${optionTagPrefix}_${optionId(option)}"),
-                    )
-                }
-            }
-        }
-        NewTerminalFieldError(error)
-    }
 }
 
 @Composable
