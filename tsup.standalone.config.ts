@@ -29,5 +29,7 @@ export default defineConfig({
   loader: {
     ".md": "text",
     ".yaml": "text",
+    ".html": "text",
+    ".py": "text",
   },
 });
