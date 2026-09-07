@@ -24,6 +24,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.jsonObject
 import com.tmuxworktree.mobile.core.relay.v2.codec.jsonOneOf
 import com.tmuxworktree.mobile.core.relay.v2.codec.jsonString
 import com.tmuxworktree.mobile.core.relay.v2.codec.required
+import com.tmuxworktree.mobile.core.relay.v2.codec.validateRelayV2Envelope
 import com.tmuxworktree.mobile.core.relay.v2.codec.schemaFailure
 import java.nio.charset.StandardCharsets
 import java.util.Base64
@@ -673,14 +674,13 @@ class AgentChatV2Codec {
                 "payload",
             ),
         )
-        jsonLiteral(required(frame, "protocolVersion"), 2)
-        jsonLiteral(required(frame, "kind"), "request")
-        jsonLiteral(required(frame, "type"), type)
-        id(required(frame, "requestId"))
-        id(required(frame, "hostId"))
-        id(required(frame, "expectedHostEpoch"))
-        id(required(frame, "scopeId"))
-        id(required(frame, "sessionId"))
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = "request",
+            expectedType = type,
+            idFields = listOf("requestId", "hostId", "expectedHostEpoch", "scopeId", "sessionId"),
+            validateId = ::id,
+        )
     }
 
     private fun responseRoot(frame: RelayV2JsonObject, type: String) {
@@ -698,14 +698,13 @@ class AgentChatV2Codec {
                 "payload",
             ),
         )
-        jsonLiteral(required(frame, "protocolVersion"), 2)
-        jsonLiteral(required(frame, "kind"), "response")
-        jsonLiteral(required(frame, "type"), type)
-        id(required(frame, "requestId"))
-        id(required(frame, "hostId"))
-        id(required(frame, "hostEpoch"))
-        id(required(frame, "scopeId"))
-        id(required(frame, "sessionId"))
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = "response",
+            expectedType = type,
+            idFields = listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId"),
+            validateId = ::id,
+        )
     }
 
     private fun eventRoot(frame: RelayV2JsonObject, type: String) {
@@ -722,13 +721,13 @@ class AgentChatV2Codec {
                 "payload",
             ),
         )
-        jsonLiteral(required(frame, "protocolVersion"), 2)
-        jsonLiteral(required(frame, "kind"), "event")
-        jsonLiteral(required(frame, "type"), type)
-        id(required(frame, "hostId"))
-        id(required(frame, "hostEpoch"))
-        id(required(frame, "scopeId"))
-        id(required(frame, "sessionId"))
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = "event",
+            expectedType = type,
+            idFields = listOf("hostId", "hostEpoch", "scopeId", "sessionId"),
+            validateId = ::id,
+        )
     }
 
     private fun errorRoot(frame: RelayV2JsonObject) {
@@ -747,15 +746,14 @@ class AgentChatV2Codec {
                 "error",
             ),
         )
-        jsonLiteral(required(frame, "protocolVersion"), 2)
-        jsonLiteral(required(frame, "kind"), "response")
-        jsonLiteral(required(frame, "type"), "error")
+        validateRelayV2Envelope(
+            frame,
+            expectedKind = "response",
+            expectedType = "error",
+            idFields = listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId"),
+            validateId = ::id,
+        )
         jsonNull(required(frame, "payload"))
-        id(required(frame, "requestId"))
-        id(required(frame, "hostId"))
-        id(required(frame, "hostEpoch"))
-        id(required(frame, "scopeId"))
-        id(required(frame, "sessionId"))
     }
 
     private fun id(value: Any?): String = stringValue(value, maxBytes = MAX_ID_BYTES)
